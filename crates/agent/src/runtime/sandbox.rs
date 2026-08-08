@@ -121,16 +121,6 @@ impl SandboxAdapter {
     /// owns, which by construction lives outside baybo's workspace and may
     /// live outside `$HOME` too — in which case the permissive bind set
     /// does not cover it and the directory is simply absent.
-    ///
-    /// Unlike [`Self::with_readable_paths`], an unresolvable path is
-    /// **kept** rather than dropped. Dropping it would hand the command a
-    /// sandbox that silently lacks the one directory it was supposed to
-    /// work in; keeping it makes the backend fail the call outright, which
-    /// is the failure everyone can see.
-    ///
-    /// These binds cannot widen the denylist: under `Permissive` the
-    /// backend applies them *before* the masking layer, so naming a
-    /// directory here never re-opens a credential vault beneath it.
     pub fn with_writable_paths(mut self, paths: Vec<PathBuf>) -> Self {
         self.writable_paths = paths
             .into_iter()
@@ -424,10 +414,6 @@ mod tests {
 
     #[tokio::test]
     async fn writable_paths_round_trip_and_keep_a_path_that_cannot_be_resolved() {
-        // The asymmetry with `readable_paths` is the point: a skill tree
-        // that isn't there is a no-op, but a checkout that isn't there
-        // means the run would work somewhere else entirely, so the path
-        // survives and the backend refuses the call.
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let checkout = tempfile::tempdir().expect("checkout tempdir");
         let missing = PathBuf::from("/definitely/not/here");

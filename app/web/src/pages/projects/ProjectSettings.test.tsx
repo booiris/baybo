@@ -5,9 +5,6 @@ import userEvent from '@testing-library/user-event';
 import { ProjectSettings } from './ProjectSettings';
 import type { Project } from './boardModel';
 
-// The wiring the parser test can't reach: that an emptied box removes the
-// ceiling rather than leaving it, and that an archived board is read-only
-// but still un-archivable.
 
 const api = vi.hoisted(() => ({ updateProject: vi.fn(), setProjectArchived: vi.fn() }));
 vi.mock('./api', () => api);
@@ -60,8 +57,6 @@ describe('ProjectSettings', () => {
   });
 
   it('sends null when the box is emptied, so a ceiling can be removed', async () => {
-    // The update is a full replace, so omitting the key would mean "leave
-    // it" — and there would be no way to go back to unlimited.
     render(
       <ProjectSettings
         project={project({ daily_budget_micros: 5_000_000 })}

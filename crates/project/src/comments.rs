@@ -1,18 +1,4 @@
 //! What happens when somebody says something on an issue.
-//!
-//! Pure, like [`crate::runs::triggers_run`] and
-//! [`crate::timeline::diff_events`]: one function, so the manager's own
-//! write path and the agent-facing `IssueComment` tool — which reports the
-//! delivery back to the model that commented — give the same answer.
-//!
-//! The web composer is **not** one of those callers. It says what a comment
-//! will do while it is still being typed, so it cannot ask the server:
-//! `commentHint` in `app/web/src/pages/projects/timelineModel.ts` is a
-//! hand-written mirror of [`comment_delivery`], and nothing but the two
-//! test suites holds the pair together. A change here — a new column that
-//! counts as live work, a run state that reads as idle — is a change there
-//! in the same commit, or the board wakes an agent while the composer is
-//! still promising "Records only".
 
 use baybo_store::project::{IssueRow, IssueStatus, RunStatus};
 
@@ -36,9 +22,6 @@ pub enum CommentDelivery {
     AfterCurrentRun,
 }
 
-/// The columns where an assignee is understood to be working. Backlog is
-/// not yet and Done is no longer — a comment there is a note for later,
-/// not an instruction.
 fn is_live_work(status: IssueStatus) -> bool {
     matches!(
         status,
@@ -47,9 +30,6 @@ fn is_live_work(status: IssueStatus) -> bool {
 }
 
 /// Decide a comment's delivery.
-///
-/// `live_run` is the issue's unsettled run, if it has one — at most one by
-/// construction (the per-issue partial unique index).
 pub(crate) fn comment_delivery(issue: &IssueRow, live_run: Option<RunStatus>) -> CommentDelivery {
     if issue.assignee.is_none() || issue.cancelled_at.is_some() || !is_live_work(issue.status) {
         return CommentDelivery::RecordOnly;
@@ -103,8 +83,6 @@ mod tests {
 
     #[test]
     fn parked_work_records_even_with_an_assignee() {
-        // Backlog is not yet and Done is no longer. Waking an agent to read
-        // a note on finished work is the board acting on its own.
         for status in [IssueStatus::Backlog, IssueStatus::Done] {
             assert_eq!(
                 comment_delivery(&issue(status, true), None),
@@ -136,8 +114,6 @@ mod tests {
                 CommentDelivery::Wake,
                 "{status:?}"
             );
-            // A settled run leaves the issue idle again, so the next
-            // comment starts a fresh one rather than being swallowed.
             assert_eq!(
                 comment_delivery(&issue(status, true), Some(RunStatus::Done)),
                 CommentDelivery::Wake
@@ -147,9 +123,6 @@ mod tests {
 
     #[test]
     fn a_run_that_has_not_started_yet_reads_the_comment_itself() {
-        // The queued run assembles its brief when it starts, so it picks
-        // this up. Enqueuing a second would be two agents on one card —
-        // which the dedupe index would refuse anyway, losing the comment.
         assert_eq!(
             comment_delivery(
                 &issue(IssueStatus::InProgress, true),

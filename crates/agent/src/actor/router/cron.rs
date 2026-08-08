@@ -538,12 +538,6 @@ impl Router {
                     project_id: event.project_id.clone(),
                 },
                 match event.project_id.as_ref() {
-                    // A board-bound fire runs as that board's lead, not as
-                    // whoever scheduled it. Not cosmetic: the timeline
-                    // records `IssueActor::Agent(ctx.agent_id)` and renders
-                    // a non-teammate as a raw ULID, so an inherited binding
-                    // would file cards signed by a 26-character id — and
-                    // run on the wrong persona and memory partition.
                     Some(project) => self.lead_binding(project).await?,
                     None => {
                         self.inherited_binding(event.origin_session_id.as_ref())

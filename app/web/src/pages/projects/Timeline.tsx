@@ -49,13 +49,6 @@ function Comment({ event, now }: { event: IssueEvent; now: number }) {
   );
 }
 
-/**
- * A prompt a run is blocked on, answerable from the card.
- *
- * Rendered above the composer rather than in timeline order: it is the one
- * entry that is a *question*, and burying a question thirty rows up is how
- * a card sits stuck for an hour with the answer one click away.
- */
 function PendingApproval({
   approval,
   onResolve,
@@ -109,13 +102,6 @@ function PendingApproval({
   );
 }
 
-/**
- * The issue's history and the place to add to it.
- *
- * Comments are shown; everything else is narrated in one line. The two
- * read differently on purpose — a wall of identically-shaped rows is how a
- * timeline stops being read at all.
- */
 export function Timeline({
   events,
   issue,
@@ -130,7 +116,6 @@ export function Timeline({
   runs: IssueRun[];
   onComment: (text: string) => void;
   onResolveApproval: (callId: string, decision: 'approve' | 'approve_always' | 'deny') => void;
-  /** For `@` completion and the handover hint. */
   team?: Agent[];
   busy: boolean;
 }) {
@@ -145,8 +130,6 @@ export function Timeline({
     const next = applyMention(draft, query, handle);
     setDraft(next.text);
     setCaret(next.caret);
-    // The caret has to be restored after React re-renders the value, or it
-    // jumps to the end and the next keystroke lands outside the mention.
     requestAnimationFrame(() => {
       box.current?.setSelectionRange(next.caret, next.caret);
       box.current?.focus();
@@ -199,17 +182,11 @@ export function Timeline({
             setCaret(event.currentTarget.selectionStart);
           }}
           onKeyDown={(event) => {
-            // Tab accepts the top completion, the way the chat composer's
-            // slash completion does. Only while one is offered, so Tab
-            // still moves focus the rest of the time.
             if (event.key === 'Tab' && candidates.length > 0) {
               event.preventDefault();
               complete(candidates[0].handle);
               return;
             }
-            // ⌘/Ctrl+↵ sends, matching the create modal. A bare ↵ is a
-            // newline: a comment is prose, and losing a half-written one to
-            // a stray keystroke is worse than one extra key to send.
             if (event.key === 'Enter' && (event.metaKey || event.ctrlKey) && trimmed.length > 0) {
               event.preventDefault();
               onComment(trimmed);
@@ -248,8 +225,6 @@ export function Timeline({
           >
             {busy ? 'Sending…' : 'Comment'}
           </Button>
-          {/* What sending will do, before it is sent — the two outcomes look
-              identical in the composer otherwise. */}
           <span className="font-mono text-[0.66rem] text-ink-soft">
             {mentionHint(issue, draft, team) ?? commentHint(issue, runs)}
           </span>

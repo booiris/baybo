@@ -73,9 +73,6 @@ describe('AgentProfile', () => {
     renderProfile(agent('qa'));
     expect(screen.getByText(/you added it/)).toBeInTheDocument();
 
-    // The hirer is resolved server-side precisely because it may no longer
-    // be on the roster, so the panel must render that case rather than a
-    // blank.
     renderProfile(agent('qa-2', { hired_by: { id: 'id-gone', handle: 'old-lead' } }));
     expect(screen.getByText(/hired by @old-lead \(since removed\)/)).toBeInTheDocument();
   });

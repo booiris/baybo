@@ -4,8 +4,6 @@ import { budgetHint, formatBudget, parseBudget } from './budgetModel';
 
 describe('parseBudget', () => {
   it('reads dollars as exact micro-USD', () => {
-    // Digit-by-digit, not `Number(x) * 1e6`: money never round-trips
-    // through a float here.
     expect(parseBudget('5')).toBe(5_000_000);
     expect(parseBudget('12.50')).toBe(12_500_000);
     expect(parseBudget('0.01')).toBe(10_000);
@@ -14,7 +12,6 @@ describe('parseBudget', () => {
   });
 
   it('treats an empty box as no ceiling, not as zero', () => {
-    // The difference matters: zero pauses the board, absent lets it spend.
     expect(parseBudget('')).toBeNull();
     expect(parseBudget('   ')).toBeNull();
     expect(parseBudget('0')).toBe(0);
@@ -27,8 +24,6 @@ describe('parseBudget', () => {
   });
 
   it('drops digits past micro-USD instead of rounding them', () => {
-    // A seventh decimal is below the unit the ledger records, so rounding
-    // it would move a number the operator cannot see.
     expect(parseBudget('1.0000009')).toBe(1_000_000);
     expect(parseBudget('1.1234567')).toBe(1_123_456);
   });

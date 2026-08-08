@@ -4,14 +4,6 @@ import { RiAddLine, RiDeleteBinLine } from 'react-icons/ri';
 import type { Agent, IssueRun } from './boardModel';
 import { workingAgentIds } from './teamModel';
 
-/**
- * The board header's roster: who is on this project, who is working right
- * now, and the ＋ that adds somebody.
- *
- * "Working" is derived from the same active-run list the cards shimmer
- * from, rather than a flag on the roster read — one source, so a dot and a
- * card can never disagree about whether an agent is busy.
- */
 export function TeamStrip({
   team,
   activeRuns,
@@ -123,11 +115,6 @@ function TeamMemberChip({
   );
 }
 
-/**
- * The handle is not a field. It is derived from the name on the server and
- * then permanent, so offering it here would be offering a choice the form
- * cannot actually honour once the name is taken.
- */
 function HireAgentForm({
   onCancel,
   onSubmit,

@@ -4,9 +4,6 @@ use baybo_store::StorageError;
 pub type Result<T> = std::result::Result<T, ProjectError>;
 
 /// What can go wrong managing a project or the issues on its board.
-///
-/// The variants are the distinctions the gateway needs to answer with
-/// different status codes; anything finer is a `reason` string.
 #[derive(Debug, thiserror::Error)]
 pub enum ProjectError {
     #[error("no such project: {0}")]

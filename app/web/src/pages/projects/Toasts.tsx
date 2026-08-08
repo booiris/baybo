@@ -1,8 +1,5 @@
 import { useCallback, useRef, useState } from 'react';
 
-// Drag is a command and it carries no confirm dialog, so the toast *is* the
-// receipt. Page-local rather than a shared component: the board is the only
-// surface that acts without asking first.
 
 export type ToastTone = 'ok' | 'warn' | 'err';
 

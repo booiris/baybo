@@ -3,8 +3,6 @@ import { describe, expect, it } from 'vitest';
 import { actorLabel, commentHint, describeEvent, eventShape, eventTime } from './timelineModel';
 import type { IssueEvent, IssueEventBody } from './timelineModel';
 
-// The server resolves an agent's handle, so a fixture's id and handle are
-// deliberately different: anything that renders the id is a bug.
 const DEV_ID = '01JC3KQ4Z8AAAAAAAAAAAAAAAA';
 
 function entry(body: IssueEventBody, actor: IssueEvent['actor'] = { kind: 'user' }): IssueEvent {
@@ -27,8 +25,6 @@ describe('describeEvent', () => {
   });
 
   it('reads all four assignment cases as sentences, not as templates', () => {
-    // The one a naive template gets wrong is unassignment: it produces
-    // "assigned it to nobody".
     expect(describeEvent({ kind: 'assigned', to: ref('dev-1') })).toBe('assigned it to @dev-1');
     expect(describeEvent({ kind: 'assigned', from: ref('dev-1'), to: ref('dev-2') })).toBe(
       'reassigned it from @dev-1 to @dev-2',
@@ -45,9 +41,6 @@ describe('describeEvent', () => {
   });
 
   it('distinguishes a reclaimed worktree from one that was left alone', () => {
-    // Not "nothing was committed": the branch is dropped when it is zero
-    // commits ahead *and* git agrees, which a branch merged before the card
-    // was dragged to Done also satisfies.
     expect(describeEvent({ kind: 'worktree_reclaimed', branch_deleted: true })).toContain(
       'nothing this repo did not already have',
     );
@@ -63,10 +56,6 @@ describe('describeEvent', () => {
   });
 
   it('says a stage emptied without claiming anybody was woken', () => {
-    // The server writes this entry whenever a stage's own children are all
-    // finished, including one that empties while an earlier stage is still
-    // open — which wakes nobody. The wake, when there is one, shows up as
-    // its own `started run #n (stage_barrier)` entry.
     const sentence = describeEvent({ kind: 'stage_completed', stage: 2 });
     expect(sentence).toBe('stage 2 finished — every step in it is done or called off');
   });
@@ -101,11 +90,6 @@ describe('describeEvent', () => {
   });
 
   it('narrates a body kind it has never heard of instead of dropping the entry', () => {
-    // A server newer than the bundle, which `IssueEventBody` is designed to
-    // allow. Returning nothing here is not a soft degradation: `Note`
-    // renders no `<li>` when the sentence is nullish, so the entry would
-    // vanish from the card's history — and `null` is reserved for a
-    // comment, which is shown rather than narrated.
     const future = { kind: 'merged', sha: 'ab12cd' } as unknown as IssueEventBody;
     const sentence = describeEvent(future);
     expect(sentence).toBeTypeOf('string');
@@ -120,16 +104,11 @@ describe('actorLabel', () => {
   });
 
   it('names an actor kind it has never heard of rather than rendering undefined', () => {
-    // `IssueActor` is designed to grow, and a page outlives the build it
-    // was served by. "01JC… undefined started run #1" is worse than a
-    // vague word.
     const future = { kind: 'webhook', id: DEV_ID } as unknown as IssueEvent['actor'];
     expect(actorLabel(entry({ kind: 'opened' }, future))).toBe('somebody');
   });
 
   it('calls the board’s own gate "the board"', () => {
-    // Nobody held this run. "you held the run — $5.00 of the $5.00 daily
-    // budget is spent" accuses the reader of a decision the gate made.
     expect(
       actorLabel(
         entry({ kind: 'budget_exhausted', spent_micros: 0, limit_micros: 0 }, { kind: 'system' }),
@@ -139,8 +118,6 @@ describe('actorLabel', () => {
 });
 
 describe('commentHint', () => {
-  // Mirrors `comment_delivery` in crates/project — the same four branches,
-  // asserted here so the two cannot drift silently.
   const live = [{ status: 'running' as const }];
   const queued = [{ status: 'queued' as const }];
   const settled = [{ status: 'done' as const }];
@@ -166,13 +143,10 @@ describe('commentHint', () => {
     expect(commentHint({ status: 'todo', assignee: 'dev-1' }, [])).toBe(
       'Starts a run: @dev-1 will read this now.',
     );
-    // A settled run leaves the issue idle again.
     expect(commentHint({ status: 'review', assignee: 'dev-1' }, settled)).toContain('Starts a run');
   });
 
   it('distinguishes a queued run from one already going', () => {
-    // The two differ in when the comment is read, and that is exactly what
-    // somebody about to press send wants to know.
     expect(commentHint({ status: 'in_progress', assignee: 'dev-1' }, queued)).toContain(
       'when the queued run starts',
     );
@@ -182,9 +156,6 @@ describe('commentHint', () => {
   });
 
   it('says a held run will read it, and why it has not started', () => {
-    // A held run has not assembled its brief either — the wait is on the
-    // board's budget, not on the comment. Mirrors `comment_delivery`,
-    // which folds Held in with Queued for the same reason.
     const hint = commentHint({ status: 'in_progress', assignee: 'dev-1' }, held);
     expect(hint).toContain('held run starts');
     expect(hint).toContain('daily budget');

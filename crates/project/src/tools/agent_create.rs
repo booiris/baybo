@@ -81,11 +81,6 @@ The `role` becomes the new agent's own soul: write what it is for, in its own te
                 NewTeamMember {
                     name: p.name,
                     role: p.role,
-                    // Neither knob is exposed. A framework other than baybo
-                    // cannot host an issue's session, so offering it would
-                    // let an agent staff the board with teammates nothing
-                    // can assign; the llm pin is the operator's cost lever,
-                    // not a hiring decision.
                     framework: None,
                     llm: None,
                 },

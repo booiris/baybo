@@ -5,14 +5,6 @@ import { useAdminClient, useAuth } from '../../api/auth';
 import { fetchFeed } from './api';
 import { actorLabel, describeEvent, eventTime, type IssueEvent } from './timelineModel';
 
-/**
- * The board's activity, newest first.
- *
- * Read-only and derived: these are the same `issue_events` rows the
- * per-issue timelines render, queried across the project instead of down
- * one card. Clicking an entry opens the card it belongs to, which is the
- * only action a feed needs — everything else happens on the issue.
- */
 export function ActivityDrawer({
   projectId,
   refreshKey,
@@ -94,9 +86,6 @@ export function ActivityDrawer({
                   {eventTime(event.created_at_ms, now)}
                 </span>
               </div>
-              {/* A comment is shown, not narrated — the same rule the
-                  per-issue timeline follows, so one entry reads the same
-                  in both places. */}
               <p className="font-mono text-[0.66rem] leading-snug break-words">
                 {narration ?? (event.body.kind === 'comment' ? event.body.text : '')}
               </p>

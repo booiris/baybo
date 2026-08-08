@@ -1,10 +1,4 @@
 //! Putting a run's approval prompts on the card that asked for them.
-//!
-//! An issue run blocks on the same approval gate every other session does,
-//! and the prompt itself surfaces where that channel's UI is. What was
-//! missing is the *board's* side of it: a card that stops moving because a
-//! person has not answered a modal looks exactly like a card whose agent
-//! has silently wedged.
 
 use std::sync::Arc;
 
@@ -16,21 +10,10 @@ use baybo_tools::{ApprovalGate, ApprovalRequest};
 
 use crate::ProjectManager;
 
-/// Upper bound on the one-line summary written to the timeline. The full
-/// parameters live in the trace; this is what a person reads on a card.
 const MAX_SUMMARY_CHARS: usize = 160;
 
 /// Wraps a channel's approval gate and writes what it sees onto the issue's
 /// timeline.
-///
-/// Installed once, over the **type-level** gate of the channel a board's
-/// runs use — not per run. There is nothing to arm or disarm, so there is
-/// nothing to leak when a run dies in an unusual way, and a board opened
-/// after boot is covered without anybody remembering to register it.
-///
-/// A prompt from an ordinary session passes straight through: the trigger
-/// lookup says it belongs to no issue, and this adds one session read to a
-/// path that is already blocking on a human.
 pub struct TimelineApprovalGate {
     /// The gate that actually prompts. Held directly rather than resolved
     /// per call, because resolving would find *this* wrapper.
@@ -52,12 +35,6 @@ impl TimelineApprovalGate {
         }
     }
 
-    /// The card this prompt belongs to, if any.
-    ///
-    /// Reads the session's trigger rather than taking the issue as a
-    /// parameter: the gate is shared by every session on the channel, and a
-    /// wrapper that had to be told which issue it was serving would be a
-    /// wrapper somebody has to keep in sync with the run lifecycle.
     async fn card(&self, session_id: &SessionId) -> Option<(baybo_model::ProjectId, i64)> {
         let session = self.sessions.get(session_id).await.ok().flatten()?;
         session
@@ -74,10 +51,6 @@ impl ApprovalGate for TimelineApprovalGate {
             return self.inner.request(req).await;
         };
         let call_id = req.call_id.clone();
-        // The actor is the agent whose tool call is blocked — the card's
-        // assignee. A prompt is something an agent asked for, not something
-        // the operator did, and attributing it to the operator would make
-        // the timeline read as if they had asked themselves.
         let actor = match self.manager.get_issue(&project, number).await {
             Ok(issue) => issue.assignee.map_or(IssueActor::User, IssueActor::Agent),
             Err(_) => IssueActor::User,
@@ -97,10 +70,6 @@ impl ApprovalGate for TimelineApprovalGate {
 
         let decision = self.inner.request(req).await;
 
-        // Written on every path, including the gate's own deny-on-timeout:
-        // a card that stops explaining itself at the prompt is the worst
-        // version of this feature, because the prompt is exactly where a
-        // reader would go looking.
         self.manager
             .record_event(
                 &project,
@@ -113,10 +82,6 @@ impl ApprovalGate for TimelineApprovalGate {
     }
 }
 
-/// One line a person can decide from.
-///
-/// Prefers the tool's own label (Bash's `description`, WebFetch's URL) and
-/// falls back to the parameter preview, which is already truncated JSON.
 fn summarise(req: &ApprovalRequest) -> String {
     let raw = req
         .description
@@ -149,7 +114,6 @@ mod tests {
         };
         assert_eq!(summarise(&base), "Clean the build directory");
 
-        // Blank or absent falls back to the preview rather than to nothing.
         for description in [None, Some("   ".to_owned())] {
             let req = ApprovalRequest {
                 description,
@@ -158,8 +122,6 @@ mod tests {
             assert_eq!(summarise(&req), "{\"command\":\"rm -rf build\"}");
         }
 
-        // …and a long one is cut with a mark, so a card never silently
-        // shows half a sentence as if it were the whole thing.
         let long = ApprovalRequest {
             description: Some("x".repeat(MAX_SUMMARY_CHARS + 10)),
             ..base

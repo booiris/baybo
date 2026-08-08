@@ -38,11 +38,7 @@ export function CreateProjectForm({ onDone }: { onDone?: () => void }) {
     const outcome = await createProject(client, {
       name,
       description,
-      // An omitted directory is the signal to make one; sending an empty
-      // string would be a different, invalid request.
       ...(trimmedWorkdir.length > 0 ? { workdir: trimmedWorkdir } : {}),
-      // Absent and zero are different answers — no ceiling versus paused —
-      // so an empty box omits the key rather than sending 0.
       ...(micros === null ? {} : { daily_budget_micros: micros }),
     });
     setSubmitting(false);

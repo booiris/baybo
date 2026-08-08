@@ -6,10 +6,6 @@ import type { Project } from './boardModel';
 import { CreateProjectForm } from './CreateProjectForm';
 import { attentionFor, useAttention, type ProjectAttention } from './useAttention';
 
-/**
- * The board's top-left pill. There is no project list page, so this is the
- * only way between boards — and the only place a new one is opened.
- */
 export function ProjectSwitcher({
   current,
   projects,
@@ -24,10 +20,6 @@ export function ProjectSwitcher({
   const [creating, setCreating] = useState(false);
   const [showArchived, setShowArchived] = useState(false);
   const root = useRef<HTMLDivElement>(null);
-  // Archived boards are hidden rather than absent: the parent hands over
-  // every project, and this decides what the dropdown shows. The current
-  // board always appears, so opening an archived one by deep link does not
-  // produce a switcher that cannot name where you are.
   const visible = projects.filter(
     (project) => showArchived || project.archived_at_ms == null || project.id === current?.id,
   );
@@ -102,9 +94,6 @@ export function ProjectSwitcher({
                             archived
                           </span>
                         )}
-                        {/* The rail badge counts boards; this is where the
-                            board says what, so a number the rail cannot
-                            explain always has somewhere to decompose. */}
                         {stuck === null ? null : (
                           <span
                             title={stuckSummary(stuck)}
@@ -155,7 +144,6 @@ export function ProjectSwitcher({
   );
 }
 
-/** What one board's counts say, for the row's tooltip. */
 function stuckSummary(stuck: ProjectAttention): string {
   const parts: string[] = [];
   if (stuck.approvals > 0) parts.push(`${stuck.approvals} waiting on approval`);

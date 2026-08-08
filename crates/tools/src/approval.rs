@@ -163,10 +163,6 @@ impl ApprovalGateMap {
 
     /// The **type-level** gate for a channel, ignoring any session-scoped
     /// entry. Fail-closed like [`Self::get`].
-    ///
-    /// Exists for decorators: a wrapper that observes approvals has to
-    /// delegate to the gate it replaced, and reaching for it through
-    /// [`Self::get`] would find the wrapper itself and recurse forever.
     pub fn type_gate(&self, channel: &ChannelType) -> Arc<dyn ApprovalGate> {
         self.type_level
             .get(channel)

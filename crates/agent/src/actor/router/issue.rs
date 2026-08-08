@@ -1,21 +1,4 @@
 //! Executing a board issue's run.
-//!
-//! The ledger row already exists — `baybo-project` wrote it before anything
-//! was told about it. This module is the consumer: it claims the row, mints
-//! or reuses the session its agent works the card in, runs the brief as one
-//! turn, and settles the row with what happened.
-//!
-//! The shape is cron's one-shot fire (`cron.rs`), with two differences that
-//! matter. An issue keeps **one session per agent that has run it**, so a
-//! follow-up sees what that same agent did last time — and an agent whose
-//! runs have not opened one sees none of the transcript, which is why the
-//! brief it is given is the whole conversation rather than a delta
-//! (`baybo::runtime::issue_brief`, bounded by [`session_run_before`] so the
-//! two answers cannot drift apart). That is safe only because at most one
-//! run per issue is ever in flight (a partial unique index enforces it),
-//! which is what lets the waiter treat the terminal turn at or after its
-//! own enqueue as unambiguously its own. And nothing is dispatched to a
-//! channel: an issue's audience is its card.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -47,12 +30,6 @@ pub struct IssueRunEvent {
     /// know the issue's shape.
     pub brief: String,
     /// The worktree this run works in, already cut by the dispatcher.
-    ///
-    /// Prepared there rather than here on purpose: `git worktree add`
-    /// shells out, and this handler is awaited directly on the router's
-    /// `select!` loop — the same loop that serves every user message and
-    /// every agent response. A slow checkout must not be head-of-line
-    /// blocking for the whole process.
     pub checkout: PathBuf,
     /// Who the run belongs to, for session ownership.
     pub user_id: String,
@@ -60,15 +37,6 @@ pub struct IssueRunEvent {
 }
 
 /// Everything executing a run needs from the board, as one value.
-///
-/// One `Option` rather than three, because no assembly produces any of
-/// these without the others: the store settles the ledger row, the events
-/// hook tells whoever is watching the card, and the manager starts whatever
-/// the settle turns out to owe. Three independent `Option`s made the bad
-/// combinations representable and left the invariant to a comment — and one
-/// of them (a store with no manager) refused a run that had already been
-/// dispatched, returning without settling its row, which is exactly the
-/// shape the per-issue live index turns into a permanently stuck card.
 #[derive(Clone)]
 pub struct BoardWiring {
     pub store: Arc<dyn ProjectStore>,
@@ -79,10 +47,6 @@ pub struct BoardWiring {
 impl Router {
     pub(super) async fn handle_issue_run(&mut self, event: IssueRunEvent) {
         let run_id = event.run.id.clone();
-        // The only refusal left, and it settles nothing on purpose: with no
-        // board there is no store this row lives in. An assembly without one
-        // (the TUI's runtime) also has no `issue_run_rx`, so nothing can
-        // arrive here in the first place.
         let Some(board) = self.board.clone() else {
             warn!(%run_id, "issue run arrived with no board wiring; cannot execute");
             return;
@@ -105,10 +69,6 @@ impl Router {
             }
         };
 
-        // Claim before dispatching. A run already claimed by another
-        // dispatch of the same row — a boot sweep racing a live enqueue —
-        // stops here, which is how a double dispatch collapses into one
-        // execution rather than two agents on one card.
         match store.claim_run(&run_id, &session.id).await {
             Ok(true) => {}
             Ok(false) => {
@@ -184,23 +144,6 @@ impl Router {
         tokio::spawn(waiter.run(actor_token));
     }
 
-    /// The issue's session for the agent this run belongs to — reused
-    /// across that agent's runs, minted on its first.
-    ///
-    /// A session's [`AgentBinding`] is write-once: it selects the persona
-    /// and SOUL the turn runs as, the skills it may reach, and the name its
-    /// commits are authored with, and none of those may change mid-thread.
-    /// So the session cannot follow a reassignment — the *run* has to. A run
-    /// handed to a session bound to somebody else would load the previous
-    /// assignee's persona and sign that agent's name onto work the board
-    /// says belongs to the new one, which is worse than an unattributed
-    /// commit because it names the wrong somebody.
-    ///
-    /// Continuity is per agent, not per issue: an agent that already worked
-    /// this card continues in the session it worked it in, however many
-    /// hands the card has passed through since. Which run that is comes
-    /// from [`session_run_to_continue`] — the one rule for the question,
-    /// shared with the brief window.
     async fn issue_session(
         &self,
         store: &Arc<dyn ProjectStore>,
@@ -217,10 +160,6 @@ impl Router {
         let binding = self.binding_for(&event.run.agent_id).await?;
 
         let runs = store.list_runs(&issue.id).await?;
-        // The binding check is the write-once guard, not the selection: the
-        // row's `session_id` is what says which session, and a session whose
-        // binding disagrees with the row is a broken pairing this run must
-        // not be handed into whatever the ledger says.
         if let Some(previous) = session_run_to_continue(&event.run, &runs)
             && let Some(id) = previous.session_id.as_ref()
             && let Some(session) = self.session_manager.get(id).await?
@@ -249,22 +188,6 @@ impl Router {
             .await?)
     }
 
-    /// The binding this run's session is opened with, read from the agent's
-    /// profile rather than assumed.
-    ///
-    /// Every other binding in the tree is built from the row — the lead's, the
-    /// chat leg's, cron's. This one used to name `Baybo` outright, which was
-    /// true only because [`baybo_project::can_host_a_session`] refuses anything
-    /// else at assign time. That answer expires: a profile's framework is
-    /// editable, and a row the boot sweep re-drives was recorded under whatever
-    /// the agent was then. So the fact is re-established here, at the last
-    /// moment before it is written into a session write-once.
-    ///
-    /// Refused rather than recorded, because a top-level session bound to an
-    /// external backend would still be executed by the internal loop — the card
-    /// would name an agent that never worked it. The run settles `Failed` with
-    /// this reason on its card, which is the visible half of the same refusal
-    /// the operator would have got from the assign form.
     async fn binding_for(&self, agent: &AgentProfileId) -> anyhow::Result<AgentBinding> {
         let profile = self
             .agent_profiles
@@ -286,35 +209,10 @@ impl Router {
 
 /// Whether this run ever got as far as being picked up — the router's name
 /// for [`IssueRunRow::was_claimed`], which is where the rule lives.
-///
-/// It is spelled again here only because this crate's callers read better
-/// for it; `baybo-project` asks the same question of the same row to pick
-/// the sentence a called-off run settles with, and it cannot depend on
-/// `baybo-agent` without a cycle. One rule, one home, two names.
-///
-/// Note what it does **not** say. The executor claims the row before the
-/// actor is spawned, so a claimed run is one the card has announced as
-/// started — not necessarily one that opened a turn. A run whose trigger
-/// never reached its actor leaves a claimed row and an empty transcript,
-/// and callers that care about the transcript rather than the announcement
-/// are reading a slightly stronger fact than this answers.
 pub fn ever_ran(run: &IssueRunRow) -> bool {
     run.was_claimed()
 }
 
-/// The run whose session this one is handed, if any — **the** rule for
-/// "has this agent worked this card before".
-///
-/// [`Router::issue_session`] hands the run into this row's session and
-/// mints a fresh one when there is none. `baybo`'s `brief_window` asks the
-/// same question through [`session_run_before`] to decide how much of the
-/// card's conversation this run has already read, and the two must agree:
-/// a brief bounded by a run whose session this one is *not* given trims the
-/// conversation as "already read" against a transcript that does not
-/// contain it. This function is the authority; the window follows it.
-///
-/// This run's own row is a candidate, which is what lets a run
-/// re-dispatched by the boot sweep resume the session it already claimed.
 fn session_run_to_continue<'a>(
     run: &IssueRunRow,
     runs: &'a [IssueRunRow],
@@ -325,13 +223,6 @@ fn session_run_to_continue<'a>(
 /// `session_run_to_continue`'s rule over the runs *before* this one — the
 /// run whose turn is already in the transcript this one opens, and so the
 /// point the card's conversation is a delta from.
-///
-/// This is what `baybo`'s `brief_window` reads. It is exported for that one
-/// caller: the window is not allowed a rule of its own.
-///
-/// Excludes this run's own row on purpose — bounding a brief by the clock
-/// of the run being briefed would filter out the very comment that started
-/// it.
 pub fn session_run_before<'a>(
     run: &IssueRunRow,
     runs: &'a [IssueRunRow],
@@ -342,8 +233,6 @@ pub fn session_run_before<'a>(
     )
 }
 
-/// Newest by attempt rather than by clock: attempts are handed out in
-/// order by the store, under the same transaction that writes the row.
 fn newest_run_that_ran<'a>(
     agent: &AgentProfileId,
     runs: impl Iterator<Item = &'a IssueRunRow>,
@@ -352,31 +241,6 @@ fn newest_run_that_ran<'a>(
         .max_by_key(|candidate| candidate.attempt)
 }
 
-/// Start a follow-up run if anybody said anything while this one was
-/// executing.
-///
-/// A comment that arrives mid-run is past the point where its brief was
-/// assembled, and a one-shot actor has no mailbox anybody can reach — so
-/// the comment waits here rather than being lost. This terminates: the
-/// follow-up only looks at comments newer than its own predecessor's
-/// start, so a quiet issue stops after one.
-///
-/// Started through the manager rather than written to the store here. That
-/// is the one path that consults the board's budget, refuses a second live
-/// run and hands the row to the dispatcher; a row written directly would be
-/// a run nothing ever starts, holding the issue's only live-run slot until
-/// the next boot.
-///
-/// A run **a human stopped** starts nothing, whatever was said. The card is
-/// still InProgress and still assigned, so the board would happily answer
-/// `Wake` — and a fresh run seconds after somebody pressed Cancel reads as
-/// the Stop button not working.
-///
-/// Every other ending follows up, and that includes a run that merely
-/// *settled* `Cancelled`: an actor that dies takes its turn to
-/// `Cancelled { SystemCrash }`, and the ledger row cannot tell that apart
-/// from a Stop. Keying on the row's status would drop the comment in
-/// exactly the case this mechanism exists for — see [`RunOutcome`].
 async fn follow_up_on_comments(
     projects: &Arc<ProjectManager>,
     store: &Arc<dyn ProjectStore>,
@@ -399,15 +263,7 @@ async fn follow_up_on_comments(
     if !said {
         return;
     }
-    // Whether that still wakes anybody is the board's call, not this one's:
-    // the issue may have been cancelled, unassigned or dragged out of live
-    // work while the run was going, and the board goes out of budget or is
-    // archived on its own schedule.
     match projects.wake_on_comment(&run.project_id, run.number).await {
-        // The board may record the follow-up without starting it: an
-        // exhausted daily budget parks it `Held` until headroom returns.
-        // Saying "queued" for that is how an operator concludes the board
-        // is stuck when it is merely waiting.
         Some(next) if next.status == RunStatus::Held => {
             info!(run = %run.id, next = %next.id, "a comment arrived mid-run; the follow-up is held until the board has budget")
         }
@@ -420,18 +276,6 @@ async fn follow_up_on_comments(
     }
 }
 
-/// Record the branch on the issue once the work has actually produced
-/// something.
-///
-/// Worktree and branch are separate ideas: every run gets a worktree, but
-/// the branch is the *deliverable*, and an issue whose answer was a report
-/// rather than code should show no branch anywhere. Keying the row's
-/// `branch` on "has a commit" rather than storing it at creation is what
-/// makes that fall out — there is no second flag that could disagree.
-///
-/// A count git could not take reads the same way as no commits at all: a
-/// branch chip is a claim that there is something to look at, and an
-/// unverified one is worse than none.
 async fn surface_branch(
     store: &Arc<dyn ProjectStore>,
     events: &Arc<dyn ProjectEvents>,
@@ -499,11 +343,6 @@ async fn settle(
     }
 }
 
-/// Put a run's lifecycle on the issue's timeline, attributed to the agent
-/// doing the work rather than to the operator who dragged the card.
-///
-/// Best-effort, like every other timeline write: a run that executed and
-/// whose note did not land is far better than the reverse.
 async fn record(
     store: &Arc<dyn ProjectStore>,
     events: &Arc<dyn ProjectEvents>,
@@ -526,7 +365,6 @@ async fn record(
     }
 }
 
-/// Watches one run's turn and settles its ledger row.
 struct IssueRunWaiter {
     /// The run as it was **enqueued** — the row the dispatcher handed over,
     /// cloned before `claim_run` stamped it. Its `status` therefore reads
@@ -564,16 +402,6 @@ impl IssueRunWaiter {
         )
         .await;
 
-        // After the row is settled, not before: the per-issue live index
-        // would refuse a follow-up while this run still held the slot.
-        // Only here, and not in `settle` itself — the two early-failure
-        // settles above never started anything, so there is no branch to
-        // surface and nothing that could have been said mid-run.
-        //
-        // Branch first, follow-up second. Both only read git, so the worst
-        // an overlap costs is a missing chip — but a follow-up run works in
-        // this same worktree, and reading it while somebody else is in it
-        // is a race that need not exist.
         surface_branch(store, &self.board.events, &self.checkout, &self.enqueued).await;
         follow_up_on_comments(&self.board.manager, store, &self.enqueued, &outcome).await;
     }
@@ -621,17 +449,6 @@ impl IssueRunWaiter {
         ev.session_id == self.session_id && ev.kind == TurnInputKind::IssueRun
     }
 
-    /// The outcome of a terminal edge seen on the lifecycle bus.
-    ///
-    /// The edge says a turn was cancelled but not why, and why is the whole
-    /// question — so a cancel, and only a cancel, goes back to the turn for
-    /// its [`CancelReason`]. The row is written before the edge is
-    /// published, so the reason is already durable by the time this reads
-    /// it.
-    ///
-    /// A reason the store cannot produce answers "not a human": one extra
-    /// follow-up run is visible on the card and stoppable, while a comment
-    /// nothing ever answers is the loss the follow-up exists to prevent.
     async fn outcome_of_edge(&self, turn: &TurnId, kind: TurnStatusKind) -> RunOutcome {
         let outcome = RunOutcome::of(kind);
         if kind != TurnStatusKind::Cancelled {
@@ -651,27 +468,6 @@ impl IssueRunWaiter {
         }
     }
 
-    /// The run's outcome from the store, or `None` if this run has no
-    /// finished turn.
-    ///
-    /// Bounded at both ends. **Newest** terminal issue turn, not the first:
-    /// this session hosts every run its agent has worked on this issue, so
-    /// the first one is that agent's first run forever. And **at or after
-    /// this run's own enqueue**, because everything older belongs to a
-    /// previous run of the same card — settling on one of those would hand
-    /// this run its predecessor's outcome, `stopped_by_a_human` and all,
-    /// and a run wrongly reading as stopped-by-a-human drops the comment
-    /// waiting on the card. A run whose actor never opened a turn has
-    /// nothing in the window, and the caller settles it as having failed —
-    /// which is what happened.
-    ///
-    /// The turn is created inside the actor the claim spawns, so the row
-    /// this run is executing can only be older than its own turn; `>=`
-    /// rather than `>` because the two clocks are the same wall clock and a
-    /// turn opened in the same microsecond is still this run's.
-    ///
-    /// That there is exactly one candidate in that window is the dedupe
-    /// guard's doing: an issue holds at most one unfinished run at a time.
     async fn reconcile(&self) -> Option<RunOutcome> {
         let turns = match self.lifecycle.list_by_session(&self.session_id, None).await {
             Ok(turns) => turns,
@@ -694,13 +490,6 @@ impl IssueRunWaiter {
 
 /// How a run ended: what the ledger row records, plus the one thing the row
 /// cannot carry.
-///
-/// `RunStatus::Cancelled` is written both when somebody presses Stop and
-/// when the run dies — crash recovery rolls an orphaned turn to
-/// `Cancelled { SystemCrash }`, and a cancel propagated down the token tree
-/// arrives as `ParentCancelled`. The turn's [`CancelReason`] is the only
-/// place the two are distinguishable, so it is read once here rather than
-/// guessed at from the status by whoever needs the answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RunOutcome {
     status: RunStatus,
@@ -711,9 +500,6 @@ struct RunOutcome {
 }
 
 impl RunOutcome {
-    /// What a terminal turn status settles the row as. Says nothing about
-    /// who stopped it — that is [`stopped_by_a_human`], which needs the
-    /// reason the kind has already dropped.
     fn of(kind: TurnStatusKind) -> Self {
         match kind {
             TurnStatusKind::Completed => Self {
@@ -740,33 +526,6 @@ impl RunOutcome {
     }
 }
 
-/// Whether a cancelled turn was cancelled because a person asked for it.
-///
-/// The operator's Cancel button on the card reaches the turn as
-/// [`CancelReason::OperatorCancel`] (so does the CLI), and `/stop` inside
-/// the session as [`CancelReason::UserStopped`]. Every other reason is a
-/// run that stopped without anybody asking this run to stop: an actor that
-/// panicked, a parent that went away or was deleted, a subagent that timed
-/// out, a process killed and swept at boot. `UserPreempt` sits on that side
-/// too — it belongs to a chat turn superseded by the next message, which a
-/// one-shot issue actor has no path to.
-///
-/// Matched exhaustively rather than with `matches!`: this is a
-/// classification over another crate's enum, and a reason added there must
-/// break this build rather than default to "not a human" and quietly
-/// falsify the paragraph above.
-///
-/// `ParentCancelled` reads as not-a-human, and that is the deliberate side
-/// of a race: `TurnLifecycle::cancel` trips the token before it writes the
-/// row, and the run's own body settles the row `ParentCancelled` when it
-/// unwinds — whichever gets there first is the reason that sticks. The
-/// window is open on **every** press, not only on one that arrives as the
-/// run was finishing; how often the operator loses it is a function of what
-/// the body was awaiting, and it is often enough to see. Erring the other
-/// way would make every shutdown look like a Stop and drop the comment it
-/// was carrying; erring this way costs one follow-up run, visible on the
-/// card and stoppable again. Closing it for real needs the intended reason
-/// recorded before the token is tripped, which is `baybo-turn`'s to do.
 fn stopped_by_a_human(status: &TurnStatus) -> bool {
     let TurnStatus::Cancelled { reason, .. } = status else {
         return false;
@@ -783,10 +542,6 @@ fn stopped_by_a_human(status: &TurnStatus) -> bool {
 
 #[cfg(test)]
 mod tests {
-    //! What settling a run owes the card: a comment that arrived while it
-    //! was executing has to *start* something, not merely be recorded — and
-    //! which session a run is handed, which is what decides whose persona,
-    //! skills and commit name it works under.
 
     use std::sync::Arc;
 
@@ -812,21 +567,13 @@ mod tests {
     struct Board {
         projects: Arc<ProjectManager>,
         store: Arc<dyn ProjectStore>,
-        /// The whole sqlite handle, for the stores this board's fixtures
-        /// reach past `ProjectStore` for (the team roster, the router's
-        /// profile lookups).
         db: baybo_storage::Store,
         project: ProjectRow,
-        /// Every run the board handed to an executor, in order. A run
-        /// written to the store that never lands here is a run nothing ever
-        /// starts — and it holds the issue's only live-run slot.
         dispatched: Arc<parking_lot::Mutex<Vec<IssueRunRow>>>,
         _workspace: tempfile::TempDir,
     }
 
     impl Board {
-        /// The run the board dispatched `nth` (0-based), which is how these
-        /// tests get the row an executor would have been handed.
         fn nth_dispatched(&self, nth: usize) -> IssueRunRow {
             self.dispatched
                 .lock()
@@ -835,7 +582,6 @@ mod tests {
                 .unwrap_or_else(|| panic!("the board dispatched a run #{nth}"))
         }
 
-        /// Put `agent` on this board's team under `handle`.
         async fn hire(&self, agent: &AgentProfileId, handle: &str) {
             let now = chrono::Utc::now();
             self.db
@@ -860,9 +606,6 @@ mod tests {
                 .expect("teammate");
         }
 
-        /// Hand the card to somebody else, the way the assignee picker
-        /// does. In progress and staffed either way, so this is a pure
-        /// handover.
         async fn reassign(&self, to: &AgentProfileId) {
             self.projects
                 .update_issue(
@@ -879,8 +622,6 @@ mod tests {
         }
     }
 
-    /// A board with one in-progress card assigned to `dev-1`, and its first
-    /// run dispatched but not yet claimed.
     async fn board_with_in_progress_card() -> (Board, IssueRunRow) {
         let workspace = tempfile::tempdir().expect("tempdir");
         let paths = WorkspacePaths::new(workspace.path().to_path_buf());
@@ -920,7 +661,6 @@ mod tests {
             _workspace: workspace,
         };
 
-        // An assignee has to be on the board's team.
         let agent = AgentProfileId::parse(HANDLE).expect("agent id");
         board.hire(&agent, HANDLE).await;
 
@@ -947,8 +687,6 @@ mod tests {
         (board, first)
     }
 
-    /// A board with one in-progress card whose first run is executing —
-    /// the state the waiter is in when somebody comments.
     async fn mid_run() -> (Board, IssueRunRow) {
         let (board, first) = board_with_in_progress_card().await;
         assert!(
@@ -962,11 +700,6 @@ mod tests {
         (board, first)
     }
 
-    /// A router wired to this board, plus the session store it mints into.
-    ///
-    /// These tests stop at the session a run would have been handed, which
-    /// is the thing that decides whose persona, whose skills and whose name
-    /// the work happens under — so the actor spawner is never reached.
     struct RouterHarness {
         router: Router,
         sessions: Arc<baybo_session::SessionManager>,
@@ -1036,8 +769,6 @@ mod tests {
         }
     }
 
-    /// Say something on the card while its run is executing, and confirm
-    /// the board deferred it rather than answering now.
     async fn comment_mid_run(board: &Board) {
         board
             .projects
@@ -1065,10 +796,6 @@ mod tests {
         );
     }
 
-    /// The deferred comment has to reach the *dispatcher*. A ledger row
-    /// written straight to the store is a run nothing ever executes, and
-    /// because an issue may hold only one live run it blocks every later
-    /// start on that card until the next boot.
     #[tokio::test]
     async fn a_comment_left_mid_run_starts_a_follow_up_the_dispatcher_actually_gets() {
         let (board, first) = mid_run().await;
@@ -1100,9 +827,6 @@ mod tests {
         );
     }
 
-    /// And it goes through the budget gate on the way, like every other
-    /// start: a board with nothing left records the run it owes and holds
-    /// it, rather than dispatching work it cannot pay for.
     #[tokio::test]
     async fn a_follow_up_the_board_cannot_afford_is_held_rather_than_dispatched() {
         let (board, first) = mid_run().await;
@@ -1112,7 +836,6 @@ mod tests {
             .settle_run(&first.id, RunStatus::Done, None)
             .await
             .expect("settle");
-        // Zero is how an operator pauses a board without archiving it.
         board
             .projects
             .update_project(
@@ -1148,14 +871,6 @@ mod tests {
         );
     }
 
-    /// How the waiter reads a run whose turn ended in `reason` — the one
-    /// input that separates a Stop somebody pressed from a run that died,
-    /// since both settle the ledger row `Cancelled`.
-    ///
-    /// Asserts the bus edge and the store reconcile agree: production takes
-    /// the edge, the lagged and actor-died paths take the reconcile, and a
-    /// difference between them would be a comment lost on whichever path
-    /// the timing picked.
     async fn outcome_after_cancel(
         board: &Board,
         run: &IssueRunRow,
@@ -1206,10 +921,6 @@ mod tests {
         reconciled
     }
 
-    /// Cancel is the operator saying stop. The card stays InProgress and
-    /// stays assigned, so the board would happily answer "wake" — and a
-    /// fresh run seconds after the Cancel button reads as the button not
-    /// working.
     #[tokio::test]
     async fn cancelling_a_run_with_a_comment_waiting_does_not_start_another() {
         let (board, first) = mid_run().await;
@@ -1247,12 +958,6 @@ mod tests {
         );
     }
 
-    /// A run that *died* settles `Cancelled` too: crash recovery rolls the
-    /// turn of an actor that panicked to `Cancelled { SystemCrash }`, and a
-    /// cancel that propagated down the token tree arrives as
-    /// `ParentCancelled`. Nobody pressed Stop in either case, so the comment
-    /// waiting on the card still has to start something — that loss is the
-    /// whole reason the follow-up exists.
     #[tokio::test]
     async fn a_run_that_died_with_a_comment_waiting_still_starts_a_follow_up() {
         for reason in [CancelReason::SystemCrash, CancelReason::ParentCancelled] {
@@ -1284,14 +989,6 @@ mod tests {
         }
     }
 
-    /// A handover has to run as the agent the card now names.
-    ///
-    /// The session carries the binding, the binding selects the persona and
-    /// the skills, and — since this PR — the name the run's commits are
-    /// authored with. A run handed to the previous assignee's session does
-    /// all of its work as that agent while the card, the timeline and the
-    /// ledger row all say somebody else. The ledger row is right in that
-    /// state, which is why asserting on it cannot see this.
     #[tokio::test]
     async fn a_reassigned_card_runs_as_its_new_agent_and_not_the_old_one() {
         let (board, first) = board_with_in_progress_card().await;
@@ -1339,8 +1036,6 @@ mod tests {
             "and the session it does work in is bound to dev-2"
         );
 
-        // Continuity is per agent, not per run: hand the card back and the
-        // first agent picks up where it left off rather than starting over.
         board
             .store
             .claim_run(&handover.id, &handover_session.id)
@@ -1361,16 +1056,6 @@ mod tests {
         );
     }
 
-    /// The brief window and the session rule answer one question, and this
-    /// is where they are held to it.
-    ///
-    /// `issue_session` is the authority: it decides which session — and so
-    /// which transcript — this run is handed. `session_run_before` is what
-    /// `baybo`'s `brief_window` reads to decide how much of the card's
-    /// conversation the run has already seen. Either the run continues a
-    /// previous run's session, and the window is that run; or it does not,
-    /// and the window is the whole card. Anything else trims a conversation
-    /// as read against a transcript that does not contain it.
     async fn window_and_session_agree(
         board: &Board,
         harness: &RouterHarness,
@@ -1397,16 +1082,6 @@ mod tests {
         session
     }
 
-    /// The narrower shape of the same disagreement: a *same-agent* run that
-    /// never claimed a session.
-    ///
-    /// The operator presses Cancel while the run is still queued, so the
-    /// manager settles the row where it stands and no executor ever claims
-    /// it. The card is still InProgress and still assigned, so the next
-    /// comment wakes the same agent again — into a session with nothing in
-    /// it, because there is no claimed session to continue. A window that
-    /// merely matched on `agent_id` would call that a follow-up and trim
-    /// the whole discussion that set the work up.
     #[tokio::test]
     async fn a_run_whose_predecessor_never_opened_a_session_starts_a_fresh_one() {
         let (board, first) = board_with_in_progress_card().await;
@@ -1456,16 +1131,6 @@ mod tests {
         );
     }
 
-    /// A run settles on its own turn or on nothing.
-    ///
-    /// The session hosts every run its agent has worked on this card, so
-    /// the newest terminal turn in it is the *previous* run's until this
-    /// one opens its own. A run whose actor never got that far — the
-    /// mailbox send failed, so `handle_issue_run` cancels the token — has
-    /// to read as having failed. Inheriting instead means inheriting
-    /// `stopped_by_a_human` from an operator's Cancel that was aimed at a
-    /// run which has already ended, and the comment waiting on the card
-    /// then starts nothing.
     #[tokio::test]
     async fn a_run_whose_actor_never_opened_a_turn_does_not_inherit_the_last_ones_outcome() {
         let (board, first) = mid_run().await;
@@ -1474,7 +1139,6 @@ mod tests {
             baybo_turn::test_support::MemoryTurnStore::new(),
         )));
 
-        // Run #1's turn, stopped by the operator.
         let stopped = lifecycle
             .start_turn(
                 session.clone(),
@@ -1498,7 +1162,6 @@ mod tests {
             .await
             .expect("settle");
 
-        // A comment then asks the same agent again, in the same session.
         board
             .projects
             .comment(
@@ -1519,8 +1182,6 @@ mod tests {
             .claim_run(&second.id, &session)
             .await
             .expect("claim");
-        // And somebody says something else while run #2 is live, which is
-        // what the follow-up exists to carry.
         board
             .projects
             .comment(
@@ -1578,9 +1239,6 @@ mod tests {
         assert_eq!(dispatched[2].trigger, RunTrigger::Comment);
     }
 
-    /// The continuity F4 exists for, unchanged by the handover rule: a run
-    /// interrupted by a restart is resumed in the session it was already
-    /// running in, not a fresh one with an empty transcript.
     #[tokio::test]
     async fn a_resumed_run_continues_in_the_session_it_was_already_in() {
         let (board, first) = board_with_in_progress_card().await;
@@ -1597,7 +1255,6 @@ mod tests {
             .await
             .expect("claim");
 
-        // What the boot sweep hands back: the same row, still unsettled.
         let resumed = harness
             .router
             .issue_session(&board.store, &run_event(&first))
@@ -1616,12 +1273,6 @@ mod tests {
         );
     }
 
-    /// The binding is read, not assumed — and this is the path that needs it
-    /// to be. `enqueue` refuses a card whose agent has moved off baybo, but
-    /// the sweeps hand out rows recorded *earlier*, so a row written while
-    /// the agent was baybo arrives here after the flip having passed no gate
-    /// at all. Binding it `Baybo` anyway would run a codex agent's persona
-    /// on the internal loop and sign its name to the commits.
     #[tokio::test]
     async fn a_run_is_refused_a_session_its_agent_can_no_longer_host() {
         let (board, run) = board_with_in_progress_card().await;

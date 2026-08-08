@@ -1,8 +1,4 @@
 //! Kanban project value types: the container id and the issue id.
-//!
-//! Only the types shared across layers live here; row shapes and store
-//! ports live in `baybo-store`, the sqlite impls in `baybo-storage`, and
-//! the domain logic in `baybo-project`. See `docs/todo/kanban.md`.
 
 use std::fmt;
 
@@ -27,13 +23,6 @@ pub struct InvalidProjectValue {
 }
 
 /// Server-generated identifier for a project.
-///
-/// A ULID at genesis, and the directory name of the project's folder under
-/// `projects/` — so it is **not** opaque: every construction path runs the
-/// same grammar, `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`, which is what keeps
-/// every derived path inside the workspace. `Deserialize` is deliberately
-/// not transparent: a guard only on the constructor would be bypassed by
-/// every request body and stored row that parses one.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
 pub struct ProjectId(String);
@@ -115,12 +104,6 @@ impl<'de> Deserialize<'de> for ProjectId {
 }
 
 /// Server-generated identifier for one issue.
-///
-/// Opaque (a ULID at genesis) — unlike [`ProjectId`] it never reaches the
-/// filesystem, so a key is all it needs to be. The human-facing address is
-/// its per-project `number`, and the REST surface only ever addresses an
-/// issue as `(project, number)`; this id exists so child tables (runs,
-/// events) can carry a single-column reference.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct IssueId(String);
@@ -259,8 +242,6 @@ mod tests {
 
     #[test]
     fn deserialize_runs_the_grammar() {
-        // The whole reason `Deserialize` is hand-written: a request body or
-        // a stored row must not be a way around `parse`.
         let refused = serde_json::from_str::<ProjectId>("\"../etc\"");
         assert!(refused.is_err(), "deserialization must re-run the grammar");
         let accepted: ProjectId =

@@ -5,9 +5,6 @@ import userEvent from '@testing-library/user-event';
 import { ActivityDrawer } from './ActivityDrawer';
 import type { IssueEvent } from './timelineModel';
 
-// The wiring the model tests can't reach: that a comment is shown rather
-// than narrated (the same rule the per-issue timeline follows), and that
-// an entry opens the card it belongs to.
 
 const feed = vi.hoisted(() => ({ fetchFeed: vi.fn() }));
 vi.mock('./api', () => ({ fetchFeed: feed.fetchFeed }));

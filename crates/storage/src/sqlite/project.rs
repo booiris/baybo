@@ -21,9 +21,6 @@ impl SqliteProjectStore {
         Self { pool }
     }
 
-    /// One issue's timeline, oldest first, optionally only what landed
-    /// strictly after `since_us`. Both readers want the same ordering and
-    /// the same row mapping; the only difference is the bound.
     async fn events_query(
         &self,
         issue_id: String,
@@ -47,9 +44,6 @@ impl SqliteProjectStore {
 
 const EVENT_COLUMNS: &str = "id, issue_id, project_id, number, actor, body, created_at";
 
-/// Raw event tuple, in `EVENT_COLUMNS` order. `kind` is deliberately not
-/// read back: it is derived from `body`, so reading it would invite the two
-/// to disagree.
 type RawEvent = (String, String, String, i64, String, String, i64);
 
 fn read_raw_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawEvent> {
@@ -90,7 +84,6 @@ const ISSUE_COLUMNS: &str = "id, project_id, number, title, description, status,
 const RUN_COLUMNS: &str = "id, issue_id, project_id, number, agent_id, session_id, trigger, \
      status, attempt, error, created_at, started_at, settled_at";
 
-/// Raw run tuple, in `RUN_COLUMNS` order.
 type RawRun = (
     String,
     String,
@@ -163,7 +156,6 @@ fn run_from_raw(raw: RawRun) -> Result<IssueRunRow> {
     })
 }
 
-/// Raw project tuple, in `PROJECT_COLUMNS` order. Timestamps are µs.
 type RawProject = (
     String,
     String,
@@ -176,7 +168,6 @@ type RawProject = (
     i64,
 );
 
-/// Raw issue tuple, in `ISSUE_COLUMNS` order.
 type RawIssue = (
     String,
     String,
@@ -422,11 +413,6 @@ impl ProjectStore for SqliteProjectStore {
         let micros = self
             .pool
             .interact("projects.spend_since", move |conn| {
-                // `IN (SELECT …)` over this board's run sessions rather than
-                // a join: runs share sessions — an issue keeps one per agent
-                // that works it — so a join would count one call once per
-                // run that shared the session. The subquery deduplicates by
-                // construction, whatever the sharing rule is.
                 let total: i64 = conn.query_row(
                     "SELECT COALESCE(SUM(cost_usd), 0) FROM cost_records \
                      WHERE timestamp >= ?2 AND session_id IN ( \
@@ -451,10 +437,6 @@ impl ProjectStore for SqliteProjectStore {
         let affected = self
             .pool
             .interact("projects.mark_read", move |conn| {
-                // `MAX` rather than a plain set: two tabs on one board race,
-                // and the later read is the true one. A blind write lets a
-                // slow request rewind the cursor and resurrect a badge that
-                // was already cleared.
                 Ok(conn.execute(
                     "UPDATE projects SET read_at = MAX(COALESCE(read_at, 0), ?2) WHERE id = ?1",
                     rusqlite::params![id, at],
@@ -471,11 +453,6 @@ impl ProjectStore for SqliteProjectStore {
         let affected = self
             .pool
             .interact("projects.set_archived", move |conn| {
-                // Scoped to the state it is asked to leave, so `affected`
-                // counts state changes rather than existing rows. A caller
-                // reads the difference as the edge and does the work a
-                // restore owes — which on a board that was never away would
-                // be work somebody else is already carrying.
                 Ok(conn.execute(
                     "UPDATE projects SET archived_at = ?2, updated_at = ?3 \
                      WHERE id = ?1 AND (archived_at IS NOT NULL) <> ?4",
@@ -544,10 +521,6 @@ impl ProjectStore for SqliteProjectStore {
             .interact("issues.create", move |conn| {
                 let tx =
                     conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-                // Both derived values are read inside the transaction that
-                // writes them: computed outside, two concurrent creates would
-                // pick the same number and the second would trip the unique
-                // index instead of getting the next one.
                 let number: i64 = tx.query_row(
                     "SELECT COALESCE(MAX(number), 0) + 1 FROM issues WHERE project_id = ?1",
                     rusqlite::params![project],
@@ -607,11 +580,6 @@ impl ProjectStore for SqliteProjectStore {
         let affected = self
             .pool
             .interact("issues.update", move |conn| {
-                // COALESCE(?, column) leaves an unset field alone, so a
-                // sparse patch never clobbers a field the caller didn't name.
-                // `blocked_reason` and `cancelled_at` are clearable, so they
-                // take a flag beside the value rather than relying on NULL to
-                // mean "unset" — NULL is a value they can legitimately take.
                 let title = update.title.clone();
                 let description = update.description.clone();
                 let priority = update.priority.map(|p| p.as_str());
@@ -685,10 +653,6 @@ impl ProjectStore for SqliteProjectStore {
                 let mut counts: std::collections::HashMap<String, (usize, usize, usize)> =
                     std::collections::HashMap::new();
 
-                // Held runs. Served by `idx_issue_runs_unsettled`, which is
-                // small by construction, and already per-issue because
-                // `idx_issue_runs_live` makes at most one unfinished run per
-                // issue structurally possible.
                 {
                     let mut stmt = conn.prepare(
                         "SELECT r.project_id, COUNT(*) FROM issue_runs r \
@@ -705,15 +669,6 @@ impl ProjectStore for SqliteProjectStore {
                     }
                 }
 
-                // Live cards whose NEWEST run failed. A correlated subquery
-                // rather than a window function over every run: this way the
-                // cost is one index seek per live card
-                // (`idx_issue_runs_log`), bounded by the working set, where
-                // a partition would be bounded by run history.
-                //
-                // `id DESC` tiebreaks alongside `created_at DESC` for the
-                // same reason the feed does: two runs written in one
-                // microsecond must not flip the answer.
                 {
                     let mut stmt = conn.prepare(
                         "SELECT i.project_id, COUNT(*) FROM issues i \
@@ -735,11 +690,6 @@ impl ProjectStore for SqliteProjectStore {
                     }
                 }
 
-                // What has happened since the operator looked. Only the two
-                // things that leave no other trace when read: an agent
-                // asking something, and a card arriving in Review. Every
-                // other event kind is either already counted above as
-                // actionable state, or is the board's own traffic.
                 {
                     let mut stmt = conn.prepare(
                         "SELECT e.project_id, COUNT(*) FROM issue_events e \
@@ -853,10 +803,6 @@ impl ProjectStore for SqliteProjectStore {
         let raw = self
             .pool
             .interact("issues.by_source_key", move |conn| {
-                // The WHERE clause mirrors `idx_issues_source_key` exactly.
-                // A check that admitted a finished card would report a
-                // duplicate the index would happily allow, which is worse
-                // than no check: the caller would decline to open work.
                 Ok(conn
                     .query_row(
                         &format!(
@@ -924,10 +870,6 @@ impl ProjectStore for SqliteProjectStore {
                      WHERE project_id = ?1 AND number = ?2",
                     rusqlite::params![project, number, status, now],
                 )?;
-                // Renumber the destination column densely. Every UPDATE is
-                // scoped to (project, status), so a number from another
-                // project — or from a column the caller mis-read — updates
-                // nothing instead of being adopted into this column.
                 for (index, target) in ordered.iter().enumerate() {
                     tx.execute(
                         "UPDATE issues SET position = ?3 \
@@ -936,11 +878,6 @@ impl ProjectStore for SqliteProjectStore {
                     )?;
                 }
                 if previous != status {
-                    // The source column keeps its order and closes the gap.
-                    // Left alone it would hold a hole at the departed card's
-                    // rank — harmless for sorting, but it makes `position`
-                    // mean two different things depending on history, and a
-                    // later reader that trusts density would be wrong.
                     let remaining: Vec<i64> = {
                         let mut stmt = tx.prepare(
                             "SELECT number FROM issues \
@@ -1157,11 +1094,6 @@ impl ProjectStore for SqliteProjectStore {
         let affected = self
             .pool
             .interact("issue_runs.settle", move |conn| {
-                // `settled_at IS NULL` is what makes a re-driven run safe to
-                // replay: a second settle of the same run touches nothing.
-                // It is *only* that — the statement is not scoped to an
-                // owner, so it settles a row somebody else has claimed just
-                // as readily.
                 Ok(conn.execute(
                     "UPDATE issue_runs SET status = ?2, error = ?3, settled_at = ?4 \
                      WHERE id = ?1 AND settled_at IS NULL",
@@ -1222,20 +1154,6 @@ impl ProjectStore for SqliteProjectStore {
     async fn requeue_unsettled(&self) -> Result<()> {
         self.pool
             .interact("issue_runs.requeue", move |conn| {
-                // A `running` row whose actor died with the process is work
-                // that never finished, so it goes back to `queued` for the
-                // caller to hand out again, board by board. The session it
-                // was claimed with stays: the resumed run is the same run,
-                // executed by the same agent, so it belongs in the same
-                // thread — and `claim_run` gates on the status alone, so a
-                // session already on the row cannot refuse the re-claim.
-                // Dropping it would start the resumed run from an empty
-                // transcript and take its spend out of `spend_since`.
-                //
-                // `held` is untouched for the same reason it is not an
-                // orphan: it was never started, so there is nothing to roll
-                // forward, and today's budget is the only thing that should
-                // decide whether it starts.
                 conn.execute(
                     "UPDATE issue_runs SET status = 'queued', started_at = NULL \
                      WHERE settled_at IS NULL AND status = 'running'",
@@ -1349,9 +1267,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_typed_body_survives_the_round_trip_whole() {
-        // The payload is JSON in one column, so this is the test that a
-        // reader gets back exactly the variant a writer stored — every
-        // field, including the ones that are only sometimes there.
         let (_dir, store) = store().await;
         let p = project("proj-b", "B");
         store.create_project(&p).await.unwrap();
@@ -1406,8 +1321,6 @@ mod tests {
 
     #[tokio::test]
     async fn the_delta_since_a_moment_excludes_what_came_before_it() {
-        // What a follow-up run's brief is built from: everything said since
-        // the last run started, and nothing it already read.
         let (_dir, store) = store().await;
         let p = project("proj-d", "D");
         store.create_project(&p).await.unwrap();
@@ -1484,8 +1397,6 @@ mod tests {
             1,
             "an archived project leaves the default listing"
         );
-        // `true` is the edge, not "the row is there": a caller hangs the
-        // work a restore owes on it, and a repeat owes nothing.
         let shelved_at = store
             .get_project(&a.id)
             .await
@@ -1533,7 +1444,6 @@ mod tests {
             "the row itself is never removed"
         );
 
-        // An unknown id reports no row rather than erroring.
         let ghost = ProjectId::parse("ghost").unwrap();
         assert!(!store.set_project_archived(&ghost, true).await.unwrap());
     }
@@ -1567,7 +1477,6 @@ mod tests {
             "a new card lands at the tail of its column"
         );
 
-        // Addressing is (project, number): b's #1 is not a's #1.
         assert_eq!(
             store.get_issue(&a.id, 1).await.unwrap().unwrap().title,
             "first"
@@ -1623,7 +1532,6 @@ mod tests {
                 .await
                 .unwrap();
         }
-        // Card #3 jumps to Todo; Backlog closes ranks behind it.
         assert!(
             store
                 .move_issue(&p.id, 3, IssueStatus::Todo, &[3])
@@ -1644,7 +1552,6 @@ mod tests {
         assert_eq!(by_number(2).position, 0);
         assert_eq!(by_number(1).position, 1);
 
-        // A number from another column cannot be renumbered into this one.
         assert!(
             store
                 .move_issue(&p.id, 2, IssueStatus::Backlog, &[2, 3])
@@ -1677,9 +1584,6 @@ mod tests {
                 .await
                 .unwrap();
         }
-        // #2 leaves from the middle. The caller only ever knows the
-        // destination's contents, so closing the source's rank is the
-        // store's job — otherwise position 1 stays vacant forever.
         assert!(
             store
                 .move_issue(&p.id, 2, IssueStatus::Review, &[2])
@@ -1715,15 +1619,12 @@ mod tests {
         assert_eq!(run.attempt, 1);
         assert!(run.session_id.is_none(), "a queued run has no session yet");
 
-        // The dedupe guard is the index, not a check-then-write: a second
-        // unfinished run for the same issue cannot exist.
         let refused = store
             .enqueue_run(&new_run(&issue))
             .await
             .expect_err("an issue holds one run at a time");
         assert!(matches!(refused, StorageError::Conflict(_)), "{refused:?}");
 
-        // Claim, then settle. Both are scoped, so a replay is a no-op.
         let session = SessionId::from("issue-1");
         assert!(store.claim_run(&run.id, &session).await.unwrap());
         assert!(
@@ -1753,7 +1654,6 @@ mod tests {
         assert_eq!(settled.status, RunStatus::Done);
         assert!(settled.error.is_none());
 
-        // …and the slot is free again.
         let second = store.enqueue_run(&new_run(&issue)).await.unwrap();
         assert_eq!(second.attempt, 2);
     }
@@ -1776,7 +1676,6 @@ mod tests {
             .await
             .unwrap();
 
-        // One never started, one died mid-flight, one finished before the crash.
         let queued = store.enqueue_run(&new_run(&one)).await.unwrap();
         let running = store.enqueue_run(&new_run(&two)).await.unwrap();
         store
@@ -1791,9 +1690,6 @@ mod tests {
 
         store.requeue_unsettled().await.unwrap();
 
-        // The sweep's whole product is the state it leaves: it hands nothing
-        // back, because who gets to *run* these is a per-board question the
-        // caller asks next, one `active_runs` at a time.
         let swept = store.active_runs(&p.id).await.unwrap();
         let ids: Vec<&str> = swept.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(
@@ -1824,13 +1720,9 @@ mod tests {
             "a run that was never claimed still has no session"
         );
 
-        // The sweep is idempotent — booting twice is not a double dispatch.
         store.requeue_unsettled().await.unwrap();
         assert_eq!(store.active_runs(&p.id).await.unwrap().len(), 2);
 
-        // The worry the sweep used to null the session over: `claim_run`
-        // gates on the status, so a session already on the row does not
-        // refuse the re-claim.
         assert!(store.claim_run(&running.id, &session).await.unwrap());
     }
 
@@ -1864,8 +1756,6 @@ mod tests {
         );
         assert_eq!(issue.description, "filled in");
 
-        // Blocking, then clearing the block: `Some(None)` is a real value,
-        // distinct from `None` meaning "leave it".
         store
             .update_issue(
                 &p.id,
@@ -1926,7 +1816,6 @@ mod tests {
                 .is_none()
         );
 
-        // Cancel is the terminal negative: the row stays, stamped.
         store
             .update_issue(
                 &p.id,
@@ -1955,10 +1844,6 @@ mod tests {
         );
     }
 
-    /// The budget gate's read. Two things it has to get right: only this
-    /// board's sessions count, and a session reused by several runs counts
-    /// once — an issue keeps one session per agent that works it, so a join
-    /// would multiply the same call by the number of runs that shared it.
     #[tokio::test]
     async fn spend_since_sums_one_board_and_never_double_counts_a_session() {
         let dir = tempfile::tempdir().unwrap();
@@ -1987,8 +1872,6 @@ mod tests {
         let ours = store.create_issue(&issue(&mine, "ours")).await.unwrap();
         let other = store.create_issue(&issue(&theirs, "theirs")).await.unwrap();
 
-        // One session on our issue, shared by two runs of it — the real
-        // shape, since consecutive runs by the same agent share its session.
         let shared = SessionId::from("sess-ours".to_owned());
         let their_session = SessionId::from("sess-theirs".to_owned());
         for (row, session, settle) in [
@@ -2038,7 +1921,6 @@ mod tests {
         for record in [
             spend(&shared, 300, now),
             spend(&shared, 200, now),
-            // Outside the window, and another board's — neither counts.
             spend(&shared, 9_000, yesterday),
             spend(&their_session, 7_000, now),
         ] {
@@ -2059,9 +1941,6 @@ mod tests {
         );
     }
 
-    /// `spend_since` reaches `cost_records` only through the sessions named
-    /// on a board's runs, so a run that loses its session takes its spend off
-    /// the board's books with it — a restart would refund the budget.
     #[tokio::test]
     async fn an_interrupted_runs_spend_still_counts_against_its_board() {
         let dir = tempfile::tempdir().unwrap();

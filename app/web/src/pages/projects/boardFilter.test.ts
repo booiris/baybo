@@ -60,11 +60,9 @@ describe('matches', () => {
   });
 
   it('finds a card by number, with or without the hash', () => {
-    // `#12` is how the card is written everywhere else on the page.
     const card = issue(12, { title: 'nothing to match on' });
     expect(matches(card, filter({ text: '#12' }), TEAM)).toBe(true);
     expect(matches(card, filter({ text: '12' }), TEAM)).toBe(true);
-    // …and not by a prefix of it, which would make #1 match every #1x.
     expect(matches(card, filter({ text: '1' }), TEAM)).toBe(false);
   });
 
@@ -84,9 +82,6 @@ describe('matches', () => {
   });
 
   it('matches an assignee by the handle the card renders', () => {
-    // A departed agent is not on the roster, so `handleOf` falls back to
-    // its id — which simply never equals a live handle rather than
-    // matching the wrong teammate.
     const departed = issue(1, { assignee: 'id-gone' });
     expect(matches(departed, filter({ assignee: { kind: 'handle', handle: 'dev-1' } }), TEAM)).toBe(
       false,
@@ -120,15 +115,12 @@ describe('filterBoard', () => {
     const view = filterBoard(board, filter({ text: 'keep' }), TEAM);
     expect(view.backlog.map((i) => i.number)).toEqual([1]);
     expect(view.todo.map((i) => i.number)).toEqual([3]);
-    // The board it derived from is what a move request reads.
     expect(board.backlog).toHaveLength(2);
   });
 });
 
 describe('isRestrictive / isDefault', () => {
   it('treats the cancelled toggle as widening, not narrowing', () => {
-    // It adds cards, so a board showing them is not "filtered" — but it is
-    // also not the default, which is what the Clear button reacts to.
     const shown = filter({ showCancelled: true });
     expect(isRestrictive(shown)).toBe(false);
     expect(isDefault(shown)).toBe(false);
@@ -165,15 +157,11 @@ describe('the URL codec', () => {
   });
 
   it('degrades a hand-edited URL to the default rather than to an empty board', () => {
-    // Refusing to render would turn a typo into a board nobody can open.
     const params = new URLSearchParams('assignee=%40&blocked=yes&cancelled=maybe');
     expect(parseBoardFilter(params)).toEqual(filter());
   });
 
   it('cannot confuse the unassigned sentinel with a handle', () => {
-    // A handle is always written with a leading `@`, and `@` is outside the
-    // handle grammar, so an agent literally called "unassigned" is still
-    // written `@unassigned`.
     const asHandle = filter({ assignee: { kind: 'handle', handle: 'unassigned' } });
     expect(boardFilterParams(asHandle).get('assignee')).toBe('@unassigned');
     expect(parseBoardFilter(boardFilterParams(asHandle))).toEqual(asHandle);

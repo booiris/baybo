@@ -6,10 +6,6 @@ import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { ProjectBoardPage } from './ProjectBoardPage';
 import type { Issue, Project } from './boardModel';
 
-// The board renders five fixed columns from a flat listing, counts only
-// live work in each header, and marks the flags a card can carry. This is
-// the wiring a reducer test can't reach: that the page asks for the right
-// things and paints what comes back.
 
 const PROJECT: Project = {
   id: '01JPROJECT',
@@ -50,7 +46,6 @@ const ISSUES: Issue[] = [
   }),
 ];
 
-// #4 is being worked on right now; #1 is waiting its turn.
 const RUNS = [
   { number: 4, attempt: 1, agent_id: 'dev-1', status: 'running', trigger: 'started', created_at_ms: 0 },
   { number: 1, attempt: 1, agent_id: 'dev-1', status: 'queued', trigger: 'started', created_at_ms: 0 },
@@ -103,10 +98,6 @@ function stubClient() {
 
 const client = stubClient();
 
-// Both hooks must return a STABLE value, as the real context does. A fresh
-// object per call changes the identity of the load effect's dependencies on
-// every render, which re-fetches the board continuously — and hides exactly
-// the kind of over-fetching a test would otherwise catch.
 const auth = { logout: vi.fn() };
 vi.mock('../../api/auth', () => ({
   useAdminClient: () => client,
@@ -132,7 +123,6 @@ describe('ProjectBoardPage', () => {
       expect(screen.getByRole('heading', { name: label })).toBeInTheDocument();
     }
     expect(screen.getByText('Under way')).toBeInTheDocument();
-    // Three empty columns say so rather than rendering as blank space.
     expect(screen.getAllByText('No issues')).toHaveLength(3);
   });
 
@@ -140,8 +130,6 @@ describe('ProjectBoardPage', () => {
     renderBoard();
     await screen.findByText('Wire the board');
 
-    // Backlog holds #1, #2 and cancelled #3 — but #3 is hidden by default
-    // and would not count even when shown.
     expect(screen.queryByText('Cancelled one')).not.toBeInTheDocument();
     const backlog = screen.getByRole('heading', { name: 'Backlog' }).parentElement;
     expect(backlog?.textContent).toContain('2');
@@ -154,7 +142,6 @@ describe('ProjectBoardPage', () => {
     await userEvent.click(screen.getByLabelText('Show cancelled'));
     const cancelled = await screen.findByText('Cancelled one');
     expect(cancelled.className).toContain('line-through');
-    // …and it still is not counted as outstanding work.
     const backlog = screen.getByRole('heading', { name: 'Backlog' }).parentElement;
     expect(backlog?.textContent).toContain('2');
   });
@@ -164,7 +151,6 @@ describe('ProjectBoardPage', () => {
     await screen.findByText('Blocked one');
 
     expect(screen.getByText('⚑ Blocked')).toBeInTheDocument();
-    // Urgent renders its mark on the card face; priority never reorders.
     expect(screen.getByText('▲▲')).toBeInTheDocument();
   });
 
@@ -172,11 +158,8 @@ describe('ProjectBoardPage', () => {
     renderBoard();
     await screen.findByText('Under way');
 
-    // The state a card shows is its run's, and only unfinished runs reach
-    // the board — a finished one is history for the execution log.
     expect(screen.getByText('working')).toBeInTheDocument();
     expect(screen.getByText('queued')).toBeInTheDocument();
-    // The cards nobody is on say nothing.
     expect(screen.getAllByText(/^(working|queued)$/)).toHaveLength(2);
   });
 
@@ -188,17 +171,10 @@ describe('ProjectBoardPage', () => {
     await waitFor(() => {
       expect(screen.getByPlaceholderText('Issue title')).toBeInTheDocument();
     });
-    // The pre-filled column is the whole reason the modal knows the status.
     const modal = screen.getByPlaceholderText('Issue title').closest('div')?.parentElement;
     expect(modal?.textContent).toContain('Review');
   });
 
-  /**
-   * Narrowing the board is a render-time concern. Keying the load effect on
-   * the filter would spend five requests per keystroke, and — worse — a
-   * board rebuilt from a filtered fetch would be a board that cannot
-   * describe its own columns to a move request.
-   */
   it('does not refetch when the filter changes', async () => {
     const { rerender } = renderBoard();
     await screen.findByText('Wire the board');
@@ -216,28 +192,15 @@ describe('ProjectBoardPage', () => {
     await screen.findByText('Blocked one');
     expect(screen.queryByText('Wire the board')).not.toBeInTheDocument();
 
-    // The header still says how much live work the column holds, with the
-    // matching count beside it — a count that followed the filter would be
-    // indistinguishable from an empty board.
     expect(await screen.findByTitle(/1 of 2 live cards match/)).toBeInTheDocument();
   });
 
   it('shows cancelled cards only when the URL asks for them', async () => {
     renderBoard('?cancelled=1');
     expect(await screen.findByText('Cancelled one')).toBeInTheDocument();
-    // …and they still do not count as live work.
     expect(await screen.findByTitle('2 live')).toBeInTheDocument();
   });
 
-  /**
-   * The panels sit over the board, not beside it. Docking one narrows every
-   * column the moment it opens — so reading the activity feed would reflow
-   * the thing it is about.
-   *
-   * jsdom has no layout, so what is checkable is the mechanism: the panel
-   * is inside an absolutely-positioned container and therefore out of the
-   * flow. That is exactly what a regression would undo.
-   */
   it('floats a side panel over the board instead of docking it', async () => {
     renderBoard();
     await screen.findByText('Wire the board');
@@ -245,7 +208,6 @@ describe('ProjectBoardPage', () => {
 
     const panel = await screen.findByRole('complementary');
     expect(panel.parentElement?.className).toContain('absolute');
-    // …and the board is still underneath it, at its own width.
     expect(screen.getByText('Wire the board')).toBeInTheDocument();
   });
 });

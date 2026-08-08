@@ -1,9 +1,4 @@
 //! Framing for a board issue's brief.
-//!
-//! The brief is what the assignee is asked to do, framed the way a cron
-//! fire is: a tagged envelope so the model can tell an instruction it was
-//! handed from something a person typed at it, and so an operator surface
-//! can identify a run's input by provenance rather than by sniffing text.
 
 /// Opening tag of the framed brief. The issue number rides in it, so a
 /// transcript read on its own still says which card the work belongs to.
@@ -17,13 +12,6 @@ decide."#;
 
 const INSTRUCTION_LABEL: &str = "The issue:";
 
-/// Where the run works, stated because nothing else tells it.
-///
-/// The Bash tool's description is rendered once at construction and names
-/// the workspace work directory for every session — it structurally cannot
-/// mention a per-run checkout. So without this the model is told its
-/// commands land somewhere they do not, and would reasonably `cd` its way
-/// out of the tree that was cut for it.
 const CHECKOUT_BODY: &str = r#"Your checkout for this issue is:
 
   {{checkout}}

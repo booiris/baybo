@@ -332,10 +332,6 @@ const ADD_COLUMNS: &[AddColumn] = &[
         column: "branch",
         definition: "TEXT",
     },
-    // `issues` was created one commit ago and has never shipped, so its
-    // CREATE carries `assignee` directly. The ALTER is here for the
-    // databases that commit already made — the pragma guard makes it a
-    // no-op everywhere else.
     AddColumn {
         table: "issues",
         column: "assignee",
@@ -1844,11 +1840,6 @@ mod tests {
         .expect("migration interact");
     }
 
-    /// A database written before the team columns existed must still open,
-    /// and must come out with the handle index. The ordering is the hazard:
-    /// `idx_agent_profiles_handle` names two columns that only exist after
-    /// the `ADD_COLUMNS` loop, so a batch-time `CREATE INDEX` would fail
-    /// here and nowhere else — a fresh DB never notices.
     #[tokio::test]
     async fn a_pre_team_database_migrates_and_gains_the_handle_index() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1882,7 +1873,6 @@ mod tests {
                 |r| r.get(0),
             )?;
             assert_eq!(indexed, 1, "the handle index must exist after migration");
-            // The pre-existing row survived and reads as a global agent.
             let (project_id, handle): (Option<String>, Option<String>) = conn.query_row(
                 "SELECT project_id, handle FROM agent_profiles WHERE id = '01JOLD'",
                 [],

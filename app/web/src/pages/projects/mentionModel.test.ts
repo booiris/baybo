@@ -21,13 +21,10 @@ describe('mentionQuery', () => {
   it('offers a completion while a handle is being typed', () => {
     expect(mentionQuery('@de', 3)).toEqual({ start: 0, prefix: 'de' });
     expect(mentionQuery('ask @de', 7)).toEqual({ start: 4, prefix: 'de' });
-    // A bare `@` offers the whole team.
     expect(mentionQuery('@', 1)).toEqual({ start: 0, prefix: '' });
   });
 
   it('does not offer inside something that is not a mention', () => {
-    // Same rule the server applies, so the composer cannot promise a
-    // handover the server will not make.
     expect(mentionQuery('me@dev', 6)).toBeNull();
     expect(mentionQuery('docs/x@lead', 11)).toBeNull();
     expect(mentionQuery('no handle here', 5)).toBeNull();
@@ -49,29 +46,24 @@ describe('mentionCandidates', () => {
 describe('applyMention', () => {
   it('replaces what was typed and leaves the caret one past the mention', () => {
     const cases = [
-      // Mid-sentence: the tail's space is reused, and the caret steps over it.
       {
         text: 'ask @de about it',
         query: { start: 4, prefix: 'de' },
         want: 'ask @dev-1 about it',
         caretAt: 'ask @dev-1 ',
       },
-      // Before punctuation: the inserted space is the separator, so the caret
-      // belongs before the comma, not after it.
       {
         text: 'ask @de,',
         query: { start: 4, prefix: 'de' },
         want: 'ask @dev-1 ,',
         caretAt: 'ask @dev-1 ',
       },
-      // At the end of the box, where the caret must not run past the text.
       {
         text: 'ask @de',
         query: { start: 4, prefix: 'de' },
         want: 'ask @dev-1 ',
         caretAt: 'ask @dev-1 ',
       },
-      // The mention is the whole comment.
       {
         text: '@de',
         query: { start: 0, prefix: 'de' },
@@ -84,8 +76,6 @@ describe('applyMention', () => {
       const result = applyMention(text, query, 'dev-1');
       expect(result.text).toBe(want);
       expect(result.text.slice(0, result.caret)).toBe(caretAt);
-      // The offset itself, not just the prefix: `slice` clamps, which is how
-      // a caret past the end of the text stayed invisible.
       expect(result.caret).toBe(caretAt.length);
     }
   });
@@ -96,8 +86,6 @@ describe('mentionHint', () => {
     expect(mentionHint({ assignee: null }, '@dev-1 take this', TEAM)).toBe(
       'Sending this puts @dev-1 on the issue.',
     );
-    // On an owned card a mention is a question, so promising a handover
-    // would be promising something the server will not do.
     expect(mentionHint({ assignee: 'id-dev-2' }, '@dev-1 take this', TEAM)).toBeNull();
   });
 

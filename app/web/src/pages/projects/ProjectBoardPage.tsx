@@ -102,21 +102,12 @@ export function ProjectBoardPage() {
   const [dragging, setDragging] = useState<Issue | null>(null);
   const [createIn, setCreateIn] = useState<IssueStatus | null>(null);
   const [params, setParams] = useSearchParams();
-  // The filter lives in the URL so the board→detail→back loop and a reload
-  // keep it, and so a narrowed board is a link somebody can send.
   const filter = useMemo(() => parseBoardFilter(params), [params]);
-  // One right-hand slot, so the two panels are mutually exclusive — the
-  // spec's rule, and the board would have no room for both anyway.
   const [rightPanel, setRightPanel] = useState<'activity' | 'lead' | null>(null);
-  // The profile shares the right-hand slot with the other two panels: the
-  // board has room for one, and three mutually exclusive things read more
-  // simply as two pieces of state than as one four-way enum nobody can
-  // exhaustively name.
   const [profileOf, setProfileOf] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
 
-  // The board dnd-kit shows mid-drag is already mutated by `onDragOver`, so
-  // a rollback needs the board as it was before the drag started.
+  // onDragOver mutates the preview, so rollback needs the drag-start board.
   const preDrag = useRef<Board | null>(null);
 
   useEffect(() => {
@@ -127,10 +118,6 @@ export function ProjectBoardPage() {
         await Promise.all([
           fetchProject(client, projectId),
           fetchIssues(client, projectId),
-          // Archived boards included: the switcher hides them behind its
-          // own toggle, which is a render-time decision like the board's
-          // own filters. The landing resolver still asks for live ones
-          // only — it must never open a read-only board by default.
           fetchProjects(client, true),
           fetchTeam(client, projectId),
           fetchActiveRuns(client, projectId),
@@ -161,32 +148,18 @@ export function ProjectBoardPage() {
       if (agentsOutcome.kind === 'ok') setTeam(agentsOutcome.value);
       setActiveRuns(runsOutcome.kind === 'ok' ? runsOutcome.value : []);
       setLoading(false);
-      // Remembered only once the board actually resolved: a 404'd deep link
-      // must not poison what the rail opens next time.
       writeLastProjectId(projectId);
-      // Looking at the board is what clears its unread count. Fire and
-      // forget: a failed mark leaves the badge up, which is the harmless
-      // direction — the alternative is hiding something that needs
-      // attention because one request dropped.
       void markProjectRead(client, projectId);
     }
     void load();
     return () => {
       canceled = true;
     };
-    // Deliberately not keyed on the filter: narrowing the board is a
-    // render-time concern, and refetching five endpoints per keystroke
-    // would be the cost of a `useMemo`.
   }, [client, logout, projectId, refreshKey]);
 
-  // `board` is every card the server has; `view` is what is rendered. They
-  // must not be conflated: a move sends its destination column's whole new
-  // order, which only `board` knows.
+  // Move requests use the full column order, never this filtered view.
   const view = useMemo(() => filterBoard(board, filter, team), [board, filter, team]);
 
-  // The board refetches when the server says this project changed —
-  // including changes nobody on this page made, which is how a lead's own
-  // card appears while you watch.
   useBoardStream(
     projectId,
     null,
@@ -209,18 +182,12 @@ export function ProjectBoardPage() {
     [board],
   );
 
-  // dnd-kit only opens a gap in a column whose SortableContext actually
-  // holds the dragged id, so the cross-column move has to be applied while
-  // the pointer is still down — not on drop.
+  // dnd-kit needs cross-column previews here to open the destination gap.
   const onDragOver = useCallback(
     (event: DragOverEvent) => {
       const activeId = String(event.active.id);
       const overId = event.over === null ? null : String(event.over.id);
       setBoard((current) => {
-        // Resolved against the *view* — those are the ids dnd-kit collided
-        // with — and applied to the whole board. The view is recomputed from
-        // `current` rather than closed over, so a burst of drag-over events
-        // between renders still resolves against the freshest state.
         const drop = resolveDrop(filterBoard(current, filter, team), activeId, overId);
         return drop === null ? current : moveCard(current, drop);
       });
@@ -239,8 +206,6 @@ export function ProjectBoardPage() {
       if (target?.kind !== 'card') return;
       const number = target.number;
 
-      // `board` here is the preview `onDragOver` built; resolve once more so
-      // a drop straight onto a card lands in that card's slot.
       const drop = resolveDrop(
         filterBoard(board, filter, team),
         String(event.active.id),
@@ -257,8 +222,6 @@ export function ProjectBoardPage() {
       if (issue === null) return;
       const refusal = dropRejection(issue, issue.status);
       if (refusal !== null) {
-        // Bounce before the request: the server refuses this too, but the
-        // card should snap back rather than flicker through the column.
         setBoard(before);
         pushToast('warn', refusal);
         return;
@@ -399,8 +362,6 @@ export function ProjectBoardPage() {
         filter={filter}
         team={team}
         onChange={(next: BoardFilter) => {
-          // `replace` because a search box that pushes a history entry per
-          // keystroke makes the back button useless.
           setParams(boardFilterParams(next), { replace: true });
         }}
       />
@@ -411,11 +372,6 @@ export function ProjectBoardPage() {
         </div>
       ) : null}
 
-      {/* The panels float over the board rather than sharing a row with
-          it: docking them would narrow every column the moment one opens,
-          so reading the activity feed would reflow the thing it is about.
-          This element is their positioning context, which is why the board
-          keeps its full width underneath. */}
       <div className="relative flex-1 min-h-0 flex">
         <DndContext
           sensors={sensors}
@@ -453,8 +409,6 @@ export function ProjectBoardPage() {
           <FloatingPanel>
             <ActivityDrawer
               projectId={projectId}
-              // The feed refetches on the same signal the board does, so an
-              // entry and the card it describes appear together.
               refreshKey={refreshKey}
               onClose={() => {
                 setRightPanel(null);
@@ -471,8 +425,6 @@ export function ProjectBoardPage() {
                   <AgentProfile
                     agent={agent}
                     team={team}
-                    // Every card on the board, so a step assigned to this agent
-                    // shows even when the filter hides it.
                     issues={Object.values(board).flat()}
                     activeRuns={activeRuns}
                     readOnly={archived}
@@ -525,8 +477,6 @@ export function ProjectBoardPage() {
           }}
           onSaved={(saved) => {
             setProject(saved);
-            // The board refetches too: raising a ceiling releases held
-            // runs on the spot, so the cards change with the setting.
             setRefreshKey((key) => key + 1);
           }}
         />
@@ -563,9 +513,7 @@ function BoardColumn({
   onCreate,
 }: {
   status: IssueStatus;
-  /** The cards this column is showing, after the filter. */
   issues: Issue[];
-  /** How much live work the column actually holds, filter or no filter. */
   total: number;
   activeRuns: IssueRun[];
   team: Agent[];
@@ -573,9 +521,6 @@ function BoardColumn({
   onOpen: (number: number) => void;
   onCreate: () => void;
 }) {
-  // A plain droppable on the column *body*: it has no sortable identity of
-  // its own, and it is what makes an empty column reachable — an empty
-  // SortableContext has no items to collide with.
   const { setNodeRef, isOver } = useDroppable({ id: columnDropId(status) });
 
   return (
@@ -584,11 +529,6 @@ function BoardColumn({
         <h2 className="font-mono text-[0.68rem] font-bold uppercase tracking-wider">
           {COLUMN_LABEL[status]}
         </h2>
-        {/* The count keeps meaning the column's true live size. Letting it
-            follow the filter would render 1,0,2,0,0 over a forty-card board,
-            which is indistinguishable from an empty one — and saying how
-            much work a column holds is the count's whole job. When the
-            filter hides something, both numbers are shown. */}
         <span
           className="rounded-full bg-ink text-brand font-mono text-[0.58rem] px-2 leading-[1.15rem] tabular-nums"
           title={
@@ -673,14 +613,6 @@ function SortableIssueCard({
   );
 }
 
-/**
- * A parent card's progress: how many of its steps are done.
- *
- * The server counts cancelled steps out of *both* numbers, so a card whose
- * last steps were called off reads `3/3` and finished rather than `3/5` and
- * stuck. Rendered as a bar rather than a literal ring — at this size a ring
- * is two pixels of arc and a bar is legible.
- */
 function SubIssueRing({ progress }: { progress: { done: number; total: number } }) {
   const { done, total } = progress;
   const pct = total === 0 ? 0 : Math.round((done / total) * 100);
@@ -702,23 +634,12 @@ function SubIssueRing({ progress }: { progress: { done: number; total: number } 
   );
 }
 
-/**
- * Holds a side panel over the board's right edge.
- *
- * No backdrop and no outside-click dismissal: these panels are read
- * alongside the board — the activity feed's entries open cards, the lead's
- * replies move them — so blocking the board would defeat the reason they
- * are on this page at all. They close by their own button.
- *
- * Below the modal layer (`z-40`), which does take the screen.
- */
 function FloatingPanel({ children }: { children: React.ReactNode }) {
   return (
     <div className="absolute inset-y-0 right-0 z-30 flex shadow-brutal">{children}</div>
   );
 }
 
-/** Initial-free avatar dot — the agent's identity is its colour and title. */
 function AssigneeDot({ assignee, working = false }: { assignee: string; working?: boolean }) {
   return (
     <span
@@ -774,8 +695,6 @@ function IssueCard({
           ⚑ Blocked
         </span>
       ) : null}
-      {/* Only once the work produced a commit — the server leaves `branch`
-          unset until then, so a research issue never shows one. */}
       {issue.branch != null ? (
         <span
           className="self-start max-w-full truncate border border-black/25 bg-canvas rounded px-1.5 font-mono text-[0.56rem] text-ink-soft"

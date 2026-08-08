@@ -126,10 +126,6 @@ Putting an issue straight into `in_progress` with an assignee starts that agent 
         let team = self.manager.team(&project).await.map_err(exec_err)?;
         let mut out = render_issue(issue.issue(), &team);
         if let (Value::Object(map), false) = (&mut out, issue.was_created()) {
-            // Said rather than silently returning the card: a scheduled
-            // check that files the same finding every day should be told
-            // its card is already open, so it comments instead of
-            // wondering why the number did not move.
             map.insert("already_open".into(), json!(true));
         }
         Ok(ToolOutput::Json(out))

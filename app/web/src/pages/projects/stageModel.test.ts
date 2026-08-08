@@ -23,8 +23,6 @@ function child(stage: number, overrides: Partial<Issue> = {}): Issue {
 
 describe('groupByStage', () => {
   it('opens only the first stage with work left', () => {
-    // The barrier starts stage N+1 when N empties, so marking every
-    // unfinished stage "open" would promise work the server will not run.
     const grouped = groupByStage([
       child(0, { status: 'done' }),
       child(1),

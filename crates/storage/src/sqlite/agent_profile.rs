@@ -629,10 +629,6 @@ mod tests {
         );
     }
 
-    /// The two rosters are disjoint by construction. A teammate leaking
-    /// into `list()` would offer it as a chat persona and as a subagent on
-    /// every other board; a global agent leaking into `list_team()` would
-    /// make it assignable to work it has no handle for.
     #[tokio::test]
     async fn the_global_roster_and_a_team_roster_never_overlap() {
         let store = open_store().await;
@@ -663,8 +659,6 @@ mod tests {
         assert_eq!(handles, vec!["dev-1", "lead"], "ordered by handle");
     }
 
-    /// One board's `@lead` and another's are different agents, so the
-    /// uniqueness that matters is per project, not global.
     #[tokio::test]
     async fn a_handle_is_unique_within_its_board_and_stays_reserved() {
         let store = open_store().await;
@@ -677,8 +671,6 @@ mod tests {
             "a duplicate handle is a conflict, not an internal error: {clash:?}"
         );
 
-        // …and removal does not free it. A timeline entry that says
-        // '@lead did this' must not come to mean somebody else.
         let leaving = store.list_team(&alpha).await.unwrap()[0].id.clone();
         assert!(store.remove_from_team(&leaving).await.unwrap());
         assert!(matches!(
@@ -687,8 +679,6 @@ mod tests {
         ));
     }
 
-    /// Removal is a tombstone, not a delete: the row is what lets a card,
-    /// a run and every timeline entry still say who did the work.
     #[tokio::test]
     async fn a_removed_teammate_leaves_the_roster_and_stays_resolvable() {
         let store = open_store().await;
@@ -705,14 +695,11 @@ mod tests {
             Some("dev-1".to_owned())
         );
 
-        // Removing twice must not rewrite when the agent actually left.
         assert!(!store.remove_from_team(&row.id).await.unwrap());
         let again = store.get(&row.id).await.unwrap().expect("row survives");
         assert_eq!(again.deleted_at, back.deleted_at);
     }
 
-    /// The delete path is for global agents only. A teammate reached by it
-    /// would strand every issue whose `assignee` names it.
     #[tokio::test]
     async fn delete_refuses_a_team_member() {
         let store = open_store().await;
@@ -721,7 +708,6 @@ mod tests {
 
         assert!(!store.delete(&row.id).await.unwrap());
         assert!(store.get(&row.id).await.unwrap().is_some());
-        // A removed one is still not deletable — the row is the record.
         assert!(store.remove_from_team(&row.id).await.unwrap());
         assert!(!store.delete(&row.id).await.unwrap());
         assert!(store.get(&row.id).await.unwrap().is_some());

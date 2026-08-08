@@ -5,9 +5,6 @@ import userEvent from '@testing-library/user-event';
 import { TeamStrip } from './TeamStrip';
 import type { Agent, IssueRun } from './boardModel';
 
-// The wiring the model tests can't reach: that the lead has no remove
-// button, that an archived board offers no writes at all, and that a
-// refused hire keeps the form open with the server's reason on it.
 
 function member(handle: string, lead = false): Agent {
   return {
@@ -53,7 +50,6 @@ describe('TeamStrip', () => {
     expect(screen.getByText('@lead')).toBeInTheDocument();
     expect(screen.getByText('@dev-1')).toBeInTheDocument();
 
-    // The board would have no coordinator, which nothing downstream handles.
     expect(
       screen.queryByRole('button', { name: /Remove @lead/ }),
     ).not.toBeInTheDocument();
@@ -125,8 +121,6 @@ describe('TeamStrip', () => {
     );
     await userEvent.click(screen.getByRole('button', { name: /Add an agent/ }));
 
-    // Both fields are required: a nameless or roleless agent is refused by
-    // the server, so the form does not offer to send one.
     const submit = screen.getByRole('button', { name: 'Add agent' });
     expect(submit).toBeDisabled();
     await userEvent.type(screen.getByLabelText(/Name/), 'QA');

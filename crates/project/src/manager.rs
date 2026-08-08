@@ -1,11 +1,5 @@
 //! Project and issue lifecycle: validation, workdir materialisation, and
 //! the board's write surface.
-//!
-//! The store below is a dumb writer. Everything that has to be true before
-//! a row lands — a name that isn't blank, a workdir that doesn't overlap
-//! baybo's own workspace, an issue that names a project that exists — is
-//! decided here, once, so the HTTP layer and any future tool caller get
-//! the same answers.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -37,19 +31,12 @@ pub(crate) const MAX_ISSUE_TITLE_CHARS: usize = 200;
 /// handle a person can type without looking the team up first.
 pub const LEAD_HANDLE: &str = "lead";
 
-/// What the lead calls itself before it renames itself.
 const LEAD_DISPLAY_NAME: &str = "Lead";
 
-/// The lead's roster line. The operator can edit it like any other agent's.
 const LEAD_DESCRIPTION: &str =
     "Coordinates this project's board: triages Backlog, assigns work, and staffs the team.";
 
 /// How many live agents one project may have, lead included.
-///
-/// A ceiling rather than a budget: each agent is a persona directory, a
-/// slice of every roster read, and a possible concurrent run. The number is
-/// not load-bearing — it exists so a hiring loop cannot staff a board with
-/// two hundred agents before anybody notices.
 pub const MAX_TEAM_AGENTS: usize = 16;
 
 /// Upper bound on a teammate's role line (chars, after trim). It seeds a
@@ -59,42 +46,14 @@ pub(crate) const MAX_ROLE_CHARS: usize = 280;
 /// Upper bound on one activity-feed page.
 pub const MAX_FEED_PAGE: usize = 100;
 
-/// Why a recorded run was called off, when nothing had picked it up yet:
-/// its card reached Done or was cancelled before the board got round to it.
-/// Read on the card, so it is a sentence rather than a code.
 const RUN_CALLED_OFF_UNSTARTED: &str = "the card was finished or cancelled before this run started";
 
-/// The same call-off, on a run that **had** already started.
-///
-/// The boot sweep hands out rows an executor was in the middle of when the
-/// process died, and the card carries a `RunStarted` entry for each of
-/// them. Telling the operator two lines later that the run never started
-/// contradicts the entry directly above it — and the settled row still
-/// carries the session, which opens the transcript of the work that really
-/// was done.
 const RUN_CALLED_OFF_INTERRUPTED: &str =
     "this run was interrupted, and the card was finished or cancelled before it could resume";
 
-/// Why a retry is refused while the budget is holding this card's run.
-///
-/// Pressing "run it again" on a held card is not a no-op: `enqueue`
-/// releases what the ceiling allows *before* it writes, so the press starts
-/// the run whenever there is room, and `retry_run` reports that as the start
-/// it is. This sentence is the other answer — the press happened, the
-/// release was still refused, and the reason is the board's ceiling rather
-/// than anything about this card.
-///
-/// Not the dedupe guard's "this issue already has a run": that names a row
-/// which never started and points the reader at nothing to do.
 const HELD_RUN_REFUSAL: &str =
     "this run is held — the project is over its daily budget, and starts as soon as there is room";
 
-/// Why an agent cannot be given, or handed, an issue's session.
-///
-/// One sentence for two askers: the assign-time refusal an operator reads in
-/// a form, and the run-time one that lands on the card when the framework
-/// changed after the card was assigned. They are the same fact, so a reword
-/// cannot leave them disagreeing about why the board will not run something.
 fn framework_refusal(agent: &AgentProfileId, framework: AgentFramework) -> String {
     format!(
         "{agent} runs on {}, which cannot yet host an issue's session — assign a baybo agent",
@@ -102,14 +61,6 @@ fn framework_refusal(agent: &AgentProfileId, framework: AgentFramework) -> Strin
     )
 }
 
-/// Which of the two sentences is true of this row.
-///
-/// Derived from the row rather than chosen by the call site, because one
-/// call site hands out both kinds: the boot sweep returns a `queued` row
-/// nothing ever claimed and a `running` row that was half-done, and by the
-/// time either reaches here they look alike. [`IssueRunRow::was_claimed`]
-/// is the fact that separates them, and it is the same fact the card's
-/// `RunStarted` entry is written from.
 fn call_off_reason(run: &IssueRunRow) -> &'static str {
     if run.was_claimed() {
         RUN_CALLED_OFF_INTERRUPTED
@@ -118,11 +69,6 @@ fn call_off_reason(run: &IssueRunRow) -> &'static str {
     }
 }
 
-/// How many `-2`, `-3`, … suffixes to try when a derived handle is taken.
-///
-/// Bounded because handles stay reserved after removal: a board that has
-/// hired and released "QA" a dozen times should get a clear refusal, not a
-/// silent `@qa-47`.
 const MAX_HANDLE_ATTEMPTS: usize = 9;
 
 /// A board's capacity, as [`ProjectManager::board_load`] reports it.
@@ -185,11 +131,6 @@ pub struct NewIssueRequest {
 }
 
 /// What happened when a card was opened.
-///
-/// An enum rather than a bool or a second method: a caller that passes no
-/// `source_key` can never see `AlreadyOpen`, but the compiler still makes
-/// every call site say what it does with it — which is the point, because
-/// the two outcomes read identically in a log line.
 #[derive(Debug, Clone)]
 pub enum Opened {
     Created(IssueRow),
@@ -258,15 +199,6 @@ impl ProjectManager {
         }
     }
 
-    /// Record a run if this transition starts one, then announce it.
-    ///
-    /// Record-before-deliver: the row exists before anything can act on
-    /// it, so a crash between the two is a run the boot sweep finds rather
-    /// than work that silently never happened.
-    ///
-    /// The transition is only half the question — [`Self::enqueue`] asks the
-    /// other half, of the card, and every reason it can decline is one this
-    /// caller has nothing to do about.
     async fn dispatch_if_triggered(&self, transition: Transition, issue: &IssueRow) {
         let Some(trigger) = triggers_run(transition) else {
             return;
@@ -274,40 +206,6 @@ impl ProjectManager {
         self.enqueue(issue, trigger).await;
     }
 
-    /// Record a run and start it, unless the board has spent its budget.
-    ///
-    /// The single enqueue path — a drag, a comment, a retry, a stage
-    /// barrier and a tool call all arrive here, so the gates cannot be
-    /// forgotten on one of them. There are three, and this is where each is
-    /// asked exactly once: **liveness** ([`crate::runs::accepts_runs`]),
-    /// **dedupe** (the store's per-issue partial unique index), and
-    /// **budget**.
-    ///
-    /// Liveness comes first, before anything is written. A card that is
-    /// Done or cancelled has already had its worktree reclaimed, so a run
-    /// recorded on it would either cut a fresh checkout for abandoned work
-    /// or — held, then never dispatched — sit unsettled holding the issue's
-    /// dedupe slot against the day somebody revives the card.
-    ///
-    /// The order of the other two is deliberate: **the budget never decides
-    /// whether the row is written**, only what happens to it afterwards. The
-    /// headroom is measured first (the release below needs it), the row lands
-    /// either way, and an exhausted board then holds it — so the work it owes
-    /// is recorded rather than dropped. The run lands `Held`, holds the
-    /// issue's dedupe slot, and starts the moment there is headroom again. A
-    /// refused write means the issue already has a run in flight — the dedupe
-    /// guard doing its job, not a failure the caller should see.
-    ///
-    /// Whatever the board is already holding is released **before** that
-    /// write, and deliberately so. This is the release site that makes a
-    /// rolled-over ceiling need no timer — the others being a budget change,
-    /// a process start, and a board coming back off the shelf. It cannot
-    /// move after the write: on the board that actually needs releasing, the
-    /// exhausted one, every card is holding its own dedupe slot, so every
-    /// enqueue is refused and a release placed afterwards would never be
-    /// reached. The price is that a caller whose own
-    /// held run has just become affordable is told the issue already has a run
-    /// in flight — which is true, and it is the run they asked for.
     async fn enqueue(&self, issue: &IssueRow, trigger: RunTrigger) -> Option<IssueRunRow> {
         if !crate::runs::accepts_runs(issue) {
             tracing::debug!(
@@ -317,11 +215,6 @@ impl ProjectManager {
             );
             return None;
         }
-        // Re-asked here rather than trusted from assign time: this is the
-        // one gate whose answer expires, and every door that records a row
-        // comes through here. The sweeps that hand out rows recorded
-        // *earlier* do not, which is why the executor asks a third time
-        // before it binds a session.
         if self.assignee_can_run(issue).await != Some(true) {
             tracing::debug!(
                 issue = issue.number,
@@ -376,11 +269,6 @@ impl ProjectManager {
         Some(run)
     }
 
-    /// This project's spend against its ceiling, for today.
-    ///
-    /// Fails **open**: a board that cannot be measured keeps working. The
-    /// alternative is a storage hiccup silently pausing every project, which
-    /// looks exactly like the product being broken.
     async fn headroom(&self, project: &ProjectId) -> Headroom {
         let limit = match self.store.get_project(project).await {
             Ok(Some(row)) => row.daily_budget,
@@ -408,30 +296,11 @@ impl ProjectManager {
     }
 
     /// Start whatever this board is holding, if it has room again.
-    ///
-    /// Released by activity on the board rather than by a clock. Four things
-    /// release: a budget change calls this, so do the two callers of
-    /// [`Self::resume_project_runs`] — a process start and a board coming
-    /// back off the shelf — and [`Self::enqueue`] calls
-    /// [`Self::release_holds`] directly with the headroom it has already
-    /// measured, on every enqueue that gets past the liveness gate onto a
-    /// card with somebody on it, which is every enqueue that was going to
-    /// write anything. An enqueue the liveness
-    /// gate refuses releases nothing, and the board's other holds wait for
-    /// the next thing that happens on it. A daily ceiling that rolls over
-    /// while nothing is happening therefore needs no timer: the first thing
-    /// that happens next releases the hold, and if nothing happens, nothing
-    /// needed releasing.
     pub(crate) async fn release_held_runs(&self, project: &ProjectId) -> Result<usize> {
         let headroom = self.headroom(project).await;
         self.release_holds(project, headroom).await
     }
 
-    /// Release every hold this headroom allows, and hand each out.
-    ///
-    /// Takes the headroom rather than reading it, so [`Self::enqueue`] —
-    /// which has already measured the board to decide whether to hold — does
-    /// not query the budget twice for one write.
     async fn release_holds(&self, project: &ProjectId, headroom: Headroom) -> Result<usize> {
         if headroom.is_exhausted() {
             return Ok(0);
@@ -469,22 +338,6 @@ impl ProjectManager {
         Ok(released)
     }
 
-    /// The card a recorded run is for, when the board should still run it.
-    ///
-    /// The two sweeps that hand out rows — a hold the budget has released,
-    /// and the re-drive of a board that booted or was restored — carry
-    /// entries written while the card was live. Neither has a transition to
-    /// consult, so the liveness question [`Self::enqueue`] answered before
-    /// writing has to be asked again here, against the card as it is *now*.
-    ///
-    /// `None` covers two different things on purpose, because the caller
-    /// does the same thing with both: do not hand this run out. A card that
-    /// has stopped accepting work has its run **called off**, so the ledger
-    /// stops owing work nobody wants and the issue's dedupe slot is free
-    /// again — a row left unsettled there would refuse every run on the card
-    /// if it were ever revived. A card that could not be *read* is left
-    /// exactly as it is, so a storage hiccup costs a delay until the next
-    /// release or boot rather than a settled run.
     async fn live_card(&self, run: &IssueRunRow) -> Option<IssueRow> {
         match self.store.get_issue(&run.project_id, run.number).await {
             Ok(Some(issue)) if crate::runs::accepts_runs(&issue) => Some(issue),
@@ -499,14 +352,6 @@ impl ProjectManager {
         }
     }
 
-    /// Settle a run the board is never going to make, and say so on the
-    /// card.
-    ///
-    /// Recorded like any other settlement rather than dropped quietly: a run
-    /// the operator can see on the card has to end somewhere the operator
-    /// can see it end — in the words [`call_off_reason`] picks for the row
-    /// in hand, because a held run and an interrupted one are called off by
-    /// the same code and are not the same story.
     async fn call_off(&self, run: &IssueRunRow, issue: Option<&IssueRow>) {
         let reason = call_off_reason(run);
         match self
@@ -538,12 +383,6 @@ impl ProjectManager {
         }
     }
 
-    /// Append to an issue's timeline, and tell whoever is watching.
-    ///
-    /// A failed append is logged and swallowed. The timeline is a record of
-    /// work, not a gate on it: losing the note that a card moved is bad,
-    /// and refusing the move because the note could not be written is
-    /// worse.
     async fn record(&self, issue: &IssueRow, actor: IssueActor, body: IssueEventBody) {
         let entry = NewIssueEvent {
             issue_id: issue.id.clone(),
@@ -568,12 +407,6 @@ impl ProjectManager {
 
     /// Append one entry to an issue's timeline, addressed the way the
     /// board addresses everything: by number.
-    ///
-    /// Public because writers outside this manager have entries to add —
-    /// the approval gate, which sees prompts the board never asked for.
-    /// Swallows a missing issue for the same reason [`Self::record`]
-    /// swallows a failed append: losing the note is bad, and failing the
-    /// thing the note was about is worse.
     pub async fn record_event(
         &self,
         project: &ProjectId,
@@ -589,22 +422,12 @@ impl ProjectManager {
         }
     }
 
-    /// Record whatever this edit is worth saying, if anything.
     async fn record_diff(&self, before: &IssueRow, after: &IssueRow, actor: IssueActor) {
         for body in crate::timeline::diff_events(before, after) {
             self.record(after, actor.clone(), body).await;
         }
     }
 
-    /// Give the worktree back when an issue reaches Done or Cancelled.
-    ///
-    /// Only on the *transition*: re-saving a card that was already Done
-    /// must not keep trying, and an issue reopened and finished again gets
-    /// its second reclamation honestly.
-    ///
-    /// Nothing here fails the edit. Dragging a card to Done is a statement
-    /// about the work, not a filesystem operation, and it stands whatever
-    /// git says.
     async fn reclaim_if_finished(&self, before: &IssueRow, after: &IssueRow, actor: IssueActor) {
         if crate::stages::is_finished(before) || !crate::stages::is_finished(after) {
             return;
@@ -644,11 +467,6 @@ impl ProjectManager {
     }
 
     /// Say something on an issue, and reach whoever should hear it.
-    ///
-    /// The comment always lands on the timeline; what else happens is
-    /// [`Self::comment_delivery`]'s decision. Recording comes first in
-    /// every branch, so a wake that fails is a comment that is still there
-    /// to be read rather than one that was never said.
     pub async fn comment(
         &self,
         project: &ProjectId,
@@ -676,14 +494,6 @@ impl ProjectManager {
             .await?;
         self.events.timeline_changed(project, number);
 
-        // An @mention on a card nobody is on is the commenter saying "you
-        // take this". Applied after the comment is recorded, so the words
-        // survive even if the assignment is refused — and applied through
-        // `update_issue`, so it goes down the same path a drag does and
-        // gets the same trigger, the same timeline entry, and the same
-        // refusals for an agent that cannot run. In the commenter's name,
-        // too: a handover a lead performed must not read as the operator's
-        // on a card the operator is being asked to trust.
         let issue = match self.mention_assignment(project, &issue, text).await {
             Some(assignee) => {
                 match self
@@ -716,29 +526,12 @@ impl ProjectManager {
 
     /// Start the run a comment asked for, on an issue whose answer had to
     /// wait.
-    ///
-    /// The wake half of [`Self::comment`], reachable on its own because a
-    /// comment left while a run was executing is deferred
-    /// ([`CommentDelivery::AfterCurrentRun`]) — the executor calls this once
-    /// that run settles and the issue's live-run slot is free again. It goes
-    /// through [`Self::enqueue`] like every other start, so a deferred wake
-    /// gets the same budget gate, the same dedupe guard and the same
-    /// dispatch a drag does; a ledger row written straight to the store
-    /// would be a run nothing ever starts, holding the slot until the next
-    /// boot.
-    ///
-    /// `None` is an answer, not a failure: an issue cancelled, unassigned or
-    /// dragged out of live work while the run was going — or one on a board
-    /// archived meanwhile — is one nobody should be woken on.
     pub async fn wake_on_comment(&self, project: &ProjectId, number: i64) -> Option<IssueRunRow> {
         self.writable_project(project).await.ok()?;
         let issue = self.get_issue(project, number).await.ok()?;
         self.wake_if_listening(&issue).await
     }
 
-    /// Enqueue for a comment if the issue is listening. One implementation,
-    /// shared by [`Self::comment`] (which has the row in hand) and
-    /// [`Self::wake_on_comment`] (which has to re-read it).
     async fn wake_if_listening(&self, issue: &IssueRow) -> Option<IssueRunRow> {
         if self.delivery_for(issue).await != CommentDelivery::Wake {
             return None;
@@ -746,12 +539,6 @@ impl ProjectManager {
         self.enqueue(issue, RunTrigger::Comment).await
     }
 
-    /// The teammate an @mention hands this card to, if it hands it to
-    /// anybody.
-    ///
-    /// A handle that names nobody on this board resolves to `None` rather
-    /// than to an error: the comment is still worth recording, and a typo
-    /// in a mention should not refuse the sentence around it.
     async fn mention_assignment(
         &self,
         project: &ProjectId,
@@ -770,15 +557,6 @@ impl ProjectManager {
     }
 
     /// What this comment will do besides being recorded.
-    ///
-    /// Public for the `IssueComment` tool, which asks *before* it writes and
-    /// hands the answer back to the model: the difference between "somebody
-    /// will read this" and "this is a note for later" is invisible in the
-    /// act of commenting, and a caller that expects the first and gets the
-    /// second waits for an answer nobody is sending. The web composer says
-    /// the same thing from its own mirror of the rule rather than from here
-    /// — there is no route onto this method — which is the seam `comments.rs`
-    /// documents.
     pub async fn comment_delivery(
         &self,
         project: &ProjectId,
@@ -788,13 +566,6 @@ impl ProjectManager {
         Ok(self.delivery_for(&issue).await)
     }
 
-    /// The run holding this card's single live slot, if it has one.
-    ///
-    /// At most one can exist — `idx_issue_runs_live` is what makes that true
-    /// — and while it does, nothing can record a second run on the card.
-    /// Asked as "unsettled, then which" rather than as a list of the live
-    /// statuses, because enumerating them at a call site is how `Held` gets
-    /// forgotten: it is unsettled without anything executing.
     async fn live_run(&self, issue: &IssueRow) -> Result<Option<IssueRunRow>> {
         Ok(self
             .store
@@ -830,19 +601,6 @@ impl ProjectManager {
     }
 
     /// Stop an issue's run.
-    ///
-    /// A run that never started is settled here and now — there is nothing
-    /// to interrupt. A run already executing is *not* settled here: its
-    /// session is returned so the caller can cancel the live turn, and the
-    /// waiter watching that turn settles the row with `Cancelled`. Settling
-    /// it from both ends would race, and the waiter is the one that knows
-    /// whether the turn actually stopped.
-    ///
-    /// The **status**, not the session, is what says a turn is live: the boot
-    /// sweep returns an interrupted run to the queue with the session it was
-    /// claimed with, and there is no turn left in it to stop. Chasing that
-    /// session instead would leave the row unsettled forever, blocking every
-    /// later run on the issue.
     pub async fn cancel_run(
         &self,
         project: &ProjectId,
@@ -870,23 +628,6 @@ impl ProjectManager {
     /// Run an issue again. Refused while one is already in flight — the
     /// same dedupe guard a drag hits, surfaced as a conflict rather than a
     /// silent second agent.
-    ///
-    /// A finished or cancelled card is refused too, and with its own
-    /// message. [`Self::enqueue`]'s liveness gate would stop the run either
-    /// way, but the only thing it can tell a caller is `None`, which this
-    /// method reads as the dedupe guard — so the operator would be told the
-    /// card already has a run when it has none and never will. Both
-    /// refusals name something the caller can act on: cancel the other run,
-    /// or reopen the card.
-    ///
-    /// A **held** run is the one occupied slot a press can do something
-    /// about, and the guard alone cannot see that. [`Self::enqueue`] releases
-    /// what the ceiling allows before it writes, so on a board with room the
-    /// press starts the very run the guard then collides with — the call
-    /// would report a conflict for the work it had just set going. So the
-    /// hold is read before and after: released means started, and this
-    /// returns the row that went out. Still held means the ceiling really did
-    /// refuse, and the reason named is the budget rather than the row.
     pub async fn retry_run(&self, project: &ProjectId, number: i64) -> Result<IssueRunRow> {
         self.writable_project(project).await?;
         let issue = self.get_issue(project, number).await?;
@@ -896,10 +637,6 @@ impl ProjectManager {
                 "an issue with nobody on it cannot be run",
             ));
         };
-        // Asked here as well as at the chokepoint, for the same reason the
-        // card's own refusals are: `enqueue` can only answer `None`, which
-        // this method reads as the dedupe guard — so an operator whose agent
-        // has moved to codex would be told the card already has a run.
         self.validate_assignee(project, &assignee).await?;
         if !crate::runs::accepts_runs(&issue) {
             return Err(ProjectError::invalid(
@@ -940,17 +677,6 @@ impl ProjectManager {
     /// Called once per process start, from a task that races the server
     /// coming up rather than one that finishes before it: a `running` row
     /// whose actor died with the process is work that never finished.
-    ///
-    /// Returning them to the queue is global — an orphan is an orphan
-    /// whatever board it is on, an archived one included, and rolling a row
-    /// forward settles nothing. Handing them back out is per board, through
-    /// [`Self::resume_project_runs`], which is what asks whether the board
-    /// takes work at all: one loop over one list of boards, so the runs this
-    /// sweep re-drives and the holds it releases cannot come to disagree
-    /// about which boards are in scope. Boards come in the order they are
-    /// listed and each board's runs by issue number, oldest card first; no
-    /// order is promised *across* boards. The count is what was actually
-    /// re-driven, not what the sweep found.
     pub async fn resume_unsettled_runs(&self) -> Result<usize> {
         self.store.requeue_unsettled().await?;
         let mut count = 0;
@@ -965,57 +691,6 @@ impl ProjectManager {
         Ok(count)
     }
 
-    /// Hand out everything one board owes: the runs recorded but never
-    /// started, and the holds today's budget allows.
-    ///
-    /// Not through [`Self::enqueue`] — these rows already exist — so the two
-    /// gates that door applies are asked here instead. **Archived**, once
-    /// for the board, through [`Self::writable_project`]: every door that
-    /// writes a run row refuses a shelved board there, and a sweep that
-    /// dispatched anyway would put an agent to work on a board the operator
-    /// has put away. **Liveness**, once per row, through
-    /// [`Self::live_card`]: the process may have been down for a week, and a
-    /// card cancelled meanwhile must not come back to life.
-    ///
-    /// The two gates dispose of a row differently, and deliberately.
-    /// A finished card's run is **called off**, because that card is never
-    /// taking work again and an unsettled row would hold its dedupe slot for
-    /// nothing. An archived board's runs are **left exactly as they are**,
-    /// because archiving is reversible and is not a judgement on the work:
-    /// [`Self::set_project_archived`] calls this on restore, so the shelved
-    /// run resumes rather than having to be noticed and retried by hand.
-    /// Nothing can enqueue against the slot it holds meanwhile — every door
-    /// that would is refused for the same reason this one is.
-    ///
-    /// Only `Queued` rows are handed out. `Running` means an executor has
-    /// the row: on a restore it is an actor that outlived the archiving and
-    /// is still working, and at a process start the requeue in
-    /// [`Self::resume_unsettled_runs`] turns the orphans back into `Queued`
-    /// before this runs. That sweep races the server rather than preceding
-    /// it, so a restore landing between process start and the requeue's
-    /// commit is the one case where a `Running` row is neither: it is
-    /// skipped, and waits for the next process start. `Held` is the
-    /// budget's to release, which is the second half below — a process
-    /// start is the one moment guaranteed to happen after a ceiling rolls
-    /// over.
-    ///
-    /// This does not make a row's dispatch unique, and nothing here can.
-    /// `claim_run` is scoped to `queued`, so two dispatches of one row
-    /// collapse into one *execution* — but not into one dispatcher: the
-    /// checkout is cut before the claim, and the task that loses that race
-    /// settles the row the winner is running. A restore is an edge, so it
-    /// overlaps only a dispatcher still cutting its worktree. A **process
-    /// start is not an edge at all**: this sweep comes up alongside the
-    /// server rather than before it, and hands out every `Queued` row it
-    /// finds, including one a live enqueue wrote a moment ago and is
-    /// dispatching right now. Closing that is the failure path settling only
-    /// a run nobody has claimed — the dispatcher's code rather than this
-    /// crate's (`docs/modules/project.md`, "One dispatch per row").
-    ///
-    /// The two halves are counted apart. A board whose holds could not be
-    /// read still re-drove what it re-drove, and the operator is told both
-    /// things; folding them into one error would report runs that are
-    /// already under way as work that never started.
     async fn resume_project_runs(&self, project: &ProjectId) -> Result<usize> {
         self.writable_project(project).await?;
         let mut count = 0;
@@ -1039,10 +714,6 @@ impl ProjectManager {
         let name = validate_name(&new.name)?;
         let id = ProjectId::generate();
 
-        // Filesystem first, row second. A crash between the two leaves an
-        // empty directory nobody references — inert. The other order leaves
-        // a project pointing at somewhere that does not exist, which every
-        // later run would have to handle.
         let workdir = match new.workdir.as_deref().map(str::trim) {
             Some(given) if !given.is_empty() => {
                 validate_workdir(given, &self.paths)?;
@@ -1061,12 +732,6 @@ impl ProjectManager {
             _ => self.materialise_workdir(&name).await?,
         };
 
-        // Before the project row, not after. A lead that fails to
-        // materialise this way leaves an agent row whose project does not
-        // exist — invisible to both rosters and inert, like the orphaned
-        // persona directory above. The other order leaves a *visible* board
-        // with no coordinator, which is the state every other path here
-        // assumes cannot happen.
         self.seed_lead(&id).await?;
 
         let now = chrono::Utc::now();
@@ -1088,19 +753,13 @@ impl ProjectManager {
         Ok(row)
     }
 
-    /// Staff a brand-new board with its coordinator.
-    ///
-    /// Every project has a lead, and it is created here rather than on first
-    /// use so the invariant holds for every reader — the team strip, the
-    /// triage loop, the chat panel — instead of each one having to handle a
-    /// board that has nobody on it yet.
     async fn seed_lead(&self, project: &ProjectId) -> Result<()> {
         // A compile-time literal, so this can only fail if somebody edits
         // `LEAD_HANDLE` into something the grammar refuses — which the test
         // below catches long before a project is ever opened.
         let handle = AgentHandle::parse(LEAD_HANDLE)
             .map_err(|e| anyhow::anyhow!("LEAD_HANDLE is not a valid handle: {e}"))?;
-        let id = AgentProfileId::generate();
+        let id = AgentProfileId::generate_project();
         baybo_workspace::ensure_named_persona_layout(
             &self.paths,
             id.as_str(),
@@ -1140,27 +799,6 @@ impl ProjectManager {
 
     /// The profile rows for `ids` **on this board**, reaching agents that
     /// have left its team.
-    ///
-    /// [`Self::team`] is the live roster and deliberately hides a departed
-    /// teammate; a timeline is permanent history and still names one, which
-    /// is exactly what [`baybo_store::AgentProfileStore::get`] is for. An id
-    /// nothing answers to is simply absent from the result — a broken
-    /// reference is not a departed teammate, and the caller renders it as
-    /// the id rather than inventing a handle for it.
-    ///
-    /// `project` is the whole reason this is not a bare `get`. A handle is
-    /// unique only inside its board, so `@dev-1` here and `@dev-1` there are
-    /// two different agents and an id belonging to another board must not
-    /// render under this one's naming. It costs the departed teammate
-    /// nothing: removal is a tombstone that stamps `deleted_at` and leaves
-    /// the membership untouched, so an agent that has left still answers
-    /// with the board it worked. Together with [`Self::team`], which is
-    /// board-scoped in SQL, that makes every row a timeline resolves a row
-    /// from this board — so no caller has to remember the rule.
-    ///
-    /// One point-get per id, sequentially: a team is capped at
-    /// [`MAX_TEAM_AGENTS`], so a card's timeline names a handful at most and
-    /// the caller has already passed the roster's own read.
     pub(crate) async fn agent_profiles(
         &self,
         project: &ProjectId,
@@ -1187,16 +825,6 @@ impl ProjectManager {
     }
 
     /// Put somebody new on a team.
-    ///
-    /// `hired_by` is `None` when the operator did it and `Some(agent)` when
-    /// a teammate did — the lead staffing its own team. The distinction is
-    /// kept on the row rather than in a log line because the profile panel
-    /// shows it, and because a hiring loop is only auditable if each hire
-    /// names who made it.
-    ///
-    /// Refusals are all things the caller can fix: a blank or unusable
-    /// name, a role that is too long, a full team, or a name whose handle
-    /// is already taken and stays taken.
     pub async fn hire(
         &self,
         project: &ProjectId,
@@ -1226,7 +854,7 @@ impl ProjectManager {
             )
         })?;
 
-        let id = AgentProfileId::generate();
+        let id = AgentProfileId::generate_project();
         let soul =
             baybo_workspace::prompt::PROJECT_TEAMMATE_SOUL_TEMPLATE.replace("{{role}}", &role);
         baybo_workspace::ensure_named_persona_layout(&self.paths, id.as_str(), &soul, &name)
@@ -1250,10 +878,6 @@ impl ProjectManager {
             created_at: now,
             updated_at: now,
         };
-        // The handle index is the arbiter, not the roster read above: two
-        // hires racing for `@qa` both see it free, and only the loser needs
-        // a different one. Suffixing on the conflict rather than checking
-        // first is what makes that race correct instead of merely unlikely.
         for attempt in 1..=MAX_HANDLE_ATTEMPTS {
             let candidate = if attempt == 1 {
                 base.clone()
@@ -1286,16 +910,6 @@ impl ProjectManager {
     }
 
     /// Take somebody off a team.
-    ///
-    /// A tombstone, never a delete: the agent's id is written into every
-    /// issue it was assigned, every run it executed and every timeline entry
-    /// it wrote, and the board has to keep being able to say who did what.
-    ///
-    /// Two refusals. The **lead** cannot leave — the board would have no
-    /// coordinator, which nothing downstream is written to handle. An agent
-    /// with a **run in flight** cannot leave either: the run keeps going
-    /// (its row is what it reads, not the roster), so removing it now just
-    /// hides who is doing the work that is happening. Cancel the run first.
     pub async fn remove_from_team(
         &self,
         project: &ProjectId,
@@ -1347,12 +961,6 @@ impl ProjectManager {
         Ok(())
     }
 
-    /// Create `work/<slug>/` and make it a git repository.
-    ///
-    /// An existing non-empty directory is an error rather than a silent
-    /// reuse: `work/` is shared with the bash tool's scratch space, and
-    /// adopting whatever is already sitting there would hand a project a
-    /// working tree it did not create.
     async fn materialise_workdir(&self, name: &str) -> Result<String> {
         let slug = slugify(name);
         let dir = self.paths.work_dir().join(&slug);
@@ -1417,22 +1025,6 @@ impl ProjectManager {
 
     /// Archive or restore. Either is allowed on a board already in that
     /// state — a repeat is not an error, it is simply nothing.
-    ///
-    /// A restore hands the board its shelved work back, on the same idiom as
-    /// a budget change ([`Self::update_project`]): released by activity, not
-    /// by a clock. The board's own restoration is that activity. Without it
-    /// the runs recorded before the board was put away — which
-    /// [`Self::resume_project_runs`] deliberately leaves unsettled rather
-    /// than calling off — would wait for the next process restart, each one
-    /// holding its issue's live-run slot until then, so the operator's first
-    /// act on the restored card would be refused as "this issue already has
-    /// a run".
-    ///
-    /// Which is why the store's answer has to be the archived→live **edge**
-    /// and not "the row is there": on a board that was never away the same
-    /// re-drive would hand out the ordinary queued rows a dispatcher is
-    /// already carrying, and a queued row dispatched twice is not free (see
-    /// [`Self::resume_project_runs`]).
     pub async fn set_project_archived(&self, id: &ProjectId, archived: bool) -> Result<ProjectRow> {
         // `Ok(false)` is "nothing moved" — a board already in that state,
         // which owes nothing, or no board at all, which is an error. The
@@ -1481,11 +1073,6 @@ impl ProjectManager {
             Some(number) => Some(self.validate_parent(project, number, None).await?),
             None => None,
         };
-        // Checked before the write and enforced by the index behind it. The
-        // check alone would race; the index alone would surface as an
-        // opaque conflict the caller could not distinguish from a real
-        // failure. Both, so the common case answers with the standing card
-        // and a race still cannot produce two.
         if let Some(key) = new.source_key.as_deref()
             && let Some(standing) = self.store.live_issue_by_source_key(project, key).await?
         {
@@ -1594,34 +1181,6 @@ impl ProjectManager {
         Ok(after)
     }
 
-    /// Tell a parent one of its stages just emptied, and wake it when that
-    /// opens a barrier.
-    ///
-    /// Two questions, deliberately answered separately, because they have
-    /// different answers. **Announcing** asks whether this stage's own
-    /// children are all done — a fact about the stage, true whenever it
-    /// happens, and the only thing [`IssueEventBody::StageCompleted`]
-    /// claims. **Waking** asks [`crate::stages::barrier_opens`], which also
-    /// requires nothing earlier to be open: a parent holds one run at a
-    /// time, so waking it on a stage the board has not reached yet spends
-    /// the slot the real barrier needs and the wake that matters is then
-    /// refused by the dedupe index. Folding the two together loses one or
-    /// the other — either the operator is told a stage opened when nobody
-    /// was woken, or a stage that emptied out of order is never mentioned
-    /// at all.
-    ///
-    /// Only on the *transition* into a finished state, and only for a child:
-    /// re-saving a Done sub-issue must not announce again, and an ordinary
-    /// card has no parent to tell. That is also what bounds the entry to one
-    /// per completion — a stage that is already complete has no child left
-    /// to finish, so it can only be announced a second time after it
-    /// genuinely re-opens (a step reopened, or a new step filed into it),
-    /// which the timeline records too.
-    ///
-    /// The wake goes through the same ledger as everything else — record,
-    /// then dispatch — so a barrier that fires while the process dies is a
-    /// run the boot sweep finds rather than a stage that silently never
-    /// opened.
     async fn check_stage_barrier(&self, before: &IssueRow, after: &IssueRow, actor: IssueActor) {
         if crate::stages::is_finished(before) || !crate::stages::is_finished(after) {
             return;
@@ -1701,17 +1260,6 @@ impl ProjectManager {
 
     /// One board's capacity right now: who is actually executing, what is
     /// parked on budget, and how much is left to spend.
-    ///
-    /// One typed read rather than three public accessors, because the rule
-    /// that makes it correct — **a held run is not a busy agent** — has to
-    /// live in one place. On an exhausted board the opposite reading
-    /// inverts the truth exactly when it matters: the team is idle and the
-    /// wallet is empty, but a caller counting held runs as work sees a
-    /// saturated roster and stops promoting, so the hold is never noticed.
-    ///
-    /// `headroom` fails open, so a board that cannot be measured reports
-    /// `Unlimited` — which is what the enqueue gate acts on too, so a
-    /// reader is told the same story the gate believes.
     pub(crate) async fn board_load(&self, project: &ProjectId) -> Result<BoardLoad> {
         self.get_project(project).await?;
         let (held, working) = self
@@ -1728,11 +1276,6 @@ impl ProjectManager {
     }
 
     /// What is stuck on the operator, per board.
-    ///
-    /// `pending_approval_sessions` is the channel's live approval queue,
-    /// passed in rather than reached for: this crate must not know about
-    /// channels, and the queue is the authority on which prompts are still
-    /// open — it cannot show one that already timed out.
     pub async fn attention(
         &self,
         pending_approval_sessions: &[baybo_model::SessionId],
@@ -1770,10 +1313,6 @@ impl ProjectManager {
     }
 
     /// Note that the operator has looked at this board.
-    ///
-    /// Called when the board page loads, and only there: the detail route
-    /// is one card, and marking the whole board read from it would clear a
-    /// question asked on a card the operator never saw.
     pub async fn mark_read(&self, project: &ProjectId) -> Result<()> {
         self.get_project(project).await?;
         self.store
@@ -1783,10 +1322,6 @@ impl ProjectManager {
     }
 
     /// The whole board's activity, newest first.
-    ///
-    /// Capped rather than paged-without-limit: a feed is read from the top
-    /// and abandoned, and an unbounded read of a year-old board is a
-    /// request nobody wanted to make.
     pub async fn feed(
         &self,
         project: &ProjectId,
@@ -1806,14 +1341,6 @@ impl ProjectManager {
         Ok(self.store.list_children(&issue.id).await?)
     }
 
-    /// Resolve and check a proposed parent.
-    ///
-    /// Three refusals, all of which would otherwise produce a board nobody
-    /// can read: a parent on another project (or missing), an issue made a
-    /// step of itself, and a second level of nesting — either because the
-    /// proposed parent is already a child, or because the issue being
-    /// re-parented has children of its own. One level is a decision, and
-    /// this is where it is kept.
     async fn validate_parent(
         &self,
         project: &ProjectId,
@@ -1856,12 +1383,6 @@ impl ProjectManager {
     }
 
     /// This board's issue with that ULID.
-    ///
-    /// Scoped on purpose: `IssueUpdate::parent` carries an id, so without
-    /// this a caller could make one board's card a step of another's. The
-    /// lookup is by list rather than by a store method because the scope
-    /// *is* the check — a `get_by_id` would be the thing that lets it
-    /// through.
     pub async fn issue_by_id(&self, project: &ProjectId, id: &IssueId) -> Result<IssueRow> {
         self.store
             .list_issues(project)
@@ -1871,21 +1392,6 @@ impl ProjectManager {
             .ok_or_else(|| ProjectError::invalid("parent", format!("no issue {id} on this board")))
     }
 
-    /// `ordered_numbers` has to be the destination column's **whole** new
-    /// membership: every card that will be in it once the move lands, and
-    /// nothing else.
-    ///
-    /// Checked rather than assumed, because the store renumbers exactly the
-    /// numbers it is handed and leaves every other row's `position` alone.
-    /// A caller that sends the list it is *showing* — a board with cancelled
-    /// cards hidden, or any later filter — omits precisely the rows nobody
-    /// is looking at, and those keep a stale rank that now collides with a
-    /// renumbered one. Nothing downstream reads `position` for anything but
-    /// sorting, so the corruption is silent and permanent.
-    ///
-    /// A refusal is not a cost here: every legitimate caller already knows
-    /// the whole column, because it just read the board to compute the
-    /// order.
     async fn validate_column_order(
         &self,
         project: &ProjectId,
@@ -1921,19 +1427,6 @@ impl ProjectManager {
         ))
     }
 
-    /// An assignee has to be an agent on *this* board that can actually run.
-    ///
-    /// Three refusals, each for work that could never happen:
-    ///
-    /// - **Not on the team.** A global chat persona has no handle here, is
-    ///   absent from the team strip, and cannot be mentioned — assigning one
-    ///   produces a card addressed to somebody the board cannot name.
-    /// - **Removed.** Its row survives so the timeline can still say what it
-    ///   did, which is exactly why the tombstone has to be checked here: a
-    ///   `get` that resolves is not a member who can be given new work.
-    /// - **External framework.** A top-level session cannot be bound to a
-    ///   non-baybo framework today — the external backend exists only inside
-    ///   the subagent spawner — so the card could never start.
     async fn validate_assignee(
         &self,
         project: &ProjectId,
@@ -1969,14 +1462,6 @@ impl ProjectManager {
         Ok(())
     }
 
-    /// The assignee's framework, re-read at the moment a run would start.
-    ///
-    /// [`Self::validate_assignee`] answered this when the card was assigned,
-    /// and that answer does not keep: a profile's framework is editable
-    /// (pinned only for builtins), so an agent given a card as baybo can be
-    /// on codex by the time a comment wakes it. `None` when the profile is
-    /// unreadable or gone — a caller that cannot establish the fact must not
-    /// assume the permissive half of it.
     async fn assignee_can_run(&self, issue: &IssueRow) -> Option<bool> {
         let assignee = issue.assignee.as_ref()?;
         match self.agents.get(assignee).await {
@@ -1989,9 +1474,6 @@ impl ProjectManager {
         }
     }
 
-    /// In Progress means somebody is on it. A card in that column with no
-    /// assignee is work the board claims is happening and nobody is doing;
-    /// every other column is free to be unassigned.
     fn validate_staffing(
         &self,
         status: IssueStatus,
@@ -2006,27 +1488,6 @@ impl ProjectManager {
         Ok(())
     }
 
-    /// Resolve a project and refuse if it is archived.
-    ///
-    /// Every write that changes what is *on* a board starts here — an
-    /// issue, a comment, the team, a retry — so "archived is read-only" is
-    /// one rule in one place rather than a check each endpoint has to
-    /// remember.
-    ///
-    /// Three kinds of write do not ask, and each is deliberate:
-    /// [`Self::set_project_archived`], because a board that could not be
-    /// written could not be restored either; the operator's own bookkeeping
-    /// ([`Self::mark_read`], [`Self::cancel_run`] — stopping work and noting
-    /// it was seen are not additions to the board); and
-    /// [`Self::record_event`], which describes work already under way rather
-    /// than starting any.
-    ///
-    /// Everything that *starts* a run asks. Every door into
-    /// [`Self::enqueue`] begins here, and so does
-    /// [`Self::resume_project_runs`] — the re-drive half for the board, and
-    /// the release half through it, since [`Self::release_held_runs`] is
-    /// reached either from there or from a budget change that has already
-    /// asked.
     async fn writable_project(&self, id: &ProjectId) -> Result<ProjectRow> {
         let project = self.get_project(id).await?;
         if project.archived_at.is_some() {
@@ -2050,10 +1511,6 @@ fn validate_name(name: &str) -> Result<String> {
     Ok(trimmed.to_owned())
 }
 
-/// A ceiling has to be something a board can actually spend against.
-///
-/// Negative is refused rather than clamped: it is a caller mistake, and
-/// clamping it to zero would silently pause every board on that project.
 fn validate_budget(budget: Option<baybo_model::MicroUsd>) -> Result<Option<baybo_model::MicroUsd>> {
     if budget.is_some_and(|b| b.into_micros() < 0) {
         return Err(ProjectError::invalid(
@@ -2098,8 +1555,6 @@ fn validate_role(role: &str) -> Result<String> {
     Ok(trimmed.to_owned())
 }
 
-/// `base` with `-n` appended, truncated so the result still fits the handle
-/// grammar's length bound.
 fn suffixed_handle(base: &AgentHandle, n: usize) -> Result<AgentHandle> {
     let suffix = format!("-{n}");
     let room = baybo_model::MAX_AGENT_HANDLE_CHARS.saturating_sub(suffix.chars().count());
@@ -2161,28 +1616,15 @@ async fn git_init(dir: &PathBuf) -> Result<()> {
 }
 
 /// Refuse a workdir that overlaps baybo's own workspace.
-///
-/// A project's checkout is bound read-write into every shell command its
-/// team runs, so it must be neither inside the workspace tree nor a parent
-/// of it.
 pub fn validate_workdir(workdir: &str, paths: &WorkspacePaths) -> Result<()> {
     let path = Path::new(workdir);
     if !path.is_absolute() {
         return Err(ProjectError::invalid("workdir", "must be an absolute path"));
     }
-    // Canonicalise before comparing, because the sandbox resolves symlinks
-    // when it mounts: a lexical-only check passes a link aimed at `state/`
-    // and then binds exactly what it refused. A path that does not exist
-    // yet can only be checked lexically — and cannot be bound either.
     let resolve = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
     let target = resolve(path);
     let root = resolve(&baybo_workspace::absolutise(paths.root()));
     let work = resolve(&baybo_workspace::absolutise(&paths.work_dir()));
-    // Both directions. A descendant is the obvious one; an **ancestor** is
-    // the one that bites, because the default workspace lives in `~/.baybo`
-    // and `workdir = $HOME` would bind the whole home directory — baybo's
-    // own state, keys and all — read-write into every shell the team runs.
-    // `work/` is the single exemption: a shell may already write there.
     let inside = target.starts_with(&root) && !target.starts_with(&work);
     // No `work/` exemption on this side: containing `work/` does not stop a
     // parent from containing `state/` and `.key/` as well.

@@ -48,8 +48,6 @@ const PRIORITY_LABEL: Record<IssuePriority, string> = {
 const railLabel = 'font-mono text-[0.6rem] font-bold uppercase tracking-wider text-ink-soft';
 
 const RUN_TONE: Record<IssueRun['status'], string> = {
-  // Held is not a failure and not progress: the work is recorded and
-  // waiting on budget, so it reads as a warning rather than an error.
   held: 'border-warn/50 bg-warn/12 text-warn',
   queued: 'border-black/35 bg-canvas text-ink-soft',
   running: 'border-black bg-brand/40 text-ink',
@@ -109,12 +107,6 @@ function RunRow({
 const railSelect =
   'w-full mt-1 px-2 py-1 bg-surface border-2 border-black rounded-md font-mono text-[0.72rem] outline-none cursor-pointer';
 
-/**
- * The two-pane issue view. Phase 1 is the skeleton: prose on the left,
- * properties on the right. The timeline, execution log and branch box land
- * with the execution pipeline — this page exists now so the board has
- * somewhere to open into.
- */
 export function IssueDetailPage() {
   const { pid, num } = useParams<{ pid: string; num: string }>();
   const projectId = pid ?? '';
@@ -133,8 +125,6 @@ export function IssueDetailPage() {
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
   const [saving, setSaving] = useState(false);
-  /// What the server last said the prose was — the yardstick for "has the
-  /// operator touched this?".
   const serverProse = useRef({ title: '', description: '' });
 
   useEffect(() => {
@@ -146,8 +136,6 @@ export function IssueDetailPage() {
           fetchTeam(client, projectId),
           fetchIssueRuns(client, projectId, number),
           fetchTimeline(client, projectId, number),
-          // The whole board, because a step's own card carries only its
-          // parent's number — the children hang the other way round.
           fetchIssues(client, projectId),
         ]);
       if (canceled) return;
@@ -165,9 +153,7 @@ export function IssueDetailPage() {
         return;
       }
       setIssue(outcome.value);
-      // Reseed the prose only when the operator has not touched it. A
-      // refetch triggered by a run finishing must not overwrite a
-      // description someone is halfway through typing.
+      // Live refreshes must not overwrite an edit in progress.
       setTitle((current) => (current === serverProse.current.title ? outcome.value.title : current));
       setDescription((current) =>
         current === serverProse.current.description ? outcome.value.description : current,
@@ -185,7 +171,6 @@ export function IssueDetailPage() {
     };
   }, [client, logout, number, projectId, refreshKey]);
 
-  // A run starting or settling elsewhere still changes this page.
   useBoardStream(
     projectId,
     number,
@@ -219,21 +204,6 @@ export function IssueDetailPage() {
     [client, logout, number, projectId],
   );
 
-  /**
-   * Changing status here is the same act as a drag, so it goes through the
-   * same endpoint. The board is where the destination's order is visible,
-   * so from here the card simply joins that column's tail — which means
-   * reading the column first.
-   */
-  /**
-   * Move one of this card's steps.
-   *
-   * The same column-order rule every move follows: the request carries the
-   * destination column's whole new membership, so the board is read first
-   * and the step joins that column's tail. Sharing `relocate`'s body was
-   * tempting and wrong — that one moves *this* card and reseeds the page's
-   * own prose from the response.
-   */
   const moveChild = useCallback(
     async (childNumber: number, status: IssueStatus) => {
       setSaving(true);
@@ -264,9 +234,6 @@ export function IssueDetailPage() {
         return;
       }
       setError(null);
-      // Refetch rather than patch in place: finishing a step can open the
-      // next stage and wake this card's assignee, so the timeline and the
-      // run log change too.
       setRefreshKey((key) => key + 1);
     },
     [client, logout, projectId],
@@ -321,8 +288,6 @@ export function IssueDetailPage() {
       return;
     }
     setError(null);
-    // The row settles on the server — for a run that was executing, only
-    // once its turn actually stops. The board frame brings the result.
     setRefreshKey((key) => key + 1);
   }, [client, logout, number, projectId]);
 
@@ -340,8 +305,6 @@ export function IssueDetailPage() {
         return;
       }
       setError(null);
-      // Append rather than refetch: the entry is already in hand, and the
-      // broadcast this write triggers will reconcile the rest anyway.
       setEvents((current) => [...current, outcome.value]);
     },
     [client, logout, number, projectId],
@@ -361,10 +324,6 @@ export function IssueDetailPage() {
         return;
       }
       setError(null);
-      // Refetch rather than append: the resolution is written by the gate
-      // on the server side, so this page has no entry in hand to add. The
-      // prompt disappears when that entry arrives, which is also what
-      // stops a stale click from looking like it worked.
       setRefreshKey((key) => key + 1);
     },
     [client, logout, number, projectId],
@@ -406,12 +365,6 @@ export function IssueDetailPage() {
 
   const cancelled = issue.cancelled_at_ms != null;
   const blocked = issue.blocked_reason != null;
-  // The one run the ledger lets exist at a time, if this card has it. Held
-  // is unsettled without being in flight — nothing is executing and there
-  // is nothing to stop, the row is waiting on the board's budget — and it
-  // still holds the slot, so a retry is refused for as long as it sits
-  // there. Asked as "unsettled, then which" rather than as a list of live
-  // states, because that list is what forgets `held`.
   const live = unsettledRun(runs);
   const inFlight = live !== null && live.status !== 'held';
   const retryRefusal = retryRejection(issue);
@@ -491,8 +444,6 @@ export function IssueDetailPage() {
 
           <SubIssues
             projectId={projectId}
-            // The whole board is held; the steps are whichever cards name
-            // this one as their parent.
             children={children}
             team={agents}
             disabled={saving}
@@ -573,10 +524,6 @@ export function IssueDetailPage() {
             </label>
           </section>
 
-          {/* No diff viewer and no merge button, per decision 9: review
-              rides the transcript plus the branch checked out locally, and
-              merging is the assignee's job on request or yours in a
-              terminal. So the branch's whole job here is to be copied. */}
           {issue.branch != null ? (
             <section className="border-2 border-black rounded-md bg-surface p-3">
               <h2 className={railLabel}>Branch</h2>
@@ -599,20 +546,6 @@ export function IssueDetailPage() {
 
           <section className="border-2 border-black rounded-md bg-surface p-3">
             <h2 className={railLabel}>Execution log</h2>
-            {/* Three shapes, because what the reader can do about them
-                differs. A run in flight: the button goes — its own row is
-                directly below with the stop on it, so the reason is already
-                on screen and a click could only collect a conflict. A card
-                the board has finished with, or one nobody is on: the button
-                stays, dead, and says why — the way out (reopen it, drag it
-                back out of Done, assign someone) is not deducible from a
-                control that quietly vanished. A held run: the button stays
-                and *works*, because pressing it is what releases the hold
-                (`enqueue` releases before it writes), with a note saying
-                what it is waiting on.
-                In the page rather than in `title`: a disabled control takes
-                no pointer events, which makes its tooltip exactly the thing
-                an operator cannot reach. */}
             {inFlight ? null : (
               <>
                 <button

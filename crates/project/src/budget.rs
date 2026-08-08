@@ -1,9 +1,4 @@
 //! What a project may spend, and what happens when it has spent it.
-//!
-//! Pure, like [`crate::runs::triggers_run`] and
-//! [`crate::comments::comment_delivery`]: the decision is one function so
-//! the gate, the timeline entry, and anything that later shows a burn bar
-//! all read the same rule.
 
 use baybo_model::MicroUsd;
 use chrono::{DateTime, Utc};
@@ -42,10 +37,6 @@ impl Headroom {
 }
 
 /// Decide against a limit and a day's spend.
-///
-/// The comparison is `>=`: a board that has spent exactly its ceiling has
-/// no room for a run whose cost is unknown in advance. Erring the other way
-/// would let every board overspend by one run's worth, every day.
 pub(crate) fn headroom(limit: Option<MicroUsd>, spent: MicroUsd) -> Headroom {
     let Some(limit) = limit else {
         return Headroom::Unlimited;
@@ -59,11 +50,6 @@ pub(crate) fn headroom(limit: Option<MicroUsd>, spent: MicroUsd) -> Headroom {
 
 /// The start of the UTC day containing `now` — the window a daily budget
 /// measures.
-///
-/// UTC rather than a local zone: the operator's timezone is not stored, a
-/// server's is an accident of deployment, and a budget that rolls over at a
-/// time nobody can predict is worse than one that rolls over at an
-/// inconvenient one.
 pub(crate) fn day_start(now: DateTime<Utc>) -> DateTime<Utc> {
     now.date_naive()
         .and_hms_opt(0, 0, 0)
@@ -90,8 +76,6 @@ mod tests {
 
     #[test]
     fn the_boundary_is_closed_against_starting_more_work() {
-        // Exactly at the ceiling is exhausted. A run's cost is unknown until
-        // it has run, so "there is 0 left" cannot mean "start one more".
         assert!(headroom(Some(usd(100)), usd(100)).is_exhausted());
         assert!(headroom(Some(usd(100)), usd(101)).is_exhausted());
         assert!(!headroom(Some(usd(100)), usd(99)).is_exhausted());
@@ -99,8 +83,6 @@ mod tests {
 
     #[test]
     fn a_zero_budget_stops_everything() {
-        // Not a special case, and worth pinning: `0` is how an operator
-        // pauses a board without archiving it.
         assert!(headroom(Some(MicroUsd::ZERO), MicroUsd::ZERO).is_exhausted());
     }
 
@@ -119,8 +101,6 @@ mod tests {
             .expect("rfc3339")
             .with_timezone(&Utc);
         assert_eq!(day_start(now).to_rfc3339(), "2026-08-05T00:00:00+00:00");
-        // …and the first instant of a day is its own window start, so a run
-        // at midnight is not measured against yesterday.
         assert_eq!(day_start(day_start(now)), day_start(now));
     }
 }

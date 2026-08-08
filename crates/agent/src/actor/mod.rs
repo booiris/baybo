@@ -660,9 +660,6 @@ impl AgentActor {
         }
     }
 
-    /// Run an issue's brief as one turn. No channel dispatch: an issue's
-    /// audience is its card, and the run's outcome is recorded by the
-    /// waiter off this turn's terminal lifecycle edge.
     async fn dispatch_issue_run(
         &mut self,
         run_id: &baybo_model::IssueRunId,

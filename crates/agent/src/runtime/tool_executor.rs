@@ -48,15 +48,6 @@ fn sandbox_readable_paths(
     vec![agent.skills_dir(paths)]
 }
 
-/// Whether a **resolved** worktree path may be bound read-write.
-///
-/// Named rather than inlined because it is a security rule, and a security
-/// rule that only exists inside a closure is one nothing can assert. The
-/// worktree lives under the work dir, which the running session's own shell
-/// may write — so an agent can delete its checkout and leave a symlink in
-/// its place. Canonicalising and then demanding containment is what makes
-/// that swap inert: a link to `/` resolves to `/`, which is not under the
-/// work dir, so nothing is bound.
 fn admits_worktree(resolved: &Path, work_dir: &Path) -> Result<(), String> {
     if resolved.starts_with(work_dir) {
         Ok(())
@@ -65,39 +56,6 @@ fn admits_worktree(resolved: &Path, work_dir: &Path) -> Result<(), String> {
     }
 }
 
-/// Whether a **resolved** project repository may be bound read-write.
-///
-/// Plain containment cannot be the test here — a project's repository is a
-/// user-chosen path outside the workspace by design, and that is the
-/// feature. What it must never be is a directory whose writable bind would
-/// swallow the read-only system layer, or one that overlaps baybo's own
-/// workspace **in either direction**: a parent of the workspace binds
-/// `state/` and `.key/` read-write, and so does a directory inside it. The
-/// single exemption is `work/`, which a run's shell may already write and
-/// which is where a project created without a workdir gets its repository.
-///
-/// That pair of rules is exactly [`baybo_project::validate_workdir`]'s, so
-/// the creation-time and bind-time answers cannot disagree — a workdir the
-/// board refuses to accept is one the sandbox also refuses to bind, and the
-/// defence-in-depth is real rather than claimed.
-///
-/// Only `resolved` arrives canonical (from [`ToolExecutor::bindable`]); the
-/// workspace paths are resolved *here*, because the configured spelling is
-/// not the one the filesystem uses. The default workspace is reached through
-/// `~/.baybo -> /data/…/.baybo`, and with that layout a repository at
-/// `/data/x` never prefixes `/home/u/.baybo` — so comparing a resolved path
-/// against an unresolved base is a guard that can never fire, and the
-/// directory holding baybo's own `state/` and `.key/` would be bound
-/// read-write into the run's sandbox.
-///
-/// [`baybo_workspace::absolutise`] rather than a bare `canonicalize`, so a
-/// root that cannot be resolved degrades to its lexical spelling instead of
-/// refusing every repository. That is not fail-open: the containment checks
-/// still run, only the symlink resolution is skipped — and it is skipped
-/// only when the root is not on disk, which is a workspace with no `state/`
-/// or `.key/` to protect and which boot's `ensure_layout` makes unreachable
-/// in production anyway. Refusing instead would break every issue run on a
-/// mistyped `workspace.path` while protecting nothing.
 fn admits_repo(resolved: &Path, paths: &baybo_workspace::WorkspacePaths) -> Result<(), String> {
     if let Some(why) = baybo_sandbox::args::writable_bind_refusal(resolved) {
         return Err(why);
@@ -115,22 +73,6 @@ fn admits_repo(resolved: &Path, paths: &baybo_workspace::WorkspacePaths) -> Resu
     Ok(())
 }
 
-/// The handle `agent` answers to on `project`, or `None` when it has none
-/// there.
-///
-/// Scoped to the board the run belongs to, because a handle is unique only
-/// inside its board: `@dev-1` here and `@dev-1` there are two different
-/// agents, so a profile whose team is somewhere else must not sign this
-/// board's commits under this board's naming. A removed teammate still
-/// answers — removal is a `deleted_at` tombstone that leaves the
-/// membership itself untouched, and `AgentProfileStore::get` reaches
-/// rows `list_team` filters out.
-///
-/// Degrades instead of failing on every miss — a global agent, a profile
-/// row that is gone, a store error, a membership on another board —
-/// because the one consumer is the commit identity an issue run's shell
-/// carries, and a commit attributed to a name no reader can resolve is
-/// worse than one attributed to baybo. Neither may stop the commit.
 async fn board_handle(
     agents: &Arc<dyn AgentProfileStore>,
     agent: &baybo_model::AgentProfileId,
@@ -434,11 +376,6 @@ fn tool_output_media(output: &ToolOutput) -> (Vec<ContentBlock>, Vec<ContentBloc
 /// The two stores an issue run's tool call reads: the project row says
 /// where the repository is, the profile row says what the agent working it
 /// is called.
-///
-/// One field rather than two `Option`s because no assembly wires one
-/// without the other — a second `Option` would admit a board whose agents
-/// cannot be named, which is a state nothing produces and everything
-/// downstream would have to handle.
 pub struct BoardStores {
     pub projects: Arc<dyn ProjectStore>,
     pub agents: Arc<dyn AgentProfileStore>,
@@ -544,14 +481,6 @@ impl ToolExecutor {
         }
     }
 
-    /// The checkout backing an issue session, or `None` for every other
-    /// session.
-    ///
-    /// Reports only a worktree that is already on disk. Creating it is the
-    /// run dispatcher's job, done once when the run starts and settled as a
-    /// run failure if it cannot be done; a tool call is the wrong place to
-    /// discover that a checkout is missing and much the wrong place to
-    /// shell out to `git` to make one.
     async fn issue_checkout(&self, trigger: &baybo_model::TriggerSource) -> Option<Checkout> {
         let baybo_model::TriggerSource::Issue {
             project_id, number, ..
@@ -570,33 +499,14 @@ impl ToolExecutor {
         };
         let root = worktree::worktree_root(&self.workspace_paths, project_id, *number);
 
-        // Resolve both paths and re-check them on every call, because this
-        // runs on behalf of a session whose own shell can write inside
-        // `work/`. An agent that replaces its worktree directory with a
-        // symlink would otherwise have the next tool call bind the link's
-        // target read-write — and `/` is a valid target. Canonicalising and
-        // then demanding containment is what makes the swap inert: the
-        // resolved path either still lands under the work dir or it is not
-        // bound at all.
-        // `workspace_root` is the sandbox scope — the *canonicalised*
-        // `<workspace>/work/` (see the field, and `sandbox_root` in
-        // `baybo::runtime`), so this compares resolved against resolved
-        // even when the workspace is reached through a symlink.
         let work_dir = self.workspace_root.clone();
         let root = self.bindable(&root, |p| admits_worktree(p, &work_dir))?;
-        // The repository is a user-chosen path outside the workspace by
-        // design, so plain containment cannot be the test. What it must
-        // never be is a directory whose writable bind would swallow the
-        // read-only system layer, or one overlapping baybo's own workspace
-        // either way round.
         let repo = self.bindable(Path::new(&project.workdir), |p| {
             admits_repo(p, &self.workspace_paths)
         })?;
         Some(Checkout { root, repo })
     }
 
-    /// Canonicalise a path and apply `admit`, logging and refusing rather
-    /// than binding anything the check does not accept.
     fn bindable(
         &self,
         path: &Path,
@@ -887,21 +797,7 @@ impl ToolExecutor {
                     .is_some_and(|manifest| {
                         manifest.capabilities.contains(&ToolCapability::ExecCommand)
                     });
-                // The checkout this session owns, if it is an issue's. Both
-                // paths go to the sandbox: the worktree because that is
-                // where edits land, and the repository because a git
-                // worktree keeps neither its index nor its refs — a commit
-                // made in the worktree is written entirely under the
-                // repository's `.git`.
                 let checkout = self.issue_checkout(session_trigger).await;
-                // Gated on the checkout, so an ordinary session pays for no
-                // store read at all. An issue run pays one profile point-get
-                // per tool call — every call, not just the one that commits,
-                // because the handle rides `ToolContext` and the context is
-                // built per call. That is deliberately the same freshness
-                // rule as the checkout resolved just above: team membership
-                // is a row a lead can edit mid-run, and the read joins one
-                // that path already makes.
                 let agent_handle = match (&checkout, &self.board, session_trigger.project()) {
                     (Some(_), Some(board), Some(project)) => {
                         board_handle(&board.agents, agent_id, project).await
@@ -1181,10 +1077,6 @@ mod tests {
     use super::{admits_repo, admits_worktree};
     use std::path::Path;
 
-    /// The escape this guard exists to close: an issue run's own shell can
-    /// write inside `work/`, so it can delete its checkout and leave a
-    /// symlink behind. The path is resolved on every call, so what must be
-    /// rejected is the *target* — and `/` is a legal target.
     #[test]
     fn a_worktree_that_resolves_outside_the_work_dir_is_not_bound() {
         let work = Path::new("/ws/work");
@@ -1197,9 +1089,6 @@ mod tests {
         }
     }
 
-    /// A repository is outside the workspace by design, so the rule is not
-    /// plain containment — it is that the bind must not swallow the
-    /// read-only system layer or baybo's own state.
     #[test]
     fn a_repository_may_be_anywhere_except_over_the_system_or_the_workspace() {
         let ws = baybo_workspace::WorkspacePaths::new("/home/u/.baybo");
@@ -1213,14 +1102,6 @@ mod tests {
         }
     }
 
-    /// The half the bind-time guard was missing: a directory *inside* the
-    /// workspace. `validate_workdir` refuses one at project-creation time,
-    /// so admitting it here meant the two answers disagreed and a row that
-    /// reached the store some other way (an edit, an import, a future
-    /// caller) would bind `state/` and `.key/` read-write into a run's
-    /// shell. `work/` is the one exemption, and not a cosmetic one: it is
-    /// where a project created without a workdir gets its repository, so
-    /// refusing it would refuse the default project shape.
     #[test]
     fn a_repository_inside_the_workspace_is_refused_unless_it_is_under_work() {
         let ws = baybo_workspace::WorkspacePaths::new("/home/u/.baybo");
@@ -1240,14 +1121,6 @@ mod tests {
         );
     }
 
-    /// The shape the default install has: `~/.baybo` is a symlink to the
-    /// real workspace on a data volume, so the configured root and the
-    /// resolved one are different strings. The repository arrives already
-    /// canonical (that is what `bindable` hands in), so unless the root is
-    /// resolved too, the containment test compares `/home/u/.baybo` against
-    /// `/data/x` — never a prefix, so the guard never fires and the
-    /// directory holding baybo's own `state/` and `.key/` is bound
-    /// read-write into the run's sandbox.
     #[test]
     fn a_repo_that_contains_the_workspace_through_a_symlink_is_still_refused() {
         let real = tempfile::tempdir().expect("tempdir");
@@ -1315,9 +1188,6 @@ mod tests {
         }
     }
 
-    /// What a commit is authored as. The profile id is a ULID, so resolving
-    /// the handle is the whole point of reading this row — `git log` showing
-    /// `01JC3KQ4Z8…` names nobody.
     #[tokio::test]
     async fn a_team_members_handle_is_what_its_commits_are_authored_as() {
         let agents = baybo_store::test_support::MemoryAgentProfileStore::new();
@@ -1340,10 +1210,6 @@ mod tests {
         );
     }
 
-    /// A removed teammate still signs the commits it is about to make: the
-    /// board's own resolver reaches tombstoned rows on purpose, and a run
-    /// settling after its agent was let go must not silently fall back to
-    /// the workspace identity.
     #[tokio::test]
     async fn a_removed_teammate_still_resolves_on_the_board_it_worked() {
         let agents = baybo_store::test_support::MemoryAgentProfileStore::new();
@@ -1368,10 +1234,6 @@ mod tests {
         );
     }
 
-    /// A handle is unique only inside its board, so an agent whose team is
-    /// somewhere else has no name *here* — signing this board's commits
-    /// with another board's `@dev-1` names the wrong somebody, which is the
-    /// failure the handle replaced the ULID to avoid.
     #[tokio::test]
     async fn an_agent_on_another_board_does_not_sign_this_ones_commits() {
         let agents = baybo_store::test_support::MemoryAgentProfileStore::new();
@@ -1391,9 +1253,6 @@ mod tests {
         );
     }
 
-    /// The two states that license the bash tool's fallback to the
-    /// workspace `.gitconfig`: an agent on no board, and a row that is gone.
-    /// Neither may fail the commit.
     #[tokio::test]
     async fn an_agent_with_no_board_and_a_row_that_is_gone_have_no_handle() {
         let agents = baybo_store::test_support::MemoryAgentProfileStore::new();
@@ -1412,7 +1271,6 @@ mod tests {
     const FIXTURE_HANDLE: &str = "dev-1";
     const CAPTURE_TOOL: &str = "capture_ctx";
 
-    /// The two context fields an issue run's identity lives in.
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct SeenContext {
         checkout_root: Option<PathBuf>,
@@ -1421,11 +1279,6 @@ mod tests {
 
     type Seen = Arc<Mutex<Option<SeenContext>>>;
 
-    /// A tool that records the context it was handed and does nothing else.
-    ///
-    /// Declares `ExecCommand` because that is the capability the one real
-    /// consumer of the identity (`Bash`) carries, so the executor takes the
-    /// same branch it takes in production.
     struct CaptureTool {
         seen: Seen,
     }
@@ -1454,14 +1307,10 @@ mod tests {
         }
     }
 
-    /// An executor wired the way `baybo::runtime` wires the real one, on a
-    /// workspace reached through a symlink — the default install's shape
-    /// (`~/.baybo -> /data/…/.baybo`).
     struct IssueRunFixture {
         executor: ToolExecutor,
         trigger: baybo_model::TriggerSource,
         agent: baybo_model::AgentProfileId,
-        /// Resolved (post-symlink) locations, which is what a bind must be.
         worktree: PathBuf,
         repo: PathBuf,
         seen: Seen,
@@ -1478,9 +1327,6 @@ mod tests {
         let link = home.path().join(".baybo");
         std::os::unix::fs::symlink(&workspace, &link).expect("symlink");
 
-        // Exactly the two values `baybo::runtime` builds: the layout is
-        // anchored at the CONFIGURED spelling, the sandbox scope is the
-        // canonicalised `work/`.
         let paths = baybo_workspace::WorkspacePaths::new(link.clone());
         std::fs::create_dir_all(paths.work_dir()).expect("work dir");
         let sandbox_root = paths.work_dir().canonicalize().expect("canonical work dir");
@@ -1522,8 +1368,6 @@ mod tests {
             .await
             .expect("teammate");
 
-        // The dispatcher cuts this before the run starts; the executor only
-        // ever reports one that is already on disk.
         let worktree = worktree::worktree_root(&paths, &project_id, number);
         std::fs::create_dir_all(&worktree).expect("worktree");
 
@@ -1587,13 +1431,6 @@ mod tests {
         }
     }
 
-    /// The whole worktree layer on the default install's layout. The
-    /// worktree is addressed through the configured spelling
-    /// (`~/.baybo/work/.worktrees/…`) and resolves to the real volume, so
-    /// the containment guard has to be comparing resolved-vs-resolved —
-    /// `workspace_root` is the canonicalised `work/` dir, not
-    /// `config.workspace.path`. If it were the latter, this returns `None`
-    /// and no issue run in production is ever handed a checkout at all.
     #[tokio::test]
     async fn a_worktree_under_a_symlinked_workspace_is_still_bound() {
         let fixture = issue_run_fixture().await;
@@ -1607,12 +1444,6 @@ mod tests {
         assert_eq!(checkout.repo, fixture.repo);
     }
 
-    /// The wiring nothing else covers: the bash tool's tests set
-    /// `agent_handle` by hand and the resolver's tests call it directly, so
-    /// only an end-to-end call proves the executor puts the resolved handle
-    /// on the context an issue run's tool actually receives. Without it,
-    /// `let agent_handle = None;` keeps every other test green and silently
-    /// hands every commit back to the workspace fallback.
     #[tokio::test]
     async fn an_issue_runs_tool_call_carries_the_agents_handle() {
         let fixture = issue_run_fixture().await;

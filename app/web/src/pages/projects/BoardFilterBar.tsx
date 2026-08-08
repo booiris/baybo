@@ -3,7 +3,6 @@ import { RiCloseLine, RiSearchLine } from 'react-icons/ri';
 import { assignableAgents, type Agent } from './boardModel';
 import { EMPTY_FILTER, isDefault, type AssigneeFilter, type BoardFilter } from './boardFilter';
 
-/** The `assignee` select's sentinel values, kept out of the handle space. */
 const ANYONE = '';
 const UNASSIGNED = 'unassigned';
 
@@ -24,13 +23,6 @@ function parseAssignee(value: string): AssigneeFilter {
   return { kind: 'anyone' };
 }
 
-/**
- * A second, thin header row that narrows the board.
- *
- * Its own row because the bar above it is already carrying the switcher,
- * the team strip and the Activity toggle, and a filter that has to fight
- * for width is a filter nobody uses.
- */
 export function BoardFilterBar({
   filter,
   team,
@@ -50,8 +42,6 @@ export function BoardFilterBar({
           aria-label="Filter cards by title or number"
           placeholder="Title or #number"
           onChange={(event) => {
-            // Not debounced: this drives a memo over an in-memory array,
-            // not a request.
             onChange({ ...filter, text: event.target.value });
           }}
           className="w-44 bg-transparent font-mono text-[0.68rem] outline-none"

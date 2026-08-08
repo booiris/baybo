@@ -6,11 +6,6 @@ import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { IssueDetailPage } from './IssueDetailPage';
 import type { Issue, IssueRun } from './boardModel';
 
-// What a reducer test cannot reach: that the retry button offers a run only
-// when the server would take one — the card's refusals (`retryRejection`)
-// and the ledger's (`unsettledRun`) both reaching the same control. The two
-// predicates' own cases live in `boardModel.test.ts`; these are about the
-// affordance — gone, or disabled and saying why.
 
 const PROJECT_ID = '01JPROJECT';
 
@@ -42,8 +37,6 @@ function run(status: IssueRun['status']): IssueRun {
   };
 }
 
-// One run, settled: the button reads "Run it again" and the card takes
-// another — the unsettled states are the cases below.
 const RUNS: IssueRun[] = [run('failed')];
 
 const TEAM = [
@@ -86,8 +79,6 @@ const client = {
   PATCH: vi.fn(),
 };
 
-// Stable values, as the real context gives — a fresh object per call would
-// re-run the load effect on every render.
 const auth = { logout: vi.fn() };
 vi.mock('../../api/auth', () => ({
   useAdminClient: () => client,
@@ -124,8 +115,6 @@ describe('IssueDetailPage retry', () => {
 
     const button = await retryButton();
     expect(button).toBeDisabled();
-    // Still on the page, and next to the way out — a button that vanished
-    // would leave the operator hunting for the reason.
     expect(
       screen.getByText('this issue was cancelled — reopen it before running it again'),
     ).toBeInTheDocument();
@@ -154,10 +143,6 @@ describe('IssueDetailPage retry', () => {
     renderIssue(issue(), [run('held')]);
 
     const button = await retryButton();
-    // `retry_run` goes through `enqueue`, which releases what the ceiling
-    // allows *before* it writes, so this press is the operator's one control
-    // over a held card. Disabling it would leave an exhausted board offering
-    // nothing at all.
     expect(button).toBeEnabled();
     expect(
       screen.getByText(
@@ -175,9 +160,6 @@ describe('IssueDetailPage retry', () => {
   it('says the card refusal, not the budget, when both are true', async () => {
     renderIssue(issue({ status: 'done' }), [run('held')]);
 
-    // The server asks in this order too: `retry_run` refuses a finished card
-    // before `enqueue` ever reaches the ledger, so the budget note would be
-    // an answer the click never brings back.
     expect(await retryButton()).toBeDisabled();
     expect(
       screen.getByText('this issue is done — move it back into the board before running it again'),
@@ -187,8 +169,6 @@ describe('IssueDetailPage retry', () => {
   it('hides the button while a run is in flight, where the run row answers instead', async () => {
     for (const status of ['queued', 'running'] as const) {
       const view = renderIssue(issue(), [run(status)]);
-      // The run row is what says why — wait for it, or the absence below
-      // is only the page still loading.
       expect(await screen.findByText(status)).toBeInTheDocument();
       expect(screen.queryByRole('button', { name: 'Run it again' })).toBeNull();
       view.unmount();

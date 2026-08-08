@@ -214,13 +214,6 @@ pub trait SessionStore: Send + Sync {
     /// Operator-facing: drives `baybo session list`.
     async fn list_all(&self) -> Result<Vec<Session>>;
 
-    /// The lead's planning conversations for one board, newest first.
-    ///
-    /// Matched on the trigger's `project_id` inside the `data` blob rather
-    /// than on a flat column: these rows are rare (a handful per board),
-    /// the chat list never touches them, and a column would be a second
-    /// place the binding could disagree with the trigger it is copied
-    /// from.
     async fn list_project_conversations(&self, project_id: &str) -> Result<Vec<Session>>;
 
     /// Return live sessions whose `channel` equals `channel`,

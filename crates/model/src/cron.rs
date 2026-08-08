@@ -115,12 +115,6 @@ pub struct CronJob {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     /// The board this job files work on, if it was pointed at one.
-    ///
-    /// Rides the `data` blob rather than a flat column: it is authored at
-    /// creation and never written by a fire, so it round-trips safely
-    /// through `save_if_unchanged` and survives `record_fire`, which
-    /// stamps only its own four fields onto the stored blob. Nothing
-    /// queries on it, so there is no index to justify a column either.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<crate::ProjectId>,
     /// Session where this cron job was created (for traceability).
@@ -406,11 +400,6 @@ pub struct CronExecution {
     #[serde(default)]
     pub origin_session_id: Option<SessionId>,
     /// The board this fire files work on, snapshotted from the job.
-    ///
-    /// Snapshotted rather than read live off the job row for the same
-    /// reason `prompt` and `title` are: the boot re-dispatch rebuilds a
-    /// `CronTriggerEvent` from this row alone, and a fire must run against
-    /// the board it was scheduled for even if the job has since changed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<crate::ProjectId>,
 

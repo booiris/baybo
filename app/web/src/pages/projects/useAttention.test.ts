@@ -21,9 +21,6 @@ function board(overrides: Partial<ProjectAttention> = {}): ProjectAttention {
 
 describe('boardsNeedingAttention', () => {
   it('counts boards, not the things on them', () => {
-    // The rail entry opens exactly one board, so a total across boards is a
-    // number that clicking it cannot discharge — you would deal with two of
-    // seven and watch it sit at five with no explanation.
     const boards = [
       board({ approvals: 3, held: 2 }),
       board({ project_id: '01JB', name: 'Beta', failed: 4 }),
@@ -57,8 +54,6 @@ describe('attentionSummary', () => {
   });
 
   it('names the unread signal separately from the actionable ones', () => {
-    // It is the one count that is time-based rather than state-based, so
-    // "3 new since you looked" has to read differently from "3 failed".
     expect(attentionSummary([board({ unread: 3 })])).toBe(
       'Alpha: 3 new since you looked',
     );

@@ -11,19 +11,6 @@ import {
   type LeadTurn,
 } from './api';
 
-/**
- * Talk to a board's coordinator, without leaving the board.
- *
- * Transport is the ordinary chat stack: the WS scopes a subscription by
- * channel and the sync endpoint by channel, so a board's session rides both
- * unchanged. Only the chat *list* filters these out, which is the whole
- * point — a board's conversations live on the board.
- *
- * The thread is rendered plainly rather than through the chat page's
- * renderer: that component is bound to the chat page's own state machine,
- * and a panel that has to talk to the lead is worth more than one that
- * matches its typography.
- */
 export function LeadPanel({
   projectId,
   readOnly,
@@ -33,7 +20,6 @@ export function LeadPanel({
   projectId: string;
   readOnly: boolean;
   onClose: () => void;
-  /** The lead's tool calls change the board; the page refetches on this. */
   onBoardChanged: () => void;
 }) {
   const client = useAdminClient();
@@ -59,12 +45,6 @@ export function LeadPanel({
     }
     setError(null);
     setConversations(outcome.value);
-    // Open on the most recently active one, which is what the operator was
-    // last doing. An empty board waits for them to start one. Written as a
-    // length check rather than an index-and-coalesce because this project
-    // does not run `noUncheckedIndexedAccess`, so `value[0]` types as
-    // present and the coalesce would be dead in the type system while very
-    // much alive at runtime.
     const newest = outcome.value.length > 0 ? outcome.value[0].session_id : null;
     setActive((current) => current ?? newest);
   }, [client, logout, projectId]);
@@ -73,7 +53,6 @@ export function LeadPanel({
     void load();
   }, [load]);
 
-  // History, refetched whenever the selected conversation changes.
   useEffect(() => {
     if (active === null) {
       setTurns([]);
@@ -98,9 +77,6 @@ export function LeadPanel({
     };
   }, [active, client, logout]);
 
-  // One socket for the panel's lifetime, resubscribed as the selection
-  // moves. Reconnect is internal to ChatWs; recovery is the sync above,
-  // which reruns on every selection change.
   useEffect(() => {
     if (token === null || active === null) return;
     const ws = new ChatWs({
@@ -112,9 +88,6 @@ export function LeadPanel({
           setTurns((current) => [
             ...current,
             {
-              // A live frame carries no transcript id — durability is the
-              // sync surface's job — so the key is local and stable only
-              // until the next selection change refetches.
               id: `live-${frame.ordinal ?? current.length}-${current.length}`,
               kind: 'message',
               role: frame.role,
@@ -122,8 +95,6 @@ export function LeadPanel({
               at: new Date().toISOString(),
             },
           ]);
-          // The lead files cards through tools, so anything it says may
-          // have moved the board behind this panel.
           if (frame.role !== 'user') onBoardChanged();
         }
       },
@@ -160,8 +131,6 @@ export function LeadPanel({
     const text = draft.trim();
     if (text === '' || active === null || wsRef.current === null) return;
     wsRef.current.sendMessage({ sessionId: active, userId: 'owner', content: text });
-    // Optimistic: the echo arrives on the socket, but a composer that
-    // clears only on the round trip feels broken on a slow turn.
     setTurns((current) => [
       ...current,
       {
@@ -234,8 +203,6 @@ export function LeadPanel({
           </p>
         ) : null}
         {turns.map((turn) =>
-          // Work blocks are the lead's tool calls; the board beside this
-          // panel is where their result shows, so a line is enough here.
           turn.kind === 'work' ? (
             <p
               key={turn.id}

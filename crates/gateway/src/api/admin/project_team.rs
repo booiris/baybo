@@ -1,10 +1,4 @@
 //! `/v1/projects/{project_id}/agents` — one board's team.
-//!
-//! Separate from `/v1/agents` because the two rosters are disjoint by
-//! construction: that surface lists global chat personas, this one lists
-//! the agents that belong to a project. A teammate is addressed by
-//! `@handle` on its board and is never offered as a chat persona; a global
-//! persona has no handle here and cannot be assigned an issue.
 
 use axum::Json;
 use axum::extract::{Path, State};
@@ -31,13 +25,7 @@ pub fn routes() -> OpenApiRouter<AdminState> {
         .routes(routes!(list_lead_conversations, open_lead_conversation))
 }
 
-// ── DTOs ────────────────────────────────────────────────────────────────
-
 /// Who brought an agent onto the board. Absent means the operator did.
-///
-/// The handle rides along because that is what gets rendered — resolved
-/// here rather than by the client, since a hire made by an agent that has
-/// since been removed is not in the team list the client holds.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct HiredByDto {
     pub id: String,
@@ -45,10 +33,6 @@ pub struct HiredByDto {
 }
 
 /// One member of a project's team.
-///
-/// Deliberately carries no "is working" flag: the board already subscribes
-/// to run frames, and a second copy of that state on a roster read is a
-/// copy that can disagree with the shimmer on the card.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct TeamMemberDto {
     pub id: String,
@@ -88,8 +72,6 @@ pub struct HireAgentRequest {
     pub llm: Option<String>,
 }
 
-/// Build one wire row, reading the display name off the agent's own file
-/// and resolving whoever hired it.
 async fn member_dto(state: &AdminState, row: AgentProfileRow) -> TeamMemberDto {
     let name = read_display_name(state, &row).await;
     let handle = row
@@ -128,8 +110,6 @@ async fn member_dto(state: &AdminState, row: AgentProfileRow) -> TeamMemberDto {
         created_at_ms: row.created_at.timestamp_millis(),
     }
 }
-
-// ── Handlers ────────────────────────────────────────────────────────────
 
 #[utoipa::path(
     get,
@@ -225,8 +205,6 @@ async fn remove_agent(
         .map_err(project_err)?;
     Ok(StatusCode::NO_CONTENT)
 }
-
-// ── The lead's planning conversations ───────────────────────────────────
 
 /// One conversation with a board's lead.
 #[derive(Debug, Serialize, ToSchema)]

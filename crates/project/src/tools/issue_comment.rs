@@ -65,10 +65,6 @@ A comment on a card somebody is assigned to **reaches them**: if they are idle i
         let p: Params =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
         let project = scope(ctx)?;
-        // Asked before the write, because posting the comment can change the
-        // answer: an idle card acquires a queued run, and reading the
-        // delivery afterwards would report "waits for the queued run" about
-        // the run this very comment started.
         let delivery = self
             .manager
             .comment_delivery(&project, p.number)
@@ -85,8 +81,6 @@ A comment on a card somebody is assigned to **reaches them**: if they are idle i
     }
 }
 
-/// What the caller should expect to happen next, in the words the composer
-/// chip uses — one rule, stated the same way to a person and to a model.
 fn describe(delivery: CommentDelivery) -> &'static str {
     match delivery {
         CommentDelivery::RecordOnly => {

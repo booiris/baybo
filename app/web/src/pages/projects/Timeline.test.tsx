@@ -6,9 +6,6 @@ import { Timeline } from './Timeline';
 import type { Issue } from './boardModel';
 import type { IssueEvent, IssueEventBody } from './timelineModel';
 
-// The wiring a reducer test can't reach: that comments and system notes
-// render as two different things, and that the composer sends what the
-// operator meant rather than what they typed.
 
 const ISSUE: Issue = {
   number: 4,
@@ -25,8 +22,6 @@ const ISSUE: Issue = {
 };
 
 let seq = 0;
-// A ULID id with a separate handle, the way the server ships one: a
-// fixture that reused the handle as the id could not tell them apart.
 function entry(body: IssueEventBody, handle?: string): IssueEvent {
   seq += 1;
   return {
@@ -66,11 +61,8 @@ describe('Timeline', () => {
 
     expect(screen.getByText('opened this issue')).toBeInTheDocument();
     expect(screen.getByText('moved it from Todo to In Progress')).toBeInTheDocument();
-    // A comment is shown verbatim, not narrated.
     expect(screen.getByText('check the reconnect path')).toBeInTheDocument();
-    // …and a run's failure carries its reason where a reader will see it.
     expect(screen.getByText('run #2 failed — ran out')).toBeInTheDocument();
-    // The operator and the agent are told apart.
     expect(screen.getAllByText('@dev-1').length).toBeGreaterThan(0);
     expect(screen.getAllByText('you').length).toBeGreaterThan(0);
   });
@@ -99,8 +91,6 @@ describe('Timeline', () => {
   });
 
   it('tells the operator what sending will actually do', async () => {
-    // The expensive failure is silent: someone comments believing an agent
-    // will read it, and waits for an answer nobody is going to send.
     renderTimeline([]);
     expect(screen.getByText(/Starts a run/)).toBeInTheDocument();
   });
@@ -136,8 +126,6 @@ describe('pending approvals', () => {
   });
 
   it('stops offering a prompt that has been answered', () => {
-    // Derived from the timeline, so the card cannot offer to answer
-    // something the server already closed.
     render(
       <Timeline
         events={[

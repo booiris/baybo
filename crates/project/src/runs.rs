@@ -1,39 +1,10 @@
 //! The predicates a run has to satisfy, and the ledger entry it becomes.
-//!
-//! Two are about the write and the card, and are deliberately not folded
-//! together.
-//! [`triggers_run`] asks about an **edge**: did this particular write start
-//! work? [`accepts_runs`] asks about a **card**: does this issue still take
-//! work at all? Only the first needs a transition, and only three of the
-//! doors into a run carry one: creating a card, editing one, moving one. A
-//! comment wake, a retry and a stage barrier arrive at
-//! [`crate::ProjectManager::enqueue`] with nothing but a row, and the two
-//! sweeps — a released hold, and the re-drive a process start or a restored
-//! board runs — hand out rows recorded earlier without passing through it at
-//! all. So the card-level rule cannot
-//! live here on the edge: `enqueue` asks it once for everything that writes
-//! a row, and each sweep asks it again for itself, against the card as it is
-//! now.
-//!
-//! The third, [`can_host_a_session`], is about neither: it asks about the
-//! **assignee**, and it is the one predicate whose answer can change while a
-//! recorded run waits, which is why the executor asks it again rather than
-//! trusting the answer given when the card was assigned.
 
 use baybo_model::{AgentFramework, AgentProfileId, IssueRunId};
 use baybo_store::project::{IssueRow, IssueStatus, NewIssueRun, RunTrigger};
 
 /// What a write did to an issue, in the only terms [`triggers_run`] cares
 /// about.
-///
-/// The assignee is carried whole rather than reduced to "somebody is on
-/// it": handing live work to a *different* agent is an edge the predicate
-/// has to see, and a bool cannot show it.
-///
-/// Cancellation is *not* carried, and that is the point: it is a fact about
-/// the card rather than about the edge, so it is asked once at the enqueue
-/// chokepoint (see [`accepts_runs`]) instead of once per predicate that
-/// happens to have a transition in hand.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Transition {
     pub before_status: IssueStatus,
@@ -43,26 +14,6 @@ pub(crate) struct Transition {
 }
 
 /// Whether this transition starts work, and why.
-///
-/// Two edges lead into a run, and they are deliberately both here rather
-/// than one being special-cased at a call site:
-///
-/// * the issue **enters** In Progress with somebody on it — a drag, a REST
-///   move, an agent's own status change;
-/// * an agent is **put on** an issue already sitting in In Progress,
-///   including in place of a different one — without this, assigning a card
-///   that is already in the column leaves the board claiming work is under
-///   way that nobody started.
-///
-/// Everything else is not a trigger: staying in the column, leaving it,
-/// re-ordering, editing prose. In particular, dragging *out* of In
-/// Progress does not stop anything — the run outlives the column, and
-/// cancelling it is a separate, explicit act.
-///
-/// Whether the card is one that still takes work at all is **not** asked
-/// here: that is [`accepts_runs`], and
-/// [`crate::ProjectManager::enqueue`] asks it for every door, this one
-/// included.
 pub(crate) fn triggers_run(t: Transition) -> Option<RunTrigger> {
     if t.after_status != IssueStatus::InProgress || t.after_assignee.is_none() {
         return None;
@@ -77,50 +28,11 @@ pub(crate) fn triggers_run(t: Transition) -> Option<RunTrigger> {
 }
 
 /// Whether this card still takes work at all.
-///
-/// A card the board has finished with does not, and "finished" is
-/// [`crate::stages::is_finished`]'s single definition — Done, or cancelled.
-/// The board acts on it everywhere else: `comment_delivery` refuses to wake
-/// one, [`crate::stages`] counts it out of its stage, and
-/// `reclaim_if_finished` has already taken its worktree back. So a run
-/// started on one would cut a fresh checkout and put an agent to work on
-/// abandoned work.
-///
-/// Asked of the card rather than of a write, because most of the doors into
-/// a run have no write to look at: a comment on live work, a retry, a parent
-/// woken by its last step, a hold released when the budget rolls over and a
-/// row a process start or a restore re-drives were all recorded — or last
-/// looked at —
-/// while the card was still live. [`crate::ProjectManager::enqueue`] asks
-/// this once for all of them, and the two sweeps that hand out rows recorded
-/// earlier ask it again against the card as it is now.
-///
-/// Reviving a cancelled card, or dragging a Done one back, is what makes it
-/// startable again.
 pub(crate) fn accepts_runs(issue: &IssueRow) -> bool {
     !crate::stages::is_finished(issue)
 }
 
 /// Whether an agent on this framework can host an issue's session.
-///
-/// A run is one turn in a **top-level** session bound to its assignee, and
-/// there is no code that would run an external one there. The registry that
-/// owns the `claude`/`codex` wrappers is a field of `SubagentSpawner` and
-/// nothing else in the tree holds it; the top-level actor never reads a
-/// framework at all. So this is an unimplemented path rather than a policy —
-/// which is exactly why it has to be refused rather than recorded. Binding a
-/// session to `codex` today changes one column and nothing else: the turn
-/// still runs on the internal loop, under that agent's persona, signing its
-/// name to the commits. Nothing errors, so nothing looks wrong.
-///
-/// Asked twice, and both times on purpose. `validate_assignee` asks it when
-/// the assignee is set, so the operator hears "assign a baybo agent" instead
-/// of watching a card sit there. The executor asks it again when the run
-/// actually starts, because the first answer does not stay true: a profile's
-/// framework is editable (`AgentProfileUpdate`, pinned only for builtins),
-/// and a row the boot sweep re-drives was recorded under whatever the agent
-/// was then. One rule, so the day a top-level session can host an external
-/// backend both askers change together.
 pub fn can_host_a_session(framework: AgentFramework) -> bool {
     framework == AgentFramework::Baybo
 }
@@ -217,7 +129,6 @@ mod tests {
             )),
             Some(RunTrigger::Started)
         );
-        // Wherever it came from.
         for from in [IssueStatus::Backlog, IssueStatus::Review, IssueStatus::Done] {
             assert_eq!(
                 triggers_run(t(
@@ -233,8 +144,6 @@ mod tests {
 
     #[test]
     fn assigning_a_card_already_in_the_column_starts_work_too() {
-        // Without this edge the board would show work in flight that
-        // nobody ever started.
         assert_eq!(
             triggers_run(t(
                 IssueStatus::InProgress,
@@ -248,9 +157,6 @@ mod tests {
 
     #[test]
     fn reassigning_in_the_column_hands_the_card_over() {
-        // A handover on live work is still a start: the new agent has done
-        // nothing yet, and a card showing @dev-2 on work only @dev-1 ever
-        // touched is the board lying about who is doing it.
         assert_eq!(
             triggers_run(t(
                 IssueStatus::InProgress,
@@ -264,8 +170,6 @@ mod tests {
 
     #[test]
     fn nothing_else_starts_work() {
-        // Already running and still the same agent: an edit is not a
-        // restart.
         assert!(
             triggers_run(t(
                 IssueStatus::InProgress,
@@ -275,9 +179,6 @@ mod tests {
             ))
             .is_none()
         );
-        // Leaving the column never starts anything — and never stops
-        // anything either; the run outlives the drag. Both arms: the plain
-        // drag, and a drag that also hands the card on.
         assert!(
             triggers_run(t(
                 IssueStatus::InProgress,
@@ -296,7 +197,6 @@ mod tests {
             ))
             .is_none()
         );
-        // Handing finished work to somebody else does not reopen it.
         assert!(
             triggers_run(t(
                 IssueStatus::Done,
@@ -306,10 +206,7 @@ mod tests {
             ))
             .is_none()
         );
-        // Unassigned work cannot start, and the manager refuses this state
-        // anyway.
         assert!(triggers_run(t(IssueStatus::Todo, None, IssueStatus::InProgress, None)).is_none());
-        // Moving between other columns is just moving.
         assert!(
             triggers_run(t(
                 IssueStatus::Backlog,
@@ -323,14 +220,10 @@ mod tests {
 
     #[test]
     fn a_card_the_board_has_finished_with_takes_no_more_runs() {
-        // Cancelled and Done are both "finished" everywhere else on the
-        // board, and the worktree of either is already gone. Every door
-        // into a run asks this, not just the ones that carry a transition.
         let mut cancelled = issue(IssueStatus::InProgress);
         cancelled.cancelled_at = Some(chrono::Utc::now());
         assert!(!accepts_runs(&cancelled), "cancelled");
         assert!(!accepts_runs(&issue(IssueStatus::Done)), "done");
-        // Cancelled outranks the column it is parked in.
         let mut cancelled_in_review = issue(IssueStatus::Review);
         cancelled_in_review.cancelled_at = Some(chrono::Utc::now());
         assert!(!accepts_runs(&cancelled_in_review), "cancelled in Review");

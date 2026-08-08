@@ -4,14 +4,6 @@ import { RiCloseLine } from 'react-icons/ri';
 import { COLUMN_LABEL, type Agent, type Issue, type IssueRun } from './boardModel';
 import { workingAgentIds } from './teamModel';
 
-/**
- * Who one teammate is, and what it is doing.
- *
- * Read-only. Editing an agent's persona, its llm pin, or its name belongs
- * to the Agents page, which already owns those files and their audited
- * commit pipeline; duplicating that here would be two writers of one
- * `SOUL.md` with different locking.
- */
 export function AgentProfile({
   agent,
   team,
@@ -36,8 +28,6 @@ export function AgentProfile({
     (issue) => issue.assignee === agent.id && issue.cancelled_at_ms == null,
   );
   const hiredBy = agent.hired_by;
-  // A hire made by an agent that has since been removed is not in the
-  // roster, so the handle the server resolved is the only name for it.
   const hirerStillHere = hiredBy != null && team.some((row) => row.id === hiredBy.id);
 
   return (

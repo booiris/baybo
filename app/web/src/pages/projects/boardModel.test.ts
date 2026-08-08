@@ -70,9 +70,6 @@ describe('groupByStatus', () => {
   });
 
   it('keeps every card, cancelled ones included', () => {
-    // Hiding is a render-time concern. The board state has to hold the
-    // whole column, because a move sends that column's full new order and
-    // the server renumbers exactly what it is handed.
     const issues = [issue(1), issue(2, { cancelled_at_ms: 123 })];
     expect(groupByStatus(issues).backlog.map((i) => i.number)).toEqual([1, 2]);
   });
@@ -80,7 +77,6 @@ describe('groupByStatus', () => {
 
 describe('liveCount', () => {
   it('counts outstanding work, never cancelled cards', () => {
-    // A shown-but-cancelled card is on the board and still not work.
     expect(liveCount([issue(1), issue(2, { cancelled_at_ms: 1 }), issue(3)])).toBe(2);
   });
 });
@@ -119,7 +115,6 @@ describe('resolveDrop', () => {
   it('resolves to nothing when the drag ends where it began', () => {
     expect(resolveDrop(start, cardDragId(1), cardDragId(1))).toBeNull();
     expect(resolveDrop(start, cardDragId(1), null)).toBeNull();
-    // #2 is already last in backlog: appending it there changes nothing.
     expect(resolveDrop(start, cardDragId(2), columnDropId('backlog'))).toBeNull();
   });
 
@@ -135,14 +130,10 @@ describe('moveCard', () => {
     const next = moveCard(start, { status: 'done', before: null, issue: issue(1) });
     expect(next.backlog.map((i) => i.number)).toEqual([2]);
     expect(next.done.map((i) => i.number)).toEqual([1]);
-    // …and the input is untouched, so a rollback has something to roll back to.
     expect(start.backlog.map((i) => i.number)).toEqual([1, 2]);
   });
 
   it('appends when the anchor is not in the destination column', () => {
-    // The anchor can be a card the filter hides, or one that moved since
-    // the drag began. Appending beats what `findIndex`'s -1 would do,
-    // which is to throw the card at the front of the column.
     const start = board({ todo: [issue(1, { status: 'todo' }), issue(2, { status: 'todo' })] });
     const next = moveCard(start, {
       status: 'todo',
@@ -158,16 +149,11 @@ describe('moveCard', () => {
     expect(next.backlog.map((i) => i.number)).toEqual([1, 3, 2]);
   });
 
-  /**
-   * The anchor exists so one drop can be applied to two different lists:
-   * resolved against what the operator sees, applied to the whole board.
-   */
   it('places the same drop consistently in a filtered and an unfiltered column', () => {
     const full = board({ backlog: [issue(1), issue(2, { cancelled_at_ms: 1 }), issue(3)] });
     const visible = board({ backlog: [issue(1), issue(3)] });
     const drop = { status: 'backlog' as const, before: 3, issue: issue(4) };
     expect(moveCard(visible, drop).backlog.map((i) => i.number)).toEqual([1, 4, 3]);
-    // The hidden card keeps its place, and the request still names it.
     expect(moveCard(full, drop).backlog.map((i) => i.number)).toEqual([1, 2, 4, 3]);
   });
 });
@@ -184,9 +170,6 @@ describe('orderedNumbers + placementChanged', () => {
     const moved = moveCard(start, { status: 'todo', before: null, issue: issue(1) });
     expect(placementChanged(start, moved, 1)).toBe(true);
 
-    // Back where it started. With an anchor that is the card *after* it —
-    // which is what `resolveDrop` computes for a downward-into-its-own-slot
-    // drop — the card lands exactly where it was.
     const same = moveCard(start, { status: 'backlog', before: 2, issue: issue(1) });
     expect(placementChanged(start, same, 1)).toBe(false);
   });
@@ -210,17 +193,12 @@ describe('runIndicator', () => {
     expect(runIndicator(active, 1)).toBe('running');
     expect(runIndicator(active, 2)).toBe('queued');
     expect(runIndicator(active, 3)).toBeNull();
-    // A finished run is history and belongs in the log, not on the card —
-    // the board is only ever handed unfinished ones.
     expect(runIndicator([], 1)).toBeNull();
   });
 });
 
 describe('unsettledRun', () => {
   it('counts every state that is not over — `held` included', () => {
-    // The one that is easy to forget, and the one that matters: a held run
-    // is not executing, but it holds the issue's slot, so nothing else can
-    // start while it sits there.
     expect(unsettledRun([run(1, { status: 'held' })])?.status).toBe('held');
     expect(unsettledRun([run(1, { status: 'queued' })])?.status).toBe('queued');
     expect(unsettledRun([run(1, { status: 'running' })])?.status).toBe('running');
@@ -248,31 +226,18 @@ describe('runDuration', () => {
     expect(runDuration(run(1, { started_at_ms: 0, settled_at_ms: 45_000 }), 99_000)).toBe('45s');
     expect(runDuration(run(1, { started_at_ms: 0, settled_at_ms: 125_000 }), 0)).toBe('2m05s');
     expect(runDuration(run(1, { started_at_ms: 10_000 }), 40_000)).toBe('30s');
-    // A queued run has not started, so it has no duration to report.
     expect(runDuration(run(1), 40_000)).toBeNull();
   });
 });
 
-/**
- * The client half of a hand-written mirror. Its Rust half is
- * `the_retry_refusals_say_exactly_what_the_button_predicts` in
- * `crates/project/tests/manager.rs`, which asserts all three sentences
- * verbatim and in this order — the cases below are those cases, and the
- * strings are the endpoint's own. Nothing but this pair keeps the button and
- * the server agreeing on what a run is refused for, so a reword has to break
- * a build on the side that owns the wording.
- */
 describe('retryRejection', () => {
   it('refuses a card the board has finished with, in the server’s own words', () => {
-    // Cancelled and Done are one rule on the server (`stages::is_finished`)
-    // with two sentences, because the way out differs.
     expect(retryRejection(issue(1, { assignee: 'dev-1', cancelled_at_ms: 111 }))).toBe(
       'this issue was cancelled — reopen it before running it again',
     );
     expect(retryRejection(issue(1, { assignee: 'dev-1', status: 'done' }))).toBe(
       'this issue is done — move it back into the board before running it again',
     );
-    // Cancelled outranks the column it is parked in.
     expect(
       retryRejection(issue(1, { assignee: 'dev-1', status: 'review', cancelled_at_ms: 111 })),
     ).toBe('this issue was cancelled — reopen it before running it again');
@@ -280,8 +245,6 @@ describe('retryRejection', () => {
 
   it('refuses a card nobody is on, first — the answer the click would bring back', () => {
     expect(retryRejection(issue(1))).toBe('an issue with nobody on it cannot be run');
-    // The server asks about the assignee before it asks about the card, so
-    // a cancelled card with nobody on it is refused for the assignee.
     expect(retryRejection(issue(1, { cancelled_at_ms: 111 }))).toBe(
       'an issue with nobody on it cannot be run',
     );
@@ -298,19 +261,15 @@ describe('dropRejection', () => {
   it('refuses In Progress for work nobody is on', () => {
     const unclaimed = issue(1);
     expect(dropRejection(unclaimed, 'in_progress')).toContain('needs an assignee');
-    // Every other column takes unassigned work.
     for (const status of ['backlog', 'todo', 'review', 'done'] as const) {
       expect(dropRejection(unclaimed, status)).toBeNull();
     }
-    // Assigned, it starts.
     expect(dropRejection(issue(1, { assignee: 'dev-1' }), 'in_progress')).toBeNull();
   });
 });
 
 describe('assignableAgents', () => {
   it('keeps only agents that can host an issue session', () => {
-    // An external profile has no top-level session leg, so a card assigned
-    // to one could never start — it must not be offerable.
     const agents = [
       { id: 'a', name: 'A', framework: 'baybo' },
       { id: 'b', name: 'B', framework: 'codex' },
@@ -327,7 +286,6 @@ describe('resolveLanding', () => {
   });
 
   it('falls back to the most recently touched when the memory is stale', () => {
-    // The remembered project was archived out of the listing since last visit.
     const projects = [project('a'), project('b')];
     expect(resolveLanding(projects, 'gone')).toEqual({ kind: 'go', id: 'a' });
     expect(resolveLanding(projects, null)).toEqual({ kind: 'go', id: 'a' });
@@ -343,7 +301,6 @@ describe('updatedAgo', () => {
   const ago = (ms: number) => updatedAgo(now - ms, now);
 
   it('reads as `now` inside the minute, not as 0m', () => {
-    // `0m` looks like a missing value; `now` is what a reader means.
     expect(ago(0)).toBe('now');
     expect(ago(59_000)).toBe('now');
   });
@@ -359,8 +316,6 @@ describe('updatedAgo', () => {
   });
 
   it('never renders a negative age', () => {
-    // A card written a moment in the future — clock skew between the
-    // server's stamp and the browser — must not read as `-1m`.
     expect(updatedAgo(now + 5_000, now)).toBe('now');
   });
 });

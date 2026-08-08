@@ -16,13 +16,6 @@ const STAGE_NOTE: Record<'done' | 'open' | 'waiting', string> = {
   waiting: 'starts when the stage above finishes',
 };
 
-/**
- * A parent card's steps, grouped into the barriers the server enforces.
- *
- * The stage grouping is the whole point of showing them here: until now the
- * barrier existed — finishing a stage wakes the parent's assignee — and was
- * invisible, so a card could be waiting on a step nobody could see.
- */
 export function SubIssues({
   projectId,
   children,

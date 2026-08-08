@@ -4,9 +4,6 @@ import userEvent from '@testing-library/user-event';
 
 import { LeadPanel } from './LeadPanel';
 
-// The wiring no model test can reach: that the panel opens on the newest
-// conversation, that sending reaches the socket, and that an archived board
-// offers no writes.
 
 const api = vi.hoisted(() => ({
   fetchLeadConversations: vi.fn(),
@@ -15,11 +12,6 @@ const api = vi.hoisted(() => ({
 }));
 const socket = vi.hoisted(() => ({ sendMessage: vi.fn(), close: vi.fn(), subscribed: [] as string[] }));
 
-// Both hooks must return a STABLE value, as the real providers do (they
-// `useMemo`). A fresh object per call changes the identity of every
-// dependency array here, and the load effect then re-fires on its own
-// output — which in this component is an unbounded loop, not merely
-// wasteful.
 const client = vi.hoisted(() => ({}));
 const auth = vi.hoisted(() => ({ token: 'tok', baseUrl: 'http://x', logout: () => {} }));
 
@@ -68,7 +60,6 @@ describe('LeadPanel', () => {
   it('says what the panel is for when the board has no conversations', async () => {
     renderPanel();
     expect(await screen.findByText(/turns what you agree into cards/)).toBeInTheDocument();
-    // Nothing to send to yet, so no composer.
     expect(screen.queryByRole('button', { name: 'Send' })).not.toBeInTheDocument();
   });
 
@@ -87,8 +78,6 @@ describe('LeadPanel', () => {
     renderPanel();
 
     expect(await screen.findByText('plan the parser')).toBeInTheDocument();
-    // A work block is the lead's tool calls; the board beside the panel is
-    // where the result shows, so one line is enough.
     expect(screen.getByText('opened #4')).toBeInTheDocument();
     await waitFor(() => {
       expect(api.fetchLeadMessages).toHaveBeenCalledWith(client, 'board-new');
@@ -113,7 +102,6 @@ describe('LeadPanel', () => {
       content: 'split this into stages',
     });
     expect(box).toHaveValue('');
-    // Optimistic, so a slow turn does not look like a dropped message.
     expect(screen.getByText('split this into stages')).toBeInTheDocument();
   });
 

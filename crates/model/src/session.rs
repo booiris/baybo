@@ -137,25 +137,10 @@ pub enum TriggerSource {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         job_title: Option<String>,
         /// The board this fire files work on, snapshotted from the job.
-        ///
-        /// Serde-defaulted like `conversation`, so every session row
-        /// persisted before this existed deserializes unbound with no
-        /// migration. It is what makes the board's tools visible to the
-        /// fire (see [`Self::project`]) and — unlike a planning
-        /// conversation — it deliberately does **not** make the session a
-        /// project session: a bound fire is still an ordinary cron
-        /// conversation, so it stays listed, pushable, and able to call
-        /// `report_nothing`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         project_id: Option<crate::ProjectId>,
     },
     /// The lead's planning conversation for one board.
-    ///
-    /// A board-scoped session that is not an issue: the operator talks to
-    /// the coordinator here and it turns conclusions into cards through the
-    /// same tools a run uses. Like an issue's session it is invisible to
-    /// the chat surface — a board's conversations live on the board — which
-    /// is why it counts as a project session below.
     Project {
         project_id: crate::ProjectId,
     },
@@ -163,12 +148,6 @@ pub enum TriggerSource {
     /// the issue**, reused by every run of that agent on it — so a
     /// follow-up sees what the same agent did last time — and never listed
     /// in the chat surface: a board's conversations live on the board.
-    ///
-    /// Not one per issue: a session's [`crate::AgentBinding`] is write-once, and
-    /// it selects the persona, the skills and the name the run's commits
-    /// are authored with. A card handed to somebody else therefore gets a
-    /// new session rather than a rebound one, and continuity follows the
-    /// agent through however many hands the card passes.
     Issue {
         project_id: crate::ProjectId,
         issue_id: crate::IssueId,
@@ -189,12 +168,6 @@ impl TriggerSource {
     }
 
     /// The board this session belongs to, if it belongs to one.
-    ///
-    /// Deliberately separate from [`Self::issue`] rather than a widening of
-    /// it: `issue()` answers "which **card**", which is what the approval
-    /// gate needs to know where to write, and a planning conversation has
-    /// no card. This answers "which **board**", which is what decides
-    /// whether the board's tools are visible and what they are scoped to.
     pub fn project(&self) -> Option<&crate::ProjectId> {
         match self {
             TriggerSource::Project { project_id } | TriggerSource::Issue { project_id, .. } => {
@@ -233,12 +206,6 @@ impl TriggerSource {
     /// Whether this session belongs to a project board. Such sessions are
     /// never listed in the chat surface, never pushed, and never fed to the
     /// dream pass: their conversation belongs to an issue.
-    ///
-    /// Spelled as a `match` rather than `matches!` for the same reason as
-    /// every accessor here — this one decides whether a conversation is
-    /// hidden from the user, and a new variant that silently inherited
-    /// `false` would be listed, pushed and dreamed on with nobody having
-    /// decided that.
     pub fn is_project_session(&self) -> bool {
         match self {
             TriggerSource::Project { .. } | TriggerSource::Issue { .. } => true,
@@ -426,10 +393,6 @@ impl Session {
     /// complete by the time it notifies. See
     /// `agent::runtime::background_jobs::background_eligible`.
     pub fn can_host_background_jobs(&self) -> bool {
-        // Exhaustive over the trigger for the same reason the accessors on
-        // `TriggerSource` are: a new variant has to say whether a
-        // background result may land in it, and the answer for a board
-        // session is no — nobody can open it to read one.
         let hostable = match &self.trigger {
             TriggerSource::User => true,
             TriggerSource::Cron { .. } => self.trigger.is_cron_conversation(),
@@ -1046,9 +1009,6 @@ mod tests {
         assert_eq!(back.cron_job_title(), Some("每日晨报"));
     }
 
-    /// Every accessor matches exhaustively, so a new `TriggerSource`
-    /// variant cannot inherit a silent answer from any of them — this pins
-    /// the answers the variants that exist today actually give.
     #[test]
     fn every_accessor_answers_for_every_trigger() {
         let project_id = crate::ProjectId::generate();
@@ -1059,9 +1019,6 @@ mod tests {
             job_title: None,
             project_id: Some(project_id.clone()),
         };
-        // A board-bound fire is still an ordinary cron conversation: the
-        // binding makes the board's tools visible, it does not hide the
-        // session from the chat surface.
         assert_eq!(cron.project(), Some(&project_id));
         assert!(!cron.is_project_session());
         assert!(!TriggerSource::User.is_project_session());
@@ -1071,9 +1028,6 @@ mod tests {
         assert_eq!(TriggerSource::User.kind(), TriggerKind::User);
     }
 
-    /// The board triggers are not cron fires. The cron accessors match
-    /// exhaustively, so a new `TriggerSource` variant cannot inherit a silent
-    /// `None` from them — this pins the answer the board variants give.
     #[test]
     fn board_triggers_answer_none_to_every_cron_question() {
         let project_id = crate::ProjectId::generate();

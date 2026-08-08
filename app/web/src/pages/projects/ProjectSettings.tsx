@@ -6,15 +6,6 @@ import type { Project } from './boardModel';
 import { budgetHint, formatBudget, parseBudget } from './budgetModel';
 import { fieldLabel, textInput } from './CreateProjectForm';
 
-/**
- * The board's own knobs: what it is called, what it may spend, and whether
- * it is still open.
- *
- * The budget is here rather than only at creation because it is the one
- * setting an operator changes in response to something happening — a board
- * holding work is unstuck by raising it, and raising it releases the hold
- * on the spot.
- */
 export function ProjectSettings({
   project,
   onClose,
@@ -44,9 +35,6 @@ export function ProjectSettings({
     const outcome = await updateProject(client, project.id, {
       name,
       description,
-      // A full replace, so an emptied box has to be sent as `null` rather
-      // than omitted — omitting it would mean "leave it", and there is no
-      // other way to remove a ceiling.
       daily_budget_micros: micros,
     });
     setBusy(false);

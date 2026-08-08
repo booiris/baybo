@@ -1,10 +1,3 @@
-//! The board's tools, exercised through the same `Tool::execute` the agent
-//! loop calls.
-//!
-//! The through-line: an agent may only reach the project its session
-//! belongs to, and it addresses everything by the names a person reads off
-//! the board — `#4`, `@dev-1` — never by ULID.
-
 use std::sync::Arc;
 
 use baybo_model::{IssueId, ProjectId};
@@ -54,7 +47,6 @@ impl Fixture {
             .0
     }
 
-    /// A context that looks like an issue run on `project`.
     fn ctx(&self, project: &ProjectId, agent: &baybo_model::AgentProfileId) -> ToolContext {
         ToolContext {
             session_trigger: baybo_model::TriggerSource::Issue {
@@ -100,8 +92,6 @@ impl Fixture {
     }
 }
 
-/// The scope check is the security model here: a tool that took a
-/// `project_id` would let one board's agent edit another's.
 #[tokio::test]
 async fn every_board_tool_is_scoped_to_its_own_session() {
     let f = fixture().await;
@@ -127,15 +117,11 @@ async fn every_board_tool_is_scoped_to_its_own_session() {
         .into_issue();
 
     let ctx = f.ctx(&mine, &lead);
-    // Nothing on the other board is visible…
     let listed = f.call("IssueList", &ctx, json!({})).await;
     assert_eq!(listed["count"], 0);
-    // …and its #1 is simply not there, rather than reachable by number.
     let err = f.refuse("IssueGet", &ctx, json!({ "number": 1 })).await;
     assert!(err.contains("issue #1"), "{err}");
 
-    // Every one of them declares the board scope, so none is ever offered
-    // to a session that has no project.
     for (tool, _) in &f.tools {
         assert_eq!(
             tool.trigger_scope(),
@@ -144,7 +130,6 @@ async fn every_board_tool_is_scoped_to_its_own_session() {
             tool.name()
         );
     }
-    // And a call that reaches one anyway fails closed rather than guessing.
     let stray = ToolContext::for_test();
     for (tool, _) in &f.tools {
         let err = tool
@@ -192,8 +177,6 @@ async fn an_agent_opens_assigns_and_starts_work_by_handle() {
     assert_eq!(created["status"], "backlog");
     assert!(created.get("assignee").is_none());
 
-    // Assign and start in one call: the fields land before the column does,
-    // so the card arrives in In Progress already staffed.
     let started = f
         .call(
             "IssueUpdate",
@@ -209,7 +192,6 @@ async fn an_agent_opens_assigns_and_starts_work_by_handle() {
         "a card reaching In Progress with somebody on it starts them"
     );
 
-    // The hire's own record names who hired it.
     let team = f.manager.team(&project).await.expect("team");
     let hire = team
         .iter()
@@ -261,8 +243,6 @@ async fn a_comment_says_whether_anybody_will_read_it() {
     f.call("IssueCreate", &ctx, json!({ "title": "unowned" }))
         .await;
 
-    // Nobody on it: the comment is history and says so, rather than leaving
-    // the caller waiting for an answer that is not coming.
     let recorded = f
         .call(
             "IssueComment",
@@ -278,7 +258,6 @@ async fn a_comment_says_whether_anybody_will_read_it() {
         "{recorded}"
     );
 
-    // Assigned and idle in a live column: the comment wakes them.
     f.call(
         "IssueUpdate",
         &ctx,
@@ -304,8 +283,6 @@ async fn a_comment_says_whether_anybody_will_read_it() {
         1
     );
 
-    // …and the next one lands in the run that is already queued rather than
-    // starting a second agent on one card.
     let merged = f
         .call(
             "IssueComment",
@@ -348,14 +325,11 @@ async fn a_read_returns_the_card_and_what_has_been_said_on_it() {
     assert_eq!(issue["title"], "Fix the leak");
     assert_eq!(issue["description"], "Under load.");
     let timeline = issue["timeline"].as_array().expect("timeline");
-    // Third person, by handle — the same sentences the operator reads.
     assert_eq!(timeline[0]["event"], "opened the issue");
     assert_eq!(timeline[0]["by"], "@lead");
     assert_eq!(timeline.last().expect("entry")["event"], "reproduced it");
 }
 
-/// Triage is "what has nobody picked up", so it has to be one filter rather
-/// than a full board read the model sorts itself.
 #[tokio::test]
 async fn the_triage_filter_finds_the_cards_nobody_is_on() {
     let f = fixture().await;
@@ -387,10 +361,8 @@ async fn the_triage_filter_finds_the_cards_nobody_is_on() {
         .await;
     assert_eq!(listed["count"], 2);
     let issues = listed["issues"].as_array().expect("issues");
-    // Most urgent first, so the read is already in triage order.
     assert_eq!(issues[0]["title"], "urgent one");
     assert_eq!(issues[1]["title"], "low one");
-    // The roster rides along, so deciding who to assign needs no second call.
     let team: Vec<&str> = listed["team"]
         .as_array()
         .expect("team")
@@ -406,10 +378,6 @@ async fn the_triage_filter_finds_the_cards_nobody_is_on() {
     assert_eq!(taken["issues"][0]["title"], "taken");
 }
 
-/// A card's history keeps naming an agent long after it leaves the team, so
-/// the timeline the *agents* read has to resolve one — the live roster is
-/// exactly what stops carrying it. A ULID here is unusable: `@handle` is the
-/// only name a follow-up run can address anything by.
 #[tokio::test]
 async fn a_departed_teammate_is_still_named_on_the_timeline_an_agent_reads() {
     let f = fixture().await;
@@ -445,8 +413,6 @@ async fn a_departed_teammate_is_still_named_on_the_timeline_an_agent_reads() {
         })
         .expect("the hire is on the roster")
         .id;
-    // Nothing unassigns a departed teammate's cards, so both the entry that
-    // named it and the card face outlive its membership.
     f.manager
         .remove_from_team(&project, &leaver)
         .await
@@ -478,15 +444,6 @@ async fn a_departed_teammate_is_still_named_on_the_timeline_an_agent_reads() {
     assert_eq!(assigned, "assigned it to @test-engineer");
 }
 
-/// A handle is unique only inside its board, so an id belonging to another
-/// one must not be rendered under this board's naming — `@lead` on their
-/// board is a different agent from `@lead` on ours. It falls back to what
-/// this reader already does for an id it cannot name: the id itself.
-///
-/// The other half of the same rule is the test above: a *departed* teammate
-/// keeps its membership row, so it still resolves. Both are asserted here,
-/// because a scope check written the obvious way ("is it on the live
-/// roster?") passes the first and breaks the second.
 #[tokio::test]
 async fn a_timeline_never_renders_another_boards_handle() {
     let f = fixture().await;
@@ -496,9 +453,6 @@ async fn a_timeline_never_renders_another_boards_handle() {
     f.call("IssueCreate", &ctx, json!({ "title": "our card" }))
         .await;
 
-    // An entry on our card naming their agent. No verb produces this today
-    // — `validate_assignee` keeps an assignee on its own board — which is
-    // exactly why the resolver must not be the thing that depends on that.
     f.manager
         .record_event(
             &mine,
@@ -516,16 +470,11 @@ async fn a_timeline_never_renders_another_boards_handle() {
         .iter()
         .find(|entry| entry["event"] == "passing through")
         .expect("the entry is on the card");
-    // Their lead's handle is `@lead` — the same string our own lead answers
-    // to — which is precisely why resolving without the board check reads
-    // as somebody who is on this team.
     assert_eq!(
         foreign["by"],
         json!(their_lead.as_str()),
         "a foreign id renders as itself, not under this board's naming"
     );
-    // And our own agents are still named, so this is a scope check rather
-    // than a resolver that stopped working.
     assert!(
         timeline
             .iter()
@@ -544,8 +493,6 @@ async fn an_update_that_changes_nothing_is_a_mistake_worth_saying() {
 
     let err = f.refuse("IssueUpdate", &ctx, json!({ "number": 1 })).await;
     assert!(err.contains("at least one field"), "{err}");
-    // A status equal to the one it already has is not a move, and must not
-    // renumber the column or record a timeline entry for a non-event.
     let same = f
         .call(
             "IssueUpdate",
@@ -562,9 +509,6 @@ async fn an_update_that_changes_nothing_is_a_mistake_worth_saying() {
     );
 }
 
-/// Every refusal an agent can provoke has to come back as `InvalidParams`,
-/// which is what the loop shows the model as a correctable mistake — an
-/// `Execution` error reads as the system breaking.
 #[tokio::test]
 async fn a_refusal_the_agent_can_fix_comes_back_as_bad_parameters() {
     let f = fixture().await;
@@ -602,17 +546,12 @@ fn member(name: &str) -> baybo_project::NewTeamMember {
     }
 }
 
-/// The gate's own behaviour: it records both halves and stays out of the
-/// way of the decision itself.
 mod approvals {
     use super::*;
     use baybo_model::{ApprovalDecision, SessionId, TriggerSource};
     use baybo_store::project::IssueEventBody;
     use baybo_tools::{ApprovalGate, ApprovalRequest};
 
-    /// A gate that answers with whatever it was built with, and remembers
-    /// that it was asked — so the decorator can be shown to delegate
-    /// rather than decide.
     struct FixedGate {
         decision: ApprovalDecision,
         asked: Arc<parking_lot::Mutex<Vec<String>>>,
@@ -639,7 +578,6 @@ mod approvals {
         }
     }
 
-    /// Bind a session to an issue the way an issue run's session is bound.
     async fn issue_session(
         store: &baybo_storage::Store,
         project: &ProjectId,
@@ -737,7 +675,6 @@ mod approvals {
         let session = issue_session(&store, &project.id, issue.number, issue.id.clone()).await;
         let decision = gate.request(request(&session, "c1")).await;
 
-        // The wrapper observes; it never decides.
         assert_eq!(decision, ApprovalDecision::Deny);
         assert_eq!(*asked.lock(), vec!["c1".to_owned()]);
 
@@ -769,8 +706,6 @@ mod approvals {
             baybo_store::project::IssueActor::Agent(lead),
             "a prompt is something the agent asked for, not something the operator did"
         );
-        // Both halves, so the card never stops explaining itself at the
-        // prompt — including on the gate's own deny-on-timeout.
         assert!(timeline.iter().any(|e| matches!(
             &e.body,
             IssueEventBody::ApprovalResolved { call_id, decision }
@@ -778,8 +713,6 @@ mod approvals {
         )));
     }
 
-    /// An ordinary conversation's prompt must pass straight through: the
-    /// gate is shared by every session on the channel.
     #[tokio::test]
     async fn a_prompt_from_an_ordinary_session_is_only_forwarded() {
         let workspace = tempfile::tempdir().expect("tempdir");
@@ -807,9 +740,6 @@ mod approvals {
             Arc::clone(&store.session),
         );
 
-        // A session that was never created, let alone bound to an issue —
-        // the shape a chat prompt arrives in as far as this gate is
-        // concerned.
         let decision = gate
             .request(request(&SessionId::from("not-an-issue".to_owned()), "c9"))
             .await;
@@ -818,11 +748,6 @@ mod approvals {
     }
 }
 
-/// What the lead is told when it sits down to triage.
-///
-/// Every fact here is derived over the WHOLE board — the canonical triage
-/// call filters to unassigned cards, and a roster load derived from that
-/// set would always read as an idle team.
 #[tokio::test]
 async fn the_triage_read_says_who_is_free_and_what_is_stuck() {
     let f = fixture().await;
@@ -835,7 +760,6 @@ async fn the_triage_read_says_who_is_free_and_what_is_stuck() {
     )
     .await;
 
-    // #1 is being worked by @dev; #2 is unassigned and waiting.
     f.call(
         "IssueCreate",
         &ctx,
@@ -872,9 +796,6 @@ async fn the_triage_read_says_who_is_free_and_what_is_stuck() {
     assert!(lead_row.get("working_on").is_none(), "nothing in flight");
 }
 
-/// A held run is idle work, not a busy agent. Reading it the other way
-/// inverts the truth exactly when it matters: the team is free and the
-/// wallet is empty.
 #[tokio::test]
 async fn an_exhausted_board_reads_as_idle_and_says_why() {
     let f = fixture().await;
@@ -918,8 +839,6 @@ async fn an_exhausted_board_reads_as_idle_and_says_why() {
     assert_eq!(listed["board"]["budget"]["limit"], "$0.00");
 }
 
-/// A board with no ceiling reports no budget block at all — no spend query
-/// ran, and an absent key is honest where `$0.00` would be a lie.
 #[tokio::test]
 async fn a_board_with_no_ceiling_reports_no_budget() {
     let f = fixture().await;
@@ -934,8 +853,6 @@ async fn a_board_with_no_ceiling_reports_no_budget() {
     assert!(listed["board"].get("held").is_none());
 }
 
-/// Parents and steps, derived over the whole board so a filtered call
-/// cannot make a parent read `0/0`.
 #[tokio::test]
 async fn a_parent_row_carries_its_progress_and_open_stages() {
     let f = fixture().await;
@@ -958,7 +875,6 @@ async fn a_parent_row_carries_its_progress_and_open_stages() {
     )
     .await;
 
-    // Filtered to the parent alone: its ring still counts its children.
     let listed = f
         .call("IssueList", &ctx, json!({ "status": "backlog" }))
         .await;
@@ -989,12 +905,10 @@ async fn a_parent_row_carries_its_progress_and_open_stages() {
     assert_eq!(child["stage"], 1);
 }
 
-/// A scheduled check must not lay down one card per fire.
 mod dedupe {
     use super::*;
     use baybo_model::TriggerSource;
 
-    /// A context that looks like a cron fire pointed at a board.
     fn fire_ctx(
         f: &Fixture,
         project: &ProjectId,
@@ -1021,8 +935,6 @@ mod dedupe {
         let (project, lead) = f.open("Nightly").await;
         let ctx = fire_ctx(&f, &project, &lead, "cj-1");
 
-        // No `key` at all — the naive reminder. Omitting it has to be the
-        // safe behaviour, or the feature ships a footgun as its default.
         let first = f
             .call("IssueCreate", &ctx, json!({ "title": "the build is red" }))
             .await;
@@ -1058,7 +970,6 @@ mod dedupe {
         )
         .await;
 
-        // Next month's failure is genuinely new work.
         let next = f
             .call(
                 "IssueCreate",
@@ -1069,7 +980,6 @@ mod dedupe {
         assert_eq!(next["number"], 2);
         assert!(next.get("already_open").is_none());
 
-        // …and cancelling releases it too.
         f.call(
             "IssueUpdate",
             &ctx,
@@ -1099,7 +1009,6 @@ mod dedupe {
             f.manager.list_issues(&project).await.expect("issues").len(),
             2
         );
-        // And each one still dedupes against itself.
         let again = f
             .call(
                 "IssueCreate",
@@ -1114,9 +1023,6 @@ mod dedupe {
     async fn two_jobs_on_one_board_do_not_collide() {
         let f = fixture().await;
         let (project, lead) = f.open("Two Jobs").await;
-        // The key is namespaced by job id server-side, so a model cannot
-        // make one job's card block another's — or collide with a card a
-        // person opened.
         f.call(
             "IssueCreate",
             &fire_ctx(&f, &project, &lead, "cj-1"),
@@ -1134,8 +1040,6 @@ mod dedupe {
         assert!(second.get("already_open").is_none());
     }
 
-    /// An issue run opening a card is doing it once, on purpose. A key
-    /// there would silently refuse the second one.
     #[tokio::test]
     async fn an_ordinary_run_gets_no_key_and_so_never_dedupes() {
         let f = fixture().await;

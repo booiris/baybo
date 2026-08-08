@@ -14,7 +14,6 @@ use crate::ProjectManager;
 
 pub const ISSUE_UPDATE_TOOL_NAME: &str = "IssueUpdate";
 
-/// The `assignee` value that takes somebody off a card.
 const UNASSIGN: &str = "none";
 
 pub(super) struct IssueUpdateTool {
@@ -54,12 +53,6 @@ struct Params {
 }
 
 impl IssueUpdateTool {
-    /// The destination column's contents with `number` appended.
-    ///
-    /// A move rewrites the whole target column's order, so the tool has to
-    /// say where the card lands. The end of the column is the honest answer:
-    /// an agent moving a card is saying it belongs in that state, not that
-    /// it outranks everything already there.
     async fn column_order(
         &self,
         project: &baybo_model::ProjectId,
@@ -172,10 +165,6 @@ Two of these do more than edit a row:
             ));
         }
 
-        // Fields first, column second. A card that arrives in In Progress
-        // already carrying its assignee starts on that move; the other
-        // order refuses it — In Progress needs somebody on it — and would
-        // make "assign and start" two calls instead of one.
         let mut issue = if update.is_empty() {
             self.manager
                 .get_issue(&project, p.number)

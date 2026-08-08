@@ -1404,14 +1404,7 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
-        /**
-         * @description Who did the thing an entry records.
-         *
-         *     Tagged, and three kinds, so the client switches instead of parsing. The
-         *     pair it replaces — a string plus an `is_agent` flag — was two fields
-         *     that could disagree, and it had no way at all to say the board acted on
-         *     its own.
-         */
+        /** @description Who did the thing an entry records. */
         ActorDto: {
             /** @enum {string} */
             kind: "user";
@@ -1469,15 +1462,7 @@ export interface components {
             /** Format: date-time */
             updated_at: string;
         };
-        /**
-         * @description An agent as a timeline entry names it.
-         *
-         *     The handle is resolved server-side rather than by the client, for the
-         *     same reason `HiredByDto`'s is: a timeline is history, so it names agents
-         *     that have since left the team — and those are precisely the rows the
-         *     roster the client holds has filtered out. The id rides along because it
-         *     is what opens the agent's profile.
-         */
+        /** @description An agent as a timeline entry names it. */
         AgentRefDto: {
             /**
              * @description The `@handle` to render, without the `@`. Falls back to the id when
@@ -2411,13 +2396,7 @@ export interface components {
              */
             role: string;
         };
-        /**
-         * @description Who brought an agent onto the board. Absent means the operator did.
-         *
-         *     The handle rides along because that is what gets rendered — resolved
-         *     here rather than by the client, since a hire made by an agent that has
-         *     since been removed is not in the team list the client holds.
-         */
+        /** @description Who brought an agent onto the board. Absent means the operator did. */
         HiredByDto: {
             handle: string;
             id: string;
@@ -2472,14 +2451,7 @@ export interface components {
             /** Format: int64 */
             updated_at_ms: number;
         };
-        /**
-         * @description What one timeline entry says.
-         *
-         *     A mirror of the store's `IssueEventBody` rather than the type itself,
-         *     like every other enum on this surface. Tagged on `kind`, so the client
-         *     gets a discriminated union it can exhaustively switch on — the whole
-         *     reason this is not a free-form payload.
-         */
+        /** @description What one timeline entry says. */
         IssueEventBodyDto: {
             /** @enum {string} */
             kind: "comment";
@@ -3147,13 +3119,7 @@ export interface components {
             /** Format: int64 */
             total: number;
         };
-        /**
-         * @description One member of a project's team.
-         *
-         *     Deliberately carries no "is working" flag: the board already subscribes
-         *     to run frames, and a second copy of that state on a roster read is a
-         *     copy that can disagree with the shimmer on the card.
-         */
+        /** @description One member of a project's team. */
         TeamMemberDto: {
             avatar_blob_id?: string | null;
             /** Format: int64 */

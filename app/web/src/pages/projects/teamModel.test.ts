@@ -28,8 +28,6 @@ function member(id: string, handle: string): Agent {
 
 describe('workingAgentIds', () => {
   it('counts running work and not queued work', () => {
-    // A queued run has not started. Showing its agent as busy would make the
-    // strip claim work that has not begun.
     const working = workingAgentIds([run('a', 'running'), run('b', 'queued')]);
     expect([...working]).toEqual(['a']);
   });
@@ -45,8 +43,6 @@ describe('handleOf', () => {
   });
 
   it('falls back to the id for somebody who has left', () => {
-    // A removed agent keeps its row so past work still resolves, but it is
-    // not in the roster — a card assigned to one still has to render.
     expect(handleOf([member('01J', 'dev-1')], '01GONE')).toBe('01GONE');
   });
 });

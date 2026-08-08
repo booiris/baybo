@@ -202,13 +202,6 @@ pub struct InvalidAgentHandle {
 }
 
 /// What a project agent is called on its board: `@lead`, `@dev-1`.
-///
-/// Deliberately not the profile id. The id is a ULID that names a directory
-/// on disk; the handle is what a person types into a comment, so it is
-/// short, lowercase, and readable. It is also **immutable and permanently
-/// reserved within its project** — a timeline entry saying "@dev-1 moved
-/// this" has to keep meaning the same agent after that agent is removed,
-/// which it cannot if the handle is ever reissued.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
 pub struct AgentHandle(String);
@@ -216,11 +209,6 @@ pub struct AgentHandle(String);
 impl AgentHandle {
     /// Validate `value` against the handle grammar:
     /// `[a-z][a-z0-9-]{0,31}`, no trailing dash.
-    ///
-    /// Narrower than the id grammar in every direction — no uppercase, no
-    /// dots, no underscores — because a handle is read aloud and typed from
-    /// memory. Two handles that differ only in case would be one name to
-    /// every reader and two to the index.
     pub fn parse(value: impl Into<String>) -> Result<Self, InvalidAgentHandle> {
         let value = value.into();
         let reject = |reason| InvalidAgentHandle {
@@ -292,11 +280,6 @@ impl<'de> Deserialize<'de> for AgentHandle {
 
 /// An agent's place on a project team: which board, and the handle it
 /// answers to there.
-///
-/// One field rather than two nullable columns' worth of `Option`, because
-/// the two facts are never independent — an agent with a board but no
-/// handle cannot be mentioned, and a handle with no board is scoped to
-/// nothing. `None` on the profile means a global agent, which has neither.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TeamMembership {
     pub project_id: crate::ProjectId,
@@ -505,11 +488,8 @@ mod tests {
             Some("test-engineer".to_owned())
         );
         assert_eq!(derive("dev_1"), Some("dev-1".to_owned()));
-        // Truncation must not leave the trailing dash the grammar refuses.
         let long = derive(&format!("{} tail", "a".repeat(MAX_AGENT_HANDLE_CHARS - 1)));
         assert_eq!(long, Some("a".repeat(MAX_AGENT_HANDLE_CHARS - 1)));
-        // Nothing usable is `None`, not an invented identifier: the point of
-        // a handle is that a person can read it.
         assert_eq!(derive("!!!"), None);
         assert_eq!(derive("42"), None, "a handle cannot start with a digit");
     }

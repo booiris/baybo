@@ -464,11 +464,6 @@ fn is_subagent(session: &Session) -> bool {
 fn should_fire_session_end(session: &Session) -> bool {
     let user_trigger = match &session.trigger {
         TriggerSource::User | TriggerSource::Cron { .. } => true,
-        // A board's sessions belong to the board, not to a person: an
-        // issue's transcript is that card's work log and the lead's
-        // planning thread is the project's, so consolidating either into
-        // the agent's long-term memory would file project work as personal
-        // history.
         TriggerSource::Project { .. } | TriggerSource::Issue { .. } => false,
     };
     user_trigger && !is_subagent(session)

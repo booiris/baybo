@@ -1,19 +1,8 @@
 //! What an edit is worth saying on the timeline.
-//!
-//! Kept pure and apart from the manager for the same reason
-//! [`crate::runs::triggers_run`] is: "which edits are worth a timeline
-//! entry" is a product rule that wants to be read and tested on its own,
-//! not inferred from the middle of a write path.
 
 use baybo_store::project::{IssueEventBody, IssueRow};
 
 /// The entries one edit deserves, in the order they should read.
-///
-/// Title and description edits deliberately produce nothing. The timeline
-/// answers "what happened to this work" — who is on it, where it is, why
-/// it stopped — and a stream that also announced every keystroke of a
-/// description would bury exactly that. The description's current text is
-/// on the page above; its history is not something anyone has asked for.
 pub(crate) fn diff_events(before: &IssueRow, after: &IssueRow) -> Vec<IssueEventBody> {
     let mut out = Vec::new();
     if before.status != after.status {
@@ -147,7 +136,6 @@ mod tests {
             diff_events(&before, &after),
             vec![IssueEventBody::Cancelled]
         );
-        // Cancelling twice is not two cancellations.
         assert!(diff_events(&after, &after).is_empty());
     }
 }

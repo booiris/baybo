@@ -1,10 +1,5 @@
 //! `/v1/projects/*` — kanban projects and the issues on their boards
 //! (docs/todo/kanban.md).
-//!
-//! An issue is addressed as `(project, number)` everywhere on this surface.
-//! Its ULID exists for child tables to reference, and is deliberately not a
-//! route parameter: a request that could name an issue without naming its
-//! project would be a request that can reach across boards.
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -62,12 +57,6 @@ pub(super) fn project_err(e: ProjectError) -> GatewayError {
     }
 }
 
-/// One card, with the parent number and progress ring its board implies.
-///
-/// A second read of the board — the price of `parent` being a *number* on
-/// the wire while the row carries an id. Worth it: every other reference on
-/// this surface is a number, and a client that had to resolve ULIDs to draw
-/// a card would need a second endpoint to do it.
 async fn on_board(state: &AdminState, project: &ProjectId, row: IssueRow) -> Result<IssueDto> {
     let board = state
         .project_manager
@@ -77,26 +66,8 @@ async fn on_board(state: &AdminState, project: &ProjectId, row: IssueRow) -> Res
     Ok(IssueDto::on_board(row, &board))
 }
 
-/// Every agent a page of timeline entries names, mapped to its `@handle`.
 type ActorHandles = std::collections::HashMap<AgentProfileId, baybo_model::AgentHandle>;
 
-/// Resolve the agents a page of entries names, once for the whole page.
-///
-/// Through `AgentProfileStore::get` rather than the board's roster, because
-/// a timeline is permanent history: it names agents that have since left
-/// the team, and `list_team` filters exactly those out while `get`
-/// deliberately still reaches them. One point-get per *distinct* agent,
-/// concurrently, the way the roster reads its members' names — and a team
-/// is capped at sixteen, so a page names a handful at most.
-///
-/// Scoped to `project` all the same. A handle is unique only inside its
-/// board, so `@dev-1` here and `@dev-1` there are two different agents, and
-/// an id belonging to another board must not be rendered under this one's
-/// naming. This does not cost the departed teammate anything: removal is a
-/// tombstone that stamps `deleted_at` and leaves the membership itself
-/// untouched, so a departed agent still answers with the board it worked
-/// on. An id that fails the check resolves to nothing and renders as the
-/// id, which is what a reference this board cannot name should look like.
 async fn actor_handles(
     state: &AdminState,
     project: &ProjectId,
@@ -135,20 +106,12 @@ pub(super) fn parse_project_id(raw: &str) -> Result<ProjectId> {
     ProjectId::parse(raw).map_err(|e| GatewayError::BadRequest(e.to_string()))
 }
 
-/// Parse an assignee, running the agent-id grammar rather than trusting
-/// the body. The manager still checks the agent exists and can run.
 fn parse_assignee(raw: Option<String>) -> Result<Option<AgentProfileId>> {
     raw.map(AgentProfileId::parse)
         .transpose()
         .map_err(|e| GatewayError::BadRequest(e.to_string()))
 }
 
-/// Deserialize a clearable optional field.
-///
-/// Plain `Option<Option<T>>` cannot express "explicitly null": serde folds
-/// both a missing key and a `null` into the outer `None`. Wrapping the
-/// parsed value in `Some` restores the distinction the patch semantics
-/// need — absent leaves the field alone, `null` clears it.
 fn double_option<'de, T, D>(deserializer: D) -> std::result::Result<Option<Option<T>>, D::Error>
 where
     T: Deserialize<'de>,
@@ -156,8 +119,6 @@ where
 {
     Option::deserialize(deserializer).map(Some)
 }
-
-// ── DTOs ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ProjectDto {
@@ -312,11 +273,6 @@ pub struct SubIssueProgress {
 
 impl IssueDto {
     /// Build one card against the board it lives on.
-    ///
-    /// The parent number and the progress ring are both derived from
-    /// `board` rather than queried: a list read already holds every issue
-    /// in the project, so resolving them in memory costs nothing and
-    /// cannot disagree with the rows beside it.
     pub fn on_board(row: IssueRow, board: &[IssueRow]) -> Self {
         let parent = row.parent_issue_id.as_ref().and_then(|id| {
             board
@@ -449,12 +405,6 @@ impl From<ApprovalDecisionDto> for baybo_model::ApprovalDecision {
 }
 
 /// An agent as a timeline entry names it.
-///
-/// The handle is resolved server-side rather than by the client, for the
-/// same reason `HiredByDto`'s is: a timeline is history, so it names agents
-/// that have since left the team — and those are precisely the rows the
-/// roster the client holds has filtered out. The id rides along because it
-/// is what opens the agent's profile.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct AgentRefDto {
     pub id: String,
@@ -464,11 +414,6 @@ pub struct AgentRefDto {
 }
 
 /// Who did the thing an entry records.
-///
-/// Tagged, and three kinds, so the client switches instead of parsing. The
-/// pair it replaces — a string plus an `is_agent` flag — was two fields
-/// that could disagree, and it had no way at all to say the board acted on
-/// its own.
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ActorDto {
@@ -479,12 +424,6 @@ pub enum ActorDto {
     Agent(AgentRefDto),
 }
 
-/// Name one agent, falling back to the bare id when nothing resolved.
-///
-/// An id no profile answers to is a broken reference, not a departed
-/// teammate — the tombstone is what keeps those resolvable — and rendering
-/// the id beats rendering nothing, since it is then the only thing left
-/// that says who acted.
 fn agent_ref(id: &AgentProfileId, handles: &ActorHandles) -> AgentRefDto {
     AgentRefDto {
         id: id.as_str().to_owned(),
@@ -496,11 +435,6 @@ fn agent_ref(id: &AgentProfileId, handles: &ActorHandles) -> AgentRefDto {
 }
 
 /// What one timeline entry says.
-///
-/// A mirror of the store's `IssueEventBody` rather than the type itself,
-/// like every other enum on this surface. Tagged on `kind`, so the client
-/// gets a discriminated union it can exhaustively switch on — the whole
-/// reason this is not a free-form payload.
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum IssueEventBodyDto {
@@ -562,8 +496,6 @@ pub enum IssueEventBodyDto {
 }
 
 impl IssueEventBodyDto {
-    /// Build one body, naming the agents it mentions from the handles
-    /// resolved for the whole page.
     fn with_handles(body: IssueEventBody, handles: &ActorHandles) -> Self {
         match body {
             IssueEventBody::ApprovalRequested {
@@ -604,10 +536,6 @@ impl IssueEventBodyDto {
                 from: from.map(|id| agent_ref(&id, handles)),
                 to: to.map(|id| agent_ref(&id, handles)),
             },
-            // The run id is deliberately dropped: the execution log in the
-            // rail addresses a run by its attempt within this issue, and a
-            // second identifier for the same thing is one the UI would have
-            // to keep consistent for no reader's benefit.
             IssueEventBody::RunStarted {
                 attempt, trigger, ..
             } => Self::RunStarted {
@@ -646,10 +574,6 @@ pub struct IssueEventDto {
 }
 
 impl IssueEventDto {
-    /// Build one entry against the handles resolved for its page.
-    ///
-    /// Not a `From`, because the row alone cannot answer what an agent is
-    /// called — the same reason [`on_board`] is not one either.
     fn with_handles(row: IssueEventRow, handles: &ActorHandles) -> Self {
         let actor = match &row.actor {
             IssueActor::User => ActorDto::User,
@@ -812,8 +736,6 @@ pub struct MoveIssueRequest {
     pub ordered_numbers: Vec<i64>,
 }
 
-// ── Projects ────────────────────────────────────────────────────────────
-
 #[utoipa::path(
     get,
     path = "/projects",
@@ -955,8 +877,6 @@ async fn set_project_archived(
         .map_err(project_err)?;
     Ok(Json(ProjectDto::from(row)))
 }
-
-// ── Issues ──────────────────────────────────────────────────────────────
 
 #[utoipa::path(
     get,
@@ -1205,14 +1125,6 @@ pub struct ResolveApprovalRequest {
     pub decision: ApprovalDecisionDto,
 }
 
-/// The session a still-parked prompt was raised in, if the queue has one
-/// for `call_id`.
-///
-/// A pass over the sessions with something parked, because that is how the
-/// queue is addressable — and it is bounded by prompts a person has not
-/// answered yet, not by anything a board accumulates. `None` covers both
-/// "no such call" and "already answered", which the caller must not tell
-/// apart on the wire.
 fn parked_approval_session(
     channel: &baybo_channels::Channel,
     call_id: &str,
@@ -1259,20 +1171,6 @@ async fn resolve_approval(
         .channel_registry
         .get(&baybo_model::ChannelType::owner())
         .ok_or_else(|| GatewayError::NotFound("the owner channel".to_owned()))?;
-    // Naming a card is not authority to answer for it: the queue is keyed
-    // by call id alone. What binds a prompt to a card is the **session** it
-    // was raised in — `TimelineApprovalGate` puts the prompt on whatever
-    // card that session's trigger names — so this asks the gate's own
-    // question rather than re-reading the timeline entry the gate wrote
-    // afterwards. Two things follow. A subagent inherits its parent's
-    // trigger, so a prompt raised one level inside a run is still this
-    // card's. And a timeline append that failed (`record_event` swallows
-    // one) no longer decides this endpoint's answer, which comes from the
-    // queue rather than from the row. The independence is the endpoint's,
-    // not the operator's: that entry is the only thing on the board
-    // carrying a call id, so a swallowed append still leaves the card with
-    // no button to draw and the prompt ends at the gate's own
-    // deny-on-timeout.
     let raised_here = match parked_approval_session(&channel, &call_id) {
         Some(session) => state
             .session_manager
@@ -1290,13 +1188,6 @@ async fn resolve_approval(
         None => false,
     };
     let decision: baybo_model::ApprovalDecision = req.decision.into();
-    // `resolve_approval` returns the queue entry's own session id, which is
-    // what the broadcast has to target — the fan-out is per session, and
-    // dispatching without one reaches nobody.
-    //
-    // One exit for both refusals: "not this card's call" must be
-    // indistinguishable from "nothing is waiting", or the status itself
-    // confirms the call exists on some other board.
     let Some(session_id) = raised_here
         .then(|| channel.resolve_approval(&call_id, decision))
         .flatten()
@@ -1604,11 +1495,6 @@ async fn retry_run(
     State(state): State<AdminState>,
     Path((project_id, number)): Path<(String, i64)>,
 ) -> Result<(StatusCode, Json<IssueRunDto>)> {
-    // Which cards can be retried is not this handler's question:
-    // `ProjectManager::retry_run` is the single place that decides, and the
-    // 400 above is that function's refusal set spelled for a client that
-    // reads it in `schema.d.ts` rather than in Rust. A refusal added there
-    // is a refusal missing from this description.
     let id = parse_project_id(&project_id)?;
     let run = state
         .project_manager

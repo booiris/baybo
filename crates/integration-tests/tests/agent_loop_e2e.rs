@@ -4670,9 +4670,6 @@ async fn stop_persists_partial_work_so_it_survives_reload() {
 
 #[tokio::test]
 async fn an_issue_run_executes_as_its_own_kind_of_turn() {
-    // A run happens in a session rooted at the issue, and `TurnLifecycle`
-    // only admits `TurnInput::IssueRun` under such a session — so this is
-    // also the check that the two agree.
     let mut session = SessionBuilder::new().build();
     session.trigger = TriggerSource::Issue {
         project_id: baybo_model::ProjectId::parse("proj-a").expect("project id"),
@@ -4681,7 +4678,6 @@ async fn an_issue_run_executes_as_its_own_kind_of_turn() {
     };
     let mut harness = AgentTestHarness::builder().session(session).build();
 
-    // An issue run is dispatched non-streaming, like a cron fire.
     harness.stub_llm.push_response(LlmResponse {
         content: "Cleared the reconnect storm and added a regression test.".into(),
         content_blocks: vec![],
@@ -4703,8 +4699,6 @@ async fn an_issue_run_executes_as_its_own_kind_of_turn() {
         .expect("mailbox accepts the run");
     harness.drain_outputs(DRAIN_TIMEOUT).await;
 
-    // The brief reached the model framed as board work, not as something a
-    // person just typed.
     let requests = harness.stub_llm.captured_requests();
     let framed = requests
         .iter()
@@ -4725,17 +4719,11 @@ async fn an_issue_run_executes_as_its_own_kind_of_turn() {
         framed.contains("Fix the WS reconnect storm"),
         "carries the brief: {framed}"
     );
-    // …and says where the work happens. Nothing else does: the Bash tool's
-    // description is rendered once per process and names the workspace work
-    // directory for every session, so without this the model is told its
-    // commands land somewhere they do not.
     assert!(
         framed.contains("/ws/work/projects/p/7"),
         "the run must be told its checkout: {framed}"
     );
 
-    // …and the turn is recorded as a run, which is what the waiter keys on
-    // to settle the ledger row.
     let turns = harness
         .turn_lifecycle
         .list_by_session(&harness.session.id, None)

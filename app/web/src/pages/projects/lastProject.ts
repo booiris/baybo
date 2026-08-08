@@ -1,6 +1,3 @@
-// Which board the Projects rail entry opens. A client-only preference: the
-// server has no notion of a "current" project, and a remembered id that has
-// since been archived is a hint the resolver discards, never an error.
 
 const LAST_PROJECT_KEY = 'baybo.projects.last';
 

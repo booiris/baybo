@@ -1,7 +1,3 @@
-//! Domain-level tests for [`ProjectManager`]: what a write has to satisfy
-//! before it lands, and the workdir guard that keeps a project's checkout
-//! out of baybo's own workspace.
-
 use std::sync::Arc;
 
 use baybo_model::{
@@ -19,20 +15,13 @@ use chrono::{DateTime, Utc};
 
 struct Fixture {
     manager: ProjectManager,
-    /// The raw store, for the few facts a test has to arrange that no
-    /// public method produces — a run that failed, which only an executor
-    /// settles.
     store: Arc<dyn baybo_store::project::ProjectStore>,
-    /// Every run the manager announced, in order — what an executor would
-    /// have been handed.
     dispatched: Arc<parking_lot::Mutex<Vec<IssueRunRow>>>,
     agents: Arc<dyn baybo_store::AgentProfileStore>,
     paths: WorkspacePaths,
     _workspace: tempfile::TempDir,
 }
 
-/// Put an agent on a project's team. Assignees have to be teammates, so
-/// every fixture that assigns work goes through here.
 async fn seed_agent(
     f: &Fixture,
     project: &ProjectId,
@@ -93,8 +82,6 @@ async fn fixture() -> Fixture {
 }
 
 impl Fixture {
-    /// Settle a run the way the waiter would. There is no public path: the
-    /// manager records runs and an executor settles them.
     async fn store_settle(&self, run: &baybo_model::IssueRunId, status: RunStatus) {
         self.store
             .settle_run(run, status, None)
@@ -143,8 +130,6 @@ async fn an_empty_workdir_is_materialised_as_a_repo_under_work() {
     assert!(expected.join(".git").exists(), "and it is a git repository");
 }
 
-/// Every board opens with a coordinator, so no reader — the team strip, the
-/// triage loop, the chat panel — has to handle a project nobody is on.
 #[tokio::test]
 async fn a_new_project_comes_with_a_lead() {
     let f = fixture().await;
@@ -166,8 +151,6 @@ async fn a_new_project_comes_with_a_lead() {
     );
     assert_eq!(lead.framework, AgentFramework::Baybo);
 
-    // Its persona is on disk with the coordinator soul and a name, so the
-    // first run reads a lead rather than the blank custom-agent skeleton.
     let soul = tokio::fs::read_to_string(
         lead.id
             .identity_file(&f.paths, baybo_workspace::IdentityKind::Soul),
@@ -189,15 +172,12 @@ async fn a_new_project_comes_with_a_lead() {
         Some("Lead")
     );
 
-    // And it is a teammate, not a chat persona: the global roster is
-    // exactly what it was before the project existed.
     let global = f.agents.list().await.expect("global roster");
     assert!(
         global.iter().all(|row| row.id != lead.id),
         "the lead must not appear in the global agent list"
     );
 
-    // Two boards get two leads, each answering to `@lead` on its own.
     let other = f
         .manager
         .create_project(new_project("Also Staffed"))
@@ -214,8 +194,6 @@ async fn a_new_project_comes_with_a_lead() {
     );
 }
 
-/// The lead is a teammate like any other, which is what makes it usable as
-/// an assignee without a special case anywhere.
 #[tokio::test]
 async fn the_lead_can_be_assigned_work() {
     let f = fixture().await;
@@ -295,7 +273,6 @@ async fn a_hire_gets_a_handle_a_soul_and_a_name() {
 
     let team = f.manager.team(&p.id).await.expect("team");
     assert_eq!(team.len(), 2);
-    // Still nobody's chat persona.
     assert!(
         f.agents
             .list()
@@ -306,9 +283,6 @@ async fn a_hire_gets_a_handle_a_soul_and_a_name() {
     );
 }
 
-/// Handles stay reserved after a removal, so a second "QA" cannot simply
-/// take `@qa` back — it gets numbered rather than refused or, worse,
-/// silently inheriting the departed agent's mentions.
 #[tokio::test]
 async fn a_taken_handle_is_numbered_rather_than_reused() {
     let f = fixture().await;
@@ -335,7 +309,6 @@ async fn a_taken_handle_is_numbered_rather_than_reused() {
         Some("qa-2")
     );
 
-    // Even after the first one leaves: its timeline entries still say @qa.
     f.manager
         .remove_from_team(&p.id, &first.id)
         .await
@@ -384,7 +357,6 @@ async fn hiring_refuses_a_nameless_agent_and_a_full_team() {
         assert!(matches!(refused, ProjectError::Invalid { .. }), "{why}");
     }
 
-    // The board already has its lead, so the cap allows one fewer hire.
     for n in 1..baybo_project::MAX_TEAM_AGENTS {
         f.manager
             .hire(&p.id, new_member(&format!("Dev {n}")), None)
@@ -455,19 +427,15 @@ async fn the_lead_cannot_be_removed_and_neither_can_a_busy_agent() {
         "{refused:?}"
     );
 
-    // Cancel the run and the removal goes through.
     f.manager.cancel_run(&p.id, 1).await.expect("cancel");
     f.manager
         .remove_from_team(&p.id, &dev.id)
         .await
         .expect("remove");
     assert_eq!(f.manager.team(&p.id).await.expect("team").len(), 1);
-    // Twice is refused rather than silently accepted.
     assert!(f.manager.remove_from_team(&p.id, &dev.id).await.is_err());
 }
 
-/// Another board's agent is not this board's to remove, even though the row
-/// resolves and the tombstone would happily be written.
 #[tokio::test]
 async fn removal_is_scoped_to_the_board_that_asks() {
     let f = fixture().await;
@@ -502,8 +470,6 @@ async fn removal_is_scoped_to_the_board_that_asks() {
 #[tokio::test]
 async fn a_non_empty_work_directory_is_never_silently_adopted() {
     let f = fixture().await;
-    // `work/` is shared with the bash tool's scratch space; something is
-    // already sitting where this project's name would put it.
     let squatted = f.paths.work_dir().join("taken");
     tokio::fs::create_dir_all(&squatted).await.expect("mkdir");
     tokio::fs::write(squatted.join("notes.txt"), b"someone else's")
@@ -550,7 +516,6 @@ async fn a_supplied_workdir_must_be_an_existing_repo() {
         .expect_err("a relative path resolves against nothing in particular");
     assert!(matches!(relative, ProjectError::Invalid { .. }));
 
-    // The same directory, once it is a repo, is accepted.
     std::fs::create_dir_all(outside.path().join(".git")).expect("fake repo");
     let ok = f
         .manager
@@ -570,8 +535,6 @@ async fn a_supplied_workdir_must_be_an_existing_repo() {
 #[tokio::test]
 async fn a_workdir_inside_the_workspace_is_refused() {
     let f = fixture().await;
-    // `state/` holds baybo's own database. Binding it read-write into every
-    // shell the team runs is the whole reason this guard exists.
     let inside = f.paths.root().join("state");
     tokio::fs::create_dir_all(inside.join(".git"))
         .await
@@ -594,9 +557,6 @@ async fn a_workdir_inside_the_workspace_is_refused() {
 #[tokio::test]
 async fn a_workdir_that_swallows_the_workspace_is_refused() {
     let f = fixture().await;
-    // The ancestor direction: the default workspace lives in `~/.baybo`, so
-    // `workdir = $HOME` passes any descendant-only check and then binds the
-    // whole home directory.
     let parent = f
         .paths
         .root()
@@ -624,8 +584,6 @@ async fn a_workdir_that_swallows_the_workspace_is_refused() {
 #[tokio::test]
 async fn a_workdir_symlinked_into_the_workspace_is_refused_too() {
     let f = fixture().await;
-    // The sandbox resolves symlinks when it mounts, so a lexical-only check
-    // would pass this link and then bind exactly what it refused.
     let secret = f.paths.root().join("state");
     tokio::fs::create_dir_all(secret.join(".git"))
         .await
@@ -706,11 +664,9 @@ async fn an_archived_project_is_read_only() {
         .expect_err("nor a rename");
     assert!(matches!(refused, ProjectError::Archived(_)));
 
-    // Reading still works — that is what makes archive different from delete.
     let issues = f.manager.list_issues(&project.id).await.expect("list");
     assert_eq!(issues.len(), 1);
 
-    // And it comes back.
     f.manager
         .set_project_archived(&project.id, false)
         .await
@@ -733,7 +689,6 @@ async fn issues_answer_only_within_their_own_project() {
         .expect("issue")
         .into_issue();
 
-    // Both projects have a #1, and each one only has its own.
     let refused = f
         .manager
         .get_issue(&b.id, 1)
@@ -767,7 +722,6 @@ async fn a_patch_that_sets_nothing_is_refused() {
         .expect_err("an empty patch is a caller mistake, not a no-op write");
     assert!(matches!(refused, ProjectError::Invalid { .. }));
 
-    // A whitespace-only block reason reads as an unblock, not a blank block.
     let issue = f
         .manager
         .update_issue(
@@ -796,8 +750,6 @@ async fn a_move_must_name_the_issue_it_moves() {
             .into_issue();
     }
 
-    // `ordered_numbers` is the destination column's new contents, so a list
-    // that omits the moved card would leave it unplaced.
     let refused = f
         .manager
         .move_issue(&p.id, 1, IssueActor::User, IssueStatus::Todo, &[2])
@@ -825,7 +777,6 @@ async fn in_progress_needs_somebody_on_it() {
         .expect("issue")
         .into_issue();
 
-    // The board would otherwise claim work is under way that nobody is doing.
     let refused = f
         .manager
         .move_issue(&p.id, 1, IssueActor::User, IssueStatus::InProgress, &[1])
@@ -836,13 +787,11 @@ async fn in_progress_needs_somebody_on_it() {
         "{refused:?}"
     );
 
-    // Every other column is free to be unassigned.
     f.manager
         .move_issue(&p.id, 1, IssueActor::User, IssueStatus::Todo, &[1])
         .await
         .expect("todo takes unassigned work");
 
-    // Assigned, it moves.
     f.manager
         .update_issue(
             &p.id,
@@ -862,7 +811,6 @@ async fn in_progress_needs_somebody_on_it() {
         .expect("assigned work starts");
     assert_eq!(moved.assignee.as_ref(), Some(&dev));
 
-    // …and cannot be abandoned mid-flight.
     let refused = f
         .manager
         .update_issue(
@@ -903,8 +851,6 @@ async fn an_assignee_must_exist_and_must_be_able_to_run() {
         .expect_err("an agent that does not exist cannot be assigned");
     assert!(matches!(refused, ProjectError::Invalid { .. }));
 
-    // An external profile has no top-level session leg, so a card assigned
-    // to one could never start. Refused at the door rather than at run time.
     let refused = f
         .manager
         .create_issue(
@@ -923,9 +869,6 @@ async fn an_assignee_must_exist_and_must_be_able_to_run() {
     );
 }
 
-/// The roster is the assignable set. A global chat persona is a real,
-/// runnable baybo agent — and still not assignable here, because it has no
-/// handle on this board and appears in none of its surfaces.
 #[tokio::test]
 async fn an_assignee_must_be_on_this_board() {
     let f = fixture().await;
@@ -980,8 +923,6 @@ async fn an_assignee_must_be_on_this_board() {
     }
 }
 
-/// A removed teammate still resolves — that is what keeps the timeline
-/// readable — so "the row exists" is not the question the assign path asks.
 #[tokio::test]
 async fn a_removed_teammate_takes_no_new_work() {
     let f = fixture().await;
@@ -1038,8 +979,6 @@ async fn a_card_reaching_in_progress_records_a_run_before_anything_starts() {
         .await
         .expect("start");
 
-    // The row exists before anything could have acted on it — that is what
-    // makes a crash here recoverable rather than a run that never happened.
     let runs = f.manager.list_runs(&p.id, 1).await.expect("runs");
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].status, RunStatus::Queued);
@@ -1050,8 +989,6 @@ async fn a_card_reaching_in_progress_records_a_run_before_anything_starts() {
     assert_eq!(announced.len(), 1, "and exactly one run was handed out");
     assert_eq!(announced[0].id, runs[0].id);
 
-    // Dragging within the column, or out of it, starts nothing more — and
-    // in particular leaving the column does not stop the run.
     f.manager
         .move_issue(&p.id, 1, IssueActor::User, IssueStatus::Review, &[1])
         .await
@@ -1071,7 +1008,6 @@ async fn assigning_work_already_in_flight_starts_it_and_never_twice() {
     let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
     let other = seed_agent(&f, &p.id, "dev-2", AgentFramework::Baybo).await;
 
-    // Straight into In Progress at creation: one edge.
     f.manager
         .create_issue(
             &p.id,
@@ -1091,10 +1027,6 @@ async fn assigning_work_already_in_flight_starts_it_and_never_twice() {
         "creation into the column starts work"
     );
 
-    // Reassigning while a run is in flight does not start a second one:
-    // the trigger predicate does fire — a handover is a start — and the
-    // dedupe guard, a unique index, is what refuses it. Do not "simplify"
-    // the predicate to make this pass; the index is the backstop.
     f.manager
         .update_issue(
             &p.id,
@@ -1115,9 +1047,6 @@ async fn assigning_work_already_in_flight_starts_it_and_never_twice() {
     assert_eq!(f.manager.list_runs(&p.id, 1).await.expect("runs").len(), 1);
 }
 
-/// Handing live work to a different agent starts that agent. Otherwise the
-/// board shows @dev-2 on a card only @dev-1 ever touched, and nothing
-/// happens until somebody notices.
 #[tokio::test]
 async fn reassigning_live_work_starts_the_new_agent() {
     let f = fixture().await;
@@ -1163,11 +1092,6 @@ async fn reassigning_live_work_starts_the_new_agent() {
     assert_eq!(f.manager.list_runs(&p.id, 1).await.expect("runs").len(), 2);
 }
 
-/// A cancelled card starts nothing, whichever edge is walked. The assignee
-/// picker on the detail page is not disabled for a cancelled card, and
-/// `reclaim_if_finished` has already torn that card's worktree down — a run
-/// started here cuts a fresh checkout and puts an agent to work on
-/// abandoned work.
 #[tokio::test]
 async fn a_cancelled_card_never_starts_a_run() {
     let f = fixture().await;
@@ -1205,7 +1129,6 @@ async fn a_cancelled_card_never_starts_a_run() {
         .expect("cancel the card");
     f.dispatched.lock().clear();
 
-    // The handover edge: a cancelled card is not live work to hand over.
     f.manager
         .update_issue(
             &p.id,
@@ -1228,8 +1151,6 @@ async fn a_cancelled_card_never_starts_a_run() {
         "and no ledger row is written either"
     );
 
-    // The entering edge: dragging it back into the column does not revive
-    // it. Un-cancelling is the explicit act that does.
     f.manager
         .move_issue(&p.id, 1, IssueActor::User, IssueStatus::Todo, &[1])
         .await
@@ -1243,8 +1164,6 @@ async fn a_cancelled_card_never_starts_a_run() {
         "a cancelled card entering In Progress starts nothing either"
     );
 
-    // And it is not a one-way door: reviving the card and staffing it is
-    // the explicit act that makes it startable again.
     f.manager
         .update_issue(
             &p.id,
@@ -1276,10 +1195,6 @@ async fn a_cancelled_card_never_starts_a_run() {
     );
 }
 
-/// A run on a card the board has finished with is refused whichever door it
-/// arrives at — and only one of those doors carries a transition to look
-/// at, which is why the rule sits on `enqueue` rather than on the trigger
-/// predicate. Here: the retry button.
 #[tokio::test]
 async fn retry_is_refused_on_a_card_the_board_has_finished_with() {
     let f = fixture().await;
@@ -1315,9 +1230,6 @@ async fn retry_is_refused_on_a_card_the_board_has_finished_with() {
         .expect("cancel the card");
     f.dispatched.lock().clear();
 
-    // Refused as something the operator can fix, not as "this issue already
-    // has a run" — which is what a bare `None` out of `enqueue` would have
-    // been reported as, and it would be a lie.
     let refused = f
         .manager
         .retry_run(&p.id, 1)
@@ -1337,18 +1249,6 @@ async fn retry_is_refused_on_a_card_the_board_has_finished_with() {
     );
 }
 
-/// The retry button predicts these refusals client-side — it has to, or it
-/// would offer a run the server rejects — so `retryRejection` in
-/// `app/web/src/pages/projects/boardModel.ts` carries the server's
-/// sentences word for word, and the toast an operator racing into the 400
-/// gets carries them too.
-///
-/// Nothing generates that correspondence, so it is held by two suites
-/// asserting the same literals, one per language. **The literals are
-/// restated here on purpose**: a test that read them from the same constant
-/// the code does would go green through a reword and leave the button
-/// quoting a sentence nobody sends. This is the side that owns the wording,
-/// so a reword has to break here first.
 #[tokio::test]
 async fn the_retry_refusals_say_exactly_what_the_button_predicts() {
     let f = fixture().await;
@@ -1410,9 +1310,6 @@ async fn the_retry_refusals_say_exactly_what_the_button_predicts() {
         "this issue is done — move it back into the board before running it again"
     );
 
-    // And the order is the server's, which is why the button follows it: a
-    // cancelled card with nobody on it is refused for the assignee, because
-    // that is the answer the click would have brought back.
     f.manager
         .update_issue(
             &p.id,
@@ -1428,12 +1325,6 @@ async fn the_retry_refusals_say_exactly_what_the_button_predicts() {
     assert_eq!(refusal(1).await, "an issue with nobody on it cannot be run");
 }
 
-/// A profile's framework is editable, so "checked when the card was
-/// assigned" is not the same fact as "true when the run starts". Only baybo
-/// can host a top-level session — the external backends live inside the
-/// subagent spawner — so a card whose agent has moved to codex since must
-/// stop recording runs, and say why rather than answering with the dedupe
-/// guard's sentence about a run that does not exist.
 #[tokio::test]
 async fn an_agent_that_moved_off_baybo_stops_getting_runs() {
     let f = fixture().await;
@@ -1486,8 +1377,6 @@ async fn an_agent_that_moved_off_baybo_stops_getting_runs() {
         "and no second row was recorded"
     );
 
-    // The quiet doors go through `enqueue`, which has no way to say a
-    // sentence — they must simply not start anything.
     f.manager
         .comment(&p.id, 1, IssueActor::User, "@dev-1 pick this back up")
         .await
@@ -1498,14 +1387,6 @@ async fn an_agent_that_moved_off_baybo_stops_getting_runs() {
     );
 }
 
-/// The other half of `touching_the_held_card_itself_releases_it`: the press
-/// happened, the ceiling still refused, and what the operator is told is the
-/// budget rather than the row. "This issue already has a run" names a run
-/// that never started and points at nothing to do.
-///
-/// The sentence is restated rather than read from the const, so a reword
-/// breaks here instead of going green while the button's own copy
-/// (`HELD_RUN_NOTE` in `app/web/src/pages/projects/boardModel.ts`) drifts.
 #[tokio::test]
 async fn a_retry_on_a_held_run_blames_the_budget_when_there_is_still_no_room() {
     let f = fixture().await;
@@ -1534,8 +1415,6 @@ async fn a_retry_on_a_held_run_blames_the_budget_when_there_is_still_no_room() {
     assert_eq!(held.status, RunStatus::Held, "the board is broke");
     f.dispatched.lock().clear();
 
-    // Still no room: the press is refused, and for the budget rather than
-    // for the row it collided with.
     match f.manager.retry_run(&p.id, 1).await {
         Err(ProjectError::Conflict(reason)) => assert_eq!(
             reason,
@@ -1573,7 +1452,6 @@ async fn a_crash_leaves_runs_the_boot_sweep_hands_back() {
         .into_issue();
     f.dispatched.lock().clear();
 
-    // Nothing settled the run — the process died. Boot finds it.
     let resumed = f.manager.resume_unsettled_runs().await.expect("boot sweep");
     assert_eq!(resumed, 1);
     let announced = f.dispatched.lock().clone();
@@ -1581,11 +1459,6 @@ async fn a_crash_leaves_runs_the_boot_sweep_hands_back() {
     assert_eq!(announced[0].status, RunStatus::Queued);
 }
 
-/// The sweep does not go through `enqueue`, so it asks the liveness
-/// question for itself. The process can have been down for a week: a card
-/// the operator called off meanwhile must not come back to life at boot —
-/// its worktree is already reclaimed, so the resumed run would cut a fresh
-/// one and work on what the operator stopped.
 #[tokio::test]
 async fn the_boot_sweep_calls_off_a_run_whose_card_was_cancelled() {
     let f = fixture().await;
@@ -1625,15 +1498,10 @@ async fn the_boot_sweep_calls_off_a_run_whose_card_was_cancelled() {
     );
     assert!(f.dispatched.lock().is_empty());
 
-    // Settled rather than skipped: an unsettled row holds the issue's
-    // dedupe slot, so leaving it would refuse every run on the card if the
-    // operator ever revived it.
     let runs = f.manager.list_runs(&p.id, 1).await.expect("runs");
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].status, RunStatus::Cancelled);
     assert!(runs[0].status.is_settled());
-    // And the card says so, in the board's own name — nobody pressed
-    // anything.
     let settled = f
         .manager
         .timeline(&p.id, 1)
@@ -1652,7 +1520,6 @@ async fn the_boot_sweep_calls_off_a_run_whose_card_was_cancelled() {
         .expect("the card says the run was called off");
     assert_eq!(settled.actor, IssueActor::System);
 
-    // The slot really is free: revive the card and it takes work again.
     f.manager
         .update_issue(
             &p.id,
@@ -1680,14 +1547,6 @@ async fn the_boot_sweep_calls_off_a_run_whose_card_was_cancelled() {
     assert_eq!(f.dispatched.lock().len(), 1);
 }
 
-/// The sweep calls off two kinds of row and they are not the same story. A
-/// run an executor had already claimed carries a `RunStarted` entry on the
-/// card and a session that opens the transcript of the work it did; telling
-/// the operator, two lines below that entry, that the card was finished
-/// "before this run started" contradicts the card itself. A row nothing ever
-/// claimed really did never start, and still says so — the sentence is
-/// picked from the row, not from the call site, because one sweep hands out
-/// both.
 #[tokio::test]
 async fn a_run_called_off_after_it_started_is_not_told_it_never_did() {
     let f = fixture().await;
@@ -1708,8 +1567,6 @@ async fn a_run_called_off_after_it_started_is_not_told_it_never_did() {
             .expect("issue");
     }
 
-    // #1's run was picked up the way the router picks one up: the claim
-    // stamps the session, and the card's `RunStarted` entry follows it.
     let session = baybo_model::SessionId::from("issue-1-dev-1");
     let claimed = f.manager.list_runs(&p.id, 1).await.expect("runs")[0]
         .id
@@ -1721,10 +1578,7 @@ async fn a_run_called_off_after_it_started_is_not_told_it_never_did() {
             .expect("claim the run"),
         "the executor took it"
     );
-    // #2's was never claimed by anything.
 
-    // The process dies mid-run, and both cards are finished with while it is
-    // down: one cancelled, one dragged to Done.
     f.manager
         .update_issue(
             &p.id,
@@ -1774,8 +1628,6 @@ async fn a_run_called_off_after_it_started_is_not_told_it_never_did() {
         "a row nothing ever claimed never did start: {unstarted_reason}"
     );
 
-    // The same sentence reaches the timeline, which is where the operator
-    // reads it — right under the `RunStarted` entry it has to agree with.
     let told = f
         .manager
         .timeline(&p.id, 1)
@@ -1790,17 +1642,6 @@ async fn a_run_called_off_after_it_started_is_not_told_it_never_did() {
     assert_eq!(told, started_reason);
 }
 
-/// Archived is the board's read-only state, and the sweep is subject to it
-/// like every other door into a run: an operator who put a board away and
-/// then restarts baybo must not find its agents working again. Both halves
-/// of the sweep answer to it — the hold release always did, and the re-drive
-/// now does.
-///
-/// Left where it is rather than called off, which is the other half of the
-/// rule: a finished card is a judgement on the work and its run is settled,
-/// while archiving is a shelf the board comes back off. Nothing can claim
-/// the dedupe slot the row holds meanwhile, because everything that would is
-/// refused for the same reason the sweep is.
 #[tokio::test]
 async fn the_boot_sweep_leaves_an_archived_boards_runs_where_they_are() {
     let f = fixture().await;
@@ -1832,8 +1673,6 @@ async fn the_boot_sweep_leaves_an_archived_boards_runs_where_they_are() {
     let shelved_run = f.manager.list_runs(&shelved.id, 1).await.expect("runs")[0]
         .id
         .clone();
-    // Claimed, so the requeue has something to roll forward: this is the
-    // shape a restart leaves behind, not a row nothing ever started.
     assert!(
         f.store
             .claim_run(&shelved_run, &baybo_model::SessionId::from("shelved-1"))
@@ -1863,8 +1702,6 @@ async fn the_boot_sweep_leaves_an_archived_boards_runs_where_they_are() {
         "the work is shelved, not called off: {:?}",
         shelved_runs[0].status
     );
-    // The card itself never stopped taking work — the board did — so the
-    // operator is told nothing about a run ending.
     assert!(
         !f.manager
             .timeline(&shelved.id, 1)
@@ -1879,13 +1716,6 @@ async fn the_boot_sweep_leaves_an_archived_boards_runs_where_they_are() {
     );
 }
 
-/// The other end of the rule above. Holding the run rather than calling it
-/// off is only right if something hands it back: the board's own restoration
-/// is that activity, exactly as a raised ceiling is the activity that
-/// releases a hold. Without this the shelved row waits for the next process
-/// restart while holding the issue's live-run slot, so the first thing the
-/// operator does on the restored card is refused as "this issue already has
-/// a run".
 #[tokio::test]
 async fn restoring_a_board_hands_its_shelved_run_back_out() {
     let f = fixture().await;
@@ -1914,7 +1744,6 @@ async fn restoring_a_board_hands_its_shelved_run_back_out() {
         .set_project_archived(&p.id, true)
         .await
         .expect("archive");
-    // A restart while it was away changed nothing about it.
     f.manager.resume_unsettled_runs().await.expect("boot sweep");
     f.dispatched.lock().clear();
 
@@ -1933,16 +1762,6 @@ async fn restoring_a_board_hands_its_shelved_run_back_out() {
     assert_eq!(f.manager.list_runs(&p.id, 1).await.expect("runs").len(), 1);
 }
 
-/// …and it hangs off the archived→live **edge**, not off the request. A
-/// board that was never away owes nothing, and the rows a re-drive would
-/// find on it are the ordinary queued ones — a card that has just started,
-/// whose dispatcher is still cutting the worktree. Handing one of those out
-/// a second time is not a no-op: `claim_run` collapses the two into one
-/// *execution*, but only after both dispatchers have run the checkout, and
-/// the one that loses that race settles the row the winner is working in.
-///
-/// A repeat in either direction is still not an error — the board simply
-/// ends up where the caller asked for it.
 #[tokio::test]
 async fn a_board_that_was_never_archived_is_not_re_dispatched_by_a_restore() {
     let f = fixture().await;
@@ -2002,12 +1821,6 @@ async fn a_board_that_was_never_archived_is_not_re_dispatched_by_a_restore() {
     assert!(matches!(refused, ProjectError::NoSuchProject(_)));
 }
 
-/// The real store with one read rigged to fail. No public method can
-/// arrange a storage error, and an erroring read is the whole case the two
-/// halves of a board's resume are counted apart for.
-///
-/// The forwarding is generated rather than typed out: thirty identical
-/// one-line delegations would bury the one method this exists for.
 struct HeldRunsUnreadable(Arc<dyn baybo_store::project::ProjectStore>);
 
 macro_rules! forwards_everything_else {
@@ -2061,12 +1874,6 @@ forwards_everything_else! {
     requeue_unsettled() -> StoreResult<()>;
 }
 
-/// A board resumes two things — the runs it recorded but never started, and
-/// the holds today's budget allows — and they are counted apart. A board
-/// that cannot read its holds has still re-driven what it re-drove, and the
-/// operator is told both: one number for the work now under way, one error
-/// for the half that failed. Folding them into a single `Err` reports live
-/// agents as work that never started.
 #[tokio::test]
 async fn a_board_that_cannot_read_its_holds_still_reports_what_it_re_drove() {
     let f = fixture().await;
@@ -2089,8 +1896,6 @@ async fn a_board_that_cannot_read_its_holds_still_reports_what_it_re_drove() {
         .await
         .expect("issue");
 
-    // The same board, over a store that answers everything except what it
-    // is holding.
     let dispatched: Arc<parking_lot::Mutex<Vec<IssueRunRow>>> = Arc::default();
     let manager = ProjectManager::new(
         Arc::new(HeldRunsUnreadable(Arc::clone(&f.store))),
@@ -2120,9 +1925,6 @@ async fn a_board_that_cannot_read_its_holds_still_reports_what_it_re_drove() {
 
 #[tokio::test]
 async fn the_board_writes_its_own_history() {
-    // The end-to-end claim of the timeline: work the operator does through
-    // the board leaves a readable trail without anybody being asked to
-    // write one.
     let f = fixture().await;
     let project = f
         .manager
@@ -2223,8 +2025,6 @@ async fn an_empty_comment_is_refused_rather_than_recorded() {
 
 #[tokio::test]
 async fn a_comment_on_live_work_starts_a_run_and_a_comment_on_parked_work_does_not() {
-    // The board's promise: saying something to somebody who is on the job
-    // gets you an agent. Saying something into the backlog gets you a note.
     let f = fixture().await;
     let project = f
         .manager
@@ -2283,9 +2083,6 @@ async fn a_comment_on_live_work_starts_a_run_and_a_comment_on_parked_work_does_n
 
 #[tokio::test]
 async fn a_comment_while_a_run_is_queued_does_not_start_a_second() {
-    // The queued run assembles its brief when it starts, so it reads this
-    // itself. A second run would be two agents on one card — and the
-    // dedupe index would refuse it, losing the wake entirely.
     let f = fixture().await;
     let project = f
         .manager
@@ -2307,7 +2104,6 @@ async fn a_comment_while_a_run_is_queued_does_not_start_a_second() {
         .await
         .expect("create")
         .into_issue();
-    // Creating it in In Progress already queued a run.
     assert_eq!(f.dispatched.lock().len(), 1);
 
     for text in ["also this", "and this"] {
@@ -2333,9 +2129,6 @@ async fn a_comment_while_a_run_is_queued_does_not_start_a_second() {
 
 #[tokio::test]
 async fn finishing_an_issue_gives_its_worktree_back_and_says_so() {
-    // Reclamation is the only thing that ever removes a worktree — nothing
-    // sweeps them — so an issue that reaches Done and keeps its checkout
-    // forever is a disk leak with no other backstop.
     let f = fixture().await;
     let project = f
         .manager
@@ -2384,9 +2177,6 @@ async fn finishing_an_issue_gives_its_worktree_back_and_says_so() {
 
 #[tokio::test]
 async fn a_worktree_holding_uncommitted_work_survives_being_finished() {
-    // The checkout is the only copy of whatever the agent had not
-    // committed. Reaching Done is a statement about the work, not
-    // permission to delete it.
     let f = fixture().await;
     let project = f
         .manager
@@ -2436,15 +2226,12 @@ async fn a_worktree_holding_uncommitted_work_survives_being_finished() {
     );
 }
 
-/// The gate's shape: the run is **recorded** and then held, so an
-/// exhausted board owes work rather than dropping it.
 #[tokio::test]
 async fn a_board_over_budget_records_the_work_it_is_not_doing() {
     let f = fixture().await;
     let project = f
         .manager
         .create_project(NewProject {
-            // Zero is how an operator pauses a board without archiving it.
             daily_budget: Some(baybo_model::MicroUsd::ZERO),
             ..new_project("Skint")
         })
@@ -2478,7 +2265,6 @@ async fn a_board_over_budget_records_the_work_it_is_not_doing() {
         "a held run holds the issue's dedupe slot"
     );
 
-    // And the card says why, in figures.
     let timeline = f.manager.timeline(&project.id, 1).await.expect("timeline");
     let held = timeline
         .iter()
@@ -2500,13 +2286,9 @@ async fn a_board_over_budget_records_the_work_it_is_not_doing() {
         "{:?}",
         held.body
     );
-    // In the board's own name. Nobody held this run; attributing the gate to
-    // the operator makes the card accuse the person reading it.
     assert_eq!(held.actor, IssueActor::System);
 }
 
-/// Raising the ceiling starts what it was blocking, without the operator
-/// touching each card.
 #[tokio::test]
 async fn a_raised_budget_releases_what_it_was_holding() {
     let f = fixture().await;
@@ -2568,8 +2350,6 @@ async fn a_raised_budget_releases_what_it_was_holding() {
     );
 }
 
-/// The release is what makes a rolled-over ceiling need no timer: the next
-/// thing that happens on the board hands out what it was holding.
 #[tokio::test]
 async fn the_next_enqueue_releases_a_hold_the_budget_no_longer_justifies() {
     let f = fixture().await;
@@ -2597,9 +2377,6 @@ async fn the_next_enqueue_releases_a_hold_the_budget_no_longer_justifies() {
         .into_issue();
     assert!(f.dispatched.lock().is_empty(), "nothing to spend it on");
 
-    // Through the raw store, deliberately: `manager.update_project` releases
-    // holds itself, and going around it is the shape of a day rolling over —
-    // headroom changes and nobody tells the manager.
     f.store
         .update_project(
             &project.id,
@@ -2653,9 +2430,6 @@ async fn the_next_enqueue_releases_a_hold_the_budget_no_longer_justifies() {
     );
 }
 
-/// The release happens **before** the write it shares a call with, so the
-/// board that needs it most — the one where every card holds its own dedupe
-/// slot — is reachable at all.
 #[tokio::test]
 async fn touching_the_held_card_itself_releases_it() {
     let f = fixture().await;
@@ -2694,13 +2468,6 @@ async fn touching_the_held_card_itself_releases_it() {
         .expect("a new day's ceiling");
     f.dispatched.lock().clear();
 
-    // The press releases the hold and hands the row out, and it is reported
-    // as the start it is. The dedupe guard does refuse the row the press
-    // would have written — the slot is taken by the run it just released —
-    // but answering with that conflict would tell the operator nothing
-    // happened about work that is now under way. Releasing *after* the write
-    // instead would leave this board held forever: every enqueue on it is
-    // refused before it gets there.
     let started = f
         .manager
         .retry_run(&project.id, 1)
@@ -2713,8 +2480,6 @@ async fn touching_the_held_card_itself_releases_it() {
     assert_eq!(runs[0].id, started.id);
 }
 
-/// A negative ceiling is a caller mistake, not a board to be silently
-/// paused.
 #[tokio::test]
 async fn a_negative_budget_is_refused() {
     let f = fixture().await;
@@ -2741,13 +2506,6 @@ async fn a_negative_budget_is_refused() {
     );
 }
 
-/// A hold outlives the write that recorded it, and the release is on the
-/// enqueue path — so *any* activity anywhere on the board reaches every
-/// hold on it, including holds on cards that were finished or called off in
-/// the meantime. Their worktrees are already reclaimed; dispatching one
-/// would cut a fresh checkout for abandoned work.
-///
-/// Both ways a card stops, because the door does not know which one it is.
 #[tokio::test]
 async fn a_released_hold_never_lands_on_a_card_the_board_has_finished_with() {
     for called_off in [true, false] {
@@ -2800,9 +2558,6 @@ async fn a_released_hold_never_lands_on_a_card_the_board_has_finished_with() {
         }
 
         f.dispatched.lock().clear();
-        // Raising the ceiling is the door a release comes through, so the
-        // release is driven the way an operator drives it rather than by
-        // reaching past `update_project` into the sweep.
         f.manager
             .update_project(
                 &project.id,
@@ -2819,9 +2574,6 @@ async fn a_released_hold_never_lands_on_a_card_the_board_has_finished_with() {
             f.dispatched.lock().is_empty(),
             "called_off={called_off}: a run was dispatched on a card the board is done with"
         );
-        // Called off rather than left Held: the row would otherwise hold
-        // the issue's dedupe slot forever, and the board would keep
-        // re-reading it on every release.
         let runs = f.manager.list_runs(&project.id, 1).await.expect("runs");
         assert_eq!(
             runs[0].status,
@@ -2843,8 +2595,6 @@ async fn a_released_hold_never_lands_on_a_card_the_board_has_finished_with() {
                 )),
             "called_off={called_off}: and the card says the run ended"
         );
-        // Nothing claimed the budget was restored on a card nobody is
-        // working.
         assert!(
             !f.manager
                 .timeline(&project.id, 1)
@@ -2860,8 +2610,6 @@ async fn a_released_hold_never_lands_on_a_card_the_board_has_finished_with() {
     }
 }
 
-/// The boot sweep must not start held runs as if they were orphans, and
-/// must re-evaluate them against the budget it finds.
 #[tokio::test]
 async fn the_boot_sweep_leaves_a_hold_held_while_the_board_is_still_broke() {
     let f = fixture().await;
@@ -2896,7 +2644,6 @@ async fn the_boot_sweep_leaves_a_hold_held_while_the_board_is_still_broke() {
     assert_eq!(runs[0].status, RunStatus::Held);
 }
 
-/// No ceiling is the default, and it must cost nothing and gate nothing.
 #[tokio::test]
 async fn a_board_with_no_ceiling_is_never_held() {
     let f = fixture().await;
@@ -2927,8 +2674,6 @@ async fn a_board_with_no_ceiling_is_never_held() {
     );
 }
 
-/// The barrier: a stage opens exactly once, when the last step in it
-/// finishes, and it wakes whoever is on the parent.
 #[tokio::test]
 async fn finishing_a_stage_wakes_the_parent_once() {
     let f = fixture().await;
@@ -2970,7 +2715,6 @@ async fn finishing_a_stage_wakes_the_parent_once() {
     }
     f.dispatched.lock().clear();
 
-    // The first step of stage 0 finishing is not the stage finishing.
     f.manager
         .move_issue(&p.id, 2, IssueActor::User, IssueStatus::Done, &[2])
         .await
@@ -3004,9 +2748,6 @@ async fn finishing_a_stage_wakes_the_parent_once() {
         "and the parent's card says which stage opened"
     );
 
-    // Re-saving a Done step must not wake it again. The parent's run has
-    // to be settled first, or the dedupe index would refuse the second
-    // enqueue and hide a barrier that fires on every save.
     f.manager
         .cancel_run(&p.id, parent.number)
         .await
@@ -3030,13 +2771,6 @@ async fn finishing_a_stage_wakes_the_parent_once() {
     );
 }
 
-/// Cancelling a parent calls off the whole plan. Its steps carry on
-/// existing and can still be closed one by one, but the last one closing
-/// must not wake a card whose worktree has already been handed back.
-///
-/// The barrier has no transition on the *parent* to consult — it is looking
-/// at the child's — so this is a door the trigger predicate could never
-/// have covered.
 #[tokio::test]
 async fn a_cancelled_parent_is_not_woken_by_its_last_step() {
     let f = fixture().await;
@@ -3102,8 +2836,6 @@ async fn a_cancelled_parent_is_not_woken_by_its_last_step() {
             .is_empty(),
         "and no ledger row was written for it either"
     );
-    // The stage still emptied, and the operator is still told: the entry is
-    // a fact about the stage, and only the wake is about the parent.
     assert!(
         f.manager
             .timeline(&p.id, parent.number)
@@ -3117,8 +2849,6 @@ async fn a_cancelled_parent_is_not_woken_by_its_last_step() {
     );
 }
 
-/// A cancelled step must not hold its stage open — cancelling is how an
-/// operator unblocks a barrier on work nobody is going to do.
 #[tokio::test]
 async fn a_cancelled_step_opens_its_stage() {
     let f = fixture().await;
@@ -3179,11 +2909,6 @@ async fn a_cancelled_step_opens_its_stage() {
     assert_eq!(f.dispatched.lock()[0].trigger, RunTrigger::StageBarrier);
 }
 
-/// Stages are planned up front, so a step of a later stage routinely
-/// finishes while the current one is still being worked. That is a fact
-/// worth telling the operator and not a barrier: the parent holds one run
-/// at a time, so waking it early spends the slot the real barrier needs and
-/// the wake that matters is lost. The card says so; nobody is woken.
 #[tokio::test]
 async fn a_later_stage_finishing_early_is_announced_but_wakes_nobody() {
     let f = fixture().await;
@@ -3224,7 +2949,6 @@ async fn a_later_stage_finishing_early_is_announced_but_wakes_nobody() {
     }
     f.dispatched.lock().clear();
 
-    // Stage 1's only step finishes while stage 0 is still open.
     f.manager
         .move_issue(&p.id, 3, IssueActor::User, IssueStatus::Done, &[3])
         .await
@@ -3252,8 +2976,6 @@ async fn a_later_stage_finishing_early_is_announced_but_wakes_nobody() {
          waited for the barrier the operator would never hear about it"
     );
 
-    // Now stage 0 empties — the barrier that actually matters, and the one
-    // the early wake would have made unenqueueable.
     f.manager
         .move_issue(&p.id, 2, IssueActor::User, IssueStatus::Done, &[2, 3])
         .await
@@ -3268,9 +2990,6 @@ async fn a_later_stage_finishing_early_is_announced_but_wakes_nobody() {
         "and each stage is named once, in the order it actually closed"
     );
 
-    // Re-saving the step that closed stage 1 must not announce it again:
-    // the announcement is bounded by the transition into a finished state,
-    // not by the stage still being complete.
     f.manager
         .update_issue(
             &p.id,
@@ -3290,7 +3009,6 @@ async fn a_later_stage_finishing_early_is_announced_but_wakes_nobody() {
     );
 }
 
-/// Sub-issues are one level deep, and that is enforced in both directions.
 #[tokio::test]
 async fn sub_issues_do_not_nest() {
     let f = fixture().await;
@@ -3319,7 +3037,6 @@ async fn sub_issues_do_not_nest() {
         .expect("child")
         .into_issue();
 
-    // A step cannot be given steps.
     let refused = f
         .manager
         .create_issue(
@@ -3337,7 +3054,6 @@ async fn sub_issues_do_not_nest() {
         "{refused:?}"
     );
 
-    // …and a card that already has steps cannot become one.
     let refused = f
         .manager
         .update_issue(
@@ -3356,7 +3072,6 @@ async fn sub_issues_do_not_nest() {
         "{refused:?}"
     );
 
-    // Nor can an issue be its own step.
     let refused = f
         .manager
         .update_issue(
@@ -3376,9 +3091,6 @@ async fn sub_issues_do_not_nest() {
     );
 }
 
-/// A parent id from another board must not resolve — `IssueUpdate::parent`
-/// carries a ULID, so the scope check is the only thing between a request
-/// and somebody else's card.
 #[tokio::test]
 async fn a_parent_from_another_board_does_not_resolve() {
     let f = fixture().await;
@@ -3423,13 +3135,6 @@ async fn a_parent_from_another_board_does_not_resolve() {
     );
 }
 
-/// A move renumbers the destination column densely, so an `ordered_numbers`
-/// that omits a card in that column leaves it holding a stale rank that
-/// collides with a renumbered one — silently, because nothing downstream
-/// reads `position` for anything but sorting.
-///
-/// The way a client gets this wrong is by sending the list it is *showing*:
-/// a filtered board omits exactly the cards the operator cannot see.
 #[tokio::test]
 async fn a_move_must_name_its_whole_destination_column() {
     let f = fixture().await;
@@ -3445,8 +3150,6 @@ async fn a_move_must_name_its_whole_destination_column() {
             .expect("issue")
             .into_issue();
     }
-    // #2 is cancelled — still in Backlog, still holding rank 1, and exactly
-    // the kind of card a board hides.
     f.manager
         .update_issue(
             &p.id,
@@ -3470,7 +3173,6 @@ async fn a_move_must_name_its_whole_destination_column() {
         "{refused:?}"
     );
 
-    // The board is untouched: refusing beats renumbering half a column.
     let mut ranks: Vec<(i64, i64)> = f
         .manager
         .list_issues(&p.id)
@@ -3482,13 +3184,10 @@ async fn a_move_must_name_its_whole_destination_column() {
     ranks.sort();
     assert_eq!(ranks, vec![(1, 0), (2, 1), (3, 2)]);
 
-    // Naming every card in the column — cancelled ones included — works.
     f.manager
         .move_issue(&p.id, 3, IssueActor::User, IssueStatus::Backlog, &[3, 1, 2])
         .await
         .expect("the whole column is a valid order");
-    // By number, because `list_issues` returns board order and the claim
-    // here is about ranks, not about listing order.
     let mut ranks: Vec<(i64, i64)> = f
         .manager
         .list_issues(&p.id)
@@ -3505,8 +3204,6 @@ async fn a_move_must_name_its_whole_destination_column() {
     );
 }
 
-/// The same rule across a column boundary: the destination list is the
-/// column the card is arriving in, plus the card.
 #[tokio::test]
 async fn a_cross_column_move_names_the_destination_plus_the_card() {
     let f = fixture().await;
@@ -3527,7 +3224,6 @@ async fn a_cross_column_move_names_the_destination_plus_the_card() {
         .await
         .expect("todo was empty");
 
-    // Todo now holds #1; moving #2 in has to name both.
     let refused = f
         .manager
         .move_issue(&p.id, 2, IssueActor::User, IssueStatus::Todo, &[2])
@@ -3544,9 +3240,6 @@ async fn a_cross_column_move_names_the_destination_plus_the_card() {
         .expect("both named");
 }
 
-/// The badge's contract: it counts things only the operator can unstick,
-/// and each one disappears when they unstick it. No read state, so nothing
-/// can be left showing a fact that is no longer true.
 #[tokio::test]
 async fn the_attention_count_is_what_only_the_operator_can_clear() {
     let f = fixture().await;
@@ -3560,8 +3253,6 @@ async fn the_attention_count_is_what_only_the_operator_can_clear() {
         .expect("p");
     let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
 
-    // Nothing waiting yet: a board with no work is absent entirely, not a
-    // row of zeroes.
     assert!(
         f.manager
             .attention(&[])
@@ -3570,7 +3261,6 @@ async fn the_attention_count_is_what_only_the_operator_can_clear() {
             .is_empty()
     );
 
-    // A run the budget held.
     f.manager
         .create_issue(
             &p.id,
@@ -3589,8 +3279,6 @@ async fn the_attention_count_is_what_only_the_operator_can_clear() {
     assert_eq!(counts[0].1.held, 1);
     assert_eq!(counts[0].1.failed, 0);
 
-    // Raising the ceiling releases it — the operator's action, and the
-    // count goes with it rather than needing to be marked read.
     f.manager
         .update_project(
             &p.id,
@@ -3609,8 +3297,6 @@ async fn the_attention_count_is_what_only_the_operator_can_clear() {
     );
 }
 
-/// A failed run counts only while the card is live and nobody has parked
-/// it, and only if it is the *newest* run — a retry supersedes it.
 #[tokio::test]
 async fn a_failed_run_stops_counting_once_somebody_acts_on_it() {
     let f = fixture().await;
@@ -3642,8 +3328,6 @@ async fn a_failed_run_stops_counting_once_somebody_acts_on_it() {
     assert_eq!(counts.len(), 1);
     assert_eq!(counts[0].1.failed, 1);
 
-    // Blocking it with a reason is the operator saying "I know" — the card
-    // stops asking.
     f.manager
         .update_issue(
             &p.id,
@@ -3664,7 +3348,6 @@ async fn a_failed_run_stops_counting_once_somebody_acts_on_it() {
             .is_empty()
     );
 
-    // Unblocking brings it back, and a retry supersedes it for good.
     f.manager
         .update_issue(
             &p.id,
@@ -3694,7 +3377,6 @@ async fn a_failed_run_stops_counting_once_somebody_acts_on_it() {
     );
 }
 
-/// An archived board is read-only, so nothing on it is waiting for anybody.
 #[tokio::test]
 async fn an_archived_board_asks_for_nothing() {
     let f = fixture().await;
@@ -3735,8 +3417,6 @@ async fn an_archived_board_asks_for_nothing() {
     );
 }
 
-/// The one read cursor in the feature, and what it is for: two signals
-/// that leave no trace when read, so nothing derived could clear them.
 #[tokio::test]
 async fn a_boards_unread_count_is_what_happened_since_you_looked() {
     let f = fixture().await;
@@ -3760,7 +3440,6 @@ async fn a_boards_unread_count_is_what_happened_since_you_looked() {
         .expect("create")
         .into_issue();
 
-    // The operator's own comment is not news to the operator.
     f.manager
         .comment(&p.id, 1, IssueActor::User, "any progress?")
         .await
@@ -3774,7 +3453,6 @@ async fn a_boards_unread_count_is_what_happened_since_you_looked() {
         "your own words are not unread"
     );
 
-    // An agent's is.
     f.manager
         .comment(
             &p.id,
@@ -3788,7 +3466,6 @@ async fn a_boards_unread_count_is_what_happened_since_you_looked() {
     assert_eq!(counts.len(), 1);
     assert_eq!(counts[0].1.unread, 1);
 
-    // …and so is a card arriving in Review, which nothing else notices.
     f.manager
         .move_issue(&p.id, 1, IssueActor::Agent(dev), IssueStatus::Review, &[1])
         .await
@@ -3800,7 +3477,6 @@ async fn a_boards_unread_count_is_what_happened_since_you_looked() {
         2
     );
 
-    // Looking at the board clears it, and nothing else does.
     f.manager.mark_read(&p.id).await.expect("mark read");
     assert!(
         f.manager
@@ -3811,9 +3487,6 @@ async fn a_boards_unread_count_is_what_happened_since_you_looked() {
     );
 }
 
-/// Ordinary board traffic is not news. This is the line between "something
-/// needs you" and "the board is working", and getting it wrong makes the
-/// badge permanent.
 #[tokio::test]
 async fn the_boards_own_traffic_is_never_unread() {
     let f = fixture().await;
@@ -3825,8 +3498,6 @@ async fn the_boards_own_traffic_is_never_unread() {
     let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
     f.manager.mark_read(&p.id).await.expect("mark read");
 
-    // Opening a card, assigning it, starting it, moving it anywhere but
-    // Review — all of it is the board doing its job.
     f.manager
         .create_issue(
             &p.id,
@@ -3856,8 +3527,6 @@ async fn the_boards_own_traffic_is_never_unread() {
     );
 }
 
-/// An @mention on a card nobody is on hands it over — and then follows the
-/// ordinary assign rule, so a card already in a live column starts.
 #[tokio::test]
 async fn a_mention_on_an_unowned_card_hands_it_over() {
     let f = fixture().await;
@@ -3901,8 +3570,6 @@ async fn a_mention_on_an_unowned_card_hands_it_over() {
         1,
         "assigned into a live column, so it starts — one run, not two"
     );
-    // The handover is on the timeline like any other, so the card explains
-    // itself without anybody re-reading the comment.
     assert!(
         f.manager
             .timeline(&p.id, 1)
@@ -3916,8 +3583,6 @@ async fn a_mention_on_an_unowned_card_hands_it_over() {
     );
 }
 
-/// A handover an agent performed is that agent's, not the operator's. The
-/// card is asking the operator to trust what it says happened.
 #[tokio::test]
 async fn a_mention_hands_the_card_over_in_the_commenters_name() {
     let f = fixture().await;
@@ -3980,9 +3645,6 @@ async fn a_mention_hands_the_card_over_in_the_commenters_name() {
     );
 }
 
-/// On a card somebody is working, an @mention is a question — not a
-/// reassignment. Otherwise a passing remark takes work away from whoever
-/// is doing it.
 #[tokio::test]
 async fn a_mention_never_takes_a_card_off_its_owner() {
     let f = fixture().await;
@@ -4016,7 +3678,6 @@ async fn a_mention_never_takes_a_card_off_its_owner() {
     assert_ne!(issue.assignee.as_ref(), Some(&other));
 }
 
-/// A mention that names nobody must not refuse the sentence around it.
 #[tokio::test]
 async fn a_mention_of_a_stranger_still_records_the_comment() {
     let f = fixture().await;
@@ -4053,10 +3714,6 @@ async fn a_mention_of_a_stranger_still_records_the_comment() {
     );
 }
 
-/// A comment left while a run was executing is deferred, and the executor
-/// asks for it once that run settles. It has to come back through the
-/// board: a row written straight to the store is a run nothing starts,
-/// sitting on the issue's only live-run slot until the next boot.
 #[tokio::test]
 async fn a_deferred_wake_starts_the_run_the_comment_asked_for() {
     let f = fixture().await;
@@ -4107,8 +3764,6 @@ async fn a_deferred_wake_starts_the_run_the_comment_asked_for() {
     );
 }
 
-/// `None` from a wake is an answer, not a failure: an issue dragged out of
-/// live work while its run was going is one nobody should be woken on.
 #[tokio::test]
 async fn a_wake_after_a_run_is_refused_once_the_card_leaves_live_work() {
     let f = fixture().await;
@@ -4156,9 +3811,6 @@ async fn a_wake_after_a_run_is_refused_once_the_card_leaves_live_work() {
     );
 }
 
-/// The boot sweep hands an interrupted run back with the session it was
-/// working in, so the executor continues that transcript rather than
-/// opening a second one on the same issue.
 #[tokio::test]
 async fn a_resumed_run_keeps_the_session_it_was_working_in() {
     let f = fixture().await;
@@ -4203,10 +3855,6 @@ async fn a_resumed_run_keeps_the_session_it_was_working_in() {
     );
 }
 
-/// Cancel has to settle a resumed run. The **status** says whether a turn
-/// is live; a queued row carries a session with nothing running in it, and
-/// chasing that session would leave the row unsettled forever, blocking
-/// every later run on the issue.
 #[tokio::test]
 async fn cancelling_a_resumed_run_settles_it_rather_than_chasing_a_dead_turn() {
     let f = fixture().await;

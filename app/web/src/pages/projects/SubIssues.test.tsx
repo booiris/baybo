@@ -6,9 +6,6 @@ import { MemoryRouter } from 'react-router-dom';
 import { SubIssues } from './SubIssues';
 import type { Agent, Issue } from './boardModel';
 
-// The wiring the model test can't reach: that the barrier is visible — a
-// waiting stage says it is waiting — and that a step's status is editable
-// in place.
 
 let seq = 0;
 function child(stage: number, overrides: Partial<Issue> = {}): Issue {
@@ -67,8 +64,6 @@ describe('SubIssues', () => {
   });
 
   it('makes the barrier visible: only one stage is in progress', () => {
-    // This is why the list exists here at all — finishing a stage wakes the
-    // parent's assignee, and until now that was invisible.
     renderSteps([child(0, { status: 'done' }), child(1), child(2)]);
     expect(screen.getByText('finished')).toBeInTheDocument();
     expect(screen.getByText('in progress')).toBeInTheDocument();
@@ -81,7 +76,6 @@ describe('SubIssues', () => {
       child(0, { status: 'done' }),
       child(1, { cancelled_at_ms: 1 }),
     ]);
-    // Not 2/3: the third step was called off, so the card is finished.
     expect(screen.getByText('2/2 done')).toBeInTheDocument();
   });
 

@@ -1,10 +1,3 @@
-//! `/v1/projects/*` — the kanban board's HTTP surface.
-//!
-//! The through-line these tests protect: an issue is addressed as
-//! `(project, number)`, so no request can reach a card on another board,
-//! and a move is one transaction that leaves the destination column
-//! densely ordered.
-
 use axum::body::{self, Body};
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
@@ -18,8 +11,6 @@ async fn router() -> (axum::Router, baybo_gateway::test_support::TestGateway) {
     (router.with_state(state), tg)
 }
 
-/// Open a project and return its id. Workdir is left to the server, which
-/// materialises one under the per-test workspace.
 async fn open_project(router: &axum::Router, name: &str) -> String {
     let created = post(
         router,
@@ -31,20 +22,10 @@ async fn open_project(router: &axum::Router, name: &str) -> String {
     created["id"].as_str().expect("id").to_owned()
 }
 
-/// Put a runnable agent on a board's team. Assignment is roster-scoped, so
-/// the profile has to name the project it is being assigned inside.
-///
-/// The id is the handle, which production never mints — see
-/// [`seed_teammate_with_id`] for the shape that tells the two apart.
 async fn seed_teammate(tg: &baybo_gateway::test_support::TestGateway, project: &str, handle: &str) {
     seed_teammate_with_id(tg, project, handle, handle).await
 }
 
-/// The same, with the id and the handle told apart.
-///
-/// `AgentProfileId::generate` is a ULID and a handle is a short name a
-/// person types, so anything a reader sees that came from the id is a bug —
-/// which a fixture reusing the handle as the id cannot catch.
 async fn seed_teammate_with_id(
     tg: &baybo_gateway::test_support::TestGateway,
     project: &str,
@@ -75,7 +56,6 @@ async fn seed_teammate_with_id(
         .expect("seed agent");
 }
 
-/// One card's timeline, as the client reads it.
 async fn issue_events(router: &axum::Router, project: &str, number: i64) -> Vec<Value> {
     let body = get(
         router,
@@ -128,14 +108,12 @@ async fn a_project_opens_with_a_repo_and_an_empty_board() {
     .await;
     assert_eq!(board["items"].as_array().expect("items").len(), 0);
 
-    // An unknown board is a 404, not an empty board.
     get(
         &router,
         "/v1/projects/01JGHOSTGHOSTGHOSTGHOSTGH/issues",
         StatusCode::NOT_FOUND,
     )
     .await;
-    // A path segment that fails the id grammar never reaches the store.
     get(&router, "/v1/projects/..%2Fetc", StatusCode::BAD_REQUEST).await;
 }
 
@@ -173,7 +151,6 @@ async fn issues_are_numbered_per_project_and_never_cross_boards() {
         "numbering restarts inside each project"
     );
 
-    // Both boards have a #1 and each request only ever reaches its own.
     let from_a = get(
         &router,
         &format!("/v1/projects/{a}/issues/1"),
@@ -189,7 +166,6 @@ async fn issues_are_numbered_per_project_and_never_cross_boards() {
     assert_eq!(from_a["title"], "a's first");
     assert_eq!(from_b["title"], "b's first");
 
-    // b has no #2, even though a does.
     get(
         &router,
         &format!("/v1/projects/{b}/issues/2"),
@@ -206,7 +182,6 @@ async fn a_move_relocates_the_card_and_renumbers_its_column() {
         open_issue(&router, &p, title).await;
     }
 
-    // #3 crosses into Todo; Backlog closes ranks behind it.
     let moved = post(
         &router,
         &format!("/v1/projects/{p}/issues/3/move"),
@@ -235,7 +210,6 @@ async fn a_move_relocates_the_card_and_renumbers_its_column() {
     assert_eq!(find(2)["position"], 0);
     assert_eq!(find(1)["position"], 1);
 
-    // A destination list that omits the moved card would leave it unplaced.
     post(
         &router,
         &format!("/v1/projects/{p}/issues/1/move"),
@@ -243,7 +217,6 @@ async fn a_move_relocates_the_card_and_renumbers_its_column() {
         StatusCode::BAD_REQUEST,
     )
     .await;
-    // An unknown card cannot be moved.
     post(
         &router,
         &format!("/v1/projects/{p}/issues/99/move"),
@@ -274,9 +247,6 @@ async fn a_patch_leaves_unnamed_fields_alone_and_null_clears_the_block() {
     assert_eq!(patched["description"], "filled in");
     assert_eq!(patched["blocked_reason"], "waiting on tmux");
 
-    // An absent key leaves the block; an explicit null clears it. Plain
-    // `Option<Option<_>>` cannot tell those apart, which is why the field
-    // has a custom deserializer.
     let patched = patch(&router, &uri, json!({ "priority": "high" }), StatusCode::OK).await;
     assert_eq!(patched["blocked_reason"], "waiting on tmux");
     assert_eq!(patched["priority"], "high");
@@ -290,12 +260,10 @@ async fn a_patch_leaves_unnamed_fields_alone_and_null_clears_the_block() {
     .await;
     assert!(patched.get("blocked_reason").is_none(), "null unblocked it");
 
-    // Cancel keeps the row; it just stops being live work.
     let patched = patch(&router, &uri, json!({ "cancelled": true }), StatusCode::OK).await;
     assert!(patched["cancelled_at_ms"].is_i64());
     get(&router, &uri, StatusCode::OK).await;
 
-    // A body that sets nothing is a caller mistake, not a silent no-op.
     patch(&router, &uri, json!({}), StatusCode::BAD_REQUEST).await;
     patch(
         &router,
@@ -331,8 +299,6 @@ async fn an_archived_project_leaves_the_listing_and_stops_taking_writes() {
     .await;
     assert_eq!(listed["items"].as_array().expect("items").len(), 1);
 
-    // Reading works; writing does not. That is the whole difference
-    // between archiving and deleting.
     get(&router, &format!("/v1/projects/{p}/issues"), StatusCode::OK).await;
     post(
         &router,
@@ -349,7 +315,6 @@ async fn an_archived_project_leaves_the_listing_and_stops_taking_writes() {
     )
     .await;
 
-    // And it comes back.
     post(
         &router,
         &format!("/v1/projects/{p}/archive"),
@@ -382,7 +347,6 @@ async fn a_card_can_open_straight_into_a_column() {
     assert_eq!(created["priority"], "urgent");
     assert_eq!(created["position"], 0);
 
-    // The default is the backlog, and each column ranks from zero.
     let created = post(
         &router,
         &format!("/v1/projects/{p}/issues"),
@@ -400,7 +364,6 @@ async fn in_progress_is_refused_without_an_assignee() {
     let p = open_project(&router, "staffing").await;
     open_issue(&router, &p, "unclaimed").await;
 
-    // The board must not claim work is under way that nobody is on.
     post(
         &router,
         &format!("/v1/projects/{p}/issues/1/move"),
@@ -415,7 +378,6 @@ async fn in_progress_is_refused_without_an_assignee() {
         StatusCode::BAD_REQUEST,
     )
     .await;
-    // Every other column takes unassigned work.
     post(
         &router,
         &format!("/v1/projects/{p}/issues/1/move"),
@@ -424,7 +386,6 @@ async fn in_progress_is_refused_without_an_assignee() {
     )
     .await;
 
-    // An agent that does not exist is refused before it can be stored.
     patch(
         &router,
         &format!("/v1/projects/{p}/issues/1"),
@@ -434,8 +395,6 @@ async fn in_progress_is_refused_without_an_assignee() {
     .await;
 }
 
-/// The team surface is the board's roster: it opens with a lead, hires get
-/// handles, and nothing on it leaks into `/v1/agents`.
 #[tokio::test]
 async fn a_board_staffs_itself_through_its_own_roster() {
     let (router, _tg) = router().await;
@@ -460,10 +419,8 @@ async fn a_board_staffs_itself_through_its_own_roster() {
     assert_eq!(hired["handle"], "test-engineer");
     assert_eq!(hired["lead"], false);
     assert_eq!(hired["description"], "Writes the tests.");
-    // The operator did this one, so nobody is credited with the hire.
     assert!(hired.get("hired_by").is_none());
 
-    // …and the global roster is untouched: a teammate is not a chat persona.
     let global = get(&router, "/v1/agents", StatusCode::OK).await;
     let ids: Vec<&str> = global["items"]
         .as_array()
@@ -474,7 +431,6 @@ async fn a_board_staffs_itself_through_its_own_roster() {
     assert!(!ids.contains(&lead_id.as_str()), "{ids:?}");
     assert!(!ids.contains(&hired["id"].as_str().expect("id")), "{ids:?}");
 
-    // A name with no handle in it is refused rather than given a ULID.
     post(
         &router,
         &format!("/v1/projects/{p}/agents"),
@@ -482,7 +438,6 @@ async fn a_board_staffs_itself_through_its_own_roster() {
         StatusCode::BAD_REQUEST,
     )
     .await;
-    // And so is a hire with no role — it is what seeds the agent's soul.
     post(
         &router,
         &format!("/v1/projects/{p}/agents"),
@@ -492,8 +447,6 @@ async fn a_board_staffs_itself_through_its_own_roster() {
     .await;
 }
 
-/// Removing an agent keeps its row, because the board still has to say who
-/// did the work it did.
 #[tokio::test]
 async fn a_removed_teammate_leaves_the_roster_but_not_the_record() {
     let (router, _tg) = router().await;
@@ -507,7 +460,6 @@ async fn a_removed_teammate_leaves_the_roster_but_not_the_record() {
     .await;
     let dev = hired["id"].as_str().expect("id").to_owned();
 
-    // The card it worked on keeps naming it after it leaves.
     post(
         &router,
         &format!("/v1/projects/{p}/issues"),
@@ -532,7 +484,6 @@ async fn a_removed_teammate_leaves_the_roster_but_not_the_record() {
     .await;
     assert_eq!(issue["assignee"], dev, "the card still says who was on it");
 
-    // Twice is a refusal, and the lead never leaves at all.
     delete(
         &router,
         &format!("/v1/projects/{p}/agents/{dev}"),
@@ -552,7 +503,6 @@ async fn a_removed_teammate_leaves_the_roster_but_not_the_record() {
 async fn a_started_card_shows_a_run_on_the_board_and_in_its_log() {
     let (router, tg) = router().await;
     let p = open_project(&router, "runs").await;
-    // An agent on this board that can actually host a run.
     seed_teammate(&tg, &p, "dev-1").await;
     post(
         &router,
@@ -562,8 +512,6 @@ async fn a_started_card_shows_a_run_on_the_board_and_in_its_log() {
     )
     .await;
 
-    // The card is working, and the board learns that in one read rather
-    // than a lookup per card.
     let active = get(&router, &format!("/v1/projects/{p}/runs"), StatusCode::OK).await;
     let items = active["items"].as_array().expect("items");
     assert_eq!(items.len(), 1);
@@ -572,7 +520,6 @@ async fn a_started_card_shows_a_run_on_the_board_and_in_its_log() {
     assert_eq!(items[0]["trigger"], "started");
     assert_eq!(items[0]["agent_id"], "dev-1");
 
-    // …and the issue's own log has it too.
     let log = get(
         &router,
         &format!("/v1/projects/{p}/issues/1/runs"),
@@ -581,7 +528,6 @@ async fn a_started_card_shows_a_run_on_the_board_and_in_its_log() {
     .await;
     assert_eq!(log["items"].as_array().expect("items").len(), 1);
 
-    // A card nobody started has an empty log rather than a 404.
     post(
         &router,
         &format!("/v1/projects/{p}/issues"),
@@ -611,8 +557,6 @@ async fn a_run_can_be_stopped_and_started_again() {
     )
     .await;
 
-    // While a run is in flight, a retry is refused rather than putting a
-    // second agent on the same card.
     post(
         &router,
         &format!("/v1/projects/{p}/issues/1/runs/retry"),
@@ -621,8 +565,6 @@ async fn a_run_can_be_stopped_and_started_again() {
     )
     .await;
 
-    // Nothing has claimed the run in this harness (no router), so it is
-    // still queued — cancelling settles it outright.
     post(
         &router,
         &format!("/v1/projects/{p}/issues/1/runs/cancel"),
@@ -637,12 +579,9 @@ async fn a_run_can_be_stopped_and_started_again() {
     )
     .await;
     assert_eq!(log["items"][0]["status"], "cancelled");
-    // …and the board stops calling the card busy.
     let active = get(&router, &format!("/v1/projects/{p}/runs"), StatusCode::OK).await;
     assert_eq!(active["items"].as_array().expect("items").len(), 0);
 
-    // With the slot free, it can run again — as a retry, so the log says
-    // where the second attempt came from.
     let retried = post(
         &router,
         &format!("/v1/projects/{p}/issues/1/runs/retry"),
@@ -653,7 +592,6 @@ async fn a_run_can_be_stopped_and_started_again() {
     assert_eq!(retried["attempt"], 2);
     assert_eq!(retried["trigger"], "retry");
 
-    // Cancelling when nothing is running is a caller mistake, not a no-op.
     post(
         &router,
         &format!("/v1/projects/{p}/issues/1/runs/cancel"),
@@ -669,8 +607,6 @@ async fn a_run_can_be_stopped_and_started_again() {
     )
     .await;
 }
-
-// ── helpers ─────────────────────────────────────────────────────────────
 
 async fn request(
     router: &axum::Router,
@@ -727,8 +663,6 @@ async fn delete(router: &axum::Router, uri: &str, expected: StatusCode) -> Value
     request(router, "DELETE", uri, None, expected).await
 }
 
-/// The activity feed is derived, not stored twice: the same rows the
-/// per-issue timelines render, read across the board and newest first.
 #[tokio::test]
 async fn the_activity_feed_is_the_boards_timelines_read_across_it() {
     let (router, _tg) = router().await;
@@ -744,28 +678,21 @@ async fn the_activity_feed_is_the_boards_timelines_read_across_it() {
         StatusCode::OK,
     )
     .await;
-    // The posted entry comes back in the same shape the feed renders it in,
-    // and the operator's own comment names nobody — so there is no handle
-    // for this response to resolve.
     assert_eq!(posted["actor"], json!({ "kind": "user" }));
     assert_eq!(posted["body"]["text"], "a note on #1");
     open_issue(&router, &b, "somebody else's").await;
 
     let feed = get(&router, &format!("/v1/projects/{a}/feed"), StatusCode::OK).await;
     let items = feed["items"].as_array().expect("items");
-    // Two opens plus one comment. The other board's card is not here.
     assert_eq!(items.len(), 3);
     assert_eq!(items[0]["body"]["kind"], "comment", "newest first");
     assert_eq!(items[0]["number"], 1);
-    // The operator is a tagged actor like any other, not an absent field or
-    // a bare string the client has to interpret.
     assert_eq!(items[0]["actor"], json!({ "kind": "user" }));
     assert!(
         items.iter().all(|e| e["number"] != 3),
         "another board's issue must not appear: {items:?}"
     );
 
-    // Paging backwards from the newest entry excludes it.
     let cursor = items[0]["created_at_ms"].as_i64().expect("ms");
     let older = get(
         &router,
@@ -789,13 +716,8 @@ async fn the_activity_feed_is_the_boards_timelines_read_across_it() {
     .await;
 }
 
-/// A timeline names its agents by `@handle`, never by the ULID on the row —
-/// and keeps naming them after they have left the team, which is the half a
-/// roster held by the client could not do.
 #[tokio::test]
 async fn a_timeline_names_agents_by_handle_even_after_they_leave() {
-    // A real production id: `AgentProfileId::generate` mints a ULID, and the
-    // handle is a separate, shorter name.
     const DEV_ID: &str = "01JC3KQ4Z8AAAAAAAAAAAAAAAA";
 
     let (router, tg) = router().await;
@@ -803,7 +725,6 @@ async fn a_timeline_names_agents_by_handle_even_after_they_leave() {
     seed_teammate_with_id(&tg, &p, DEV_ID, "dev-1").await;
     open_issue(&router, &p, "hand it over").await;
 
-    // One entry that *names* the agent…
     patch(
         &router,
         &format!("/v1/projects/{p}/issues/1"),
@@ -811,7 +732,6 @@ async fn a_timeline_names_agents_by_handle_even_after_they_leave() {
         StatusCode::OK,
     )
     .await;
-    // …and one the agent itself wrote, so the actor is an agent too.
     let project = baybo_model::ProjectId::parse(p.clone()).expect("project id");
     let dev = baybo_model::AgentProfileId::parse(DEV_ID).expect("agent id");
     tg.deps
@@ -850,9 +770,6 @@ async fn a_timeline_names_agents_by_handle_even_after_they_leave() {
     assert_eq!(comment["actor"]["handle"], "dev-1");
     assert_eq!(comment["actor"]["id"], DEV_ID);
 
-    // The agent leaves. Its past work still names it — the roster the client
-    // holds no longer has it at all, which is why the handle is resolved
-    // here and not there.
     tg.deps
         .project_manager
         .remove_from_team(&project, &dev)
@@ -876,10 +793,6 @@ async fn a_timeline_names_agents_by_handle_even_after_they_leave() {
     assert_eq!(comment["actor"]["handle"], "dev-1");
 }
 
-/// A handle is unique only inside its board, so an id belonging to another
-/// board cannot be rendered under this one's naming: `@dev-1` there and
-/// `@dev-1` here are two different agents, and lending the name across
-/// would say a teammate did work they have never seen.
 #[tokio::test]
 async fn a_timeline_will_not_name_an_agent_from_another_board() {
     const THEIR_ID: &str = "01JC3KQ4Z8BBBBBBBBBBBBBBBB";
@@ -887,8 +800,6 @@ async fn a_timeline_will_not_name_an_agent_from_another_board() {
     let (router, tg) = router().await;
     let ours = open_project(&router, "ours").await;
     let theirs = open_project(&router, "theirs").await;
-    // Same handle on both boards — which is legal, and exactly what makes a
-    // cross-board resolution a lie rather than a curiosity.
     seed_teammate(&tg, &ours, "dev-1").await;
     seed_teammate_with_id(&tg, &theirs, THEIR_ID, "dev-1").await;
     open_issue(&router, &ours, "our card").await;
@@ -919,9 +830,6 @@ async fn a_timeline_will_not_name_an_agent_from_another_board() {
     );
 }
 
-/// The budget gate acts with nobody asking, so the wire has to be able to
-/// say so: "you held the run — $5.00 of the $5.00 daily budget is spent"
-/// accuses the reader of a decision the board made on its own.
 #[tokio::test]
 async fn the_boards_own_actions_are_neither_the_operators_nor_an_agents() {
     let (router, tg) = router().await;
@@ -949,26 +857,13 @@ async fn the_boards_own_actions_are_neither_the_operators_nor_an_agents() {
     assert_eq!(held["actor"], json!({ "kind": "system" }));
 }
 
-/// The approval queue is keyed by call id alone, so the endpoint's job is
-/// to refuse a request that names a card it has no business answering for.
-///
-/// Driven through the real `TimelineApprovalGate`, so the `call_id` the
-/// card's button posts is the one the queue is actually keyed by — a
-/// fixture that writes the timeline entry by hand proves the endpoint's
-/// arithmetic and nothing about that coupling.
 #[tokio::test]
 async fn answering_an_approval_has_to_name_a_card_on_this_board() {
     let (router, tg) = router().await;
-    // The harness installs no channels, so the route would otherwise 404 at
-    // the channel lookup — which looks exactly like the card check this
-    // test exists to exercise. Installed first, so every 404 below is the
-    // refusal it claims to be.
     install_owner_channel(&tg);
     let p = open_project(&router, "approving").await;
     open_issue(&router, &p, "needs a hand").await;
 
-    // An unknown board and an unknown card are both 404s, and neither
-    // reaches the queue.
     post(
         &router,
         "/v1/projects/01JGHOSTGHOSTGHOSTGHOSTGH/issues/1/approvals/c1",
@@ -983,8 +878,6 @@ async fn answering_an_approval_has_to_name_a_card_on_this_board() {
         StatusCode::NOT_FOUND,
     )
     .await;
-    // A real card with no prompt waiting on that call is also a 404 —
-    // "answered" and "there was nothing to answer" must not look alike.
     post(
         &router,
         &format!("/v1/projects/{p}/issues/1/approvals/c1"),
@@ -993,9 +886,6 @@ async fn answering_an_approval_has_to_name_a_card_on_this_board() {
     )
     .await;
 
-    // Now a real prompt: raised inside #1's own session, through the gate
-    // production installs, so both the queue entry and the timeline entry
-    // are written by the code that writes them for real.
     open_issue(&router, &p, "a card that did not ask").await;
     let other = open_project(&router, "somebody else's").await;
     open_issue(&router, &other, "their card").await;
@@ -1007,8 +897,6 @@ async fn answering_an_approval_has_to_name_a_card_on_this_board() {
         .get(&baybo_model::ChannelType::owner())
         .expect("owner channel");
 
-    // The card offers a button, and the call id on it is the queue's own —
-    // that pair is what the operator actually posts.
     let asked = issue_events(&router, &p, 1)
         .await
         .into_iter()
@@ -1020,7 +908,6 @@ async fn answering_an_approval_has_to_name_a_card_on_this_board() {
         .expect("call id")
         .to_owned();
 
-    // A card that exists on another board must not be able to answer it…
     post(
         &router,
         &format!("/v1/projects/{other}/issues/1/approvals/{call_id}"),
@@ -1033,8 +920,6 @@ async fn answering_an_approval_has_to_name_a_card_on_this_board() {
         1,
         "and the prompt is still waiting"
     );
-    // …nor a real card on the right board that never asked. Existing is not
-    // the same as having raised it.
     post(
         &router,
         &format!("/v1/projects/{p}/issues/2/approvals/{call_id}"),
@@ -1048,7 +933,6 @@ async fn answering_an_approval_has_to_name_a_card_on_this_board() {
         "still waiting"
     );
 
-    // …while the card that raised it answers it, and the call unblocks.
     post(
         &router,
         &format!("/v1/projects/{p}/issues/1/approvals/{call_id}"),
@@ -1062,9 +946,6 @@ async fn answering_an_approval_has_to_name_a_card_on_this_board() {
     );
 }
 
-/// Install the owner channel and put the board's approval gate over it, the
-/// way `runtime.rs` does at boot — a prompt raised in an issue's session is
-/// only ever on a card because that wrapper put it there.
 fn install_owner_channel(tg: &baybo_gateway::test_support::TestGateway) {
     baybo_gateway::channel::boot::install_channels(
         &tg.deps.channel_registry,
@@ -1084,9 +965,6 @@ fn install_owner_channel(tg: &baybo_gateway::test_support::TestGateway) {
     );
 }
 
-/// The session an issue's run works in: bound to the card by its trigger,
-/// which is the only thing that tells the gate — and the endpoint — which
-/// card a prompt belongs to.
 async fn issue_session(
     tg: &baybo_gateway::test_support::TestGateway,
     project: &str,
@@ -1121,9 +999,6 @@ async fn issue_session(
         .id
 }
 
-/// Park a real approval prompt for `session`, the way a blocked tool call
-/// parks one: through the gate the tool path resolves, not the channel's
-/// own. Returns the call still waiting on an answer.
 async fn park_approval(
     tg: &baybo_gateway::test_support::TestGateway,
     session: &baybo_model::SessionId,
@@ -1137,9 +1012,6 @@ async fn park_approval(
     park_through(tg, gate, session, call_id).await
 }
 
-/// The same, through whichever gate the caller wants to exercise — the
-/// channel's own one skips the board wrapper, which is how a test reaches
-/// the state a swallowed timeline append leaves behind.
 async fn park_through(
     tg: &baybo_gateway::test_support::TestGateway,
     gate: std::sync::Arc<dyn baybo_tools::ApprovalGate>,
@@ -1178,14 +1050,6 @@ async fn park_through(
     blocked
 }
 
-/// The card that raised a prompt can answer it even if the timeline entry
-/// for it never landed.
-///
-/// `record_event` swallows a failed append by its own doc, and the answer
-/// is what unblocks the run — so the endpoint asks the session the prompt
-/// was raised in, which is the same thing the gate asked before writing
-/// anything. A check derived from the timeline instead would 404 here and
-/// leave the tool call parked until the gate timed it out.
 #[tokio::test]
 async fn answering_a_prompt_does_not_depend_on_its_timeline_entry() {
     let (router, tg) = router().await;
@@ -1194,8 +1058,6 @@ async fn answering_a_prompt_does_not_depend_on_its_timeline_entry() {
     open_issue(&router, &p, "still blocked").await;
     let session = issue_session(&tg, &p, 1).await;
 
-    // Through the channel's own gate, so nothing is written to the card:
-    // exactly the state a swallowed append leaves behind.
     let channel = tg
         .deps
         .channel_registry
@@ -1229,8 +1091,6 @@ async fn answering_a_prompt_does_not_depend_on_its_timeline_entry() {
     );
 }
 
-/// A prompt raised by an ordinary chat session belongs to no card, so no
-/// card can answer it. The board API is not a second door onto the queue.
 #[tokio::test]
 async fn a_prompt_from_a_chat_session_cannot_be_answered_from_a_card() {
     let (router, tg) = router().await;
@@ -1238,8 +1098,6 @@ async fn a_prompt_from_a_chat_session_cannot_be_answered_from_a_card() {
     let p = open_project(&router, "not a door").await;
     open_issue(&router, &p, "unrelated").await;
 
-    // A session the gate finds no card for: it passes straight through and
-    // writes to no timeline.
     let session = baybo_model::SessionId::new();
     let _blocked = park_approval(&tg, &session, "c-chat").await;
     assert!(
@@ -1269,8 +1127,6 @@ async fn a_prompt_from_a_chat_session_cannot_be_answered_from_a_card() {
     );
 }
 
-/// The lead's planning conversations: a board-scoped session that runs as
-/// the lead and stays off the chat surface.
 #[tokio::test]
 async fn a_board_opens_conversations_with_its_lead() {
     let (router, _tg) = router().await;
@@ -1295,8 +1151,6 @@ async fn a_board_opens_conversations_with_its_lead() {
         .as_str()
         .expect("session id")
         .to_owned();
-    // The prefix is how a reader tells a board's thread from a chat at a
-    // glance in logs and the trace viewer.
     assert!(sid.starts_with("board-"), "{sid}");
 
     let listed = get(
@@ -1308,8 +1162,6 @@ async fn a_board_opens_conversations_with_its_lead() {
     assert_eq!(listed["items"].as_array().expect("items").len(), 1);
     assert_eq!(listed["items"][0]["session_id"], sid);
 
-    // A second conversation is a second thread, not a replacement — the
-    // panel keeps history.
     post(
         &router,
         &format!("/v1/projects/{p}/lead/conversations"),
@@ -1325,8 +1177,6 @@ async fn a_board_opens_conversations_with_its_lead() {
     .await;
     assert_eq!(listed["items"].as_array().expect("items").len(), 2);
 
-    // …and none of them is in the chat list. A board's conversations live
-    // on the board.
     let chats = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
     let ids: Vec<&str> = chats["items"]
         .as_array()
@@ -1336,7 +1186,6 @@ async fn a_board_opens_conversations_with_its_lead() {
         .collect();
     assert!(!ids.contains(&sid.as_str()), "{ids:?}");
 
-    // Another board's conversations are its own.
     let other = open_project(&router, "elsewhere").await;
     let theirs = get(
         &router,
@@ -1354,7 +1203,6 @@ async fn a_board_opens_conversations_with_its_lead() {
     .await;
 }
 
-/// An archived board is read-only, so it does not open new conversations.
 #[tokio::test]
 async fn an_archived_board_opens_no_new_conversation() {
     let (router, _tg) = router().await;

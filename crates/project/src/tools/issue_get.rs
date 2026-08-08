@@ -12,11 +12,6 @@ use crate::ProjectManager;
 
 pub const ISSUE_GET_TOOL_NAME: &str = "IssueGet";
 
-/// How many timeline entries to return, newest last.
-///
-/// A cap rather than the whole history: a long-running card accumulates a
-/// run-started/run-settled pair per attempt, and a tool result that grows
-/// without bound is a tool result that eventually costs more than the work.
 const MAX_TIMELINE_ENTRIES: usize = 40;
 
 pub(super) struct IssueGetTool {
@@ -88,12 +83,6 @@ impl Tool for IssueGetTool {
 
         let skipped = events.len().saturating_sub(MAX_TIMELINE_ENTRIES);
         let shown = &events[skipped..];
-        // A timeline is permanent history, so it names agents the live
-        // roster no longer carries — and the roster is what `team` is.
-        // Nothing unassigns a departed teammate's cards either, so the
-        // assignee is asked for too. Whoever the card names but the roster
-        // does not is resolved one by one, so a teammate that has left
-        // still reads as `@handle` instead of a ULID nobody recognises.
         let mut known = team;
         let mut absent: Vec<AgentProfileId> = Vec::new();
         for id in issue
@@ -132,9 +121,6 @@ impl Tool for IssueGetTool {
     }
 }
 
-/// Every agent one timeline entry names — its actor, plus both sides of a
-/// reassignment, which names two more agents than its actor does and
-/// renders both.
 fn named_agents(entry: &IssueEventRow) -> Vec<AgentProfileId> {
     let mut ids = Vec::new();
     if let baybo_store::project::IssueActor::Agent(id) = &entry.actor {
@@ -146,16 +132,6 @@ fn named_agents(entry: &IssueEventRow) -> Vec<AgentProfileId> {
     ids
 }
 
-/// One timeline entry as a sentence.
-///
-/// Prose rather than the tagged JSON the web client renders: the reader
-/// here is a model assembling context, and "moved from todo to in_progress"
-/// costs fewer tokens than the object it came from and needs no schema to
-/// interpret.
-///
-/// `known` carries the agents the entry may name. Agents address each other
-/// by handle everywhere else on the board, so a sentence that reads
-/// "assigned it to 01JC3KQ4…" is one the next run cannot act on.
 fn narrate(body: &IssueEventBody, known: &[baybo_store::AgentProfileRow]) -> String {
     match body {
         IssueEventBody::Comment { text } => text.clone(),

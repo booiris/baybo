@@ -207,11 +207,6 @@ pub enum ToolTriggerScope {
     /// and `ProjectAgentCreate`: outside a board there is no project for
     /// them to name, so offering them would be offering an action that can
     /// only fail.
-    ///
-    /// Keyed on `project()` rather than `is_project_session()` because the
-    /// two answer different questions: this one is "is there a board to act
-    /// on", and the other is "should this session stay off the chat
-    /// surface". They coincide today and need not later.
     ProjectBoard,
 }
 
@@ -388,21 +383,12 @@ pub struct ToolContext {
     /// it, so an unqualified `git status` describes the project the card is
     /// about rather than baybo's own work directory. `None` for every
     /// ordinary session, which keeps the existing default.
-    ///
-    /// Only the worktree appears here. The project *repository* also has to
-    /// be writable for a commit to work (see `baybo_project::worktree`), but
-    /// that is a sandbox concern and never a cwd, so it stops at the
-    /// executor.
     pub checkout_root: Option<PathBuf>,
     /// What this session's agent is called on the board its card belongs
     /// to: the `@handle` a person types into a comment, not the ULID that
     /// names its persona directory. Populated only alongside
     /// [`Self::checkout_root`], because its one consumer is the commit
     /// identity an issue run's shell carries.
-    ///
-    /// `None` for an agent with no board (a chat persona), and for one
-    /// whose profile row could not be read — a commit is then authored by
-    /// the workspace fallback rather than by a name no reader can resolve.
     pub agent_handle: Option<AgentHandle>,
 }
 

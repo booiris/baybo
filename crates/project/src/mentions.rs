@@ -1,24 +1,8 @@
 //! Who a comment is addressed to.
-//!
-//! Pure, like the other rule modules here: the manager and the agent-facing
-//! comment tool both reach [`assigns_to`], so a mention means one thing on
-//! the board however it arrives.
-//!
-//! The web composer cannot reach it — it says what sending will do while
-//! the sentence is still being typed. `mentionHint` and `mentionQuery` in
-//! `app/web/src/pages/projects/mentionModel.ts` re-implement this grammar
-//! and this rule in TypeScript, held to it by nothing but the two test
-//! suites, so a change here is a change there in the same commit.
 
 use baybo_model::AgentHandle;
 
 /// Every `@handle` in a comment, in the order written, deduplicated.
-///
-/// A handle must be preceded by whitespace or start the text, so an email
-/// address or a path fragment is not a mention. The grammar is
-/// [`AgentHandle`]'s, so the scan stops at the first character a handle
-/// cannot contain — which is what lets `@dev-1's` and `@dev-1,` both name
-/// `dev-1`.
 pub(crate) fn mentions(text: &str) -> Vec<AgentHandle> {
     let mut found: Vec<AgentHandle> = Vec::new();
     let bytes = text.as_bytes();
@@ -47,16 +31,6 @@ pub(crate) fn mentions(text: &str) -> Vec<AgentHandle> {
 
 /// The handle a comment is addressed to, if it should change who is on the
 /// card.
-///
-/// **Only when nobody is assigned.** An @mention on somebody else's card is
-/// how one agent asks another a question; treating that as a reassignment
-/// would let a passing remark take work away from whoever is doing it. The
-/// spec's rule is for the unassigned case, where a mention is the operator
-/// saying "you take this".
-///
-/// The *first* mention wins: "@dev-1 and @qa should look" names one owner
-/// and asks a second to read, and picking the last would silently make the
-/// aside the assignee.
 pub(crate) fn assigns_to(assignee_is_set: bool, text: &str) -> Option<AgentHandle> {
     if assignee_is_set {
         return None;
@@ -84,7 +58,6 @@ mod tests {
 
     #[test]
     fn punctuation_ends_a_handle_without_eating_it() {
-        // The grammar stops the scan, so possessives and commas work.
         assert_eq!(names("@dev-1's branch"), vec!["dev-1"]);
         assert_eq!(names("@dev-1, @qa: look"), vec!["dev-1", "qa"]);
         assert_eq!(names("ask @dev-."), vec!["dev"]);
@@ -92,11 +65,8 @@ mod tests {
 
     #[test]
     fn something_that_is_not_a_mention_is_not_one() {
-        // An address and a path fragment both contain an `@` with a handle
-        // after it, and neither is addressed to anybody.
         assert!(names("mail me at me@dev-1").is_empty());
         assert!(names("see docs/x@lead").is_empty());
-        // …and an empty or ungrammatical handle names nobody.
         assert!(names("@ dev").is_empty());
         assert!(names("@Dev").is_empty());
         assert!(names("@1st").is_empty());
@@ -109,9 +79,6 @@ mod tests {
 
     #[test]
     fn a_mention_assigns_only_when_nobody_is_on_the_card() {
-        // On a card somebody is working, an @mention is one agent asking
-        // another a question. Treating it as a reassignment would let a
-        // passing remark take work away from whoever is doing it.
         assert!(assigns_to(true, "@dev-1 what do you think?").is_none());
         assert_eq!(
             assigns_to(false, "@dev-1 what do you think?").map(|h| h.as_str().to_owned()),
@@ -122,8 +89,6 @@ mod tests {
 
     #[test]
     fn the_first_mention_is_the_owner() {
-        // "@dev-1 and @qa should look" names one owner and asks a second to
-        // read; taking the last would silently make the aside the assignee.
         assert_eq!(
             assigns_to(false, "@dev-1 and @qa should look").map(|h| h.as_str().to_owned()),
             Some("dev-1".to_owned())

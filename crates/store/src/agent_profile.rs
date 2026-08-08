@@ -67,15 +67,8 @@ pub struct AgentProfileUpdate {
 /// the gateway sorts by the derived name after reading it.
 #[async_trait]
 pub trait AgentProfileStore: Send + Sync {
-    /// Every **global** profile, builtin first then by id.
-    ///
-    /// Project agents are excluded by the statement, not by the caller: this
-    /// list feeds the Agents page, the session-binding picker and the
-    /// subagent roster, none of which should offer somebody else's teammate.
-    /// Use [`Self::list_team`] to read a board's roster.
     async fn list(&self) -> Result<Vec<AgentProfileRow>>;
 
-    /// One project's live team, by handle.
     async fn list_team(&self, project: &ProjectId) -> Result<Vec<AgentProfileRow>>;
 
     /// Fetch a single profile, or `None` if it doesn't exist.
@@ -117,14 +110,7 @@ pub trait AgentProfileStore: Send + Sync {
     /// Returns `Ok(false)` if no row matched.
     async fn set_llm(&self, id: &AgentProfileId, llm: Option<&LlmEntryName>) -> Result<bool>;
 
-    /// Plain row delete, guarded `WHERE builtin = 0 AND project_id IS NULL`.
-    /// Returns `Ok(false)` if no row matched (missing id, the builtin, or a
-    /// team member — those leave through [`Self::remove_from_team`] and
-    /// keep their row).
     async fn delete(&self, id: &AgentProfileId) -> Result<bool>;
 
-    /// Tombstone a team member: stamp `deleted_at` so the roster stops
-    /// offering it while every issue, run and timeline entry that names it
-    /// still resolves. Returns `Ok(false)` if no live team member matched.
     async fn remove_from_team(&self, id: &AgentProfileId) -> Result<bool>;
 }

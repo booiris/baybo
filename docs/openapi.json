@@ -4379,7 +4379,7 @@
                       "type": "array",
                       "items": {
                         "type": "object",
-                        "description": "One member of a project's team.\n\nDeliberately carries no \"is working\" flag: the board already subscribes\nto run frames, and a second copy of that state on a roster read is a\ncopy that can disagree with the shimmer on the card.",
+                        "description": "One member of a project's team.",
                         "required": [
                           "id",
                           "handle",
@@ -7080,7 +7080,7 @@
             ]
           }
         ],
-        "description": "Who did the thing an entry records.\n\nTagged, and three kinds, so the client switches instead of parsing. The\npair it replaces — a string plus an `is_agent` flag — was two fields\nthat could disagree, and it had no way at all to say the board acted on\nits own."
+        "description": "Who did the thing an entry records."
       },
       "AgentFrameworkDto": {
         "type": "string",
@@ -7167,7 +7167,7 @@
       },
       "AgentRefDto": {
         "type": "object",
-        "description": "An agent as a timeline entry names it.\n\nThe handle is resolved server-side rather than by the client, for the\nsame reason `HiredByDto`'s is: a timeline is history, so it names agents\nthat have since left the team — and those are precisely the rows the\nroster the client holds has filtered out. The id rides along because it\nis what opens the agent's profile.",
+        "description": "An agent as a timeline entry names it.",
         "required": [
           "id",
           "handle"
@@ -8711,7 +8711,7 @@
       },
       "HiredByDto": {
         "type": "object",
-        "description": "Who brought an agent onto the board. Absent means the operator did.\n\nThe handle rides along because that is what gets rendered — resolved\nhere rather than by the client, since a hire made by an agent that has\nsince been removed is not in the team list the client holds.",
+        "description": "Who brought an agent onto the board. Absent means the operator did.",
         "required": [
           "id",
           "handle"
@@ -9168,7 +9168,7 @@
             }
           }
         ],
-        "description": "What one timeline entry says.\n\nA mirror of the store's `IssueEventBody` rather than the type itself,\nlike every other enum on this surface. Tagged on `kind`, so the client\ngets a discriminated union it can exhaustively switch on — the whole\nreason this is not a free-form payload."
+        "description": "What one timeline entry says."
       },
       "IssueEventDto": {
         "type": "object",
@@ -10384,7 +10384,7 @@
       },
       "TeamMemberDto": {
         "type": "object",
-        "description": "One member of a project's team.\n\nDeliberately carries no \"is working\" flag: the board already subscribes\nto run frames, and a second copy of that state on a roster read is a\ncopy that can disagree with the shimmer on the card.",
+        "description": "One member of a project's team.",
         "required": [
           "id",
           "handle",

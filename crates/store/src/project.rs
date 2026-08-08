@@ -1,14 +1,4 @@
 //! Persistence interface for kanban projects and the issues on their board.
-//!
-//! A **project** is the container: a workdir, a team, and one board. An
-//! **issue** is the unit of work on that board. Issues are numbered
-//! per-project — `#3` means one thing inside one project — and the number
-//! is assigned inside the insert transaction, never by the caller.
-//!
-//! Neither entity is ever hard-deleted from a production path: a project
-//! archives (`archived_at`, the `cron_jobs`/`deck_cards` pattern) and an
-//! issue cancels (`cancelled_at`). Issues carry conversation history, so
-//! the session-data-is-core rule in `CLAUDE.md` covers them too.
 
 use async_trait::async_trait;
 use baybo_model::{AgentProfileId, IssueEventId, IssueId, IssueRunId, ProjectId, SessionId};
@@ -125,12 +115,6 @@ pub struct ProjectRow {
     /// limit nobody chose is a board whose silence nobody can explain.
     pub daily_budget: Option<baybo_model::MicroUsd>,
     /// When the operator last looked at this board. `None` means never.
-    ///
-    /// The only read cursor in the feature. Everything else the badge
-    /// counts is state a person can act on and clears when they do; these
-    /// two — an agent asking a question, a card arriving in Review — leave
-    /// no trace at all when read, so without a cursor they could only be
-    /// approximated or dropped.
     pub read_at: Option<DateTime<Utc>>,
     /// Soft archive. There is no hard delete in any production path.
     pub archived_at: Option<DateTime<Utc>>,
@@ -240,38 +224,18 @@ pub struct NewIssue {
     pub parent_issue_id: Option<IssueId>,
     pub stage: i64,
     /// What opened this card, for a caller that must not open it twice.
-    ///
-    /// A partial unique index makes one **live** card per key per board
-    /// structural, so a daily job cannot lay down 365 copies of the same
-    /// card — and the key is released when the card is finished or
-    /// cancelled, so next month's occurrence legitimately gets a new one.
-    /// `None` for anything a person or an ordinary run created.
     pub source_key: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
 /// The storage spelling of the operator, and of the board acting on its
 /// own.
-///
-/// Named rather than written at each end: [`IssueActor::to_storage`] and
-/// [`IssueActor::parse`] are the two halves of a fail-closed round trip — an
-/// actor string `parse` does not recognise fails the whole timeline read —
-/// so the two ends must spell it identically or a written row becomes
-/// unreadable. Nothing outside this crate touches the column's text:
-/// readers get [`IssueActor`] back and match on that.
 pub(crate) const ACTOR_USER: &str = "user";
 
 /// See [`ACTOR_USER`].
 pub(crate) const ACTOR_SYSTEM: &str = "system";
 
 /// Who did the thing a timeline entry records.
-///
-/// Three kinds and no more: the operator working the board, one of the
-/// project's agents, and the board itself. The third is not a courtesy —
-/// the budget gate holds and releases runs with nobody asking, and
-/// attributing that to the operator makes the card accuse the person
-/// reading it of something they did not do. A string here would let a
-/// caller invent a fourth.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IssueActor {
     User,
@@ -304,11 +268,6 @@ impl IssueActor {
 }
 
 /// What one timeline entry says.
-///
-/// A tagged enum rather than a `kind` string beside a free-form payload:
-/// every reader — the detail page, the activity feed, the brief assembled
-/// for the next run — has to agree on what a "run settled" entry carries,
-/// and the place to write that down once is here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum IssueEventBody {
@@ -356,11 +315,6 @@ pub enum IssueEventBody {
     /// A run asked the operator to approve a tool call. Recorded before
     /// the prompt is answered, so the card shows work that is *waiting on
     /// a person* rather than work that has mysteriously stopped.
-    ///
-    /// Pending-ness is derived: a request with no matching
-    /// [`IssueEventBody::ApprovalResolved`] on the same `call_id` is still
-    /// open. Storing a `pending` flag would be a second copy of a fact the
-    /// timeline already carries, and the two would eventually disagree.
     ApprovalRequested {
         call_id: String,
         /// The tool whose call is blocked.
@@ -378,14 +332,6 @@ pub enum IssueEventBody {
     },
     /// Every non-cancelled child in one of this issue's stages reached
     /// Done.
-    ///
-    /// A statement about the stage, not about a wake. Stages are planned up
-    /// front, so a later one routinely empties while the board is still on
-    /// an earlier one; that is worth telling the operator and is not a
-    /// barrier, so the assignee is woken only when nothing earlier is still
-    /// open. Widening this to mean "and your assignee was woken" would make
-    /// the out-of-order case unsayable, and the operator would simply never
-    /// hear that the stage closed.
     StageCompleted {
         stage: i64,
     },
@@ -455,65 +401,27 @@ pub struct NewIssueEvent {
 
 #[async_trait]
 pub trait ProjectStore: Send + Sync {
-    /// Every project, newest activity first. `include_archived` folds the
-    /// recycle bin back in.
     async fn list_projects(&self, include_archived: bool) -> Result<Vec<ProjectRow>>;
 
-    /// Fetch one project, or `None` if it doesn't exist.
     async fn get_project(&self, id: &ProjectId) -> Result<Option<ProjectRow>>;
 
-    /// Insert a project row verbatim. The workdir it names must already
-    /// exist — materialising it is the domain layer's job, and it happens
-    /// first so a crash leaves an unreferenced directory rather than a row
-    /// pointing at nothing.
     async fn create_project(&self, row: &ProjectRow) -> Result<()>;
 
-    /// Rename / re-describe. `Ok(false)` if no row matched.
     async fn update_project(&self, id: &ProjectId, update: &ProjectUpdate) -> Result<bool>;
 
-    /// This project's LLM spend since `since`, summed across every session
-    /// its runs have used.
-    ///
-    /// The join lives on this port rather than on the cost store because
-    /// "what has this board spent" is a project question — the cost store
-    /// knows sessions, and only `issue_runs` knows which sessions belong to
-    /// which board. Both tables are in one database, so it is one statement
-    /// rather than a fan-out.
     async fn spend_since(
         &self,
         project: &ProjectId,
         since: DateTime<Utc>,
     ) -> Result<baybo_model::MicroUsd>;
 
-    /// Per-board counts of work that is stuck on the operator: held runs
-    /// and live cards whose newest run failed.
-    ///
-    /// Approvals are **not** here — they live in the channel's in-memory
-    /// queue, which is authoritative and self-expiring, so the caller adds
-    /// them. Archived boards are excluded: they are read-only, so nothing
-    /// on them is waiting for anybody.
-    ///
-    /// One call for every board rather than one per board: this feeds a
-    /// rail badge that repaints on every board change, and a fan-out would
-    /// make that cost grow with the number of projects.
     async fn attention(&self) -> Result<Vec<(ProjectId, AttentionCounts)>>;
 
-    /// Which board each of these sessions belongs to, for the sessions that
-    /// are an issue run's. Sessions that are not are simply absent.
     async fn projects_for_sessions(
         &self,
         sessions: &[SessionId],
     ) -> Result<Vec<(SessionId, ProjectId)>>;
 
-    /// One project's timeline, newest first — the activity feed.
-    ///
-    /// Derived from `issue_events` rather than stored a second time: the
-    /// feed is the same rows the per-issue timelines are, read across the
-    /// board instead of down one card. Two copies would be two things that
-    /// can disagree about what happened (the cron-groups lesson).
-    ///
-    /// `before` pages backwards from a µs cursor; `None` starts at the
-    /// newest.
     async fn project_feed(
         &self,
         project: &ProjectId,
@@ -521,60 +429,30 @@ pub trait ProjectStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<IssueEventRow>>;
 
-    /// The live card opened under `source_key` on this board, if there is
-    /// one. Mirrors the partial unique index exactly, so a caller that
-    /// checks and a caller that races see the same answer.
     async fn live_issue_by_source_key(
         &self,
         project: &ProjectId,
         source_key: &str,
     ) -> Result<Option<IssueRow>>;
 
-    /// One issue's direct children, by stage then position.
     async fn list_children(&self, parent: &IssueId) -> Result<Vec<IssueRow>>;
 
-    /// Move a just-recorded run to `Held`: the board is over budget, so it
-    /// was recorded but must not start. Guarded on `Queued`, so a run the
-    /// router already claimed is never pulled back out from under it.
-    /// `Ok(false)` if it had already moved on.
     async fn hold_run(&self, id: &IssueRunId) -> Result<bool>;
 
-    /// One project's held runs, oldest first — the work waiting on budget.
     async fn held_runs(&self, project: &ProjectId) -> Result<Vec<IssueRunRow>>;
 
-    /// Move a held run back to `Queued` so it can be dispatched. Guarded on
-    /// `Held`, so two concurrent releases start it once.
     async fn release_run(&self, id: &IssueRunId) -> Result<bool>;
 
-    /// Stamp when the operator looked at this board. `Ok(false)` if no row
-    /// matched.
     async fn mark_project_read(&self, id: &ProjectId, at: DateTime<Utc>) -> Result<bool>;
 
-    /// Stamp or clear `archived_at`, when that is a change. Conditional on
-    /// the state it is asked to leave, so `Ok(true)` is the *edge* — this
-    /// call is what put the board away or brought it back — and a caller
-    /// can hang the work a restore owes on it.
-    ///
-    /// `Ok(false)` is "nothing moved": the board was already in that state,
-    /// or there is no such board. Telling those two apart costs a read of
-    /// the row, which the caller that cares does anyway.
     async fn set_project_archived(&self, id: &ProjectId, archived: bool) -> Result<bool>;
 
-    /// Every issue on one board, ordered by status then position — the
-    /// order the columns render in, so the caller needs no second sort.
     async fn list_issues(&self, project: &ProjectId) -> Result<Vec<IssueRow>>;
 
-    /// Fetch one issue by its human address. Scoped by construction: there
-    /// is no way to name an issue without naming its project.
     async fn get_issue(&self, project: &ProjectId, number: i64) -> Result<Option<IssueRow>>;
 
-    /// Insert an issue, assigning its per-project `number` and its tail
-    /// `position` **inside** the transaction. A caller-computed number is
-    /// a race: two creates would read the same maximum and the second
-    /// would trip the uniqueness constraint.
     async fn create_issue(&self, new: &NewIssue) -> Result<IssueRow>;
 
-    /// Apply a sparse patch. `Ok(false)` if no row matched.
     async fn update_issue(
         &self,
         project: &ProjectId,
@@ -582,10 +460,6 @@ pub trait ProjectStore: Send + Sync {
         update: &IssueUpdate,
     ) -> Result<bool>;
 
-    /// Move one issue into `status` and renumber that column to
-    /// `ordered_numbers`, in one transaction so a partial move never
-    /// lands. Ids outside the project are ignored rather than adopted.
-    /// `Ok(false)` if the moved issue doesn't exist.
     async fn move_issue(
         &self,
         project: &ProjectId,
@@ -594,62 +468,28 @@ pub trait ProjectStore: Send + Sync {
         ordered_numbers: &[i64],
     ) -> Result<bool>;
 
-    /// Record a run before anything is dispatched — the ledger's whole
-    /// point. The attempt number is assigned inside the insert, and the
-    /// per-issue live index rejects a second unfinished run with
-    /// [`StorageError::Conflict`], which callers read as "already working
-    /// on it" rather than a failure.
     async fn enqueue_run(&self, new: &NewIssueRun) -> Result<IssueRunRow>;
 
-    /// Append to an issue's timeline. Returns the stored row so a caller
-    /// can announce exactly what a reader will fetch.
     async fn append_event(&self, new: &NewIssueEvent) -> Result<IssueEventRow>;
 
-    /// One issue's timeline, oldest first — reading order, and the order
-    /// the next run's brief wants its delta in.
     async fn list_events(&self, issue: &IssueId) -> Result<Vec<IssueEventRow>>;
 
-    /// The timeline entries added to an issue after `since`, oldest first.
-    /// This is the "what happened while you were away" a follow-up run's
-    /// brief is built from, rather than replaying the whole history.
     async fn events_since(
         &self,
         issue: &IssueId,
         since: DateTime<Utc>,
     ) -> Result<Vec<IssueEventRow>>;
 
-    /// Record the branch an issue's work landed on. Called once its
-    /// worktree has a commit; `Ok(false)` if no row matched.
     async fn set_issue_branch(&self, id: &IssueId, branch: &str) -> Result<bool>;
 
-    /// Every run of one issue, newest first — the execution log.
     async fn list_runs(&self, issue: &IssueId) -> Result<Vec<IssueRunRow>>;
 
-    /// The unfinished runs of one board. One query rather than a lookup per
-    /// card: this is what tells the board which cards are working.
     async fn active_runs(&self, project: &ProjectId) -> Result<Vec<IssueRunRow>>;
 
     async fn get_run(&self, id: &IssueRunId) -> Result<Option<IssueRunRow>>;
 
-    /// Claim a queued run: stamp it `running` with the session it will
-    /// execute in. `Ok(false)` if it is no longer queued — which is how two
-    /// dispatches of one row resolve into one *execution*. Only the
-    /// execution: whatever each dispatcher did before it got here has
-    /// already happened, the checkout included.
     async fn claim_run(&self, id: &IssueRunId, session: &SessionId) -> Result<bool>;
 
-    /// Settle a run. Terminal and idempotent: a replay of the same outcome
-    /// is a no-op, so a re-driven run can never double-settle.
-    /// `Ok(false)` if it was already settled.
-    ///
-    /// The gate is `settled_at IS NULL` and nothing else. It does not ask
-    /// *whose* row this is, so it will settle a run another executor has
-    /// claimed and is working — freeing the issue's dedupe slot under a live
-    /// agent. A caller that might be settling somebody else's row has to
-    /// establish that itself (`docs/modules/project.md`, "One dispatch per
-    /// row"); `status` is what says whether anyone has it, because a
-    /// `queued` row keeps the session of the run it was rolled forward from
-    /// and so cannot be told apart by that.
     async fn settle_run(
         &self,
         id: &IssueRunId,
@@ -657,22 +497,6 @@ pub trait ProjectStore: Send + Sync {
         error: Option<&str>,
     ) -> Result<bool>;
 
-    /// Return every `running` run to `queued`, and hand back nothing. Run
-    /// once per process start: a `running` row whose actor died with the
-    /// process is work that never finished, not work in flight.
-    ///
-    /// The session it was claimed with is kept: the resumed run is the same
-    /// run, executed by the same agent, so it belongs in the same thread —
-    /// and [`ProjectStore::claim_run`] gates on the status, not on the
-    /// session being absent, so a session already on the row cannot refuse
-    /// the re-claim. Dropping it would restart the run from an empty
-    /// transcript. `held` rows are not touched; the budget, not this sweep,
-    /// decides whether they start.
-    ///
-    /// Which of the rolled-forward rows is then *handed out* is a per-board
-    /// question — an archived board's are not — so the caller reads each
-    /// board's own unfinished runs with [`ProjectStore::active_runs`]
-    /// afterwards, rather than being given one global list to re-filter.
     async fn requeue_unsettled(&self) -> Result<()>;
 }
 
@@ -782,13 +606,6 @@ impl RunStatus {
 }
 
 /// What is waiting on the operator on one board.
-///
-/// Every field counts something **only a person can clear** — an agent
-/// cannot approve its own tool call, raise its own budget, or retry its own
-/// failed run. That is what lets the whole thing be derived: each count
-/// goes away when the operator does the thing they were going to do anyway,
-/// so there is no read cursor, no `seen_at`, and no way to be stuck showing
-/// a fact that is no longer true.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AttentionCounts {
     /// Tool calls parked on an approval prompt. Filled from the channel's
@@ -852,29 +669,6 @@ pub struct IssueRunRow {
 impl IssueRunRow {
     /// Whether an executor ever picked this run up — which is the same
     /// question as "does the card already say this run started?".
-    ///
-    /// **The one home for that question**, on the row it is about, in the
-    /// crate that owns the row. Both askers reach it here: `baybo-project`
-    /// picks the sentence a called-off run settles with, and `baybo-agent`
-    /// decides which run's session a follow-up continues and whose
-    /// uncommitted work is in the checkout it inherits (the issue router's
-    /// `ever_ran` is this function under the router's own name).
-    /// `baybo-project` cannot reach into `baybo-agent` — that is the
-    /// dependency cycle — so a second spelling on either side would be two
-    /// rules that only look like one.
-    ///
-    /// **The session answers it and `started_at` cannot**, which is the
-    /// part worth keeping. [`ProjectStore::claim_run`] stamps both in one
-    /// statement and the issue router writes the card's `RunStarted` entry
-    /// immediately after, so a row carrying a session is a row the timeline
-    /// has already announced. But only the session is durable:
-    /// [`ProjectStore::requeue_unsettled`] clears `started_at` when it
-    /// returns an interrupted run to the queue and deliberately leaves
-    /// `session_id` alone, so a run that worked for an hour before the
-    /// process died comes back with no start time and its transcript
-    /// intact. Reading `started_at` here would call that run one that never
-    /// started — which is the bug this exists to stop, not a simplification
-    /// waiting to be made.
     pub fn was_claimed(&self) -> bool {
         self.session_id.is_some()
     }
@@ -895,10 +689,6 @@ pub struct NewIssueRun {
 mod tests {
     use super::*;
 
-    /// Every actor has to survive the round trip through a row. Reading is
-    /// fail-closed — an actor string the enum cannot parse fails the whole
-    /// timeline read — so a variant that writes a spelling `parse` does not
-    /// know makes every card it ever touched unreadable.
     #[test]
     fn every_actor_round_trips_through_storage() {
         for actor in [

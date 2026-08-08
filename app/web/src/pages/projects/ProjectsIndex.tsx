@@ -8,12 +8,6 @@ import { resolveLanding } from './boardModel';
 import { readLastProjectId } from './lastProject';
 import { CreateProjectForm } from './CreateProjectForm';
 
-/**
- * The rail's `/projects` entry is a resolver, not a page: there is no
- * project list in this product. It restores the board the operator was last
- * on, falls back to the most recently touched one, and only shows a form
- * when there is genuinely nothing to open.
- */
 export function ProjectsIndex() {
   const client = useAdminClient();
   const { logout } = useAuth();

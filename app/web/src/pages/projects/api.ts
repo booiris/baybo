@@ -6,11 +6,6 @@ import type { IssueEvent } from './timelineModel';
 export type CreateIssueRequest = components['schemas']['CreateIssueRequest'];
 export type UpdateIssueRequest = components['schemas']['UpdateIssueRequest'];
 
-/**
- * Every call answers with one of three shapes. `unauthorized` is separate
- * because it is the one outcome the page must not render — a dead token
- * has to log out, not paint an empty board.
- */
 export type Outcome<T> =
   | { kind: 'ok'; value: T }
   | { kind: 'unauthorized' }
@@ -20,7 +15,6 @@ function networkMessage(e: unknown): string {
   return e instanceof Error ? `Network error: ${e.message}` : 'Network error contacting gateway';
 }
 
-/** The gateway's error body, when it sent one; otherwise the bare status. */
 function failure(status: number, detail: string | undefined): Outcome<never> {
   return {
     kind: 'failed',
@@ -45,11 +39,6 @@ export async function fetchProjects(
   }
 }
 
-/**
- * This board's team — not `/v1/agents`, which lists global chat personas.
- * The two rosters are disjoint on the server: only a teammate can be
- * assigned an issue here, and only a global persona can be a chat persona.
- */
 export async function fetchTeam(
   client: AdminClient,
   projectId: string,
@@ -349,10 +338,6 @@ export async function postComment(
   }
 }
 
-/**
- * The whole board's activity, newest first — the same rows the per-issue
- * timelines are, read across the board instead of down one card.
- */
 export async function fetchFeed(
   client: AdminClient,
   projectId: string,
@@ -374,13 +359,6 @@ export async function fetchFeed(
   }
 }
 
-/**
- * Answer an approval a run is blocked on, from its card.
- *
- * Scoped to the issue on purpose: the approval queue is keyed by call id
- * alone, so the server checks the card exists on this board before it
- * answers anything.
- */
 export async function resolveApproval(
   client: AdminClient,
   projectId: string,
@@ -444,17 +422,8 @@ export async function openLeadConversation(
   }
 }
 
-/** One transcript row the panel renders. */
 export type LeadTurn = { id: string; kind: string; role: string; text: string; at: string };
 
-/**
- * One conversation's newest page.
- *
- * The ordinary chat sync endpoint: it scopes by channel, not by whether a
- * session is on the chat *list*, so a board's thread reads through it
- * unchanged. Nothing here re-implements the transcript — `rows` is already
- * the flattened shape the chat client renders.
- */
 export async function fetchLeadMessages(
   client: AdminClient,
   sessionId: string,
@@ -519,13 +488,6 @@ export async function setProjectArchived(
   }
 }
 
-/**
- * Note that the operator looked at this board.
- *
- * Called from the board page only. The detail route is one card, and
- * marking the whole board read from it would clear a question asked on a
- * card the operator never saw.
- */
 export async function markProjectRead(
   client: AdminClient,
   projectId: string,

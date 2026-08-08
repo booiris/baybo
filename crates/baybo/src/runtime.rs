@@ -611,11 +611,6 @@ pub async fn build_managers(
         tool_registry.register(tool, manifest);
     }
 
-    // --- Kanban projects (docs/todo/kanban.md).
-    // The board's runs reach the router over a channel, so `baybo-project`
-    // never depends on the agent runtime. The ledger row is already written
-    // by the time anything is sent here — a full queue or a dead receiver
-    // costs a delay until the next boot sweep, never a lost run.
     let (issue_run_tx, issue_run_rx) = mpsc::channel(64);
     let issue_dispatch = {
         let store = stores.project.clone();
@@ -645,10 +640,6 @@ pub async fn build_managers(
                 let said = comments_for_brief(&store, &run).await;
                 let brief = issue_brief(&issue, &said);
 
-                // Cutting the worktree happens here, on this spawned task,
-                // and not in the router: `git worktree add` shells out, and
-                // the router's handler is awaited on the `select!` loop that
-                // also serves every user message and agent response.
                 let checkout = match prepare_checkout(&store, &paths, &issue).await {
                     Ok(root) => root,
                     Err(e) => {
@@ -690,10 +681,6 @@ pub async fn build_managers(
         )),
         issue_dispatch,
     ));
-    // The board's own tools. Scoped to a project by the calling session's
-    // trigger rather than by a parameter, so they are absent from every
-    // other session's tool list and refuse the call outright if one ever
-    // reaches them anyway.
     for (tool, manifest) in baybo_project::tools::agent_tools(Arc::clone(&project_manager)) {
         tool_registry.register(tool, manifest);
     }
@@ -707,14 +694,6 @@ pub async fn build_managers(
     ));
     let gate_map = channels_registry.approval_gates();
 
-    // Put a run's approval prompts on the card that asked for them.
-    //
-    // Installed once over the owner channel's **type-level** gate rather
-    // than per run: there is nothing to arm or disarm, so nothing leaks
-    // when a run dies in an unusual way, and a board opened after boot is
-    // covered without anybody remembering to register it. A prompt from an
-    // ordinary session passes straight through — the wrapper asks the
-    // session what it belongs to and finds no issue.
     {
         let owner = baybo_model::ChannelType::owner();
         let inner = gate_map.type_gate(&owner);
@@ -1248,24 +1227,6 @@ pub fn force_exit_watchdog(
 }
 
 /// How far back the comments in a run's brief reach.
-///
-/// A run reads the card through the transcript of the session it is handed,
-/// and which session that is comes from
-/// [`baybo_agent::router::session_run_before`] — the same rule the router's
-/// `issue_session` selects by, and the authority this window follows. If
-/// that run does not exist, this run opens an empty transcript and has read
-/// nothing, however much was said to whoever worked the card last. Trimming
-/// a conversation as "already read" against a reader that has not read it is
-/// how a fresh session loses the whole discussion that set the work up.
-///
-/// The named run is one that was *claimed*, which is one notch weaker than
-/// "left a turn in that transcript": a run whose trigger never reached its
-/// actor claims the row and opens nothing. Such a run still bounds this
-/// window, so the rare card whose previous run died between claim and first
-/// turn re-reads less than it should. Closing that would mean asking the
-/// turn store rather than the ledger — the ledger is what both sides of this
-/// rule can see, and having one rule matters more here than having the
-/// sharper one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BriefWindow {
     /// This run opens an empty transcript: nobody has run the card, or the
@@ -1278,7 +1239,6 @@ enum BriefWindow {
     SinceItsLastRun(chrono::DateTime<chrono::Utc>),
 }
 
-/// The card's conversation as one run should read it.
 struct Said {
     window: BriefWindow,
     /// The checkout this run is handed was last worked in by another agent,
@@ -1290,54 +1250,21 @@ struct Said {
     comments: Vec<String>,
 }
 
-/// The label on a delta: everything before it is already in the reader's
-/// transcript. Said last, because the comments are the newest instruction
-/// on the card and a reader that takes them for part of the original
-/// description weights them as background.
 const SAID_SINCE_LAST_RUN: &str = "\n\nSaid since your last run:\n";
 
-/// The label on the whole conversation — the honest one for a reader that
-/// has seen none of it. Calling those comments "since your last run" would
-/// invite an agent to assume it had acted on everything older.
 const SAID_ON_THE_CARD: &str = "\n\nSaid on the card so far:\n";
 
-/// What a run picking a card up after somebody else is owed beyond the
-/// conversation: every run of a card works in the same worktree, so this
-/// one arrives holding whatever the last agent left uncommitted, with none
-/// of it in its transcript.
 const INHERITED_WORKTREE: &str = r#"
 
 You are picking this card up after another agent worked it. The checkout you
 are given is the one it worked in, so any uncommitted change in there is its
 work and not yours — read what is already in the tree before you add to it."#;
 
-/// How much of the card's conversation one brief carries, in bytes of
-/// comment text.
-///
-/// A card's timeline has no ceiling and the whole-card window reads all of
-/// it — and the cards that get picked up by a second agent, which is
-/// exactly when that window is used, are the ones with the longest
-/// timelines. The brief is the first user message of a fresh transcript, so
-/// nothing downstream can compact it: past the model's context window it
-/// does not degrade, it fails the call, and a busy card would then be
-/// unable to run at all. Sized so that a long discussion still arrives
-/// whole — roughly four thousand tokens, small next to any model's window.
 const COMMENT_BUDGET: usize = 16_000;
 
-/// What stands in for the comments the budget dropped. Said rather than
-/// silently omitted: an agent that knows the discussion goes further back
-/// can go and read the card, whereas a silent trim reads as the whole
-/// story.
 const EARLIER_COMMENTS_TRIMMED: &str =
     "(earlier comments are not repeated here — the card itself has all of them)";
 
-/// The comments as the brief lists them, oldest first, within
-/// [`COMMENT_BUDGET`].
-///
-/// Trimmed from the old end, because the newest instruction on a card is
-/// the one a run must not miss. The newest comment is kept whatever it
-/// costs — a brief that lists nothing but the trim notice would be worse
-/// than an oversized one.
 fn comment_block(comments: &[String]) -> String {
     let mut kept: Vec<&str> = Vec::new();
     let mut spent = 0usize;
@@ -1358,10 +1285,6 @@ fn comment_block(comments: &[String]) -> String {
     block
 }
 
-/// What an issue's assignee is asked to work on: its title, its description
-/// when it has one, and the part of the card's conversation this run has
-/// not already read. Assembled here rather than in the router so the
-/// execution path never has to know an issue's shape.
 fn issue_brief(issue: &baybo_store::project::IssueRow, said: &Said) -> String {
     let mut brief = if issue.description.trim().is_empty() {
         issue.title.clone()
@@ -1381,12 +1304,6 @@ fn issue_brief(issue: &baybo_store::project::IssueRow, said: &Said) -> String {
     brief
 }
 
-/// Cut the issue's worktree if this is its first run, and make sure git
-/// has an identity to commit as.
-///
-/// Idempotent, so a retry or a boot-swept run re-enters the tree the last
-/// attempt left rather than starting from a clean one — half-done work
-/// belongs to the card, not to the attempt.
 async fn prepare_checkout(
     store: &Arc<dyn baybo_store::project::ProjectStore>,
     paths: &baybo_workspace::WorkspacePaths,
@@ -1403,15 +1320,6 @@ async fn prepare_checkout(
     Ok(root)
 }
 
-/// Which of the card's runs bounds this one's brief.
-///
-/// Nothing decided here: the answer is whichever run the router will hand
-/// this one's session from, and `baybo_agent::router::session_run_before`
-/// is the one place that is worked out. A second rule spelled the same way
-/// would drift the first time either moved — and the shape it drifted into
-/// last time was a same-agent run that never claimed a session, which left
-/// this window trimming the conversation against a transcript the router
-/// had just minted empty.
 fn brief_window(
     run: &baybo_store::project::IssueRunRow,
     runs: &[baybo_store::project::IssueRunRow],
@@ -1422,22 +1330,6 @@ fn brief_window(
     }
 }
 
-/// Whether the checkout this run is handed was last worked in by a
-/// different agent.
-///
-/// Every run of a card works in the same worktree, so what is uncommitted
-/// in there belongs to whoever ran last — and a run that was never picked
-/// up never touched it, which is why the question is asked of the runs that
-/// were claimed. Independent of [`brief_window`]: a card handed back to an
-/// agent that already worked it is bounded by that agent's own last run and
-/// still inherits the tree the agent in between left.
-///
-/// Claimed is the same one-notch-weak answer [`brief_window`] settles for,
-/// and here it can err either way: a run that died between claim and first
-/// turn touched nothing, so it can hide an earlier agent's changes from this
-/// notice, or attribute this agent's own changes to somebody else. Both cost
-/// a sentence in a brief rather than any work — the tree itself is unchanged,
-/// and `reclaim` still refuses to delete a dirty one.
 fn inherits_a_worktree(
     run: &baybo_store::project::IssueRunRow,
     runs: &[baybo_store::project::IssueRunRow],
@@ -1448,8 +1340,6 @@ fn inherits_a_worktree(
         .is_some_and(|last| last.agent_id != run.agent_id)
 }
 
-/// The part of the card's conversation this run is being asked to take
-/// account of, and how much of it that is.
 async fn comments_for_brief(
     store: &Arc<dyn baybo_store::project::ProjectStore>,
     run: &baybo_store::project::IssueRunRow,
@@ -1458,10 +1348,6 @@ async fn comments_for_brief(
         Ok(runs) => (brief_window(run, &runs), inherits_a_worktree(run, &runs)),
         Err(e) => {
             tracing::warn!(run = %run.id, error = %e, "could not read prior runs for the brief");
-            // The whole card, unwarned: with no ledger to read, the safe
-            // guess is that this run has read nothing, and a worktree notice
-            // nobody can substantiate would be a claim about work that may
-            // not exist.
             return Said {
                 window: BriefWindow::WholeCard,
                 inherited_worktree: false,
@@ -1499,9 +1385,6 @@ pub(crate) fn manager_shutdown_deadline(budget: std::time::Duration) -> tokio::t
 
 #[cfg(test)]
 mod tests {
-    //! What an issue run is actually told. The session it works in belongs
-    //! to its agent, so the brief is the only thing an agent handed a card
-    //! mid-flight ever sees of what came before.
 
     use super::*;
     use baybo_model::{AgentProfileId, IssueId, IssueRunId, ProjectId, SessionId};
@@ -1533,9 +1416,6 @@ mod tests {
         }
     }
 
-    /// A ledger row as the dispatcher hands it over: queued, and not yet
-    /// claimed by any executor — so it has opened no transcript and touched
-    /// no checkout.
     fn run(issue: &IssueRow, agent: &AgentProfileId, attempt: i64) -> IssueRunRow {
         IssueRunRow {
             id: IssueRunId::generate(),
@@ -1554,10 +1434,6 @@ mod tests {
         }
     }
 
-    /// A run that executed. The executor claims the row with the session it
-    /// is about to work in, so the `session_id` is the record that this run
-    /// opened a transcript and worked in the card's checkout — which is
-    /// what both `session_run_before` and the worktree notice read.
     fn ran(issue: &IssueRow, agent: &AgentProfileId, attempt: i64) -> IssueRunRow {
         IssueRunRow {
             session_id: Some(SessionId::from(format!(
@@ -1570,8 +1446,6 @@ mod tests {
         }
     }
 
-    /// The first run has nothing to be bounded against, and nothing to
-    /// inherit.
     #[test]
     fn a_cards_first_run_reads_the_whole_card_as_its_own() {
         let issue = card();
@@ -1596,8 +1470,6 @@ mod tests {
         assert!(brief.contains(SAID_ON_THE_CARD.trim()));
     }
 
-    /// A second run by the same agent continues one transcript, so the
-    /// delta since its own last run is exactly what it has not read.
     #[test]
     fn a_second_run_by_the_same_agent_is_bounded_by_its_own_previous_one() {
         let issue = card();
@@ -1628,23 +1500,10 @@ mod tests {
         );
     }
 
-    /// The rule the window has to follow is the router's: the session a run
-    /// is handed comes from the newest run of the same agent **that claimed
-    /// one**, and a run cancelled while it was still queued claimed
-    /// nothing. Bounding by that row hands an empty transcript a delta —
-    /// the reader is told the discussion that set the work up is already
-    /// behind it, and the heading names a run it never made.
-    ///
-    /// The other half of this pin is
-    /// `a_run_whose_predecessor_never_opened_a_session_starts_a_fresh_one`
-    /// in `baybo-agent`, which holds `issue_session` to the same rule.
     #[test]
     fn a_same_agent_run_that_never_opened_a_session_does_not_bound_the_window() {
         let issue = card();
         let dev_1 = AgentProfileId::parse("dev-1").expect("agent id");
-        // Enqueued, then cancelled by the operator before any executor
-        // claimed it — the row is real and it is dev-1's, and no transcript
-        // was ever opened for it.
         let never_started = IssueRunRow {
             status: RunStatus::Cancelled,
             ..run(&issue, &dev_1, 1)
@@ -1659,12 +1518,6 @@ mod tests {
         );
     }
 
-    /// An agent that has not run this card opens an **empty** transcript:
-    /// the card's session belongs to the agent, so dev-2 has seen nothing
-    /// dev-1 was told. Bounding its brief by dev-1's run trims the
-    /// conversation as "already read" against a reader that has not read
-    /// it, and the heading then claims those are the comments since a run
-    /// it never made.
     #[test]
     fn a_card_picked_up_by_another_agent_gets_the_whole_conversation() {
         let issue = card();
@@ -1710,11 +1563,6 @@ mod tests {
         );
     }
 
-    /// Handing the card back is not a fresh start: that agent's own
-    /// session, with its own transcript, is what it resumes in. But the
-    /// worktree is the card's, not the session's — dev-1 comes back to the
-    /// tree dev-2 left, which its transcript ends before, so it is told so
-    /// even though its conversation is only a delta.
     #[test]
     fn an_agent_handed_the_card_back_is_bounded_by_its_own_last_run_and_still_warned() {
         let issue = card();
@@ -1747,9 +1595,6 @@ mod tests {
         );
     }
 
-    /// A run that never executed left nothing in the tree, so it is not
-    /// what the notice is about: the card's checkout still holds the work
-    /// of the last agent that actually ran.
     #[test]
     fn a_run_that_never_started_does_not_count_as_having_had_the_checkout() {
         let issue = card();
@@ -1766,10 +1611,6 @@ mod tests {
         );
     }
 
-    /// A card's conversation has no ceiling, and the whole-card window
-    /// reads all of it. The brief is the first message of a fresh
-    /// transcript, so an unbounded one does not degrade — it fails the
-    /// call, and the card can then never run again.
     #[test]
     fn a_very_long_conversation_still_makes_a_bounded_brief() {
         let issue = card();
@@ -1805,8 +1646,6 @@ mod tests {
         );
     }
 
-    /// Nothing is trimmed, and nothing is claimed to have been, when the
-    /// whole conversation fits.
     #[test]
     fn a_short_conversation_arrives_whole_and_unannotated() {
         let issue = card();

@@ -359,6 +359,18 @@ way: a brief bounded by a run whose session this one is *not* given would trim
 the card's conversation as "already read" against a transcript that does not
 contain it.
 
+The brief keeps at most 16,000 bytes of comment text, newest first, and always
+keeps the newest comment. If older comments are dropped it inserts an explicit
+marker instead of presenting the tail as the whole discussion. A run taking
+over after another agent also gets a warning that the shared issue worktree may
+contain that agent's uncommitted changes.
+
+`was_claimed()` is a ledger-level approximation: a process can die after claim
+but before the first turn opens. In that narrow case the next brief may trim
+against a transcript that never received the run. A sharper answer would require
+joining the turn store; both session reuse and brief construction deliberately
+use the same ledger predicate so they cannot disagree about the boundary.
+
 "Ever got as far as executing" is itself one predicate with one home —
 `IssueRunRow::was_claimed()` in `baybo-store`, on the row it is about, in the
 crate `baybo-project` and `baybo-agent` both depend on (the router's `ever_ran`

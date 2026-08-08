@@ -440,10 +440,6 @@ mod tests {
         assert!(!has(&cron(false)));
     }
 
-    /// The board scope's own case. Kept beside the cron one because the two
-    /// are the only narrowings that exist, and a third variant added without
-    /// a matching arm in `allows_trigger` would silently be visible
-    /// everywhere.
     #[test]
     fn trigger_scope_shows_board_tools_only_to_a_project_session() {
         use crate::{Tool, ToolContext, ToolOutput, ToolTriggerScope};

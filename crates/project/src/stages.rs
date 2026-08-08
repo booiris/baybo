@@ -1,51 +1,18 @@
 //! Sub-issues and the barriers between them.
-//!
-//! Pure, like the other rule modules here: whether a stage has emptied is
-//! decided once, in [`stage_complete`], whether that opens the next stage
-//! once in [`barrier_opens`], and the announcement, the wake and the card's
-//! progress ring read this module rather than counting children for
-//! themselves.
 
 use baybo_store::project::{IssueRow, IssueStatus};
 
 /// Whether the board is done with this issue.
-///
-/// Cancelled counts, which is the whole content of the rule. A stage
-/// waiting on work somebody decided not to do would never open, and "cancel
-/// the step you are not doing" is exactly how an operator unblocks one; by
-/// the same token a cancelled card has had its worktree reclaimed and takes
-/// no more runs ([`crate::runs::accepts_runs`]).
-///
-/// One definition, because the board would otherwise carry several: the
-/// barrier here, the reclamation, and the enqueue gate all mean the same
-/// thing by "finished", and a card that is finished for one of them and not
-/// for another is a card that leaks a worktree or a run.
 pub(crate) fn is_finished(issue: &IssueRow) -> bool {
     issue.status == IssueStatus::Done || issue.cancelled_at.is_some()
 }
 
-/// A child that still has to happen for its stage to open the next one.
-///
-/// Cancelled children are not pending, but they are also not *progress* —
-/// see [`progress`], which counts them out of both numerator and
-/// denominator so a ring never reads `3/5` on a card whose last two steps
-/// were called off.
 fn is_pending(child: &IssueRow) -> bool {
     child.cancelled_at.is_none() && child.status != IssueStatus::Done
 }
 
 /// Whether `stage` has just emptied, given the parent's children and the
 /// child that reached a terminal state.
-///
-/// Returns `false` when the stage has no children at all: nothing finished,
-/// so there is nothing to announce. That is not a hypothetical — detaching
-/// or cancelling the last child of a stage would otherwise read as a
-/// completion.
-///
-/// This is the question the **announcement** asks, and it is all
-/// `StageCompleted` claims. It is not the barrier: a stage can empty while
-/// an earlier one is still being worked, and the parent has nothing new to
-/// drive then. [`barrier_opens`] is the question the **wake** asks.
 pub(crate) fn stage_complete(children: &[IssueRow], stage: i64) -> bool {
     let mut seen = false;
     for child in children.iter().filter(|c| c.stage == stage) {
@@ -59,28 +26,12 @@ pub(crate) fn stage_complete(children: &[IssueRow], stage: i64) -> bool {
 
 /// Whether finishing a child in `stage` opens a barrier: that stage has
 /// emptied **and** nothing earlier is still open.
-///
-/// The second clause is what makes it a barrier rather than a bulletin —
-/// and the bulletin is [`stage_complete`]'s job, which is why the two are
-/// separate questions rather than one. Stages are planned up front, so a
-/// parent routinely carries children in stages the board has not reached;
-/// finishing — or cancelling — one of those empties a *later* stage while
-/// the current one is still being worked. That is worth saying on the card
-/// and worth doing nothing about: an issue holds one unfinished run at a
-/// time, so a wake there would spend the parent's only slot and the barrier
-/// that matters, when the current stage finally empties, would be refused
-/// by the dedupe index and lost.
 pub(crate) fn barrier_opens(children: &[IssueRow], stage: i64) -> bool {
     stage_complete(children, stage) && !children.iter().any(|c| is_pending(c) && c.stage < stage)
 }
 
 /// `(done, total)` for a parent's card, counting only work that is still
 /// meant to happen.
-///
-/// Cancelled children leave both counts, so a parent whose last two steps
-/// were called off reads `3/3` rather than `3/5` — the ring means "how much
-/// of the remaining work is done", which is the question somebody looking
-/// at a card is asking.
 pub fn progress(children: &[IssueRow]) -> (usize, usize) {
     let live: Vec<&IssueRow> = children
         .iter()
@@ -156,8 +107,6 @@ mod tests {
 
     #[test]
     fn a_cancelled_step_does_not_hold_its_stage_open() {
-        // Otherwise a stage waiting on work somebody decided not to do
-        // would never open, and cancelling is how an operator unblocks one.
         let children = vec![
             child(0, IssueStatus::Done, false),
             child(0, IssueStatus::Todo, true),
@@ -167,17 +116,12 @@ mod tests {
 
     #[test]
     fn an_empty_stage_has_not_completed() {
-        // Nothing finished, so there is nothing to announce. Detaching the
-        // last child of a stage must not read as that stage being done.
         assert!(!stage_complete(&[], 0));
         assert!(!stage_complete(&[child(1, IssueStatus::Done, false)], 0));
     }
 
     #[test]
     fn a_later_stage_emptying_first_is_not_a_barrier() {
-        // Stage 2 has genuinely emptied — but the board is still on stage 0,
-        // so there is nothing new for the parent to drive, and waking it
-        // would spend the one run slot the real barrier needs.
         let children = vec![
             child(0, IssueStatus::InProgress, false),
             child(2, IssueStatus::Done, false),
@@ -197,8 +141,6 @@ mod tests {
 
     #[test]
     fn the_last_stage_emptying_still_opens_the_barrier() {
-        // Nothing open at all is a barrier, not a suppression: the parent is
-        // woken to close its own work.
         assert!(barrier_opens(&[child(0, IssueStatus::Done, false)], 0));
     }
 
@@ -220,7 +162,6 @@ mod tests {
             child(1, IssueStatus::Todo, true),
             child(1, IssueStatus::Todo, true),
         ];
-        // Not 3/5: two steps were called off, so the card is finished.
         assert_eq!(progress(&children), (3, 3));
         assert_eq!(progress(&[]), (0, 0));
     }
@@ -240,8 +181,6 @@ mod tests {
 
     #[test]
     fn finished_means_done_or_called_off() {
-        // The one definition the barrier, the worktree reclamation and the
-        // enqueue gate all read.
         assert!(is_finished(&child(0, IssueStatus::Done, false)));
         assert!(is_finished(&child(0, IssueStatus::Todo, true)));
         assert!(!is_finished(&child(0, IssueStatus::InProgress, false)));

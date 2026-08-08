@@ -32,10 +32,6 @@ struct Params {
     include_cancelled: bool,
 }
 
-/// The `assignee` filter value that means "nobody is on it" — the set the
-/// lead triages. A sentinel rather than a second boolean parameter, because
-/// "assigned to nobody" is a value of the same field, not a different
-/// question.
 const UNASSIGNED: &str = "unassigned";
 
 #[async_trait]
@@ -89,10 +85,6 @@ Alongside them: `team`, where each member's `working_on` is what they have in fl
         let status = p.status.as_deref().map(parse_status).transpose()?;
 
         let team = self.manager.team(&project).await.map_err(exec_err)?;
-        // Every derived fact below is computed over the WHOLE board, never
-        // the filtered rows. `assignee: unassigned` is the canonical triage
-        // call, and a roster load derived from that set would always read
-        // as an idle team.
         let load = self.manager.board_load(&project).await.map_err(exec_err)?;
         let board = self.manager.list_issues(&project).await.map_err(exec_err)?;
         let wanted_assignee = match p.assignee.as_deref().map(str::trim) {
@@ -111,10 +103,6 @@ Alongside them: `team`, where each member's `working_on` is what they have in fl
                     .as_ref()
                     .is_none_or(|wanted| &issue.assignee == wanted)
         });
-        // Most urgent first inside each column, so a triage read does not
-        // have to sort a hundred rows itself. `IssueStatus::ALL` is board
-        // order and `IssuePriority::ALL` is urgency order, so deriving the
-        // keys from them keeps this from drifting.
         issues.sort_by_key(|issue| {
             (
                 IssueStatus::ALL.iter().position(|s| *s == issue.status),

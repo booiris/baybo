@@ -22,11 +22,6 @@ const PRIORITY_LABEL: Record<IssuePriority, string> = {
 const pill =
   'inline-flex items-center gap-1.5 border-2 border-black rounded-full px-3 py-1 font-mono text-[0.66rem] font-bold bg-surface cursor-pointer';
 
-/**
- * Document-first: a free title and description carry the intent, and the
- * properties sit underneath as chips. The column the `+` was pressed in is
- * pre-filled — that is the whole reason the modal knows about status.
- */
 export function CreateIssueModal({
   projectId,
   status,
@@ -60,7 +55,6 @@ export function CreateIssueModal({
     };
   }, [onClose]);
 
-  // The modal twin of the drag bounce: In Progress means somebody is on it.
   const needsAssignee = status === 'in_progress' && assignee.length === 0;
 
   async function submit() {
@@ -84,7 +78,6 @@ export function CreateIssueModal({
       return;
     }
     if (keepOpen) {
-      // Continue create: the column and priority stay, the prose resets.
       setTitle('');
       setDescription('');
       return;

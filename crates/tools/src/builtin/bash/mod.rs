@@ -221,13 +221,6 @@ impl LivePermissionMode {
 }
 
 /// What a command's child is given, and what must never come back out.
-///
-/// These were one list. They read the same — pairs of names and values —
-/// but they are used for opposite things: `vars` is handed to the child,
-/// and `secret_values` is an exact-match filter applied to everything the
-/// child prints. Conflating them meant anything injected was also
-/// redacted, so a variable holding something ordinary (an agent's id, say)
-/// vanished from every command's output that happened to mention it.
 #[derive(Debug, Default, Clone)]
 struct ChildEnv {
     /// Every variable the child process gets.
@@ -238,26 +231,6 @@ struct ChildEnv {
     secret_values: Vec<String>,
 }
 
-/// The identity git commits as inside an issue run.
-///
-/// Env beats every config file git would otherwise consult, so this is
-/// what makes a commit say which agent made it. The workspace-level
-/// `.gitconfig` stays as the fallback — for every other session, and for
-/// an issue run whose agent has no handle to author as. One that never
-/// commits pays nothing for it, and one that does is still attributable to
-/// baybo rather than failing outright.
-///
-/// The two halves are deliberately different identifiers. The **name** is
-/// the handle, because that is the half a person reads: `git log` and
-/// `git shortlog` show it, and a ULID there names nobody. The **email**
-/// keeps the profile id, because a handle is unique only within its
-/// project ([`baybo_model::AgentHandle`]) — two boards' `@dev-1` are two
-/// different agents and must not collapse into one author — and because
-/// the id still maps a commit back to an exact profile row after the
-/// agent leaves the team.
-///
-/// The address is deliberately unroutable: these commits are machine-made
-/// and nobody should be able to reply to one.
 fn git_identity(
     agent: &baybo_model::AgentProfileId,
     handle: &baybo_model::AgentHandle,
@@ -760,11 +733,6 @@ impl Tool for BashTool {
         } else {
             None
         };
-        // An issue run defaults to the checkout it owns, so a bare
-        // `git status` / `cargo test` describes the project the card is
-        // about. Without this the command lands in `<workspace>/work`,
-        // which is not a repository at all — and the model is told the
-        // project it can plainly see is not one.
         let cwd_ref: Option<&Path> = p
             .cwd
             .as_deref()
@@ -852,12 +820,6 @@ impl Tool for BashTool {
             extra_env.vars = handle.resolve_env(&p.secret_env).await?;
             extra_env.secret_values = extra_env.vars.iter().map(|(_, v)| v.clone()).collect();
         }
-        // An issue run commits as the agent working the card. Only there:
-        // `checkout_root` is set for exactly those sessions, and a session
-        // that never commits gains nothing from carrying an identity. An
-        // agent whose handle could not be resolved gets no identity at all
-        // and falls through to the workspace `.gitconfig`, which authors
-        // the commit as baybo — true, where a bare id says nothing.
         if ctx.checkout_root.is_some()
             && let Some(handle) = ctx.agent_handle.as_ref()
         {
@@ -3783,9 +3745,6 @@ mod tests {
 
     #[tokio::test]
     async fn an_issue_runs_commands_in_its_checkout_by_default() {
-        // Without this, an unqualified `git status` runs in
-        // `<workspace>/work`, which is not a repository — so the model is
-        // told the project it can plainly see is not one.
         let (fake, sandbox) = fake_with_response(SandboxedOutput {
             exit_code: 0,
             stdout: Vec::new(),
@@ -3861,8 +3820,6 @@ mod tests {
             timed_out: false,
         });
         let mut ctx = ctx_with(Some(sandbox));
-        // A real generated id, which is a ULID — the shape every production
-        // agent has. A handle-shaped id is reachable only from a test.
         let id = baybo_model::AgentProfileId::generate();
         ctx.checkout_root = Some(PathBuf::from("/tmp/work/projects/p/4"));
         ctx.agent_id = id.clone();
@@ -3945,10 +3902,6 @@ mod tests {
 
     #[tokio::test]
     async fn the_agents_own_id_is_not_scrubbed_out_of_its_output() {
-        // The reason the injected env and the redaction list had to stop
-        // being one list: they are both name/value pairs, so conflating
-        // them made anything injected disappear from output that mentioned
-        // it — and an agent's id appears in its own output constantly.
         let id = baybo_model::AgentProfileId::generate();
         let (_fake, sandbox) = fake_with_response(SandboxedOutput {
             exit_code: 0,
