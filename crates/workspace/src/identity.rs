@@ -131,11 +131,10 @@ pub fn persona_seed(agent_id: &str, kind: IdentityKind) -> &'static str {
     }
 }
 
-/// Materialize one agent's persona directory: create
-/// `personas/<agent_id>/skills/` and `personas/<agent_id>/memory/`, then
-/// write `SOUL.md`, `IDENTITY.md`, `USER.md` and an empty `MEMORY.md`
-/// index **only if absent**, each staged through a sibling `.tmp` file and
-/// renamed.
+/// Materialize one agent's resolved persona directory: create its `skills/`
+/// and `memory/`, then write `SOUL.md`, `IDENTITY.md`, `USER.md` and an empty
+/// `MEMORY.md` index **only if absent**, each staged through a sibling `.tmp`
+/// file and renamed.
 ///
 /// Idempotent and never destructive — files the agent has since rewritten
 /// survive every later call. Run at profile creation and again defensively
@@ -150,7 +149,22 @@ pub async fn ensure_persona_layout(
     agent_id: &str,
     seed_soul: &str,
 ) -> anyhow::Result<()> {
-    let skills = paths.persona_skills_dir(agent_id);
+    let persona = paths.persona_dir(agent_id);
+    ensure_persona_layout_at(paths, agent_id, seed_soul, &persona).await
+}
+
+async fn ensure_persona_layout_at(
+    paths: &WorkspacePaths,
+    agent_id: &str,
+    seed_soul: &str,
+    persona: &Path,
+) -> anyhow::Result<()> {
+    let relative = persona
+        .strip_prefix(paths.personas_dir())
+        .map_err(|e| anyhow::anyhow!("resolve persona path {}: {e}", persona.display()))?
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("persona path is not valid UTF-8: {}", persona.display()))?;
+    let skills = persona.join(crate::paths::SKILLS_DIR);
     tokio::fs::create_dir_all(&skills)
         .await
         .map_err(|e| anyhow::anyhow!("create persona skills dir {}: {e}", skills.display()))?;
@@ -158,12 +172,14 @@ pub async fn ensure_persona_layout(
     // The memory index joins the baseline for the same reason the identity
     // files do: its first real change should read as a change, not as the
     // file appearing out of nowhere.
-    let memory_index = paths.persona_memory_index_file(agent_id);
+    let memory_index = persona
+        .join(crate::paths::PERSONA_MEMORY_DIR)
+        .join(crate::paths::MEMORY_INDEX_FILE);
     let memory_existed = tokio::fs::try_exists(&memory_index).await.unwrap_or(false);
     crate::memory::load_memory_index(&memory_index).await?;
     if !memory_existed {
         seeded.push(format!(
-            "{agent_id}/{}/{}",
+            "{relative}/{}/{}",
             crate::paths::PERSONA_MEMORY_DIR,
             crate::paths::MEMORY_INDEX_FILE
         ));
@@ -175,13 +191,13 @@ pub async fn ensure_persona_layout(
             IdentityKind::Soul => seed_soul,
             other => persona_seed(agent_id, other),
         };
-        let path = paths.persona_identity_file(agent_id, kind);
+        let path = persona.join(kind.file_name());
         let existed = tokio::fs::try_exists(&path).await.unwrap_or(false);
         read_or_seed(&path, seed)
             .await
             .map_err(|e| anyhow::anyhow!("seed persona {}: {e}", path.display()))?;
         if !existed {
-            seeded.push(format!("{agent_id}/{}", kind.file_name()));
+            seeded.push(format!("{relative}/{}", kind.file_name()));
         }
     }
     // Only the files this call created. The pathspec is what git stages, so
@@ -195,9 +211,9 @@ pub async fn ensure_persona_layout(
     Ok(())
 }
 
-/// Materialise a persona and give it a name in one step, for an agent the
-/// system is creating on the operator's behalf rather than at their keyboard
-/// — currently a project's lead.
+/// Materialise a project-owned persona under `personas/project/` and give it
+/// a name in one step, for an agent the system is creating on the operator's
+/// behalf rather than at their keyboard — a project's lead or teammate.
 ///
 /// Two writes, in the order that matters: [`ensure_persona_layout`] seeds
 /// the files and commits the baseline, then the name is spliced into the
@@ -215,8 +231,15 @@ pub async fn ensure_named_persona_layout(
     seed_soul: &str,
     display_name: &str,
 ) -> anyhow::Result<()> {
-    ensure_persona_layout(paths, agent_id, seed_soul).await?;
-    let path = paths.persona_identity_file(agent_id, IdentityKind::Identity);
+    if !crate::paths::is_project_persona_id(agent_id) {
+        anyhow::bail!(
+            "project persona id {agent_id:?} must start with {:?}",
+            crate::paths::PROJECT_PERSONA_ID_PREFIX
+        );
+    }
+    let persona = paths.project_persona_dir(agent_id);
+    ensure_persona_layout_at(paths, agent_id, seed_soul, &persona).await?;
+    let path = persona.join(IdentityKind::Identity.file_name());
     let current = tokio::fs::read_to_string(&path)
         .await
         .map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
@@ -234,7 +257,8 @@ pub async fn ensure_named_persona_layout(
     commit_personas(
         paths,
         &[&format!(
-            "{agent_id}/{}",
+            "{}/{agent_id}/{}",
+            crate::paths::PROJECT_PERSONAS_DIR,
             IdentityKind::Identity.file_name()
         )],
         &format!("personas: name {agent_id}"),
@@ -397,6 +421,64 @@ mod tests {
             .unwrap();
         let count = git(vec!["rev-list", "--count", "HEAD"]).await;
         assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "1");
+    }
+
+    #[tokio::test]
+    async fn materialising_a_named_project_persona_groups_it_under_project() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = WorkspacePaths::new(tmp.path().to_path_buf());
+        let personas = paths.personas_dir();
+        tokio::fs::create_dir_all(&personas).await.unwrap();
+        let git = async |args: Vec<&str>| {
+            tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(&personas)
+                .args(args)
+                .output()
+                .await
+                .unwrap()
+        };
+        git(vec!["init", "--quiet", "-b", "main"]).await;
+
+        let agent_id = "project-01JLEAD";
+        ensure_named_persona_layout(&paths, agent_id, "LEAD SOUL", "Lead")
+            .await
+            .unwrap();
+
+        let project = paths.project_persona_dir(agent_id);
+        assert!(project.join(IdentityKind::Soul.file_name()).exists());
+        assert_eq!(paths.persona_dir(agent_id), project);
+        assert!(!paths.personas_dir().join(agent_id).exists());
+        let identity = tokio::fs::read_to_string(
+            paths.persona_identity_file(agent_id, IdentityKind::Identity),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            crate::name::display_name(&identity).as_deref(),
+            Some("Lead")
+        );
+
+        let status = git(vec!["status", "--porcelain"]).await;
+        assert!(
+            String::from_utf8_lossy(&status.stdout).trim().is_empty(),
+            "nothing may be left untracked: {}",
+            String::from_utf8_lossy(&status.stdout),
+        );
+        let subjects = git(vec!["log", "--format=%s"]).await;
+        let subjects = String::from_utf8_lossy(&subjects.stdout);
+        let subjects: Vec<&str> = subjects.lines().collect();
+        assert_eq!(
+            subjects,
+            [
+                "personas: name project-01JLEAD",
+                "personas: baseline project-01JLEAD"
+            ]
+        );
+        let log = git(vec!["log", "--format=%s", "--name-only"]).await;
+        let log = String::from_utf8_lossy(&log.stdout);
+        assert!(log.contains("project/project-01JLEAD/SOUL.md"), "{log}");
+        assert!(log.contains("project/project-01JLEAD/IDENTITY.md"), "{log}");
     }
 
     /// Load the workspace's own three sections — i.e. what the built-in

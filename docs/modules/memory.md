@@ -98,7 +98,8 @@ One human, many personas: every recall and write carries
 recalls agent B's memories. `BUILTIN_AGENT_PROFILE_ID` is `"baybo"`, which is
 what both backends already sent, so an unbound session sees exactly the
 memories it always did; custom agents partition under their ULID
-(rename-proof, and it survives the profile row being deleted).
+or `project-<ULID>` profile id (rename-proof, and it survives the profile row
+being deleted).
 
 - **mem0** — `agent_id` on writes, and an `agent_id` condition in `recall`'s
   filter set beside `user_id`.

@@ -4,7 +4,17 @@
 
 Agent profiles are user-managed personas: a named, avatar-carrying row bundling an execution framework (`baybo` / `claude` / `codex`) and an optional LLM pin. The operator creates and edits them from the web dashboard, and a chat session binds to one at creation.
 
-**The row is half of an agent.** The other half is its persona directory, `<workspace>/personas/<agent_id>/`, holding the `SOUL.md` and `IDENTITY.md` it reads and the `skills/` directory only it sees. The split is by kind of content: the row carries what the system queries (a unique name to sort and pick by, a binary avatar, a framework), the directory carries the prose the agent itself rewrites. Neither a prompt nor a skill list is a column. See [`../todo/multi-agent-chat.md`](../todo/multi-agent-chat.md) for the binding, the resolution rules, and what is still unbuilt.
+**The row is half of an agent.** The other half is its persona directory,
+holding the `SOUL.md` and `IDENTITY.md` it reads and the `skills/` directory
+only it sees. Global agents use `<workspace>/personas/<agent_id>/`; newly
+created project agents have a `project-<ULID>` id and use
+`<workspace>/personas/project/<agent_id>/`. Older unprefixed project ids remain
+at their original flat location. The split is by kind of content: the row
+carries what the system queries (a unique name to sort and pick by, a binary
+avatar, a framework), the directory carries the prose the agent itself
+rewrites. Neither a prompt nor a skill list is a column. See
+[`../todo/multi-agent-chat.md`](../todo/multi-agent-chat.md) for the binding,
+the resolution rules, and what is still unbuilt.
 
 This is a cross-crate feature subsystem, not a crate. The pieces live where their kind of code already lives:
 
@@ -21,7 +31,7 @@ This is a cross-crate feature subsystem, not a crate. The pieces live where thei
 ```rust
 // crates/store/src/agent_profile.rs
 pub struct AgentProfileRow {
-    pub id: AgentProfileId,            // ULID at genesis; also the persona dir name
+    pub id: AgentProfileId,            // ULID, or project-<ULID>; persona leaf-dir name
     pub description: String,
     pub avatar_blob_id: Option<String>,// full blob id incl. read token, from POST /v1/blobs
     pub framework: AgentFramework,     // baybo | claude | codex
@@ -41,8 +51,8 @@ pub struct AgentProfileRow {
 | `llm` | follow `default-llm` | pin to this `baybo.json` entry name |
 
 **There is no prompt column, and no name column.** An agent's prompt is its
-own `personas/<id>/SOUL.md`, and its name is the `Name:` line in its
-`personas/<id>/IDENTITY.md` — files, so the agent rewrites both through
+own persona's `SOUL.md`, and its name is the `Name:` line in that persona's
+`IDENTITY.md` — files, so the agent rewrites both through
 `Edit` and git keeps the history (see
 [`../todo/multi-agent-chat.md`](../todo/multi-agent-chat.md)).
 
@@ -103,7 +113,7 @@ Nullable fields where `NULL` is meaningful make a partial `PATCH` need absent-vs
 
 ### Identity
 
-`id` is minted server-side (`AgentProfileId::generate()`, a ULID — the `FolderId` pattern) and, unlike `FolderId`, is **not** opaque: it becomes the persona directory's name, so it carries the skill-name grammar enforced by `AgentProfileId::parse` and by a validating `Deserialize` (a guard only on the constructor would be bypassed by every request body and stored row that parses one).
+`id` is minted server-side: global agents use `AgentProfileId::generate()` (a ULID — the `FolderId` pattern), while project-owned agents use `AgentProfileId::generate_project()` (`project-<ULID>`). Unlike `FolderId`, it is **not** opaque: it becomes the persona directory's leaf name, and the project prefix also selects the grouped tree. It therefore carries the skill-name grammar enforced by `AgentProfileId::parse` and by a validating `Deserialize`; the exact id `project` is reserved for the container directory (a guard only on the constructor would be bypassed by every request body and stored row that parses one).
 
 The **name** is not stored. `POST` / `PUT /v1/agents` still accept one — free-form after trim, non-empty, at most `MAX_AGENT_PROFILE_NAME_CHARS` (64) characters — but the handler splices it into the `Name:` line of that agent's `IDENTITY.md` rather than a column, preserving every other line the agent wrote. Reads derive it back the same way, falling back to the id when the file carries no usable name (the shipped template's state — it invites the agent to choose). Editing the name is therefore the same operation whether the operator or the agent does it, and there is nothing to keep in sync.
 
@@ -175,9 +185,18 @@ Shape changes ride the standard openapi regen chain — see the header of `crate
 ## Constraints
 
 - Feature subsystem, not a crate: no `baybo-agent-profiles` crate until there is behavior beyond CRUD. Domain types in `model`, port in `store`, impl in `storage`, policy in `gateway` handlers.
-- **The row is not the agent.** `ContextManager` reads the persona from `personas/<id>/`, the skills from `personas/<id>/skills/`, and the memory partition from the id — all keyed by the id the session carries, none of them by the row. So deleting a row strands nothing: the conversation keeps the persona, the skills and the memories it has been talking to, and only the row's own fields (the llm pin, the roster entry) go.
+- **The row is not the agent.** `ContextManager` reads the resolved persona,
+  skills, and memory partition keyed by the id the session carries, none of
+  them by the row. So deleting a row strands nothing: the conversation keeps
+  the persona, the skills and the memories it has been talking to, and only
+  the row's own fields (the llm pin, the roster entry) go.
 - Strictly disjoint from `SubagentProfile` and from the workspace Soul; the only shared vocabulary is `baybo-model` (`ExternalAgentKind`, `LlmEntryName`, the backend tag strings).
-- All cross-entity references are soft (FKs are off): `avatar_blob_id` into `blobs`, `llm` into `baybo.json`. Write-time validation where it's cheap and crisp (llm, avatar), tolerance at read time everywhere. Deleting a row does not touch `personas/<id>/`, and nothing in the persona path consults the row — so a bound conversation keeps the agent it has been talking to, the same way it keeps that agent's memories.
+- All cross-entity references are soft (FKs are off): `avatar_blob_id` into
+  `blobs`, `llm` into `baybo.json`. Write-time validation where it's cheap and
+  crisp (llm, avatar), tolerance at read time everywhere. Deleting a row does
+  not touch its resolved persona directory, and nothing in the persona path
+  consults the row — so a bound conversation keeps the agent it has been
+  talking to, the same way it keeps that agent's memories.
 - `name` carries an explicit length bound (`MAX_AGENT_PROFILE_NAME_CHARS`) **and** a round-trip check — it is rejected unless `display_name(with_display_name(…))` returns it unchanged, so a create response and the next `GET` can never disagree about what the agent is called. Identity-file writes carry a 1 MiB cap enforced by the API and by the `Edit` tool alike. `description` is deliberately bounded only by the admin request-body limit.
 - Profile rows are user data with a normal delete affordance — the session never-delete rule does not apply — but there is still no background sweeper of any kind, and orphaned avatar blobs stay inert.
 
@@ -195,7 +214,7 @@ authoritative for all three. What is left:
 
 | Module | Role |
 |---|---|
-| `model` | `AgentProfileId` (ULID-minted string newtype), `AgentFramework` (+ `to_backend_kind`), `BUILTIN_AGENT_PROFILE_ID`, `MAX_AGENT_PROFILE_NAME_CHARS` |
+| `model` | `AgentProfileId` (ULID / `project-<ULID>` string newtype), `AgentFramework` (+ `to_backend_kind`), `BUILTIN_AGENT_PROFILE_ID`, `MAX_AGENT_PROFILE_NAME_CHARS` |
 | `store` | `AgentProfileRow` / `AgentProfileUpdate` / `AgentProfileStore` port; `StorageError::Conflict` carries duplicate names |
 | `storage` | `SqliteAgentProfileStore` (async `open` seeds the builtin), `agent_profiles` DDL in `init_db()`, `Store.agent_profile` bundle field |
 | `gateway` | `api/admin/agents.rs` handlers + DTOs, `AdminState.{agent_profile_store, blob_store}`, the shared `validate_llm_pin`; `GET /v1/skills` (now `{name, description}` from `all_summaries_sorted`) and `GET /v1/llm/models` feed the read-only skills readout and the model picker |

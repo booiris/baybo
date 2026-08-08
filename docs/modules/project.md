@@ -395,6 +395,13 @@ disagree). Every board opens with a `@lead`, seeded **before** the project row s
 a failure leaves an inert orphan rather than a visible board with no
 coordinator.
 
+Project-owned persona trees are grouped at
+`personas/project/<agent_id>/`. New leads and teammates are minted with a
+`project-<ULID>` id, which makes the grouped location deterministic anywhere
+only the profile id is available. Existing project personas keep their older
+unprefixed ids in the flat layout; they remain readable and are not moved
+behind the operator's back.
+
 - Handles are derived from the display name and then permanent, and unique only
   *within* a board — `@dev-1` here and `@dev-1` there are different agents.
 - Removal is a **tombstone**: `deleted_at` is stamped and the membership row

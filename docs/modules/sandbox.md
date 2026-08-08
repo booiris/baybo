@@ -299,7 +299,7 @@ build time so bwrap never sees a `--tmpfs <missing>` line.
 `SandboxAdapter::with_readable_paths(paths)` adds **read-only** re-binds
 on top of that policy (filtered to existing paths at build time). The
 agent layer passes the calling agent's own skill directory,
-`<workspace>/personas/<id>/skills`, because the denylist masks all of
+`<persona>/skills` (including the `personas/project/` layout), because the denylist masks all of
 `~/.baybo` and installed skill scripts must still be executable in
 place. It is re-bound RO *after* the masking tmpfs — the same last-wins
 ordering that re-establishes the `work/` dir, except RO. The bind is not

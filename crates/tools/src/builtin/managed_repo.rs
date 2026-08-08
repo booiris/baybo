@@ -3,11 +3,12 @@
 //!
 //! Two tiers, both inside the one `personas/` repo:
 //!
-//! - **Identity files** — `personas/<agent_id>/{SOUL,IDENTITY,USER}.md`. A
+//! - **Identity files** — an agent's `{SOUL,IDENTITY,USER}.md`, either in the
+//!   flat global/legacy layout or under `personas/project/<agent_id>/`. A
 //!   closed allowlist: a persona directory is a declarative slot store.
-//! - **Memory files** — anything under `personas/<agent_id>/memory/`. No
-//!   filename allowlist: a memory tree is a freeform set of markdown files
-//!   the agent names as it likes.
+//! - **Memory files** — anything under that agent's `memory/`. No filename
+//!   allowlist: a memory tree is a freeform set of markdown files the agent
+//!   names as it likes.
 //!
 //! Both share three guards: the approval bypass (the audit commit is the
 //! accountability, not a per-write prompt), a size cap, and a commit into
@@ -48,7 +49,7 @@ pub(crate) const MAX_MANAGED_FILE_BYTES: u64 = 1 << 20;
 /// An audited write, resolved to the path to stage inside `personas/`.
 pub(crate) struct ManagedTarget {
     /// Repo-relative, so `git add --` stages exactly this file:
-    /// `<agent_id>/SOUL.md`, `<agent_id>/memory/fact.md`.
+    /// `<agent_id>/SOUL.md`, `project/<agent_id>/memory/fact.md`.
     pub(crate) rel_path: String,
 }
 
@@ -116,8 +117,8 @@ impl ManagedRoots {
         }
     }
 
-    /// Whether `file_path` looks like an identity file: the shared
-    /// `personas/USER.md`, or `personas/<any agent>/<IDENTITY>.md`.
+    /// Whether `file_path` looks like the shared `personas/USER.md` or an
+    /// identity file in either persona layout.
     fn is_identity_shape(&self, file_path: &Path) -> bool {
         matches!(
             self.shape(file_path),
@@ -125,7 +126,7 @@ impl ManagedRoots {
         )
     }
 
-    /// Whether `file_path` looks like `personas/<any agent>/memory/<file>`.
+    /// Whether `file_path` looks like a memory file in either persona layout.
     pub(crate) fn is_memory_shape(&self, file_path: &Path) -> bool {
         matches!(self.shape(file_path), PersonaPath::Memory { .. })
     }
@@ -195,8 +196,8 @@ impl ManagedRoots {
         self.identity_target(file_path, agent)
     }
 
-    /// Resolve `personas/<agent_id>/{SOUL,IDENTITY,USER}.md` for the calling
-    /// agent, rejecting a path under `personas/` that is not one of its own.
+    /// Resolve the calling agent's `{SOUL,IDENTITY,USER}.md` in either persona
+    /// layout, rejecting a path under `personas/` that is not one of its own.
     /// `None` when the path is outside `personas/` altogether.
     pub(crate) fn identity_target(
         &self,
@@ -231,8 +232,8 @@ impl ManagedRoots {
         }))
     }
 
-    /// Resolve a file under the calling agent's own memory tree,
-    /// `personas/<agent_id>/memory/…`.
+    /// Resolve a file under the calling agent's own memory tree in either
+    /// persona layout.
     ///
     /// Location-keyed with no filename allowlist — which is exactly why the
     /// guards in [`Self::locate`] and [`reject_symlinked_path`] carry the
@@ -486,6 +487,35 @@ mod tests {
             .expect("resolve")
             .expect("is a memory target");
         assert_eq!(target.rel_path, "baybo/memory/anything-at-all.md");
+    }
+
+    #[test]
+    fn a_project_agent_can_write_its_nested_identity_and_memory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let r = roots(tmp.path());
+        let paths = WorkspacePaths::new(tmp.path().to_path_buf());
+        let project = paths.project_persona_dir("project-01JLEAD");
+        std::fs::create_dir_all(project.join(baybo_workspace::paths::PERSONA_MEMORY_DIR))
+            .expect("project persona");
+        let me = agent("project-01JLEAD");
+
+        let identity = paths.persona_identity_file("project-01JLEAD", IdentityKind::Soul);
+        let target = r
+            .identity_target(&identity, &me)
+            .expect("resolve")
+            .expect("identity target");
+        assert_eq!(target.rel_path, "project/project-01JLEAD/SOUL.md");
+
+        let memory = paths.persona_memory_dir("project-01JLEAD").join("fact.md");
+        let target = r
+            .memory_target(&memory, &me)
+            .expect("resolve")
+            .expect("memory target");
+        assert_eq!(target.rel_path, "project/project-01JLEAD/memory/fact.md");
+        assert!(
+            r.memory_target(&memory, &agent("project-01JOTHER"))
+                .is_err()
+        );
     }
 
     #[test]

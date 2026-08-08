@@ -30,7 +30,7 @@ pub const BUILTIN_AGENT_PROFILE_ID: &str = baybo_workspace::paths::BUILTIN_PERSO
 pub const MAX_AGENT_PROFILE_NAME_CHARS: usize = 64;
 
 /// Upper bound on an agent profile *id*, which — unlike the display name —
-/// becomes a directory name under the workspace `personas/` tree.
+/// becomes one component of a directory under the workspace `personas/` tree.
 pub const MAX_AGENT_PROFILE_ID_CHARS: usize = 64;
 
 /// Upper bound on an [`AgentHandle`]. Short on purpose: a handle is typed
@@ -49,9 +49,10 @@ pub struct InvalidAgentProfileId {
 
 /// Server-generated identifier for an agent profile.
 ///
-/// A ULID at genesis (the fixed sentinel for the built-in row), and the
-/// directory name of the profile's persona folder — so it is **not** an
-/// opaque string: every construction path runs the same grammar,
+/// A ULID at genesis for global agents, `project-<ULID>` for project-owned
+/// agents (or the fixed sentinel for the built-in row), and one path component
+/// of the profile's persona folder — so it is **not** an opaque string: every
+/// construction path runs the same grammar,
 /// `[A-Za-z0-9][A-Za-z0-9._-]{0,63}` (the skill-name grammar), which is
 /// what keeps [`Self::identity_file`] and [`Self::skills_dir`] inside
 /// the workspace. There is deliberately no infallible `From<String>`, and
@@ -65,6 +66,17 @@ impl AgentProfileId {
     /// Mint a fresh profile id (a ULID rendered as its canonical string).
     pub fn generate() -> Self {
         Self(Ulid::new().to_string())
+    }
+
+    /// Mint a fresh project-owned profile id. The prefix is what routes every
+    /// identity, skill, and memory lookup into `personas/project/` without a
+    /// store lookup or filesystem probe.
+    pub fn generate_project() -> Self {
+        Self(format!(
+            "{}{}",
+            baybo_workspace::paths::PROJECT_PERSONA_ID_PREFIX,
+            Ulid::new()
+        ))
     }
 
     /// The fixed id of the seeded built-in profile.
@@ -98,6 +110,9 @@ impl AgentProfileId {
         if value.chars().count() > MAX_AGENT_PROFILE_ID_CHARS {
             return Err(reject("longer than 64 characters"));
         }
+        if value == baybo_workspace::paths::PROJECT_PERSONAS_DIR {
+            return Err(reject("reserved for the project persona directory"));
+        }
         Ok(Self(value))
     }
 
@@ -124,15 +139,16 @@ impl AgentProfileId {
     /// curates — stays at `personas/USER.md` and every agent reads it too; see
     /// `baybo_context::prompts::soul`.
     ///
-    /// One rule, no special cases: an agent's files live in its own
-    /// directory, the built-in's at `personas/baybo/`. The shared human
-    /// profile (`personas/USER.md`) is not addressed here — it belongs to no
-    /// agent, so it is not one of anyone's identity files.
+    /// An agent's files live in its resolved persona directory: global and
+    /// legacy project agents are flat, while newly created project agents are
+    /// grouped below `personas/project/`. The shared human profile
+    /// (`personas/USER.md`) is not addressed here — it belongs to no agent, so
+    /// it is not one of anyone's identity files.
     pub fn identity_file(&self, paths: &WorkspacePaths, kind: IdentityKind) -> PathBuf {
         paths.persona_identity_file(&self.0, kind)
     }
 
-    /// This agent's skills, at `personas/<id>/skills/`.
+    /// This agent's skills below its resolved persona directory.
     ///
     /// Every agent owns its set outright — there is no shared tree to inherit
     /// from or be shadowed by, and the built-in is not a special case: its
@@ -358,7 +374,11 @@ mod tests {
 
     #[test]
     fn generated_and_builtin_ids_pass_their_own_grammar() {
-        for id in [AgentProfileId::generate(), AgentProfileId::builtin()] {
+        for id in [
+            AgentProfileId::generate(),
+            AgentProfileId::generate_project(),
+            AgentProfileId::builtin(),
+        ] {
             AgentProfileId::parse(id.as_str())
                 .unwrap_or_else(|e| panic!("minted id must be parseable: {e}"));
         }
@@ -376,6 +396,7 @@ mod tests {
             "-lead",
             "has space",
             "naïve",
+            baybo_workspace::paths::PROJECT_PERSONAS_DIR,
             &"a".repeat(MAX_AGENT_PROFILE_ID_CHARS + 1),
         ] {
             assert!(
@@ -445,6 +466,28 @@ mod tests {
     #[test]
     fn generated_profile_ids_are_unique() {
         assert_ne!(AgentProfileId::generate(), AgentProfileId::generate());
+        assert_ne!(
+            AgentProfileId::generate_project(),
+            AgentProfileId::generate_project()
+        );
+    }
+
+    #[test]
+    fn project_profile_ids_select_the_grouped_persona() {
+        let paths = WorkspacePaths::new("/ws");
+        let project = AgentProfileId::generate_project();
+
+        assert!(
+            project
+                .as_str()
+                .starts_with(baybo_workspace::paths::PROJECT_PERSONA_ID_PREFIX)
+        );
+        assert_eq!(
+            project.memory_dir(&paths),
+            paths
+                .project_persona_dir(project.as_str())
+                .join(baybo_workspace::paths::PERSONA_MEMORY_DIR)
+        );
     }
 
     #[test]
