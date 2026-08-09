@@ -92,6 +92,93 @@ pub enum FilesystemPolicy {
     },
 }
 
+/// Read-only system roots the Linux (bwrap) backend binds into every
+/// sandbox. Single source of truth for the argv builder and
+/// [`path_visibility`].
+pub(crate) const LINUX_RO_SYSTEM_ROOTS: &[&str] = &[
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib64",
+    "/etc",
+    "/run/systemd/resolve",
+];
+
+/// Read-only system roots the macOS (sandbox-exec) backend allows.
+/// Same role as [`LINUX_RO_SYSTEM_ROOTS`] for the SBPL profile.
+pub(crate) const MACOS_RO_SYSTEM_ROOTS: &[&str] = &[
+    "/usr",
+    "/System",
+    "/Library",
+    "/private/var/db/dyld",
+    "/private/etc",
+    "/private/tmp",
+    "/bin",
+    "/sbin",
+];
+
+/// Scratch roots every backend exposes in `Permissive` mode. `/tmp` is
+/// a host bind; `/proc` and `/dev` are synthesised, so a host file path
+/// underneath them is not a meaningful question — all three are treated
+/// as "may be visible" so [`path_visibility`] never claims otherwise.
+const SHARED_SCRATCH_ROOTS: &[&str] = &["/tmp", "/proc", "/dev"];
+
+/// Whether `path` is reachable from inside a sandbox built with this
+/// policy, as a three-valued answer:
+///
+/// - `Some(true)` — reachable on **every** backend.
+/// - `Some(false)` — reachable on **no** backend.
+/// - `None` — backend-dependent, or the question is not well-formed
+///   (relative path, `Workspace` policy whose scratch roots are
+///   per-call tmpfs). Callers MUST treat `None` as "do not claim
+///   anything"; it is not a synonym for either boolean.
+///
+/// The system-root check deliberately unions the Linux and macOS lists
+/// rather than picking the running platform's: a wrong `Some(false)`
+/// would have the agent told a visible path is invisible, which is a
+/// worse failure than declining to answer.
+pub fn path_visibility(
+    policy: &FilesystemPolicy,
+    workspace_root: &Path,
+    readable_paths: &[PathBuf],
+    path: &Path,
+) -> Option<bool> {
+    if !path.is_absolute() {
+        return None;
+    }
+    // Mount order is last-wins, so the re-exposing binds are tested
+    // before the masking tmpfs: `readable_paths` and `workspace_root`
+    // are bound *after* `denied_paths` precisely so a work dir nested
+    // inside a masked state dir stays reachable.
+    if path.starts_with(workspace_root) || readable_paths.iter().any(|p| path.starts_with(p)) {
+        return Some(true);
+    }
+    let FilesystemPolicy::Permissive {
+        extra_root,
+        denied_paths,
+    } = policy
+    else {
+        // `Workspace` mode gives `/tmp` a fresh per-call tmpfs and no
+        // extra root; nothing outside the binds above is worth a claim.
+        return None;
+    };
+    if denied_paths.iter().any(|p| path.starts_with(p)) {
+        return Some(false);
+    }
+    if path.starts_with(extra_root) {
+        return Some(true);
+    }
+    let under_any = |roots: &[&str]| roots.iter().any(|r| path.starts_with(Path::new(r)));
+    if under_any(SHARED_SCRATCH_ROOTS) {
+        return None;
+    }
+    if under_any(LINUX_RO_SYSTEM_ROOTS) || under_any(MACOS_RO_SYSTEM_ROOTS) {
+        return None;
+    }
+    Some(false)
+}
+
 /// Per-invocation resource caps applied by whichever isolation backend
 /// supports them. `None` keeps the backend default (which on Linux means
 /// "inherit the host's per-user limits", on Docker means "the daemon's
@@ -192,4 +279,126 @@ pub enum Backend {
     Bwrap,
     SandboxExec,
     Docker,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn permissive(extra_root: &str, denied: &[&str]) -> FilesystemPolicy {
+        FilesystemPolicy::Permissive {
+            extra_root: PathBuf::from(extra_root),
+            denied_paths: denied.iter().map(PathBuf::from).collect(),
+        }
+    }
+
+    #[test]
+    fn a_path_outside_every_root_is_provably_invisible() {
+        // The incident: the gateway binary lives in the repo's `target/`,
+        // which no bind covers, so `exit 127` there means "never mounted".
+        let policy = permissive("/home/u", &["/home/u/.baybo"]);
+        assert_eq!(
+            path_visibility(
+                &policy,
+                Path::new("/home/u/.baybo/work"),
+                &[],
+                Path::new("/data/aura/target/release/baybo")
+            ),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn the_re_exposing_binds_win_over_the_masking_tmpfs() {
+        // Mount order is last-wins: the work dir and the readable skill tree
+        // are bound AFTER the denylist tmpfs precisely so they survive it.
+        let policy = permissive("/home/u", &["/home/u/.baybo"]);
+        let work = Path::new("/home/u/.baybo/work");
+        let skills = [PathBuf::from("/home/u/.baybo/personas/b/skills")];
+        assert_eq!(
+            path_visibility(
+                &policy,
+                work,
+                &skills,
+                Path::new("/home/u/.baybo/work/x.py")
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            path_visibility(
+                &policy,
+                work,
+                &skills,
+                Path::new("/home/u/.baybo/personas/b/skills/s/run.sh")
+            ),
+            Some(true)
+        );
+        // The rest of the masked tree stays hidden.
+        assert_eq!(
+            path_visibility(
+                &policy,
+                work,
+                &skills,
+                Path::new("/home/u/.baybo/state/storage.db")
+            ),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn the_extra_root_is_visible_and_system_roots_are_undecided() {
+        let policy = permissive("/home/u", &["/home/u/.ssh"]);
+        let work = Path::new("/home/u/.baybo/work");
+        assert_eq!(
+            path_visibility(&policy, work, &[], Path::new("/home/u/notes.txt")),
+            Some(true)
+        );
+        assert_eq!(
+            path_visibility(&policy, work, &[], Path::new("/home/u/.ssh/id_rsa")),
+            Some(false)
+        );
+        // Backend-dependent roots must never be claimed either way: a wrong
+        // `Some(false)` would tell the agent a mounted path is invisible.
+        for p in [
+            "/usr/bin/python3",
+            "/tmp/scratch",
+            "/private/tmp/x",
+            "/System/L",
+        ] {
+            assert_eq!(
+                path_visibility(&policy, work, &[], Path::new(p)),
+                None,
+                "{p}"
+            );
+        }
+    }
+
+    #[test]
+    fn relative_paths_and_workspace_mode_decline_to_answer() {
+        let policy = permissive("/home/u", &[]);
+        assert_eq!(
+            path_visibility(&policy, Path::new("/home/u/w"), &[], Path::new("target/x")),
+            None
+        );
+        // `Workspace` mode gives `/tmp` a per-call tmpfs and has no extra
+        // root; only the explicit binds are worth a claim.
+        assert_eq!(
+            path_visibility(
+                &FilesystemPolicy::Workspace,
+                Path::new("/home/u/w"),
+                &[],
+                Path::new("/home/u/w/x")
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            path_visibility(
+                &FilesystemPolicy::Workspace,
+                Path::new("/home/u/w"),
+                &[],
+                Path::new("/opt/x")
+            ),
+            None
+        );
+    }
 }

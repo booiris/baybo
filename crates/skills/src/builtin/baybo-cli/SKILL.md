@@ -11,9 +11,24 @@ allowed-tools:
 # baybo CLI
 
 You are operating against the **running Baybo instance** via its CLI.
-The binary is at the absolute path shown below — use that path
-verbatim, not bare `baybo`, because the agent's Bash subshell may
-not have the binary on `$PATH`. The Bash tool also pre-exports
+The binary is at the absolute path shown below. Two hard rules govern
+how you may spell the invocation — the Bash tool rejects both violations
+with an explanation, so a mistake here costs you a turn:
+
+1. **Use the absolute path verbatim.** A bare `baybo` or a relative path
+   is rejected: the unsandboxed shell must never resolve the gateway
+   binary through `$PATH`.
+2. **The baybo invocation must come FIRST on the command line.** Only a
+   leading `{{BAYBO_BIN}}` runs outside the OS sandbox. Putting anything
+   before it — `cd … && {{BAYBO_BIN}} …`, `python3 … && {{BAYBO_BIN}} …`,
+   `for p in …; do "$p" …; done`, `if [ -x … ]` — makes the *whole* line
+   run inside the sandbox, where this binary is not mounted. That fails
+   with `exit 127` / `No such file or directory`, which does **not** mean
+   the binary is missing on the host. Split it into two Bash calls
+   instead. Chaining other commands *after* a leading `{{BAYBO_BIN}}` is
+   fine.
+
+The Bash tool also pre-exports
 `BAYBO_HELP_AGENT=1` and `BAYBO_CONFIG_PATH=<active config>`, so
 commands you compose:
 

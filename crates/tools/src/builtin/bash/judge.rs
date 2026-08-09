@@ -69,7 +69,26 @@ pub(crate) enum PreExec {
     Prompt(String),
 }
 
+/// The failed sandboxed run [`judge_post_fail`] reasons about. Grouped into a
+/// struct so every field arrives at the call site by name — several are bare
+/// strings and a bool whose order would otherwise be easy to transpose
+/// silently.
+pub(crate) struct PostFailInput<'a> {
+    pub command: &'a str,
+    pub cwd: Option<&'a Path>,
+    pub exit_code: i32,
+    /// Already secret-redacted AND injection-sanitised by the caller.
+    pub stdout_tail: &'a str,
+    /// Already secret-redacted AND injection-sanitised by the caller.
+    pub stderr_tail: &'a str,
+    /// Caller-side evidence that the failure WAS the sandbox's doing, for
+    /// facts the judge cannot see. See the `judge_post_fail` docs for the
+    /// cap this carries.
+    pub known_sandbox_related: bool,
+}
+
 /// Post-failure decision for a sandboxed command that exited non-zero.
+#[derive(Debug)]
 pub(crate) enum PostFail {
     /// Not sandbox-related (or judge couldn't establish it): return the
     /// original sandboxed failure unchanged.
@@ -155,15 +174,31 @@ pub(crate) async fn judge_pre_exec(
 /// lands here, and a `safe` verdict re-runs that command on the host with no
 /// approval gate — so they get the same framing as tool output entering the
 /// main transcript rather than being interpolated raw.
+///
+/// `known_sandbox_related` lets the caller settle the `sandbox_related` half
+/// from evidence the judge cannot see — today, the sandbox proving that the
+/// program the shell could not exec was never mounted, which the judge reads
+/// as an ordinary missing file roughly four times in five.
+///
+/// It can only ADD the sandbox-related reading, never remove it, and it
+/// deliberately **caps its own outcome at [`PostFail::Prompt`]**: an override
+/// the judge disagreed with may put the escape in front of a human, but must
+/// never be the thing that re-runs a command on the host unattended. Only a
+/// verdict where the judge *itself* said `sandbox_related` can still reach
+/// [`PostFail::Unsandbox`], exactly as before.
 pub(crate) async fn judge_post_fail(
     llm: &dyn BilledChat,
     events: &Arc<dyn ToolEventSink>,
-    command: &str,
-    cwd: Option<&Path>,
-    exit_code: i32,
-    stdout_tail: &str,
-    stderr_tail: &str,
+    failure: PostFailInput<'_>,
 ) -> PostFail {
+    let PostFailInput {
+        command,
+        cwd,
+        exit_code,
+        stdout_tail,
+        stderr_tail,
+        known_sandbox_related,
+    } = failure;
     let user = format!(
         "Command:\n{command}\n\nWorking directory: {}\nExit code: {exit_code}\n\n\
          {}\n\n{}\n\nRespond with the JSON verdict only.",
@@ -178,7 +213,13 @@ pub(crate) async fn judge_post_fail(
         return PostFail::Prompt("risk judge unavailable — approval required".to_string());
     };
     if !verdict.sandbox_related {
-        return PostFail::Keep;
+        if !known_sandbox_related {
+            return PostFail::Keep;
+        }
+        return PostFail::Prompt(rationale_or(
+            verdict.rationale,
+            "the sandbox proves this path was never mounted, though the judge read the failure as an ordinary missing file",
+        ));
     }
     match parse_risk(&verdict.risk) {
         Risk::Safe => PostFail::Unsandbox(rationale_or(
@@ -412,6 +453,78 @@ mod tests {
         let (verdict, stub) = run(vec![Ok("nope"), Ok("still nope")]).await;
         assert!(verdict.is_none(), "fail closed after the retry");
         assert_eq!(stub.captured_requests().len(), 2);
+    }
+
+    /// The incident verdict, verbatim from the trace: the judge read an
+    /// unmounted binary as an ordinary missing file, and `sandbox_related:
+    /// false` short-circuited to `Keep` before the (correct) `risk: safe`
+    /// was ever consulted. The command then failed silently, with nothing in
+    /// the tool result naming the sandbox.
+    const INCIDENT_VERDICT: &str = r#"{"sandbox_related":false,"risk":"safe","rationale":"The failure is due to a missing local executable."}"#;
+
+    async fn post_fail(reply: &str, known_sandbox_related: bool) -> PostFail {
+        let (llm, _stub) = judge_stub(vec![Ok(reply)]);
+        let events = crate::noop_event_sink();
+        judge_post_fail(
+            llm.as_ref(),
+            &events,
+            PostFailInput {
+                command: "/opt/x/bin/tool --probe",
+                cwd: None,
+                exit_code: 127,
+                stdout_tail: "",
+                stderr_tail: "sh: line 1: /opt/x/bin/tool: No such file or directory",
+                known_sandbox_related,
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_judge_miss_without_corroboration_still_keeps_the_failure() {
+        // Unchanged behaviour: with no independent evidence, the judge's
+        // "not the sandbox's doing" stands, and the escape prompt — the most
+        // privileged one in the system — does not fire on a plain failure.
+        assert!(matches!(
+            post_fail(INCIDENT_VERDICT, false).await,
+            PostFail::Keep
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_proven_unmounted_path_overrides_the_miss_but_only_up_to_a_prompt() {
+        // The override may put the escape in front of a human. It must NOT
+        // reach `Unsandbox`, even though this verdict says `risk: safe`:
+        // re-running a command on the host unattended is not something our
+        // own heuristic gets to decide over the judge's objection.
+        let decision = post_fail(INCIDENT_VERDICT, true).await;
+        let PostFail::Prompt(rationale) = decision else {
+            panic!("expected Prompt, got {decision:?}");
+        };
+        assert!(!rationale.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_judges_own_sandbox_related_safe_verdict_still_re_runs() {
+        // The override must not disturb the existing auto-escape path.
+        let reply =
+            r#"{"sandbox_related":true,"risk":"safe","rationale":"needs the masked state dir"}"#;
+        assert!(matches!(
+            post_fail(reply, false).await,
+            PostFail::Unsandbox(_)
+        ));
+        assert!(matches!(
+            post_fail(reply, true).await,
+            PostFail::Unsandbox(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_risky_verdict_prompts_regardless_of_corroboration() {
+        let reply =
+            r#"{"sandbox_related":true,"risk":"risky","rationale":"downloads and runs a payload"}"#;
+        assert!(matches!(post_fail(reply, false).await, PostFail::Prompt(_)));
+        assert!(matches!(post_fail(reply, true).await, PostFail::Prompt(_)));
     }
 
     /// Provider errors already have a retry layer inside `baybo_llm`;

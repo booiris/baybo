@@ -76,9 +76,22 @@ safe.
 - No approval handle for a verdict that needs one, such as cron or an
   unattended nested run: return the original sandboxed failure.
 
+One correction rides on top of that verdict. A program the sandbox never
+mounted fails with exactly the `exit 127` / `No such file or directory` a
+genuinely deleted binary produces, and the judge reads the second: in this
+repo's trace history it answered `sandbox_related: false` on four of five such
+failures. So when the sandbox backend can *prove* the named program was outside
+its mounts, that fact overrides a `false` verdict — but only as far as the
+approval prompt. A judge that did not see the sandbox itself never causes an
+unattended host rerun; reaching `Unsandbox` still requires the judge's own
+`sandbox_related` verdict.
+
 An unsandboxed retry after a command failure records `sandbox_escalation` in
 the tool result, and every unsandboxed escape emits a warning notice when a
-notifier is available.
+notifier is available. Independently of any retry, a sandboxed `exit 127` whose
+program is provably unmounted records `sandbox_visibility` in the tool result,
+naming the path and stating that the exit code is not evidence about whether
+the file exists on the host.
 
 ### `manual`
 

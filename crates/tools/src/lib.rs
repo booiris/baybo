@@ -704,6 +704,15 @@ pub trait ExecSandbox: Send + Sync {
             "detached spawn is not supported by this sandbox backend".into(),
         ))
     }
+
+    /// Whether the host path `path` is reachable from inside this sandbox.
+    /// `None` means the backend cannot answer — callers MUST NOT render
+    /// that as either answer. Lets a caller tell "the sandbox never
+    /// mounted this" apart from "the file is genuinely missing", which
+    /// are indistinguishable from the `ENOENT` a failed `execve` prints.
+    fn path_is_visible(&self, _path: &Path) -> Option<bool> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Default)]

@@ -217,6 +217,15 @@ impl ExecSandbox for SandboxAdapter {
             Err(e) => Err(ToolError::Execution(e.to_string())),
         }
     }
+
+    fn path_is_visible(&self, path: &Path) -> Option<bool> {
+        baybo_sandbox::path_visibility(
+            &self.filesystem_policy,
+            &self.workspace_root,
+            &self.readable_paths,
+            path,
+        )
+    }
 }
 
 /// Bridges a backend's [`baybo_sandbox::DetachedChild`] to the tool layer's
