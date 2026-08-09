@@ -2386,8 +2386,10 @@ export interface components {
             /** @description `baybo.json` LLM entry name; must match a configured entry. */
             llm?: string | null;
             /**
-             * @description Display name. The `@handle` is derived from it and then immutable —
-             *     renaming the agent later never moves its handle.
+             * @description Display name, and the only chance to choose one: the `@handle` is
+             *     derived from it here, and neither can be changed afterwards — a board
+             *     that called an agent one thing while everybody addressed it as another
+             *     would be lying on every card.
              */
             name: string;
             /**
@@ -3004,7 +3006,13 @@ export interface components {
             /** @description `baybo.json` LLM entry name, or `null`/absent to follow `default-llm`. */
             llm?: string | null;
         };
-        /** @description Request body for `PUT /v1/agents/{agent_id}/name`. */
+        /**
+         * @description Request body for `PUT /v1/agents/{agent_id}/name`.
+         *
+         *     Rejected for an agent on a project team: the `@handle` its board addresses
+         *     it by was derived from its name when it was hired, so the name is fixed for
+         *     as long as the agent exists.
+         */
         SetAgentNameRequest: {
             name: string;
         };
@@ -3134,7 +3142,10 @@ export interface components {
             /** @description The coordinator, which every board has and none may remove. */
             lead: boolean;
             llm?: string | null;
-            /** @description Display name from the agent's own `IDENTITY.md`. */
+            /**
+             * @description Display name from the agent's own `IDENTITY.md`. Fixed at hire, like
+             *     the handle derived from it.
+             */
             name: string;
         };
         /**
@@ -3710,7 +3721,7 @@ export interface operations {
                     "application/json": components["schemas"]["AgentIdentityFileDto"];
                 };
             };
-            /** @description Malformed agent id */
+            /** @description Malformed agent id, or a body that renames a project agent — its @handle came from that name */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -3823,7 +3834,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description Malformed agent id or name */
+            /** @description Malformed agent id or name, or a project agent, whose name its @handle was derived from and cannot outlive */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -6791,7 +6802,10 @@ export interface operations {
                             /** @description The coordinator, which every board has and none may remove. */
                             lead: boolean;
                             llm?: string | null;
-                            /** @description Display name from the agent's own `IDENTITY.md`. */
+                            /**
+                             * @description Display name from the agent's own `IDENTITY.md`. Fixed at hire, like
+                             *     the handle derived from it.
+                             */
                             name: string;
                         }[];
                         next_cursor?: string | null;

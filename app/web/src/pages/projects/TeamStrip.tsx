@@ -154,7 +154,8 @@ function HireAgentForm({
             className="border-2 border-black rounded-md px-2 py-1 font-sans text-sm"
           />
           <span className="text-ink-soft">
-            Its @handle comes from this name and never changes afterwards.
+            Its @handle comes from this name. Neither can be changed afterwards &mdash; not by
+            you, not by the agent.
           </span>
         </label>
         <label className="flex flex-col gap-1 font-mono text-[0.68rem]">

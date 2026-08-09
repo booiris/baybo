@@ -447,6 +447,76 @@ async fn a_board_staffs_itself_through_its_own_roster() {
     .await;
 }
 
+/// A board addresses an agent by a `@handle` derived from its name at hire,
+/// and the handle never moves — so the name must not either, through any of
+/// the doors onto the `Name:` line of the agent's own `IDENTITY.md`.
+#[tokio::test]
+async fn a_hired_agent_keeps_the_name_its_handle_came_from() {
+    let (router, _tg) = router().await;
+    let p = open_project(&router, "naming").await;
+    let hired = post(
+        &router,
+        &format!("/v1/projects/{p}/agents"),
+        json!({ "name": "Test Engineer", "role": "Writes the tests." }),
+        StatusCode::CREATED,
+    )
+    .await;
+    let id = hired["id"].as_str().expect("id").to_owned();
+    assert_eq!(hired["handle"], "test-engineer");
+
+    let refused = put(
+        &router,
+        &format!("/v1/agents/{id}/name"),
+        json!({ "name": "Aster" }),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("@handle"),
+        "{refused:?}"
+    );
+
+    // The whole-file door onto the same line is shut too, version token and
+    // all — otherwise the rename endpoint would just be the polite way in.
+    let identity = get(
+        &router,
+        &format!("/v1/agents/{id}/identity"),
+        StatusCode::OK,
+    )
+    .await;
+    let body = identity["content"].as_str().expect("content");
+    assert!(body.contains("* **Name:** Test Engineer"), "{body}");
+    put(
+        &router,
+        &format!("/v1/agents/{id}/identity"),
+        json!({ "content": body.replace("Test Engineer", "Aster"), "version": identity["version"] }),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+
+    // Everything it writes around the name is still its own.
+    put(
+        &router,
+        &format!("/v1/agents/{id}/identity"),
+        json!({ "content": format!("{body}* **Vibe:** dry\n"), "version": identity["version"] }),
+        StatusCode::OK,
+    )
+    .await;
+
+    let team = get(&router, &format!("/v1/projects/{p}/agents"), StatusCode::OK).await;
+    let member = team["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|m| m["id"] == json!(id))
+        .expect("still on the team");
+    assert_eq!(member["name"], "Test Engineer");
+    assert_eq!(member["handle"], "test-engineer");
+}
+
 #[tokio::test]
 async fn a_removed_teammate_leaves_the_roster_but_not_the_record() {
     let (router, _tg) = router().await;

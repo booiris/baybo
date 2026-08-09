@@ -123,10 +123,14 @@ pub fn persona_seed(agent_id: &str, kind: IdentityKind) -> &'static str {
         (IdentityKind::Soul, true) => IdentityKind::Soul.default_content(),
         (IdentityKind::Soul, false) => crate::prompt::PERSONA_SOUL_TEMPLATE,
         (IdentityKind::User, _) => crate::prompt::PERSONA_USER_TEMPLATE,
-        // The self-image template is seeded verbatim for everyone: it invites
-        // the agent to pick its own name and emoji, and pre-filling it from a
-        // profile row would only mint a copy that goes stale on the next
-        // rename.
+        // A project agent's name is fixed at hire, so its self-image template
+        // says so instead of inviting it to choose one.
+        (IdentityKind::Identity, _) if crate::name::name_is_fixed(agent_id) => {
+            crate::prompt::PROJECT_PERSONA_IDENTITY_TEMPLATE
+        }
+        // Everyone else gets the template verbatim: it invites the agent to
+        // pick its own name and emoji, and pre-filling it from a profile row
+        // would only mint a copy that goes stale on the next rename.
         (IdentityKind::Identity, _) => IdentityKind::Identity.default_content(),
     }
 }
@@ -457,6 +461,12 @@ mod tests {
         assert_eq!(
             crate::name::display_name(&identity).as_deref(),
             Some("Lead")
+        );
+        // …and the file it was named in does not then invite it to pick a
+        // different one, which is an act every writer of that line refuses.
+        assert!(
+            !identity.contains("pick something you like"),
+            "a project persona must not be seeded from the global template: {identity}"
         );
 
         let status = git(vec!["status", "--porcelain"]).await;

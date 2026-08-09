@@ -1,7 +1,7 @@
 pub mod paths;
 pub use paths::{IdentityKind, WorkspacePaths, absolutise};
 pub mod name;
-pub use name::{display_name, with_display_name};
+pub use name::{display_name, rejected_name_removal, rejected_rename, with_display_name};
 pub mod prompt;
 pub mod walk;
 

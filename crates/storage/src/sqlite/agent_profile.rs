@@ -679,6 +679,70 @@ mod tests {
         ));
     }
 
+    /// Raw `UPDATE`, deliberately going under the trait: the point is that
+    /// the membership is fixed by the *schema*, not by this file's statements
+    /// happening never to name those two columns. A future `set_handle`, or
+    /// one more field on `AgentProfileUpdate`, must fail loudly rather than
+    /// silently repoint every `@dev-1` already typed into a comment.
+    #[tokio::test]
+    async fn a_board_and_handle_cannot_be_moved_after_the_hire() {
+        let store = open_store().await;
+        let alpha = project("alpha");
+        let row = team_row(&alpha, "dev-1");
+        store.create(&row).await.unwrap();
+
+        async fn refused(
+            store: &SqliteAgentProfileStore,
+            id: &AgentProfileId,
+            sql: &'static str,
+        ) -> Option<String> {
+            let id = id.as_str().to_string();
+            store
+                .pool
+                .interact("test.move_membership", move |conn| {
+                    Ok(conn
+                        .execute(sql, rusqlite::params![id])
+                        .err()
+                        .map(|e| e.to_string()))
+                })
+                .await
+                .unwrap()
+        }
+
+        for sql in [
+            "UPDATE agent_profiles SET handle = 'renamed' WHERE id = ?1",
+            "UPDATE agent_profiles SET project_id = 'beta' WHERE id = ?1",
+            "UPDATE agent_profiles SET project_id = NULL, handle = NULL WHERE id = ?1",
+        ] {
+            let err = refused(&store, &row.id, sql)
+                .await
+                .unwrap_or_else(|| panic!("{sql} must abort"));
+            assert!(err.contains("fixed when it is hired"), "{sql}: {err}");
+        }
+        let back = store.get(&row.id).await.unwrap().unwrap();
+        assert_eq!(back.team, row.team, "a refused write changes nothing");
+
+        // The guard is on the value, not on the column being mentioned: a
+        // statement that writes the same membership back is not a move.
+        assert!(
+            refused(
+                &store,
+                &row.id,
+                "UPDATE agent_profiles SET handle = handle WHERE id = ?1"
+            )
+            .await
+            .is_none()
+        );
+
+        // And it does not over-fire on the writes that legitimately touch
+        // this row — leaving a team is a `deleted_at` stamp, not a move.
+        assert!(store.update(&row.id, &content_update()).await.unwrap());
+        assert!(store.remove_from_team(&row.id).await.unwrap());
+        let back = store.get(&row.id).await.unwrap().unwrap();
+        assert_eq!(back.team, row.team);
+        assert!(back.deleted_at.is_some());
+    }
+
     #[tokio::test]
     async fn a_removed_teammate_leaves_the_roster_and_stays_resolvable() {
         let store = open_store().await;

@@ -375,10 +375,13 @@ pub enum PersonaPath<'a> {
     /// `personas/USER.md` — the human profile every agent shares.
     SharedUser,
     /// An agent's `{SOUL,IDENTITY,USER}.md`, in either the flat legacy/global
-    /// layout or `personas/project/<agent_id>/`. Which of the three is
-    /// deliberately not carried: every caller so far asks only whose the file
-    /// is, and a field nobody reads is a field nobody maintains.
-    Identity { agent_id: &'a str },
+    /// layout or `personas/project/<agent_id>/`. Carries which of the three,
+    /// because `IDENTITY.md` has a rule about its contents that its siblings
+    /// — and a memory file that merely happens to share its name — do not.
+    Identity {
+        agent_id: &'a str,
+        kind: IdentityKind,
+    },
     /// A file under an agent's `memory/` directory in either layout.
     Memory { agent_id: &'a str },
     /// Anything else: an agent's skills directory, a bare directory, a stray
@@ -400,20 +403,23 @@ pub fn classify_persona_path(relative: &Path) -> PersonaPath<'_> {
     }
     match parts.as_slice() {
         [SHARED_USER_FILE] => PersonaPath::SharedUser,
-        [PROJECT_PERSONAS_DIR, agent_id, name]
-            if IdentityKind::all().iter().any(|k| k.file_name() == *name) =>
-        {
-            PersonaPath::Identity { agent_id }
-        }
+        // Exactly three components, so this never shadows the memory arm
+        // below (four or more). A name that is not one of the three identity
+        // files lands where it did before: `Other`.
+        [PROJECT_PERSONAS_DIR, agent_id, name] => match IdentityKind::from_file_name(name) {
+            Some(kind) => PersonaPath::Identity { agent_id, kind },
+            None => PersonaPath::Other,
+        },
         [PROJECT_PERSONAS_DIR, agent_id, dir, _rest @ ..]
             if *dir == PERSONA_MEMORY_DIR && parts.len() >= 4 =>
         {
             PersonaPath::Memory { agent_id }
         }
         [PROJECT_PERSONAS_DIR, ..] => PersonaPath::Other,
-        [agent_id, name] if IdentityKind::all().iter().any(|k| k.file_name() == *name) => {
-            PersonaPath::Identity { agent_id }
-        }
+        [agent_id, name] => match IdentityKind::from_file_name(name) {
+            Some(kind) => PersonaPath::Identity { agent_id, kind },
+            None => PersonaPath::Other,
+        },
         // A bare `<agent_id>/memory` is the directory itself, not a file in it.
         [agent_id, dir, _rest @ ..] if *dir == PERSONA_MEMORY_DIR && parts.len() >= 3 => {
             PersonaPath::Memory { agent_id }
@@ -443,6 +449,14 @@ impl IdentityKind {
             Self::User => IDENTITY_USER_FILE,
             Self::Identity => IDENTITY_IDENTITY_FILE,
         }
+    }
+
+    /// The kind stored under `file_name`, or `None` for any other name.
+    /// The exact-cased inverse of [`Self::file_name`] — unlike
+    /// [`Self::from_label`], which is a tolerant parser for what a person
+    /// types, this one decides what a path on disk *is*.
+    pub fn from_file_name(file_name: &str) -> Option<Self> {
+        Self::all().into_iter().find(|k| k.file_name() == file_name)
     }
 
     /// Default initial markdown body used to seed this identity file on
@@ -889,7 +903,10 @@ mod tests {
         for kind in IdentityKind::all() {
             assert_eq!(
                 classify_persona_path(&rel(p.persona_identity_file("agt_1", kind))),
-                PersonaPath::Identity { agent_id: "agt_1" },
+                PersonaPath::Identity {
+                    agent_id: "agt_1",
+                    kind
+                },
                 "{kind:?}",
             );
         }
@@ -903,7 +920,8 @@ mod tests {
             assert_eq!(
                 classify_persona_path(&rel(project.join(kind.file_name()))),
                 PersonaPath::Identity {
-                    agent_id: "agt_project"
+                    agent_id: "agt_project",
+                    kind
                 },
                 "{kind:?}",
             );

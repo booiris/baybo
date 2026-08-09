@@ -38,7 +38,8 @@ pub struct TeamMemberDto {
     pub id: String,
     /// Immutable `@handle` on this board — what a comment mentions.
     pub handle: String,
-    /// Display name from the agent's own `IDENTITY.md`.
+    /// Display name from the agent's own `IDENTITY.md`. Fixed at hire, like
+    /// the handle derived from it.
     pub name: String,
     /// One line saying what this agent is for.
     pub description: String,
@@ -57,8 +58,10 @@ pub struct TeamMemberDto {
 /// Request body for `POST /v1/projects/{project_id}/agents`.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct HireAgentRequest {
-    /// Display name. The `@handle` is derived from it and then immutable —
-    /// renaming the agent later never moves its handle.
+    /// Display name, and the only chance to choose one: the `@handle` is
+    /// derived from it here, and neither can be changed afterwards — a board
+    /// that called an agent one thing while everybody addressed it as another
+    /// would be lying on every card.
     pub name: String,
     /// One line saying what this agent is for. Seeds its `SOUL.md` and
     /// becomes its roster description.

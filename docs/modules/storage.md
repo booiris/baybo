@@ -311,6 +311,19 @@ What makes the tombstone safe is that the filter lives in SQL, not in Rust: `lis
 
 **A project's agents are the fifth, and the split runs down the middle of one table.** `agent_profiles` holds both global chat personas and project teammates, distinguished by `project_id`/`handle` being set (`TeamMembership`). A global persona is deleted outright — nothing references it by id. A teammate is not: `issues.assignee`, `issue_runs.agent_id` and every `issue_events.actor` name it, and a board that cannot say who did the work is worse than one listing an agent nobody can assign. So `AgentProfileStore::delete` carries `AND project_id IS NULL` and `remove_from_team` stamps `deleted_at` instead — two verbs on one table because the table holds two kinds of row, with the guard in SQL rather than in a caller's memory. `get` still resolves a removed teammate, which is what makes an old timeline entry readable; `list_team` filters `deleted_at IS NULL`, and the domain layer refuses to assign new work to a removed agent (a resolving `get` is not a member). Unlike the other tombstones there is **no restore and no bin**: the handle stays permanently reserved by `idx_agent_profiles_handle` (which deliberately omits `deleted_at IS NULL`), because reissuing `@dev-1` would silently repoint every timeline entry that already said it.
 
+That reservation is one half of a wider rule about those two columns: **`agent_profiles.project_id`/`handle` are insert-only**, and that is the schema's job, not the store impl's. Today no statement in `SqliteAgentProfileStore` names either column after the `INSERT` — but "no statement happens to name it" is a coincidence, and one added field on `AgentProfileUpdate` ends it silently. So a trigger says it instead:
+
+```sql
+CREATE TRIGGER IF NOT EXISTS agent_profiles_team_is_insert_only
+    BEFORE UPDATE OF project_id, handle ON agent_profiles
+    WHEN NEW.project_id IS NOT OLD.project_id OR NEW.handle IS NOT OLD.handle
+    BEGIN SELECT RAISE(ABORT, '…'); END;
+```
+
+The only trigger in the schema, and it earns that by guarding the one column a *human* typed into prose that is already stored: `@dev-1` in a comment resolves through this row and nothing else. It fires on the value, not on the column being mentioned, so a write-back of the same membership passes and `remove_from_team`'s `deleted_at` stamp never touches it. It lives with the post-migration indexes rather than the `CREATE TABLE` batch, for the same reason they do — on a pre-team DB the columns do not exist until the `ALTER` loop runs.
+
+It is also half of an invariant that SQL alone cannot hold. The display name the handle was derived from is frozen in the same way and for the same reason, but it is a line in the agent's own `IDENTITY.md` — there is no name column here to constrain, deliberately (see [`agent-profiles.md`](agent-profiles.md)). That half is enforced inside the one writer of that file in each crate that has one; this is the half a trigger can keep.
+
 **`projects` and `issues` are the third and fourth, and neither has a delete path at all.** A project carries `archived_at INTEGER` and an issue carries `cancelled_at INTEGER`; `ProjectStore` exposes no `delete_project` and no `delete_issue`, so there is nothing to call from a sweeper. The reason is the same one that protects sessions: an issue is a unit of work with conversation history hanging off it (its runs, its timeline), and the project row is what ties a working directory and a team to the board they belong to. Archiving is the whole affordance — `list_projects(include_archived = false)` filters `WHERE archived_at IS NULL` in SQL, `get_project` still resolves an archived row by id, and the domain layer refuses writes to an archived project while leaving reads open. Cancelling an issue is the same shape one level down: the row keeps its number, its position and its history, and only stops counting as live work.
 
 

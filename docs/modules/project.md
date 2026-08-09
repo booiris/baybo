@@ -491,6 +491,26 @@ behind the operator's back.
 
 - Handles are derived from the display name and then permanent, and unique only
   *within* a board — `@dev-1` here and `@dev-1` there are different agents.
+  Permanence is the schema's, not this crate's: `idx_agent_profiles_handle`
+  keeps it unique and reserved, and the `agent_profiles_team_is_insert_only`
+  trigger aborts any `UPDATE` that would move a membership at all.
+- **The name is permanent too**, which is what makes that survivable: a handle
+  frozen against a name that drifts would leave the roster and every mention
+  disagreeing about who somebody is. Hiring is the only moment either is
+  chosen. The rule lives one layer down as
+  `baybo_workspace::name::rejected_rename` (see
+  [`agent-profiles.md`](agent-profiles.md)) because the name is a line in the
+  agent's own `IDENTITY.md`, not a column here — so it has to hold at the
+  operator's two endpoints *and* inside the agent's own `Edit`/`Write`, and it
+  is keyed on the `project-` id prefix, the only signal a tool has.
+
+  That prefix is also the rule's limit, and it is worth naming rather than
+  implying: a project agent minted **before** the prefix existed keeps a flat
+  id, and nothing at the tool doors can tell it from a global persona, so it
+  can still rename itself. Asking the store instead would fix those two doors
+  and leave the other two answering a different question — and a predicate
+  with two homes is how the four doors stopped agreeing in the first place.
+  Boards opened by this build have no such agent.
 - Removal is a **tombstone**: `deleted_at` is stamped and the membership row
   stays, because `issues.assignee`, `issue_runs.agent_id` and every timeline
   `actor` name an agent by id, and the board has to keep being able to say who

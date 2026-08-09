@@ -57,12 +57,37 @@ own persona's `SOUL.md`, and its name is the `Name:` line in that persona's
 [`../todo/multi-agent-chat.md`](../todo/multi-agent-chat.md)).
 
 That makes the name **not unique and not sortable in SQL**, which is not a
-loss: no constraint could have held one, since the agent may rename itself to
-anything at any moment. The **id** is the identity — every binding, memory
+loss: no constraint could have held one, since a global agent may rename itself
+to anything at any moment. The **id** is the identity — every binding, memory
 partition, skill directory and API path keys off it — so a duplicate name is a
 display ambiguity, never a correctness problem. `list` therefore orders by
 `builtin DESC, id` and the gateway re-sorts by the name it reads from each
 agent's file.
+
+**A project agent is the exception: its name is fixed at hire.** Its `@handle`
+was derived from that name and never moves (see
+[`project.md`](project.md#the-team)), so a rename would leave the roster and
+every mention, assignment and timeline entry naming different things. The rule
+is `baybo_workspace::name::rejected_rename`, keyed on the `project-` id prefix
+so it is answerable in the tool layer too.
+
+Four doors reach that line — `PUT …/name`, `PUT …/identity`, and the agent's
+own `Edit` and `Write` — and three of four asking would not be a rule at all.
+So none of them asks: each crate has exactly **one writer** of an identity
+file, and applying the rules is part of writing rather than a step a caller
+takes first. `baybo_tools::builtin::managed_repo::write_managed_file` is the
+tools' (nothing else in that crate `fs::write`s under `personas/`), and
+`replace_identity_file` in `api/admin/agents.rs` is the gateway's (the sole
+caller of its `write_file_atomic`). A fifth door gets the rules by
+construction; one that skips them has left the tier, losing the audit commit
+and the approval bypass with it — not something done by accident.
+
+Losing the line entirely is a second, narrower rule
+(`rejected_name_removal`): refused at the two tool doors, where an incidental
+reformat could cost the agent its name, and *not* at the whole-file `PUT`,
+where a caller who replaces the document means it — restoring the shipped
+template leaves it nameless, which is exactly why an unnamed agent has a
+defined rendering (its id).
 
 `llm` is stored regardless of `framework` (the server never clears it on a framework switch, so switching never destroys data), but it is genuinely baybo-only: it names a `baybo.json` LLM-pool entry, which an external CLI (billed against its own subscription) can't route through — the editor greys it out for external frameworks. It is read at actor spawn, behind the session's own `last_llm` pin — see [`../todo/multi-agent-chat.md`](../todo/multi-agent-chat.md).
 
@@ -115,7 +140,9 @@ Nullable fields where `NULL` is meaningful make a partial `PATCH` need absent-vs
 
 `id` is minted server-side: global agents use `AgentProfileId::generate()` (a ULID — the `FolderId` pattern), while project-owned agents use `AgentProfileId::generate_project()` (`project-<ULID>`). Unlike `FolderId`, it is **not** opaque: it becomes the persona directory's leaf name, and the project prefix also selects the grouped tree. It therefore carries the skill-name grammar enforced by `AgentProfileId::parse` and by a validating `Deserialize`; the exact id `project` is reserved for the container directory (a guard only on the constructor would be bypassed by every request body and stored row that parses one).
 
-The **name** is not stored. `POST` / `PUT /v1/agents` still accept one — free-form after trim, non-empty, at most `MAX_AGENT_PROFILE_NAME_CHARS` (64) characters — but the handler splices it into the `Name:` line of that agent's `IDENTITY.md` rather than a column, preserving every other line the agent wrote. Reads derive it back the same way, falling back to the id when the file carries no usable name (the shipped template's state — it invites the agent to choose). Editing the name is therefore the same operation whether the operator or the agent does it, and there is nothing to keep in sync.
+The **name** is not stored. `POST` / `PUT /v1/agents` still accept one — free-form after trim, non-empty, at most `MAX_AGENT_PROFILE_NAME_CHARS` (64) characters — but the handler splices it into the `Name:` line of that agent's `IDENTITY.md` rather than a column, preserving every other line the agent wrote. Reads derive it back the same way, falling back to the id when the file carries no usable name (the shipped template's state — it invites the agent to choose). Editing the name is therefore the same operation whether the operator or the agent does it, and there is nothing to keep in sync — which is also what lets the fixed-name rule above be enforced in one place for both.
+
+That template is the *global* one. A project agent is seeded from `PROJECT_PERSONA_IDENTITY_TEMPLATE` instead, whose `Name:` line says the board set it and that the `@handle` came from it — the fields are otherwise identical. A file that invited the agent every turn to pick a name the tools then refuse to change would be a prompt bug, not a harmless nicety.
 
 ### Avatars ride the existing blob pipeline
 
@@ -151,7 +178,7 @@ pub trait AgentProfileStore: Send + Sync {
 }
 ```
 
-`AgentProfileUpdate` is the row's remaining content state minus `id`/`avatar_blob_id`/`builtin`/timestamps (so: description, framework); `update`, `set_llm` and `set_avatar` bump `updated_at`. No write can conflict — the one `UNIQUE` column went away with `name`. `Ok(false)` = no row matched (missing id, or the builtin behind the guard) — the gateway `get`s first to disambiguate, and reads `Ok(false)` after a non-builtin `get` as a concurrent delete → 404. The store stays a dumb writer — name/llm/blob validation lives in the gateway handlers — and rides the `Store.agent_profile` bundle field out of `Store::open`.
+`AgentProfileUpdate` is the row's remaining content state minus `id`/`avatar_blob_id`/`builtin`/timestamps (so: description, framework); `update`, `set_llm` and `set_avatar` bump `updated_at`. `project_id`/`handle` are absent from every one of these, and that is enforced by the schema rather than by this list staying short: an `agent_profiles_team_is_insert_only` trigger aborts any `UPDATE` that moves either (see [`storage.md`](storage.md)). It is the store-side twin of the fixed name above — the same identity, split across a column SQL can guard and a file it cannot. No write can conflict on content — the one `UNIQUE` column went away with `name`. `Ok(false)` = no row matched (missing id, or the builtin behind the guard) — the gateway `get`s first to disambiguate, and reads `Ok(false)` after a non-builtin `get` as a concurrent delete → 404. The store stays a dumb writer — name/llm/blob validation lives in the gateway handlers — and rides the `Store.agent_profile` bundle field out of `Store::open`.
 
 ## HTTP API
 

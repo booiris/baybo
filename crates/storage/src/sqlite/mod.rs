@@ -1468,11 +1468,11 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
         migration.apply(conn)?;
     }
 
-    // Indexes on migration-added columns. Created AFTER the ALTER loop,
-    // not in the schema batch above: on a legacy DB the column doesn't
-    // exist until the ALTER runs, so a batch-time CREATE INDEX referencing
-    // it would fail. `IF NOT EXISTS` keeps them idempotent on every
-    // subsequent boot.
+    // Indexes and triggers on migration-added columns. Created AFTER the
+    // ALTER loop, not in the schema batch above: on a legacy DB the column
+    // doesn't exist until the ALTER runs, so a batch-time statement
+    // referencing it would fail. `IF NOT EXISTS` keeps them idempotent on
+    // every subsequent boot.
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_sessions_folder
              ON sessions(folder_id) WHERE folder_id IS NOT NULL;
@@ -1496,6 +1496,27 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
          -- `deleted_at IS NULL` here.
          CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_profiles_handle
              ON agent_profiles(project_id, handle) WHERE project_id IS NOT NULL;
+         -- …and unique is only half of it: the pair is also INSERT-only. A
+         -- membership is granted when the agent is hired and never moves,
+         -- because `issues.assignee`, `issue_runs.agent_id` and every
+         -- timeline `actor` resolve through it, and the '@dev-1' already
+         -- typed into a comment resolves through nothing else at all.
+         --
+         -- Stated here rather than left to the store's statements happening
+         -- not to name these columns: that is a coincidence, and one future
+         -- `UPDATE` ends it. It is also the store's half of a fixed identity
+         -- — the display name the handle was derived from is frozen too, and
+         -- freezing one without the other only moves the drift. That name is
+         -- a line in the agent's own IDENTITY.md, which no column here can
+         -- hold, so its rule lives in `baybo_workspace::name`; this is the
+         -- half SQL *can* keep.
+         CREATE TRIGGER IF NOT EXISTS agent_profiles_team_is_insert_only
+             BEFORE UPDATE OF project_id, handle ON agent_profiles
+             WHEN NEW.project_id IS NOT OLD.project_id
+               OR NEW.handle IS NOT OLD.handle
+             BEGIN
+                 SELECT RAISE(ABORT, 'an agent''s board and @handle are fixed when it is hired');
+             END;
          -- Serves the board's roster read.
          CREATE INDEX IF NOT EXISTS idx_agent_profiles_team
              ON agent_profiles(project_id)
@@ -1517,7 +1538,7 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
              ON issues(parent_issue_id, stage, position)
              WHERE parent_issue_id IS NOT NULL;",
     )
-    .map_err(|e| anyhow::anyhow!("failed to create post-migration indexes: {e}"))?;
+    .map_err(|e| anyhow::anyhow!("failed to create post-migration indexes and triggers: {e}"))?;
 
     // One-time data collapse: the retired per-surface channel tags `http`
     // (web) and `device` (mobile) were unified into a single `owner` pool
@@ -1841,7 +1862,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_pre_team_database_migrates_and_gains_the_handle_index() {
+    async fn a_pre_team_database_migrates_and_gains_the_handle_index_and_trigger() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("legacy.db");
         {
@@ -1873,6 +1894,16 @@ mod tests {
                 |r| r.get(0),
             )?;
             assert_eq!(indexed, 1, "the handle index must exist after migration");
+            // Both statements name columns the ALTER loop adds, so both have
+            // to be created after it — a DB that migrated without the trigger
+            // would enforce nothing and say nothing.
+            let triggered: i64 = conn.query_row(
+                "SELECT count(*) FROM sqlite_master \
+                 WHERE type = 'trigger' AND name = 'agent_profiles_team_is_insert_only'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(triggered, 1, "the membership trigger must exist too");
             let (project_id, handle): (Option<String>, Option<String>) = conn.query_row(
                 "SELECT project_id, handle FROM agent_profiles WHERE id = '01JOLD'",
                 [],

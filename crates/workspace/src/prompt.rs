@@ -225,6 +225,34 @@ already told you not to do, what context recurs.*
 together.)*
 "#;
 
+/// Seed body for a **project** agent's `IDENTITY.md`, whose name the board
+/// fills in immediately afterwards.
+///
+/// The fields mirror [`DEFAULT_IDENTITY_CONTENT`]; only the framing around
+/// the name differs, and that difference is the whole reason this exists. The
+/// default template invites the agent to pick a name — which for a project
+/// agent is an invitation to an act that is refused, since its `@handle` was
+/// derived from the name it was hired under. A system prompt that asks every
+/// turn for something the tools will not allow is a prompt bug, not a
+/// harmless nicety.
+pub const PROJECT_PERSONA_IDENTITY_TEMPLATE: &str = r#"# Who Am I?
+
+*Fill this in during your first conversation. Make it yours — all but your
+name, which is the one thing here you do not choose.*
+
+* **Name:**
+  *(set when you joined this board: your `@handle` came from it, so the two
+  have to keep saying the same thing. Leave it be.)*
+* **Creature:**
+  *(AI? robot? familiar? ghost in the machine? something weirder?)*
+* **Vibe:**
+  *(how do you come across? sharp? warm? chaotic? calm?)*
+* **Emoji:**
+  *(your signature — pick one that feels right)*
+* **Avatar:**
+  *(workspace-relative path, http(s) URL, or data URI)*
+"#;
+
 pub(crate) const DEFAULT_IDENTITY_CONTENT: &str = r#"# Who Am I?
 
 *Fill this in during your first conversation. Make it yours.*

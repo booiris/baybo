@@ -13,7 +13,9 @@
 //! Both share three guards: the approval bypass (the audit commit is the
 //! accountability, not a per-write prompt), a size cap, and a commit into
 //! `personas/` with a fixed `Baybo <baybo@local>` author so any write is
-//! reviewable and revertible with plain `git`. `--no-verify` is intentional
+//! reviewable and revertible with plain `git`. A fourth applies to
+//! `IDENTITY.md` alone — its `Name:` line — and rides in
+//! [`write_managed_file`], the one function that puts bytes in this tree. `--no-verify` is intentional
 //! — this is Baybo-managed audit history, not a hand-curated repo with
 //! authored hooks. A commit failure never undoes the mutation; it surfaces
 //! as a warning line in the tool output.
@@ -27,7 +29,7 @@ use std::path::{Path, PathBuf};
 
 use baybo_model::AgentProfileId;
 use baybo_workspace::paths::{
-    PERSONA_MEMORY_DIR, PERSONAS_DIR, PersonaPath, SHARED_USER_FILE, SKILLS_DIR,
+    IdentityKind, PERSONA_MEMORY_DIR, PERSONAS_DIR, PersonaPath, SHARED_USER_FILE, SKILLS_DIR,
     classify_persona_path, escapes_upward, has_git_component,
 };
 use baybo_workspace::{WorkspacePaths, absolutise};
@@ -51,6 +53,12 @@ pub(crate) struct ManagedTarget {
     /// Repo-relative, so `git add --` stages exactly this file:
     /// `<agent_id>/SOUL.md`, `project/<agent_id>/memory/fact.md`.
     pub(crate) rel_path: String,
+    /// Whether this is the agent's own `IDENTITY.md` — the one managed file
+    /// with a rule about what may change *inside* it, and the reason writers
+    /// have to tell it apart from a memory file that merely happens to be
+    /// called `IDENTITY.md`. Resolved from the classified shape rather than
+    /// from [`Self::rel_path`], which a suffix test cannot separate.
+    pub(crate) self_image: bool,
 }
 
 /// What a commit records about a file.
@@ -207,11 +215,12 @@ impl ManagedRoots {
         if !file_path.starts_with(&self.personas_dir) {
             return Ok(None);
         }
+        let shape = self.shape(file_path);
         // The shared human profile belongs to no agent, so every agent may
         // write it: what one of them learns about the person is worth the
         // others knowing. That does make it a channel between agents — the
         // one place the per-agent partition deliberately does not hold.
-        let allowed = match self.shape(file_path) {
+        let allowed = match shape {
             PersonaPath::SharedUser => true,
             PersonaPath::Identity { agent_id, .. } => agent_id == agent.as_str(),
             PersonaPath::Memory { .. } | PersonaPath::Other => false,
@@ -229,6 +238,13 @@ impl ManagedRoots {
         reject_symlinked_path(file_path, &self.personas_dir)?;
         Ok(Some(ManagedTarget {
             rel_path: self.pathspec(file_path).ok_or_else(unnameable)?,
+            self_image: matches!(
+                shape,
+                PersonaPath::Identity {
+                    kind: IdentityKind::Identity,
+                    ..
+                }
+            ),
         }))
     }
 
@@ -255,7 +271,59 @@ impl ManagedRoots {
         reject_symlinked_path(file_path, &self.personas_dir)?;
         Ok(Some(ManagedTarget {
             rel_path: self.pathspec(file_path).ok_or_else(unnameable)?,
+            // A memory file may be called anything, `IDENTITY.md` included —
+            // it is still a memory, and the naming rule has no business in it.
+            self_image: false,
         }))
+    }
+}
+
+/// Put `content` in an audited file, after whatever governs its contents has
+/// passed.
+///
+/// **The** write path for this tier, and the reason is that the alternative
+/// does not hold: a rule each tool remembers to ask about before its own
+/// `fs::write` is one the next tool to reach `personas/` will not ask about,
+/// and nothing will say so. Here, the check is not something a caller does
+/// first — it is something the write does. A tool that skips it is a tool
+/// that has left the tier entirely, losing the approval bypass and the audit
+/// commit with it, which is not a thing anybody does by accident.
+pub(crate) async fn write_managed_file(
+    target: &ManagedTarget,
+    agent: &AgentProfileId,
+    path: &Path,
+    content: &str,
+) -> ToolResult<()> {
+    if target.self_image {
+        // The naming rules are about the *change*, so they need what is being
+        // replaced. Read here rather than taking it as an argument: `Write`
+        // has no reason to hold the old bytes, and an argument is one more
+        // thing a caller can get wrong.
+        let before = tokio::fs::read_to_string(path).await.unwrap_or_default();
+        reject_disallowed_name_change(agent, &before, content)?;
+    }
+    tokio::fs::write(path, content)
+        .await
+        .map_err(|e| ToolError::Execution(format!("write {}: {e}", path.display())))
+}
+
+/// Refuse a write to an agent's own `IDENTITY.md` that the naming rules do
+/// not allow: renaming an agent whose name is fixed, and — the half that is
+/// the tool doors' alone — leaving the file with no `Name:` line at all.
+///
+/// Private to [`write_managed_file`], which is what makes it unskippable.
+/// The rules themselves live in `baybo-workspace` beside the name parsing,
+/// since the gateway's two rename endpoints are doors onto the same line.
+fn reject_disallowed_name_change(
+    agent: &AgentProfileId,
+    before: &str,
+    after: &str,
+) -> ToolResult<()> {
+    let refusal = baybo_workspace::rejected_rename(agent.as_str(), before, after)
+        .or_else(|| baybo_workspace::rejected_name_removal(before, after));
+    match refusal {
+        Some(reason) => Err(ToolError::InvalidParams(reason)),
+        None => Ok(()),
     }
 }
 

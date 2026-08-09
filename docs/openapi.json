@@ -480,7 +480,7 @@
             }
           },
           "400": {
-            "description": "Malformed agent id",
+            "description": "Malformed agent id, or a body that renames a project agent — its @handle came from that name",
             "content": {
               "application/json": {
                 "schema": {
@@ -618,7 +618,7 @@
             "description": "Name set"
           },
           "400": {
-            "description": "Malformed agent id or name",
+            "description": "Malformed agent id or name, or a project agent, whose name its @handle was derived from and cannot outlive",
             "content": {
               "application/json": {
                 "schema": {
@@ -4436,7 +4436,7 @@
                           },
                           "name": {
                             "type": "string",
-                            "description": "Display name from the agent's own `IDENTITY.md`."
+                            "description": "Display name from the agent's own `IDENTITY.md`. Fixed at hire, like\nthe handle derived from it."
                           }
                         }
                       }
@@ -8701,7 +8701,7 @@
           },
           "name": {
             "type": "string",
-            "description": "Display name. The `@handle` is derived from it and then immutable —\nrenaming the agent later never moves its handle."
+            "description": "Display name, and the only chance to choose one: the `@handle` is\nderived from it here, and neither can be changed afterwards — a board\nthat called an agent one thing while everybody addressed it as another\nwould be lying on every card."
           },
           "role": {
             "type": "string",
@@ -10160,7 +10160,7 @@
       },
       "SetAgentNameRequest": {
         "type": "object",
-        "description": "Request body for `PUT /v1/agents/{agent_id}/name`.",
+        "description": "Request body for `PUT /v1/agents/{agent_id}/name`.\n\nRejected for an agent on a project team: the `@handle` its board addresses\nit by was derived from its name when it was hired, so the name is fixed for\nas long as the agent exists.",
         "required": [
           "name"
         ],
@@ -10441,7 +10441,7 @@
           },
           "name": {
             "type": "string",
-            "description": "Display name from the agent's own `IDENTITY.md`."
+            "description": "Display name from the agent's own `IDENTITY.md`. Fixed at hire, like\nthe handle derived from it."
           }
         }
       },

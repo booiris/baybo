@@ -171,7 +171,11 @@ existing git repo.
 - Clicking any avatar (team strip, card face, timeline, execution log)
   slides out the **agent profile panel** (same layer as the activity
   drawer, mutually exclusive; no dedicated route in v1): display name
-  from `IDENTITY.md` beside the immutable `@handle`, birth audit line
+  from `IDENTITY.md` beside the `@handle` derived from it — **both
+  immutable**, since a handle frozen against a name that drifts would
+  leave the roster and every mention naming different things, so the
+  IDENTITY editor below refuses a write that moves the `Name:` line and
+  so does the agent's own `Edit` — birth audit line
   (`created_by` — user-created or hired by the lead), live run state
   shared with the board's status frames, assigned issues, recent runs
   with transcript links, the **llm pin editor** (`profile.llm`; empty
@@ -181,7 +185,8 @@ existing git repo.
   action. Only the lead's panel carries a chat button; other agents are
   reached by @mention in issue comments (no DM in v1).
 - The team strip ends in a dashed **＋ (new agent)**: a small form —
-  display name, immutable `@handle` derived from it, a one-line role
+  display name (the only moment it is chosen), immutable `@handle`
+  derived from it, a one-line role
   description that seeds `SOUL.md`, optional framework
   (native/claude/codex) and llm pin. Unlike `ProjectAgentCreate` (which
   deliberately exposes neither knob), the user form may set framework and

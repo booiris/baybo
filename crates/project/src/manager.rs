@@ -88,7 +88,8 @@ pub(crate) struct BoardLoad {
 /// What a caller supplies to put somebody new on a team.
 #[derive(Debug, Clone)]
 pub struct NewTeamMember {
-    /// Display name. The `@handle` is derived from it and then immutable.
+    /// Display name, chosen once: the `@handle` is derived from it here and
+    /// both are then fixed, so the roster and every mention keep agreeing.
     pub name: String,
     /// One line saying what this agent is for. Seeds its `SOUL.md` and
     /// becomes its roster description.
