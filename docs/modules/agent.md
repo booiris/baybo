@@ -34,6 +34,7 @@ agent/src/
 │   ├── compression.rs        # compaction LLM call: step/span, cost, retry
 │   ├── billed_chat.rs        # cost-aware LLM call wrapper
 │   ├── error_recovery.rs     # retry / degrade policy
+│   ├── progress_ledger.rs    # per-turn file-mutation ledger; spots edits that cancelled out
 │   ├── sandbox.rs            # SandboxAdapter glue for tool exec
 │   ├── scope.rs              # with_turn / with_step / with_span / LLM span guards
 │   ├── llm_pool.rs           # per-provider LlmClient pool
@@ -214,7 +215,7 @@ Persistence and the live re-pin are deliberately **split** to avoid a lost-updat
 
 Consolidated reference for every time bound a turn can hit. Two structural facts come first, because they explain why most of the table is about tools and subprocesses rather than the loop itself:
 
-- **A turn is bounded by step count, not a wall clock.** `agent.max_iterations` (default 1000, range 1–1000; `AgentConfig` in `baybo-config`, enforced in `config/src/validate.rs`) caps how many LLM↔tool iterations one turn may run. Cancellation is cooperative, checked at the iteration boundary (`/stop` is the only hard interrupt) — there is no per-turn timer.
+- **A turn is bounded by step count, not a wall clock.** `agent.max_iterations` (default 1000, range 1–1000; `AgentConfig` in `baybo-config`, enforced in `config/src/validate.rs`) caps how many LLM↔tool iterations one turn may run. Cancellation is cooperative, checked at the iteration boundary (`/stop` is the only hard interrupt) — there is no per-turn timer. At 1000 this is a runaway-cost backstop, not a loop detector: a turn can churn for dozens of iterations well inside it (see *No-progress detection* below).
 - **The main LLM chat call has no Baybo-imposed wall-clock timeout.** The shared reqwest client (`baybo_security::http::client`) sets no `.timeout()`, so a `chat` / `chat_stream` call is bounded only by the provider/transport. Transient failures (5xx/408/429, connect/transport flake) are absorbed by the retry loop below, not by a deadline.
 
 **LLM retry** — `ErrorHandler::default` in `runtime/error_recovery.rs`, wrapping every model call in `AgentLoop::call_llm`. Exponential backoff, capped; not configurable (hardcoded default).
@@ -281,6 +282,30 @@ process.
 | `RETRY_MAX_BACKOFF` (`actor/background_notification.rs`) | 300s | …capped at |
 
 Router-level user rate limiting (`actor/router`) uses a sliding window (default 60s) — a time *window*, not a timeout.
+
+### No-progress detection
+
+`runtime/progress_ledger.rs` keeps a per-turn record of every `Edit` / `Write`, and tells the model when a turn's edits have stopped going anywhere. It exists because nothing else in the loop could: `max_iterations` is a cost backstop at 1000, `error_recovery` only classifies LLM/IO errors, the progress observer never writes back into the turn, and a denied tool call leaves no state the loop can reason over — so a turn could edit one file five times, net zero, and no part of the runtime would notice.
+
+**What it compares.** Not file contents — `Edit` rejects `old_string == new_string`, so every applied edit changes the bytes, and `FileFingerprint` carries an mtime, so it moves even when the content comes back. What identifies churn is the *sequence of state transitions*: an `Edit` names both endpoints of its own transition, so an edit whose `new_string` reproduces an earlier edit's `old_string` has undone that edit. A `Write` names only its result, so results are compared to results. Only the two hashes are kept, never the payloads.
+
+**Detection is not reporting.** A repeat or a revisit is a *churn signal*; nothing is said until a file has produced three. One is not evidence of a loop — undoing an edit you just made is a normal way to explore, and a lone A→B→A is indistinguishable from a flag toggled on to test and back off. The incident this was built from reached three on its fifth edit, one edit before the user asked what was going on.
+
+Signals need not be consecutive — a short burst of work between two of them is still one file the turn is failing to move — but **three consecutive advancing edits clear the count**. Without that decay, two stray signals in iteration 3 would still be sitting there in iteration 400 waiting to convict an unrelated third. A refusal breaks the run without earning decay: it is not progress. The decay threshold cannot drop to one without losing the founding case, which had a single genuinely-new edit between its second and third signals; tests pin it from both sides.
+
+| Signal / verdict | Recognised when |
+|---|---|
+| `AttemptRepeated` | The exact same transition is submitted again — including a denied call resubmitted verbatim. |
+| `StateRevisited` | An applied mutation puts the file back in a state it already held this turn. |
+| `Futile` | Three consecutive attempts on one file were all refused or failed. Counts its own consecutive run, independent of the churn threshold. |
+
+The reported verdict names whichever signal crossed the threshold, so the observation describes what just happened rather than the accumulated total. At most one observation per file per turn.
+
+**It injects, it does not stop.** The verdict renders (`baybo_context::prompts::no_progress`) into a transient tail row via `ContextManager::set_progress_observation`, which rides exactly one request and is then cleared — never persisted, so it cannot replay as history. Injection rather than enforcement because the runtime knows the *fact* (this file is back where it was) but not whether it is a mistake: a flag toggled on to test and off again is indistinguishable. A model reasoning correctly from a missing fact needs the fact, not a killed turn.
+
+**Per-turn, deliberately.** The ledger is cleared at the top of every `run_inner`. "Change that back" is ordinary work when the user asks for it between turns; it is only churn inside one turn.
+
+Bounded at 128 files × 64 attempts, **least-recently-touched evicted first**. Both numbers are sized against the failure mode rather than against memory — the whole structure is a few hundred KB at pathological worst case, next to an LLM context measured in megabytes — and the eviction order is load-bearing: a turn that sweeps a crate and *then* churns one file is exactly the case worth catching, and insertion-order eviction drops that file's history precisely because it was seen first.
 
 ## Constraints
 

@@ -350,6 +350,18 @@ pub struct ContextManager {
     /// reminder to the compression decision) and [`Self::record_call_actual`]
     /// subtracts it so the provider-anchored baseline stays messages-only.
     task_reminder_raw: usize,
+    /// Transient "you are going in circles" observation, set by the agent loop
+    /// when a turn's file edits cancelled out (see
+    /// [`crate::prompts::no_progress`]). Same contract as
+    /// [`Self::task_reminder`]: never persisted, never in `self.messages`,
+    /// appended at the tail by [`Self::messages_for_llm`]. Cleared once the
+    /// model has seen it — it is a nudge about a specific moment, and leaving
+    /// it mounted would keep re-litigating an edit the model has already
+    /// accounted for.
+    progress_observation: Option<ChatMessage>,
+    /// Cached raw tokenizer count of `progress_observation`, folded into the
+    /// budget exactly like [`Self::task_reminder_raw`].
+    progress_observation_raw: usize,
     /// Request-time retry cue for a background-notification turn (see
     /// [`crate::prompts::background_notification`]). Set for the duration of a
     /// notification delivery and cleared after; like [`Self::task_reminder`] it
@@ -452,6 +464,8 @@ impl ContextManager {
             compaction_declined_at_len: None,
             task_reminder: None,
             task_reminder_raw: 0,
+            progress_observation: None,
+            progress_observation_raw: 0,
             notification_cue: None,
             system_prompt_version: None,
             skills_version: None,
@@ -503,13 +517,22 @@ impl ContextManager {
         // row. The no-framing / no-reminder path stays clone-free.
         let mut base = if needs_framing {
             frame_recalled_memories(&frame_interjections(&self.messages))
-        } else if self.task_reminder.is_some() || self.active_notification_cue().is_some() {
+        } else if self.task_reminder.is_some()
+            || self.progress_observation.is_some()
+            || self.active_notification_cue().is_some()
+        {
             self.messages.clone()
         } else {
             return merge_for_llm(&self.messages);
         };
         if let Some(reminder) = &self.task_reminder {
             base.push(reminder.clone());
+        }
+        // After the checklist: the checklist says what the turn is for, and
+        // this says the last few steps did not serve it. Read in that order it
+        // is a correction; read first it is context-free scolding.
+        if let Some(observation) = &self.progress_observation {
+            base.push(observation.clone());
         }
         if let Some(cue) = self.active_notification_cue() {
             base.push(cue.clone());
@@ -569,6 +592,39 @@ impl ContextManager {
         // Charge the (possibly resized) reminder to the budget now so the
         // compression gate this turn sees the real request size.
         self.budget.update(self.count_tokens());
+    }
+
+    /// Arm (or clear) the transient no-progress observation for the next
+    /// request. Same never-persisted contract as [`Self::refresh_task_reminder`].
+    ///
+    /// The agent loop clears it after the request that carried it: the
+    /// observation is about a specific moment, and a mount that outlived that
+    /// moment would keep answering an objection the model already handled.
+    pub fn set_progress_observation(
+        &mut self,
+        observation: Option<crate::prompts::no_progress::Rendered>,
+    ) {
+        // The loop clears this after every LLM call, so the overwhelmingly
+        // common call is "None over None" — nothing mounted, nothing to
+        // recost. Returning early keeps that off the budget path entirely.
+        if observation.is_none() && self.progress_observation.is_none() {
+            return;
+        }
+        self.progress_observation = observation
+            .map(|o| ChatMessage::agent_context(vec![ContentBlock::Text(o.into_text())]));
+        self.progress_observation_raw = self
+            .progress_observation
+            .as_ref()
+            .map_or(0, |m| self.tokenizer.count_message(m));
+        self.budget.update(self.count_tokens());
+    }
+
+    /// Raw token cost of every transient row that rides the request without
+    /// living in `self.messages`. Both accounting sites read this rather than
+    /// the individual fields, so adding a third transient row cannot leave one
+    /// of them behind.
+    fn transient_tail_raw(&self) -> usize {
+        self.task_reminder_raw + self.progress_observation_raw
     }
 
     /// Resolve the system prompt to seed the leading `Role::System` row. The
@@ -1284,7 +1340,7 @@ impl ContextManager {
         // transcript only — otherwise a large checklist is counted twice. Only
         // the main-turn call records actuals; the compression call (no reminder)
         // never reaches here.
-        let actual_messages = actual_input_tokens.saturating_sub(self.task_reminder_raw);
+        let actual_messages = actual_input_tokens.saturating_sub(self.transient_tail_raw());
         if let Some(model_id) = self.current_model.read().as_deref()
             && self.media_is_small_enough_to_sample()
         {
@@ -1877,11 +1933,12 @@ impl ContextManager {
     /// cold start, or after compression, or if the message list
     /// shrank below the anchor.
     fn count_tokens(&self) -> usize {
-        // The transient task reminder rides in the real request but isn't a
-        // stored message, so fold its raw count into the estimate (the baseline
-        // is kept reminder-free by `record_call_actual`, so this isn't double
-        // counted). It is pure text — the reminder is a rendered checklist.
-        let reminder = self.task_reminder_raw;
+        // The transient rows (task reminder, no-progress observation) ride in
+        // the real request but aren't stored messages, so fold their raw count
+        // into the estimate (the baseline is kept free of them by
+        // `record_call_actual`, so this isn't double counted). Both are pure
+        // text — a rendered checklist and a rendered reminder.
+        let reminder = self.transient_tail_raw();
         let snapshot = *self.baseline.read();
         // Media rides beside the calibrated text rather than through it.
         // Rows before the anchor are already inside `actual_tokens` at the
@@ -4254,6 +4311,85 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    fn observation() -> crate::prompts::no_progress::Rendered {
+        crate::prompts::no_progress::render(
+            crate::prompts::no_progress::Kind::StateRevisited,
+            "/tmp/x.json",
+            3,
+        )
+    }
+
+    fn contains_observation(messages: &[ChatMessage]) -> bool {
+        messages.iter().any(|m| {
+            m.content.iter().any(
+                |b| matches!(b, ContentBlock::Text(t) if t.contains("returned to a state it already had")),
+            )
+        })
+    }
+
+    /// The observation must reach the model but never the transcript: it is
+    /// about one moment in one turn, and a persisted copy would be replayed
+    /// as history forever after.
+    #[tokio::test]
+    async fn the_progress_observation_rides_the_request_without_being_stored() {
+        let mut ctx = make_ctx(5, 100_000, 0.75);
+        ctx.append(&make_msg(Role::User, "fix the config")).await;
+
+        ctx.set_progress_observation(Some(observation()));
+        assert!(contains_observation(&ctx.messages_for_llm()));
+        assert!(
+            !contains_observation(ctx.messages()),
+            "the observation must not be persisted"
+        );
+
+        ctx.set_progress_observation(None);
+        assert!(!contains_observation(&ctx.messages_for_llm()));
+    }
+
+    /// It rides the real request, so it is charged like the task reminder —
+    /// otherwise the compression gate under-counts by exactly this row.
+    #[tokio::test]
+    async fn the_progress_observation_is_charged_to_the_budget() {
+        let mut ctx = make_ctx(5, 100_000, 0.75);
+        ctx.append(&make_msg(Role::User, "fix the config")).await;
+        let before = ctx.count_tokens();
+
+        ctx.set_progress_observation(Some(observation()));
+        let raw = ctx.progress_observation_raw;
+        assert!(raw > 0);
+        assert_eq!(
+            ctx.count_tokens(),
+            before + raw,
+            "charged exactly once while mounted"
+        );
+
+        ctx.set_progress_observation(None);
+        assert_eq!(ctx.progress_observation_raw, 0);
+        assert_eq!(ctx.count_tokens(), before);
+    }
+
+    /// Both transient rows can be mounted at once (a turn with a checklist
+    /// that is also churning). `record_call_actual` must strip BOTH from the
+    /// provider-anchored baseline, or the estimate double-counts whichever it
+    /// forgot.
+    #[tokio::test]
+    async fn both_transient_rows_are_stripped_from_the_baseline() {
+        let mut ctx = make_ctx(5, 100_000, 0.75);
+        ctx.append(&make_msg(Role::User, "plan this")).await;
+        ctx.refresh_task_reminder(&[make_task("a"), make_task("b")]);
+        ctx.set_progress_observation(Some(observation()));
+        assert!(ctx.task_reminder_raw > 0 && ctx.progress_observation_raw > 0);
+
+        let actual = 5_000;
+        ctx.record_call_actual(actual);
+
+        assert_eq!(
+            ctx.count_tokens(),
+            actual,
+            "the provider's count already included both rows"
+        );
     }
 
     /// The transient task reminder rides in the real request, so its tokens

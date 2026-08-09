@@ -9,6 +9,7 @@ pub mod compression;
 pub mod cron;
 pub mod interjection;
 pub mod line_diff;
+pub mod no_progress;
 pub mod recalled_memory;
 pub mod skills_update;
 pub mod soul;

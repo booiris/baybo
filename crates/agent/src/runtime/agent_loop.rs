@@ -25,6 +25,7 @@ use tracing::{debug, info, warn};
 
 use crate::runtime::compression::CompressionRunner;
 use crate::runtime::error_recovery::ErrorHandler;
+use crate::runtime::progress_ledger::{ProgressVerdict, TurnProgressLedger};
 use crate::runtime::progress_observer::{
     ObserverState, ProgressObserverRunner, build_observer_prompt, channel_wants_progress,
     should_fire_observer,
@@ -541,6 +542,12 @@ pub struct AgentLoop {
     /// row persists the fingerprint it observed — so a read survives actor
     /// eviction / process restart. Any gap fails closed (forces a re-read).
     read_tracker: ReadTracker,
+    /// Per-turn record of file mutations, used to tell the model when its
+    /// edits have cancelled out (see
+    /// [`crate::runtime::progress_ledger`]). Reset at the top of every turn:
+    /// "change this file back" is ordinary work when the user asked for it
+    /// between turns, and only becomes churn inside a single turn.
+    progress_ledger: TurnProgressLedger,
 }
 
 /// Construction bundle for [`AgentLoop`]. Every field maps 1:1 to a
@@ -678,6 +685,7 @@ impl AgentLoop {
             title_generation: None,
             title_sink,
             read_tracker: ReadTracker::default(),
+            progress_ledger: TurnProgressLedger::default(),
         }
     }
 
@@ -926,6 +934,10 @@ impl AgentLoop {
         let background_eligible =
             crate::runtime::background_jobs::background_eligible(session, turn_kind);
         self.context_manager.ensure_seeded().await;
+        // Churn is a within-turn property. Editing a file back to how it was
+        // is exactly what "undo that" means when the user asks between turns.
+        self.progress_ledger.clear();
+        self.context_manager.set_progress_observation(None);
 
         // Fire-and-forget at turn start so the title derives concurrently with
         // the answer (it needs only the question, already in context).
@@ -1233,6 +1245,11 @@ impl AgentLoop {
                 return Err(e);
             }
         };
+        // The observation has now ridden a request, so retire it. Leaving it
+        // mounted would re-raise, on every later iteration, an objection the
+        // model has already answered — and the tool loop below may well mount
+        // a fresh one, which must not be confused with this one.
+        self.context_manager.set_progress_observation(None);
 
         // If no tool calls, we have the final response.
         if response.tool_calls.is_empty() {
@@ -1563,6 +1580,18 @@ impl AgentLoop {
                     .and_then(|p| self.read_tracker.get(std::path::Path::new(p)))
             })
             .flatten();
+            // Same three inputs the fingerprint above uses, read for a
+            // different question: not "what does the file look like now" but
+            // "has this turn's editing gone anywhere". A denial and a failure
+            // both count as "the file did not move" — a mid-turn `/stop`
+            // surfaces as `Denied`, so they are not reliably distinguishable.
+            if let Some(verdict) = self.progress_ledger.record(
+                &tool_call.name,
+                &tool_call.arguments,
+                tool_wrote_successfully(&executed.output),
+            ) {
+                self.note_no_progress(&verdict);
+            }
             let meta = (read_fingerprint.is_some()
                 || write_fingerprint.is_some()
                 || call_approval.is_some())
@@ -1601,6 +1630,38 @@ impl AgentLoop {
             .iter()
             .any(|tc| baybo_model::TASK_MUTATING_TOOL_NAMES.contains(&tc.name.as_str()));
         Ok(IterationOutcome::Continue { task_mutated })
+    }
+
+    /// Mount the no-progress observation for the next request and log the
+    /// fact once.
+    ///
+    /// Injected rather than enforced. The runtime knows the file is back where
+    /// it started, but not whether that is a mistake: a flag toggled on to
+    /// test and off again looks the same from here. So the model gets the fact
+    /// and stays in charge of the turn — which is also the only option that
+    /// helps, since the model in the incident this comes from reasoned
+    /// perfectly well once it had the missing fact, and killing its turn would
+    /// have told it nothing. `max_iterations` remains the hard backstop.
+    fn note_no_progress(&mut self, verdict: &ProgressVerdict) {
+        use baybo_context::prompts::no_progress;
+        let (kind, count) = match verdict {
+            ProgressVerdict::StateRevisited { edits, .. } => {
+                (no_progress::Kind::StateRevisited, *edits)
+            }
+            ProgressVerdict::AttemptRepeated { attempts, .. } => {
+                (no_progress::Kind::AttemptRepeated, *attempts)
+            }
+            ProgressVerdict::Futile { streak, .. } => (no_progress::Kind::Futile, *streak),
+        };
+        let path = verdict.path().display().to_string();
+        warn!(
+            path = %path,
+            count,
+            kind = ?kind,
+            "turn is churning a file without net progress; telling the model"
+        );
+        self.context_manager
+            .set_progress_observation(Some(no_progress::render(kind, &path, count)));
     }
 
     /// Call the LLM with retry on transient errors using `ErrorHandler`.

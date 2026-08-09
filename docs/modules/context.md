@@ -68,6 +68,8 @@ ContextManager (struct)
     ├── interjection.rs    — wrap_interjections (mid-turn steering envelope)
     ├── recalled_memory.rs — wrap_recalled_memories (recall envelope)
     ├── tasks.rs           — render_task_list (transient checklist reminder)
+    ├── no_progress.rs     — render (transient "your edits cancelled out"
+    │                        observation; see agent.md → No-progress detection)
     ├── title.rs           — build_title_prompt (conversation-title pass)
     ├── cancelled_turn.rs  — /stop salvage marker (SUFFIX + strip_marker)
     ├── tool_output.rs     — cap_tool_output / spill (+ MAX cap)

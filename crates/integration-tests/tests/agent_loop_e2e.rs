@@ -4777,3 +4777,114 @@ async fn stop_persists_partial_work_so_it_survives_reload() {
         cancelled.thinking
     );
 }
+
+/// A turn whose edits cancel out must be told so, on the very next request.
+///
+/// This is the incident from session cddcfcdb-c5f8-43fc-bb83-01385d0a7b31
+/// reduced to its shape: the model edits a config file, then edits it straight
+/// back, and — before this — nothing anywhere in the runtime noticed. The unit
+/// tests cover the decision; this covers the wiring, which is the part that
+/// silently does nothing if the hook is misplaced.
+#[tokio::test(start_paused = true)]
+async fn a_turn_that_churns_one_file_is_told_it_made_no_progress() {
+    const CONFIG: &str = "/tmp/harness/.mcp.json";
+    // The wording of the observation this script earns: the fourth edit
+    // resubmits the second one verbatim, so the third churn signal is a
+    // repeat rather than a revisit.
+    const CHURN_PHRASE: &str = "already submitted earlier in this turn";
+    // Named `Edit` because that is what makes it a file mutation as far as
+    // the ledger is concerned (`baybo_tools::FILE_WRITING_TOOLS`).
+    let tool = Arc::new(RecordingTool::new("Edit"));
+    tool.set_response(ToolOutput::Text("replaced 1 occurrence(s)".into()));
+    let manifest = tool.manifest();
+
+    let mut harness = AgentTestHarness::builder()
+        .with_tool(tool.clone() as Arc<dyn Tool>, manifest)
+        .build();
+
+    let edit = |id: &str, old: &str, new: &str| {
+        StreamEvent::ToolCall(ToolCallInfo {
+            id: id.into(),
+            name: "Edit".into(),
+            arguments: json!({
+                "file_path": CONFIG,
+                "old_string": old,
+                "new_string": new,
+            }),
+            signature: None,
+        })
+    };
+
+    // Drop the server entry, put it back, drop it, put it back. Reverts two,
+    // three and four are the churn signals; the ledger stays quiet until the
+    // third. A fifth iteration carries whatever the model says next.
+    const FULL: &str = "servers: [netdata]";
+    const EMPTY: &str = "servers: []";
+    for (i, (old, new)) in [(FULL, EMPTY), (EMPTY, FULL), (FULL, EMPTY), (EMPTY, FULL)]
+        .into_iter()
+        .enumerate()
+    {
+        harness
+            .stub_llm
+            .push_stream(vec![edit(&format!("call-{i}"), old, new)]);
+    }
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("let me reconsider".into())]);
+
+    harness
+        .send_text("make the filter take effect")
+        .await
+        .unwrap();
+    let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    assert_eq!(tool.invocations().len(), 4, "every edit ran");
+
+    let captured = harness.stub_llm.captured_requests();
+    assert_eq!(captured.len(), 5, "five iterations");
+
+    let observation_in = |i: usize| -> bool {
+        captured[i]
+            .messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .any(|b| matches!(b, ContentBlock::Text(t) if t.contains(CHURN_PHRASE)))
+    };
+
+    assert!(
+        (0..4).all(|i| !observation_in(i)),
+        "one or two reverts are ordinary exploration — say nothing"
+    );
+    assert!(
+        observation_in(4),
+        "the request after the third churn signal must carry the observation"
+    );
+    let text = captured[4]
+        .messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter_map(|b| match b {
+            ContentBlock::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .find(|t| t.contains(CHURN_PHRASE))
+        .expect("the observation text");
+    assert!(text.contains(CONFIG), "it must name the file: {text}");
+
+    // The observation is never persisted: it is about one moment, and a
+    // stored copy would replay as history on every later turn.
+    let stored = harness
+        .session_manager
+        .load_active_session_messages(&harness.session.id)
+        .await
+        .expect("load transcript");
+    assert!(
+        !stored
+            .iter()
+            .flat_map(|m| &m.content)
+            .any(|b| matches!(b, ContentBlock::Text(t) if t.contains(CHURN_PHRASE))),
+        "the observation must not reach the transcript"
+    );
+
+    harness.shutdown().await;
+}
