@@ -408,7 +408,16 @@ final class AppStore: ObservableObject {
                 return
             }
             if directBound {
-                await registerPushBestEffort()
+                // Detached, exactly as the foreground path runs it
+                // (`didBecomeActive`). Awaiting it here put TWO REST round trips
+                // (`GET /v1/push/params`, `POST /v1/push/register`, 30 s reply
+                // budget each on a 20 s connect budget) in front of the chat
+                // leg's warm-up, the chat list, the push-tap route and the
+                // stranded-send resume — on the one code path where none of
+                // them is on screen yet. Whether a given launch paid for it was
+                // a race with the APNs token callback, which is what made it
+                // feel intermittent. Nothing below needs its result.
+                Task { await registerPushBestEffort() }
                 preconnectDirectBestEffort()
             } else if paired != nil {
                 preconnectRelayBestEffort()

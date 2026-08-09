@@ -18,7 +18,7 @@ use super::pairing::{PairedRecord, load_paired_record};
 use crate::core::{ContentHandshake, ContentSession, Frame, user_message_frame};
 use crate::transport::{
     ChatTransport, Connection, FrameCodec, SessionLeg, SessionRegistry, TransportError,
-    UserFrameFn, WsStream, recv_binary,
+    UserFrameFn, WsStream, recv_binary_handshake,
 };
 
 /// The relay leg's state: the shared session registry. The durable pairing
@@ -134,7 +134,7 @@ async fn handshake_over(
     ws.send(Message::Binary(msg1))
         .await
         .map_err(|e| TransportError::Other(format!("send handshake: {e}")))?;
-    let msg2 = recv_binary(&mut ws).await?;
+    let msg2 = recv_binary_handshake(&mut ws).await?;
     let session = handshake
         .finish(&msg2)
         .map_err(|e| TransportError::Other(format!("finish handshake: {e}")))?;

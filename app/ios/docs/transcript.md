@@ -170,6 +170,22 @@ Sink callbacks hop to the main queue via GCD (FIFO), **not** `Task` — reordere
 to `connecting` + 2s backoff; foreground reconnects debounce 400ms; the core coalesces
 concurrent dials.
 
+**`connected` means the gateway acknowledged the subscription, not that a `Subscribe`
+was queued.** `SessionRegistry::connect` waits for that session's `SubscribeState` —
+the bundle the gateway sends the moment a `Subscribe` registers — under
+`SUBSCRIBE_ACK_TIMEOUT` (8s). Do not "optimise" that wait away. Enqueueing proves only
+that a process-local unbounded mpsc accepted the frame; it says nothing about the
+socket. And a cold start is the one path where the chat screen never dials for itself —
+it always inherits the leg `relay_preconnect`/`direct_preconnect` opened at launch — so
+without the ack a leg that died silently showed up as `connected`, with no `wifi.slash`,
+until the pump's 45s `INBOUND_LIVENESS_TIMEOUT` noticed.
+
+When the ack does not come, the core decides whether the LEG or the SESSION is at fault
+from the leg's `last_inbound` stamp: a leg that carried nothing at all is retired (the
+handle is **dropped**, not aborted, so the pump exits normally and its `on_disconnected`
+fan-out sends every session on it back around the reconnect ladder); a leg that kept
+delivering other traffic is left alone and only this connect fails.
+
 ## The native ⇄ web bridge
 
 `app/ios/App/Web/TranscriptBridge.swift` ⇄ `app/ios/web/src/bridge.ts`.

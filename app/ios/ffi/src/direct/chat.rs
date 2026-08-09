@@ -18,7 +18,7 @@ use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use crate::core::{Frame, MobileError, decode, encode, register_device_frame, user_message_frame};
 use crate::transport::{
     ChatTransport, Connection, FrameCodec, SessionLeg, TransportError, UserFrameFn, WsStream,
-    recv_binary,
+    recv_binary_handshake,
 };
 
 /// The direct frame codec: raw MessagePack, one frame per WS message — no Noise,
@@ -140,6 +140,6 @@ async fn dial_and_register(http: &super::DirectHttp) -> Result<WsStream, DialErr
 /// Read the next binary WS message and decode it as a `Frame` (skipping ping/pong)
 /// — used for the `RegisterAck` reply before the pump takes over.
 async fn recv_frame(ws: &mut WsStream) -> Result<Frame, String> {
-    let bytes = recv_binary(ws).await.map_err(|e| e.to_string())?;
+    let bytes = recv_binary_handshake(ws).await.map_err(|e| e.to_string())?;
     decode(&bytes).map_err(|e| format!("decode frame: {e}"))
 }
