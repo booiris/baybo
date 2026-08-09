@@ -1,7 +1,7 @@
 pub mod paths;
 pub use paths::{IdentityKind, WorkspacePaths, absolutise};
 pub mod name;
-pub use name::{display_name, with_display_name};
+pub use name::{display_name, rejected_name_removal, rejected_rename, with_display_name};
 pub mod prompt;
 pub mod walk;
 
@@ -12,8 +12,8 @@ pub mod test_support;
 pub mod identity;
 #[cfg(feature = "io")]
 pub use identity::{
-    IdentityFiles, IdentitySource, commit_personas, ensure_persona_layout, load_identity,
-    load_identity_files, personas_git_lock,
+    IdentityFiles, IdentitySource, commit_personas, ensure_named_persona_layout,
+    ensure_persona_layout, load_identity, load_identity_files, personas_git_lock,
 };
 
 #[cfg(feature = "io")]

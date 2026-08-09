@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,6 +22,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 use uuid::Uuid;
 
+use baybo_project::worktree::{self, Checkout, ProjectRepo};
+use baybo_store::agent_profile::AgentProfileStore;
+
 use crate::runtime::sandbox::SandboxAdapter;
 use crate::security::SecurityGateway;
 
@@ -42,6 +45,52 @@ fn sandbox_readable_paths(
     agent: &baybo_model::AgentProfileId,
 ) -> Vec<PathBuf> {
     vec![agent.skills_dir(paths)]
+}
+
+fn admits_worktree(resolved: &Path, work_dir: &Path) -> Result<(), String> {
+    if resolved.starts_with(work_dir) {
+        Ok(())
+    } else {
+        Err("it is no longer inside the work directory".to_owned())
+    }
+}
+
+fn admits_repo(resolved: &Path, paths: &baybo_workspace::WorkspacePaths) -> Result<(), String> {
+    if let Some(why) = baybo_sandbox::args::writable_bind_refusal(resolved) {
+        return Err(why);
+    }
+    let root = baybo_workspace::absolutise(paths.root());
+    let work = baybo_workspace::absolutise(&paths.work_dir());
+    if root.starts_with(resolved) {
+        return Err("it contains baybo's own workspace".to_owned());
+    }
+    // No `work/` exemption on the ancestor side above: containing `work/`
+    // does not stop a parent from containing `state/` and `.key/` as well.
+    if resolved.starts_with(&root) && !resolved.starts_with(&work) {
+        return Err("it is inside baybo's protected workspace data".to_owned());
+    }
+    Ok(())
+}
+
+async fn board_handle(
+    agents: &Arc<dyn AgentProfileStore>,
+    agent: &baybo_model::AgentProfileId,
+    project: &baybo_model::ProjectId,
+) -> Option<baybo_model::AgentHandle> {
+    match agents.get(agent).await {
+        Ok(Some(row)) => row
+            .team
+            .filter(|team| team.project_id == *project)
+            .map(|team| team.handle),
+        Ok(None) => {
+            debug!(agent_id = %agent, "the agent working this issue has no profile row; its commits carry no agent trailer");
+            None
+        }
+        Err(e) => {
+            debug!(agent_id = %agent, error = %e, "could not read the profile of the agent working this issue; its commits carry no agent trailer");
+            None
+        }
+    }
 }
 
 /// Preview length used when rendering parameters inside an approval prompt.
@@ -323,6 +372,16 @@ fn tool_output_media(output: &ToolOutput) -> (Vec<ContentBlock>, Vec<ContentBloc
     }
 }
 
+/// The two board facts an issue run's tool call reads: where the
+/// repository is, and what the agent working it is called.
+///
+/// `projects` is a one-method port rather than the store, because that is
+/// the whole of what a tool call is entitled to ask a board.
+pub struct BoardStores {
+    pub projects: Arc<dyn ProjectRepo>,
+    pub agents: Arc<dyn AgentProfileStore>,
+}
+
 /// Executes tools with trust-level validation, approval gating, and
 /// observability recording.
 pub struct ToolExecutor {
@@ -350,6 +409,14 @@ pub struct ToolExecutor {
     /// Control surface for the `JobList` / `JobStop` tools. Wired like
     /// [`Self::background_jobs`] (same runtime component implements both).
     background_control: Option<Arc<dyn baybo_tools::BackgroundJobControl>>,
+    /// Board stores, consulted only for a session whose trigger is an
+    /// issue: the checkout it works in, and the handle its commits are
+    /// authored as. Both resolved per call rather than held on the session,
+    /// because a session's issue is stable but the project's workdir and
+    /// the agent's team membership are rows a user can edit. `None` ⇒ no
+    /// board wired (argv-mode boots, tests), and issue sessions then behave
+    /// like ordinary ones.
+    board: Option<BoardStores>,
 }
 
 impl ToolExecutor {
@@ -365,6 +432,7 @@ impl ToolExecutor {
         virtual_reads: Option<Arc<dyn VirtualReadResolver>>,
         background_jobs: Option<Arc<dyn baybo_tools::BackgroundJobSink>>,
         background_control: Option<Arc<dyn baybo_tools::BackgroundJobControl>>,
+        board: Option<BoardStores>,
     ) -> Self {
         Self {
             tool_registry,
@@ -377,6 +445,7 @@ impl ToolExecutor {
             virtual_reads,
             background_jobs,
             background_control,
+            board,
         }
     }
 
@@ -411,6 +480,50 @@ impl ToolExecutor {
                 debug!(error = %e, "sanitize_tool_event_payload: sanitize_stream_fragment failed");
             }
         }
+    }
+
+    async fn issue_checkout(&self, trigger: &baybo_model::TriggerSource) -> Option<Checkout> {
+        let baybo_model::TriggerSource::Issue {
+            project_id, number, ..
+        } = trigger
+        else {
+            return None;
+        };
+        let workdir = self.board.as_ref()?.projects.workdir(project_id).await?;
+        let root = worktree::worktree_root(&self.workspace_paths, project_id, *number);
+
+        let work_dir = self.workspace_root.clone();
+        let root = self.bindable(&root, |p| admits_worktree(p, &work_dir))?;
+        let repo = self.bindable(&workdir, |p| admits_repo(p, &self.workspace_paths))?;
+        Some(Checkout { root, repo })
+    }
+
+    fn bindable(
+        &self,
+        path: &Path,
+        admit: impl Fn(&Path) -> Result<(), String>,
+    ) -> Option<PathBuf> {
+        let resolved = match path.canonicalize() {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                debug!(path = %path.display(), error = %e, "checkout path does not resolve");
+                return None;
+            }
+        };
+        if !resolved.is_dir() {
+            debug!(path = %resolved.display(), "checkout path is not a directory");
+            return None;
+        }
+        if let Err(why) = admit(&resolved) {
+            tracing::warn!(
+                requested = %path.display(),
+                resolved = %resolved.display(),
+                reason = %why,
+                "refusing to bind a checkout path into the sandbox"
+            );
+            return None;
+        }
+        Some(resolved)
     }
 
     /// Validate that the tool's trust level permits execution with its declared capabilities.
@@ -675,6 +788,20 @@ impl ToolExecutor {
                     .is_some_and(|manifest| {
                         manifest.capabilities.contains(&ToolCapability::ExecCommand)
                     });
+                let checkout = self.issue_checkout(session_trigger).await;
+                let agent_handle = match (&checkout, &self.board, session_trigger.project()) {
+                    (Some(_), Some(board), Some(project)) => {
+                        board_handle(&board.agents, agent_id, project).await
+                    }
+                    _ => None,
+                };
+                // Re-resolved per call rather than cached, so an operator who
+                // edits their git identity is obeyed by the next command. It
+                // costs one `git config` against the sandbox spawn below.
+                let checkout_git_config = match (uses_exec_command, &checkout) {
+                    (true, Some(checkout)) => worktree::ensure_identity_config(checkout).await,
+                    _ => None,
+                };
                 let sandbox: Option<Arc<dyn ExecSandbox>> = if uses_exec_command {
                     self.sandbox_runner.as_ref().map(|runner| {
                         let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -686,6 +813,10 @@ impl ToolExecutor {
                         let denied =
                             default_sensitive_denylist(home.as_deref(), baybo_state.as_deref());
                         let skill_roots = sandbox_readable_paths(&self.workspace_paths, agent_id);
+                        let checkout_paths = checkout
+                            .as_ref()
+                            .map(|c| vec![c.root.clone(), c.repo.clone()])
+                            .unwrap_or_default();
                         Arc::new(
                             SandboxAdapter::new(
                                 Arc::clone(runner),
@@ -693,7 +824,8 @@ impl ToolExecutor {
                                 NetworkPolicy::All,
                             )
                             .with_permissive_filesystem(extra_root, denied)
-                            .with_readable_paths(skill_roots),
+                            .with_readable_paths(skill_roots)
+                            .with_writable_paths(checkout_paths),
                         ) as Arc<dyn ExecSandbox>
                     })
                 } else {
@@ -776,6 +908,9 @@ impl ToolExecutor {
                     background_jobs: self.background_jobs.clone(),
                     background_control: self.background_control.clone(),
                     notify_silence,
+                    checkout_root: checkout.map(|c| c.root),
+                    agent_handle,
+                    checkout_git_config,
                 };
 
                 // Reveal placeholders in the tool's arguments just
@@ -938,6 +1073,69 @@ impl ToolExecutor {
 
 #[cfg(test)]
 mod tests {
+    use super::{admits_repo, admits_worktree};
+    use std::path::Path;
+
+    #[test]
+    fn a_worktree_that_resolves_outside_the_work_dir_is_not_bound() {
+        let work = Path::new("/ws/work");
+        assert!(admits_worktree(Path::new("/ws/work/projects/p/4"), work).is_ok());
+        for escaped in ["/", "/etc", "/ws", "/home/u"] {
+            assert!(
+                admits_worktree(Path::new(escaped), work).is_err(),
+                "a worktree resolving to {escaped} must not be bound"
+            );
+        }
+    }
+
+    #[test]
+    fn a_repository_may_be_anywhere_except_over_the_system_or_the_workspace() {
+        let ws = baybo_workspace::WorkspacePaths::new("/home/u/.baybo");
+        assert!(admits_repo(Path::new("/data/kanban"), &ws).is_ok());
+        assert!(admits_repo(Path::new("/home/u/code/app"), &ws).is_ok());
+        for bad in ["/", "/usr", "/etc", "/home/u/.baybo", "/home/u"] {
+            assert!(
+                admits_repo(Path::new(bad), &ws).is_err(),
+                "{bad} must not be bindable as a repository"
+            );
+        }
+    }
+
+    #[test]
+    fn a_repository_inside_the_workspace_is_refused_unless_it_is_under_work() {
+        let ws = baybo_workspace::WorkspacePaths::new("/home/u/.baybo");
+        for bad in [
+            "/home/u/.baybo/state",
+            "/home/u/.baybo/.key",
+            "/home/u/.baybo/personas/01J",
+        ] {
+            assert!(
+                admits_repo(Path::new(bad), &ws).is_err(),
+                "{bad} is inside the workspace and must not be bound as a repository"
+            );
+        }
+        assert!(
+            admits_repo(Path::new("/home/u/.baybo/work/importer"), &ws).is_ok(),
+            "the auto-created workdir of a project with no repository must still bind"
+        );
+    }
+
+    #[test]
+    fn a_repo_that_contains_the_workspace_through_a_symlink_is_still_refused() {
+        let real = tempfile::tempdir().expect("tempdir");
+        let workspace = real.path().join(".baybo");
+        std::fs::create_dir(&workspace).expect("workspace dir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let link = home.path().join(".baybo");
+        std::os::unix::fs::symlink(&workspace, &link).expect("symlink");
+        let repo = real.path().canonicalize().expect("canonical repo");
+
+        assert!(
+            admits_repo(&repo, &baybo_workspace::WorkspacePaths::new(link)).is_err(),
+            "the guard must see the workspace's real location however the root is spelled"
+        );
+    }
+
     /// The sandbox binds the caller's own skill directory and no other
     /// agent's. Nothing downstream fails if the wrong one is bound — the
     /// session simply gains read access to skills its scope does not admit —
@@ -966,6 +1164,365 @@ mod tests {
         assert_ne!(
             super::sandbox_readable_paths(&paths, &theirs),
             super::sandbox_readable_paths(&paths, &mine),
+        );
+    }
+
+    fn profile_row(
+        id: baybo_model::AgentProfileId,
+        team: Option<baybo_model::TeamMembership>,
+    ) -> baybo_store::AgentProfileRow {
+        let now = chrono::Utc::now();
+        baybo_store::AgentProfileRow {
+            id,
+            description: String::new(),
+            avatar_blob_id: None,
+            framework: baybo_model::AgentFramework::Baybo,
+            llm: None,
+            builtin: false,
+            team,
+            hired_by: None,
+            deleted_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_team_members_handle_is_what_its_commits_are_credited_to() {
+        let agents = baybo_store::test_support::MemoryAgentProfileStore::new();
+        let id = baybo_model::AgentProfileId::generate();
+        let board = baybo_model::ProjectId::generate();
+        agents.insert(profile_row(
+            id.clone(),
+            Some(baybo_model::TeamMembership {
+                project_id: board.clone(),
+                handle: baybo_model::AgentHandle::parse("dev-1").expect("handle"),
+            }),
+        ));
+        let agents: Arc<dyn AgentProfileStore> = Arc::new(agents);
+
+        assert_eq!(
+            super::board_handle(&agents, &id, &board)
+                .await
+                .map(|h| h.as_str().to_owned()),
+            Some("dev-1".to_owned()),
+        );
+    }
+
+    #[tokio::test]
+    async fn a_removed_teammate_still_resolves_on_the_board_it_worked() {
+        let agents = baybo_store::test_support::MemoryAgentProfileStore::new();
+        let id = baybo_model::AgentProfileId::generate();
+        let board = baybo_model::ProjectId::generate();
+        let mut row = profile_row(
+            id.clone(),
+            Some(baybo_model::TeamMembership {
+                project_id: board.clone(),
+                handle: baybo_model::AgentHandle::parse("dev-1").expect("handle"),
+            }),
+        );
+        row.deleted_at = Some(chrono::Utc::now());
+        agents.insert(row);
+        let agents: Arc<dyn AgentProfileStore> = Arc::new(agents);
+
+        assert_eq!(
+            super::board_handle(&agents, &id, &board)
+                .await
+                .map(|h| h.as_str().to_owned()),
+            Some("dev-1".to_owned()),
+        );
+    }
+
+    #[tokio::test]
+    async fn an_agent_on_another_board_does_not_sign_this_ones_commits() {
+        let agents = baybo_store::test_support::MemoryAgentProfileStore::new();
+        let id = baybo_model::AgentProfileId::generate();
+        agents.insert(profile_row(
+            id.clone(),
+            Some(baybo_model::TeamMembership {
+                project_id: baybo_model::ProjectId::generate(),
+                handle: baybo_model::AgentHandle::parse("dev-1").expect("handle"),
+            }),
+        ));
+        let agents: Arc<dyn AgentProfileStore> = Arc::new(agents);
+
+        assert_eq!(
+            super::board_handle(&agents, &id, &baybo_model::ProjectId::generate()).await,
+            None,
+        );
+    }
+
+    #[tokio::test]
+    async fn an_agent_with_no_board_and_a_row_that_is_gone_have_no_handle() {
+        let agents = baybo_store::test_support::MemoryAgentProfileStore::new();
+        let global = baybo_model::AgentProfileId::generate();
+        let board = baybo_model::ProjectId::generate();
+        agents.insert(profile_row(global.clone(), None));
+        let agents: Arc<dyn AgentProfileStore> = Arc::new(agents);
+
+        assert_eq!(super::board_handle(&agents, &global, &board).await, None);
+        assert_eq!(
+            super::board_handle(&agents, &baybo_model::AgentProfileId::generate(), &board).await,
+            None,
+        );
+    }
+
+    const FIXTURE_HANDLE: &str = "dev-1";
+    const CAPTURE_TOOL: &str = "capture_ctx";
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct SeenContext {
+        checkout_root: Option<PathBuf>,
+        agent_handle: Option<baybo_model::AgentHandle>,
+        checkout_git_config: Option<PathBuf>,
+    }
+
+    type Seen = Arc<Mutex<Option<SeenContext>>>;
+
+    struct CaptureTool {
+        seen: Seen,
+    }
+
+    #[async_trait::async_trait]
+    impl baybo_tools::Tool for CaptureTool {
+        fn name(&self) -> &str {
+            CAPTURE_TOOL
+        }
+        fn description(&self) -> String {
+            "records its context".to_owned()
+        }
+        fn parameters_schema(&self) -> Value {
+            json!({"type": "object", "properties": {}})
+        }
+        async fn execute(
+            &self,
+            _params: Value,
+            ctx: &ToolContext,
+        ) -> baybo_tools::Result<ToolOutput> {
+            *self.seen.lock() = Some(SeenContext {
+                checkout_root: ctx.checkout_root.clone(),
+                agent_handle: ctx.agent_handle.clone(),
+                checkout_git_config: ctx.checkout_git_config.clone(),
+            });
+            Ok(ToolOutput::Text(String::new()))
+        }
+    }
+
+    struct IssueRunFixture {
+        executor: ToolExecutor,
+        trigger: baybo_model::TriggerSource,
+        agent: baybo_model::AgentProfileId,
+        worktree: PathBuf,
+        repo: PathBuf,
+        seen: Seen,
+        _real: tempfile::TempDir,
+        _home: tempfile::TempDir,
+        _repo_dir: tempfile::TempDir,
+    }
+
+    async fn issue_run_fixture() -> IssueRunFixture {
+        let real = tempfile::tempdir().expect("tempdir");
+        let workspace = real.path().join(".baybo");
+        std::fs::create_dir(&workspace).expect("workspace dir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let link = home.path().join(".baybo");
+        std::os::unix::fs::symlink(&workspace, &link).expect("symlink");
+
+        let paths = baybo_workspace::WorkspacePaths::new(link.clone());
+        let paths_for_board = paths.clone();
+        std::fs::create_dir_all(paths.work_dir()).expect("work dir");
+        let sandbox_root = paths.work_dir().canonicalize().expect("canonical work dir");
+
+        let repo_dir = tempfile::tempdir().expect("tempdir");
+        let store = baybo_storage::Store::open(workspace.join("storage.db"))
+            .await
+            .expect("store");
+
+        let project_id = baybo_model::ProjectId::generate();
+        let number = 4;
+        let now = chrono::Utc::now();
+        store
+            .project
+            .create_project(&baybo_store::project::ProjectRow {
+                id: project_id.clone(),
+                name: "Importer".to_owned(),
+                description: String::new(),
+                workdir: repo_dir.path().to_string_lossy().into_owned(),
+                daily_budget: None,
+                read_at: None,
+                archived_at: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .expect("project");
+
+        let agent = baybo_model::AgentProfileId::generate();
+        store
+            .agent_profile
+            .create(&profile_row(
+                agent.clone(),
+                Some(baybo_model::TeamMembership {
+                    project_id: project_id.clone(),
+                    handle: baybo_model::AgentHandle::parse(FIXTURE_HANDLE).expect("handle"),
+                }),
+            ))
+            .await
+            .expect("teammate");
+
+        let worktree = worktree::worktree_root(&paths, &project_id, number);
+        std::fs::create_dir_all(&worktree).expect("worktree");
+
+        let seen = Arc::new(Mutex::new(None));
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            Arc::new(CaptureTool {
+                seen: Arc::clone(&seen),
+            }),
+            ToolManifest {
+                name: CAPTURE_TOOL.to_owned(),
+                description: "records its context".to_owned(),
+                trust_level: TrustLevel::Trusted,
+                parameters_schema: json!({"type": "object", "properties": {}}),
+                capabilities: vec![ToolCapability::ExecCommand],
+                channels: Vec::new(),
+            },
+        );
+
+        let key = baybo_security::EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec())
+            .expect("key");
+        let security_gateway = Arc::new(SecurityGateway::new(
+            Arc::new(baybo_security::LeakDetector::with_default_rules()),
+            Arc::new(baybo_security::SecretVault::new(
+                key,
+                Arc::new(baybo_security::test_support::MemorySecretStore::new()),
+            )),
+        ));
+
+        let executor = ToolExecutor::new(
+            Arc::new(registry),
+            Arc::new(ApprovalGateMap::new()),
+            security_gateway,
+            sandbox_root,
+            paths,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(BoardStores {
+                projects: Arc::new(baybo_project::ProjectManager::new(
+                    Arc::clone(&store.project),
+                    Arc::clone(&store.agent_profile),
+                    paths_for_board,
+                    Arc::new(baybo_project::NoopProjectEvents),
+                    baybo_project::no_dispatch(),
+                )),
+                agents: Arc::clone(&store.agent_profile),
+            }),
+        );
+
+        IssueRunFixture {
+            executor,
+            trigger: baybo_model::TriggerSource::Issue {
+                project_id,
+                issue_id: baybo_model::IssueId::generate(),
+                number,
+            },
+            agent,
+            worktree: worktree.canonicalize().expect("canonical worktree"),
+            repo: repo_dir.path().canonicalize().expect("canonical repo"),
+            seen,
+            _real: real,
+            _home: home,
+            _repo_dir: repo_dir,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_worktree_under_a_symlinked_workspace_is_still_bound() {
+        let fixture = issue_run_fixture().await;
+
+        let checkout = fixture
+            .executor
+            .issue_checkout(&fixture.trigger)
+            .await
+            .expect("an issue session gets its checkout");
+        assert_eq!(checkout.root, fixture.worktree);
+        assert_eq!(checkout.repo, fixture.repo);
+    }
+
+    #[tokio::test]
+    async fn an_issue_runs_tool_call_carries_the_agents_handle() {
+        let fixture = issue_run_fixture().await;
+        let session_id = SessionId::from("sess-issue-4");
+        let recorder = Arc::new(SpanRecorder::new(
+            session_id.clone(),
+            "u1".to_owned(),
+            Arc::new(baybo_trace::test_support::MemoryTraceStore::new()),
+            baybo_trace::TraceEventStream::default(),
+        ));
+        let step = recorder
+            .begin_step(TurnId::new(), baybo_trace::StepKind::LlmIteration)
+            .await
+            .expect("step");
+        let user = User {
+            id: "u1".to_owned(),
+            name: None,
+            channel: baybo_model::ChannelType::tui(),
+        };
+
+        let executed = fixture
+            .executor
+            .execute(
+                CAPTURE_TOOL,
+                json!({}),
+                &session_id,
+                &fixture.trigger,
+                &fixture.agent,
+                &user,
+                &Arc::new(Mutex::new(Vec::new())),
+                &recorder,
+                &step,
+                None,
+                "tool-use-1".to_owned(),
+                None,
+                None,
+                CancellationToken::new(),
+                None,
+                None,
+                false,
+                ReadTracker::default(),
+                None,
+            )
+            .await;
+        assert!(executed.output.is_ok(), "the capture tool ran");
+
+        let seen = fixture.seen.lock().clone().expect("the tool saw a context");
+        assert_eq!(
+            seen.checkout_root,
+            Some(fixture.worktree.clone()),
+            "an issue run's tool works in the card's worktree"
+        );
+        assert_eq!(
+            seen.agent_handle.map(|h| h.as_str().to_owned()),
+            Some(FIXTURE_HANDLE.to_owned()),
+            "and credits the agent working the card, not its ULID"
+        );
+
+        // The identity is resolved on the host and handed over already
+        // answered; the shell only ever sees the file.
+        let expected = seen
+            .checkout_root
+            .as_ref()
+            .expect("worktree")
+            .with_extension("gitconfig");
+        assert_eq!(seen.checkout_git_config.as_ref(), Some(&expected));
+        assert!(
+            std::fs::read_to_string(&expected)
+                .expect("the identity config is materialised")
+                .contains("[user]"),
+            "an issue run's shell must have somebody to commit as"
         );
     }
 

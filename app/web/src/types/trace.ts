@@ -89,6 +89,7 @@ export type MessageSource =
   | 'user'
   | 'user_interjection'
   | 'cron'
+  | 'issue_brief'
   | 'cron_notification'
   | 'recalled_memory'
   | 'system_prompt_update'
@@ -319,7 +320,8 @@ export type TurnInputKind =
   | 'cron_notification'
   | 'compact'
   | 'spawned'
-  | 'subagent_notification';
+  | 'subagent_notification'
+  | 'issue_run';
 
 /**
  * Whether a turn of this kind is a **chat turn** — one the user saw in the

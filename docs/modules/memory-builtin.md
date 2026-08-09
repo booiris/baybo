@@ -48,7 +48,7 @@ Memory is partitioned **per agent**, and an agent's partition is wherever its
 persona already lives:
 
 ```text
-<root>/personas/<agent_id>/
+<persona>/                         # personas/<agent_id>/, or personas/project/<agent_id>/
   SOUL.md  IDENTITY.md  USER.md      # the agent's identity files
   skills/                            # the skills only it sees
   memory/
@@ -56,10 +56,11 @@ persona already lives:
     cat-name.md                      #   one fact per file
 ```
 
-One rule, no special cases: the built-in is just another persona directory
-(`personas/baybo/`), so its memory lives beside its soul like everyone
-else's. There is no shared tree — nowhere for one agent's writes to land in
-another's reach.
+The built-in is just another persona directory (`personas/baybo/`), so its
+memory lives beside its soul like everyone else's. Newly created project
+agents use `project-<ULID>` ids and are grouped under `personas/project/`;
+legacy unprefixed project personas remain flat and valid. There is no shared
+memory tree — nowhere for one agent's writes to land in another's reach.
 
 A custom agent's tree is materialised by `ensure_persona_layout` at creation;
 the built-in is skipped there (it has no create step), so its index is seeded
@@ -120,8 +121,8 @@ writes are audited instead of approved, in three tiers:
 | Tier | Roots | Approval | Allowlist | Size cap | Audit commit |
 |---|---|---|---|---|---|
 | Shared profile | `personas/USER.md` | bypassed for `Edit` | yes | 1 MiB | yes |
-| Identity | `personas/<agent_id>/{SOUL,IDENTITY,USER}.md` | bypassed for `Edit` | yes | 1 MiB | yes |
-| Memory | `personas/<agent_id>/memory/**` | bypassed | **no** | 1 MiB | yes |
+| Identity | `<persona>/{SOUL,IDENTITY,USER}.md` | bypassed for `Edit` | yes | 1 MiB | yes |
+| Memory | `<persona>/memory/**` | bypassed | **no** | 1 MiB | yes |
 | Scratch | `work/` | bypassed | no | no | no |
 
 The per-agent tiers are **owned**: `<agent_id>` is the calling agent, and a
@@ -209,7 +210,7 @@ makes location the entire guard:
 The first two live in `baybo-workspace` beside `absolutise`, whose own
 doc-comment warns that it leaves `..` intact for exactly this reason — and so
 does the **shape recogniser**, `classify_persona_path`. Recognising
-`personas/<id>/memory/x.md` is the same knowledge as constructing it, and the
+Recognising a persona memory path is the same knowledge as constructing it, and the
 constructors (`persona_identity_file`, `persona_memory_dir`,
 `shared_user_file`) are right there: a recogniser kept in another crate would
 go on matching a layout that had moved, and it is the recogniser that grants

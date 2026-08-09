@@ -214,6 +214,8 @@ pub trait SessionStore: Send + Sync {
     /// Operator-facing: drives `baybo session list`.
     async fn list_all(&self) -> Result<Vec<Session>>;
 
+    async fn list_project_conversations(&self, project_id: &str) -> Result<Vec<Session>>;
+
     /// Return live sessions whose `channel` equals `channel`,
     /// newest-active first. Used by the chat REST surface
     /// (`GET /v1/chat/sessions`) so a long-running gateway with

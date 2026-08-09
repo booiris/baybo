@@ -447,7 +447,10 @@ fn map_frame(
         | Frame::SessionActivity { .. }
         | Frame::FoldersChanged { .. }
         | Frame::DeckCardData { .. }
-        | Frame::DeckChanged => {
+        | Frame::DeckChanged
+        // Board traffic on the shared owner channel — expected, not a
+        // protocol violation, and the TUI has no board to update.
+        | Frame::ProjectChanged { .. } => {
             // Web-chat sidebar / deck signals — TUI tracks a single
             // session of its own and has no list or deck view, so it
             // ignores rather than warning.

@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 #[cfg(any(test, feature = "test-support"))]
 use baybo_model::ChannelType;
-use baybo_model::{AgentProfileId, SessionId, SpanId, TriggerSource, TurnId, User};
+use baybo_model::{AgentHandle, AgentProfileId, SessionId, SpanId, TriggerSource, TurnId, User};
 use baybo_trace::ToolEventPayload;
 use baybo_workspace::WorkspacePaths;
 use serde::{Deserialize, Serialize};
@@ -202,6 +202,12 @@ pub enum ToolTriggerScope {
     /// (`TriggerSource::Cron { conversation: true }`). Used by `report_nothing`,
     /// which can only suppress a recurring fire's own notification.
     CronFire,
+    /// Visible only in a session that names a project board — an issue's
+    /// run, or the lead's planning conversation. Used by the `Issue*` tools
+    /// and `ProjectAgentCreate`: outside a board there is no project for
+    /// them to name, so offering them would be offering an action that can
+    /// only fail.
+    ProjectBoard,
 }
 
 impl ToolTriggerScope {
@@ -210,6 +216,7 @@ impl ToolTriggerScope {
         match self {
             ToolTriggerScope::Any => true,
             ToolTriggerScope::CronFire => trigger.is_cron_conversation(),
+            ToolTriggerScope::ProjectBoard => trigger.project().is_some(),
         }
     }
 }
@@ -371,6 +378,24 @@ pub struct ToolContext {
     /// else, so the tool no-ops on a user reply, a one-shot fire, or any
     /// ordinary turn. See [`NotifySilence`].
     pub notify_silence: Option<NotifySilence>,
+    /// The checkout this session owns, when it is a kanban issue's run: the
+    /// git worktree cut for that issue. Shell commands default their cwd to
+    /// it, so an unqualified `git status` describes the project the card is
+    /// about rather than baybo's own work directory. `None` for every
+    /// ordinary session, which keeps the existing default.
+    pub checkout_root: Option<PathBuf>,
+    /// What this session's agent is called on the board its card belongs
+    /// to: the `@handle` a person types into a comment, not the ULID that
+    /// names its persona directory. Populated only alongside
+    /// [`Self::checkout_root`], because its one consumer is the
+    /// `Co-authored-by:` trailer an issue run's commits carry.
+    pub agent_handle: Option<AgentHandle>,
+    /// Git config naming who [`Self::checkout_root`]'s commits belong to,
+    /// resolved on the host by `baybo-project` and handed over already
+    /// answered. The shell is pointed at it with `GIT_CONFIG_GLOBAL`, because
+    /// the sandbox remaps `HOME` and the operator's own config is therefore
+    /// not where git looks. `None` for every session that is not an issue run.
+    pub checkout_git_config: Option<PathBuf>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -417,6 +442,9 @@ impl ToolContext {
             background_jobs: None,
             background_control: None,
             notify_silence: None,
+            checkout_root: None,
+            agent_handle: None,
+            checkout_git_config: None,
         }
     }
 }

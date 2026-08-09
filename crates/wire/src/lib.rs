@@ -92,6 +92,31 @@ pub enum ActivityKind {
     Assistant,
 }
 
+/// Which plane of a project changed, so a client refetches one thing
+/// instead of reloading the board, the detail page and the run log at
+/// once. A discriminant, not a payload — the same role [`ActivityKind`]
+/// plays on [`Frame::SessionActivity`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-export",
+    ts(export, export_to = "../../../sidecars/sdk/channel-ts/src/generated/")
+)]
+pub enum ProjectChangeScope {
+    /// The project row itself — renamed, re-described, archived.
+    Project,
+    /// The board: an issue was created, edited, moved, blocked, cancelled.
+    Board,
+    /// One issue's execution state — a run was queued, started, settled.
+    Run,
+    /// One issue's timeline gained an entry — a comment, or a system note.
+    /// Distinct from [`Self::Board`] because no card moved: a board that
+    /// refetched every column to learn somebody said something would be
+    /// doing the most expensive thing for the least reason.
+    Timeline,
+}
+
 /// Reference to a media payload that travels alongside a [`Message`].
 /// The bytes themselves never ride the WS — they live in the gateway's
 /// `BlobStore` and are uploaded / fetched out-of-band via
@@ -928,6 +953,28 @@ pub enum Frame {
     /// refetch also replaces cached snapshots + seqs). Clients without
     /// deck UI ignore this frame.
     DeckChanged,
+    /// Server → client: something changed inside a project — a board move,
+    /// a run transition. Broadcast to every connection on the owner
+    /// channel regardless of subscription, exactly like
+    /// [`Frame::DeckChanged`]: a board has no session to subscribe to, so
+    /// a session-scoped frame could never reach the page.
+    ///
+    /// Carries no state, only what to refetch. Deliberately not a patch: a
+    /// move renumbers the whole destination column in one transaction, so
+    /// a per-issue delta would have to carry the column anyway. Clients
+    /// without board UI ignore this frame.
+    ProjectChanged {
+        project_id: String,
+        scope: ProjectChangeScope,
+        /// The issue the change is about, when it is about one. A detail
+        /// page ignores anything for another number.
+        ///
+        /// `u32` for the same reason as [`DeckCardData::seq`]: keeps
+        /// `bigint` out of the generated TS contract.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts-export", ts(optional))]
+        issue_number: Option<u32>,
+    },
     /// Liveness probe (either direction). The receiver MUST reply with
     /// [`Frame::Pong`].
     ///
@@ -983,6 +1030,7 @@ impl Frame {
             | Frame::FoldersChanged { .. }
             | Frame::DeckCardData { .. }
             | Frame::DeckChanged
+            | Frame::ProjectChanged { .. }
             | Frame::Ping
             | Frame::Pong => None,
         }

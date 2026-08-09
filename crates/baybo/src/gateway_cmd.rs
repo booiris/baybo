@@ -509,6 +509,17 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
         }));
     }
 
+    {
+        let projects = Arc::clone(&graph.project_manager);
+        task_tracker.track(tokio::spawn(async move {
+            match projects.resume_unsettled_runs().await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(runs = n, "resumed issue runs interrupted by shutdown"),
+                Err(e) => tracing::warn!(error = %e, "could not resume interrupted issue runs"),
+            }
+        }));
+    }
+
     // Build the axum server from the assembled graph.
     let deps = GatewayDeps {
         config: Arc::clone(&graph.config),
@@ -532,6 +543,7 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
         channel_control,
         bot_reconciler: Arc::clone(&bot_reconciler),
         deck_manager: Arc::clone(&graph.deck_manager),
+        project_manager: Arc::clone(&graph.project_manager),
         workspace_paths: Arc::new(baybo_workspace::WorkspacePaths::new(
             graph.workspace.root().to_path_buf(),
         )),

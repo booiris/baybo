@@ -7,6 +7,7 @@ mod cost;
 mod cron;
 mod deck;
 mod device;
+mod project;
 mod search;
 mod secret;
 mod session;
@@ -26,6 +27,7 @@ pub use cost::SqliteCostStore;
 pub use cron::SqliteCronStore;
 pub use deck::SqliteDeckCardStore;
 pub use device::SqliteDeviceStore;
+pub use project::SqliteProjectStore;
 pub use search::SqliteMessageSearchStore;
 pub use secret::SqliteSecretStore;
 pub use session::SqliteSessionStore;
@@ -280,6 +282,61 @@ fn migrate_turn_entity_rename(conn: &mut rusqlite::Connection) -> anyhow::Result
 
 /// Columns added after their `CREATE TABLE` shipped.
 const ADD_COLUMNS: &[AddColumn] = &[
+    AddColumn {
+        table: "agent_profiles",
+        column: "project_id",
+        definition: "TEXT",
+    },
+    AddColumn {
+        table: "agent_profiles",
+        column: "handle",
+        definition: "TEXT",
+    },
+    AddColumn {
+        table: "agent_profiles",
+        column: "hired_by",
+        definition: "TEXT",
+    },
+    AddColumn {
+        table: "agent_profiles",
+        column: "deleted_at",
+        definition: "INTEGER",
+    },
+    AddColumn {
+        table: "projects",
+        column: "daily_budget_micros",
+        definition: "INTEGER",
+    },
+    AddColumn {
+        table: "projects",
+        column: "read_at",
+        definition: "INTEGER",
+    },
+    AddColumn {
+        table: "issues",
+        column: "parent_issue_id",
+        definition: "TEXT",
+    },
+    AddColumn {
+        table: "issues",
+        column: "stage",
+        definition: "INTEGER NOT NULL DEFAULT 0",
+    },
+    AddColumn {
+        table: "issues",
+        column: "source_key",
+        definition: "TEXT",
+    },
+    AddColumn {
+        table: "issues",
+        column: "branch",
+        definition: "TEXT",
+    },
+    AddColumn {
+        table: "issues",
+        column: "assignee",
+        definition: "TEXT",
+    },
     AddColumn {
         table: "sessions",
         column: "parent_span_id",
@@ -1163,6 +1220,16 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     framework       TEXT NOT NULL,
                     llm             TEXT,
                     builtin         INTEGER NOT NULL DEFAULT 0,
+                    -- A project team member. Both NULL for a global agent;
+                    -- both set for a teammate. Nothing sets one alone —
+                    -- see `TeamMembership`.
+                    project_id      TEXT,
+                    handle          TEXT,
+                    -- Which agent hired this one. NULL is the operator.
+                    hired_by        TEXT,
+                    -- Removed from its team. The row stays: issues, runs and
+                    -- timeline entries all name agents by id.
+                    deleted_at      INTEGER,
                     created_at      INTEGER NOT NULL,
                     updated_at      INTEGER NOT NULL
                 );
@@ -1246,7 +1313,151 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     fetched_at INTEGER NOT NULL,
                     error      TEXT,
                     PRIMARY KEY (card_id, seq)
-                );",
+                );
+
+                -- Kanban projects (docs/todo/kanban.md). The id is also the
+                -- project's directory name under workspace/projects/, which
+                -- is why ProjectId carries a grammar rather than being
+                -- opaque. archived_at is the soft-archive recycle bin (the
+                -- cron_jobs pattern); there is no hard delete.
+                CREATE TABLE IF NOT EXISTS projects (
+                    id          TEXT    PRIMARY KEY,
+                    name        TEXT    NOT NULL,
+                    description TEXT    NOT NULL DEFAULT '',
+                    -- Absolute path to the git repo the team works in.
+                    workdir     TEXT    NOT NULL,
+                    -- Micro-USD this board's agents may spend per UTC day.
+                    -- NULL is no ceiling. INTEGER, never REAL — see
+                    -- `cost_records.cost_usd`.
+                    daily_budget_micros INTEGER,
+                    -- When the operator last looked at this board. The only
+                    -- read state in the feature, and it exists because the
+                    -- two signals that need it — an agent's comment, a card
+                    -- arriving in Review — leave no other trace when read.
+                    read_at     INTEGER,
+                    archived_at INTEGER,
+                    created_at  INTEGER NOT NULL,
+                    updated_at  INTEGER NOT NULL
+                );
+
+                -- One card on one board. `number` is the human address and
+                -- is per-project, assigned inside the insert transaction;
+                -- the unique index below is the backstop that turns a race
+                -- into a constraint trip rather than two issues called #3.
+                -- The ULID `id` is what child tables (runs, events) will
+                -- reference — the REST surface never addresses by it, so a
+                -- request cannot name an issue without naming its project.
+                CREATE TABLE IF NOT EXISTS issues (
+                    id             TEXT    PRIMARY KEY,
+                    project_id     TEXT    NOT NULL,
+                    number         INTEGER NOT NULL,
+                    title          TEXT    NOT NULL,
+                    description    TEXT    NOT NULL DEFAULT '',
+                    status         TEXT    NOT NULL,
+                    priority       TEXT    NOT NULL DEFAULT 'none',
+                    -- Who is on it. An agent profile id, or NULL for work
+                    -- nobody has picked up.
+                    assignee       TEXT,
+                    -- Dense rank within (project_id, status); a move
+                    -- renumbers the whole target column in one transaction.
+                    position       INTEGER NOT NULL,
+                    blocked_reason TEXT,
+                    -- Sub-issues, one level deep. `stage` is the barrier a
+                    -- child belongs to under its parent; it is 0 and
+                    -- meaningless on a top-level issue.
+                    parent_issue_id TEXT,
+                    stage          INTEGER NOT NULL DEFAULT 0,
+                    -- What opened this card, for callers that must not open
+                    -- it twice. Namespaced server-side; NULL for anything a
+                    -- person or an ordinary run created.
+                    source_key     TEXT,
+                    -- The branch this issue's work landed on. NULL until it
+                    -- has a commit: worktree and branch are separate ideas,
+                    -- and a research issue that produced a report and no
+                    -- code should show no branch anywhere.
+                    branch         TEXT,
+                    cancelled_at   INTEGER,
+                    created_at     INTEGER NOT NULL,
+                    updated_at     INTEGER NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_issues_number
+                    ON issues(project_id, number);
+                -- Serves the board's only read: one project's cards,
+                -- column by column, in order.
+                CREATE INDEX IF NOT EXISTS idx_issues_board
+                    ON issues(project_id, status, position);
+
+                -- One execution of one issue by its assignee. The row IS the
+                -- delivery ledger entry: it is written before anything is
+                -- dispatched, stamped on resolution, and re-driven at boot,
+                -- so a crash anywhere in between leaves work that resumes
+                -- rather than a card that shimmers forever.
+                CREATE TABLE IF NOT EXISTS issue_runs (
+                    id         TEXT    PRIMARY KEY,
+                    issue_id   TEXT    NOT NULL,
+                    project_id TEXT    NOT NULL,
+                    number     INTEGER NOT NULL,
+                    agent_id   TEXT    NOT NULL,
+                    -- The issue's session, stamped when the run is claimed
+                    -- and null until then. NOT cleared by the boot sweep: a
+                    -- run returned to the queue keeps the session it was
+                    -- already working in, so the resumed run continues one
+                    -- transcript instead of opening a second.
+                    session_id TEXT,
+                    trigger    TEXT    NOT NULL,
+                    status     TEXT    NOT NULL,
+                    attempt    INTEGER NOT NULL,
+                    error      TEXT,
+                    created_at INTEGER NOT NULL,
+                    started_at INTEGER,
+                    settled_at INTEGER
+                );
+                -- The dedupe guard, structural rather than checked: an issue
+                -- may hold at most one unfinished run. Two drags racing trip
+                -- the constraint instead of starting the same work twice —
+                -- and it is what lets the waiter treat 'the newest terminal
+                -- turn' as unambiguously its own.
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_issue_runs_live
+                    ON issue_runs(issue_id) WHERE settled_at IS NULL;
+                -- The unfinished slice of a table that only grows: at most
+                -- one row per live issue, and every sweep works from it.
+                -- The process-start requeue rewrites it whole, `held_runs`
+                -- reads it in this order, and `active_runs` narrows it to
+                -- one board (re-sorting a handful of rows by issue number,
+                -- which is cheaper than a second index to serve).
+                CREATE INDEX IF NOT EXISTS idx_issue_runs_unsettled
+                    ON issue_runs(created_at) WHERE settled_at IS NULL;
+                -- The per-issue execution log, newest attempt first.
+                CREATE INDEX IF NOT EXISTS idx_issue_runs_log
+                    ON issue_runs(issue_id, created_at DESC);
+                -- The issue timeline: comments and system events in one
+                -- stream, because a reader wants them interleaved and a
+                -- second table would only have to be merged back.
+                CREATE TABLE IF NOT EXISTS issue_events (
+                    id         TEXT    PRIMARY KEY,
+                    issue_id   TEXT    NOT NULL,
+                    project_id TEXT    NOT NULL,
+                    number     INTEGER NOT NULL,
+                    -- 'user', 'system' or 'agent:<id>' — the three forms
+                    -- `IssueActor::to_storage` writes. The read is
+                    -- fail-closed (an unrecognised value fails the whole
+                    -- timeline), so anything writing this column has to
+                    -- spell it the way that enum does.
+                    actor      TEXT    NOT NULL,
+                    -- Derived from `body`, stored so a filter by kind does
+                    -- not have to parse every row's JSON.
+                    kind       TEXT    NOT NULL,
+                    body       TEXT    NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+                -- Reading order for one issue, and the range scan a
+                -- follow-up run's brief uses to take only the delta.
+                CREATE INDEX IF NOT EXISTS idx_issue_events_timeline
+                    ON issue_events(issue_id, created_at);
+                -- The project-wide activity feed, derived from this same
+                -- table rather than stored a second time.
+                CREATE INDEX IF NOT EXISTS idx_issue_events_feed
+                    ON issue_events(project_id, created_at DESC);",
     )
     .map_err(|e| anyhow::anyhow!("failed to initialize sqlite schema: {e}"))?;
 
@@ -1257,11 +1468,11 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
         migration.apply(conn)?;
     }
 
-    // Indexes on migration-added columns. Created AFTER the ALTER loop,
-    // not in the schema batch above: on a legacy DB the column doesn't
-    // exist until the ALTER runs, so a batch-time CREATE INDEX referencing
-    // it would fail. `IF NOT EXISTS` keeps them idempotent on every
-    // subsequent boot.
+    // Indexes and triggers on migration-added columns. Created AFTER the
+    // ALTER loop, not in the schema batch above: on a legacy DB the column
+    // doesn't exist until the ALTER runs, so a batch-time statement
+    // referencing it would fail. `IF NOT EXISTS` keeps them idempotent on
+    // every subsequent boot.
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_sessions_folder
              ON sessions(folder_id) WHERE folder_id IS NOT NULL;
@@ -1278,9 +1489,56 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
              WHERE source_event_id IS NOT NULL;
          -- Serves the chat-list base query (channel scope + newest-first).
          CREATE INDEX IF NOT EXISTS idx_sessions_channel_active
-             ON sessions(channel, last_active DESC);",
+             ON sessions(channel, last_active DESC);
+         -- A handle is unique within its board and stays reserved after the
+         -- agent is removed: reissuing it would silently repoint every
+         -- timeline entry that already said '@dev-1'. Hence no
+         -- `deleted_at IS NULL` here.
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_profiles_handle
+             ON agent_profiles(project_id, handle) WHERE project_id IS NOT NULL;
+         -- …and unique is only half of it: the pair is also INSERT-only. A
+         -- membership is granted when the agent is hired and never moves,
+         -- because `issues.assignee`, `issue_runs.agent_id` and every
+         -- timeline `actor` resolve through it, and the '@dev-1' already
+         -- typed into a comment resolves through nothing else at all.
+         --
+         -- Stated here rather than left to the store's statements happening
+         -- not to name these columns: that is a coincidence, and one future
+         -- `UPDATE` ends it. It is also the store's half of a fixed identity
+         -- — the display name the handle was derived from is frozen too, and
+         -- freezing one without the other only moves the drift. That name is
+         -- a line in the agent's own IDENTITY.md, which no column here can
+         -- hold, so its rule lives in `baybo_workspace::name`; this is the
+         -- half SQL *can* keep.
+         CREATE TRIGGER IF NOT EXISTS agent_profiles_team_is_insert_only
+             BEFORE UPDATE OF project_id, handle ON agent_profiles
+             WHEN NEW.project_id IS NOT OLD.project_id
+               OR NEW.handle IS NOT OLD.handle
+             BEGIN
+                 SELECT RAISE(ABORT, 'an agent''s board and @handle are fixed when it is hired');
+             END;
+         -- Serves the board's roster read.
+         CREATE INDEX IF NOT EXISTS idx_agent_profiles_team
+             ON agent_profiles(project_id)
+             WHERE project_id IS NOT NULL AND deleted_at IS NULL;
+         -- Serves the budget gate: one board's run sessions, which the
+         -- spend query joins `cost_records` against.
+         CREATE INDEX IF NOT EXISTS idx_issue_runs_project_session
+             ON issue_runs(project_id, session_id) WHERE session_id IS NOT NULL;
+         -- Serves the stage barrier and the card's progress ring: one
+         -- parent's children, in stage order.
+         -- One LIVE card per key per board. The card leaves the index when
+         -- it is finished or cancelled, which is the whole design: this
+         -- month's build failure gets a fresh card, and this month's does
+         -- not get thirty.
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_issues_source_key
+             ON issues(project_id, source_key)
+             WHERE source_key IS NOT NULL AND cancelled_at IS NULL AND status <> 'done';
+         CREATE INDEX IF NOT EXISTS idx_issues_children
+             ON issues(parent_issue_id, stage, position)
+             WHERE parent_issue_id IS NOT NULL;",
     )
-    .map_err(|e| anyhow::anyhow!("failed to create post-migration indexes: {e}"))?;
+    .map_err(|e| anyhow::anyhow!("failed to create post-migration indexes and triggers: {e}"))?;
 
     // One-time data collapse: the retired per-surface channel tags `http`
     // (web) and `device` (mobile) were unified into a single `owner` pool
@@ -1601,6 +1859,61 @@ mod tests {
         })
         .await
         .expect("migration interact");
+    }
+
+    #[tokio::test]
+    async fn a_pre_team_database_migrates_and_gains_the_handle_index_and_trigger() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("legacy.db");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("open raw");
+            conn.execute_batch(
+                "CREATE TABLE agent_profiles (
+                     id             TEXT PRIMARY KEY,
+                     description    TEXT NOT NULL,
+                     avatar_blob_id TEXT,
+                     framework      TEXT NOT NULL,
+                     llm            TEXT,
+                     builtin        INTEGER NOT NULL DEFAULT 0,
+                     created_at     INTEGER NOT NULL,
+                     updated_at     INTEGER NOT NULL
+                 );
+                 INSERT INTO agent_profiles
+                     (id, description, framework, created_at, updated_at)
+                     VALUES ('01JOLD', 'a persona from before', 'baybo', 1, 1);",
+            )
+            .expect("seed the pre-migration shape");
+        }
+
+        let pool = SqlitePool::open(&path).await.expect("open must migrate");
+        pool.interact("test.assert_migrated", |conn| {
+            let indexed: i64 = conn.query_row(
+                "SELECT count(*) FROM sqlite_master \
+                 WHERE type = 'index' AND name = 'idx_agent_profiles_handle'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(indexed, 1, "the handle index must exist after migration");
+            // Both statements name columns the ALTER loop adds, so both have
+            // to be created after it — a DB that migrated without the trigger
+            // would enforce nothing and say nothing.
+            let triggered: i64 = conn.query_row(
+                "SELECT count(*) FROM sqlite_master \
+                 WHERE type = 'trigger' AND name = 'agent_profiles_team_is_insert_only'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(triggered, 1, "the membership trigger must exist too");
+            let (project_id, handle): (Option<String>, Option<String>) = conn.query_row(
+                "SELECT project_id, handle FROM agent_profiles WHERE id = '01JOLD'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            assert_eq!((project_id, handle), (None, None));
+            Ok(())
+        })
+        .await
+        .expect("assert interact");
     }
 
     /// A migration naming a missing table is a programming error in

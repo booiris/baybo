@@ -480,7 +480,7 @@
             }
           },
           "400": {
-            "description": "Malformed agent id",
+            "description": "Malformed agent id, or a body that renames a project agent — its @handle came from that name",
             "content": {
               "application/json": {
                 "schema": {
@@ -618,7 +618,7 @@
             "description": "Name set"
           },
           "400": {
-            "description": "Malformed agent id or name",
+            "description": "Malformed agent id or name, or a project agent, whose name its @handle was derived from and cannot outlive",
             "content": {
               "application/json": {
                 "schema": {
@@ -3977,6 +3977,2201 @@
         }
       }
     },
+    "/v1/projects": {
+      "get": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "list_projects",
+        "parameters": [
+          {
+            "name": "include_archived",
+            "in": "query",
+            "description": "Fold the archive back into the listing.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Projects, most recently touched first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Envelope for list endpoints. `next_cursor` is opaque — clients\npass it back as `?cursor=` to fetch the next page, and treat\n`None` as \"no more pages.\" The cursor's internal scheme may change\nacross releases; clients must not parse it.",
+                  "required": [
+                    "items"
+                  ],
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "id",
+                          "name",
+                          "description",
+                          "workdir",
+                          "created_at_ms",
+                          "updated_at_ms"
+                        ],
+                        "properties": {
+                          "archived_at_ms": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ],
+                            "format": "int64",
+                            "description": "Present only while the project sits in the archive."
+                          },
+                          "created_at_ms": {
+                            "type": "integer",
+                            "format": "int64"
+                          },
+                          "daily_budget_micros": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ],
+                            "format": "int64",
+                            "description": "Daily spend ceiling in micro-USD. Absent means no limit."
+                          },
+                          "description": {
+                            "type": "string"
+                          },
+                          "id": {
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "updated_at_ms": {
+                            "type": "integer",
+                            "format": "int64"
+                          },
+                          "workdir": {
+                            "type": "string",
+                            "description": "Absolute path to the git repository this project's agents work in."
+                          }
+                        }
+                      }
+                    },
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "create_project",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateProjectRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The new project",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Blank name, or a workdir that is relative, not a repo, or overlaps the workspace",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/projects/attention": {
+      "get": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "projects_attention",
+        "responses": {
+          "200": {
+            "description": "Boards with work stuck on the operator. Boards with nothing waiting are absent.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Envelope for list endpoints. `next_cursor` is opaque — clients\npass it back as `?cursor=` to fetch the next page, and treat\n`None` as \"no more pages.\" The cursor's internal scheme may change\nacross releases; clients must not parse it.",
+                  "required": [
+                    "items"
+                  ],
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "description": "One board with something waiting on the operator.",
+                        "required": [
+                          "project_id",
+                          "name",
+                          "approvals",
+                          "held",
+                          "failed",
+                          "unread"
+                        ],
+                        "properties": {
+                          "approvals": {
+                            "type": "integer",
+                            "description": "Tool calls parked on an approval prompt.",
+                            "minimum": 0
+                          },
+                          "failed": {
+                            "type": "integer",
+                            "description": "Live cards whose newest run failed.",
+                            "minimum": 0
+                          },
+                          "held": {
+                            "type": "integer",
+                            "description": "Runs recorded but not started, because the board is over budget.",
+                            "minimum": 0
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "project_id": {
+                            "type": "string"
+                          },
+                          "unread": {
+                            "type": "integer",
+                            "description": "Agents' comments and cards arriving in Review since you last looked.",
+                            "minimum": 0
+                          }
+                        }
+                      }
+                    },
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/projects/{project_id}": {
+      "get": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "get_project",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The project",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown project",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "update_project",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateProjectRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The edited project",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Blank name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown project",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The project is archived",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/projects/{project_id}/agents": {
+      "get": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "list_team",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "This project's team, by handle",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Envelope for list endpoints. `next_cursor` is opaque — clients\npass it back as `?cursor=` to fetch the next page, and treat\n`None` as \"no more pages.\" The cursor's internal scheme may change\nacross releases; clients must not parse it.",
+                  "required": [
+                    "items"
+                  ],
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "description": "One member of a project's team.",
+                        "required": [
+                          "id",
+                          "handle",
+                          "name",
+                          "description",
+                          "framework",
+                          "lead",
+                          "created_at_ms"
+                        ],
+                        "properties": {
+                          "avatar_blob_id": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "created_at_ms": {
+                            "type": "integer",
+                            "format": "int64"
+                          },
+                          "description": {
+                            "type": "string",
+                            "description": "One line saying what this agent is for."
+                          },
+                          "framework": {
+                            "$ref": "#/components/schemas/AgentFrameworkDto"
+                          },
+                          "handle": {
+                            "type": "string",
+                            "description": "Immutable `@handle` on this board — what a comment mentions."
+                          },
+                          "hired_by": {
+                            "oneOf": [
+                              {
+                                "type": "null"
+                              },
+                              {
+                                "$ref": "#/components/schemas/HiredByDto"
+                              }
+                            ]
+                          },
+                          "id": {
+                            "type": "string"
+                          },
+                          "lead": {
+                            "type": "boolean",
+                            "description": "The coordinator, which every board has and none may remove."
+                          },
+                          "llm": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "name": {
+                            "type": "string",
+                            "description": "Display name from the agent's own `IDENTITY.md`. Fixed at hire, like\nthe handle derived from it."
+                          }
+                        }
+                      }
+                    },
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown project",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "hire_agent",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HireAgentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The new teammate",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TeamMemberDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Unusable name, missing role, full team, or unknown LLM entry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown project",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The project is archived",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/projects/{project_id}/agents/{agent_id}": {
+      "delete": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "remove_agent",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "agent_id",
+            "in": "path",
+            "description": "Agent profile id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The agent left the team; its past work still names it"
+          },
+          "400": {
+            "description": "Not on this team, the lead, or an agent with a run in flight",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown project",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The project is archived",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/projects/{project_id}/archive": {
+      "post": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "set_project_archived",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetArchivedRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The project, archived or restored",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown project",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/projects/{project_id}/feed": {
+      "get": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "project_feed",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "before_ms",
+            "in": "query",
+            "description": "Page backwards from this instant (ms). Omit for the newest.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "How many entries. Clamped by the server.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "This project's activity, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Envelope for list endpoints. `next_cursor` is opaque — clients\npass it back as `?cursor=` to fetch the next page, and treat\n`None` as \"no more pages.\" The cursor's internal scheme may change\nacross releases; clients must not parse it.",
+                  "required": [
+                    "items"
+                  ],
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "description": "One entry on an issue's timeline.",
+                        "required": [
+                          "id",
+                          "number",
+                          "actor",
+                          "body",
+                          "created_at_ms"
+                        ],
+                        "properties": {
+                          "actor": {
+                            "$ref": "#/components/schemas/ActorDto"
+                          },
+                          "body": {
+                            "$ref": "#/components/schemas/IssueEventBodyDto"
+                          },
+                          "created_at_ms": {
+                            "type": "integer",
+                            "format": "int64"
+                          },
+                          "id": {
+                            "type": "string"
+                          },
+                          "number": {
+                            "type": "integer",
+                            "format": "int64"
+                          }
+                        }
+                      }
+                    },
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown project",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/projects/{project_id}/issues": {
+      "get": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "list_issues",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The whole board, column by column, in order",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Envelope for list endpoints. `next_cursor` is opaque — clients\npass it back as `?cursor=` to fetch the next page, and treat\n`None` as \"no more pages.\" The cursor's internal scheme may change\nacross releases; clients must not parse it.",
+                  "required": [
+                    "items"
+                  ],
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "number",
+                          "project_id",
+                          "title",
+                          "description",
+                          "status",
+                          "priority",
+                          "position",
+                          "stage",
+                          "created_at_ms",
+                          "updated_at_ms"
+                        ],
+                        "properties": {
+                          "assignee": {
+                            "type": [
+                              "string",
+                              "null"
+                            ],
+                            "description": "The agent on it, if any. In Progress always has one."
+                          },
+                          "blocked_reason": {
+                            "type": [
+                              "string",
+                              "null"
+                            ],
+                            "description": "Why work stopped. A badge on the card — blocked work stays in\nwhichever column it was in."
+                          },
+                          "branch": {
+                            "type": [
+                              "string",
+                              "null"
+                            ],
+                            "description": "The branch this issue's work landed on. Absent until it has a\ncommit, so a research issue never shows one."
+                          },
+                          "cancelled_at_ms": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ],
+                            "format": "int64",
+                            "description": "Present once the issue is cancelled. The row is never deleted."
+                          },
+                          "created_at_ms": {
+                            "type": "integer",
+                            "format": "int64"
+                          },
+                          "description": {
+                            "type": "string"
+                          },
+                          "number": {
+                            "type": "integer",
+                            "format": "int64",
+                            "description": "The human address, unique within its project: `#3`."
+                          },
+                          "parent": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ],
+                            "format": "int64",
+                            "description": "The issue this one is a step of, by its number on this board.\nAbsent on a top-level card."
+                          },
+                          "position": {
+                            "type": "integer",
+                            "format": "int64",
+                            "description": "Rank within the column, dense and ascending."
+                          },
+                          "priority": {
+                            "$ref": "#/components/schemas/IssuePriorityDto"
+                          },
+                          "project_id": {
+                            "type": "string"
+                          },
+                          "stage": {
+                            "type": "integer",
+                            "format": "int64",
+                            "description": "Which barrier under that parent. `0` and meaningless without one."
+                          },
+                          "status": {
+                            "$ref": "#/components/schemas/IssueStatusDto"
+                          },
+                          "sub_issues": {
+                            "oneOf": [
+                              {
+                                "type": "null"
+                              },
+                              {
+                                "$ref": "#/components/schemas/SubIssueProgress",
+                                "description": "This card's own steps, if it has any: how many are done out of how\nmany still meant to happen. Cancelled steps leave both counts, so a\ncard whose last steps were called off reads finished rather than\nstuck."
+                              }
+                            ]
+                          },
+                          "title": {
+                            "type": "string"
+                          },
+                          "updated_at_ms": {
+                            "type": "integer",
+                            "format": "int64"
+                          }
+                        }
+                      }
+                    },
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown project",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "create_issue",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateIssueRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The new issue, numbered and placed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IssueDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Blank title",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown project",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The project is archived",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/projects/{project_id}/issues/{number}": {
+      "get": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "get_issue",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "number",
+            "in": "path",
+            "description": "Issue number within the project",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The issue",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IssueDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown project or issue",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "update_issue",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "number",
+            "in": "path",
+            "description": "Issue number within the project",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateIssueRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The edited issue; omitted fields are unchanged",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IssueDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Blank title, or a body that sets no field",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown project or issue",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The project is archived",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/projects/{project_id}/issues/{number}/approvals/{call_id}": {
+      "post": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "resolve_approval",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "number",
+            "in": "path",
+            "description": "Issue number within the project",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "call_id",
+            "in": "path",
+            "description": "The approval's call id, from its timeline entry",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResolveApprovalRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "The prompt was answered"
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown project or issue, or this card has no prompt waiting on that call",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/projects/{project_id}/issues/{number}/comments": {
+      "post": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "create_comment",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "number",
+            "in": "path",
+            "description": "Issue number within the project",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewCommentBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The recorded comment",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IssueEventDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Empty comment",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown project or issue",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/projects/{project_id}/issues/{number}/events": {
+      "get": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "list_issue_events",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "number",
+            "in": "path",
+            "description": "Issue number within the project",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "This issue's timeline, oldest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Envelope for list endpoints. `next_cursor` is opaque — clients\npass it back as `?cursor=` to fetch the next page, and treat\n`None` as \"no more pages.\" The cursor's internal scheme may change\nacross releases; clients must not parse it.",
+                  "required": [
+                    "items"
+                  ],
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "description": "One entry on an issue's timeline.",
+                        "required": [
+                          "id",
+                          "number",
+                          "actor",
+                          "body",
+                          "created_at_ms"
+                        ],
+                        "properties": {
+                          "actor": {
+                            "$ref": "#/components/schemas/ActorDto"
+                          },
+                          "body": {
+                            "$ref": "#/components/schemas/IssueEventBodyDto"
+                          },
+                          "created_at_ms": {
+                            "type": "integer",
+                            "format": "int64"
+                          },
+                          "id": {
+                            "type": "string"
+                          },
+                          "number": {
+                            "type": "integer",
+                            "format": "int64"
+                          }
+                        }
+                      }
+                    },
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown project or issue",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/projects/{project_id}/issues/{number}/move": {
+      "post": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "move_issue",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "number",
+            "in": "path",
+            "description": "Issue number within the project",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MoveIssueRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The moved issue, in its new column and place",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IssueDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The destination's contents don't include the moved issue",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown project or issue",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The project is archived",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/projects/{project_id}/issues/{number}/runs": {
+      "get": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "list_issue_runs",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "number",
+            "in": "path",
+            "description": "Issue number within the project",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Every run of this issue, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Envelope for list endpoints. `next_cursor` is opaque — clients\npass it back as `?cursor=` to fetch the next page, and treat\n`None` as \"no more pages.\" The cursor's internal scheme may change\nacross releases; clients must not parse it.",
+                  "required": [
+                    "items"
+                  ],
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "description": "One execution of an issue.",
+                        "required": [
+                          "number",
+                          "attempt",
+                          "agent_id",
+                          "status",
+                          "trigger",
+                          "created_at_ms"
+                        ],
+                        "properties": {
+                          "agent_id": {
+                            "type": "string"
+                          },
+                          "attempt": {
+                            "type": "integer",
+                            "format": "int64",
+                            "description": "1 for an issue's first run, incrementing thereafter — how the\nexecution log addresses it."
+                          },
+                          "created_at_ms": {
+                            "type": "integer",
+                            "format": "int64"
+                          },
+                          "error": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "number": {
+                            "type": "integer",
+                            "format": "int64",
+                            "description": "The issue this ran, by its per-project number."
+                          },
+                          "session_id": {
+                            "type": [
+                              "string",
+                              "null"
+                            ],
+                            "description": "The session the run executed in. Present once claimed; it is what\nthe trace viewer opens."
+                          },
+                          "settled_at_ms": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ],
+                            "format": "int64"
+                          },
+                          "started_at_ms": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ],
+                            "format": "int64"
+                          },
+                          "status": {
+                            "$ref": "#/components/schemas/RunStatusDto"
+                          },
+                          "trigger": {
+                            "$ref": "#/components/schemas/RunTriggerDto"
+                          }
+                        }
+                      }
+                    },
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown project or issue",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/projects/{project_id}/issues/{number}/runs/cancel": {
+      "post": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "cancel_run",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "number",
+            "in": "path",
+            "description": "Issue number within the project",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The run is stopping, or was never started and is now cancelled"
+          },
+          "400": {
+            "description": "Nothing is running on this issue",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown project or issue",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/projects/{project_id}/issues/{number}/runs/retry": {
+      "post": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "retry_run",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "number",
+            "in": "path",
+            "description": "Issue number within the project",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "The new run",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IssueRunDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The issue has nobody on it, or the board has finished with it: a cancelled card has to be reopened and a done one moved back before it runs again",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown project or issue",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A run is already in flight, or the project is archived",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/projects/{project_id}/lead/conversations": {
+      "get": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "list_lead_conversations",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "This board's conversations with its lead, most recently active first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Envelope for list endpoints. `next_cursor` is opaque — clients\npass it back as `?cursor=` to fetch the next page, and treat\n`None` as \"no more pages.\" The cursor's internal scheme may change\nacross releases; clients must not parse it.",
+                  "required": [
+                    "items"
+                  ],
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "description": "One conversation with a board's lead.",
+                        "required": [
+                          "session_id",
+                          "last_active_ms",
+                          "created_at_ms"
+                        ],
+                        "properties": {
+                          "created_at_ms": {
+                            "type": "integer",
+                            "format": "int64"
+                          },
+                          "last_active_ms": {
+                            "type": "integer",
+                            "format": "int64"
+                          },
+                          "session_id": {
+                            "type": "string",
+                            "description": "The session id. Everything else — history, live traffic, sending —\ngoes through the ordinary chat transport, which scopes by channel\nand is happy to carry a board's session; only the chat *list*\nfilters these out, which is the point."
+                          },
+                          "title": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          }
+                        }
+                      }
+                    },
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown project",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "open_lead_conversation",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "A fresh conversation with the lead",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LeadConversationDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown project, or it has no lead",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The project is archived",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/projects/{project_id}/read": {
+      "post": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "mark_project_read",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Noted; the board's unread count resets"
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown project",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/projects/{project_id}/runs": {
+      "get": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "list_active_runs",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The board's unfinished runs — which cards are working",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Envelope for list endpoints. `next_cursor` is opaque — clients\npass it back as `?cursor=` to fetch the next page, and treat\n`None` as \"no more pages.\" The cursor's internal scheme may change\nacross releases; clients must not parse it.",
+                  "required": [
+                    "items"
+                  ],
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "description": "One execution of an issue.",
+                        "required": [
+                          "number",
+                          "attempt",
+                          "agent_id",
+                          "status",
+                          "trigger",
+                          "created_at_ms"
+                        ],
+                        "properties": {
+                          "agent_id": {
+                            "type": "string"
+                          },
+                          "attempt": {
+                            "type": "integer",
+                            "format": "int64",
+                            "description": "1 for an issue's first run, incrementing thereafter — how the\nexecution log addresses it."
+                          },
+                          "created_at_ms": {
+                            "type": "integer",
+                            "format": "int64"
+                          },
+                          "error": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "number": {
+                            "type": "integer",
+                            "format": "int64",
+                            "description": "The issue this ran, by its per-project number."
+                          },
+                          "session_id": {
+                            "type": [
+                              "string",
+                              "null"
+                            ],
+                            "description": "The session the run executed in. Present once claimed; it is what\nthe trace viewer opens."
+                          },
+                          "settled_at_ms": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ],
+                            "format": "int64"
+                          },
+                          "started_at_ms": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ],
+                            "format": "int64"
+                          },
+                          "status": {
+                            "$ref": "#/components/schemas/RunStatusDto"
+                          },
+                          "trigger": {
+                            "$ref": "#/components/schemas/RunTriggerDto"
+                          }
+                        }
+                      }
+                    },
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown project",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/push/params": {
       "get": {
         "tags": [
@@ -4831,6 +7026,62 @@
   },
   "components": {
     "schemas": {
+      "ActorDto": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "The operator working the board.",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "user"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "The board acting on its own — today, the budget gate.",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "system"
+                ]
+              }
+            }
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/AgentRefDto"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "kind"
+                ],
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "agent"
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        ],
+        "description": "Who did the thing an entry records."
+      },
       "AgentFrameworkDto": {
         "type": "string",
         "description": "Mirror of [`baybo_model::AgentFramework`]; wire strings match the\nspawn protocol's backend tags (`baybo`/`claude`/`codex`).",
@@ -4911,6 +7162,23 @@
           "updated_at": {
             "type": "string",
             "format": "date-time"
+          }
+        }
+      },
+      "AgentRefDto": {
+        "type": "object",
+        "description": "An agent as a timeline entry names it.",
+        "required": [
+          "id",
+          "handle"
+        ],
+        "properties": {
+          "handle": {
+            "type": "string",
+            "description": "The `@handle` to render, without the `@`. Falls back to the id when\nthe reference resolves to nothing at all."
+          },
+          "id": {
+            "type": "string"
           }
         }
       },
@@ -5167,6 +7435,15 @@
             "description": "Exclusive upper bound used for the aggregation (UTC)."
           }
         }
+      },
+      "ApprovalDecisionDto": {
+        "type": "string",
+        "description": "Mirror of [`baybo_model::ApprovalDecision`], so the client gets the same\ndiscriminated union it switches on everywhere else here.",
+        "enum": [
+          "approve",
+          "approve_always",
+          "deny"
+        ]
       },
       "BackgroundJob": {
         "type": "object",
@@ -5868,6 +8145,13 @@
               "null"
             ]
           },
+          "project_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Point this job at a board: its fires run as that project's lead and\ncan open issues on it. Absent is an ordinary job.\n\nSet once, at creation. Re-pointing a live job is deliberately not\noffered — its past fires filed cards on the old board, so its\nexecution history would describe work on a board it no longer\ntouches."
+          },
           "schedule": {
             "type": "string"
           },
@@ -5902,6 +8186,93 @@
               "null"
             ],
             "description": "Parent folder id (`null`/absent = top-level)."
+          }
+        }
+      },
+      "CreateIssueRequest": {
+        "type": "object",
+        "required": [
+          "title"
+        ],
+        "properties": {
+          "assignee": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The agent to put on it. Required when opening straight into\nIn Progress."
+          },
+          "description": {
+            "type": "string"
+          },
+          "parent": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Open it as a step of that issue's number. One level only."
+          },
+          "priority": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/IssuePriorityDto"
+              }
+            ]
+          },
+          "stage": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Which barrier under the parent. Ignored without one."
+          },
+          "status": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/IssueStatusDto",
+                "description": "Which column the card opens in. Defaults to the backlog."
+              }
+            ]
+          },
+          "title": {
+            "type": "string"
+          }
+        }
+      },
+      "CreateProjectRequest": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "daily_budget_micros": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Daily spend ceiling in micro-USD (USD × 10^6). Omit for no limit;\n`0` pauses the board's agents without archiving it. Integer, never a\nfloat — a budget compared with rounding error is a budget that\ndisagrees with the ledger it is measured against."
+          },
+          "description": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "workdir": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Absolute path to an existing git repository. Omit it and the server\ncreates one under the workspace's `work/` directory instead."
           }
         }
       },
@@ -6299,6 +8670,647 @@
               "type": "string"
             },
             "description": "The sessions to hide. Like the per-session `DELETE`, this preserves every\nrow — see the module docstring. Sessions the caller cannot see are\nrejected."
+          }
+        }
+      },
+      "HireAgentRequest": {
+        "type": "object",
+        "description": "Request body for `POST /v1/projects/{project_id}/agents`.",
+        "required": [
+          "name",
+          "role"
+        ],
+        "properties": {
+          "framework": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AgentFrameworkDto",
+                "description": "The operator's form may pin a framework; `ProjectAgentCreate`\ndeliberately exposes neither this nor `llm`."
+              }
+            ]
+          },
+          "llm": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`baybo.json` LLM entry name; must match a configured entry."
+          },
+          "name": {
+            "type": "string",
+            "description": "Display name, and the only chance to choose one: the `@handle` is\nderived from it here, and neither can be changed afterwards — a board\nthat called an agent one thing while everybody addressed it as another\nwould be lying on every card."
+          },
+          "role": {
+            "type": "string",
+            "description": "One line saying what this agent is for. Seeds its `SOUL.md` and\nbecomes its roster description."
+          }
+        }
+      },
+      "HiredByDto": {
+        "type": "object",
+        "description": "Who brought an agent onto the board. Absent means the operator did.",
+        "required": [
+          "id",
+          "handle"
+        ],
+        "properties": {
+          "handle": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          }
+        }
+      },
+      "IssueDto": {
+        "type": "object",
+        "required": [
+          "number",
+          "project_id",
+          "title",
+          "description",
+          "status",
+          "priority",
+          "position",
+          "stage",
+          "created_at_ms",
+          "updated_at_ms"
+        ],
+        "properties": {
+          "assignee": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The agent on it, if any. In Progress always has one."
+          },
+          "blocked_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why work stopped. A badge on the card — blocked work stays in\nwhichever column it was in."
+          },
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The branch this issue's work landed on. Absent until it has a\ncommit, so a research issue never shows one."
+          },
+          "cancelled_at_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Present once the issue is cancelled. The row is never deleted."
+          },
+          "created_at_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "description": {
+            "type": "string"
+          },
+          "number": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The human address, unique within its project: `#3`."
+          },
+          "parent": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The issue this one is a step of, by its number on this board.\nAbsent on a top-level card."
+          },
+          "position": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Rank within the column, dense and ascending."
+          },
+          "priority": {
+            "$ref": "#/components/schemas/IssuePriorityDto"
+          },
+          "project_id": {
+            "type": "string"
+          },
+          "stage": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Which barrier under that parent. `0` and meaningless without one."
+          },
+          "status": {
+            "$ref": "#/components/schemas/IssueStatusDto"
+          },
+          "sub_issues": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SubIssueProgress",
+                "description": "This card's own steps, if it has any: how many are done out of how\nmany still meant to happen. Cancelled steps leave both counts, so a\ncard whose last steps were called off reads finished rather than\nstuck."
+              }
+            ]
+          },
+          "title": {
+            "type": "string"
+          },
+          "updated_at_ms": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "IssueEventBodyDto": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "text",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "comment"
+                ]
+              },
+              "text": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "opened"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "from",
+              "to",
+              "kind"
+            ],
+            "properties": {
+              "from": {
+                "$ref": "#/components/schemas/IssueStatusDto"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "moved"
+                ]
+              },
+              "to": {
+                "$ref": "#/components/schemas/IssueStatusDto"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "from": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/AgentRefDto"
+                  }
+                ]
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "assigned"
+                ]
+              },
+              "to": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/AgentRefDto"
+                  }
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "attempt",
+              "trigger",
+              "kind"
+            ],
+            "properties": {
+              "attempt": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "run_started"
+                ]
+              },
+              "trigger": {
+                "$ref": "#/components/schemas/RunTriggerDto"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "attempt",
+              "status",
+              "kind"
+            ],
+            "properties": {
+              "attempt": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "error": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "run_settled"
+                ]
+              },
+              "status": {
+                "$ref": "#/components/schemas/RunStatusDto"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "reason",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "blocked"
+                ]
+              },
+              "reason": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "unblocked"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "cancelled"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "branch_deleted",
+              "kind"
+            ],
+            "properties": {
+              "branch_deleted": {
+                "type": "boolean"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "worktree_reclaimed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "reason",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "worktree_kept"
+                ]
+              },
+              "reason": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "call_id",
+              "tool",
+              "summary",
+              "kind"
+            ],
+            "properties": {
+              "call_id": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "approval_requested"
+                ]
+              },
+              "summary": {
+                "type": "string"
+              },
+              "tool": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "call_id",
+              "decision",
+              "kind"
+            ],
+            "properties": {
+              "call_id": {
+                "type": "string"
+              },
+              "decision": {
+                "$ref": "#/components/schemas/ApprovalDecisionDto"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "approval_resolved"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "stage",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "stage_completed"
+                ]
+              },
+              "stage": {
+                "type": "integer",
+                "format": "int64"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "spent_micros",
+              "limit_micros",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "budget_exhausted"
+                ]
+              },
+              "limit_micros": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "spent_micros": {
+                "type": "integer",
+                "format": "int64"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "spent_micros",
+              "limit_micros",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "budget_restored"
+                ]
+              },
+              "limit_micros": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "spent_micros": {
+                "type": "integer",
+                "format": "int64"
+              }
+            }
+          }
+        ],
+        "description": "What one timeline entry says."
+      },
+      "IssueEventDto": {
+        "type": "object",
+        "description": "One entry on an issue's timeline.",
+        "required": [
+          "id",
+          "number",
+          "actor",
+          "body",
+          "created_at_ms"
+        ],
+        "properties": {
+          "actor": {
+            "$ref": "#/components/schemas/ActorDto"
+          },
+          "body": {
+            "$ref": "#/components/schemas/IssueEventBodyDto"
+          },
+          "created_at_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "id": {
+            "type": "string"
+          },
+          "number": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "IssuePriorityDto": {
+        "type": "string",
+        "enum": [
+          "urgent",
+          "high",
+          "medium",
+          "low",
+          "none"
+        ]
+      },
+      "IssueRunDto": {
+        "type": "object",
+        "description": "One execution of an issue.",
+        "required": [
+          "number",
+          "attempt",
+          "agent_id",
+          "status",
+          "trigger",
+          "created_at_ms"
+        ],
+        "properties": {
+          "agent_id": {
+            "type": "string"
+          },
+          "attempt": {
+            "type": "integer",
+            "format": "int64",
+            "description": "1 for an issue's first run, incrementing thereafter — how the\nexecution log addresses it."
+          },
+          "created_at_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "number": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The issue this ran, by its per-project number."
+          },
+          "session_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The session the run executed in. Present once claimed; it is what\nthe trace viewer opens."
+          },
+          "settled_at_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "started_at_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "status": {
+            "$ref": "#/components/schemas/RunStatusDto"
+          },
+          "trigger": {
+            "$ref": "#/components/schemas/RunTriggerDto"
+          }
+        }
+      },
+      "IssueStatusDto": {
+        "type": "string",
+        "description": "Which column a card sits in. Entering `in_progress` is what will start\nan agent once execution lands, which is why the set is fixed.",
+        "enum": [
+          "backlog",
+          "todo",
+          "in_progress",
+          "review",
+          "done"
+        ]
+      },
+      "LeadConversationDto": {
+        "type": "object",
+        "description": "One conversation with a board's lead.",
+        "required": [
+          "session_id",
+          "last_active_ms",
+          "created_at_ms"
+        ],
+        "properties": {
+          "created_at_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "last_active_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "session_id": {
+            "type": "string",
+            "description": "The session id. Everything else — history, live traffic, sending —\ngoes through the ordinary chat transport, which scopes by channel\nand is happy to carry a board's session; only the chat *list*\nfilters these out, which is the point."
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       },
@@ -6838,6 +9850,27 @@
           }
         }
       },
+      "MoveIssueRequest": {
+        "type": "object",
+        "description": "One drag-and-drop: where the card lands, plus that column's full\ncontents in their new order.",
+        "required": [
+          "status",
+          "ordered_numbers"
+        ],
+        "properties": {
+          "ordered_numbers": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "description": "Every issue number in the destination column, in order, including\nthe one being moved."
+          },
+          "status": {
+            "$ref": "#/components/schemas/IssueStatusDto"
+          }
+        }
+      },
       "MutateResponse": {
         "type": "object",
         "description": "Response body for `PUT` / `DELETE /v1/config`.",
@@ -6855,6 +9888,68 @@
           },
           "written_to": {
             "type": "string"
+          }
+        }
+      },
+      "NewCommentBody": {
+        "type": "object",
+        "description": "A comment being posted.",
+        "required": [
+          "text"
+        ],
+        "properties": {
+          "text": {
+            "type": "string"
+          }
+        }
+      },
+      "ProjectDto": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "description",
+          "workdir",
+          "created_at_ms",
+          "updated_at_ms"
+        ],
+        "properties": {
+          "archived_at_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Present only while the project sits in the archive."
+          },
+          "created_at_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "daily_budget_micros": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Daily spend ceiling in micro-USD. Absent means no limit."
+          },
+          "description": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "updated_at_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "workdir": {
+            "type": "string",
+            "description": "Absolute path to the git repository this project's agents work in."
           }
         }
       },
@@ -6973,13 +10068,49 @@
           }
         }
       },
+      "ResolveApprovalRequest": {
+        "type": "object",
+        "description": "Request body for resolving an approval from a card.",
+        "required": [
+          "decision"
+        ],
+        "properties": {
+          "decision": {
+            "$ref": "#/components/schemas/ApprovalDecisionDto"
+          }
+        }
+      },
+      "RunStatusDto": {
+        "type": "string",
+        "description": "Where a run is. `queued` and `running` are the unfinished states — a\ncard showing either is a card being worked.",
+        "enum": [
+          "held",
+          "queued",
+          "running",
+          "done",
+          "failed",
+          "cancelled"
+        ]
+      },
+      "RunTriggerDto": {
+        "type": "string",
+        "description": "Why a run was started.",
+        "enum": [
+          "started",
+          "assigned",
+          "retry",
+          "comment",
+          "stage_barrier"
+        ]
+      },
       "SessionKind": {
         "type": "string",
         "description": "Wire mirror of [`baybo_query::SessionKind`]. Coarse trigger/lineage\nlabel for the trace browser list view.",
         "enum": [
           "user",
           "cron",
-          "subagent"
+          "subagent",
+          "issue"
         ]
       },
       "SetAgentAvatarRequest": {
@@ -7029,13 +10160,24 @@
       },
       "SetAgentNameRequest": {
         "type": "object",
-        "description": "Request body for `PUT /v1/agents/{agent_id}/name`.",
+        "description": "Request body for `PUT /v1/agents/{agent_id}/name`.\n\nRejected for an agent on a project team: the `@handle` its board addresses\nit by was derived from its name when it was hired, so the name is fixed for\nas long as the agent exists.",
         "required": [
           "name"
         ],
         "properties": {
           "name": {
             "type": "string"
+          }
+        }
+      },
+      "SetArchivedRequest": {
+        "type": "object",
+        "required": [
+          "archived"
+        ],
+        "properties": {
+          "archived": {
+            "type": "boolean"
           }
         }
       },
@@ -7222,6 +10364,87 @@
           }
         }
       },
+      "SubIssueProgress": {
+        "type": "object",
+        "description": "A parent card's progress ring.",
+        "required": [
+          "done",
+          "total"
+        ],
+        "properties": {
+          "done": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "TeamMemberDto": {
+        "type": "object",
+        "description": "One member of a project's team.",
+        "required": [
+          "id",
+          "handle",
+          "name",
+          "description",
+          "framework",
+          "lead",
+          "created_at_ms"
+        ],
+        "properties": {
+          "avatar_blob_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "description": {
+            "type": "string",
+            "description": "One line saying what this agent is for."
+          },
+          "framework": {
+            "$ref": "#/components/schemas/AgentFrameworkDto"
+          },
+          "handle": {
+            "type": "string",
+            "description": "Immutable `@handle` on this board — what a comment mentions."
+          },
+          "hired_by": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/HiredByDto"
+              }
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "lead": {
+            "type": "boolean",
+            "description": "The coordinator, which every board has and none may remove."
+          },
+          "llm": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string",
+            "description": "Display name from the agent's own `IDENTITY.md`. Fixed at hire, like\nthe handle derived from it."
+          }
+        }
+      },
       "TraceSessionSummary": {
         "type": "object",
         "description": "One row of the trace browser list view. Mirrors\n[`baybo_query::SessionSummary`] for the wire.",
@@ -7395,7 +10618,8 @@
           "cron_notification",
           "compact",
           "spawned",
-          "subagent_notification"
+          "subagent_notification",
+          "issue_run"
         ]
       },
       "TurnOrigin": {
@@ -7404,7 +10628,8 @@
         "enum": [
           "user",
           "cron",
-          "spawned"
+          "spawned",
+          "issue"
         ]
       },
       "TurnStatus": {
@@ -7542,6 +10767,68 @@
           }
         }
       },
+      "UpdateIssueRequest": {
+        "type": "object",
+        "description": "Sparse patch: a field the body leaves out is left alone.\n`blocked_reason` is doubly optional — an explicit `null` clears the\nblock, an absent key leaves it.",
+        "properties": {
+          "assignee": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An explicit `null` unassigns; an absent key leaves the assignee."
+          },
+          "blocked_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cancelled": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "parent": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Re-parent by number; `0` detaches. Absent leaves the parent alone."
+          },
+          "priority": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/IssuePriorityDto"
+              }
+            ]
+          },
+          "stage": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
       "UpdateLlmModelRequest": {
         "type": "object",
         "description": "`PUT /v1/llm/models/{name}` body. Every field is optional — only\npresent fields are applied. To clear an override pass an explicit\n`null` (handled by including the key in the request JSON; serde\ncan't distinguish \"missing key\" from \"key with null\" by default, so\nthe handler treats `Some(None)` as clear and an absent key as keep).",
@@ -7613,6 +10900,28 @@
               "null"
             ],
             "description": "`supports_vision` override for the entry's **default** model, or\n`null` to clear. Lands in that model's `model_list` spec; the\nentry's other models are file-edited only."
+          }
+        }
+      },
+      "UpdateProjectRequest": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "daily_budget_micros": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Daily spend ceiling in micro-USD (USD × 10^6). Omit for no limit;\n`0` pauses the board's agents without archiving it. Integer, never a\nfloat — a budget compared with rounding error is a budget that\ndisagrees with the ledger it is measured against."
+          },
+          "description": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
           }
         }
       },

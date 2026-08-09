@@ -281,6 +281,10 @@ impl Router {
                     origin_session_id: None,
                     conversation: true,
                     job_title: Some(event.title.clone()),
+                    // The dream pass is a per-agent reflection, not board
+                    // work: it must not acquire the board's tools even when
+                    // the job that woke it is bound to one.
+                    project_id: None,
                 },
                 Some(binding),
             )
@@ -531,9 +535,15 @@ impl Router {
                     origin_session_id: event.origin_session_id.clone(),
                     conversation,
                     job_title: Some(event.title.clone()),
+                    project_id: event.project_id.clone(),
                 },
-                self.inherited_binding(event.origin_session_id.as_ref())
-                    .await?,
+                match event.project_id.as_ref() {
+                    Some(project) => self.lead_binding(project).await?,
+                    None => {
+                        self.inherited_binding(event.origin_session_id.as_ref())
+                            .await?
+                    }
+                },
             )
             .await?;
         Ok(session)
@@ -557,6 +567,33 @@ impl Router {
     /// would answer in the wrong persona, write into the wrong memory
     /// partition, and leave nothing but a `warn!` to say so. Failing the
     /// mint surfaces it and leaves the schedule to retry.
+    /// The board's coordinator, for a fire pointed at a project.
+    ///
+    /// `None` when the board has no lead — which is not a state project
+    /// creation can produce, but a fire must not invent one, so it runs
+    /// unbound and files nothing rather than filing as somebody else.
+    async fn lead_binding(
+        &self,
+        project: &baybo_model::ProjectId,
+    ) -> anyhow::Result<Option<AgentBinding>> {
+        let team = self
+            .agent_profiles
+            .list_team(project)
+            .await
+            .map_err(|e| anyhow::anyhow!("read the team of project {project}: {e}"))?;
+        Ok(team
+            .into_iter()
+            .find(|row| {
+                row.team
+                    .as_ref()
+                    .is_some_and(|t| t.handle.as_str() == baybo_project::LEAD_HANDLE)
+            })
+            .map(|row| AgentBinding {
+                agent_id: row.id,
+                framework: row.framework,
+            }))
+    }
+
     async fn inherited_binding(
         &self,
         origin: Option<&SessionId>,
@@ -1302,6 +1339,8 @@ mod tests {
                 turn_lifecycle: Arc::clone(&turn_lifecycle),
                 cron_store: Arc::clone(&cron_store) as Arc<dyn CronStore>,
                 cron_trigger_rx,
+                issue_run_rx: None,
+                board: None,
                 actor_parent_token: CancellationToken::new(),
                 rate_limit: LiveRateLimit::new(100, std::time::Duration::from_secs(60)),
             });
@@ -1330,6 +1369,7 @@ mod tests {
                 timezone: "UTC".into(),
                 prompt: "Summarise the news".into(),
                 one_shot,
+                project_id: None,
                 origin_session_id: Some(SessionId::from("sess-user")),
                 previous_fire_at: None,
             }
@@ -1485,6 +1525,9 @@ mod tests {
                 framework: AgentFramework::Baybo,
                 llm: None,
                 builtin: false,
+                team: None,
+                hired_by: None,
+                deleted_at: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             },
@@ -1928,6 +1971,9 @@ mod tests {
                 framework: AgentFramework::Codex,
                 llm: None,
                 builtin: false,
+                team: None,
+                hired_by: None,
+                deleted_at: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             },
@@ -2170,6 +2216,7 @@ mod tests {
             next_trigger_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            project_id: None,
             origin_session_id: None,
             deleted_at: None,
             pinned: false,
@@ -2230,6 +2277,7 @@ mod tests {
                     origin_session_id: Some(convo.id.clone()),
                     conversation: true,
                     job_title: Some("Daily news".into()),
+                    project_id: None,
                 },
             )
             .await
@@ -2254,6 +2302,7 @@ mod tests {
                     origin_session_id: Some(convo.id.clone()),
                     conversation: false,
                     job_title: None,
+                    project_id: None,
                 },
             )
             .await

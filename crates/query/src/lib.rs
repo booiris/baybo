@@ -178,6 +178,9 @@ pub enum SessionKind {
     /// Subagent spawned by another session — its trigger is inherited
     /// from the root, but `lineage.kind == Subagent` wins for display.
     Subagent,
+    /// Work on a project board. Browsable in the trace viewer; never in
+    /// the chat surface.
+    Issue,
 }
 
 fn derive_session_kind(session: &Session) -> SessionKind {
@@ -190,6 +193,13 @@ fn derive_session_kind(session: &Session) -> SessionKind {
     }
     match session.trigger {
         baybo_model::TriggerSource::Cron { .. } => SessionKind::Cron,
+        // A board's planning conversation shares the issue kind: both are
+        // work on a project, and the trace surface groups them the same
+        // way. A separate kind would be a wire break for a distinction no
+        // reader of that surface makes.
+        baybo_model::TriggerSource::Project { .. } | baybo_model::TriggerSource::Issue { .. } => {
+            SessionKind::Issue
+        }
         baybo_model::TriggerSource::User => SessionKind::User,
     }
 }
@@ -1590,6 +1600,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SessionStore for MemSessionStore {
+        async fn list_project_conversations(
+            &self,
+            _project_id: &str,
+        ) -> baybo_store::session::Result<Vec<baybo_model::Session>> {
+            Ok(Vec::new())
+        }
+
         async fn get(
             &self,
             id: &SessionId,

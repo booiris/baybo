@@ -13,6 +13,7 @@ mod message;
 mod model_tier;
 mod money;
 mod pricing;
+mod project;
 mod security_types;
 mod session;
 pub mod spawn_protocol;
@@ -20,8 +21,9 @@ mod task;
 mod tool_output;
 
 pub use agent_profile::{
-    AgentBinding, AgentFramework, AgentProfileId, BUILTIN_AGENT_PROFILE_ID, InvalidAgentProfileId,
-    MAX_AGENT_PROFILE_ID_CHARS, MAX_AGENT_PROFILE_NAME_CHARS,
+    AgentBinding, AgentFramework, AgentHandle, AgentProfileId, BUILTIN_AGENT_PROFILE_ID,
+    InvalidAgentHandle, InvalidAgentProfileId, MAX_AGENT_HANDLE_CHARS, MAX_AGENT_PROFILE_ID_CHARS,
+    MAX_AGENT_PROFILE_NAME_CHARS, TeamMembership,
 };
 pub use approval::{ApprovalDecision, ApprovedResource, HostPattern, ResourceAccess};
 pub use control_event::{ControlEvent, ControlEventKind, control_event_row_id};
@@ -46,6 +48,10 @@ pub use message::{
 pub use model_tier::ModelTier;
 pub use money::{MicroUsd, usd_decimal_option};
 pub use pricing::LlmPricingOverride;
+pub use project::{
+    InvalidProjectValue, IssueEventId, IssueId, IssueRunId, MAX_PROJECT_ID_CHARS,
+    MAX_PROJECT_NAME_CHARS, ProjectId,
+};
 pub use security_types::{PlaceholderId, SecretKind};
 pub use session::{
     BackgroundNotificationDelivery, BackgroundNotificationGroup, BackgroundNotificationState,

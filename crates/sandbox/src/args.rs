@@ -14,6 +14,34 @@ const BWRAP_RO_ROOTS: &[&str] = &[
     "/run/systemd/resolve",
 ];
 
+/// Why this path must never be handed to [`SandboxSpec::writable_paths`],
+/// or `None` if it is safe to bind.
+///
+/// A writable bind is emitted *after* the read-only FHS layer, and bwrap is
+/// last-wins, so binding `/usr` — or anything containing it — silently
+/// re-mounts the system read-write; the macOS profile has the same shape
+/// under last-match-wins. The whole filesystem root is the extreme case of
+/// the same mistake.
+///
+/// Callers must **canonicalise before asking**. The path a caller holds can
+/// be a symlink, and a symlink whose target changes between two tool calls
+/// is precisely how a directory the agent legitimately owns turns into a
+/// bind of somewhere it does not.
+pub fn writable_bind_refusal(path: &Path) -> Option<String> {
+    if path.parent().is_none() {
+        return Some("it is the filesystem root".to_owned());
+    }
+    for root in BWRAP_RO_ROOTS {
+        if Path::new(root).starts_with(path) {
+            return Some(format!(
+                "it contains the read-only system directory {root}, which a writable \
+                 bind would silently re-mount read-write"
+            ));
+        }
+    }
+    None
+}
+
 pub fn build_bwrap_argv(
     spec: &SandboxSpec,
     workspace_symlink_mount: Option<&WorkspaceSymlinkMount>,
@@ -110,6 +138,26 @@ pub fn build_bwrap_argv(
             argv.push(OsString::from("--bind-try"));
             argv.push(extra_root.as_os_str().to_owned());
             argv.push(extra_root.as_os_str().to_owned());
+
+            // Extra RW roots outside `extra_root` — a project checkout the
+            // running issue owns. Bound BEFORE the denylist below, not
+            // after: mounts are last-wins, so a writable root that happens
+            // to contain a masked directory (`~/.ssh` under a `$HOME`-ish
+            // checkout) still gets that directory masked. Binding these
+            // after the tmpfs layer would let a caller un-mask a
+            // credential vault by naming its parent, which is a hole the
+            // read-only list is allowed to open deliberately and this one
+            // is not.
+            // `--bind`, not `--bind-try`: a checkout that is not there
+            // should abort the command with a bwrap error, because the
+            // alternative is the run quietly proceeding in some other
+            // directory — the exact silent failure this whole binding
+            // exists to end.
+            for path in &spec.writable_paths {
+                argv.push(OsString::from("--bind"));
+                argv.push(path.as_os_str().to_owned());
+                argv.push(path.as_os_str().to_owned());
+            }
 
             // Each denied path becomes an empty per-call tmpfs that
             // hides the host directory underneath. Non-existent paths
@@ -444,6 +492,9 @@ pub fn render_sbpl_profile(
                 sbpl_quote(&spec.workspace_root)
             ));
             s.push_str(&format!("  (subpath \"{}\")\n", sbpl_quote(extra_root)));
+            for p in &spec.writable_paths {
+                s.push_str(&format!("  (subpath \"{}\")\n", sbpl_quote(p)));
+            }
             if let Some(mount) = workspace_symlink_mount {
                 s.push_str(&format!(
                     "  (subpath \"{}\")\n",
@@ -459,6 +510,13 @@ pub fn render_sbpl_profile(
                 sbpl_quote(&spec.workspace_root)
             ));
             s.push_str(&format!("  (subpath \"{}\")\n", sbpl_quote(extra_root)));
+            // Emitted before the denies for the same reason the bwrap arm
+            // binds them before the masking tmpfs: SBPL is last-match-wins,
+            // so a `writable_paths` entry must not be able to re-open a
+            // denied subpath it happens to contain.
+            for p in &spec.writable_paths {
+                s.push_str(&format!("  (subpath \"{}\")\n", sbpl_quote(p)));
+            }
             if let Some(mount) = workspace_symlink_mount {
                 s.push_str(&format!(
                     "  (subpath \"{}\")\n",
@@ -1202,6 +1260,104 @@ mod tests {
                 "writable path {p} must NOT appear under --ro-bind-try"
             );
         }
+    }
+
+    // The production agent path only ever builds `Permissive` (see
+    // `SandboxAdapter::with_permissive_filesystem`), so the test above —
+    // which rides `FilesystemPolicy::default()` — proves nothing about
+    // what a real run gets. These two cover the branch that ships.
+    #[test]
+    fn a_writable_bind_is_refused_where_it_would_outrank_the_read_only_system() {
+        // The bind loop is emitted after the RO FHS layer and bwrap is
+        // last-wins, so these paths would silently re-mount the system
+        // read-write. Reachable in practice: the caller resolves a symlink
+        // an agent controls, so the answer has to be no rather than
+        // "callers won't do that".
+        for bad in ["/", "/usr", "/etc"] {
+            assert!(
+                writable_bind_refusal(Path::new(bad)).is_some(),
+                "{bad} must never be bindable read-write"
+            );
+        }
+        // …while an ordinary checkout is fine.
+        for ok in ["/data/checkout", "/home/u/code/app"] {
+            assert!(
+                writable_bind_refusal(Path::new(ok)).is_none(),
+                "{ok} is a legitimate checkout"
+            );
+        }
+    }
+
+    #[test]
+    fn bwrap_permissive_binds_writable_paths_rw() {
+        let mut spec = spec_for(NetworkPolicy::None, "/tmp/ws");
+        spec.writable_paths = vec![PathBuf::from("/data/checkout")];
+        spec.filesystem_policy = FilesystemPolicy::Permissive {
+            extra_root: PathBuf::from("/home/u"),
+            denied_paths: vec![],
+        };
+        let strs = argv_strs(&build_bwrap_argv(&spec, None));
+        assert!(
+            strs.windows(3)
+                .any(|w| w[0] == "--bind" && w[1] == "/data/checkout" && w[2] == "/data/checkout"),
+            "a checkout outside extra_root must be RW-bound under Permissive: {strs:?}"
+        );
+    }
+
+    #[test]
+    fn bwrap_permissive_denylist_still_masks_inside_a_writable_path() {
+        // The ordering guarantee: naming a directory writable must not
+        // re-open a credential vault that lives underneath it. bwrap is
+        // last-wins, so the masking tmpfs has to come after the bind.
+        let mut spec = spec_for(NetworkPolicy::None, "/tmp/ws");
+        spec.writable_paths = vec![PathBuf::from("/home/u")];
+        spec.filesystem_policy = FilesystemPolicy::Permissive {
+            extra_root: PathBuf::from("/home/u"),
+            denied_paths: vec![PathBuf::from("/home/u/.ssh")],
+        };
+        let strs = argv_strs(&build_bwrap_argv(&spec, None));
+        let bind = strs
+            .windows(3)
+            .position(|w| w[0] == "--bind" && w[1] == "/home/u" && w[2] == "/home/u")
+            .expect("writable path must be bound");
+        let mask = strs
+            .windows(2)
+            .position(|w| w[0] == "--tmpfs" && w[1] == "/home/u/.ssh")
+            .expect("denied path must be masked");
+        assert!(
+            mask > bind,
+            "the mask must be applied after the writable bind, else it is punched through: {strs:?}"
+        );
+    }
+
+    #[test]
+    fn sbpl_permissive_writable_paths_are_writable_and_still_deniable() {
+        let mut spec = spec_for(NetworkPolicy::None, "/tmp/ws");
+        spec.writable_paths = vec![PathBuf::from("/data/checkout")];
+        spec.filesystem_policy = FilesystemPolicy::Permissive {
+            extra_root: PathBuf::from("/home/u"),
+            denied_paths: vec![PathBuf::from("/home/u/.ssh")],
+        };
+        let profile = render_sbpl_profile(&spec, None);
+        let write_block = profile
+            .split("(allow file-write*")
+            .nth(1)
+            .expect("permissive profile must have a write block");
+        assert!(
+            write_block.contains("/data/checkout"),
+            "checkout must be writable under Permissive: {profile}"
+        );
+        // SBPL is last-match-wins, so the allow has to precede the deny.
+        let allow_at = profile
+            .find("(subpath \"/data/checkout\")")
+            .expect("checkout allow");
+        let deny_at = profile
+            .find("(deny file-write* (subpath \"/home/u/.ssh\"))")
+            .expect("denied path");
+        assert!(
+            allow_at < deny_at,
+            "writable allows must be emitted before the denies: {profile}"
+        );
     }
 
     #[test]

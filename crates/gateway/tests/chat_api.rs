@@ -1038,6 +1038,7 @@ async fn a_recurring_fire_scheduled_from_the_phone_is_listed_on_the_phone() {
                     origin_session_id: None,
                     conversation,
                     job_title: Some("Morning brief".into()),
+                    project_id: None,
                 },
             )
             .await
@@ -1117,6 +1118,7 @@ async fn a_cron_group_is_labelled_by_the_live_job_title_and_falls_back_to_the_sn
             prompt: "brief me".into(),
             timezone: "UTC".into(),
             origin_session_id: None,
+            project_id: None,
         })
         .await
         .expect("create cron job");
@@ -1135,6 +1137,7 @@ async fn a_cron_group_is_labelled_by_the_live_job_title_and_falls_back_to_the_sn
                 origin_session_id: None,
                 conversation: true,
                 job_title: Some("the name it was fired under".into()),
+                project_id: None,
             },
         )
         .await
@@ -1213,6 +1216,7 @@ async fn a_pre_snapshot_fire_whose_job_is_gone_has_no_group_label() {
                 origin_session_id: None,
                 conversation: true,
                 job_title: None,
+                project_id: None,
             },
         )
         .await
@@ -1545,40 +1549,7 @@ async fn approved_device_token_with_header_creates_device_session() {
 fn build_admin_state(
     tg: &baybo_gateway::test_support::TestGateway,
 ) -> baybo_gateway::server::AdminState {
-    baybo_gateway::server::AdminState {
-        // Per-test workspace, from the same tempdir the deps were built
-        // with: the agents surface writes identity files under it, so a
-        // shared path would leak one test's persona into the next.
-        workspace_paths: std::sync::Arc::clone(&tg.deps.workspace_paths),
-        config: Arc::clone(&tg.deps.config),
-        config_path: tg.deps.config_path.clone(),
-        session_manager: Arc::clone(&tg.deps.session_manager),
-        turn_lifecycle: Arc::clone(&tg.deps.turn_lifecycle),
-        cron_scheduler: Arc::clone(&tg.deps.cron_scheduler),
-        trace_store: tg.deps.stores.trace.clone(),
-        cost_store: tg.deps.stores.cost.clone(),
-        message_search: tg.deps.stores.message_search.clone(),
-        query_api: Arc::new(baybo_query::QueryApi::new(
-            tg.deps.session_manager.store(),
-            Arc::clone(&tg.deps.turn_lifecycle),
-            tg.deps.stores.trace.clone(),
-            tg.deps.stores.cost.clone(),
-        )),
-        skill_registry: Arc::clone(&tg.deps.skill_registry),
-        tool_registry: Arc::clone(&tg.deps.tool_registry),
-        channel_registry: Arc::clone(&tg.deps.channel_registry),
-        llm_pool: tg.deps.llm_pool.clone(),
-        supervisor: tg.deps.supervisor.clone(),
-        config_reloader: tg.deps.config_reloader.clone(),
-        log_buffer: Arc::clone(&tg.deps.log_buffer),
-        channel_bot_store: tg.deps.stores.channel_bot.clone(),
-        agent_profile_store: tg.deps.stores.agent_profile.clone(),
-        blob_store: tg.deps.stores.blob.clone(),
-        channel_control: Arc::clone(&tg.deps.channel_control),
-        secret_vault: Arc::clone(&tg.deps.secret_vault),
-        deck_manager: Arc::clone(&tg.deps.deck_manager),
-        bind_display: tg.deps.runtime_config.admin_bind.to_string(),
-    }
+    baybo_gateway::server::AdminState::from_deps(&tg.deps)
 }
 
 fn build_router(state: baybo_gateway::server::AdminState) -> axum::Router {
@@ -1866,11 +1837,11 @@ async fn list_sessions_exposes_last_user_text_preview() {
 // so it is listed and attachable like any other. A one-shot's session is a
 // private workspace — its result is reported into the conversation that
 // scheduled it — so it stays out of the list and cannot be attached to. The
-// opt-in `?include_cron=true` query is the operator escape hatch that shows
-// both.
+// opt-in `?include_cron=true` query admits that private cron workspace, but
+// board-owned conversations remain on the board.
 #[tokio::test]
-async fn recurring_fire_conversations_are_listed_and_one_shot_sessions_are_not() {
-    use baybo_model::{ChannelType, TriggerSource, User};
+async fn chat_visibility_distinguishes_recurring_private_cron_and_project_sessions() {
+    use baybo_model::{ChannelType, ProjectId, TriggerSource, User};
 
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let state = build_admin_state(&tg);
@@ -1902,6 +1873,7 @@ async fn recurring_fire_conversations_are_listed_and_one_shot_sessions_are_not()
                     origin_session_id: None,
                     conversation,
                     job_title: Some("Morning brief".into()),
+                    project_id: None,
                 },
             )
             .await
@@ -1909,6 +1881,19 @@ async fn recurring_fire_conversations_are_listed_and_one_shot_sessions_are_not()
         ids.push(session.id.to_string());
     }
     let (recurring_id, one_shot_id) = (ids[0].clone(), ids[1].clone());
+    let project_session = tg
+        .deps
+        .session_manager
+        .create_session_with_trigger(
+            operator,
+            ChannelType::owner(),
+            TriggerSource::Project {
+                project_id: ProjectId::generate(),
+            },
+        )
+        .await
+        .expect("create project session");
+    let project_session_id = project_session.id.to_string();
 
     let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
     let items = list["items"].as_array().expect("items");
@@ -1929,6 +1914,10 @@ async fn recurring_fire_conversations_are_listed_and_one_shot_sessions_are_not()
         !listed(&one_shot_id),
         "a one-shot fire session has no conversation to show, got {items:?}",
     );
+    assert!(
+        !listed(&project_session_id),
+        "a board-owned conversation must stay out of global chat, got {items:?}",
+    );
 
     let list_inc = get(
         &router,
@@ -1943,9 +1932,16 @@ async fn recurring_fire_conversations_are_listed_and_one_shot_sessions_are_not()
             .any(|row| row["session_id"].as_str() == Some(one_shot_id.as_str())),
         "include_cron=true is the operator view: it shows even the private fire sessions",
     );
+    assert!(
+        !items_inc
+            .iter()
+            .any(|row| row["session_id"].as_str() == Some(project_session_id.as_str())),
+        "include_cron=true must not leak board-owned conversations into global chat",
+    );
 
     // Attaching: a recurring fire's conversation can be continued (the user
-    // replies to what the fire reported); a one-shot's workspace cannot.
+    // replies to what the fire reported); private cron and board workspaces
+    // cannot be entered through global chat.
     post(
         &router,
         "/v1/chat/sessions",
@@ -1957,6 +1953,13 @@ async fn recurring_fire_conversations_are_listed_and_one_shot_sessions_are_not()
         &router,
         "/v1/chat/sessions",
         Body::from(json!({ "session_id": one_shot_id }).to_string()),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    post(
+        &router,
+        "/v1/chat/sessions",
+        Body::from(json!({ "session_id": project_session_id }).to_string()),
         StatusCode::NOT_FOUND,
     )
     .await;
@@ -2109,6 +2112,7 @@ async fn a_cron_group_pin_rides_the_job_and_reads_unpinned_once_deleted() {
             prompt: "weekly digest".into(),
             timezone: "UTC".into(),
             origin_session_id: None,
+            project_id: None,
         })
         .await
         .expect("create cron job");
@@ -2124,6 +2128,7 @@ async fn a_cron_group_pin_rides_the_job_and_reads_unpinned_once_deleted() {
                 origin_session_id: None,
                 conversation: true,
                 job_title: Some("Weekly digest".into()),
+                project_id: None,
             },
         )
         .await
@@ -2219,6 +2224,7 @@ async fn a_cron_pin_reaches_across_the_owner_pool_but_not_outside_it() {
         prompt: "brief me".into(),
         timezone: "UTC".into(),
         origin_session_id: None,
+        project_id: None,
     };
 
     // A legacy `http` job (same owner pool as the phone) and a private `tui` job.

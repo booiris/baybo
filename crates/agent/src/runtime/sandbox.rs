@@ -18,6 +18,7 @@ pub struct SandboxAdapter {
     allowed_hosts: BTreeSet<String>,
     filesystem_policy: FilesystemPolicy,
     readable_paths: Vec<PathBuf>,
+    writable_paths: Vec<PathBuf>,
     cwd_must_be_in_workspace: bool,
 }
 
@@ -44,6 +45,7 @@ impl SandboxAdapter {
             allowed_hosts: BTreeSet::new(),
             filesystem_policy: FilesystemPolicy::Workspace,
             readable_paths: Vec::new(),
+            writable_paths: Vec::new(),
             cwd_must_be_in_workspace: true,
         }
     }
@@ -114,6 +116,19 @@ impl SandboxAdapter {
         self
     }
 
+    /// Expose extra host paths **read-write** at the same path inside the
+    /// sandbox. This is how an issue run reaches the project checkout it
+    /// owns, which by construction lives outside baybo's workspace and may
+    /// live outside `$HOME` too — in which case the permissive bind set
+    /// does not cover it and the directory is simply absent.
+    pub fn with_writable_paths(mut self, paths: Vec<PathBuf>) -> Self {
+        self.writable_paths = paths
+            .into_iter()
+            .map(|p| p.canonicalize().unwrap_or_else(|_| absolutise(&p)))
+            .collect();
+        self
+    }
+
     /// Validate the cwd and build the [`SandboxSpec`] — shared by the
     /// blocking [`ExecSandbox::spawn_command`] and the detached
     /// [`ExecSandbox::spawn_command_detached`] so both enforce the same
@@ -163,7 +178,7 @@ impl SandboxAdapter {
             cwd: opts.cwd,
             workspace_root: self.workspace_root.clone(),
             readable_paths: self.readable_paths.clone(),
-            writable_paths: Vec::new(),
+            writable_paths: self.writable_paths.clone(),
             allowed_hosts: self.allowed_hosts.clone(),
             network_policy: self.network_policy,
             env,
@@ -394,6 +409,43 @@ mod tests {
             seen.readable_paths,
             vec![skills.path().canonicalize().expect("canonicalize skills")],
             "existing readable path must round-trip (canonicalised); missing path must be dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn writable_paths_round_trip_and_keep_a_path_that_cannot_be_resolved() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let checkout = tempfile::tempdir().expect("checkout tempdir");
+        let missing = PathBuf::from("/definitely/not/here");
+        let runner = Arc::new(RecordingRunner::default());
+        let adapter = SandboxAdapter::new(
+            Arc::clone(&runner) as Arc<dyn SandboxRunner>,
+            workspace.path().to_path_buf(),
+            NetworkPolicy::All,
+        )
+        .with_permissive_filesystem(workspace.path().to_path_buf(), vec![])
+        .with_writable_paths(vec![checkout.path().to_path_buf(), missing.clone()]);
+        adapter
+            .spawn_command(
+                Path::new("/bin/echo"),
+                &["hi".into()],
+                SpawnOpts {
+                    timeout: Duration::from_secs(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("recording runner accepts");
+        let seen = runner.seen.lock().take().expect("runner saw spec");
+        assert_eq!(
+            seen.writable_paths,
+            vec![
+                checkout
+                    .path()
+                    .canonicalize()
+                    .expect("canonicalize checkout"),
+                missing,
+            ],
         );
     }
 

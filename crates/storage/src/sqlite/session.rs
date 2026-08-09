@@ -91,6 +91,7 @@ pub(super) fn rehydrate_message(
         MessageSource::User => ChatMessage::user(content),
         MessageSource::UserInterjection => ChatMessage::user_interjection(content),
         MessageSource::Cron => ChatMessage::cron_fire(content),
+        MessageSource::IssueBrief => ChatMessage::issue_brief(content),
         MessageSource::CronNotification => ChatMessage::cron_notification(content),
         MessageSource::RecalledMemory => ChatMessage::recalled_memory(content),
         MessageSource::SystemPromptUpdate => ChatMessage::system_prompt_update(content),
@@ -297,6 +298,7 @@ impl SessionStore for SqliteSessionStore {
             baybo_model::TriggerKind::User => "user",
             baybo_model::TriggerKind::Cron => "cron",
             baybo_model::TriggerKind::Spawned => "spawned",
+            baybo_model::TriggerKind::Issue => "issue",
         };
         let parent_session = session
             .lineage
@@ -609,6 +611,29 @@ impl SessionStore for SqliteSessionStore {
             })
             .await?;
         Ok(ids.into_iter().map(SessionId::from).collect())
+    }
+
+    async fn list_project_conversations(&self, project_id: &str) -> Result<Vec<Session>> {
+        let project_id = project_id.to_string();
+        let rows = self
+            .pool
+            .interact("sessions.list_project_conversations", move |conn| {
+                // Both halves are required: the trigger kind pins it to a
+                // planning conversation, so an issue *run*'s session — which
+                // carries the same `project_id` — is not returned here.
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {SESSION_LIST_COLUMNS} FROM sessions \
+                     WHERE json_extract(data, '$.trigger.kind') = 'project' \
+                       AND json_extract(data, '$.trigger.project_id') = ?1 \
+                     ORDER BY last_active DESC"
+                ))?;
+                let rows = stmt
+                    .query_map(rusqlite::params![project_id], read_session_list_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
+        Ok(decode_session_list_rows(rows))
     }
 
     async fn list_all(&self) -> Result<Vec<Session>> {
@@ -1405,6 +1430,7 @@ impl SessionStore for SqliteSessionStore {
                        FROM session_messages m \
                        JOIN sessions s ON s.id = m.session_id \
                        WHERE s.dreamed_through_ordinal IS NULL \
+                         AND s.trigger_kind != 'issue' \
                          AND m.created_at >= ?1 AND m.created_at < ?2 \
                          AND m.compaction_inserted = 0 \
                          AND m.source IN ({HUMAN_SOURCES_SQL}) \
@@ -1418,6 +1444,7 @@ impl SessionStore for SqliteSessionStore {
                        FROM session_messages m \
                        JOIN sessions s ON s.id = m.session_id \
                        WHERE s.dreamed_through_ordinal IS NOT NULL \
+                         AND s.trigger_kind != 'issue' \
                          AND m.ordinal > s.dreamed_through_ordinal \
                          AND m.compaction_inserted = 0 \
                        GROUP BY m.session_id \

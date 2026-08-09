@@ -125,7 +125,7 @@ fn fallback_display_name(row: &AgentProfileRow) -> String {
 /// A file that is missing, unreadable, or has been reformatted past
 /// recognition falls back rather than failing the request: the roster must
 /// still render, and the agent owns that file.
-async fn read_display_name(state: &AdminState, row: &AgentProfileRow) -> String {
+pub(super) async fn read_display_name(state: &AdminState, row: &AgentProfileRow) -> String {
     let path = row
         .id
         .identity_file(&state.workspace_paths, IdentityKind::Identity);
@@ -149,6 +149,9 @@ async fn read_display_name(state: &AdminState, row: &AgentProfileRow) -> String 
 /// one field, not replacing the document, and the splice preserves every
 /// other line — so unlike a whole-file `PUT` it cannot delete what the agent
 /// wrote around it.
+///
+/// The naming rule reaches it through [`replace_identity_file`], which is the
+/// one writer both this and the whole-file `PUT` go through.
 async fn set_display_name(state: &AdminState, row: &AgentProfileRow, name: &str) -> Result<()> {
     let path = row
         .id
@@ -164,10 +167,49 @@ async fn set_display_name(state: &AdminState, row: &AgentProfileRow, name: &str)
     if updated == current {
         return Ok(());
     }
-    write_file_atomic(&path, &updated)
+    replace_identity_file(
+        state,
+        row,
+        IdentityKind::Identity,
+        &path,
+        &current,
+        &updated,
+    )
+    .await
+}
+
+/// Put `content` in one of an agent's identity files, after whatever governs
+/// that file's contents has passed, and record it in the persona repo.
+///
+/// **The** gateway write path for these files, for the same reason
+/// `baybo-tools` has exactly one: a rule each endpoint remembers to ask about
+/// before its own write is a rule the third endpoint will not ask about. Here
+/// the check is not a step a handler takes first — it is part of writing.
+///
+/// `current` is what is on disk *now*, read under the caller's
+/// [`identity_write_lock`]: the rules are about the change, and a caller
+/// re-reading here would be reading outside its own compare-and-set.
+async fn replace_identity_file(
+    state: &AdminState,
+    row: &AgentProfileRow,
+    kind: IdentityKind,
+    path: &std::path::Path,
+    current: &str,
+    content: &str,
+) -> Result<()> {
+    // Only the rename half. A caller replacing the whole document may leave
+    // it without a name — restoring the shipped template does exactly that —
+    // which is why an unnamed agent has a defined rendering at all. Losing
+    // the line by accident is the *tools'* risk, and their writer refuses it.
+    if kind == IdentityKind::Identity
+        && let Some(reason) = baybo_workspace::rejected_rename(row.id.as_str(), current, content)
+    {
+        return Err(GatewayError::BadRequest(reason));
+    }
+    write_file_atomic(path, content)
         .await
-        .map_err(|e| GatewayError::Internal(format!("write agent identity: {e}")))?;
-    commit_persona_edit(state, row.id.as_str(), IdentityKind::Identity.file_name()).await;
+        .map_err(|e| GatewayError::Internal(format!("write agent {kind:?} file: {e}")))?;
+    commit_persona_edit(state, row.id.as_str(), kind.file_name()).await;
     Ok(())
 }
 
@@ -225,7 +267,7 @@ async fn commit_persona_edit(state: &AdminState, agent_id: &str, file: &str) {
 }
 
 /// [`AgentProfileDto`] for one row, with its name read from disk.
-async fn agent_dto(state: &AdminState, row: AgentProfileRow) -> AgentProfileDto {
+pub(super) async fn agent_dto(state: &AdminState, row: AgentProfileRow) -> AgentProfileDto {
     let name = read_display_name(state, &row).await;
     AgentProfileDto::from_parts(row, name)
 }
@@ -266,6 +308,10 @@ pub struct UpdateAgentProfileRequest {
 }
 
 /// Request body for `PUT /v1/agents/{agent_id}/name`.
+///
+/// Rejected for an agent on a project team: the `@handle` its board addresses
+/// it by was derived from its name when it was hired, so the name is fixed for
+/// as long as the agent exists.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetAgentNameRequest {
     pub name: String,
@@ -449,6 +495,12 @@ async fn create_agent(
         framework: req.framework.into(),
         llm,
         builtin: false,
+        // `POST /v1/agents` opens a global chat persona. A project's team is
+        // staffed through its own board (`/v1/projects/{pid}/agents`), which
+        // is the only surface that mints a handle.
+        team: None,
+        hired_by: None,
+        deleted_at: None,
         created_at: now,
         updated_at: now,
     };
@@ -547,7 +599,7 @@ async fn update_agent(
     request_body = SetAgentNameRequest,
     responses(
         (status = 204, description = "Name set"),
-        (status = 400, description = "Malformed agent id or name", body = ErrorBody),
+        (status = 400, description = "Malformed agent id or name, or a project agent, whose name its @handle was derived from and cannot outlive", body = ErrorBody),
         (status = 401, description = "Unauthorized", body = ErrorBody),
         (status = 404, description = "No such agent profile", body = ErrorBody),
     )
@@ -708,24 +760,21 @@ async fn write_agent_identity_file(
     // Held across the read, the comparison and the write: a compare-and-set
     // whose three steps another request can interleave with is not one.
     let _guard = identity_write_lock(&path).await;
-    if let Some(expected) = req.version.as_deref() {
-        // Read what is actually on disk now, not what this request thinks was
-        // there. A missing file hashes as empty, so a fresh write after a
-        // delete conflicts rather than silently resurrecting old content.
-        let current = tokio::fs::read_to_string(&path).await.unwrap_or_default();
-        let actual = content_version(&current);
-        if actual != expected {
-            return Err(GatewayError::Conflict(format!(
-                "{} changed since it was read (the agent may have rewritten it); \
-                 re-read it and reapply the edit",
-                path.display()
-            )));
-        }
+    // What is actually on disk now, not what this request thinks was there. A
+    // missing file reads as empty, so a fresh write after a delete conflicts
+    // rather than silently resurrecting old content — and carries no name to
+    // protect, which is how a deleted `IDENTITY.md` can be named again.
+    let current = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+    if let Some(expected) = req.version.as_deref()
+        && content_version(&current) != expected
+    {
+        return Err(GatewayError::Conflict(format!(
+            "{} changed since it was read (the agent may have rewritten it); \
+             re-read it and reapply the edit",
+            path.display()
+        )));
     }
-    write_file_atomic(&path, &req.content)
-        .await
-        .map_err(|e| GatewayError::Internal(format!("write agent {kind:?} file: {e}")))?;
-    commit_persona_edit(state, agent_id, kind.file_name()).await;
+    replace_identity_file(state, &row, kind, &path, &current, &req.content).await?;
     // Return the new state, so an editor that stays open holds a fresh base
     // for its next conditional write instead of conflicting with itself.
     Ok(Json(AgentIdentityFileDto {
@@ -803,7 +852,7 @@ async fn get_agent_identity(
     request_body = SetAgentIdentityFileRequest,
     responses(
         (status = 200, description = "Self-image replaced; carries the new version", body = AgentIdentityFileDto),
-        (status = 400, description = "Malformed agent id", body = ErrorBody),
+        (status = 400, description = "Malformed agent id, or a body that renames a project agent — its @handle came from that name", body = ErrorBody),
         (status = 401, description = "Unauthorized", body = ErrorBody),
         (status = 404, description = "No such agent profile", body = ErrorBody),
         (status = 409, description = "The file changed since it was read", body = ErrorBody),

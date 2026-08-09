@@ -2585,6 +2585,7 @@ async fn cron_fire_is_framed_as_a_task_not_a_user_message() {
         // dispatches out through the channel (what this test asserts on).
         conversation: true,
         job_title: Some("Demo".into()),
+        project_id: None,
     };
     let mut harness = AgentTestHarness::builder().session(session).build();
 
@@ -2706,6 +2707,7 @@ async fn recurring_fire_that_reports_nothing_notifies_no_one() {
         origin_session_id: None,
         conversation: true,
         job_title: Some("Watcher".into()),
+        project_id: None,
     };
     let fire_session_id = session.id.clone();
 
@@ -2831,6 +2833,7 @@ async fn one_shot_cron_result_lands_in_the_scheduling_conversation() {
                 origin_session_id: Some(origin_id.clone()),
                 conversation: false,
                 job_title: None,
+                project_id: None,
             },
         )
         .await
@@ -2858,6 +2861,7 @@ async fn one_shot_cron_result_lands_in_the_scheduling_conversation() {
         next_trigger_at: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        project_id: None,
         origin_session_id: Some(origin_id.clone()),
         deleted_at: None,
         pinned: false,
@@ -2988,6 +2992,7 @@ async fn replayed_cron_result_does_not_duplicate_the_notification() {
                 origin_session_id: Some(origin_id.clone()),
                 conversation: false,
                 job_title: None,
+                project_id: None,
             },
         )
         .await
@@ -3014,6 +3019,7 @@ async fn replayed_cron_result_does_not_duplicate_the_notification() {
         next_trigger_at: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        project_id: None,
         origin_session_id: Some(origin_id.clone()),
         deleted_at: None,
         pinned: false,
@@ -3137,6 +3143,7 @@ async fn a_failed_recurring_fire_reports_a_real_notification_in_its_conversation
         origin_session_id: None,
         conversation: true,
         job_title: Some("News".into()),
+        project_id: None,
     };
     let session_id = session.id.clone();
     let mut harness = AgentTestHarness::builder().session(session).build();
@@ -3230,6 +3237,7 @@ async fn a_cron_notification_that_cannot_be_persisted_is_not_marked_delivered() 
         next_trigger_at: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        project_id: None,
         origin_session_id: Some(origin_id.clone()),
         deleted_at: None,
         pinned: false,
@@ -4658,4 +4666,78 @@ async fn stop_persists_partial_work_so_it_survives_reload() {
         "the cancelled LLM span must record the partial reasoning, got {:?}",
         cancelled.thinking
     );
+}
+
+#[tokio::test]
+async fn an_issue_run_executes_as_its_own_kind_of_turn() {
+    let mut session = SessionBuilder::new().build();
+    session.trigger = TriggerSource::Issue {
+        project_id: baybo_model::ProjectId::parse("proj-a").expect("project id"),
+        issue_id: baybo_model::IssueId::from("issue-1"),
+        number: 7,
+    };
+    let mut harness = AgentTestHarness::builder().session(session).build();
+
+    harness.stub_llm.push_response(LlmResponse {
+        content: "Cleared the reconnect storm and added a regression test.".into(),
+        content_blocks: vec![],
+        tool_calls: vec![],
+        usage: Default::default(),
+        thinking: None,
+    });
+
+    let run_id = baybo_model::IssueRunId::generate();
+    harness
+        .mailbox
+        .send(AgentMessage::IssueRun {
+            run_id: run_id.clone(),
+            number: 7,
+            brief: "Fix the WS reconnect storm\n\nThe timer never clears.".into(),
+            checkout: "/ws/work/projects/p/7".into(),
+        })
+        .await
+        .expect("mailbox accepts the run");
+    harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    let requests = harness.stub_llm.captured_requests();
+    let framed = requests
+        .iter()
+        .flat_map(|r| &r.messages)
+        .filter(|m| matches!(m.role, Role::User))
+        .flat_map(|m| &m.content)
+        .filter_map(|b| match b {
+            ContentBlock::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .find(|t| t.contains("[issue #7]"))
+        .expect("a user turn carrying the issue framing");
+    assert!(
+        framed.contains("not a message from a person"),
+        "the run must not read as a chat turn: {framed}"
+    );
+    assert!(
+        framed.contains("Fix the WS reconnect storm"),
+        "carries the brief: {framed}"
+    );
+    assert!(
+        framed.contains("/ws/work/projects/p/7"),
+        "the run must be told its checkout: {framed}"
+    );
+
+    let turns = harness
+        .turn_lifecycle
+        .list_by_session(&harness.session.id, None)
+        .await
+        .expect("turns");
+    let run_turn = turns
+        .iter()
+        .find(|t| t.input_kind() == baybo_turn::TurnInputKind::IssueRun)
+        .expect("the run opened a turn of its own kind");
+    assert!(
+        run_turn.is_terminal(),
+        "and it finished, so the waiter has an edge to settle on: {:?}",
+        run_turn.status
+    );
+
+    harness.shutdown().await;
 }

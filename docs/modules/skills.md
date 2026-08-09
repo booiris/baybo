@@ -23,7 +23,7 @@ At startup the registry calls `SkillRegistry::register_builtins()` to register e
 The first built-in is `baybo-cli` — a non-user-invocable skill that tells the agent to introspect the running Baybo instance through the `baybo` CLI (the BashTool auto-injects `BAYBO_HELP_AGENT` and `BAYBO_CONFIG_PATH`, so the agent sees the full inventory and the right config without needing flags). The second is `deck` — the inverse shape: slash-only (`command: deck` + `disable-model-invocation: true`, so the model never auto-selects it; the user types `/deck <request>`) and owner-channel-only (`channels: [owner]`) — carrying the deck card bundle contract, the `ctx`/`deck` SDK surface, and worked examples for authoring a card before `DeckCardCreate`/`DeckCardUpdate`; see [`deck.md`](deck.md#authoring-pipeline). The third is `html-gen`: an agent- and slash-invocable, owner-only skill for authoring a self-contained HTML page, staging it through `PutBlob`, and returning the `baybo-html` blob marker understood by the iOS transcript.
 
 ```
-<workspace>/personas/<agent_id>/skills/     # baybo/ for the default scope
+<persona>/skills/     # personas/<agent_id>/, or personas/project/<agent_id>/
 ├── greet/
 │   └── SKILL.md
 └── deploy/
@@ -84,11 +84,13 @@ The `/<name>` entry point is surfaced on channel adapters by `baybo-cli`'s `CliS
 
 ### Every agent owns its skills
 
-**There is no shared skill tree.** Each agent's skills live in its own
-directory at `<workspace>/personas/<agent_id>/skills/`, one directory per
-skill, and no agent reads another's. The built-in is not a special case — its
-skills are at `personas/baybo/skills/`, which is also what an unbound session
-reads, since an unbound session *is* the built-in. A persona someone curated
+**There is no shared skill tree.** Each agent's skills live below its resolved
+persona directory, one directory per skill, and no agent reads another's.
+Newly created project agents carry `project-<ULID>` ids and resolve below
+`personas/project/`; legacy unprefixed project personas remain flat and valid.
+The built-in is not a special case — its skills are at
+`personas/baybo/skills/`, which is also what an unbound session reads, since an
+unbound session *is* the built-in. A persona someone curated
 should not silently acquire every skill the workspace happens to hold; granting
 one is a decision, made by putting the skill in that agent's folder.
 
@@ -132,8 +134,8 @@ a scope for the same reason.
   per-agent map**, so every reader of a scope calls it first: boot (for the
   built-in, whose id is a constant), the actor build (`runtime.rs`, on the cold
   spawn of a session) and `GET /v1/skills` when the query names an agent. It
-  derives `personas/<id>/skills/` from the id, so a call site holding only a
-  session's agent needs nothing else; an already-scanned agent is a no-op.
+  derives the resolved persona's `skills/` from the id, so a call site holding
+  only a session's agent needs nothing else; an already-scanned agent is a no-op.
   `reload()` replays every scan.
 
 `None` as a scope means the built-in, directory included — an unbound session
@@ -156,7 +158,7 @@ and the risk assessor judges them by content hash like any other.
 `SkillInstall` / `SkillUninstall` write in the scope the caller reads — see
 [Skill installation](#skill-installation). `SkillInstall` is also the **only**
 writer of a skill directory: `Edit` and `Write` refuse a path under
-`personas/<id>/skills/` outright (`classify_persona_path` gives it
+the resolved persona's `skills/` outright (`classify_persona_path` gives it
 `PersonaPath::Other`, which the managed-repo tier treats as unwritable), so a
 skill gets in by being installed — and therefore by passing the risk assessor —
 never by being hand-authored in place.
@@ -324,7 +326,7 @@ not a blip: the skill listing a session seeds from is persisted and is not
 refreshed until a compaction, so a session that seeded inside the window
 advertised a truncated set for its whole life. The TUI
 Skills dashboard wires this into its refresh action (`r` key), so an
-operator editing `<workspace>/personas/<agent_id>/skills/<name>/SKILL.md` can press refresh
+operator editing `<persona>/skills/<name>/SKILL.md` can press refresh
 to pick up the change without restarting Baybo. Individual broken
 `SKILL.md` files are logged and skipped, matching startup behaviour.
 Filesystem watching is not wired yet — reload is on-demand only.

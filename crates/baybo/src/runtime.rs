@@ -26,7 +26,7 @@ use baybo_agent::agent_loop::{AgentLoop, AgentLoopConfig};
 use baybo_agent::router::Router;
 use baybo_agent::service::{ShutdownSignal, TaskTracker};
 use baybo_agent::supervisor::AgentSupervisor;
-use baybo_agent::tool_executor::ToolExecutor;
+use baybo_agent::tool_executor::{BoardStores, ToolExecutor};
 use baybo_agent::{CronScheduler, CronTriggerEvent, SecretVault, SecurityGateway, SessionManager};
 use baybo_channels::{AgentOutput, ChannelRegistry, RouterInbound};
 use baybo_config::{BayboConfig, LlmEntryName};
@@ -172,6 +172,10 @@ pub struct ManagerGraph {
     /// Deck card manager (`/v1/deck/*` + the DeckCard* tools). Boot and
     /// shutdown are the gateway entrypoint's responsibility.
     pub deck_manager: Arc<baybo_deck::DeckManager>,
+    /// Kanban projects and their boards (`/v1/projects/*`). One per
+    /// process: later phases hang the run ledger's wake signal off it, and
+    /// a second instance would raise signals nobody is listening for.
+    pub project_manager: Arc<baybo_project::ProjectManager>,
     /// Cloneable bundle of every sqlite-backed store handle. Keeping the
     /// whole [`Store`] in one field means adding a new store only
     /// touches [`Store`] itself — the graph and its downstream consumers
@@ -194,6 +198,9 @@ pub struct ManagerGraph {
     /// `wire_router` twice panics loudly instead of silently handing
     /// out a dummy receiver.
     pub cron_trigger_rx: Option<mpsc::Receiver<CronTriggerEvent>>,
+    /// Recorded issue runs waiting to execute. A one-shot like
+    /// `cron_trigger_rx` — [`wire_router`] consumes it.
+    pub issue_run_rx: Option<mpsc::Receiver<baybo_project::IssueRunEvent>>,
 
     /// Late-set slot for the actor-backed subagent spawner. The
     /// `spawn_subagent` tool holds a clone (taken at build time, before the
@@ -604,6 +611,35 @@ pub async fn build_managers(
         tool_registry.register(tool, manifest);
     }
 
+    // One hook, shared by everything that writes the board: the manager and
+    // the dispatcher both announce, and a board watched through two hooks
+    // would be a board where which writer you went through decides whether
+    // anybody sees it.
+    let project_events: Arc<dyn baybo_project::ProjectEvents> = Arc::new(
+        baybo_gateway::project_events::GatewayProjectEvents::new(Arc::clone(&channels_registry)),
+    );
+
+    let (issue_dispatch, issue_run_rx) =
+        baybo_project::dispatch::build(baybo_project::DispatchConfig {
+            store: stores.project.clone(),
+            agents: stores.agent_profile.clone(),
+            events: Arc::clone(&project_events),
+            paths: baybo_workspace::WorkspacePaths::new(workspace_paths.root().to_path_buf()),
+            user_id: baybo_gateway::auth::OWNER_USER_ID.to_string(),
+            channel: baybo_model::ChannelType::owner(),
+        });
+
+    let project_manager = Arc::new(baybo_project::ProjectManager::new(
+        stores.project.clone(),
+        stores.agent_profile.clone(),
+        baybo_workspace::WorkspacePaths::new(workspace_paths.root().to_path_buf()),
+        project_events,
+        issue_dispatch,
+    ));
+    for (tool, manifest) in baybo_project::tools::agent_tools(Arc::clone(&project_manager)) {
+        tool_registry.register(tool, manifest);
+    }
+
     // --- security gateway + tool executor
     // Tool-output spill now lives in `baybo-context` (resolved from the
     // session's workspace handle); the gateway only does scan + sanitize.
@@ -612,6 +648,12 @@ pub async fn build_managers(
         Arc::clone(&secret_vault),
     ));
     let gate_map = channels_registry.approval_gates();
+    baybo_gateway::channel::boot::install_timeline_approval_gate(
+        &channels_registry,
+        Arc::clone(&project_manager),
+        stores.session.clone(),
+    );
+
     let sandbox_boot = crate::sandbox_boot::resolve_sandbox_runner(
         config.permission,
         Arc::clone(&process_manager),
@@ -713,6 +755,10 @@ pub async fn build_managers(
         virtual_reads,
         background_jobs,
         background_control,
+        Some(BoardStores {
+            projects: Arc::clone(&project_manager) as Arc<dyn baybo_project::ProjectRepo>,
+            agents: stores.agent_profile.clone(),
+        }),
     ));
 
     // --- per-actor parent token. The spawner factory derives each
@@ -770,9 +816,11 @@ pub async fn build_managers(
         channels_registry,
         secret_vault,
         deck_manager,
+        project_manager,
         stores,
         memory,
         cron_trigger_rx: Some(cron_trigger_rx),
+        issue_run_rx: Some(issue_run_rx),
         subagent_spawner_slot,
         actor_parent_token,
         subagent_dispatch_limiter,
@@ -1062,6 +1110,8 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         turn_lifecycle: Arc::clone(&graph.turn_lifecycle),
         cron_store: graph.stores.cron.clone(),
         cron_trigger_rx,
+        issue_run_rx: graph.issue_run_rx.take(),
+        board: Some(Arc::clone(&graph.project_manager)),
         actor_parent_token: graph.actor_parent_token.clone(),
         rate_limit: Arc::clone(&graph.rate_limit),
     });

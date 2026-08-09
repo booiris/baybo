@@ -3,6 +3,7 @@ import type { ActivityKind } from "./ActivityKind";
 import type { ApprovalCard } from "./ApprovalCard";
 import type { FolderView } from "./FolderView";
 import type { Message } from "./Message";
+import type { ProjectChangeScope } from "./ProjectChangeScope";
 import type { ResourceAccess } from "./ResourceAccess";
 import type { SessionPatch } from "./SessionPatch";
 import type { SlashCommandSpec } from "./SlashCommandSpec";
@@ -91,4 +92,12 @@ source: ActivityKind, at: string, } | { "kind": "deck_card_data", card_id: strin
  * [`WireAttachment::size`]: avoids the TS-side `BigInt`
  * round-trip the default msgpack encoder rejects.
  */
-seq: number, payload: string, } | { "kind": "deck_changed" } | { "kind": "ping" } | { "kind": "pong" };
+seq: number, payload: string, } | { "kind": "deck_changed" } | { "kind": "project_changed", project_id: string, scope: ProjectChangeScope, 
+/**
+ * The issue the change is about, when it is about one. A detail
+ * page ignores anything for another number.
+ *
+ * `u32` for the same reason as [`DeckCardData::seq`]: keeps
+ * `bigint` out of the generated TS contract.
+ */
+issue_number?: number, } | { "kind": "ping" } | { "kind": "pong" };

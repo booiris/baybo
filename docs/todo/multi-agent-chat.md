@@ -16,9 +16,10 @@ An **agent** is two halves that share one identity:
 - an `agent_profiles` **row** — the management surface (name, description,
   avatar, framework, llm pin), DB-authoritative, edited from the web
   **Agents** page;
-- a **persona directory** — the declarative surface
-  (`<workspace>/personas/<agent_id>/`), filesystem-authoritative, git-versioned,
-  hand- or self-edited: `SOUL.md` and `skills/`.
+- a **persona directory** — the declarative surface (flat below `personas/` for
+  global and legacy agents, grouped below `personas/project/` for newly created
+  project agents), filesystem-authoritative, git-versioned, hand- or
+  self-edited: `SOUL.md` and `skills/`.
 
 The split is by *kind of content*, not by convenience. Avatars are binary and
 edits are concurrent, so the row belongs in sqlite next to `sessions` and
@@ -59,8 +60,8 @@ so memory partitions by `(user, agent)` and cost still bills one owner.
 
 | Facet | Source of truth | Resolved at | A live edit lands |
 |---|---|---|---|
-| soul | `personas/<id>/SOUL.md` (builtin: `personas/baybo/SOUL.md`) | context seed + every post-compaction reseed | next seed/reseed |
-| skills | `personas/<id>/skills/` | per-turn listing, `Skill` tool lookup, slash expansion | next actor spawn, or `reload()` |
+| soul | resolved persona's `SOUL.md` (builtin: `personas/baybo/SOUL.md`) | context seed + every post-compaction reseed | next seed/reseed |
+| skills | resolved persona's `skills/` | per-turn listing, `Skill` tool lookup, slash expansion | next actor spawn, or `reload()` |
 | memory partition | `sessions.agent_id` | every recall / write / memory-tool call | immediately |
 | llm pin | `profile.llm` | actor spawn / hydration | next hydration, unless the session switched models explicitly |
 | framework | `sessions.agent_framework` (snapshot) | actor build | **never** — new sessions only |
@@ -141,7 +142,8 @@ The memory partition key is `agent_id` with `NULL` → `"baybo"`.
 `BUILTIN_AGENT_PROFILE_ID` is literally `"baybo"`, which is exactly what both
 memory backends already send (`DEFAULT_AGENT_ID` in `mem0.rs`, the hardcoded
 `x-openviking-agent`), so **existing memories stay where builtin sessions look
-for them** and custom agents partition under their ULID — rename-proof.
+for them** and custom agents partition under their stable profile id —
+rename-proof.
 
 ### The persona directory
 
@@ -167,21 +169,25 @@ Three new `WorkspacePaths` methods carry that rule so no call site branches:
 
 ```rust
 pub fn personas_dir(&self) -> PathBuf;                                    // <root>/personas
-pub fn persona_dir(&self, agent: &str) -> PathBuf;                        // <root>/personas/<id>
+pub fn persona_dir(&self, agent: &str) -> PathBuf;                        // resolved flat/project location
+pub fn project_persona_dir(&self, agent: &str) -> PathBuf;                // <root>/personas/project/<id>
 pub fn persona_identity_file(&self, agent: &str, kind: IdentityKind) -> PathBuf;
-pub fn persona_skills_dir(&self, agent: &str) -> PathBuf;                 // <root>/personas/<id>/skills
+pub fn persona_skills_dir(&self, agent: &str) -> PathBuf;                 // <persona>/skills
 pub fn shared_user_file(&self) -> PathBuf;                                // <root>/personas/USER.md
 ```
 
-Every method keys on the id alone, builtin included — `"baybo"` is a persona
-directory name like any other, so no call site branches on it.
+Every ordinary read keys on the id alone, builtin included — `"baybo"` is a
+persona directory name like any other. Newly minted project ids use
+`project-<ULID>`, so `persona_dir` selects the grouped location from the id
+alone; older unprefixed ids retain the flat layout and need no migration.
 
 **Path safety.** This is the first time a profile id reaches the filesystem. Ids
-are server-minted ULIDs, but `AgentProfileId` is an opaque newtype whose
+are server-minted ULIDs or `project-<ULID>` values, but `AgentProfileId` is an opaque newtype whose
 `#[serde(transparent)]` `Deserialize` currently turns *any* string into one, so a
 crafted request body or a hand-written row could carry `../`. The id therefore
 gains a grammar — `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`, the skill-name grammar —
-enforced by a fallible `AgentProfileId::parse` / `TryFrom<String>`, **and** by a
+with the container name `project` reserved, enforced by a fallible
+`AgentProfileId::parse` / `TryFrom<String>`, **and** by a
 validating `Deserialize` that replaces the transparent one. A guard only on the
 constructor would be bypassable by every deserialization site, which is most of
 them. Nothing can then escape `personas/`, and a corrupt row is a crisp error
@@ -198,7 +204,7 @@ pub async fn ensure_persona_layout(
 ) -> anyhow::Result<()>;
 ```
 
-Creates `personas/<id>/skills/` and writes `SOUL.md` **only if absent**
+Creates the resolved persona's `skills/` and writes `SOUL.md` **only if absent**
 (tmp-file + rename, like `write_identity_file`). Idempotent, and it never
 overwrites — a soul the agent has since rewritten is safe. Called from two
 places: `POST /v1/agents` right after the row is created, and defensively on the
@@ -499,8 +505,8 @@ is the CLI's problem; the baybo-side transcript is display plus memory input).
 | External backend disabled or unprobed at creation | 400 "enable claude first" |
 | Backend disabled after sessions exist | turn fails with a clear in-chat error; the session survives and works again on re-enable |
 | Profile row deleted with bound sessions | the conversation keeps the agent's **own** persona and skill overlay — both are named by the id the session carries, so they outlive the row, exactly as its memory partition does. Only the row's own fields go: the LLM pin falls back to `default-llm` with a `warn!` at the next spawn, and the roster loses the entry |
-| `personas/<id>/SOUL.md` missing | re-seeded from the shipped template and used |
-| `personas/<id>/SOUL.md` unreadable (I/O error) | `error!` naming both paths, then the minimal `FALLBACK_SYSTEM_PROMPT` — **never** the workspace persona |
+| resolved persona's `SOUL.md` missing | re-seeded from the shipped template and used |
+| resolved persona's `SOUL.md` unreadable (I/O error) | `error!` naming both paths, then the minimal `FALLBACK_SYSTEM_PROMPT` — **never** the workspace persona |
 | Persona directory deleted while sessions live | empty overlay, soul re-seeded; no error |
 | Stale `profile.llm` pin | existing tolerance: `warn!` + default |
 | External CLI crash / parse error / lost resume state | turn fails visibly; `resume_key` untouched, nothing auto-cleared |

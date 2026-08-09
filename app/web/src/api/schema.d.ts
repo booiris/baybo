@@ -904,6 +904,310 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/projects": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_projects"];
+        put?: never;
+        post: operations["create_project"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/attention": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["projects_attention"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_project"];
+        put: operations["update_project"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/agents": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_team"];
+        put?: never;
+        post: operations["hire_agent"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/agents/{agent_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete: operations["remove_agent"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/archive": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["set_project_archived"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/feed": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["project_feed"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/issues": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_issues"];
+        put?: never;
+        post: operations["create_issue"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/issues/{number}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_issue"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch: operations["update_issue"];
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/issues/{number}/approvals/{call_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["resolve_approval"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/issues/{number}/comments": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["create_comment"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/issues/{number}/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_issue_events"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/issues/{number}/move": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["move_issue"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/issues/{number}/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_issue_runs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/issues/{number}/runs/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["cancel_run"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/issues/{number}/runs/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["retry_run"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/lead/conversations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_lead_conversations"];
+        put?: never;
+        post: operations["open_lead_conversation"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/read": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["mark_project_read"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_active_runs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/push/params": {
         parameters: {
             query?: never;
@@ -1100,6 +1404,17 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** @description Who did the thing an entry records. */
+        ActorDto: {
+            /** @enum {string} */
+            kind: "user";
+        } | {
+            /** @enum {string} */
+            kind: "system";
+        } | (components["schemas"]["AgentRefDto"] & {
+            /** @enum {string} */
+            kind: "agent";
+        });
         /**
          * @description Mirror of [`baybo_model::AgentFramework`]; wire strings match the
          *     spawn protocol's backend tags (`baybo`/`claude`/`codex`).
@@ -1146,6 +1461,15 @@ export interface components {
             name: string;
             /** Format: date-time */
             updated_at: string;
+        };
+        /** @description An agent as a timeline entry names it. */
+        AgentRefDto: {
+            /**
+             * @description The `@handle` to render, without the `@`. Falls back to the id when
+             *     the reference resolves to nothing at all.
+             */
+            handle: string;
+            id: string;
         };
         /**
          * @description One bucket per UTC day for the analytics chart.
@@ -1242,6 +1566,12 @@ export interface components {
              */
             until: string;
         };
+        /**
+         * @description Mirror of [`baybo_model::ApprovalDecision`], so the client gets the same
+         *     discriminated union it switches on everywhere else here.
+         * @enum {string}
+         */
+        ApprovalDecisionDto: "approve" | "approve_always" | "deny";
         /**
          * @description One in-flight background job (detached subagent or `Bash` command),
          *     across all sessions — the cross-session twin of the `JobList` tool.
@@ -1800,6 +2130,16 @@ export interface components {
         CreateCronRequest: {
             channel?: null | components["schemas"]["ChannelType"];
             origin_session_id?: string | null;
+            /**
+             * @description Point this job at a board: its fires run as that project's lead and
+             *     can open issues on it. Absent is an ordinary job.
+             *
+             *     Set once, at creation. Re-pointing a live job is deliberately not
+             *     offered — its past fires filed cards on the old board, so its
+             *     execution history would describe work on a board it no longer
+             *     touches.
+             */
+            project_id?: string | null;
             schedule: string;
             text: string;
             /**
@@ -1821,6 +2161,44 @@ export interface components {
             name: string;
             /** @description Parent folder id (`null`/absent = top-level). */
             parent_id?: string | null;
+        };
+        CreateIssueRequest: {
+            /**
+             * @description The agent to put on it. Required when opening straight into
+             *     In Progress.
+             */
+            assignee?: string | null;
+            description?: string;
+            /**
+             * Format: int64
+             * @description Open it as a step of that issue's number. One level only.
+             */
+            parent?: number | null;
+            priority?: null | components["schemas"]["IssuePriorityDto"];
+            /**
+             * Format: int64
+             * @description Which barrier under the parent. Ignored without one.
+             */
+            stage?: number | null;
+            status?: null | components["schemas"]["IssueStatusDto"];
+            title: string;
+        };
+        CreateProjectRequest: {
+            /**
+             * Format: int64
+             * @description Daily spend ceiling in micro-USD (USD × 10^6). Omit for no limit;
+             *     `0` pauses the board's agents without archiving it. Integer, never a
+             *     float — a budget compared with rounding error is a budget that
+             *     disagrees with the ledger it is measured against.
+             */
+            daily_budget_micros?: number | null;
+            description?: string;
+            name: string;
+            /**
+             * @description Absolute path to an existing git repository. Omit it and the server
+             *     creates one under the workspace's `work/` directory instead.
+             */
+            workdir?: string | null;
         };
         /** @description Request body for `POST /v1/chat/sessions`. */
         CreateSessionRequest: {
@@ -2001,6 +2379,221 @@ export interface components {
              *     rejected.
              */
             session_ids: string[];
+        };
+        /** @description Request body for `POST /v1/projects/{project_id}/agents`. */
+        HireAgentRequest: {
+            framework?: null | components["schemas"]["AgentFrameworkDto"];
+            /** @description `baybo.json` LLM entry name; must match a configured entry. */
+            llm?: string | null;
+            /**
+             * @description Display name, and the only chance to choose one: the `@handle` is
+             *     derived from it here, and neither can be changed afterwards — a board
+             *     that called an agent one thing while everybody addressed it as another
+             *     would be lying on every card.
+             */
+            name: string;
+            /**
+             * @description One line saying what this agent is for. Seeds its `SOUL.md` and
+             *     becomes its roster description.
+             */
+            role: string;
+        };
+        /** @description Who brought an agent onto the board. Absent means the operator did. */
+        HiredByDto: {
+            handle: string;
+            id: string;
+        };
+        IssueDto: {
+            /** @description The agent on it, if any. In Progress always has one. */
+            assignee?: string | null;
+            /**
+             * @description Why work stopped. A badge on the card — blocked work stays in
+             *     whichever column it was in.
+             */
+            blocked_reason?: string | null;
+            /**
+             * @description The branch this issue's work landed on. Absent until it has a
+             *     commit, so a research issue never shows one.
+             */
+            branch?: string | null;
+            /**
+             * Format: int64
+             * @description Present once the issue is cancelled. The row is never deleted.
+             */
+            cancelled_at_ms?: number | null;
+            /** Format: int64 */
+            created_at_ms: number;
+            description: string;
+            /**
+             * Format: int64
+             * @description The human address, unique within its project: `#3`.
+             */
+            number: number;
+            /**
+             * Format: int64
+             * @description The issue this one is a step of, by its number on this board.
+             *     Absent on a top-level card.
+             */
+            parent?: number | null;
+            /**
+             * Format: int64
+             * @description Rank within the column, dense and ascending.
+             */
+            position: number;
+            priority: components["schemas"]["IssuePriorityDto"];
+            project_id: string;
+            /**
+             * Format: int64
+             * @description Which barrier under that parent. `0` and meaningless without one.
+             */
+            stage: number;
+            status: components["schemas"]["IssueStatusDto"];
+            sub_issues?: null | components["schemas"]["SubIssueProgress"];
+            title: string;
+            /** Format: int64 */
+            updated_at_ms: number;
+        };
+        /** @description What one timeline entry says. */
+        IssueEventBodyDto: {
+            /** @enum {string} */
+            kind: "comment";
+            text: string;
+        } | {
+            /** @enum {string} */
+            kind: "opened";
+        } | {
+            from: components["schemas"]["IssueStatusDto"];
+            /** @enum {string} */
+            kind: "moved";
+            to: components["schemas"]["IssueStatusDto"];
+        } | {
+            from?: null | components["schemas"]["AgentRefDto"];
+            /** @enum {string} */
+            kind: "assigned";
+            to?: null | components["schemas"]["AgentRefDto"];
+        } | {
+            /** Format: int64 */
+            attempt: number;
+            /** @enum {string} */
+            kind: "run_started";
+            trigger: components["schemas"]["RunTriggerDto"];
+        } | {
+            /** Format: int64 */
+            attempt: number;
+            error?: string | null;
+            /** @enum {string} */
+            kind: "run_settled";
+            status: components["schemas"]["RunStatusDto"];
+        } | {
+            /** @enum {string} */
+            kind: "blocked";
+            reason: string;
+        } | {
+            /** @enum {string} */
+            kind: "unblocked";
+        } | {
+            /** @enum {string} */
+            kind: "cancelled";
+        } | {
+            branch_deleted: boolean;
+            /** @enum {string} */
+            kind: "worktree_reclaimed";
+        } | {
+            /** @enum {string} */
+            kind: "worktree_kept";
+            reason: string;
+        } | {
+            call_id: string;
+            /** @enum {string} */
+            kind: "approval_requested";
+            summary: string;
+            tool: string;
+        } | {
+            call_id: string;
+            decision: components["schemas"]["ApprovalDecisionDto"];
+            /** @enum {string} */
+            kind: "approval_resolved";
+        } | {
+            /** @enum {string} */
+            kind: "stage_completed";
+            /** Format: int64 */
+            stage: number;
+        } | {
+            /** @enum {string} */
+            kind: "budget_exhausted";
+            /** Format: int64 */
+            limit_micros: number;
+            /** Format: int64 */
+            spent_micros: number;
+        } | {
+            /** @enum {string} */
+            kind: "budget_restored";
+            /** Format: int64 */
+            limit_micros: number;
+            /** Format: int64 */
+            spent_micros: number;
+        };
+        /** @description One entry on an issue's timeline. */
+        IssueEventDto: {
+            actor: components["schemas"]["ActorDto"];
+            body: components["schemas"]["IssueEventBodyDto"];
+            /** Format: int64 */
+            created_at_ms: number;
+            id: string;
+            /** Format: int64 */
+            number: number;
+        };
+        /** @enum {string} */
+        IssuePriorityDto: "urgent" | "high" | "medium" | "low" | "none";
+        /** @description One execution of an issue. */
+        IssueRunDto: {
+            agent_id: string;
+            /**
+             * Format: int64
+             * @description 1 for an issue's first run, incrementing thereafter — how the
+             *     execution log addresses it.
+             */
+            attempt: number;
+            /** Format: int64 */
+            created_at_ms: number;
+            error?: string | null;
+            /**
+             * Format: int64
+             * @description The issue this ran, by its per-project number.
+             */
+            number: number;
+            /**
+             * @description The session the run executed in. Present once claimed; it is what
+             *     the trace viewer opens.
+             */
+            session_id?: string | null;
+            /** Format: int64 */
+            settled_at_ms?: number | null;
+            /** Format: int64 */
+            started_at_ms?: number | null;
+            status: components["schemas"]["RunStatusDto"];
+            trigger: components["schemas"]["RunTriggerDto"];
+        };
+        /**
+         * @description Which column a card sits in. Entering `in_progress` is what will start
+         *     an agent once execution lands, which is why the set is fixed.
+         * @enum {string}
+         */
+        IssueStatusDto: "backlog" | "todo" | "in_progress" | "review" | "done";
+        /** @description One conversation with a board's lead. */
+        LeadConversationDto: {
+            /** Format: int64 */
+            created_at_ms: number;
+            /** Format: int64 */
+            last_active_ms: number;
+            /**
+             * @description The session id. Everything else — history, live traffic, sending —
+             *     goes through the ordinary chat transport, which scopes by channel
+             *     and is happy to carry a board's session; only the chat *list*
+             *     filters these out, which is the point.
+             */
+            session_id: string;
+            title?: string | null;
         };
         /**
          * @description Envelope for list endpoints. `next_cursor` is opaque — clients
@@ -2256,11 +2849,48 @@ export interface components {
             /** @description New parent id, or `null` to promote the folder to top-level. */
             parent_id?: string | null;
         };
+        /**
+         * @description One drag-and-drop: where the card lands, plus that column's full
+         *     contents in their new order.
+         */
+        MoveIssueRequest: {
+            /**
+             * @description Every issue number in the destination column, in order, including
+             *     the one being moved.
+             */
+            ordered_numbers: number[];
+            status: components["schemas"]["IssueStatusDto"];
+        };
         /** @description Response body for `PUT` / `DELETE /v1/config`. */
         MutateResponse: {
             path: string;
             requires_restart: boolean;
             written_to: string;
+        };
+        /** @description A comment being posted. */
+        NewCommentBody: {
+            text: string;
+        };
+        ProjectDto: {
+            /**
+             * Format: int64
+             * @description Present only while the project sits in the archive.
+             */
+            archived_at_ms?: number | null;
+            /** Format: int64 */
+            created_at_ms: number;
+            /**
+             * Format: int64
+             * @description Daily spend ceiling in micro-USD. Absent means no limit.
+             */
+            daily_budget_micros?: number | null;
+            description: string;
+            id: string;
+            name: string;
+            /** Format: int64 */
+            updated_at_ms: number;
+            /** @description Absolute path to the git repository this project's agents work in. */
+            workdir: string;
         };
         /** @description Response of `GET /v1/push/params`. */
         PushParams: {
@@ -2325,12 +2955,27 @@ export interface components {
             /** @description Parent of the sibling group being reordered (`null` = top-level). */
             parent_id?: string | null;
         };
+        /** @description Request body for resolving an approval from a card. */
+        ResolveApprovalRequest: {
+            decision: components["schemas"]["ApprovalDecisionDto"];
+        };
+        /**
+         * @description Where a run is. `queued` and `running` are the unfinished states — a
+         *     card showing either is a card being worked.
+         * @enum {string}
+         */
+        RunStatusDto: "held" | "queued" | "running" | "done" | "failed" | "cancelled";
+        /**
+         * @description Why a run was started.
+         * @enum {string}
+         */
+        RunTriggerDto: "started" | "assigned" | "retry" | "comment" | "stage_barrier";
         /**
          * @description Wire mirror of [`baybo_query::SessionKind`]. Coarse trigger/lineage
          *     label for the trace browser list view.
          * @enum {string}
          */
-        SessionKind: "user" | "cron" | "subagent";
+        SessionKind: "user" | "cron" | "subagent" | "issue";
         /** @description Request body for `PUT /v1/agents/{agent_id}/avatar`. */
         SetAgentAvatarRequest: {
             /**
@@ -2361,9 +3006,18 @@ export interface components {
             /** @description `baybo.json` LLM entry name, or `null`/absent to follow `default-llm`. */
             llm?: string | null;
         };
-        /** @description Request body for `PUT /v1/agents/{agent_id}/name`. */
+        /**
+         * @description Request body for `PUT /v1/agents/{agent_id}/name`.
+         *
+         *     Rejected for an agent on a project team: the `@handle` its board addresses
+         *     it by was derived from its name when it was hired, so the name is fixed for
+         *     as long as the agent exists.
+         */
         SetAgentNameRequest: {
             name: string;
+        };
+        SetArchivedRequest: {
+            archived: boolean;
         };
         /** @description `PUT /v1/config` body. */
         SetConfigRequest: {
@@ -2466,6 +3120,34 @@ export interface components {
             turns_in_flight: number;
             version: string;
         };
+        /** @description A parent card's progress ring. */
+        SubIssueProgress: {
+            /** Format: int64 */
+            done: number;
+            /** Format: int64 */
+            total: number;
+        };
+        /** @description One member of a project's team. */
+        TeamMemberDto: {
+            avatar_blob_id?: string | null;
+            /** Format: int64 */
+            created_at_ms: number;
+            /** @description One line saying what this agent is for. */
+            description: string;
+            framework: components["schemas"]["AgentFrameworkDto"];
+            /** @description Immutable `@handle` on this board — what a comment mentions. */
+            handle: string;
+            hired_by?: null | components["schemas"]["HiredByDto"];
+            id: string;
+            /** @description The coordinator, which every board has and none may remove. */
+            lead: boolean;
+            llm?: string | null;
+            /**
+             * @description Display name from the agent's own `IDENTITY.md`. Fixed at hire, like
+             *     the handle derived from it.
+             */
+            name: string;
+        };
         /**
          * @description One row of the trace browser list view. Mirrors
          *     [`baybo_query::SessionSummary`] for the wire.
@@ -2526,13 +3208,13 @@ export interface components {
          * @description Wire mirror of [`baybo_turn::TurnInputKind`] — what payload fed the turn.
          * @enum {string}
          */
-        TurnInputKind: "user_chat" | "cron" | "cron_notification" | "compact" | "spawned" | "subagent_notification";
+        TurnInputKind: "user_chat" | "cron" | "cron_notification" | "compact" | "spawned" | "subagent_notification" | "issue_run";
         /**
          * @description Wire mirror of a turn's origin (the owning session's root trigger,
          *     [`baybo_model::TriggerKind`]).
          * @enum {string}
          */
-        TurnOrigin: "user" | "cron" | "spawned";
+        TurnOrigin: "user" | "cron" | "spawned" | "issue";
         /**
          * @description Wire mirror of [`baybo_turn::TurnStatus`]. Carries the same payload
          *     the domain enum carries (cancel reason, partial-artifact span IDs);
@@ -2600,6 +3282,27 @@ export interface components {
             name?: string | null;
         };
         /**
+         * @description Sparse patch: a field the body leaves out is left alone.
+         *     `blocked_reason` is doubly optional — an explicit `null` clears the
+         *     block, an absent key leaves it.
+         */
+        UpdateIssueRequest: {
+            /** @description An explicit `null` unassigns; an absent key leaves the assignee. */
+            assignee?: string | null;
+            blocked_reason?: string | null;
+            cancelled?: boolean | null;
+            description?: string | null;
+            /**
+             * Format: int64
+             * @description Re-parent by number; `0` detaches. Absent leaves the parent alone.
+             */
+            parent?: number | null;
+            priority?: null | components["schemas"]["IssuePriorityDto"];
+            /** Format: int64 */
+            stage?: number | null;
+            title?: string | null;
+        };
+        /**
          * @description `PUT /v1/llm/models/{name}` body. Every field is optional — only
          *     present fields are applied. To clear an override pass an explicit
          *     `null` (handled by including the key in the request JSON; serde
@@ -2632,6 +3335,18 @@ export interface components {
              *     entry's other models are file-edited only.
              */
             supports_vision?: boolean | null;
+        };
+        UpdateProjectRequest: {
+            /**
+             * Format: int64
+             * @description Daily spend ceiling in micro-USD (USD × 10^6). Omit for no limit;
+             *     `0` pauses the board's agents without archiving it. Integer, never a
+             *     float — a budget compared with rounding error is a budget that
+             *     disagrees with the ledger it is measured against.
+             */
+            daily_budget_micros?: number | null;
+            description?: string;
+            name: string;
         };
         /**
          * @description Kind of a reconstructed [`ChatWorkStep`] — serialized as
@@ -3006,7 +3721,7 @@ export interface operations {
                     "application/json": components["schemas"]["AgentIdentityFileDto"];
                 };
             };
-            /** @description Malformed agent id */
+            /** @description Malformed agent id, or a body that renames a project agent — its @handle came from that name */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -3119,7 +3834,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description Malformed agent id or name */
+            /** @description Malformed agent id or name, or a project agent, whose name its @handle was derived from and cannot outlive */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -5801,6 +6516,1424 @@ export interface operations {
             };
             /** @description Persist failed */
             500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_projects: {
+        parameters: {
+            query?: {
+                /** @description Fold the archive back into the listing. */
+                include_archived?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Projects, most recently touched first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        items: {
+                            /**
+                             * Format: int64
+                             * @description Present only while the project sits in the archive.
+                             */
+                            archived_at_ms?: number | null;
+                            /** Format: int64 */
+                            created_at_ms: number;
+                            /**
+                             * Format: int64
+                             * @description Daily spend ceiling in micro-USD. Absent means no limit.
+                             */
+                            daily_budget_micros?: number | null;
+                            description: string;
+                            id: string;
+                            name: string;
+                            /** Format: int64 */
+                            updated_at_ms: number;
+                            /** @description Absolute path to the git repository this project's agents work in. */
+                            workdir: string;
+                        }[];
+                        next_cursor?: string | null;
+                    };
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_project: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateProjectRequest"];
+            };
+        };
+        responses: {
+            /** @description The new project */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectDto"];
+                };
+            };
+            /** @description Blank name, or a workdir that is relative, not a repo, or overlaps the workspace */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    projects_attention: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Boards with work stuck on the operator. Boards with nothing waiting are absent. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        items: {
+                            /** @description Tool calls parked on an approval prompt. */
+                            approvals: number;
+                            /** @description Live cards whose newest run failed. */
+                            failed: number;
+                            /** @description Runs recorded but not started, because the board is over budget. */
+                            held: number;
+                            name: string;
+                            project_id: string;
+                            /** @description Agents' comments and cards arriving in Review since you last looked. */
+                            unread: number;
+                        }[];
+                        next_cursor?: string | null;
+                    };
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_project: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project id */
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The project */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectDto"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unknown project */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    update_project: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project id */
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateProjectRequest"];
+            };
+        };
+        responses: {
+            /** @description The edited project */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectDto"];
+                };
+            };
+            /** @description Blank name */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unknown project */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The project is archived */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_team: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project id */
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description This project's team, by handle */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        items: {
+                            avatar_blob_id?: string | null;
+                            /** Format: int64 */
+                            created_at_ms: number;
+                            /** @description One line saying what this agent is for. */
+                            description: string;
+                            framework: components["schemas"]["AgentFrameworkDto"];
+                            /** @description Immutable `@handle` on this board — what a comment mentions. */
+                            handle: string;
+                            hired_by?: null | components["schemas"]["HiredByDto"];
+                            id: string;
+                            /** @description The coordinator, which every board has and none may remove. */
+                            lead: boolean;
+                            llm?: string | null;
+                            /**
+                             * @description Display name from the agent's own `IDENTITY.md`. Fixed at hire, like
+                             *     the handle derived from it.
+                             */
+                            name: string;
+                        }[];
+                        next_cursor?: string | null;
+                    };
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unknown project */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    hire_agent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project id */
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["HireAgentRequest"];
+            };
+        };
+        responses: {
+            /** @description The new teammate */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TeamMemberDto"];
+                };
+            };
+            /** @description Unusable name, missing role, full team, or unknown LLM entry */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unknown project */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The project is archived */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    remove_agent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project id */
+                project_id: string;
+                /** @description Agent profile id */
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The agent left the team; its past work still names it */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Not on this team, the lead, or an agent with a run in flight */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unknown project */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The project is archived */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_project_archived: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project id */
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetArchivedRequest"];
+            };
+        };
+        responses: {
+            /** @description The project, archived or restored */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectDto"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unknown project */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    project_feed: {
+        parameters: {
+            query?: {
+                /** @description Page backwards from this instant (ms). Omit for the newest. */
+                before_ms?: number | null;
+                /** @description How many entries. Clamped by the server. */
+                limit?: number | null;
+            };
+            header?: never;
+            path: {
+                /** @description Project id */
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description This project's activity, newest first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        items: {
+                            actor: components["schemas"]["ActorDto"];
+                            body: components["schemas"]["IssueEventBodyDto"];
+                            /** Format: int64 */
+                            created_at_ms: number;
+                            id: string;
+                            /** Format: int64 */
+                            number: number;
+                        }[];
+                        next_cursor?: string | null;
+                    };
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unknown project */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_issues: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project id */
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The whole board, column by column, in order */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        items: {
+                            /** @description The agent on it, if any. In Progress always has one. */
+                            assignee?: string | null;
+                            /**
+                             * @description Why work stopped. A badge on the card — blocked work stays in
+                             *     whichever column it was in.
+                             */
+                            blocked_reason?: string | null;
+                            /**
+                             * @description The branch this issue's work landed on. Absent until it has a
+                             *     commit, so a research issue never shows one.
+                             */
+                            branch?: string | null;
+                            /**
+                             * Format: int64
+                             * @description Present once the issue is cancelled. The row is never deleted.
+                             */
+                            cancelled_at_ms?: number | null;
+                            /** Format: int64 */
+                            created_at_ms: number;
+                            description: string;
+                            /**
+                             * Format: int64
+                             * @description The human address, unique within its project: `#3`.
+                             */
+                            number: number;
+                            /**
+                             * Format: int64
+                             * @description The issue this one is a step of, by its number on this board.
+                             *     Absent on a top-level card.
+                             */
+                            parent?: number | null;
+                            /**
+                             * Format: int64
+                             * @description Rank within the column, dense and ascending.
+                             */
+                            position: number;
+                            priority: components["schemas"]["IssuePriorityDto"];
+                            project_id: string;
+                            /**
+                             * Format: int64
+                             * @description Which barrier under that parent. `0` and meaningless without one.
+                             */
+                            stage: number;
+                            status: components["schemas"]["IssueStatusDto"];
+                            sub_issues?: null | components["schemas"]["SubIssueProgress"];
+                            title: string;
+                            /** Format: int64 */
+                            updated_at_ms: number;
+                        }[];
+                        next_cursor?: string | null;
+                    };
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unknown project */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_issue: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project id */
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateIssueRequest"];
+            };
+        };
+        responses: {
+            /** @description The new issue, numbered and placed */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IssueDto"];
+                };
+            };
+            /** @description Blank title */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unknown project */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The project is archived */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_issue: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project id */
+                project_id: string;
+                /** @description Issue number within the project */
+                number: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The issue */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IssueDto"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unknown project or issue */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    update_issue: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project id */
+                project_id: string;
+                /** @description Issue number within the project */
+                number: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateIssueRequest"];
+            };
+        };
+        responses: {
+            /** @description The edited issue; omitted fields are unchanged */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IssueDto"];
+                };
+            };
+            /** @description Blank title, or a body that sets no field */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unknown project or issue */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The project is archived */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    resolve_approval: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project id */
+                project_id: string;
+                /** @description Issue number within the project */
+                number: number;
+                /** @description The approval's call id, from its timeline entry */
+                call_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResolveApprovalRequest"];
+            };
+        };
+        responses: {
+            /** @description The prompt was answered */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unknown project or issue, or this card has no prompt waiting on that call */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_comment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project id */
+                project_id: string;
+                /** @description Issue number within the project */
+                number: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewCommentBody"];
+            };
+        };
+        responses: {
+            /** @description The recorded comment */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IssueEventDto"];
+                };
+            };
+            /** @description Empty comment */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unknown project or issue */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_issue_events: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project id */
+                project_id: string;
+                /** @description Issue number within the project */
+                number: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description This issue's timeline, oldest first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        items: {
+                            actor: components["schemas"]["ActorDto"];
+                            body: components["schemas"]["IssueEventBodyDto"];
+                            /** Format: int64 */
+                            created_at_ms: number;
+                            id: string;
+                            /** Format: int64 */
+                            number: number;
+                        }[];
+                        next_cursor?: string | null;
+                    };
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unknown project or issue */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    move_issue: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project id */
+                project_id: string;
+                /** @description Issue number within the project */
+                number: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MoveIssueRequest"];
+            };
+        };
+        responses: {
+            /** @description The moved issue, in its new column and place */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IssueDto"];
+                };
+            };
+            /** @description The destination's contents don't include the moved issue */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unknown project or issue */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The project is archived */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_issue_runs: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project id */
+                project_id: string;
+                /** @description Issue number within the project */
+                number: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Every run of this issue, newest first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        items: {
+                            agent_id: string;
+                            /**
+                             * Format: int64
+                             * @description 1 for an issue's first run, incrementing thereafter — how the
+                             *     execution log addresses it.
+                             */
+                            attempt: number;
+                            /** Format: int64 */
+                            created_at_ms: number;
+                            error?: string | null;
+                            /**
+                             * Format: int64
+                             * @description The issue this ran, by its per-project number.
+                             */
+                            number: number;
+                            /**
+                             * @description The session the run executed in. Present once claimed; it is what
+                             *     the trace viewer opens.
+                             */
+                            session_id?: string | null;
+                            /** Format: int64 */
+                            settled_at_ms?: number | null;
+                            /** Format: int64 */
+                            started_at_ms?: number | null;
+                            status: components["schemas"]["RunStatusDto"];
+                            trigger: components["schemas"]["RunTriggerDto"];
+                        }[];
+                        next_cursor?: string | null;
+                    };
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unknown project or issue */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    cancel_run: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project id */
+                project_id: string;
+                /** @description Issue number within the project */
+                number: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The run is stopping, or was never started and is now cancelled */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Nothing is running on this issue */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unknown project or issue */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    retry_run: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project id */
+                project_id: string;
+                /** @description Issue number within the project */
+                number: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The new run */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IssueRunDto"];
+                };
+            };
+            /** @description The issue has nobody on it, or the board has finished with it: a cancelled card has to be reopened and a done one moved back before it runs again */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unknown project or issue */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description A run is already in flight, or the project is archived */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_lead_conversations: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project id */
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description This board's conversations with its lead, most recently active first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        items: {
+                            /** Format: int64 */
+                            created_at_ms: number;
+                            /** Format: int64 */
+                            last_active_ms: number;
+                            /**
+                             * @description The session id. Everything else — history, live traffic, sending —
+                             *     goes through the ordinary chat transport, which scopes by channel
+                             *     and is happy to carry a board's session; only the chat *list*
+                             *     filters these out, which is the point.
+                             */
+                            session_id: string;
+                            title?: string | null;
+                        }[];
+                        next_cursor?: string | null;
+                    };
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unknown project */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    open_lead_conversation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project id */
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A fresh conversation with the lead */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LeadConversationDto"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unknown project, or it has no lead */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The project is archived */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    mark_project_read: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project id */
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Noted; the board's unread count resets */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unknown project */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_active_runs: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project id */
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The board's unfinished runs — which cards are working */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        items: {
+                            agent_id: string;
+                            /**
+                             * Format: int64
+                             * @description 1 for an issue's first run, incrementing thereafter — how the
+                             *     execution log addresses it.
+                             */
+                            attempt: number;
+                            /** Format: int64 */
+                            created_at_ms: number;
+                            error?: string | null;
+                            /**
+                             * Format: int64
+                             * @description The issue this ran, by its per-project number.
+                             */
+                            number: number;
+                            /**
+                             * @description The session the run executed in. Present once claimed; it is what
+                             *     the trace viewer opens.
+                             */
+                            session_id?: string | null;
+                            /** Format: int64 */
+                            settled_at_ms?: number | null;
+                            /** Format: int64 */
+                            started_at_ms?: number | null;
+                            status: components["schemas"]["RunStatusDto"];
+                            trigger: components["schemas"]["RunTriggerDto"];
+                        }[];
+                        next_cursor?: string | null;
+                    };
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unknown project */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

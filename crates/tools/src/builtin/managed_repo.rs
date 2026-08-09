@@ -3,16 +3,19 @@
 //!
 //! Two tiers, both inside the one `personas/` repo:
 //!
-//! - **Identity files** — `personas/<agent_id>/{SOUL,IDENTITY,USER}.md`. A
+//! - **Identity files** — an agent's `{SOUL,IDENTITY,USER}.md`, either in the
+//!   flat global/legacy layout or under `personas/project/<agent_id>/`. A
 //!   closed allowlist: a persona directory is a declarative slot store.
-//! - **Memory files** — anything under `personas/<agent_id>/memory/`. No
-//!   filename allowlist: a memory tree is a freeform set of markdown files
-//!   the agent names as it likes.
+//! - **Memory files** — anything under that agent's `memory/`. No filename
+//!   allowlist: a memory tree is a freeform set of markdown files the agent
+//!   names as it likes.
 //!
 //! Both share three guards: the approval bypass (the audit commit is the
 //! accountability, not a per-write prompt), a size cap, and a commit into
 //! `personas/` with a fixed `Baybo <baybo@local>` author so any write is
-//! reviewable and revertible with plain `git`. `--no-verify` is intentional
+//! reviewable and revertible with plain `git`. A fourth applies to
+//! `IDENTITY.md` alone — its `Name:` line — and rides in
+//! [`write_managed_file`], the one function that puts bytes in this tree. `--no-verify` is intentional
 //! — this is Baybo-managed audit history, not a hand-curated repo with
 //! authored hooks. A commit failure never undoes the mutation; it surfaces
 //! as a warning line in the tool output.
@@ -26,7 +29,7 @@ use std::path::{Path, PathBuf};
 
 use baybo_model::AgentProfileId;
 use baybo_workspace::paths::{
-    PERSONA_MEMORY_DIR, PERSONAS_DIR, PersonaPath, SHARED_USER_FILE, SKILLS_DIR,
+    IdentityKind, PERSONA_MEMORY_DIR, PERSONAS_DIR, PersonaPath, SHARED_USER_FILE, SKILLS_DIR,
     classify_persona_path, escapes_upward, has_git_component,
 };
 use baybo_workspace::{WorkspacePaths, absolutise};
@@ -48,8 +51,14 @@ pub(crate) const MAX_MANAGED_FILE_BYTES: u64 = 1 << 20;
 /// An audited write, resolved to the path to stage inside `personas/`.
 pub(crate) struct ManagedTarget {
     /// Repo-relative, so `git add --` stages exactly this file:
-    /// `<agent_id>/SOUL.md`, `<agent_id>/memory/fact.md`.
+    /// `<agent_id>/SOUL.md`, `project/<agent_id>/memory/fact.md`.
     pub(crate) rel_path: String,
+    /// Whether this is the agent's own `IDENTITY.md` — the one managed file
+    /// with a rule about what may change *inside* it, and the reason writers
+    /// have to tell it apart from a memory file that merely happens to be
+    /// called `IDENTITY.md`. Resolved from the classified shape rather than
+    /// from [`Self::rel_path`], which a suffix test cannot separate.
+    pub(crate) self_image: bool,
 }
 
 /// What a commit records about a file.
@@ -116,8 +125,8 @@ impl ManagedRoots {
         }
     }
 
-    /// Whether `file_path` looks like an identity file: the shared
-    /// `personas/USER.md`, or `personas/<any agent>/<IDENTITY>.md`.
+    /// Whether `file_path` looks like the shared `personas/USER.md` or an
+    /// identity file in either persona layout.
     fn is_identity_shape(&self, file_path: &Path) -> bool {
         matches!(
             self.shape(file_path),
@@ -125,7 +134,7 @@ impl ManagedRoots {
         )
     }
 
-    /// Whether `file_path` looks like `personas/<any agent>/memory/<file>`.
+    /// Whether `file_path` looks like a memory file in either persona layout.
     pub(crate) fn is_memory_shape(&self, file_path: &Path) -> bool {
         matches!(self.shape(file_path), PersonaPath::Memory { .. })
     }
@@ -195,8 +204,8 @@ impl ManagedRoots {
         self.identity_target(file_path, agent)
     }
 
-    /// Resolve `personas/<agent_id>/{SOUL,IDENTITY,USER}.md` for the calling
-    /// agent, rejecting a path under `personas/` that is not one of its own.
+    /// Resolve the calling agent's `{SOUL,IDENTITY,USER}.md` in either persona
+    /// layout, rejecting a path under `personas/` that is not one of its own.
     /// `None` when the path is outside `personas/` altogether.
     pub(crate) fn identity_target(
         &self,
@@ -206,11 +215,12 @@ impl ManagedRoots {
         if !file_path.starts_with(&self.personas_dir) {
             return Ok(None);
         }
+        let shape = self.shape(file_path);
         // The shared human profile belongs to no agent, so every agent may
         // write it: what one of them learns about the person is worth the
         // others knowing. That does make it a channel between agents — the
         // one place the per-agent partition deliberately does not hold.
-        let allowed = match self.shape(file_path) {
+        let allowed = match shape {
             PersonaPath::SharedUser => true,
             PersonaPath::Identity { agent_id, .. } => agent_id == agent.as_str(),
             PersonaPath::Memory { .. } | PersonaPath::Other => false,
@@ -228,11 +238,18 @@ impl ManagedRoots {
         reject_symlinked_path(file_path, &self.personas_dir)?;
         Ok(Some(ManagedTarget {
             rel_path: self.pathspec(file_path).ok_or_else(unnameable)?,
+            self_image: matches!(
+                shape,
+                PersonaPath::Identity {
+                    kind: IdentityKind::Identity,
+                    ..
+                }
+            ),
         }))
     }
 
-    /// Resolve a file under the calling agent's own memory tree,
-    /// `personas/<agent_id>/memory/…`.
+    /// Resolve a file under the calling agent's own memory tree in either
+    /// persona layout.
     ///
     /// Location-keyed with no filename allowlist — which is exactly why the
     /// guards in [`Self::locate`] and [`reject_symlinked_path`] carry the
@@ -254,7 +271,59 @@ impl ManagedRoots {
         reject_symlinked_path(file_path, &self.personas_dir)?;
         Ok(Some(ManagedTarget {
             rel_path: self.pathspec(file_path).ok_or_else(unnameable)?,
+            // A memory file may be called anything, `IDENTITY.md` included —
+            // it is still a memory, and the naming rule has no business in it.
+            self_image: false,
         }))
+    }
+}
+
+/// Put `content` in an audited file, after whatever governs its contents has
+/// passed.
+///
+/// **The** write path for this tier, and the reason is that the alternative
+/// does not hold: a rule each tool remembers to ask about before its own
+/// `fs::write` is one the next tool to reach `personas/` will not ask about,
+/// and nothing will say so. Here, the check is not something a caller does
+/// first — it is something the write does. A tool that skips it is a tool
+/// that has left the tier entirely, losing the approval bypass and the audit
+/// commit with it, which is not a thing anybody does by accident.
+pub(crate) async fn write_managed_file(
+    target: &ManagedTarget,
+    agent: &AgentProfileId,
+    path: &Path,
+    content: &str,
+) -> ToolResult<()> {
+    if target.self_image {
+        // The naming rules are about the *change*, so they need what is being
+        // replaced. Read here rather than taking it as an argument: `Write`
+        // has no reason to hold the old bytes, and an argument is one more
+        // thing a caller can get wrong.
+        let before = tokio::fs::read_to_string(path).await.unwrap_or_default();
+        reject_disallowed_name_change(agent, &before, content)?;
+    }
+    tokio::fs::write(path, content)
+        .await
+        .map_err(|e| ToolError::Execution(format!("write {}: {e}", path.display())))
+}
+
+/// Refuse a write to an agent's own `IDENTITY.md` that the naming rules do
+/// not allow: renaming an agent whose name is fixed, and — the half that is
+/// the tool doors' alone — leaving the file with no `Name:` line at all.
+///
+/// Private to [`write_managed_file`], which is what makes it unskippable.
+/// The rules themselves live in `baybo-workspace` beside the name parsing,
+/// since the gateway's two rename endpoints are doors onto the same line.
+fn reject_disallowed_name_change(
+    agent: &AgentProfileId,
+    before: &str,
+    after: &str,
+) -> ToolResult<()> {
+    let refusal = baybo_workspace::rejected_rename(agent.as_str(), before, after)
+        .or_else(|| baybo_workspace::rejected_name_removal(before, after));
+    match refusal {
+        Some(reason) => Err(ToolError::InvalidParams(reason)),
+        None => Ok(()),
     }
 }
 
@@ -486,6 +555,35 @@ mod tests {
             .expect("resolve")
             .expect("is a memory target");
         assert_eq!(target.rel_path, "baybo/memory/anything-at-all.md");
+    }
+
+    #[test]
+    fn a_project_agent_can_write_its_nested_identity_and_memory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let r = roots(tmp.path());
+        let paths = WorkspacePaths::new(tmp.path().to_path_buf());
+        let project = paths.project_persona_dir("project-01JLEAD");
+        std::fs::create_dir_all(project.join(baybo_workspace::paths::PERSONA_MEMORY_DIR))
+            .expect("project persona");
+        let me = agent("project-01JLEAD");
+
+        let identity = paths.persona_identity_file("project-01JLEAD", IdentityKind::Soul);
+        let target = r
+            .identity_target(&identity, &me)
+            .expect("resolve")
+            .expect("identity target");
+        assert_eq!(target.rel_path, "project/project-01JLEAD/SOUL.md");
+
+        let memory = paths.persona_memory_dir("project-01JLEAD").join("fact.md");
+        let target = r
+            .memory_target(&memory, &me)
+            .expect("resolve")
+            .expect("memory target");
+        assert_eq!(target.rel_path, "project/project-01JLEAD/memory/fact.md");
+        assert!(
+            r.memory_target(&memory, &agent("project-01JOTHER"))
+                .is_err()
+        );
     }
 
     #[test]

@@ -97,6 +97,13 @@ impl std::fmt::Display for ChannelType {
 /// not "who literally constructed this session row".
 ///
 /// Closed strong-typed enum. Extend by adding variants, never by string.
+/// Every accessor below — and [`Session::can_host_background_jobs`], which
+/// reads the trigger too — matches exhaustively rather than through a
+/// catch-all or a `matches!`, so adding a variant fails the build until
+/// each one says what the new trigger answers. `matches!` is not
+/// exhaustiveness-checked, which is the whole reason none is used here:
+/// under one a new board-shaped variant would silently inherit "not a
+/// project session" and be listed, pushed and dreamed on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TriggerSource {
@@ -129,6 +136,24 @@ pub enum TriggerSource {
         /// before it existed; those group only while their turn is alive.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         job_title: Option<String>,
+        /// The board this fire files work on, snapshotted from the job.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_id: Option<crate::ProjectId>,
+    },
+    /// The lead's planning conversation for one board.
+    Project {
+        project_id: crate::ProjectId,
+    },
+    /// The session an issue's work happens in. One per **agent that works
+    /// the issue**, reused by every run of that agent on it — so a
+    /// follow-up sees what the same agent did last time — and never listed
+    /// in the chat surface: a board's conversations live on the board.
+    Issue {
+        project_id: crate::ProjectId,
+        issue_id: crate::IssueId,
+        /// The issue's human address, so a reader does not need a join to
+        /// say which card this belongs to.
+        number: i64,
     },
 }
 
@@ -138,14 +163,53 @@ impl TriggerSource {
         match self {
             TriggerSource::User => TriggerKind::User,
             TriggerSource::Cron { .. } => TriggerKind::Cron,
+            TriggerSource::Project { .. } | TriggerSource::Issue { .. } => TriggerKind::Issue,
         }
     }
 
-    /// The cron job this session fired for, or `None` for a user session.
+    /// The board this session belongs to, if it belongs to one.
+    pub fn project(&self) -> Option<&crate::ProjectId> {
+        match self {
+            TriggerSource::Project { project_id } | TriggerSource::Issue { project_id, .. } => {
+                Some(project_id)
+            }
+            TriggerSource::Cron { project_id, .. } => project_id.as_ref(),
+            TriggerSource::User => None,
+        }
+    }
+
+    /// The cron job this session fired for, or `None` for any session no
+    /// cron job started.
     pub fn cron_job_id(&self) -> Option<&str> {
         match self {
-            TriggerSource::User => None,
             TriggerSource::Cron { cron_job_id, .. } => Some(cron_job_id),
+            TriggerSource::User | TriggerSource::Project { .. } | TriggerSource::Issue { .. } => {
+                None
+            }
+        }
+    }
+
+    /// The issue this session works on, if it is an issue session.
+    pub fn issue(&self) -> Option<(&crate::ProjectId, &crate::IssueId, i64)> {
+        match self {
+            TriggerSource::Issue {
+                project_id,
+                issue_id,
+                number,
+            } => Some((project_id, issue_id, *number)),
+            TriggerSource::User | TriggerSource::Cron { .. } | TriggerSource::Project { .. } => {
+                None
+            }
+        }
+    }
+
+    /// Whether this session belongs to a project board. Such sessions are
+    /// never listed in the chat surface, never pushed, and never fed to the
+    /// dream pass: their conversation belongs to an issue.
+    pub fn is_project_session(&self) -> bool {
+        match self {
+            TriggerSource::Project { .. } | TriggerSource::Issue { .. } => true,
+            TriggerSource::User | TriggerSource::Cron { .. } => false,
         }
     }
 
@@ -154,10 +218,12 @@ impl TriggerSource {
     /// fire) and as the delivery target of a one-shot fire's result.
     pub fn cron_origin_session_id(&self) -> Option<&SessionId> {
         match self {
-            TriggerSource::User => None,
             TriggerSource::Cron {
                 origin_session_id, ..
             } => origin_session_id.as_ref(),
+            TriggerSource::User | TriggerSource::Project { .. } | TriggerSource::Issue { .. } => {
+                None
+            }
         }
     }
 
@@ -165,7 +231,12 @@ impl TriggerSource {
     /// (recurring fires). Chat-list filtering and the push allowlist key off
     /// this: a cron session that is *not* a conversation stays invisible.
     pub fn is_cron_conversation(&self) -> bool {
-        matches!(self, TriggerSource::Cron { conversation, .. } if *conversation)
+        match self {
+            TriggerSource::Cron { conversation, .. } => *conversation,
+            TriggerSource::User | TriggerSource::Project { .. } | TriggerSource::Issue { .. } => {
+                false
+            }
+        }
     }
 
     /// The job's title as it stood when this fire was minted — the fallback
@@ -173,8 +244,10 @@ impl TriggerSource {
     /// job's live title when the job still exists.
     pub fn cron_job_title(&self) -> Option<&str> {
         match self {
-            TriggerSource::User => None,
             TriggerSource::Cron { job_title, .. } => job_title.as_deref(),
+            TriggerSource::User | TriggerSource::Project { .. } | TriggerSource::Issue { .. } => {
+                None
+            }
         }
     }
 }
@@ -190,6 +263,8 @@ pub enum TriggerKind {
     User,
     Cron,
     Spawned,
+    /// Work on a project board. See docs/todo/kanban.md.
+    Issue,
 }
 /// Direct parent relationship for sessions spawned from another session.
 ///
@@ -318,7 +393,12 @@ impl Session {
     /// complete by the time it notifies. See
     /// `agent::runtime::background_jobs::background_eligible`.
     pub fn can_host_background_jobs(&self) -> bool {
-        (matches!(self.trigger, TriggerSource::User) || self.trigger.is_cron_conversation())
+        let hostable = match &self.trigger {
+            TriggerSource::User => true,
+            TriggerSource::Cron { .. } => self.trigger.is_cron_conversation(),
+            TriggerSource::Project { .. } | TriggerSource::Issue { .. } => false,
+        };
+        hostable
             && match &self.lineage {
                 None => true,
                 Some(l) => !matches!(l.kind, LineageKind::Subagent),
@@ -881,6 +961,7 @@ mod tests {
             origin_session_id: Some(SessionId::from("sess-origin")),
             conversation: true,
             job_title: Some("Morning brief".into()),
+            project_id: None,
         };
         let s = serde_json::to_string(&t).unwrap();
         let back: TriggerSource = serde_json::from_str(&s).unwrap();
@@ -921,10 +1002,55 @@ mod tests {
             origin_session_id: None,
             conversation: true,
             job_title: Some("每日晨报".into()),
+            project_id: None,
         };
         let back: TriggerSource =
             serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
         assert_eq!(back.cron_job_title(), Some("每日晨报"));
+    }
+
+    #[test]
+    fn every_accessor_answers_for_every_trigger() {
+        let project_id = crate::ProjectId::generate();
+        let cron = TriggerSource::Cron {
+            cron_job_id: "cron-1".into(),
+            origin_session_id: None,
+            conversation: false,
+            job_title: None,
+            project_id: Some(project_id.clone()),
+        };
+        assert_eq!(cron.project(), Some(&project_id));
+        assert!(!cron.is_project_session());
+        assert!(!TriggerSource::User.is_project_session());
+        assert!(TriggerSource::User.project().is_none());
+        assert!(TriggerSource::User.issue().is_none());
+        assert!(!TriggerSource::User.is_cron_conversation());
+        assert_eq!(TriggerSource::User.kind(), TriggerKind::User);
+    }
+
+    #[test]
+    fn board_triggers_answer_none_to_every_cron_question() {
+        let project_id = crate::ProjectId::generate();
+        let issue = TriggerSource::Issue {
+            project_id: project_id.clone(),
+            issue_id: crate::IssueId::from("issue-1"),
+            number: 7,
+        };
+        let planning = TriggerSource::Project {
+            project_id: project_id.clone(),
+        };
+
+        for trigger in [&issue, &planning] {
+            assert!(trigger.cron_job_id().is_none());
+            assert!(trigger.cron_origin_session_id().is_none());
+            assert!(trigger.cron_job_title().is_none());
+            assert!(!trigger.is_cron_conversation());
+            assert_eq!(trigger.project(), Some(&project_id));
+            assert!(trigger.is_project_session());
+        }
+
+        assert_eq!(issue.issue().map(|(_, _, number)| number), Some(7));
+        assert!(planning.issue().is_none());
     }
 
     #[test]

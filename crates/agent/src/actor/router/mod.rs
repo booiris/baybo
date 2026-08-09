@@ -14,6 +14,7 @@
 //! `spawn_subagent` tool calls directly.
 
 mod cron;
+mod issue;
 mod output;
 mod user_input;
 
@@ -25,6 +26,7 @@ use std::time::Instant;
 use baybo_channels::{AgentOutput, ChannelRegistry, RouterInbound};
 use baybo_cron::CronTriggerEvent;
 use baybo_model::{LlmEntryName, Session};
+use baybo_project::IssueRunEvent;
 use baybo_store::agent_profile::AgentProfileStore;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -247,6 +249,14 @@ pub struct Router {
     /// `self` to drive in a `select!` arm; populated unconditionally from
     /// `RouterConfig` at construction.
     cron_trigger_rx: Option<mpsc::Receiver<CronTriggerEvent>>,
+    /// Recorded issue runs waiting to execute. Same `Option<Receiver>`
+    /// shape and reason as `cron_trigger_rx`.
+    issue_run_rx: Option<mpsc::Receiver<IssueRunEvent>>,
+    /// The board a run belongs to. The manager and nothing under it: this
+    /// crate reports how a run went and the board decides what that costs
+    /// the card. `None` in assemblies with no board (the TUI's embedded
+    /// runtime), which also have no `issue_run_rx`.
+    board: Option<Arc<baybo_project::ProjectManager>>,
     /// Cancellation parent passed to every top-level actor the router
     /// spawns. Bridged to the process-wide `ShutdownSignal` upstream;
     /// each actor derives its `actor_token` as a child of this so
@@ -275,6 +285,11 @@ pub struct RouterConfig {
     /// [`resolve_spawn_pins`].
     pub agent_profiles: Arc<dyn AgentProfileStore>,
     pub cron_trigger_rx: mpsc::Receiver<CronTriggerEvent>,
+    /// Recorded issue runs waiting to execute. `None` in an assembly with
+    /// no board.
+    pub issue_run_rx: Option<mpsc::Receiver<IssueRunEvent>>,
+    /// See [`Router::board`]. `None` in an assembly with no board.
+    pub board: Option<Arc<baybo_project::ProjectManager>>,
     /// Cancellation parent passed to every top-level actor the router
     /// spawns. Bridged to the process-wide `ShutdownSignal` upstream.
     pub actor_parent_token: CancellationToken,
@@ -300,6 +315,8 @@ impl Router {
             cron_store,
             agent_profiles,
             cron_trigger_rx,
+            issue_run_rx,
+            board,
             actor_parent_token,
             rate_limit,
             workspace,
@@ -316,6 +333,8 @@ impl Router {
             cron_store,
             agent_profiles,
             cron_trigger_rx: Some(cron_trigger_rx),
+            issue_run_rx,
+            board,
             actor_parent_token,
             workspace,
         }
@@ -336,6 +355,7 @@ impl Router {
         self.redrive_cron_deliveries().await;
 
         let mut cron_rx = self.cron_trigger_rx.take();
+        let mut issue_rx = self.issue_run_rx.take();
 
         loop {
             tokio::select! {
@@ -365,6 +385,14 @@ impl Router {
                     if let Err(e) = self.handle_cron_trigger(event).await {
                         error!(error = %e, "failed to handle cron trigger");
                     }
+                }
+                Some(event) = async {
+                    match issue_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.handle_issue_run(event).await;
                 }
                 else => {
                     info!("router channels closed, shutting down");

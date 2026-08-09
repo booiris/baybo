@@ -1,0 +1,106 @@
+//! What a project may spend, and what happens when it has spent it.
+
+use baybo_model::MicroUsd;
+use chrono::{DateTime, Utc};
+
+/// Whether a board can start more work right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Headroom {
+    /// No ceiling is set. The default, and the only state in which the
+    /// gate costs nothing — no spend query runs.
+    Unlimited,
+    Available {
+        spent: MicroUsd,
+        limit: MicroUsd,
+    },
+    Exhausted {
+        spent: MicroUsd,
+        limit: MicroUsd,
+    },
+}
+
+impl Headroom {
+    pub(crate) fn is_exhausted(self) -> bool {
+        matches!(self, Headroom::Exhausted { .. })
+    }
+
+    /// `(spent, limit)` in micro-USD, for the timeline entry. `None` when
+    /// there is no ceiling to report against.
+    pub(crate) fn figures(self) -> Option<(i64, i64)> {
+        match self {
+            Headroom::Unlimited => None,
+            Headroom::Available { spent, limit } | Headroom::Exhausted { spent, limit } => {
+                Some((spent.into_micros(), limit.into_micros()))
+            }
+        }
+    }
+}
+
+/// Decide against a limit and a day's spend.
+pub(crate) fn headroom(limit: Option<MicroUsd>, spent: MicroUsd) -> Headroom {
+    let Some(limit) = limit else {
+        return Headroom::Unlimited;
+    };
+    if spent.into_micros() >= limit.into_micros() {
+        Headroom::Exhausted { spent, limit }
+    } else {
+        Headroom::Available { spent, limit }
+    }
+}
+
+/// The start of the UTC day containing `now` — the window a daily budget
+/// measures.
+pub(crate) fn day_start(now: DateTime<Utc>) -> DateTime<Utc> {
+    now.date_naive()
+        .and_hms_opt(0, 0, 0)
+        // `00:00:00` is valid for every date, so this cannot fire; falling
+        // back to `now` would make the window empty rather than panicking.
+        .map_or(now, |naive| naive.and_utc())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn usd(micros: i64) -> MicroUsd {
+        MicroUsd::from_micros(micros)
+    }
+
+    #[test]
+    fn no_limit_never_gates_and_reports_no_figures() {
+        let h = headroom(None, usd(999_999_999));
+        assert_eq!(h, Headroom::Unlimited);
+        assert!(!h.is_exhausted());
+        assert_eq!(h.figures(), None);
+    }
+
+    #[test]
+    fn the_boundary_is_closed_against_starting_more_work() {
+        assert!(headroom(Some(usd(100)), usd(100)).is_exhausted());
+        assert!(headroom(Some(usd(100)), usd(101)).is_exhausted());
+        assert!(!headroom(Some(usd(100)), usd(99)).is_exhausted());
+    }
+
+    #[test]
+    fn a_zero_budget_stops_everything() {
+        assert!(headroom(Some(MicroUsd::ZERO), MicroUsd::ZERO).is_exhausted());
+    }
+
+    #[test]
+    fn figures_survive_for_the_timeline() {
+        assert_eq!(
+            headroom(Some(usd(100)), usd(120)).figures(),
+            Some((120, 100))
+        );
+        assert_eq!(headroom(Some(usd(100)), usd(20)).figures(), Some((20, 100)));
+    }
+
+    #[test]
+    fn the_window_is_the_utc_day() {
+        let now = DateTime::parse_from_rfc3339("2026-08-05T23:59:59Z")
+            .expect("rfc3339")
+            .with_timezone(&Utc);
+        assert_eq!(day_start(now).to_rfc3339(), "2026-08-05T00:00:00+00:00");
+        assert_eq!(day_start(day_start(now)), day_start(now));
+    }
+}

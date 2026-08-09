@@ -19,6 +19,7 @@ pub mod deck;
 pub mod device;
 pub mod error;
 pub mod message_search;
+pub mod project;
 pub mod secret;
 pub mod session;
 pub mod session_folder;
@@ -40,6 +41,10 @@ pub use deck::{DeckCardRow, DeckCardStore, DeckLayoutEntry, DeckSize, DeckSnapsh
 pub use device::{DeviceRow, DeviceStatus, DeviceStore};
 pub use error::StorageError;
 pub use message_search::{MessageSearchStore, SearchHit, SearchScope};
+pub use project::{
+    IssuePriority, IssueRow, IssueRunRow, IssueStatus, IssueUpdate, NewIssue, NewIssueRun,
+    ProjectRow, ProjectStore, ProjectUpdate, RunStatus, RunTrigger,
+};
 pub use secret::{SecretStore, StoreIdentity};
 pub use session::{DreamCandidate, SessionMessageAppendOutcome, SessionStore, StoredMessage};
 pub use session_folder::{SessionFolderRow, SessionFolderStore};

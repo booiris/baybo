@@ -12,6 +12,9 @@ import { AnalyticsPage } from './pages/AnalyticsPage';
 import { AgentsPage } from './pages/AgentsPage';
 import { LlmPage } from './pages/LlmPage';
 import { ChatPage } from './pages/ChatPage';
+import { ProjectsIndex } from './pages/projects/ProjectsIndex';
+import { ProjectBoardPage } from './pages/projects/ProjectBoardPage';
+import { IssueDetailPage } from './pages/projects/IssueDetailPage';
 import { useAuth } from './api/auth';
 
 export default function App() {
@@ -73,6 +76,9 @@ export default function App() {
           <Route path="/" element={<Navigate to="/chat" replace />} />
           <Route path="/chat" element={<ChatPage />} />
           <Route path="/chat/:sessionId" element={<ChatPage />} />
+          <Route path="/projects" element={<ProjectsIndex />} />
+          <Route path="/projects/:pid" element={<ProjectBoardPage />} />
+          <Route path="/projects/:pid/issues/:num" element={<IssueDetailPage />} />
           <Route path="/logs" element={<LogsPage />} />
           <Route path="/traces" element={<TracesPage />} />
           <Route path="/traces/:id" element={<TraceSessionPage />} />

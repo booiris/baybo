@@ -430,6 +430,7 @@ mod tests {
             origin_session_id: None,
             conversation,
             job_title: None,
+            project_id: None,
         };
 
         // A recurring fire (its own conversation) sees it; an ordinary session
@@ -437,5 +438,68 @@ mod tests {
         assert!(has(&cron(true)));
         assert!(!has(&TriggerSource::User));
         assert!(!has(&cron(false)));
+    }
+
+    #[test]
+    fn trigger_scope_shows_board_tools_only_to_a_project_session() {
+        use crate::{Tool, ToolContext, ToolOutput, ToolTriggerScope};
+        use baybo_model::TriggerSource;
+
+        struct BoardOnly;
+        #[async_trait::async_trait]
+        impl Tool for BoardOnly {
+            fn name(&self) -> &str {
+                "IssueList"
+            }
+            fn description(&self) -> String {
+                "x".into()
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            fn trigger_scope(&self) -> ToolTriggerScope {
+                ToolTriggerScope::ProjectBoard
+            }
+            async fn execute(
+                &self,
+                _p: serde_json::Value,
+                _c: &ToolContext,
+            ) -> crate::Result<ToolOutput> {
+                Ok(ToolOutput::Text(String::new()))
+            }
+        }
+
+        let mut registry = default_registry();
+        registry.register(
+            Arc::new(BoardOnly),
+            crate::ToolManifest {
+                name: "IssueList".into(),
+                description: "x".into(),
+                trust_level: baybo_model::TrustLevel::Trusted,
+                parameters_schema: serde_json::json!({"type": "object"}),
+                capabilities: vec![],
+                channels: Vec::new(),
+            },
+        );
+
+        let has = |trigger: &TriggerSource| {
+            registry
+                .tool_definitions_for_session(&baybo_model::ChannelType::owner(), trigger)
+                .into_iter()
+                .any(|d| d.name == "IssueList")
+        };
+        assert!(has(&TriggerSource::Issue {
+            project_id: baybo_model::ProjectId::generate(),
+            issue_id: baybo_model::IssueId::generate(),
+            number: 1,
+        }));
+        assert!(!has(&TriggerSource::User));
+        assert!(!has(&TriggerSource::Cron {
+            cron_job_id: "cj".into(),
+            origin_session_id: None,
+            conversation: true,
+            job_title: None,
+            project_id: None,
+        }));
     }
 }
