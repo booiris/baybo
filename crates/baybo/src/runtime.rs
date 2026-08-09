@@ -200,7 +200,7 @@ pub struct ManagerGraph {
     pub cron_trigger_rx: Option<mpsc::Receiver<CronTriggerEvent>>,
     /// Recorded issue runs waiting to execute. A one-shot like
     /// `cron_trigger_rx` — [`wire_router`] consumes it.
-    pub issue_run_rx: Option<mpsc::Receiver<baybo_agent::router::IssueRunEvent>>,
+    pub issue_run_rx: Option<mpsc::Receiver<baybo_project::IssueRunEvent>>,
 
     /// Late-set slot for the actor-backed subagent spawner. The
     /// `spawn_subagent` tool holds a clone (taken at build time, before the
@@ -611,74 +611,28 @@ pub async fn build_managers(
         tool_registry.register(tool, manifest);
     }
 
-    let (issue_run_tx, issue_run_rx) = mpsc::channel(64);
-    let issue_dispatch = {
-        let store = stores.project.clone();
-        let tx = issue_run_tx.clone();
-        let owner = baybo_model::ChannelType::owner();
-        let paths = baybo_workspace::WorkspacePaths::new(workspace_paths.root().to_path_buf());
-        Arc::new(move |run: baybo_store::project::IssueRunRow| {
-            let store = Arc::clone(&store);
-            let tx = tx.clone();
-            let owner = owner.clone();
-            let paths = paths.clone();
-            tokio::spawn(async move {
-                // The brief is read at dispatch, not at enqueue: a comment
-                // left while the run was queued is part of what it should
-                // work on.
-                let issue = match store.get_issue(&run.project_id, run.number).await {
-                    Ok(Some(issue)) => issue,
-                    Ok(None) => {
-                        tracing::warn!(run = %run.id, "issue is gone; not running it");
-                        return;
-                    }
-                    Err(e) => {
-                        tracing::warn!(run = %run.id, error = %e, "could not read issue for run");
-                        return;
-                    }
-                };
-                let said = comments_for_brief(&store, &run).await;
-                let brief = issue_brief(&issue, &said);
+    // One hook, shared by everything that writes the board: the manager and
+    // the dispatcher both announce, and a board watched through two hooks
+    // would be a board where which writer you went through decides whether
+    // anybody sees it.
+    let project_events: Arc<dyn baybo_project::ProjectEvents> = Arc::new(
+        baybo_gateway::project_events::GatewayProjectEvents::new(Arc::clone(&channels_registry)),
+    );
 
-                let checkout = match prepare_checkout(&store, &paths, &issue).await {
-                    Ok(root) => root,
-                    Err(e) => {
-                        tracing::warn!(run = %run.id, error = %e, "could not open the issue's checkout");
-                        // Settle here too: nothing downstream will ever see
-                        // this run, so nothing downstream can settle it, and
-                        // a card that shimmers forever is the alternative.
-                        let _ = store
-                            .settle_run(
-                                &run.id,
-                                baybo_store::project::RunStatus::Failed,
-                                Some(&e.to_string()),
-                            )
-                            .await;
-                        return;
-                    }
-                };
-
-                let event = baybo_agent::router::IssueRunEvent {
-                    run,
-                    brief,
-                    checkout,
-                    user_id: baybo_gateway::auth::OWNER_USER_ID.to_string(),
-                    channel: owner,
-                };
-                if let Err(e) = tx.send(event).await {
-                    tracing::warn!(error = %e, "issue run could not reach the router");
-                }
-            });
-        }) as baybo_project::RunDispatch
-    };
+    let (issue_dispatch, issue_run_rx) =
+        baybo_project::dispatch::build(baybo_project::DispatchConfig {
+            store: stores.project.clone(),
+            events: Arc::clone(&project_events),
+            paths: baybo_workspace::WorkspacePaths::new(workspace_paths.root().to_path_buf()),
+            user_id: baybo_gateway::auth::OWNER_USER_ID.to_string(),
+            channel: baybo_model::ChannelType::owner(),
+        });
 
     let project_manager = Arc::new(baybo_project::ProjectManager::new(
         stores.project.clone(),
         stores.agent_profile.clone(),
         baybo_workspace::WorkspacePaths::new(workspace_paths.root().to_path_buf()),
-        Arc::new(baybo_gateway::project_events::GatewayProjectEvents::new(
-            Arc::clone(&channels_registry),
-        )),
+        project_events,
         issue_dispatch,
     ));
     for (tool, manifest) in baybo_project::tools::agent_tools(Arc::clone(&project_manager)) {
@@ -809,7 +763,7 @@ pub async fn build_managers(
         background_jobs,
         background_control,
         Some(BoardStores {
-            projects: stores.project.clone(),
+            projects: Arc::clone(&project_manager) as Arc<dyn baybo_project::ProjectRepo>,
             agents: stores.agent_profile.clone(),
         }),
     ));
@@ -1164,13 +1118,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         cron_store: graph.stores.cron.clone(),
         cron_trigger_rx,
         issue_run_rx: graph.issue_run_rx.take(),
-        board: Some(baybo_agent::router::BoardWiring {
-            store: graph.stores.project.clone(),
-            events: Arc::new(baybo_gateway::project_events::GatewayProjectEvents::new(
-                Arc::clone(&graph.channels_registry),
-            )),
-            manager: Arc::clone(&graph.project_manager),
-        }),
+        board: Some(Arc::clone(&graph.project_manager)),
         actor_parent_token: graph.actor_parent_token.clone(),
         rate_limit: Arc::clone(&graph.rate_limit),
     });
@@ -1226,442 +1174,6 @@ pub fn force_exit_watchdog(
     });
 }
 
-/// How far back the comments in a run's brief reach.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BriefWindow {
-    /// This run opens an empty transcript: nobody has run the card, or the
-    /// runs before it were this agent's but never got as far as executing,
-    /// or they were somebody else's. It gets the whole conversation.
-    WholeCard,
-    /// A previous run of this agent's put its turn in the transcript this
-    /// one opens. Everything up to the moment that run was enqueued has
-    /// been read.
-    SinceItsLastRun(chrono::DateTime<chrono::Utc>),
-}
-
-struct Said {
-    window: BriefWindow,
-    /// The checkout this run is handed was last worked in by another agent,
-    /// so it may hold that agent's uncommitted changes. Tracked apart from
-    /// [`BriefWindow`]: a card handed *back* to its first agent is bounded
-    /// by that agent's own last run and still arrives holding whatever the
-    /// agent in between left behind.
-    inherited_worktree: bool,
-    comments: Vec<String>,
-}
-
-const SAID_SINCE_LAST_RUN: &str = "\n\nSaid since your last run:\n";
-
-const SAID_ON_THE_CARD: &str = "\n\nSaid on the card so far:\n";
-
-const INHERITED_WORKTREE: &str = r#"
-
-You are picking this card up after another agent worked it. The checkout you
-are given is the one it worked in, so any uncommitted change in there is its
-work and not yours — read what is already in the tree before you add to it."#;
-
-const COMMENT_BUDGET: usize = 16_000;
-
-const EARLIER_COMMENTS_TRIMMED: &str =
-    "(earlier comments are not repeated here — the card itself has all of them)";
-
-fn comment_block(comments: &[String]) -> String {
-    let mut kept: Vec<&str> = Vec::new();
-    let mut spent = 0usize;
-    for comment in comments.iter().rev() {
-        if !kept.is_empty() && spent + comment.len() > COMMENT_BUDGET {
-            break;
-        }
-        spent += comment.len();
-        kept.push(comment);
-    }
-    let mut block = String::new();
-    if kept.len() < comments.len() {
-        block.push_str(&format!("- {EARLIER_COMMENTS_TRIMMED}\n"));
-    }
-    for comment in kept.iter().rev() {
-        block.push_str(&format!("- {comment}\n"));
-    }
-    block
-}
-
-fn issue_brief(issue: &baybo_store::project::IssueRow, said: &Said) -> String {
-    let mut brief = if issue.description.trim().is_empty() {
-        issue.title.clone()
-    } else {
-        format!("{}\n\n{}", issue.title, issue.description)
-    };
-    if said.inherited_worktree {
-        brief.push_str(INHERITED_WORKTREE);
-    }
-    if !said.comments.is_empty() {
-        brief.push_str(match said.window {
-            BriefWindow::SinceItsLastRun(_) => SAID_SINCE_LAST_RUN,
-            BriefWindow::WholeCard => SAID_ON_THE_CARD,
-        });
-        brief.push_str(&comment_block(&said.comments));
-    }
-    brief
-}
-
-async fn prepare_checkout(
-    store: &Arc<dyn baybo_store::project::ProjectStore>,
-    paths: &baybo_workspace::WorkspacePaths,
-    issue: &baybo_store::project::IssueRow,
-) -> anyhow::Result<std::path::PathBuf> {
-    let project = store
-        .get_project(&issue.project_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("the issue's project is gone"))?;
-    let root = baybo_project::worktree::worktree_root(paths, &issue.project_id, issue.number);
-    let branch = baybo_project::worktree::branch_name(issue.number, &issue.title);
-    baybo_project::worktree::ensure(std::path::Path::new(&project.workdir), &root, &branch).await?;
-    baybo_project::worktree::ensure_commit_identity(&paths.work_dir()).await?;
-    Ok(root)
-}
-
-fn brief_window(
-    run: &baybo_store::project::IssueRunRow,
-    runs: &[baybo_store::project::IssueRunRow],
-) -> BriefWindow {
-    match baybo_agent::router::session_run_before(run, runs) {
-        Some(previous) => BriefWindow::SinceItsLastRun(previous.created_at),
-        None => BriefWindow::WholeCard,
-    }
-}
-
-fn inherits_a_worktree(
-    run: &baybo_store::project::IssueRunRow,
-    runs: &[baybo_store::project::IssueRunRow],
-) -> bool {
-    runs.iter()
-        .filter(|candidate| candidate.id != run.id && baybo_agent::router::ever_ran(candidate))
-        .max_by_key(|candidate| candidate.attempt)
-        .is_some_and(|last| last.agent_id != run.agent_id)
-}
-
-async fn comments_for_brief(
-    store: &Arc<dyn baybo_store::project::ProjectStore>,
-    run: &baybo_store::project::IssueRunRow,
-) -> Said {
-    let (window, inherited_worktree) = match store.list_runs(&run.issue_id).await {
-        Ok(runs) => (brief_window(run, &runs), inherits_a_worktree(run, &runs)),
-        Err(e) => {
-            tracing::warn!(run = %run.id, error = %e, "could not read prior runs for the brief");
-            return Said {
-                window: BriefWindow::WholeCard,
-                inherited_worktree: false,
-                comments: Vec::new(),
-            };
-        }
-    };
-    let events = match window {
-        BriefWindow::SinceItsLastRun(since) => store.events_since(&run.issue_id, since).await,
-        BriefWindow::WholeCard => store.list_events(&run.issue_id).await,
-    };
-    let comments = match events {
-        Ok(events) => events
-            .into_iter()
-            .filter_map(|event| match event.body {
-                baybo_store::project::IssueEventBody::Comment { text } => Some(text),
-                _ => None,
-            })
-            .collect(),
-        Err(e) => {
-            tracing::warn!(run = %run.id, error = %e, "could not read comments for the brief");
-            Vec::new()
-        }
-    };
-    Said {
-        window,
-        inherited_worktree,
-        comments,
-    }
-}
-
 pub(crate) fn manager_shutdown_deadline(budget: std::time::Duration) -> tokio::time::Instant {
     tokio::time::Instant::now() + budget.saturating_sub(SHUTDOWN_WATCHDOG_MARGIN)
-}
-
-#[cfg(test)]
-mod tests {
-
-    use super::*;
-    use baybo_model::{AgentProfileId, IssueId, IssueRunId, ProjectId, SessionId};
-    use baybo_store::project::{
-        IssuePriority, IssueRow, IssueRunRow, IssueStatus, RunStatus, RunTrigger,
-    };
-    use chrono::{Duration, Utc};
-
-    fn card() -> IssueRow {
-        let now = Utc::now();
-        IssueRow {
-            id: IssueId::generate(),
-            project_id: ProjectId::generate(),
-            number: 7,
-            title: "wire the importer".to_owned(),
-            description: "it should skip rows with no id".to_owned(),
-            status: IssueStatus::InProgress,
-            priority: IssuePriority::None,
-            assignee: None,
-            position: 0,
-            blocked_reason: None,
-            branch: None,
-            parent_issue_id: None,
-            stage: 0,
-            source_key: None,
-            cancelled_at: None,
-            created_at: now,
-            updated_at: now,
-        }
-    }
-
-    fn run(issue: &IssueRow, agent: &AgentProfileId, attempt: i64) -> IssueRunRow {
-        IssueRunRow {
-            id: IssueRunId::generate(),
-            issue_id: issue.id.clone(),
-            project_id: issue.project_id.clone(),
-            number: issue.number,
-            agent_id: agent.clone(),
-            session_id: None,
-            trigger: RunTrigger::Assigned,
-            status: RunStatus::Queued,
-            attempt,
-            error: None,
-            created_at: issue.created_at + Duration::minutes(attempt),
-            started_at: None,
-            settled_at: None,
-        }
-    }
-
-    fn ran(issue: &IssueRow, agent: &AgentProfileId, attempt: i64) -> IssueRunRow {
-        IssueRunRow {
-            session_id: Some(SessionId::from(format!(
-                "sess-{}-{attempt}",
-                agent.as_str()
-            ))),
-            status: RunStatus::Done,
-            settled_at: Some(issue.created_at + Duration::minutes(attempt) + Duration::seconds(30)),
-            ..run(issue, agent, attempt)
-        }
-    }
-
-    #[test]
-    fn a_cards_first_run_reads_the_whole_card_as_its_own() {
-        let issue = card();
-        let dev_1 = AgentProfileId::parse("dev-1").expect("agent id");
-        let first = run(&issue, &dev_1, 1);
-        let runs = [first.clone()];
-
-        assert_eq!(brief_window(&first, &runs), BriefWindow::WholeCard);
-        assert!(!inherits_a_worktree(&first, &runs));
-        let brief = issue_brief(
-            &issue,
-            &Said {
-                window: BriefWindow::WholeCard,
-                inherited_worktree: false,
-                comments: vec!["start with the CSV path".to_owned()],
-            },
-        );
-        assert!(
-            !brief.contains(INHERITED_WORKTREE),
-            "there is nobody to pick it up after:\n{brief}"
-        );
-        assert!(brief.contains(SAID_ON_THE_CARD.trim()));
-    }
-
-    #[test]
-    fn a_second_run_by_the_same_agent_is_bounded_by_its_own_previous_one() {
-        let issue = card();
-        let dev_1 = AgentProfileId::parse("dev-1").expect("agent id");
-        let first = ran(&issue, &dev_1, 1);
-        let second = run(&issue, &dev_1, 2);
-        let runs = [first.clone(), second.clone()];
-
-        assert_eq!(
-            brief_window(&second, &runs),
-            BriefWindow::SinceItsLastRun(first.created_at)
-        );
-        assert!(
-            !inherits_a_worktree(&second, &runs),
-            "the checkout holds nobody's work but its own"
-        );
-        let brief = issue_brief(
-            &issue,
-            &Said {
-                window: BriefWindow::SinceItsLastRun(first.created_at),
-                inherited_worktree: false,
-                comments: vec!["also handle the empty case".to_owned()],
-            },
-        );
-        assert!(
-            brief.contains(SAID_SINCE_LAST_RUN.trim()),
-            "an agent that has read the rest is told only what is new:\n{brief}"
-        );
-    }
-
-    #[test]
-    fn a_same_agent_run_that_never_opened_a_session_does_not_bound_the_window() {
-        let issue = card();
-        let dev_1 = AgentProfileId::parse("dev-1").expect("agent id");
-        let never_started = IssueRunRow {
-            status: RunStatus::Cancelled,
-            ..run(&issue, &dev_1, 1)
-        };
-        let second = run(&issue, &dev_1, 2);
-        let runs = [never_started, second.clone()];
-
-        assert_eq!(
-            brief_window(&second, &runs),
-            BriefWindow::WholeCard,
-            "the run this one would be bounded by never opened the transcript it is bounded against"
-        );
-    }
-
-    #[test]
-    fn a_card_picked_up_by_another_agent_gets_the_whole_conversation() {
-        let issue = card();
-        let dev_1 = AgentProfileId::parse("dev-1").expect("agent id");
-        let dev_2 = AgentProfileId::parse("dev-2").expect("agent id");
-        let theirs = ran(&issue, &dev_1, 1);
-        let handover = run(&issue, &dev_2, 2);
-        let runs = [theirs.clone(), handover.clone()];
-
-        assert_eq!(
-            brief_window(&handover, &runs),
-            BriefWindow::WholeCard,
-            "dev-2's brief must not be bounded by a run of dev-1's"
-        );
-        assert!(
-            inherits_a_worktree(&handover, &runs),
-            "and the checkout it is given is the one dev-1 worked in"
-        );
-
-        let brief = issue_brief(
-            &issue,
-            &Said {
-                window: BriefWindow::WholeCard,
-                inherited_worktree: true,
-                comments: vec![
-                    "start with the CSV path".to_owned(),
-                    "also handle the empty case".to_owned(),
-                ],
-            },
-        );
-        assert!(
-            brief.contains(SAID_ON_THE_CARD.trim()),
-            "and must not be told they are the comments since its own last run:\n{brief}"
-        );
-        assert!(!brief.contains(SAID_SINCE_LAST_RUN.trim()), "{brief}");
-        assert!(
-            brief.contains("start with the CSV path") && brief.contains("also handle the empty"),
-            "everything said on the card is new to it:\n{brief}"
-        );
-        assert!(
-            brief.contains(INHERITED_WORKTREE),
-            "and it arrives holding somebody else's uncommitted work:\n{brief}"
-        );
-    }
-
-    #[test]
-    fn an_agent_handed_the_card_back_is_bounded_by_its_own_last_run_and_still_warned() {
-        let issue = card();
-        let dev_1 = AgentProfileId::parse("dev-1").expect("agent id");
-        let dev_2 = AgentProfileId::parse("dev-2").expect("agent id");
-        let first = ran(&issue, &dev_1, 1);
-        let handover = ran(&issue, &dev_2, 2);
-        let back = run(&issue, &dev_1, 3);
-        let runs = [first.clone(), handover, back.clone()];
-
-        assert_eq!(
-            brief_window(&back, &runs),
-            BriefWindow::SinceItsLastRun(first.created_at),
-        );
-        assert!(
-            inherits_a_worktree(&back, &runs),
-            "dev-2 had the checkout last, and may have left work in it"
-        );
-        let brief = issue_brief(
-            &issue,
-            &Said {
-                window: BriefWindow::SinceItsLastRun(first.created_at),
-                inherited_worktree: true,
-                comments: Vec::new(),
-            },
-        );
-        assert!(
-            brief.contains(INHERITED_WORKTREE),
-            "or it commits dev-2's changes as its own, or reverts them as stray:\n{brief}"
-        );
-    }
-
-    #[test]
-    fn a_run_that_never_started_does_not_count_as_having_had_the_checkout() {
-        let issue = card();
-        let dev_1 = AgentProfileId::parse("dev-1").expect("agent id");
-        let dev_2 = AgentProfileId::parse("dev-2").expect("agent id");
-        let theirs = ran(&issue, &dev_1, 1);
-        let cancelled_before_it_started = run(&issue, &dev_2, 2);
-        let mine = run(&issue, &dev_1, 3);
-        let runs = [theirs, cancelled_before_it_started, mine.clone()];
-
-        assert!(
-            !inherits_a_worktree(&mine, &runs),
-            "dev-2 never opened the tree; what is in it is dev-1's own"
-        );
-    }
-
-    #[test]
-    fn a_very_long_conversation_still_makes_a_bounded_brief() {
-        let issue = card();
-        let comments: Vec<String> = (0..500)
-            .map(|n| format!("comment {n}: {}", "x".repeat(200)))
-            .collect();
-
-        let brief = issue_brief(
-            &issue,
-            &Said {
-                window: BriefWindow::WholeCard,
-                inherited_worktree: false,
-                comments: comments.clone(),
-            },
-        );
-
-        assert!(
-            brief.len() < COMMENT_BUDGET * 2,
-            "a hundred thousand characters of card discussion is not a brief: {} chars",
-            brief.len()
-        );
-        assert!(
-            brief.contains(comments.last().expect("comments")),
-            "the newest instruction is the one a run must not miss:\n{brief}"
-        );
-        assert!(
-            !brief.contains("comment 0:"),
-            "and the oldest is what gives way for it"
-        );
-        assert!(
-            brief.contains(EARLIER_COMMENTS_TRIMMED),
-            "a silent trim reads as the whole story:\n{brief}"
-        );
-    }
-
-    #[test]
-    fn a_short_conversation_arrives_whole_and_unannotated() {
-        let issue = card();
-        let brief = issue_brief(
-            &issue,
-            &Said {
-                window: BriefWindow::WholeCard,
-                inherited_worktree: false,
-                comments: vec![
-                    "start with the CSV path".to_owned(),
-                    "also handle the empty case".to_owned(),
-                ],
-            },
-        );
-        assert!(brief.contains("- start with the CSV path\n"));
-        assert!(brief.contains("- also handle the empty case\n"));
-        assert!(!brief.contains(EARLIER_COMMENTS_TRIMMED), "{brief}");
-    }
 }

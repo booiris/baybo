@@ -1,15 +1,11 @@
 //! Executing a board issue's run.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use baybo_model::{
-    AgentBinding, AgentProfileId, ChannelType, Session, SessionId, TriggerSource, TurnId, User,
-};
-use baybo_project::{ProjectEvents, ProjectManager, worktree};
-use baybo_store::project::{
-    IssueActor, IssueEventBody, IssueRunRow, NewIssueEvent, ProjectStore, RunStatus,
-};
+use baybo_model::{AgentBinding, AgentProfileId, Session, SessionId, TriggerSource, TurnId, User};
+use baybo_project::{IssueRunEvent, ProjectManager, RunOutcome, session_run_to_continue};
+use baybo_store::project::{IssueRunRow, RunStatus};
 use baybo_turn::{
     CancelReason, TurnInputKind, TurnLifecycle, TurnLifecycleEvent, TurnStatus, TurnStatusKind,
 };
@@ -21,55 +17,35 @@ use crate::actor::AgentMessage;
 
 use super::Router;
 
-/// What a run needs to execute, as the dispatcher hands it over.
-#[derive(Debug, Clone)]
-pub struct IssueRunEvent {
-    pub run: IssueRunRow,
-    /// The brief the assignee is asked to work on — the issue's title and
-    /// description, assembled by the caller so this module never has to
-    /// know the issue's shape.
-    pub brief: String,
-    /// The worktree this run works in, already cut by the dispatcher.
-    pub checkout: PathBuf,
-    /// Who the run belongs to, for session ownership.
-    pub user_id: String,
-    pub channel: ChannelType,
-}
-
-/// Everything executing a run needs from the board, as one value.
-#[derive(Clone)]
-pub struct BoardWiring {
-    pub store: Arc<dyn ProjectStore>,
-    pub events: Arc<dyn ProjectEvents>,
-    pub manager: Arc<ProjectManager>,
-}
-
 impl Router {
     pub(super) async fn handle_issue_run(&mut self, event: IssueRunEvent) {
         let run_id = event.run.id.clone();
         let Some(board) = self.board.clone() else {
-            warn!(%run_id, "issue run arrived with no board wiring; cannot execute");
+            warn!(%run_id, "issue run arrived with no board; cannot execute");
             return;
         };
-        let store = &board.store;
 
-        let session = match self.issue_session(store, &event).await {
+        let session = match self.issue_session(&board, &event).await {
             Ok(session) => session,
             Err(e) => {
                 warn!(%run_id, error = %e, "could not open the issue's session");
-                settle(
-                    store,
-                    &board.events,
-                    &event.run,
-                    RunStatus::Failed,
-                    Some(&e.to_string()),
-                )
-                .await;
+                board
+                    .finish_run(
+                        &event.run,
+                        &event.checkout,
+                        event.briefed_at,
+                        RunOutcome {
+                            status: RunStatus::Failed,
+                            error: Some(e.to_string()),
+                            stopped_by_a_human: false,
+                        },
+                    )
+                    .await;
                 return;
             }
         };
 
-        match store.claim_run(&run_id, &session.id).await {
+        match board.start_run(&event.run, &session.id).await {
             Ok(true) => {}
             Ok(false) => {
                 debug!(%run_id, "run was already claimed; not executing it twice");
@@ -83,28 +59,17 @@ impl Router {
 
         let checkout = event.checkout.clone();
 
-        record(
-            store,
-            &board.events,
-            &event.run,
-            IssueEventBody::RunStarted {
-                run_id: event.run.id.clone(),
-                attempt: event.run.attempt,
-                trigger: event.run.trigger,
-            },
-        )
-        .await;
-
         // Subscribed before the trigger is sent, and this is load-bearing:
         // the terminal event is published from inside the run's own turn, so
         // a subscription opened afterwards can miss a fast failure entirely.
         let waiter = IssueRunWaiter {
             enqueued: event.run.clone(),
             checkout: checkout.clone(),
+            briefed_at: event.briefed_at,
             session_id: session.id.clone(),
             lifecycle: Arc::clone(&self.turn_lifecycle),
             terminal_rx: self.turn_lifecycle.subscribe_lifecycle_events(),
-            board: board.clone(),
+            board: Arc::clone(&board),
         };
 
         let pins = super::resolve_spawn_pins(&session, &self.agent_profiles).await;
@@ -146,20 +111,21 @@ impl Router {
 
     async fn issue_session(
         &self,
-        store: &Arc<dyn ProjectStore>,
+        board: &Arc<ProjectManager>,
         event: &IssueRunEvent,
     ) -> anyhow::Result<Session> {
-        let issue = store
+        let issue = board
             .get_issue(&event.run.project_id, event.run.number)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("issue #{} is gone", event.run.number))?;
+            .await?;
 
         // Before either branch, not only the minting one: a session opened
         // while the agent was on baybo must not be handed a run the agent
         // can no longer host.
         let binding = self.binding_for(&event.run.agent_id).await?;
 
-        let runs = store.list_runs(&issue.id).await?;
+        let runs = board
+            .list_runs(&event.run.project_id, event.run.number)
+            .await?;
         if let Some(previous) = session_run_to_continue(&event.run, &runs)
             && let Some(id) = previous.session_id.as_ref()
             && let Some(session) = self.session_manager.get(id).await?
@@ -207,203 +173,37 @@ impl Router {
     }
 }
 
-/// Whether this run ever got as far as being picked up — the router's name
-/// for [`IssueRunRow::was_claimed`], which is where the rule lives.
-pub fn ever_ran(run: &IssueRunRow) -> bool {
-    run.was_claimed()
-}
-
-fn session_run_to_continue<'a>(
-    run: &IssueRunRow,
-    runs: &'a [IssueRunRow],
-) -> Option<&'a IssueRunRow> {
-    newest_run_that_ran(&run.agent_id, runs.iter())
-}
-
-/// `session_run_to_continue`'s rule over the runs *before* this one — the
-/// run whose turn is already in the transcript this one opens, and so the
-/// point the card's conversation is a delta from.
-pub fn session_run_before<'a>(
-    run: &IssueRunRow,
-    runs: &'a [IssueRunRow],
-) -> Option<&'a IssueRunRow> {
-    newest_run_that_ran(
-        &run.agent_id,
-        runs.iter().filter(|candidate| candidate.id != run.id),
-    )
-}
-
-fn newest_run_that_ran<'a>(
-    agent: &AgentProfileId,
-    runs: impl Iterator<Item = &'a IssueRunRow>,
-) -> Option<&'a IssueRunRow> {
-    runs.filter(|candidate| &candidate.agent_id == agent && ever_ran(candidate))
-        .max_by_key(|candidate| candidate.attempt)
-}
-
-async fn follow_up_on_comments(
-    projects: &Arc<ProjectManager>,
-    store: &Arc<dyn ProjectStore>,
-    run: &IssueRunRow,
-    outcome: &RunOutcome,
-) {
-    if outcome.stopped_by_a_human {
-        debug!(run = %run.id, "somebody stopped this run; not starting a follow-up on it");
-        return;
-    }
-    let said = match store.events_since(&run.issue_id, run.created_at).await {
-        Ok(events) => events
-            .into_iter()
-            .any(|e| matches!(e.body, IssueEventBody::Comment { .. })),
-        Err(e) => {
-            warn!(run = %run.id, error = %e, "could not check for comments left during the run");
-            return;
-        }
-    };
-    if !said {
-        return;
-    }
-    match projects.wake_on_comment(&run.project_id, run.number).await {
-        Some(next) if next.status == RunStatus::Held => {
-            info!(run = %run.id, next = %next.id, "a comment arrived mid-run; the follow-up is held until the board has budget")
-        }
-        Some(next) => {
-            info!(run = %run.id, next = %next.id, "a comment arrived mid-run; queued a follow-up")
-        }
-        None => {
-            debug!(run = %run.id, "a comment arrived mid-run, but the issue is no longer listening")
-        }
-    }
-}
-
-async fn surface_branch(
-    store: &Arc<dyn ProjectStore>,
-    events: &Arc<dyn ProjectEvents>,
-    checkout: &Path,
-    run: &IssueRunRow,
-) {
-    let (Ok(Some(issue)), Ok(Some(project))) = (
-        store.get_issue(&run.project_id, run.number).await,
-        store.get_project(&run.project_id).await,
-    ) else {
-        return;
-    };
-    if issue.branch.is_some() {
-        return;
-    }
-    // The worktree's own branch. Recomputing it from the title would
-    // record the wrong name for an issue renamed since its first run.
-    let Some(branch) = worktree::branch_of(checkout).await else {
-        return;
-    };
-    if worktree::commits_ahead(Path::new(&project.workdir), &branch)
-        .await
-        .is_none_or(|ahead| ahead == 0)
-    {
-        return;
-    }
-    match store.set_issue_branch(&issue.id, &branch).await {
-        Ok(true) => events.board_changed(&issue.project_id, Some(issue.number)),
-        Ok(false) => {}
-        Err(e) => warn!(run = %run.id, error = %e, "could not record the issue's branch"),
-    }
-}
-
-async fn settle(
-    store: &Arc<dyn ProjectStore>,
-    events: &Arc<dyn ProjectEvents>,
-    run: &IssueRunRow,
-    status: RunStatus,
-    error: Option<&str>,
-) {
-    match store.settle_run(&run.id, status, error).await {
-        // Announce only a settle that actually landed: a replay of an
-        // already-settled run changed nothing and has nothing to say —
-        // and must not put a second entry on the timeline either.
-        Ok(true) => {
-            events.run_changed(&run.project_id, run.number);
-            record(
-                store,
-                events,
-                run,
-                IssueEventBody::RunSettled {
-                    run_id: run.id.clone(),
-                    attempt: run.attempt,
-                    status,
-                    error: error.map(str::to_owned),
-                },
-            )
-            .await;
-        }
-        Ok(false) => {}
-        Err(e) => {
-            let run_id = &run.id;
-            warn!(%run_id, error = %e, "could not settle run; the boot sweep will retry it");
-        }
-    }
-}
-
-async fn record(
-    store: &Arc<dyn ProjectStore>,
-    events: &Arc<dyn ProjectEvents>,
-    run: &IssueRunRow,
-    body: IssueEventBody,
-) {
-    let entry = NewIssueEvent {
-        issue_id: run.issue_id.clone(),
-        project_id: run.project_id.clone(),
-        number: run.number,
-        actor: IssueActor::Agent(run.agent_id.clone()),
-        body,
-    };
-    match store.append_event(&entry).await {
-        Ok(_) => events.timeline_changed(&run.project_id, run.number),
-        Err(e) => {
-            let run_id = &run.id;
-            warn!(%run_id, error = %e, "could not record a run's timeline entry");
-        }
-    }
-}
-
 struct IssueRunWaiter {
     /// The run as it was **enqueued** — the row the dispatcher handed over,
-    /// cloned before `claim_run` stamped it. Its `status` therefore reads
+    /// cloned before the claim stamped it. Its `status` therefore reads
     /// `Queued` and its `started_at` is empty for the whole life of the
-    /// turn, however long that is. Only what never changes is read from it —
-    /// the ids, the number, the attempt, `created_at` — and what the settle
-    /// needs to know about how the run *ended* comes from the turn.
+    /// turn, however long that is. Only what never changes is read from it
+    /// here — the ids, the number, `created_at` — and the board re-reads
+    /// the row for anything the claim wrote.
     enqueued: IssueRunRow,
-    /// The worktree this run worked in — asked for its branch once the run
-    /// is over, because that is the authoritative name.
+    /// The worktree this run worked in. Handed to the board when the run is
+    /// over, which is when the branch it left behind can be named.
     checkout: PathBuf,
+    /// When the brief this run was handed was read off the card. Carried
+    /// rather than re-derived because it is the only record of it — the
+    /// ledger row's two instants both fall on the wrong side of the brief.
+    briefed_at: chrono::DateTime<chrono::Utc>,
     session_id: SessionId,
     lifecycle: Arc<TurnLifecycle>,
     terminal_rx: broadcast::Receiver<TurnLifecycleEvent>,
-    /// The board. Carries the manager, not just a store handle, because the
-    /// one thing settling a run can owe — a follow-up for a comment that
-    /// landed mid-run — has to go through the same enqueue, and therefore
-    /// the same budget gate and the same dispatcher, as every other run.
-    board: BoardWiring,
+    /// The board this run belongs to. The manager and nothing under it: how
+    /// a settled run is written down, and whether it owes a follow-up, are
+    /// the board's rules, and this crate only reports what it watched.
+    board: Arc<ProjectManager>,
 }
 
 impl IssueRunWaiter {
     async fn run(mut self, actor_token: CancellationToken) {
         let outcome = self.await_run(actor_token).await;
-        let run_id = &self.enqueued.id;
-        let status = outcome.status;
-        info!(%run_id, ?status, "issue run settled");
-        let store = &self.board.store;
-        settle(
-            store,
-            &self.board.events,
-            &self.enqueued,
-            status,
-            outcome.error.as_deref(),
-        )
-        .await;
-
-        surface_branch(store, &self.board.events, &self.checkout, &self.enqueued).await;
-        follow_up_on_comments(&self.board.manager, store, &self.enqueued, &outcome).await;
+        info!(run_id = %self.enqueued.id, status = ?outcome.status, "issue run settled");
+        self.board
+            .finish_run(&self.enqueued, &self.checkout, self.briefed_at, outcome)
+            .await;
     }
 
     async fn await_run(&mut self, actor_token: CancellationToken) -> RunOutcome {
@@ -429,7 +229,7 @@ impl IssueRunWaiter {
                         continue;
                     }
                     Err(broadcast::error::RecvError::Closed) => {
-                        return RunOutcome::failed("lifecycle bus closed before the run finished");
+                        return failed_outcome("lifecycle bus closed before the run finished");
                     }
                 },
                 _ = actor_token.cancelled() => {
@@ -439,7 +239,7 @@ impl IssueRunWaiter {
                     if let Some(outcome) = self.reconcile().await {
                         return outcome;
                     }
-                    return RunOutcome::failed("the run stopped before producing anything");
+                    return failed_outcome("the run stopped before producing anything");
                 }
             }
         }
@@ -450,7 +250,7 @@ impl IssueRunWaiter {
     }
 
     async fn outcome_of_edge(&self, turn: &TurnId, kind: TurnStatusKind) -> RunOutcome {
-        let outcome = RunOutcome::of(kind);
+        let outcome = outcome_of(kind);
         if kind != TurnStatusKind::Cancelled {
             return outcome;
         }
@@ -483,46 +283,37 @@ impl IssueRunWaiter {
             .max_by_key(|t| t.created_at)
             .map(|t| RunOutcome {
                 stopped_by_a_human: stopped_by_a_human(&t.status),
-                ..RunOutcome::of(t.status.kind())
+                ..outcome_of(t.status.kind())
             })
     }
 }
 
-/// How a run ended: what the ledger row records, plus the one thing the row
-/// cannot carry.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RunOutcome {
-    status: RunStatus,
-    error: Option<String>,
-    /// A person asked for this to stop, as opposed to it stopping on its
-    /// own. Never true for a status other than `Cancelled`.
-    stopped_by_a_human: bool,
+/// How a turn ending maps onto how a run ended. The only half of a
+/// [`RunOutcome`] this crate is entitled to decide: it is the one that
+/// watched the turn, and the board is the one that decides what the answer
+/// costs the card.
+fn outcome_of(kind: TurnStatusKind) -> RunOutcome {
+    match kind {
+        TurnStatusKind::Completed => RunOutcome {
+            status: RunStatus::Done,
+            error: None,
+            stopped_by_a_human: false,
+        },
+        TurnStatusKind::Cancelled => RunOutcome {
+            status: RunStatus::Cancelled,
+            error: None,
+            stopped_by_a_human: false,
+        },
+        TurnStatusKind::Failed => failed_outcome("the run failed; its transcript has the detail"),
+        other => failed_outcome(format!("the run ended as {other:?}")),
+    }
 }
 
-impl RunOutcome {
-    fn of(kind: TurnStatusKind) -> Self {
-        match kind {
-            TurnStatusKind::Completed => Self {
-                status: RunStatus::Done,
-                error: None,
-                stopped_by_a_human: false,
-            },
-            TurnStatusKind::Cancelled => Self {
-                status: RunStatus::Cancelled,
-                error: None,
-                stopped_by_a_human: false,
-            },
-            TurnStatusKind::Failed => Self::failed("the run failed; its transcript has the detail"),
-            other => Self::failed(format!("the run ended as {other:?}")),
-        }
-    }
-
-    fn failed(error: impl Into<String>) -> Self {
-        Self {
-            status: RunStatus::Failed,
-            error: Some(error.into()),
-            stopped_by_a_human: false,
-        }
+fn failed_outcome(error: impl Into<String>) -> RunOutcome {
+    RunOutcome {
+        status: RunStatus::Failed,
+        error: Some(error.into()),
+        stopped_by_a_human: false,
     }
 }
 
@@ -549,9 +340,10 @@ mod tests {
         AgentFramework, AgentHandle, AgentProfileId, ChannelType, MicroUsd, SessionId,
         TeamMembership,
     };
-    use baybo_project::{NewIssueRequest, NewProject, ProjectManager};
+    use baybo_project::{NewIssueRequest, NewProject, ProjectManager, session_run_before};
     use baybo_store::project::{
-        IssuePriority, IssueStatus, IssueUpdate, ProjectRow, ProjectUpdate, RunTrigger,
+        IssueActor, IssuePriority, IssueStatus, IssueUpdate, ProjectRow, ProjectStore,
+        ProjectUpdate, RunTrigger,
     };
     use baybo_workspace::WorkspacePaths;
 
@@ -743,11 +535,7 @@ mod tests {
             agent_profiles: Arc::clone(&board.db.agent_profile),
             cron_trigger_rx,
             issue_run_rx: None,
-            board: Some(BoardWiring {
-                store: Arc::clone(&board.store),
-                events: Arc::new(baybo_project::NoopProjectEvents),
-                manager: Arc::clone(&board.projects),
-            }),
+            board: Some(Arc::clone(&board.projects)),
             actor_parent_token: CancellationToken::new(),
             rate_limit: LiveRateLimit::new(100, std::time::Duration::from_secs(60)),
             workspace: Arc::new(WorkspacePaths::new("/tmp/baybo-issue-router-test")),
@@ -761,12 +549,28 @@ mod tests {
 
     fn run_event(run: &IssueRunRow) -> IssueRunEvent {
         IssueRunEvent {
+            briefed_at: run.created_at,
             run: run.clone(),
             brief: "wire the importer".to_owned(),
             checkout: PathBuf::from("/tmp/does-not-matter"),
             user_id: "u1".to_owned(),
             channel: ChannelType::tui(),
         }
+    }
+
+    /// Close a run out the way the waiter does. The checkout is a path that
+    /// never existed — these tests are about what settling owes the card,
+    /// and a card with no worktree has no branch to surface.
+    async fn finish(board: &Board, run: &IssueRunRow, outcome: RunOutcome) {
+        board
+            .projects
+            .finish_run(
+                run,
+                std::path::Path::new("/nonexistent/checkout"),
+                run.created_at,
+                outcome,
+            )
+            .await;
     }
 
     async fn comment_mid_run(board: &Board) {
@@ -800,19 +604,7 @@ mod tests {
     async fn a_comment_left_mid_run_starts_a_follow_up_the_dispatcher_actually_gets() {
         let (board, first) = mid_run().await;
         comment_mid_run(&board).await;
-        board
-            .store
-            .settle_run(&first.id, RunStatus::Done, None)
-            .await
-            .expect("settle");
-
-        follow_up_on_comments(
-            &board.projects,
-            &board.store,
-            &first,
-            &RunOutcome::of(TurnStatusKind::Completed),
-        )
-        .await;
+        finish(&board, &first, outcome_of(TurnStatusKind::Completed)).await;
 
         let dispatched = board.dispatched.lock().clone();
         assert_eq!(dispatched.len(), 2, "the follow-up was handed to somebody");
@@ -832,11 +624,6 @@ mod tests {
         let (board, first) = mid_run().await;
         comment_mid_run(&board).await;
         board
-            .store
-            .settle_run(&first.id, RunStatus::Done, None)
-            .await
-            .expect("settle");
-        board
             .projects
             .update_project(
                 &board.project.id,
@@ -849,13 +636,7 @@ mod tests {
             .await
             .expect("budget");
 
-        follow_up_on_comments(
-            &board.projects,
-            &board.store,
-            &first,
-            &RunOutcome::of(TurnStatusKind::Completed),
-        )
-        .await;
+        finish(&board, &first, outcome_of(TurnStatusKind::Completed)).await;
 
         assert_eq!(
             board.dispatched.lock().len(),
@@ -900,15 +681,12 @@ mod tests {
 
         let waiter = IssueRunWaiter {
             enqueued: run.clone(),
+            briefed_at: run.created_at,
             checkout: PathBuf::from("/tmp/does-not-matter"),
             session_id: session.clone(),
             terminal_rx: lifecycle.subscribe_lifecycle_events(),
             lifecycle: Arc::clone(&lifecycle),
-            board: BoardWiring {
-                store: Arc::clone(&board.store),
-                events: Arc::new(baybo_project::NoopProjectEvents),
-                manager: Arc::clone(&board.projects),
-            },
+            board: Arc::clone(&board.projects),
         };
         let reconciled = waiter.reconcile().await.expect("the turn is terminal");
         assert_eq!(
@@ -933,13 +711,7 @@ mod tests {
         )
         .await;
         assert_eq!(outcome.status, RunStatus::Cancelled);
-        board
-            .store
-            .settle_run(&first.id, outcome.status, None)
-            .await
-            .expect("settle");
-
-        follow_up_on_comments(&board.projects, &board.store, &first, &outcome).await;
+        finish(&board, &first, outcome).await;
 
         assert_eq!(
             board.dispatched.lock().len(),
@@ -971,13 +743,7 @@ mod tests {
                 RunStatus::Cancelled,
                 "{reason:?} settles the row exactly as a Stop does"
             );
-            board
-                .store
-                .settle_run(&first.id, outcome.status, None)
-                .await
-                .expect("settle");
-
-            follow_up_on_comments(&board.projects, &board.store, &first, &outcome).await;
+            finish(&board, &first, outcome).await;
 
             let dispatched = board.dispatched.lock().clone();
             assert_eq!(
@@ -999,7 +765,7 @@ mod tests {
 
         let first_session = harness
             .router
-            .issue_session(&board.store, &run_event(&first))
+            .issue_session(&board.projects, &run_event(&first))
             .await
             .expect("session");
         assert_eq!(
@@ -1023,7 +789,7 @@ mod tests {
         assert_eq!(handover.agent_id, dev_2, "the run is dev-2's");
         let handover_session = harness
             .router
-            .issue_session(&board.store, &run_event(&handover))
+            .issue_session(&board.projects, &run_event(&handover))
             .await
             .expect("session");
         assert_ne!(
@@ -1064,7 +830,7 @@ mod tests {
         let runs = board.store.list_runs(&run.issue_id).await.expect("runs");
         let session = harness
             .router
-            .issue_session(&board.store, &run_event(run))
+            .issue_session(&board.projects, &run_event(run))
             .await
             .expect("session");
         match session_run_before(run, &runs) {
@@ -1194,16 +960,13 @@ mod tests {
             .expect("comment");
 
         let mut waiter = IssueRunWaiter {
+            briefed_at: second.created_at,
             enqueued: second.clone(),
             checkout: PathBuf::from("/tmp/does-not-matter"),
             session_id: session.clone(),
             terminal_rx: lifecycle.subscribe_lifecycle_events(),
             lifecycle: Arc::clone(&lifecycle),
-            board: BoardWiring {
-                store: Arc::clone(&board.store),
-                events: Arc::new(baybo_project::NoopProjectEvents),
-                manager: Arc::clone(&board.projects),
-            },
+            board: Arc::clone(&board.projects),
         };
         assert_eq!(
             waiter.reconcile().await,
@@ -1224,12 +987,7 @@ mod tests {
             "and nobody stopped it — the Cancel it would have inherited was aimed at run #1"
         );
 
-        board
-            .store
-            .settle_run(&second.id, outcome.status, outcome.error.as_deref())
-            .await
-            .expect("settle");
-        follow_up_on_comments(&board.projects, &board.store, &second, &outcome).await;
+        finish(&board, &second, outcome).await;
         let dispatched = board.dispatched.lock().clone();
         assert_eq!(
             dispatched.len(),
@@ -1246,7 +1004,7 @@ mod tests {
 
         let opened = harness
             .router
-            .issue_session(&board.store, &run_event(&first))
+            .issue_session(&board.projects, &run_event(&first))
             .await
             .expect("session");
         board
@@ -1257,7 +1015,7 @@ mod tests {
 
         let resumed = harness
             .router
-            .issue_session(&board.store, &run_event(&first))
+            .issue_session(&board.projects, &run_event(&first))
             .await
             .expect("session");
         assert_eq!(resumed.id, opened.id);
@@ -1301,7 +1059,7 @@ mod tests {
 
         let refused = harness
             .router
-            .issue_session(&board.store, &run_event(&run))
+            .issue_session(&board.projects, &run_event(&run))
             .await
             .expect_err("codex cannot host an issue's session");
         assert!(

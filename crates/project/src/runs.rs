@@ -1,7 +1,23 @@
-//! The predicates a run has to satisfy, and the ledger entry it becomes.
+//! The predicates a run has to satisfy, the ledger entry it becomes, and
+//! which of a card's earlier runs this one is a continuation of.
 
 use baybo_model::{AgentFramework, AgentProfileId, IssueRunId};
-use baybo_store::project::{IssueRow, IssueStatus, NewIssueRun, RunTrigger};
+use baybo_store::project::{
+    IssueRow, IssueRunRow, IssueStatus, NewIssueRun, RunStatus, RunTrigger,
+};
+
+/// How a run ended, as the executor that ran it saw it.
+///
+/// The executor decides these — only it watched the turn — and the board
+/// decides what they cost the card. `stopped_by_a_human` is separate from
+/// `status` because the ledger row cannot carry it and it changes what the
+/// board owes: a person who pressed stop is not asking for a follow-up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunOutcome {
+    pub status: RunStatus,
+    pub error: Option<String>,
+    pub stopped_by_a_human: bool,
+}
 
 /// What a write did to an issue, in the only terms [`triggers_run`] cares
 /// about.
@@ -58,6 +74,42 @@ impl Transition {
             after_assignee: after.assignee.clone(),
         }
     }
+}
+
+/// Whether this run ever got as far as being picked up — a name for
+/// [`IssueRunRow::was_claimed`], which is where the rule lives.
+pub(crate) fn ever_ran(run: &IssueRunRow) -> bool {
+    run.was_claimed()
+}
+
+/// The run whose session this one continues: the newest run of the same
+/// agent's that actually executed. `None` opens a fresh session.
+pub fn session_run_to_continue<'a>(
+    run: &IssueRunRow,
+    runs: &'a [IssueRunRow],
+) -> Option<&'a IssueRunRow> {
+    newest_run_that_ran(&run.agent_id, runs.iter())
+}
+
+/// [`session_run_to_continue`]'s rule over the runs *before* this one — the
+/// run whose turn is already in the transcript this one opens, and so the
+/// point the card's conversation is a delta from.
+pub fn session_run_before<'a>(
+    run: &IssueRunRow,
+    runs: &'a [IssueRunRow],
+) -> Option<&'a IssueRunRow> {
+    newest_run_that_ran(
+        &run.agent_id,
+        runs.iter().filter(|candidate| candidate.id != run.id),
+    )
+}
+
+fn newest_run_that_ran<'a>(
+    agent: &AgentProfileId,
+    runs: impl Iterator<Item = &'a IssueRunRow>,
+) -> Option<&'a IssueRunRow> {
+    runs.filter(|candidate| &candidate.agent_id == agent && ever_ran(candidate))
+        .max_by_key(|candidate| candidate.attempt)
 }
 
 /// Build the ledger entry for a triggered run. Fails only if the issue has

@@ -22,9 +22,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 use uuid::Uuid;
 
-use baybo_project::worktree::{self, Checkout};
+use baybo_project::worktree::{self, Checkout, ProjectRepo};
 use baybo_store::agent_profile::AgentProfileStore;
-use baybo_store::project::ProjectStore;
 
 use crate::runtime::sandbox::SandboxAdapter;
 use crate::security::SecurityGateway;
@@ -68,7 +67,7 @@ fn admits_repo(resolved: &Path, paths: &baybo_workspace::WorkspacePaths) -> Resu
     // No `work/` exemption on the ancestor side above: containing `work/`
     // does not stop a parent from containing `state/` and `.key/` as well.
     if resolved.starts_with(&root) && !resolved.starts_with(&work) {
-        return Err("it is inside baybo's own workspace".to_owned());
+        return Err("it is inside baybo's protected workspace data".to_owned());
     }
     Ok(())
 }
@@ -373,11 +372,13 @@ fn tool_output_media(output: &ToolOutput) -> (Vec<ContentBlock>, Vec<ContentBloc
     }
 }
 
-/// The two stores an issue run's tool call reads: the project row says
-/// where the repository is, the profile row says what the agent working it
-/// is called.
+/// The two board facts an issue run's tool call reads: where the
+/// repository is, and what the agent working it is called.
+///
+/// `projects` is a one-method port rather than the store, because that is
+/// the whole of what a tool call is entitled to ask a board.
 pub struct BoardStores {
-    pub projects: Arc<dyn ProjectStore>,
+    pub projects: Arc<dyn ProjectRepo>,
     pub agents: Arc<dyn AgentProfileStore>,
 }
 
@@ -488,22 +489,12 @@ impl ToolExecutor {
         else {
             return None;
         };
-        let store = &self.board.as_ref()?.projects;
-        let project = match store.get_project(project_id).await {
-            Ok(Some(project)) => project,
-            Ok(None) => return None,
-            Err(e) => {
-                debug!(error = %e, "could not resolve the project behind an issue session");
-                return None;
-            }
-        };
+        let workdir = self.board.as_ref()?.projects.workdir(project_id).await?;
         let root = worktree::worktree_root(&self.workspace_paths, project_id, *number);
 
         let work_dir = self.workspace_root.clone();
         let root = self.bindable(&root, |p| admits_worktree(p, &work_dir))?;
-        let repo = self.bindable(Path::new(&project.workdir), |p| {
-            admits_repo(p, &self.workspace_paths)
-        })?;
+        let repo = self.bindable(&workdir, |p| admits_repo(p, &self.workspace_paths))?;
         Some(Checkout { root, repo })
     }
 
@@ -1328,6 +1319,7 @@ mod tests {
         std::os::unix::fs::symlink(&workspace, &link).expect("symlink");
 
         let paths = baybo_workspace::WorkspacePaths::new(link.clone());
+        let paths_for_board = paths.clone();
         std::fs::create_dir_all(paths.work_dir()).expect("work dir");
         let sandbox_root = paths.work_dir().canonicalize().expect("canonical work dir");
 
@@ -1409,7 +1401,13 @@ mod tests {
             None,
             None,
             Some(BoardStores {
-                projects: Arc::clone(&store.project),
+                projects: Arc::new(baybo_project::ProjectManager::new(
+                    Arc::clone(&store.project),
+                    Arc::clone(&store.agent_profile),
+                    paths_for_board,
+                    Arc::new(baybo_project::NoopProjectEvents),
+                    baybo_project::no_dispatch(),
+                )),
                 agents: Arc::clone(&store.agent_profile),
             }),
         );

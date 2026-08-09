@@ -1,8 +1,10 @@
 //! The checkout an issue's run works in.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use baybo_model::ProjectId;
+use baybo_store::project::{IssueRow, ProjectStore};
 use baybo_workspace::WorkspacePaths;
 
 use crate::error::{ProjectError, Result};
@@ -106,6 +108,38 @@ pub async fn ensure(repo: &Path, root: &Path, branch: &str) -> Result<Checkout> 
         git(repo, &args).await?;
     }
     Ok(checkout)
+}
+
+/// Where a project's repository is on disk.
+///
+/// Its own port because its one consumer — binding an issue run's checkout
+/// into the sandbox — needs exactly this one fact about a board. Handing it
+/// a `ProjectStore` instead would hand it `create_issue`, `enqueue_run` and
+/// every other board write, to answer a question about a directory.
+#[async_trait::async_trait]
+pub trait ProjectRepo: Send + Sync {
+    /// `None` if the project is gone or unreadable. The distinction is not
+    /// carried because the one caller does the same thing either way: it
+    /// binds nothing.
+    async fn workdir(&self, project: &ProjectId) -> Option<PathBuf>;
+}
+
+/// Open the checkout an issue's run is handed, cutting it on first use.
+/// The four steps in order, so no caller has to know they are four.
+pub async fn prepare_for_issue(
+    store: &Arc<dyn ProjectStore>,
+    paths: &WorkspacePaths,
+    issue: &IssueRow,
+) -> Result<PathBuf> {
+    let project = store
+        .get_project(&issue.project_id)
+        .await?
+        .ok_or_else(|| ProjectError::NoSuchProject(issue.project_id.clone()))?;
+    let root = worktree_root(paths, &issue.project_id, issue.number);
+    let branch = branch_name(issue.number, &issue.title);
+    ensure(Path::new(&project.workdir), &root, &branch).await?;
+    ensure_commit_identity(&paths.work_dir()).await?;
+    Ok(root)
 }
 
 /// The branch an existing worktree is actually on.

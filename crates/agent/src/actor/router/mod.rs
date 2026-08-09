@@ -15,8 +15,6 @@
 
 mod cron;
 mod issue;
-
-pub use issue::{BoardWiring, IssueRunEvent, ever_ran, session_run_before};
 mod output;
 mod user_input;
 
@@ -28,6 +26,7 @@ use std::time::Instant;
 use baybo_channels::{AgentOutput, ChannelRegistry, RouterInbound};
 use baybo_cron::CronTriggerEvent;
 use baybo_model::{LlmEntryName, Session};
+use baybo_project::IssueRunEvent;
 use baybo_store::agent_profile::AgentProfileStore;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -252,12 +251,12 @@ pub struct Router {
     cron_trigger_rx: Option<mpsc::Receiver<CronTriggerEvent>>,
     /// Recorded issue runs waiting to execute. Same `Option<Receiver>`
     /// shape and reason as `cron_trigger_rx`.
-    issue_run_rx: Option<mpsc::Receiver<issue::IssueRunEvent>>,
-    /// Everything a run needs from the board — see [`BoardWiring`], which
-    /// says why it is one field and not three. `None` in assemblies with no
-    /// board (the TUI's embedded runtime), which also have no
-    /// `issue_run_rx`.
-    board: Option<BoardWiring>,
+    issue_run_rx: Option<mpsc::Receiver<IssueRunEvent>>,
+    /// The board a run belongs to. The manager and nothing under it: this
+    /// crate reports how a run went and the board decides what that costs
+    /// the card. `None` in assemblies with no board (the TUI's embedded
+    /// runtime), which also have no `issue_run_rx`.
+    board: Option<Arc<baybo_project::ProjectManager>>,
     /// Cancellation parent passed to every top-level actor the router
     /// spawns. Bridged to the process-wide `ShutdownSignal` upstream;
     /// each actor derives its `actor_token` as a child of this so
@@ -288,9 +287,9 @@ pub struct RouterConfig {
     pub cron_trigger_rx: mpsc::Receiver<CronTriggerEvent>,
     /// Recorded issue runs waiting to execute. `None` in an assembly with
     /// no board.
-    pub issue_run_rx: Option<mpsc::Receiver<issue::IssueRunEvent>>,
+    pub issue_run_rx: Option<mpsc::Receiver<IssueRunEvent>>,
     /// See [`Router::board`]. `None` in an assembly with no board.
-    pub board: Option<BoardWiring>,
+    pub board: Option<Arc<baybo_project::ProjectManager>>,
     /// Cancellation parent passed to every top-level actor the router
     /// spawns. Bridged to the process-wide `ShutdownSignal` upstream.
     pub actor_parent_token: CancellationToken,

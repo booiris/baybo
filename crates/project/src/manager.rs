@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use baybo_model::{
     AgentFramework, AgentHandle, AgentProfileId, IssueId, MAX_PROJECT_NAME_CHARS, ProjectId,
-    TeamMembership,
+    SessionId, TeamMembership,
 };
 use baybo_store::AgentProfileStore;
 use baybo_store::project::{
@@ -15,12 +15,13 @@ use baybo_store::project::{
     RunTrigger,
 };
 use baybo_workspace::WorkspacePaths;
+use chrono::{DateTime, Utc};
 
 use crate::CommentDelivery;
 use crate::budget::Headroom;
 use crate::error::{ProjectError, Result};
 use crate::events::ProjectEvents;
-use crate::runs::{Transition, ledger_entry, triggers_run};
+use crate::runs::{RunOutcome, Transition, ledger_entry, triggers_run};
 
 /// Upper bound on an issue title (chars, after trim). Long enough for a
 /// sentence, short enough that a card face can show it.
@@ -50,6 +51,8 @@ const RUN_CALLED_OFF_UNSTARTED: &str = "the card was finished or cancelled befor
 
 const RUN_CALLED_OFF_INTERRUPTED: &str =
     "this run was interrupted, and the card was finished or cancelled before it could resume";
+
+const RUN_CANCELLED_BEFORE_STARTING: &str = "cancelled before it started";
 
 const HELD_RUN_REFUSAL: &str =
     "this run is held — the project is over its daily budget, and starts as soon as there is room";
@@ -180,6 +183,20 @@ pub type RunDispatch = Arc<dyn Fn(IssueRunRow) + Send + Sync>;
 /// headless assembly and every store-level test wants.
 pub fn no_dispatch() -> RunDispatch {
     Arc::new(|_run| {})
+}
+
+#[async_trait::async_trait]
+impl crate::worktree::ProjectRepo for ProjectManager {
+    async fn workdir(&self, project: &ProjectId) -> Option<PathBuf> {
+        match self.store.get_project(project).await {
+            Ok(Some(project)) => Some(PathBuf::from(project.workdir)),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::debug!(%project, error = %e, "could not resolve a project's repository");
+                None
+            }
+        }
+    }
 }
 
 impl ProjectManager {
@@ -341,8 +358,8 @@ impl ProjectManager {
     async fn live_card(&self, run: &IssueRunRow) -> Option<IssueRow> {
         match self.store.get_issue(&run.project_id, run.number).await {
             Ok(Some(issue)) if crate::runs::accepts_runs(&issue) => Some(issue),
-            Ok(issue) => {
-                self.call_off(run, issue.as_ref()).await;
+            Ok(_) => {
+                self.call_off(run).await;
                 None
             }
             Err(e) => {
@@ -352,34 +369,192 @@ impl ProjectManager {
         }
     }
 
-    async fn call_off(&self, run: &IssueRunRow, issue: Option<&IssueRow>) {
+    async fn call_off(&self, run: &IssueRunRow) {
         let reason = call_off_reason(run);
-        match self
-            .store
-            .settle_run(&run.id, RunStatus::Cancelled, Some(reason))
-            .await
+        if let Err(e) = crate::settle::settle_run(
+            &self.store,
+            &self.events,
+            run,
+            IssueActor::System,
+            RunStatus::Cancelled,
+            Some(reason),
+        )
+        .await
         {
-            Ok(true) => {}
-            // Somebody else settled it first, which is the same outcome.
-            Ok(false) => return,
+            tracing::error!(issue = run.number, error = %e, "could not call off a run on a finished card");
+        }
+    }
+
+    /// Take a recorded run for execution and say so on the card.
+    ///
+    /// `Ok(false)` means another executor claimed it first and this one
+    /// must not run it — the claim is the only thing standing between a
+    /// re-dispatched row and two agents on one card.
+    pub async fn start_run(&self, run: &IssueRunRow, session: &SessionId) -> Result<bool> {
+        if !self.store.claim_run(&run.id, session).await? {
+            return Ok(false);
+        }
+        crate::settle::record(
+            &self.store,
+            &self.events,
+            run,
+            IssueActor::Agent(run.agent_id.clone()),
+            IssueEventBody::RunStarted {
+                run_id: run.id.clone(),
+                attempt: run.attempt,
+                trigger: run.trigger,
+            },
+        )
+        .await;
+        Ok(true)
+    }
+
+    /// Close out a run its executor has finished with: settle the ledger,
+    /// surface the branch its work is on, and follow up if somebody spoke
+    /// while it worked.
+    ///
+    /// The three are in this order and not the caller's business. The
+    /// branch is read before the follow-up because a follow-up enqueues
+    /// another run against the same checkout, and the settle comes first so
+    /// that a card whose branch cannot be read still stops shimmering.
+    ///
+    /// `briefed_at` is [`IssueRunEvent::briefed_at`](crate::IssueRunEvent) —
+    /// what this run was told, as an instant.
+    pub async fn finish_run(
+        &self,
+        run: &IssueRunRow,
+        checkout: &Path,
+        briefed_at: DateTime<Utc>,
+        outcome: RunOutcome,
+    ) {
+        if let Err(e) = crate::settle::settle_run(
+            &self.store,
+            &self.events,
+            run,
+            IssueActor::Agent(run.agent_id.clone()),
+            outcome.status,
+            outcome.error.as_deref(),
+        )
+        .await
+        {
+            tracing::error!(run = %run.id, error = %e, "could not settle a finished run; the boot sweep will retry it");
+        }
+        self.record_branch(run, checkout).await;
+        self.wake_after_run(run, briefed_at, outcome.stopped_by_a_human)
+            .await;
+    }
+
+    /// Record the branch a run's work is on, once there is work on it.
+    ///
+    /// The board never merges, so this ref is the artefact it hands the
+    /// operator. It is read from the checkout rather than derived from the
+    /// title so that a retitle mid-run cannot rename it, and it falls back
+    /// to the name the tree was cut with so that a card finished *before*
+    /// its run settled — which reclaims the tree — still surfaces one.
+    async fn record_branch(&self, run: &IssueRunRow, checkout: &Path) {
+        let (Ok(Some(issue)), Ok(Some(project))) = (
+            self.store.get_issue(&run.project_id, run.number).await,
+            self.store.get_project(&run.project_id).await,
+        ) else {
+            return;
+        };
+        if issue.branch.is_some() {
+            return;
+        }
+        let branch = self.branch_worked_on(checkout, &issue).await;
+        // Asked of the repository, not the checkout: the tree may already
+        // have been reclaimed, while the ref it left behind has not.
+        if crate::worktree::commits_ahead(Path::new(&project.workdir), &branch)
+            .await
+            .is_none_or(|ahead| ahead == 0)
+        {
+            return;
+        }
+        match self.store.set_issue_branch(&issue.id, &branch).await {
+            Ok(true) => self
+                .events
+                .board_changed(&issue.project_id, Some(issue.number)),
+            Ok(false) => {}
             Err(e) => {
-                tracing::error!(issue = run.number, error = %e, "could not call off a run on a finished card");
-                return;
+                tracing::error!(issue = issue.number, error = %e, "could not record the issue's branch")
             }
         }
-        self.events.run_changed(&run.project_id, run.number);
-        if let Some(issue) = issue {
-            self.record(
-                issue,
-                IssueActor::System,
-                IssueEventBody::RunSettled {
-                    run_id: run.id.clone(),
-                    attempt: run.attempt,
-                    status: RunStatus::Cancelled,
-                    error: Some(reason.to_owned()),
-                },
-            )
-            .await;
+    }
+
+    /// The branch an issue's work is on: the checkout's own, or — once the
+    /// checkout is gone — the name it was cut with. Never re-derived from
+    /// the *current* title while the tree can answer, because a retitle
+    /// would otherwise name a ref git still knows by the old one.
+    async fn branch_worked_on(&self, root: &Path, issue: &IssueRow) -> String {
+        match crate::worktree::branch_of(root).await {
+            Some(branch) => branch,
+            None => crate::worktree::branch_name(issue.number, &issue.title),
+        }
+    }
+
+    /// Start another run if somebody asked for one while this one worked.
+    ///
+    /// The window is the instant the run's brief was **read**, which is
+    /// neither of the two instants the ledger row carries. `created_at` is
+    /// the enqueue, and a run held over budget can sit there a day before
+    /// its brief is cut — waking on all of it re-instructs the agent to
+    /// redo what it just did. `started_at` is the claim, which happens
+    /// *after* the brief: a `git worktree add` and a trip through the run
+    /// channel sit in between, and anything said in that gap is in neither
+    /// the brief nor a window bounded by the claim, so nothing would ever
+    /// pick it up.
+    ///
+    /// The run's own comments are skipped as well — an agent reporting
+    /// progress is not somebody asking it for more.
+    async fn wake_after_run(
+        &self,
+        run: &IssueRunRow,
+        briefed_at: DateTime<Utc>,
+        stopped_by_a_human: bool,
+    ) -> Option<IssueRunRow> {
+        if stopped_by_a_human {
+            tracing::debug!(run = %run.id, "somebody stopped this run; not starting a follow-up on it");
+            return None;
+        }
+        if !self.was_told_something_during(run, briefed_at).await {
+            return None;
+        }
+        let next = self.wake_on_comment(&run.project_id, run.number).await;
+        match &next {
+            Some(next) if next.status == RunStatus::Held => {
+                tracing::info!(run = %run.id, next = %next.id, "a comment arrived mid-run; the follow-up is held until the board has budget")
+            }
+            Some(next) => {
+                tracing::info!(run = %run.id, next = %next.id, "a comment arrived mid-run; queued a follow-up")
+            }
+            None => {
+                tracing::debug!(run = %run.id, "a comment arrived mid-run, but the issue is no longer listening")
+            }
+        }
+        next
+    }
+
+    async fn was_told_something_during(
+        &self,
+        run: &IssueRunRow,
+        briefed_at: DateTime<Utc>,
+    ) -> bool {
+        // Keyed on the profile, not on the run that wrote it, because a
+        // timeline entry records only its actor. One agent holding two live
+        // cards can therefore comment from one onto the other and have it
+        // skipped here. Narrowing it needs the authoring run on the event
+        // body, which is a stored-shape change; until then this errs
+        // towards a missed nudge rather than an agent that answers its own
+        // progress note and wakes itself again on the answer.
+        let own = IssueActor::Agent(run.agent_id.clone());
+        match self.store.events_since(&run.issue_id, briefed_at).await {
+            Ok(events) => events
+                .iter()
+                .any(|e| matches!(e.body, IssueEventBody::Comment { .. }) && e.actor != own),
+            Err(e) => {
+                tracing::warn!(run = %run.id, error = %e, "could not check for comments left during the run");
+                false
+            }
         }
     }
 
@@ -436,13 +611,7 @@ impl ProjectManager {
             return;
         };
         let root = crate::worktree::worktree_root(&self.paths, &after.project_id, after.number);
-        // The tree's own branch, not the one this issue's *current* title
-        // implies: a retitle between the run and the reclamation would
-        // otherwise delete-or-keep the wrong ref, or none at all.
-        let branch = match crate::worktree::branch_of(&root).await {
-            Some(branch) => branch,
-            None => crate::worktree::branch_name(after.number, &after.title),
-        };
+        let branch = self.branch_worked_on(&root, after).await;
         match crate::worktree::reclaim(Path::new(&project.workdir), &root, &branch).await {
             Ok(crate::worktree::Reclaimed::Removed { branch_deleted }) => {
                 self.record(
@@ -613,13 +782,25 @@ impl ProjectManager {
                 "nothing is running on this issue",
             ));
         };
-        match run.session_id.filter(|_| run.status == RunStatus::Running) {
+        // A run with a session is stopped by cancelling its turn, and the
+        // executor settles it on the way out. Only a run that never reached
+        // one — `Queued` or `Held` — is settled here.
+        let live_session = run
+            .session_id
+            .clone()
+            .filter(|_| run.status == RunStatus::Running);
+        match live_session {
             Some(session) => Ok(Some(session)),
             None => {
-                self.store
-                    .settle_run(&run.id, RunStatus::Cancelled, None)
-                    .await?;
-                self.events.run_changed(project, number);
+                crate::settle::settle_run(
+                    &self.store,
+                    &self.events,
+                    &run,
+                    IssueActor::User,
+                    RunStatus::Cancelled,
+                    Some(RUN_CANCELLED_BEFORE_STARTING),
+                )
+                .await?;
                 Ok(None)
             }
         }

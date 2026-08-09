@@ -56,6 +56,9 @@ baybo-cron = { workspace = true, features = ["test-support"] }
 baybo-turn = { workspace = true, features = ["test-support"] }
 baybo-llm = { workspace = true, features = ["test-support"] }
 baybo-memory = { workspace = true, features = ["test-support"] }
+# `session_run_before` — the router tests assert the session it opens and
+# the window the brief is a delta from name the same run.
+baybo-project = { workspace = true, features = ["test-support"] }
 baybo-security = { workspace = true, features = ["test-support"] }
 baybo-session = { workspace = true, features = ["test-support"] }
 baybo-storage = { workspace = true, features = ["test-support"] }

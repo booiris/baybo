@@ -6,6 +6,11 @@ edition = "2024"
 [lib]
 doctest = false
 
+[features]
+# Test-only items other crates' tests reach for. Never enabled by a
+# release build.
+test-support = []
+
 [dependencies]
 baybo-model = { workspace = true }
 baybo-store = { workspace = true }

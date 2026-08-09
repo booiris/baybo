@@ -3899,3 +3899,448 @@ async fn cancelling_a_resumed_run_settles_it_rather_than_chasing_a_dead_turn() {
         RunStatus::Cancelled
     );
 }
+
+/// A board with one card in progress, its first run recorded and claimed —
+/// the state an executor is handed.
+async fn card_being_worked() -> (Fixture, ProjectRow, AgentProfileId, IssueRunRow) {
+    let f = fixture().await;
+    let p = f.manager.create_project(new_project("p")).await.expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev.clone()),
+                ..new_issue("wire the importer")
+            },
+        )
+        .await
+        .expect("issue");
+    let run = f.dispatched.lock()[0].clone();
+    assert!(
+        f.manager
+            .start_run(&run, &SessionId::from("sess-1"))
+            .await
+            .expect("claim"),
+        "the first executor to arrive takes it"
+    );
+    f.dispatched.lock().clear();
+    (f, p, dev, run)
+}
+
+fn settled_entries(timeline: &[IssueEventRow]) -> Vec<&IssueEventRow> {
+    timeline
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.body,
+                baybo_store::project::IssueEventBody::RunSettled { .. }
+            )
+        })
+        .collect()
+}
+
+/// The checkout the executor hands back. Never created, so there is no
+/// branch to surface — which is what every test here wants except the one
+/// about surfacing branches.
+fn no_checkout() -> &'static std::path::Path {
+    std::path::Path::new("/nonexistent/checkout")
+}
+
+fn done() -> baybo_project::RunOutcome {
+    baybo_project::RunOutcome {
+        status: RunStatus::Done,
+        error: None,
+        stopped_by_a_human: false,
+    }
+}
+
+/// Close a run out the way the waiter does. `briefed_at` is the instant the
+/// run's brief was read, which the dispatcher stamps in production — every
+/// test names its own, because which side of it a comment falls on is the
+/// rule being tested.
+async fn finish(
+    f: &Fixture,
+    run: &IssueRunRow,
+    briefed_at: DateTime<Utc>,
+    outcome: baybo_project::RunOutcome,
+) {
+    f.manager
+        .finish_run(run, no_checkout(), briefed_at, outcome)
+        .await;
+}
+
+#[tokio::test]
+async fn cancelling_a_run_that_never_started_says_so_on_the_card() {
+    let f = fixture().await;
+    let p = f.manager.create_project(new_project("p")).await.expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev),
+                ..new_issue("queued and then thought better of")
+            },
+        )
+        .await
+        .expect("issue");
+
+    assert!(
+        f.manager
+            .cancel_run(&p.id, 1)
+            .await
+            .expect("cancel")
+            .is_none(),
+        "a queued run is settled where it stands; there is no session to stop"
+    );
+
+    let timeline = f.manager.timeline(&p.id, 1).await.expect("timeline");
+    let settled = settled_entries(&timeline);
+    assert_eq!(
+        settled.len(),
+        1,
+        "the card says the run was cancelled, the same as every other settle does:\n{timeline:#?}"
+    );
+    assert_eq!(
+        settled[0].actor,
+        IssueActor::User,
+        "and says a person asked for it"
+    );
+}
+
+#[tokio::test]
+async fn a_settle_is_written_down_once_however_many_times_it_is_asked_for() {
+    let (f, p, _dev, run) = card_being_worked().await;
+
+    finish(&f, &run, run.created_at, done()).await;
+    finish(
+        &f,
+        &run,
+        run.created_at,
+        baybo_project::RunOutcome {
+            status: RunStatus::Failed,
+            error: Some("a replayed settle".to_owned()),
+            stopped_by_a_human: false,
+        },
+    )
+    .await;
+
+    assert_eq!(
+        f.manager.list_runs(&p.id, 1).await.expect("runs")[0].status,
+        RunStatus::Done,
+        "the first settle is the one that stands"
+    );
+    let timeline = f.manager.timeline(&p.id, 1).await.expect("timeline");
+    assert_eq!(
+        settled_entries(&timeline).len(),
+        1,
+        "and a replay puts nothing second on the timeline:\n{timeline:#?}"
+    );
+}
+
+#[tokio::test]
+async fn a_comment_the_run_was_already_told_about_does_not_start_a_second_one() {
+    let f = fixture().await;
+    let p = f.manager.create_project(new_project("p")).await.expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev),
+                ..new_issue("wire the importer")
+            },
+        )
+        .await
+        .expect("issue");
+    let run = f.dispatched.lock()[0].clone();
+
+    // Said while the run was still queued — a held run can sit there a day.
+    // The dispatcher reads the brief afterwards, so this is in it.
+    f.manager
+        .comment(&p.id, 1, IssueActor::User, "start with the CSV path")
+        .await
+        .expect("comment");
+    f.dispatched.lock().clear();
+    let briefed_at = Utc::now();
+
+    assert!(
+        f.manager
+            .start_run(&run, &SessionId::from("sess-1"))
+            .await
+            .expect("claim"),
+        "and only then does an executor pick it up"
+    );
+    finish(&f, &run, briefed_at, done()).await;
+
+    assert!(
+        f.dispatched.lock().is_empty(),
+        "the run was handed this comment; going back for it would ask for the work twice"
+    );
+}
+
+#[tokio::test]
+async fn a_comment_left_while_the_checkout_was_being_cut_is_still_picked_up() {
+    let f = fixture().await;
+    let p = f.manager.create_project(new_project("p")).await.expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev),
+                ..new_issue("wire the importer")
+            },
+        )
+        .await
+        .expect("issue");
+    let run = f.dispatched.lock()[0].clone();
+
+    // The gap neither instant on the ledger row can see. The brief has been
+    // read; the dispatcher is still inside `git worktree add`, and the run
+    // has not crossed the channel to be claimed. Backdated a millisecond so
+    // the ordering is the clock's to prove, not the scheduler's.
+    let briefed_at = Utc::now() - chrono::Duration::milliseconds(1);
+    f.manager
+        .comment(&p.id, 1, IssueActor::User, "also handle the empty case")
+        .await
+        .expect("comment");
+    f.dispatched.lock().clear();
+
+    // Only now does the executor pick it up, so `started_at` falls on the
+    // far side of the comment.
+    assert!(
+        f.manager
+            .start_run(&run, &SessionId::from("sess-1"))
+            .await
+            .expect("claim"),
+        "the executor claims after the comment landed"
+    );
+    finish(&f, &run, briefed_at, done()).await;
+
+    let dispatched = f.dispatched.lock().clone();
+    assert_eq!(
+        dispatched.len(),
+        1,
+        "the run was never told this, and `comment_delivery` promised the \
+         operator it would be — a window bounded by the claim drops it and \
+         nothing else comes back for it"
+    );
+    assert_eq!(dispatched[0].trigger, RunTrigger::Comment);
+}
+
+#[tokio::test]
+async fn a_run_does_not_wake_itself_on_its_own_progress_note() {
+    let (f, p, dev, run) = card_being_worked().await;
+
+    f.manager
+        .comment(
+            &p.id,
+            1,
+            IssueActor::Agent(dev.clone()),
+            "halfway through the importer",
+        )
+        .await
+        .expect("the run says where it has got to");
+
+    finish(&f, &run, run.created_at, done()).await;
+
+    assert!(
+        f.dispatched.lock().is_empty(),
+        "an agent reporting progress is not somebody asking it for more"
+    );
+}
+
+#[tokio::test]
+async fn somebody_elses_comment_during_a_run_does_start_a_follow_up() {
+    let (f, p, _dev, run) = card_being_worked().await;
+
+    f.manager
+        .comment(&p.id, 1, IssueActor::User, "also handle the empty case")
+        .await
+        .expect("comment");
+
+    finish(&f, &run, run.created_at, done()).await;
+
+    let dispatched = f.dispatched.lock().clone();
+    assert_eq!(dispatched.len(), 1, "the card is picked back up");
+    assert_eq!(dispatched[0].trigger, RunTrigger::Comment);
+}
+
+#[tokio::test]
+async fn a_run_somebody_stopped_is_left_stopped() {
+    let (f, p, _dev, run) = card_being_worked().await;
+
+    f.manager
+        .comment(&p.id, 1, IssueActor::User, "actually, stop")
+        .await
+        .expect("comment");
+
+    finish(
+        &f,
+        &run,
+        run.created_at,
+        baybo_project::RunOutcome {
+            status: RunStatus::Cancelled,
+            error: None,
+            stopped_by_a_human: true,
+        },
+    )
+    .await;
+
+    assert!(
+        f.dispatched.lock().is_empty(),
+        "somebody who pressed stop is not asking for the work to continue"
+    );
+}
+
+async fn git(dir: &std::path::Path, args: &[&str]) {
+    let out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .await
+        .expect("run git");
+    assert!(
+        out.status.success(),
+        "git {args:?} in {}: {}",
+        dir.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[tokio::test]
+async fn a_card_finished_before_its_run_settles_still_surfaces_the_branch() {
+    let (f, p, _dev, run) = card_being_worked().await;
+
+    let root = baybo_project::worktree::worktree_root(&f.paths, &p.id, 1);
+    let branch = baybo_project::worktree::branch_name(1, "wire the importer");
+    baybo_project::worktree::ensure(std::path::Path::new(&p.workdir), &root, &branch)
+        .await
+        .expect("cut the worktree a run works in");
+    tokio::fs::write(root.join("importer.rs"), "fn main() {}")
+        .await
+        .expect("the run's work");
+    git(&root, &["add", "."]).await;
+    git(
+        &root,
+        &[
+            "-c",
+            "user.name=dev-1",
+            "-c",
+            "user.email=dev-1@baybo.local",
+            "commit",
+            "-qm",
+            "wire the importer",
+        ],
+    )
+    .await;
+
+    // The card is finished while the run is still in flight — the assignee
+    // closing its own card, or an operator doing it. That reclaims the
+    // checkout out from under the run that is about to settle.
+    f.manager
+        .move_issue(&p.id, 1, IssueActor::User, IssueStatus::Done, &[1])
+        .await
+        .expect("finish it");
+    assert!(!root.exists(), "the checkout was reclaimed");
+
+    f.manager
+        .finish_run(&run, &root, run.created_at, done())
+        .await;
+
+    assert_eq!(
+        f.manager
+            .get_issue(&p.id, 1)
+            .await
+            .expect("issue")
+            .branch
+            .as_deref(),
+        Some(branch.as_str()),
+        "the board never merges, so the branch is the one artefact it hands over"
+    );
+}
+
+/// A hook that reports what the board announced, in order. The channel is
+/// what lets a test await a dispatcher's own background task without
+/// sleeping on it.
+struct RecordingEvents(tokio::sync::mpsc::UnboundedSender<String>);
+
+impl baybo_project::ProjectEvents for RecordingEvents {
+    fn project_changed(&self, project: &ProjectId) {
+        let _ = self.0.send(format!("project {project}"));
+    }
+    fn board_changed(&self, project: &ProjectId, issue: Option<i64>) {
+        let _ = self.0.send(format!("board {project} {issue:?}"));
+    }
+    fn run_changed(&self, project: &ProjectId, issue: i64) {
+        let _ = self.0.send(format!("run {project} #{issue}"));
+    }
+    fn timeline_changed(&self, project: &ProjectId, issue: i64) {
+        let _ = self.0.send(format!("timeline {project} #{issue}"));
+    }
+}
+
+#[tokio::test]
+async fn a_run_whose_checkout_cannot_be_cut_says_so_instead_of_shimmering() {
+    let f = fixture().await;
+    let p = f.manager.create_project(new_project("p")).await.expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev),
+                ..new_issue("wire the importer")
+            },
+        )
+        .await
+        .expect("issue");
+    let run = f.dispatched.lock()[0].clone();
+
+    // The repository the card's checkout would be cut from is gone.
+    tokio::fs::remove_dir_all(&p.workdir)
+        .await
+        .expect("take the repository away");
+
+    let (tx, mut announced) = tokio::sync::mpsc::unbounded_channel();
+    let (dispatch, _rx) = baybo_project::dispatch::build(baybo_project::DispatchConfig {
+        store: Arc::clone(&f.store),
+        events: Arc::new(RecordingEvents(tx)),
+        paths: f.paths.clone(),
+        user_id: "owner".to_owned(),
+        channel: baybo_model::ChannelType::owner(),
+    });
+    dispatch(run.clone());
+
+    // The dispatcher prepares on its own task; its first announcement is
+    // what says it has got as far as settling.
+    let first = tokio::time::timeout(std::time::Duration::from_secs(10), announced.recv())
+        .await
+        .expect("the board is told, rather than left to work it out")
+        .expect("hook is live");
+    assert_eq!(first, format!("run {} #1", p.id));
+
+    let runs = f.manager.list_runs(&p.id, 1).await.expect("runs");
+    assert_eq!(runs[0].status, RunStatus::Failed);
+    let timeline = f.manager.timeline(&p.id, 1).await.expect("timeline");
+    let settled = settled_entries(&timeline);
+    assert_eq!(
+        settled.len(),
+        1,
+        "and the card says why, not just that it stopped:\n{timeline:#?}"
+    );
+    assert_eq!(settled[0].actor, IssueActor::System);
+}

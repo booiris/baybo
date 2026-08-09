@@ -37,8 +37,11 @@ every door leads through it.
 
 | File | What it owns |
 | --- | --- |
-| `manager.rs` | `ProjectManager`: the whole write surface, and the enqueue chokepoint |
-| `runs.rs` | The two run predicates (`triggers_run`, `accepts_runs`) and the ledger entry |
+| `manager.rs` | `ProjectManager`: the whole write surface, the enqueue chokepoint, and the executor's port |
+| `settle.rs` | The settle chokepoint: the ledger row, the invalidation, and the timeline entry, as one sequence |
+| `runs.rs` | The two run predicates (`triggers_run`, `accepts_runs`), the ledger entry, which earlier run a run continues, and `RunOutcome` |
+| `dispatch.rs` | Turning a recorded row into an `IssueRunEvent` the executor can run |
+| `brief.rs` | The brief a run is handed: the card, and what has been said on it since |
 | `comments.rs` | `comment_delivery` — what a comment does besides being recorded |
 | `mentions.rs` | `@handle` scanning, and when a mention is a handover |
 | `stages.rs` | Sub-issues, `is_finished`, the stage barrier's two questions, the progress ring |
@@ -84,6 +87,20 @@ A run is a row (`issue_runs`) written **before** anything can act on it, and
 settled by whoever executed it. Record-before-deliver, the same discipline cron
 delivery uses: a crash between recording and dispatch is a run the boot sweep
 finds, not work that silently never happened.
+
+**Settling is three writes, not one**, and `settle.rs` is where they happen
+together: the ledger row, the run's own invalidation, and the `RunSettled`
+entry saying how it ended. A caller doing only the first leaves a card claiming
+something the ledger under it contradicts — either a card that shimmers forever
+because nobody was told, or a timeline that skips a run's whole ending. Every
+door goes through it: the executor's `finish_run`, the operator's `cancel_run`,
+the sweep's `call_off`, and the dispatcher settling a checkout it could not cut.
+The actor differs per door and is the caller's to supply; the sequence is not.
+
+Nothing in `settle.rs` consults `writable_project`, deliberately. A run archived
+out from under mid-flight still has to finish its own bookkeeping — refusing
+that write would strand the card, which is the failure settling exists to
+prevent.
 
 ```
                        ┌──────(restart)───────┐
@@ -191,6 +208,12 @@ The card would then show a git error while an agent is live, the winner's own
 settle would be a no-op, and the freed dedupe slot would let a comment wake or a
 retry put a second agent into the same worktree.
 
+Since the dispatcher settles through `settle.rs` like everybody else, that
+losing settle now *announces* and writes its timeline entry. That makes the race
+more visible, not more likely: the row was already wrong, and a board that
+renders the wrong row faithfully is easier to diagnose than one that renders a
+stale right one.
+
 The callers narrow this; none of them removes it.
 
 A **restore** is an edge — `set_project_archived`'s UPDATE is conditional on the
@@ -202,9 +225,10 @@ assembled after), and `resume_project_runs` hands out every `Queued` row
 `active_runs` returns with no filter on when the row was written. So a card
 filed into In Progress in the first seconds of a process — by an operator, by
 `issue_create`, by a cron-fired session — is dispatched by its own `enqueue` and
-again by the sweep, and the first dispatcher is still inside `get_issue` →
-`comments_for_brief` → `prepare_checkout`, which shells out to git. That window
-is 100 ms to seconds on a real repo, not microseconds.
+again by the sweep, and the first dispatcher is still inside `dispatch::prepare`
+— `get_issue` → `comments_for_brief` → `worktree::prepare_for_issue`, which
+shells out to git. That window is 100 ms to seconds on a real repo, not
+microseconds.
 
 Two smaller shapes sit beside it: the restore one above, and the gap inside
 `resume_project_runs` between `set_project_archived` committing and `active_runs`
@@ -322,11 +346,39 @@ timeline, from the issue and its unsettled run:
 | A `Held` or `Queued` run exists | `WaitsForQueuedRun` — it assembles its brief later, so it will read this |
 | A `Running` run exists | `AfterCurrentRun` — deferred |
 
-The deferred case is the one with a moving part: the executor calls
-`wake_on_comment` when the run settles and the issue's live-run slot is free
-again, and that goes through `enqueue` like every other start. Writing the
-ledger row directly would produce a run nothing ever dispatches, holding the
-slot until the next boot.
+The deferred case is the one with a moving part, and it is the board's to
+resolve, not the executor's: `finish_run` asks `wake_after_run` once the run
+settles and the issue's live-run slot is free again, and that goes through
+`enqueue` like every other start. Writing the ledger row directly would produce
+a run nothing ever dispatches, holding the slot until the next boot.
+
+Two things bound "somebody said something", and both are the reason the
+predicate lives here rather than beside the executor, which can see neither:
+
+- **The window is when the brief was read**, and that is *neither* instant the
+  ledger row carries. `created_at` is the enqueue: a `Held` run can sit there a
+  day before its brief is cut, and waking on all of it re-instructs the agent to
+  redo what it just did. `started_at` is the claim, which lands *after* the
+  brief — `dispatch::prepare` reads the card, then shells out to `git worktree
+  add`, then the event crosses the run channel, then the router mints a session.
+  That interval is the same "100 ms to seconds" the double-dispatch section
+  measures, and everything said inside it is in neither the brief nor a
+  claim-bounded window, so nothing would ever come back for it — while
+  `comment_delivery` has been answering `WaitsForQueuedRun`, which promises the
+  operator the opposite. So the dispatcher stamps `IssueRunEvent::briefed_at`
+  immediately *before* it reads, and the executor hands it back to `finish_run`.
+  Stamped before rather than after so a comment racing the read is over-read
+  rather than dropped.
+- **A comment the run's own agent wrote is not somebody asking for more.** An
+  agent posting progress through `IssueComment` would otherwise wake itself, and
+  then wake itself again on whatever the follow-up says.
+
+  The key is the **agent profile**, because a timeline entry records only its
+  actor. One agent holding two live cards can comment from one onto the other
+  and have it skipped here. Narrowing that needs the authoring run recorded on
+  the event body — a stored-shape change — so until then the filter errs towards
+  a missed nudge rather than a run that answers its own note and wakes on the
+  answer.
 
 An `@mention` on a card **nobody is on** is the commenter saying "you take
 this", and it is applied through `update_issue` — the same path a drag takes,
@@ -334,6 +386,39 @@ so it gets the same trigger, the same timeline entry and the same refusals for
 an agent that cannot run. In the *commenter's* name, not the operator's. A
 mention on somebody else's card is a question, never a reassignment: treating it
 otherwise would let a passing remark take work away from whoever is doing it.
+
+### What the executor may do
+
+`baybo-agent` executes runs; it does not write boards. It holds an
+`Arc<ProjectManager>` and nothing under it — no `ProjectStore`, no
+`ProjectEvents` — so the set of board writes it can perform is exactly the two
+this crate offers it:
+
+| | What it does | Why it is one call and not three |
+| --- | --- | --- |
+| `start_run(run, session)` | Claims the row, then says `RunStarted` on the card | The claim is what stops two agents on one card, so nothing may say a run started without having won it |
+| `finish_run(run, checkout, briefed_at, outcome)` | Settles, surfaces the branch, then follows up on comments | The order is a rule: the branch is read before the follow-up because a follow-up enqueues another run against the same checkout, and the settle is first so a card whose branch cannot be read still stops shimmering |
+
+`briefed_at` is handed straight back from `IssueRunEvent` — the executor carries
+it rather than deriving it, because it is the only record of when the run's
+brief was read and the ledger row's own two instants both fall on the wrong side
+of it. See the follow-up window below.
+
+`RunOutcome` is the whole of what the executor decides — it watched the turn, so
+`status`, `error` and `stopped_by_a_human` are its answers — and what those cost
+the card is this crate's. `stopped_by_a_human` is separate from `status` because
+the ledger row cannot carry it and it changes what the board owes: somebody who
+pressed stop is not asking for a follow-up.
+
+**The branch is the one artefact a board hands over**, since it never merges, so
+`record_branch` is written to survive the awkward order rather than assume a
+tidy one. It reads the checkout's *own* branch, so a retitle mid-run cannot
+rename a ref git already knows; and when the checkout is gone it falls back to
+the name the tree was cut with, so a card finished *before* its run settled —
+which reclaims the tree — still surfaces one. `commits_ahead` is then asked of
+the repository rather than the checkout, because the tree may be gone while the
+ref it left behind is not. `reclaim_if_finished` shares the same fallback:
+whichever of the two runs first, both name the same branch.
 
 ### Sessions
 
@@ -350,14 +435,16 @@ Session continuity is what makes a follow-up run see what the last one did.
 Because at most one run per issue is in flight, the waiter can treat the newest
 terminal turn at or after its own enqueue as unambiguously its own.
 
-**Which** session a run is handed is decided in exactly one place, and it is not
-here: `session_run_to_continue` in `baybo-agent`'s issue router picks the newest
-run of the *same agent* that ever got as far as executing, and `issue_session`
-mints a fresh session when there is none. A run's brief is a delta against that
-same run (`session_run_before`), never against a second rule spelled the same
-way: a brief bounded by a run whose session this one is *not* given would trim
-the card's conversation as "already read" against a transcript that does not
-contain it.
+**Which** session a run is handed is decided in exactly one place: `runs.rs`'s
+`session_run_to_continue` picks the newest run of the *same agent* that ever got
+as far as executing, and `baybo-agent`'s `issue_session` — which mints a fresh
+session when there is none — is its only caller. A run's brief is a delta
+against that same run (`session_run_before`, its sibling in the same module),
+never against a second rule spelled the same way: a brief bounded by a run whose
+session this one is *not* given would trim the card's conversation as "already
+read" against a transcript that does not contain it. The two predicates live
+here rather than beside the executor because the brief is assembled here too,
+and a rule with two homes is a rule with two answers.
 
 The brief keeps at most 16,000 bytes of comment text, newest first, and always
 keeps the newest comment. If older comments are dropped it inserts an explicit
@@ -373,8 +460,8 @@ use the same ledger predicate so they cannot disagree about the boundary.
 
 "Ever got as far as executing" is itself one predicate with one home —
 `IssueRunRow::was_claimed()` in `baybo-store`, on the row it is about, in the
-crate `baybo-project` and `baybo-agent` both depend on (the router's `ever_ran`
-is that function under the router's own name). It reads the **session**, not
+crate `baybo-project` and `baybo-agent` both depend on (`runs::ever_ran` is that
+function under this crate's own name). It reads the **session**, not
 `started_at`: the executor stamps both when it claims a run, but the boot sweep
 clears `started_at` and leaves the session, so only the session still answers
 for a run the process died in the middle of. This crate asks the same predicate
