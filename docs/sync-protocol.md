@@ -196,6 +196,19 @@ Semantics:
   their content lives in the retained outbox entry (outbox rule 2); an
   echoed-but-unpersisted interjection would otherwise vanish from screen
   with nothing left to restore it.
+- **A REPLACE is authoritative only between the page's oldest and newest
+  ordinals**, and silent outside them. The page is a snapshot: a durable row
+  the client renders whose ordinal is ABOVE the page's newest is one the
+  snapshot predates — the turn's final reply, arriving live while the request
+  was in flight. Dropping it is not a redraw but a permanent hole, and one
+  the rebase-dirty rule above does not cover: a *baseline* is not rebased, so
+  that live frame's `advanceFromLive` stands, the cursor sits at the dropped
+  row's own ordinal, and the strictly-`>` select can never return it. A cold
+  open is the only path that runs a baseline, so the symptom is precise:
+  the newest message never appears, until the client is restarted. Both
+  clients therefore keep rows above the page's ceiling (`rowsAbovePageCeiling`
+  / the `keptLive` filter) — the mirror image of iOS's floor rule, which keeps
+  the scrolled-up history *below* it (`rowsAboveFloor`).
 - Control events (notices, slash echoes) are NOT ordinal-addressed — they
   live in `session_control_events(seq, after_ordinal)`, and a notice can be
   written later with an anchor at or below an ordinal the client already

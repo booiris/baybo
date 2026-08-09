@@ -1136,7 +1136,13 @@ export function mergeSyncPage(
     next.splice(at, 0, row);
     byId = new Map(next.map((r, i) => [r.id, i] as const));
   }
-  return next;
+  // The tail-append and re-home branches ask the fold guards themselves; the
+  // ordinal SPLICE above asks nothing, and `placeAt` always lands a row directly
+  // below an ordinal-bearing one — which may be a work block whose turn this row
+  // continues. Fold once at the end, as app/web's `applySyncMerge` does. A
+  // healthy page has no adjacency and `foldAdjacentWork` is idempotent, so the
+  // other two branches pass through unchanged.
+  return foldAdjacentWork(next, compactionPoints);
 }
 
 /// Apply a REPLACE page (a baseline, or a rebase) over the rendered thread: the
@@ -1195,6 +1201,20 @@ export function applySyncReplace(
   const keptSends = prev.filter(
     (r) => r.role === "user" && unconfirmedSends.has(r.id) && !pageIds.has(r.id),
   );
+  // Rows the page PREDATES. Its newest ordinal is the instant the server
+  // snapshotted it, and a durable row above that is one this page cannot be
+  // speaking about — a live reply that landed while the request was in flight.
+  // Dropping it is permanent, not a redraw: that frame already advanced the
+  // cursor to its own ordinal, a difference selects strictly `>`, and the cursor
+  // is max-wins — so no later sync can return the row, and on a cold open (the
+  // path that runs a baseline) the newest message simply never appears. This is
+  // `rowsAboveFloor`'s rule at the other edge: a REPLACE is authoritative
+  // between the page's oldest and newest ordinals, and silent outside them.
+  const ceiling = page.reduce((hi, r) => Math.max(hi, rowCoverageOrdinal(r) ?? hi), -Infinity);
+  const keptLive = prev.filter((r) => {
+    const ordinal = rowCoverageOrdinal(r);
+    return ordinal !== null && ordinal > ceiling && !pageIds.has(r.id);
+  });
   let rows = page;
   let carried = openWork;
   if (openWork.length > 0) {
@@ -1212,7 +1232,7 @@ export function applySyncReplace(
       carried = [];
     }
   }
-  return [...rows, ...keptSends, ...carried];
+  return [...rows, ...keptLive, ...keptSends, ...carried];
 }
 
 /// Restored rows re-enter with live-turn state INTACT: a work block that was
@@ -3539,7 +3559,28 @@ export function Transcript({
           if (head.length === 0) return rebuilt;
           // The seam is the same one scroll-up paging makes: a turn wider than
           // the page has a work block on both sides of it and must stay one card.
-          return foldAdjacentWork([...head, ...rebuilt], frame.compaction_points ?? []);
+          //
+          // With one difference the fold cannot see on its own. A kept head can
+          // only END on a work block when the row that CLOSED that turn — its
+          // answer bubble, or the notice that severed it — fell at or below the
+          // page's floor and so went to the page. The page then re-cut the same
+          // turn at its START, and `flush` flags a block cut at its start whole
+          // (`turn_complete: true`) exactly as it flags a real turn end, because
+          // the accumulator only ever learns about its END. The head's copy
+          // inherited that `true` (directly, or through `joinWorkHalves`), so
+          // `sameContinuingTurn` refuses and one turn renders as two cards — and
+          // it is STICKY: the pair persists into the mirror, and
+          // `sanitizeRestoredRows` will not heal a head that says complete.
+          // Restate the head half as what it now is, a block whose turn
+          // continues below, and let the ordinary guards adjudicate:
+          // `crossesCompaction` still refuses across a watermark, and `foldWork`
+          // takes `joinWorkHalves` so the card spans the real turn.
+          const last = head[head.length - 1];
+          const seam =
+            last.role === "work" && rowOrdinal(last.id) !== null && rebuilt[0]?.role === "work"
+              ? [...head.slice(0, -1), { ...last, turnComplete: false }]
+              : head;
+          return foldAdjacentWork([...seam, ...rebuilt], frame.compaction_points ?? []);
         });
         if (keepFloor === null) {
           // The page IS the thread now, and it brings its own paging window. Rows

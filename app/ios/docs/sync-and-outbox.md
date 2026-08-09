@@ -30,8 +30,8 @@ on open / reconnect / gap / buffer-overflow re-attach / safety tick:
   cursor = max(cursor, page.next_cursor)   # frozen while rebase-dirty
 ```
 
-Every REPLACE branch keeps the open work block + the optimistic sends
-(`applySyncReplace`).
+Every REPLACE branch keeps the open work block, the optimistic sends, and the
+durable rows the page PREDATES (`applySyncReplace`).
 
 ### Only a REPAIR may throw the loaded history away
 
@@ -60,6 +60,23 @@ would delete every one of them out of the half that survives.
 The client cannot read the reason off the reply — the frame carries only
 `since_ordinal: null` — so `runSync` records it (`baselineIsRepair`) when it
 posts.
+
+### …and no REPLACE may throw away the rows it PREDATES
+
+The floor rule has a ceiling twin, and it applies to **every** branch, repair
+included. The page is a snapshot taken at its own newest ordinal; a durable row
+the client renders above that is one the snapshot could not have seen — the
+turn's final reply, landing live while the request was in flight. `keptLive` in
+`applySyncReplace` keeps those. Dropping them was not a redraw but a permanent
+hole: that live frame already ran `advanceCursorFromLive` on its own ordinal, a
+difference selects strictly `>` the cursor, and the cursor is max-wins, so
+`next_cursor` (lower, from the older snapshot) cannot pull it back down. Nothing
+re-delivers the row, the mirror persists the thread without it, and the reader
+sees a conversation whose newest message never arrives. A cold open is the one
+path that runs a baseline, which is exactly where it was reported.
+
+The rebase-dirty freeze does not cover this: a baseline is not `rebased`, so the
+live advance stands.
 
 Both non-repair cases are reached by ordinary use, not by pathology. The rebase
 test counts *emitted* rows against `limit`, but the server scans past the
@@ -234,8 +251,23 @@ boundary (the final answer, the next user turn, a `/stop`, a compaction
 watermark) closed it in-window. `sameContinuingTurn` (`Transcript.tsx`, mirroring
 `app/web`'s) lets a block be JOINED onto the previous one only when that previous
 one is a cut-off (`false`) head — every seam asks it: `foldAdjacentWork` (the
-prepend and REPLACE folds), `mergeSyncPage`'s tail fold, and the REPLACE
-overlay's live-block fuse. A live block is keyed by `uid()`, carries no flag, and
+prepend and REPLACE folds, and `mergeSyncPage`'s closing pass), `mergeSyncPage`'s
+tail fold, and the REPLACE overlay's live-block fuse. `mergeSyncPage` folds at
+the END as well as at its tail branch, because its third path — the ordinal
+SPLICE that files a late row — lands a row directly beneath whatever
+ordinal-bearing row precedes it, which may be a work block whose turn that row
+continues; that branch asked no guard at all.
+
+The REPLACE fold has one thing to say first. A kept head can only END on a work
+block when the row that CLOSED that turn fell into the page's window, which means
+the page re-cut the same turn at its START — and `flush` flags a block cut at its
+start `turn_complete: true`, exactly as it flags a real turn end, because the
+accumulator only ever learns about a block's END. Both halves then claim to be
+whole turns and `sameContinuingTurn` refuses, so one turn renders as two cards —
+stickily, since the pair persists into the mirror and the restore heal below will
+not touch a head that says complete. The seam therefore restates that head as
+what it now is (`turnComplete: false`) before folding, and the ordinary guards
+adjudicate from there. A live block is keyed by `uid()`, carries no flag, and
 still fuses with its own reconstruction — that is RECONCILE (one span, two
 representations), not a join. An ABSENT flag declines: an extra card is
 cosmetic, a wrong join swallows a whole turn into another's card.

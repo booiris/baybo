@@ -585,6 +585,7 @@ export function ChatPage() {
   const transcriptScrollRef = useRef<HTMLDivElement | null>(null);
   const transcriptEndRef = useRef<HTMLDivElement | null>(null);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
+  const transcriptContentObserver = useRef<ResizeObserver | null>(null);
   // True when the user is parked within 64px of the latest message. When
   // false a new delta/message must *not* drag them back down — the user
   // is reading scroll-back. Re-asserts itself the moment they scroll back
@@ -922,6 +923,22 @@ export function ChatPage() {
             return;
           }
           const replace = data.rebased || baseline;
+          // Only a REPAIR may throw the loaded history away. Three situations
+          // reach a REPLACE and only one puts the rendered rows in doubt:
+          //   * repair — `syncSince` refused a NON-null cursor because a
+          //     rendered row outran it, so the thread may be out of ORDER and
+          //     the rows dropped are exactly the ones under suspicion;
+          //   * rebase — says only that the difference outran the server's limit
+          //     or its scan bound and here is the newest page instead, NOT that
+          //     ordinals were rewritten;
+          //   * cursor-less baseline — a cold open with no watermark, which has
+          //     no loaded history to keep anyway.
+          // Both non-repair cases are reached by ordinary use: one agentic turn
+          // persists hundreds of invisible tool rows, so a handful of turns
+          // since the cursor is enough to rebase. Dropping the head there costs
+          // the reader every page they scrolled up for, mid-read. iOS has kept
+          // it since af7372bc; this is the same rule.
+          const repair = baseline && before.cursor !== null;
           const pageRows = data.rows.map((item) => transcriptItemToRow(sid, item));
           confirmDurableFromItems(sid, data.rows);
           // A work row is a turn-END signal for the SubscribeState
@@ -939,21 +956,61 @@ export function ChatPage() {
             if (ms !== null) recordEndedTurn(sid, ms);
           }
           const unconfirmed = outbox.unconfirmedIds(sid);
+          // Every sync response carries the session's whole boundary set (empty
+          // ⇒ never compacted), so this is the authoritative refresh — the meta
+          // GET can't be, since a warm re-entry syncs without it, a `gap` /
+          // reconnect recovery never re-issues it, and a failed one is
+          // swallowed. A stale set is not cosmetic: `crossesCompaction` is the
+          // ONLY guard against fusing the two halves of a turn a watermark cut
+          // in the gap between two pages, and the divider that explains the
+          // split to the reader draws off the same data. iOS refreshes on every
+          // page for the same reason (`applySyncPage`).
+          const compactionPoints = (data.compaction_points ?? []).map((p) => ({
+            ordinal: p.ordinal,
+            at: p.at,
+          }));
           setViews((prev) => {
             const view = prev[sid] ?? EMPTY_VIEW;
-            const transcript = replace
-              ? applySyncReplace(view.transcript, pageRows, unconfirmed, view.turn)
-              : applySyncMerge(view.transcript, pageRows, view.compactionPoints);
+            if (!replace) {
+              return {
+                ...prev,
+                [sid]: {
+                  ...view,
+                  transcript: applySyncMerge(view.transcript, pageRows, compactionPoints),
+                  compactionPoints,
+                  historyLoaded: true,
+                  historyLoading: false,
+                },
+              };
+            }
+            const rebuilt = applySyncReplace(view.transcript, pageRows, unconfirmed, view.turn);
+            // The page's floor is only a cut point when loaded rows sit below
+            // it — which is the same statement as "there is history above the
+            // page", since `oldestOrdinal` is by construction the oldest
+            // durable ordinal actually rendered.
+            const pageFloor = data.oldest_ordinal ?? null;
+            const keepHead =
+              !repair &&
+              pageFloor !== null &&
+              view.oldestOrdinal !== null &&
+              view.oldestOrdinal < pageFloor;
+            const head = keepHead
+              ? rowsAboveFloor(view.transcript, pageFloor, new Set(rebuilt.map((r) => r.key)))
+              : [];
             return {
               ...prev,
               [sid]: {
                 ...view,
-                transcript,
+                transcript:
+                  head.length > 0 ? joinKeptHead(head, rebuilt, compactionPoints) : rebuilt,
+                compactionPoints,
                 historyLoaded: true,
                 historyLoading: false,
-                ...(replace
-                  ? { oldestOrdinal: data.oldest_ordinal ?? null, hasMore: data.has_more_older }
-                  : {}),
+                // The kept head still describes the window it was paged in
+                // under, so its floor outlives the page's.
+                ...(head.length > 0
+                  ? {}
+                  : { oldestOrdinal: pageFloor, hasMore: data.has_more_older }),
               },
             };
           });
@@ -1199,10 +1256,11 @@ export function ChatPage() {
 
   /** Re-read a session's compaction boundaries (the light `?limit=1` meta
    *  fetch, whose transcript slice is ignored). Fired when a live `compacted`
-   *  status frame lands: the forward sync response carries no
-   *  `compaction_points`, and a compaction that happens while the tab is open
-   *  supersedes rows in place — so without this the boundary divider would not
-   *  appear until a reload. */
+   *  status frame lands, which is the FAST path: a compaction that happens
+   *  while the tab is open supersedes rows in place, and this shows the
+   *  boundary at once rather than at whatever later moment a sync happens to
+   *  run. `runSyncSession` carries the same set on every response, so this is
+   *  no longer the only refresh. */
   const refreshCompactionPoints = useCallback(
     async (sid: string) => {
       try {
@@ -1494,7 +1552,7 @@ export function ChatPage() {
         }
         // A live compaction rewrote the LLM context server-side — refresh this
         // session's compaction boundaries so the pre-compaction divider appears
-        // without a reload (sync carries no compaction_points).
+        // at the seam's own moment, not at the next sync's.
         if (frame.kind === 'status' && frame.phase === 'compacted') {
           void refreshCompactionPoints(frame.session_id);
         }
@@ -1874,6 +1932,33 @@ export function ChatPage() {
     sessionId,
     loadOlder,
   ]);
+
+  // Hold the newest edge through height that lands AFTER the transcript commit.
+  // The bottom-pin below is keyed on the transcript array, and plenty of growth
+  // never touches it: an attachment thumbnail swapping its 96px placeholder for
+  // the real image (`AttachmentImage` fetches the blob itself, so the box has no
+  // reserved size), the webfont swap, KaTeX. On a cold open those all resolve
+  // after the first paint — so the reader was left above the newest message,
+  // with no pill to point at it either, since `transcriptTailSignature` never
+  // moved. A warm reload hid it: the bytes are already cached and land before
+  // the pin. Attached by ref callback because the observed box unmounts with the
+  // empty/loading branches. iOS holds the edge the same way (its `.chat-log`
+  // ResizeObserver, added for the same two causes).
+  const observeTranscriptContent = useCallback((node: HTMLDivElement | null) => {
+    transcriptContentObserver.current?.disconnect();
+    transcriptContentObserver.current = null;
+    if (node === null || typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(() => {
+      const scroller = transcriptScrollRef.current;
+      // Only while pinned: growth under a reader in scroll-back must not yank
+      // them down, and the browser already holds their position for it.
+      if (!scroller || !pinnedToBottomRef.current) return;
+      scroller.scrollTop = scroller.scrollHeight;
+    });
+    observer.observe(node);
+    transcriptContentObserver.current = observer;
+  }, []);
+  useEffect(() => () => transcriptContentObserver.current?.disconnect(), []);
 
   const jumpToLatest = useCallback(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -2961,7 +3046,7 @@ export function ChatPage() {
           ) : currentView.transcript.length === 0 && !currentView.pendingApproval ? (
             <WelcomeEmpty slashCommands={slashCommands} onPick={handleComposerChange} />
           ) : (
-            <div className="flex flex-col gap-3 w-full max-w-4xl mx-auto">
+            <div ref={observeTranscriptContent} className="flex flex-col gap-3 w-full max-w-4xl mx-auto">
               {currentView.olderLoading ? (
                 <div className="flex justify-center py-2 text-ink-soft">
                   <RiLoader4Line className="text-xl animate-spin" />
@@ -3978,13 +4063,25 @@ function ensureWork(
   while (scan >= 0 && rows[scan].notice !== undefined) scan -= 1;
   const tail = rows[scan];
   let idx: number;
-  if (tail?.kind === 'work' && (tail.workActive || turnActive === false)) {
+  if (
+    tail?.kind === 'work' &&
+    (tail.workActive || turnActive === false || tail.workComplete === false)
+  ) {
     // Reuse the turn's work block: an active one (a live turn), OR —
     // when the server says the turn already ended — its just-closed block,
     // so a late trailing frame (e.g. a tool call that completed after a
     // `/stop` cancel) folds into that turn's collapsed block instead of
     // spawning a perpetual "Working" box that no turn-end frame will close.
     // Only steps are appended — a frozen block keeps its `workEndedAt`.
+    //
+    // `workComplete === false` covers the window where the turn state is not
+    // known yet (`turnActive === null`): a REPLACE lands before the
+    // `subscribe_state` bundle on every cold open, so the page's in-flight
+    // block is on screen `workActive: false` with no turn to re-open it, and a
+    // progress frame arriving first would otherwise fork a second card. Only
+    // the server sets that flag, and only on a block its own window cut off —
+    // which on the newest page IS the running turn. An `undefined` flag (older
+    // gateway) still declines, matching `sameContinuingTurn`'s degradation.
     idx = scan;
   } else {
     // No reusable block. Open one — pre-closed when the server says the
@@ -4945,9 +5042,14 @@ export function applySyncMerge(
     if (row.kind === 'work' && row.workStartedAt !== undefined) {
       const idx = findOpenWorkIndex(next, row.workStartedAt);
       if (idx >= 0) {
-        // The server's reconstruction of the turn we were watching live —
-        // its closed work row supersedes the open block.
-        next[idx] = row;
+        // The server's reconstruction of the turn we were watching live. A
+        // CUT-OFF block (`turn_complete: false`) means that turn is still
+        // running, so reconcile into the open block — adopt the server's steps
+        // and timing, keep it live. Overwriting it outright closes a block the
+        // turn hasn't finished, and the next progress frame then finds a frozen
+        // tail and forks a second card. Only a block the server calls whole
+        // supersedes: that turn ended while the live frames were missing.
+        next[idx] = row.workComplete === false ? reconcileWork(next[idx], row) : row;
         changed = true;
         continue;
       }
@@ -5034,6 +5136,84 @@ function dropInFlightAnswerStep(page: TranscriptRow[]): TranscriptRow[] {
   return [...page.slice(0, i), ...next, ...page.slice(i + 1)];
 }
 
+/** The rows a REPLACE page does not reach: everything before the FIRST row whose
+ *  ordinal its window covers. `taken` drops any the rebuilt thread already
+ *  carries, so a key can never render twice.
+ *
+ *  Cut by POSITION, not filtered on `ordinal < floor`: a notice or a `/stop`
+ *  echo carries no ordinal, and a filter would delete every one of them out of
+ *  the half that survives. Mirrors iOS `rowsAboveFloor`. */
+export function rowsAboveFloor(
+  rows: TranscriptRow[],
+  floor: number,
+  taken: ReadonlySet<string>,
+): TranscriptRow[] {
+  let cut = rows.length;
+  for (let i = 0; i < rows.length; i++) {
+    const ordinal = workRowOrdinal(rows[i].key);
+    if (ordinal !== null && ordinal >= floor) {
+      cut = i;
+      break;
+    }
+  }
+  return rows.slice(0, cut).filter((r) => !taken.has(r.key));
+}
+
+/** Stitch a kept head onto a REPLACE page's rebuilt thread.
+ *
+ *  The head can only END on a work block when the row that CLOSED that turn fell
+ *  into the page's window — so the page re-cut the same turn at its START, and
+ *  `flush` flags a start-cut block `turn_complete: true` exactly as it flags a
+ *  real turn end (the accumulator only ever learns about a block's END). Both
+ *  halves then claim to be whole turns, `sameContinuingTurn` refuses, and one
+ *  turn renders as two "Worked" cards. Restate the head half as what it now is —
+ *  a block whose turn continues below — and let the ordinary guards adjudicate:
+ *  `crossesCompaction` still refuses across a watermark, and `foldWork` takes
+ *  `joinWorkHalves` so the fused card spans the real turn. Mirrors the iOS
+ *  REPLACE seam. */
+export function joinKeptHead(
+  head: TranscriptRow[],
+  rebuilt: TranscriptRow[],
+  compactionPoints: { ordinal: number; at: string }[],
+): TranscriptRow[] {
+  if (head.length === 0) return rebuilt;
+  const last = head[head.length - 1];
+  const cutAtStart =
+    last.kind === 'work' &&
+    workRowOrdinal(last.key) !== null &&
+    rebuilt.length > 0 &&
+    rebuilt[0].kind === 'work';
+  const seam = cutAtStart ? [...head.slice(0, -1), { ...last, workComplete: false }] : head;
+  return foldAdjacentWork([...seam, ...rebuilt], compactionPoints);
+}
+
+/** Rows the page cannot be speaking about: the ones whose ordinal is ABOVE its
+ *  newest, which is the instant the server snapshotted it. A live
+ *  ordinal-stamped reply landing while the request is in flight is exactly that
+ *  — and dropping it is not a redraw, it is permanent: the frame already
+ *  advanced the cursor to its own ordinal (`advanceFromLive`), a sync selects
+ *  strictly `>`, and `advanceFromSync` is max-wins, so no later difference can
+ *  ever return the row. On a cold open (the one path that runs a baseline) that
+ *  reads as "the newest message never arrives", until the tab is reloaded.
+ *
+ *  The mirror image of the iOS floor rule: a REPLACE is authoritative between
+ *  the page's oldest and newest ordinals and says nothing outside them. Rows
+ *  with no durable ordinal are not covered here — an optimistic send is
+ *  re-overlaid by the unconfirmed-send rule, and live-only chrome (the open work
+ *  block, the streaming bubble) by the turn overlays below. */
+function rowsAbovePageCeiling(prev: TranscriptRow[], page: TranscriptRow[]): TranscriptRow[] {
+  const held = new Set(page.map((r) => r.key));
+  let ceiling = Number.NEGATIVE_INFINITY;
+  for (const row of page) {
+    const ordinal = workRowOrdinal(row.key);
+    if (ordinal !== null && ordinal > ceiling) ceiling = ordinal;
+  }
+  return prev.filter((r) => {
+    const ordinal = workRowOrdinal(r.key);
+    return ordinal !== null && ordinal > ceiling && !held.has(r.key);
+  });
+}
+
 export function applySyncReplace(
   prev: TranscriptRow[],
   page: TranscriptRow[],
@@ -5044,13 +5224,20 @@ export function applySyncReplace(
   for (const row of page) {
     if (row.clientMsgId !== undefined) pageSendIds.add(row.clientMsgId);
   }
+  const keptLive = rowsAbovePageCeiling(prev, page);
   const keptSends = prev.filter(
     (r) =>
       r.clientMsgId !== undefined &&
       unconfirmedSendIds.has(r.clientMsgId) &&
       !pageSendIds.has(r.clientMsgId),
   );
-  let rows = [...(turn?.active === true ? dropInFlightAnswerStep(page) : page), ...keptSends];
+  // Durable rows the page predates first, then the sends it cannot know about
+  // at all — both are newer than everything the page carries.
+  let rows = [
+    ...(turn?.active === true ? dropInFlightAnswerStep(page) : page),
+    ...keptLive,
+    ...keptSends,
+  ];
   if (turn?.active && turn.startedAt !== null) {
     let inherited: WorkStep[] | undefined;
     for (let i = prev.length - 1; i >= 0; i--) {

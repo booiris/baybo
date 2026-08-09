@@ -1233,6 +1233,55 @@ describe("mergeSyncPage — a page that lands late is placed, not piled on the e
     // Which is exactly the condition the re-check keys on.
     expect(syncSince(100, rendered)).toBeNull();
   });
+
+  // `placeAt` always splices directly below an ordinal-bearing row, which may be
+  // a work block whose turn the placed row continues. The tail-append and
+  // re-home branches ask the fold guards; the splice asked nothing, so one turn
+  // could land as two adjacent cards with no row between them.
+  it("folds a placed half into the block above it — one turn, one card", () => {
+    const rendered: Row[] = [
+      { id: "m10", role: "user", ordinal: 10, content: "asked" },
+      work({ id: "w11", steps: [tool({ callId: "c1" })], turnComplete: false }),
+      { id: "m13", role: "assistant", ordinal: 13, content: "the reply" },
+      { id: "pm-mine", role: "user", content: "asked again", sendState: "sending" },
+    ];
+    const page: Row[] = [work({ id: "w12", steps: [tool({ callId: "c2" })], turnComplete: true })];
+    const out = mergeSyncPage(rendered, page, []);
+    expect(out.map((r) => r.id)).toEqual(["m10", "w11", "m13", "pm-mine"]);
+    expect((out[1] as WorkRow).steps.map((s) => (s.kind === "tool" ? s.callId : s.kind))).toEqual([
+      "c1",
+      "c2",
+    ]);
+  });
+
+  it("but leaves two COMPLETE blocks apart — those are two turns, and two cards is right", () => {
+    const rendered: Row[] = [
+      { id: "m10", role: "user", ordinal: 10, content: "asked" },
+      work({ id: "w11", steps: [tool({ callId: "c1" })], turnComplete: true }),
+      { id: "m13", role: "assistant", ordinal: 13, content: "the reply" },
+      { id: "pm-mine", role: "user", content: "asked again", sendState: "sending" },
+    ];
+    const page: Row[] = [work({ id: "w12", steps: [tool({ callId: "c2" })], turnComplete: true })];
+    expect(mergeSyncPage(rendered, page, []).map((r) => r.id)).toEqual([
+      "m10",
+      "w11",
+      "w12",
+      "m13",
+      "pm-mine",
+    ]);
+  });
+
+  it("never fuses a placed half across a compaction boundary", () => {
+    const rendered: Row[] = [
+      { id: "m10", role: "user", ordinal: 10, content: "asked" },
+      work({ id: "w11", steps: [tool({ callId: "c1" })], turnComplete: false }),
+      { id: "m13", role: "assistant", ordinal: 13, content: "the reply" },
+      { id: "pm-mine", role: "user", content: "asked again", sendState: "sending" },
+    ];
+    const page: Row[] = [work({ id: "w12", steps: [tool({ callId: "c2" })], turnComplete: true })];
+    const out = mergeSyncPage(rendered, page, [{ ordinal: 12, at: "2026-08-09T10:00:00.000Z" }]);
+    expect(out.map((r) => r.id)).toEqual(["m10", "w11", "w12", "m13", "pm-mine"]);
+  });
 });
 
 describe("rowsAboveFloor — a rebase must not cost the reader the history they paged in", () => {
@@ -1345,6 +1394,30 @@ describe("applySyncReplace — the overlay keeps what the page cannot carry", ()
     ];
     const page: Row[] = [{ id: "m987", role: "assistant", ordinal: 987, content: "answered" }];
     expect(applySyncReplace(prev, page, owed("pm-live")).map((r) => r.id)).toEqual(["m987", "pm-live"]);
+  });
+
+  // The page is a SNAPSHOT: its newest ordinal is when the server took it. A
+  // reply persisted after that arrives over the socket carrying its own ordinal,
+  // and that frame advances the cursor — so dropping the row is permanent, since
+  // a difference selects strictly `>` the cursor the row itself set. A cold open
+  // is the one path that runs a baseline, which is where this read as "the
+  // newest message never arrives".
+  it("keeps a live reply the page predates", () => {
+    const prev: Row[] = [
+      { id: "m10", role: "assistant", ordinal: 10, content: "older answer" },
+      { id: "m12", role: "assistant", ordinal: 12, content: "the newest" },
+    ];
+    const page: Row[] = [{ id: "m10", role: "assistant", ordinal: 10, content: "older answer" }];
+    expect(applySyncReplace(prev, page, owed()).map((r) => r.id)).toEqual(["m10", "m12"]);
+  });
+
+  it("keeps it behind the page's own rows, and never twice", () => {
+    const prev: Row[] = [{ id: "m12", role: "assistant", ordinal: 12, content: "the newest" }];
+    const page: Row[] = [
+      { id: "m10", role: "assistant", ordinal: 10, content: "a" },
+      { id: "m12", role: "assistant", ordinal: 12, content: "the newest" },
+    ];
+    expect(applySyncReplace(prev, page, owed()).map((r) => r.id)).toEqual(["m10", "m12"]);
   });
 
   it("DROPS another client's live-echoed message — this device's outbox never owed it", () => {
