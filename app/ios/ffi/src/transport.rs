@@ -25,11 +25,11 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
@@ -54,6 +54,23 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// sends an application keepalive every 20s, so a silent window this long means
 /// the socket is gone.
 const INBOUND_LIVENESS_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// How long either leg's `establish` waits for the reply to its handshake — the
+/// relay's Noise message 2, the direct leg's `RegisterAck`. Deliberately far
+/// under [`CONNECT_TIMEOUT`]: a dial that dies here dies for a reason a redial
+/// can fix, so it should cost one retry-ladder step, not the whole budget. Three
+/// tries fit inside what a single unbounded wait used to burn.
+const HANDSHAKE_REPLY_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// How long [`SessionRegistry::connect`] waits for the gateway's
+/// `SubscribeState` — the frame it sends the moment a `Subscribe` registers —
+/// before declaring the subscribe unproven. This is the whole point of the ack:
+/// enqueueing a `Subscribe` proves only that a process-local channel accepted
+/// it, so without waiting for a reply "connected" could describe a socket that
+/// is a black hole, and nothing would notice until
+/// [`INBOUND_LIVENESS_TIMEOUT`]. Generous enough for the bundle's several
+/// storage reads on a cold gateway.
+const SUBSCRIBE_ACK_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// One error surface for both legs. Specific variants carry the few cases the
 /// shared lifecycle distinguishes; [`TransportError::Other`] carries each leg's
@@ -158,11 +175,19 @@ enum OutboundCmd {
     },
 }
 
-/// The live pump for a binding: where to enqueue commands, and the task to abort
-/// on teardown.
+/// The live pump for a binding: where to enqueue commands, the task to abort on
+/// teardown, and the leg's proof of life.
 struct Handle {
     outbound_tx: mpsc::UnboundedSender<OutboundCmd>,
     task: tokio::task::JoinHandle<()>,
+    /// When this leg last carried bytes the other way. Seeded at install (the
+    /// handshake reply that produced the [`Connection`] is itself inbound
+    /// traffic) and restamped by the pump on every inbound message — the same
+    /// signal [`INBOUND_LIVENESS_TIMEOUT`] watches, read by
+    /// [`SessionRegistry::await_subscribe_ack`] to tell a leg that has gone
+    /// silent (retire it) from a leg that is delivering fine while one
+    /// particular `Subscribe` went unanswered (leave it alone).
+    last_inbound: Arc<parking_lot::Mutex<Instant>>,
 }
 
 /// The pump slot plus a teardown epoch. The epoch fences a slow dial against a
@@ -187,6 +212,22 @@ pub(crate) type SharedListSink = Arc<parking_lot::Mutex<Option<Arc<dyn SessionLi
 /// [`FrameSink`].
 pub(crate) type SharedDeckSink = Arc<parking_lot::Mutex<Option<Arc<dyn DeckSink>>>>;
 
+/// Connects parked in [`SessionRegistry::connect`] waiting for their session's
+/// `SubscribeState`, keyed by session id. A `Vec` because two opens of the same
+/// session can be in flight at once (a redial racing a foreground reconnect).
+type SubscribeAcks = Arc<parking_lot::Mutex<HashMap<String, Vec<oneshot::Sender<()>>>>>;
+
+/// Everything [`pump`] needs besides the socket: where inbound frames go, and
+/// the two signals `connect` reads back off the inbound path — the leg's
+/// proof-of-life stamp and the parked `SubscribeState` waiters.
+struct PumpCtx {
+    sinks: Arc<Mutex<HashMap<String, Arc<dyn FrameSink>>>>,
+    list_sink: SharedListSink,
+    deck_sink: SharedDeckSink,
+    subscribe_acks: SubscribeAcks,
+    last_inbound: Arc<parking_lot::Mutex<Instant>>,
+}
+
 /// The single live chat leg for one binding. The socket itself is global, while
 /// `sinks` maps each subscribed session to the Swift owner that should receive
 /// that session's frames.
@@ -198,6 +239,11 @@ pub(crate) struct SessionRegistry {
     list_sink: SharedListSink,
     /// Connection-global deck pushes (`DeckCardData` / `DeckChanged`) land here.
     deck_sink: SharedDeckSink,
+    /// Connects waiting for the gateway to acknowledge their `Subscribe`.
+    subscribe_acks: SubscribeAcks,
+    /// [`SUBSCRIBE_ACK_TIMEOUT`], injectable so the tests that must sit out an
+    /// unanswered subscribe cost milliseconds instead of seconds.
+    subscribe_ack_timeout: Duration,
 }
 
 impl Default for SessionRegistry {
@@ -208,11 +254,21 @@ impl Default for SessionRegistry {
             sinks: Arc::new(Mutex::new(HashMap::new())),
             list_sink: Arc::new(parking_lot::Mutex::new(None)),
             deck_sink: Arc::new(parking_lot::Mutex::new(None)),
+            subscribe_acks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            subscribe_ack_timeout: SUBSCRIBE_ACK_TIMEOUT,
         }
     }
 }
 
 impl SessionRegistry {
+    /// Shrink the subscribe-ack budget so a test can exercise the unanswered
+    /// path without sleeping through the production one.
+    #[cfg(test)]
+    fn with_subscribe_ack_timeout(mut self, budget: Duration) -> Self {
+        self.subscribe_ack_timeout = budget;
+        self
+    }
+
     /// Open the binding's global chat leg without subscribing any session. Used
     /// to warm the relay content leg at app launch so the first chat screen only
     /// needs to enqueue `Subscribe`.
@@ -235,7 +291,8 @@ impl SessionRegistry {
     /// Subscribe `session_id` on the binding's global chat leg, streaming that
     /// session's frames to `sink`. Concurrent first dials coalesce behind
     /// `connect_lock`; once a socket is live, this only sends another
-    /// `Subscribe`.
+    /// `Subscribe`. Returns once the gateway has ACKNOWLEDGED the subscription
+    /// (see [`Self::await_subscribe_ack`]) — enqueueing is not connecting.
     pub(crate) async fn connect<T: ChatTransport>(
         &self,
         transport: &T,
@@ -243,32 +300,59 @@ impl SessionRegistry {
         sink: Arc<dyn FrameSink>,
     ) -> Result<(), TransportError> {
         self.sinks.lock().await.insert(session_id.to_string(), sink);
+        self.subscribe_and_prove(transport, session_id, "chat connect", || {
+            vec![OutboundCmd::Subscribe {
+                session_id: session_id.to_string(),
+            }]
+        })
+        .await
+    }
 
-        let subscribe = OutboundCmd::Subscribe {
-            session_id: session_id.to_string(),
+    /// The shared body of [`Self::connect`] and [`Self::connect_and_send`]: park
+    /// the ack, get `cmds` onto a live pump (dialing one if there is none), then
+    /// wait for the gateway to answer.
+    ///
+    /// `cmds` is a closure rather than a value because each of the three
+    /// attempts below consumes the commands it enqueues.
+    ///
+    /// `connect_lock` is released before the ack wait, deliberately: it exists to
+    /// coalesce DIALS, and a session parked on its own acknowledgement is not
+    /// dialing. Holding it across the wait would put every other session's open
+    /// behind this one's ack budget.
+    async fn subscribe_and_prove<T: ChatTransport>(
+        &self,
+        transport: &T,
+        session_id: &str,
+        operation: &str,
+        cmds: impl Fn() -> Vec<OutboundCmd>,
+    ) -> Result<(), TransportError> {
+        // Parked BEFORE anything reaches the wire: the gateway's bundle can
+        // land while `try_enqueue_all` is still returning.
+        let ack = self.park_subscribe_ack(session_id);
+
+        let leg = match self.try_enqueue_all(cmds()).await? {
+            Some(leg) => leg,
+            None => {
+                let _connect = self.connect_lock.lock().await;
+                match self.try_enqueue_all(cmds()).await? {
+                    Some(leg) => leg,
+                    None => {
+                        self.establish_pump(transport, operation).await?;
+                        match self.try_enqueue_all(cmds()).await? {
+                            Some(leg) => leg,
+                            None => {
+                                self.clear_subscribe_ack(session_id);
+                                return Err(TransportError::SessionClosed);
+                            }
+                        }
+                    }
+                }
+                // `_connect` drops here, ending the dial-coalescing window
+                // before the ack wait below.
+            }
         };
-        if self.try_enqueue(subscribe).await? {
-            return Ok(());
-        }
 
-        let _connect = self.connect_lock.lock().await;
-        let subscribe = OutboundCmd::Subscribe {
-            session_id: session_id.to_string(),
-        };
-        if self.try_enqueue(subscribe).await? {
-            return Ok(());
-        }
-
-        self.establish_pump(transport, "chat connect").await?;
-
-        let subscribe = OutboundCmd::Subscribe {
-            session_id: session_id.to_string(),
-        };
-        if self.try_enqueue(subscribe).await? {
-            Ok(())
-        } else {
-            Err(TransportError::SessionClosed)
-        }
+        self.await_subscribe_ack(ack, session_id, leg).await
     }
 
     /// Subscribe `session_id` and enqueue the first user message on the same
@@ -282,46 +366,103 @@ impl SessionRegistry {
         message: OutboundMessage,
     ) -> Result<(), TransportError> {
         self.sinks.lock().await.insert(session_id.to_string(), sink);
-
-        if self
-            .try_enqueue_all(subscribe_and_send_cmds(
+        self.subscribe_and_prove(transport, session_id, "chat connect+send", || {
+            Vec::from(subscribe_and_send_cmds(
                 session_id,
                 &message.text,
                 &message.msg_id,
                 &message.attachments,
             ))
-            .await?
-        {
+        })
+        .await
+    }
+
+    /// Register this connect's interest in `session_id`'s `SubscribeState` so
+    /// the inbound path can wake it. Prunes waiters whose connect has already
+    /// gone away (a cancelled FFI call drops its receiver).
+    fn park_subscribe_ack(&self, session_id: &str) -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        let mut acks = self.subscribe_acks.lock();
+        let waiters = acks.entry(session_id.to_string()).or_default();
+        waiters.retain(|waiter| !waiter.is_closed());
+        waiters.push(tx);
+        rx
+    }
+
+    fn clear_subscribe_ack(&self, session_id: &str) {
+        let mut acks = self.subscribe_acks.lock();
+        if let Some(waiters) = acks.get_mut(session_id) {
+            waiters.retain(|waiter| !waiter.is_closed());
+            if waiters.is_empty() {
+                acks.remove(session_id);
+            }
+        }
+    }
+
+    /// Block until the gateway answers this `Subscribe` with its
+    /// `SubscribeState` bundle, which it sends the moment the subscription
+    /// registers.
+    ///
+    /// The timeout is where the real work is, because it has to tell two very
+    /// different failures apart. `leg` is the proof-of-life stamp of the pump
+    /// the commands went onto:
+    ///
+    /// * The leg delivered NOTHING while we waited — it is a black hole (a
+    ///   half-open socket, typically one dialed as the radio came up and then
+    ///   silently orphaned). Retire it so every session on it redials. Retiring
+    ///   DROPS the handle instead of aborting the task: closing the outbound
+    ///   channel ends the pump's loop normally, which is what lets [`pump`] run
+    ///   its `on_disconnected` fan-out. An `abort` here would strand every
+    ///   OTHER subscribed session — their sinks would survive on a socket the
+    ///   gateway no longer has their subscription on, with nothing to tell them.
+    /// * The leg kept delivering other traffic — it is healthy and this one
+    ///   subscribe was rejected or lost (e.g. a session scoped to another
+    ///   channel, which the gateway answers with a `Notice` and no bundle).
+    ///   Fail this connect only; tearing the leg down would put every other
+    ///   session through a redial on someone else's behalf, forever.
+    async fn await_subscribe_ack(
+        &self,
+        ack: oneshot::Receiver<()>,
+        session_id: &str,
+        leg: Arc<parking_lot::Mutex<Instant>>,
+    ) -> Result<(), TransportError> {
+        let parked_at = Instant::now();
+        let budget = self.subscribe_ack_timeout;
+        let acked = tokio::time::timeout(budget, ack).await;
+        self.clear_subscribe_ack(session_id);
+        if matches!(acked, Ok(Ok(()))) {
             return Ok(());
         }
 
-        let _connect = self.connect_lock.lock().await;
-        if self
-            .try_enqueue_all(subscribe_and_send_cmds(
-                session_id,
-                &message.text,
-                &message.msg_id,
-                &message.attachments,
-            ))
-            .await?
-        {
-            return Ok(());
+        if *leg.lock() > parked_at {
+            log::warn!(
+                "subscribe session={session_id} unacknowledged after {budget:?}, but the leg is live; not touching it"
+            );
+            return Err(TransportError::NotConnected);
         }
 
-        self.establish_pump(transport, "chat connect+send").await?;
+        log::warn!(
+            "subscribe session={session_id} unacknowledged after {budget:?} and the leg carried nothing; retiring it"
+        );
+        self.retire_pump(&leg).await;
+        Err(TransportError::SessionClosed)
+    }
 
-        if self
-            .try_enqueue_all(subscribe_and_send_cmds(
-                session_id,
-                &message.text,
-                &message.msg_id,
-                &message.attachments,
-            ))
-            .await?
-        {
-            Ok(())
-        } else {
-            Err(TransportError::SessionClosed)
+    /// End the live pump if it is still `leg`'s, WITHOUT aborting it — see
+    /// [`Self::await_subscribe_ack`] for why the difference matters. Dropping
+    /// the handle drops the only outbound sender, so the pump's `recv` returns
+    /// `None` and it winds down through its normal exit.
+    ///
+    /// No epoch bump: the epoch fences dials against a deliberate TEARDOWN, and
+    /// a dial racing this one is producing the replacement leg we want.
+    async fn retire_pump(&self, leg: &Arc<parking_lot::Mutex<Instant>>) {
+        let mut slot = self.slot.lock().await;
+        let ours = slot
+            .handle
+            .as_ref()
+            .is_some_and(|handle| Arc::ptr_eq(&handle.last_inbound, leg));
+        if ours {
+            drop(slot.handle.take());
         }
     }
 
@@ -372,53 +513,57 @@ impl SessionRegistry {
             return Err(TransportError::SessionClosed);
         }
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
+        // Seeded now, not at the pump's first poll: the handshake reply that
+        // produced `conn` already crossed the wire, so the leg is proven as of
+        // this instant.
+        let last_inbound = Arc::new(parking_lot::Mutex::new(Instant::now()));
         let task = tokio::spawn(pump(
             conn,
-            self.sinks.clone(),
-            self.list_sink.clone(),
-            self.deck_sink.clone(),
+            PumpCtx {
+                sinks: self.sinks.clone(),
+                list_sink: self.list_sink.clone(),
+                deck_sink: self.deck_sink.clone(),
+                subscribe_acks: self.subscribe_acks.clone(),
+                last_inbound: last_inbound.clone(),
+            },
             outbound_rx,
         ));
         if let Some(prev) = slot.handle.take() {
             prev.task.abort();
         }
-        slot.handle = Some(Handle { outbound_tx, task });
+        slot.handle = Some(Handle {
+            outbound_tx,
+            task,
+            last_inbound,
+        });
         Ok(())
     }
 
     async fn try_enqueue(&self, cmd: OutboundCmd) -> Result<bool, TransportError> {
-        let mut slot = self.slot.lock().await;
-        let Some(handle) = slot.handle.as_ref() else {
-            return Ok(false);
-        };
-        match handle.outbound_tx.send(cmd) {
-            Ok(()) => Ok(true),
-            Err(_) => {
-                if let Some(prev) = slot.handle.take() {
-                    prev.task.abort();
-                }
-                Ok(false)
-            }
-        }
+        Ok(self.try_enqueue_all([cmd]).await?.is_some())
     }
 
+    /// Enqueue `cmds` on the live pump, returning that leg's proof-of-life stamp
+    /// (the caller's handle on WHICH leg took them) or `None` when there is no
+    /// live pump to take them.
     async fn try_enqueue_all(
         &self,
         cmds: impl IntoIterator<Item = OutboundCmd>,
-    ) -> Result<bool, TransportError> {
+    ) -> Result<Option<Arc<parking_lot::Mutex<Instant>>>, TransportError> {
         let mut slot = self.slot.lock().await;
         let Some(handle) = slot.handle.as_ref() else {
-            return Ok(false);
+            return Ok(None);
         };
         for cmd in cmds {
             if handle.outbound_tx.send(cmd).is_err() {
                 if let Some(prev) = slot.handle.take() {
                     prev.task.abort();
                 }
-                return Ok(false);
+                return Ok(None);
             }
         }
-        Ok(true)
+        let leg = handle.last_inbound.clone();
+        Ok(Some(leg))
     }
 
     /// Abort the live pump only if no teardown/install happened since
@@ -647,14 +792,9 @@ pub(crate) fn set_deck_sink<L: SessionLeg>(leg: &L, sink: Option<Arc<dyn DeckSin
 /// Returning means the session ended on its own, so the task calls
 /// [`FrameSink::on_disconnected`] last. A deliberate teardown aborts this task
 /// before the call runs, so it fires only on an unsolicited drop.
-async fn pump(
-    conn: Connection,
-    sinks: Arc<Mutex<HashMap<String, Arc<dyn FrameSink>>>>,
-    list_sink: SharedListSink,
-    deck_sink: SharedDeckSink,
-    outbound_rx: mpsc::UnboundedReceiver<OutboundCmd>,
-) {
-    run_pump(conn, sinks.clone(), list_sink, deck_sink, outbound_rx).await;
+async fn pump(conn: Connection, ctx: PumpCtx, outbound_rx: mpsc::UnboundedReceiver<OutboundCmd>) {
+    let sinks = ctx.sinks.clone();
+    run_pump(conn, ctx, outbound_rx).await;
     let sinks: Vec<(String, Arc<dyn FrameSink>)> = sinks
         .lock()
         .await
@@ -670,9 +810,7 @@ async fn pump(
 /// session sink and seal outbound commands until the leg ends for any reason.
 async fn run_pump(
     conn: Connection,
-    sinks: Arc<Mutex<HashMap<String, Arc<dyn FrameSink>>>>,
-    list_sink: SharedListSink,
-    deck_sink: SharedDeckSink,
+    ctx: PumpCtx,
     mut outbound_rx: mpsc::UnboundedReceiver<OutboundCmd>,
 ) {
     let Connection {
@@ -691,6 +829,9 @@ async fn run_pump(
                 liveness
                     .as_mut()
                     .reset(tokio::time::Instant::now() + INBOUND_LIVENESS_TIMEOUT);
+                // The same signal, published so a parked `connect` can read it
+                // (see `SessionRegistry::await_subscribe_ack`).
+                *ctx.last_inbound.lock() = Instant::now();
                 match inbound {
                     Some(Ok(Message::Binary(bytes))) => {
                         // Relay: a decrypt desync is fatal (Err → break). Direct: an
@@ -717,7 +858,7 @@ async fn run_pump(
                             // The sink is a foreign callback and can't signal a
                             // dropped consumer (unlike the old webview channel);
                             // session lifetime is owned by explicit disconnects.
-                            dispatch_inbound_frame(&sinks, &list_sink, &deck_sink, frame).await;
+                            dispatch_inbound_frame(&ctx, frame).await;
                         }
                     }
                     Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
@@ -821,12 +962,14 @@ fn with_global_sink<S: ?Sized>(
     }
 }
 
-async fn dispatch_inbound_frame(
-    sinks: &Mutex<HashMap<String, Arc<dyn FrameSink>>>,
-    list_sink: &SharedListSink,
-    deck_sink: &SharedDeckSink,
-    frame: Frame,
-) {
+async fn dispatch_inbound_frame(ctx: &PumpCtx, frame: Frame) {
+    let PumpCtx {
+        sinks,
+        list_sink,
+        deck_sink,
+        subscribe_acks,
+        ..
+    } = ctx;
     // Connection-global lanes first. These frames have no per-session routing
     // target (or, for `SessionActivity`, deliberately ignore it): letting them
     // continue would fan them to per-session transcript sinks that can't use
@@ -895,6 +1038,18 @@ async fn dispatch_inbound_frame(
         // connections subscribed to that session, so a device sitting on the
         // chat list would otherwise learn nothing about a conversation whose
         // tool call is blocked waiting on it.
+        // TEE: this bundle is the gateway's acknowledgement of a `Subscribe`,
+        // so it wakes whoever is parked in `connect` for that session — and
+        // STILL routes per-session, because its payload (turn, work steps,
+        // pending approvals, tasks) is what the transcript REPLACEs its view
+        // with.
+        Frame::SubscribeState { session_id, .. } => {
+            let waiters = subscribe_acks.lock().remove(session_id.as_str());
+            for waiter in waiters.unwrap_or_default() {
+                let _ = waiter.send(());
+            }
+            true
+        }
         Frame::SessionUpdated { session_id, patch } => {
             if let Some(title) = &patch.title {
                 with_global_sink(list_sink, |sink| {
@@ -943,8 +1098,16 @@ async fn route_per_session(sinks: &Mutex<HashMap<String, Arc<dyn FrameSink>>>, f
     }
 }
 
-/// Read the next binary WS message (skipping ping/pong) — used by both legs'
-/// `establish` for the handshake reply before the pump takes over.
+/// Read the next binary WS message (skipping ping/pong).
+///
+/// UNBOUNDED, and it must stay that way: this is not a handshake helper. It is
+/// also `relay::tunnel::NoiseFrames::recv`, i.e. the read under every
+/// REST-over-relay response frame and every blob chunk, whose budgets are owned
+/// by their own callers (`POOLED_LEG_FIRST_BYTE_TIMEOUT`,
+/// `TUNNEL_REQUEST_TIMEOUT`, `TUNNEL_HANDSHAKE_TIMEOUT`) and are far wider than
+/// any handshake's. A blanket timeout here silently caps all of them — and a
+/// 100 MiB upload's post-transfer wait, which is deliberately uncapped. Wrap the
+/// CALL SITE that wants a bound; see [`recv_binary_handshake`].
 pub(crate) async fn recv_binary(ws: &mut WsStream) -> Result<Vec<u8>, TransportError> {
     loop {
         match ws.next().await {
@@ -957,6 +1120,27 @@ pub(crate) async fn recv_binary(ws: &mut WsStream) -> Result<Vec<u8>, TransportE
             Some(Err(e)) => return Err(TransportError::Other(format!("ws: {e}"))),
         }
     }
+}
+
+/// [`recv_binary`] for the ONE thing that deserves a short leash: a leg's
+/// handshake reply (the relay's Noise message 2, the direct leg's
+/// `RegisterAck`).
+///
+/// The upgrade completing does not mean anyone is on the other end yet. The
+/// relay parks a content-join leg the moment it accepts it, and only then does
+/// the gateway dial in to claim it — so a gateway that fails to claim leaves the
+/// phone blocked on a perfectly healthy socket with nothing ever coming back.
+/// Left unbounded that costs the whole [`CONNECT_TIMEOUT`]; bounded, it costs
+/// one step of the retry ladder.
+pub(crate) async fn recv_binary_handshake(ws: &mut WsStream) -> Result<Vec<u8>, TransportError> {
+    tokio::time::timeout(HANDSHAKE_REPLY_TIMEOUT, recv_binary(ws))
+        .await
+        .map_err(|_| {
+            TransportError::Other(format!(
+                "no handshake reply within {}s (the peer accepted the socket but never answered)",
+                HANDSHAKE_REPLY_TIMEOUT.as_secs()
+            ))
+        })?
 }
 
 #[cfg(test)]
@@ -1074,9 +1258,7 @@ mod tests {
     }
 
     struct Fixture {
-        sinks: Mutex<HashMap<String, Arc<dyn FrameSink>>>,
-        list_sink: SharedListSink,
-        deck_sink: SharedDeckSink,
+        ctx: PumpCtx,
         list: Arc<RecordingListSink>,
         deck: Arc<RecordingDeckSink>,
     }
@@ -1094,13 +1276,17 @@ mod tests {
             }
             (
                 Self {
-                    sinks: Mutex::new(map),
-                    list_sink: Arc::new(parking_lot::Mutex::new(Some(
-                        list.clone() as Arc<dyn SessionListSink>
-                    ))),
-                    deck_sink: Arc::new(parking_lot::Mutex::new(Some(
-                        deck.clone() as Arc<dyn DeckSink>
-                    ))),
+                    ctx: PumpCtx {
+                        sinks: Arc::new(Mutex::new(map)),
+                        list_sink: Arc::new(parking_lot::Mutex::new(Some(
+                            list.clone() as Arc<dyn SessionListSink>
+                        ))),
+                        deck_sink: Arc::new(parking_lot::Mutex::new(Some(
+                            deck.clone() as Arc<dyn DeckSink>
+                        ))),
+                        subscribe_acks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+                        last_inbound: Arc::new(parking_lot::Mutex::new(Instant::now())),
+                    },
                     list,
                     deck,
                 },
@@ -1111,19 +1297,19 @@ mod tests {
         /// Drop the connection-global list sink: a leg can pump before Swift has
         /// installed one.
         fn without_list_sink(self) -> Self {
-            *self.list_sink.lock() = None;
+            *self.ctx.list_sink.lock() = None;
             self
         }
 
         /// Drop the connection-global deck sink: a leg can pump before Swift
         /// has installed one (or the deck tab was never opened).
         fn without_deck_sink(self) -> Self {
-            *self.deck_sink.lock() = None;
+            *self.ctx.deck_sink.lock() = None;
             self
         }
 
         async fn dispatch(&self, frame: Frame) {
-            dispatch_inbound_frame(&self.sinks, &self.list_sink, &self.deck_sink, frame).await;
+            dispatch_inbound_frame(&self.ctx, frame).await;
         }
     }
 
@@ -1573,22 +1759,94 @@ mod tests {
         }
     }
 
-    /// The gateway side of the loopback: accepts one connection and hands the test
-    /// the live server socket.
+    /// What the test pushes at the client.
+    enum ServerAction {
+        Frame(Frame),
+        Close(CloseFrame<'static>),
+    }
+
+    /// The gateway side of the loopback: serves connections (one at a time, so a
+    /// redial is picked up), mirrors every frame the client sends into a channel
+    /// the test drains, and — like the real gateway — answers each `Subscribe`
+    /// with the `SubscribeState` bundle that acknowledges it.
+    ///
+    /// That ack is not decoration. `SessionRegistry::connect` now waits for it,
+    /// so a loopback that stayed silent would no longer be a fake gateway; it
+    /// would be a broken one, and every test here would sit out
+    /// `SUBSCRIBE_ACK_TIMEOUT`. `Server::silent` is the deliberate opposite,
+    /// used to test what happens when the ack never comes.
     struct Server {
         addr: std::net::SocketAddr,
-        accepted: tokio::task::JoinHandle<WebSocketStream<TcpStream>>,
+        inbound: mpsc::UnboundedReceiver<Frame>,
+        outbound: mpsc::UnboundedSender<ServerAction>,
     }
 
     impl Server {
         async fn start() -> Self {
+            Self::spawn(true).await
+        }
+
+        /// A gateway that takes the `Subscribe` and never acknowledges it.
+        async fn silent() -> Self {
+            Self::spawn(false).await
+        }
+
+        async fn spawn(auto_ack: bool) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("addr");
-            let accepted = tokio::spawn(async move {
-                let (tcp, _) = listener.accept().await.expect("accept");
-                accept_async(tcp).await.expect("ws handshake")
+            let (inbound_tx, inbound) = mpsc::unbounded_channel();
+            let (outbound, mut outbound_rx) = mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((tcp, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let ws = accept_async(tcp).await.expect("ws handshake");
+                    let (mut sink, mut stream) = ws.split();
+                    loop {
+                        tokio::select! {
+                            message = stream.next() => {
+                                let Some(Ok(Message::Binary(bytes))) = message else {
+                                    break;
+                                };
+                                let frame = decode(&bytes).expect("decode client frame");
+                                if auto_ack
+                                    && let Frame::Subscribe { session_id } = &frame
+                                {
+                                    let ack = encode(&subscribe_state(session_id.as_str()))
+                                        .expect("encode ack");
+                                    if sink.send(Message::Binary(ack)).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                if inbound_tx.send(frame).is_err() {
+                                    return;
+                                }
+                            }
+                            action = outbound_rx.recv() => {
+                                match action {
+                                    Some(ServerAction::Frame(frame)) => {
+                                        let bytes = encode(&frame).expect("encode server frame");
+                                        if sink.send(Message::Binary(bytes)).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Some(ServerAction::Close(close)) => {
+                                        let _ = sink.send(Message::Close(Some(close))).await;
+                                        break;
+                                    }
+                                    None => return,
+                                }
+                            }
+                        }
+                    }
+                }
             });
-            Self { addr, accepted }
+            Self {
+                addr,
+                inbound,
+                outbound,
+            }
         }
 
         fn transport(&self) -> LoopbackTransport {
@@ -1598,23 +1856,48 @@ mod tests {
             }
         }
 
-        async fn socket(self) -> WebSocketStream<TcpStream> {
-            self.accepted.await.expect("server task")
+        /// The next `Frame` the client sent, failing rather than hanging if the
+        /// socket goes quiet.
+        async fn next_frame(&mut self) -> Frame {
+            tokio::time::timeout(Duration::from_secs(5), self.inbound.recv())
+                .await
+                .expect("client sends a frame in time")
+                .expect("server task is alive")
+        }
+
+        /// Whether the client sent anything at all within `window`.
+        async fn stayed_quiet(&mut self, window: Duration) -> bool {
+            tokio::time::timeout(window, self.inbound.recv())
+                .await
+                .is_err()
+        }
+
+        fn send(&self, frame: Frame) {
+            self.outbound
+                .send(ServerAction::Frame(frame))
+                .expect("server task is alive");
+        }
+
+        fn close(&self, close: CloseFrame<'static>) {
+            self.outbound
+                .send(ServerAction::Close(close))
+                .expect("server task is alive");
         }
     }
 
-    /// Read the next `Frame` the client sent, failing rather than hanging if the
-    /// socket goes quiet.
-    async fn next_frame(ws: &mut WebSocketStream<TcpStream>) -> Frame {
-        loop {
-            let message = tokio::time::timeout(Duration::from_secs(5), ws.next())
-                .await
-                .expect("client sends a frame in time")
-                .expect("socket is open")
-                .expect("no socket error");
-            if let Message::Binary(bytes) = message {
-                return decode(&bytes).expect("decode client frame");
-            }
+    /// The acknowledgement bundle the gateway sends the moment a `Subscribe`
+    /// registers (`crates/gateway/src/channel/route.rs`, `send_subscribe_state`).
+    fn subscribe_state(session_id: &str) -> Frame {
+        Frame::SubscribeState {
+            session_id: session_id.into(),
+            as_of_ordinal: None,
+            turn: wire::TurnSnapshot {
+                active: false,
+                started_at: None,
+            },
+            work_steps: Vec::new(),
+            pending_approvals: Vec::new(),
+            tasks: Vec::new(),
         }
     }
 
@@ -1623,7 +1906,7 @@ mod tests {
     /// and this file has shipped that regression before.
     #[tokio::test]
     async fn connect_and_send_puts_subscribe_before_the_message() {
-        let server = Server::start().await;
+        let mut server = Server::start().await;
         let transport = server.transport();
         let registry = SessionRegistry::default();
         let sink = Arc::new(RecordingSink::default());
@@ -1642,12 +1925,11 @@ mod tests {
             .await
             .expect("connect and send");
 
-        let mut ws = server.socket().await;
         assert!(matches!(
-            next_frame(&mut ws).await,
+            server.next_frame().await,
             Frame::Subscribe { session_id } if session_id.as_str() == "s1"
         ));
-        match next_frame(&mut ws).await {
+        match server.next_frame().await {
             Frame::Message(message) => {
                 assert_eq!(message.session_id.as_str(), "s1");
                 assert_eq!(message.content, "hello");
@@ -1662,18 +1944,14 @@ mod tests {
     /// session must not redial (nor must switching between sessions, below).
     #[tokio::test]
     async fn preconnect_opens_the_leg_without_subscribing_a_session() {
-        let server = Server::start().await;
+        let mut server = Server::start().await;
         let transport = server.transport();
         let registry = SessionRegistry::default();
 
         registry.preconnect(&transport).await.expect("preconnect");
-        let mut ws = server.socket().await;
 
-        // Nothing at all should be on the wire yet.
         assert!(
-            tokio::time::timeout(Duration::from_millis(200), ws.next())
-                .await
-                .is_err(),
+            server.stayed_quiet(Duration::from_millis(200)).await,
             "preconnect must not send a Subscribe"
         );
 
@@ -1682,7 +1960,7 @@ mod tests {
             .await
             .expect("connect");
         assert!(matches!(
-            next_frame(&mut ws).await,
+            server.next_frame().await,
             Frame::Subscribe { session_id } if session_id.as_str() == "s1"
         ));
         assert_eq!(
@@ -1696,7 +1974,7 @@ mod tests {
     /// Subscribe on the SAME socket and leaves the first subscription alone.
     #[tokio::test]
     async fn switching_sessions_reuses_the_one_leg() {
-        let server = Server::start().await;
+        let mut server = Server::start().await;
         let transport = server.transport();
         let registry = SessionRegistry::default();
 
@@ -1709,8 +1987,7 @@ mod tests {
             .await
             .expect("connect s2");
 
-        let mut ws = server.socket().await;
-        let subscribed: Vec<String> = vec![next_frame(&mut ws).await, next_frame(&mut ws).await]
+        let subscribed: Vec<String> = vec![server.next_frame().await, server.next_frame().await]
             .into_iter()
             .map(|frame| match frame {
                 Frame::Subscribe { session_id } => session_id.as_str().to_owned(),
@@ -1730,7 +2007,7 @@ mod tests {
     /// a `Ping` reaching the transcript would render as an unknown frame.
     #[tokio::test]
     async fn a_ping_is_answered_with_a_pong_and_never_forwarded_to_a_sink() {
-        let server = Server::start().await;
+        let mut server = Server::start().await;
         let transport = server.transport();
         let registry = SessionRegistry::default();
         let sink = Arc::new(RecordingSink::default());
@@ -1739,25 +2016,21 @@ mod tests {
             .connect(&transport, "s1", sink.clone())
             .await
             .expect("connect");
-        let mut ws = server.socket().await;
-        assert!(matches!(next_frame(&mut ws).await, Frame::Subscribe { .. }));
+        assert!(matches!(server.next_frame().await, Frame::Subscribe { .. }));
 
-        ws.send(Message::Binary(encode(&Frame::Ping).expect("encode ping")))
-            .await
-            .expect("send ping");
+        server.send(Frame::Ping);
 
-        assert!(matches!(next_frame(&mut ws).await, Frame::Pong));
-        assert!(
-            sink.frames().is_empty(),
-            "the keepalive must never reach the transcript"
-        );
+        assert!(matches!(server.next_frame().await, Frame::Pong));
+        // The subscribe ack DOES reach the sink (the transcript replaces its
+        // state from it); the keepalive must not.
+        assert_eq!(sink.kinds(), ["subscribe_state"]);
     }
 
     /// A deliberate teardown aborts the pump BEFORE it can report death, so logout
     /// doesn't kick the reconnect ladder against credentials that were just wiped.
     #[tokio::test]
     async fn a_deliberate_disconnect_never_fires_on_disconnected() {
-        let server = Server::start().await;
+        let mut server = Server::start().await;
         let transport = server.transport();
         let registry = SessionRegistry::default();
         let sink = Arc::new(RecordingSink::default());
@@ -1766,8 +2039,7 @@ mod tests {
             .connect(&transport, "s1", sink.clone())
             .await
             .expect("connect");
-        let mut ws = server.socket().await;
-        assert!(matches!(next_frame(&mut ws).await, Frame::Subscribe { .. }));
+        assert!(matches!(server.next_frame().await, Frame::Subscribe { .. }));
 
         registry.disconnect().await;
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1783,7 +2055,7 @@ mod tests {
     /// reconnect ladder.
     #[tokio::test]
     async fn an_unsolicited_close_fires_on_disconnected_for_every_session() {
-        let server = Server::start().await;
+        let mut server = Server::start().await;
         let transport = server.transport();
         let registry = SessionRegistry::default();
         let first = Arc::new(RecordingSink::default());
@@ -1797,16 +2069,13 @@ mod tests {
             .connect(&transport, "s2", second.clone())
             .await
             .expect("connect s2");
-        let mut ws = server.socket().await;
-        assert!(matches!(next_frame(&mut ws).await, Frame::Subscribe { .. }));
-        assert!(matches!(next_frame(&mut ws).await, Frame::Subscribe { .. }));
+        assert!(matches!(server.next_frame().await, Frame::Subscribe { .. }));
+        assert!(matches!(server.next_frame().await, Frame::Subscribe { .. }));
 
-        ws.close(Some(CloseFrame {
+        server.close(CloseFrame {
             code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Away,
             reason: "bye".into(),
-        }))
-        .await
-        .expect("close");
+        });
 
         for (sink, session_id) in [(first, "s1"), (second, "s2")] {
             let mut waited = Duration::ZERO;
@@ -1816,6 +2085,175 @@ mod tests {
             }
             assert_eq!(sink.disconnects(), [session_id.to_string()]);
         }
+    }
+
+    /// The cold-start bug this ack exists for: enqueueing a `Subscribe` proves
+    /// only that a process-local channel accepted it. A leg that is a black hole
+    /// — established, never aborted, silently carrying nothing — used to leave
+    /// `connect` returning `Ok`, the UI saying "connected", and nothing noticing
+    /// until `INBOUND_LIVENESS_TIMEOUT` 45s later. It must fail instead.
+    /// The ack budget for the two tests whose point is that the budget EXPIRES.
+    /// Nothing races it — the server is silent, so however slow the box is, the
+    /// timeout is still what fires — which is why it can be this short.
+    ///
+    /// Real time, not a paused clock: these dial a real loopback socket, and
+    /// `start_paused` fast-forwards straight through a pending TCP connect — far
+    /// enough to trip `CONNECT_TIMEOUT` before the dial lands.
+    const TEST_ACK_BUDGET: Duration = Duration::from_millis(300);
+
+    /// The budget for the one test that needs traffic to BEAT it. A loopback
+    /// round trip is microseconds, so this is ~4 orders of magnitude of headroom
+    /// — the test must not turn into a stopwatch on a loaded runner.
+    const TEST_ACK_BUDGET_BEATABLE: Duration = Duration::from_secs(2);
+
+    #[tokio::test]
+    async fn an_unacknowledged_subscribe_fails_instead_of_reporting_connected() {
+        let mut server = Server::silent().await;
+        let transport = server.transport();
+        let registry = SessionRegistry::default().with_subscribe_ack_timeout(TEST_ACK_BUDGET);
+
+        let err = registry
+            .connect(&transport, "s1", Arc::new(RecordingSink::default()))
+            .await
+            .expect_err("an unacknowledged subscribe is not a connection");
+
+        assert!(matches!(err, TransportError::SessionClosed), "got {err:?}");
+        assert!(matches!(server.next_frame().await, Frame::Subscribe { .. }));
+    }
+
+    /// …and the silent leg is RETIRED, not merely failed: every other session on
+    /// it is subscribed on a socket that carries nothing, so each one has to be
+    /// told to redial. Retiring drops the handle so the pump exits normally and
+    /// runs its `on_disconnected` fan-out — an `abort` would strand them.
+    #[tokio::test]
+    async fn a_silent_leg_is_retired_so_every_session_on_it_redials() {
+        let server = Server::silent().await;
+        let transport = server.transport();
+        let registry = SessionRegistry::default().with_subscribe_ack_timeout(TEST_ACK_BUDGET);
+        let bystander = Arc::new(RecordingSink::default());
+
+        // `s2` is already riding the leg when `s1`'s subscribe goes unanswered.
+        registry.preconnect(&transport).await.expect("preconnect");
+        registry
+            .sinks
+            .lock()
+            .await
+            .insert("s2".to_string(), bystander.clone());
+
+        registry
+            .connect(&transport, "s1", Arc::new(RecordingSink::default()))
+            .await
+            .expect_err("unacknowledged");
+
+        let mut waited = Duration::ZERO;
+        while bystander.disconnects().is_empty() && waited < Duration::from_secs(5) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            waited += Duration::from_millis(20);
+        }
+        assert_eq!(
+            bystander.disconnects(),
+            ["s2".to_string()],
+            "a bystander on the retired leg must be told to redial"
+        );
+        assert!(
+            !registry.has_live_pump().await,
+            "the silent leg must not survive as the live pump"
+        );
+    }
+
+    /// The other side of that judgement call: when the leg is demonstrably
+    /// carrying traffic, an unanswered `Subscribe` is this SESSION's problem (a
+    /// cross-channel session, which the gateway answers with a `Notice` and no
+    /// bundle). Tearing the leg down there would put every other session through
+    /// a redial on its behalf, forever.
+    #[tokio::test]
+    async fn a_live_leg_survives_one_sessions_unanswered_subscribe() {
+        let mut server = Server::silent().await;
+        let transport = server.transport();
+        let registry =
+            SessionRegistry::default().with_subscribe_ack_timeout(TEST_ACK_BUDGET_BEATABLE);
+
+        registry.preconnect(&transport).await.expect("preconnect");
+        let connect = {
+            let transport = &transport;
+            let registry = &registry;
+            async move {
+                registry
+                    .connect(transport, "s1", Arc::new(RecordingSink::default()))
+                    .await
+            }
+        };
+        let traffic = async {
+            assert!(matches!(server.next_frame().await, Frame::Subscribe { .. }));
+            // Not the ack — just proof the socket is alive. The Pong is the
+            // client confirming it processed the Ping, which is the same poll
+            // that restamps `last_inbound`; waiting for it makes the test assert
+            // on a fact rather than on a sleep.
+            server.send(Frame::Ping);
+            assert!(matches!(server.next_frame().await, Frame::Pong));
+            tokio::time::sleep(TEST_ACK_BUDGET_BEATABLE).await;
+        };
+        let (result, ()) = tokio::join!(connect, traffic);
+
+        assert!(
+            matches!(result, Err(TransportError::NotConnected)),
+            "got {result:?}"
+        );
+        assert!(
+            registry.has_live_pump().await,
+            "a leg that is delivering must survive one session's unanswered subscribe"
+        );
+    }
+
+    /// `HANDSHAKE_REPLY_TIMEOUT` belongs to the handshake CALL SITE, never to
+    /// the shared reader. `recv_binary` is also `relay::tunnel::NoiseFrames::recv`
+    /// — every REST-over-relay response frame and every blob chunk — where the
+    /// budgets are `POOLED_LEG_FIRST_BYTE_TIMEOUT` (15s), `TUNNEL_REQUEST_TIMEOUT`
+    /// (30s) and `TUNNEL_HANDSHAKE_TIMEOUT` (15s), all wider than 6s, plus a
+    /// 100 MiB upload's post-transfer wait which is deliberately uncapped. Bound
+    /// the shared reader and you silently cap all of them.
+    ///
+    /// The tunnel's own tests drive a `ScriptedFrames` fake and never reach
+    /// `recv_binary`, so this is the only place the separation can be seen.
+    /// Paused clock is safe here (unlike the registry tests): nothing in this
+    /// test wraps a dial in a timeout, so there is no budget for the
+    /// auto-advance to consume before the socket is up. A server apiece —
+    /// `Server` serves one connection at a time, so a second dial into the same
+    /// one would never be accepted.
+    #[tokio::test(start_paused = true)]
+    async fn only_the_handshake_reader_is_time_bounded() {
+        let handshake_server = Server::silent().await;
+        let mut ws = dial_raw(handshake_server.addr).await;
+        assert!(
+            tokio::time::timeout(HANDSHAKE_REPLY_TIMEOUT * 2, recv_binary_handshake(&mut ws))
+                .await
+                .expect("the handshake reader must give up on its own")
+                .is_err(),
+            "a peer that accepts and never answers must fail the handshake"
+        );
+
+        let tunnel_server = Server::silent().await;
+        let mut ws = dial_raw(tunnel_server.addr).await;
+        assert!(
+            tokio::time::timeout(HANDSHAKE_REPLY_TIMEOUT * 2, recv_binary(&mut ws))
+                .await
+                .is_err(),
+            "the shared reader must still be waiting — a tunnel response or blob \
+             chunk is allowed to take longer than a handshake"
+        );
+    }
+
+    /// A bare client socket, no registry or pump — the two readers under test
+    /// take a `WsStream` directly.
+    async fn dial_raw(addr: std::net::SocketAddr) -> WsStream {
+        let tcp = TcpStream::connect(addr).await.expect("tcp");
+        let (ws, _) = client_async(
+            format!("ws://{addr}/v1/channel-ws"),
+            MaybeTlsStream::Plain(tcp),
+        )
+        .await
+        .expect("ws");
+        ws
     }
 
     /// `send` refuses a session with no registered sink rather than writing into a
