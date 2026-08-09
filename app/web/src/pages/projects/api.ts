@@ -113,7 +113,13 @@ export async function fetchProject(
 
 export async function createProject(
   client: AdminClient,
-  body: { name: string; description: string; workdir?: string },
+  body: {
+    name: string;
+    description: string;
+    workdir?: string;
+    daily_budget_micros?: number;
+    max_parallel_issue_runs?: number;
+  },
 ): Promise<Outcome<Project>> {
   try {
     const { data, error, response } = await client.POST('/v1/projects', { body });
@@ -453,7 +459,12 @@ export async function fetchLeadMessages(
 export async function updateProject(
   client: AdminClient,
   projectId: string,
-  body: { name: string; description: string; daily_budget_micros?: number | null },
+  body: {
+    name: string;
+    description: string;
+    daily_budget_micros?: number | null;
+    max_parallel_issue_runs: number;
+  },
 ): Promise<Outcome<Project>> {
   try {
     const { data, error, response } = await client.PUT('/v1/projects/{project_id}', {

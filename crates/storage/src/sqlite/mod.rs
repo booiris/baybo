@@ -477,6 +477,11 @@ const ADD_COLUMNS: &[AddColumn] = &[
         column: "dreamed_through_ordinal",
         definition: "INTEGER",
     },
+    AddColumn {
+        table: "projects",
+        column: "max_parallel_issue_runs",
+        definition: "INTEGER",
+    },
 ];
 
 /// Pool of sqlite connections.
@@ -1330,6 +1335,12 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     -- NULL is no ceiling. INTEGER, never REAL — see
                     -- `cost_records.cost_usd`.
                     daily_budget_micros INTEGER,
+                    -- How many runs this board may start on its own by
+                    -- promoting Todo cards. NULL on a row written before
+                    -- the column existed, and resolved on the way out to
+                    -- `DEFAULT_MAX_PARALLEL_ISSUE_RUNS` rather than to a SQL
+                    -- default that would be the number's second home.
+                    max_parallel_issue_runs INTEGER,
                     -- When the operator last looked at this board. The only
                     -- read state in the feature, and it exists because the
                     -- two signals that need it — an agent's comment, a card

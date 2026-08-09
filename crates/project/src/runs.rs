@@ -112,17 +112,23 @@ fn newest_run_that_ran<'a>(
         .max_by_key(|candidate| candidate.attempt)
 }
 
-/// Build the ledger entry for a triggered run. Fails only if the issue has
-/// no assignee, which [`triggers_run`] has already ruled out.
-pub(crate) fn ledger_entry(issue: &IssueRow, trigger: RunTrigger) -> Option<NewIssueRun> {
-    Some(NewIssueRun {
+/// Build the ledger entry for a triggered run.
+///
+/// `agent` rather than `issue.assignee`: a triage run is recorded on a card
+/// with nobody on it, and the row still has to name who is being asked.
+pub(crate) fn ledger_entry(
+    issue: &IssueRow,
+    trigger: RunTrigger,
+    agent: AgentProfileId,
+) -> NewIssueRun {
+    NewIssueRun {
         id: IssueRunId::generate(),
         issue_id: issue.id.clone(),
         project_id: issue.project_id.clone(),
         number: issue.number,
-        agent_id: issue.assignee.clone()?,
+        agent_id: agent,
         trigger,
-    })
+    }
 }
 
 #[cfg(test)]

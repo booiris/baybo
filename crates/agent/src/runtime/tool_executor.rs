@@ -1349,6 +1349,7 @@ mod tests {
                 description: String::new(),
                 workdir: repo_dir.path().to_string_lossy().into_owned(),
                 daily_budget: None,
+                max_parallel_issue_runs: baybo_store::project::DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
                 read_at: None,
                 archived_at: None,
                 created_at: now,

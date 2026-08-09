@@ -5,6 +5,7 @@ import { Button } from '../../components/Button';
 import { useAdminClient, useAuth } from '../../api/auth';
 import { createProject } from './api';
 import { budgetHint, parseBudget } from './budgetModel';
+import { parallelIssueRunsHint, parseParallelIssueRuns } from './driverModel';
 import { writeLastProjectId } from './lastProject';
 
 export const fieldLabel = 'block text-[0.7rem] font-bold uppercase tracking-wider text-ink-soft mb-1';
@@ -20,6 +21,7 @@ export function CreateProjectForm({ onDone }: { onDone?: () => void }) {
   const [description, setDescription] = useState('');
   const [workdir, setWorkdir] = useState('');
   const [budget, setBudget] = useState('');
+  const [parallelIssueRuns, setParallelIssueRuns] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
@@ -35,11 +37,18 @@ export function CreateProjectForm({ onDone }: { onDone?: () => void }) {
       setError('Daily budget must be an amount in dollars, or empty for no ceiling.');
       return;
     }
+    const slots = parseParallelIssueRuns(parallelIssueRuns);
+    if (parallelIssueRuns.trim() !== '' && slots === undefined) {
+      setSubmitting(false);
+      setError('Parallel issue runs must be a whole number, or empty for the default.');
+      return;
+    }
     const outcome = await createProject(client, {
       name,
       description,
       ...(trimmedWorkdir.length > 0 ? { workdir: trimmedWorkdir } : {}),
       ...(micros === null ? {} : { daily_budget_micros: micros }),
+      ...(slots === undefined ? {} : { max_parallel_issue_runs: slots }),
     });
     setSubmitting(false);
     if (outcome.kind === 'unauthorized') {
@@ -125,6 +134,24 @@ export function CreateProjectForm({ onDone }: { onDone?: () => void }) {
         />
         <p className="mt-1 text-[0.7rem] text-ink-soft leading-snug">
           {budgetHint(parseBudget(budget) ?? null)} You can change it later.
+        </p>
+      </div>
+      <div>
+        <label className={fieldLabel} htmlFor="project-parallel-issue-runs">
+          Parallel issue runs — optional
+        </label>
+        <input
+          id="project-parallel-issue-runs"
+          className={textInput}
+          value={parallelIssueRuns}
+          inputMode="numeric"
+          onChange={(event) => {
+            setParallelIssueRuns(event.target.value);
+          }}
+          placeholder="Leave empty for the default"
+        />
+        <p className="mt-1 text-[0.7rem] text-ink-soft leading-snug">
+          {parallelIssueRunsHint(parseParallelIssueRuns(parallelIssueRuns))} You can change it later.
         </p>
       </div>
       {error != null ? (

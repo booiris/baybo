@@ -2193,6 +2193,13 @@ export interface components {
              */
             daily_budget_micros?: number | null;
             description?: string;
+            /**
+             * Format: int64
+             * @description How many runs the board may start on its own, by promoting cards off
+             *     the top of Todo. Omit for the default; `0` leaves every start to
+             *     whoever drags the card.
+             */
+            max_parallel_issue_runs?: number | null;
             name: string;
             /**
              * @description Absolute path to an existing git repository. Omit it and the server
@@ -2886,6 +2893,13 @@ export interface components {
             daily_budget_micros?: number | null;
             description: string;
             id: string;
+            /**
+             * Format: int64
+             * @description How many runs this board starts on its own, by taking cards off the
+             *     top of Todo as room appears. `0` means it starts only what somebody
+             *     drags into In Progress.
+             */
+            max_parallel_issue_runs: number;
             name: string;
             /** Format: int64 */
             updated_at_ms: number;
@@ -2969,7 +2983,7 @@ export interface components {
          * @description Why a run was started.
          * @enum {string}
          */
-        RunTriggerDto: "started" | "assigned" | "retry" | "comment" | "stage_barrier";
+        RunTriggerDto: "started" | "assigned" | "retry" | "comment" | "promoted" | "triage" | "stage_barrier";
         /**
          * @description Wire mirror of [`baybo_query::SessionKind`]. Coarse trigger/lineage
          *     label for the trace browser list view.
@@ -3346,6 +3360,13 @@ export interface components {
              */
             daily_budget_micros?: number | null;
             description?: string;
+            /**
+             * Format: int64
+             * @description How many runs the board may start on its own, by promoting cards off
+             *     the top of Todo. Full-replace like every other field here: omitting
+             *     it restores the default rather than keeping what the board had.
+             */
+            max_parallel_issue_runs?: number | null;
             name: string;
         };
         /**
@@ -6559,6 +6580,13 @@ export interface operations {
                             daily_budget_micros?: number | null;
                             description: string;
                             id: string;
+                            /**
+                             * Format: int64
+                             * @description How many runs this board starts on its own, by taking cards off the
+                             *     top of Todo as room appears. `0` means it starts only what somebody
+                             *     drags into In Progress.
+                             */
+                            max_parallel_issue_runs: number;
                             name: string;
                             /** Format: int64 */
                             updated_at_ms: number;

@@ -12,8 +12,9 @@ use utoipa_axum::routes;
 use baybo_model::{AgentProfileId, ProjectId};
 use baybo_project::{NewIssueRequest, NewProject, ProjectError};
 use baybo_store::project::{
-    IssueActor, IssueEventBody, IssueEventRow, IssuePriority, IssueRow, IssueRunRow, IssueStatus,
-    IssueUpdate, ProjectRow, ProjectUpdate, RunStatus, RunTrigger,
+    DEFAULT_MAX_PARALLEL_ISSUE_RUNS, IssueActor, IssueEventBody, IssueEventRow, IssuePriority,
+    IssueRow, IssueRunRow, IssueStatus, IssueUpdate, ProjectRow, ProjectUpdate, RunStatus,
+    RunTrigger,
 };
 
 use crate::api::dto::{ErrorBody, ListResponse};
@@ -130,6 +131,10 @@ pub struct ProjectDto {
     /// Daily spend ceiling in micro-USD. Absent means no limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daily_budget_micros: Option<i64>,
+    /// How many runs this board starts on its own, by taking cards off the
+    /// top of Todo as room appears. `0` means it starts only what somebody
+    /// drags into In Progress.
+    pub max_parallel_issue_runs: i64,
     /// Present only while the project sits in the archive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at_ms: Option<i64>,
@@ -145,6 +150,7 @@ impl From<ProjectRow> for ProjectDto {
             description: row.description,
             workdir: row.workdir,
             daily_budget_micros: row.daily_budget.map(baybo_model::MicroUsd::into_micros),
+            max_parallel_issue_runs: i64::try_from(row.max_parallel_issue_runs).unwrap_or(i64::MAX),
             archived_at_ms: row.archived_at.map(|t| t.timestamp_millis()),
             created_at_ms: row.created_at.timestamp_millis(),
             updated_at_ms: row.updated_at.timestamp_millis(),
@@ -351,6 +357,24 @@ impl From<RunStatus> for RunStatusDto {
     }
 }
 
+/// A run ceiling off the wire, as the board's own type.
+///
+/// The board itself sets no upper bound — how much work it may start at
+/// once is the operator's call. What it cannot represent is a negative, and
+/// that has to be refused *here*, at the conversion: `usize::try_from` is
+/// the only place the sign still exists, and letting one through as a
+/// saturated `usize` would hand the driver a slot count that empties the
+/// whole Todo column in one pass.
+fn parallel_issue_runs(value: i64) -> Result<usize> {
+    usize::try_from(value).map_err(|_| {
+        GatewayError::BadRequest(
+            "max_parallel_issue_runs must not be negative — use 0 to stop the board \
+             starting work by itself"
+                .to_owned(),
+        )
+    })
+}
+
 /// Why a run was started.
 #[derive(Debug, Clone, Copy, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -359,6 +383,8 @@ pub enum RunTriggerDto {
     Assigned,
     Retry,
     Comment,
+    Promoted,
+    Triage,
     StageBarrier,
 }
 
@@ -369,6 +395,8 @@ impl From<RunTrigger> for RunTriggerDto {
             RunTrigger::Assigned => Self::Assigned,
             RunTrigger::Retry => Self::Retry,
             RunTrigger::Comment => Self::Comment,
+            RunTrigger::Promoted => Self::Promoted,
+            RunTrigger::Triage => Self::Triage,
             RunTrigger::StageBarrier => Self::StageBarrier,
         }
     }
@@ -652,6 +680,11 @@ pub struct CreateProjectRequest {
     /// disagrees with the ledger it is measured against.
     #[serde(default)]
     pub daily_budget_micros: Option<i64>,
+    /// How many runs the board may start on its own, by promoting cards off
+    /// the top of Todo. Omit for the default; `0` leaves every start to
+    /// whoever drags the card.
+    #[serde(default)]
+    pub max_parallel_issue_runs: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -665,6 +698,11 @@ pub struct UpdateProjectRequest {
     /// disagrees with the ledger it is measured against.
     #[serde(default)]
     pub daily_budget_micros: Option<i64>,
+    /// How many runs the board may start on its own, by promoting cards off
+    /// the top of Todo. Full-replace like every other field here: omitting
+    /// it restores the default rather than keeping what the board had.
+    #[serde(default)]
+    pub max_parallel_issue_runs: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -785,6 +823,10 @@ async fn create_project(
             daily_budget: req
                 .daily_budget_micros
                 .map(baybo_model::MicroUsd::from_micros),
+            max_parallel_issue_runs: req
+                .max_parallel_issue_runs
+                .map(parallel_issue_runs)
+                .transpose()?,
         })
         .await
         .map_err(project_err)?;
@@ -845,6 +887,11 @@ async fn update_project(
                 daily_budget: req
                     .daily_budget_micros
                     .map(baybo_model::MicroUsd::from_micros),
+                max_parallel_issue_runs: req
+                    .max_parallel_issue_runs
+                    .map(parallel_issue_runs)
+                    .transpose()?
+                    .unwrap_or(DEFAULT_MAX_PARALLEL_ISSUE_RUNS),
             },
         )
         .await

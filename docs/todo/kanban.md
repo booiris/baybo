@@ -99,6 +99,28 @@ the behaviour was verified against its source (clone inspected 2026-08-05).
     boards; switcher dropdown stats are live; merging is
     comment-the-assignee or local (no platform merge); column counts
     exclude cancelled; comments on a queued run merge into its brief.
+17. **The board drives Todo itself** (2026-08-09), reversing the original
+    "no auto-promotion machinery" default. Todo is a queue the board
+    empties: whenever fewer than `max_parallel_issue_runs` runs are in flight,
+    it takes the top staffed card out of Todo, moves it into In Progress
+    in its own name and starts it (`RunTrigger::Promoted`). It runs as a
+    **periodic sweep** (one task per process, every few seconds), not off
+    each board write: the write-driven version made seven call sites
+    load-bearing, where forgetting one parks a board until restart. The
+    cost is that a card starts up to one tick after it became ready. The knob is
+    **per project, on by default** (`0` = the old manual board) and has no
+    upper bound — how much a board may run at once is the operator's call,
+    and the only refusal is a negative, at the wire edge where the sign
+    still exists. Order is **priority first, then column position** —
+    which is the order the lead's `IssueList` already reads a column in,
+    and is *not* the web board's own top-to-bottom order. A card reaching
+    Todo **unassigned** wakes the lead to staff it (`RunTrigger::Triage`,
+    the one run whose agent is not the card's assignee), asked once per
+    state of the card so a lead that leaves it alone is not asked again.
+    The board never promotes a blocked card, never promotes a card that
+    already has a run, never starts work it cannot afford, and never
+    preempts — priority decides who gets the *next* free slot, not who
+    keeps one. A manual drag is unaffected by the ceiling: it is a command.
 
 ## Pages and interactions (`app/web`)
 
@@ -114,7 +136,7 @@ on the board header (`name ▾`); its dropdown lists projects with live
 working count and today's burn, ends in a "New project…" action and a
 "Show archived" toggle (archived projects are hidden by default; an
 archived board is read-only until unarchived). Create form: name,
-description, workdir (optional), daily budget. Workdir left empty →
+description, workdir (optional), daily budget, parallel runs. Workdir left empty →
 the server creates `<workspace>/work/<name>/`, git-initialises it, and
 stores that path (an existing non-empty `work/<name>` is an inline error,
 never silently reused); workdir filled → must be an absolute path to an
@@ -211,7 +233,8 @@ Two-pane route, no tabs (multica's shape):
   **Cancel issue** (the terminal negative; rows are never deleted);
   **branch** (name + copy — no diff viewer and no merge
   button, per decision 9); **execution log** — every run with trigger
-  reason ("drag", "comment", "stage barrier", "retry"), status, duration,
+  reason ("drag", "comment", "stage barrier", "retry", "promoted",
+  "triage"), status, duration,
   cost, Cancel / Retry / **View transcript** (links into the existing
   trace viewer for the run's session); token totals.
 - Approval requests raised by a run (tool approvals) render as timeline
@@ -242,6 +265,8 @@ announces which of these will happen before sending.
 ## Data model (sqlite, `crates/storage`)
 
 - `projects` — id (ULID), name, description, workdir, budget knobs,
+  `max_parallel_issue_runs` (how many runs the board starts by itself; `0` is the
+  manual board),
   `archived_at`, timestamps. No hard delete.
 - `issues` — id, project_id, `number` (per-project sequence), title,
   description, `status` (`backlog|todo|in_progress|review|done`),
@@ -637,8 +662,9 @@ remain, all recorded with their reasons rather than left to be re-derived:
 
 ## Defaults chosen without a grill question (veto anytime)
 
-- Priority field exists (`urgent|high|medium|low|none`) but only informs
-  the lead's triage and the card face; no automatic ordering.
+- Priority field exists (`urgent|high|medium|low|none`). It informs the
+  lead's triage, the card face, and the order the board takes work out of
+  Todo (decision 17). It never reorders a column on its own.
 - No confirm dialog on drag; toasts + the timeline are the audit trail.
 - Board grouping v1 is status-only; list/table/gantt/swimlane views, label
   system, and custom properties are all out of v1.
@@ -650,5 +676,6 @@ remain, all recorded with their reasons rather than left to be re-derived:
   prefix (decision 14). Cross-project ambiguity is acceptable in a
   single-operator product; a prefix can return if forge sync ever needs
   branch/PR-title matching.
-- Lead scheduling of Todo → In Progress is prompt-driven (the lead moves
-  issues when concurrency frees up); no hidden auto-promotion machinery.
+- Everything the board starts on its own is decision 17; the lead may
+  still move any card at any time, and a manual drag is never gated on the
+  run ceiling.

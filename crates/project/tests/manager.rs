@@ -6,9 +6,9 @@ use baybo_model::{
 };
 use baybo_project::{NewIssueRequest, NewProject, ProjectError, ProjectManager};
 use baybo_store::project::{
-    AttentionCounts, IssueActor, IssueEventRow, IssuePriority, IssueRow, IssueRunRow, IssueStatus,
-    IssueUpdate, NewIssue, NewIssueEvent, NewIssueRun, ProjectRow, ProjectUpdate,
-    Result as StoreResult, RunStatus, RunTrigger,
+    AttentionCounts, DEFAULT_MAX_PARALLEL_ISSUE_RUNS, IssueActor, IssueEventRow, IssuePriority,
+    IssueRow, IssueRunRow, IssueStatus, IssueUpdate, NewIssue, NewIssueEvent, NewIssueRun,
+    ProjectRow, ProjectUpdate, Result as StoreResult, RunStatus, RunTrigger,
 };
 use baybo_workspace::WorkspacePaths;
 use chrono::{DateTime, Utc};
@@ -90,12 +90,26 @@ impl Fixture {
     }
 }
 
+/// A board that starts only what it is told to.
+///
+/// The driver is on by default in production, and Todo is where it looks —
+/// so a test about anything else would otherwise have its cards promoted
+/// out from under it the moment they were staffed. The driver's own tests
+/// call [`driven_project`] instead.
 fn new_project(name: &str) -> NewProject {
+    NewProject {
+        max_parallel_issue_runs: Some(0),
+        ..driven_project(name)
+    }
+}
+
+fn driven_project(name: &str) -> NewProject {
     NewProject {
         name: name.to_owned(),
         description: String::new(),
         workdir: None,
         daily_budget: None,
+        max_parallel_issue_runs: None,
     }
 }
 
@@ -658,6 +672,7 @@ async fn an_archived_project_is_read_only() {
                 name: "renamed".into(),
                 description: String::new(),
                 daily_budget: None,
+                max_parallel_issue_runs: DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
             },
         )
         .await
@@ -2323,6 +2338,7 @@ async fn a_raised_budget_releases_what_it_was_holding() {
                 name: project.name.clone(),
                 description: String::new(),
                 daily_budget: Some(baybo_model::MicroUsd::from_micros(5_000_000)),
+                max_parallel_issue_runs: DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
             },
         )
         .await
@@ -2384,6 +2400,7 @@ async fn the_next_enqueue_releases_a_hold_the_budget_no_longer_justifies() {
                 name: project.name.clone(),
                 description: String::new(),
                 daily_budget: Some(baybo_model::MicroUsd::from_micros(5_000_000)),
+                max_parallel_issue_runs: DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
             },
         )
         .await
@@ -2462,6 +2479,7 @@ async fn touching_the_held_card_itself_releases_it() {
                 name: project.name.clone(),
                 description: String::new(),
                 daily_budget: Some(baybo_model::MicroUsd::from_micros(5_000_000)),
+                max_parallel_issue_runs: DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
             },
         )
         .await
@@ -2496,6 +2514,7 @@ async fn a_negative_budget_is_refused() {
                 name: project.name.clone(),
                 description: String::new(),
                 daily_budget: Some(baybo_model::MicroUsd::from_micros(-1)),
+                max_parallel_issue_runs: DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
             },
         )
         .await
@@ -2565,6 +2584,7 @@ async fn a_released_hold_never_lands_on_a_card_the_board_has_finished_with() {
                     name: project.name.clone(),
                     description: String::new(),
                     daily_budget: Some(baybo_model::MicroUsd::from_micros(5_000_000)),
+                    max_parallel_issue_runs: DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
                 },
             )
             .await
@@ -3286,6 +3306,7 @@ async fn the_attention_count_is_what_only_the_operator_can_clear() {
                 name: p.name.clone(),
                 description: String::new(),
                 daily_budget: Some(baybo_model::MicroUsd::from_micros(5_000_000)),
+                max_parallel_issue_runs: DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
             },
         )
         .await
@@ -4410,4 +4431,654 @@ async fn a_brief_names_who_said_each_thing_on_the_card() {
             event.brief
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The driver: what the board starts without being told to.
+// ---------------------------------------------------------------------------
+
+/// A board with `slots` of room and one agent to fill it with.
+async fn driven_board(f: &Fixture, slots: usize) -> (ProjectRow, AgentProfileId) {
+    let project = f
+        .manager
+        .create_project(NewProject {
+            max_parallel_issue_runs: Some(slots),
+            ..driven_project("Self-driving")
+        })
+        .await
+        .expect("project");
+    let dev = seed_agent(f, &project.id, "dev-1", AgentFramework::Baybo).await;
+    (project, dev)
+}
+
+/// Open a card straight into Todo, staffed and ready.
+async fn queue_card(
+    f: &Fixture,
+    project: &ProjectId,
+    title: &str,
+    assignee: Option<AgentProfileId>,
+    priority: IssuePriority,
+) -> IssueRow {
+    f.manager
+        .create_issue(
+            project,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::Todo,
+                assignee,
+                priority,
+                ..new_issue(title)
+            },
+        )
+        .await
+        .expect("queue")
+        .into_issue()
+}
+
+async fn set_ceiling(f: &Fixture, project: &ProjectRow, slots: usize) {
+    f.manager
+        .update_project(
+            &project.id,
+            ProjectUpdate {
+                name: project.name.clone(),
+                description: project.description.clone(),
+                daily_budget: project.daily_budget,
+                max_parallel_issue_runs: slots,
+            },
+        )
+        .await
+        .expect("ceiling");
+}
+
+async fn set_budget(f: &Fixture, project: &ProjectRow, budget: Option<baybo_model::MicroUsd>) {
+    f.manager
+        .update_project(
+            &project.id,
+            ProjectUpdate {
+                name: project.name.clone(),
+                description: project.description.clone(),
+                daily_budget: budget,
+                max_parallel_issue_runs: project.max_parallel_issue_runs,
+            },
+        )
+        .await
+        .expect("budget");
+}
+
+async fn lead_of(f: &Fixture, project: &ProjectId) -> AgentProfileId {
+    f.manager
+        .team(project)
+        .await
+        .expect("team")
+        .into_iter()
+        .find(|row| {
+            row.team
+                .as_ref()
+                .is_some_and(|t| t.handle.as_str() == baybo_project::LEAD_HANDLE)
+        })
+        .expect("every board has a lead")
+        .id
+}
+
+/// Give the board its turn.
+///
+/// In production this is the sweep's tick and nothing else; here it is
+/// explicit so a test asserting the board did *nothing* cannot pass merely
+/// because the board was never asked.
+async fn tick(f: &Fixture, project: &ProjectId) -> usize {
+    f.manager.drive(project).await
+}
+
+async fn column_of(f: &Fixture, project: &ProjectId, number: i64) -> IssueStatus {
+    f.manager
+        .get_issue(project, number)
+        .await
+        .expect("issue")
+        .status
+}
+
+#[tokio::test]
+async fn a_staffed_card_in_todo_starts_itself() {
+    let f = fixture().await;
+    let (p, dev) = driven_board(&f, 2).await;
+
+    queue_card(
+        &f,
+        &p.id,
+        "wire the importer",
+        Some(dev),
+        IssuePriority::None,
+    )
+    .await;
+    assert_eq!(
+        column_of(&f, &p.id, 1).await,
+        IssueStatus::Todo,
+        "the write itself starts nothing — the board is driven on a tick"
+    );
+
+    assert_eq!(tick(&f, &p.id).await, 1);
+    assert_eq!(
+        column_of(&f, &p.id, 1).await,
+        IssueStatus::InProgress,
+        "Todo is a queue the board pulls from, so a ready card does not sit in it"
+    );
+    let dispatched = f.dispatched.lock().clone();
+    assert_eq!(
+        dispatched.len(),
+        1,
+        "and something is actually running on it"
+    );
+    assert_eq!(
+        dispatched[0].trigger,
+        RunTrigger::Promoted,
+        "recorded as the board's doing, not as a drag nobody performed"
+    );
+    assert!(
+        f.manager
+            .timeline(&p.id, 1)
+            .await
+            .expect("timeline")
+            .iter()
+            .any(|e| e.actor == IssueActor::System
+                && matches!(
+                    e.body,
+                    baybo_store::project::IssueEventBody::Moved {
+                        to: IssueStatus::InProgress,
+                        ..
+                    }
+                )),
+        "and the card says the board moved it, so the column change is not unexplained"
+    );
+}
+
+#[tokio::test]
+async fn the_ceiling_is_what_stops_it() {
+    let f = fixture().await;
+    let (p, dev) = driven_board(&f, 2).await;
+
+    for title in ["first", "second", "third"] {
+        queue_card(&f, &p.id, title, Some(dev.clone()), IssuePriority::None).await;
+    }
+    assert_eq!(tick(&f, &p.id).await, 2);
+
+    assert_eq!(
+        f.dispatched.lock().len(),
+        2,
+        "two slots, two runs — the third waits where the operator can see it"
+    );
+    assert_eq!(column_of(&f, &p.id, 3).await, IssueStatus::Todo);
+
+    let first = f.dispatched.lock()[0].clone();
+    f.manager
+        .finish_run(
+            &first,
+            std::path::Path::new("/nonexistent/checkout"),
+            first.created_at,
+            baybo_project::RunOutcome {
+                status: RunStatus::Done,
+                error: None,
+                stopped_by_a_human: false,
+            },
+        )
+        .await;
+    assert_eq!(tick(&f, &p.id).await, 1);
+
+    assert_eq!(
+        column_of(&f, &p.id, 3).await,
+        IssueStatus::InProgress,
+        "and the slot a finished run gives back is filled without anybody asking"
+    );
+    assert_eq!(f.dispatched.lock().len(), 3);
+}
+
+#[tokio::test]
+async fn a_board_told_to_start_nothing_starts_nothing() {
+    let f = fixture().await;
+    let (p, dev) = driven_board(&f, 0).await;
+
+    queue_card(
+        &f,
+        &p.id,
+        "wire the importer",
+        Some(dev),
+        IssuePriority::None,
+    )
+    .await;
+    assert_eq!(tick(&f, &p.id).await, 0);
+
+    assert_eq!(column_of(&f, &p.id, 1).await, IssueStatus::Todo);
+    assert!(
+        f.dispatched.lock().is_empty(),
+        "a ceiling of zero is the manual board, and it has to still exist"
+    );
+}
+
+#[tokio::test]
+async fn urgent_work_is_taken_first() {
+    let f = fixture().await;
+    // No room while the queue fills: the board cannot preempt a card it has
+    // already started, so a priority rule only means anything about cards
+    // that were both waiting when the slot appeared.
+    let (p, dev) = driven_board(&f, 0).await;
+    queue_card(&f, &p.id, "tidy up", Some(dev.clone()), IssuePriority::Low).await;
+    queue_card(&f, &p.id, "prod is down", Some(dev), IssuePriority::Urgent).await;
+    assert_eq!(tick(&f, &p.id).await, 0);
+    assert!(f.dispatched.lock().is_empty());
+
+    set_ceiling(&f, &p, 1).await;
+    assert_eq!(tick(&f, &p.id).await, 1);
+
+    assert_eq!(
+        f.dispatched.lock()[0].number,
+        2,
+        "the one slot goes to the urgent card, not the one that was queued first"
+    );
+    assert_eq!(column_of(&f, &p.id, 1).await, IssueStatus::Todo);
+}
+
+#[tokio::test]
+async fn the_board_does_not_start_work_somebody_stopped() {
+    let f = fixture().await;
+    let (p, dev) = driven_board(&f, 3).await;
+
+    // Blocked before it reaches Todo, because a card that arrives ready is
+    // started before anybody could block it.
+    let blocked = f
+        .manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                assignee: Some(dev.clone()),
+                ..new_issue("blocked")
+            },
+        )
+        .await
+        .expect("create")
+        .into_issue();
+    f.manager
+        .update_issue(
+            &p.id,
+            blocked.number,
+            IssueActor::User,
+            IssueUpdate {
+                blocked_reason: Some(Some("waiting on the operator".into())),
+                ..IssueUpdate::default()
+            },
+        )
+        .await
+        .expect("block");
+    f.manager
+        .move_issue(
+            &p.id,
+            blocked.number,
+            IssueActor::User,
+            IssueStatus::Todo,
+            &[blocked.number],
+        )
+        .await
+        .expect("to todo");
+    assert_eq!(tick(&f, &p.id).await, 0);
+
+    assert_eq!(
+        column_of(&f, &p.id, blocked.number).await,
+        IssueStatus::Todo,
+        "a block is a person saying stop; the board does not overrule it"
+    );
+    assert!(f.dispatched.lock().is_empty());
+
+    f.manager
+        .update_issue(
+            &p.id,
+            blocked.number,
+            IssueActor::User,
+            IssueUpdate {
+                blocked_reason: Some(None),
+                ..IssueUpdate::default()
+            },
+        )
+        .await
+        .expect("unblock");
+    assert_eq!(tick(&f, &p.id).await, 1);
+    assert_eq!(
+        column_of(&f, &p.id, blocked.number).await,
+        IssueStatus::InProgress,
+        "and unblocking it is enough to get it moving again"
+    );
+}
+
+#[tokio::test]
+async fn an_exhausted_budget_parks_the_driver_rather_than_filling_in_progress() {
+    let f = fixture().await;
+    let (p, dev) = driven_board(&f, 3).await;
+    f.manager
+        .update_project(
+            &p.id,
+            ProjectUpdate {
+                name: p.name.clone(),
+                description: String::new(),
+                daily_budget: Some(baybo_model::MicroUsd::ZERO),
+                max_parallel_issue_runs: 3,
+            },
+        )
+        .await
+        .expect("skint");
+
+    queue_card(
+        &f,
+        &p.id,
+        "wire the importer",
+        Some(dev),
+        IssuePriority::None,
+    )
+    .await;
+    assert_eq!(tick(&f, &p.id).await, 0);
+
+    assert_eq!(
+        column_of(&f, &p.id, 1).await,
+        IssueStatus::Todo,
+        "In Progress means an agent is working now, and a held run is not that"
+    );
+    assert!(f.dispatched.lock().is_empty());
+}
+
+#[tokio::test]
+async fn an_unstaffed_card_in_todo_wakes_the_lead_once() {
+    let f = fixture().await;
+    let (p, _dev) = driven_board(&f, 3).await;
+    let lead = lead_of(&f, &p.id).await;
+
+    let card = queue_card(
+        &f,
+        &p.id,
+        "somebody should do this",
+        None,
+        IssuePriority::None,
+    )
+    .await;
+    tick(&f, &p.id).await;
+
+    let asked = f.dispatched.lock().clone();
+    assert_eq!(asked.len(), 1, "the lead is woken to staff it");
+    assert_eq!(asked[0].trigger, RunTrigger::Triage);
+    assert_eq!(asked[0].agent_id, lead, "on a card nobody is assigned to");
+    assert_eq!(
+        column_of(&f, &p.id, card.number).await,
+        IssueStatus::Todo,
+        "and the card does not move: nothing is being worked on yet"
+    );
+
+    // The lead reads it and leaves it alone, which is a legitimate answer.
+    let triage = asked[0].clone();
+    f.manager
+        .finish_run(
+            &triage,
+            std::path::Path::new("/nonexistent/checkout"),
+            triage.created_at,
+            baybo_project::RunOutcome {
+                status: RunStatus::Done,
+                error: None,
+                stopped_by_a_human: false,
+            },
+        )
+        .await;
+    tick(&f, &p.id).await;
+    tick(&f, &p.id).await;
+
+    assert_eq!(
+        f.dispatched.lock().len(),
+        1,
+        "and it is not asked the same question again on every later pass"
+    );
+}
+
+#[tokio::test]
+async fn staffing_a_card_the_lead_was_asked_about_starts_it() {
+    let f = fixture().await;
+    let (p, dev) = driven_board(&f, 3).await;
+    queue_card(
+        &f,
+        &p.id,
+        "somebody should do this",
+        None,
+        IssuePriority::None,
+    )
+    .await;
+    tick(&f, &p.id).await;
+    let triage = f.dispatched.lock()[0].clone();
+
+    // The lead assigns it from inside its own triage run, so the card is
+    // ready while its one run slot is still spoken for.
+    f.manager
+        .update_issue(
+            &p.id,
+            1,
+            IssueActor::Agent(triage.agent_id.clone()),
+            IssueUpdate {
+                assignee: Some(Some(dev.clone())),
+                ..IssueUpdate::default()
+            },
+        )
+        .await
+        .expect("assign");
+    assert_eq!(tick(&f, &p.id).await, 0);
+    assert_eq!(
+        column_of(&f, &p.id, 1).await,
+        IssueStatus::Todo,
+        "promoting it now would move it into In Progress and start nothing"
+    );
+
+    f.manager
+        .finish_run(
+            &triage,
+            std::path::Path::new("/nonexistent/checkout"),
+            triage.created_at,
+            baybo_project::RunOutcome {
+                status: RunStatus::Done,
+                error: None,
+                stopped_by_a_human: false,
+            },
+        )
+        .await;
+    assert_eq!(tick(&f, &p.id).await, 1);
+
+    assert_eq!(
+        column_of(&f, &p.id, 1).await,
+        IssueStatus::InProgress,
+        "the card the lead staffed starts as soon as its slot is free again"
+    );
+    let dispatched = f.dispatched.lock().clone();
+    assert_eq!(dispatched.len(), 2);
+    assert_eq!(dispatched[1].trigger, RunTrigger::Promoted);
+    assert_eq!(dispatched[1].agent_id, dev);
+}
+
+/// Held runs are work the board already owes, so they take the next slots —
+/// and they have to be counted *as* slots, not released on top of them.
+///
+/// The bug this pins: a held run is not in `board_load.working`, so a pass
+/// that counts slots before releasing sees an idle board. The first
+/// promotion's `enqueue` then releases every hold on its way past the budget
+/// gate, and the board runs the promotions *and* the holds at once.
+///
+/// The headroom is restored through the **store**, not `update_project`,
+/// because that is the shape production actually has: `update_project`
+/// releases what it un-parks itself, so the case where a tick is the first
+/// thing to see the new headroom is the UTC day rolling over, which nothing
+/// is notified about.
+#[tokio::test]
+async fn work_the_board_already_owes_takes_the_slots_a_rolled_over_budget_frees() {
+    let f = fixture().await;
+    let (p, dev) = driven_board(&f, 2).await;
+    set_budget(&f, &p, Some(baybo_model::MicroUsd::ZERO)).await;
+
+    // Two cards dragged straight into In Progress: each records a run, and
+    // each is parked because the board has nothing to spend.
+    for number in [1, 2] {
+        queue_card(
+            &f,
+            &p.id,
+            &format!("owed {number}"),
+            Some(dev.clone()),
+            IssuePriority::None,
+        )
+        .await;
+        let order: Vec<i64> = (1..=number).collect();
+        f.manager
+            .move_issue(
+                &p.id,
+                number,
+                IssueActor::User,
+                IssueStatus::InProgress,
+                &order,
+            )
+            .await
+            .expect("drag");
+    }
+    let statuses: Vec<RunStatus> = f
+        .manager
+        .active_runs(&p.id)
+        .await
+        .expect("runs")
+        .iter()
+        .map(|run| run.status)
+        .collect();
+    assert_eq!(
+        statuses,
+        vec![RunStatus::Held, RunStatus::Held],
+        "both runs are owed and parked"
+    );
+
+    // A third card is staffed and waiting, and then the day rolls over.
+    queue_card(&f, &p.id, "waiting", Some(dev), IssuePriority::None).await;
+    f.store
+        .update_project(
+            &p.id,
+            &ProjectUpdate {
+                name: p.name.clone(),
+                description: p.description.clone(),
+                daily_budget: None,
+                max_parallel_issue_runs: 2,
+            },
+        )
+        .await
+        .expect("headroom, without the manager releasing anything");
+
+    tick(&f, &p.id).await;
+
+    let live = f
+        .manager
+        .active_runs(&p.id)
+        .await
+        .expect("runs")
+        .iter()
+        .filter(|run| run.status != RunStatus::Held)
+        .count();
+    assert_eq!(
+        live, 2,
+        "the ceiling is 2 and the two owed runs fill it exactly"
+    );
+    assert_eq!(
+        column_of(&f, &p.id, 3).await,
+        IssueStatus::Todo,
+        "the waiting card gets the next slot to come free, not one already promised"
+    );
+}
+
+/// The property the whole design rests on: the driver is level-triggered, so
+/// running it again is not a second helping. Nothing announces a card to it,
+/// so nothing can announce one twice either — every pass just re-reads the
+/// board and closes whatever gap it finds.
+#[tokio::test]
+async fn driving_a_board_again_does_not_start_the_same_card_twice() {
+    let f = fixture().await;
+    let (p, dev) = driven_board(&f, 0).await;
+    queue_card(
+        &f,
+        &p.id,
+        "wire the importer",
+        Some(dev),
+        IssuePriority::None,
+    )
+    .await;
+    assert_eq!(tick(&f, &p.id).await, 0, "no room yet");
+
+    set_ceiling(&f, &p, 2).await;
+    assert_eq!(tick(&f, &p.id).await, 1, "the ceiling made room");
+    assert_eq!(column_of(&f, &p.id, 1).await, IssueStatus::InProgress);
+
+    for _ in 0..3 {
+        assert_eq!(
+            tick(&f, &p.id).await,
+            0,
+            "the card is no longer in Todo, so later passes have nothing to do"
+        );
+    }
+    assert_eq!(
+        f.manager.list_runs(&p.id, 1).await.expect("runs").len(),
+        1,
+        "one card, one run"
+    );
+
+    // The boot sweep runs alongside the driver and hands the same recorded
+    // row back out; it must not become a second run either.
+    f.dispatched.lock().clear();
+    f.manager
+        .resume_unsettled_runs()
+        .await
+        .expect("the boot sweep");
+    assert!(
+        f.dispatched
+            .lock()
+            .iter()
+            .all(|run| run.number == 1 && run.trigger == RunTrigger::Promoted),
+        "the boot sweep re-drives what was already recorded rather than recording more"
+    );
+    assert_eq!(f.manager.list_runs(&p.id, 1).await.expect("runs").len(), 1);
+}
+
+/// The sweep is the only thing that drives a board in production, so its
+/// first tick has to be the boot pass — a board whose queue moved while the
+/// process was down has nobody else left to notice.
+#[tokio::test(start_paused = true)]
+async fn the_sweep_drives_on_its_first_tick_and_stops_when_told_to() {
+    let f = std::sync::Arc::new(fixture().await);
+    let (p, dev) = driven_board(&f, 1).await;
+    queue_card(
+        &f,
+        &p.id,
+        "wire the importer",
+        Some(dev),
+        IssuePriority::None,
+    )
+    .await;
+
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let driver = {
+        let f = std::sync::Arc::clone(&f);
+        tokio::spawn(async move {
+            f.manager
+                .run_driver(async move {
+                    let _ = stopped.await;
+                })
+                .await
+        })
+    };
+
+    // Time is paused, so this costs no wall clock: it only hands the
+    // runtime enough turns for the driver's first tick — which a
+    // `tokio::time::interval` fires immediately, and which is what makes
+    // the sweep its own boot pass — to finish its queries.
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    assert_eq!(
+        column_of(&f, &p.id, 1).await,
+        IssueStatus::InProgress,
+        "the sweep started the card without anybody calling drive"
+    );
+
+    stop.send(()).expect("the driver is still listening");
+    tokio::time::timeout(std::time::Duration::from_secs(1), driver)
+        .await
+        .expect("the driver stops on the shutdown signal rather than outliving it")
+        .expect("no panic");
 }

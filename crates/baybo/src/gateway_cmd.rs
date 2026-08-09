@@ -509,14 +509,27 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
         }));
     }
 
+    // The board's whole lifecycle, in the one order it has: recover what the
+    // last process left in flight, then drive.
+    //
+    // `resume_unsettled_runs` is once-per-process and cannot be folded into
+    // the tick — it rolls every `running` row back to `queued`, which on a
+    // live board would orphan the runs actually executing. Sequencing it
+    // here instead of racing it in a second task is what makes the driver's
+    // first tick see a settled board: two tasks would leave a re-dispatch
+    // and a promotion to be sorted out by `claim_run` alone.
     {
         let projects = Arc::clone(&graph.project_manager);
+        let driver_shutdown = shutdown.clone();
         task_tracker.track(tokio::spawn(async move {
             match projects.resume_unsettled_runs().await {
                 Ok(0) => {}
                 Ok(n) => tracing::info!(runs = n, "resumed issue runs interrupted by shutdown"),
                 Err(e) => tracing::warn!(error = %e, "could not resume interrupted issue runs"),
             }
+            projects
+                .run_driver(async move { driver_shutdown.wait().await })
+                .await;
         }));
     }
 

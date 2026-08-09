@@ -10,9 +10,9 @@ use baybo_model::{
 };
 use baybo_store::AgentProfileStore;
 use baybo_store::project::{
-    IssueActor, IssueEventBody, IssueEventRow, IssuePriority, IssueRow, IssueRunRow, IssueStatus,
-    IssueUpdate, NewIssue, NewIssueEvent, ProjectRow, ProjectStore, ProjectUpdate, RunStatus,
-    RunTrigger,
+    DEFAULT_MAX_PARALLEL_ISSUE_RUNS, IssueActor, IssueEventBody, IssueEventRow, IssuePriority,
+    IssueRow, IssueRunRow, IssueStatus, IssueUpdate, NewIssue, NewIssueEvent, ProjectRow,
+    ProjectStore, ProjectUpdate, RunStatus, RunTrigger,
 };
 use baybo_workspace::WorkspacePaths;
 use chrono::{DateTime, Utc};
@@ -39,6 +39,15 @@ const LEAD_DESCRIPTION: &str =
 
 /// How many live agents one project may have, lead included.
 pub const MAX_TEAM_AGENTS: usize = 16;
+
+/// How often the board driver looks at every live board.
+///
+/// The upper bound on how long a ready card sits in Todo after the thing
+/// that made it ready — a drag, a run settling, the lead assigning it. Short
+/// enough that a person watching the board sees it move; a pass is three
+/// queries per board against local sqlite, so the tick is cheaper than the
+/// UI it feeds.
+const DRIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Upper bound on a teammate's role line (chars, after trim). It seeds a
 /// SOUL and shows on a roster card, so it is a sentence, not a brief.
@@ -114,6 +123,10 @@ pub struct NewProject {
     /// of the box, and a limit the operator did not choose is a board that
     /// stops for a reason nobody can explain.
     pub daily_budget: Option<baybo_model::MicroUsd>,
+    /// How many runs the board may start on its own. `None` takes
+    /// [`DEFAULT_MAX_PARALLEL_ISSUE_RUNS`]; `Some(0)` opens a board that only
+    /// ever runs what somebody drags.
+    pub max_parallel_issue_runs: Option<usize>,
 }
 
 /// What a caller supplies to open an issue. Status is where the card
@@ -173,6 +186,10 @@ pub struct ProjectManager {
     /// and this only nudges — a send that fails, or a receiver that died,
     /// costs a delay until the next boot sweep, never a lost run.
     dispatch: RunDispatch,
+    /// Serialises [`drive`](Self::drive). See the comment there: deciding
+    /// how much room a board has and then filling it is a read-then-write,
+    /// and every run that settles asks the question again.
+    driving: tokio::sync::Mutex<()>,
 }
 
 /// The seam between recording a run and executing it. A channel rather
@@ -214,6 +231,7 @@ impl ProjectManager {
             paths,
             events,
             dispatch,
+            driving: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -225,6 +243,19 @@ impl ProjectManager {
     }
 
     async fn enqueue(&self, issue: &IssueRow, trigger: RunTrigger) -> Option<IssueRunRow> {
+        self.enqueue_as(issue, trigger, issue.assignee.clone()?)
+            .await
+    }
+
+    /// [`enqueue`](Self::enqueue) for a run whose runner is not the card's
+    /// assignee. Only [`RunTrigger::Triage`] is that today: the lead is
+    /// woken *on* a card precisely because nobody is on it.
+    async fn enqueue_as(
+        &self,
+        issue: &IssueRow,
+        trigger: RunTrigger,
+        agent: AgentProfileId,
+    ) -> Option<IssueRunRow> {
         if !crate::runs::accepts_runs(issue) {
             tracing::debug!(
                 issue = issue.number,
@@ -233,15 +264,16 @@ impl ProjectManager {
             );
             return None;
         }
-        if self.assignee_can_run(issue).await != Some(true) {
+        if self.can_run(&agent).await != Some(true) {
             tracing::debug!(
                 issue = issue.number,
                 ?trigger,
-                "the assignee cannot host an issue's session; not starting a run"
+                %agent,
+                "that agent cannot host an issue's session; not starting a run"
             );
             return None;
         }
-        let entry = ledger_entry(issue, trigger)?;
+        let entry = ledger_entry(issue, trigger, agent);
         let headroom = self.headroom(&issue.project_id).await;
         if let Err(e) = self.release_holds(&issue.project_id, headroom).await {
             tracing::error!(project = %issue.project_id, error = %e, "could not release held runs");
@@ -354,6 +386,285 @@ impl ProjectManager {
             (self.dispatch)(run);
         }
         Ok(released)
+    }
+
+    /// Drive every live board until `shutdown` resolves.
+    ///
+    /// The board's whole scheduler, and deliberately the *only* thing that
+    /// calls [`drive`](Self::drive) in production. The alternative — a
+    /// `drive` at the end of each of the seven writes that can change
+    /// either side of the gap — makes every one of them load-bearing, so a
+    /// new write path that forgets it leaves a board stuck until the
+    /// process restarts. Here a forgotten anything costs at most one tick.
+    ///
+    /// The first tick is **not** consumed: a board whose queue moved while
+    /// the process was down needs driving at boot, and that is the same
+    /// pass rather than a special case.
+    pub async fn run_driver(&self, shutdown: impl std::future::Future<Output = ()> + Send) {
+        let mut ticker = tokio::time::interval(DRIVE_INTERVAL);
+        // Skip rather than burst: a pass delayed by a slow tick is not a
+        // reason to run several immediately, since each is level-triggered
+        // and the last one would have done all the work anyway.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        tokio::pin!(shutdown);
+        loop {
+            tokio::select! {
+                () = &mut shutdown => {
+                    tracing::debug!("board driver: shutting down");
+                    return;
+                }
+                _ = ticker.tick() => self.drive_every_board().await,
+            }
+        }
+    }
+
+    async fn drive_every_board(&self) {
+        let projects = match self.store.list_projects(false).await {
+            Ok(projects) => projects,
+            Err(e) => {
+                tracing::error!(error = %e, "board driver could not list projects");
+                return;
+            }
+        };
+        for project in projects {
+            self.drive(&project.id).await;
+        }
+    }
+
+    /// Start whatever this board should be running and is not.
+    ///
+    /// Level-triggered and idempotent: it reads the board as it stands and
+    /// fills the gap between what is executing and what the ceiling allows,
+    /// so running it twice on an unchanged board does nothing the second
+    /// time. That is what lets [`run_driver`](Self::run_driver) be the only
+    /// caller — nothing has to *tell* it a card became ready.
+    ///
+    /// Returns how many cards it moved, for the tests and the log.
+    pub async fn drive(&self, project: &ProjectId) -> usize {
+        // One board at a time, process-wide. Reading the load and acting on
+        // it is not atomic against the store, and three runs settling
+        // together would otherwise each see the other two's slots as free
+        // and promote into all of them. The critical section is a handful
+        // of queries with no long await in it.
+        let _driving = self.driving.lock().await;
+        match self.promotions(project).await {
+            Ok(moved) => moved,
+            Err(e) => {
+                tracing::error!(%project, error = %e, "could not drive the board");
+                0
+            }
+        }
+    }
+
+    async fn promotions(&self, project: &ProjectId) -> Result<usize> {
+        let row = self.get_project(project).await?;
+        if row.archived_at.is_some() || row.max_parallel_issue_runs == 0 {
+            return Ok(0);
+        }
+        // Owed work first, and *before* the load is read. A held run is a
+        // card the board already promised to start, so it has the next slot
+        // ahead of anything still sitting in Todo — and a held run is not in
+        // `working`, so counting slots before releasing would hand those
+        // slots out twice. The overshoot was real: the first promotion's
+        // `enqueue` releases the holds itself, on its way past the budget
+        // gate, so a board with three held runs and a rolled-over ceiling
+        // ended up running six.
+        self.release_held_runs(project).await?;
+
+        let load = self.board_load(project).await?;
+        // Whatever is still held after that release is held on budget, and
+        // starting more work on top of it would mint cards that sit in In
+        // Progress with nothing running under them — which is the one thing
+        // that column is supposed to mean.
+        if load.headroom.is_exhausted() {
+            return Ok(0);
+        }
+        let slots = row
+            .max_parallel_issue_runs
+            .saturating_sub(load.working.len());
+        let issues = self.store.list_issues(project).await?;
+        // Held runs count here even though they do not count as load: a
+        // card the budget parked has already spent its one run slot, and
+        // promoting it would move it into In Progress on top of a run that
+        // is deliberately not executing.
+        let busy = crate::driver::busy(
+            load.working
+                .iter()
+                .chain(load.held.iter())
+                .map(|run| run.number),
+        );
+
+        let slate = crate::driver::slate(&issues, &busy, slots);
+        let mut moved = 0;
+        for issue in &slate {
+            if self.promote(issue).await {
+                moved += 1;
+            }
+        }
+        // After the promotions, and out of whatever room they left: work
+        // somebody is already on outranks asking who should do work nobody
+        // is on. A board with no capacity left says nothing rather than
+        // queueing a question it cannot act on the answer to.
+        if slots > moved {
+            self.ask_for_triage(project, &issues, &busy).await;
+        }
+        Ok(moved)
+    }
+
+    /// Move one ready card into In Progress and start it.
+    ///
+    /// Deliberately not [`move_issue`](Self::move_issue): that is the
+    /// operator's door, and it would record the run as
+    /// [`RunTrigger::Started`] — indistinguishable, in the execution log,
+    /// from the drag this exists to save.
+    ///
+    /// The two writes are a move and an enqueue, in that order and not
+    /// atomic, so **every reason the enqueue could refuse has to be asked
+    /// before the move**. A card moved into In Progress whose run is then
+    /// refused is stranded: it is no longer in Todo, so no later pass looks
+    /// at it again.
+    async fn promote(&self, issue: &IssueRow) -> bool {
+        // `is_promotable` established that somebody is on the card. Whether
+        // that somebody can still host a session is a different question,
+        // and its answer changes under the board's feet — an operator can
+        // move an agent to a framework that cannot run issues long after it
+        // was assigned.
+        let Some(assignee) = issue.assignee.clone() else {
+            return false;
+        };
+        if self.can_run(&assignee).await != Some(true) {
+            tracing::debug!(
+                issue = issue.number,
+                %assignee,
+                "the card is ready but its assignee cannot host a run; leaving it in Todo"
+            );
+            return false;
+        }
+        let column: Vec<i64> = match self.store.list_issues(&issue.project_id).await {
+            Ok(issues) => {
+                let mut in_progress: Vec<&IssueRow> = issues
+                    .iter()
+                    .filter(|other| other.status == IssueStatus::InProgress)
+                    .collect();
+                in_progress.sort_by_key(|other| (other.position, other.number));
+                // Appended, not inserted: a card the board started is the
+                // newest thing in flight, and the operator's own ordering
+                // of what was already there is not the board's to rewrite.
+                in_progress
+                    .into_iter()
+                    .map(|other| other.number)
+                    .chain(std::iter::once(issue.number))
+                    .collect()
+            }
+            Err(e) => {
+                tracing::error!(issue = issue.number, error = %e, "could not read the In Progress column");
+                return false;
+            }
+        };
+        match self
+            .store
+            .move_issue(
+                &issue.project_id,
+                issue.number,
+                IssueStatus::InProgress,
+                &column,
+            )
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => return false,
+            Err(e) => {
+                tracing::error!(issue = issue.number, error = %e, "could not promote a card");
+                return false;
+            }
+        }
+        let after = match self.get_issue(&issue.project_id, issue.number).await {
+            Ok(after) => after,
+            Err(e) => {
+                tracing::error!(issue = issue.number, error = %e, "could not re-read a promoted card");
+                return false;
+            }
+        };
+        self.events
+            .board_changed(&issue.project_id, Some(issue.number));
+        self.record_diff(issue, &after, IssueActor::System).await;
+        tracing::info!(
+            project = %issue.project_id,
+            issue = issue.number,
+            "the board had room and started this card"
+        );
+        if self.enqueue(&after, RunTrigger::Promoted).await.is_some() {
+            return true;
+        }
+        // The pre-checks passed and the enqueue still refused, so something
+        // took the card's run slot between the load read and this write —
+        // most likely a comment waking its assignee. Loud, because the card
+        // is now in In Progress and no later pass will look at it again:
+        // recovering it is Retry, and somebody has to know to press it.
+        tracing::error!(
+            project = %issue.project_id,
+            issue = issue.number,
+            "promoted a card and then could not start it; it is in In Progress with no run"
+        );
+        false
+    }
+
+    /// Wake the lead for the first card that reached Todo with nobody on
+    /// it, if there is one it has not already been asked about.
+    async fn ask_for_triage(
+        &self,
+        project: &ProjectId,
+        issues: &[IssueRow],
+        busy: &std::collections::BTreeSet<i64>,
+    ) {
+        let unstaffed = crate::driver::awaiting_triage(issues, busy);
+        if unstaffed.is_empty() {
+            return;
+        }
+        let Some(lead) = self.lead_of(project).await else {
+            return;
+        };
+        for issue in unstaffed {
+            let runs = match self.store.list_runs(&issue.id).await {
+                Ok(runs) => runs,
+                Err(e) => {
+                    tracing::error!(issue = issue.number, error = %e, "could not read a card's runs");
+                    continue;
+                }
+            };
+            if crate::driver::already_triaged(&issue, &runs) {
+                continue;
+            }
+            if self
+                .enqueue_as(&issue, RunTrigger::Triage, lead.clone())
+                .await
+                .is_some()
+            {
+                tracing::info!(%project, issue = issue.number, "asked the lead to staff an unassigned card");
+            }
+            // One question per pass, whatever came of it: the lead reads the
+            // whole board when it is woken, so a second card would be the
+            // same conversation twice.
+            return;
+        }
+    }
+
+    /// The board's coordinator, by the handle every board issues it.
+    async fn lead_of(&self, project: &ProjectId) -> Option<AgentProfileId> {
+        match self.team(project).await {
+            Ok(rows) => rows
+                .into_iter()
+                .find(|row| {
+                    row.team
+                        .as_ref()
+                        .is_some_and(|team| team.handle.as_str() == LEAD_HANDLE)
+                })
+                .map(|row| row.id),
+            Err(e) => {
+                tracing::error!(%project, error = %e, "could not find the board's lead");
+                None
+            }
+        }
     }
 
     async fn live_card(&self, run: &IssueRunRow) -> Option<IssueRow> {
@@ -923,6 +1234,9 @@ impl ProjectManager {
             description: new.description.trim().to_owned(),
             workdir,
             daily_budget: new.daily_budget,
+            max_parallel_issue_runs: new
+                .max_parallel_issue_runs
+                .unwrap_or(DEFAULT_MAX_PARALLEL_ISSUE_RUNS),
             // Never read, so a board's first agent comment is unread even
             // if it lands before anybody opens it.
             read_at: None,
@@ -1177,6 +1491,7 @@ impl ProjectManager {
             name: validate_name(&update.name)?,
             description: update.description.trim().to_owned(),
             daily_budget: validate_budget(update.daily_budget)?,
+            max_parallel_issue_runs: update.max_parallel_issue_runs,
         };
         self.store.update_project(id, &update).await?;
         self.events.project_changed(id);
@@ -1627,13 +1942,15 @@ impl ProjectManager {
         Ok(())
     }
 
-    async fn assignee_can_run(&self, issue: &IssueRow) -> Option<bool> {
-        let assignee = issue.assignee.as_ref()?;
-        match self.agents.get(assignee).await {
+    /// Whether this agent can host a run at all. `None` is "the store could
+    /// not say", which every caller treats as "do not start anything" —
+    /// distinct from `Some(false)`, which is a settled no.
+    async fn can_run(&self, agent: &AgentProfileId) -> Option<bool> {
+        match self.agents.get(agent).await {
             Ok(Some(profile)) => Some(crate::runs::can_host_a_session(profile.framework)),
             Ok(None) => Some(false),
             Err(e) => {
-                tracing::error!(%assignee, error = %e, "could not read the assignee's framework");
+                tracing::error!(%agent, error = %e, "could not read an agent's framework");
                 None
             }
         }

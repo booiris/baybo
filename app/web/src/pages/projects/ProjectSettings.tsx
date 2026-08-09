@@ -4,6 +4,7 @@ import { useAdminClient, useAuth } from '../../api/auth';
 import { setProjectArchived, updateProject } from './api';
 import type { Project } from './boardModel';
 import { budgetHint, formatBudget, parseBudget } from './budgetModel';
+import { formatParallelIssueRuns, parallelIssueRunsHint, parseParallelIssueRuns } from './driverModel';
 import { fieldLabel, textInput } from './CreateProjectForm';
 
 export function ProjectSettings({
@@ -20,6 +21,7 @@ export function ProjectSettings({
   const [name, setName] = useState(project.name);
   const [description, setDescription] = useState(project.description);
   const [budget, setBudget] = useState(formatBudget(project.daily_budget_micros));
+  const [parallelIssueRuns, setParallelIssueRuns] = useState(formatParallelIssueRuns(project.max_parallel_issue_runs));
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const archived = project.archived_at_ms != null;
@@ -30,12 +32,18 @@ export function ProjectSettings({
       setError('Daily budget must be an amount in dollars, or empty for no ceiling.');
       return;
     }
+    const slots = parseParallelIssueRuns(parallelIssueRuns);
+    if (slots === undefined) {
+      setError('Parallel issue runs must be a whole number. Use 0 to stop the board starting work.');
+      return;
+    }
     setBusy(true);
     setError(null);
     const outcome = await updateProject(client, project.id, {
       name,
       description,
       daily_budget_micros: micros,
+      max_parallel_issue_runs: slots,
     });
     setBusy(false);
     if (outcome.kind === 'unauthorized') {
@@ -119,6 +127,25 @@ export function ProjectSettings({
           />
           <p className="mt-1 text-[0.7rem] text-ink-soft leading-snug">
             {budgetHint(parseBudget(budget) ?? null)}
+          </p>
+        </div>
+
+        <div>
+          <label className={fieldLabel} htmlFor="settings-parallel-issue-runs">
+            Parallel issue runs
+          </label>
+          <input
+            id="settings-parallel-issue-runs"
+            className={textInput}
+            value={parallelIssueRuns}
+            inputMode="numeric"
+            disabled={archived}
+            onChange={(event) => {
+              setParallelIssueRuns(event.target.value);
+            }}
+          />
+          <p className="mt-1 text-[0.7rem] text-ink-soft leading-snug">
+            {parallelIssueRunsHint(parseParallelIssueRuns(parallelIssueRuns))}
           </p>
         </div>
 

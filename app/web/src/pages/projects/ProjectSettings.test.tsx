@@ -18,6 +18,7 @@ function project(overrides: Partial<Project> = {}): Project {
     name: 'Kanban',
     description: 'the board',
     workdir: '/tmp/kanban',
+    max_parallel_issue_runs: 3,
     created_at_ms: 0,
     updated_at_ms: 0,
     ...overrides,
@@ -73,6 +74,48 @@ describe('ProjectSettings', () => {
         expect.objectContaining({ daily_budget_micros: null }),
       );
     });
+  });
+
+  it('shows the run ceiling and saves the number back', async () => {
+    render(
+      <ProjectSettings
+        project={project({ max_parallel_issue_runs: 2 })}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+    const box = screen.getByLabelText('Parallel issue runs');
+    expect(box).toHaveValue('2');
+
+    await userEvent.clear(box);
+    await userEvent.type(box, '5');
+    await userEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => {
+      expect(api.updateProject).toHaveBeenCalledWith(
+        client,
+        '01JP',
+        expect.objectContaining({ max_parallel_issue_runs: 5 }),
+      );
+    });
+  });
+
+  it('says what zero means, because it is the off switch and not a blank', async () => {
+    render(
+      <ProjectSettings
+        project={project({ max_parallel_issue_runs: 0 })}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+    expect(screen.getByText(/cards stay in Todo until you move them/)).toBeInTheDocument();
+  });
+
+  it('refuses an empty run ceiling rather than silently restoring the default', async () => {
+    render(<ProjectSettings project={project()} onClose={vi.fn()} onSaved={vi.fn()} />);
+    await userEvent.clear(screen.getByLabelText('Parallel issue runs'));
+    await userEvent.click(screen.getByRole('button', { name: 'Save' }));
+    expect(await screen.findByText(/must be a whole number/)).toBeInTheDocument();
+    expect(api.updateProject).not.toHaveBeenCalled();
   });
 
   it('separates zero from empty in what it tells the operator', () => {

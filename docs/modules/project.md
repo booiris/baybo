@@ -46,6 +46,7 @@ every door leads through it.
 | `actors.rs` | What an agent-facing surface calls the somebody a timeline entry names |
 | `mentions.rs` | `@handle` scanning, and when a mention is a handover |
 | `stages.rs` | Sub-issues, `is_finished`, the stage barrier's two questions, the progress ring |
+| `driver.rs` | Which Todo cards the board starts by itself, in what order, and when the lead is asked to staff one |
 | `budget.rs` | `Headroom` and the UTC-day window a daily ceiling measures |
 | `timeline.rs` | `diff_events` — an edit reduced to the entries worth writing |
 | `worktree.rs` | The per-issue git worktree: create, branch, resolve the commit identity, reclaim |
@@ -53,8 +54,8 @@ every door leads through it.
 | `events.rs` | The `ProjectEvents` push port (the gateway implements it) |
 | `tools/` | The six board tools an agent working a project can call |
 
-Everything under `runs`/`comments`/`mentions`/`stages`/`budget`/`timeline` is a
-**pure rule module**: no store, no clock beyond an argument, unit-tested in
+Everything under `runs`/`comments`/`mentions`/`stages`/`budget`/`timeline`/`driver`
+is a **pure rule module**: no store, no clock beyond an argument, unit-tested in
 place. That is what lets every caller *in this process* — the manager, the six
 board tools, the REST routes — answer a question the same way without any of
 them carrying a copy of the rule.
@@ -128,9 +129,12 @@ unambiguously its own.
 
 ### One enqueue path, three gates
 
-`ProjectManager::enqueue` is the only function that writes a run row. A drag, a
-REST move, an assignment, a comment wake, a retry, a stage barrier and an agent
-tool all arrive there, and it asks three questions once each:
+`ProjectManager::enqueue_as` is the only function that writes a run row —
+`enqueue` is the same door for the ordinary case, filling in the card's own
+assignee as the runner. A drag, a
+REST move, an assignment, a comment wake, a retry, a stage barrier, a promotion
+by the driver, a triage wake and an agent tool all arrive there, and it asks
+three questions once each:
 
 1. **Liveness** — `runs::accepts_runs`. A card the board has finished with —
    Done, or cancelled — takes no runs. Asked first, before anything is written.
@@ -152,9 +156,9 @@ Two predicates, not one, because they answer different questions:
 
 The distinction is not academic, and getting it wrong is the bug this crate has
 had twice. Only three of the doors into a run carry a transition — creating a
-card, editing one, moving one. A comment wake, a retry and a stage barrier
-arrive at `enqueue` with nothing but a row, and a released hold and a boot
-re-drive never reach `enqueue` at all. A cancellation rule enforced on the edge
+card, editing one, moving one. A comment wake, a retry, a stage barrier and both
+of the driver's runs arrive at `enqueue` with nothing but a row, and a released
+hold and a boot re-drive never reach `enqueue` at all. A cancellation rule enforced on the edge
 covers three doors and misses five — so it lives on the card, at the
 chokepoint, and each sweep asks it again for itself.
 
@@ -276,6 +280,121 @@ already holding its own dedupe slot, so every enqueue is refused and a release
 placed afterwards would never be reached. The price is that a caller whose own
 held run has just become affordable is told the issue already has a run in
 flight, which is true, and it is the run they asked for.
+
+### The driver: what the board starts by itself
+
+Todo means "ready, waiting for capacity", and `ProjectManager::drive` is the
+thing that notices the capacity. When a board has fewer runs in flight than
+`projects.max_parallel_issue_runs`, it takes cards off the top of Todo — most urgent
+first, then column order — moves each into In Progress in the board's own name
+(`IssueActor::System`) and enqueues it as `RunTrigger::Promoted`. The default
+ceiling is `DEFAULT_MAX_PARALLEL_ISSUE_RUNS`; `0` is the manual board, where nothing
+starts that nobody dragged.
+
+There is deliberately **no upper bound** on that number — how much a board may
+have going at once is the operator's call, and any cap this crate invented
+would be a policy nobody asked for. The single refusal is a **negative**, and
+it happens in the gateway's `parallel_issue_runs`, at the `i64 → usize`
+conversion: that is the last point where the sign still exists, and a
+saturating conversion would hand the driver a slot count that empties the
+whole Todo column in one pass.
+
+The driver is **level-triggered**: it reads the board as it stands and closes
+the gap, so calling it twice on an unchanged board does nothing the second
+time. Nothing tells it a card became ready — it looks.
+
+That is what lets **one caller** exist. `ProjectManager::run_driver`, spawned
+once per process from `gateway_cmd.rs` beside the boot sweep, ticks every
+`DRIVE_INTERVAL` (5s) and drives every unarchived board; in production nothing
+else calls `drive`. The tick is also the boot pass, because a
+`tokio::time::interval` fires its first tick immediately.
+
+**This was the seven-call-site version first, and that was worse.** Ending
+each write that can change either side of the gap — `create_issue`,
+`update_issue`, `move_issue`, `finish_run`, `cancel_run`, `update_project`,
+`resume_project_runs` — in a `drive` makes all seven load-bearing: the model
+is sound (board state only moves through writes), but a new write path that
+does not know about the driver leaves a board parked until the process
+restarts, and nothing catches it. Two of those tails were already verbatim
+copies of each other. On a tick, a forgotten anything costs one interval.
+
+The price paid for that is **latency**: a card staffed in Todo, or a slot
+freed by a settling run, waits up to `DRIVE_INTERVAL` before anything happens.
+That is the trade, and it is why the interval is seconds rather than the
+minute a pure safety net would want.
+
+This is *not* the shape `release_holds` uses — that one is edge-driven off
+activity, and the difference is worth knowing: a hold only matters to the card
+holding it, so the next thing that happens on that board releases it. A
+promotion is about the board's spare capacity, which the card that would use
+it has no way to observe.
+
+`drive` takes a process-wide lock. Reading the load and acting on it is not
+atomic against the store, and three runs settling together would otherwise each
+see the other two's slots as free.
+
+A pass **releases holds before it counts slots**, and that order is load-bearing
+rather than tidy. A held run is not in `board_load.working`, so counting first
+sees an idle board — and the first promotion's `enqueue` then releases every
+hold on its way past the budget gate, so the board runs the promotions *and*
+the holds. Releasing first turns them into `Queued` rows the count can see. The
+case is not hypothetical: `update_project` releases what it un-parks itself, so
+the situation where a tick is the first thing to see new headroom is the **UTC
+day rolling over**, which nothing is notified about — exactly when a
+budget-limited board is holding runs.
+
+At a process start the driver is sequenced *after* `resume_unsettled_runs`, in
+the same task (`gateway_cmd.rs`). They cannot be folded into one function —
+`requeue_unsettled` rolls every `running` row back to `queued`, which on a live
+board would orphan the runs actually executing, so it is once-per-process and
+the sweep is not. But racing them in two tasks leaves a re-dispatch and a
+promotion to be sorted out by `claim_run` alone, and there is no reason to
+spend that guard here.
+
+Five things it will not do, each of which is a rule and not a coincidence:
+
+- **It will not promote a card whose assignee cannot host a run.** Asked in
+  `promote`, *before* the move — and that ordering is the whole point. The two
+  writes a promotion makes are a move and an enqueue, in that order and not
+  atomic, so every reason the enqueue could refuse has to be settled first: a
+  card moved into In Progress and then refused a run is stranded, because it is
+  no longer in Todo for a later pass to find. `is_promotable` only knows that
+  *somebody* is on the card; whether that somebody still runs on baybo changes
+  under the board's feet, since an operator can move an agent to another
+  framework long after it was assigned.
+- **It will not promote a card that already has a run recorded.** A card holds
+  one run slot; promoting one that is spoken for would move it into In Progress
+  and then fail to start anything, which is the one state that column must never
+  be in. This is not an edge case — a comment on a Todo card wakes its assignee
+  where it stands, and a triage run sits on an unstaffed card by construction.
+  Both are in the busy set, held runs included.
+- **It will not overrule a block.** A person dragging a blocked card into In
+  Progress is overriding the block deliberately; the board doing it would be
+  overriding it on nobody's authority.
+- **It will not start work while the budget is exhausted.** `enqueue` would
+  record the run and hold it, leaving a card in In Progress with nothing running
+  under it. The existing hold/release path already owes that work.
+- **It will not preempt.** Priority decides who gets the *next* free slot, not
+  who keeps one. A card already running keeps running when something more
+  urgent arrives.
+
+Ordering is `(priority, position, number)` — the same order `IssueList` already
+reads a column in, deliberately, so "what is next in Todo" has one answer
+whether an agent asks or the board acts. Note that the **web board sorts by
+`position` alone**, so on a column with mixed priorities the card the board
+takes next is not necessarily the one rendered at the top.
+
+**Triage.** A card that reaches Todo with nobody on it is work the board cannot
+start, so the lead is woken on that card with `RunTrigger::Triage` — the one run
+whose `agent_id` is not the card's assignee, because the question is *who should
+do this*. One card per pass: the lead reads the whole board when it is woken.
+
+The spin this could obviously become is closed by `driver::already_triaged`,
+which compares the card's `updated_at` against its newest triage run. A lead
+that read the card and decided to leave it unstaffed changed nothing, so it is
+not asked again — and editing or moving the card makes it a new question. The
+guard is a comparison rather than a flag precisely so that "has anything changed
+since the lead looked?" has no second copy that could disagree.
 
 ### Stages and the barrier
 

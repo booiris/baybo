@@ -99,6 +99,13 @@ impl IssuePriority {
     }
 }
 
+/// How many runs a board starts on its own before it waits for one to end.
+///
+/// The single home for the number: the `projects.max_parallel_issue_runs` column
+/// is nullable with no SQL default, so a row that predates it resolves
+/// here instead of at a second literal the DDL would have to keep in step.
+pub const DEFAULT_MAX_PARALLEL_ISSUE_RUNS: usize = 3;
+
 /// One row of `projects`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectRow {
@@ -114,6 +121,14 @@ pub struct ProjectRow {
     /// ceiling — the default, because a board that stops working against a
     /// limit nobody chose is a board whose silence nobody can explain.
     pub daily_budget: Option<baybo_model::MicroUsd>,
+    /// How many runs this board may start **on its own** at once, by
+    /// promoting Todo cards into In Progress. `0` turns the driver off and
+    /// leaves promotion to whoever drags the card.
+    ///
+    /// Not `Option`: every board has an answer, and a row written before
+    /// the column existed resolves to [`DEFAULT_MAX_PARALLEL_ISSUE_RUNS`] at the
+    /// storage edge rather than making every reader decide again.
+    pub max_parallel_issue_runs: usize,
     /// When the operator last looked at this board. `None` means never.
     pub read_at: Option<DateTime<Utc>>,
     /// Soft archive. There is no hard delete in any production path.
@@ -131,6 +146,9 @@ pub struct ProjectUpdate {
     pub description: String,
     /// Full-replace like the rest of this struct: `None` clears the ceiling.
     pub daily_budget: Option<baybo_model::MicroUsd>,
+    /// See [`ProjectRow::max_parallel_issue_runs`]. `0` stops the board driving
+    /// itself.
+    pub max_parallel_issue_runs: usize,
 }
 
 /// One row of `issues`.
@@ -515,6 +533,15 @@ pub enum RunTrigger {
     Retry,
     /// Somebody commented on live work that nobody was reading.
     Comment,
+    /// The board took this card off the top of Todo by itself, because it
+    /// had room. The counterpart of [`RunTrigger::Started`], and separate
+    /// from it so the execution log can say "nobody asked for this — the
+    /// board had capacity" without the operator opening the transcript.
+    Promoted,
+    /// The lead was woken to staff a card that reached Todo with nobody on
+    /// it. The one run that happens on a card its runner is not assigned
+    /// to: the lead is being asked *who should do this*, not to do it.
+    Triage,
     /// Every child in one of this issue's stages finished **and nothing
     /// earlier was still open**, so its assignee was woken to drive what
     /// comes next. Strictly narrower than
@@ -531,6 +558,8 @@ impl RunTrigger {
             RunTrigger::Assigned => "assigned",
             RunTrigger::Retry => "retry",
             RunTrigger::Comment => "comment",
+            RunTrigger::Promoted => "promoted",
+            RunTrigger::Triage => "triage",
             RunTrigger::StageBarrier => "stage_barrier",
         }
     }
@@ -541,6 +570,8 @@ impl RunTrigger {
             "assigned" => Some(RunTrigger::Assigned),
             "retry" => Some(RunTrigger::Retry),
             "comment" => Some(RunTrigger::Comment),
+            "promoted" => Some(RunTrigger::Promoted),
+            "triage" => Some(RunTrigger::Triage),
             "stage_barrier" => Some(RunTrigger::StageBarrier),
             _ => None,
         }

@@ -31,4 +31,7 @@ baybo-storage = { workspace = true }
 baybo-tools = { workspace = true, features = ["test-support"] }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# `test-util` (not in the `full` feature set) backs
+# `#[tokio::test(start_paused = true)]` in the board-driver sweep test, which
+# would otherwise have to sleep on the real tick interval.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }

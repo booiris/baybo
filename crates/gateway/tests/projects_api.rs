@@ -137,6 +137,42 @@ async fn a_blank_name_and_a_bad_workdir_are_refused() {
     .await;
 }
 
+/// The board sets no upper bound on how much it may start at once — that is
+/// the operator's call — but a negative is not a smaller number, it is a
+/// number the driver would read as "empty the whole Todo column".
+#[tokio::test]
+async fn a_negative_run_ceiling_is_refused_rather_than_saturated() {
+    let (router, _tg) = router().await;
+
+    post(
+        &router,
+        "/v1/projects",
+        json!({ "name": "backwards", "max_parallel_issue_runs": -1 }),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+
+    let id = open_project(&router, "forwards").await;
+    put(
+        &router,
+        &format!("/v1/projects/{id}"),
+        json!({ "name": "forwards", "max_parallel_issue_runs": -1 }),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+
+    // …and a large one is simply accepted, because nothing here is a policy
+    // about how many agents a board ought to have going.
+    let raised = put(
+        &router,
+        &format!("/v1/projects/{id}"),
+        json!({ "name": "forwards", "max_parallel_issue_runs": 64 }),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(raised["max_parallel_issue_runs"], 64);
+}
+
 #[tokio::test]
 async fn issues_are_numbered_per_project_and_never_cross_boards() {
     let (router, _tg) = router().await;

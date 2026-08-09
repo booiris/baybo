@@ -7,6 +7,7 @@ mod brief;
 mod budget;
 mod comments;
 pub mod dispatch;
+mod driver;
 mod error;
 mod events;
 mod manager;

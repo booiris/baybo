@@ -12,6 +12,7 @@ const PROJECT: Project = {
   name: 'Kanban',
   description: '',
   workdir: '/tmp/kanban',
+  max_parallel_issue_runs: 3,
   created_at_ms: 0,
   updated_at_ms: 0,
 };

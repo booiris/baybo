@@ -4015,6 +4015,7 @@
                           "name",
                           "description",
                           "workdir",
+                          "max_parallel_issue_runs",
                           "created_at_ms",
                           "updated_at_ms"
                         ],
@@ -4044,6 +4045,11 @@
                           },
                           "id": {
                             "type": "string"
+                          },
+                          "max_parallel_issue_runs": {
+                            "type": "integer",
+                            "format": "int64",
+                            "description": "How many runs this board starts on its own, by taking cards off the\ntop of Todo as room appears. `0` means it starts only what somebody\ndrags into In Progress."
                           },
                           "name": {
                             "type": "string"
@@ -8264,6 +8270,14 @@
           "description": {
             "type": "string"
           },
+          "max_parallel_issue_runs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "How many runs the board may start on its own, by promoting cards off\nthe top of Todo. Omit for the default; `0` leaves every start to\nwhoever drags the card."
+          },
           "name": {
             "type": "string"
           },
@@ -9910,6 +9924,7 @@
           "name",
           "description",
           "workdir",
+          "max_parallel_issue_runs",
           "created_at_ms",
           "updated_at_ms"
         ],
@@ -9939,6 +9954,11 @@
           },
           "id": {
             "type": "string"
+          },
+          "max_parallel_issue_runs": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many runs this board starts on its own, by taking cards off the\ntop of Todo as room appears. `0` means it starts only what somebody\ndrags into In Progress."
           },
           "name": {
             "type": "string"
@@ -10100,6 +10120,8 @@
           "assigned",
           "retry",
           "comment",
+          "promoted",
+          "triage",
           "stage_barrier"
         ]
       },
@@ -10919,6 +10941,14 @@
           },
           "description": {
             "type": "string"
+          },
+          "max_parallel_issue_runs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "How many runs the board may start on its own, by promoting cards off\nthe top of Todo. Full-replace like every other field here: omitting\nit restores the default rather than keeping what the board had."
           },
           "name": {
             "type": "string"

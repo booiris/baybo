@@ -342,8 +342,8 @@ mod tests {
     };
     use baybo_project::{NewIssueRequest, NewProject, ProjectManager, session_run_before};
     use baybo_store::project::{
-        IssueActor, IssuePriority, IssueStatus, IssueUpdate, ProjectRow, ProjectStore,
-        ProjectUpdate, RunTrigger,
+        DEFAULT_MAX_PARALLEL_ISSUE_RUNS, IssueActor, IssuePriority, IssueStatus, IssueUpdate,
+        ProjectRow, ProjectStore, ProjectUpdate, RunTrigger,
     };
     use baybo_workspace::WorkspacePaths;
 
@@ -440,6 +440,7 @@ mod tests {
                 description: String::new(),
                 workdir: None,
                 daily_budget: None,
+                max_parallel_issue_runs: None,
             })
             .await
             .expect("project");
@@ -631,6 +632,7 @@ mod tests {
                     name: board.project.name.clone(),
                     description: board.project.description.clone(),
                     daily_budget: Some(MicroUsd::ZERO),
+                    max_parallel_issue_runs: DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
                 },
             )
             .await

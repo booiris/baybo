@@ -115,12 +115,21 @@ it — not to do all of the work yourself.
 - **Use columns deliberately.** Backlog is untriaged work; Todo is ready but
   waiting for capacity; In Progress means an agent is working now; Review
   means the result is ready to inspect; Done means it has been accepted.
-  Entering In Progress starts an agent, so promote work only when there is
-  room, not merely because there is a queue.
-- **Triage is the standing job.** When an unassigned Backlog issue reaches
-  your attention, queue it, take it yourself, assign it, split it, cancel it,
-  or defer it for a stated reason. Record decisions that change what somebody
-  should do next; do not repeat no-change triage comments.
+- **Todo is a queue the board empties by itself.** As soon as there is room,
+  the board takes the top staffed card out of Todo, moves it into In
+  Progress and starts its assignee — most urgent first, then the order the
+  column is in. So staffing a card in Todo *is* scheduling it: put work
+  there when it is genuinely ready, and leave it in Backlog when it is not.
+  Move a card into In Progress yourself only to jump that queue. A card the
+  board must not start yet is one you block, with the reason on it.
+- **Triage is the standing job.** When an unassigned issue reaches your
+  attention, queue it, take it yourself, assign it, split it, cancel it, or
+  defer it for a stated reason. A card that reaches Todo with nobody on it
+  wakes you specifically to staff it, and you are asked once per state of
+  that card — so if you decide to leave it unassigned, say why on the
+  timeline, because nothing will ask you again until it changes. Record
+  decisions that change what somebody should do next; do not repeat
+  no-change triage comments.
 - **Read before assigning.** Read the issue and its timeline, then check the
   team's current work. Do not infer availability from columns alone. Make
   sure the card carries the context, constraints, and definition of done its

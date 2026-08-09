@@ -75,7 +75,7 @@ fn event_from_raw(raw: RawEvent) -> Result<IssueEventRow> {
 }
 
 const PROJECT_COLUMNS: &str = "id, name, description, workdir, daily_budget_micros, \
-     read_at, archived_at, created_at, updated_at";
+     max_parallel_issue_runs, read_at, archived_at, created_at, updated_at";
 
 const ISSUE_COLUMNS: &str = "id, project_id, number, title, description, status, priority, \
      assignee, position, blocked_reason, branch, parent_issue_id, stage, source_key, \
@@ -164,6 +164,7 @@ type RawProject = (
     Option<i64>,
     Option<i64>,
     Option<i64>,
+    Option<i64>,
     i64,
     i64,
 );
@@ -199,6 +200,7 @@ fn read_raw_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawProject> {
         row.get(6)?,
         row.get(7)?,
         row.get(8)?,
+        row.get(9)?,
     ))
 }
 
@@ -243,6 +245,7 @@ fn project_from_raw(raw: RawProject) -> Result<ProjectRow> {
         description,
         workdir,
         daily_budget_micros,
+        max_parallel_issue_runs,
         read_at,
         archived_at,
         created_at,
@@ -256,6 +259,12 @@ fn project_from_raw(raw: RawProject) -> Result<ProjectRow> {
         description,
         workdir,
         daily_budget: daily_budget_micros.map(baybo_model::MicroUsd::from_micros),
+        // NULL is a row written before the column existed, not a board that
+        // chose "no ceiling": the driver has to have a number, and the one
+        // it gets is the same one a board opened today starts with.
+        max_parallel_issue_runs: max_parallel_issue_runs
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(baybo_store::project::DEFAULT_MAX_PARALLEL_ISSUE_RUNS),
         read_at: ts_opt("projects.read_at", read_at)?,
         archived_at: ts_opt("projects.archived_at", archived_at)?,
         created_at: ts("projects.created_at", created_at)?,
@@ -359,21 +368,24 @@ impl ProjectStore for SqliteProjectStore {
         let description = row.description.clone();
         let workdir = row.workdir.clone();
         let daily_budget = row.daily_budget.map(baybo_model::MicroUsd::into_micros);
+        let max_parallel_issue_runs =
+            i64::try_from(row.max_parallel_issue_runs).unwrap_or(i64::MAX);
         let created_at = super::time::to_us(row.created_at);
         let updated_at = super::time::to_us(row.updated_at);
         self.pool
             .interact("projects.create", move |conn| {
                 conn.execute(
                     "INSERT INTO projects \
-                     (id, name, description, workdir, daily_budget_micros, read_at, \
-                      archived_at, created_at, updated_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, ?7)",
+                     (id, name, description, workdir, daily_budget_micros, \
+                      max_parallel_issue_runs, read_at, archived_at, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, ?7, ?8)",
                     rusqlite::params![
                         id,
                         name,
                         description,
                         workdir,
                         daily_budget,
+                        max_parallel_issue_runs,
                         created_at,
                         updated_at
                     ],
@@ -388,15 +400,24 @@ impl ProjectStore for SqliteProjectStore {
         let name = update.name.clone();
         let description = update.description.clone();
         let daily_budget = update.daily_budget.map(baybo_model::MicroUsd::into_micros);
+        let max_parallel_issue_runs =
+            i64::try_from(update.max_parallel_issue_runs).unwrap_or(i64::MAX);
         let now = super::time::now_us();
         let affected = self
             .pool
             .interact("projects.update", move |conn| {
                 Ok(conn.execute(
                     "UPDATE projects SET name = ?2, description = ?3, \
-                     daily_budget_micros = ?4, updated_at = ?5 \
+                     daily_budget_micros = ?4, max_parallel_issue_runs = ?5, updated_at = ?6 \
                      WHERE id = ?1",
-                    rusqlite::params![id, name, description, daily_budget, now],
+                    rusqlite::params![
+                        id,
+                        name,
+                        description,
+                        daily_budget,
+                        max_parallel_issue_runs,
+                        now
+                    ],
                 )?)
             })
             .await?;
@@ -1169,7 +1190,7 @@ impl ProjectStore for SqliteProjectStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use baybo_store::project::IssueEventBody;
+    use baybo_store::project::{DEFAULT_MAX_PARALLEL_ISSUE_RUNS, IssueEventBody};
 
     async fn store() -> (tempfile::TempDir, SqliteProjectStore) {
         let dir = tempfile::tempdir().unwrap();
@@ -1185,6 +1206,7 @@ mod tests {
             description: String::new(),
             workdir: format!("/tmp/{id}"),
             daily_budget: None,
+            max_parallel_issue_runs: DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
             read_at: None,
             archived_at: None,
             created_at: now,
@@ -1382,6 +1404,7 @@ mod tests {
                         name: "Alpha".into(),
                         description: "the first".into(),
                         daily_budget: None,
+                        max_parallel_issue_runs: DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
                     }
                 )
                 .await

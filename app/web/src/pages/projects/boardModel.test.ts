@@ -47,6 +47,7 @@ function project(id: string): Project {
     name: id,
     description: '',
     workdir: `/tmp/${id}`,
+    max_parallel_issue_runs: 3,
     created_at_ms: 0,
     updated_at_ms: 0,
   };

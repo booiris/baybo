@@ -74,6 +74,9 @@ impl Fixture {
         }
     }
 
+    /// A board that starts only what a tool call asks it to: these tests are
+    /// about the tools, and the driver would otherwise promote their cards
+    /// out of Todo between one assertion and the next.
     async fn open(&self, name: &str) -> (ProjectId, baybo_model::AgentProfileId) {
         let project = self
             .manager
@@ -82,6 +85,7 @@ impl Fixture {
                 description: String::new(),
                 workdir: None,
                 daily_budget: None,
+                max_parallel_issue_runs: Some(0),
             })
             .await
             .expect("create project");
@@ -639,6 +643,7 @@ mod approvals {
                 description: String::new(),
                 workdir: None,
                 daily_budget: None,
+                max_parallel_issue_runs: None,
             })
             .await
             .expect("project");
@@ -806,6 +811,7 @@ async fn an_exhausted_board_reads_as_idle_and_says_why() {
             description: String::new(),
             workdir: None,
             daily_budget: Some(baybo_model::MicroUsd::ZERO),
+            max_parallel_issue_runs: None,
         })
         .await
         .expect("project");
