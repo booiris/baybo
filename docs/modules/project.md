@@ -43,6 +43,7 @@ every door leads through it.
 | `dispatch.rs` | Turning a recorded row into an `IssueRunEvent` the executor can run |
 | `brief.rs` | The brief a run is handed: the card, and what has been said on it since |
 | `comments.rs` | `comment_delivery` — what a comment does besides being recorded |
+| `actors.rs` | What an agent-facing surface calls the somebody a timeline entry names |
 | `mentions.rs` | `@handle` scanning, and when a mention is a handover |
 | `stages.rs` | Sub-issues, `is_finished`, the stage barrier's two questions, the progress ring |
 | `budget.rs` | `Headroom` and the UTC-day window a daily ceiling measures |
@@ -451,6 +452,20 @@ keeps the newest comment. If older comments are dropped it inserts an explicit
 marker instead of presenting the tail as the whole discussion. A run taking
 over after another agent also gets a warning that the shared issue worktree may
 contain that agent's uncommitted changes.
+
+**Every comment in it is attributed** — `- the operator: …`, `- @qa: …` — and a
+comment's own newlines are indented so a line inside one cannot read as the next
+speaker. Unattributed, a card's discussion arrives as one voice: the operator's
+instruction, a teammate's question and the agent's own note from its last run
+all carry the same weight, and an agent asked something cannot tell who is
+waiting on the answer. `actors.rs` is the one home for that name — the same
+`@handle` / `the operator` / `the board` that `IssueGet` renders a timeline
+with, so the brief and the card an agent reads afterwards never name the same
+somebody two ways. It deliberately has no `you`: `you` means *the reader*, and
+the web board's reader is the person while a brief's is the agent, so a shared
+spelling of it would be a shared word for two different somebodies. An agent
+that has left the team is still named; an id belonging to another board renders
+as itself rather than under a handle this board never issued.
 
 `was_claimed()` is a ledger-level approximation: a process can die after claim
 but before the first turn opens. In that narrow case the next brief may trim

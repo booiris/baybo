@@ -1,6 +1,7 @@
 //! Kanban projects: the container, its board, and the rules a write has
 //! to satisfy before it reaches the store.
 
+mod actors;
 mod approvals;
 mod brief;
 mod budget;

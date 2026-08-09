@@ -15,6 +15,7 @@ use baybo_tools::{Tool, ToolContext, ToolError, ToolManifest};
 use serde_json::{Value, json};
 
 use crate::ProjectManager;
+use crate::actors::handle_of;
 
 pub use agent_create::PROJECT_AGENT_CREATE_TOOL_NAME;
 pub use issue_comment::ISSUE_COMMENT_TOOL_NAME;
@@ -84,15 +85,6 @@ async fn resolve_handle(
                 "no agent @{wanted} on this project. Use IssueList to see who is on the team."
             ))
         })
-}
-
-fn handle_of(known: &[baybo_store::AgentProfileRow], id: &AgentProfileId) -> String {
-    known
-        .iter()
-        .find(|row| &row.id == id)
-        .and_then(|row| row.team.as_ref())
-        .map(|t| format!("@{}", t.handle))
-        .unwrap_or_else(|| id.as_str().to_owned())
 }
 
 const CRON_SOURCE_KEY_PREFIX: &str = "cron:";

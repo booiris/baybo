@@ -3,8 +3,11 @@
 
 use std::sync::Arc;
 
-use baybo_store::project::{IssueEventBody, IssueRow, IssueRunRow, ProjectStore};
+use baybo_model::AgentProfileId;
+use baybo_store::AgentProfileStore;
+use baybo_store::project::{IssueEventBody, IssueEventRow, IssueRow, IssueRunRow, ProjectStore};
 
+use crate::actors;
 use crate::runs::{ever_ran, session_run_before};
 
 /// How far back the comments in a run's brief reach.
@@ -28,7 +31,19 @@ pub(crate) struct Said {
     /// by that agent's own last run and still arrives holding whatever the
     /// agent in between left behind.
     inherited_worktree: bool,
-    comments: Vec<String>,
+    comments: Vec<Comment>,
+}
+
+/// One thing said on the card, and who said it.
+///
+/// The name is not decoration: an unattributed block reads as one voice, so
+/// an operator's instruction, a teammate's aside and the agent's own note
+/// from its last run all arrive with the same authority. Named, they can be
+/// weighed — and an agent asked something can tell who is waiting on the
+/// answer. [`crate::actors`] owns the spelling of the name.
+pub(crate) struct Comment {
+    by: String,
+    text: String,
 }
 
 const SAID_SINCE_LAST_RUN: &str = "\n\nSaid since your last run:\n";
@@ -46,22 +61,29 @@ const COMMENT_BUDGET: usize = 16_000;
 const EARLIER_COMMENTS_TRIMMED: &str =
     "(earlier comments are not repeated here — the card itself has all of them)";
 
-fn comment_block(comments: &[String]) -> String {
-    let mut kept: Vec<&str> = Vec::new();
+/// One comment as the brief reads it. Newlines inside it are indented, so
+/// a line of somebody's prose can never be read as the next speaker.
+fn comment_line(comment: &Comment) -> String {
+    format!("- {}: {}\n", comment.by, comment.text.replace('\n', "\n  "))
+}
+
+fn comment_block(comments: &[Comment]) -> String {
+    let lines: Vec<String> = comments.iter().map(comment_line).collect();
+    let mut kept = 0usize;
     let mut spent = 0usize;
-    for comment in comments.iter().rev() {
-        if !kept.is_empty() && spent + comment.len() > COMMENT_BUDGET {
+    for line in lines.iter().rev() {
+        if kept > 0 && spent + line.len() > COMMENT_BUDGET {
             break;
         }
-        spent += comment.len();
-        kept.push(comment);
+        spent += line.len();
+        kept += 1;
     }
     let mut block = String::new();
-    if kept.len() < comments.len() {
+    if kept < lines.len() {
         block.push_str(&format!("- {EARLIER_COMMENTS_TRIMMED}\n"));
     }
-    for comment in kept.iter().rev() {
-        block.push_str(&format!("- {comment}\n"));
+    for line in &lines[lines.len() - kept..] {
+        block.push_str(line);
     }
     block
 }
@@ -99,7 +121,11 @@ fn inherits_a_worktree(run: &IssueRunRow, runs: &[IssueRunRow]) -> bool {
         .is_some_and(|last| last.agent_id != run.agent_id)
 }
 
-pub(crate) async fn comments_for_brief(store: &Arc<dyn ProjectStore>, run: &IssueRunRow) -> Said {
+pub(crate) async fn comments_for_brief(
+    store: &Arc<dyn ProjectStore>,
+    agents: &Arc<dyn AgentProfileStore>,
+    run: &IssueRunRow,
+) -> Said {
     let (window, inherited_worktree) = match store.list_runs(&run.issue_id).await {
         Ok(runs) => (brief_window(run, &runs), inherits_a_worktree(run, &runs)),
         Err(e) => {
@@ -116,13 +142,7 @@ pub(crate) async fn comments_for_brief(store: &Arc<dyn ProjectStore>, run: &Issu
         BriefWindow::WholeCard => store.list_events(&run.issue_id).await,
     };
     let comments = match events {
-        Ok(events) => events
-            .into_iter()
-            .filter_map(|event| match event.body {
-                IssueEventBody::Comment { text } => Some(text),
-                _ => None,
-            })
-            .collect(),
+        Ok(events) => attributed(agents, run, events).await,
         Err(e) => {
             tracing::warn!(run = %run.id, error = %e, "could not read comments for the brief");
             Vec::new()
@@ -133,6 +153,39 @@ pub(crate) async fn comments_for_brief(store: &Arc<dyn ProjectStore>, run: &Issu
         inherited_worktree,
         comments,
     }
+}
+
+/// The comments among `events`, each under the name the board knows its
+/// author by.
+async fn attributed(
+    agents: &Arc<dyn AgentProfileStore>,
+    run: &IssueRunRow,
+    events: Vec<IssueEventRow>,
+) -> Vec<Comment> {
+    let spoken: Vec<IssueEventRow> = events
+        .into_iter()
+        .filter(|event| matches!(event.body, IssueEventBody::Comment { .. }))
+        .collect();
+    let mut ids: Vec<AgentProfileId> = Vec::new();
+    for id in spoken
+        .iter()
+        .filter_map(|event| actors::named_agent(&event.actor))
+    {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    let known = actors::profiles(agents, &run.project_id, ids).await;
+    spoken
+        .into_iter()
+        .filter_map(|event| match event.body {
+            IssueEventBody::Comment { text } => Some(Comment {
+                by: actors::label(&event.actor, &known),
+                text,
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -162,6 +215,13 @@ mod tests {
             cancelled_at: None,
             created_at: now,
             updated_at: now,
+        }
+    }
+
+    fn said(by: &str, text: &str) -> Comment {
+        Comment {
+            by: by.to_owned(),
+            text: text.to_owned(),
         }
     }
 
@@ -209,7 +269,7 @@ mod tests {
             &Said {
                 window: BriefWindow::WholeCard,
                 inherited_worktree: false,
-                comments: vec!["start with the CSV path".to_owned()],
+                comments: vec![said(actors::OPERATOR, "start with the CSV path")],
             },
         );
         assert!(
@@ -240,7 +300,7 @@ mod tests {
             &Said {
                 window: BriefWindow::SinceItsLastRun(first.created_at),
                 inherited_worktree: false,
-                comments: vec!["also handle the empty case".to_owned()],
+                comments: vec![said(actors::OPERATOR, "also handle the empty case")],
             },
         );
         assert!(
@@ -292,8 +352,8 @@ mod tests {
                 window: BriefWindow::WholeCard,
                 inherited_worktree: true,
                 comments: vec![
-                    "start with the CSV path".to_owned(),
-                    "also handle the empty case".to_owned(),
+                    said(actors::OPERATOR, "start with the CSV path"),
+                    said("@dev-1", "also handle the empty case"),
                 ],
             },
         );
@@ -363,16 +423,22 @@ mod tests {
     #[test]
     fn a_very_long_conversation_still_makes_a_bounded_brief() {
         let issue = card();
-        let comments: Vec<String> = (0..500)
-            .map(|n| format!("comment {n}: {}", "x".repeat(200)))
+        let comments: Vec<Comment> = (0..500)
+            .map(|n| {
+                said(
+                    actors::OPERATOR,
+                    &format!("comment {n}: {}", "x".repeat(200)),
+                )
+            })
             .collect();
+        let newest = comments.last().expect("comments").text.clone();
 
         let brief = issue_brief(
             &issue,
             &Said {
                 window: BriefWindow::WholeCard,
                 inherited_worktree: false,
-                comments: comments.clone(),
+                comments,
             },
         );
 
@@ -382,7 +448,7 @@ mod tests {
             brief.len()
         );
         assert!(
-            brief.contains(comments.last().expect("comments")),
+            brief.contains(&newest),
             "the newest instruction is the one a run must not miss:\n{brief}"
         );
         assert!(
@@ -404,13 +470,68 @@ mod tests {
                 window: BriefWindow::WholeCard,
                 inherited_worktree: false,
                 comments: vec![
-                    "start with the CSV path".to_owned(),
-                    "also handle the empty case".to_owned(),
+                    said(actors::OPERATOR, "start with the CSV path"),
+                    said("@qa", "also handle the empty case"),
                 ],
             },
         );
-        assert!(brief.contains("- start with the CSV path\n"));
-        assert!(brief.contains("- also handle the empty case\n"));
+        assert!(brief.contains("- the operator: start with the CSV path\n"));
+        assert!(brief.contains("- @qa: also handle the empty case\n"));
         assert!(!brief.contains(EARLIER_COMMENTS_TRIMMED), "{brief}");
+    }
+
+    #[test]
+    fn every_comment_says_who_said_it() {
+        let issue = card();
+        let brief = issue_brief(
+            &issue,
+            &Said {
+                window: BriefWindow::WholeCard,
+                inherited_worktree: false,
+                comments: vec![
+                    said(actors::OPERATOR, "ship the CSV path first"),
+                    said("@qa", "@dev-1 does it skip a row with no id?"),
+                    said("@dev-1", "not yet — doing that now"),
+                    said(actors::BOARD, "held the run: the project is out of budget"),
+                ],
+            },
+        );
+
+        // Who is asking is what says whether an answer is owed, and to whom:
+        // an unattributed block turns the operator's instruction, a
+        // teammate's question and the agent's own note into one voice.
+        for line in [
+            "- the operator: ship the CSV path first\n",
+            "- @qa: @dev-1 does it skip a row with no id?\n",
+            "- @dev-1: not yet — doing that now\n",
+            "- the board: held the run: the project is out of budget\n",
+        ] {
+            assert!(brief.contains(line), "{line:?} is missing from:\n{brief}");
+        }
+    }
+
+    #[test]
+    fn a_comment_of_several_lines_stays_under_one_name() {
+        let issue = card();
+        let brief = issue_brief(
+            &issue,
+            &Said {
+                window: BriefWindow::WholeCard,
+                inherited_worktree: false,
+                comments: vec![
+                    said(
+                        actors::OPERATOR,
+                        "two things:\n- the header row\n- the id column",
+                    ),
+                    said("@qa", "agreed"),
+                ],
+            },
+        );
+
+        assert!(
+            brief.contains("- the operator: two things:\n  - the header row\n  - the id column\n"),
+            "a line inside somebody's comment must not read as the next speaker:\n{brief}"
+        );
+        assert!(brief.contains("- @qa: agreed\n"), "{brief}");
     }
 }

@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use baybo_model::ChannelType;
+use baybo_store::AgentProfileStore;
 use baybo_store::project::{IssueActor, IssueRunRow, ProjectStore, RunStatus};
 use baybo_workspace::WorkspacePaths;
 use chrono::{DateTime, Utc};
@@ -48,6 +49,10 @@ pub struct IssueRunEvent {
 /// process's answer, not the board's.
 pub struct DispatchConfig {
     pub store: Arc<dyn ProjectStore>,
+    /// How an agent id becomes the `@handle` the brief attributes a comment
+    /// to. The board's own store: an agent on another project is named by
+    /// its id rather than by a handle this board never issued.
+    pub agents: Arc<dyn AgentProfileStore>,
     /// The same hook the manager announces through. A dispatcher settles
     /// the runs it cannot prepare, and a settle nobody hears leaves the
     /// card shimmering — which is the outcome settling here exists to
@@ -69,6 +74,7 @@ pub fn build(config: DispatchConfig) -> (RunDispatch, mpsc::Receiver<IssueRunEve
     let (tx, rx) = mpsc::channel(RUN_QUEUE_DEPTH);
     let DispatchConfig {
         store,
+        agents,
         events,
         paths,
         user_id,
@@ -77,13 +83,15 @@ pub fn build(config: DispatchConfig) -> (RunDispatch, mpsc::Receiver<IssueRunEve
 
     let dispatch = Arc::new(move |run: IssueRunRow| {
         let store = Arc::clone(&store);
+        let agents = Arc::clone(&agents);
         let events = Arc::clone(&events);
         let tx = tx.clone();
         let paths = paths.clone();
         let user_id = user_id.clone();
         let channel = channel.clone();
         tokio::spawn(async move {
-            if let Some(event) = prepare(&store, &events, &paths, run, user_id, channel).await
+            if let Some(event) =
+                prepare(&store, &agents, &events, &paths, run, user_id, channel).await
                 && let Err(e) = tx.send(event).await
             {
                 tracing::warn!(error = %e, "issue run could not reach its executor");
@@ -96,6 +104,7 @@ pub fn build(config: DispatchConfig) -> (RunDispatch, mpsc::Receiver<IssueRunEve
 
 async fn prepare(
     store: &Arc<dyn ProjectStore>,
+    agents: &Arc<dyn AgentProfileStore>,
     events: &Arc<dyn ProjectEvents>,
     paths: &WorkspacePaths,
     run: IssueRunRow,
@@ -119,7 +128,7 @@ async fn prepare(
     // the brief may not have caught, and the follow-up window has to be the
     // side that over-reads rather than the side that drops it.
     let briefed_at = Utc::now();
-    let said = comments_for_brief(store, &run).await;
+    let said = comments_for_brief(store, agents, &run).await;
     let brief = issue_brief(&issue, &said);
 
     let checkout = match worktree::prepare_for_issue(store, paths, &issue).await {

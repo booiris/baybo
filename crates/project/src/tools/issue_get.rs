@@ -7,8 +7,9 @@ use baybo_tools::{Tool, ToolConcurrency, ToolContext, ToolError, ToolOutput, Too
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{exec_err, handle_of, project_err, render_issue, scope, usd};
+use super::{exec_err, project_err, render_issue, scope, usd};
 use crate::ProjectManager;
+use crate::actors::{OPERATOR, handle_of, label, named_agent};
 
 pub const ISSUE_GET_TOOL_NAME: &str = "IssueGet";
 
@@ -100,11 +101,7 @@ impl Tool for IssueGetTool {
         let timeline: Vec<Value> = shown
             .iter()
             .map(|entry| {
-                let who = match &entry.actor {
-                    baybo_store::project::IssueActor::User => "the operator".to_owned(),
-                    baybo_store::project::IssueActor::System => "the board".to_owned(),
-                    baybo_store::project::IssueActor::Agent(id) => handle_of(&known, id),
-                };
+                let who = label(&entry.actor, &known);
                 json!({ "at": entry.created_at.to_rfc3339(), "by": who, "event": narrate(&entry.body, &known) })
             })
             .collect();
@@ -123,9 +120,7 @@ impl Tool for IssueGetTool {
 
 fn named_agents(entry: &IssueEventRow) -> Vec<AgentProfileId> {
     let mut ids = Vec::new();
-    if let baybo_store::project::IssueActor::Agent(id) = &entry.actor {
-        ids.push(id.clone());
-    }
+    ids.extend(named_agent(&entry.actor));
     if let IssueEventBody::Assigned { from, to } = &entry.body {
         ids.extend(from.iter().chain(to.iter()).cloned());
     }
@@ -177,10 +172,10 @@ fn narrate(body: &IssueEventBody, known: &[baybo_store::AgentProfileRow]) -> Str
             format!("left the worktree in place: {reason}")
         }
         IssueEventBody::ApprovalRequested { tool, summary, .. } => {
-            format!("asked the operator to approve a {tool} call: {summary}")
+            format!("asked {OPERATOR} to approve a {tool} call: {summary}")
         }
         IssueEventBody::ApprovalResolved { decision, .. } => {
-            format!("the operator answered: {}", decision.as_str())
+            format!("{OPERATOR} answered: {}", decision.as_str())
         }
         IssueEventBody::StageCompleted { stage } => {
             // "or called off", because a cancelled step counts out of its

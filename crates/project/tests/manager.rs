@@ -4318,6 +4318,7 @@ async fn a_run_whose_checkout_cannot_be_cut_says_so_instead_of_shimmering() {
     let (tx, mut announced) = tokio::sync::mpsc::unbounded_channel();
     let (dispatch, _rx) = baybo_project::dispatch::build(baybo_project::DispatchConfig {
         store: Arc::clone(&f.store),
+        agents: Arc::clone(&f.agents),
         events: Arc::new(RecordingEvents(tx)),
         paths: f.paths.clone(),
         user_id: "owner".to_owned(),
@@ -4343,4 +4344,70 @@ async fn a_run_whose_checkout_cannot_be_cut_says_so_instead_of_shimmering() {
         "and the card says why, not just that it stopped:\n{timeline:#?}"
     );
     assert_eq!(settled[0].actor, IssueActor::System);
+}
+
+#[tokio::test]
+async fn a_brief_names_who_said_each_thing_on_the_card() {
+    let f = fixture().await;
+    let p = f.manager.create_project(new_project("p")).await.expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    let qa = seed_agent(&f, &p.id, "qa", AgentFramework::Baybo).await;
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev.clone()),
+                ..new_issue("wire the importer")
+            },
+        )
+        .await
+        .expect("issue");
+    for (actor, text) in [
+        (IssueActor::User, "start with the CSV path"),
+        (
+            IssueActor::Agent(qa),
+            "@dev-1 does it skip rows with no id?",
+        ),
+        (IssueActor::Agent(dev), "picking this up"),
+    ] {
+        f.manager
+            .comment(&p.id, 1, actor, text)
+            .await
+            .expect("comment");
+    }
+
+    let run = f.dispatched.lock()[0].clone();
+    let (tx, _announced) = tokio::sync::mpsc::unbounded_channel();
+    let (dispatch, mut prepared) = baybo_project::dispatch::build(baybo_project::DispatchConfig {
+        store: Arc::clone(&f.store),
+        agents: Arc::clone(&f.agents),
+        events: Arc::new(RecordingEvents(tx)),
+        paths: f.paths.clone(),
+        user_id: "owner".to_owned(),
+        channel: baybo_model::ChannelType::owner(),
+    });
+    dispatch(run);
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(10), prepared.recv())
+        .await
+        .expect("the dispatcher prepares the run")
+        .expect("the run reaches its executor");
+
+    // Who said it is what decides whether an answer is owed and to whom.
+    // Unattributed, the operator's instruction and a teammate's question
+    // arrive as one voice — and the agent's own note reads as somebody
+    // else telling it what it already did.
+    for line in [
+        "- the operator: start with the CSV path\n",
+        "- @qa: @dev-1 does it skip rows with no id?\n",
+        "- @dev-1: picking this up\n",
+    ] {
+        assert!(
+            event.brief.contains(line),
+            "{line:?} is missing from the brief:\n{}",
+            event.brief
+        );
+    }
 }

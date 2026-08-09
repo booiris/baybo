@@ -986,24 +986,7 @@ impl ProjectManager {
         project: &ProjectId,
         ids: impl IntoIterator<Item = AgentProfileId>,
     ) -> Vec<baybo_store::AgentProfileRow> {
-        let mut rows = Vec::new();
-        for id in ids {
-            match self.agents.get(&id).await {
-                Ok(Some(row))
-                    if row
-                        .team
-                        .as_ref()
-                        .is_some_and(|team| &team.project_id == project) =>
-                {
-                    rows.push(row)
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(agent = %id, error = %e, "could not resolve an agent a timeline names")
-                }
-            }
-        }
-        rows
+        crate::actors::profiles(&self.agents, project, ids).await
     }
 
     /// Put somebody new on a team.
