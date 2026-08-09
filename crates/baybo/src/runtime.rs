@@ -647,19 +647,11 @@ pub async fn build_managers(
         Arc::clone(&secret_vault),
     ));
     let gate_map = channels_registry.approval_gates();
-
-    {
-        let owner = baybo_model::ChannelType::owner();
-        let inner = gate_map.type_gate(&owner);
-        gate_map.insert(
-            owner,
-            Arc::new(baybo_project::TimelineApprovalGate::new(
-                inner,
-                Arc::clone(&project_manager),
-                stores.session.clone(),
-            )),
-        );
-    }
+    baybo_gateway::channel::boot::install_timeline_approval_gate(
+        &channels_registry,
+        Arc::clone(&project_manager),
+        stores.session.clone(),
+    );
 
     let sandbox_boot = crate::sandbox_boot::resolve_sandbox_runner(
         config.permission,

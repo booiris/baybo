@@ -952,16 +952,10 @@ fn install_owner_channel(tg: &baybo_gateway::test_support::TestGateway) {
         &tg.deps.config.channels,
     )
     .expect("install the owner channel");
-    let owner = baybo_model::ChannelType::owner();
-    let gates = tg.deps.channel_registry.approval_gates();
-    let inner = gates.type_gate(&owner);
-    gates.insert(
-        owner,
-        std::sync::Arc::new(baybo_project::TimelineApprovalGate::new(
-            inner,
-            std::sync::Arc::clone(&tg.deps.project_manager),
-            tg.deps.session_manager.store(),
-        )),
+    baybo_gateway::channel::boot::install_timeline_approval_gate(
+        &tg.deps.channel_registry,
+        std::sync::Arc::clone(&tg.deps.project_manager),
+        tg.deps.session_manager.store(),
     );
 }
 

@@ -22,6 +22,8 @@ use baybo_channels::{
 };
 use baybo_config::ChannelsConfig;
 use baybo_model::{ChannelType, SessionId};
+use baybo_project::{ProjectManager, TimelineApprovalGate};
+use baybo_store::SessionStore;
 use baybo_tools::{ApprovalGate, ApprovalQueue, ApprovalRequest, ChannelApprovalGate};
 
 use super::session_pulse::SessionPulse;
@@ -76,6 +78,30 @@ pub fn install_channels(
     // device connection.
     install_channel(registry, ChannelType::owner())?;
     Ok(())
+}
+
+/// Wrap the owner channel's approval gate so an issue run's prompts also land
+/// on the card that raised them — see [`TimelineApprovalGate`]. Call once,
+/// after [`install_channels`].
+///
+/// The gate being wrapped is read off the channel that owns it, not back out
+/// of the map this is about to overwrite: the channel's gate is by
+/// construction the one that prompts, so the wrapper cannot end up wrapping
+/// itself or a later replacement.
+pub fn install_timeline_approval_gate(
+    registry: &Arc<ChannelRegistry>,
+    manager: Arc<ProjectManager>,
+    sessions: Arc<dyn SessionStore>,
+) {
+    let owner = ChannelType::owner();
+    let Some(inner) = registry.get(&owner).and_then(|c| c.approval_gate()) else {
+        tracing::warn!("no owner approval gate to wrap; cards will not record their prompts");
+        return;
+    };
+    registry.approval_gates().insert(
+        owner,
+        Arc::new(TimelineApprovalGate::new(inner, manager, sessions)),
+    );
 }
 
 /// Install one channel with its approval gate. For the shared `owner` chat
