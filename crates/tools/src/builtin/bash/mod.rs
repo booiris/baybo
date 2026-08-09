@@ -231,19 +231,65 @@ struct ChildEnv {
     secret_values: Vec<String>,
 }
 
-fn git_identity(
-    agent: &baybo_model::AgentProfileId,
-    handle: &baybo_model::AgentHandle,
-) -> Vec<(String, String)> {
-    let name = handle.as_str().to_owned();
-    let email = format!("{}@baybo.local", agent.as_str());
-    vec![
-        ("GIT_AUTHOR_NAME".to_owned(), name.clone()),
-        ("GIT_AUTHOR_EMAIL".to_owned(), email.clone()),
-        ("GIT_COMMITTER_NAME".to_owned(), name),
-        ("GIT_COMMITTER_EMAIL".to_owned(), email),
-    ]
+/// The trailer an issue run's commits carry, and `None` for every other
+/// session. A trailer rather than `GIT_AUTHOR_*`/`GIT_COMMITTER_*` because
+/// those outrank every config file git consults, so the operator's own
+/// identity vanished from work they are still accountable for. The address
+/// is the persona ULID rather than the `@handle` so renaming an agent does
+/// not repoint historic commits, and `.local` resolves nowhere, so no
+/// GitHub account is ever credited for them.
+fn commit_trailer(ctx: &ToolContext) -> Option<String> {
+    match (&ctx.checkout_root, &ctx.agent_handle) {
+        (Some(_), Some(handle)) => Some(format!(
+            "Co-authored-by: {} <{}@baybo.local>",
+            handle.as_str(),
+            ctx.agent_id.as_str()
+        )),
+        _ => None,
+    }
 }
+
+/// Carries [`commit_trailer`]'s line to the `git()` shim instead of splicing
+/// it into shell source, so a handle never has to be quoted into a script.
+const COMMIT_TRAILER_ENV: &str = "BAYBO_COMMIT_TRAILER";
+
+/// `git()` shell function that splices [`commit_trailer`]'s line into a
+/// `commit` invocation. Reaches exactly as far as [`UV_SHELL_SHIMS`] — the
+/// immediate `sh -c` body, not `bash -c '…'` subshells, scripts, or
+/// `/usr/bin/git`; a commit that misses it is still authored as the
+/// operator, it just carries no attribution.
+///
+/// The trailer is inserted straight after the `commit` word rather than
+/// appended, because `git commit -m x -- path` ends in a pathspec list where
+/// a trailing `--trailer` would be read as a file name. The scan skips git's
+/// own leading options — and the values of the ones that take a separate
+/// argument — so `git -C dir commit` is still recognised.
+static GIT_COMMIT_TRAILER_SHIM: LazyLock<String> = LazyLock::new(|| {
+    GIT_COMMIT_TRAILER_SHIM_TEMPLATE.replace("{{trailer_env}}", COMMIT_TRAILER_ENV)
+});
+
+const GIT_COMMIT_TRAILER_SHIM_TEMPLATE: &str = r##"git() {
+    __bb_at=0; __bb_i=0; __bb_skip=0
+    for __bb_a in "$@"; do
+        __bb_i=$((__bb_i + 1))
+        if [ "$__bb_skip" = 1 ]; then __bb_skip=0; continue; fi
+        case "$__bb_a" in
+            -C|-c|--git-dir|--work-tree|--namespace|--exec-path|--super-prefix|--attr-source) __bb_skip=1 ;;
+            -*) ;;
+            commit) __bb_at=$__bb_i; break ;;
+            *) break ;;
+        esac
+    done
+    if [ "$__bb_at" = 0 ] || [ -z "${{trailer_env}}" ]; then command git "$@"; return; fi
+    __bb_n=$#; __bb_i=0
+    while [ "$__bb_i" -lt "$__bb_n" ]; do
+        __bb_i=$((__bb_i + 1)); __bb_v=$1; shift
+        set -- "$@" "$__bb_v"
+        if [ "$__bb_i" = "$__bb_at" ]; then set -- "$@" --trailer "${{trailer_env}}"; fi
+    done
+    command git "$@"
+}
+"##;
 
 pub struct BashTool {
     /// Tool descriptions pre-rendered per [`BashPermissionMode`], indexed by
@@ -340,12 +386,12 @@ impl BashTool {
         permission_skips_os_sandbox(self.permission())
     }
 
-    /// Prefix `command` with the workspace-scoped UV exports and the
-    /// Baybo-CLI env injection. Two callers (the sandboxed `execute` path
-    /// and the unsandboxed retry below) compose the same `sh -c` body —
-    /// keep the ordering in one place so a future reshuffle doesn't
+    /// Prefix `command` with the workspace-scoped UV exports, the commit-trailer
+    /// `git()` shim, and the Baybo-CLI env injection. Two callers (the sandboxed
+    /// `execute` path and the unsandboxed retry below) compose the same `sh -c`
+    /// body — keep the ordering in one place so a future reshuffle doesn't
     /// drift between them.
-    fn wrap_command(&self, command: &str) -> String {
+    fn wrap_command(&self, command: &str, ctx: &ToolContext) -> String {
         let injected = inject_baybo_env(command);
         // Only the bench profile skips the uv shims/exports: that container ships
         // its own python/pip and has no `uv`, so the `python() { uv run python …; }`
@@ -354,8 +400,14 @@ impl BashTool {
         if BENCH {
             return injected;
         }
-        let mut out = String::with_capacity(self.uv_env_prefix.len() + injected.len());
+        let git_shim = match commit_trailer(ctx) {
+            Some(_) => GIT_COMMIT_TRAILER_SHIM.as_str(),
+            None => "",
+        };
+        let mut out =
+            String::with_capacity(self.uv_env_prefix.len() + git_shim.len() + injected.len());
         out.push_str(&self.uv_env_prefix);
+        out.push_str(git_shim);
         out.push_str(&injected);
         out
     }
@@ -820,10 +872,15 @@ impl Tool for BashTool {
             extra_env.vars = handle.resolve_env(&p.secret_env).await?;
             extra_env.secret_values = extra_env.vars.iter().map(|(_, v)| v.clone()).collect();
         }
-        if ctx.checkout_root.is_some()
-            && let Some(handle) = ctx.agent_handle.as_ref()
-        {
-            extra_env.vars.extend(git_identity(&ctx.agent_id, handle));
+        if let Some(trailer) = commit_trailer(ctx) {
+            extra_env
+                .vars
+                .push((COMMIT_TRAILER_ENV.to_owned(), trailer));
+        }
+        if let Some(config) = ctx.checkout_git_config.as_deref() {
+            extra_env
+                .vars
+                .push(("GIT_CONFIG_GLOBAL".to_owned(), config.display().to_string()));
         }
 
         // Auto permission, destructive-token command: the LLM judge decides before
@@ -838,7 +895,7 @@ impl Tool for BashTool {
             self.notify_sandbox_bypass(ctx, &command);
         }
 
-        let args = vec!["-c".into(), self.wrap_command(&command)];
+        let args = vec!["-c".into(), self.wrap_command(&command, ctx)];
         let detached_route = if sandbox_bypassed {
             Some(DetachedExecutionRoute::Unsandboxed)
         } else {
@@ -1740,7 +1797,7 @@ impl BashTool {
         timeout: Duration,
         ctx: &ToolContext,
     ) -> crate::Result<crate::SandboxedOutput> {
-        let args = ["-c".to_string(), self.wrap_command(command)];
+        let args = ["-c".to_string(), self.wrap_command(command, ctx)];
         tokio::select! {
             _ = ctx.cancellation_token.cancelled() => {
                 Err(ToolError::Execution("cancelled".into()))
@@ -2184,6 +2241,7 @@ mod tests {
     use crate::{ApprovalHandle, ApprovedResource};
     use baybo_model::{ChannelType, User};
     use parking_lot::Mutex;
+    use std::os::unix::fs::PermissionsExt;
 
     /// A phrase only the sandboxed `{{isolation}}` section carries, so a test
     /// can tell "the OS sandbox is on" from `free`'s "no credential-vault
@@ -2937,7 +2995,7 @@ mod tests {
             baybo_process::ProcessManager::transient(),
         )
         .with_permission(BashPermissionMode::Free);
-        let wrapped = free.wrap_command("python -c 'x'");
+        let wrapped = free.wrap_command("python -c 'x'", &ToolContext::for_test());
         assert!(
             wrapped.contains("uv run python"),
             "free must keep the uv shim: {wrapped}"
@@ -2987,7 +3045,7 @@ mod tests {
                 baybo_workspace::WorkspacePaths::new("/tmp"),
                 baybo_process::ProcessManager::transient(),
             )
-            .wrap_command("python -c 'x'");
+            .wrap_command("python -c 'x'", &ToolContext::for_test());
             assert!(!w.contains("uv run"), "bench leaked uv shim: {w}");
             assert!(!w.contains("UV_CACHE_DIR"), "bench leaked uv exports: {w}");
         }
@@ -3812,7 +3870,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_issue_run_commits_as_the_agent_working_the_card() {
+    async fn an_issue_run_credits_the_agent_without_taking_over_the_authorship() {
         let (fake, sandbox) = fake_with_response(SandboxedOutput {
             exit_code: 0,
             stdout: Vec::new(),
@@ -3830,27 +3888,30 @@ mod tests {
             .await
             .expect("bash runs");
 
-        let env = &fake.calls()[0].extra_env;
-        let value = |key: &str| {
+        let call = &fake.calls()[0];
+        let env = &call.extra_env;
+        assert_eq!(
             env.iter()
-                .find(|(k, _)| k == key)
-                .map(|(_, v)| v.as_str())
-                .unwrap_or_else(|| panic!("{key} must reach the child: {env:?}"))
-        };
-        assert_eq!(value("GIT_AUTHOR_NAME"), "dev-1");
-        assert_eq!(value("GIT_COMMITTER_NAME"), "dev-1");
-        let email = format!("{id}@baybo.local");
-        assert_eq!(value("GIT_AUTHOR_EMAIL"), email);
-        assert_eq!(value("GIT_COMMITTER_EMAIL"), email);
+                .find(|(k, _)| k == COMMIT_TRAILER_ENV)
+                .map(|(_, v)| v.as_str()),
+            Some(format!("Co-authored-by: dev-1 <{id}@baybo.local>").as_str()),
+            "the agent is credited in the message: {env:?}"
+        );
         assert!(
             !env.iter()
-                .any(|(k, v)| k.ends_with("_NAME") && v.contains(id.as_str())),
-            "the ULID must not be what `git log` shows as the author: {env:?}"
+                .any(|(k, _)| k.starts_with("GIT_AUTHOR") || k.starts_with("GIT_COMMITTER")),
+            "an identity env var outranks every config file, so it would erase the \
+             operator whose work this still is: {env:?}"
+        );
+        assert!(
+            call.args.iter().any(|a| a.contains("git() {")),
+            "the shim that splices the trailer must reach the shell: {:?}",
+            call.args
         );
     }
 
     #[tokio::test]
-    async fn an_issue_run_whose_agent_has_no_handle_falls_back_to_the_workspace_identity() {
+    async fn an_issue_run_whose_agent_has_no_handle_is_left_entirely_alone() {
         let (fake, sandbox) = fake_with_response(SandboxedOutput {
             exit_code: 0,
             stdout: Vec::new(),
@@ -3866,18 +3927,23 @@ mod tests {
             .await
             .expect("bash runs");
 
+        let call = &fake.calls()[0];
         assert!(
-            !fake.calls()[0]
+            !call
                 .extra_env
                 .iter()
-                .any(|(k, _)| k.starts_with("GIT_")),
-            "a commit git authors from the workspace `.gitconfig` says baybo, which is \
-             true; one authored by a ULID says nothing"
+                .any(|(k, _)| k.starts_with("GIT_") || k == COMMIT_TRAILER_ENV),
+            "there is no board name to credit, so the commit is an ordinary one"
+        );
+        assert!(
+            !call.args.iter().any(|a| a.contains("git() {")),
+            "no trailer to splice means no reason to wrap git: {:?}",
+            call.args
         );
     }
 
     #[tokio::test]
-    async fn an_ordinary_session_carries_no_git_identity() {
+    async fn an_ordinary_session_carries_no_git_env() {
         let (fake, sandbox) = fake_with_response(SandboxedOutput {
             exit_code: 0,
             stdout: Vec::new(),
@@ -3895,9 +3961,129 @@ mod tests {
             !fake.calls()[0]
                 .extra_env
                 .iter()
-                .any(|(k, _)| k.starts_with("GIT_")),
-            "a session that never commits gains nothing from an identity"
+                .any(|(k, _)| k.starts_with("GIT_") || k == COMMIT_TRAILER_ENV),
+            "a session that never commits gains nothing from a trailer"
         );
+    }
+
+    #[tokio::test]
+    async fn an_issue_run_is_pointed_at_the_identity_resolved_for_its_checkout() {
+        let (fake, sandbox) = fake_with_response(SandboxedOutput {
+            exit_code: 0,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            timed_out: false,
+        });
+        let mut ctx = ctx_with(Some(sandbox));
+        ctx.checkout_root = Some(PathBuf::from("/tmp/work/projects/p/4"));
+        ctx.agent_handle = Some(baybo_model::AgentHandle::parse("dev-1").expect("handle"));
+        ctx.checkout_git_config = Some(PathBuf::from("/tmp/work/projects/p/4.gitconfig"));
+
+        BashTool::for_test()
+            .execute(json!({ "command": "git commit -m x" }), &ctx)
+            .await
+            .expect("bash runs");
+
+        assert_eq!(
+            fake.calls()[0]
+                .extra_env
+                .iter()
+                .find(|(k, _)| k == "GIT_CONFIG_GLOBAL")
+                .map(|(_, v)| v.as_str()),
+            Some("/tmp/work/projects/p/4.gitconfig"),
+            "the sandbox remaps HOME, so git has to be told where to look"
+        );
+    }
+
+    /// The shim rebuilds the argument list by hand, which is exactly the kind
+    /// of shell that reads fine and is wrong — so run it, against a `git` that
+    /// records the argv it was handed.
+    fn shim_argv(command: &str, trailer: &str) -> Vec<String> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorded = dir.path().join("argv");
+        let fake_git = dir.path().join("git");
+        std::fs::write(
+            &fake_git,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > {}\n",
+                recorded.display()
+            ),
+        )
+        .expect("write fake git");
+        std::fs::set_permissions(&fake_git, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake git");
+
+        let script = format!(
+            "export PATH={}:$PATH; export {COMMIT_TRAILER_ENV}={}; {}{command}",
+            sh_quote(&dir.path().to_string_lossy()),
+            sh_quote(trailer),
+            GIT_COMMIT_TRAILER_SHIM.as_str(),
+        );
+        let out = std::process::Command::new("sh")
+            .args(["-c", &script])
+            .output()
+            .expect("sh runs");
+        assert!(out.status.success(), "shim script failed: {out:?}");
+        std::fs::read_to_string(&recorded)
+            .expect("fake git ran")
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn the_shim_splices_the_trailer_before_a_pathspec_list() {
+        // Appending at the end would land the trailer *after* `--`, where git
+        // reads it as a file name rather than an option.
+        assert_eq!(
+            shim_argv(
+                "git commit -m x -- a.rs",
+                "Co-authored-by: dev-1 <x@baybo.local>"
+            ),
+            [
+                "commit",
+                "--trailer",
+                "Co-authored-by: dev-1 <x@baybo.local>",
+                "-m",
+                "x",
+                "--",
+                "a.rs"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_shim_sees_through_gits_own_leading_options() {
+        assert_eq!(
+            shim_argv("git -C /some/repo -c core.pager=cat commit --amend", "T: t"),
+            [
+                "-C",
+                "/some/repo",
+                "-c",
+                "core.pager=cat",
+                "commit",
+                "--trailer",
+                "T: t",
+                "--amend"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_shim_leaves_every_other_subcommand_untouched() {
+        // `--grep=commit` must not be mistaken for the subcommand, and a value
+        // that happens to be `commit` sits after one, so the scan has to stop
+        // at the first non-option word either way.
+        assert_eq!(
+            shim_argv("git log --grep=commit -- commit", "T: t"),
+            ["log", "--grep=commit", "--", "commit"]
+        );
+        assert_eq!(shim_argv("git status", "T: t"), ["status"]);
+    }
+
+    #[test]
+    fn the_shim_stays_out_of_the_way_when_no_trailer_is_set() {
+        assert_eq!(shim_argv("git commit -m x", ""), ["commit", "-m", "x"]);
     }
 
     #[tokio::test]

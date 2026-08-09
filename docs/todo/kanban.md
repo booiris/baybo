@@ -382,13 +382,22 @@ announces which of these will happen before sending.
 - **Known gaps in the shipped worktree layer** (adversarial review,
   2026-08-05 — the escape it found is fixed; these are not):
   - ~~A run cannot commit~~ **fixed**, and ~~not per-agent~~ **also
-    fixed**: an issue run's shell carries its assignee's
-    `GIT_AUTHOR_*`/`GIT_COMMITTER_*`, so `git log` says which agent wrote
-    what. That needed the Bash tool's env channel split from its
-    redaction list (`ChildEnv`) — they were one `Vec`, so anything
-    injected was also scrubbed from output, and an agent's id appears in
-    its own output constantly. `<workspace>/work/.gitconfig` stays as the
-    fallback for every other session.
+    fixed**: an issue run's commits say which agent wrote them. That
+    needed the Bash tool's env channel split from its redaction list
+    (`ChildEnv`) — they were one `Vec`, so anything injected was also
+    scrubbed from output, and an agent's id appears in its own output
+    constantly. It said so through `GIT_AUTHOR_*`/`GIT_COMMITTER_*`
+    until that turned out to erase the operator's own identity, which
+    beats every config file git consults; it now appends a
+    `Co-authored-by:` trailer instead, and the identity itself is
+    resolved on the host and handed over as an answer rather than as the
+    operator's config file (the sandbox remaps `HOME`, so every `~`
+    inside such a file re-expands against the workspace). The
+    write-it-and-hope fallback that was supposed to cover this —
+    `ensure_commit_identity`, at `<workspace>/work/.gitconfig` — had
+    **zero production readers** and was deleted; the only thing that
+    ever read it was a test helper built to model a sandbox shape that
+    does not exist. See [`docs/modules/project.md`](../modules/project.md).
   - ~~The Bash description says the cwd is `work/`~~ **worked around**:
     it still does (`Tool::description()` takes only `&self` and is
     pre-rendered per process), but the issue brief now names the checkout

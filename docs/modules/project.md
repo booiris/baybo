@@ -48,7 +48,7 @@ every door leads through it.
 | `stages.rs` | Sub-issues, `is_finished`, the stage barrier's two questions, the progress ring |
 | `budget.rs` | `Headroom` and the UTC-day window a daily ceiling measures |
 | `timeline.rs` | `diff_events` — an edit reduced to the entries worth writing |
-| `worktree.rs` | The per-issue git worktree: create, branch, commit identity, reclaim |
+| `worktree.rs` | The per-issue git worktree: create, branch, resolve the commit identity, reclaim |
 | `approvals.rs` | `TimelineApprovalGate` — a run's approval prompts, on the card |
 | `events.rs` | The `ProjectEvents` push port (the gateway implements it) |
 | `tools/` | The six board tools an agent working a project can call |
@@ -330,10 +330,38 @@ Three details that are easy to get wrong and are pinned by tests:
   which is never read as zero. A branch that still carries work is the
   deliverable: baybo does not merge, the operator decides.
 
-`ensure_commit_identity` writes a fallback `.gitconfig` into the work dir, so a
-sandboxed `git commit` has somebody to be. An issue run overrides it with its
-assignee's identity through `GIT_AUTHOR_*`/`GIT_COMMITTER_*`, which beats every
-config file git consults.
+**A run's commits stay the operator's.** An issue run is credited in the
+message, not in the authorship: `BashTool` appends a
+`Co-authored-by: <handle> <persona-ULID@baybo.local>` trailer and leaves
+`user.name`/`user.email` to whatever git would have resolved anyway. It used to
+inject `GIT_AUTHOR_*`/`GIT_COMMITTER_*` instead, which beats every config file
+git consults — so an operator's own name disappeared from work they are still
+accountable for.
+
+Two details that pin it:
+
+- **Reaching the trailer.** It rides a `git()` shell function in the same
+  `sh -c` body as the uv shims, so it covers a direct `git commit …` and nothing
+  else — `bash -c '…'`, a script, and `/usr/bin/git` commit without it. Those
+  commits are still authored correctly; they just carry no attribution. The
+  trailer is spliced *after* the `commit` word, because `git commit -m x -- path`
+  ends in a pathspec list where a trailing `--trailer` reads as a file name.
+- **Having an identity at all.** `ensure_identity_config` asks git, **on the
+  host**, who this checkout commits as, and writes the answer to a file beside
+  the worktree that the shell is pointed at with `GIT_CONFIG_GLOBAL`. Handing
+  the operator's own `~/.gitconfig` across instead looks equivalent and is not:
+  the sandbox remaps `HOME`, so every `~` in that file — an
+  `includeIf "gitdir:~/work/**"`, an `[include] path` — re-expands against the
+  workspace and silently resolves to nothing, exactly defeating the per-repo
+  identity it was written to select, while `core.hooksPath`, pagers and
+  credential helpers come along uninvited. Resolving here gets `includeIf`,
+  XDG, system and repo-local evaluated as the operator sees them and carries
+  two strings. It is written at **global** scope, so `.git/config` and anything
+  the run sets mid-flight still outrank it; a key set nowhere falls back to
+  `baybo <baybo@localhost>`, because a run that cannot commit is worse than one
+  signed by an obvious placeholder. Nothing is cached — one `git config` per
+  call, against a sandbox spawn that costs several times more — so editing your
+  identity is obeyed by the next command.
 
 ### Comments, mentions, and the deferred wake
 

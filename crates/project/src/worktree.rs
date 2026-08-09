@@ -52,24 +52,109 @@ pub fn branch_name(number: i64, title: &str) -> String {
 
 const MAX_SLUG_CHARS: usize = 40;
 
-/// Give sandboxed git commands somebody to be.
-pub async fn ensure_commit_identity(work_dir: &Path) -> Result<()> {
-    const IDENTITY: &str = r#"# Written by baybo so agent runs can commit. Yours to edit.
-[user]
-	name = baybo
-	email = baybo@localhost
-"#;
-    let file = work_dir.join(".gitconfig");
-    if file.exists() {
-        return Ok(());
+/// Who this checkout's commits belong to, as a config file a sandboxed shell
+/// can be pointed at with `GIT_CONFIG_GLOBAL`. `None` when git could not be
+/// asked at all.
+///
+/// The question is answered **here**, on the host, and only the answer crosses
+/// into the sandbox. Handing the operator's own `~/.gitconfig` across instead
+/// looks equivalent and is not: the sandbox remaps `HOME`, so every `~` in that
+/// file — an `includeIf "gitdir:~/work/**"` condition, an `[include] path` —
+/// re-expands against the workspace and silently resolves to nothing, which
+/// defeats exactly the per-repository identity it was written to select, while
+/// everything else in the file (`core.hooksPath`, pagers, credential helpers)
+/// comes along uninvited. Asking git here gets `includeIf`, XDG, system and
+/// repo-local evaluated the way the operator sees them, and carries two
+/// strings.
+///
+/// Written at **global** scope, so the repository's own `.git/config` — and
+/// anything the run itself sets mid-flight — still outranks it, exactly as
+/// outside. Nothing is cached: a re-resolve costs one `git config` against a
+/// sandbox spawn that costs several times more, and the operator editing their
+/// identity is obeyed by the next command.
+pub async fn ensure_identity_config(checkout: &Checkout) -> Option<PathBuf> {
+    let (name, email) = resolve_identity(&checkout.root).await?;
+    let file = identity_config_path(&checkout.root);
+    let body = format!(
+        "# Written by baybo: the identity git resolved for this checkout on the host.\n\
+         [user]\n\tname = {}\n\temail = {}\n",
+        config_value(&name),
+        config_value(&email)
+    );
+    if tokio::fs::read_to_string(&file).await.ok().as_deref() == Some(body.as_str()) {
+        return Some(file);
     }
-    tokio::fs::create_dir_all(work_dir).await.map_err(|e| {
-        ProjectError::Workdir(anyhow::anyhow!("create {}: {e}", work_dir.display()))
-    })?;
-    tokio::fs::write(&file, IDENTITY)
-        .await
-        .map_err(|e| ProjectError::Workdir(anyhow::anyhow!("write {}: {e}", file.display())))?;
-    Ok(())
+    let tmp = file.with_extension("gitconfig.tmp");
+    tokio::fs::write(&tmp, &body).await.ok()?;
+    // Rename rather than write in place: a concurrent run's `git` may be
+    // reading this file, and half a config is an identity git will reject.
+    tokio::fs::rename(&tmp, &file).await.ok()?;
+    Some(file)
+}
+
+/// Sibling of the worktree rather than a file inside it, so the run's `git
+/// status` stays clean; [`reclaim`] takes it away with the tree.
+fn identity_config_path(root: &Path) -> PathBuf {
+    root.with_extension("gitconfig")
+}
+
+/// What git — with the gateway's own environment, so the real `HOME` — says
+/// this checkout commits as. A key the operator has not set anywhere falls
+/// back to baybo's own name, because a run that cannot commit is worse than
+/// one signed by an obvious placeholder.
+async fn resolve_identity(root: &Path) -> Option<(String, String)> {
+    let out = run(
+        root,
+        &["config", "-z", "--get-regexp", r"^user\.(name|email)$"],
+    )
+    .await
+    .ok()?;
+    Some(identity_or_fallback(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// `git config -z` emits NUL-separated `key\nvalue` records, and answers
+/// nothing at all when a key is unset — which is why the fallback lives here
+/// rather than in a `git config` default.
+///
+/// `--get-regexp` lists **every** value of a key, one per config layer, in the
+/// order git read them (system, global, an `includeIf` where its directive
+/// sat, local, worktree). Later assignment wins here for the same reason it
+/// wins in git: last read is the effective one. Asking `--get` per key would
+/// say the same thing in two subprocesses instead of one.
+fn identity_or_fallback(raw: &str) -> (String, String) {
+    const FALLBACK_NAME: &str = "baybo";
+    const FALLBACK_EMAIL: &str = "baybo@localhost";
+    let mut name = None;
+    let mut email = None;
+    for record in raw.split('\0') {
+        match record.split_once('\n') {
+            Some(("user.name", v)) => name = Some(v.to_owned()),
+            Some(("user.email", v)) => email = Some(v.to_owned()),
+            _ => {}
+        }
+    }
+    (
+        name.unwrap_or_else(|| FALLBACK_NAME.to_owned()),
+        email.unwrap_or_else(|| FALLBACK_EMAIL.to_owned()),
+    )
+}
+
+/// Quote a resolved value into git-config syntax. Git's own parser is what
+/// reads this back, so `"` and `\` have to survive the round trip, and a
+/// newline would otherwise end the entry and turn the rest into a directive.
+fn config_value(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 2);
+    out.push('"');
+    for ch in raw.chars() {
+        match ch {
+            '"' => out.push_str(r#"\""#),
+            '\\' => out.push_str(r"\\"),
+            '\n' | '\r' => out.push(' '),
+            _ => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Open the issue's checkout, creating the worktree on first use.
@@ -138,7 +223,6 @@ pub async fn prepare_for_issue(
     let root = worktree_root(paths, &issue.project_id, issue.number);
     let branch = branch_name(issue.number, &issue.title);
     ensure(Path::new(&project.workdir), &root, &branch).await?;
-    ensure_commit_identity(&paths.work_dir()).await?;
     Ok(root)
 }
 
@@ -191,6 +275,8 @@ pub async fn reclaim(repo: &Path, root: &Path, branch: &str) -> Result<Reclaimed
         }
         return Ok(Reclaimed::Kept { reason: stderr });
     }
+
+    let _ = tokio::fs::remove_file(identity_config_path(root)).await;
 
     let mut branch_deleted = false;
     if branch_exists(repo, branch).await? && commits_ahead(repo, branch).await == Some(0) {
@@ -348,14 +434,25 @@ mod tests {
         assert!(root.join("scratch.txt").exists());
     }
 
-    async fn git_as_a_run(dir: &Path, work_dir: &Path, args: &[&str]) -> std::process::Output {
+    /// A run's shell as the sandbox actually shapes it: `HOME` remapped away
+    /// from the operator's own (`baybo_sandbox`'s `resolve_env` points it at
+    /// the workspace), no `GIT_AUTHOR_*`/`GIT_COMMITTER_*`, and the identity
+    /// reaching it only through `GIT_CONFIG_GLOBAL`. The remap is the whole
+    /// point: a test that leaves `HOME` on the operator's home proves nothing,
+    /// because that is the one thing production takes away.
+    async fn git_in_sandbox(
+        dir: &Path,
+        home: &Path,
+        config: &Path,
+        args: &[&str],
+    ) -> std::process::Output {
         tokio::process::Command::new("git")
             .arg("-C")
             .arg(dir)
             .args(args)
-            .env("HOME", work_dir)
+            .env("HOME", home)
+            .env("GIT_CONFIG_GLOBAL", config)
             .env_remove("XDG_CONFIG_HOME")
-            .env_remove("GIT_CONFIG_GLOBAL")
             .env_remove("GIT_AUTHOR_NAME")
             .env_remove("GIT_AUTHOR_EMAIL")
             .env_remove("GIT_COMMITTER_NAME")
@@ -366,51 +463,110 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_run_can_commit_without_anyone_telling_it_who_it_is() {
+    async fn a_run_commits_as_whoever_the_repository_says_the_operator_is() {
         let repo = fresh_repo().await;
-        let work_dir = tempfile::tempdir().expect("work dir");
+        // Repo-local, so the assertion is about this checkout rather than
+        // about whichever identity the host running the suite happens to have.
+        git(repo.path(), &["config", "user.name", "Ada Lovelace"])
+            .await
+            .expect("name");
+        git(repo.path(), &["config", "user.email", "ada@example.com"])
+            .await
+            .expect("email");
         let root = repo.path().join("wt").join("5");
         ensure(repo.path(), &root, "issue/5-x")
             .await
             .expect("worktree");
-        ensure_commit_identity(work_dir.path())
-            .await
-            .expect("identity");
+        let config = ensure_identity_config(&Checkout {
+            root: root.clone(),
+            repo: repo.path().to_path_buf(),
+        })
+        .await
+        .expect("identity config");
+        let home = tempfile::tempdir().expect("remapped home");
 
         tokio::fs::write(root.join("a.txt"), b"work")
             .await
             .expect("write");
-        let add = git_as_a_run(&root, work_dir.path(), &["add", "."]).await;
+        let add = git_in_sandbox(&root, home.path(), &config, &["add", "."]).await;
         assert!(add.status.success(), "git add must work");
-        let commit = git_as_a_run(&root, work_dir.path(), &["commit", "-m", "done"]).await;
+        let commit = git_in_sandbox(&root, home.path(), &config, &["commit", "-m", "done"]).await;
         assert!(
             commit.status.success(),
             "a run must be able to commit: {}",
             String::from_utf8_lossy(&commit.stderr)
         );
 
-        let who = git_as_a_run(&root, work_dir.path(), &["log", "-1", "--format=%an <%ae>"]).await;
+        let who = git_in_sandbox(
+            &root,
+            home.path(),
+            &config,
+            &["log", "-1", "--format=%an <%ae>"],
+        )
+        .await;
         assert_eq!(
             String::from_utf8_lossy(&who.stdout).trim(),
-            "baybo <baybo@localhost>",
-            "and the commit must be plainly machine-made"
+            "Ada Lovelace <ada@example.com>",
+            "the operator's identity has to survive the HOME remap"
         );
     }
 
     #[tokio::test]
-    async fn an_identity_the_user_has_edited_is_left_alone() {
-        let work_dir = tempfile::tempdir().expect("work dir");
-        let file = work_dir.path().join(".gitconfig");
-        tokio::fs::write(&file, b"[user]\n\tname = mine\n")
+    async fn reclaiming_a_checkout_takes_its_identity_config_with_it() {
+        let repo = fresh_repo().await;
+        let root = repo.path().join("wt").join("6");
+        ensure(repo.path(), &root, "issue/6-x")
             .await
-            .expect("write");
-        ensure_commit_identity(work_dir.path())
+            .expect("worktree");
+        let config = ensure_identity_config(&Checkout {
+            root: root.clone(),
+            repo: repo.path().to_path_buf(),
+        })
+        .await
+        .expect("identity config");
+        assert!(config.exists());
+
+        reclaim(repo.path(), &root, "issue/6-x")
             .await
-            .expect("identity");
-        assert_eq!(
-            tokio::fs::read_to_string(&file).await.expect("read"),
-            "[user]\n\tname = mine\n"
+            .expect("reclaim");
+        assert!(
+            !config.exists(),
+            "a reclaimed tree leaves no identity behind"
         );
+    }
+
+    #[test]
+    fn the_last_layer_that_set_a_key_is_the_one_that_answers() {
+        // What a repo-local override looks like on the wire: the global value
+        // first, the winning one second.
+        assert_eq!(
+            identity_or_fallback("user.email\nglobal@example.com\0user.email\nlocal@example.com\0"),
+            ("baybo".to_owned(), "local@example.com".to_owned())
+        );
+    }
+
+    #[test]
+    fn an_unset_key_falls_back_rather_than_leaving_the_run_unable_to_commit() {
+        assert_eq!(
+            identity_or_fallback("user.name\nAda\0user.email\nada@example.com\0"),
+            ("Ada".to_owned(), "ada@example.com".to_owned())
+        );
+        assert_eq!(
+            identity_or_fallback("user.name\nAda\0"),
+            ("Ada".to_owned(), "baybo@localhost".to_owned())
+        );
+        assert_eq!(
+            identity_or_fallback(""),
+            ("baybo".to_owned(), "baybo@localhost".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_value_cannot_break_out_of_the_entry_it_is_written_into() {
+        // Unquoted, a `"` or a newline would end the value and turn whatever
+        // follows into config syntax of the operator's choosing.
+        assert_eq!(config_value(r#"a"b\c"#), r#""a\"b\\c""#);
+        assert_eq!(config_value("two\nlines"), r#""two lines""#);
     }
 
     #[tokio::test]

@@ -83,11 +83,11 @@ async fn board_handle(
             .filter(|team| team.project_id == *project)
             .map(|team| team.handle),
         Ok(None) => {
-            debug!(agent_id = %agent, "the agent working this issue has no profile row; its commits use the workspace identity");
+            debug!(agent_id = %agent, "the agent working this issue has no profile row; its commits carry no agent trailer");
             None
         }
         Err(e) => {
-            debug!(agent_id = %agent, error = %e, "could not read the profile of the agent working this issue; its commits use the workspace identity");
+            debug!(agent_id = %agent, error = %e, "could not read the profile of the agent working this issue; its commits carry no agent trailer");
             None
         }
     }
@@ -795,6 +795,13 @@ impl ToolExecutor {
                     }
                     _ => None,
                 };
+                // Re-resolved per call rather than cached, so an operator who
+                // edits their git identity is obeyed by the next command. It
+                // costs one `git config` against the sandbox spawn below.
+                let checkout_git_config = match (uses_exec_command, &checkout) {
+                    (true, Some(checkout)) => worktree::ensure_identity_config(checkout).await,
+                    _ => None,
+                };
                 let sandbox: Option<Arc<dyn ExecSandbox>> = if uses_exec_command {
                     self.sandbox_runner.as_ref().map(|runner| {
                         let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -903,6 +910,7 @@ impl ToolExecutor {
                     notify_silence,
                     checkout_root: checkout.map(|c| c.root),
                     agent_handle,
+                    checkout_git_config,
                 };
 
                 // Reveal placeholders in the tool's arguments just
@@ -1180,7 +1188,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_team_members_handle_is_what_its_commits_are_authored_as() {
+    async fn a_team_members_handle_is_what_its_commits_are_credited_to() {
         let agents = baybo_store::test_support::MemoryAgentProfileStore::new();
         let id = baybo_model::AgentProfileId::generate();
         let board = baybo_model::ProjectId::generate();
@@ -1266,6 +1274,7 @@ mod tests {
     struct SeenContext {
         checkout_root: Option<PathBuf>,
         agent_handle: Option<baybo_model::AgentHandle>,
+        checkout_git_config: Option<PathBuf>,
     }
 
     type Seen = Arc<Mutex<Option<SeenContext>>>;
@@ -1293,6 +1302,7 @@ mod tests {
             *self.seen.lock() = Some(SeenContext {
                 checkout_root: ctx.checkout_root.clone(),
                 agent_handle: ctx.agent_handle.clone(),
+                checkout_git_config: ctx.checkout_git_config.clone(),
             });
             Ok(ToolOutput::Text(String::new()))
         }
@@ -1497,7 +1507,22 @@ mod tests {
         assert_eq!(
             seen.agent_handle.map(|h| h.as_str().to_owned()),
             Some(FIXTURE_HANDLE.to_owned()),
-            "and commits as the agent working the card, not as its ULID"
+            "and credits the agent working the card, not its ULID"
+        );
+
+        // The identity is resolved on the host and handed over already
+        // answered; the shell only ever sees the file.
+        let expected = seen
+            .checkout_root
+            .as_ref()
+            .expect("worktree")
+            .with_extension("gitconfig");
+        assert_eq!(seen.checkout_git_config.as_ref(), Some(&expected));
+        assert!(
+            std::fs::read_to_string(&expected)
+                .expect("the identity config is materialised")
+                .contains("[user]"),
+            "an issue run's shell must have somebody to commit as"
         );
     }
 

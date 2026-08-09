@@ -387,9 +387,15 @@ pub struct ToolContext {
     /// What this session's agent is called on the board its card belongs
     /// to: the `@handle` a person types into a comment, not the ULID that
     /// names its persona directory. Populated only alongside
-    /// [`Self::checkout_root`], because its one consumer is the commit
-    /// identity an issue run's shell carries.
+    /// [`Self::checkout_root`], because its one consumer is the
+    /// `Co-authored-by:` trailer an issue run's commits carry.
     pub agent_handle: Option<AgentHandle>,
+    /// Git config naming who [`Self::checkout_root`]'s commits belong to,
+    /// resolved on the host by `baybo-project` and handed over already
+    /// answered. The shell is pointed at it with `GIT_CONFIG_GLOBAL`, because
+    /// the sandbox remaps `HOME` and the operator's own config is therefore
+    /// not where git looks. `None` for every session that is not an issue run.
+    pub checkout_git_config: Option<PathBuf>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -438,6 +444,7 @@ impl ToolContext {
             notify_silence: None,
             checkout_root: None,
             agent_handle: None,
+            checkout_git_config: None,
         }
     }
 }
