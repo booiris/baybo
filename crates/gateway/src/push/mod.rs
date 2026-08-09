@@ -710,12 +710,13 @@ impl PushDispatcher {
             );
             return;
         }
-        // A one-shot cron fire's workspace is not a conversation the app can
-        // open, so a notification deep-linking into it would be a dead end.
-        if crate::api::admin::chat::is_hidden_cron_session(&session) {
+        // A session owned by a board or a private cron workspace cannot be
+        // opened from global chat, so a notification deep-link would be a
+        // dead end.
+        if crate::api::admin::chat::is_excluded_from_global_chat(&session) {
             tracing::debug!(
                 session = %push.session_id,
-                "push: approval prompt is in a private cron workspace; not pushing"
+                "push: approval prompt is outside global chat; not pushing"
             );
             return;
         }

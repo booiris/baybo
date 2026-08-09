@@ -1077,7 +1077,8 @@ async fn list_sessions(
     let visible: Vec<Session> = scoped
         .into_iter()
         .filter(|s| query.include_hidden || !s.hidden)
-        .filter(|s| query.include_cron || !is_hidden_cron_session(s))
+        .filter(|s| !s.trigger.is_project_session())
+        .filter(|s| query.include_cron || !is_private_cron_session(s))
         .collect();
     // One grouped scan for every per-session aggregate the sidebar
     // needs (first-line previews, second-line tail windows, unread
@@ -2568,7 +2569,7 @@ async fn create_or_load_chat_session(
         // gone: one gateway is one owner, and pre-unification rows still carry
         // the old `web-operator`/`device_id` ids in `user.id` (only the
         // `channel` is migrated), so equating it would 404 legacy sessions.
-        if existing.channel != channel_type || is_hidden_cron_session(&existing) {
+        if existing.channel != channel_type || is_excluded_from_global_chat(&existing) {
             return Err(GatewayError::NotFound(format!("chat session {session_id}")));
         }
         return Ok(existing);
@@ -2738,22 +2739,22 @@ pub(crate) fn broadcast_session_list_stale(state: &AdminState, channel: &Channel
     }
 }
 
-/// True for a cron fire session that is **not** a conversation of its own: a
-/// one-shot's private workspace (its result is reported into the conversation
-/// that scheduled it), or a historical fire from before recurring fires became
-/// conversations. Such a session is kept out of the chat list and cannot be
-/// attached to — there is nothing there for a user to read or continue.
+/// Whether a cron fire owns no conversation the user can read or continue.
 ///
-/// A recurring fire's session *is* the notification, so it is listed and
-/// replyable like any other conversation.
-pub(crate) fn is_hidden_cron_session(session: &Session) -> bool {
-    if session.trigger.is_project_session() {
-        // A board's conversations belong to the board. An issue's session
-        // is reachable through its card and its transcript, never through
-        // the chat list — kanban and chat stay separate worlds.
-        return true;
-    }
+/// This covers one-shot private workspaces and historical fires from before
+/// recurring fires became conversations. A recurring fire's session *is* its
+/// notification, so it is listed and replyable like any other conversation.
+pub(crate) fn is_private_cron_session(session: &Session) -> bool {
     matches!(session.trigger, TriggerSource::Cron { .. }) && !session.trigger.is_cron_conversation()
+}
+
+/// Whether a session belongs outside the global chat surface.
+///
+/// Private cron workspaces have no conversation of their own. Board
+/// conversations instead belong to the board: an issue session is reached
+/// through its card and transcript, never through the global chat list.
+pub(crate) fn is_excluded_from_global_chat(session: &Session) -> bool {
+    session.trigger.is_project_session() || is_private_cron_session(session)
 }
 
 async fn transcript_attachments(
