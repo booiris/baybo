@@ -112,6 +112,10 @@ struct ArchivedScreen: View {
                     }
                     .tint(Theme.err)
                 }
+                // The resync rides here too: archiving a conversation is a
+                // filing decision, not a decision to stop being able to repair
+                // it (see `resyncContextMenu`).
+                .resyncContextMenu(row.id)
             }
         }
         .listStyle(.plain)
