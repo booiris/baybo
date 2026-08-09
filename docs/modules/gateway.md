@@ -273,9 +273,19 @@ registry wiring installs a type-level gate into the shared
 frame to the WS sink with
 [`rmp_serde::to_vec_named`](baybo_channels::wire::encode) —
 everything fans *in* to the mpsc, the pump is the only thing that
-touches the socket. On disconnect `Sidecar::into_pump()` detaches the
+touches the socket. On disconnect `Sidecar::shutdown()` detaches the
 connection from the channel and drops the last `frame_tx` clones, so the
 pump exits cleanly without a separate stop signal.
+
+A `Sidecar` that is never wound down that way — the relay chat leg's
+normal ending, since `LegDedup::install` and `legs.shutdown()` both
+**abort** the leg task — gets the same cleanup from the `LegTeardown`
+guard field's `Drop`, which detaches and then aborts the pump. Both
+halves matter: leaving the connection attached keeps an `Arc<Connection>`
+alive in the channel, and its `GatewaySink` holds clones of the very
+senders the pump and translator are waiting to see closed, so neither
+ever exits and the pump keeps the socket's write half and its keepalive
+running against a peer that is gone.
 
 ### Tool approval over the sidecar WS
 
