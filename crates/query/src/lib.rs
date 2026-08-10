@@ -1732,6 +1732,20 @@ mod tests {
                 None => Ok(false),
             }
         }
+        async fn set_title_if_absent(
+            &self,
+            id: &SessionId,
+            title: &str,
+        ) -> std::result::Result<bool, baybo_store::StorageError> {
+            let mut data = self.sessions.lock();
+            match data.get_mut(id) {
+                Some(s) if s.title.is_none() => {
+                    s.title = Some(title.to_string());
+                    Ok(true)
+                }
+                _ => Ok(false),
+            }
+        }
         async fn delete(
             &self,
             _id: &SessionId,

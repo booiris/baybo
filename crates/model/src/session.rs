@@ -292,11 +292,18 @@ pub struct Session {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub folder_id: Option<crate::FolderId>,
 
-    /// Auto-generated conversation title. Stored as a flat column; `get`
+    /// Conversation title — generated on the first user turn, and editable by
+    /// the user from a chat client thereafter. Stored as a flat column; `get`
     /// patches it from the column on read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
 }
+
+/// Upper bound on a conversation title, in Unicode scalars. Single source of
+/// truth for every site that produces one: the auto-titler's sanitizer caps
+/// the model's output here, and the rename endpoint rejects anything longer,
+/// so both writers land the same shape.
+pub const MAX_SESSION_TITLE_LEN: usize = 80;
 
 impl Session {
     /// Whether a background job's completion notification could land here —

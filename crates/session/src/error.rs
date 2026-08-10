@@ -26,6 +26,13 @@ pub enum SessionError {
     #[error("invalid folder operation: {0}")]
     InvalidFolderOp(String),
 
+    /// A user-supplied value failed validation (an empty or over-long
+    /// conversation title). Maps to a 400 at the gateway. Distinct from
+    /// `InvalidState`, which reports a session whose state machine forbids the
+    /// operation — here the session is fine and the argument is not.
+    #[error("invalid session argument: {0}")]
+    InvalidArgument(String),
+
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }

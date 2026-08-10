@@ -424,6 +424,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/chat/sessions/{session_id}/title": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["set_session_title"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/chat/sessions/{session_id}/unhide": {
         parameters: {
             query?: never;
@@ -2449,6 +2465,19 @@ export interface components {
              */
             pinned: boolean;
         };
+        /** @description Request body for `PUT /v1/chat/sessions/{session_id}/title`. */
+        SetSessionTitleRequest: {
+            /**
+             * @description The conversation's new title. Interior whitespace is collapsed and the
+             *     ends trimmed; the result must be non-empty and at most
+             *     `baybo_model::MAX_SESSION_TITLE_LEN` characters, or the call is a 400.
+             *
+             *     There is no "clear it and let the model re-title" form: a cleared title
+             *     cannot be expressed on the wire, where an absent `SessionPatch.title`
+             *     already means "unchanged".
+             */
+            title: string;
+        };
         /**
          * @description Wire DTO for slash command entries. Mirror of
          *     [`baybo_channels::wire::SlashCommandSpec`] so the OpenAPI surface
@@ -4271,6 +4300,58 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ChatSyncResponse"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Session not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_session_title: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Session id to rename */
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetSessionTitleRequest"];
+            };
+        };
+        responses: {
+            /** @description Title updated */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Empty or over-long title */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
                 };
             };
             /** @description Unauthorized */

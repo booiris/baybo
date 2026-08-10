@@ -233,6 +233,79 @@ async fn chat_api_round_trip() {
 }
 
 #[tokio::test]
+async fn chat_rename_round_trips_and_validates() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
+
+    let state = build_admin_state(&tg);
+    let router = build_router(state.clone());
+
+    let cred = post(&router, "/v1/chat/sessions", Body::empty(), StatusCode::OK).await;
+    let session_id = cred["session_id"].as_str().expect("session_id").to_owned();
+
+    let renamed = put(
+        &router,
+        &format!("/v1/chat/sessions/{session_id}/title"),
+        Body::from(json!({ "title": "  Fix   login\nredirect " }).to_string()),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    assert!(renamed.is_null());
+
+    // The stored title is the normalized one — the list is what a cold client
+    // reads, so it must not disagree with what the broadcast carried.
+    let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
+    let row = list["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|row| row["session_id"].as_str() == Some(session_id.as_str()))
+        .expect("created session listed")
+        .clone();
+    assert_eq!(row["title"].as_str(), Some("Fix login redirect"));
+
+    for bad in ["", "   "] {
+        put(
+            &router,
+            &format!("/v1/chat/sessions/{session_id}/title"),
+            Body::from(json!({ "title": bad }).to_string()),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+    }
+    put(
+        &router,
+        &format!("/v1/chat/sessions/{session_id}/title"),
+        Body::from(json!({ "title": "x".repeat(81) }).to_string()),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+
+    let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
+    let row = list["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|row| row["session_id"].as_str() == Some(session_id.as_str()))
+        .expect("created session listed")
+        .clone();
+    assert_eq!(
+        row["title"].as_str(),
+        Some("Fix login redirect"),
+        "a rejected rename must leave the stored title alone"
+    );
+
+    put(
+        &router,
+        "/v1/chat/sessions/does-not-exist/title",
+        Body::from(json!({ "title": "Anything" }).to_string()),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn chat_archive_round_trip() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();

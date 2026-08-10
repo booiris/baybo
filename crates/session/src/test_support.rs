@@ -206,6 +206,17 @@ impl SessionStore for MemorySessionStore {
         }
     }
 
+    async fn set_title_if_absent(&self, session_id: &SessionId, title: &str) -> Result<bool> {
+        let mut data = self.data.lock();
+        match data.get_mut(session_id) {
+            Some(s) if s.title.is_none() => {
+                s.title = Some(title.to_string());
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     async fn delete(&self, session_id: &SessionId) -> Result<bool> {
         self.transcripts.lock().remove(session_id);
         Ok(self.data.lock().remove(session_id).is_some())

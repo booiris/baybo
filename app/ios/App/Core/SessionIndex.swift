@@ -7,9 +7,11 @@ struct SessionRow: Codable, Identifiable, Equatable {
     let id: String
     var createdAt: Date
     var lastActive: Date
-    /// Auto-generated conversation title (server-side, from the first user
-    /// question); nil until the title pass has run. The list's bold first line;
-    /// live-updated by a `SessionUpdated` patch (`SessionIndex.applyTitle`).
+    /// Conversation title: generated server-side from the first user question,
+    /// or set by the user renaming it from the web; nil until either has
+    /// happened. The list's bold first line; live-updated by a
+    /// `SessionUpdated` patch (`SessionIndex.applyTitle`). iOS is
+    /// receive-only — there is no rename affordance here yet.
     var title: String?
     /// Second-line preview: the most-recent message regardless of author (user
     /// prompt or agent reply). Captured locally on send, reconciled to server

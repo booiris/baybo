@@ -141,9 +141,10 @@ pub struct ChatSessionSummary {
     /// gateway that predates the field, or a session with no displayable turn;
     /// the row falls back to `last_user_text` / its title.
     pub last_message_text: Option<String>,
-    /// Auto-generated conversation title (from the first user question), or
-    /// `None` before the title pass has run. The list renders it as the row's
-    /// bold first line; live updates arrive via [`SessionListSink::on_title`].
+    /// Conversation title — generated from the first user question, or set by
+    /// a user rename — and `None` before either has happened. The list renders
+    /// it as the row's bold first line; live updates arrive via
+    /// [`SessionListSink::on_title`].
     pub title: Option<String>,
     pub pinned: bool,
     pub archived: bool,

@@ -3127,11 +3127,17 @@ impl AgentLoop {
     /// — present in the running gateway, absent in tests / headless, so
     /// titles are only generated where something renders them); the session is
     /// a top-level user session (`TriggerSource::User`, no lineage — cron /
-    /// subagent skipped); it has no title yet (`session.title.is_none()`, the
-    /// durable once-only guard, self-healing across rehydration); this actor
-    /// hasn't already attempted one ([`Self::title_generation`] present, the
-    /// per-actor-lifetime guard); and the transcript has a text-bearing first
-    /// user question ([`first_user_question`]).
+    /// subagent skipped); it has no title yet (`session.title.is_none()`);
+    /// this actor hasn't already attempted one ([`Self::title_generation`]
+    /// present, the per-actor-lifetime guard); and the transcript has a
+    /// text-bearing first user question ([`first_user_question`]).
+    ///
+    /// The `session.title.is_none()` arm is only a cheap pre-filter. It reads
+    /// the actor's long-lived `Session` snapshot, which a rename (a targeted
+    /// column UPDATE from the gateway) never refreshes, so the authoritative
+    /// guard is the conditional write at the end of the spawned task —
+    /// `set_title_if_absent`. Losing that race costs one lite-model call and
+    /// nothing else.
     async fn maybe_generate_title(
         &mut self,
         session: &Session,
@@ -3179,8 +3185,13 @@ impl AgentLoop {
                 cancel_token,
             };
             match runner.run(question).await {
-                Ok(Some(title)) => match sessions.set_title(&session_id, Some(&title)).await {
-                    Ok(()) => title_sink.title_updated(&session_id, &title),
+                // Conditional write, not a plain set: the gate below ran
+                // before this LLM call, so the user may have renamed the
+                // conversation in the meantime. Staying silent on `false`
+                // keeps a generated title off every client's sidebar too.
+                Ok(Some(title)) => match sessions.set_title_if_absent(&session_id, &title).await {
+                    Ok(true) => title_sink.title_updated(&session_id, &title),
+                    Ok(false) => {}
                     Err(e) => warn!(
                         session_id = %session_id,
                         error = %e,

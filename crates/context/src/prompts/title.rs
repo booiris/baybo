@@ -1,7 +1,6 @@
 //! Prompt + response sanitizing for the conversation-title pass.
 
-/// Upper bound on a stored title's length, in characters.
-pub const MAX_TITLE_CHARS: usize = 80;
+use baybo_model::MAX_SESSION_TITLE_LEN;
 
 const PROMPT_TEMPLATE: &str = r#"You are titling a brand-new conversation from the user's first message. Write a short, specific title that captures what the user is asking about — the key subject, not filler.
 
@@ -38,7 +37,7 @@ pub fn sanitize_title(raw: &str) -> Option<String> {
         return None;
     }
 
-    Some(cap_chars(&collapsed, MAX_TITLE_CHARS))
+    Some(cap_chars(&collapsed, MAX_SESSION_TITLE_LEN))
 }
 
 fn strip_label(s: &str) -> &str {
@@ -137,15 +136,15 @@ mod tests {
     fn sanitize_caps_length_on_word_boundary() {
         let long = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho";
         let out = sanitize_title(long).unwrap();
-        assert!(out.chars().count() <= MAX_TITLE_CHARS, "got {out:?}");
+        assert!(out.chars().count() <= MAX_SESSION_TITLE_LEN, "got {out:?}");
         assert!(!out.ends_with(' '));
         assert!(long.starts_with(&out));
     }
 
     #[test]
     fn sanitize_hard_cuts_a_single_overlong_token() {
-        let token = "a".repeat(MAX_TITLE_CHARS + 20);
+        let token = "a".repeat(MAX_SESSION_TITLE_LEN + 20);
         let out = sanitize_title(&token).unwrap();
-        assert_eq!(out.chars().count(), MAX_TITLE_CHARS);
+        assert_eq!(out.chars().count(), MAX_SESSION_TITLE_LEN);
     }
 }

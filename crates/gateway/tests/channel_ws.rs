@@ -848,6 +848,84 @@ async fn chat_list_broadcast_reaches_every_web_tab() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn renaming_a_conversation_reaches_a_tab_that_never_opened_it() {
+    // The rename endpoint's whole cross-client story is one fire-and-forget
+    // `broadcast_session_patch` call with an early return when no channel is
+    // installed — nothing surfaces an error if it silently does nothing. This
+    // drives the real `PUT` over HTTP and asserts a tab parked on its
+    // conversation list (subscribed to nothing) sees the new title, which is
+    // also what would catch a future swap to the all-channels title sink.
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    boot::install_channels(&tg.deps.channel_registry, &ChannelsConfig::default()).expect("install");
+
+    let shutdown = tg.shutdown.clone();
+    let (port, server_handle) = start_admin_ws_server(&tg.deps, shutdown.clone())
+        .await
+        .expect("bind admin server");
+
+    let mut bystander = connect_register(port, &tg.deps.admin_token, ChannelType::owner())
+        .await
+        .expect("bystander handshake");
+
+    let http = reqwest::Client::new();
+    let created: serde_json::Value = http
+        .post(format!("http://127.0.0.1:{port}/v1/chat/sessions"))
+        .bearer_auth(&tg.deps.admin_token)
+        .send()
+        .await
+        .expect("create session")
+        .json()
+        .await
+        .expect("create session body");
+    let session_id = created["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_owned();
+
+    // Creating the session broadcasts its own patch; the rename is the next
+    // one on the wire.
+    let frame = recv_frame(&mut bystander, Duration::from_secs(2))
+        .await
+        .expect("bystander receives the create patch");
+    assert!(
+        matches!(frame, Frame::SessionUpdated { .. }),
+        "expected the create patch, got {frame:?}"
+    );
+
+    let status = http
+        .put(format!(
+            "http://127.0.0.1:{port}/v1/chat/sessions/{session_id}/title"
+        ))
+        .bearer_auth(&tg.deps.admin_token)
+        .json(&serde_json::json!({ "title": "  Renamed   from\tanother tab " }))
+        .send()
+        .await
+        .expect("rename")
+        .status();
+    assert_eq!(status, reqwest::StatusCode::NO_CONTENT);
+
+    let frame = recv_frame(&mut bystander, Duration::from_secs(2))
+        .await
+        .expect("bystander receives the rename patch");
+    match frame {
+        Frame::SessionUpdated {
+            session_id: id,
+            patch,
+        } => {
+            assert_eq!(id, session_id);
+            // The normalized title, not what the client submitted — otherwise
+            // this tab renders a name the next list pull silently rewrites.
+            assert_eq!(patch.title.as_deref(), Some("Renamed from another tab"));
+        }
+        other => panic!("expected SessionUpdated, got {other:?}"),
+    }
+
+    drop(bystander);
+    shutdown.trigger();
+    let _ = server_handle.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn approval_gate_marks_the_session_for_an_unsubscribed_client() {
     // The reason the mark is a broadcast patch and not `ApprovalRequested`:
     // the prompt frame only reaches connections subscribed to the call's

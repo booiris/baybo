@@ -58,7 +58,10 @@ archived?: boolean,
  */
 folder_id?: FolderChange, 
 /**
- * Generated conversation title; absent means no change.
+ * Conversation title; absent means no change. Written either by the
+ * first-turn title pass or by a user rename
+ * (`PUT /v1/chat/sessions/:id/title`). There is no cleared form — a title
+ * can only be replaced, never taken away.
  */
 title?: string, 
 /**

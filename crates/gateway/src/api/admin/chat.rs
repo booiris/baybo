@@ -77,6 +77,7 @@ pub fn routes() -> OpenApiRouter<AdminState> {
         .routes(routes!(set_session_model))
         .routes(routes!(set_session_pin))
         .routes(routes!(set_session_archive))
+        .routes(routes!(set_session_title))
         .routes(routes!(mark_session_read))
         .routes(routes!(mark_sessions_read))
         .routes(routes!(set_session_folder))
@@ -1841,6 +1842,75 @@ pub struct SetSessionArchiveRequest {
     /// `true` to move this session into the archived group, `false` to
     /// restore it to the main chat list.
     pub archived: bool,
+}
+
+/// Request body for `PUT /v1/chat/sessions/{session_id}/title`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetSessionTitleRequest {
+    /// The conversation's new title. Interior whitespace is collapsed and the
+    /// ends trimmed; the result must be non-empty and at most
+    /// `baybo_model::MAX_SESSION_TITLE_LEN` characters, or the call is a 400.
+    ///
+    /// There is no "clear it and let the model re-title" form: a cleared title
+    /// cannot be expressed on the wire, where an absent `SessionPatch.title`
+    /// already means "unchanged".
+    pub title: String,
+}
+
+/// Map a session-argument failure onto its status. Kept apart from
+/// [`folder_err`] so a bad title reports as a title problem rather than
+/// borrowing the folder wording.
+fn session_title_err(e: SessionError) -> GatewayError {
+    match e {
+        SessionError::NotFound(m) => GatewayError::NotFound(m),
+        SessionError::InvalidArgument(m) => GatewayError::BadRequest(m),
+        other => GatewayError::Internal(format!("set session title: {other}")),
+    }
+}
+
+#[utoipa::path(
+    put,
+    path = "/chat/sessions/{session_id}/title",
+    tag = "chat",
+    params(
+        ("session_id" = String, Path, description = "Session id to rename"),
+    ),
+    request_body = SetSessionTitleRequest,
+    responses(
+        (status = 204, description = "Title updated"),
+        (status = 400, description = "Empty or over-long title", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Session not found", body = ErrorBody),
+    )
+)]
+async fn set_session_title(
+    State(state): State<AdminState>,
+    Path(session_id): Path<String>,
+    authed: Option<Extension<AuthedClient>>,
+    Json(req): Json<SetSessionTitleRequest>,
+) -> Result<axum::http::StatusCode> {
+    let authed = authed.as_ref().map(|ext| &ext.0);
+    let (sid, session) = load_scoped_chat_session(&state, &session_id, authed).await?;
+    // Targeted flat-column write — like `set_pinned`, it survives a
+    // concurrent `touch` (full-blob save) so the rename can't be clobbered.
+    let stored = state
+        .session_manager
+        .set_user_title(&sid, req.title)
+        .await
+        .map_err(session_title_err)?;
+    // Broadcast the STORED title, never the submitted one: the manager
+    // normalizes, and shipping the raw value would leave every other client
+    // showing something the next list refetch silently rewrites.
+    broadcast_session_patch(
+        &state,
+        &session.channel,
+        &sid,
+        SessionPatch {
+            title: Some(stored),
+            ..SessionPatch::default()
+        },
+    );
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 /// Request body for `PUT /v1/chat/sessions/{session_id}/read`.

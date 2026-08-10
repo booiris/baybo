@@ -42,6 +42,7 @@ import type { Folder, SessionSummary } from './types';
 import { useQueueCounts } from './queueStore';
 import { useFolders, useFolderStore } from './folderStore';
 import { ChatContextMenu, FolderContextMenu } from './FolderContextMenu';
+import { MAX_SESSION_TITLE_LEN, seedTitleDraft, titleToCommit } from './renameTitle';
 import {
   bucketSessions,
   cronCollapseKey,
@@ -113,6 +114,16 @@ interface RowCallbacks {
   onContextMenu: (session: SessionSummary, x: number, y: number) => void;
 }
 
+/** Per-row rename state, threaded down the same way the folder tree threads
+ *  its own (see `FolderHeader`). Only the row being renamed gets `renaming`. */
+interface RowRenameProps {
+  renaming: boolean;
+  renameDraft: string;
+  onRenameDraft: (value: string) => void;
+  onRenameCommit: () => void;
+  onRenameCancel: () => void;
+}
+
 function SessionRow({
   session,
   active,
@@ -123,6 +134,11 @@ function SessionRow({
   onHide,
   onTogglePin,
   onContextMenu,
+  renaming,
+  renameDraft,
+  onRenameDraft,
+  onRenameCommit,
+  onRenameCancel,
 }: {
   session: SessionSummary;
   active: boolean;
@@ -131,7 +147,8 @@ function SessionRow({
   queueCount: number;
   /** Indent level (0 for top-level buckets, 1+ inside folders). */
   depth: number;
-} & RowCallbacks) {
+} & RowCallbacks &
+  RowRenameProps) {
   // A chat is a plain draggable, NOT a sortable: chat order is server-driven
   // (newest-first), so dragging one must not reflow the list — it only lifts
   // out to drop onto a folder. The floating preview is the DragOverlay; the
@@ -156,6 +173,43 @@ function SessionRow({
   const iconBtn = `flex items-center justify-center h-5 w-5 rounded shrink-0 ${
     active ? 'text-ink hover:bg-white/40' : 'text-ink-soft hover:bg-white'
   }`;
+  const rowClass = `group relative flex items-center gap-2 px-3 py-1.5 rounded-md border-2 touch-none ${
+    active
+      ? 'bg-selected text-ink border-black shadow-brutal-sm'
+      : 'border-transparent hover:bg-gray-100 text-ink'
+  }`;
+  // While renaming, the row is a plain div rather than a draggable Link. The
+  // input would otherwise sit inside an anchor that navigates on click, a
+  // draggable that swallows pointer moves, and dnd-kit's KeyboardSensor, which
+  // claims Space and the arrow keys — the three things typing a name needs.
+  if (renaming) {
+    return (
+      <div style={style} className={rowClass}>
+        <RiChat1Line
+          className={`text-[0.8rem] shrink-0 ${active ? 'text-ink/70' : 'text-ink-soft'}`}
+          aria-hidden
+        />
+        <input
+          autoFocus
+          value={renameDraft}
+          maxLength={MAX_SESSION_TITLE_LEN}
+          aria-label="Conversation title"
+          onChange={(e) => onRenameDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              onRenameCommit();
+            } else if (e.key === 'Escape') {
+              e.preventDefault();
+              onRenameCancel();
+            }
+          }}
+          onBlur={onRenameCommit}
+          className="flex-1 min-w-0 bg-surface border-2 border-black rounded px-1.5 py-0.5 font-mono text-xs text-ink focus:outline-none"
+        />
+      </div>
+    );
+  }
   return (
     <Link
       ref={setNodeRef}
@@ -167,11 +221,7 @@ function SessionRow({
         e.preventDefault();
         onContextMenu(session, e.clientX, e.clientY);
       }}
-      className={`group relative flex items-center gap-2 px-3 py-1.5 rounded-md border-2 touch-none ${
-        active
-          ? 'bg-selected text-ink border-black shadow-brutal-sm'
-          : 'border-transparent hover:bg-gray-100 text-ink'
-      }`}
+      className={rowClass}
       title={session.session_id}
     >
       {/* Leading conversation glyph — distinguishes a chat row from a
@@ -559,6 +609,7 @@ export function SessionSidebar({
   onTogglePin,
   onToggleCronPin,
   onAssignFolder,
+  onRenameSession,
   onCreateFolder,
   onRenameFolder,
   onMoveFolder,
@@ -579,6 +630,8 @@ export function SessionSidebar({
    *  fires. See `docs/cron-groups.md`. */
   onToggleCronPin: (jobId: string, pinned: boolean) => void;
   onAssignFolder: (id: string, folderId: string | null) => void;
+  /** Rename a conversation. `title` is already trimmed and non-empty. */
+  onRenameSession: (id: string, title: string) => void;
   onCreateFolder: (name: string, parentId?: string) => void;
   onRenameFolder: (id: string, name: string) => void;
   onMoveFolder: (id: string, parentId: string | null) => void;
@@ -695,6 +748,28 @@ export function SessionSidebar({
   }, [renamingId, renameDraft, folderById, onRenameFolder]);
   const cancelRename = useCallback(() => setRenamingId(null), []);
 
+  // Conversation rename, mirroring the folder trio above. The rules live in
+  // `renameTitle.ts` so the cap and the "unchanged commits nothing" case are
+  // testable without mounting the sidebar.
+  const [renamingChatId, setRenamingChatId] = useState<string | null>(null);
+  const [chatRenameDraft, setChatRenameDraft] = useState('');
+  const [chatRenameSeed, setChatRenameSeed] = useState('');
+
+  const startChatRename = useCallback((session: SessionSummary) => {
+    const seed = seedTitleDraft(session);
+    setRenamingChatId(session.session_id);
+    setChatRenameDraft(seed);
+    setChatRenameSeed(seed);
+  }, []);
+  const commitChatRename = useCallback(() => {
+    if (renamingChatId !== null) {
+      const title = titleToCommit(chatRenameDraft, chatRenameSeed);
+      if (title !== null) onRenameSession(renamingChatId, title);
+    }
+    setRenamingChatId(null);
+  }, [renamingChatId, chatRenameDraft, chatRenameSeed, onRenameSession]);
+  const cancelChatRename = useCallback(() => setRenamingChatId(null), []);
+
   // ── Context menu state ───────────────────────────────────────────────────
   const [folderMenu, setFolderMenu] = useState<FolderMenuState | null>(null);
   const [chatMenu, setChatMenu] = useState<ChatMenuState | null>(null);
@@ -797,9 +872,25 @@ export function SessionSidebar({
         onHide={onHide}
         onTogglePin={onTogglePin}
         onContextMenu={openChatMenu}
+        renaming={renamingChatId === s.session_id}
+        renameDraft={chatRenameDraft}
+        onRenameDraft={setChatRenameDraft}
+        onRenameCommit={commitChatRename}
+        onRenameCancel={cancelChatRename}
       />
     ),
-    [activeSessionId, pendingIds, queueCounts, onHide, onTogglePin, openChatMenu],
+    [
+      activeSessionId,
+      pendingIds,
+      queueCounts,
+      onHide,
+      onTogglePin,
+      openChatMenu,
+      renamingChatId,
+      chatRenameDraft,
+      commitChatRename,
+      cancelChatRename,
+    ],
   );
 
   const renderFolderSubtree = useCallback(
@@ -1065,6 +1156,7 @@ export function SessionSidebar({
           canMoveToFolder={chatMenu.session.cron_job_id === undefined}
           folders={folders}
           onMoveToFolder={(folderId) => onAssignFolder(chatMenu.session.session_id, folderId)}
+          onRename={() => startChatRename(chatMenu.session)}
           onTogglePin={() => onTogglePin(chatMenu.session.session_id, !chatMenu.session.pinned)}
           onHide={() => onHide(chatMenu.session.session_id)}
           onClose={() => setChatMenu(null)}

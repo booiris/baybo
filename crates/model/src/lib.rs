@@ -49,7 +49,8 @@ pub use pricing::LlmPricingOverride;
 pub use security_types::{PlaceholderId, SecretKind};
 pub use session::{
     BackgroundNotificationDelivery, BackgroundNotificationGroup, BackgroundNotificationState,
-    ChannelType, Lineage, LineageKind, Session, SessionState, TriggerKind, TriggerSource, User,
+    ChannelType, Lineage, LineageKind, MAX_SESSION_TITLE_LEN, Session, SessionState, TriggerKind,
+    TriggerSource, User,
 };
 pub use spawn_protocol::{
     BACKGROUND_DISPATCH_ACK_PREFIX, BACKGROUND_DISPATCH_YIELD_GUIDANCE,

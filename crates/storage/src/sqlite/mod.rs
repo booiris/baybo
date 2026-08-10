@@ -729,7 +729,9 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     -- and omitted from the DO UPDATE in `save`, so a concurrent
                     -- `touch` can't clobber it. NULL ⇒ nothing read yet.
                     read_cursor           INTEGER,
-                    -- Auto-generated conversation title; owned by set_title.
+                    -- Conversation title: generated on the first user turn
+                    -- (set_title_if_absent) or renamed by the user
+                    -- (set_title). Never written by a blob `save`.
                     title                 TEXT,
                     -- The agent profile this session's work belongs to: its
                     -- soul, skill overlay and memory partition. NULL ⇒ the

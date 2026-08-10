@@ -249,7 +249,7 @@ impl Router {
         let title = cron_conversation_title(&titled, &event.timezone);
         if let Err(e) = self
             .session_manager
-            .set_title(session_id, Some(&title))
+            .set_title_if_absent(session_id, &title)
             .await
         {
             warn!(session_id = %session_id, error = %e, "failed to title dream conversation");
@@ -770,7 +770,7 @@ impl Router {
         let title = cron_conversation_title(&event.title, &event.timezone);
         if let Err(e) = self
             .session_manager
-            .set_title(session_id, Some(&title))
+            .set_title_if_absent(session_id, &title)
             .await
         {
             warn!(

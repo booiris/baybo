@@ -792,7 +792,9 @@ The full frame set (see `crates/wire/src/lib.rs`):
   (server → client).
 - **Chat session signalling (the `owner` subscribed channel):** `SessionUpdated
   { session_id, patch }` (the `SessionPatch` carries Create/Hide/Unhide
-  plus `pinned` and `folder_id` changes), `SessionActivity { session_id,
+  plus `pinned`, `archived`, `folder_id`, `title` and `approval_pending`
+  changes; an absent field means "unchanged", so `title` can be replaced
+  but never cleared), `SessionActivity { session_id,
   source, at }`, `FoldersChanged { folders }` (a full folder-tree snapshot
   re-broadcast after any folder mutation).
 - **Deck (server → client, the `owner` subscribed channel):**

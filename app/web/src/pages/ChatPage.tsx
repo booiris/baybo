@@ -2691,6 +2691,39 @@ export function ChatPage() {
     [client],
   );
 
+  // Rename a conversation. Optimistic like the pin above: show the new title
+  // immediately, then PUT; the server's SessionPatch broadcast converges every
+  // other tab and the iOS app. On failure we put the old title back, so the
+  // row never keeps a name the server rejected.
+  const handleRenameSession = useCallback(
+    async (id: string, title: string) => {
+      let previous: string | undefined;
+      setSessions((prev) => {
+        const idx = prev.findIndex((s) => s.session_id === id);
+        if (idx === -1) return prev;
+        previous = prev[idx].title;
+        const next = prev.slice();
+        next[idx] = { ...prev[idx], title };
+        return next;
+      });
+      const { error, response } = await client.PUT('/v1/chat/sessions/{session_id}/title', {
+        params: { path: { session_id: id } },
+        body: { title },
+      });
+      if (error || !response.ok) {
+        console.warn('rename session failed', id, error);
+        setSessions((prev) => {
+          const idx = prev.findIndex((s) => s.session_id === id);
+          if (idx === -1 || prev[idx].title !== title) return prev;
+          const next = prev.slice();
+          next[idx] = { ...prev[idx], title: previous };
+          return next;
+        });
+      }
+    },
+    [client],
+  );
+
   // Pin / unpin a cron GROUP. The bit lives on the JOB (`PUT /v1/cron/{id}/pin`),
   // not on any session — the group is a view over the job's fires — so the
   // optimistic flip has to touch every member row, which is what carries
@@ -2990,6 +3023,7 @@ export function ChatPage() {
         onTogglePin={handleTogglePin}
         onToggleCronPin={handleToggleCronPin}
         onAssignFolder={handleAssignFolder}
+        onRenameSession={handleRenameSession}
         onCreateFolder={handleCreateFolder}
         onRenameFolder={handleRenameFolder}
         onMoveFolder={handleMoveFolder}

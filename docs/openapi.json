@@ -2083,6 +2083,70 @@
         }
       }
     },
+    "/v1/chat/sessions/{session_id}/title": {
+      "put": {
+        "tags": [
+          "chat"
+        ],
+        "operationId": "set_session_title",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Session id to rename",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetSessionTitleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Title updated"
+          },
+          "400": {
+            "description": "Empty or over-long title",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Session not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/chat/sessions/{session_id}/unhide": {
       "post": {
         "tags": [
@@ -7177,6 +7241,19 @@
           "pinned": {
             "type": "boolean",
             "description": "`true` to pin this session to the top of the chat list, `false`\nto unpin it back into the regular list."
+          }
+        }
+      },
+      "SetSessionTitleRequest": {
+        "type": "object",
+        "description": "Request body for `PUT /v1/chat/sessions/{session_id}/title`.",
+        "required": [
+          "title"
+        ],
+        "properties": {
+          "title": {
+            "type": "string",
+            "description": "The conversation's new title. Interior whitespace is collapsed and the\nends trimmed; the result must be non-empty and at most\n`baybo_model::MAX_SESSION_TITLE_LEN` characters, or the call is a 400.\n\nThere is no \"clear it and let the model re-title\" form: a cleared title\ncannot be expressed on the wire, where an absent `SessionPatch.title`\nalready means \"unchanged\"."
           }
         }
       },
