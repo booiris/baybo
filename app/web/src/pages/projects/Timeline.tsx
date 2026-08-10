@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { RiSendPlane2Line } from 'react-icons/ri';
 
 import { MarkdownBody } from '../ChatPage';
 import { Avatar } from './Avatar';
@@ -23,6 +24,10 @@ import {
   type PendingApproval as PendingApprovalRow,
   type Tone,
 } from './timelineModel';
+
+/// How tall the composer may grow before it scrolls instead. The chat
+/// composer's number, so the two boxes behave the same.
+const COMPOSER_MAX_PX = 200;
 
 const TONE_DOT: Record<Tone, string> = {
   ok: 'bg-ok',
@@ -91,7 +96,7 @@ function Comment({ event, now }: { event: IssueEvent; now: number }) {
           <span className="tabular-nums font-normal">{eventTime(event.created_at_ms, now)}</span>
         </div>
         <div
-          className={`mt-1 border-2 border-black rounded-md px-3 py-2 shadow-brutal-xs chat-prose text-[0.82rem] break-words ${
+          className={`mt-1 border-2 border-black rounded-md px-3 py-2 shadow-brutal-xs chat-prose timeline-prose break-words ${
             mine ? 'bg-brand/60' : 'bg-surface'
           }`}
         >
@@ -237,6 +242,16 @@ export function Timeline({
   const query = mentionQuery(draft, caret);
   const candidates = query === null || dismissed ? [] : mentionCandidates(team, query.prefix);
 
+  // Auto-grow up to a cap, as the chat composer does: idle is one line, a
+  // multi-paragraph draft grows into it, and past the cap it scrolls rather
+  // than eating the timeline above.
+  useLayoutEffect(() => {
+    const field = box.current;
+    if (field === null) return;
+    field.style.height = 'auto';
+    field.style.height = `${String(Math.min(field.scrollHeight, COMPOSER_MAX_PX))}px`;
+  }, [draft]);
+
   // Measured after layout, from the field itself: the popup follows the caret
   // through wraps, scrolls and resizes, none of which can be worked out from
   // the offset alone.
@@ -280,55 +295,61 @@ export function Timeline({
   const asks = approvalAsks(events);
   const open = new Set(pendingApprovals(events).map((approval) => approval.callId));
   const mention = mentionHint(issue, draft, team);
-  const hint = mention === null ? commentHint(issue, runs, team) : { text: mention, tone: 'brand' as const };
+  const hint = mention ?? commentHint(issue, runs, team);
 
   return (
-    <section className="mt-6 border-t-2 border-black/20 pt-4">
+    // A column that takes whatever height is left in the pane, so the entry
+    // list can absorb the slack and leave the composer at the foot even on a
+    // card with two lines of history. `sticky` alone only pins once the page
+    // is long enough to scroll.
+    <section className="mt-2 flex flex-1 flex-col border-t border-black/20 pt-4">
       <h2 className="font-mono text-[0.62rem] font-bold uppercase tracking-[0.14em] text-ink-soft">
         Activity
       </h2>
 
-      {events.length === 0 ? (
-        <p className="mt-2 font-mono text-[0.7rem] text-ink-soft">Nothing has happened yet.</p>
-      ) : (
-        <ul
-          // `pr-4` is the composer's own right inset — its 2px border plus its
-          // 14px padding — so a row's timestamp lands on the same line as the
-          // send button rather than 16px past it.
-          className="mt-2 ml-[5px] pr-4 border-l-2 border-black/20"
-        >
-          {events.map((event) => {
-            if (eventShape(event) === 'comment') {
-              return <Comment key={event.id} event={event} now={now} />;
-            }
-            if (event.body.kind === 'approval_resolved') {
-              return (
-                <ResolvedApproval
-                  key={event.id}
-                  event={event}
-                  ask={asks.get(event.body.call_id)}
-                  now={now}
-                />
-              );
-            }
-            if (event.body.kind === 'approval_requested') {
-              // Answered prompts are not narrated twice: the resolved card
-              // below carries the same command with its verdict on it.
-              if (!open.has(event.body.call_id)) return null;
-              const approval = asks.get(event.body.call_id);
-              return approval === undefined ? null : (
-                <PendingApproval
-                  key={event.id}
-                  approval={approval}
-                  onResolve={onResolveApproval}
-                  busy={busy}
-                />
-              );
-            }
-            return <Note key={event.id} event={event} now={now} />;
-          })}
-        </ul>
-      )}
+      <div className="flex-1">
+        {events.length === 0 ? (
+          <p className="mt-2 font-mono text-[0.7rem] text-ink-soft">Nothing has happened yet.</p>
+        ) : (
+          <ul
+            // `pr-4` is the composer's own right inset — its 2px border plus its
+            // 14px padding — so a row's timestamp lands on the same line as the
+            // send button rather than 16px past it.
+            className="mt-2 ml-[5px] pr-4 border-l-2 border-black/20"
+          >
+            {events.map((event) => {
+              if (eventShape(event) === 'comment') {
+                return <Comment key={event.id} event={event} now={now} />;
+              }
+              if (event.body.kind === 'approval_resolved') {
+                return (
+                  <ResolvedApproval
+                    key={event.id}
+                    event={event}
+                    ask={asks.get(event.body.call_id)}
+                    now={now}
+                  />
+                );
+              }
+              if (event.body.kind === 'approval_requested') {
+                // Answered prompts are not narrated twice: the resolved card
+                // below carries the same command with its verdict on it.
+                if (!open.has(event.body.call_id)) return null;
+                const approval = asks.get(event.body.call_id);
+                return approval === undefined ? null : (
+                  <PendingApproval
+                    key={event.id}
+                    approval={approval}
+                    onResolve={onResolveApproval}
+                    busy={busy}
+                  />
+                );
+              }
+              return <Note key={event.id} event={event} now={now} />;
+            })}
+          </ul>
+        )}
+      </div>
 
       {/* Pinned to the bottom of the pane: the timeline is the long thing on
           this page, and a composer that scrolls away with it means reading
@@ -345,12 +366,13 @@ export function Timeline({
           aria-hidden
           className="pointer-events-none absolute -inset-x-2 -bottom-5 -top-16 bg-linear-to-t from-surface from-45% to-transparent"
         />
-        <div className="relative border-2 border-black rounded-xl bg-surface px-3.5 py-2.5 shadow-brutal-sm">
+        <div className="relative border-2 border-black rounded-2xl bg-white shadow-brutal">
           <div className="relative">
             <textarea
               ref={box}
-              className="w-full min-h-[64px] bg-transparent font-sans text-[0.82rem] outline-none resize-y"
-              placeholder="Reply… @ a teammate to bring them onto this issue"
+              rows={1}
+              className="w-full resize-none bg-transparent px-4 pt-3 pb-1.5 font-sans text-sm leading-relaxed focus:outline-none placeholder:text-ink-soft/70"
+              placeholder="Comment…  (@ a teammate, Shift+Enter for newline)"
               value={draft}
               onChange={(event) => {
                 setDraft(event.target.value);
@@ -365,12 +387,12 @@ export function Timeline({
                   setDismissed(true);
                   return;
                 }
-                if (event.key === 'Tab' && candidates.length > 0) {
+                if ((event.key === 'Tab' || event.key === 'Enter') && candidates.length > 0) {
                   event.preventDefault();
                   complete(candidates[0].handle);
                   return;
                 }
-                if (event.key === 'Enter' && (event.metaKey || event.ctrlKey) && trimmed.length > 0) {
+                if (event.key === 'Enter' && !event.shiftKey && trimmed.length > 0) {
                   event.preventDefault();
                   send();
                 }
@@ -410,24 +432,16 @@ export function Timeline({
               </ul>
             )}
           </div>
-          <div className="mt-2.5 flex items-center justify-end gap-2">
-            {/* The words are gone, the warning is not: whether sending spends
-                money or only records is the one thing worth knowing before
-                the click, and it is the button's own tooltip. */}
-            <span
-              aria-hidden
-              title={hint.text}
-              className={`h-[7px] w-[7px] shrink-0 rounded-full ${TONE_DOT[hint.tone]}`}
-            />
+          <div className="flex items-center justify-end gap-2 px-2.5 pb-2 pt-0.5">
             <button
               type="button"
               aria-label="Comment"
-              title={hint.text}
+              title={hint}
               disabled={trimmed.length === 0 || busy}
               onClick={send}
-              className="flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-full border-2 border-black bg-brand font-mono text-[0.9rem] font-bold text-ink shadow-brutal-xs disabled:opacity-40 disabled:shadow-none"
+              className="shrink-0 h-8 w-8 flex items-center justify-center bg-brand text-ink border-2 border-black rounded-full shadow-brutal-xs hover:bg-brand-hover active:translate-x-[1px] active:translate-y-[1px] active:shadow-none disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
             >
-              ↑
+              <RiSendPlane2Line className="text-base" />
             </button>
           </div>
         </div>

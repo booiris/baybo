@@ -97,7 +97,7 @@ describe('Timeline', () => {
         busy={false}
       />,
     );
-    const box = screen.getByPlaceholderText(/^Reply…/);
+    const box = screen.getByPlaceholderText(/^Comment…/);
     await userEvent.type(box, 'ask @de');
 
     await userEvent.click(screen.getByRole('button', { name: /@dev-1/ }));
@@ -118,7 +118,7 @@ describe('Timeline', () => {
         busy={false}
       />,
     );
-    const box = screen.getByPlaceholderText(/^Reply…/);
+    const box = screen.getByPlaceholderText(/^Comment…/);
     await userEvent.type(box, 'ask @de');
     expect(screen.getByRole('button', { name: /@dev-1/ })).toBeInTheDocument();
 
@@ -129,7 +129,7 @@ describe('Timeline', () => {
 
   it('sends trimmed text and clears the box', async () => {
     const onComment = renderTimeline([]);
-    const box = screen.getByPlaceholderText(/^Reply…/);
+    const box = screen.getByPlaceholderText(/^Comment…/);
 
     await userEvent.type(box, '   look at the retry path   ');
     await userEvent.click(screen.getByRole('button', { name: 'Comment' }));
@@ -140,7 +140,7 @@ describe('Timeline', () => {
 
   it('refuses to send whitespace', async () => {
     const onComment = renderTimeline([]);
-    await userEvent.type(screen.getByPlaceholderText(/^Reply…/), '   ');
+    await userEvent.type(screen.getByPlaceholderText(/^Comment…/), '   ');
     expect(screen.getByRole('button', { name: 'Comment' })).toBeDisabled();
     expect(onComment).not.toHaveBeenCalled();
   });

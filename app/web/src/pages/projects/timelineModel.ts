@@ -17,9 +17,8 @@ export function eventShape(event: IssueEvent): EventShape {
   return event.body.kind === 'comment' ? 'comment' : 'note';
 }
 
-/// The six colours this board reads a status in. One vocabulary for the
-/// timeline's dots and the composer's chip, so "amber" cannot mean a warning
-/// on one and work-about-to-start on the other.
+/// The six colours this board reads a status in — one vocabulary, so "amber"
+/// cannot mean a warning in one place and work-about-to-start in another.
 export type Tone = 'ok' | 'err' | 'warn' | 'info' | 'brand' | 'muted';
 
 /// What colour an entry's dot is. The timeline is skimmed down its rail
@@ -177,8 +176,7 @@ function unnamedEvent(_body: never): string {
   return 'did something this page is too old to describe';
 }
 
-/// What sending will do, in the assignee's own name, and the colour that
-/// says it at a glance.
+/// What sending will do, in the assignee's own name.
 ///
 /// `team` is required rather than optional: the assignee on an issue is an
 /// agent **id**, and every sentence below addresses a person. Resolving it
@@ -188,40 +186,28 @@ export function commentHint(
   issue: { status: IssueStatus; assignee?: string | null; cancelled_at_ms?: number | null },
   runs: { status: RunStatus }[],
   team: Agent[],
-): { text: string; tone: Tone } {
+): string {
   const assignee = issue.assignee == null ? null : handleOf(team, issue.assignee);
   if (assignee == null) {
-    return { text: 'Records only — nobody is assigned to this issue yet.', tone: 'warn' };
+    return 'Records only — nobody is assigned to this issue yet.';
   }
   if (issue.cancelled_at_ms != null) {
-    return { text: 'Records only — this issue is cancelled.', tone: 'muted' };
+    return 'Records only — this issue is cancelled.';
   }
   if (issue.status === 'backlog' || issue.status === 'done') {
-    return {
-      text: `Records only — @${assignee} is not working on this right now.`,
-      tone: 'muted',
-    };
+    return `Records only — @${assignee} is not working on this right now.`;
   }
   const live = unsettledRun(runs);
   if (live?.status === 'held') {
-    return {
-      text: `@${assignee} will read this when the held run starts — the project is over its daily budget.`,
-      tone: 'warn',
-    };
+    return `@${assignee} will read this when the held run starts — the project is over its daily budget.`;
   }
   if (live?.status === 'queued') {
-    return {
-      text: `@${assignee} will read this when the queued run starts.`,
-      tone: 'brand',
-    };
+    return `@${assignee} will read this when the queued run starts.`;
   }
   if (live?.status === 'running') {
-    return {
-      text: `@${assignee} is mid-run — this is picked up when that run finishes.`,
-      tone: 'info',
-    };
+    return `@${assignee} is mid-run — this is picked up when that run finishes.`;
   }
-  return { text: `Starts a run: @${assignee} will read this now.`, tone: 'brand' };
+  return `Starts a run: @${assignee} will read this now.`;
 }
 
 /// When an entry happened, to the minute — always. An older entry used to

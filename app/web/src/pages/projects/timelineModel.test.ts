@@ -140,52 +140,46 @@ describe('commentHint', () => {
 
   it('says record-only when nobody is on the issue', () => {
     const hint = commentHint({ status: 'in_progress', assignee: null }, [], team);
-    expect(hint.text).toContain('nobody is assigned');
-    // Degraded, not neutral: the chip's dot is the only thing a reader
-    // takes in before pressing send.
-    expect(hint.tone).toBe('warn');
+    expect(hint).toContain('nobody is assigned');
   });
 
   it('says record-only for parked or cancelled work even with an assignee', () => {
-    expect(commentHint({ status: 'backlog', assignee: DEV_1 }, [], team).text).toContain(
+    expect(commentHint({ status: 'backlog', assignee: DEV_1 }, [], team)).toContain(
       'not working on this',
     );
-    expect(commentHint({ status: 'done', assignee: DEV_1 }, [], team).text).toContain(
+    expect(commentHint({ status: 'done', assignee: DEV_1 }, [], team)).toContain(
       'not working on this',
     );
     expect(
-      commentHint({ status: 'in_progress', assignee: DEV_1, cancelled_at_ms: 1 }, [], team).text,
+      commentHint({ status: 'in_progress', assignee: DEV_1, cancelled_at_ms: 1 }, [], team),
     ).toContain('cancelled');
-    expect(commentHint({ status: 'backlog', assignee: DEV_1 }, [], team).tone).toBe('muted');
   });
 
   it('promises a run when the assignee is on live work and nothing is reading', () => {
-    expect(commentHint({ status: 'todo', assignee: DEV_1 }, [], team)).toEqual({
-      text: 'Starts a run: @dev-1 will read this now.',
-      tone: 'brand',
-    });
+    expect(commentHint({ status: 'todo', assignee: DEV_1 }, [], team)).toBe(
+      'Starts a run: @dev-1 will read this now.',
+    );
     // The id must never reach the composer — a person is addressed by
     // handle, and a ULID in a sentence is the tell that a raw row escaped.
-    expect(commentHint({ status: 'todo', assignee: DEV_1 }, [], team).text).not.toContain(DEV_1);
-    expect(commentHint({ status: 'review', assignee: DEV_1 }, settled, team).text).toContain(
+    expect(commentHint({ status: 'todo', assignee: DEV_1 }, [], team)).not.toContain(DEV_1);
+    expect(commentHint({ status: 'review', assignee: DEV_1 }, settled, team)).toContain(
       'Starts a run',
     );
   });
 
   it('distinguishes a queued run from one already going', () => {
-    expect(commentHint({ status: 'in_progress', assignee: DEV_1 }, queued, team).text).toContain(
+    expect(commentHint({ status: 'in_progress', assignee: DEV_1 }, queued, team)).toContain(
       'when the queued run starts',
     );
-    expect(commentHint({ status: 'in_progress', assignee: DEV_1 }, live, team).text).toContain(
+    expect(commentHint({ status: 'in_progress', assignee: DEV_1 }, live, team)).toContain(
       'when that run finishes',
     );
   });
 
   it('says a held run will read it, and why it has not started', () => {
     const hint = commentHint({ status: 'in_progress', assignee: DEV_1 }, held, team);
-    expect(hint.text).toContain('held run starts');
-    expect(hint.text).toContain('daily budget');
-    expect(hint.tone).toBe('warn');
+    expect(hint).toContain('held run starts');
+    expect(hint).toContain('daily budget');
   });
 });
 

@@ -36,7 +36,7 @@ import {
   type IssuePriority,
   type IssueStatus,
 } from './boardModel';
-import { MarkdownBody } from '../ChatPage';
+import { MarkdownEditor } from './MarkdownEditor';
 import { Avatar } from './Avatar';
 import { PickerOverlay } from './PickerOverlay';
 import { SubIssues } from './SubIssues';
@@ -169,7 +169,6 @@ export function IssueDetailPage() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [title, setTitle] = useState('');
-  const [description, setDescription] = useState('');
   const [saving, setSaving] = useState(false);
   const [showMore, setShowMore] = useState(false);
   const [confirmCancel, setConfirmCancel] = useState(false);
@@ -177,26 +176,18 @@ export function IssueDetailPage() {
   const [blockReason, setBlockReason] = useState('');
   const [copied, setCopied] = useState(false);
   const [editingTitle, setEditingTitle] = useState(false);
-  const [editingDescription, setEditingDescription] = useState(false);
-  const serverProse = useRef({ title: '', description: '' });
-  const descriptionBox = useRef<HTMLTextAreaElement | null>(null);
+  const serverTitle = useRef('');
+  /// What the editor last reported, for a blur listener that was registered
+  /// once and cannot see React state — and whether it ever reported at all.
+  /// A blur fires whether or not anything was typed, and the draft starts
+  /// empty, so committing unconditionally would wipe the description of any
+  /// card you merely clicked into.
+  const draftDescription = useRef('');
+  const descriptionTouched = useRef(false);
   const pane = useRef<HTMLElement | null>(null);
   /// Whether this card has already been dropped at the foot of its timeline.
   /// Reset per card, so opening a second one lands the same way.
   const landed = useRef(false);
-
-  // The field grows to its text, so entering and leaving the editor does not
-  // move the page. A textarea's own height comes from `rows`, which is a
-  // count of lines and knows nothing about the rendered markdown standing in
-  // its place — a long description would collapse to the minimum the moment
-  // it was clicked, and spring back on blur. Laid out before paint, or the
-  // jump happens anyway and is merely one frame shorter.
-  useLayoutEffect(() => {
-    const box = descriptionBox.current;
-    if (box === null) return;
-    box.style.height = 'auto';
-    box.style.height = `${String(box.scrollHeight)}px`;
-  }, [description, editingDescription]);
 
   // A card opens at the foot of its own history — the newest entries and the
   // composer — rather than at a title you have already read. Once per card,
@@ -205,6 +196,8 @@ export function IssueDetailPage() {
   // reading back through it. Before paint, so it lands rather than jumps.
   useEffect(() => {
     landed.current = false;
+    draftDescription.current = '';
+    descriptionTouched.current = false;
   }, [projectId, number]);
 
   useLayoutEffect(() => {
@@ -252,15 +245,9 @@ export function IssueDetailPage() {
       // *new* server value — never equal on a first load, which left both
       // editors empty on every card and armed Save to write those blanks
       // back.
-      const previous = serverProse.current;
-      serverProse.current = {
-        title: outcome.value.title,
-        description: outcome.value.description,
-      };
-      setTitle((current) => (current === previous.title ? outcome.value.title : current));
-      setDescription((current) =>
-        current === previous.description ? outcome.value.description : current,
-      );
+      const previousTitle = serverTitle.current;
+      serverTitle.current = outcome.value.title;
+      setTitle((current) => (current === previousTitle ? outcome.value.title : current));
       setError(null);
       setLoading(false);
     }
@@ -292,11 +279,7 @@ export function IssueDetailPage() {
       setError(null);
       setIssue(outcome.value);
       setTitle(outcome.value.title);
-      setDescription(outcome.value.description);
-      serverProse.current = {
-        title: outcome.value.title,
-        description: outcome.value.description,
-      };
+      serverTitle.current = outcome.value.title;
     },
     [client, logout, number, projectId],
   );
@@ -472,7 +455,6 @@ export function IssueDetailPage() {
 
   const commitDescription = useCallback(
     (next: string) => {
-      setEditingDescription(false);
       if (issue != null && next !== issue.description) void apply({ description: next });
     },
     [apply, issue],
@@ -574,15 +556,27 @@ export function IssueDetailPage() {
         >
           <RiArrowLeftLine /> Board
         </Link>
-        <span className="font-mono text-[0.85rem] font-bold">#{issue.number}</span>
-        <span className="border-2 border-black bg-brand/35 rounded px-2 font-mono text-[0.6rem] font-bold uppercase tracking-wider">
+        <span className="shrink-0 border-2 border-black bg-brand/35 rounded px-2 font-mono text-[0.6rem] font-bold uppercase tracking-wider">
           {COLUMN_LABEL[issue.status]}
         </span>
         {cancelled ? (
-          <span className="border-2 border-black bg-canvas rounded px-2 font-mono text-[0.6rem] font-bold uppercase tracking-wider text-ink-soft">
+          <span className="shrink-0 border-2 border-black bg-canvas rounded px-2 font-mono text-[0.6rem] font-bold uppercase tracking-wider text-ink-soft">
             Cancelled
           </span>
         ) : null}
+        <span className="shrink-0 font-mono text-[0.85rem] font-bold">#{issue.number}</span>
+        {/* The card opens at the foot of its timeline, which puts the heading
+            off-screen — so the header carries the name too. Tracks the editor
+            rather than the loaded row, so a title being typed reads the same
+            in both places. */}
+        <span
+          title={title}
+          className={`min-w-0 flex-1 truncate font-mono text-[0.78rem] ${
+            cancelled ? 'line-through text-ink-soft' : ''
+          }`}
+        >
+          {title.trim() === '' ? <span className="text-ink-soft">Untitled</span> : title}
+        </span>
         {live !== null && issue.assignee != null ? (
           // The same run-status frame the board card and the team strip
           // read, so the shimmer means one thing everywhere.
@@ -609,7 +603,7 @@ export function IssueDetailPage() {
       <div className="flex-1 min-h-0 flex overflow-hidden bg-surface">
         <main
           ref={pane}
-          className="flex-1 min-w-0 overflow-y-auto overscroll-none py-5 pl-18 pr-5"
+          className="flex flex-col flex-1 min-w-0 overflow-y-auto overscroll-none py-5 pl-18 pr-5"
         >
           {error != null ? (
             <div className="mb-4 bg-white border-2 border-err text-err rounded-md px-3 py-2 font-mono text-[0.78rem] break-words">
@@ -623,10 +617,10 @@ export function IssueDetailPage() {
               nameless text box — a two-field form where the mockup has a
               document. Both halves now share one read-then-edit gesture, and
               leaving the field is what writes it. */}
-          <h1 className="font-mono text-[1.15rem] font-bold leading-[1.7rem]">
+          <h1 className="font-mono text-[1.4rem] font-bold leading-[2rem]">
             {editingTitle ? (
               <input
-                className="block w-full bg-transparent border-b-2 border-black outline-none font-mono text-[1.15rem] font-bold leading-[1.7rem]"
+                className="block w-full bg-transparent border-b-2 border-black outline-none font-mono text-[1.4rem] font-bold leading-[2rem]"
                 value={title}
                 autoFocus
                 aria-label="Issue title"
@@ -651,7 +645,7 @@ export function IssueDetailPage() {
                 onClick={() => {
                   setEditingTitle(true);
                 }}
-                className={`block w-full text-left border-b-2 border-transparent leading-[1.7rem] cursor-text underline-offset-4 hover:underline hover:decoration-dashed hover:decoration-black/40 ${
+                className={`block w-full text-left border-b-2 border-transparent leading-[2rem] cursor-text underline-offset-4 hover:underline hover:decoration-dashed hover:decoration-black/40 ${
                   cancelled ? 'line-through text-ink-soft' : ''
                 }`}
               >
@@ -663,67 +657,34 @@ export function IssueDetailPage() {
               </button>
             )}
           </h1>
-          {/* The mode is the edit flag and nothing else. It used to also open
-              the field whenever the text was empty — so on a card with no
-              description you got a textarea you had not asked for, and the
-              first character you typed made the text non-empty, flipped the
-              condition, and swapped the field out from under the cursor.
-              One character in, and typing stopped. */}
-          {editingDescription ? (
-            <textarea
-              ref={descriptionBox}
-              // Metrically identical to the read view above it, or clicking
-              // in resizes the text under the cursor: `.chat-prose` is
-              // unlayered on purpose (`index.css:147`) so its 15px/1.7 beats
-              // any `text-*` utility, and the field was sitting at 13.6px.
-              className="mt-1 block w-full min-h-24 bg-canvas rounded-md py-2.5 font-sans text-[15px] leading-relaxed outline-none resize-none overflow-hidden"
-              placeholder="What, why, and what done looks like…"
-              aria-label="Issue description"
-              autoFocus
-              onBlur={() => {
-                commitDescription(description);
-              }}
-              onKeyDown={(event) => {
-                if (event.key === 'Escape') {
-                  setDescription(issue.description);
-                  setEditingDescription(false);
-                }
-              }}
-              value={description}
-              onChange={(event) => {
-                setDescription(event.target.value);
-              }}
-            />
-          ) : (
-            // Read mode renders the markdown the description is written in,
-            // through the same component the chat thread uses — a raw
-            // textarea showed `**bold**` and bare `-` bullets to a reader
-            // who only wanted to read it.
-            <div
-              role="button"
-              tabIndex={0}
-              title="Click to edit"
-              // Squared off against the pane on both sides: the box now
-              // spans exactly what the comment composer below spans, and with
-              // no padding of its own the prose still starts on the same edge
-              // as the title and every heading under it.
-              className="mt-1 w-full min-h-24 rounded-md py-2.5 chat-prose cursor-text hover:bg-canvas"
-              onClick={() => {
-                setEditingDescription(true);
-              }}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter') setEditingDescription(true);
-              }}
-            >
-              {description.trim() === '' ? (
-                // Same shape the title uses for a card with no name: an
-                // invitation you click, not a field lying in wait.
-                <p className="text-ink-soft">What, why, and what done looks like…</p>
-              ) : (
-                <MarkdownBody text={description} />
-              )}
-            </div>
-          )}
+          {/* One always-on editor, keyed to the card so opening another
+              one does not inherit this one's document. There is no read mode
+              to swap to any more, which is what every height-jump on this
+              block was: two boxes pretending to be one.
+
+              No minimum height: an empty document is one empty paragraph,
+              which is one line, which is what an empty description should
+              look like. `shrink-0` stays — the pane is a flex column and a
+              flex item is otherwise free to be squeezed below its content. */}
+          <MarkdownEditor
+            key={`${projectId}:${String(issue.number)}`}
+            className="mt-1 w-full shrink-0 md-editor"
+            initialValue={issue.description}
+            ariaLabel="Issue description"
+            placeholder="Add description…"
+            onChange={(markdown) => {
+              draftDescription.current = markdown;
+              descriptionTouched.current = true;
+            }}
+            onBlur={() => {
+              // From the ref, not from state: Milkdown registers this listener
+              // once, so a closure over state would commit whatever the
+              // description was when the editor mounted.
+              if (!descriptionTouched.current) return;
+              commitDescription(draftDescription.current);
+            }}
+          />
+
           <SubIssues
             projectId={projectId}
             children={children}

@@ -279,3 +279,104 @@ ul.md-list ul.md-list > li::before {
 ol.md-list > li::before {
   content: counter(list-item) ".";
 }
+
+/* Milkdown's editable surface. The library ships no styling of its own beyond
+   its theme packages, which we do not use — the card's prose has to look like
+   the rest of this system, not like somebody else's editor. Unlayered on
+   purpose, same reason `.chat-prose` above is: it has to outrank the utility
+   classes on the wrapper. */
+.md-editor .ProseMirror {
+  /* The placeholder below is absolutely positioned; without this it would
+     resolve against whatever positioned ancestor it happened to find. */
+  position: relative;
+  outline: none;
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.625;
+}
+
+.md-editor .ProseMirror > * + * {
+  margin-top: 0.5rem;
+}
+
+.md-editor .ProseMirror h1,
+.md-editor .ProseMirror h2,
+.md-editor .ProseMirror h3 {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.md-editor .ProseMirror h1 { font-size: 1rem; }
+.md-editor .ProseMirror h2 { font-size: 0.92rem; }
+.md-editor .ProseMirror h3 { font-size: 0.85rem; }
+
+.md-editor .ProseMirror ul,
+.md-editor .ProseMirror ol {
+  padding-left: 1.25rem;
+}
+.md-editor .ProseMirror ul { list-style: disc; }
+.md-editor .ProseMirror ol { list-style: decimal; }
+.md-editor .ProseMirror li::marker { color: var(--color-ink-soft); }
+
+.md-editor .ProseMirror code {
+  font-family: var(--font-mono);
+  font-size: 0.86em;
+  background: var(--color-canvas);
+  border: 1px solid rgba(42, 37, 32, 0.25);
+  border-radius: 4px;
+  padding: 0 0.25em;
+}
+
+.md-editor .ProseMirror pre {
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  background: var(--color-canvas);
+  border: 2px solid var(--color-ink);
+  border-radius: 6px;
+  padding: 0.6rem 0.75rem;
+  overflow-x: auto;
+}
+.md-editor .ProseMirror pre code {
+  background: none;
+  border: 0;
+  padding: 0;
+}
+
+.md-editor .ProseMirror blockquote {
+  border-left: 3px solid rgba(42, 37, 32, 0.3);
+  padding-left: 0.75rem;
+  color: var(--color-ink-soft);
+}
+
+.md-editor .ProseMirror a {
+  text-decoration: underline;
+}
+
+/* The prompt for an empty document. `attr()` only reads the element's own
+   attributes, so the rule hangs off the node carrying `data-placeholder`.
+   Two gates, and both must agree the document is empty: `.md-empty` comes
+   from the component, and the `:has()` reads the editor's own DOM — an empty
+   ProseMirror paragraph holds a trailing `<br>` (which is also why it never
+   matches `:empty`). The DOM changes on the keystroke itself, so the prompt
+   disappears with the first character instead of a React render later, and
+   the two-gate shape means the worst either can do is fail to *show* a
+   prompt rather than leave one sitting under the text. */
+.md-empty .ProseMirror[data-placeholder]:has(> p:only-child > br)::before {
+  content: attr(data-placeholder);
+  color: var(--color-ink-soft);
+  pointer-events: none;
+  position: absolute;
+  top: 0;
+  left: 0;
+}
+
+/* A timeline bubble is smaller than a chat message on purpose: the card's
+   history is skimmed beside its properties, not read full-width like a
+   conversation. Two classes rather than a utility, because `.chat-prose` is
+   unlayered and would outrank any `text-*` on the same element — a plain
+   utility here is a class that looks applied and never is. */
+.chat-prose.timeline-prose {
+  font-size: 13.5px;
+}

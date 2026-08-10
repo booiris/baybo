@@ -79,6 +79,32 @@ const client = {
   PATCH: vi.fn(),
 };
 
+vi.mock('./MarkdownEditor', () => ({
+  MarkdownEditor: ({
+    initialValue,
+    onChange,
+    onBlur,
+    ariaLabel,
+    placeholder,
+  }: {
+    initialValue: string;
+    onChange: (markdown: string) => void;
+    onBlur?: () => void;
+    ariaLabel: string;
+    placeholder?: string;
+  }) => (
+    <textarea
+      aria-label={ariaLabel}
+      placeholder={placeholder}
+      defaultValue={initialValue}
+      onChange={(event) => {
+        onChange(event.target.value);
+      }}
+      onBlur={onBlur}
+    />
+  ),
+}));
+
 const auth = { logout: vi.fn() };
 vi.mock('../../api/auth', () => ({
   useAdminClient: () => client,
@@ -152,6 +178,22 @@ describe('IssueDetailPage prose', () => {
 
     await userEvent.click(screen.getByRole('button', { name: 'Wire the retry' }));
     expect(screen.getByLabelText('Issue title')).toHaveValue('Wire the retry');
+  });
+
+  it('names the card in the header too, since it opens below the heading', async () => {
+    renderIssue(issue());
+
+    // Landing at the foot of the timeline puts the heading off-screen, so the
+    // header is the only place the name shows — and it follows the editor, so
+    // a title being typed reads the same in both.
+    const heading = await screen.findByRole('button', { name: 'Wire the retry' });
+    const header = document.querySelector('header');
+    expect(header).not.toBeNull();
+    expect(header?.textContent ?? '').toContain('Wire the retry');
+
+    await userEvent.click(heading);
+    await userEvent.type(screen.getByLabelText('Issue title'), ' now');
+    expect(header?.textContent).toContain('Wire the retry now');
   });
 
   it('writes the title when the field is left, not when a button is pressed', async () => {
@@ -232,25 +274,12 @@ describe('IssueDetailPage prose', () => {
 
   it('says a card has no title rather than showing nothing to click', async () => {
     renderIssue(issue({ title: '' }));
-    expect(await screen.findByText('Untitled')).toBeInTheDocument();
+    // The heading specifically — the header carries the name too, so a bare
+    // text match would find either and prove neither is clickable.
+    expect(await screen.findByRole('button', { name: 'Untitled' })).toBeInTheDocument();
   });
 
-  it('keeps taking input on a card whose description is empty', async () => {
-    // The field used to open by itself whenever the text was empty, so the
-    // first character typed made it non-empty and swapped the field out from
-    // under the cursor: one character in, and typing stopped.
-    client.PATCH.mockClear();
-    renderIssue(issue({ description: '' }));
 
-    await userEvent.click(await screen.findByText(/What, why/));
-    const box = screen.getByLabelText('Issue description');
-    await userEvent.type(box, 'the timer never clears');
-
-    expect(box).toHaveValue('the timer never clears');
-    expect(box).toHaveFocus();
-    // …and nothing was written until the field was left.
-    expect(client.PATCH).not.toHaveBeenCalled();
-  });
 
   it('writes the description when the field is left', async () => {
     client.PATCH.mockClear().mockResolvedValue({
@@ -260,8 +289,7 @@ describe('IssueDetailPage prose', () => {
     });
     renderIssue(issue({ description: '' }));
 
-    await userEvent.click(await screen.findByText(/What, why/));
-    await userEvent.type(screen.getByLabelText('Issue description'), 'clear on ack');
+    await userEvent.type(await screen.findByLabelText('Issue description'), 'clear on ack');
     await userEvent.tab();
 
     expect(client.PATCH).toHaveBeenCalledWith(
