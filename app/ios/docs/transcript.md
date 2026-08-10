@@ -86,14 +86,22 @@ hatch (not the fix): it puts one conversation back into the state a COLD OPEN
 would produce, by re-running the cold path rather than by adding a second
 synchronisation routine.
 
-**It is reached from the CHAT LIST** — a row's long-press context menu, behind a
+**It is reached by long-pressing a conversation ROW** — a `.contextMenu` behind a
 `ConfirmDialog` (`AppStore.promptResync` → `requestResync`). The header capsule's
-`ModelMenuPanel` carried it first and no longer does: the list needs no
-conversation opened first, does not depend on `ModelCatalog` having loaded, and
-already owns the other session-level operations (archive / delete / pin). The
-confirm is the one in `RootView` that does not wear red (`commitTint: Theme.ink`)
-— nothing is taken away — but it still asks, because the thread blanks under a
-reader who may be mid-way through it and there is no undo the way archive has one.
+`ModelMenuPanel` carried it first and no longer does: a row needs no conversation
+opened first, does not depend on `ModelCatalog` having loaded, and already owns
+the other session-level operations (archive / delete / pin). The confirm is the
+one in `RootView` that does not wear red (`commitTint: Theme.ink`) — nothing is
+taken away — but it still asks, because the thread blanks under a reader who may
+be mid-way through it and there is no undo the way archive has one.
+
+**Every screen that lists a conversation carries it**, via the one
+`resyncContextMenu` modifier (`ChatListScreen.swift`): the chat list, a cron
+job's fires (`CronGroupScreen`), and the archived screen. It shipped on the chat
+list alone, which left a cron fire — a long, unattended, tool-heavy thread, the
+exact shape the hatch exists for — as the one conversation with no way to reach
+it. Where a row happens to be listed is not a property of the conversation, so a
+new list surface gets the modifier too.
 
 Two steps: **delete the mirror** (`SessionIndex.dropTranscriptMirror` — the row
 stays), then **reload the page IF the webview is standing on that session**

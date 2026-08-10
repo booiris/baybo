@@ -38,9 +38,14 @@ Trailing swipe archives / deletes, leading swipe pins — the three everyday ver
 (`ChatListScreen.chatRow`). **Long-press** adds the fourth, the per-session
 resync ([transcript.md](transcript.md#per-session-resync-the-escape-hatch)), in a
 `.contextMenu` rather than a fourth swipe button: it is reached once a year, and
-a menu row has space to say what it does. It lives on the list because it needs
+a menu row has space to say what it does. It lives on a row because it needs
 no conversation opened first and belongs beside the other session-level
 operations; the header capsule's model panel carried it first and no longer does.
+
+The long-press is one shared modifier, `resyncContextMenu`, and **every screen
+that lists a conversation applies it** — this list, `CronGroupScreen`'s fires and
+`ArchivedScreen` — because where a row is listed says nothing about whether its
+transcript can drift. A new session-listing screen wires it in too.
 
 ## Live list unread
 

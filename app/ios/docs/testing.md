@@ -93,6 +93,30 @@ hit-testing (the stroke-only pill whose flanks were dead), UIKit swipe
 thresholds, presentation-binding lifecycles, the native↔web bridge round-trip.
 Everything else is 100x cheaper as a reducer test.
 
+### A tap lands on the element's CENTRE, so an a11y frame is a test surface
+
+`element.tap()` synthesises a touch at the middle of the element's
+**accessibility frame** — not on the pixels you can see. When the two disagree
+the button is dead to XCUITest and perfectly alive to a finger, which reads as
+"navigation is broken" and is nothing of the sort.
+
+It has already happened once. `ChatHeaderView`'s back chevron reported
+`(0, 0, 402, 108)` — the whole bar, status bar included — because an offline
+session renders neither the model pill nor the index button, leaving the chevron
+as the bar's ONLY focusable child; SwiftUI collapsed the bar into it, and the
+inherited frame was the one the veil's `ignoresSafeArea` had stretched. Every
+back tap landed on empty header. `CronExitUITests` (both cases) and
+`ArchiveFlowUITests.testDeepNavChainLeavesStackResponsive` failed for weeks with
+no navigation code involved. The fix is one line — `.accessibilityElement(children:
+.contain)` on the bar — and the general rule is: **a container whose visible
+children come and go must be declared a container**, or the last child standing
+inherits its geometry.
+
+Diagnose it by printing `app.debugDescription` and reading the frames, then
+confirm with a raw-coordinate tap (`app.coordinate(withNormalizedOffset: .zero)
+.withOffset(...)`): if the coordinate tap works and `element.tap()` does not, the
+frame is the bug.
+
 ## `BayboUITestCase` and the launch contract
 
 **`BayboUITestCase` is the base class and every smoke must use its `launch(_:)`.**

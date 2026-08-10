@@ -214,19 +214,8 @@ struct ChatListScreen: View {
             }
             .tint(Theme.ink)
         }
-        // Long-press: the per-session resync ([docs/transcript.md]). It belongs
-        // on the LIST — the conversation need not be opened first, and it is a
-        // session-level operation like the swipes beside it — but not ON a
-        // swipe: those three are the everyday verbs, and a fourth would crowd
-        // them for something reached once a year. A context menu also has room
-        // to say what the action means, which a swipe glyph does not.
-        .contextMenu {
-            Button {
-                appStore.promptResync(row.id)
-            } label: {
-                Label(lang.t("list.resync"), systemImage: "arrow.clockwise")
-            }
-        }
+        // Long-press: the per-session resync — see `resyncContextMenu`.
+        .resyncContextMenu(row.id)
     }
 
     /// A cron group: tap pushes that job's fires.
@@ -478,6 +467,43 @@ struct SessionRowView: View {
         return collapsed.count > headlineMaxChars
             ? String(collapsed.prefix(headlineMaxChars)) + "…"
             : collapsed
+    }
+}
+
+/// Long-press a conversation row for the **per-session resync**
+/// ([docs/transcript.md]), behind `RootView`'s confirm (`AppStore.promptResync`
+/// → `requestResync`).
+///
+/// A modifier rather than the same six lines per screen, because the hatch has
+/// to ride EVERY surface that lists a conversation — the chat list, a cron job's
+/// fires (`CronGroupScreen`), the archived screen. It first shipped on the chat
+/// list alone, which left a cron fire — a long, tool-heavy thread, exactly what
+/// the hatch is for — as the one conversation with no way to reach it. Where a
+/// row happens to be listed is not a property of the conversation.
+///
+/// Not a fourth swipe button: the three swipes are the everyday verbs and this
+/// is reached once a year, and a menu row has room to say what it does, which a
+/// swipe glyph does not.
+extension View {
+    func resyncContextMenu(_ sessionId: String) -> some View {
+        modifier(ResyncContextMenu(sessionId: sessionId))
+    }
+}
+
+struct ResyncContextMenu: ViewModifier {
+    let sessionId: String
+
+    @EnvironmentObject private var appStore: AppStore
+    @ObservedObject private var lang = Lang.shared
+
+    func body(content: Content) -> some View {
+        content.contextMenu {
+            Button {
+                appStore.promptResync(sessionId)
+            } label: {
+                Label(lang.t("list.resync"), systemImage: "arrow.clockwise")
+            }
+        }
     }
 }
 
