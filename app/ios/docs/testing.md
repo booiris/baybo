@@ -93,6 +93,22 @@ hit-testing (the stroke-only pill whose flanks were dead), UIKit swipe
 thresholds, presentation-binding lifecycles, the native↔web bridge round-trip.
 Everything else is 100x cheaper as a reducer test.
 
+### Typing into a SEEDED field: clear it yourself, never via the edit menu
+
+`typeText` **appends at the caret**. A field the app pre-filled (the rename
+editor seeds the current title) therefore needs an explicit clear, and reaching
+for the long-press edit menu's *Select All* to do it is a trap: that menu is
+system chrome whose appearance is timing-dependent — it showed for one case and
+not its sibling in the same run — and when it does not appear the typing lands
+appended to the seed. The test then drives a rename nobody asked for, and only an
+exact-match assertion catches it (a `contains` or a "the dialog closed" check
+goes green).
+
+Send `XCUIKeyboardKey.delete` once per existing character instead
+(`RenameMenuUITests.replaceText`), and do not tap the field first — a tap moves
+the caret into the middle of the text, where backspaces eat the wrong half. The
+dialog focuses the field itself and parks the caret at the end.
+
 ### A tap lands on the element's CENTRE, so an a11y frame is a test surface
 
 `element.tap()` synthesises a touch at the middle of the element's

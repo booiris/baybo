@@ -90,23 +90,22 @@ struct RootView: View {
                 .zIndex(1)
             }
 
-            // The resync is the one commit here that takes nothing away — the
-            // gateway is authoritative and the outbox is untouched — so it is
-            // the one that does not wear red. It still stops and asks: it blanks
-            // a thread the reader may be mid-way through, and there is no undo
-            // for it the way archive and pin have one.
-            if let sessionId = store.confirmResyncSession {
-                ConfirmDialog(
-                    titleKey: "list.resyncConfirmTitle",
-                    bodyKey: "list.resyncConfirmBody",
-                    commitKey: "list.resync",
-                    commitTint: Theme.ink,
-                    onCancel: dismissResyncConfirm,
-                    onConfirm: {
-                        dismissResyncConfirm()
-                        store.requestResync(sessionId)
+            // The rename editor shares that hosting for the same two reasons,
+            // and needs it for a third: it is the one dialog here that raises a
+            // keyboard, and mounting it at the root is what lets it own the
+            // avoidance instead of the shell sliding under the scrim.
+            if let pending = store.renameSession {
+                RenameDialog(
+                    seed: pending.seed,
+                    onCancel: dismissRename,
+                    onCommit: { title in
+                        dismissRename()
+                        store.requestRename(pending.sessionId, title: title)
                     }
                 )
+                // Keyed by session: reopening the editor on another row must
+                // rebuild the field, not carry the last row's draft into it.
+                .id(pending.sessionId)
                 .zIndex(1)
             }
 
@@ -169,9 +168,9 @@ struct RootView: View {
         }
     }
 
-    private func dismissResyncConfirm() {
+    private func dismissRename() {
         withAnimation(ConfirmDialog.exitMotion) {
-            store.confirmResyncSession = nil
+            store.renameSession = nil
         }
     }
 

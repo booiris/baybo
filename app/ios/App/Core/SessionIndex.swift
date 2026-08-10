@@ -8,10 +8,10 @@ struct SessionRow: Codable, Identifiable, Equatable {
     var createdAt: Date
     var lastActive: Date
     /// Conversation title: generated server-side from the first user question,
-    /// or set by the user renaming it from the web; nil until either has
-    /// happened. The list's bold first line; live-updated by a
-    /// `SessionUpdated` patch (`SessionIndex.applyTitle`). iOS is
-    /// receive-only — there is no rename affordance here yet.
+    /// or set by a user rename (here — the row's long-press — or from the web);
+    /// nil until either has happened. The list's bold first line; live-updated
+    /// by a `SessionUpdated` patch (`SessionIndex.applyTitle`) and written
+    /// optimistically by `beginRename`, which is the only local write.
     var title: String?
     /// Second-line preview: the most-recent message regardless of author (user
     /// prompt or agent reply). Captured locally on send, reconciled to server
@@ -199,6 +199,22 @@ final class SessionIndex: ObservableObject {
     private var archiveBaselines: [String: Bool] = [:]
     /// Same idea as `archiveBaselines`, for the pin toggle.
     private var pinBaselines: [String: Bool] = [:]
+    /// In-flight rename intents — the LATEST title the user asked for, held per
+    /// session until its PUT resolves.
+    ///
+    /// A map of its own rather than a fourth `PendingMutation` case, for the
+    /// reason `pendingCronPins` is separate: `pendingMutations` holds ONE
+    /// desired state per session, so staging a rename there would silently
+    /// discard a pending archive/pin and vice versa. They are also different
+    /// KINDS of intent — archive, pin and hide are bits the user can flip back
+    /// by repeating the gesture, and a name is not.
+    private var pendingTitles: [String: String] = [:]
+    /// The title last acknowledged by the server, staged when a session's first
+    /// pending rename lands, so a chained failure rolls back to truth rather
+    /// than to the previous *attempt*. Optional because "had no title yet" is a
+    /// real baseline — rolling an untitled row back to some title would settle
+    /// it against the auto-titler on the strength of a rename that failed.
+    private var titleBaselines: [String: String?] = [:]
     /// Bumped on every mutation stage/resolve. A list fetch that STARTED
     /// before a mutation resolved is a stale snapshot even after the pending
     /// entry is gone — `merge` compares epochs and drops it.
@@ -412,14 +428,19 @@ final class SessionIndex: ObservableObject {
 
     /// A live `SessionUpdated` title patch reached the connection-global list
     /// sink (`SessionActivityHandler.onTitle`): swap the row's bold first line
-    /// in place. Title is server-authoritative and never mutated locally, so it
-    /// applies unconditionally for a known row; an unknown id waits for a REST
-    /// merge to surface it (the title is also carried on the summary).
+    /// in place. An unknown id waits for a REST merge to surface it (the title
+    /// is also carried on the summary).
+    ///
+    /// A staged rename beats it, like every other in-flight intent beats a
+    /// remote value. The patch that races one can only be OLDER — the auto
+    /// titler writes solely into a session with no title
+    /// (`set_title_if_absent`), so the one patch that can arrive mid-rename is a
+    /// generated title the user's PUT is about to overwrite server-side. Letting
+    /// it land would leave this device showing a name the gateway no longer
+    /// holds, until some later merge happened to correct it.
     func applyTitle(sessionId: String, title: String) {
-        guard let idx = rows.firstIndex(where: { $0.id == sessionId }), rows[idx].title != title
-        else { return }
-        rows[idx].title = title
-        save()
+        guard pendingTitles[sessionId] == nil else { return }
+        setTitle(sessionId, title: title)
     }
 
     /// A connection-global `SessionUpdated{approval_pending}` reached the list
@@ -516,6 +537,54 @@ final class SessionIndex: ObservableObject {
         pendingMutations[sessionId] = .pinned(pinned)
         mutationEpoch += 1
         setPinnedFlag(sessionId, pinned: pinned)
+    }
+
+    /// Optimistic rename: the row's bold first line changes at once, and the
+    /// staged intent shields it from a racing merge — and from a stale
+    /// `SessionUpdated` title patch — until the PUT resolves. No-ops for a row
+    /// that is gone or has a delete in flight.
+    ///
+    /// `title` must already be `RenameTitle.normalized`: it is both what goes on
+    /// the wire and what the row renders, and the gateway stores the normalized
+    /// form, so anything else shows the user a title that rewrites itself when
+    /// the endpoint's own broadcast comes back.
+    func beginRename(_ sessionId: String, title: String) {
+        guard pendingMutations[sessionId] != .hidden,
+            let idx = rows.firstIndex(where: { $0.id == sessionId })
+        else { return }
+        if pendingTitles[sessionId] == nil {
+            titleBaselines[sessionId] = rows[idx].title
+        }
+        pendingTitles[sessionId] = title
+        setTitle(sessionId, title: title)
+    }
+
+    /// The title a rename is trying to land, or `nil` if none is in flight —
+    /// `AppStore.pumpRename`'s "is my ack still the current intent" test.
+    func pendingTitle(for sessionId: String) -> String? {
+        pendingTitles[sessionId]
+    }
+
+    /// The staged rename reached the server: remote truth takes over again.
+    func finishRename(_ sessionId: String) {
+        pendingTitles.removeValue(forKey: sessionId)
+        titleBaselines.removeValue(forKey: sessionId)
+    }
+
+    /// The rename PUT failed: rewind to the last server-acknowledged title —
+    /// including back to no title at all, which is why the baseline is optional
+    /// rather than an empty string (`""` is not a title the server can hold).
+    func rollBackRename(_ sessionId: String) {
+        pendingTitles.removeValue(forKey: sessionId)
+        guard let baseline = titleBaselines.removeValue(forKey: sessionId) else { return }
+        setTitle(sessionId, title: baseline)
+    }
+
+    private func setTitle(_ sessionId: String, title: String?) {
+        guard let idx = rows.firstIndex(where: { $0.id == sessionId }), rows[idx].title != title
+        else { return }
+        rows[idx].title = title
+        save()
     }
 
     /// Optimistic delete (soft-hide): remove the row now — and its transcript
@@ -710,7 +779,10 @@ final class SessionIndex: ObservableObject {
             // Remote title is authoritative, but a live patch may have set it
             // before this (older) snapshot caught up — keep the local one when
             // the snapshot has none rather than blanking a title just shown.
-            let title = summary.title ?? mine?.title
+            // An in-flight rename beats both: it is a local intent the server
+            // has not answered yet, exactly like a staged pin (and staged the
+            // same way, per session rather than in `pendingMutations`).
+            let title = pendingTitles[summary.sessionId] ?? summary.title ?? mine?.title
 
             let archived: Bool
             if case .archived(let flag)? = pending {
@@ -792,6 +864,8 @@ final class SessionIndex: ObservableObject {
         hiddenBackups = [:]
         archiveBaselines = [:]
         pinBaselines = [:]
+        pendingTitles = [:]
+        titleBaselines = [:]
         mutationEpoch += 1
         save()
         TranscriptStore.deleteAll(in: supportDirectory)

@@ -52,6 +52,9 @@ struct CronGroupScreen: View {
             header
         }
         .background(Theme.paper)
+        // Like the home shell: no typed input here, and the rename editor that
+        // can float over it owns its own keyboard avoidance.
+        .ignoresSafeArea(.keyboard)
         // The system nav bar is hidden (custom chrome), which also disables the
         // interactive pop — this presence-only host re-enables the edge swipe.
         .background(PopGestureEnabler().frame(width: 0, height: 0))
@@ -158,8 +161,10 @@ struct CronGroupScreen: View {
                 // …and so does the long-press: a fire is where the escape hatch
                 // is needed MOST (an unattended job's thread is the long,
                 // tool-heavy kind that drifts), and this screen is the only
-                // place one is listed.
-                .resyncContextMenu(row.id)
+                // place one is listed. Rename comes with it — a fire's title is
+                // minted from the job's, and telling two of them apart is
+                // exactly what a hand-written name is for.
+                .sessionContextMenu(row.id)
             }
         }
         .listStyle(.plain)

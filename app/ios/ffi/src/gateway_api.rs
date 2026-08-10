@@ -314,6 +314,11 @@ struct SetPinnedRequest {
 }
 
 #[derive(Serialize)]
+struct SetTitleRequest<'a> {
+    title: &'a str,
+}
+
+#[derive(Serialize)]
 struct MarkReadRequest {
     ordinal: i64,
 }
@@ -733,6 +738,29 @@ pub(crate) async fn set_pinned<C: GatewayJsonClient + Sync>(
     let body = serde_json::to_vec(&SetPinnedRequest { pinned })
         .map_err(|e| format!("encode set pinned request: {e}"))?;
     let path = format!("{PATH_CHAT_SESSIONS}/{session_id}/pin");
+    client.put_empty(&path, body).await
+}
+
+/// Rename a conversation (`PUT /v1/chat/sessions/{id}/title`).
+///
+/// The gateway normalizes what it stores (interior whitespace collapsed, trimmed,
+/// capped at `baybo_model::MAX_SESSION_TITLE_LEN`) and answers 400 for a title
+/// that ends up empty or over-long — so the client sends the normalized form it
+/// intends to render (`RenameTitle` on the Swift side) rather than raw input, and
+/// a 400 here means the two normalizers have drifted apart.
+///
+/// The response is 204: nothing comes back to adopt. Every other client learns
+/// the new title from the `SessionUpdated` patch the endpoint broadcasts, which
+/// carries the STORED value.
+pub(crate) async fn set_title<C: GatewayJsonClient + Sync>(
+    client: &C,
+    session_id: String,
+    title: String,
+) -> Result<(), String> {
+    validate_path_segment(&session_id, "session_id")?;
+    let body = serde_json::to_vec(&SetTitleRequest { title: &title })
+        .map_err(|e| format!("encode set title request: {e}"))?;
+    let path = format!("{PATH_CHAT_SESSIONS}/{session_id}/title");
     client.put_empty(&path, body).await
 }
 
@@ -1480,6 +1508,25 @@ mod tests {
                 method: "PUT",
                 path: "/v1/chat/sessions/s1/pin".to_string(),
                 body: r#"{"pinned":false}"#.to_string(),
+            }
+        );
+    }
+
+    /// The rename rides the session's own `/title` path with the title as a JSON
+    /// STRING — the one call in this file whose body is user text, so an escape
+    /// bug here would ship a malformed request for any title holding a quote.
+    #[tokio::test]
+    async fn set_title_puts_the_name_on_the_title_path() {
+        let client = RecordingClient::empty();
+        set_title(&client, "s1".to_string(), r#"Ship "it""#.to_string())
+            .await
+            .expect("rename");
+        assert_eq!(
+            client.only_call(),
+            RecordedCall {
+                method: "PUT",
+                path: "/v1/chat/sessions/s1/title".to_string(),
+                body: r#"{"title":"Ship \"it\""}"#.to_string(),
             }
         );
     }
