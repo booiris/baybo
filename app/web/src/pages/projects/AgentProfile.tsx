@@ -103,7 +103,7 @@ export function AgentProfile({
         </button>
       </header>
 
-      <div className="flex-1 overflow-y-auto p-3 flex flex-col gap-3">
+      <div className="flex-1 overflow-y-auto overscroll-none p-3 flex flex-col gap-3">
         <div>
           <p className="font-sans text-[0.9rem] font-bold">{agent.name}</p>
           <p className="mt-1 font-sans text-[0.78rem] leading-snug break-words">

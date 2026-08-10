@@ -63,6 +63,7 @@ import {
   resolveDrop,
   runIndicator,
 } from './boardModel';
+import { Avatar } from './Avatar';
 import { writeLastProjectId } from './lastProject';
 import { CreateIssueModal } from './CreateIssueModal';
 import { ProjectSwitcher } from './ProjectSwitcher';
@@ -630,7 +631,7 @@ function BoardColumn({
       </header>
       <div
         ref={setNodeRef}
-        className={`flex-1 min-h-[70px] overflow-y-auto flex flex-col gap-2 p-2 ${
+        className={`flex-1 min-h-[70px] overflow-y-auto overscroll-none flex flex-col gap-2 p-2 ${
           targeted ? 'bg-brand/15' : ''
         }`}
       >
@@ -758,33 +759,6 @@ function FloatingPanel({ children }: { children: React.ReactNode }) {
   );
 }
 
-/// The three states the mockup's avatar has: shimmering while a run is
-/// executing, **dimmed** while one is only queued, and plain otherwise.
-/// Queued had no look of its own before, so a card waiting its turn was
-/// pixel-identical to one nobody had started.
-function AssigneeDot({
-  assignee,
-  run = null,
-}: {
-  assignee: string;
-  run?: 'queued' | 'running' | null;
-}) {
-  const title =
-    run === 'running'
-      ? `${assignee} — working`
-      : run === 'queued'
-        ? `${assignee} — queued, waiting for a free slot`
-        : assignee;
-  return (
-    <span
-      title={title}
-      className={`w-4 h-4 rounded-full border-2 border-black shrink-0 ${
-        run === 'running' ? 'bg-ok motion-safe:animate-pulse' : 'bg-brand'
-      } ${run === 'queued' ? 'opacity-40' : ''}`}
-    />
-  );
-}
-
 /// The branch chip. Copies rather than navigates: it sits inside a card
 /// whose own click opens the issue, so without stopping the event the one
 /// affordance the mockup gives it would be unreachable.
@@ -889,7 +863,7 @@ function IssueCard({
             }}
             className="flex items-center gap-1.5 min-w-0 cursor-pointer hover:underline"
           >
-            <AssigneeDot assignee={handleOf(team, issue.assignee)} run={run} />
+            <Avatar handle={handleOf(team, issue.assignee)} run={run} size="sm" />
             <span className="font-mono text-[0.58rem] text-ink-soft truncate">
               @{handleOf(team, issue.assignee)}
             </span>

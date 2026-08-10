@@ -1,6 +1,14 @@
 import { describe, expect, it } from 'vitest';
 
-import { actorLabel, commentHint, describeEvent, eventShape, eventTime } from './timelineModel';
+import {
+  actorLabel,
+  approvalAsks,
+  commentHint,
+  describeEvent,
+  eventShape,
+  eventTime,
+  eventTone,
+} from './timelineModel';
 import type { IssueEvent, IssueEventBody } from './timelineModel';
 
 const DEV_ID = '01JC3KQ4Z8AAAAAAAAAAAAAAAA';
@@ -131,51 +139,100 @@ describe('commentHint', () => {
   const held = [{ status: 'held' as const }];
 
   it('says record-only when nobody is on the issue', () => {
-    expect(commentHint({ status: 'in_progress', assignee: null }, [], team)).toContain(
-      'nobody is assigned',
-    );
+    const hint = commentHint({ status: 'in_progress', assignee: null }, [], team);
+    expect(hint.text).toContain('nobody is assigned');
+    // Degraded, not neutral: the chip's dot is the only thing a reader
+    // takes in before pressing send.
+    expect(hint.tone).toBe('warn');
   });
 
   it('says record-only for parked or cancelled work even with an assignee', () => {
-    expect(commentHint({ status: 'backlog', assignee: DEV_1 }, [], team)).toContain(
+    expect(commentHint({ status: 'backlog', assignee: DEV_1 }, [], team).text).toContain(
       'not working on this',
     );
-    expect(commentHint({ status: 'done', assignee: DEV_1 }, [], team)).toContain('not working on this');
+    expect(commentHint({ status: 'done', assignee: DEV_1 }, [], team).text).toContain(
+      'not working on this',
+    );
     expect(
-      commentHint({ status: 'in_progress', assignee: DEV_1, cancelled_at_ms: 1 }, [], team),
+      commentHint({ status: 'in_progress', assignee: DEV_1, cancelled_at_ms: 1 }, [], team).text,
     ).toContain('cancelled');
+    expect(commentHint({ status: 'backlog', assignee: DEV_1 }, [], team).tone).toBe('muted');
   });
 
   it('promises a run when the assignee is on live work and nothing is reading', () => {
-    expect(commentHint({ status: 'todo', assignee: DEV_1 }, [], team)).toBe(
-      'Starts a run: @dev-1 will read this now.',
-    );
+    expect(commentHint({ status: 'todo', assignee: DEV_1 }, [], team)).toEqual({
+      text: 'Starts a run: @dev-1 will read this now.',
+      tone: 'brand',
+    });
     // The id must never reach the composer — a person is addressed by
     // handle, and a ULID in a sentence is the tell that a raw row escaped.
-    expect(commentHint({ status: 'todo', assignee: DEV_1 }, [], team)).not.toContain(DEV_1);
-    expect(commentHint({ status: 'review', assignee: DEV_1 }, settled, team)).toContain('Starts a run');
+    expect(commentHint({ status: 'todo', assignee: DEV_1 }, [], team).text).not.toContain(DEV_1);
+    expect(commentHint({ status: 'review', assignee: DEV_1 }, settled, team).text).toContain(
+      'Starts a run',
+    );
   });
 
   it('distinguishes a queued run from one already going', () => {
-    expect(commentHint({ status: 'in_progress', assignee: DEV_1 }, queued, team)).toContain(
+    expect(commentHint({ status: 'in_progress', assignee: DEV_1 }, queued, team).text).toContain(
       'when the queued run starts',
     );
-    expect(commentHint({ status: 'in_progress', assignee: DEV_1 }, live, team)).toContain(
+    expect(commentHint({ status: 'in_progress', assignee: DEV_1 }, live, team).text).toContain(
       'when that run finishes',
     );
   });
 
   it('says a held run will read it, and why it has not started', () => {
     const hint = commentHint({ status: 'in_progress', assignee: DEV_1 }, held, team);
-    expect(hint).toContain('held run starts');
-    expect(hint).toContain('daily budget');
+    expect(hint.text).toContain('held run starts');
+    expect(hint.text).toContain('daily budget');
+    expect(hint.tone).toBe('warn');
+  });
+});
+
+describe('eventTone', () => {
+  it('separates the outcomes a reader is scanning the rail for', () => {
+    expect(eventTone({ kind: 'run_settled', attempt: 1, status: 'done' })).toBe('ok');
+    expect(eventTone({ kind: 'run_settled', attempt: 1, status: 'failed' })).toBe('err');
+    expect(eventTone({ kind: 'run_settled', attempt: 1, status: 'cancelled' })).toBe('muted');
+    expect(eventTone({ kind: 'blocked', reason: 'waiting on the API' })).toBe('warn');
+    expect(eventTone({ kind: 'approval_resolved', call_id: 'c', decision: 'deny' })).toBe('err');
+    expect(eventTone({ kind: 'approval_resolved', call_id: 'c', decision: 'approve' })).toBe('ok');
+  });
+
+  it('falls back to a neutral dot rather than throwing on an unknown entry', () => {
+    expect(eventTone({ kind: 'opened' })).toBe('muted');
+  });
+});
+
+describe('approvalAsks', () => {
+  it('keeps the command of a settled prompt, so the frozen card can show it', () => {
+    const ask = { kind: 'approval_requested' as const, call_id: 'c1', tool: 'Bash', summary: 'git push' };
+    const asks = approvalAsks([
+      { id: 'e1', number: 1, actor: { kind: 'user' }, body: ask, created_at_ms: 0 },
+      {
+        id: 'e2',
+        number: 1,
+        actor: { kind: 'user' },
+        body: { kind: 'approval_resolved', call_id: 'c1', decision: 'approve' },
+        created_at_ms: 1,
+      },
+    ] as unknown as Parameters<typeof approvalAsks>[0]);
+    expect(asks.get('c1')).toMatchObject({ tool: 'Bash', summary: 'git push' });
   });
 });
 
 describe('eventTime', () => {
-  it('shows a clock for today and a date for anything older', () => {
+  it('carries a clock at every age — the date is what drops off, not the time', () => {
     const now = Date.parse('2026-08-05T12:00:00Z');
-    expect(eventTime(Date.parse('2026-08-05T09:30:00Z'), now)).toMatch(/\d/);
-    expect(eventTime(Date.parse('2026-07-01T09:30:00Z'), now)).not.toMatch(/:/);
+    const today = eventTime(Date.parse('2026-08-05T09:30:00Z'), now);
+    const older = eventTime(Date.parse('2026-07-01T09:30:00Z'), now);
+
+    // Locale decides the separator and the 12/24-hour form, so the assertion
+    // is on the shape: two clock parts either way, and a date only on the
+    // entry that needs one to be placed.
+    expect(today).toMatch(/\d{1,2}:\d{2}/);
+    expect(older).toMatch(/\d{1,2}:\d{2}/);
+    expect(older).toMatch(/Jul/);
+    expect(today).not.toMatch(/Aug/);
   });
 });

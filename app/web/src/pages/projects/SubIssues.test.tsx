@@ -93,13 +93,23 @@ describe('SubIssues', () => {
   it('moves a step in place and shows who is on it', async () => {
     const step = child(1, { assignee: 'id-dev' });
     const onStatus = renderSteps([step]);
-    expect(screen.getByText('@dev-1')).toBeInTheDocument();
+    // A face and a status pill, as the mockup's row has them — the pickers
+    // are laid over them rather than replacing them with form widgets.
+    expect(screen.getByTitle('@dev-1')).toBeInTheDocument();
+    expect(screen.getByText('BACKLOG')).toBeInTheDocument();
 
     await userEvent.selectOptions(
       screen.getByLabelText(`Status of #${step.number}`),
       'in_progress',
     );
     expect(onStatus).toHaveBeenCalledWith(step.number, 'in_progress');
+  });
+
+  it('shows an empty seat rather than nothing when a step has nobody on it', () => {
+    const step = child(1);
+    renderSteps([step]);
+    expect(screen.getByTitle('Unassigned')).toBeInTheDocument();
+    expect(screen.getByLabelText(`Assignee of #${step.number}`)).toHaveValue('');
   });
 
   it('does not offer to move a cancelled step or anything while saving', () => {

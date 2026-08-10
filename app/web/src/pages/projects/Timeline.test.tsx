@@ -3,7 +3,19 @@ import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 
 import { Timeline } from './Timeline';
-import type { Issue } from './boardModel';
+import type { Agent, Issue } from './boardModel';
+
+const TEAM: Agent[] = [
+  {
+    id: '01JDEV',
+    handle: 'dev-1',
+    name: 'Dev One',
+    description: '',
+    framework: 'baybo',
+    lead: false,
+    created_at_ms: 0,
+  },
+];
 import type { IssueEvent, IssueEventBody } from './timelineModel';
 
 
@@ -72,9 +84,52 @@ describe('Timeline', () => {
     expect(screen.getByText('Nothing has happened yet.')).toBeInTheDocument();
   });
 
+  it('offers teammates as you type an @, and takes the one you pick', async () => {
+    const onComment = vi.fn();
+    render(
+      <Timeline
+        events={[]}
+        issue={ISSUE}
+        runs={[]}
+        onComment={onComment}
+        onResolveApproval={vi.fn()}
+        team={TEAM}
+        busy={false}
+      />,
+    );
+    const box = screen.getByPlaceholderText(/^Reply…/);
+    await userEvent.type(box, 'ask @de');
+
+    await userEvent.click(screen.getByRole('button', { name: /@dev-1/ }));
+    expect(box).toHaveValue('ask @dev-1 ');
+    // The field keeps focus, or the caret would jump back to the start.
+    expect(box).toHaveFocus();
+  });
+
+  it('closes the picker on Escape without touching the draft', async () => {
+    render(
+      <Timeline
+        events={[]}
+        issue={ISSUE}
+        runs={[]}
+        onComment={vi.fn()}
+        onResolveApproval={vi.fn()}
+        team={TEAM}
+        busy={false}
+      />,
+    );
+    const box = screen.getByPlaceholderText(/^Reply…/);
+    await userEvent.type(box, 'ask @de');
+    expect(screen.getByRole('button', { name: /@dev-1/ })).toBeInTheDocument();
+
+    await userEvent.type(box, '{Escape}');
+    expect(screen.queryByRole('button', { name: /@dev-1/ })).toBeNull();
+    expect(box).toHaveValue('ask @de');
+  });
+
   it('sends trimmed text and clears the box', async () => {
     const onComment = renderTimeline([]);
-    const box = screen.getByPlaceholderText('Say something about this issue…');
+    const box = screen.getByPlaceholderText(/^Reply…/);
 
     await userEvent.type(box, '   look at the retry path   ');
     await userEvent.click(screen.getByRole('button', { name: 'Comment' }));
@@ -85,14 +140,19 @@ describe('Timeline', () => {
 
   it('refuses to send whitespace', async () => {
     const onComment = renderTimeline([]);
-    await userEvent.type(screen.getByPlaceholderText('Say something about this issue…'), '   ');
+    await userEvent.type(screen.getByPlaceholderText(/^Reply…/), '   ');
     expect(screen.getByRole('button', { name: 'Comment' })).toBeDisabled();
     expect(onComment).not.toHaveBeenCalled();
   });
 
-  it('tells the operator what sending will actually do', async () => {
+  it('tells the operator what sending will actually do', () => {
     renderTimeline([]);
-    expect(screen.getByText(/Starts a run/)).toBeInTheDocument();
+    // The sentence lost its chip but not its job: whether sending spends
+    // money or only records is on the button you are about to press.
+    expect(screen.getByRole('button', { name: 'Comment' })).toHaveAttribute(
+      'title',
+      expect.stringContaining('Starts a run') as unknown as string,
+    );
   });
 });
 
@@ -117,7 +177,9 @@ describe('pending approvals', () => {
       />,
     );
     expect(screen.getByText(/Waiting on you/)).toBeInTheDocument();
-    expect(screen.getByText('rm -rf build')).toBeInTheDocument();
+    // The command is what is being approved, so it gets its own box rather
+    // than sharing a paragraph with the ask.
+    expect(screen.getByText(/Bash · rm -rf build/)).toBeInTheDocument();
 
     await userEvent.click(screen.getByRole('button', { name: 'Approve always' }));
     expect(onResolveApproval).toHaveBeenCalledWith('c1', 'approve_always');
@@ -125,7 +187,28 @@ describe('pending approvals', () => {
     expect(onResolveApproval).toHaveBeenCalledWith('c1', 'deny');
   });
 
-  it('stops offering a prompt that has been answered', () => {
+  it('asks where it happened rather than above the whole history', () => {
+    // Hoisting every open prompt to the top of the timeline detached the
+    // decision from the run that provoked it.
+    const { container } = render(
+      <Timeline
+        events={[
+          entry({ kind: 'moved', from: 'todo', to: 'in_progress' }),
+          entry({ kind: 'approval_requested', call_id: 'c2', tool: 'Bash', summary: 'git push' }),
+        ]}
+        issue={ISSUE}
+        runs={[]}
+        onComment={vi.fn()}
+        onResolveApproval={vi.fn()}
+        busy={false}
+      />,
+    );
+    const rows = [...container.querySelectorAll('li')];
+    expect(rows[0].textContent).toContain('moved it from Todo');
+    expect(rows[1].textContent).toContain('Waiting on you');
+  });
+
+  it('stops offering a prompt that has been answered, and keeps what was answered', () => {
     render(
       <Timeline
         events={[
@@ -146,8 +229,12 @@ describe('pending approvals', () => {
     );
     expect(screen.queryByText(/Waiting on you/)).not.toBeInTheDocument();
     // The decision freezes in place rather than collapsing to a sentence:
-    // "who let this through, and when" is what a reader comes back for.
+    // "who let this through, what, and when" is what a reader comes back
+    // for — and a verdict with the command stripped off answers none of it.
     expect(screen.getByText(/Denied/)).toBeInTheDocument();
+    expect(screen.getByText(/Bash · rm -rf build/)).toBeInTheDocument();
+    // …and the ask is not narrated a second time above its own verdict.
+    expect(screen.getAllByText(/Bash · rm -rf build/)).toHaveLength(1);
   });
 
   it('marks the operator’s own comment apart from an agent’s report', () => {
@@ -170,9 +257,31 @@ describe('pending approvals', () => {
     );
     // The user's bubble carries the chat page's amber; the agent's is
     // surface. Identical bubbles made the two indistinguishable.
-    const bubbles = container.querySelectorAll('li > div');
+    const bubbles = container.querySelectorAll('.chat-prose');
     expect(bubbles[0].className).toContain('bg-brand');
     expect(bubbles[1].className).toContain('bg-surface');
+  });
+
+  it('gives each speaker a face, and marks the operator’s own', () => {
+    render(
+      <Timeline
+        events={[
+          { ...entry({ kind: 'comment', text: 'do the thing' }), actor: { kind: 'user' } },
+          {
+            ...entry({ kind: 'comment', text: 'done' }),
+            id: 'e9',
+            actor: { kind: 'agent', id: '01JA', handle: 'dev-1' },
+          },
+        ]}
+        issue={ISSUE}
+        runs={[]}
+        onComment={vi.fn()}
+        onResolveApproval={vi.fn()}
+        busy={false}
+      />,
+    );
+    expect(screen.getByTitle('you')).toBeInTheDocument();
+    expect(screen.getByTitle('@dev-1')).toBeInTheDocument();
   });
 
   it('renders a comment’s markdown rather than its source', () => {

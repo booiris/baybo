@@ -19,7 +19,6 @@ import {
   orderedNumbers,
   parseDragId,
   placementChanged,
-  retryRejection,
   runDuration,
   runIndicator,
   resolveDrop,
@@ -230,33 +229,6 @@ describe('runDuration', () => {
     expect(runDuration(run(1, { started_at_ms: 0, settled_at_ms: 125_000 }), 0)).toBe('2m05s');
     expect(runDuration(run(1, { started_at_ms: 10_000 }), 40_000)).toBe('30s');
     expect(runDuration(run(1), 40_000)).toBeNull();
-  });
-});
-
-describe('retryRejection', () => {
-  it('refuses a card the board has finished with, in the server’s own words', () => {
-    expect(retryRejection(issue(1, { assignee: 'dev-1', cancelled_at_ms: 111 }))).toBe(
-      'this issue was cancelled — reopen it before running it again',
-    );
-    expect(retryRejection(issue(1, { assignee: 'dev-1', status: 'done' }))).toBe(
-      'this issue is done — move it back into the board before running it again',
-    );
-    expect(
-      retryRejection(issue(1, { assignee: 'dev-1', status: 'review', cancelled_at_ms: 111 })),
-    ).toBe('this issue was cancelled — reopen it before running it again');
-  });
-
-  it('refuses a card nobody is on, first — the answer the click would bring back', () => {
-    expect(retryRejection(issue(1))).toBe('an issue with nobody on it cannot be run');
-    expect(retryRejection(issue(1, { cancelled_at_ms: 111 }))).toBe(
-      'an issue with nobody on it cannot be run',
-    );
-  });
-
-  it('lets every live column run', () => {
-    for (const status of ['backlog', 'todo', 'in_progress', 'review'] as const) {
-      expect(retryRejection(issue(1, { assignee: 'dev-1', status }))).toBeNull();
-    }
   });
 });
 

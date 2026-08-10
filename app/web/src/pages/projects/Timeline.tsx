@@ -1,7 +1,8 @@
-import { useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 
-import { Button } from '../../components/Button';
 import { MarkdownBody } from '../ChatPage';
+import { Avatar } from './Avatar';
+import { caretPoint, type CaretPoint } from './caret';
 import type { Agent, Issue, IssueRun } from './boardModel';
 import {
   applyMention,
@@ -11,20 +12,47 @@ import {
 } from './mentionModel';
 import {
   actorLabel,
+  approvalAsks,
   commentHint,
   describeEvent,
   eventShape,
   eventTime,
+  eventTone,
   pendingApprovals,
   type IssueEvent,
   type PendingApproval as PendingApprovalRow,
+  type Tone,
 } from './timelineModel';
+
+const TONE_DOT: Record<Tone, string> = {
+  ok: 'bg-ok',
+  err: 'bg-err',
+  warn: 'bg-warn',
+  info: 'bg-info',
+  brand: 'bg-brand-hover',
+  muted: 'bg-ink-soft',
+};
+
+/// One node on the rail. The dot is a real element rather than a `::before`
+/// so its colour can come from the entry it belongs to.
+function RailDot({ tone, size, top }: { tone: Tone; size: 'sm' | 'lg'; top: string }) {
+  return (
+    <span
+      aria-hidden
+      className={`absolute rounded-full ${TONE_DOT[tone]} ${
+        size === 'lg' ? '-left-[6px] w-2.5 h-2.5' : '-left-[5px] w-2 h-2'
+      }`}
+      style={{ top }}
+    />
+  );
+}
 
 function Note({ event, now }: { event: IssueEvent; now: number }) {
   const sentence = describeEvent(event.body);
   if (sentence == null) return null;
   return (
-    <li className="flex items-baseline gap-2 py-1 font-mono text-[0.7rem] text-ink-soft">
+    <li className="relative flex items-baseline gap-2.5 py-1.5 pl-3.5 font-mono text-[0.7rem] text-ink-soft">
+      <RailDot tone={eventTone(event.body)} size="sm" top="12px" />
       <span className="font-bold text-ink">{actorLabel(event)}</span>
       <span className="min-w-0 break-words">{sentence}</span>
       <span className="ml-auto shrink-0 tabular-nums text-[0.62rem] opacity-60">
@@ -40,20 +68,33 @@ function Comment({ event, now }: { event: IssueEvent; now: number }) {
   // agent's report is surface. Rendering both identically made a timeline
   // where you could not tell what you had asked for from what came back.
   const mine = event.actor.kind === 'user';
+  const who =
+    event.actor.kind === 'agent' ? event.actor.handle : event.actor.kind === 'user' ? 'you' : 'board';
   return (
-    <li className="py-1.5">
-      <div
-        className={`border-2 border-black rounded-md px-3 py-2 shadow-brutal-sm ${
-          mine ? 'bg-brand/60' : 'bg-surface'
-        }`}
-      >
-        <div className="flex items-baseline gap-2 font-mono text-[0.66rem]">
-          <span className="font-bold">{actorLabel(event)}</span>
-          <span className="ml-auto tabular-nums text-[0.62rem] text-ink-soft">
-            {eventTime(event.created_at_ms, now)}
-          </span>
+    <li className="relative flex gap-2.5 py-2 pl-3.5">
+      <RailDot tone="muted" size="lg" top="14px" />
+      <Avatar handle={who} />
+      {/* Three quarters of the timeline, and a maximum rather than a width: a
+          run report is hundreds of words and needs the cap, while "ok" has no
+          business being stretched to meet it.
+          The cap sits on this column, not on the bubble inside it. A
+          percentage resolves against the containing block, and the bubble's
+          containing block is this column — which is a flex item sized by its
+          own content. Capping the bubble at a fraction of a box that was
+          measured *from* the bubble is circular, and browsers settle it by
+          squeezing the bubble inside a column that keeps the full width. The
+          column's own containing block is the row, which is block-level and
+          full width, so the fraction here means what it says. */}
+      <div className="min-w-0 max-w-3/4">
+        <div className="flex items-baseline gap-2 font-mono text-[0.6rem] font-bold text-ink-soft">
+          <span>{actorLabel(event)} · comment</span>
+          <span className="tabular-nums font-normal">{eventTime(event.created_at_ms, now)}</span>
         </div>
-        <div className="mt-1 chat-prose text-[0.82rem] break-words">
+        <div
+          className={`mt-1 border-2 border-black rounded-md px-3 py-2 shadow-brutal-xs chat-prose text-[0.82rem] break-words ${
+            mine ? 'bg-brand/60' : 'bg-surface'
+          }`}
+        >
           <MarkdownBody text={text} />
         </div>
       </div>
@@ -61,18 +102,37 @@ function Comment({ event, now }: { event: IssueEvent; now: number }) {
   );
 }
 
-/// A settled approval, frozen where it happened. The mockup's second state:
-/// the decision stays on the timeline rather than collapsing into a
-/// sentence, because "who let this through, and when" is the question a
-/// reader comes back to the card with.
-function ResolvedApproval({ event, now }: { event: IssueEvent; now: number }) {
+/// The command a run was gated on, in its own box. What is being approved is
+/// the whole question, so it does not get to share a paragraph with the ask.
+function ApprovalCommand({ tool, summary }: { tool: string; summary: string }) {
+  return (
+    <pre className="mt-1.5 overflow-x-auto rounded border border-black/30 bg-canvas px-2.5 py-1.5 font-mono text-[0.7rem] whitespace-pre-wrap break-words">
+      {`${tool} · ${summary}`}
+    </pre>
+  );
+}
+
+/// A settled approval, frozen where it happened — including what was let
+/// through. The mockup's second state: the decision stays on the timeline
+/// rather than collapsing into a sentence, because "who approved what, and
+/// when" is the question a reader comes back to the card with.
+function ResolvedApproval({
+  event,
+  ask,
+  now,
+}: {
+  event: IssueEvent;
+  ask: PendingApprovalRow | undefined;
+  now: number;
+}) {
   if (event.body.kind !== 'approval_resolved') return null;
   const approved = event.body.decision !== 'deny';
   return (
-    <li className="py-1.5">
+    <li className="relative py-2 pl-3.5">
+      <RailDot tone={approved ? 'ok' : 'err'} size="lg" top="16px" />
       <div
-        className={`border-2 rounded-md px-3 py-2 ${
-          approved ? 'border-ok/60 bg-ok/10' : 'border-err/50 bg-err/10'
+        className={`max-w-[480px] border-2 border-black rounded-md bg-surface px-3.5 py-2.5 shadow-brutal-xs ${
+          approved ? 'border-l-[6px] border-l-ok' : 'border-l-[6px] border-l-err'
         }`}
       >
         <p
@@ -82,7 +142,8 @@ function ResolvedApproval({ event, now }: { event: IssueEvent; now: number }) {
         >
           {approved ? '✓ Approved · run continued' : '✕ Denied'}
         </p>
-        <p className="mt-1 font-mono text-[0.62rem] text-ink-soft">
+        {ask === undefined ? null : <ApprovalCommand tool={ask.tool} summary={ask.summary} />}
+        <p className="mt-1.5 font-mono text-[0.56rem] text-ink-soft">
           {actorLabel(event)} · {eventTime(event.created_at_ms, now)}
         </p>
       </div>
@@ -100,47 +161,51 @@ function PendingApproval({
   busy: boolean;
 }) {
   return (
-    <div className="mt-3 border-[3px] border-warn rounded-md bg-warn/10 px-3 py-2 shadow-brutal-sm">
-      <p className="font-mono text-[0.62rem] font-bold uppercase tracking-wider text-warn">
-        ⚑ Waiting on you — {approval.tool}
-        {approval.attempt == null ? '' : ` · run #${approval.attempt}`}
-      </p>
-      <p className="mt-1 whitespace-pre-wrap break-words font-mono text-[0.74rem]">
-        {approval.summary}
-      </p>
-      <div className="mt-2 flex flex-wrap gap-2">
-        <button
-          type="button"
-          disabled={busy}
-          onClick={() => {
-            onResolve(approval.callId, 'approve');
-          }}
-          className="border-2 border-black rounded-md px-2 py-0.5 font-mono text-[0.66rem] font-bold bg-brand text-ink disabled:opacity-50"
-        >
-          Approve
-        </button>
-        <button
-          type="button"
-          disabled={busy}
-          onClick={() => {
-            onResolve(approval.callId, 'approve_always');
-          }}
-          className="border-2 border-black rounded-md px-2 py-0.5 font-mono text-[0.66rem] bg-surface disabled:opacity-50"
-        >
-          Approve always
-        </button>
-        <button
-          type="button"
-          disabled={busy}
-          onClick={() => {
-            onResolve(approval.callId, 'deny');
-          }}
-          className="border-2 border-err rounded-md px-2 py-0.5 font-mono text-[0.66rem] text-err bg-surface disabled:opacity-50"
-        >
-          Deny
-        </button>
+    <li className="relative py-2 pl-3.5">
+      <RailDot tone="warn" size="lg" top="16px" />
+      <div className="max-w-[480px] border-2 border-black border-l-[6px] border-l-warn rounded-md bg-surface px-3.5 py-2.5 shadow-brutal-sm">
+        <p className="font-mono text-[0.62rem] font-bold uppercase tracking-wider text-warn">
+          ⚑ Waiting on you
+          {approval.attempt == null ? '' : ` · run #${approval.attempt}`}
+        </p>
+        <ApprovalCommand tool={approval.tool} summary={approval.summary} />
+        <div className="mt-2 flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => {
+              onResolve(approval.callId, 'approve');
+            }}
+            className="border-2 border-black rounded-md px-2 py-0.5 font-mono text-[0.66rem] font-bold bg-brand text-ink disabled:opacity-50"
+          >
+            Approve
+          </button>
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => {
+              onResolve(approval.callId, 'approve_always');
+            }}
+            className="border-2 border-black rounded-md px-2 py-0.5 font-mono text-[0.66rem] bg-surface disabled:opacity-50"
+          >
+            Approve always
+          </button>
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => {
+              onResolve(approval.callId, 'deny');
+            }}
+            className="border-2 border-err rounded-md px-2 py-0.5 font-mono text-[0.66rem] text-err bg-surface disabled:opacity-50"
+          >
+            Deny
+          </button>
+          <span className="font-mono text-[0.56rem] text-ink-soft">
+            Mirrored into the activity feed · closes itself if it times out
+          </span>
+        </div>
       </div>
-    </div>
+    </li>
   );
 }
 
@@ -163,9 +228,36 @@ export function Timeline({
 }) {
   const [draft, setDraft] = useState('');
   const [caret, setCaret] = useState(0);
+  // Esc closes the picker without closing anything else. Cleared whenever the
+  // caret moves onto a different mention, so dismissing one does not silence
+  // the next.
+  const [dismissed, setDismissed] = useState(false);
+  const [point, setPoint] = useState<CaretPoint | null>(null);
   const box = useRef<HTMLTextAreaElement | null>(null);
   const query = mentionQuery(draft, caret);
-  const candidates = query === null ? [] : mentionCandidates(team, query.prefix);
+  const candidates = query === null || dismissed ? [] : mentionCandidates(team, query.prefix);
+
+  // Measured after layout, from the field itself: the popup follows the caret
+  // through wraps, scrolls and resizes, none of which can be worked out from
+  // the offset alone.
+  //
+  // The dependency is the mention's **offset**, not the query object —
+  // `mentionQuery` builds a fresh one every render, so depending on it made
+  // the effect run on every render, and the effect's own `setPoint` caused
+  // the next one.
+  const mentionAt = query?.start ?? null;
+  useLayoutEffect(() => {
+    if (mentionAt === null || box.current === null) {
+      setPoint(null);
+      return;
+    }
+    setPoint(caretPoint(box.current, mentionAt));
+  }, [draft, caret, mentionAt]);
+
+  // A dismissal belongs to the mention it dismissed, not to the composer.
+  useEffect(() => {
+    setDismissed(false);
+  }, [mentionAt]);
 
   function complete(handle: string) {
     if (query === null) return;
@@ -177,101 +269,167 @@ export function Timeline({
       box.current?.focus();
     });
   }
+  function send() {
+    onComment(draft.trim());
+    setDraft('');
+  }
   const now = Date.now();
   const trimmed = draft.trim();
-  const waiting = pendingApprovals(events);
+  // Approvals render where they happened rather than hoisted above the
+  // history: a decision pulled out of its run loses the run it belonged to.
+  const asks = approvalAsks(events);
+  const open = new Set(pendingApprovals(events).map((approval) => approval.callId));
+  const mention = mentionHint(issue, draft, team);
+  const hint = mention === null ? commentHint(issue, runs, team) : { text: mention, tone: 'brand' as const };
 
   return (
     <section className="mt-6 border-t-2 border-black/20 pt-4">
-      <h2 className="font-mono text-[0.6rem] font-bold uppercase tracking-wider text-ink-soft">
-        Timeline
+      <h2 className="font-mono text-[0.62rem] font-bold uppercase tracking-[0.14em] text-ink-soft">
+        Activity
       </h2>
-
-      {waiting.map((approval) => (
-        <PendingApproval
-          key={approval.callId}
-          approval={approval}
-          onResolve={onResolveApproval}
-          busy={busy}
-        />
-      ))}
 
       {events.length === 0 ? (
         <p className="mt-2 font-mono text-[0.7rem] text-ink-soft">Nothing has happened yet.</p>
       ) : (
-        <ul className="mt-2">
-          {events.map((event) =>
-            eventShape(event) === 'comment' ? (
-              <Comment key={event.id} event={event} now={now} />
-            ) : event.body.kind === 'approval_resolved' ? (
-              <ResolvedApproval key={event.id} event={event} now={now} />
-            ) : (
-              <Note key={event.id} event={event} now={now} />
-            ),
-          )}
+        <ul
+          // `pr-4` is the composer's own right inset — its 2px border plus its
+          // 14px padding — so a row's timestamp lands on the same line as the
+          // send button rather than 16px past it.
+          className="mt-2 ml-[5px] pr-4 border-l-2 border-black/20"
+        >
+          {events.map((event) => {
+            if (eventShape(event) === 'comment') {
+              return <Comment key={event.id} event={event} now={now} />;
+            }
+            if (event.body.kind === 'approval_resolved') {
+              return (
+                <ResolvedApproval
+                  key={event.id}
+                  event={event}
+                  ask={asks.get(event.body.call_id)}
+                  now={now}
+                />
+              );
+            }
+            if (event.body.kind === 'approval_requested') {
+              // Answered prompts are not narrated twice: the resolved card
+              // below carries the same command with its verdict on it.
+              if (!open.has(event.body.call_id)) return null;
+              const approval = asks.get(event.body.call_id);
+              return approval === undefined ? null : (
+                <PendingApproval
+                  key={event.id}
+                  approval={approval}
+                  onResolve={onResolveApproval}
+                  busy={busy}
+                />
+              );
+            }
+            return <Note key={event.id} event={event} now={now} />;
+          })}
         </ul>
       )}
 
-      <div className="mt-3">
-        <textarea
-          ref={box}
-          className="w-full min-h-[72px] bg-canvas border-2 border-black rounded-md px-3 py-2 font-sans text-[0.82rem] outline-none resize-y"
-          placeholder="Say something about this issue…"
-          value={draft}
-          onChange={(event) => {
-            setDraft(event.target.value);
-            setCaret(event.target.selectionStart);
-          }}
-          onSelect={(event) => {
-            setCaret(event.currentTarget.selectionStart);
-          }}
-          onKeyDown={(event) => {
-            if (event.key === 'Tab' && candidates.length > 0) {
-              event.preventDefault();
-              complete(candidates[0].handle);
-              return;
-            }
-            if (event.key === 'Enter' && (event.metaKey || event.ctrlKey) && trimmed.length > 0) {
-              event.preventDefault();
-              onComment(trimmed);
-              setDraft('');
-            }
-          }}
+      {/* Pinned to the bottom of the pane: the timeline is the long thing on
+          this page, and a composer that scrolls away with it means reading
+          the history and replying to it are two different scroll positions. */}
+      <div className="sticky bottom-0 z-10 mt-8">
+        {/* The timeline scrolls *behind* the composer, and a flat opaque band
+            above it cuts entries off mid-line — a white edge across the page.
+            The chat thread's answer, reused: a page-colour gradient, opaque
+            under and below the box and fading out above it, so an entry
+            dissolves as it slides in. `-bottom-5` reaches under the pane's own
+            bottom padding so nothing shows below the box; `-inset-x-2`
+            overhangs the card's 2px shadow. */}
+        <div
+          aria-hidden
+          className="pointer-events-none absolute -inset-x-2 -bottom-5 -top-16 bg-linear-to-t from-surface from-45% to-transparent"
         />
-        {candidates.length === 0 ? null : (
-          <ul className="mt-1 flex flex-wrap gap-1">
-            {candidates.map((agent, index) => (
-              <li key={agent.id}>
-                <button
-                  type="button"
-                  onClick={() => {
-                    complete(agent.handle);
-                  }}
-                  className={`border-2 rounded-md px-1.5 py-0.5 font-mono text-[0.62rem] ${
-                    index === 0 ? 'border-black bg-brand/40' : 'border-black/30 bg-surface'
-                  }`}
-                >
-                  @{agent.handle}
-                </button>
-              </li>
-            ))}
-          </ul>
-        )}
-        <div className="mt-2 flex items-center gap-3">
-          <Button
-            className="!px-4 !py-1.5 !text-[0.75rem]"
-            variant="primary"
-            disabled={trimmed.length === 0 || busy}
-            onClick={() => {
-              onComment(trimmed);
-              setDraft('');
-            }}
-          >
-            {busy ? 'Sending…' : 'Comment'}
-          </Button>
-          <span className="font-mono text-[0.66rem] text-ink-soft">
-            {mentionHint(issue, draft, team) ?? commentHint(issue, runs, team)}
-          </span>
+        <div className="relative border-2 border-black rounded-xl bg-surface px-3.5 py-2.5 shadow-brutal-sm">
+          <div className="relative">
+            <textarea
+              ref={box}
+              className="w-full min-h-[64px] bg-transparent font-sans text-[0.82rem] outline-none resize-y"
+              placeholder="Reply… @ a teammate to bring them onto this issue"
+              value={draft}
+              onChange={(event) => {
+                setDraft(event.target.value);
+                setCaret(event.target.selectionStart);
+              }}
+              onSelect={(event) => {
+                setCaret(event.currentTarget.selectionStart);
+              }}
+              onKeyDown={(event) => {
+                if (event.key === 'Escape' && candidates.length > 0) {
+                  event.preventDefault();
+                  setDismissed(true);
+                  return;
+                }
+                if (event.key === 'Tab' && candidates.length > 0) {
+                  event.preventDefault();
+                  complete(candidates[0].handle);
+                  return;
+                }
+                if (event.key === 'Enter' && (event.metaKey || event.ctrlKey) && trimmed.length > 0) {
+                  event.preventDefault();
+                  send();
+                }
+              }}
+            />
+            {/* At the caret, not under the box. A list pinned to the bottom of
+                the composer makes you look away from what you are typing to
+                find out what you are choosing between. It opens **upward**:
+                the composer is at the bottom of the page, so downward is off
+                the screen. */}
+            {candidates.length === 0 || point === null ? null : (
+              <ul
+                className="absolute z-30 max-h-40 min-w-[9rem] overflow-y-auto border-2 border-black rounded-md bg-surface py-0.5 shadow-brutal-sm"
+                style={{ bottom: point.fieldHeight - point.top + 4, left: point.left }}
+              >
+                {candidates.map((agent, index) => (
+                  <li key={agent.id}>
+                    <button
+                      type="button"
+                      onMouseDown={(event) => {
+                        // The textarea must keep focus, or completing puts the
+                        // caret back at the start of the draft.
+                        event.preventDefault();
+                      }}
+                      onClick={() => {
+                        complete(agent.handle);
+                      }}
+                      className={`flex w-full items-baseline gap-2 px-2 py-1 text-left font-mono text-[0.66rem] ${
+                        index === 0 ? 'bg-brand/40 font-bold' : 'hover:bg-canvas'
+                      }`}
+                    >
+                      <span>@{agent.handle}</span>
+                      <span className="truncate text-[0.58rem] text-ink-soft">{agent.name}</span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+          <div className="mt-2.5 flex items-center justify-end gap-2">
+            {/* The words are gone, the warning is not: whether sending spends
+                money or only records is the one thing worth knowing before
+                the click, and it is the button's own tooltip. */}
+            <span
+              aria-hidden
+              title={hint.text}
+              className={`h-[7px] w-[7px] shrink-0 rounded-full ${TONE_DOT[hint.tone]}`}
+            />
+            <button
+              type="button"
+              aria-label="Comment"
+              title={hint.text}
+              disabled={trimmed.length === 0 || busy}
+              onClick={send}
+              className="flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-full border-2 border-black bg-brand font-mono text-[0.9rem] font-bold text-ink shadow-brutal-xs disabled:opacity-40 disabled:shadow-none"
+            >
+              ↑
+            </button>
+          </div>
         </div>
       </div>
     </section>

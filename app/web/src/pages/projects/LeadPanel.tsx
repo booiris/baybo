@@ -374,7 +374,7 @@ export function LeadPanel({
         ) : null}
       </header>
 
-      <div className="flex-1 overflow-y-auto p-2 flex flex-col gap-2">
+      <div className="flex-1 overflow-y-auto overscroll-none p-2 flex flex-col gap-2">
         {error !== null && isMissingLead(error) ? (
           // Not a failure the operator can retry past: this board predates
           // the lead being seeded with the project, so there is nobody for

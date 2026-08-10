@@ -57,7 +57,7 @@ export function ActivityDrawer({
           <RiCloseLine />
         </button>
       </header>
-      <div className="flex-1 overflow-y-auto p-2 flex flex-col gap-1">
+      <div className="flex-1 overflow-y-auto overscroll-none p-2 flex flex-col gap-1">
         {error !== null ? (
           <p className="border-2 border-err text-err rounded-md px-2 py-1 font-mono text-[0.66rem] break-words">
             {error}

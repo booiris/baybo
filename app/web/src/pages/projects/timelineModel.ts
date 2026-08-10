@@ -17,6 +17,38 @@ export function eventShape(event: IssueEvent): EventShape {
   return event.body.kind === 'comment' ? 'comment' : 'note';
 }
 
+/// The six colours this board reads a status in. One vocabulary for the
+/// timeline's dots and the composer's chip, so "amber" cannot mean a warning
+/// on one and work-about-to-start on the other.
+export type Tone = 'ok' | 'err' | 'warn' | 'info' | 'brand' | 'muted';
+
+/// What colour an entry's dot is. The timeline is skimmed down its rail
+/// before it is read, so a failure and a hire must be distinguishable
+/// without parsing either sentence.
+export function eventTone(body: IssueEventBody): Tone {
+  switch (body.kind) {
+    case 'assigned':
+      return 'brand';
+    case 'moved':
+    case 'run_started':
+      return 'info';
+    case 'run_settled':
+      return body.status === 'done' ? 'ok' : body.status === 'failed' ? 'err' : 'muted';
+    case 'blocked':
+    case 'approval_requested':
+    case 'budget_exhausted':
+      return 'warn';
+    case 'unblocked':
+    case 'stage_completed':
+    case 'budget_restored':
+      return 'ok';
+    case 'approval_resolved':
+      return body.decision === 'deny' ? 'err' : 'ok';
+    default:
+      return 'muted';
+  }
+}
+
 export function actorLabel(event: IssueEvent): string {
   switch (event.actor.kind) {
     case 'user':
@@ -52,6 +84,25 @@ export type PendingApproval = {
   /// tracked it — the card still says a tool is waiting.
   attempt: number | null;
 };
+
+/// Every approval this card has ever asked for, open or settled, by call id.
+///
+/// The settled card still shows the command that was approved — "who let
+/// this through" is only half the question a reader comes back with, and a
+/// decision with the command stripped off answers neither half.
+export function approvalAsks(events: IssueEvent[]): Map<string, PendingApproval> {
+  const asks = new Map<string, PendingApproval>();
+  for (const event of events) {
+    if (event.body.kind !== 'approval_requested') continue;
+    asks.set(event.body.call_id, {
+      callId: event.body.call_id,
+      tool: event.body.tool,
+      summary: event.body.summary,
+      attempt: event.body.attempt ?? null,
+    });
+  }
+  return asks;
+}
 
 export function pendingApprovals(events: IssueEvent[]): PendingApproval[] {
   const open = new Map<string, PendingApproval>();
@@ -126,7 +177,8 @@ function unnamedEvent(_body: never): string {
   return 'did something this page is too old to describe';
 }
 
-/// What sending will do, in the assignee's own name.
+/// What sending will do, in the assignee's own name, and the colour that
+/// says it at a glance.
 ///
 /// `team` is required rather than optional: the assignee on an issue is an
 /// agent **id**, and every sentence below addresses a person. Resolving it
@@ -136,36 +188,52 @@ export function commentHint(
   issue: { status: IssueStatus; assignee?: string | null; cancelled_at_ms?: number | null },
   runs: { status: RunStatus }[],
   team: Agent[],
-): string {
+): { text: string; tone: Tone } {
   const assignee = issue.assignee == null ? null : handleOf(team, issue.assignee);
   if (assignee == null) {
-    return 'Records only — nobody is assigned to this issue yet.';
+    return { text: 'Records only — nobody is assigned to this issue yet.', tone: 'warn' };
   }
   if (issue.cancelled_at_ms != null) {
-    return 'Records only — this issue is cancelled.';
+    return { text: 'Records only — this issue is cancelled.', tone: 'muted' };
   }
   if (issue.status === 'backlog' || issue.status === 'done') {
-    return `Records only — @${assignee} is not working on this right now.`;
+    return {
+      text: `Records only — @${assignee} is not working on this right now.`,
+      tone: 'muted',
+    };
   }
   const live = unsettledRun(runs);
   if (live?.status === 'held') {
-    return `@${assignee} will read this when the held run starts — the project is over its daily budget.`;
+    return {
+      text: `@${assignee} will read this when the held run starts — the project is over its daily budget.`,
+      tone: 'warn',
+    };
   }
   if (live?.status === 'queued') {
-    return `@${assignee} will read this when the queued run starts.`;
+    return {
+      text: `@${assignee} will read this when the queued run starts.`,
+      tone: 'brand',
+    };
   }
   if (live?.status === 'running') {
-    return `@${assignee} is mid-run — this is picked up when that run finishes.`;
+    return {
+      text: `@${assignee} is mid-run — this is picked up when that run finishes.`,
+      tone: 'info',
+    };
   }
-  return `Starts a run: @${assignee} will read this now.`;
+  return { text: `Starts a run: @${assignee} will read this now.`, tone: 'brand' };
 }
 
+/// When an entry happened, to the minute — always. An older entry used to
+/// carry its date and no clock, which reads fine in a list until two runs a
+/// morning apart sit next to each other saying the same thing. The date is
+/// what drops off for today, not the time.
 export function eventTime(atMs: number, nowMs: number): string {
   const at = new Date(atMs);
+  const clock = at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   const sameDay = new Date(nowMs).toDateString() === at.toDateString();
-  return sameDay
-    ? at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-    : at.toLocaleDateString([], { month: 'short', day: 'numeric' });
+  if (sameDay) return clock;
+  return `${at.toLocaleDateString([], { month: 'short', day: 'numeric' })} ${clock}`;
 }
 
 /// How long ago, for a feed that is skimmed rather than read. A wall clock

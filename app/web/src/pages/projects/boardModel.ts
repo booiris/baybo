@@ -30,6 +30,17 @@ export const COLUMN_LABEL: Record<IssueStatus, string> = {
   done: 'Done',
 };
 
+/// The same five names, for a pill too narrow to spell them out. Kept beside
+/// the long form so a column renamed in one place cannot keep its old name
+/// in the other.
+export const COLUMN_PILL_LABEL: Record<IssueStatus, string> = {
+  backlog: 'BACKLOG',
+  todo: 'TODO',
+  in_progress: 'IN PROG',
+  review: 'REVIEW',
+  done: 'DONE',
+};
+
 export const PRIORITIES: readonly IssuePriority[] = [
   'urgent',
   'high',
@@ -190,24 +201,6 @@ const SETTLED: ReadonlySet<RunStatus> = new Set<RunStatus>(['done', 'failed', 'c
 
 export function unsettledRun<T extends { status: RunStatus }>(runs: readonly T[]): T | null {
   return runs.find((run) => !SETTLED.has(run.status)) ?? null;
-}
-
-export const HELD_RUN_NOTE =
-  'this run is held — the project is over its daily budget, and starts as soon as there is room';
-
-export function retryRejection(issue: {
-  status: IssueStatus;
-  assignee?: string | null;
-  cancelled_at_ms?: number | null;
-}): string | null {
-  if (issue.assignee == null) return 'an issue with nobody on it cannot be run';
-  if (issue.cancelled_at_ms != null) {
-    return 'this issue was cancelled — reopen it before running it again';
-  }
-  if (issue.status === 'done') {
-    return 'this issue is done — move it back into the board before running it again';
-  }
-  return null;
 }
 
 export function dropRejection(issue: Issue, target: IssueStatus): string | null {
