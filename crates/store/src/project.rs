@@ -335,6 +335,13 @@ pub enum IssueEventBody {
     /// a person* rather than work that has mysteriously stopped.
     ApprovalRequested {
         call_id: String,
+        /// Which run is parked, by its attempt number — the same address
+        /// the execution log uses. Absent on entries written before the
+        /// card started recording it, and on a prompt raised outside any
+        /// run; the card says "a tool is waiting" either way, and inventing
+        /// an attempt would be worse than not naming one.
+        #[serde(default)]
+        attempt: Option<i64>,
         /// The tool whose call is blocked.
         tool: String,
         /// One line a person can decide from — the tool's own label when it
@@ -502,6 +509,22 @@ pub trait ProjectStore: Send + Sync {
 
     async fn list_runs(&self, issue: &IssueId) -> Result<Vec<IssueRunRow>>;
 
+    /// What each of an issue's runs spent. Derived from `cost_records`
+    /// rather than stored on the run: a session is shared by every run the
+    /// same agent does on the card, so the only thing that attributes a
+    /// call to one run is the run's own window. That window is unambiguous
+    /// because the enqueue dedupe guard keeps at most one run per issue in
+    /// flight, so two windows on one session can never overlap. A run
+    /// nobody claimed has no window and reads zero.
+    async fn run_spend(&self, issue: &IssueId) -> Result<Vec<RunSpend>>;
+
+    /// Every board's live working count and spend since `since`, in one
+    /// pass. One query rather than one per board: the switcher's dropdown
+    /// asks about all of them at once, and a per-row read is the shape
+    /// that turns a five-board dropdown into eleven round trips.
+    async fn board_activity(&self, since: DateTime<Utc>)
+    -> Result<Vec<(ProjectId, BoardActivity)>>;
+
     async fn active_runs(&self, project: &ProjectId) -> Result<Vec<IssueRunRow>>;
 
     async fn get_run(&self, id: &IssueRunId) -> Result<Option<IssueRunRow>>;
@@ -655,6 +678,19 @@ pub struct AttentionCounts {
     pub failed: usize,
 }
 
+/// What a board is doing right now, for the switcher's dropdown. Two
+/// numbers rather than the whole board, because the dropdown's job is to
+/// let the operator pick between boards without opening either.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BoardActivity {
+    /// Runs actually executing. Counted from runs rather than from the
+    /// In Progress column, because a run outlives its column — dragging a
+    /// card out never kills it.
+    pub working: usize,
+    /// Spend since the start of the caller's day.
+    pub burn: baybo_model::MicroUsd,
+}
+
 impl AttentionCounts {
     pub fn total(self) -> usize {
         self.approvals + self.held + self.failed + self.unread
@@ -703,6 +739,43 @@ impl IssueRunRow {
     pub fn was_claimed(&self) -> bool {
         self.session_id.is_some()
     }
+}
+
+/// What some LLM calls cost, summed. Tokens ride along with the money
+/// because the rail shows the two together and a second round trip to the
+/// same rows would only invite them to disagree.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Spend {
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cost: baybo_model::MicroUsd,
+}
+
+impl std::ops::Add for Spend {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            input_tokens: self.input_tokens + other.input_tokens,
+            output_tokens: self.output_tokens + other.output_tokens,
+            cost: baybo_model::MicroUsd::from_micros(
+                self.cost.into_micros() + other.cost.into_micros(),
+            ),
+        }
+    }
+}
+
+impl std::iter::Sum for Spend {
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        iter.fold(Self::default(), |acc, one| acc + one)
+    }
+}
+
+/// One run's share of its session's spend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunSpend {
+    pub run_id: IssueRunId,
+    pub spend: Spend,
 }
 
 /// A run to enqueue. Attempt and timestamps are the store's to assign.

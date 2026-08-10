@@ -4,6 +4,7 @@ import { Button } from '../../components/Button';
 import { useAdminClient, useAuth } from '../../api/auth';
 import { createIssue } from './api';
 import {
+  COLUMNS,
   COLUMN_LABEL,
   PRIORITIES,
   type Agent,
@@ -22,18 +23,33 @@ const PRIORITY_LABEL: Record<IssuePriority, string> = {
 const pill =
   'inline-flex items-center gap-1.5 border-2 border-black rounded-full px-3 py-1 font-mono text-[0.66rem] font-bold bg-surface cursor-pointer';
 
+/// `◐` is not in Space Mono, so the status chip rendered as a stray glyph.
+/// A filled circle is in the face and reads the same.
+const STATUS_GLYPH = '●';
+
 export function CreateIssueModal({
   projectId,
-  status,
+  status: initialStatus,
   agents,
+  parents,
   onClose,
   onCreated,
+  onAskLead,
 }: {
   projectId: string;
+  /// Pre-filled from the column whose `+` was pressed — a starting point,
+  /// not a lock: the mockup's chips all open their picker.
   status: IssueStatus;
   agents: Agent[];
+  /// Cards this one could be a step of. One level only, so a card that is
+  /// already a step is not offered.
+  parents: { number: number; title: string }[];
   onClose: () => void;
   onCreated: () => void;
+  /// Hand the half-written card to the lead instead of finishing the form.
+  /// The multica quick-create equivalent: some cards are easier described
+  /// in a sentence than filled in.
+  onAskLead?: (text: string) => void;
 }) {
   const client = useAdminClient();
   const { logout } = useAuth();
@@ -42,6 +58,9 @@ export function CreateIssueModal({
   const [priority, setPriority] = useState<IssuePriority>('none');
   const [assignee, setAssignee] = useState('');
   const [keepOpen, setKeepOpen] = useState(false);
+  const [status, setStatus] = useState<IssueStatus>(initialStatus);
+  const [parent, setParent] = useState<number | null>(null);
+  const [stage, setStage] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
@@ -56,6 +75,7 @@ export function CreateIssueModal({
   }, [onClose]);
 
   const needsAssignee = status === 'in_progress' && assignee.length === 0;
+  const willEnqueue = status === 'in_progress' && assignee.length > 0;
 
   async function submit() {
     if (submitting || title.trim().length === 0 || needsAssignee) return;
@@ -67,6 +87,7 @@ export function CreateIssueModal({
       status,
       priority,
       ...(assignee.length > 0 ? { assignee } : {}),
+      ...(parent == null ? {} : { parent, stage }),
     });
     setSubmitting(false);
     if (outcome.kind === 'unauthorized') {
@@ -134,7 +155,23 @@ export function CreateIssueModal({
             }}
           />
           <div className="flex flex-wrap gap-2">
-            <span className={`${pill} bg-brand/35 cursor-default`}>◐ {COLUMN_LABEL[status]}</span>
+            <label className={`${pill} bg-brand/35`}>
+              <span aria-hidden="true">{STATUS_GLYPH}</span>
+              <select
+                aria-label="Status"
+                className="bg-transparent outline-none font-bold cursor-pointer"
+                value={status}
+                onChange={(event) => {
+                  setStatus(event.target.value as IssueStatus);
+                }}
+              >
+                {COLUMNS.map((value) => (
+                  <option key={value} value={value}>
+                    {COLUMN_LABEL[value]}
+                  </option>
+                ))}
+              </select>
+            </label>
             <label className={pill}>
               <span className="text-ink-soft">Assignee</span>
               <select
@@ -152,6 +189,38 @@ export function CreateIssueModal({
                 ))}
               </select>
             </label>
+            <label className={pill}>
+              <span className="text-ink-soft">⌗ Parent</span>
+              <select
+                className="bg-transparent outline-none font-bold cursor-pointer max-w-[8rem]"
+                value={parent == null ? '' : String(parent)}
+                onChange={(event) => {
+                  const picked = event.target.value;
+                  setParent(picked === '' ? null : Number(picked));
+                }}
+              >
+                <option value="">None</option>
+                {parents.map((candidate) => (
+                  <option key={candidate.number} value={candidate.number}>
+                    #{candidate.number} {candidate.title}
+                  </option>
+                ))}
+              </select>
+            </label>
+            {parent == null ? null : (
+              <label className={pill}>
+                <span className="text-ink-soft">stage</span>
+                <input
+                  type="number"
+                  min={0}
+                  value={stage}
+                  onChange={(event) => {
+                    setStage(Math.max(0, Number(event.target.value)));
+                  }}
+                  className="w-10 bg-transparent outline-none font-bold"
+                />
+              </label>
+            )}
             <label className={pill}>
               <span className="text-ink-soft">Priority</span>
               <select
@@ -173,6 +242,14 @@ export function CreateIssueModal({
             <p className="font-mono text-[0.62rem] font-bold text-warn">
               In Progress needs an assignee — pick who is on it.
             </p>
+          ) : willEnqueue ? (
+            // Creating into In Progress with somebody on it starts an agent
+            // and spends money. The modal says so before the button is
+            // pressed rather than reporting it afterwards in a toast.
+            <p className="border-2 border-black bg-brand/25 rounded-md px-2 py-1 font-mono text-[0.62rem] font-bold">
+              ⚡ In Progress + @{agents.find((a) => a.id === assignee)?.handle ?? '?'} — creating
+              this starts a run.
+            </p>
           ) : null}
           {error != null ? (
             <div className="bg-white border-2 border-err text-err rounded-md px-3 py-2 font-mono text-[0.75rem] break-words">
@@ -192,6 +269,18 @@ export function CreateIssueModal({
             />
             Continue create
           </label>
+          {onAskLead === undefined ? null : (
+            <button
+              type="button"
+              title="Describe it in a sentence and let the lead open the card"
+              onClick={() => {
+                onAskLead(title.trim() === '' ? description : title);
+              }}
+              className="font-mono text-[0.66rem] text-ink-soft underline cursor-pointer"
+            >
+              ⇄ Switch to agent
+            </button>
+          )}
           <Button
             className="ml-auto !px-4 !py-1.5 !text-[0.78rem]"
             variant="primary"

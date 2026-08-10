@@ -1,6 +1,7 @@
 import { useRef, useState } from 'react';
 
 import { Button } from '../../components/Button';
+import { MarkdownBody } from '../ChatPage';
 import type { Agent, Issue, IssueRun } from './boardModel';
 import {
   applyMention,
@@ -16,6 +17,7 @@ import {
   eventTime,
   pendingApprovals,
   type IssueEvent,
+  type PendingApproval as PendingApprovalRow,
 } from './timelineModel';
 
 function Note({ event, now }: { event: IssueEvent; now: number }) {
@@ -34,16 +36,55 @@ function Note({ event, now }: { event: IssueEvent; now: number }) {
 
 function Comment({ event, now }: { event: IssueEvent; now: number }) {
   const text = event.body.kind === 'comment' ? event.body.text : '';
+  // The operator's own words carry the chat page's amber user bubble; an
+  // agent's report is surface. Rendering both identically made a timeline
+  // where you could not tell what you had asked for from what came back.
+  const mine = event.actor.kind === 'user';
   return (
     <li className="py-1.5">
-      <div className="border-2 border-black rounded-md bg-surface px-3 py-2 shadow-brutal-sm">
+      <div
+        className={`border-2 border-black rounded-md px-3 py-2 shadow-brutal-sm ${
+          mine ? 'bg-brand/60' : 'bg-surface'
+        }`}
+      >
         <div className="flex items-baseline gap-2 font-mono text-[0.66rem]">
           <span className="font-bold">{actorLabel(event)}</span>
           <span className="ml-auto tabular-nums text-[0.62rem] text-ink-soft">
             {eventTime(event.created_at_ms, now)}
           </span>
         </div>
-        <p className="mt-1 whitespace-pre-wrap break-words font-sans text-[0.82rem]">{text}</p>
+        <div className="mt-1 chat-prose text-[0.82rem] break-words">
+          <MarkdownBody text={text} />
+        </div>
+      </div>
+    </li>
+  );
+}
+
+/// A settled approval, frozen where it happened. The mockup's second state:
+/// the decision stays on the timeline rather than collapsing into a
+/// sentence, because "who let this through, and when" is the question a
+/// reader comes back to the card with.
+function ResolvedApproval({ event, now }: { event: IssueEvent; now: number }) {
+  if (event.body.kind !== 'approval_resolved') return null;
+  const approved = event.body.decision !== 'deny';
+  return (
+    <li className="py-1.5">
+      <div
+        className={`border-2 rounded-md px-3 py-2 ${
+          approved ? 'border-ok/60 bg-ok/10' : 'border-err/50 bg-err/10'
+        }`}
+      >
+        <p
+          className={`font-mono text-[0.62rem] font-bold uppercase tracking-wider ${
+            approved ? 'text-ok' : 'text-err'
+          }`}
+        >
+          {approved ? '✓ Approved · run continued' : '✕ Denied'}
+        </p>
+        <p className="mt-1 font-mono text-[0.62rem] text-ink-soft">
+          {actorLabel(event)} · {eventTime(event.created_at_ms, now)}
+        </p>
       </div>
     </li>
   );
@@ -54,14 +95,15 @@ function PendingApproval({
   onResolve,
   busy,
 }: {
-  approval: { callId: string; tool: string; summary: string };
+  approval: PendingApprovalRow;
   onResolve: (callId: string, decision: 'approve' | 'approve_always' | 'deny') => void;
   busy: boolean;
 }) {
   return (
     <div className="mt-3 border-[3px] border-warn rounded-md bg-warn/10 px-3 py-2 shadow-brutal-sm">
       <p className="font-mono text-[0.62rem] font-bold uppercase tracking-wider text-warn">
-        Waiting on you — {approval.tool}
+        ⚑ Waiting on you — {approval.tool}
+        {approval.attempt == null ? '' : ` · run #${approval.attempt}`}
       </p>
       <p className="mt-1 whitespace-pre-wrap break-words font-mono text-[0.74rem]">
         {approval.summary}
@@ -161,6 +203,8 @@ export function Timeline({
           {events.map((event) =>
             eventShape(event) === 'comment' ? (
               <Comment key={event.id} event={event} now={now} />
+            ) : event.body.kind === 'approval_resolved' ? (
+              <ResolvedApproval key={event.id} event={event} now={now} />
             ) : (
               <Note key={event.id} event={event} now={now} />
             ),
@@ -226,7 +270,7 @@ export function Timeline({
             {busy ? 'Sending…' : 'Comment'}
           </Button>
           <span className="font-mono text-[0.66rem] text-ink-soft">
-            {mentionHint(issue, draft, team) ?? commentHint(issue, runs)}
+            {mentionHint(issue, draft, team) ?? commentHint(issue, runs, team)}
           </span>
         </div>
       </div>

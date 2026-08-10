@@ -55,6 +55,19 @@ impl ApprovalGate for TimelineApprovalGate {
             Ok(issue) => issue.assignee.map_or(IssueActor::User, IssueActor::Agent),
             Err(_) => IssueActor::User,
         };
+        // Which run is parked. The dedupe guard keeps at most one run per
+        // issue in flight, so "the unsettled one" is unambiguous — the same
+        // reasoning the run waiter relies on.
+        let attempt = self
+            .manager
+            .list_runs(&project, number)
+            .await
+            .ok()
+            .and_then(|runs| {
+                runs.into_iter()
+                    .find(|run| run.settled_at.is_none())
+                    .map(|run| run.attempt)
+            });
         self.manager
             .record_event(
                 &project,
@@ -62,6 +75,7 @@ impl ApprovalGate for TimelineApprovalGate {
                 actor.clone(),
                 IssueEventBody::ApprovalRequested {
                     call_id: call_id.clone(),
+                    attempt,
                     tool: req.tool.clone(),
                     summary: summarise(&req),
                 },

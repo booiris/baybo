@@ -1,6 +1,9 @@
+import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { RiCloseLine } from 'react-icons/ri';
 
+import { useAdminClient } from '../../api/auth';
+import { fetchModelPool, setAgentModel } from './api';
 import { COLUMN_LABEL, type Agent, type Issue, type IssueRun } from './boardModel';
 import { workingAgentIds } from './teamModel';
 
@@ -13,6 +16,8 @@ export function AgentProfile({
   projectId,
   onClose,
   onRemove,
+  onChanged,
+  onChatWithLead,
 }: {
   agent: Agent;
   team: Agent[];
@@ -22,6 +27,12 @@ export function AgentProfile({
   projectId: string;
   onClose: () => void;
   onRemove: (agent: Agent) => void;
+  /// Refetch after an edit the panel made — the roster it was handed is a
+  /// snapshot, and a pin it just wrote must not read back stale.
+  onChanged: () => void;
+  /// Only the lead's card carries this; other agents are reached by
+  /// @mention on a card, and v1 has no DM.
+  onChatWithLead?: () => void;
 }) {
   const working = workingAgentIds(activeRuns).has(agent.id);
   const assigned = issues.filter(
@@ -29,6 +40,43 @@ export function AgentProfile({
   );
   const hiredBy = agent.hired_by;
   const hirerStillHere = hiredBy != null && team.some((row) => row.id === hiredBy.id);
+  // The runs this agent has in flight, which is what the status line and
+  // the queued count are both about. Drawn from the same frame the board
+  // card and the team strip read, so the three cannot disagree.
+  const mine = activeRuns.filter((run) => run.agent_id === agent.id);
+  const live = mine.find((run) => run.status === 'running') ?? null;
+  const queued = mine.filter((run) => run.status !== 'running').length;
+  const [confirmRemove, setConfirmRemove] = useState(false);
+  const [pinning, setPinning] = useState(false);
+  const [pinError, setPinError] = useState<string | null>(null);
+  const [pool, setPool] = useState<{ names: string[]; defaultName: string } | null>(null);
+  const client = useAdminClient();
+
+  useEffect(() => {
+    let canceled = false;
+    void fetchModelPool(client).then((outcome) => {
+      if (!canceled && outcome.kind === 'ok') setPool(outcome.value);
+    });
+    return () => {
+      canceled = true;
+    };
+  }, [client]);
+
+  // Esc closes, like the other layers on this board.
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key !== 'Escape') return;
+      if (confirmRemove) {
+        setConfirmRemove(false);
+        return;
+      }
+      onClose();
+    }
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('keydown', onKeyDown);
+    };
+  }, [confirmRemove, onClose]);
 
   return (
     <aside className="w-[320px] border-l-2 border-black bg-canvas flex flex-col min-h-0">
@@ -41,7 +89,7 @@ export function AgentProfile({
         />
         <h2 className="font-mono text-[0.72rem] font-bold">@{agent.handle}</h2>
         {agent.lead ? (
-          <span className="rounded border border-black/30 bg-brand/25 px-1 font-mono text-[0.52rem] font-bold uppercase">
+          <span className="rounded border-2 border-black bg-brand px-1.5 font-mono text-[0.52rem] font-bold uppercase tracking-wider text-ink">
             lead
           </span>
         ) : null}
@@ -63,17 +111,47 @@ export function AgentProfile({
           </p>
         </div>
 
+        {/* What it is doing right now, in words. The header dot alone said
+            "green" without saying on what. */}
+        <p className="flex items-baseline gap-1.5 font-mono text-[0.66rem]">
+          <span
+            className={`w-2 h-2 rounded-full border border-black shrink-0 self-center ${
+              live !== null
+                ? 'bg-ok motion-safe:animate-pulse'
+                : queued > 0
+                  ? 'bg-brand opacity-40'
+                  : 'bg-ink-soft/40'
+            }`}
+          />
+          {live !== null ? (
+            <>
+              working on{' '}
+              <Link
+                to={`/projects/${encodeURIComponent(projectId)}/issues/${String(live.number)}`}
+                className="font-bold underline"
+              >
+                #{live.number}
+              </Link>{' '}
+              · run #{live.attempt}
+            </>
+          ) : queued > 0 ? (
+            <span className="text-ink-soft">
+              queued on {queued} card{queued === 1 ? '' : 's'}
+            </span>
+          ) : (
+            <span className="text-ink-soft">idle</span>
+          )}
+        </p>
+
         <dl className="font-mono text-[0.62rem] text-ink-soft flex flex-col gap-1">
           <div className="flex gap-2">
             <dt className="shrink-0">Runs on</dt>
-            <dd className="text-ink">{agent.framework}</dd>
+            <dd className="text-ink">{agent.framework} (fixed at hire)</dd>
           </div>
-          {agent.llm == null ? null : (
-            <div className="flex gap-2">
-              <dt className="shrink-0">Model</dt>
-              <dd className="text-ink break-all">{agent.llm}</dd>
-            </div>
-          )}
+          <div className="flex gap-2">
+            <dt className="shrink-0">Queued</dt>
+            <dd className="text-ink tabular-nums">{queued}</dd>
+          </div>
           <div className="flex gap-2">
             <dt className="shrink-0">Joined</dt>
             <dd className="text-ink">
@@ -84,6 +162,53 @@ export function AgentProfile({
             </dd>
           </div>
         </dl>
+
+        <section>
+          <h3 className="font-mono text-[0.6rem] font-bold uppercase tracking-wider text-ink-soft">
+            Setup
+          </h3>
+          <label className="block mt-1">
+            <span className="font-mono text-[0.58rem] text-ink-soft">LLM pin</span>
+            <select
+              aria-label="LLM pin"
+              disabled={readOnly || pinning || pool === null}
+              value={agent.llm ?? ''}
+              onChange={(event) => {
+                const picked = event.target.value;
+                setPinning(true);
+                void setAgentModel(client, agent.id, picked).then((outcome) => {
+                  setPinning(false);
+                  setPinError(outcome.kind === 'failed' ? outcome.message : null);
+                  if (outcome.kind === 'ok') onChanged();
+                });
+              }}
+              className="w-full mt-0.5 border-2 border-black rounded-md bg-surface px-1.5 py-0.5 font-mono text-[0.66rem] disabled:opacity-50"
+            >
+              {/* Pool-only: a pin outside it is a teammate that fails every
+                  time it is woken, so the picker never offers one. */}
+              <option value="">
+                default-llm{pool === null ? '' : ` (${pool.defaultName})`}
+              </option>
+              {(pool?.names ?? []).map((name) => (
+                <option key={name} value={name}>
+                  {name}
+                </option>
+              ))}
+            </select>
+          </label>
+          {pinError == null ? null : (
+            <p className="mt-1 font-mono text-[0.58rem] text-err break-words">{pinError}</p>
+          )}
+          <p className="mt-1.5 font-mono text-[0.58rem] text-ink-soft">
+            Persona{' '}
+            <a className="underline" href={`#/agents?agent=${encodeURIComponent(agent.id)}`}>
+              SOUL.md · IDENTITY.md
+            </a>
+          </p>
+          <p className="mt-0.5 font-mono text-[0.58rem] text-ink-soft">
+            Skills — the shared set, in v1
+          </p>
+        </section>
 
         <section>
           <h3 className="font-mono text-[0.6rem] font-bold uppercase tracking-wider text-ink-soft">
@@ -114,11 +239,52 @@ export function AgentProfile({
           )}
         </section>
 
-        {readOnly || agent.lead ? null : (
+        {agent.lead && onChatWithLead !== undefined ? (
+          <button
+            type="button"
+            onClick={onChatWithLead}
+            className="self-start border-2 border-black bg-brand rounded-md px-2 py-1 font-mono text-[0.68rem] font-bold shadow-brutal-xs"
+          >
+            Chat with lead
+          </button>
+        ) : null}
+
+        {readOnly || agent.lead ? null : confirmRemove ? (
+          // A tombstone, not a delete: the row stays so every timeline entry
+          // that names this agent still resolves, and the handle is reserved
+          // for good. None of that is undoable, so it is asked for twice.
+          <div className="border-2 border-err rounded-md bg-err/10 p-2">
+            <p className="font-mono text-[0.62rem] text-err leading-snug">
+              Remove @{agent.handle} from this board? Its past work keeps its name, the handle
+              stays reserved, and there is no undo.
+            </p>
+            <div className="mt-2 flex gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setConfirmRemove(false);
+                  onRemove(agent);
+                }}
+                className="border-2 border-err bg-err text-white rounded-md px-2 py-0.5 font-mono text-[0.66rem] font-bold"
+              >
+                Remove
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setConfirmRemove(false);
+                }}
+                className="border-2 border-black bg-surface rounded-md px-2 py-0.5 font-mono text-[0.66rem]"
+              >
+                Keep
+              </button>
+            </div>
+          </div>
+        ) : (
           <button
             type="button"
             onClick={() => {
-              onRemove(agent);
+              setConfirmRemove(true);
             }}
             className="self-start border-2 border-err text-err rounded-md px-2 py-0.5 font-mono text-[0.66rem] bg-surface"
           >

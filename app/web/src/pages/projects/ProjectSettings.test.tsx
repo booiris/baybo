@@ -40,6 +40,9 @@ describe('ProjectSettings', () => {
         project={project({ daily_budget_micros: 12_500_000 })}
         onClose={vi.fn()}
         onSaved={vi.fn()}
+      team={[]}
+      onOpenProfile={vi.fn()}
+      onAddAgent={vi.fn()}
       />,
     );
     const box = screen.getByLabelText('Daily budget');
@@ -63,6 +66,9 @@ describe('ProjectSettings', () => {
         project={project({ daily_budget_micros: 5_000_000 })}
         onClose={vi.fn()}
         onSaved={vi.fn()}
+      team={[]}
+      onOpenProfile={vi.fn()}
+      onAddAgent={vi.fn()}
       />,
     );
     await userEvent.clear(screen.getByLabelText('Daily budget'));
@@ -82,6 +88,9 @@ describe('ProjectSettings', () => {
         project={project({ max_parallel_issue_runs: 2 })}
         onClose={vi.fn()}
         onSaved={vi.fn()}
+      team={[]}
+      onOpenProfile={vi.fn()}
+      onAddAgent={vi.fn()}
       />,
     );
     const box = screen.getByLabelText('Parallel issue runs');
@@ -105,13 +114,19 @@ describe('ProjectSettings', () => {
         project={project({ max_parallel_issue_runs: 0 })}
         onClose={vi.fn()}
         onSaved={vi.fn()}
+      team={[]}
+      onOpenProfile={vi.fn()}
+      onAddAgent={vi.fn()}
       />,
     );
     expect(screen.getByText(/cards stay in Todo until you move them/)).toBeInTheDocument();
   });
 
   it('refuses an empty run ceiling rather than silently restoring the default', async () => {
-    render(<ProjectSettings project={project()} onClose={vi.fn()} onSaved={vi.fn()} />);
+    render(<ProjectSettings project={project()} onClose={vi.fn()} onSaved={vi.fn()}
+      team={[]}
+      onOpenProfile={vi.fn()}
+      onAddAgent={vi.fn()} />);
     await userEvent.clear(screen.getByLabelText('Parallel issue runs'));
     await userEvent.click(screen.getByRole('button', { name: 'Save' }));
     expect(await screen.findByText(/must be a whole number/)).toBeInTheDocument();
@@ -119,12 +134,18 @@ describe('ProjectSettings', () => {
   });
 
   it('separates zero from empty in what it tells the operator', () => {
-    render(<ProjectSettings project={project()} onClose={vi.fn()} onSaved={vi.fn()} />);
+    render(<ProjectSettings project={project()} onClose={vi.fn()} onSaved={vi.fn()}
+      team={[]}
+      onOpenProfile={vi.fn()}
+      onAddAgent={vi.fn()} />);
     expect(screen.getByText(/No ceiling/)).toBeInTheDocument();
   });
 
   it('refuses text that is not an amount instead of sending something else', async () => {
-    render(<ProjectSettings project={project()} onClose={vi.fn()} onSaved={vi.fn()} />);
+    render(<ProjectSettings project={project()} onClose={vi.fn()} onSaved={vi.fn()}
+      team={[]}
+      onOpenProfile={vi.fn()}
+      onAddAgent={vi.fn()} />);
     await userEvent.type(screen.getByLabelText('Daily budget'), 'lots');
     await userEvent.click(screen.getByRole('button', { name: 'Save' }));
     expect(await screen.findByText(/must be an amount in dollars/)).toBeInTheDocument();
@@ -137,6 +158,9 @@ describe('ProjectSettings', () => {
         project={project({ archived_at_ms: 111 })}
         onClose={vi.fn()}
         onSaved={vi.fn()}
+      team={[]}
+      onOpenProfile={vi.fn()}
+      onAddAgent={vi.fn()}
       />,
     );
     expect(screen.getByLabelText('Name')).toBeDisabled();
@@ -145,5 +169,38 @@ describe('ProjectSettings', () => {
 
     await userEvent.click(screen.getByRole('button', { name: 'Unarchive' }));
     expect(api.setProjectArchived).toHaveBeenCalledWith(client, '01JP', false);
+  });
+
+  it('manages the team from settings, reaching the same profile and hire form', async () => {
+    const onOpenProfile = vi.fn();
+    const onAddAgent = vi.fn();
+    render(
+      <ProjectSettings
+        project={project()}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+        team={[
+          {
+            id: '01JLEAD',
+            handle: 'lead',
+            name: 'Lead',
+            description: '',
+            framework: 'baybo',
+            lead: true,
+            created_at_ms: 0,
+          },
+        ]}
+        onOpenProfile={onOpenProfile}
+        onAddAgent={onAddAgent}
+      />,
+    );
+
+    await userEvent.click(screen.getByText('@lead'));
+    expect(onOpenProfile).toHaveBeenCalled();
+
+    // The same form the team strip's ＋ opens — settings must not grow a
+    // second one that drifts from it.
+    await userEvent.click(screen.getByRole('button', { name: /New agent/ }));
+    expect(onAddAgent).toHaveBeenCalled();
   });
 });

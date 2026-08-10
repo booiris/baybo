@@ -2,7 +2,6 @@ import { Link } from 'react-router-dom';
 
 import { COLUMN_LABEL, type Agent, type Issue, type IssueStatus } from './boardModel';
 import { groupByStage, stageProgress } from './stageModel';
-import { handleOf } from './teamModel';
 
 const STAGE_TONE: Record<'done' | 'open' | 'waiting', string> = {
   done: 'border-ok/50 bg-ok/10 text-ok',
@@ -22,12 +21,17 @@ export function SubIssues({
   team,
   disabled,
   onStatus,
+  onAssignee,
 }: {
   projectId: string;
   children: Issue[];
   team: Agent[];
   disabled: boolean;
   onStatus: (number: number, status: IssueStatus) => void;
+  /// A step's assignee is editable in place, like its status: the mockup's
+  /// stage list is where a parent's work is handed out, and sending the
+  /// operator to each child's own page to do it defeats the grouping.
+  onAssignee: (number: number, assignee: string | null) => void;
 }) {
   if (children.length === 0) return null;
   const stages = groupByStage(children);
@@ -35,11 +39,11 @@ export function SubIssues({
 
   return (
     <section className="mt-5">
-      <h2 className="flex items-baseline gap-2 font-mono text-[0.6rem] font-bold uppercase tracking-wider text-ink-soft">
+      <h2
+        className="font-mono text-[0.6rem] font-bold uppercase tracking-wider text-ink-soft"
+        title={`${done} of ${total} steps done`}
+      >
         Sub-issues
-        <span className="tabular-nums normal-case tracking-normal">
-          {done}/{total} done
-        </span>
       </h2>
 
       <div className="mt-2 flex flex-col gap-2">
@@ -51,7 +55,10 @@ export function SubIssues({
               }`}
             >
               Stage {stage.stage}
-              <span className="normal-case tracking-normal font-normal">
+              <span className="tabular-nums normal-case tracking-normal">
+                {stageProgress(stage.issues).done}/{stageProgress(stage.issues).total} done
+              </span>
+              <span className="ml-auto normal-case tracking-normal font-normal">
                 {STAGE_NOTE[stage.state]}
               </span>
             </div>
@@ -69,11 +76,23 @@ export function SubIssues({
                   >
                     <span className="font-bold">#{child.number}</span> {child.title}
                   </Link>
-                  {child.assignee == null ? null : (
-                    <span className="shrink-0 font-mono text-[0.58rem] text-ink-soft">
-                      @{handleOf(team, child.assignee)}
-                    </span>
-                  )}
+                  <select
+                    aria-label={`Assignee of #${child.number}`}
+                    value={child.assignee ?? ''}
+                    disabled={disabled || child.cancelled_at_ms != null}
+                    onChange={(event) => {
+                      const picked = event.target.value;
+                      onAssignee(child.number, picked.length > 0 ? picked : null);
+                    }}
+                    className="shrink-0 max-w-[7.5rem] border border-black/30 rounded bg-surface px-1 py-0.5 font-mono text-[0.58rem] disabled:opacity-50"
+                  >
+                    <option value="">Unassigned</option>
+                    {team.map((agent) => (
+                      <option key={agent.id} value={agent.id}>
+                        @{agent.handle}
+                      </option>
+                    ))}
+                  </select>
                   <select
                     aria-label={`Status of #${child.number}`}
                     value={child.status}

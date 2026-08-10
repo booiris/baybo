@@ -25,8 +25,9 @@ pub use dispatch::{DispatchConfig, IssueRunEvent};
 pub use error::{ProjectError, Result};
 pub use events::{NoopProjectEvents, ProjectEvents};
 pub use manager::{
-    LEAD_HANDLE, MAX_FEED_PAGE, MAX_TEAM_AGENTS, NewIssueRequest, NewProject, NewTeamMember,
-    ProjectManager, RunDispatch, no_dispatch, validate_workdir,
+    FeedEntry, IssueRunLog, LEAD_HANDLE, MAX_FEED_PAGE, MAX_TEAM_AGENTS, NewIssueRequest,
+    NewProject, NewTeamMember, ProjectManager, RunDispatch, RunWithSpend, no_dispatch,
+    validate_workdir,
 };
 /// Reachable only from a test build. The agent crate's tests assert that
 /// the session its router opens and the window this crate's brief is a

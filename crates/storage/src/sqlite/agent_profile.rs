@@ -202,6 +202,25 @@ impl AgentProfileStore for SqliteAgentProfileStore {
         raws.into_iter().map(row_from_raw).collect()
     }
 
+    async fn list_team_history(&self, project: &ProjectId) -> Result<Vec<AgentProfileRow>> {
+        let project = project.as_str().to_string();
+        let raws = self
+            .pool
+            .interact("agent_profiles.list_team_history", move |conn| {
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {SELECT_COLS} FROM agent_profiles \
+                     WHERE project_id = ?1 \
+                     ORDER BY created_at ASC, id ASC"
+                ))?;
+                let raws = stmt
+                    .query_map(rusqlite::params![project], read_raw_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(raws)
+            })
+            .await?;
+        raws.into_iter().map(row_from_raw).collect()
+    }
+
     async fn list_team(&self, project: &ProjectId) -> Result<Vec<AgentProfileRow>> {
         let project = project.as_str().to_string();
         let raws = self

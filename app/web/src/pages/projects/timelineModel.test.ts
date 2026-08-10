@@ -118,45 +118,55 @@ describe('actorLabel', () => {
 });
 
 describe('commentHint', () => {
+  // A real assignee is an agent **id**, not a handle. The fixture used to
+  // be 'dev-1', which is handle-shaped — so a hint that printed the id
+  // read correctly here while showing a raw ULID in the app.
+  const DEV_1 = '01KZAD1QBS4A1XH456XJ7AC0V9';
+  const team = [
+    { id: DEV_1, handle: 'dev-1' },
+  ] as unknown as Parameters<typeof commentHint>[2];
   const live = [{ status: 'running' as const }];
   const queued = [{ status: 'queued' as const }];
   const settled = [{ status: 'done' as const }];
   const held = [{ status: 'held' as const }];
 
   it('says record-only when nobody is on the issue', () => {
-    expect(commentHint({ status: 'in_progress', assignee: null }, [])).toContain(
+    expect(commentHint({ status: 'in_progress', assignee: null }, [], team)).toContain(
       'nobody is assigned',
     );
   });
 
   it('says record-only for parked or cancelled work even with an assignee', () => {
-    expect(commentHint({ status: 'backlog', assignee: 'dev-1' }, [])).toContain(
+    expect(commentHint({ status: 'backlog', assignee: DEV_1 }, [], team)).toContain(
       'not working on this',
     );
-    expect(commentHint({ status: 'done', assignee: 'dev-1' }, [])).toContain('not working on this');
+    expect(commentHint({ status: 'done', assignee: DEV_1 }, [], team)).toContain('not working on this');
     expect(
-      commentHint({ status: 'in_progress', assignee: 'dev-1', cancelled_at_ms: 1 }, []),
+      commentHint({ status: 'in_progress', assignee: DEV_1, cancelled_at_ms: 1 }, [], team),
     ).toContain('cancelled');
   });
 
   it('promises a run when the assignee is on live work and nothing is reading', () => {
-    expect(commentHint({ status: 'todo', assignee: 'dev-1' }, [])).toBe(
+    expect(commentHint({ status: 'todo', assignee: DEV_1 }, [], team)).toBe(
       'Starts a run: @dev-1 will read this now.',
     );
-    expect(commentHint({ status: 'review', assignee: 'dev-1' }, settled)).toContain('Starts a run');
+    // The id must never reach the composer — a person is addressed by
+    // handle, and a ULID in a sentence is the tell that a raw row escaped.
+    expect(commentHint({ status: 'todo', assignee: DEV_1 }, [], team)).not.toContain(DEV_1);
+    expect(commentHint({ status: 'review', assignee: DEV_1 }, settled, team)).toContain('Starts a run');
   });
 
   it('distinguishes a queued run from one already going', () => {
-    expect(commentHint({ status: 'in_progress', assignee: 'dev-1' }, queued)).toContain(
+    expect(commentHint({ status: 'in_progress', assignee: DEV_1 }, queued, team)).toContain(
       'when the queued run starts',
     );
-    expect(commentHint({ status: 'in_progress', assignee: 'dev-1' }, live)).toContain(
+    expect(commentHint({ status: 'in_progress', assignee: DEV_1 }, live, team)).toContain(
       'when that run finishes',
     );
   });
 
   it('says a held run will read it, and why it has not started', () => {
-    const hint = commentHint({ status: 'in_progress', assignee: 'dev-1' }, held);
+    const hint = commentHint({ status: 'in_progress', assignee: DEV_1 }, held, team);
     expect(hint).toContain('held run starts');
     expect(hint).toContain('daily budget');
   });

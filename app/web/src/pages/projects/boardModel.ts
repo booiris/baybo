@@ -6,6 +6,10 @@ export type Agent = components['schemas']['TeamMemberDto'];
 export type IssueRun =
   paths['/v1/projects/{project_id}/runs']['get']['responses'][200]['content']['application/json']['items'][number];
 export type RunStatus = IssueRun['status'];
+/// A card's execution log with its totals. The server sums it, so the rail
+/// and the rows can never disagree about what the card cost.
+export type RunLog =
+  paths['/v1/projects/{project_id}/issues/{number}/runs']['get']['responses'][200]['content']['application/json'];
 export type Project = components['schemas']['ProjectDto'];
 export type IssueStatus = Issue['status'];
 export type IssuePriority = Issue['priority'];
@@ -94,7 +98,7 @@ export function findIssue(board: Board, number: number): Issue | null {
   return null;
 }
 
-function statusOf(board: Board, number: number): IssueStatus | null {
+export function statusOf(board: Board, number: number): IssueStatus | null {
   for (const status of COLUMNS) {
     if (board[status].some((issue) => issue.number === number)) return status;
   }
@@ -208,9 +212,35 @@ export function retryRejection(issue: {
 
 export function dropRejection(issue: Issue, target: IssueStatus): string | null {
   if (target === 'in_progress' && issue.assignee == null) {
-    return `#${issue.number} needs an assignee before it can start`;
+    return `Assign an agent first — #${issue.number} is back in ${COLUMN_LABEL[issue.status]}`;
   }
   return null;
+}
+
+/// What a completed move should announce, if anything.
+///
+/// Almost nothing. The board is the control surface and the timeline is the
+/// audit trail, so a reorder and an ordinary column change are silent; the
+/// one drop worth interrupting for is the one that **started an agent**,
+/// because that is the only one that spends money without being asked
+/// again. A toast on every move is a toast nobody reads.
+export function moveAnnouncement(
+  issue: Issue,
+  from: IssueStatus,
+  handle: string | null,
+): string | null {
+  const started = issue.status === 'in_progress' && from !== 'in_progress';
+  if (!started || issue.assignee == null || handle === null) return null;
+  return `Queued for @${handle} — #${issue.number}`;
+}
+
+/// Whether the card should show a branch element at all.
+///
+/// A branch appears only once the work has a commit, which is the same fact
+/// as "this card produced something" — so a research card, whose deliverable
+/// is its report, never shows one. See the spec's worktree-vs-branch split.
+export function hasDeliverable(issue: Issue): boolean {
+  return issue.branch != null && issue.branch.length > 0;
 }
 
 export function updatedAgo(atMs: number, nowMs: number): string {

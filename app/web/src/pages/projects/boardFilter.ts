@@ -13,11 +13,16 @@ export type BoardFilter = {
   showCancelled: boolean;
 };
 
+/// Cancelled cards are **shown** by default, struck through, and filtered
+/// out on request — not hidden and revealed on request. Cancel is the
+/// terminal negative, not a delete: a card that vanishes the moment it is
+/// called off takes its history off the board with it, and the operator
+/// loses the one view that says what was dropped and when.
 export const EMPTY_FILTER: BoardFilter = {
   text: '',
   assignee: { kind: 'anyone' },
   blockedOnly: false,
-  showCancelled: false,
+  showCancelled: true,
 };
 
 const PARAM_TEXT = 'q';
@@ -34,7 +39,7 @@ export function isRestrictive(filter: BoardFilter): boolean {
 }
 
 export function isDefault(filter: BoardFilter): boolean {
-  return !isRestrictive(filter) && !filter.showCancelled;
+  return !isRestrictive(filter) && filter.showCancelled;
 }
 
 function matchesText(issue: Issue, text: string): boolean {
@@ -83,7 +88,9 @@ export function parseBoardFilter(params: URLSearchParams): BoardFilter {
     text: params.get(PARAM_TEXT) ?? '',
     assignee,
     blockedOnly: params.get(PARAM_BLOCKED) === '1',
-    showCancelled: params.get(PARAM_CANCELLED) === '1',
+    // Absent means shown: hiding is the deliberate act, so it is the one
+    // that has to be written down in the URL.
+    showCancelled: params.get(PARAM_CANCELLED) !== '0',
   };
 }
 
@@ -96,6 +103,6 @@ export function boardFilterParams(filter: BoardFilter): URLSearchParams {
     params.set(PARAM_ASSIGNEE, `@${filter.assignee.handle}`);
   }
   if (filter.blockedOnly) params.set(PARAM_BLOCKED, '1');
-  if (filter.showCancelled) params.set(PARAM_CANCELLED, '1');
+  if (!filter.showCancelled) params.set(PARAM_CANCELLED, '0');
   return params;
 }

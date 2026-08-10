@@ -33,6 +33,7 @@ pub fn routes() -> OpenApiRouter<AdminState> {
         .routes(routes!(list_issue_events))
         .routes(routes!(project_feed))
         .routes(routes!(projects_attention))
+        .routes(routes!(projects_activity))
         .routes(routes!(mark_project_read))
         .routes(routes!(resolve_approval))
         .routes(routes!(create_comment))
@@ -85,7 +86,20 @@ async fn actor_handles(
             ids.extend(from.iter().chain(to.iter()).cloned());
         }
     }
-    futures::future::join_all(ids.into_iter().map(|id| async {
+    resolve_handles(state, project, ids).await
+}
+
+/// Look up the `@handle` for each id, dropping any that turns out to
+/// belong to another board. One home for the question, because the feed
+/// asks it of two different kinds of entry and a second spelling would be
+/// free to answer differently about who is on this team.
+async fn resolve_handles(
+    state: &AdminState,
+    project: &ProjectId,
+    ids: impl IntoIterator<Item = AgentProfileId>,
+) -> ActorHandles {
+    let unique: std::collections::HashSet<AgentProfileId> = ids.into_iter().collect();
+    futures::future::join_all(unique.into_iter().map(|id| async {
         let team = state
             .agent_profile_store
             .get(&id)
@@ -503,6 +517,10 @@ pub enum IssueEventBodyDto {
     },
     ApprovalRequested {
         call_id: String,
+        /// Which run is parked, by attempt number. Absent when the card was
+        /// not recording it yet, or when no run owns the prompt.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt: Option<i64>,
         tool: String,
         summary: String,
     },
@@ -528,10 +546,12 @@ impl IssueEventBodyDto {
         match body {
             IssueEventBody::ApprovalRequested {
                 call_id,
+                attempt,
                 tool,
                 summary,
             } => Self::ApprovalRequested {
                 call_id,
+                attempt,
                 tool,
                 summary,
             },
@@ -601,6 +621,37 @@ pub struct IssueEventDto {
     pub created_at_ms: i64,
 }
 
+/// One line of a board's activity feed. Shaped like a timeline entry
+/// because most lines are one, but `number` is optional: joining the team
+/// is a fact about the board, not about any card, so there is nothing for
+/// it to point at.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct FeedEntryDto {
+    /// The card this concerns. Absent on board-level entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub number: Option<i64>,
+    pub actor: ActorDto,
+    pub body: FeedBodyDto,
+    pub created_at_ms: i64,
+}
+
+/// A feed line's payload: either a card's timeline entry, or one of the
+/// board-level facts that has no card to live on.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(untagged)]
+pub enum FeedBodyDto {
+    Card(IssueEventBodyDto),
+    Board(BoardEventDto),
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BoardEventDto {
+    /// Somebody joined the team. Derived from the roster, never stored as
+    /// an event, so it cannot drift from who is actually on the board.
+    Hired { agent: AgentRefDto },
+}
+
 impl IssueEventDto {
     fn with_handles(row: IssueEventRow, handles: &ActorHandles) -> Self {
         let actor = match &row.actor {
@@ -646,6 +697,20 @@ pub struct IssueRunDto {
     pub started_at_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settled_at_ms: Option<i64>,
+    /// What this run's LLM calls cost, in micro-USD. Derived from the cost
+    /// ledger over the run's own window, so a session several runs share
+    /// still bills each call to the run that made it.
+    ///
+    /// **Absent, not zero**, on responses that do not price runs — the
+    /// board's active-run poll among them. Zero is a real answer there
+    /// (a run that has not billed yet), so the two states cannot share an
+    /// encoding without the board reporting free work as fact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_micros: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<i64>,
 }
 
 impl From<IssueRunRow> for IssueRunDto {
@@ -661,6 +726,35 @@ impl From<IssueRunRow> for IssueRunDto {
             created_at_ms: row.created_at.timestamp_millis(),
             started_at_ms: row.started_at.map(|t| t.timestamp_millis()),
             settled_at_ms: row.settled_at.map(|t| t.timestamp_millis()),
+            cost_micros: None,
+            input_tokens: None,
+            output_tokens: None,
+        }
+    }
+}
+
+/// A card's execution log with its totals attached. The totals ship beside
+/// the rows rather than being left to the client because a client that
+/// summed them would be the second place that decides what a card cost —
+/// and the first to disagree once a run is filtered out of the view.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct IssueRunLogDto {
+    pub items: Vec<IssueRunDto>,
+    /// Across **every** run, cancelled ones included: the money was spent
+    /// either way, and a total that skipped them would not reconcile
+    /// against the board's budget.
+    pub total_cost_micros: i64,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
+}
+
+impl From<baybo_project::RunWithSpend> for IssueRunDto {
+    fn from(row: baybo_project::RunWithSpend) -> Self {
+        Self {
+            cost_micros: Some(row.spend.cost.into_micros()),
+            input_tokens: Some(row.spend.input_tokens),
+            output_tokens: Some(row.spend.output_tokens),
+            ..Self::from(row.run)
         }
     }
 }
@@ -1134,7 +1228,7 @@ async fn move_issue(
         ("number" = i64, Path, description = "Issue number within the project"),
     ),
     responses(
-        (status = 200, description = "Every run of this issue, newest first", body = inline(ListResponse<IssueRunDto>)),
+        (status = 200, description = "Every run of this issue, newest first, priced", body = IssueRunLogDto),
         (status = 401, description = "Unauthorized", body = ErrorBody),
         (status = 404, description = "Unknown project or issue", body = ErrorBody),
     )
@@ -1142,17 +1236,19 @@ async fn move_issue(
 async fn list_issue_runs(
     State(state): State<AdminState>,
     Path((project_id, number)): Path<(String, i64)>,
-) -> Result<Json<ListResponse<IssueRunDto>>> {
+) -> Result<Json<IssueRunLogDto>> {
     let id = parse_project_id(&project_id)?;
-    let items = state
+    let log = state
         .project_manager
-        .list_runs(&id, number)
+        .run_log(&id, number)
         .await
-        .map_err(project_err)?
-        .into_iter()
-        .map(IssueRunDto::from)
-        .collect();
-    Ok(Json(ListResponse::new(items)))
+        .map_err(project_err)?;
+    Ok(Json(IssueRunLogDto {
+        items: log.runs.into_iter().map(IssueRunDto::from).collect(),
+        total_cost_micros: log.total.cost.into_micros(),
+        total_input_tokens: log.total.input_tokens,
+        total_output_tokens: log.total.output_tokens,
+    }))
 }
 
 /// Query for `GET /projects/{project_id}/feed`.
@@ -1286,6 +1382,63 @@ async fn mark_project_read(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// What one board is doing right now, for the switcher's dropdown.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ProjectActivityDto {
+    pub project_id: String,
+    /// Runs executing. Counted from runs, not from the In Progress column —
+    /// a run outlives its column, so the two disagree by design.
+    pub working: usize,
+    /// Spend since the start of your day, in micro-USD. Measured exactly as
+    /// the budget gate measures it, so the pair in the dropdown can never
+    /// accuse the board of crossing a ceiling it did not.
+    pub burn_micros: i64,
+}
+
+#[utoipa::path(
+    get,
+    path = "/projects/activity",
+    tag = "projects",
+    params(("since_ms" = Option<i64>, Query, description = "Start of your day, epoch ms. Defaults to the last 24 hours.")),
+    responses(
+        (status = 200, description = "Every board's live working count and today's burn. Boards with neither are absent.", body = inline(ListResponse<ProjectActivityDto>)),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+    )
+)]
+async fn projects_activity(
+    State(state): State<AdminState>,
+    Query(query): Query<ActivityQuery>,
+) -> Result<Json<ListResponse<ProjectActivityDto>>> {
+    // The caller's day, not the server's: "today's burn" is a question
+    // about the operator's clock, and a server in another timezone would
+    // answer a different one.
+    let since = match query.since_ms {
+        Some(ms) => chrono::DateTime::from_timestamp_millis(ms)
+            .ok_or_else(|| GatewayError::BadRequest(format!("since_ms out of range: {ms}")))?,
+        None => chrono::Utc::now() - chrono::Duration::hours(24),
+    };
+    let items = state
+        .project_manager
+        .board_activity(since)
+        .await
+        .map_err(project_err)?
+        .into_iter()
+        .map(|(project_id, activity)| ProjectActivityDto {
+            project_id: project_id.as_str().to_owned(),
+            working: activity.working,
+            burn_micros: activity.burn.into_micros(),
+        })
+        .collect();
+    Ok(Json(ListResponse::new(items)))
+}
+
+/// Query for `GET /projects/activity`.
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct ActivityQuery {
+    #[serde(default)]
+    pub since_ms: Option<i64>,
+}
+
 #[utoipa::path(
     get,
     path = "/projects/attention",
@@ -1344,7 +1497,7 @@ async fn projects_attention(
     tag = "projects",
     params(("project_id" = String, Path, description = "Project id"), FeedQuery),
     responses(
-        (status = 200, description = "This project's activity, newest first", body = inline(ListResponse<IssueEventDto>)),
+        (status = 200, description = "This project's activity, newest first", body = inline(ListResponse<FeedEntryDto>)),
         (status = 401, description = "Unauthorized", body = ErrorBody),
         (status = 404, description = "Unknown project", body = ErrorBody),
     )
@@ -1353,7 +1506,7 @@ async fn project_feed(
     State(state): State<AdminState>,
     Path(project_id): Path<String>,
     Query(query): Query<FeedQuery>,
-) -> Result<Json<ListResponse<IssueEventDto>>> {
+) -> Result<Json<ListResponse<FeedEntryDto>>> {
     let id = parse_project_id(&project_id)?;
     let before = query
         .before_ms
@@ -1371,10 +1524,57 @@ async fn project_feed(
         )
         .await
         .map_err(project_err)?;
-    let handles = actor_handles(&state, &id, &rows).await;
+    let cards: Vec<IssueEventRow> = rows
+        .iter()
+        .filter_map(|entry| match entry {
+            baybo_project::FeedEntry::Card(row) => Some(row.clone()),
+            baybo_project::FeedEntry::Hired { .. } => None,
+        })
+        .collect();
+    let mut handles = actor_handles(&state, &id, &cards).await;
+    // A hire names two agents the card entries never mention — the new
+    // teammate, and whoever hired them.
+    let mut extra: Vec<AgentProfileId> = Vec::new();
+    for entry in &rows {
+        if let baybo_project::FeedEntry::Hired {
+            agent, hired_by, ..
+        } = entry
+        {
+            extra.push(agent.clone());
+            extra.extend(hired_by.clone());
+        }
+    }
+    handles.extend(resolve_handles(&state, &id, extra).await);
     let items = rows
         .into_iter()
-        .map(|row| IssueEventDto::with_handles(row, &handles))
+        .map(|entry| match entry {
+            baybo_project::FeedEntry::Card(row) => {
+                let dto = IssueEventDto::with_handles(row, &handles);
+                FeedEntryDto {
+                    number: Some(dto.number),
+                    actor: dto.actor,
+                    body: FeedBodyDto::Card(dto.body),
+                    created_at_ms: dto.created_at_ms,
+                }
+            }
+            baybo_project::FeedEntry::Hired {
+                agent,
+                hired_by,
+                at,
+            } => FeedEntryDto {
+                number: None,
+                // Who did the hiring is the actor; the lead arrives with
+                // the board and so reads as the system's doing.
+                actor: match hired_by {
+                    Some(id) => ActorDto::Agent(agent_ref(&id, &handles)),
+                    None => ActorDto::User,
+                },
+                body: FeedBodyDto::Board(BoardEventDto::Hired {
+                    agent: agent_ref(&agent, &handles),
+                }),
+                created_at_ms: at.timestamp_millis(),
+            },
+        })
         .collect();
     Ok(Json(ListResponse::new(items)))
 }

@@ -47,6 +47,7 @@ function renderSteps(children: Issue[], disabled = false) {
         team={TEAM}
         disabled={disabled}
         onStatus={onStatus}
+      onAssignee={vi.fn()}
       />
     </MemoryRouter>,
   );
@@ -57,7 +58,14 @@ describe('SubIssues', () => {
   it('renders nothing for a card with no steps', () => {
     const { container } = render(
       <MemoryRouter>
-        <SubIssues projectId="01JP" children={[]} team={TEAM} disabled={false} onStatus={vi.fn()} />
+        <SubIssues
+          projectId="01JP"
+          children={[]}
+          team={TEAM}
+          disabled={false}
+          onStatus={vi.fn()}
+          onAssignee={vi.fn()}
+        />
       </MemoryRouter>,
     );
     expect(container).toBeEmptyDOMElement();
@@ -70,13 +78,16 @@ describe('SubIssues', () => {
     expect(screen.getByText(/starts when the stage above finishes/)).toBeInTheDocument();
   });
 
-  it('counts only work still meant to happen', () => {
+  it('counts each stage on its own, and only work still meant to happen', () => {
     renderSteps([
       child(0, { status: 'done' }),
       child(0, { status: 'done' }),
       child(1, { cancelled_at_ms: 1 }),
     ]);
+    // Stage 0 is finished; stage 1 holds one cancelled step, which leaves
+    // both sides of the count — it is neither work done nor work owed.
     expect(screen.getByText('2/2 done')).toBeInTheDocument();
+    expect(screen.getByText('0/0 done')).toBeInTheDocument();
   });
 
   it('moves a step in place and shows who is on it', async () => {

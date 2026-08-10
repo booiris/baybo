@@ -145,6 +145,47 @@ describe('pending approvals', () => {
       />,
     );
     expect(screen.queryByText(/Waiting on you/)).not.toBeInTheDocument();
-    expect(screen.getByText(/refusal was recorded/)).toBeInTheDocument();
+    // The decision freezes in place rather than collapsing to a sentence:
+    // "who let this through, and when" is what a reader comes back for.
+    expect(screen.getByText(/Denied/)).toBeInTheDocument();
+  });
+
+  it('marks the operator’s own comment apart from an agent’s report', () => {
+    const { container } = render(
+      <Timeline
+        events={[
+          { ...entry({ kind: 'comment', text: 'do the thing' }), actor: { kind: 'user' } },
+          {
+            ...entry({ kind: 'comment', text: 'done' }),
+            id: 'e9',
+            actor: { kind: 'agent', id: '01JA', handle: 'dev-1' },
+          },
+        ]}
+        issue={ISSUE}
+        runs={[]}
+        onComment={vi.fn()}
+        onResolveApproval={vi.fn()}
+        busy={false}
+      />,
+    );
+    // The user's bubble carries the chat page's amber; the agent's is
+    // surface. Identical bubbles made the two indistinguishable.
+    const bubbles = container.querySelectorAll('li > div');
+    expect(bubbles[0].className).toContain('bg-brand');
+    expect(bubbles[1].className).toContain('bg-surface');
+  });
+
+  it('renders a comment’s markdown rather than its source', () => {
+    render(
+      <Timeline
+        events={[entry({ kind: 'comment', text: 'the **root cause** is a timer' })]}
+        issue={ISSUE}
+        runs={[]}
+        onComment={vi.fn()}
+        onResolveApproval={vi.fn()}
+        busy={false}
+      />,
+    );
+    expect(screen.getByText('root cause').tagName).toBe('STRONG');
   });
 });

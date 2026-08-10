@@ -1,6 +1,38 @@
 import { describe, expect, it } from 'vitest';
 
-import { budgetHint, formatBudget, parseBudget } from './budgetModel';
+import { budgetHint, formatBudget, formatTokens, formatUsd, parseBudget } from './budgetModel';
+
+describe('formatUsd', () => {
+  it('shows ordinary spend to the cent', () => {
+    expect(formatUsd(40_000)).toBe('$0.04');
+    expect(formatUsd(310_000)).toBe('$0.31');
+    expect(formatUsd(2_500_000)).toBe('$2.50');
+  });
+
+  it('never rounds real spend down to free', () => {
+    // A run that cost a twentieth of a cent is cheap; "$0.00" is the one
+    // reading that is wrong, because it says nothing was billed.
+    expect(formatUsd(500)).not.toBe('$0.00');
+    expect(Number(formatUsd(500).slice(1))).toBeGreaterThan(0);
+    expect(Number(formatUsd(12).slice(1))).toBeGreaterThan(0);
+  });
+
+  it('separates nothing-spent from nothing-known', () => {
+    expect(formatUsd(0)).toBe('$0.00');
+    expect(formatUsd(null)).toBe('—');
+    expect(formatUsd(undefined)).toBe('—');
+  });
+});
+
+describe('formatTokens', () => {
+  it('abbreviates thousands and keeps small counts exact', () => {
+    expect(formatTokens(0)).toBe('0');
+    expect(formatTokens(999)).toBe('999');
+    expect(formatTokens(1_200)).toBe('1.2k');
+    expect(formatTokens(42_000)).toBe('42k');
+    expect(formatTokens(128_000)).toBe('128k');
+  });
+});
 
 describe('parseBudget', () => {
   it('reads dollars as exact micro-USD', () => {

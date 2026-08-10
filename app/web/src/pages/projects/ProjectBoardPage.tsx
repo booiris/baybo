@@ -51,7 +51,10 @@ import {
   emptyBoard,
   findIssue,
   groupByStatus,
+  hasDeliverable,
   liveCount,
+  moveAnnouncement,
+  statusOf,
   updatedAgo,
   moveCard,
   orderedNumbers,
@@ -89,7 +92,7 @@ export function ProjectBoardPage() {
   const client = useAdminClient();
   const { logout } = useAuth();
   const navigate = useNavigate();
-  const { toasts, pushToast } = useToasts();
+  const { toasts, pushToast, dismissToast } = useToasts();
 
   const [project, setProject] = useState<Project | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
@@ -100,12 +103,14 @@ export function ProjectBoardPage() {
   const [error, setError] = useState<string | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
   const [dragging, setDragging] = useState<Issue | null>(null);
+  const [dropInto, setDropInto] = useState<IssueStatus | null>(null);
   const [createIn, setCreateIn] = useState<IssueStatus | null>(null);
   const [params, setParams] = useSearchParams();
   const filter = useMemo(() => parseBoardFilter(params), [params]);
   const [rightPanel, setRightPanel] = useState<'activity' | 'lead' | null>(null);
   const [profileOf, setProfileOf] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
+  const [hireOpen, setHireOpen] = useState(false);
 
   // onDragOver mutates the preview, so rollback needs the drag-start board.
   const preDrag = useRef<Board | null>(null);
@@ -189,6 +194,7 @@ export function ProjectBoardPage() {
       const overId = event.over === null ? null : String(event.over.id);
       setBoard((current) => {
         const drop = resolveDrop(filterBoard(current, filter, team), activeId, overId);
+        if (drop !== null) setDropInto(drop.status);
         return drop === null ? current : moveCard(current, drop);
       });
     },
@@ -198,6 +204,7 @@ export function ProjectBoardPage() {
   const onDragEnd = useCallback(
     async (event: DragEndEvent) => {
       setDragging(null);
+      setDropInto(null);
       const before = preDrag.current;
       preDrag.current = null;
       if (before === null) return;
@@ -226,6 +233,7 @@ export function ProjectBoardPage() {
         pushToast('warn', refusal);
         return;
       }
+      const from = statusOf(before, number);
       const outcome = await moveIssue(
         client,
         projectId,
@@ -239,16 +247,28 @@ export function ProjectBoardPage() {
       }
       if (outcome.kind === 'failed') {
         setBoard(before);
-        pushToast('err', outcome.message);
+        pushToast('err', `Move failed, rolled back — ${outcome.message}`, {
+          label: 'Retry',
+          run: () => {
+            void onDragEnd(event);
+          },
+        });
         return;
       }
-      pushToast('ok', `#${number} → ${COLUMN_LABEL[issue.status]}`);
+      // Silent unless the drop started an agent: see `moveAnnouncement`.
+      const said = moveAnnouncement(
+        issue,
+        from ?? issue.status,
+        issue.assignee == null ? null : handleOf(team, issue.assignee),
+      );
+      if (said !== null) pushToast('ok', said);
     },
     [board, client, filter, logout, projectId, pushToast, team],
   );
 
   const onDragCancel = useCallback(() => {
     setDragging(null);
+    setDropInto(null);
     const before = preDrag.current;
     preDrag.current = null;
     if (before !== null) setBoard(before);
@@ -260,6 +280,12 @@ export function ProjectBoardPage() {
     },
     [navigate, projectId],
   );
+
+  /// One door to the profile, from wherever an avatar appears.
+  const openAgent = useCallback((agentId: string) => {
+    setRightPanel(null);
+    setProfileOf(agentId);
+  }, []);
 
   const archived = useMemo(() => project?.archived_at_ms != null, [project]);
 
@@ -277,6 +303,7 @@ export function ProjectBoardPage() {
         <ProjectSwitcher
           current={project}
           projects={projects}
+          refreshKey={refreshKey}
           onCreated={() => {
             setRefreshKey((key) => key + 1);
           }}
@@ -290,6 +317,10 @@ export function ProjectBoardPage() {
           team={team}
           activeRuns={activeRuns}
           readOnly={archived}
+          hireOpen={hireOpen}
+          onHireClosed={() => {
+            setHireOpen(false);
+          }}
           onOpenProfile={(agent) => {
             setRightPanel(null);
             setProfileOf(agent.id);
@@ -393,7 +424,9 @@ export function ProjectBoardPage() {
                 activeRuns={activeRuns}
                 team={team}
                 disabled={archived}
+                activeOver={dropInto}
                 onOpen={openIssue}
+                onOpenAgent={openAgent}
                 onCreate={() => {
                   setCreateIn(status);
                 }}
@@ -429,6 +462,17 @@ export function ProjectBoardPage() {
                     activeRuns={activeRuns}
                     readOnly={archived}
                     projectId={projectId}
+                    onChanged={() => {
+                      setRefreshKey((key) => key + 1);
+                    }}
+                    onChatWithLead={
+                      agent.lead
+                        ? () => {
+                            setProfileOf(null);
+                            setRightPanel('lead');
+                          }
+                        : undefined
+                    }
                     onClose={() => {
                       setProfileOf(null);
                     }}
@@ -457,12 +501,17 @@ export function ProjectBoardPage() {
           <FloatingPanel>
             <LeadPanel
               projectId={projectId}
+              projectName={project?.name ?? 'this board'}
               readOnly={archived}
               onClose={() => {
                 setRightPanel(null);
               }}
               onBoardChanged={() => {
                 setRefreshKey((key) => key + 1);
+              }}
+              onHireLead={() => {
+                setRightPanel(null);
+                setHireOpen(true);
               }}
             />
           </FloatingPanel>
@@ -474,6 +523,15 @@ export function ProjectBoardPage() {
           project={project}
           onClose={() => {
             setShowSettings(false);
+          }}
+          team={team}
+          onOpenProfile={(agent) => {
+            setShowSettings(false);
+            openAgent(agent.id);
+          }}
+          onAddAgent={() => {
+            setShowSettings(false);
+            setHireOpen(true);
           }}
           onSaved={(saved) => {
             setProject(saved);
@@ -487,6 +545,14 @@ export function ProjectBoardPage() {
           projectId={projectId}
           status={createIn}
           agents={assignableAgents(team)}
+          parents={Object.values(board)
+            .flat()
+            .filter((row) => row.parent == null && row.cancelled_at_ms == null)
+            .map((row) => ({ number: row.number, title: row.title }))}
+          onAskLead={() => {
+            setCreateIn(null);
+            setRightPanel('lead');
+          }}
           onClose={() => {
             setCreateIn(null);
           }}
@@ -497,7 +563,7 @@ export function ProjectBoardPage() {
         />
       ) : null}
 
-      <ToastStack toasts={toasts} />
+      <ToastStack toasts={toasts} onDismiss={dismissToast} />
     </div>
   );
 }
@@ -509,7 +575,9 @@ function BoardColumn({
   activeRuns,
   team,
   disabled,
+  activeOver,
   onOpen,
+  onOpenAgent,
   onCreate,
 }: {
   status: IssueStatus;
@@ -518,13 +586,25 @@ function BoardColumn({
   activeRuns: IssueRun[];
   team: Agent[];
   disabled: boolean;
+  /// Which column the dragged card would land in right now, or null when
+  /// nothing is being dragged.
+  activeOver: IssueStatus | null;
   onOpen: (number: number) => void;
+  onOpenAgent: (agentId: string) => void;
   onCreate: () => void;
 }) {
   const { setNodeRef, isOver } = useDroppable({ id: columnDropId(status) });
+  // `isOver` only fires for the column's own droppable — hovering a card
+  // inside it does not. `activeOver` is what the operator experiences as
+  // "this is where it will land", so the outline follows that instead.
+  const targeted = isOver || activeOver === status;
 
   return (
-    <section className="flex-1 min-w-[210px] flex flex-col border-2 border-black rounded-md bg-canvas max-h-full">
+    <section
+      className={`flex-1 min-w-[210px] flex flex-col border-2 rounded-md bg-canvas max-h-full ${
+        targeted ? 'border-brand-hover shadow-brutal-sm' : 'border-black'
+      }`}
+    >
       <header className="flex items-center gap-2 px-2.5 py-2 border-b-2 border-black shrink-0">
         <h2 className="font-mono text-[0.68rem] font-bold uppercase tracking-wider">
           {COLUMN_LABEL[status]}
@@ -551,7 +631,7 @@ function BoardColumn({
       <div
         ref={setNodeRef}
         className={`flex-1 min-h-[70px] overflow-y-auto flex flex-col gap-2 p-2 ${
-          isOver ? 'bg-brand/15' : ''
+          targeted ? 'bg-brand/15' : ''
         }`}
       >
         <SortableContext
@@ -566,12 +646,25 @@ function BoardColumn({
               team={team}
               disabled={disabled}
               onOpen={onOpen}
+              onOpenAgent={onOpenAgent}
             />
           ))}
         </SortableContext>
-        {issues.length === 0 ? (
+        {targeted ? (
+          // The dashed slot: where the card lands if it is let go now.
+          <div className="shrink-0 h-9 border-2 border-dashed border-brand-hover rounded-md" />
+        ) : null}
+        {issues.length === 0 && !targeted ? (
           <p className="m-auto text-center font-mono text-[0.62rem] text-ink-soft leading-snug">
-            {total === 0 ? 'No issues' : 'No matches'}
+            {total === 0 ? (
+              <>
+                No issues
+                <br />
+                Drag one in, or use the column’s +
+              </>
+            ) : (
+              'No matches'
+            )}
           </p>
         ) : null}
       </div>
@@ -585,12 +678,14 @@ function SortableIssueCard({
   team,
   disabled,
   onOpen,
+  onOpenAgent,
 }: {
   issue: Issue;
   run: 'queued' | 'running' | null;
   team: Agent[];
   disabled: boolean;
   onOpen: (number: number) => void;
+  onOpenAgent: (agentId: string) => void;
 }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: cardDragId(issue.number),
@@ -608,29 +703,52 @@ function SortableIssueCard({
         onOpen(issue.number);
       }}
     >
-      <IssueCard issue={issue} run={run} team={team} />
+      <IssueCard issue={issue} run={run} team={team} onOpenAgent={onOpenAgent} />
     </div>
   );
 }
 
+/// A ring, not a bar. It sits inline beside the assignee on a card whose
+/// other rows are already full-width, and a circle reads as "how far
+/// through the steps" at a glance where a fifth horizontal bar would just
+/// be another line of card furniture.
 function SubIssueRing({ progress }: { progress: { done: number; total: number } }) {
   const { done, total } = progress;
-  const pct = total === 0 ? 0 : Math.round((done / total) * 100);
+  const fraction = total === 0 ? 0 : done / total;
+  const radius = 5;
+  const circumference = 2 * Math.PI * radius;
   return (
-    <div
-      className="flex items-center gap-1.5"
+    <span
+      className="inline-flex items-center gap-1 shrink-0"
       title={`${done} of ${total} sub-issues done`}
     >
-      <div className="flex-1 h-1 border border-black/25 rounded-full overflow-hidden bg-canvas">
-        <div
-          className={`h-full ${done === total ? 'bg-ok' : 'bg-brand'}`}
-          style={{ width: `${pct}%` }}
+      <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true" className="shrink-0">
+        <circle
+          cx="7"
+          cy="7"
+          r={radius}
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          className="text-black/20"
         />
-      </div>
+        <circle
+          cx="7"
+          cy="7"
+          r={radius}
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeDasharray={`${circumference * fraction} ${circumference}`}
+          transform="rotate(-90 7 7)"
+          className={done === total ? 'text-ok' : 'text-brand'}
+        />
+      </svg>
       <span className="font-mono text-[0.54rem] text-ink-soft tabular-nums">
         {done}/{total}
       </span>
-    </div>
+    </span>
   );
 }
 
@@ -640,14 +758,70 @@ function FloatingPanel({ children }: { children: React.ReactNode }) {
   );
 }
 
-function AssigneeDot({ assignee, working = false }: { assignee: string; working?: boolean }) {
+/// The three states the mockup's avatar has: shimmering while a run is
+/// executing, **dimmed** while one is only queued, and plain otherwise.
+/// Queued had no look of its own before, so a card waiting its turn was
+/// pixel-identical to one nobody had started.
+function AssigneeDot({
+  assignee,
+  run = null,
+}: {
+  assignee: string;
+  run?: 'queued' | 'running' | null;
+}) {
+  const title =
+    run === 'running'
+      ? `${assignee} — working`
+      : run === 'queued'
+        ? `${assignee} — queued, waiting for a free slot`
+        : assignee;
   return (
     <span
-      title={working ? `${assignee} — working` : assignee}
+      title={title}
       className={`w-4 h-4 rounded-full border-2 border-black shrink-0 ${
-        working ? 'bg-ok motion-safe:animate-pulse' : 'bg-brand'
-      }`}
+        run === 'running' ? 'bg-ok motion-safe:animate-pulse' : 'bg-brand'
+      } ${run === 'queued' ? 'opacity-40' : ''}`}
     />
+  );
+}
+
+/// The branch chip. Copies rather than navigates: it sits inside a card
+/// whose own click opens the issue, so without stopping the event the one
+/// affordance the mockup gives it would be unreachable.
+function BranchChip({ branch }: { branch: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      type="button"
+      title={`${branch} — click to copy`}
+      className="self-start max-w-full truncate border border-black/25 bg-canvas rounded px-1.5 font-mono text-[0.56rem] text-ink-soft cursor-pointer hover:border-black"
+      onClick={(event) => {
+        event.stopPropagation();
+        try {
+          // `navigator.clipboard` is typed as always present but is
+          // **absent** outside a secure context — which a dashboard served
+          // over plain http on a LAN address is. Reading `.writeText` off
+          // `undefined` throws synchronously, so the try is the guard; a
+          // rejected promise (permission refused) is the other half.
+          void navigator.clipboard.writeText(branch).then(
+            () => {
+              setCopied(true);
+              window.setTimeout(() => {
+                setCopied(false);
+              }, 1200);
+            },
+            () => {
+              // Nothing: the branch name is still in the title attribute,
+              // and a "copied" that did not happen is worse than silence.
+            },
+          );
+        } catch {
+          // Same reasoning.
+        }
+      }}
+    >
+      ⑂ {copied ? 'copied' : branch}
+    </button>
   );
 }
 
@@ -656,11 +830,15 @@ function IssueCard({
   run = null,
   overlay = false,
   team = [],
+  onOpenAgent,
 }: {
   issue: Issue;
   run?: 'queued' | 'running' | null;
   overlay?: boolean;
   team?: Agent[];
+  /// Opens the assignee's profile. Absent on the drag overlay, which is a
+  /// picture of a card rather than a card.
+  onOpenAgent?: (agentId: string) => void;
 }) {
   const cancelled = issue.cancelled_at_ms != null;
   const priority = PRIORITY_MARK[issue.priority];
@@ -689,37 +867,58 @@ function IssueCard({
       >
         {issue.title}
       </p>
-      {issue.sub_issues != null ? <SubIssueRing progress={issue.sub_issues} /> : null}
       {issue.blocked_reason != null ? (
-        <span className="self-start border border-warn/50 bg-warn/10 text-warn rounded px-1.5 font-mono text-[0.56rem] font-bold uppercase">
+        <span
+          className="self-start border border-warn/50 bg-warn/10 text-warn rounded px-1.5 font-mono text-[0.56rem] font-bold uppercase"
+          title={issue.blocked_reason}
+        >
           ⚑ Blocked
         </span>
       ) : null}
-      {issue.branch != null ? (
-        <span
-          className="self-start max-w-full truncate border border-black/25 bg-canvas rounded px-1.5 font-mono text-[0.56rem] text-ink-soft"
-          title={issue.branch}
-        >
-          ⑂ {issue.branch}
-        </span>
-      ) : null}
-      {issue.assignee != null ? (
-        <div className="flex items-center gap-1.5">
-          <AssigneeDot assignee={handleOf(team, issue.assignee)} working={run === 'running'} />
-          <span className="font-mono text-[0.58rem] text-ink-soft truncate">
-            @{handleOf(team, issue.assignee)}
-          </span>
-          {run !== null ? (
-            <span
-              className={`ml-auto shrink-0 font-mono text-[0.54rem] font-bold uppercase ${
-                run === 'running' ? 'text-ok' : 'text-ink-soft'
-              }`}
-            >
-              {run === 'running' ? 'working' : 'queued'}
+      {hasDeliverable(issue) && issue.branch != null ? <BranchChip branch={issue.branch} /> : null}
+      <div className="flex items-center gap-1.5">
+        {issue.assignee != null ? (
+          <button
+            type="button"
+            title={`Open @${handleOf(team, issue.assignee)}'s profile`}
+            onClick={(event) => {
+              // The card's own click opens the issue, so the avatar has to
+              // claim the event or it can never be the profile's entry point.
+              event.stopPropagation();
+              onOpenAgent?.(issue.assignee ?? '');
+            }}
+            className="flex items-center gap-1.5 min-w-0 cursor-pointer hover:underline"
+          >
+            <AssigneeDot assignee={handleOf(team, issue.assignee)} run={run} />
+            <span className="font-mono text-[0.58rem] text-ink-soft truncate">
+              @{handleOf(team, issue.assignee)}
             </span>
-          ) : null}
-        </div>
-      ) : null}
+          </button>
+        ) : (
+          // A card nobody is on says so. Rendering nothing made an
+          // untriaged card look the same as one whose footer had simply
+          // scrolled off, and the parking lot is exactly where the
+          // operator is scanning for work to hand out.
+          <>
+            <span className="w-4 h-4 rounded-full border-2 border-dashed border-black/40 shrink-0" />
+            <span className="font-mono text-[0.58rem] text-ink-soft italic">unassigned</span>
+          </>
+        )}
+        {issue.sub_issues != null ? (
+          <span className="ml-auto">
+            <SubIssueRing progress={issue.sub_issues} />
+          </span>
+        ) : null}
+        {run !== null ? (
+          <span
+            className={`${issue.sub_issues == null ? 'ml-auto' : ''} shrink-0 font-mono text-[0.54rem] font-bold uppercase ${
+              run === 'running' ? 'text-ok' : 'text-ink-soft'
+            }`}
+          >
+            {run === 'running' ? 'working' : 'queued'}
+          </span>
+        ) : null}
+      </div>
     </article>
   );
 }

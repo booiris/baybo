@@ -73,6 +73,21 @@ impl AgentProfileStore for MemoryAgentProfileStore {
         Ok(rows)
     }
 
+    async fn list_team_history(
+        &self,
+        project: &baybo_model::ProjectId,
+    ) -> Result<Vec<AgentProfileRow>> {
+        let mut rows: Vec<AgentProfileRow> = self
+            .rows
+            .lock()
+            .values()
+            .filter(|row| row.team.as_ref().is_some_and(|t| &t.project_id == project))
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+        Ok(rows)
+    }
+
     async fn get(&self, id: &AgentProfileId) -> Result<Option<AgentProfileRow>> {
         Ok(self.rows.lock().get(id).cloned())
     }

@@ -694,6 +694,7 @@ mod approvals {
                     call_id,
                     tool,
                     summary,
+                    ..
                 } => Some((
                     call_id.clone(),
                     tool.clone(),

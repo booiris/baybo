@@ -28,19 +28,48 @@ describe('ActivityDrawer', () => {
     feed.fetchFeed.mockReset();
   });
 
-  it('shows comments verbatim and narrates system entries', async () => {
+  it('narrates entries without pouring a comment into the feed', async () => {
+    // A real agent's run report runs to hundreds of words. The feed is a
+    // list of things that happened, so it says *that* one was left and
+    // links to the card; the words live on the card's own timeline.
+    const report = 'Root cause confirmed. '.repeat(40);
     feed.fetchFeed.mockResolvedValue({
       kind: 'ok',
       value: [
-        entry('a', 4, { kind: 'comment', text: 'reproduced it' }),
+        entry('a', 4, { kind: 'comment', text: report }),
         entry('b', 4, { kind: 'moved', from: 'todo', to: 'in_progress' }),
       ],
     });
     render(
       <ActivityDrawer projectId="p" refreshKey={0} onClose={vi.fn()} onOpenIssue={vi.fn()} />,
     );
-    expect(await screen.findByText('reproduced it')).toBeInTheDocument();
+    expect(await screen.findByText('commented')).toBeInTheDocument();
+    expect(screen.queryByText(/Root cause confirmed/)).not.toBeInTheDocument();
     expect(screen.getByText(/moved it from/)).toBeInTheDocument();
+  });
+
+  it('shows a hire, which belongs to the board and opens no card', async () => {
+    const onOpenIssue = vi.fn();
+    feed.fetchFeed.mockResolvedValue({
+      kind: 'ok',
+      value: [
+        {
+          actor: { kind: 'agent', id: '01JC3KQ4Z8AAAAAAAAAAAAAAAA', handle: 'lead' },
+          body: {
+            kind: 'hired',
+            agent: { id: '01JC3KQ4Z8BBBBBBBBBBBBBBBB', handle: 'tester' },
+          },
+          created_at_ms: 0,
+        },
+      ],
+    });
+    render(
+      <ActivityDrawer projectId="p" refreshKey={0} onClose={vi.fn()} onOpenIssue={onOpenIssue} />,
+    );
+    const row = await screen.findByText('hired @tester');
+    expect(screen.getByText('@lead')).toBeInTheDocument();
+    await userEvent.click(row);
+    expect(onOpenIssue).not.toHaveBeenCalled();
   });
 
   it('opens the card an entry belongs to', async () => {

@@ -12,6 +12,8 @@ import {
   dropRejection,
   emptyBoard,
   groupByStatus,
+  hasDeliverable,
+  moveAnnouncement,
   liveCount,
   moveCard,
   orderedNumbers,
@@ -261,7 +263,11 @@ describe('retryRejection', () => {
 describe('dropRejection', () => {
   it('refuses In Progress for work nobody is on', () => {
     const unclaimed = issue(1);
-    expect(dropRejection(unclaimed, 'in_progress')).toContain('needs an assignee');
+    // The copy names the column the card snapped back to, because the
+    // bounce is instant and otherwise the operator has to hunt for it.
+    const refusal = dropRejection(unclaimed, 'in_progress');
+    expect(refusal).toContain('Assign an agent first');
+    expect(refusal).toContain('Backlog');
     for (const status of ['backlog', 'todo', 'review', 'done'] as const) {
       expect(dropRejection(unclaimed, status)).toBeNull();
     }
@@ -318,5 +324,46 @@ describe('updatedAgo', () => {
 
   it('never renders a negative age', () => {
     expect(updatedAgo(now + 5_000, now)).toBe('now');
+  });
+});
+
+describe('moveAnnouncement', () => {
+  const card = (over: Partial<Issue> = {}) => issue(12, over);
+
+  it('announces only the drop that started an agent', () => {
+    const started = card({ status: 'in_progress', assignee: '01JAGENT' });
+    expect(moveAnnouncement(started, 'todo', 'dev-1')).toBe('Queued for @dev-1 — #12');
+  });
+
+  it('says nothing about a reorder or an ordinary column change', () => {
+    // The board is the control surface and the timeline is the audit
+    // trail. A toast on every move is a toast nobody reads, which costs
+    // the one toast that matters.
+    expect(moveAnnouncement(card({ status: 'todo' }), 'todo', 'dev-1')).toBeNull();
+    expect(moveAnnouncement(card({ status: 'review' }), 'in_progress', 'dev-1')).toBeNull();
+    expect(moveAnnouncement(card({ status: 'done' }), 'review', 'dev-1')).toBeNull();
+  });
+
+  it('says nothing when the card was already in progress', () => {
+    // Re-ordering inside In Progress does not start anything: the run is
+    // already going, and claiming otherwise would double-count it.
+    const inside = card({ status: 'in_progress', assignee: '01JAGENT' });
+    expect(moveAnnouncement(inside, 'in_progress', 'dev-1')).toBeNull();
+  });
+
+  it('says nothing when nobody is on the card', () => {
+    // That drop bounces instead; the refusal is what speaks.
+    expect(moveAnnouncement(card({ status: 'in_progress' }), 'todo', null)).toBeNull();
+  });
+});
+
+describe('hasDeliverable', () => {
+  it('is the same question as "did this card produce something"', () => {
+    // A research card's deliverable is its report, so it never shows a
+    // branch — and the branch column is only written once there is a
+    // commit, which is why one field answers both.
+    expect(hasDeliverable(issue(1))).toBe(false);
+    expect(hasDeliverable(issue(1, { branch: '' }))).toBe(false);
+    expect(hasDeliverable(issue(1, { branch: 'issue/1-thing' }))).toBe(true);
   });
 });

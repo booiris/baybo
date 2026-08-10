@@ -920,6 +920,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/projects/activity": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["projects_activity"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/projects/attention": {
         parameters: {
             query?: never;
@@ -1589,6 +1605,11 @@ export interface components {
         /** @description Response body for `GET /v1/background-jobs`. */
         BackgroundJobsResponse: {
             jobs: components["schemas"]["BackgroundJob"][];
+        };
+        BoardEventDto: {
+            agent: components["schemas"]["AgentRefDto"];
+            /** @enum {string} */
+            kind: "hired";
         };
         /**
          * @description Admin-surface mirror of [`baybo_model::ChannelType`]. Transparent
@@ -2365,6 +2386,11 @@ export interface components {
         ErrorBody: {
             error: string;
         };
+        /**
+         * @description A feed line's payload: either a card's timeline entry, or one of the
+         *     board-level facts that has no card to live on.
+         */
+        FeedBodyDto: components["schemas"]["IssueEventBodyDto"] | components["schemas"]["BoardEventDto"];
         /** @description One folder in a folder-list / create response. */
         FolderDto: {
             /** Format: date-time */
@@ -2510,6 +2536,12 @@ export interface components {
             kind: "worktree_kept";
             reason: string;
         } | {
+            /**
+             * Format: int64
+             * @description Which run is parked, by attempt number. Absent when the card was
+             *     not recording it yet, or when no run owns the prompt.
+             */
+            attempt?: number | null;
             call_id: string;
             /** @enum {string} */
             kind: "approval_requested";
@@ -2561,14 +2593,30 @@ export interface components {
              *     execution log addresses it.
              */
             attempt: number;
+            /**
+             * Format: int64
+             * @description What this run's LLM calls cost, in micro-USD. Derived from the cost
+             *     ledger over the run's own window, so a session several runs share
+             *     still bills each call to the run that made it.
+             *
+             *     **Absent, not zero**, on responses that do not price runs — the
+             *     board's active-run poll among them. Zero is a real answer there
+             *     (a run that has not billed yet), so the two states cannot share an
+             *     encoding without the board reporting free work as fact.
+             */
+            cost_micros?: number | null;
             /** Format: int64 */
             created_at_ms: number;
             error?: string | null;
+            /** Format: int64 */
+            input_tokens?: number | null;
             /**
              * Format: int64
              * @description The issue this ran, by its per-project number.
              */
             number: number;
+            /** Format: int64 */
+            output_tokens?: number | null;
             /**
              * @description The session the run executed in. Present once claimed; it is what
              *     the trace viewer opens.
@@ -2580,6 +2628,26 @@ export interface components {
             started_at_ms?: number | null;
             status: components["schemas"]["RunStatusDto"];
             trigger: components["schemas"]["RunTriggerDto"];
+        };
+        /**
+         * @description A card's execution log with its totals attached. The totals ship beside
+         *     the rows rather than being left to the client because a client that
+         *     summed them would be the second place that decides what a card cost —
+         *     and the first to disagree once a run is filtered out of the view.
+         */
+        IssueRunLogDto: {
+            items: components["schemas"]["IssueRunDto"][];
+            /**
+             * Format: int64
+             * @description Across **every** run, cancelled ones included: the money was spent
+             *     either way, and a total that skipped them would not reconcile
+             *     against the board's budget.
+             */
+            total_cost_micros: number;
+            /** Format: int64 */
+            total_input_tokens: number;
+            /** Format: int64 */
+            total_output_tokens: number;
         };
         /**
          * @description Which column a card sits in. Entering `in_progress` is what will start
@@ -6650,6 +6718,55 @@ export interface operations {
             };
         };
     };
+    projects_activity: {
+        parameters: {
+            query?: {
+                /** @description Start of your day, epoch ms. Defaults to the last 24 hours. */
+                since_ms?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Every board's live working count and today's burn. Boards with neither are absent. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        items: {
+                            /**
+                             * Format: int64
+                             * @description Spend since the start of your day, in micro-USD. Measured exactly as
+                             *     the budget gate measures it, so the pair in the dropdown can never
+                             *     accuse the board of crossing a ceiling it did not.
+                             */
+                            burn_micros: number;
+                            project_id: string;
+                            /**
+                             * @description Runs executing. Counted from runs, not from the In Progress column —
+                             *     a run outlives its column, so the two disagree by design.
+                             */
+                            working: number;
+                        }[];
+                        next_cursor?: string | null;
+                    };
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     projects_attention: {
         parameters: {
             query?: never;
@@ -7053,12 +7170,14 @@ export interface operations {
                     "application/json": {
                         items: {
                             actor: components["schemas"]["ActorDto"];
-                            body: components["schemas"]["IssueEventBodyDto"];
+                            body: components["schemas"]["FeedBodyDto"];
                             /** Format: int64 */
                             created_at_ms: number;
-                            id: string;
-                            /** Format: int64 */
-                            number: number;
+                            /**
+                             * Format: int64
+                             * @description The card this concerns. Absent on board-level entries.
+                             */
+                            number?: number | null;
                         }[];
                         next_cursor?: string | null;
                     };
@@ -7584,43 +7703,13 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Every run of this issue, newest first */
+            /** @description Every run of this issue, newest first, priced */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        items: {
-                            agent_id: string;
-                            /**
-                             * Format: int64
-                             * @description 1 for an issue's first run, incrementing thereafter — how the
-                             *     execution log addresses it.
-                             */
-                            attempt: number;
-                            /** Format: int64 */
-                            created_at_ms: number;
-                            error?: string | null;
-                            /**
-                             * Format: int64
-                             * @description The issue this ran, by its per-project number.
-                             */
-                            number: number;
-                            /**
-                             * @description The session the run executed in. Present once claimed; it is what
-                             *     the trace viewer opens.
-                             */
-                            session_id?: string | null;
-                            /** Format: int64 */
-                            settled_at_ms?: number | null;
-                            /** Format: int64 */
-                            started_at_ms?: number | null;
-                            status: components["schemas"]["RunStatusDto"];
-                            trigger: components["schemas"]["RunTriggerDto"];
-                        }[];
-                        next_cursor?: string | null;
-                    };
+                    "application/json": components["schemas"]["IssueRunLogDto"];
                 };
             };
             /** @description Unauthorized */
@@ -7927,14 +8016,30 @@ export interface operations {
                              *     execution log addresses it.
                              */
                             attempt: number;
+                            /**
+                             * Format: int64
+                             * @description What this run's LLM calls cost, in micro-USD. Derived from the cost
+                             *     ledger over the run's own window, so a session several runs share
+                             *     still bills each call to the run that made it.
+                             *
+                             *     **Absent, not zero**, on responses that do not price runs — the
+                             *     board's active-run poll among them. Zero is a real answer there
+                             *     (a run that has not billed yet), so the two states cannot share an
+                             *     encoding without the board reporting free work as fact.
+                             */
+                            cost_micros?: number | null;
                             /** Format: int64 */
                             created_at_ms: number;
                             error?: string | null;
+                            /** Format: int64 */
+                            input_tokens?: number | null;
                             /**
                              * Format: int64
                              * @description The issue this ran, by its per-project number.
                              */
                             number: number;
+                            /** Format: int64 */
+                            output_tokens?: number | null;
                             /**
                              * @description The session the run executed in. Present once claimed; it is what
                              *     the trace viewer opens.

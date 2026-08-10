@@ -3,7 +3,7 @@ import { RiCloseLine } from 'react-icons/ri';
 
 import { useAdminClient, useAuth } from '../../api/auth';
 import { fetchFeed } from './api';
-import { actorLabel, describeEvent, eventTime, type IssueEvent } from './timelineModel';
+import { describeFeedEntry, eventAgo, feedActorLabel, type FeedEntry } from './timelineModel';
 
 export function ActivityDrawer({
   projectId,
@@ -18,7 +18,7 @@ export function ActivityDrawer({
 }) {
   const client = useAdminClient();
   const { logout } = useAuth();
-  const [events, setEvents] = useState<IssueEvent[]>([]);
+  const [events, setEvents] = useState<FeedEntry[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
@@ -68,27 +68,39 @@ export function ActivityDrawer({
             Nothing has happened on this board yet.
           </p>
         ) : null}
-        {events.map((event) => {
-          const narration = describeEvent(event.body);
-          return (
+        {events.map((event, index) => {
+          const card = event.number;
+          const line = (
+            <>
+              <div className="flex items-baseline gap-1.5 font-mono text-[0.6rem] text-ink-soft">
+                {card != null ? <span className="font-bold text-ink">#{card}</span> : null}
+                <span>{feedActorLabel(event)}</span>
+                <span className="ml-auto tabular-nums">{eventAgo(event.created_at_ms, now)}</span>
+              </div>
+              <p className="font-mono text-[0.66rem] leading-snug break-words">
+                {describeFeedEntry(event)}
+              </p>
+            </>
+          );
+          // A hire belongs to the board, so there is no card to open — it
+          // renders as a plain row rather than a button that goes nowhere.
+          return card == null ? (
+            <div
+              key={`${event.created_at_ms}-${index}`}
+              className="border-2 border-black/15 rounded-md px-2 py-1.5 bg-surface"
+            >
+              {line}
+            </div>
+          ) : (
             <button
-              key={event.id}
+              key={`${event.created_at_ms}-${index}`}
               type="button"
               onClick={() => {
-                onOpenIssue(event.number);
+                onOpenIssue(card);
               }}
               className="text-left border-2 border-black/15 hover:border-black rounded-md px-2 py-1.5 bg-surface"
             >
-              <div className="flex items-baseline gap-1.5 font-mono text-[0.6rem] text-ink-soft">
-                <span className="font-bold text-ink">#{event.number}</span>
-                <span>{actorLabel(event)}</span>
-                <span className="ml-auto tabular-nums">
-                  {eventTime(event.created_at_ms, now)}
-                </span>
-              </div>
-              <p className="font-mono text-[0.66rem] leading-snug break-words">
-                {narration ?? (event.body.kind === 'comment' ? event.body.text : '')}
-              </p>
+              {line}
             </button>
           );
         })}

@@ -84,12 +84,12 @@ export function BoardFilterBar({
       <label className="flex items-center gap-1.5 font-mono text-[0.68rem] text-ink-soft cursor-pointer">
         <input
           type="checkbox"
-          checked={filter.showCancelled}
+          checked={!filter.showCancelled}
           onChange={(event) => {
-            onChange({ ...filter, showCancelled: event.target.checked });
+            onChange({ ...filter, showCancelled: !event.target.checked });
           }}
         />
-        Show cancelled
+        Hide cancelled
       </label>
 
       {isDefault(filter) ? null : (

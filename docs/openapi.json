@@ -4137,6 +4137,87 @@
         }
       }
     },
+    "/v1/projects/activity": {
+      "get": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "projects_activity",
+        "parameters": [
+          {
+            "name": "since_ms",
+            "in": "query",
+            "description": "Start of your day, epoch ms. Defaults to the last 24 hours.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Every board's live working count and today's burn. Boards with neither are absent.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Envelope for list endpoints. `next_cursor` is opaque — clients\npass it back as `?cursor=` to fetch the next page, and treat\n`None` as \"no more pages.\" The cursor's internal scheme may change\nacross releases; clients must not parse it.",
+                  "required": [
+                    "items"
+                  ],
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "description": "What one board is doing right now, for the switcher's dropdown.",
+                        "required": [
+                          "project_id",
+                          "working",
+                          "burn_micros"
+                        ],
+                        "properties": {
+                          "burn_micros": {
+                            "type": "integer",
+                            "format": "int64",
+                            "description": "Spend since the start of your day, in micro-USD. Measured exactly as\nthe budget gate measures it, so the pair in the dropdown can never\naccuse the board of crossing a ceiling it did not."
+                          },
+                          "project_id": {
+                            "type": "string"
+                          },
+                          "working": {
+                            "type": "integer",
+                            "description": "Runs executing. Counted from runs, not from the In Progress column —\na run outlives its column, so the two disagree by design.",
+                            "minimum": 0
+                          }
+                        }
+                      }
+                    },
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/projects/attention": {
       "get": {
         "tags": [
@@ -4753,10 +4834,8 @@
                       "type": "array",
                       "items": {
                         "type": "object",
-                        "description": "One entry on an issue's timeline.",
+                        "description": "One line of a board's activity feed. Shaped like a timeline entry\nbecause most lines are one, but `number` is optional: joining the team\nis a fact about the board, not about any card, so there is nothing for\nit to point at.",
                         "required": [
-                          "id",
-                          "number",
                           "actor",
                           "body",
                           "created_at_ms"
@@ -4766,18 +4845,19 @@
                             "$ref": "#/components/schemas/ActorDto"
                           },
                           "body": {
-                            "$ref": "#/components/schemas/IssueEventBodyDto"
+                            "$ref": "#/components/schemas/FeedBodyDto"
                           },
                           "created_at_ms": {
                             "type": "integer",
                             "format": "int64"
                           },
-                          "id": {
-                            "type": "string"
-                          },
                           "number": {
-                            "type": "integer",
-                            "format": "int64"
+                            "type": [
+                              "integer",
+                              "null"
+                            ],
+                            "format": "int64",
+                            "description": "The card this concerns. Absent on board-level entries."
                           }
                         }
                       }
@@ -5594,90 +5674,11 @@
         ],
         "responses": {
           "200": {
-            "description": "Every run of this issue, newest first",
+            "description": "Every run of this issue, newest first, priced",
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "description": "Envelope for list endpoints. `next_cursor` is opaque — clients\npass it back as `?cursor=` to fetch the next page, and treat\n`None` as \"no more pages.\" The cursor's internal scheme may change\nacross releases; clients must not parse it.",
-                  "required": [
-                    "items"
-                  ],
-                  "properties": {
-                    "items": {
-                      "type": "array",
-                      "items": {
-                        "type": "object",
-                        "description": "One execution of an issue.",
-                        "required": [
-                          "number",
-                          "attempt",
-                          "agent_id",
-                          "status",
-                          "trigger",
-                          "created_at_ms"
-                        ],
-                        "properties": {
-                          "agent_id": {
-                            "type": "string"
-                          },
-                          "attempt": {
-                            "type": "integer",
-                            "format": "int64",
-                            "description": "1 for an issue's first run, incrementing thereafter — how the\nexecution log addresses it."
-                          },
-                          "created_at_ms": {
-                            "type": "integer",
-                            "format": "int64"
-                          },
-                          "error": {
-                            "type": [
-                              "string",
-                              "null"
-                            ]
-                          },
-                          "number": {
-                            "type": "integer",
-                            "format": "int64",
-                            "description": "The issue this ran, by its per-project number."
-                          },
-                          "session_id": {
-                            "type": [
-                              "string",
-                              "null"
-                            ],
-                            "description": "The session the run executed in. Present once claimed; it is what\nthe trace viewer opens."
-                          },
-                          "settled_at_ms": {
-                            "type": [
-                              "integer",
-                              "null"
-                            ],
-                            "format": "int64"
-                          },
-                          "started_at_ms": {
-                            "type": [
-                              "integer",
-                              "null"
-                            ],
-                            "format": "int64"
-                          },
-                          "status": {
-                            "$ref": "#/components/schemas/RunStatusDto"
-                          },
-                          "trigger": {
-                            "$ref": "#/components/schemas/RunTriggerDto"
-                          }
-                        }
-                      }
-                    },
-                    "next_cursor": {
-                      "type": [
-                        "string",
-                        "null"
-                      ]
-                    }
-                  }
+                  "$ref": "#/components/schemas/IssueRunLogDto"
                 }
               }
             }
@@ -6099,6 +6100,14 @@
                             "format": "int64",
                             "description": "1 for an issue's first run, incrementing thereafter — how the\nexecution log addresses it."
                           },
+                          "cost_micros": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ],
+                            "format": "int64",
+                            "description": "What this run's LLM calls cost, in micro-USD. Derived from the cost\nledger over the run's own window, so a session several runs share\nstill bills each call to the run that made it.\n\n**Absent, not zero**, on responses that do not price runs — the\nboard's active-run poll among them. Zero is a real answer there\n(a run that has not billed yet), so the two states cannot share an\nencoding without the board reporting free work as fact."
+                          },
                           "created_at_ms": {
                             "type": "integer",
                             "format": "int64"
@@ -6109,10 +6118,24 @@
                               "null"
                             ]
                           },
+                          "input_tokens": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ],
+                            "format": "int64"
+                          },
                           "number": {
                             "type": "integer",
                             "format": "int64",
                             "description": "The issue this ran, by its per-project number."
+                          },
+                          "output_tokens": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ],
+                            "format": "int64"
                           },
                           "session_id": {
                             "type": [
@@ -7494,6 +7517,29 @@
           }
         }
       },
+      "BoardEventDto": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "Somebody joined the team. Derived from the roster, never stored as\nan event, so it cannot drift from who is actually on the board.",
+            "required": [
+              "agent",
+              "kind"
+            ],
+            "properties": {
+              "agent": {
+                "$ref": "#/components/schemas/AgentRefDto"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "hired"
+                ]
+              }
+            }
+          }
+        ]
+      },
       "ChannelType": {
         "type": "string",
         "description": "Admin-surface mirror of [`baybo_model::ChannelType`]. Transparent\nwrapper around a snake_case string so the OpenAPI surface stays\nstable while the core type is open-ended (runtime-registered\nsidecars like `\"slack\"` pass through unchanged)."
@@ -8625,6 +8671,17 @@
           }
         }
       },
+      "FeedBodyDto": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/IssueEventBodyDto"
+          },
+          {
+            "$ref": "#/components/schemas/BoardEventDto"
+          }
+        ],
+        "description": "A feed line's payload: either a card's timeline entry, or one of the\nboard-level facts that has no card to live on."
+      },
       "FolderDto": {
         "type": "object",
         "description": "One folder in a folder-list / create response.",
@@ -9075,6 +9132,14 @@
               "kind"
             ],
             "properties": {
+              "attempt": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int64",
+                "description": "Which run is parked, by attempt number. Absent when the card was\nnot recording it yet, or when no run owns the prompt."
+              },
               "call_id": {
                 "type": "string"
               },
@@ -9244,6 +9309,14 @@
             "format": "int64",
             "description": "1 for an issue's first run, incrementing thereafter — how the\nexecution log addresses it."
           },
+          "cost_micros": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "What this run's LLM calls cost, in micro-USD. Derived from the cost\nledger over the run's own window, so a session several runs share\nstill bills each call to the run that made it.\n\n**Absent, not zero**, on responses that do not price runs — the\nboard's active-run poll among them. Zero is a real answer there\n(a run that has not billed yet), so the two states cannot share an\nencoding without the board reporting free work as fact."
+          },
           "created_at_ms": {
             "type": "integer",
             "format": "int64"
@@ -9254,10 +9327,24 @@
               "null"
             ]
           },
+          "input_tokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
           "number": {
             "type": "integer",
             "format": "int64",
             "description": "The issue this ran, by its per-project number."
+          },
+          "output_tokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
           },
           "session_id": {
             "type": [
@@ -9285,6 +9372,37 @@
           },
           "trigger": {
             "$ref": "#/components/schemas/RunTriggerDto"
+          }
+        }
+      },
+      "IssueRunLogDto": {
+        "type": "object",
+        "description": "A card's execution log with its totals attached. The totals ship beside\nthe rows rather than being left to the client because a client that\nsummed them would be the second place that decides what a card cost —\nand the first to disagree once a run is filtered out of the view.",
+        "required": [
+          "items",
+          "total_cost_micros",
+          "total_input_tokens",
+          "total_output_tokens"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/IssueRunDto"
+            }
+          },
+          "total_cost_micros": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Across **every** run, cancelled ones included: the money was spent\neither way, and a total that skipped them would not reconcile\nagainst the board's budget."
+          },
+          "total_input_tokens": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "total_output_tokens": {
+            "type": "integer",
+            "format": "int64"
           }
         }
       },

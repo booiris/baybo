@@ -124,25 +124,30 @@ describe('ProjectBoardPage', () => {
       expect(screen.getByRole('heading', { name: label })).toBeInTheDocument();
     }
     expect(screen.getByText('Under way')).toBeInTheDocument();
-    expect(screen.getAllByText('No issues')).toHaveLength(3);
+    // The empty columns say what to do about it, not just that they are
+    // empty — the placeholder is the only affordance a new board shows.
+    expect(screen.getAllByText(/No issues/)).toHaveLength(3);
+    expect(screen.getAllByText(/Drag one in/)).toHaveLength(3);
   });
 
-  it('counts live work only, so a cancelled card does not inflate a column', async () => {
+  it('shows a cancelled card struck through, without counting it as live work', async () => {
     renderBoard();
     await screen.findByText('Wire the board');
 
-    expect(screen.queryByText('Cancelled one')).not.toBeInTheDocument();
+    // Visible by default: cancel is the terminal negative, not a delete.
+    const cancelled = await screen.findByText('Cancelled one');
+    expect(cancelled.className).toContain('line-through');
+    // …but the column count measures live work, so it is not in the number.
     const backlog = screen.getByRole('heading', { name: 'Backlog' }).parentElement;
     expect(backlog?.textContent).toContain('2');
   });
 
-  it('shows a cancelled card struck through once the filter is on', async () => {
+  it('takes cancelled cards away when the filter asks it to', async () => {
     renderBoard();
-    await screen.findByText('Wire the board');
+    await screen.findByText('Cancelled one');
 
-    await userEvent.click(screen.getByLabelText('Show cancelled'));
-    const cancelled = await screen.findByText('Cancelled one');
-    expect(cancelled.className).toContain('line-through');
+    await userEvent.click(screen.getByLabelText('Hide cancelled'));
+    expect(screen.queryByText('Cancelled one')).not.toBeInTheDocument();
     const backlog = screen.getByRole('heading', { name: 'Backlog' }).parentElement;
     expect(backlog?.textContent).toContain('2');
   });
@@ -210,5 +215,15 @@ describe('ProjectBoardPage', () => {
     const panel = await screen.findByRole('complementary');
     expect(panel.parentElement?.className).toContain('absolute');
     expect(screen.getByText('Wire the board')).toBeInTheDocument();
+  });
+
+  it('opens the assignee’s profile from the card without opening the card', async () => {
+    renderBoard();
+    await screen.findByText('Under way');
+
+    // The card's own click navigates. Without stopping the event the
+    // avatar could never be the profile's entry point the mockup says it is.
+    await userEvent.click(screen.getAllByTitle(/Open @dev-1's profile/)[0]);
+    expect(await screen.findByRole('button', { name: /Close the agent profile/ })).toBeInTheDocument();
   });
 });

@@ -12,7 +12,7 @@ use baybo_store::AgentProfileStore;
 use baybo_store::project::{
     DEFAULT_MAX_PARALLEL_ISSUE_RUNS, IssueActor, IssueEventBody, IssueEventRow, IssuePriority,
     IssueRow, IssueRunRow, IssueStatus, IssueUpdate, NewIssue, NewIssueEvent, ProjectRow,
-    ProjectStore, ProjectUpdate, RunStatus, RunTrigger,
+    ProjectStore, ProjectUpdate, RunStatus, RunTrigger, Spend,
 };
 use baybo_workspace::WorkspacePaths;
 use chrono::{DateTime, Utc};
@@ -31,6 +31,49 @@ pub(crate) const MAX_ISSUE_TITLE_CHARS: usize = 200;
 /// derived: `@lead` means the same thing on every board, and it is the one
 /// handle a person can type without looking the team up first.
 pub const LEAD_HANDLE: &str = "lead";
+
+/// One line in a board's activity feed. Most lines are a card's timeline
+/// entry; a hire belongs to the board itself and is derived from the roster
+/// rather than written to any card's timeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeedEntry {
+    Card(IssueEventRow),
+    Hired {
+        agent: AgentProfileId,
+        /// Absent when a person did the hiring — the lead's own arrival
+        /// reads this way too, since nobody hired it: it comes with the
+        /// board.
+        hired_by: Option<AgentProfileId>,
+        at: DateTime<Utc>,
+    },
+}
+
+impl FeedEntry {
+    /// When it happened — the one thing both kinds are ordered by.
+    pub fn at(&self) -> DateTime<Utc> {
+        match self {
+            Self::Card(row) => row.created_at,
+            Self::Hired { at, .. } => *at,
+        }
+    }
+}
+
+/// One run and what it cost, as the execution log shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunWithSpend {
+    pub run: IssueRunRow,
+    pub spend: Spend,
+}
+
+/// A card's whole execution history, priced. `total` is over *every* run,
+/// including the ones the log lists as cancelled — the money was spent
+/// either way, and a total that quietly skipped them would not reconcile
+/// against the board's budget.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueRunLog {
+    pub runs: Vec<RunWithSpend>,
+    pub total: Spend,
+}
 
 const LEAD_DISPLAY_NAME: &str = "Lead";
 
@@ -1075,10 +1118,37 @@ impl ProjectManager {
         Ok(self.store.list_events(&issue.id).await?)
     }
 
-    /// Every run of one issue, newest first.
+    /// Every run of one issue, newest first. The unpriced read, for callers
+    /// choosing which run to continue rather than showing what one cost.
     pub async fn list_runs(&self, project: &ProjectId, number: i64) -> Result<Vec<IssueRunRow>> {
         let issue = self.get_issue(project, number).await?;
         Ok(self.store.list_runs(&issue.id).await?)
+    }
+
+    /// Every run of one issue, newest first, each already priced, plus what
+    /// the card has cost in total. One call rather than a run list and a
+    /// pricing recipe: the execution log and the rail's total are the same
+    /// fact at two altitudes, and a caller that summed the rows itself
+    /// would be the second place that decides what a card cost.
+    pub async fn run_log(&self, project: &ProjectId, number: i64) -> Result<IssueRunLog> {
+        let issue = self.get_issue(project, number).await?;
+        let runs = self.store.list_runs(&issue.id).await?;
+        let spend: std::collections::HashMap<_, _> = self
+            .store
+            .run_spend(&issue.id)
+            .await?
+            .into_iter()
+            .map(|row| (row.run_id, row.spend))
+            .collect();
+        let runs: Vec<RunWithSpend> = runs
+            .into_iter()
+            .map(|run| {
+                let spend = spend.get(&run.id).copied().unwrap_or_default();
+                RunWithSpend { run, spend }
+            })
+            .collect();
+        let total = runs.iter().map(|row| row.spend).sum();
+        Ok(IssueRunLog { runs, total })
     }
 
     /// Stop an issue's run.
@@ -1756,6 +1826,17 @@ impl ProjectManager {
     }
 
     /// What is stuck on the operator, per board.
+    /// What every board is doing right now, keyed by project. `since` is
+    /// the start of the operator's day — passed in rather than computed
+    /// here, because "today" is a question about the caller's clock and
+    /// this crate has no business guessing their timezone.
+    pub async fn board_activity(
+        &self,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<(ProjectId, baybo_store::project::BoardActivity)>> {
+        Ok(self.store.board_activity(since).await?)
+    }
+
     pub async fn attention(
         &self,
         pending_approval_sessions: &[baybo_model::SessionId],
@@ -1801,18 +1882,49 @@ impl ProjectManager {
         Ok(())
     }
 
-    /// The whole board's activity, newest first.
+    /// The whole board's activity, newest first. Two sources merged here
+    /// rather than in the caller: a card's timeline lives in
+    /// `issue_events`, but joining the team is a fact about the *board*
+    /// with no card to hang a row on, and `agent_profiles` already records
+    /// who joined, when, and who hired them. Writing it a second time as an
+    /// event would be the cron-groups mistake — a derived thing stored, and
+    /// then free to disagree with the roster it was derived from.
     pub async fn feed(
         &self,
         project: &ProjectId,
         before: Option<chrono::DateTime<chrono::Utc>>,
         limit: usize,
-    ) -> Result<Vec<IssueEventRow>> {
+    ) -> Result<Vec<FeedEntry>> {
         self.get_project(project).await?;
-        Ok(self
-            .store
-            .project_feed(project, before, limit.clamp(1, MAX_FEED_PAGE))
-            .await?)
+        let limit = limit.clamp(1, MAX_FEED_PAGE);
+        let cards = self.store.project_feed(project, before, limit).await?;
+        // Tombstones included: the feed is a record, and a hire that
+        // disappeared when its agent was removed would be the history
+        // rewriting itself.
+        let hires = self.agents.list_team_history(project).await?;
+
+        let mut merged: Vec<FeedEntry> = cards.into_iter().map(FeedEntry::Card).collect();
+        merged.extend(
+            hires
+                .into_iter()
+                .filter(|row| before.is_none_or(|cutoff| row.created_at < cutoff))
+                // The lead is not a hire: it is seeded with the board, so
+                // "hired @lead" would be the oldest line on every feed and
+                // would say nothing the board's existence does not.
+                .filter(|row| {
+                    row.team
+                        .as_ref()
+                        .is_none_or(|team| team.handle.as_str() != LEAD_HANDLE)
+                })
+                .map(|row| FeedEntry::Hired {
+                    agent: row.id,
+                    hired_by: row.hired_by,
+                    at: row.created_at,
+                }),
+        );
+        merged.sort_by_key(|entry| std::cmp::Reverse(entry.at()));
+        merged.truncate(limit);
+        Ok(merged)
     }
 
     /// One issue's sub-issues, by stage then position.

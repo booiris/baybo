@@ -1882,6 +1882,9 @@ forwards_everything_else! {
     events_since(issue: &IssueId, since: DateTime<Utc>) -> StoreResult<Vec<IssueEventRow>>;
     set_issue_branch(id: &IssueId, branch: &str) -> StoreResult<bool>;
     list_runs(issue: &IssueId) -> StoreResult<Vec<IssueRunRow>>;
+    run_spend(issue: &IssueId) -> StoreResult<Vec<baybo_store::project::RunSpend>>;
+    board_activity(since: DateTime<Utc>)
+        -> StoreResult<Vec<(ProjectId, baybo_store::project::BoardActivity)>>;
     active_runs(project: &ProjectId) -> StoreResult<Vec<IssueRunRow>>;
     get_run(id: &IssueRunId) -> StoreResult<Option<IssueRunRow>>;
     claim_run(id: &IssueRunId, session: &SessionId) -> StoreResult<bool>;

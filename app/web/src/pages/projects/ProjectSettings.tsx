@@ -2,6 +2,7 @@ import { useState } from 'react';
 
 import { useAdminClient, useAuth } from '../../api/auth';
 import { setProjectArchived, updateProject } from './api';
+import type { Agent } from './boardModel';
 import type { Project } from './boardModel';
 import { budgetHint, formatBudget, parseBudget } from './budgetModel';
 import { formatParallelIssueRuns, parallelIssueRunsHint, parseParallelIssueRuns } from './driverModel';
@@ -11,10 +12,18 @@ export function ProjectSettings({
   project,
   onClose,
   onSaved,
+  team,
+  onOpenProfile,
+  onAddAgent,
 }: {
   project: Project;
   onClose: () => void;
   onSaved: (project: Project) => void;
+  /// The roster, so ⚙ can manage the team the mockup says it manages
+  /// rather than only the board's knobs.
+  team: Agent[];
+  onOpenProfile: (agent: Agent) => void;
+  onAddAgent: () => void;
 }) {
   const client = useAdminClient();
   const { logout } = useAuth();
@@ -153,6 +162,43 @@ export function ProjectSettings({
           Working directory: <span className="font-mono">{project.workdir}</span> — set once, at
           creation.
         </p>
+
+        <section className="border-t-2 border-black/15 pt-3">
+          <h3 className="font-mono text-[0.6rem] font-bold uppercase tracking-wider text-ink-soft">
+            Team
+          </h3>
+          <ul className="mt-1.5 flex flex-col gap-1">
+            {team.map((agent) => (
+              <li key={agent.id}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    onOpenProfile(agent);
+                  }}
+                  className="w-full text-left flex items-baseline gap-2 border-2 border-black/15 hover:border-black rounded-md px-2 py-1 bg-surface font-mono text-[0.68rem]"
+                >
+                  <span className="font-bold">@{agent.handle}</span>
+                  <span className="min-w-0 flex-1 truncate text-ink-soft">{agent.name}</span>
+                  {agent.lead ? (
+                    <span className="shrink-0 rounded border border-black bg-brand px-1 text-[0.5rem] font-bold uppercase">
+                      lead
+                    </span>
+                  ) : null}
+                </button>
+              </li>
+            ))}
+          </ul>
+          <button
+            type="button"
+            onClick={onAddAgent}
+            className="mt-1.5 border-2 border-dashed border-black rounded-md px-2 py-1 font-mono text-[0.66rem] cursor-pointer hover:bg-canvas"
+          >
+            ＋ New agent
+          </button>
+          <p className="mt-1 font-mono text-[0.58rem] text-ink-soft">
+            team {team.length}/16 — the lead hires against the same cap.
+          </p>
+        </section>
 
         {error !== null ? (
           <p className="border-2 border-err text-err rounded-md px-2 py-1 font-mono text-[0.68rem] break-words">

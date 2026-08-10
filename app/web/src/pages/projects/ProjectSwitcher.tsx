@@ -5,24 +5,41 @@ import { RiArrowDownSLine } from 'react-icons/ri';
 import type { Project } from './boardModel';
 import { CreateProjectForm } from './CreateProjectForm';
 import { attentionFor, useAttention, type ProjectAttention } from './useAttention';
+import { activityFor, burnIsNearLimit, useBoardActivity } from './useBoardActivity';
+import { formatUsd } from './budgetModel';
 
 export function ProjectSwitcher({
   current,
   projects,
   onCreated,
+  refreshKey = 0,
 }: {
   current: Project | null;
   projects: Project[];
   onCreated: () => void;
+  /// Bumped by the board when anything changes, so an open dropdown's
+  /// numbers follow the board instead of going stale behind it.
+  refreshKey?: number;
 }) {
   const [open, setOpen] = useState(false);
   const waiting = useAttention();
   const [creating, setCreating] = useState(false);
   const [showArchived, setShowArchived] = useState(false);
+  // Fetched only while the dropdown is open, then refreshed on the board's
+  // own change signal — decision ⑦ asked for live, not for a timer.
+  const activity = useBoardActivity(open, refreshKey);
   const root = useRef<HTMLDivElement>(null);
-  const visible = projects.filter(
-    (project) => showArchived || project.archived_at_ms == null || project.id === current?.id,
-  );
+  const archivedCount = projects.filter((project) => project.archived_at_ms != null).length;
+  // Archived boards sort to the tail rather than staying in the server's
+  // recency order: they are shown on request, and a recently-touched
+  // archived board landing mid-list reads as live work.
+  const visible = projects
+    .filter(
+      (project) => showArchived || project.archived_at_ms == null || project.id === current?.id,
+    )
+    .sort(
+      (a, b) => Number(a.archived_at_ms != null) - Number(b.archived_at_ms != null),
+    );
 
   useEffect(() => {
     if (!open) return;
@@ -61,22 +78,17 @@ export function ProjectSwitcher({
 
       {open ? (
         <div className="absolute left-0 top-[calc(100%+6px)] z-40 w-[320px] bg-surface border-2 border-black rounded-md shadow-brutal overflow-hidden">
-          {creating ? (
-            <div className="p-3">
-              <CreateProjectForm
-                onDone={() => {
-                  setCreating(false);
-                  setOpen(false);
-                  onCreated();
-                }}
-              />
-            </div>
-          ) : (
+          {creating ? null : (
             <>
               <ul className="max-h-[300px] overflow-y-auto">
                 {visible.map((project) => {
                   const isCurrent = project.id === current?.id;
                   const stuck = attentionFor(waiting, project.id);
+                  const live = activityFor(activity, project.id);
+                  const near = burnIsNearLimit(
+                    live?.burn_micros ?? 0,
+                    project.daily_budget_micros,
+                  );
                   return (
                     <li key={project.id}>
                       <Link
@@ -102,8 +114,27 @@ export function ProjectSwitcher({
                             {stuck.approvals + stuck.held + stuck.failed + stuck.unread}
                           </span>
                         )}
-                        <span className="ml-auto shrink-0 text-[0.58rem] text-ink-soft truncate max-w-[45%]">
-                          {project.workdir}
+                        <span className="ml-auto shrink-0 flex items-baseline gap-2 text-[0.58rem] tabular-nums">
+                          {live !== null && live.working > 0 ? (
+                            <span className="text-ok font-bold" title="Runs executing right now">
+                              ● {live.working} working
+                            </span>
+                          ) : (
+                            <span className="text-ink-soft">idle</span>
+                          )}
+                          <span
+                            className={near ? 'text-warn font-bold' : 'text-ink-soft'}
+                            title={
+                              near
+                                ? 'Close to the daily ceiling — new runs are held once it is reached'
+                                : "Spent today / this board's daily ceiling"
+                            }
+                          >
+                            {formatUsd(live?.burn_micros ?? 0)}
+                            {project.daily_budget_micros == null
+                              ? ''
+                              : ` / ${formatUsd(project.daily_budget_micros)}`}
+                          </span>
                         </span>
                       </Link>
                     </li>
@@ -124,7 +155,7 @@ export function ProjectSwitcher({
               >
                 ＋ New project…
               </button>
-              {projects.some((project) => project.archived_at_ms != null) ? (
+              {archivedCount > 0 ? (
                 <label className="flex items-center gap-1.5 px-3 py-2 border-t border-black/20 font-mono text-[0.66rem] text-ink-soft cursor-pointer">
                   <input
                     type="checkbox"
@@ -133,11 +164,53 @@ export function ProjectSwitcher({
                       setShowArchived(event.target.checked);
                     }}
                   />
-                  Show archived
+                  Show archived ({archivedCount})
                 </label>
               ) : null}
             </>
           )}
+        </div>
+      ) : null}
+
+      {creating ? (
+        // A modal, not a form squeezed into a 320px popover: five fields
+        // and a workdir path do not fit a dropdown, and the one field
+        // people get wrong is the one with the longest explanation.
+        <div
+          className="fixed inset-0 z-50 bg-black/40 flex items-start justify-center p-8 overflow-y-auto"
+          onClick={() => {
+            setCreating(false);
+          }}
+        >
+          <div
+            className="w-full max-w-lg my-auto bg-surface border-[3px] border-black rounded-md shadow-brutal"
+            onClick={(event) => {
+              event.stopPropagation();
+            }}
+          >
+            <div className="flex items-center gap-2 px-4 py-2 border-b-2 border-black">
+              <h2 className="font-mono text-[0.78rem] font-bold">New project</h2>
+              <button
+                type="button"
+                aria-label="Close"
+                className="ml-auto cursor-pointer px-1"
+                onClick={() => {
+                  setCreating(false);
+                }}
+              >
+                ✕
+              </button>
+            </div>
+            <div className="p-4">
+              <CreateProjectForm
+                onDone={() => {
+                  setCreating(false);
+                  setOpen(false);
+                  onCreated();
+                }}
+              />
+            </div>
+          </div>
         </div>
       ) : null}
     </div>

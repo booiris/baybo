@@ -71,6 +71,14 @@ pub trait AgentProfileStore: Send + Sync {
 
     async fn list_team(&self, project: &ProjectId) -> Result<Vec<AgentProfileRow>>;
 
+    /// Every agent that has ever been on this board, tombstones included,
+    /// oldest first. The live roster filters removals; a history read must
+    /// not, because the board's activity feed says when each teammate
+    /// joined — and an entry that vanishes the day somebody leaves is the
+    /// record rewriting itself, which is the one thing the tombstone
+    /// exists to prevent.
+    async fn list_team_history(&self, project: &ProjectId) -> Result<Vec<AgentProfileRow>>;
+
     /// Fetch a single profile, or `None` if it doesn't exist.
     ///
     /// Reaches removed team members on purpose — that is what lets a

@@ -770,6 +770,43 @@ async fn delete(router: &axum::Router, uri: &str, expected: StatusCode) -> Value
 }
 
 #[tokio::test]
+async fn a_hire_reaches_the_feed_but_the_boards_own_lead_does_not() {
+    let (router, _tg) = router().await;
+    let p = open_project(&router, "staffing").await;
+
+    // Only the seeded lead so far. It arrives with the board, so it is not
+    // an event and must not open every feed with "hired @lead".
+    let feed = get(&router, &format!("/v1/projects/{p}/feed"), StatusCode::OK).await;
+    assert_eq!(
+        feed["items"].as_array().expect("items").len(),
+        0,
+        "a board that has done nothing has an empty feed: {feed:?}"
+    );
+
+    post(
+        &router,
+        &format!("/v1/projects/{p}/agents"),
+        json!({ "name": "Test Engineer", "role": "Writes the tests." }),
+        StatusCode::CREATED,
+    )
+    .await;
+
+    let feed = get(&router, &format!("/v1/projects/{p}/feed"), StatusCode::OK).await;
+    let items = feed["items"].as_array().expect("items");
+    assert_eq!(
+        items.len(),
+        1,
+        "the hire is the board's only news: {items:?}"
+    );
+    assert_eq!(items[0]["body"]["kind"], "hired");
+    assert_eq!(items[0]["body"]["agent"]["handle"], "test-engineer");
+    assert!(
+        items[0].get("number").is_none(),
+        "a hire belongs to the board, so it points at no card: {items:?}"
+    );
+}
+
+#[tokio::test]
 async fn the_activity_feed_is_the_boards_timelines_read_across_it() {
     let (router, _tg) = router().await;
     let a = open_project(&router, "watched").await;

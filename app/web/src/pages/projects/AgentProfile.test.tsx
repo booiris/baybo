@@ -6,6 +6,18 @@ import { MemoryRouter } from 'react-router-dom';
 import { AgentProfile } from './AgentProfile';
 import type { Agent, Issue, IssueRun } from './boardModel';
 
+vi.mock('../../api/auth', () => ({
+  useAdminClient: () => ({}),
+  useAuth: () => ({ token: 't', baseUrl: 'http://x', logout: vi.fn() }),
+}));
+// The model pool is a network read the panel makes on mount; the tests
+// here are about what it renders, not about which models exist.
+vi.mock('./api', () => ({
+  fetchModelPool: vi.fn().mockResolvedValue({ kind: 'ok', value: { names: [], defaultName: 'gpt' } }),
+  setAgentModel: vi.fn().mockResolvedValue({ kind: 'ok', value: null }),
+}));
+
+
 function agent(handle: string, overrides: Partial<Agent> = {}): Agent {
   return {
     id: `id-${handle}`,
@@ -50,6 +62,7 @@ function renderProfile(a: Agent, issues: Issue[] = [], runs: IssueRun[] = [], re
         projectId="01JP"
         onClose={vi.fn()}
         onRemove={onRemove}
+      onChanged={vi.fn()}
       />
     </MemoryRouter>,
   );
@@ -88,9 +101,22 @@ describe('AgentProfile', () => {
     expect(screen.queryByRole('button', { name: /Remove from project/ })).not.toBeInTheDocument();
   });
 
-  it('removes an ordinary teammate', async () => {
+  it('asks before it tombstones a teammate', async () => {
     const onRemove = renderProfile(agent('dev-1'));
     await userEvent.click(screen.getByRole('button', { name: /Remove from project/ }));
+    // One click is not enough: removal is a tombstone — the handle stays
+    // reserved for good and every past entry keeps naming this agent.
+    expect(onRemove).not.toHaveBeenCalled();
+    expect(screen.getByText(/no undo/)).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Remove' }));
     expect(onRemove).toHaveBeenCalledWith(expect.objectContaining({ handle: 'dev-1' }));
+  });
+
+  it('lets a mis-click back out', async () => {
+    const onRemove = renderProfile(agent('dev-1'));
+    await userEvent.click(screen.getByRole('button', { name: /Remove from project/ }));
+    await userEvent.click(screen.getByRole('button', { name: 'Keep' }));
+    expect(onRemove).not.toHaveBeenCalled();
   });
 });

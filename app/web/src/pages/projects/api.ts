@@ -1,7 +1,7 @@
 import type { AdminClient } from '../../api/client';
 import type { components, paths } from '../../api/schema';
-import type { Agent, Issue, IssueRun, IssueStatus, Project } from './boardModel';
-import type { IssueEvent } from './timelineModel';
+import type { Agent, Issue, IssueRun, IssueStatus, Project, RunLog } from './boardModel';
+import type { FeedEntry, IssueEvent } from './timelineModel';
 
 export type CreateIssueRequest = components['schemas']['CreateIssueRequest'];
 export type UpdateIssueRequest = components['schemas']['UpdateIssueRequest'];
@@ -59,7 +59,10 @@ export async function fetchTeam(
 export async function hireAgent(
   client: AdminClient,
   projectId: string,
-  body: { name: string; role: string },
+  // Framework and LLM pin are both on `HireAgentRequest` already; the
+  // client narrowed them away, so the user form could not offer the two
+  // knobs the spec deliberately gives it over the lead's own hiring tool.
+  body: { name: string; role: string; framework?: Agent['framework']; llm?: string },
 ): Promise<Outcome<Agent>> {
   try {
     const { data, error, response } = await client.POST('/v1/projects/{project_id}/agents', {
@@ -170,7 +173,7 @@ export async function fetchIssueRuns(
   client: AdminClient,
   projectId: string,
   number: number,
-): Promise<Outcome<IssueRun[]>> {
+): Promise<Outcome<RunLog>> {
   try {
     const { data, error, response } = await client.GET(
       '/v1/projects/{project_id}/issues/{number}/runs',
@@ -179,7 +182,7 @@ export async function fetchIssueRuns(
     if (response.status === 401) return { kind: 'unauthorized' };
     if (error !== undefined) return failure(response.status, error.error);
     if (!response.ok) return failure(response.status, undefined);
-    return { kind: 'ok', value: data.items };
+    return { kind: 'ok', value: data };
   } catch (e) {
     return { kind: 'failed', message: networkMessage(e) };
   }
@@ -348,7 +351,7 @@ export async function fetchFeed(
   client: AdminClient,
   projectId: string,
   beforeMs: number | null,
-): Promise<Outcome<IssueEvent[]>> {
+): Promise<Outcome<FeedEntry[]>> {
   try {
     const { data, error, response } = await client.GET('/v1/projects/{project_id}/feed', {
       params: {
@@ -428,28 +431,53 @@ export async function openLeadConversation(
   }
 }
 
-export type LeadTurn = { id: string; kind: string; role: string; text: string; at: string };
+/// A row of the lead's transcript, **as the server sent it**.
+///
+/// This used to be a five-field projection, which is why the panel could
+/// not draw a work block: `steps`, the work timestamps and `cancelled` were
+/// dropped at the seam, so the information never reached the renderer that
+/// needed it. Carrying the row whole costs nothing and keeps the panel able
+/// to use the chat page's own work-block helpers.
+export type LeadTurn =
+  paths['/v1/chat/sessions/{session_id}']['get']['responses'][200]['content']['application/json']['transcript'][number];
 
+/// One page of a lead conversation, with the cursor for the page above it.
+export type LeadHistory = {
+  rows: LeadTurn[];
+  /// Whether anything older exists — what the panel's upward paging asks.
+  hasMoreOlder: boolean;
+  oldestOrdinal: number | null;
+};
+
+/// One page of a lead conversation.
+///
+/// `beforeOrdinal` pages **upward**, through the same door the chat page
+/// uses — `sync` only walks forward, so a panel built on it could never
+/// show anything above the first screen.
 export async function fetchLeadMessages(
   client: AdminClient,
   sessionId: string,
-): Promise<Outcome<LeadTurn[]>> {
+  beforeOrdinal: number | null = null,
+): Promise<Outcome<LeadHistory>> {
   try {
-    const { data, error, response } = await client.GET('/v1/chat/sessions/{session_id}/sync', {
-      params: { path: { session_id: sessionId }, query: {} },
+    const { data, error, response } = await client.GET('/v1/chat/sessions/{session_id}', {
+      params: {
+        path: { session_id: sessionId },
+        query: beforeOrdinal == null ? {} : { before_ordinal: beforeOrdinal },
+      },
     });
     if (response.status === 401) return { kind: 'unauthorized' };
     if (error !== undefined) return failure(response.status, error.error);
     if (!response.ok) return failure(response.status, undefined);
     return {
       kind: 'ok',
-      value: data.rows.map((row) => ({
-        id: row.id,
-        kind: row.kind,
-        role: row.role,
-        text: row.text,
-        at: row.created_at,
-      })),
+      value: {
+        rows: data.transcript,
+        // `has_more` is the session read's name for "there is a page above
+        // this one" — the same fact the chat page's scroll-up trigger uses.
+        hasMoreOlder: data.has_more,
+        oldestOrdinal: data.oldest_ordinal ?? null,
+      },
     };
   } catch (e) {
     return { kind: 'failed', message: networkMessage(e) };
@@ -511,6 +539,50 @@ export async function markProjectRead(
     if (error !== undefined) return failure(response.status, error.error);
     if (!response.ok) return failure(response.status, undefined);
     return { kind: 'ok', value: null };
+  } catch (e) {
+    return { kind: 'failed', message: networkMessage(e) };
+  }
+}
+
+/// Pin (or unpin) an agent's model. Same door the Agents page uses — the
+/// profile is a second view of one roster, not a second way to edit it.
+export async function setAgentModel(
+  client: AdminClient,
+  agentId: string,
+  llm: string,
+): Promise<Outcome<null>> {
+  try {
+    const { error, response } = await client.PUT('/v1/agents/{agent_id}/model', {
+      params: { path: { agent_id: agentId } },
+      body: { llm },
+    });
+    if (response.status === 401) return { kind: 'unauthorized' };
+    if (error !== undefined) return failure(response.status, error.error);
+    if (!response.ok) return failure(response.status, undefined);
+    return { kind: 'ok', value: null };
+  } catch (e) {
+    return { kind: 'failed', message: networkMessage(e) };
+  }
+}
+
+/// The models this deployment can actually run, and which one `default-llm`
+/// points at. A pin outside the pool is a teammate that fails every time it
+/// is woken, so the picker offers the pool and nothing else.
+export async function fetchModelPool(
+  client: AdminClient,
+): Promise<Outcome<{ names: string[]; defaultName: string }>> {
+  try {
+    const { data, error, response } = await client.GET('/v1/llm/models');
+    if (response.status === 401) return { kind: 'unauthorized' };
+    if (error !== undefined) return failure(response.status, error.error);
+    if (!response.ok) return failure(response.status, undefined);
+    return {
+      kind: 'ok',
+      value: {
+        names: data.items.map((model) => model.name),
+        defaultName: data.default_name,
+      },
+    };
   } catch (e) {
     return { kind: 'failed', message: networkMessage(e) };
   }

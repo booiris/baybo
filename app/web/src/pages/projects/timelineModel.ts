@@ -1,9 +1,15 @@
-import type { components } from '../../api/schema';
+import type { components, paths } from '../../api/schema';
 
-import { COLUMN_LABEL, unsettledRun, type IssueStatus, type RunStatus } from './boardModel';
+import { COLUMN_LABEL, unsettledRun, type Agent, type IssueStatus, type RunStatus } from './boardModel';
+import { handleOf } from './teamModel';
 
 export type IssueEvent = components['schemas']['IssueEventDto'];
 export type IssueEventBody = components['schemas']['IssueEventBodyDto'];
+/// One line of the board's activity feed. Shaped like a timeline entry, but
+/// `number` is optional: a hire is a fact about the board, so there is no
+/// card for it to point at.
+export type FeedEntry =
+  paths['/v1/projects/{project_id}/feed']['get']['responses'][200]['content']['application/json']['items'][number];
 
 export type EventShape = 'comment' | 'note';
 
@@ -38,16 +44,24 @@ const DECISION_LABEL: Record<'approve' | 'approve_always' | 'deny', string> = {
   deny: 'refusal',
 };
 
-export function pendingApprovals(
-  events: IssueEvent[],
-): { callId: string; tool: string; summary: string }[] {
-  const open = new Map<string, { callId: string; tool: string; summary: string }>();
+export type PendingApproval = {
+  callId: string;
+  tool: string;
+  summary: string;
+  /// Which run is parked. Absent on prompts recorded before the card
+  /// tracked it — the card still says a tool is waiting.
+  attempt: number | null;
+};
+
+export function pendingApprovals(events: IssueEvent[]): PendingApproval[] {
+  const open = new Map<string, PendingApproval>();
   for (const event of events) {
     if (event.body.kind === 'approval_requested') {
       open.set(event.body.call_id, {
         callId: event.body.call_id,
         tool: event.body.tool,
         summary: event.body.summary,
+        attempt: event.body.attempt ?? null,
       });
     } else if (event.body.kind === 'approval_resolved') {
       open.delete(event.body.call_id);
@@ -112,11 +126,18 @@ function unnamedEvent(_body: never): string {
   return 'did something this page is too old to describe';
 }
 
+/// What sending will do, in the assignee's own name.
+///
+/// `team` is required rather than optional: the assignee on an issue is an
+/// agent **id**, and every sentence below addresses a person. Resolving it
+/// here — where the hint is written — is what stops a raw ULID reaching the
+/// composer, which is what happened while this took only the issue.
 export function commentHint(
   issue: { status: IssueStatus; assignee?: string | null; cancelled_at_ms?: number | null },
   runs: { status: RunStatus }[],
+  team: Agent[],
 ): string {
-  const assignee = issue.assignee;
+  const assignee = issue.assignee == null ? null : handleOf(team, issue.assignee);
   if (assignee == null) {
     return 'Records only — nobody is assigned to this issue yet.';
   }
@@ -145,4 +166,45 @@ export function eventTime(atMs: number, nowMs: number): string {
   return sameDay
     ? at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
     : at.toLocaleDateString([], { month: 'short', day: 'numeric' });
+}
+
+/// How long ago, for a feed that is skimmed rather than read. A wall clock
+/// answers "when did this happen" only after the reader does the
+/// subtraction themselves, and the feed's whole job is to be scannable.
+export function eventAgo(atMs: number, nowMs: number): string {
+  const seconds = Math.max(0, Math.round((nowMs - atMs) / 1000));
+  if (seconds < 60) return 'now';
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours}h`;
+  return `${Math.round(hours / 24)}d`;
+}
+
+/// Who did it, for a feed line. A hire whose `hired_by` was empty comes
+/// back as the user's doing, which is also how a board's own lead reads —
+/// nobody hired it, it came with the board.
+export function feedActorLabel(entry: FeedEntry): string {
+  switch (entry.actor.kind) {
+    case 'user':
+      return 'you';
+    case 'system':
+      return 'the board';
+    case 'agent':
+      return `@${entry.actor.handle}`;
+    default:
+      return unnamedActor(entry.actor);
+  }
+}
+
+/// What a feed line says. A comment's own words are deliberately *not* the
+/// line: the feed is a list of things that happened, and an agent's
+/// run report is hundreds of words that would bury every line around it.
+/// The card's timeline is where the text belongs.
+export function describeFeedEntry(entry: FeedEntry): string {
+  if (entry.body.kind === 'hired') {
+    return `hired @${entry.body.agent.handle}`;
+  }
+  if (entry.body.kind === 'comment') return 'commented';
+  return describeEvent(entry.body) ?? 'commented';
 }

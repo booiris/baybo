@@ -7,9 +7,9 @@ use rusqlite::OptionalExtension;
 use super::SqlitePool;
 use baybo_store::StorageError;
 use baybo_store::project::{
-    AttentionCounts, IssueActor, IssueEventRow, IssuePriority, IssueRow, IssueRunRow, IssueStatus,
-    IssueUpdate, NewIssue, NewIssueEvent, NewIssueRun, ProjectRow, ProjectStore, ProjectUpdate,
-    Result, RunStatus, RunTrigger,
+    AttentionCounts, BoardActivity, IssueActor, IssueEventRow, IssuePriority, IssueRow,
+    IssueRunRow, IssueStatus, IssueUpdate, NewIssue, NewIssueEvent, NewIssueRun, ProjectRow,
+    ProjectStore, ProjectUpdate, Result, RunSpend, RunStatus, RunTrigger, Spend,
 };
 
 pub struct SqliteProjectStore {
@@ -1048,6 +1048,123 @@ impl ProjectStore for SqliteProjectStore {
         raws.into_iter().map(run_from_raw).collect()
     }
 
+    async fn run_spend(&self, issue: &IssueId) -> Result<Vec<RunSpend>> {
+        let issue = issue.as_str().to_string();
+        let rows = self
+            .pool
+            .interact("issue_runs.spend", move |conn| {
+                // The window bounds are what attribute a call to one run of
+                // a session several runs share. `started_at IS NULL` (never
+                // claimed) makes every comparison NULL, so such a run
+                // matches nothing and reads zero rather than inheriting the
+                // session's whole history.
+                let mut stmt = conn.prepare(
+                    "SELECT r.id, \
+                            COALESCE(SUM(c.input_tokens), 0), \
+                            COALESCE(SUM(c.output_tokens), 0), \
+                            COALESCE(SUM(c.cost_usd), 0) \
+                     FROM issue_runs r \
+                     LEFT JOIN cost_records c \
+                       ON c.session_id = r.session_id \
+                      AND c.timestamp >= r.started_at \
+                      AND (r.settled_at IS NULL OR c.timestamp < r.settled_at) \
+                     WHERE r.issue_id = ?1 \
+                     GROUP BY r.id",
+                )?;
+                Ok(stmt
+                    .query_map(rusqlite::params![issue], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?)
+            })
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, input_tokens, output_tokens, cost)| RunSpend {
+                run_id: IssueRunId::from(id),
+                spend: Spend {
+                    input_tokens,
+                    output_tokens,
+                    cost: baybo_model::MicroUsd::from_micros(cost),
+                },
+            })
+            .collect())
+    }
+
+    async fn board_activity(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<(ProjectId, BoardActivity)>> {
+        let running = RunStatus::Running.as_str();
+        let since = super::time::to_us(since);
+        let rows = self
+            .pool
+            .interact("projects.activity", move |conn| {
+                let mut activity: std::collections::HashMap<String, (usize, i64)> =
+                    std::collections::HashMap::new();
+
+                {
+                    let mut stmt = conn.prepare(
+                        "SELECT project_id, COUNT(*) FROM issue_runs \
+                         WHERE status = ?1 AND settled_at IS NULL \
+                         GROUP BY project_id",
+                    )?;
+                    for row in stmt.query_map(rusqlite::params![running], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                    })? {
+                        let (project, count) = row?;
+                        activity.entry(project).or_default().0 += count.max(0) as usize;
+                    }
+                }
+
+                {
+                    // The all-boards spelling of `spend_since`, deliberately
+                    // identical in semantics: this number sits next to the
+                    // budget in the dropdown, and a burn that measured
+                    // something else than the gate does would accuse the
+                    // board of overspending a ceiling it never crossed.
+                    // `DISTINCT` is what stops a session shared by several
+                    // runs being counted once per run.
+                    let mut stmt = conn.prepare(
+                        "SELECT r.project_id, COALESCE(SUM(c.cost_usd), 0) \
+                         FROM cost_records c \
+                         JOIN (SELECT DISTINCT project_id, session_id FROM issue_runs \
+                               WHERE session_id IS NOT NULL) r \
+                           ON r.session_id = c.session_id \
+                         WHERE c.timestamp >= ?1 \
+                         GROUP BY r.project_id",
+                    )?;
+                    for row in stmt.query_map(rusqlite::params![since], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                    })? {
+                        let (project, micros) = row?;
+                        activity.entry(project).or_default().1 += micros;
+                    }
+                }
+
+                Ok(activity.into_iter().collect::<Vec<_>>())
+            })
+            .await?;
+        rows.into_iter()
+            .map(|(id, (working, burn))| {
+                Ok((
+                    ProjectId::parse(id).map_err(|e| {
+                        StorageError::Storage(format!("projects.id unreadable: {e}"))
+                    })?,
+                    BoardActivity {
+                        working,
+                        burn: baybo_model::MicroUsd::from_micros(burn),
+                    },
+                ))
+            })
+            .collect()
+    }
+
     async fn active_runs(&self, project: &ProjectId) -> Result<Vec<IssueRunRow>> {
         let project = project.as_str().to_string();
         let raws = self
@@ -1962,6 +2079,230 @@ mod tests {
             store.spend_since(&theirs.id, since).await.unwrap(),
             baybo_model::MicroUsd::from_micros(7_000)
         );
+    }
+
+    #[tokio::test]
+    async fn run_spend_bills_each_run_of_a_shared_session_only_its_own_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(dir.path().join("test.db")).await.unwrap();
+        let store = SqliteProjectStore::new(pool.clone());
+        let costs = crate::sqlite::cost::SqliteCostStore::new(pool);
+
+        let p = project("01JSHARED", "shared");
+        store.create_project(&p).await.unwrap();
+        let issue = store
+            .create_issue(&new_issue(
+                &p.id,
+                "two runs, one session",
+                IssueStatus::Todo,
+            ))
+            .await
+            .unwrap();
+
+        // One session, because an issue keeps one session per agent that
+        // works it — so the run windows are the only thing telling the two
+        // runs' calls apart.
+        let session = SessionId::from("sess-one".to_owned());
+
+        let first = store.enqueue_run(&new_run(&issue)).await.unwrap();
+        store.claim_run(&first.id, &session).await.unwrap();
+        let first_claimed = store.get_run(&first.id).await.unwrap().unwrap();
+        let spend = |micros: i64, tokens: usize, at: chrono::DateTime<chrono::Utc>| {
+            baybo_model::CostRecord {
+                user_id: "u".into(),
+                session_id: session.clone(),
+                turn_id: baybo_model::TurnId::new(),
+                span_id: baybo_model::SpanId::new(),
+                reason: baybo_model::CallReason::default(),
+                model: "m".into(),
+                reasoning_effort: None,
+                input_tokens: tokens,
+                output_tokens: tokens,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cost_usd: baybo_model::MicroUsd::from_micros(micros),
+                timestamp: at,
+            }
+        };
+        let started = first_claimed.started_at.expect("claimed run has a start");
+        baybo_store::cost::CostStore::record(&costs, &spend(100, 5, started))
+            .await
+            .unwrap();
+        store
+            .settle_run(&first.id, RunStatus::Done, None)
+            .await
+            .unwrap();
+
+        let second = store.enqueue_run(&new_run(&issue)).await.unwrap();
+        store.claim_run(&second.id, &session).await.unwrap();
+        let second_claimed = store.get_run(&second.id).await.unwrap().unwrap();
+        let later = second_claimed.started_at.expect("claimed run has a start");
+        baybo_store::cost::CostStore::record(&costs, &spend(700, 9, later))
+            .await
+            .unwrap();
+
+        let by_run: std::collections::HashMap<_, _> = store
+            .run_spend(&issue.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.run_id, row.spend))
+            .collect();
+        assert_eq!(
+            by_run[&first.id].cost,
+            baybo_model::MicroUsd::from_micros(100),
+            "the settled run keeps only what it spent before it settled"
+        );
+        assert_eq!(by_run[&first.id].input_tokens, 5);
+        assert_eq!(
+            by_run[&second.id].cost,
+            baybo_model::MicroUsd::from_micros(700),
+            "the live run does not inherit its predecessor's calls"
+        );
+        assert_eq!(by_run[&second.id].output_tokens, 9);
+    }
+
+    #[tokio::test]
+    async fn board_activity_burn_agrees_with_the_budget_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(dir.path().join("test.db")).await.unwrap();
+        let store = SqliteProjectStore::new(pool.clone());
+        let costs = crate::sqlite::cost::SqliteCostStore::new(pool);
+
+        let p = project("01JBURN", "burny");
+        store.create_project(&p).await.unwrap();
+        let issue = store
+            .create_issue(&new_issue(&p.id, "spends", IssueStatus::Todo))
+            .await
+            .unwrap();
+
+        // Two runs on one session — the shape that makes a naive join
+        // double-count, and the reason `spend_since` uses a set membership
+        // test rather than a join.
+        let session = SessionId::from("sess-burn".to_owned());
+        for _ in 0..2 {
+            let run = store.enqueue_run(&new_run(&issue)).await.unwrap();
+            store.claim_run(&run.id, &session).await.unwrap();
+            store
+                .settle_run(&run.id, RunStatus::Done, None)
+                .await
+                .unwrap();
+        }
+
+        let now = chrono::Utc::now();
+        baybo_store::cost::CostStore::record(
+            &costs,
+            &baybo_model::CostRecord {
+                user_id: "u".into(),
+                session_id: session.clone(),
+                turn_id: baybo_model::TurnId::new(),
+                span_id: baybo_model::SpanId::new(),
+                reason: baybo_model::CallReason::default(),
+                model: "m".into(),
+                reasoning_effort: None,
+                input_tokens: 1,
+                output_tokens: 1,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cost_usd: baybo_model::MicroUsd::from_micros(1_500),
+                timestamp: now,
+            },
+        )
+        .await
+        .unwrap();
+
+        let since = now - chrono::Duration::hours(1);
+        let gate = store.spend_since(&p.id, since).await.unwrap();
+        let activity: std::collections::HashMap<_, _> = store
+            .board_activity(since)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(
+            activity[&p.id].burn, gate,
+            "the dropdown's burn and the budget gate's spend are the same question"
+        );
+        assert_eq!(
+            gate,
+            baybo_model::MicroUsd::from_micros(1_500),
+            "one call on a session two runs shared is billed once, not twice"
+        );
+        assert_eq!(activity[&p.id].working, 0, "both runs settled");
+    }
+
+    #[tokio::test]
+    async fn board_activity_counts_runs_not_the_in_progress_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(dir.path().join("test.db")).await.unwrap();
+        let store = SqliteProjectStore::new(pool);
+
+        let p = project("01JWORKING", "working");
+        store.create_project(&p).await.unwrap();
+        // Deliberately not in In Progress: dragging a card out never kills
+        // its run, so the column and the count are allowed to disagree and
+        // the run is what the dropdown reports.
+        let issue = store
+            .create_issue(&new_issue(&p.id, "dragged out", IssueStatus::Todo))
+            .await
+            .unwrap();
+        let run = store.enqueue_run(&new_run(&issue)).await.unwrap();
+        store
+            .claim_run(&run.id, &SessionId::from("sess-live".to_owned()))
+            .await
+            .unwrap();
+
+        let activity: std::collections::HashMap<_, _> = store
+            .board_activity(chrono::Utc::now() - chrono::Duration::hours(1))
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(activity[&p.id].working, 1);
+    }
+
+    #[tokio::test]
+    async fn run_spend_reads_zero_for_a_run_nobody_claimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(dir.path().join("test.db")).await.unwrap();
+        let store = SqliteProjectStore::new(pool.clone());
+        let costs = crate::sqlite::cost::SqliteCostStore::new(pool);
+
+        let p = project("01JUNCLAIMED", "unclaimed");
+        store.create_project(&p).await.unwrap();
+        let issue = store
+            .create_issue(&new_issue(&p.id, "never started", IssueStatus::Todo))
+            .await
+            .unwrap();
+        let queued = store.enqueue_run(&new_run(&issue)).await.unwrap();
+
+        // A record on a session the run never got: an unclaimed run has no
+        // window, so it must not inherit the board's history.
+        baybo_store::cost::CostStore::record(
+            &costs,
+            &baybo_model::CostRecord {
+                user_id: "u".into(),
+                session_id: SessionId::from("sess-elsewhere".to_owned()),
+                turn_id: baybo_model::TurnId::new(),
+                span_id: baybo_model::SpanId::new(),
+                reason: baybo_model::CallReason::default(),
+                model: "m".into(),
+                reasoning_effort: None,
+                input_tokens: 3,
+                output_tokens: 3,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cost_usd: baybo_model::MicroUsd::from_micros(4_000),
+                timestamp: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let rows = store.run_spend(&issue.id).await.unwrap();
+        assert_eq!(rows.len(), 1, "the queued run is still listed");
+        assert_eq!(rows[0].run_id, queued.id);
+        assert_eq!(rows[0].spend, baybo_store::project::Spend::default());
     }
 
     #[tokio::test]

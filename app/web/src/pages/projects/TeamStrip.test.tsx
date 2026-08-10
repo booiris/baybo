@@ -5,6 +5,18 @@ import userEvent from '@testing-library/user-event';
 import { TeamStrip } from './TeamStrip';
 import type { Agent, IssueRun } from './boardModel';
 
+vi.mock('../../api/auth', () => ({
+  useAdminClient: () => ({}),
+  useAuth: () => ({ token: 't', baseUrl: 'http://x', logout: vi.fn() }),
+}));
+// The model pool is a network read the panel makes on mount; the tests
+// here are about what it renders, not about which models exist.
+vi.mock('./api', () => ({
+  fetchModelPool: vi.fn().mockResolvedValue({ kind: 'ok', value: { names: [], defaultName: 'gpt' } }),
+  setAgentModel: vi.fn().mockResolvedValue({ kind: 'ok', value: null }),
+}));
+
+
 
 function member(handle: string, lead = false): Agent {
   return {
@@ -54,7 +66,11 @@ describe('TeamStrip', () => {
       screen.queryByRole('button', { name: /Remove @lead/ }),
     ).not.toBeInTheDocument();
 
+    // Two clicks: removal is a tombstone, and the pill's trash sits under
+    // the cursor on the way to everything else in the strip.
     await userEvent.click(screen.getByRole('button', { name: /Remove @dev-1/ }));
+    expect(onRemove).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole('button', { name: /Confirm removing @dev-1/ }));
     expect(onRemove).toHaveBeenCalledWith(expect.objectContaining({ handle: 'dev-1' }));
   });
 
@@ -128,7 +144,13 @@ describe('TeamStrip', () => {
     await userEvent.type(screen.getByLabelText(/Role/), 'Tests things.');
     await userEvent.click(submit);
 
-    expect(onHire).toHaveBeenCalledWith({ name: 'QA', role: 'Tests things.' });
+    // The user form carries framework and LLM pin — the two knobs the lead's
+    // own hiring tool deliberately does not get.
+    expect(onHire).toHaveBeenCalledWith({
+      name: 'QA',
+      role: 'Tests things.',
+      framework: 'baybo',
+    });
     expect(await screen.findByText(/every numbered variant are taken/)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Add agent' })).toBeInTheDocument();
   });

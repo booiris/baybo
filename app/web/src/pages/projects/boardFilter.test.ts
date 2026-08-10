@@ -46,10 +46,12 @@ function filter(overrides: Partial<BoardFilter> = {}): BoardFilter {
 }
 
 describe('matches', () => {
-  it('hides cancelled cards until they are asked for', () => {
+  it('shows cancelled cards until they are filtered out', () => {
+    // Cancel is the terminal negative, not a delete: the card stays on the
+    // board struck through, and hiding it is the deliberate act.
     const cancelled = issue(1, { cancelled_at_ms: 123 });
-    expect(matches(cancelled, filter(), TEAM)).toBe(false);
-    expect(matches(cancelled, filter({ showCancelled: true }), TEAM)).toBe(true);
+    expect(matches(cancelled, filter(), TEAM)).toBe(true);
+    expect(matches(cancelled, filter({ showCancelled: false }), TEAM)).toBe(false);
   });
 
   it('finds a card by title substring, case-insensitively', () => {
@@ -120,10 +122,12 @@ describe('filterBoard', () => {
 });
 
 describe('isRestrictive / isDefault', () => {
-  it('treats the cancelled toggle as widening, not narrowing', () => {
-    const shown = filter({ showCancelled: true });
-    expect(isRestrictive(shown)).toBe(false);
-    expect(isDefault(shown)).toBe(false);
+  it('treats hiding cancelled as narrowing, and showing them as the default', () => {
+    const hidden = filter({ showCancelled: false });
+    // Still not "restrictive": that word means the search/assignee/blocked
+    // filters, which is what the empty-column copy keys on.
+    expect(isRestrictive(hidden)).toBe(false);
+    expect(isDefault(hidden)).toBe(false);
     expect(isDefault(filter())).toBe(true);
   });
 
@@ -141,6 +145,8 @@ describe('the URL codec', () => {
       filter({ assignee: { kind: 'unassigned' } }),
       filter({ assignee: { kind: 'handle', handle: 'dev-1' } }),
       filter({ blockedOnly: true, showCancelled: true }),
+      // The hidden case is the one that actually writes a param now.
+      filter({ showCancelled: false }),
       filter({
         text: 'x',
         assignee: { kind: 'handle', handle: 'qa-2' },
