@@ -172,6 +172,9 @@ export function IssueDetailPage() {
   const [description, setDescription] = useState('');
   const [saving, setSaving] = useState(false);
   const [showMore, setShowMore] = useState(false);
+  const [confirmCancel, setConfirmCancel] = useState(false);
+  const [blocking, setBlocking] = useState(false);
+  const [blockReason, setBlockReason] = useState('');
   const [copied, setCopied] = useState(false);
   const [editingTitle, setEditingTitle] = useState(false);
   const [editingDescription, setEditingDescription] = useState(false);
@@ -475,6 +478,45 @@ export function IssueDetailPage() {
     [apply, issue],
   );
 
+  const moreRoot = useRef<HTMLDivElement | null>(null);
+
+  const closeMore = useCallback(() => {
+    setShowMore(false);
+    setConfirmCancel(false);
+    setBlocking(false);
+    setBlockReason('');
+  }, []);
+
+  // A menu that only closes through its own button is a menu you have to
+  // remember to put away. Same handling as the project switcher: a pointer
+  // anywhere outside dismisses it, and so does Escape.
+  useEffect(() => {
+    if (!showMore) return;
+    function onPointerDown(event: PointerEvent) {
+      if (moreRoot.current === null) return;
+      if (!moreRoot.current.contains(event.target as Node)) closeMore();
+    }
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === 'Escape') closeMore();
+    }
+    document.addEventListener('pointerdown', onPointerDown);
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown);
+      document.removeEventListener('keydown', onKeyDown);
+    };
+  }, [showMore, closeMore]);
+
+  /// Record what this card is waiting on, and close the panel.
+  const block = useCallback(() => {
+    const reason = blockReason.trim();
+    if (reason === '') return;
+    setBlocking(false);
+    setShowMore(false);
+    setBlockReason('');
+    void apply({ blocked_reason: reason });
+  }, [apply, blockReason]);
+
   /// Copying the branch name, defensively. `navigator.clipboard` is typed as
   /// always present but is **absent** outside a secure context — which a
   /// dashboard served over plain http on a LAN address is — so reading
@@ -634,7 +676,7 @@ export function IssueDetailPage() {
               // in resizes the text under the cursor: `.chat-prose` is
               // unlayered on purpose (`index.css:147`) so its 15px/1.7 beats
               // any `text-*` utility, and the field was sitting at 13.6px.
-              className="mt-1 block -mx-3 w-[calc(100%+1.5rem)] min-h-24 bg-canvas rounded-md px-3 py-2.5 font-sans text-[15px] leading-relaxed outline-none resize-none overflow-hidden"
+              className="mt-1 block w-full min-h-24 bg-canvas rounded-md py-2.5 font-sans text-[15px] leading-relaxed outline-none resize-none overflow-hidden"
               placeholder="What, why, and what done looks like…"
               aria-label="Issue description"
               autoFocus
@@ -661,12 +703,11 @@ export function IssueDetailPage() {
               role="button"
               tabIndex={0}
               title="Click to edit"
-              // Pulled left by its own padding, so the prose starts on the
-              // same edge as the title and every heading below it. The box
-              // keeps the padding — a tinted band with text against its edge
-              // reads as clipped — and the bleed goes both ways, staying
-              // inside the pane's own padding so nothing scrolls sideways.
-              className="mt-1 -mx-3 w-[calc(100%+1.5rem)] min-h-24 rounded-md px-3 py-2.5 chat-prose cursor-text hover:bg-canvas"
+              // Squared off against the pane on both sides: the box now
+              // spans exactly what the comment composer below spans, and with
+              // no padding of its own the prose still starts on the same edge
+              // as the title and every heading under it.
+              className="mt-1 w-full min-h-24 rounded-md py-2.5 chat-prose cursor-text hover:bg-canvas"
               onClick={() => {
                 setEditingDescription(true);
               }}
@@ -715,21 +756,115 @@ export function IssueDetailPage() {
           <section className={railBox}>
             <div className="flex items-center gap-2">
               <h2 className={railLabel}>Properties</h2>
-              <div className="ml-auto relative">
+              <div ref={moreRoot} className="ml-auto relative">
                 <button
                   type="button"
                   aria-label="More actions"
                   aria-expanded={showMore}
                   title="Block, cancel…"
                   onClick={() => {
+                    setConfirmCancel(false);
+                    setBlocking(false);
+                    setBlockReason('');
                     setShowMore((value) => !value);
                   }}
-                  className="px-1 font-mono text-[0.8rem] font-bold leading-none cursor-pointer text-ink-soft hover:text-ink"
+                  className="flex h-6 w-6 items-center justify-center rounded-md border-2 border-black bg-surface font-mono text-[0.8rem] font-bold leading-none text-ink cursor-pointer hover:bg-brand"
                 >
                   ⋯
                 </button>
                 {showMore ? (
-                  <div className="absolute right-0 top-[calc(100%+4px)] z-30 w-[190px] bg-surface border-2 border-black rounded-md shadow-brutal py-1">
+                  <div className="absolute right-0 top-[calc(100%+4px)] z-30 w-[230px] bg-surface border-2 border-black rounded-md shadow-brutal py-1">
+                    {blocking ? (
+                      // The reason is asked for in the panel rather than by
+                      // `window.prompt`: a browser dialog blocks the page,
+                      // cannot be styled, and on a board that streams updates
+                      // it freezes everything behind it until it is answered.
+                      <div className="px-3 py-1.5">
+                        <label
+                          htmlFor="block-reason"
+                          className="block font-mono text-[0.58rem] font-bold uppercase tracking-wider text-ink-soft"
+                        >
+                          What is it blocked on?
+                        </label>
+                        <textarea
+                          id="block-reason"
+                          autoFocus
+                          value={blockReason}
+                          placeholder="Waiting on the staging key…"
+                          onChange={(event) => {
+                            setBlockReason(event.target.value);
+                          }}
+                          onKeyDown={(event) => {
+                            if (event.key === 'Escape') {
+                              // Back out to the menu, not out of it: the
+                              // document-level handler would close everything.
+                              event.stopPropagation();
+                              setBlocking(false);
+                              return;
+                            }
+                            if (event.key === 'Enter' && !event.shiftKey) {
+                              event.preventDefault();
+                              if (blockReason.trim() !== '') block();
+                            }
+                          }}
+                          className="mt-1 w-full min-h-[52px] resize-none rounded-md border-2 border-black bg-canvas px-2 py-1 font-sans text-[0.75rem] outline-none"
+                        />
+                        <div className="mt-2 flex gap-2">
+                          <button
+                            type="button"
+                            disabled={blockReason.trim() === ''}
+                            onClick={block}
+                            className="border-2 border-black bg-brand text-ink rounded-md px-2 py-0.5 font-mono text-[0.66rem] font-bold cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                          >
+                            Block
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setBlocking(false);
+                            }}
+                            className="border-2 border-black bg-surface rounded-md px-2 py-0.5 font-mono text-[0.66rem] cursor-pointer"
+                          >
+                            Never mind
+                          </button>
+                        </div>
+                      </div>
+                    ) : confirmCancel ? (
+                      // What cancelling costs, asked at the moment it is being
+                      // decided. It used to sit in the menu as standing prose
+                      // under the button, which is where nobody reads it and
+                      // where it made two ordinary actions look alarming.
+                      <div className="px-3 py-1.5">
+                        <p className="font-mono text-[0.62rem] leading-snug">
+                          Cancel #{issue.number}? It keeps its number and its whole history — it
+                          just stops counting as live work, and nothing runs on it until you
+                          reopen it.
+                        </p>
+                        <div className="mt-2 flex gap-2">
+                          <button
+                            type="button"
+                            className="border-2 border-err bg-err text-white rounded-md px-2 py-0.5 font-mono text-[0.66rem] font-bold cursor-pointer"
+                            onClick={() => {
+                              setConfirmCancel(false);
+                              setShowMore(false);
+                              void apply({ cancelled: true });
+                            }}
+                          >
+                            Cancel it
+                          </button>
+                          <button
+                            type="button"
+                            className="border-2 border-black bg-surface rounded-md px-2 py-0.5 font-mono text-[0.66rem] cursor-pointer"
+                            onClick={() => {
+                              setConfirmCancel(false);
+                            }}
+                          >
+                            Keep
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <>
                     {blocked ? (
                       <button
                         type="button"
@@ -746,11 +881,7 @@ export function IssueDetailPage() {
                         type="button"
                         className="w-full text-left px-3 py-1.5 font-mono text-[0.7rem] cursor-pointer hover:bg-canvas"
                         onClick={() => {
-                          setShowMore(false);
-                          const reason = window.prompt('What is this blocked on?');
-                          if (reason != null && reason.trim().length > 0) {
-                            void apply({ blocked_reason: reason });
-                          }
+                          setBlocking(true);
                         }}
                       >
                         Block…
@@ -762,16 +893,19 @@ export function IssueDetailPage() {
                         cancelled ? '' : 'text-err'
                       }`}
                       onClick={() => {
-                        setShowMore(false);
-                        void apply({ cancelled: !cancelled });
+                        // Reopening is not destructive, so it just happens.
+                        if (cancelled) {
+                          setShowMore(false);
+                          void apply({ cancelled: false });
+                          return;
+                        }
+                        setConfirmCancel(true);
                       }}
                     >
                       {cancelled ? 'Reopen issue' : 'Cancel issue'}
                     </button>
-                    <p className="px-3 pt-1 font-mono text-[0.55rem] text-ink-soft leading-snug">
-                      Cancelling keeps the issue, its number and its history — it just stops
-                      counting as live work.
-                    </p>
+                      </>
+                    )}
                   </div>
                 ) : null}
               </div>

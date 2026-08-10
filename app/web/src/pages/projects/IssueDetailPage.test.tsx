@@ -272,6 +272,89 @@ describe('IssueDetailPage prose', () => {
 });
 
 describe('IssueDetailPage rail', () => {
+  it('asks before cancelling, and only then says what it costs', async () => {
+    client.PATCH.mockClear().mockResolvedValue({
+      data: { ...issue(), cancelled_at_ms: 1 },
+      error: undefined,
+      response: ok,
+    });
+    renderIssue(issue());
+
+    await userEvent.click(await screen.findByRole('button', { name: 'More actions' }));
+    // The menu is two plain actions; the warning is not standing prose under
+    // them, where it went unread and made both look alarming.
+    expect(screen.queryByText(/keeps its number/, { selector: 'p' })).toBeNull();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel issue' }));
+    expect(client.PATCH).not.toHaveBeenCalled();
+    expect(screen.getByText(/keeps its number/, { selector: 'p' })).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Keep' }));
+    expect(client.PATCH).not.toHaveBeenCalled();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel issue' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel it' }));
+    expect(client.PATCH).toHaveBeenCalledWith(
+      '/v1/projects/{project_id}/issues/{number}',
+      expect.objectContaining({ body: { cancelled: true } }),
+    );
+  });
+
+  it('asks what a card is blocked on in the panel, never in a browser dialog', async () => {
+    const prompt = vi.spyOn(window, 'prompt');
+    client.PATCH.mockClear().mockResolvedValue({
+      data: { ...issue(), blocked_reason: 'waiting on the staging key' },
+      error: undefined,
+      response: ok,
+    });
+    renderIssue(issue());
+
+    await userEvent.click(await screen.findByRole('button', { name: 'More actions' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Block…' }));
+
+    // A browser dialog blocks the page and cannot be styled; on a board that
+    // streams updates it freezes everything behind it until it is answered.
+    expect(prompt).not.toHaveBeenCalled();
+    const field = screen.getByLabelText('What is it blocked on?');
+    expect(screen.getByRole('button', { name: 'Block' })).toBeDisabled();
+
+    await userEvent.type(field, 'waiting on the staging key');
+    await userEvent.click(screen.getByRole('button', { name: 'Block' }));
+
+    expect(client.PATCH).toHaveBeenCalledWith(
+      '/v1/projects/{project_id}/issues/{number}',
+      expect.objectContaining({ body: { blocked_reason: 'waiting on the staging key' } }),
+    );
+    prompt.mockRestore();
+  });
+
+  it('puts the menu away when you click somewhere else', async () => {
+    renderIssue(issue());
+
+    await userEvent.click(await screen.findByRole('button', { name: 'More actions' }));
+    expect(screen.getByRole('button', { name: 'Block…' })).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('heading', { name: 'Wire the retry' }));
+    expect(screen.queryByRole('button', { name: 'Block…' })).toBeNull();
+  });
+
+  it('reopens without asking — putting a card back is not destructive', async () => {
+    client.PATCH.mockClear().mockResolvedValue({
+      data: issue(),
+      error: undefined,
+      response: ok,
+    });
+    renderIssue(issue({ cancelled_at_ms: 1 }));
+
+    await userEvent.click(await screen.findByRole('button', { name: 'More actions' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Reopen issue' }));
+
+    expect(client.PATCH).toHaveBeenCalledWith(
+      '/v1/projects/{project_id}/issues/{number}',
+      expect.objectContaining({ body: { cancelled: false } }),
+    );
+  });
+
   it('reads as a property table, with every line answered', async () => {
     renderIssue(issue({ priority: 'high' }));
 
