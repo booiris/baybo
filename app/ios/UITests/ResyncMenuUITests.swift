@@ -1,8 +1,8 @@
 import XCTest
 
 /// Headless drive of the **per-session resync** long-press
-/// (`resyncContextMenu` → `RootView`'s confirm) on every screen that lists a
-/// conversation.
+/// (`sessionContextMenu` → `AppStore.requestResync`) on every screen that lists
+/// a conversation.
 ///
 /// The hatch shipped wired to `ChatListScreen.chatRow` alone, so a cron fire —
 /// listed only inside `CronGroupScreen`, and the long, unattended, tool-heavy
@@ -11,15 +11,16 @@ import XCTest
 /// is exactly that: which SURFACES carry the gesture. `ChatStoreResyncTests`
 /// covers what the commit then does.
 ///
+/// It commits straight off the menu row — there is no confirm in front of it,
+/// deliberately: the resync takes nothing away that the gateway cannot hand
+/// back. So the assertion after every tap is that the ROW SURVIVED, which is
+/// also what a confirm-less destructive action would fail.
+///
 /// Runs against `-baybo-open-home`: six demo conversations (demo-2 archived) and
-/// one cron group ("Morning brief", job `demo-job`) with two fires. Session
-/// mutations resolve locally there, and the resync's own two steps (drop the
-/// mirror, reload the page if it is showing) take nothing away — so on every
-/// surface the row must still be listed afterwards.
+/// one cron group ("Morning brief", job `demo-job`) with two fires.
 final class ResyncMenuUITests: BayboUITestCase {
     private static let groupTitle = "Morning brief"
     private static let fireTitle = "Morning brief · 7/14"
-    private static let confirmTitle = "Rebuild this conversation?"
     private static let resync = "Resync"
 
     private func launchHome() -> XCUIApplication {
@@ -49,7 +50,7 @@ final class ResyncMenuUITests: BayboUITestCase {
         let item = app.buttons[Self.resync]
         XCTAssertTrue(
             item.waitForExistence(timeout: 3),
-            "\(surface): long-press offered no Resync — the row is missing resyncContextMenu",
+            "\(surface): long-press offered no Resync — the row is missing sessionContextMenu",
             file: file, line: line)
         return item
     }
@@ -74,37 +75,33 @@ final class ResyncMenuUITests: BayboUITestCase {
     }
 
     /// The bug as reported: a cron fire could not be resynced. The gesture must
-    /// reach the confirm, the confirm must commit, and the fire must survive it
-    /// — this is the one commit in `RootView` that takes nothing away.
+    /// reach the commit, and the fire must survive it.
     func testCronFireLongPressResyncsAndKeepsTheFire() throws {
         let app = launchHome()
         openFireList(app)
 
         openResyncMenu(app, on: Self.fireTitle, "cron fire").tap()
-        XCTAssertTrue(
-            app.staticTexts[Self.confirmTitle].waitForExistence(timeout: 3),
-            "the resync confirm did not present over the pushed fire list")
-        try dialogCommit(app, Self.resync).tap()
 
         XCTAssertTrue(
             app.staticTexts[Self.fireTitle].waitForExistence(timeout: 3),
             "the resync removed the fire — it must discard the transcript, not the row")
     }
 
-    /// Cancel is the other half, and the reason the confirm is not red: it must
-    /// leave the fire list exactly as it found it.
-    func testCronFireResyncCancelChangesNothing() throws {
+    /// Dismissing the menu without choosing anything must leave the list exactly
+    /// as it was. With the confirm gone this is the only remaining "back out"
+    /// path, so it is the one worth pinning.
+    func testDismissingTheMenuChangesNothing() throws {
         let app = launchHome()
         openFireList(app)
 
-        openResyncMenu(app, on: Self.fireTitle, "cron fire").tap()
-        let cancel = app.buttons["Cancel"]
-        XCTAssertTrue(cancel.waitForExistence(timeout: 3), "the resync confirm did not present")
-        cancel.tap()
+        let item = openResyncMenu(app, on: Self.fireTitle, "cron fire")
+        // The dimmed backdrop, well below both the lifted row (the list's first)
+        // and the menu that hangs under it.
+        app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.92)).tap()
 
-        XCTAssertTrue(cancel.waitForNonExistence(timeout: 3), "Cancel did not dismiss")
+        XCTAssertTrue(item.waitForNonExistence(timeout: 3), "the context menu never dismissed")
         XCTAssertTrue(
-            app.staticTexts[Self.fireTitle].exists, "Cancel still took the fire off the list")
+            app.staticTexts[Self.fireTitle].exists, "dismissing the menu took the fire off the list")
     }
 
     /// Archiving is a filing decision, not a decision to stop being able to
@@ -114,10 +111,6 @@ final class ResyncMenuUITests: BayboUITestCase {
         openArchived(app)
 
         openResyncMenu(app, on: "Demo conversation number 2", "archived screen").tap()
-        XCTAssertTrue(
-            app.staticTexts[Self.confirmTitle].waitForExistence(timeout: 3),
-            "the resync confirm did not present over the archived screen")
-        try dialogCommit(app, Self.resync).tap()
 
         XCTAssertTrue(
             app.staticTexts["Demo conversation number 2"].waitForExistence(timeout: 3),
@@ -131,10 +124,6 @@ final class ResyncMenuUITests: BayboUITestCase {
         let app = launchHome()
 
         openResyncMenu(app, on: "Demo conversation number 1", "chat list").tap()
-        XCTAssertTrue(
-            app.staticTexts[Self.confirmTitle].waitForExistence(timeout: 3),
-            "the resync confirm did not present from the chat list")
-        try dialogCommit(app, Self.resync).tap()
 
         XCTAssertTrue(
             app.staticTexts["Demo conversation number 1"].waitForExistence(timeout: 3),

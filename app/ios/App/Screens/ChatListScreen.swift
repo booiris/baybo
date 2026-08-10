@@ -214,8 +214,8 @@ struct ChatListScreen: View {
             }
             .tint(Theme.ink)
         }
-        // Long-press: the per-session resync — see `resyncContextMenu`.
-        .resyncContextMenu(row.id)
+        // Long-press: rename + the per-session resync — see `sessionContextMenu`.
+        .sessionContextMenu(row.id)
     }
 
     /// A cron group: tap pushes that job's fires.
@@ -470,27 +470,31 @@ struct SessionRowView: View {
     }
 }
 
-/// Long-press a conversation row for the **per-session resync**
-/// ([docs/transcript.md]), behind `RootView`'s confirm (`AppStore.promptResync`
-/// → `requestResync`).
+/// Long-press a conversation row for the operations that are not swipes:
+/// **rename** (`AppStore.promptRename` → `RenameDialog`) and the **per-session
+/// resync** ([docs/transcript.md]).
 ///
-/// A modifier rather than the same six lines per screen, because the hatch has
-/// to ride EVERY surface that lists a conversation — the chat list, a cron job's
-/// fires (`CronGroupScreen`), the archived screen. It first shipped on the chat
-/// list alone, which left a cron fire — a long, tool-heavy thread, exactly what
-/// the hatch is for — as the one conversation with no way to reach it. Where a
-/// row happens to be listed is not a property of the conversation.
+/// A modifier rather than the same lines per screen, because both have to ride
+/// EVERY surface that lists a conversation — the chat list, a cron job's fires
+/// (`CronGroupScreen`), the archived screen. The resync first shipped on the
+/// chat list alone, which left a cron fire — a long, tool-heavy thread, exactly
+/// what the hatch is for — as the one conversation with no way to reach it.
+/// Where a row happens to be listed is not a property of the conversation.
 ///
-/// Not a fourth swipe button: the three swipes are the everyday verbs and this
-/// is reached once a year, and a menu row has room to say what it does, which a
-/// swipe glyph does not.
+/// Not more swipe buttons: the three swipes are the everyday verbs, and a menu
+/// row has room to say what it does, which a swipe glyph does not. Rename in
+/// particular opens an editor, and a swipe that raises a keyboard would fire by
+/// accident.
+///
+/// Rename leads because it is the one users reach for; the resync is a once-a-
+/// year repair and sits under it.
 extension View {
-    func resyncContextMenu(_ sessionId: String) -> some View {
-        modifier(ResyncContextMenu(sessionId: sessionId))
+    func sessionContextMenu(_ sessionId: String) -> some View {
+        modifier(SessionContextMenu(sessionId: sessionId))
     }
 }
 
-struct ResyncContextMenu: ViewModifier {
+struct SessionContextMenu: ViewModifier {
     let sessionId: String
 
     @EnvironmentObject private var appStore: AppStore
@@ -499,7 +503,12 @@ struct ResyncContextMenu: ViewModifier {
     func body(content: Content) -> some View {
         content.contextMenu {
             Button {
-                appStore.promptResync(sessionId)
+                appStore.promptRename(sessionId)
+            } label: {
+                Label(lang.t("list.rename"), systemImage: "pencil")
+            }
+            Button {
+                appStore.requestResync(sessionId)
             } label: {
                 Label(lang.t("list.resync"), systemImage: "arrow.clockwise")
             }

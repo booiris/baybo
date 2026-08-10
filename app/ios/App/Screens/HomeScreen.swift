@@ -28,6 +28,13 @@ struct HomeTabView: View {
             }
         }
         .tint(Theme.ink)
+        // Nothing in this shell takes typed input — the composer lives inside a
+        // pushed `ChatScreen`, and the deck's webview already ignores every
+        // region. The one keyboard that can rise over it belongs to the rename
+        // editor floating at the app root, and that dialog owns its own
+        // avoidance; without this opt-out the whole shell (the glass tab bar
+        // first) would slide up behind the scrim while the user types.
+        .ignoresSafeArea(.keyboard)
         #if DEBUG
             .task { await demoTabCycleIfRequested() }
         #endif

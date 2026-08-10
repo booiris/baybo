@@ -86,17 +86,21 @@ hatch (not the fix): it puts one conversation back into the state a COLD OPEN
 would produce, by re-running the cold path rather than by adding a second
 synchronisation routine.
 
-**It is reached by long-pressing a conversation ROW** — a `.contextMenu` behind a
-`ConfirmDialog` (`AppStore.promptResync` → `requestResync`). The header capsule's
+**It is reached by long-pressing a conversation ROW** — the second entry in its
+`.contextMenu`, under Rename (`AppStore.requestResync`). The header capsule's
 `ModelMenuPanel` carried it first and no longer does: a row needs no conversation
 opened first, does not depend on `ModelCatalog` having loaded, and already owns
-the other session-level operations (archive / delete / pin). The confirm is the
-one in `RootView` that does not wear red (`commitTint: Theme.ink`) — nothing is
-taken away — but it still asks, because the thread blanks under a reader who may
-be mid-way through it and there is no undo the way archive has one.
+the other session-level operations (archive / delete / pin).
+
+**It commits straight off the menu row, with no confirm.** It used to raise the
+one `ConfirmDialog` that did not wear red, on the grounds that the thread blanks
+under a reader who may be mid-way through it. That was a poor trade: the gateway
+is authoritative, the row and the outbox are untouched, and the rebuild it kicks
+off is the same one a cold open runs — so the honest cost of an accidental tap is
+one refetch, which is not worth a stop-and-decide. A haptic marks the commit.
 
 **Every screen that lists a conversation carries it**, via the one
-`resyncContextMenu` modifier (`ChatListScreen.swift`): the chat list, a cron
+`sessionContextMenu` modifier (`ChatListScreen.swift`): the chat list, a cron
 job's fires (`CronGroupScreen`), and the archived screen. It shipped on the chat
 list alone, which left a cron fire — a long, unattended, tool-heavy thread, the
 exact shape the hatch exists for — as the one conversation with no way to reach

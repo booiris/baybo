@@ -61,6 +61,18 @@ final class AppStore: ObservableObject {
         let name: String
     }
 
+    /// A conversation's rename, waiting on the editor dialog.
+    ///
+    /// The **seed** is snapshotted when the editor opens, like
+    /// `PendingCronGroupDelete`'s members: it is what decides whether an
+    /// untouched field commits anything (`RenameTitle.toCommit`), so re-deriving
+    /// it at the commit — after a live title patch or a list merge landed — could
+    /// turn "the user changed nothing" into a rename, or the reverse.
+    struct PendingRename: Equatable {
+        let sessionId: String
+        let seed: String
+    }
+
     /// A cron group's delete, waiting on the confirm dialog.
     ///
     /// The members are **snapshotted when the dialog opens**, and the confirm
@@ -137,9 +149,10 @@ final class AppStore: ObservableObject {
     @Published var confirmDeleteSession: String?
     /// The cron group a swipe-delete is asking to confirm, same host and reasons.
     @Published var confirmDeleteCronGroup: PendingCronGroupDelete?
-    /// The session the list's long-press resync is asking to confirm, same host
-    /// and reasons — and the only one of these whose commit is not destructive.
-    @Published var confirmResyncSession: String?
+    /// The conversation the list's long-press rename is editing — the one dialog
+    /// here that takes input rather than a decision, hosted at the app root for
+    /// the same latch/coverage reasons as the confirms.
+    @Published var renameSession: PendingRename?
     /// Job id → name, learned from the scheduled-jobs list. See
     /// `rememberCronJobTitles`.
     @Published private(set) var cronJobTitles: [String: String] = [:]
@@ -192,6 +205,10 @@ final class AppStore: ObservableObject {
     /// Sessions with an archive/hide request on the wire — the per-session
     /// serialization gate (`pumpSessionMutation`).
     private var sessionMutationsInFlight: Set<String> = []
+    /// Sessions with a rename on the wire — `pumpRename`'s gate. Its own set,
+    /// because a rename and an archive are independent requests that may fly at
+    /// the same time; sharing the gate would serialize two unrelated PUTs.
+    private var renamesInFlight: Set<String> = []
     /// `-baybo-open-home` (DEBUG): no gateway is bound, so archive/delete
     /// mutations resolve locally instead of failing + rolling back — the
     /// headless UI tests assert on the optimistic flip staying put.
@@ -985,20 +1002,42 @@ final class AppStore: ObservableObject {
         }
     }
 
-    /// Raise the resync confirm for a long-pressed row.
-    func promptResync(_ sessionId: String) {
+    /// Rebuild one conversation's transcript from the gateway — the per-session
+    /// escape hatch ([docs/transcript.md]). Nothing here is a server call: it
+    /// discards this device's local rendering and lets the cold path re-derive
+    /// it, so the store it materialises is the one the next visit would have
+    /// opened anyway.
+    ///
+    /// Committed straight off the menu row, with no confirm in front of it. It
+    /// takes nothing away that the gateway cannot hand back — the row, the
+    /// outbox and the server's copy are all untouched — so the honest cost of
+    /// tapping it by accident is one refetch, which is not a decision worth
+    /// stopping the user for.
+    func requestResync(_ sessionId: String) {
+        Haptics.tap()
+        chatStore(for: sessionId).resync(transcript: transcriptHost?.bridge)
+    }
+
+    /// Raise the rename editor for a long-pressed row, seeded with what the row
+    /// currently shows. No row, nothing to rename.
+    func promptRename(_ sessionId: String) {
+        guard let row = SessionIndex.shared.rows.first(where: { $0.id == sessionId })
+        else { return }
         withAnimation(ConfirmDialog.enterMotion) {
-            confirmResyncSession = sessionId
+            renameSession = PendingRename(
+                sessionId: sessionId,
+                seed: RenameTitle.seed(title: row.title, userText: row.userText))
         }
     }
 
-    /// Rebuild one conversation's transcript from the gateway, after the confirm
-    /// — the per-session escape hatch ([docs/transcript.md]). Nothing here is a
-    /// server call: it discards this device's local rendering and lets the cold
-    /// path re-derive it, so the store it materialises is the one the next visit
-    /// would have opened anyway.
-    func requestResync(_ sessionId: String) {
-        chatStore(for: sessionId).resync(transcript: transcriptHost?.bridge)
+    /// Rename, optimistically: the row's first line changes at once and the PUT
+    /// follows. `title` is already `RenameTitle.normalized`, so it is exactly
+    /// what the gateway will store — the patch it broadcasts back changes
+    /// nothing on this device, and every peer converges on the same string.
+    func requestRename(_ sessionId: String, title: String) {
+        sessionNotice = nil
+        SessionIndex.shared.beginRename(sessionId, title: title)
+        pumpRename(sessionId)
     }
 
     /// Archive or unarchive, optimistically: the row moves lists at once and
@@ -1150,6 +1189,49 @@ final class AppStore: ObservableObject {
                     SessionIndex.shared.rollBackHide(sessionId)
                     sessionNotice = Lang.shared.t("list.deleteFailed")
                 }
+            }
+        }
+    }
+
+    /// One in-flight rename per session, with `SessionIndex.pendingTitle`
+    /// holding the latest wanted name — `pumpSessionMutation`'s contract, for
+    /// the title.
+    ///
+    /// It needs the same serialization for a different failure: two renames of
+    /// one conversation racing can land out of order, and the loser there is not
+    /// a bit that self-corrects on the next flip but a name the user retyped,
+    /// left standing on the server while this device shows the newer one.
+    private func pumpRename(_ sessionId: String) {
+        guard !renamesInFlight.contains(sessionId),
+            let desired = SessionIndex.shared.pendingTitle(for: sessionId)
+        else { return }
+        #if DEBUG
+            // `-baybo-open-home` has no gateway to call; the demo asserts on the
+            // optimistic title staying put (mirrors the archive/pin demo mode).
+            if demoHomeMode {
+                SessionIndex.shared.finishRename(sessionId)
+                return
+            }
+        #endif
+        renamesInFlight.insert(sessionId)
+        Task { @MainActor in
+            do {
+                try await Baybo.client.chatSetTitle(sessionId: sessionId, title: desired)
+                renamesInFlight.remove(sessionId)
+                if SessionIndex.shared.pendingTitle(for: sessionId) == desired {
+                    SessionIndex.shared.finishRename(sessionId)
+                } else {
+                    pumpRename(sessionId)
+                }
+            } catch {
+                renamesInFlight.remove(sessionId)
+                NSLog("baybo: rename session: %@", bayboErrorText(error))
+                guard SessionIndex.shared.pendingTitle(for: sessionId) == desired else {
+                    pumpRename(sessionId)
+                    return
+                }
+                SessionIndex.shared.rollBackRename(sessionId)
+                sessionNotice = Lang.shared.t("list.renameFailed")
             }
         }
     }

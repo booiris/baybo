@@ -35,17 +35,63 @@ and retired.
 ### Row gestures
 
 Trailing swipe archives / deletes, leading swipe pins — the three everyday verbs
-(`ChatListScreen.chatRow`). **Long-press** adds the fourth, the per-session
-resync ([transcript.md](transcript.md#per-session-resync-the-escape-hatch)), in a
-`.contextMenu` rather than a fourth swipe button: it is reached once a year, and
-a menu row has space to say what it does. It lives on a row because it needs
-no conversation opened first and belongs beside the other session-level
-operations; the header capsule's model panel carried it first and no longer does.
+(`ChatListScreen.chatRow`). **Long-press** carries the other two, in a
+`.contextMenu` rather than more swipe buttons: a menu row has space to say what
+it does, and rename in particular opens an editor, which is not something a
+fling should raise.
 
-The long-press is one shared modifier, `resyncContextMenu`, and **every screen
+- **Rename** (`AppStore.promptRename` → `RenameDialog`) — see
+  [Renaming a conversation](#renaming-a-conversation) below.
+- **Resync**, the per-session transcript rebuild
+  ([transcript.md](transcript.md#per-session-resync-the-escape-hatch)). It lives
+  on a row because it needs no conversation opened first and belongs beside the
+  other session-level operations; the header capsule's model panel carried it
+  first and no longer does.
+
+The long-press is one shared modifier, `sessionContextMenu`, and **every screen
 that lists a conversation applies it** — this list, `CronGroupScreen`'s fires and
-`ArchivedScreen` — because where a row is listed says nothing about whether its
-transcript can drift. A new session-listing screen wires it in too.
+`ArchivedScreen` — because where a row is listed says nothing about whether it
+can be named or its transcript can drift. A new session-listing screen wires it
+in too.
+
+## Renaming a conversation
+
+`PUT /v1/chat/sessions/{id}/title` (`chat_set_title` over the active leg). Titles
+are otherwise machine-written — the auto-titler generates one from the first user
+question — and a rename settles the conversation against it: the titler writes
+only where there is no title (`set_title_if_absent`), so a hand-written name is
+never overwritten.
+
+**The rules live in `RenameTitle`**, the Swift mirror of the web's
+`renameTitle.ts` and, through both, of the gateway's `validate_session_title`:
+interior whitespace collapsed, ends trimmed, capped at 80 **Unicode scalars**
+(Rust's `chars()`, not Swift graphemes). The client normalizes rather than merely
+validating, because the string it sends is the one it renders optimistically —
+the endpoint stores the normalized form and broadcasts *that*, so anything else
+would visibly rewrite itself a moment later.
+
+An **empty** field cannot be committed and an **unchanged** one commits nothing.
+There is deliberately no clear/reset-to-auto: an absent `SessionPatch.title`
+already means "unchanged" on the wire, so a cleared title has no representation.
+"Unchanged" is measured against the SEED the editor opened with (snapshotted in
+`AppStore.PendingRename`) — for an untitled row that seed is the last user
+message, and committing it would rename the conversation to its own preview.
+
+**The staged intent** (`SessionIndex.pendingTitles` + `titleBaselines`) is its
+own map, not a fourth `PendingMutation` case: that map holds ONE desired state
+per session, so a rename staged there would discard a pending archive/pin. It
+shields the optimistic title from both other writers — a REST snapshot composed
+before the rename, and a live `SessionUpdated` title patch, which mid-rename can
+only be an older auto-title the user's PUT is about to replace. `AppStore.pumpRename`
+serializes one request per session (`pumpSessionMutation`'s contract) so two
+renames cannot land out of order; a failure rolls back to the last
+server-acknowledged title, including back to *no* title.
+
+The editor is `RenameDialog`, hosted at the app root beside the confirms. It is
+the one dialog here that raises a keyboard, so it owns its own avoidance and the
+surfaces it floats over (`HomeTabView`, `ArchivedScreen`, `CronGroupScreen`) opt
+out with `.ignoresSafeArea(.keyboard)` — otherwise the whole shell, glass tab bar
+first, slides up behind the scrim while the user types.
 
 ## Live list unread
 
