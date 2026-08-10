@@ -11,6 +11,8 @@ import {
 import { Button } from '../components/Button';
 import { SelectBox } from '../components/SelectBox';
 import { useAdminClient, useAuth } from '../api/auth';
+import { useBlobUrl } from '../api/blobs';
+import { botttsFace } from '../components/botttsFace';
 import { useMockMode, MOCK_AGENT_PROFILES } from '../api/mock';
 import type { components } from '../api/schema';
 // 256² webp squeezed from assets/baybo.png — the builtin profile's default
@@ -40,8 +42,8 @@ const fieldLabel = 'block text-[0.7rem] font-bold uppercase text-ink-soft mb-1';
 const textInput =
   'w-full px-3 py-2 bg-white border border-black rounded-md font-mono text-sm outline-none focus:shadow-brutal-xs disabled:opacity-60 disabled:bg-canvas disabled:cursor-not-allowed';
 
-// Deterministic per-agent portrait tint so avatar-less agents still read
-// as distinct characters; the builtin always sits on brand gold.
+// The tile behind the monogram, which only the create form still shows:
+// every saved agent has an id, and an id is all a generated face needs.
 const TILE_TINTS = ['bg-brand/60', 'bg-selected/60', 'bg-info/25', 'bg-ok/25', 'bg-warning/30'];
 
 function tileTint(agent: Pick<AgentProfile, 'id' | 'builtin'>): string {
@@ -408,42 +410,11 @@ function AgentRow({
 
 // ── avatar ──────────────────────────────────────────────────────────
 
-// `<img>` can't carry the Authorization header, so fetch the blob and hand
-// the bitmap over as an object URL (same pattern as the chat
-// AttachmentImage). Returns null while loading, on failure, or without a
-// blob id — callers fall back to their default portrait.
-function useBlobUrl(blobId: string | null, baseUrl: string, token: string | null): string | null {
-  const [url, setUrl] = useState<string | null>(null);
-  useEffect(() => {
-    setUrl(null);
-    if (blobId === null || blobId === '') return;
-    const alive = { current: true };
-    let objectUrl: string | null = null;
-    void (async () => {
-      try {
-        const base = (baseUrl || '').replace(/\/+$/, '');
-        const res = await fetch(`${base}/v1/blobs/${encodeURIComponent(blobId)}`, {
-          headers: { Authorization: `Bearer ${token ?? ''}` },
-        });
-        if (!res.ok) throw new Error(`blob ${res.status}`);
-        const blob = await res.blob();
-        if (!alive.current) return;
-        objectUrl = URL.createObjectURL(blob);
-        setUrl(objectUrl);
-      } catch {
-        // Callers render their fallback.
-      }
-    })();
-    return () => {
-      alive.current = false;
-      if (objectUrl !== null) URL.revokeObjectURL(objectUrl);
-    };
-  }, [blobId, baseUrl, token]);
-  return url;
-}
-
-// A character face on its tint tile: uploaded avatar > bundled brand image
-// (builtin) > big monogram.
+// Uploaded avatar > the bundled brand image (builtin) > a face generated
+// from the agent's id. The monogram is left for the create form alone, where
+// there is no id yet to generate from — and picking a face off the typed name
+// would show one portrait while filling the form and a different one after
+// saving.
 function AgentFace({
   agent,
   baseUrl,
@@ -458,12 +429,13 @@ function AgentFace({
   /** Local object URL that overrides the stored blob (fresh upload). */
   previewUrl?: string | null;
 }) {
-  const url = useBlobUrl(agent.avatar_blob_id ?? null, baseUrl, token);
-  const face = previewUrl ?? url ?? (agent.builtin ? bayboAvatar : null);
+  const url = useBlobUrl(agent.avatar_blob_id, baseUrl, token);
+  const generated = agent.id === '' ? null : botttsFace(agent.id);
+  const face = previewUrl ?? url ?? (agent.builtin ? bayboAvatar : generated);
   const frame =
     size === 'sm'
       ? 'h-9 w-9 rounded-md border border-black'
-      : 'h-32 w-32 rounded-md border-2 border-black shadow-brutal-sm';
+      : 'h-32 w-32 rounded-md border border-black shadow-brutal-sm';
   if (face !== null) {
     return <img src={face} alt={agent.name} className={`${frame} shrink-0 object-cover`} />;
   }

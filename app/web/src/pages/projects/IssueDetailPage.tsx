@@ -38,6 +38,7 @@ import {
 } from './boardModel';
 import { MarkdownEditor } from './MarkdownEditor';
 import { Avatar } from './Avatar';
+import { useTeamPortraits } from './portrait';
 import { PickerOverlay } from './PickerOverlay';
 import { SubIssues } from './SubIssues';
 import { Timeline } from './Timeline';
@@ -162,6 +163,7 @@ export function IssueDetailPage() {
   const [issue, setIssue] = useState<Issue | null>(null);
   const [board, setBoard] = useState<Issue[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
+  const portrait = useTeamPortraits(agents);
   const [runLog, setRunLog] = useState<RunLog | null>(null);
   const runs = runLog?.items ?? [];
   const [events, setEvents] = useState<IssueEvent[]>([]);
@@ -586,6 +588,7 @@ export function IssueDetailPage() {
           >
             <Avatar
               handle={handleOf(agents, issue.assignee)}
+              src={portrait(issue.assignee)}
               run={live.status === 'running' ? 'running' : live.status === 'held' ? 'held' : 'queued'}
               size="lg"
             />
@@ -689,6 +692,7 @@ export function IssueDetailPage() {
             projectId={projectId}
             children={children}
             team={agents}
+            portrait={portrait}
             disabled={saving}
             onStatus={(childNumber, status) => {
               void moveChild(childNumber, status);
@@ -707,6 +711,7 @@ export function IssueDetailPage() {
               void comment(text);
             }}
             team={agents}
+            portrait={portrait}
             onResolveApproval={(callId, decision) => {
               void answerApproval(callId, decision);
             }}
@@ -924,7 +929,12 @@ export function IssueDetailPage() {
                     <span className="font-normal text-ink-soft">Unassigned</span>
                   ) : (
                     <span className="inline-flex items-center gap-1.5">
-                      <Avatar handle={handleOf(agents, issue.assignee)} size="sm" />@
+                      <Avatar
+                        handle={handleOf(agents, issue.assignee)}
+                        src={portrait(issue.assignee)}
+                        size="sm"
+                      />
+                      @
                       {handleOf(agents, issue.assignee)}
                     </span>
                   )}

@@ -64,6 +64,7 @@ import {
   runIndicator,
 } from './boardModel';
 import { Avatar } from './Avatar';
+import { generatedPortrait, useTeamPortraits, type Portrait } from './portrait';
 import { writeLastProjectId } from './lastProject';
 import { CreateIssueModal } from './CreateIssueModal';
 import { ProjectSwitcher } from './ProjectSwitcher';
@@ -98,6 +99,7 @@ export function ProjectBoardPage() {
   const [project, setProject] = useState<Project | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
   const [team, setTeam] = useState<Agent[]>([]);
+  const portrait = useTeamPortraits(team);
   const [activeRuns, setActiveRuns] = useState<IssueRun[]>([]);
   const [board, setBoard] = useState<Board>(emptyBoard);
   const [loading, setLoading] = useState(true);
@@ -424,6 +426,7 @@ export function ProjectBoardPage() {
                 total={liveCount(board[status])}
                 activeRuns={activeRuns}
                 team={team}
+                portrait={portrait}
                 disabled={archived}
                 activeOver={dropInto}
                 onOpen={openIssue}
@@ -575,6 +578,7 @@ function BoardColumn({
   total,
   activeRuns,
   team,
+  portrait,
   disabled,
   activeOver,
   onOpen,
@@ -586,6 +590,7 @@ function BoardColumn({
   total: number;
   activeRuns: IssueRun[];
   team: Agent[];
+  portrait: Portrait;
   disabled: boolean;
   /// Which column the dragged card would land in right now, or null when
   /// nothing is being dragged.
@@ -645,6 +650,7 @@ function BoardColumn({
               issue={issue}
               run={runIndicator(activeRuns, issue.number)}
               team={team}
+              portrait={portrait}
               disabled={disabled}
               onOpen={onOpen}
               onOpenAgent={onOpenAgent}
@@ -677,6 +683,7 @@ function SortableIssueCard({
   issue,
   run,
   team,
+  portrait,
   disabled,
   onOpen,
   onOpenAgent,
@@ -684,6 +691,7 @@ function SortableIssueCard({
   issue: Issue;
   run: 'queued' | 'running' | null;
   team: Agent[];
+  portrait: Portrait;
   disabled: boolean;
   onOpen: (number: number) => void;
   onOpenAgent: (agentId: string) => void;
@@ -704,7 +712,13 @@ function SortableIssueCard({
         onOpen(issue.number);
       }}
     >
-      <IssueCard issue={issue} run={run} team={team} onOpenAgent={onOpenAgent} />
+      <IssueCard
+        issue={issue}
+        run={run}
+        team={team}
+        portrait={portrait}
+        onOpenAgent={onOpenAgent}
+      />
     </div>
   );
 }
@@ -804,12 +818,17 @@ function IssueCard({
   run = null,
   overlay = false,
   team = [],
+  portrait = generatedPortrait,
   onOpenAgent,
 }: {
   issue: Issue;
   run?: 'queued' | 'running' | null;
   overlay?: boolean;
   team?: Agent[];
+  /// Resolved faces from the board. The drag overlay leaves it alone and
+  /// draws the generated one, which is the same picture in every case an
+  /// upload is absent — and a drag is too short to fetch one anyway.
+  portrait?: Portrait;
   /// Opens the assignee's profile. Absent on the drag overlay, which is a
   /// picture of a card rather than a card.
   onOpenAgent?: (agentId: string) => void;
@@ -863,7 +882,12 @@ function IssueCard({
             }}
             className="flex items-center gap-1.5 min-w-0 cursor-pointer hover:underline"
           >
-            <Avatar handle={handleOf(team, issue.assignee)} run={run} size="sm" />
+            <Avatar
+              handle={handleOf(team, issue.assignee)}
+              src={portrait(issue.assignee)}
+              run={run}
+              size="sm"
+            />
             <span className="font-mono text-[0.58rem] text-ink-soft truncate">
               @{handleOf(team, issue.assignee)}
             </span>

@@ -4,6 +4,7 @@ import { RiSendPlane2Line } from 'react-icons/ri';
 import { MarkdownBody } from '../ChatPage';
 import { Avatar } from './Avatar';
 import { caretPoint, type CaretPoint } from './caret';
+import { generatedPortrait, type Portrait } from './portrait';
 import type { Agent, Issue, IssueRun } from './boardModel';
 import {
   applyMention,
@@ -67,7 +68,15 @@ function Note({ event, now }: { event: IssueEvent; now: number }) {
   );
 }
 
-function Comment({ event, now }: { event: IssueEvent; now: number }) {
+function Comment({
+  event,
+  now,
+  portrait,
+}: {
+  event: IssueEvent;
+  now: number;
+  portrait: Portrait;
+}) {
   const text = event.body.kind === 'comment' ? event.body.text : '';
   // The operator's own words carry the chat page's amber user bubble; an
   // agent's report is surface. Rendering both identically made a timeline
@@ -78,7 +87,7 @@ function Comment({ event, now }: { event: IssueEvent; now: number }) {
   return (
     <li className="relative flex gap-2.5 py-2 pl-3.5">
       <RailDot tone="muted" size="lg" top="14px" />
-      <Avatar handle={who} />
+      <Avatar handle={who} src={portrait(event.actor.kind === 'agent' ? event.actor.id : null)} />
       {/* Three quarters of the timeline, and a maximum rather than a width: a
           run report is hundreds of words and needs the cap, while "ok" has no
           business being stretched to meet it.
@@ -221,6 +230,7 @@ export function Timeline({
   onComment,
   onResolveApproval,
   team = [],
+  portrait = generatedPortrait,
   busy,
 }: {
   events: IssueEvent[];
@@ -229,6 +239,10 @@ export function Timeline({
   onComment: (text: string) => void;
   onResolveApproval: (callId: string, decision: 'approve' | 'approve_always' | 'deny') => void;
   team?: Agent[];
+  /// Resolved faces from the page that owns the roster. Left alone, every
+  /// speaker gets the face generated from its id — right for an agent
+  /// nobody has uploaded one for, which is most of them.
+  portrait?: Portrait;
   busy: boolean;
 }) {
   const [draft, setDraft] = useState('');
@@ -319,7 +333,7 @@ export function Timeline({
           >
             {events.map((event) => {
               if (eventShape(event) === 'comment') {
-                return <Comment key={event.id} event={event} now={now} />;
+                return <Comment key={event.id} event={event} now={now} portrait={portrait} />;
               }
               if (event.body.kind === 'approval_resolved') {
                 return (

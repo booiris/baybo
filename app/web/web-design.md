@@ -88,6 +88,34 @@ In the chat view the **thread sits on `surface`** (`#fffdf7`) while all **side p
 - **Library:** [Remix Icon](https://remixicon.com/) (via `react-icons/ri`).
 - **Style:** Outlined or filled depending on emphasis, usually `text-xl`.
 
+## Agent faces
+
+Every agent has a portrait, and the order is always **uploaded avatar → the
+bundled brand image (built-in profile only) → a generated Bottts robot**. The
+robot is drawn locally by `src/components/botttsFace.ts` (`@dicebear/core` +
+`@dicebear/bottts`), never fetched from `api.dicebear.com`: the dashboard is
+served off a box that need not have an internet route, and a request would
+hand an agent's id to a third party for a picture we can draw ourselves. It is
+placed on the board's own warm tints rather than DiceBear's saturated palette.
+
+The seed is the agent **profile id** — the only identity the board's roster
+(`TeamMemberDto`) and the `/agents` page (`AgentProfileDto`) share, and the
+only one that survives a rename. Seeding on the handle or the name would give
+one agent two faces.
+
+The portrait frame is **1px**, against the 2–3px this design system uses
+everywhere else. A board chip is 18–26px across, and a 2px ring on an 18px
+circle is a fifth of its radius — it read as chrome around a picture rather
+than as the edge of one. The board's other small round furniture (the team
+strip's status dot, the profile header's) already sits at 1px, so this is the
+existing idiom for things this size, not an exception to the language.
+
+Who draws what is resolved once per page in `pages/projects/portrait.ts`:
+`useTeamPortraits(team)` fetches the roster's uploaded blobs (bearer-gated, so
+they arrive as object URLs via `api/blobs.ts`) and falls back to the generated
+face per agent. Components take the **resolved `src`**, never the blob id. The
+operator and the board are not agents, get no portrait, and keep a monogram.
+
 ## App icon (PWA)
 
 The installed app's icon is `assets/baybo.png` — the line-art robot, black on white, **not** restyled onto a brutalist gold tile. It is the same artwork the iOS app ships as its AppIcon, and one product should not wear two faces in a task switcher. The dashboard's neo-brutalism is the *interface's* language, not the brand's.

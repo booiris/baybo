@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 
+import { botttsFace } from '../../components/botttsFace';
 import { Timeline } from './Timeline';
 import type { Agent, Issue } from './boardModel';
 
@@ -281,7 +282,13 @@ describe('pending approvals', () => {
       />,
     );
     expect(screen.getByTitle('you')).toBeInTheDocument();
-    expect(screen.getByTitle('@dev-1')).toBeInTheDocument();
+    // An agent nobody has uploaded a portrait for still gets a face of its
+    // own, generated from its id. The operator is not an agent and keeps
+    // initials.
+    expect(screen.getByTitle('@dev-1').querySelector('img')?.getAttribute('src')).toBe(
+      botttsFace('01JA'),
+    );
+    expect(screen.getByTitle('you').querySelector('img')).toBeNull();
   });
 
   it('renders a comment’s markdown rather than its source', () => {

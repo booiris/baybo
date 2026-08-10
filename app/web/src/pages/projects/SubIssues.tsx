@@ -1,6 +1,7 @@
 import { Link } from 'react-router-dom';
 
 import { Avatar } from './Avatar';
+import { generatedPortrait, type Portrait } from './portrait';
 import { PickerOverlay } from './PickerOverlay';
 import {
   COLUMN_LABEL,
@@ -36,6 +37,7 @@ export function SubIssues({
   projectId,
   children,
   team,
+  portrait = generatedPortrait,
   disabled,
   onStatus,
   onAssignee,
@@ -43,6 +45,9 @@ export function SubIssues({
   projectId: string;
   children: Issue[];
   team: Agent[];
+  /// Resolved faces from the page that owns the roster; generated ones
+  /// otherwise.
+  portrait?: Portrait;
   disabled: boolean;
   onStatus: (number: number, status: IssueStatus) => void;
   /// A step's assignee is editable in place, like its status: the mockup's
@@ -135,10 +140,14 @@ export function SubIssues({
                       {child.assignee == null ? (
                         <span
                           title="Unassigned"
-                          className="w-[18px] h-[18px] rounded-full border-2 border-dashed border-ink-soft/60"
+                          className="w-[18px] h-[18px] rounded-full border border-dashed border-ink-soft/60"
                         />
                       ) : (
-                        <Avatar handle={handleOf(team, child.assignee)} size="sm" />
+                        <Avatar
+                          handle={handleOf(team, child.assignee)}
+                          src={portrait(child.assignee)}
+                          size="sm"
+                        />
                       )}
                     </PickerOverlay>
                   </li>

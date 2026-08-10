@@ -2,10 +2,12 @@
 ///
 /// The board card, the issue header, a timeline comment and a step row all
 /// draw it, so a teammate looks the same wherever it turns up and its run
-/// state reads identically in all four. The mockup draws a silhouette and
-/// says in a comment that it stands in for an avatar image; we have none,
-/// and initials answer *which* teammate — the question every one of those
-/// four call sites is actually asking.
+/// state reads identically in all four.
+///
+/// Which picture to draw is decided in `portrait.ts` — an uploaded avatar
+/// when there is one, a generated bottts face when there is not. What is
+/// decided *here* is only how it is framed. The operator and the board are
+/// not agents, get no portrait, and keep a monogram.
 
 export type AvatarRun = 'queued' | 'running' | 'held' | null;
 
@@ -15,19 +17,7 @@ const SIZE = {
   lg: 'w-[26px] h-[26px] text-[0.58rem]',
 } as const;
 
-/// Faces are picked by name rather than by roster order, so a teammate keeps
-/// its colour across a hire or a removal and the eye can follow it.
-const FACES = ['#aecbdd', '#d9bfd4', '#cdd4ab', '#e5c9a0'] as const;
-
 const INK = '#2a2520';
-
-function faceOf(handle: string, lead: boolean): { background: string; color: string } {
-  if (handle === 'you') return { background: INK, color: '#faf6ec' };
-  if (lead) return { background: '#f2c14e', color: INK };
-  let hash = 0;
-  for (const ch of handle) hash = (hash * 31 + (ch.codePointAt(0) ?? 0)) % 100_000;
-  return { background: FACES[hash % FACES.length], color: INK };
-}
 
 function initialsOf(handle: string): string {
   if (handle === 'you') return 'ME';
@@ -53,27 +43,36 @@ function titleOf(handle: string, run: AvatarRun): string {
 
 export function Avatar({
   handle,
+  src = null,
   run = null,
-  lead = false,
   size = 'md',
 }: {
-  /// A bare handle (no `@`), or the literal `you` for the operator.
+  /// A bare handle (no `@`), or the literal `you` for the operator. Names the
+  /// chip; the picture comes from `src`.
   handle: string;
+  /// The resolved portrait. Null for whoever has none — the operator, the
+  /// board — who fall back to initials.
+  src?: string | null;
   run?: AvatarRun;
-  lead?: boolean;
   size?: keyof typeof SIZE;
 }) {
-  const face = faceOf(handle, lead);
   const working = run === 'running';
   return (
     <span
       title={titleOf(handle, run)}
-      style={face}
-      className={`relative inline-flex shrink-0 items-center justify-center rounded-full border-2 border-black font-mono font-bold ${
+      style={src === null ? { background: INK, color: '#faf6ec' } : undefined}
+      className={`relative inline-flex shrink-0 items-center justify-center rounded-full border border-black font-mono font-bold ${
         SIZE[size]
       } ${run === 'queued' || run === 'held' ? 'opacity-45' : ''}`}
     >
-      {initialsOf(handle)}
+      {src === null ? (
+        initialsOf(handle)
+      ) : (
+        // Clipped by the image rather than by the chip: `overflow-hidden` on
+        // the chip would cut off the run ring and the status dot, which both
+        // sit outside its box on purpose.
+        <img src={src} alt="" className="absolute inset-0 h-full w-full rounded-full object-cover" />
+      )}
       {working ? (
         <span
           aria-hidden
@@ -91,7 +90,7 @@ export function Avatar({
       {run === null ? null : (
         <span
           aria-hidden
-          className={`absolute -right-[3px] -bottom-[3px] w-[9px] h-[9px] rounded-full border-2 border-canvas ${
+          className={`absolute -right-[3px] -bottom-[3px] w-[9px] h-[9px] rounded-full border border-canvas ${
             working ? 'bg-ok' : 'bg-ink-soft'
           }`}
         />

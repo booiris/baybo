@@ -99,7 +99,11 @@ function stubClient() {
 
 const client = stubClient();
 
-const auth = { logout: vi.fn() };
+// No token on purpose: `useBoardStream` opens a real WebSocket the moment it
+// has one, and a socket that cannot connect reconnects — each reconnect
+// bumping `refreshKey` and refetching the whole board underneath the
+// assertions. `baseUrl` is here because the portraits hook reads it.
+const auth = { logout: vi.fn(), baseUrl: 'http://board.test', token: null };
 vi.mock('../../api/auth', () => ({
   useAdminClient: () => client,
   useAuth: () => auth,
