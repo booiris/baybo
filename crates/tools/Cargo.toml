@@ -80,6 +80,10 @@ ts-rs = { workspace = true, optional = true }
 
 [dev-dependencies]
 baybo-llm = { workspace = true, features = ["test-support"] }
+baybo-security = { workspace = true, features = ["test-support"] }
 baybo-session = { workspace = true, features = ["test-support"] }
 baybo-storage = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }
+# `test-util` for `#[tokio::test(start_paused = true)]`; the workspace's `full`
+# feature set does NOT include it.
+tokio = { workspace = true, features = ["test-util"] }

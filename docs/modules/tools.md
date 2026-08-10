@@ -181,6 +181,19 @@ binary and never appear in or are editable via `.mcp.json`.
   and trusts the vendor; don't gate on the transport command." Embedded
   servers that *do* declare capabilities still get the transport-derived
   approval like any stdio server.
+- **A user server's connect is bounded (`USER_CONNECT_TIMEOUT`, 90s); an
+  embedded server's is not.** `connect_server` is awaited inline by
+  `tick`, which the run loop awaits in turn, so a connect that never
+  returns does not fail one server — it stops the reconciler outright,
+  and silently, because nothing is left running to log. Every later
+  `.mcp.json` edit is then a no-op, including the ones `baybo mcp
+  add/remove` makes. Timing out is safe to do bluntly: the child is owned
+  by the connect future and `ManagedChild::Drop` SIGKILLs its process
+  group, so abandoning the future reaps it. Embedded stays unbounded
+  because the browser sidecar's docker build / Chrome download is
+  indistinguishable from a hang at this layer — the real fix there is for
+  the sidecar to connect its transport first and background the heavy
+  work.
 
 The browser sidecar arrives as one of these embedded servers; see
 [`sidecars.md`](../sidecars.md) for the CDDM wrapper, security
