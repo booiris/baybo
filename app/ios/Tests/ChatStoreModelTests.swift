@@ -373,6 +373,15 @@ struct ChatStoreModelTests {
 
     /// A failed draft-pin PUT degrades to the default model — revert the pill,
     /// raise the notice, and NEVER block the send that triggered it.
+    ///
+    /// The notice gets a wait of its own, and that is not belt-and-braces: on
+    /// the DRAFT path `putModelPin` runs with `deferNotice`, so its catch only
+    /// reverts the pill and arms a flag — the line is raised by
+    /// `surfaceDraftPinFailure` at the TAIL of the send Task, an await hop after
+    /// both conditions above already hold. Asserting it synchronously there
+    /// failed about one run in three. The sibling `listed: true` cases below
+    /// need no such wait: `deferNotice` is false for them, so the revert and the
+    /// notice land in one uninterrupted block.
     @Test func aFailedDraftPinRevertsAndStillSends() async {
         client.failSetModel(with: BayboError.Other(message: "boom"))
         let store = makeStore(listed: false)
@@ -387,7 +396,7 @@ struct ChatStoreModelTests {
             })
         #expect(await waitUntil { store.modelPin == nil })
         #expect(store.modelPinModel == nil)
-        #expect(store.notice != nil)
+        #expect(await waitUntil { store.notice != nil })
     }
 
     /// The draft-pin line is raised from the SEND path (`surfaceDraftPinFailure`),
