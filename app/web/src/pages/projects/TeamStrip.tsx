@@ -4,7 +4,7 @@ import { RiAddLine } from 'react-icons/ri';
 import { useAdminClient } from '../../api/auth';
 import { fetchModelPool } from './api';
 import type { Agent, IssueRun } from './boardModel';
-import { handleProblem, queuedAgentIds, workingAgentIds } from './teamModel';
+import { handleProblem, queuedAgentIds, workingAgentIds, UNPINNED_LLM } from './teamModel';
 import { Avatar, AVATAR_BOX, runNote, type AvatarRun } from './Avatar';
 import type { Portrait } from './portrait';
 
@@ -19,13 +19,6 @@ const MAX_AGENTS = 16;
 const fieldLabel = 'font-mono text-[0.6rem] font-bold uppercase tracking-[0.12em] text-ink-soft';
 const fieldBox =
   'border-2 border-black rounded-md bg-canvas px-2.5 py-[7px] font-mono text-[0.74rem]';
-
-/// No pin — the agent follows whatever `default-llm` is at the time.
-///
-/// Not the default's name: the pool lists it too, so two options would read
-/// `gpt` while meaning different things — one that keeps following the
-/// default when it moves, one frozen to the model it happens to be today.
-const UNPINNED_LLM = '—';
 
 export function TeamStrip({
   team,
@@ -179,7 +172,9 @@ function HireAgentForm({
   const [role, setRole] = useState('');
   const [framework, setFramework] = useState<Agent['framework']>('baybo');
   const [llm, setLlm] = useState('');
-  const [pool, setPool] = useState<{ names: string[]; defaultName: string } | null>(null);
+  // Only the names: with the unpinned option no longer spelling the
+  // default out, nothing here reads which one it is.
+  const [pool, setPool] = useState<{ names: string[] } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const client = useAdminClient();

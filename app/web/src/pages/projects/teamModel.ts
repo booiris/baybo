@@ -26,6 +26,16 @@ export function handleOf(team: Agent[], agentId: string): string {
   return team.find((agent) => agent.id === agentId)?.handle ?? agentId;
 }
 
+/// What an unpinned `llm` reads as — this agent follows whatever
+/// `default-llm` is at the time.
+///
+/// Not the default's own name, which would be the shorter answer: `GET
+/// /v1/llm/models` lists every configured entry and the default is one of
+/// them, so the name would appear twice in one picker meaning two different
+/// things — follow the default wherever it moves, or freeze to the model that
+/// happens to be default today.
+export const UNPINNED_LLM = '—';
+
 /// Longest handle the grammar accepts. Mirrors `MAX_AGENT_HANDLE_CHARS`.
 const MAX_HANDLE_CHARS = 32;
 
