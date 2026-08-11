@@ -343,6 +343,35 @@ mod tests {
             ),
             Some(false)
         );
+
+        // A readable entry may sit *inside* a masked directory and win for
+        // itself alone, without lifting the mask off its siblings. This is
+        // what lets the agent layer expose `state/blobs/` (so `GetBlob`'s
+        // path is openable) while `state/storage.db` — every transcript, the
+        // secrets rows, every blob's read_token — stays gone.
+        let with_blobs = [
+            PathBuf::from("/home/u/.baybo/personas/b/skills"),
+            PathBuf::from("/home/u/.baybo/state/blobs"),
+        ];
+        assert_eq!(
+            path_visibility(
+                &policy,
+                work,
+                &with_blobs,
+                Path::new("/home/u/.baybo/state/blobs/1f/1f00.jpg")
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            path_visibility(
+                &policy,
+                work,
+                &with_blobs,
+                Path::new("/home/u/.baybo/state/storage.db")
+            ),
+            Some(false),
+            "exposing a child must not lift the mask off its parent",
+        );
     }
 
     #[test]

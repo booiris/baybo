@@ -464,6 +464,24 @@ impl BlobStore for SqliteBlobStore {
         self.open_at(blob_id, 0).await
     }
 
+    async fn local_path(&self, blob_id: &str) -> Result<Option<PathBuf>> {
+        let (hex, _token) = split_id(blob_id)?;
+        // Through stat(), like `get`/`open_at` and for the same reason: the
+        // file is keyed by hex alone, so building the path from the digest
+        // the caller handed us would answer for a blob they hold no read
+        // capability for. This method exists to give a path OUT, which makes
+        // skipping the gate here worse than anywhere else in this impl.
+        let meta = self.stat(blob_id).await?;
+        let path = self.blob_path(hex, mime_extension(&meta.mime_type));
+        if !path_exists(&path).await {
+            return Err(StorageError::NotFound(format!(
+                "blob bytes missing for {}",
+                redacted_blob_id(blob_id),
+            )));
+        }
+        Ok(Some(path))
+    }
+
     async fn open_at(&self, blob_id: &str, offset: u64) -> Result<BlobReader> {
         let (hex, _token) = split_id(blob_id)?;
         // Re-enter stat() so the read_token gate is enforced on the offset/resume

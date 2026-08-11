@@ -16,6 +16,7 @@ test-support = []
 [dependencies]
 baybo-model = { workspace = true }
 baybo-store = { workspace = true }
+baybo-workspace = { workspace = true }
 
 async-trait = { workspace = true }
 bytes = { workspace = true }
