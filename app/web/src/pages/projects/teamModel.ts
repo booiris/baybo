@@ -26,15 +26,33 @@ export function handleOf(team: Agent[], agentId: string): string {
   return team.find((agent) => agent.id === agentId)?.handle ?? agentId;
 }
 
-/// What an unpinned `llm` reads as — this agent follows whatever
-/// `default-llm` is at the time.
+export type ModelPool = { names: string[]; defaultName: string } | null;
+
+/// The llm picker's rows: one per configured model, no more.
 ///
-/// The word, not the model it currently resolves to: `GET /v1/llm/models`
-/// lists every configured entry and the default is one of them, so the
-/// resolved name would appear twice in one picker meaning two different
-/// things — follow the default wherever it moves, or freeze to the model that
-/// happens to be default today.
-export const UNPINNED_LLM = 'default';
+/// The default's row carries the **empty value** — that is, picking it pins
+/// nothing and the agent follows `default-llm` wherever it moves. There is
+/// deliberately no way to pin the model that is default today: the two are
+/// indistinguishable until the default moves, and a picker listing `deepseek`
+/// twice — once as itself, once as "default" — is a worse thing to read than
+/// the distinction is worth keeping.
+export function llmOptions(pool: ModelPool): { value: string; label: string }[] {
+  if (pool === null) return [];
+  return pool.names.map((name) => ({
+    value: name === pool.defaultName ? '' : name,
+    label: name,
+  }));
+}
+
+/// Which row is showing, for an agent's stored pin.
+///
+/// An agent pinned to the model that is *currently* default shows as that
+/// model's row, which is the unpinned one — the only row it could show as,
+/// now that there is one row per model.
+export function llmSelected(pinned: string | null | undefined, pool: ModelPool): string {
+  if (pinned == null || pinned === '') return '';
+  return pool !== null && pinned === pool.defaultName ? '' : pinned;
+}
 
 /// Longest handle the grammar accepts. Mirrors `MAX_AGENT_HANDLE_CHARS`.
 const MAX_HANDLE_CHARS = 32;

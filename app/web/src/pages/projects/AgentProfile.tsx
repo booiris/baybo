@@ -5,7 +5,7 @@ import { RiCloseLine } from 'react-icons/ri';
 import { useAdminClient } from '../../api/auth';
 import { fetchModelPool, setAgentModel } from './api';
 import { COLUMN_LABEL, type Agent, type Issue, type IssueRun } from './boardModel';
-import { workingAgentIds, UNPINNED_LLM } from './teamModel';
+import { llmOptions, llmSelected, workingAgentIds, type ModelPool } from './teamModel';
 
 export function AgentProfile({
   agent,
@@ -45,9 +45,7 @@ export function AgentProfile({
   const [confirmRemove, setConfirmRemove] = useState(false);
   const [pinning, setPinning] = useState(false);
   const [pinError, setPinError] = useState<string | null>(null);
-  // Only the names: with the unpinned option no longer spelling the
-  // default out, nothing here reads which one it is.
-  const [pool, setPool] = useState<{ names: string[] } | null>(null);
+  const [pool, setPool] = useState<ModelPool>(null);
   const client = useAdminClient();
 
   useEffect(() => {
@@ -170,7 +168,7 @@ export function AgentProfile({
             <select
               aria-label="llm"
               disabled={readOnly || pinning || pool === null}
-              value={agent.llm ?? ''}
+              value={llmSelected(agent.llm, pool)}
               onChange={(event) => {
                 const picked = event.target.value;
                 setPinning(true);
@@ -184,10 +182,9 @@ export function AgentProfile({
             >
               {/* Pool-only: a pin outside it is a teammate that fails every
                   time it is woken, so the picker never offers one. */}
-              <option value="">{UNPINNED_LLM}</option>
-              {(pool?.names ?? []).map((name) => (
-                <option key={name} value={name}>
-                  {name}
+              {llmOptions(pool).map((option) => (
+                <option key={option.label} value={option.value}>
+                  {option.label}
                 </option>
               ))}
             </select>

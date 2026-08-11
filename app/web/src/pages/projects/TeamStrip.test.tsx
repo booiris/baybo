@@ -17,7 +17,9 @@ vi.mock('../../api/auth', () => ({
 // The model pool is a network read the panel makes on mount; the tests
 // here are about what it renders, not about which models exist.
 vi.mock('./api', () => ({
-  fetchModelPool: vi.fn().mockResolvedValue({ kind: 'ok', value: { names: [], defaultName: 'gpt' } }),
+  fetchModelPool: vi
+    .fn()
+    .mockResolvedValue({ kind: 'ok', value: { names: ['deepseek', 'gpt-5'], defaultName: 'deepseek' } }),
   setAgentModel: vi.fn().mockResolvedValue({ kind: 'ok', value: null }),
 }));
 

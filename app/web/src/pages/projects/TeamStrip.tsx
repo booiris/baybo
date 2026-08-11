@@ -4,7 +4,13 @@ import { RiAddLine } from 'react-icons/ri';
 import { useAdminClient } from '../../api/auth';
 import { fetchModelPool } from './api';
 import type { Agent, IssueRun } from './boardModel';
-import { handleProblem, queuedAgentIds, workingAgentIds, UNPINNED_LLM } from './teamModel';
+import {
+  handleProblem,
+  llmOptions,
+  queuedAgentIds,
+  workingAgentIds,
+  type ModelPool,
+} from './teamModel';
 import { Avatar, AVATAR_BOX, runNote, type AvatarRun } from './Avatar';
 import type { Portrait } from './portrait';
 
@@ -172,9 +178,7 @@ function HireAgentForm({
   const [role, setRole] = useState('');
   const [framework, setFramework] = useState<Agent['framework']>('baybo');
   const [llm, setLlm] = useState('');
-  // Only the names: with the unpinned option no longer spelling the
-  // default out, nothing here reads which one it is.
-  const [pool, setPool] = useState<{ names: string[] } | null>(null);
+  const [pool, setPool] = useState<ModelPool>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const client = useAdminClient();
@@ -298,10 +302,9 @@ function HireAgentForm({
                 }}
                 className={fieldBox}
               >
-                <option value="">{UNPINNED_LLM}</option>
-                {(pool?.names ?? []).map((model) => (
-                  <option key={model} value={model}>
-                    {model}
+                {llmOptions(pool).map((option) => (
+                  <option key={option.label} value={option.value}>
+                    {option.label}
                   </option>
                 ))}
               </select>

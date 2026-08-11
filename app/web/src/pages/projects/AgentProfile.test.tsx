@@ -13,7 +13,9 @@ vi.mock('../../api/auth', () => ({
 // The model pool is a network read the panel makes on mount; the tests
 // here are about what it renders, not about which models exist.
 vi.mock('./api', () => ({
-  fetchModelPool: vi.fn().mockResolvedValue({ kind: 'ok', value: { names: [], defaultName: 'gpt' } }),
+  fetchModelPool: vi
+    .fn()
+    .mockResolvedValue({ kind: 'ok', value: { names: ['deepseek', 'gpt-5'], defaultName: 'deepseek' } }),
   setAgentModel: vi.fn().mockResolvedValue({ kind: 'ok', value: null }),
 }));
 
@@ -82,13 +84,18 @@ describe('AgentProfile', () => {
     expect(screen.getByText('1')).toBeInTheDocument();
   });
 
-  it('calls an unpinned llm "default", the same word the hire form uses', async () => {
+  it('lists each model once, the default one standing for "not pinned"', async () => {
     renderProfile(agent('dev-1'));
-    // One constant behind both screens: this option and the new-agent form's
-    // are the same claim about what an empty pin means.
     const picker = await screen.findByLabelText('llm');
+    const rows = [...picker.querySelectorAll('option')].map((o) => [o.textContent, o.value]);
+    // No separate "default" row beside the model it resolves to: the two are
+    // indistinguishable until the default moves, and reading `deepseek` twice
+    // is worse than losing that distinction.
+    expect(rows).toEqual([
+      ['deepseek', ''],
+      ['gpt-5', 'gpt-5'],
+    ]);
     expect(picker).toHaveValue('');
-    expect(picker.querySelector('option[value=""]')?.textContent).toBe('default');
   });
 
   it('says who added it, and notes a hirer who has since gone', () => {
