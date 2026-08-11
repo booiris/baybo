@@ -16,10 +16,19 @@
 /// cannot be told from one where the dot failed to load.
 export type AvatarRun = 'queued' | 'running' | 'held' | 'idle' | null;
 
+/// A face's footprint. Exported because anything that has to line up with one
+/// — the team strip's `＋` seat — must take the number from here: written out
+/// a second time, the row stops being a row the first time this changes.
+export const AVATAR_BOX = {
+  sm: 'w-[18px] h-[18px]',
+  md: 'w-[22px] h-[22px]',
+  lg: 'w-[26px] h-[26px]',
+} as const;
+
 const SIZE = {
-  sm: 'w-[18px] h-[18px] text-[0.46rem]',
-  md: 'w-[22px] h-[22px] text-[0.5rem]',
-  lg: 'w-[26px] h-[26px] text-[0.58rem]',
+  sm: `${AVATAR_BOX.sm} text-[0.46rem]`,
+  md: `${AVATAR_BOX.md} text-[0.5rem]`,
+  lg: `${AVATAR_BOX.lg} text-[0.58rem]`,
 } as const;
 
 const INK = '#2a2520';

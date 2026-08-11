@@ -5,7 +5,7 @@ import { useAdminClient } from '../../api/auth';
 import { fetchModelPool } from './api';
 import type { Agent, IssueRun } from './boardModel';
 import { previewHandle, queuedAgentIds, workingAgentIds } from './teamModel';
-import { Avatar, runNote, type AvatarRun } from './Avatar';
+import { Avatar, AVATAR_BOX, runNote, type AvatarRun } from './Avatar';
 import type { Portrait } from './portrait';
 
 /// Seats on a board. Mirrors `MAX_TEAM_AGENTS`; the server is the judge, so
@@ -68,7 +68,9 @@ export function TeamStrip({
           onClick={() => {
             setHiring(true);
           }}
-          className="w-6 h-6 rounded-full border-2 border-dashed border-ink-soft text-ink-soft flex items-center justify-center hover:border-black hover:text-ink shrink-0"
+          // A seat's own size. At 24px in a row of 26px faces it sat a pixel
+          // proud at both ends of the row.
+          className={`${AVATAR_BOX.lg} rounded-full border-2 border-dashed border-ink-soft text-ink-soft flex items-center justify-center hover:border-black hover:text-ink shrink-0`}
         >
           <RiAddLine className="text-xs" />
         </button>
@@ -114,9 +116,12 @@ function TeamMemberChip({
       type="button"
       aria-label={`Open @${agent.handle}'s profile`}
       onClick={onOpen}
-      className={`shrink-0 rounded-full ${
-        agent.lead ? 'bg-brand p-[2px]' : ''
-      } hover:brightness-95`}
+      // The lead's halo is a ring, not padding. Padding grew that one seat to
+      // 30px in a row of 26px ones, which `items-center` then centred rather
+      // than aligned; a ring is drawn outside the box without occupying any.
+      className={`shrink-0 rounded-full hover:brightness-95 ${
+        agent.lead ? 'ring-2 ring-brand' : ''
+      }`}
     >
       <Avatar
         handle={agent.handle}
