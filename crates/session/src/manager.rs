@@ -352,11 +352,6 @@ impl SessionManager {
     /// long-running gateway with thousands of bot sessions doesn't
     /// pay an O(all) round-trip when the caller only wants the
     /// http channel.
-    /// The lead's planning conversations for one board, newest first.
-    pub async fn list_project_conversations(&self, project_id: &str) -> Result<Vec<Session>> {
-        Ok(self.store.list_project_conversations(project_id).await?)
-    }
-
     pub async fn list_by_channel(
         &self,
         channel: &baybo_model::ChannelType,

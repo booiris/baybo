@@ -34,7 +34,6 @@ export function CreateIssueModal({
   parents,
   onClose,
   onCreated,
-  onAskLead,
 }: {
   projectId: string;
   /// Pre-filled from the column whose `+` was pressed — a starting point,
@@ -46,10 +45,6 @@ export function CreateIssueModal({
   parents: { number: number; title: string }[];
   onClose: () => void;
   onCreated: () => void;
-  /// Hand the half-written card to the lead instead of finishing the form.
-  /// The multica quick-create equivalent: some cards are easier described
-  /// in a sentence than filled in.
-  onAskLead?: (text: string) => void;
 }) {
   const client = useAdminClient();
   const { logout } = useAuth();
@@ -269,18 +264,6 @@ export function CreateIssueModal({
             />
             Continue create
           </label>
-          {onAskLead === undefined ? null : (
-            <button
-              type="button"
-              title="Describe it in a sentence and let the lead open the card"
-              onClick={() => {
-                onAskLead(title.trim() === '' ? description : title);
-              }}
-              className="font-mono text-[0.66rem] text-ink-soft underline cursor-pointer"
-            >
-              ⇄ Switch to agent
-            </button>
-          )}
           <Button
             className="ml-auto !px-4 !py-1.5 !text-[0.78rem]"
             variant="primary"

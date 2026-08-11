@@ -225,24 +225,6 @@ impl SessionStore for MemorySessionStore {
         Ok(self.data.lock().values().cloned().collect())
     }
 
-    async fn list_project_conversations(&self, project_id: &str) -> Result<Vec<Session>> {
-        let mut rows: Vec<Session> = self
-            .data
-            .lock()
-            .values()
-            .filter(|s| {
-                matches!(
-                    &s.trigger,
-                    baybo_model::TriggerSource::Project { project_id: p }
-                        if p.as_str() == project_id
-                )
-            })
-            .cloned()
-            .collect();
-        rows.sort_by_key(|s| std::cmp::Reverse(s.last_active));
-        Ok(rows)
-    }
-
     async fn list_by_channel(&self, channel: &ChannelType) -> Result<Vec<Session>> {
         Ok(self
             .data

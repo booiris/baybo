@@ -73,7 +73,6 @@ import { CreateIssueModal } from './CreateIssueModal';
 import { ProjectSwitcher } from './ProjectSwitcher';
 import { ActivityDrawer } from './ActivityDrawer';
 import { AgentProfile } from './AgentProfile';
-import { LeadPanel } from './LeadPanel';
 import { ProjectSettings } from './ProjectSettings';
 import { BoardFilterMenu } from './BoardFilterMenu';
 import { boardFilterParams, filterBoard, parseBoardFilter } from './boardFilter';
@@ -113,7 +112,7 @@ export function ProjectBoardPage() {
   const [createIn, setCreateIn] = useState<IssueStatus | null>(null);
   const [params, setParams] = useSearchParams();
   const filter = useMemo(() => parseBoardFilter(params), [params]);
-  const [rightPanel, setRightPanel] = useState<'activity' | 'lead' | null>(null);
+  const [showActivity, setShowActivity] = useState(false);
   const [profileOf, setProfileOf] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [hireOpen, setHireOpen] = useState(false);
@@ -289,7 +288,7 @@ export function ProjectBoardPage() {
 
   /// One door to the profile, from wherever an avatar appears.
   const openAgent = useCallback((agentId: string) => {
-    setRightPanel(null);
+    setShowActivity(false);
     setProfileOf(agentId);
   }, []);
 
@@ -328,8 +327,7 @@ export function ProjectBoardPage() {
             setHireOpen(false);
           }}
           onOpenProfile={(agent) => {
-            setRightPanel(null);
-            setProfileOf(agent.id);
+            openAgent(agent.id);
           }}
           onHire={async (body) => {
             const outcome = await hireAgent(client, projectId, body);
@@ -366,25 +364,11 @@ export function ProjectBoardPage() {
           />
           <button
             type="button"
-            aria-pressed={rightPanel === 'lead'}
+            aria-pressed={showActivity}
             onClick={() => {
-              setRightPanel((open) => (open === 'lead' ? null : 'lead'));
+              setShowActivity((open) => !open);
             }}
-            className={`${HEADER_ACTION} ${
-              rightPanel === 'lead' ? HEADER_ACTION_ON : HEADER_ACTION_OFF
-            }`}
-          >
-            Chat with lead
-          </button>
-          <button
-            type="button"
-            aria-pressed={rightPanel === 'activity'}
-            onClick={() => {
-              setRightPanel((open) => (open === 'activity' ? null : 'activity'));
-            }}
-            className={`${HEADER_ACTION} ${
-              rightPanel === 'activity' ? HEADER_ACTION_ON : HEADER_ACTION_OFF
-            }`}
+            className={`${HEADER_ACTION} ${showActivity ? HEADER_ACTION_ON : HEADER_ACTION_OFF}`}
           >
             Activity
           </button>
@@ -453,19 +437,19 @@ export function ProjectBoardPage() {
             {dragging !== null ? <IssueCard issue={dragging} team={team} overlay /> : null}
           </DragOverlay>
         </DndContext>
-        {rightPanel === 'activity' ? (
+        {showActivity ? (
           <FloatingPanel>
             <ActivityDrawer
               projectId={projectId}
               refreshKey={refreshKey}
               onClose={() => {
-                setRightPanel(null);
+                setShowActivity(false);
               }}
               onOpenIssue={openIssue}
             />
           </FloatingPanel>
         ) : null}
-        {profileOf !== null && rightPanel === null
+        {profileOf !== null && !showActivity
           ? (() => {
               const agent = team.find((row) => row.id === profileOf);
               return agent === undefined ? null : (
@@ -480,14 +464,6 @@ export function ProjectBoardPage() {
                     onChanged={() => {
                       setRefreshKey((key) => key + 1);
                     }}
-                    onChatWithLead={
-                      agent.lead
-                        ? () => {
-                            setProfileOf(null);
-                            setRightPanel('lead');
-                          }
-                        : undefined
-                    }
                     onClose={() => {
                       setProfileOf(null);
                     }}
@@ -512,25 +488,6 @@ export function ProjectBoardPage() {
               );
             })()
           : null}
-        {rightPanel === 'lead' ? (
-          <FloatingPanel>
-            <LeadPanel
-              projectId={projectId}
-              projectName={project?.name ?? 'this board'}
-              readOnly={archived}
-              onClose={() => {
-                setRightPanel(null);
-              }}
-              onBoardChanged={() => {
-                setRefreshKey((key) => key + 1);
-              }}
-              onHireLead={() => {
-                setRightPanel(null);
-                setHireOpen(true);
-              }}
-            />
-          </FloatingPanel>
-        ) : null}
       </div>
 
       {showSettings && project !== null ? (
@@ -564,10 +521,6 @@ export function ProjectBoardPage() {
             .flat()
             .filter((row) => row.parent == null && row.cancelled_at_ms == null)
             .map((row) => ({ number: row.number, title: row.title }))}
-          onAskLead={() => {
-            setCreateIn(null);
-            setRightPanel('lead');
-          }}
           onClose={() => {
             setCreateIn(null);
           }}

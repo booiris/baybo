@@ -24,7 +24,6 @@ const DEV: Agent = {
 
 function open(status: Parameters<typeof CreateIssueModal>[0]['status'] = 'backlog') {
   const onCreated = vi.fn();
-  const onAskLead = vi.fn();
   render(
     <CreateIssueModal
       projectId="01JP"
@@ -33,10 +32,9 @@ function open(status: Parameters<typeof CreateIssueModal>[0]['status'] = 'backlo
       parents={[{ number: 5, title: 'Auth revamp' }]}
       onClose={vi.fn()}
       onCreated={onCreated}
-      onAskLead={onAskLead}
     />,
   );
-  return { onCreated, onAskLead };
+  return { onCreated };
 }
 
 describe('CreateIssueModal', () => {
@@ -85,12 +83,5 @@ describe('CreateIssueModal', () => {
     const body = api.createIssue.mock.calls[0][2] as Record<string, unknown>;
     expect(body).not.toHaveProperty('parent');
     expect(body).not.toHaveProperty('stage');
-  });
-
-  it('hands a half-written card to the lead instead', async () => {
-    const { onAskLead } = open();
-    await userEvent.type(screen.getByPlaceholderText('Issue title'), 'something vague');
-    await userEvent.click(screen.getByRole('button', { name: /Switch to agent/ }));
-    expect(onAskLead).toHaveBeenCalledWith('something vague');
   });
 });

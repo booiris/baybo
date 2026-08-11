@@ -17,7 +17,6 @@ export function AgentProfile({
   onClose,
   onRemove,
   onChanged,
-  onChatWithLead,
 }: {
   agent: Agent;
   team: Agent[];
@@ -30,9 +29,6 @@ export function AgentProfile({
   /// Refetch after an edit the panel made — the roster it was handed is a
   /// snapshot, and a pin it just wrote must not read back stale.
   onChanged: () => void;
-  /// Only the lead's card carries this; other agents are reached by
-  /// @mention on a card, and v1 has no DM.
-  onChatWithLead?: () => void;
 }) {
   const working = workingAgentIds(activeRuns).has(agent.id);
   const assigned = issues.filter(
@@ -238,16 +234,6 @@ export function AgentProfile({
             </ul>
           )}
         </section>
-
-        {agent.lead && onChatWithLead !== undefined ? (
-          <button
-            type="button"
-            onClick={onChatWithLead}
-            className="self-start border-2 border-black bg-brand rounded-md px-2 py-1 font-mono text-[0.68rem] font-bold shadow-brutal-xs"
-          >
-            Chat with lead
-          </button>
-        ) : null}
 
         {readOnly || agent.lead ? null : confirmRemove ? (
           // A tombstone, not a delete: the row stays so every timeline entry

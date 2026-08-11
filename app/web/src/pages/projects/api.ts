@@ -1,5 +1,5 @@
 import type { AdminClient } from '../../api/client';
-import type { components, paths } from '../../api/schema';
+import type { components } from '../../api/schema';
 import type { Agent, Issue, IssueRun, IssueStatus, Project, RunLog } from './boardModel';
 import type { FeedEntry, IssueEvent } from './timelineModel';
 
@@ -368,98 +368,6 @@ export async function resolveApproval(
     if (error !== undefined) return failure(response.status, error.error);
     if (!response.ok) return failure(response.status, undefined);
     return { kind: 'ok', value: null };
-  } catch (e) {
-    return { kind: 'failed', message: networkMessage(e) };
-  }
-}
-
-export type LeadConversation =
-  paths['/v1/projects/{project_id}/lead/conversations']['get']['responses'][200]['content']['application/json']['items'][number];
-
-export async function fetchLeadConversations(
-  client: AdminClient,
-  projectId: string,
-): Promise<Outcome<LeadConversation[]>> {
-  try {
-    const { data, error, response } = await client.GET(
-      '/v1/projects/{project_id}/lead/conversations',
-      { params: { path: { project_id: projectId } } },
-    );
-    if (response.status === 401) return { kind: 'unauthorized' };
-    if (error !== undefined) return failure(response.status, error.error);
-    if (!response.ok) return failure(response.status, undefined);
-    return { kind: 'ok', value: data.items };
-  } catch (e) {
-    return { kind: 'failed', message: networkMessage(e) };
-  }
-}
-
-export async function openLeadConversation(
-  client: AdminClient,
-  projectId: string,
-): Promise<Outcome<LeadConversation>> {
-  try {
-    const { data, error, response } = await client.POST(
-      '/v1/projects/{project_id}/lead/conversations',
-      { params: { path: { project_id: projectId } } },
-    );
-    if (response.status === 401) return { kind: 'unauthorized' };
-    if (error !== undefined) return failure(response.status, error.error);
-    if (!response.ok) return failure(response.status, undefined);
-    return { kind: 'ok', value: data };
-  } catch (e) {
-    return { kind: 'failed', message: networkMessage(e) };
-  }
-}
-
-/// A row of the lead's transcript, **as the server sent it**.
-///
-/// This used to be a five-field projection, which is why the panel could
-/// not draw a work block: `steps`, the work timestamps and `cancelled` were
-/// dropped at the seam, so the information never reached the renderer that
-/// needed it. Carrying the row whole costs nothing and keeps the panel able
-/// to use the chat page's own work-block helpers.
-export type LeadTurn =
-  paths['/v1/chat/sessions/{session_id}']['get']['responses'][200]['content']['application/json']['transcript'][number];
-
-/// One page of a lead conversation, with the cursor for the page above it.
-export type LeadHistory = {
-  rows: LeadTurn[];
-  /// Whether anything older exists — what the panel's upward paging asks.
-  hasMoreOlder: boolean;
-  oldestOrdinal: number | null;
-};
-
-/// One page of a lead conversation.
-///
-/// `beforeOrdinal` pages **upward**, through the same door the chat page
-/// uses — `sync` only walks forward, so a panel built on it could never
-/// show anything above the first screen.
-export async function fetchLeadMessages(
-  client: AdminClient,
-  sessionId: string,
-  beforeOrdinal: number | null = null,
-): Promise<Outcome<LeadHistory>> {
-  try {
-    const { data, error, response } = await client.GET('/v1/chat/sessions/{session_id}', {
-      params: {
-        path: { session_id: sessionId },
-        query: beforeOrdinal == null ? {} : { before_ordinal: beforeOrdinal },
-      },
-    });
-    if (response.status === 401) return { kind: 'unauthorized' };
-    if (error !== undefined) return failure(response.status, error.error);
-    if (!response.ok) return failure(response.status, undefined);
-    return {
-      kind: 'ok',
-      value: {
-        rows: data.transcript,
-        // `has_more` is the session read's name for "there is a page above
-        // this one" — the same fact the chat page's scroll-up trigger uses.
-        hasMoreOlder: data.has_more,
-        oldestOrdinal: data.oldest_ordinal ?? null,
-      },
-    };
   } catch (e) {
     return { kind: 'failed', message: networkMessage(e) };
   }

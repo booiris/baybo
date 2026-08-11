@@ -1600,13 +1600,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SessionStore for MemSessionStore {
-        async fn list_project_conversations(
-            &self,
-            _project_id: &str,
-        ) -> baybo_store::session::Result<Vec<baybo_model::Session>> {
-            Ok(Vec::new())
-        }
-
         async fn get(
             &self,
             id: &SessionId,

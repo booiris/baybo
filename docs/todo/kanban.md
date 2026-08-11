@@ -169,27 +169,17 @@ existing git repo.
   form refuses In Progress without an assignee (the modal twin of the
   drag bounce).
 - Header: the project **switcher pill** (top-left), team strip (avatars +
-  working/idle dots, click → agent profile), **Chat with lead** button
-  (slides out an in-board chat panel on the right — the same layer as
-  the activity drawer and agent profile, mutually exclusive; it never
-  leaves the kanban page. The panel holds **multiple conversations**: a
-  new-conversation action and a history picker in its header (auto
-  titles + last-active times); opening defaults to the most recently
-  active one, and the first conversation is created lazily on the first
-  message. Each is a normal session for billing/context/trace, but
-  appears **nowhere in the global chat list** — no project session does;
-  kanban and chat stay separate worlds. History lives in the panel,
-  paging upward like the chat page (no in-panel search in v1; the trace
-  page remains the audit view, and durable decisions live on the issues
-  themselves). The panel reuses the chat thread
-  renderer (bubbles, collapsed work blocks) with a trimmed composer:
-  attachments and mid-run interjection stay, model switch and slash
-  commands don't — the lead's llm pin governs its model. The lead's
-  IssueCreate/IssueUpdate calls render as inline event cards, and the
-  board beside the panel grows the same cards in the same frame.
-  Conversation is user-initiated in v1), **Activity** toggle
+  working/idle dots, click → agent profile), **Filter** menu (search,
+  assignee, blocked-only, hide-cancelled; the trigger carries a count of
+  active narrowings), **Activity** toggle
   (right drawer: the feed of status changes, run results, blockers, hires,
   budget events), settings (team management, budget knobs, archive).
+- **There is no chat with the lead.** The board is the whole control
+  surface: work is described on cards and agents are directed by
+  @mention on a card, so a conversation running beside the board would be
+  a second place where a board's intent lives, and the one place the
+  timeline could not audit. The lead stays a *role* — it is hired with
+  the board, coordinates, and cannot be removed.
 - Clicking any avatar (team strip, card face, timeline, execution log)
   slides out the **agent profile panel** (same layer as the activity
   drawer, mutually exclusive; no dedicated route in v1): display name

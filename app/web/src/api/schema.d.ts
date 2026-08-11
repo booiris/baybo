@@ -1176,22 +1176,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/projects/{project_id}/lead/conversations": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["list_lead_conversations"];
-        put?: never;
-        post: operations["open_lead_conversation"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/v1/projects/{project_id}/read": {
         parameters: {
             query?: never;
@@ -2655,21 +2639,6 @@ export interface components {
          * @enum {string}
          */
         IssueStatusDto: "backlog" | "todo" | "in_progress" | "review" | "done";
-        /** @description One conversation with a board's lead. */
-        LeadConversationDto: {
-            /** Format: int64 */
-            created_at_ms: number;
-            /** Format: int64 */
-            last_active_ms: number;
-            /**
-             * @description The session id. Everything else — history, live traffic, sending —
-             *     goes through the ordinary chat transport, which scopes by channel
-             *     and is happy to carry a board's session; only the chat *list*
-             *     filters these out, which is the point.
-             */
-            session_id: string;
-            title?: string | null;
-        };
         /**
          * @description Envelope for list endpoints. `next_cursor` is opaque — clients
          *     pass it back as `?cursor=` to fetch the next page, and treat
@@ -7833,113 +7802,6 @@ export interface operations {
                 };
             };
             /** @description A run is already in flight, or the project is archived */
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
-    list_lead_conversations: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Project id */
-                project_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description This board's conversations with its lead, most recently active first */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": {
-                        items: {
-                            /** Format: int64 */
-                            created_at_ms: number;
-                            /** Format: int64 */
-                            last_active_ms: number;
-                            /**
-                             * @description The session id. Everything else — history, live traffic, sending —
-                             *     goes through the ordinary chat transport, which scopes by channel
-                             *     and is happy to carry a board's session; only the chat *list*
-                             *     filters these out, which is the point.
-                             */
-                            session_id: string;
-                            title?: string | null;
-                        }[];
-                        next_cursor?: string | null;
-                    };
-                };
-            };
-            /** @description Unauthorized */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            /** @description Unknown project */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
-    open_lead_conversation: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Project id */
-                project_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description A fresh conversation with the lead */
-            201: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["LeadConversationDto"];
-                };
-            };
-            /** @description Unauthorized */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            /** @description Unknown project, or it has no lead */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            /** @description The project is archived */
             409: {
                 headers: {
                     [name: string]: unknown;
