@@ -12,6 +12,14 @@ import type { Portrait } from './portrait';
 /// this only decides what the form says before it asks.
 const MAX_AGENTS = 16;
 
+/// A form field's label, and its box. The explanation lives *in* the label —
+/// "@handle · from the name, and never changes" — rather than in a paragraph
+/// under the input, so a field and everything true about it are one thing to
+/// read instead of two.
+const fieldLabel = 'font-mono text-[0.6rem] font-bold uppercase tracking-[0.12em] text-ink-soft';
+const fieldBox =
+  'border-2 border-black rounded-md bg-canvas px-2.5 py-[7px] font-mono text-[0.74rem]';
+
 export function TeamStrip({
   team,
   activeRuns,
@@ -179,9 +187,15 @@ function HireAgentForm({
   }, [client]);
 
   return (
-    <div className="fixed inset-0 z-40 bg-black/40 flex items-start justify-center p-6 overflow-y-auto">
+    <div
+      className="fixed inset-0 z-40 bg-black/40 flex items-start justify-center p-6 overflow-y-auto"
+      onClick={onCancel}
+    >
       <form
-        className="bg-surface border-[3px] border-black rounded-md shadow-brutal w-full max-w-md my-auto p-4 flex flex-col gap-3"
+        className="bg-surface border-[3px] border-black rounded-md shadow-brutal w-full max-w-md my-auto"
+        onClick={(event) => {
+          event.stopPropagation();
+        }}
         onSubmit={(event) => {
           event.preventDefault();
           setBusy(true);
@@ -197,93 +211,107 @@ function HireAgentForm({
           });
         }}
       >
-        <h2 className="font-mono text-sm font-bold">New agent</h2>
-        <label className="flex flex-col gap-1 font-mono text-[0.68rem]">
-          Name
-          <input
-            autoFocus
-            value={name}
-            onChange={(event) => {
-              setName(event.target.value);
-            }}
-            placeholder="Test Engineer"
-            className="border-2 border-black rounded-md px-2 py-1 font-sans text-sm"
-          />
-          <span className="text-ink-soft">
-            {handle === null
-              ? 'Its @handle comes from this name, and neither can be changed afterwards — not by you, not by the agent.'
-              : `Becomes @${handle} (a number is added if that is taken). Permanent — not changeable by you or by the agent.`}
-          </span>
-        </label>
-        <label className="flex flex-col gap-1 font-mono text-[0.68rem]">
-          Role
-          <textarea
-            value={role}
-            onChange={(event) => {
-              setRole(event.target.value);
-            }}
-            rows={3}
-            placeholder="Writes and maintains the test suite."
-            className="border-2 border-black rounded-md px-2 py-1 font-sans text-sm resize-y"
-          />
-          <span className="text-ink-soft">One line. It seeds the agent&rsquo;s own soul.</span>
-        </label>
-        <div className="grid grid-cols-2 gap-3">
-          <label className="flex flex-col gap-1 font-mono text-[0.68rem]">
-            Framework
-            <select
-              value={framework}
-              onChange={(event) => {
-                setFramework(event.target.value as Agent['framework']);
-              }}
-              className="border-2 border-black rounded-md px-2 py-1 font-mono text-[0.72rem]"
-            >
-              <option value="baybo">native</option>
-              <option value="claude">claude</option>
-              <option value="codex">codex</option>
-            </select>
-          </label>
-          <label className="flex flex-col gap-1 font-mono text-[0.68rem]">
-            LLM pin · optional
-            <select
-              value={llm}
-              onChange={(event) => {
-                setLlm(event.target.value);
-              }}
-              className="border-2 border-black rounded-md px-2 py-1 font-mono text-[0.72rem]"
-            >
-              <option value="">default-llm{pool === null ? '' : ` (${pool.defaultName})`}</option>
-              {(pool?.names ?? []).map((model) => (
-                <option key={model} value={model}>
-                  {model}
-                </option>
-              ))}
-            </select>
-          </label>
-        </div>
-        <p className="font-mono text-[0.62rem] text-ink-soft">
-          team {teamSize}/{maxAgents} · the lead hires against the same cap, but cannot choose
-          either of these two.
-        </p>
-        {error !== null ? (
-          <p className="border-2 border-err text-err rounded-md px-2 py-1 font-mono text-[0.68rem] break-words">
-            {error}
-          </p>
-        ) : null}
-        <div className="flex justify-end gap-2">
+        <div className="flex items-center gap-2 px-4 pt-3 pb-1 font-mono text-[0.66rem] text-ink-soft">
+          <span className="font-bold text-ink">New agent</span>
           <button
             type="button"
+            className="ml-auto cursor-pointer px-1"
             onClick={onCancel}
-            className="border-2 border-black rounded-md px-3 py-1 font-mono text-[0.68rem] bg-surface"
+            aria-label="Close"
           >
-            Cancel
+            ✕
           </button>
+        </div>
+
+        <div className="px-4 pb-4 flex flex-col gap-2.5">
+          <label className="flex flex-col gap-1">
+            <span className={fieldLabel}>Name</span>
+            <input
+              autoFocus
+              value={name}
+              onChange={(event) => {
+                setName(event.target.value);
+              }}
+              placeholder="Test Engineer"
+              className={`${fieldBox} font-sans`}
+            />
+          </label>
+          {/* The handle is a field of its own rather than a sentence under
+              the name. It is the thing that is permanent, and the operator
+              should read the one they are about to be stuck with. */}
+          <div className="flex flex-col gap-1">
+            <span className={fieldLabel}>
+              @handle · from the name, and never changes afterwards
+            </span>
+            <output className={`${fieldBox} ${handle === null ? 'text-ink-soft' : 'font-bold'}`}>
+              {handle === null ? '@…' : `@${handle}`}
+            </output>
+          </div>
+          <label className="flex flex-col gap-1">
+            <span className={fieldLabel}>Role · one line, and it seeds the agent’s own soul</span>
+            <textarea
+              value={role}
+              onChange={(event) => {
+                setRole(event.target.value);
+              }}
+              rows={3}
+              placeholder="Writes and maintains the test suite."
+              className={`${fieldBox} font-sans resize-y`}
+            />
+          </label>
+          <div className="grid grid-cols-2 gap-3">
+            <label className="flex flex-col gap-1">
+              <span className={fieldLabel}>Framework</span>
+              <select
+                value={framework}
+                onChange={(event) => {
+                  setFramework(event.target.value as Agent['framework']);
+                }}
+                className={fieldBox}
+              >
+                <option value="baybo">native</option>
+                <option value="claude">claude</option>
+                <option value="codex">codex</option>
+              </select>
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className={fieldLabel}>LLM pin · optional</span>
+              <select
+                value={llm}
+                onChange={(event) => {
+                  setLlm(event.target.value);
+                }}
+                className={fieldBox}
+              >
+                <option value="">default-llm{pool === null ? '' : ` (${pool.defaultName})`}</option>
+                {(pool?.names ?? []).map((model) => (
+                  <option key={model} value={model}>
+                    {model}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+          {error !== null ? (
+            <p className="border-2 border-err text-err rounded-md px-2 py-1 font-mono text-[0.68rem] break-words">
+              {error}
+            </p>
+          ) : null}
+        </div>
+
+        <div className="flex items-center gap-3 px-4 py-3 border-t-2 border-black bg-canvas">
+          <p className="font-mono text-[0.58rem] text-ink-soft leading-snug">
+            team {teamSize}/{maxAgents} · the lead hires against the same cap, and cannot choose
+            either of these two.
+          </p>
           <button
             type="submit"
             disabled={busy || name.trim() === '' || role.trim() === ''}
-            className="border-2 border-black rounded-md px-3 py-1 font-mono text-[0.68rem] bg-brand text-white disabled:opacity-50"
+            // Dark on gold. White on this brand fails contrast, which is why
+            // the design system says to pair it with ink.
+            className="ml-auto shrink-0 border-2 border-black rounded-md px-3 py-1 font-mono text-[0.68rem] font-bold bg-brand text-ink disabled:opacity-50"
           >
-            {busy ? 'Adding…' : 'Add agent'}
+            {busy ? 'Creating…' : 'Create agent'}
           </button>
         </div>
       </form>

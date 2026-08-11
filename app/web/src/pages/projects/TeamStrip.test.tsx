@@ -133,7 +133,7 @@ describe('TeamStrip', () => {
     );
     await userEvent.click(screen.getByRole('button', { name: /Add an agent/ }));
 
-    const submit = screen.getByRole('button', { name: 'Add agent' });
+    const submit = screen.getByRole('button', { name: 'Create agent' });
     expect(submit).toBeDisabled();
     await userEvent.type(screen.getByLabelText(/Name/), 'QA');
     expect(submit).toBeDisabled();
@@ -148,7 +148,17 @@ describe('TeamStrip', () => {
       framework: 'baybo',
     });
     expect(await screen.findByText(/every numbered variant are taken/)).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Add agent' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Create agent' })).toBeInTheDocument();
+  });
+
+  it('shows the handle the name is about to buy, before it is permanent', async () => {
+    renderStrip();
+    await userEvent.click(screen.getByRole('button', { name: /Add an agent/ }));
+    // Its own field, not a sentence under the name: the handle is the part
+    // that can never be changed afterwards.
+    expect(screen.getByText('@…')).toBeInTheDocument();
+    await userEvent.type(screen.getByLabelText(/Name/), 'Test Engineer');
+    expect(screen.getByText('@test-engineer')).toBeInTheDocument();
   });
 
   it('closes the form once the hire lands', async () => {
@@ -156,9 +166,9 @@ describe('TeamStrip', () => {
     await userEvent.click(screen.getByRole('button', { name: /Add an agent/ }));
     await userEvent.type(screen.getByLabelText(/Name/), 'QA');
     await userEvent.type(screen.getByLabelText(/Role/), 'Tests things.');
-    await userEvent.click(screen.getByRole('button', { name: 'Add agent' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Create agent' }));
 
     expect(onHire).toHaveBeenCalled();
-    expect(screen.queryByRole('button', { name: 'Add agent' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Create agent' })).not.toBeInTheDocument();
   });
 });
