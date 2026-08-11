@@ -23,9 +23,7 @@ import {
   postComment,
 } from './api';
 import {
-  COLUMNS,
   COLUMN_LABEL,
-  PRIORITIES,
   STATUS_PILL,
   assignableAgents,
   runDuration,
@@ -40,31 +38,21 @@ import {
 import { MarkdownEditor } from './MarkdownEditor';
 import { Avatar } from './Avatar';
 import { useTeamPortraits } from './portrait';
-import { Picker, type PickerOption } from './Picker';
+import { Picker } from './Picker';
 import { SubIssues } from './SubIssues';
 import { Timeline } from './Timeline';
 import type { IssueEvent } from './timelineModel';
 import { useBoardStream } from './useBoardStream';
 import { formatTokens, formatUsd } from './budgetModel';
 import { handleOf } from './teamModel';
-
-const PRIORITY_LABEL: Record<IssuePriority, string> = {
-  urgent: 'Urgent',
-  high: 'High',
-  medium: 'Medium',
-  low: 'Low',
-  none: 'No priority',
-};
-
-/// Priority is read off this rail at a glance or not at all, so it carries
-/// its own colour rather than sitting in the same ink as everything else.
-const PRIORITY_TONE: Record<IssuePriority, string> = {
-  urgent: 'text-err',
-  high: 'text-warn',
-  medium: 'text-ink',
-  low: 'text-ink-soft',
-  none: 'text-ink-soft',
-};
+import {
+  assigneeOptions,
+  priorityOptions,
+  statusChipShape,
+  statusOptions,
+  PRIORITY_LABEL,
+  PRIORITY_TONE,
+} from './issueFields';
 
 const railLabel = 'font-mono text-[0.6rem] font-bold uppercase tracking-[0.12em] text-ink-soft';
 
@@ -79,17 +67,6 @@ const railPickerChip =
 /// match. Same square corner as the priority chip beside it; the tone is the
 /// only thing a status says differently, because it is the one property on
 /// this rail worth reading without stopping to read it.
-const statusChipShape =
-  'rounded-md border py-[1px] font-mono text-[0.58rem] uppercase tracking-wider';
-
-function StatusPill({ status }: { status: IssueStatus }) {
-  return (
-    <span className={`${statusChipShape} px-2 ${STATUS_PILL[status]}`}>
-      {COLUMN_LABEL[status]}
-    </span>
-  );
-}
-
 const railBox = 'border-2 border-black rounded-md bg-surface px-3 py-2.5';
 
 /// One `label ── value` line of the property table.
@@ -583,31 +560,7 @@ export function IssueDetailPage() {
   const live = unsettledRun(runs);
   const children = board.filter((candidate) => candidate.parent === issue.number);
 
-  // In board order and wearing the board's own pills, so the panel shows the
-  // pipeline the card is moving along rather than listing five words.
-  const statusOptions: PickerOption[] = COLUMNS.map((status) => ({
-    value: status,
-    label: COLUMN_LABEL[status],
-    node: <StatusPill status={status} />,
-  }));
-  const priorityOptions: PickerOption[] = PRIORITIES.map((priority) => ({
-    value: priority,
-    label: PRIORITY_LABEL[priority],
-    node: <span className={PRIORITY_TONE[priority]}>{PRIORITY_LABEL[priority]}</span>,
-  }));
-  const assigneeOptions: PickerOption[] = [
-    { value: '', label: 'Unassigned' },
-    ...agents.map((agent) => ({
-      value: agent.id,
-      label: `@${agent.handle} — ${agent.name}`,
-      node: (
-        <span className="inline-flex min-w-0 items-center gap-1.5">
-          <Avatar handle={agent.handle} src={portrait(agent.id)} size="sm" />
-          <span className="truncate">@{agent.handle}</span>
-        </span>
-      ),
-    })),
-  ];
+  const assignees = assigneeOptions(agents, portrait);
 
   return (
     <div className="flex flex-col h-full min-h-0">
@@ -975,7 +928,7 @@ export function IssueDetailPage() {
                   title="Hand this card to somebody"
                   value={issue.assignee ?? ''}
                   disabled={saving}
-                  options={assigneeOptions}
+                  options={assignees}
                   onPick={(picked) => {
                     void apply({ assignee: picked.length > 0 ? picked : null });
                   }}

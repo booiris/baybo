@@ -518,6 +518,7 @@ export function ProjectBoardPage() {
           projectId={projectId}
           status={createIn}
           agents={assignableAgents(team)}
+          portrait={portrait}
           parents={Object.values(board)
             .flat()
             .filter((row) => row.parent == null && row.cancelled_at_ms == null)

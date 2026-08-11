@@ -120,6 +120,23 @@ mode collapsing the strip could introduce, and the badge is what rules it out.
 `boardFilter.ts` owns the list of narrowings (`restrictionCount`), because the
 badge and the Clear button must never disagree about what counts as filtered.
 
+## A card's three properties
+
+Status, priority and assignee are set in two places — the issue page's rail and
+the create modal's chip row — and both read them out of
+`pages/projects/issueFields.tsx`: one list of what the choices are, one idea of
+what each looks like. Before it existed the modal had already grown a second
+`PRIORITY_LABEL`, which is one stale rename from a board where the same card
+says two different things.
+
+Each wears the board's own vocabulary rather than a word: status is the
+column's pill in its column colour, priority carries its tone, and an assignee
+is a **face** and a handle. All four chips are `Picker`s — the create modal's
+were native `<select>`s, drawing an operating-system menu in the middle of a
+hand-drawn modal, which is the same thing the rail was fixed for. Parent and
+stage share one chip, because a step's stage means nothing without the parent
+it is a step of.
+
 ## The board's right-hand layer
 
 The activity drawer and the agent profile share one layer, are mutually

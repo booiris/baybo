@@ -29,6 +29,7 @@ function open(status: Parameters<typeof CreateIssueModal>[0]['status'] = 'backlo
       projectId="01JP"
       status={status}
       agents={[DEV]}
+      portrait={(id) => (id == null ? null : `data:face/${id}`)}
       parents={[{ number: 5, title: 'Auth revamp' }]}
       onClose={vi.fn()}
       onCreated={onCreated}
@@ -44,11 +45,21 @@ describe('CreateIssueModal', () => {
 
   it('opens on the column it was pressed in, but does not lock it there', async () => {
     open('todo');
-    const status = screen.getByLabelText('Status');
-    expect(status).toHaveValue('todo');
-    // Every chip opens its picker — the status one was previously frozen.
-    await userEvent.selectOptions(status, 'review');
-    expect(status).toHaveValue('review');
+    // Chips that say what they are set to and open a panel of the board's own
+    // pills — not native selects drawing an OS menu inside a hand-drawn modal.
+    await userEvent.click(screen.getByLabelText('Status: Todo'));
+    await userEvent.click(screen.getByRole('button', { name: 'Review' }));
+    expect(screen.getByLabelText('Status: Review')).toBeInTheDocument();
+  });
+
+  it('carries the board’s own vocabulary into every chip', async () => {
+    open('todo');
+    // The same three properties are set on the issue page's rail, from the
+    // same lists — priority in its tone, the assignee by face.
+    expect(screen.getByLabelText('Priority: No priority')).toBeInTheDocument();
+    await userEvent.click(screen.getByLabelText('Assignee: Unassigned'));
+    const option = screen.getByRole('button', { name: '@dev-1' });
+    expect(option.querySelector('img')).toHaveAttribute('src', 'data:face/01JDEV');
   });
 
   it('warns before creating work that starts an agent', async () => {
@@ -56,7 +67,8 @@ describe('CreateIssueModal', () => {
     // Without somebody on it, In Progress is refused rather than announced.
     expect(screen.getByText(/needs an assignee/)).toBeInTheDocument();
 
-    await userEvent.selectOptions(screen.getByLabelText('Assignee'), '01JDEV');
+    await userEvent.click(screen.getByLabelText('Assignee: Unassigned'));
+    await userEvent.click(screen.getByRole('button', { name: '@dev-1' }));
     // With somebody on it, creating spends money — say so before the click.
     expect(screen.getByText(/starts a run/)).toBeInTheDocument();
     expect(screen.queryByText(/needs an assignee/)).not.toBeInTheDocument();
@@ -65,7 +77,8 @@ describe('CreateIssueModal', () => {
   it('files a card as a step of another', async () => {
     open();
     await userEvent.type(screen.getByPlaceholderText('Issue title'), 'Token refresh');
-    await userEvent.selectOptions(screen.getByLabelText('⌗ Parent'), '5');
+    await userEvent.click(screen.getByLabelText('Parent: No parent'));
+    await userEvent.click(screen.getByRole('button', { name: '#5 Auth revamp' }));
     await userEvent.click(screen.getByRole('button', { name: /Create issue/ }));
 
     expect(api.createIssue).toHaveBeenCalledWith(

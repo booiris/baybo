@@ -3,34 +3,36 @@ import { useEffect, useState } from 'react';
 import { Button } from '../../components/Button';
 import { useAdminClient, useAuth } from '../../api/auth';
 import { createIssue } from './api';
+import { Avatar } from './Avatar';
+import { Picker } from './Picker';
 import {
-  COLUMNS,
   COLUMN_LABEL,
-  PRIORITIES,
+  STATUS_PILL,
   type Agent,
   type IssuePriority,
   type IssueStatus,
 } from './boardModel';
+import {
+  assigneeOptions,
+  priorityOptions,
+  statusOptions,
+  PRIORITY_LABEL,
+  PRIORITY_TONE,
+} from './issueFields';
+import type { Portrait } from './portrait';
 
-const PRIORITY_LABEL: Record<IssuePriority, string> = {
-  urgent: 'Urgent',
-  high: 'High',
-  medium: 'Medium',
-  low: 'Low',
-  none: 'No priority',
-};
-
+/// A chip in the property row. Pressable, and looking it — the row is where
+/// everything about the card that is not prose gets set, and until these were
+/// buttons they were native `<select>`s drawing an operating-system menu in
+/// the middle of a hand-drawn modal.
 const pill =
-  'inline-flex items-center gap-1.5 border-2 border-black rounded-full px-3 py-1 font-mono text-[0.66rem] font-bold bg-surface cursor-pointer';
-
-/// `◐` is not in Space Mono, so the status chip rendered as a stray glyph.
-/// A filled circle is in the face and reads the same.
-const STATUS_GLYPH = '●';
+  'inline-flex items-center gap-1.5 border-2 border-black rounded-full px-2.5 py-1 font-mono text-[0.66rem] font-bold bg-surface hover:bg-brand/25';
 
 export function CreateIssueModal({
   projectId,
   status: initialStatus,
   agents,
+  portrait,
   parents,
   onClose,
   onCreated,
@@ -40,6 +42,9 @@ export function CreateIssueModal({
   /// not a lock: the mockup's chips all open their picker.
   status: IssueStatus;
   agents: Agent[];
+  /// Resolved faces, from the board's one lookup — the assignee chip shows
+  /// who, not a handle to read.
+  portrait: Portrait;
   /// Cards this one could be a step of. One level only, so a card that is
   /// already a step is not offered.
   parents: { number: number; title: string }[];
@@ -69,6 +74,7 @@ export function CreateIssueModal({
     };
   }, [onClose]);
 
+  const picked = agents.find((agent) => agent.id === assignee);
   const needsAssignee = status === 'in_progress' && assignee.length === 0;
   const willEnqueue = status === 'in_progress' && assignee.length > 0;
 
@@ -149,89 +155,89 @@ export function CreateIssueModal({
               setDescription(event.target.value);
             }}
           />
+          {/* Status, priority, assignee, parent — the design's order, and the
+              board's own vocabulary in each: the status pill's column colour,
+              the priority's tone, the assignee's face. */}
           <div className="flex flex-wrap gap-2">
-            <label className={`${pill} bg-brand/35`}>
-              <span aria-hidden="true">{STATUS_GLYPH}</span>
-              <select
-                aria-label="Status"
-                className="bg-transparent outline-none font-bold cursor-pointer"
-                value={status}
-                onChange={(event) => {
-                  setStatus(event.target.value as IssueStatus);
-                }}
-              >
-                {COLUMNS.map((value) => (
-                  <option key={value} value={value}>
-                    {COLUMN_LABEL[value]}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label className={pill}>
-              <span className="text-ink-soft">Assignee</span>
-              <select
-                className="bg-transparent outline-none font-bold cursor-pointer max-w-[9rem]"
-                value={assignee}
-                onChange={(event) => {
-                  setAssignee(event.target.value);
-                }}
-              >
-                <option value="">Unassigned</option>
-                {agents.map((agent) => (
-                  <option key={agent.id} value={agent.id}>
-                    @{agent.handle} — {agent.name}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label className={pill}>
-              <span className="text-ink-soft">⌗ Parent</span>
-              <select
-                className="bg-transparent outline-none font-bold cursor-pointer max-w-[8rem]"
+            <Picker
+              label="Status"
+              value={status}
+              disabled={submitting}
+              options={statusOptions}
+              onPick={(next) => {
+                setStatus(next as IssueStatus);
+              }}
+              triggerClassName={`${pill} !border-black ${STATUS_PILL[status]}`}
+            >
+              {COLUMN_LABEL[status]}
+            </Picker>
+            <Picker
+              label="Priority"
+              value={priority}
+              disabled={submitting}
+              options={priorityOptions}
+              onPick={(next) => {
+                setPriority(next as IssuePriority);
+              }}
+              triggerClassName={`${pill} ${PRIORITY_TONE[priority]}`}
+            >
+              {PRIORITY_LABEL[priority]}
+            </Picker>
+            <Picker
+              label="Assignee"
+              value={assignee}
+              disabled={submitting}
+              options={assigneeOptions(agents, portrait)}
+              onPick={setAssignee}
+              triggerClassName={pill}
+            >
+              {picked === undefined ? (
+                <span className="text-ink-soft">Unassigned</span>
+              ) : (
+                <span className="inline-flex min-w-0 items-center gap-1.5">
+                  <Avatar handle={picked.handle} src={portrait(picked.id)} size="sm" />
+                  <span className="truncate">@{picked.handle}</span>
+                </span>
+              )}
+            </Picker>
+            {/* One chip, as the design draws it: a step's stage is meaningless
+                without the parent it is a step of, so the two never appear
+                apart. */}
+            <span className={`${pill} hover:bg-surface`}>
+              <span className="text-ink-soft">⌗</span>
+              <Picker
+                label="Parent"
                 value={parent == null ? '' : String(parent)}
-                onChange={(event) => {
-                  const picked = event.target.value;
-                  setParent(picked === '' ? null : Number(picked));
+                disabled={submitting}
+                options={[
+                  { value: '', label: 'No parent' },
+                  ...parents.map((candidate) => ({
+                    value: String(candidate.number),
+                    label: `#${candidate.number} ${candidate.title}`,
+                  })),
+                ]}
+                onPick={(next) => {
+                  setParent(next === '' ? null : Number(next));
                 }}
+                triggerClassName="max-w-[10rem] hover:text-brand-hover"
               >
-                <option value="">None</option>
-                {parents.map((candidate) => (
-                  <option key={candidate.number} value={candidate.number}>
-                    #{candidate.number} {candidate.title}
-                  </option>
-                ))}
-              </select>
-            </label>
-            {parent == null ? null : (
-              <label className={pill}>
-                <span className="text-ink-soft">stage</span>
-                <input
-                  type="number"
-                  min={0}
-                  value={stage}
-                  onChange={(event) => {
-                    setStage(Math.max(0, Number(event.target.value)));
-                  }}
-                  className="w-10 bg-transparent outline-none font-bold"
-                />
-              </label>
-            )}
-            <label className={pill}>
-              <span className="text-ink-soft">Priority</span>
-              <select
-                className="bg-transparent outline-none font-bold cursor-pointer"
-                value={priority}
-                onChange={(event) => {
-                  setPriority(event.target.value as IssuePriority);
-                }}
-              >
-                {PRIORITIES.map((value) => (
-                  <option key={value} value={value}>
-                    {PRIORITY_LABEL[value]}
-                  </option>
-                ))}
-              </select>
-            </label>
+                <span className="truncate">{parent == null ? 'Parent' : `#${parent}`}</span>
+              </Picker>
+              {parent == null ? null : (
+                <label className="inline-flex items-center gap-1 border-l border-black/25 pl-1.5">
+                  <span className="text-ink-soft">stage</span>
+                  <input
+                    type="number"
+                    min={0}
+                    value={stage}
+                    onChange={(event) => {
+                      setStage(Math.max(0, Number(event.target.value)));
+                    }}
+                    className="w-9 bg-transparent outline-none font-bold"
+                  />
+                </label>
+              )}
+            </span>
           </div>
           {needsAssignee ? (
             <p className="font-mono text-[0.62rem] font-bold text-warn">
@@ -242,8 +248,7 @@ export function CreateIssueModal({
             // and spends money. The modal says so before the button is
             // pressed rather than reporting it afterwards in a toast.
             <p className="border-2 border-black bg-brand/25 rounded-md px-2 py-1 font-mono text-[0.62rem] font-bold">
-              ⚡ In Progress + @{agents.find((a) => a.id === assignee)?.handle ?? '?'} — creating
-              this starts a run.
+              ⚡ In Progress + @{picked?.handle ?? '?'} — creating this starts a run.
             </p>
           ) : null}
           {error != null ? (
