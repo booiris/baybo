@@ -151,6 +151,15 @@ describe('TeamStrip', () => {
     expect(screen.getByRole('button', { name: 'Create agent' })).toBeInTheDocument();
   });
 
+  it('closes on Escape as well as on ✕ and the backdrop', async () => {
+    renderStrip();
+    await userEvent.click(screen.getByRole('button', { name: /Add an agent/ }));
+    expect(screen.getByRole('button', { name: 'Create agent' })).toBeInTheDocument();
+
+    await userEvent.keyboard('{Escape}');
+    expect(screen.queryByRole('button', { name: 'Create agent' })).not.toBeInTheDocument();
+  });
+
   it('shows the handle the name is about to buy, before it is permanent', async () => {
     renderStrip();
     await userEvent.click(screen.getByRole('button', { name: /Add an agent/ }));

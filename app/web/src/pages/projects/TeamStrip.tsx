@@ -186,6 +186,19 @@ function HireAgentForm({
     };
   }, [client]);
 
+  // The third way out, alongside ✕ and the backdrop. Not `useDismiss`: that
+  // one also closes on a press outside its root, and a modal's outside is the
+  // whole screen — the backdrop's own click is what handles that here.
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === 'Escape') onCancel();
+    }
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('keydown', onKeyDown);
+    };
+  }, [onCancel]);
+
   return (
     <div
       className="fixed inset-0 z-40 bg-black/40 flex items-start justify-center p-6 overflow-y-auto"
