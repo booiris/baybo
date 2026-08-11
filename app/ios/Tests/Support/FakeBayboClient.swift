@@ -463,8 +463,11 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
 
     func setDeckSink(sink: DeckSink) {}
 
+    /// Answers from the same seeded cache the cached-read paths use, so a test
+    /// that wants a tapped attachment to have bytes seeds one map, not two.
     func blobDownloadBytes(blobId: String, progress: BlobProgress?) async throws -> Data {
-        throw Self.unsupported
+        guard let data = cachedBlobs[blobId] else { throw Self.unsupported }
+        return data
     }
 
     func blobIsCached(blobId: String) async -> Bool { cachedBlobs[blobId] != nil }

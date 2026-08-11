@@ -52,9 +52,20 @@ A flushed poster reply whose session switched away settles nothing web-side (`in
 
 ## Images and the image viewer
 
-An inline `image` attachment does NOT use the file-card path above — a decoded `AttachmentImage` is a button whose tap posts `viewImage` (blob id only), and `ChatStore.viewImage` decodes the device-cached blob into a `UIImage` and presents `ImageViewer` (`app/ios/App/Screens/ImageViewer.swift`) via `.fullScreenCover`.
+An inline `image` attachment does NOT use the file-card path above — a decoded `AttachmentImage` is a button whose tap posts `viewImage` (blob id only), and `ChatStore.viewImage` turns the device-cached blob into a `ViewedImage.Content` and presents `ImageViewer` (`app/ios/App/Screens/ImageViewer.swift`) via `.fullScreenCover`.
 
 That is a dedicated `UIScrollView`-backed zoomable viewer (pinch, double-tap-to-fit/restore, single-tap or ✕ to close, image fades onto a black field) rather than QuickLook: QuickLook embedded in a SwiftUI `.sheet` gave no reliable double-tap-to-restore (the sheet's gestures fight it), and the black edge-to-edge field matches chat images where the document previewer's white chrome does not. The blob is already on disk from the thumbnail fetch (`requestBlob` → `blob_download_bytes` writes the cache), so it opens instantly. (Files still use `previewFile` → QuickLook, above.)
+
+### A vector is a second medium, not a second format
+
+**`UIImage(data:)` is nil for an SVG on every iOS there is** — no public API decodes one (`CGImageSourceCreateWithData` returns nil and ImageIO does not carry the type; verified on iOS 26). For as long as the viewer asked only `UIImage`, a tap on an agent-drawn diagram fell out of `viewImage`'s `guard` and did *nothing whatsoever*: no viewer, no error, no log.
+
+So `ViewedImage.Content` has two cases and the election is `UIImage` first, mime second (`.raster(UIImage)` / `.vector(Data)`). A vector renders in `ZoomableVectorView`, a `WKWebView` — because ZOOM is the whole reason a chat image goes full screen, and WebKit re-renders vector art at every scale, where a rasterised copy would have to pick a resolution at open time and go soft past it. The chrome (✕, share, the fade onto black) is the same SwiftUI layer over both.
+
+Two things about that web view are load-bearing:
+
+- the page is a **data-URI `<img>`, never the SVG as the document**. An SVG document runs its own `<script>`; an SVG inside an `<img>` cannot, by spec — and these bytes are agent-authored. A `default-src 'none'` CSP and `loadHTMLString(baseURL: nil)` (a unique opaque origin) close the rest, and the configuration carries no message handlers, so it shares nothing with the transcript's bridge.
+- **both taps are bound by hand**, exactly as the raster viewer binds them — double to zoom toward the point (3× from fit) and back, single to close, waiting on the double to fail so a zoom is never read as a dismiss. Leaving the zoom to WebKit does not work: its double tap is *smart magnification*, "zoom to the block under the finger", and this page is one image already fitted to the viewport — so it computes that there is nothing to do and the gesture does nothing at all (measured: the art stayed 123pt either way). Ours drives the web view's own `scrollView`, the same one its pinch moves, so the two never disagree about the current scale. `AttachmentImageUITests.testDoubleTapZoomsAVectorAndBack` measures it off the SCREEN's pixels — the page scale lives inside the web view and nothing above the seam can read it.
 
 ### Zoom fit comes from `layoutSubviews`, never `updateUIView`
 
@@ -81,6 +92,17 @@ That release was the bug: a re-opened thread grew/shrank every image row as its 
 **The fit MUST be solved on the BUBBLE**: the frame's containing block is the bubble, a shrink-to-fit flex item, where a `%` width is cyclic and WebKit resolves it to zero (a 0×0 reservation).
 
 The mirror can outlive its blobs (a restored backup carries the transcript, not the blob cache), so the spinner still exists inside the reserved box — just delayed 400ms in CSS, invisible on the cache hit it exists to skip. An image with no recorded size (first view, a scrolled-up history page) keeps the old tile and records its size on the way through.
+
+#### A vector's size cannot be read off the element showing it
+
+**WebKit answers `naturalWidth` for an SVG with the size it is laid out at RIGHT NOW.** The same 1200×400 page measures 1200 on a detached image, 192 while it decodes inside the 12rem loading tile, and 358 once released into the reading column (all three measured). Recording what the element reported — which is what every image did — meant a wide diagram rendered full width on its first paint and came back **a third of the column** on every open after it, reserved at the size of the tile it happened to decode in.
+
+So a vector (`isVectorImage`, `image/svg+xml`) is measured BEFORE it paints: `measureIntrinsicSize` points a **detached `Image`** — one never inserted into the document, so no layout can colour the answer — at the same object URL, and hands the result up to the bubble (`onIntrinsicSize`) before the real `<img>` is given its `src`. The raster path is untouched: a PNG's pixel count is a property of its bytes, and the extra decode would buy nothing.
+
+Two things follow from measuring first rather than on load:
+
+- **an SVG written as a bare `viewBox` appears at all.** It has no intrinsic width, and the bubble is a shrink-to-fit flex item, so with no box reserved WebKit lays it out at ZERO — invisible, and untappable with it.
+- **a stale entry corrects itself.** The mirror is a file and outlives the fix, so a thread opened today can still carry the number its loading tile handed over; the measurement overwrites it on sight instead of sizing that bubble wrong for the life of the thread. This is the one exception to the read-once-at-mount rule above, and it is safe for the same reason the rule exists: nothing has painted under it yet.
 
 ## Audio attachments
 

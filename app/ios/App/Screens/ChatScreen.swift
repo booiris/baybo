@@ -159,7 +159,7 @@ struct ChatScreen: View {
             ShareSheet(url: share.url)
         }
         .fullScreenCover(item: $store.viewedImage) { viewed in
-            ImageViewer(image: viewed.image, url: viewed.url) { store.viewedImage = nil }
+            ImageViewer(content: viewed.content, url: viewed.url) { store.viewedImage = nil }
         }
         .fullScreenCover(item: $store.videoPlayback) { playback in
             VideoPlayerScreen(url: playback.url)

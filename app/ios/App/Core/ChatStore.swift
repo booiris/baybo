@@ -1622,22 +1622,37 @@ final class ChatStore: ObservableObject {
     }
 
     /// Open a tapped image full-screen. The blob is device-cached (the thumbnail
-    /// fetch wrote it), so this decodes near-instantly; a non-decodable blob
-    /// simply doesn't present. Its own viewer rather than QuickLook so pinch-zoom,
-    /// double-tap-to-restore, and the black chat-image field are guaranteed.
+    /// fetch wrote it), so this decodes near-instantly; a blob that is neither a
+    /// decodable raster nor a vector simply doesn't present. Its own viewer
+    /// rather than QuickLook so pinch-zoom, double-tap-to-restore, and the black
+    /// chat-image field are guaranteed.
+    ///
+    /// The mime is what elects the medium, and it has to: iOS decodes no SVG at
+    /// all, so `UIImage(data:)` alone made every tap on an agent's diagram a
+    /// no-op (see `ViewedImage.Content`).
     func viewImage(blobId: String, filename: String, mimeType: String) {
         Task {
-            guard let bytes = try? await client.blobDownloadBytes(
-                blobId: blobId, progress: nil),
-                let image = UIImage(data: bytes)
+            guard let bytes = await imageBytes(blobId: blobId),
+                let content = ViewedImage.Content(bytes: bytes, mimeType: mimeType)
             else { return }
             // The share sheet hands over the FILE, not the decoded image, so the
             // original encoding and name reach Photos / Files / AirDrop. A write
             // failure only costs the share button, never the viewer.
             let url = try? Self.writePreviewFile(
                 bytes: bytes, blobId: blobId, filename: filename, mimeType: mimeType)
-            viewedImage = ViewedImage(id: blobId, image: image, url: url)
+            viewedImage = ViewedImage(id: blobId, content: content, url: url)
         }
+    }
+
+    /// The bytes behind a tapped image. A demo run has no leg to download over,
+    /// and its images are served locally the same way the transcript's own
+    /// `requestBlob` gets them (`-baybo-demo-images`) — without this the viewer
+    /// is the one attachment surface no fixture can reach.
+    private func imageBytes(blobId: String) async -> Data? {
+        #if DEBUG
+            if let demo = Self.demoImageBytes(blobId: blobId) { return demo }
+        #endif
+        return try? await client.blobDownloadBytes(blobId: blobId, progress: nil)
     }
 
     // MARK: - Audio + video attachments

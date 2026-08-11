@@ -227,12 +227,23 @@ without touching `app/ios` at all.
 
 - **`-baybo-demo-images`** (DEBUG) — a file chip renders straight from the frame;
   the `image` kind needs bytes, so this flag serves its own: one agent turn
-  carrying four images of deliberately different aspect ratios (portrait / banner
-  / thumbnail / square) plus a text row UNDER them, and `ChatStore.requestBlob`
-  short-circuits the demo blob ids to a locally rendered PNG at the declared size
-  (2s delay, so the pre-decode frame is screenshot-able). That text row's
-  y-position is the test: run once (tiles → release → it moves), relaunch (sizes
-  restored → nothing moves).
+  carrying four rasters of deliberately different aspect ratios (portrait /
+  banner / thumbnail / square) and two wide SVGs, plus a text row UNDER them, and
+  `ChatStore.requestBlob` short-circuits the demo blob ids to a locally rendered
+  PNG or SVG at the declared size (2s delay, so the pre-decode frame is
+  screenshot-able). That text row's y-position is the test: run once (tiles →
+  release → it moves), relaunch (sizes restored → nothing moves).
+
+  The two vectors are both spellings of the same wide diagram because they fail
+  in opposite directions, and only one of them is a size question at all: an SVG
+  declaring `width`/`height` past the column reports the CLAMPED layout back as
+  its natural size (192px, measured inside the loading tile) and comes back a
+  third of the column on the next open, while a bare `viewBox` has no intrinsic
+  width and lays out at ZERO until something reserves a box for it.
+  `AttachmentImageUITests` drives both, plus the tap — `ChatStore.viewImage`
+  reads its blob NATIVELY rather than over the bridge, so `demoImageBytes` backs
+  that path too, and without it the image viewer is the one attachment surface no
+  fixture can reach.
 
   **The second run only works on an UNBOUND simulator** — a bound one's list
   merge keeps only remote rows, so the demo's local-only session is dropped from
@@ -298,6 +309,13 @@ without touching `app/ios` at all.
   header still existing (the pop did not fire) and the header being HITTABLE
   again (the preview really left, rather than the swipe doing nothing behind an
   `allowsHitTesting(false)` chrome layer).
+
+  **The demo document is dark on purpose.** It was white, which is the one colour
+  that cannot show how the frame around it is painted: the expanded preview
+  reserved the home indicator in `--color-paper`, and no screenshot of a white
+  page could ever show that band. The same suite now samples the screenshot's
+  bottom rows for brightness, so a white fixture would take that assertion with
+  it.
 
 - **`-baybo-demo-models`** (DEBUG, with `-baybo-open-chat`) seeds a canned model
   catalog into `ModelCatalog` — gpt-5.5 deliberately via TWO provider entries,

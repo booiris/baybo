@@ -59,6 +59,49 @@ final class HtmlPreviewUITests: BayboUITestCase {
         attachScreenshot(app, name: "html-preview-after-swipe")
     }
 
+    /// The agent's page has to reach the BOTTOM EDGE of the screen — which is a
+    /// claim about pixels, and so a claim no other assertion in this file can
+    /// make. Everything here is `exists` / `isHittable`, and by both of those the
+    /// bug this pins was invisible: the box was full screen, the iframe was in
+    /// it, and the last 34pt of it were a band of the transcript's own paper
+    /// white, reserved to clear the home indicator. Nothing on this side can
+    /// paint that band in the page's colours (the preview is opaque-origin), so
+    /// the only honest full-bleed is no band at all.
+    ///
+    /// It reads the SCREENSHOT because that is where the failure lives, and it
+    /// samples off-centre to stay clear of the home indicator itself, which the
+    /// system draws over the page.
+    func testTheFullScreenPreviewReachesTheBottomEdge() throws {
+        let app = launch(Self.chatArguments)
+
+        let expand = app.buttons[Self.expandLabel]
+        XCTAssertTrue(
+            expand.waitForExistence(timeout: Self.webviewTimeout),
+            "the transcript never rendered the demo turn's HTML preview card")
+        expand.tap()
+        XCTAssertTrue(
+            app.buttons[Self.closeLabel].waitForExistence(timeout: 10),
+            "the preview never expanded")
+        attachScreenshot(app, name: "html-preview-bottom-edge")
+
+        let shot = try XCTUnwrap(screenPixels(), "could not read the screen")
+        // The demo page is dark on purpose (`TranscriptSchemeHandler`); the paper
+        // band is near-white, so "is this pixel bright" separates them with a
+        // wide margin either side.
+        for x in [0.12, 0.28, 0.86] {
+            for inset in [4.0, 16.0] {
+                let point = CGPoint(
+                    x: shot.size.width * x, y: shot.size.height - inset)
+                let brightness = try XCTUnwrap(
+                    shot.brightness(at: point), "could not read the screenshot at \(point)")
+                XCTAssertLessThan(
+                    brightness, 0.5,
+                    "the agent's page stops short of the bottom edge — \(point) is bright, "
+                        + "which is the frame's paper showing through under it")
+            }
+        }
+    }
+
     /// The dangerous half of the same gesture. A drag released SHORT has to snap
     /// back to full screen — and above all must not have popped the chat on its
     /// way, which is the failure this whole override exists to prevent and the

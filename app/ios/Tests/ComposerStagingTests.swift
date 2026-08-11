@@ -337,7 +337,7 @@ struct ComposerStagingTests {
         let work = try #require(fixture.work())
 
         // Every presentation `ChatScreen` mounts, opened and dismissed.
-        fixture.store.viewedImage = ViewedImage(id: "b1", image: UIImage(), url: nil)
+        fixture.store.viewedImage = ViewedImage(id: "b1", content: .raster(UIImage()), url: nil)
         fixture.store.viewedImage = nil
         fixture.store.videoPlayback = VideoPlayback(id: "b2", url: Self.devNull)
         fixture.store.videoPlayback = nil

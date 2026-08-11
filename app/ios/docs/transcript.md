@@ -475,6 +475,8 @@ agent page and both fixed:
   `HtmlPreview.tsx` writes EARLY — a dismissal starts at 0, a drag rides
   `1 - travelled` — so the values travel with the box. **Anything added to
   `.is-maximized` that is not position/rect has to go through that variable.**
+  (That bottom inset is gone entirely now — see below. What survives it is the
+  rule: the class flip may change nothing.)
 - **the settle retired the box on the first `transitionend`** — that event fires
   PER PROPERTY, and the morph moves seven of them. Whichever landed first flipped
   the class while the rest were a pixel or two short. It now waits on
@@ -485,6 +487,24 @@ place, so the moment the fullscreen box drops below full opacity the reader is
 looking at the EMPTY reserved slot behind it. Measured off a 60fps capture:
 ~80ms of blank screen at the end of every dismissal, and a blank first frame on
 every expand. Do not reintroduce an opacity-based enter or exit.
+
+#### Full screen runs UNDER the home indicator
+
+The expanded box clears no bottom safe area, and must not start: nothing on this
+side can paint that strip in the page's own colours (the preview is
+opaque-origin, unmeasurable and unreadable), so an inset drawn in
+`--color-paper` is a **white band across the bottom of every agent page that
+isn't white** — which the fixture's own white dashboard hid for as long as it
+existed. An indicator over the last ~34pt of a scrollable page is the smaller
+cost, and it is what a full-bleed web surface does everywhere else in the app.
+The top is different and keeps its clearance: the chrome bar is OURS, and
+`--html-preview-safe-top` pads it off the status bar.
+
+`HtmlPreviewUITests.testTheFullScreenPreviewReachesTheBottomEdge` samples the
+screenshot's bottom rows for brightness, because this is a claim about PIXELS —
+by `exists` and `isHittable` the band was invisible, the box was full screen and
+the iframe was in it. The demo document is deliberately DARK for the same
+reason; a white one takes the assertion with it.
 
 Two ways out, both the same morph home:
 
