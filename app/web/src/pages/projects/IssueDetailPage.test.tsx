@@ -169,6 +169,27 @@ describe('IssueDetailPage execution log', () => {
     expect(await screen.findByText(/No runs yet/)).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Run it now' })).toBeNull();
   });
+
+  it('reaches the transcript by icon, and says where the icon goes', async () => {
+    renderIssue(issue(), [{ ...run('done'), session_id: '01SESSION' }]);
+
+    // The word is gone from the rail but not from the accessibility tree —
+    // an unlabelled glyph is a link to nowhere for anybody not looking at it.
+    const link = await screen.findByRole('link', { name: 'Transcript of run #1' });
+    expect(link).toHaveAttribute('href', '#/traces/01SESSION');
+  });
+
+  it('keeps what a run cost on its own line, away from what a run is', async () => {
+    // Seven fields in a 340px rail used to `flex-wrap` at whatever point each
+    // row's own trigger label ran out of room, so no two rows lined up.
+    renderIssue(issue(), [{ ...run('done'), session_id: '01SESSION', cost_micros: 30_000 }]);
+
+    const cost = await screen.findByText('$0.03');
+    const metaRow = cost.parentElement;
+    expect(metaRow?.className).toContain('justify-end');
+    // …and the status chip is on the other line, not sharing the row.
+    expect(metaRow?.textContent).not.toContain('done');
+  });
 });
 
 describe('IssueDetailPage prose', () => {
@@ -396,8 +417,10 @@ describe('IssueDetailPage rail', () => {
       'In Progress',
     );
     expect(screen.getByText('Priority').closest('div')?.textContent).toContain('High');
-    expect(screen.getByLabelText('Status')).toHaveValue('in_progress');
-    expect(screen.getByLabelText('Priority')).toHaveValue('high');
+    // Each of the three is a button that names what it is set to, so a
+    // screen reader hears the value and not just the field.
+    expect(screen.getByLabelText('Status: In Progress')).toBeInTheDocument();
+    expect(screen.getByLabelText('Priority: High')).toBeInTheDocument();
     // A card with no parent and no blocker still says so. Leaving the row
     // out entirely made "no parent" and "this page is out of date" look the
     // same.
@@ -412,13 +435,32 @@ describe('IssueDetailPage rail', () => {
     expect(screen.getByText('0 / 0')).toBeInTheDocument();
   });
 
-  it('copies the branch without a clipboard, rather than throwing at one', async () => {
-    // `navigator.clipboard` is absent outside a secure context — which a
-    // dashboard on a plain-http LAN address is, and which jsdom is too.
+  it('lines every property value up on the right, picker-wrapped or not', async () => {
+    renderIssue(issue());
+    await screen.findByText('Status');
+
+    // Three of these rows sit inside a PickerOverlay, which is itself a flex
+    // container: without `w-full` the row is sized by its own content and
+    // `justify-between` has no slack to push the value into. That is what
+    // left Status/Priority/Assignee beside their labels while Parent and
+    // Blocked sat flush right. The fixed height is what evens the spacing
+    // out, the Assignee row carrying an 18px face and the rest one line.
+    for (const label of ['Status', 'Priority', 'Assignee', 'Parent', 'Blocked']) {
+      const row = screen.getByText(label).parentElement;
+      expect(row?.className, label).toContain('w-full');
+      expect(row?.className, label).toContain('justify-between');
+      expect(row?.className, label).toContain('min-h-[26px]');
+    }
+  });
+
+  it('names the branch, and says the worktree will not be there forever', async () => {
     renderIssue(issue({ branch: 'issue/7-ws-reconnect' }));
 
-    expect(await screen.findByText('issue/7-ws-reconnect')).toBeInTheDocument();
-    await userEvent.click(screen.getByRole('button', { name: 'copy' }));
-    expect(screen.getByRole('button', { name: 'copy' })).toBeInTheDocument();
+    // Truncated in the rail, so the full name has to be reachable somewhere.
+    expect(await screen.findByText('issue/7-ws-reconnect')).toHaveAttribute(
+      'title',
+      'issue/7-ws-reconnect',
+    );
+    expect(screen.getByText(/reclaimed at Done/)).toBeInTheDocument();
   });
 });

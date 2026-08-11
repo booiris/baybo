@@ -41,6 +41,14 @@
   --radius-brutal: 6px;
 }
 
+/* One reading size for a card's own text. The description and the comments
+   under it are the same document to whoever is reading them, and they sit a
+   few hundred pixels apart on the issue page — chat's roomier 15px is a
+   different surface, read full-width and one message at a time. */
+:root {
+  --text-card: 13.5px;
+}
+
 /* Assistant prose in the chat thread reads as Inter sans at a comfortable
    reading size (mono is kept for metadata/code via `font-mono`); the rest of
    the dashboard stays monospace. */
@@ -291,12 +299,12 @@ ol.md-list > li::before {
   position: relative;
   outline: none;
   font-family: var(--font-sans);
-  font-size: 15px;
-  line-height: 1.625;
+  font-size: var(--text-card);
+  line-height: 1.25;
 }
 
 .md-editor .ProseMirror > * + * {
-  margin-top: 0.5rem;
+  margin-top: 0.25rem;
 }
 
 .md-editor .ProseMirror h1,
@@ -378,5 +386,5 @@ ol.md-list > li::before {
    unlayered and would outrank any `text-*` on the same element — a plain
    utility here is a class that looks applied and never is. */
 .chat-prose.timeline-prose {
-  font-size: 13.5px;
+  font-size: var(--text-card);
 }

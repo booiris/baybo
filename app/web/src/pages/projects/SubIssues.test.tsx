@@ -94,31 +94,35 @@ describe('SubIssues', () => {
     const step = child(1, { assignee: 'id-dev' });
     const onStatus = renderSteps([step]);
     // A face and a status pill, as the mockup's row has them — the pickers
-    // are laid over them rather than replacing them with form widgets.
+    // wear them rather than replacing them with form widgets.
     expect(screen.getByTitle('@dev-1')).toBeInTheDocument();
     expect(screen.getByText('BACKLOG')).toBeInTheDocument();
 
-    await userEvent.selectOptions(
-      screen.getByLabelText(`Status of #${step.number}`),
-      'in_progress',
-    );
+    // The pill IS the control, and the panel it opens is the board's own
+    // columns rather than the operating system's dropdown.
+    await userEvent.click(screen.getByLabelText(`Status of #${step.number}: Backlog`));
+    await userEvent.click(screen.getByRole('button', { name: 'IN PROG' }));
     expect(onStatus).toHaveBeenCalledWith(step.number, 'in_progress');
+    // …and the panel is gone once it has been answered.
+    expect(screen.queryByRole('button', { name: 'IN PROG' })).toBeNull();
   });
 
   it('shows an empty seat rather than nothing when a step has nobody on it', () => {
     const step = child(1);
     renderSteps([step]);
     expect(screen.getByTitle('Unassigned')).toBeInTheDocument();
-    expect(screen.getByLabelText(`Assignee of #${step.number}`)).toHaveValue('');
+    expect(
+      screen.getByLabelText(`Assignee of #${step.number}: Unassigned`),
+    ).toBeInTheDocument();
   });
 
   it('does not offer to move a cancelled step or anything while saving', () => {
     const cancelled = child(0, { cancelled_at_ms: 1 });
     renderSteps([cancelled]);
-    expect(screen.getByLabelText(`Status of #${cancelled.number}`)).toBeDisabled();
+    expect(screen.getByLabelText(`Status of #${cancelled.number}: Backlog`)).toBeDisabled();
 
     const live = child(0);
     renderSteps([live], true);
-    expect(screen.getByLabelText(`Status of #${live.number}`)).toBeDisabled();
+    expect(screen.getByLabelText(`Status of #${live.number}: Backlog`)).toBeDisabled();
   });
 });

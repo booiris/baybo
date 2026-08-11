@@ -82,6 +82,16 @@ In the chat view the **thread sits on `surface`** (`#fffdf7`) while all **side p
 
 - **SearchBox:** Minimalist, with search icon and 2px border.
 - **SelectBox:** Custom styled to match the brutalist aesthetic.
+- **Picker** (`pages/projects/Picker.tsx`): a value you can press. The current
+  value *is* the trigger — a status pill, a priority word, a face — wearing a
+  caret, and the panel under it is a brutalist popover, not the OS dropdown.
+  It replaced a transparent native `<select>` laid over the value, which drew
+  an operating-system menu in the middle of a hand-drawn rail and gave the
+  value no sign it could be pressed at all. Options may carry a `node`, so the
+  status panel lists the board's own pills in column order and the assignee
+  panel lists faces. Deliberately **not** `role="listbox"`: the options are
+  ordinary buttons reachable by Tab, and claiming the role without arrow-key
+  roving would advertise an interaction that is not there.
 
 ## Iconography
 

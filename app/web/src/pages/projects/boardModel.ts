@@ -41,6 +41,17 @@ export const COLUMN_PILL_LABEL: Record<IssueStatus, string> = {
   done: 'DONE',
 };
 
+/// The tone a status wears wherever it is shown as a pill — the step rows,
+/// the rail's own picker, and that picker's panel. One table, so a column
+/// cannot read as "in progress" in one place and as nothing in another.
+export const STATUS_PILL: Record<IssueStatus, string> = {
+  backlog: 'border-black/35 bg-canvas text-ink-soft',
+  todo: 'border-black/35 bg-canvas text-ink',
+  in_progress: 'border-black bg-brand/30 text-ink font-bold',
+  review: 'border-info/45 bg-info/12 text-info',
+  done: 'border-ok/50 bg-ok/15 text-ok font-bold',
+};
+
 export const PRIORITIES: readonly IssuePriority[] = [
   'urgent',
   'high',

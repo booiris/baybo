@@ -2,10 +2,12 @@ import { Link } from 'react-router-dom';
 
 import { Avatar } from './Avatar';
 import { generatedPortrait, type Portrait } from './portrait';
-import { PickerOverlay } from './PickerOverlay';
+import { Picker, type PickerOption } from './Picker';
 import {
   COLUMN_LABEL,
   COLUMN_PILL_LABEL,
+  COLUMNS,
+  STATUS_PILL,
   type Agent,
   type Issue,
   type IssueStatus,
@@ -23,14 +25,6 @@ const STAGE_NOTE: Record<'done' | 'open' | 'waiting', string> = {
   done: 'finished',
   open: 'in progress',
   waiting: 'starts when the stage above finishes',
-};
-
-const STATUS_PILL: Record<IssueStatus, string> = {
-  backlog: 'border-black/35 bg-canvas text-ink-soft',
-  todo: 'border-black/35 bg-canvas text-ink',
-  in_progress: 'border-black bg-brand/30 text-ink font-bold',
-  review: 'border-info/45 bg-info/12 text-info',
-  done: 'border-ok/50 bg-ok/15 text-ok font-bold',
 };
 
 export function SubIssues({
@@ -58,13 +52,31 @@ export function SubIssues({
   if (children.length === 0) return null;
   const stages = groupByStage(children);
   const { done, total } = stageProgress(children);
-  const people = [
+  const people: PickerOption[] = [
     { value: '', label: 'Unassigned' },
-    ...team.map((agent) => ({ value: agent.id, label: `@${agent.handle}` })),
+    ...team.map((agent) => ({
+      value: agent.id,
+      label: `@${agent.handle}`,
+      node: (
+        <span className="inline-flex items-center gap-1.5">
+          <Avatar handle={agent.handle} src={portrait(agent.id)} size="sm" />@{agent.handle}
+        </span>
+      ),
+    })),
   ];
-  const statuses = (Object.keys(COLUMN_LABEL) as IssueStatus[]).map((status) => ({
+  // In board order, and wearing the board's pills: the panel is where you
+  // see what you are moving the step *to*, so it may as well show the
+  // pipeline instead of listing five words.
+  const statuses: PickerOption[] = COLUMNS.map((status) => ({
     value: status,
     label: COLUMN_LABEL[status],
+    node: (
+      <span
+        className={`rounded-full border px-2 font-mono text-[0.54rem] uppercase tracking-wider ${STATUS_PILL[status]}`}
+      >
+        {COLUMN_PILL_LABEL[status]}
+      </span>
+    ),
   }));
 
   return (
@@ -111,25 +123,24 @@ export function SubIssues({
                     >
                       {child.title}
                     </Link>
-                    <PickerOverlay
+                    <Picker
                       label={`Status of #${child.number}`}
+                      title="Move this step to another column"
                       value={child.status}
                       disabled={disabled || cancelled}
                       options={statuses}
                       onPick={(picked) => {
                         onStatus(child.number, picked as IssueStatus);
                       }}
+                      triggerClassName={`rounded-full border px-2 font-mono text-[0.54rem] uppercase tracking-wider ${
+                        STATUS_PILL[child.status]
+                      }`}
                     >
-                      <span
-                        className={`rounded-full border px-2 font-mono text-[0.54rem] uppercase tracking-wider ${
-                          STATUS_PILL[child.status]
-                        }`}
-                      >
-                        {COLUMN_PILL_LABEL[child.status]}
-                      </span>
-                    </PickerOverlay>
-                    <PickerOverlay
+                      {COLUMN_PILL_LABEL[child.status]}
+                    </Picker>
+                    <Picker
                       label={`Assignee of #${child.number}`}
+                      title="Hand this step to somebody"
                       value={child.assignee ?? ''}
                       disabled={disabled || cancelled}
                       options={people}
@@ -149,7 +160,7 @@ export function SubIssues({
                           size="sm"
                         />
                       )}
-                    </PickerOverlay>
+                    </Picker>
                   </li>
                 );
               })}

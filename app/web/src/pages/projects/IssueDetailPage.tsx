@@ -7,7 +7,7 @@ import {
   type ReactNode,
 } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import { RiArrowLeftLine, RiLoader4Line } from 'react-icons/ri';
+import { RiArrowLeftLine, RiGitMergeLine, RiLoader4Line } from 'react-icons/ri';
 
 import { useAdminClient, useAuth } from '../../api/auth';
 import {
@@ -26,6 +26,7 @@ import {
   COLUMNS,
   COLUMN_LABEL,
   PRIORITIES,
+  STATUS_PILL,
   assignableAgents,
   runDuration,
   unsettledRun,
@@ -39,7 +40,7 @@ import {
 import { MarkdownEditor } from './MarkdownEditor';
 import { Avatar } from './Avatar';
 import { useTeamPortraits } from './portrait';
-import { PickerOverlay } from './PickerOverlay';
+import { Picker, type PickerOption } from './Picker';
 import { SubIssues } from './SubIssues';
 import { Timeline } from './Timeline';
 import type { IssueEvent } from './timelineModel';
@@ -67,12 +68,46 @@ const PRIORITY_TONE: Record<IssuePriority, string> = {
 
 const railLabel = 'font-mono text-[0.6rem] font-bold uppercase tracking-[0.12em] text-ink-soft';
 
+/// The skin a rail value wears once it is pressable. Three of the five rows
+/// set something, and until they looked like this the rail read as a table of
+/// facts with three of its lines secretly controls.
+const railPickerChip =
+  'rounded-md border border-black/30 bg-canvas pl-1.5 pr-0.5 py-[1px] hover:border-black hover:bg-brand/25';
+
+/// The rail's status chip, minus its horizontal padding — the trigger and the
+/// panel's rows need different amounts, and everything else about them has to
+/// match. Same square corner as the priority chip beside it; the tone is the
+/// only thing a status says differently, because it is the one property on
+/// this rail worth reading without stopping to read it.
+const statusChipShape =
+  'rounded-md border py-[1px] font-mono text-[0.58rem] uppercase tracking-wider';
+
+function StatusPill({ status }: { status: IssueStatus }) {
+  return (
+    <span className={`${statusChipShape} px-2 ${STATUS_PILL[status]}`}>
+      {COLUMN_LABEL[status]}
+    </span>
+  );
+}
+
 const railBox = 'border-2 border-black rounded-md bg-surface px-3 py-2.5';
 
 /// One `label ── value` line of the property table.
+///
+/// `w-full` is load-bearing. The row is not always a block: it has sat inside
+/// a flex container, where without this it is sized by its own content and
+/// `justify-between` has no slack left to push the value into — which is what
+/// left three of these five values beside their labels while the other two
+/// sat flush right.
+///
+/// The height is pinned for the same kind of reason: the Assignee row carries
+/// an 18px face and the rest carry one line of 11px mono, so content-sized
+/// rows gave a five-row table five different line spacings. Centred rather
+/// than baselined, because an inline-flex box holding an avatar does not have
+/// a baseline anybody would choose.
 function Row({ label, children }: { label: string; children: ReactNode }) {
   return (
-    <div className="flex items-baseline justify-between gap-2.5 py-[3px] font-mono text-[0.68rem]">
+    <div className="flex w-full min-h-[26px] items-center justify-between gap-2.5 py-[2px] font-mono text-[0.68rem]">
       <span className="shrink-0 text-ink-soft">{label}</span>
       <span className="min-w-0 text-right font-bold break-words">{children}</span>
     </div>
@@ -113,42 +148,67 @@ function RunRow({
 }) {
   const duration = runDuration(run, Date.now());
   const live = run.status === 'queued' || run.status === 'running' || run.status === 'held';
+  const cost =
+    run.cost_micros != null && run.cost_micros > 0 ? formatUsd(run.cost_micros) : null;
   // A live run can be stopped; every run has a transcript once it has a
   // session to open. Nothing here starts one — work begins by moving the
   // card, putting somebody on it, commenting, a stage barrier, or the board
   // taking it off the top of Todo.
+  //
+  // Two fixed lines rather than one wrapping one: seven fields in a 340px
+  // rail meant `flex-wrap` broke each run at whatever point its own trigger
+  // label ran out of room, so no two rows in the log lined up. What the row
+  // *is* stays on the first line, what it *cost* and what you can *do* on
+  // the second, flush right.
+  const meta = duration != null || cost != null || live || run.session_id != null;
   return (
-    <li className="flex flex-wrap items-center gap-2 py-1.5 border-b border-black/15 last:border-0 font-mono text-[0.62rem]">
-      <span className="font-bold">#{run.attempt}</span>
-      <span className="text-ink-soft">{RUN_TRIGGER_LABEL[run.trigger]}</span>
-      <span
-        className={`rounded-full border px-2 font-bold uppercase tracking-wider ${RUN_TONE[run.status]}`}
-      >
-        {run.status}
-      </span>
-      {duration != null ? <span className="text-ink-soft">{duration}</span> : null}
-      {run.cost_micros != null && run.cost_micros > 0 ? (
-        <span className="text-ink-soft tabular-nums" title="What this run's model calls cost">
-          {formatUsd(run.cost_micros)}
+    <li className="py-1.5 border-b border-black/15 last:border-0 font-mono text-[0.62rem]">
+      <div className="flex items-center gap-2">
+        <span className="shrink-0 font-bold">#{run.attempt}</span>
+        <span
+          className="min-w-0 flex-1 truncate text-ink-soft"
+          title={RUN_TRIGGER_LABEL[run.trigger]}
+        >
+          {RUN_TRIGGER_LABEL[run.trigger]}
         </span>
+        <span
+          className={`shrink-0 rounded-full border px-2 font-bold uppercase tracking-wider ${RUN_TONE[run.status]}`}
+        >
+          {run.status}
+        </span>
+      </div>
+      {meta ? (
+        <div className="mt-1 flex items-center justify-end gap-2.5 text-ink-soft">
+          {duration != null ? <span className="tabular-nums">{duration}</span> : null}
+          {cost != null ? (
+            <span className="tabular-nums" title="What this run's model calls cost">
+              {cost}
+            </span>
+          ) : null}
+          {live ? (
+            <button
+              type="button"
+              className="font-bold text-err underline cursor-pointer disabled:opacity-50"
+              disabled={busy}
+              onClick={onCancel}
+            >
+              Cancel
+            </button>
+          ) : null}
+          {run.session_id != null ? (
+            // The trace page's own icon, so the link wears the face of where
+            // it lands rather than a second symbol for the same place.
+            <a
+              aria-label={`Transcript of run #${run.attempt}`}
+              title="Open this run's transcript"
+              href={`#/traces/${encodeURIComponent(run.session_id)}`}
+              className="flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded-md border border-black/40 bg-surface text-info hover:border-black hover:bg-brand hover:text-ink"
+            >
+              <RiGitMergeLine aria-hidden />
+            </a>
+          ) : null}
+        </div>
       ) : null}
-      <span className="ml-auto flex items-center gap-2 font-bold">
-        {live ? (
-          <button
-            type="button"
-            className="text-err underline cursor-pointer disabled:opacity-50"
-            disabled={busy}
-            onClick={onCancel}
-          >
-            Cancel
-          </button>
-        ) : null}
-        {run.session_id != null ? (
-          <a className="text-info underline" href={`#/traces/${encodeURIComponent(run.session_id)}`}>
-            Transcript
-          </a>
-        ) : null}
-      </span>
     </li>
   );
 }
@@ -176,7 +236,6 @@ export function IssueDetailPage() {
   const [confirmCancel, setConfirmCancel] = useState(false);
   const [blocking, setBlocking] = useState(false);
   const [blockReason, setBlockReason] = useState('');
-  const [copied, setCopied] = useState(false);
   const [editingTitle, setEditingTitle] = useState(false);
   const serverTitle = useRef('');
   /// What the editor last reported, for a blur listener that was registered
@@ -501,31 +560,6 @@ export function IssueDetailPage() {
     void apply({ blocked_reason: reason });
   }, [apply, blockReason]);
 
-  /// Copying the branch name, defensively. `navigator.clipboard` is typed as
-  /// always present but is **absent** outside a secure context — which a
-  /// dashboard served over plain http on a LAN address is — so reading
-  /// `.writeText` off `undefined` throws synchronously. The board's branch
-  /// chip has guarded this since it shipped; this rail did not.
-  const copyBranch = useCallback((branch: string | null | undefined) => {
-    if (branch == null) return;
-    try {
-      void navigator.clipboard.writeText(branch).then(
-        () => {
-          setCopied(true);
-          window.setTimeout(() => {
-            setCopied(false);
-          }, 1200);
-        },
-        () => {
-          // Nothing: the name is still in the title attribute, and a
-          // "copied" that did not happen is worse than silence.
-        },
-      );
-    } catch {
-      // Same reasoning.
-    }
-  }, []);
-
   if (loading) {
     return (
       <div className="flex flex-1 items-center justify-center">
@@ -548,6 +582,32 @@ export function IssueDetailPage() {
   const blocked = issue.blocked_reason != null;
   const live = unsettledRun(runs);
   const children = board.filter((candidate) => candidate.parent === issue.number);
+
+  // In board order and wearing the board's own pills, so the panel shows the
+  // pipeline the card is moving along rather than listing five words.
+  const statusOptions: PickerOption[] = COLUMNS.map((status) => ({
+    value: status,
+    label: COLUMN_LABEL[status],
+    node: <StatusPill status={status} />,
+  }));
+  const priorityOptions: PickerOption[] = PRIORITIES.map((priority) => ({
+    value: priority,
+    label: PRIORITY_LABEL[priority],
+    node: <span className={PRIORITY_TONE[priority]}>{PRIORITY_LABEL[priority]}</span>,
+  }));
+  const assigneeOptions: PickerOption[] = [
+    { value: '', label: 'Unassigned' },
+    ...agents.map((agent) => ({
+      value: agent.id,
+      label: `@${agent.handle} — ${agent.name}`,
+      node: (
+        <span className="inline-flex min-w-0 items-center gap-1.5">
+          <Avatar handle={agent.handle} src={portrait(agent.id)} size="sm" />
+          <span className="truncate">@{agent.handle}</span>
+        </span>
+      ),
+    })),
+  ];
 
   return (
     <div className="flex flex-col h-full min-h-0">
@@ -877,54 +937,50 @@ export function IssueDetailPage() {
               </div>
             </div>
             <div className="mt-1.5">
-              <PickerOverlay
-                label="Status"
-                className="flex w-full"
-                value={issue.status}
-                disabled={saving}
-                options={COLUMNS.map((status) => ({ value: status, label: COLUMN_LABEL[status] }))}
-                onPick={(picked) => {
-                  void relocate(picked as IssueStatus);
-                }}
-              >
-                <Row label="Status">{COLUMN_LABEL[issue.status]}</Row>
-              </PickerOverlay>
-              <PickerOverlay
-                label="Priority"
-                className="flex w-full"
-                value={issue.priority}
-                disabled={saving}
-                options={PRIORITIES.map((priority) => ({
-                  value: priority,
-                  label: PRIORITY_LABEL[priority],
-                }))}
-                onPick={(picked) => {
-                  void apply({ priority: picked as IssuePriority });
-                }}
-              >
-                <Row label="Priority">
-                  <span className={PRIORITY_TONE[issue.priority]}>
-                    {PRIORITY_LABEL[issue.priority]}
-                  </span>
-                </Row>
-              </PickerOverlay>
-              <PickerOverlay
-                label="Assignee"
-                className="flex w-full"
-                value={issue.assignee ?? ''}
-                disabled={saving}
-                options={[
-                  { value: '', label: 'Unassigned' },
-                  ...agents.map((agent) => ({
-                    value: agent.id,
-                    label: `@${agent.handle} — ${agent.name}`,
-                  })),
-                ]}
-                onPick={(picked) => {
-                  void apply({ assignee: picked.length > 0 ? picked : null });
-                }}
-              >
-                <Row label="Assignee">
+              <Row label="Status">
+                <Picker
+                  label="Status"
+                  title="Move this card to another column"
+                  value={issue.status}
+                  disabled={saving}
+                  options={statusOptions}
+                  onPick={(picked) => {
+                    void relocate(picked as IssueStatus);
+                  }}
+                  triggerClassName={`${statusChipShape} pl-2 pr-0.5 ${
+                    STATUS_PILL[issue.status]
+                  } hover:border-black`}
+                >
+                  {COLUMN_LABEL[issue.status]}
+                </Picker>
+              </Row>
+              <Row label="Priority">
+                <Picker
+                  label="Priority"
+                  title="Change this card's priority"
+                  value={issue.priority}
+                  disabled={saving}
+                  options={priorityOptions}
+                  onPick={(picked) => {
+                    void apply({ priority: picked as IssuePriority });
+                  }}
+                  triggerClassName={`${railPickerChip} ${PRIORITY_TONE[issue.priority]}`}
+                >
+                  {PRIORITY_LABEL[issue.priority]}
+                </Picker>
+              </Row>
+              <Row label="Assignee">
+                <Picker
+                  label="Assignee"
+                  title="Hand this card to somebody"
+                  value={issue.assignee ?? ''}
+                  disabled={saving}
+                  options={assigneeOptions}
+                  onPick={(picked) => {
+                    void apply({ assignee: picked.length > 0 ? picked : null });
+                  }}
+                  triggerClassName={railPickerChip}
+                >
                   {issue.assignee == null ? (
                     <span className="font-normal text-ink-soft">Unassigned</span>
                   ) : (
@@ -934,12 +990,11 @@ export function IssueDetailPage() {
                         src={portrait(issue.assignee)}
                         size="sm"
                       />
-                      @
-                      {handleOf(agents, issue.assignee)}
+                      @{handleOf(agents, issue.assignee)}
                     </span>
                   )}
-                </Row>
-              </PickerOverlay>
+                </Picker>
+              </Row>
               <Row label="Parent">
                 {issue.parent == null ? (
                   <span className="font-normal text-ink-soft">—</span>
@@ -972,19 +1027,9 @@ export function IssueDetailPage() {
                 <code className="min-w-0 flex-1 truncate" title={issue.branch}>
                   {issue.branch}
                 </code>
-                <button
-                  type="button"
-                  className="shrink-0 font-bold text-info underline cursor-pointer"
-                  onClick={() => {
-                    copyBranch(issue.branch);
-                  }}
-                >
-                  {copied ? 'copied' : 'copy'}
-                </button>
               </div>
               <p className="mt-1.5 font-mono text-[0.56rem] text-ink-soft leading-snug">
-                No diff and no merge button here — take the branch locally, or ask the assignee in a
-                comment. The worktree is reclaimed once this card reaches Done.
+                No diff or merge here. The worktree is reclaimed at Done.
               </p>
             </section>
           ) : null}
@@ -994,12 +1039,12 @@ export function IssueDetailPage() {
             {/* Read-only, apart from stopping what is running: the log
                 reports the board's work rather than commanding it. */}
             {runs.length === 0 ? (
-              <p className="mt-2 font-mono text-[0.62rem] text-ink-soft leading-snug">
+              <p className="mt-1.5 font-mono text-[0.62rem] text-ink-soft leading-snug">
                 No runs yet — this card starts working when it reaches In Progress with an
                 assignee.
               </p>
             ) : (
-              <ul className="mt-2 flex flex-col">
+              <ul className="mt-1.5 flex flex-col">
                 {runs.map((run) => (
                   <RunRow
                     key={run.attempt}
