@@ -26,13 +26,33 @@ use crate::runtime::sandbox::SandboxAdapter;
 use crate::security::SecurityGateway;
 
 /// The read-only paths a session's sandbox re-binds over the `$BAYBO_HOME`
-/// mask: the **calling agent's own** skill directory, and nothing else.
+/// mask: the **calling agent's own** skill directory, and the blob payload
+/// tree. Nothing else — the mask exists to keep `storage.db` (every
+/// transcript, the secrets rows, and every blob's `read_token`) and the
+/// browser profile's cookies out of a shell, and each entry added here
+/// carves a hole in exactly that.
 ///
-/// Not optional — `SkillInstall` writes there, so without the bind an agent
-/// can install a skill whose bundled `scripts/` it is then unable to run. And
-/// deliberately only its own: binding a second agent's directory would hand
-/// this session read access to skills its scope does not admit, which is the
-/// isolation the scoped registry exists to provide.
+/// The skill directory is not optional — `SkillInstall` writes there, so
+/// without the bind an agent can install a skill whose bundled `scripts/` it
+/// is then unable to run. And deliberately only its own: binding a second
+/// agent's directory would hand this session read access to skills its scope
+/// does not admit, which is the isolation the scoped registry exists to
+/// provide.
+///
+/// `blobs/` is what makes `GetBlob` worth anything: the tool answers with the
+/// store's own path, and a path the sandbox masks is a path the model cannot
+/// hand to `ffmpeg`. **Read-only is load-bearing, not incidental** — the
+/// payload is content-addressed and shared by every row with that digest, so
+/// a writable bind would let one in-place edit rewrite every blob referencing
+/// that content. Note this is a *directory* bind, not a per-blob one: a shell
+/// can enumerate and read every blob on the host, which is why `GetBlob`
+/// still enforces the `read_token` (a tool answer is a capability check; a
+/// shell already has the filesystem).
+///
+/// **Must stay in step with `BashTool::nameable_workspace_roots`**, which
+/// exempts exactly these from the tool-layer work-dir jail. That check runs
+/// *before* the sandbox is built, so a path bound here but not exempted
+/// there is rejected on its string and never reaches the mount at all.
 ///
 /// A named function rather than an inline `vec![]` so the rule is assertable —
 /// binding the wrong agent's directory is a silent privacy regression that
@@ -41,7 +61,7 @@ fn sandbox_readable_paths(
     paths: &baybo_workspace::WorkspacePaths,
     agent: &baybo_model::AgentProfileId,
 ) -> Vec<PathBuf> {
-    vec![agent.skills_dir(paths)]
+    vec![agent.skills_dir(paths), paths.blobs_dir()]
 }
 
 /// Preview length used when rendering parameters inside an approval prompt.
@@ -938,19 +958,19 @@ impl ToolExecutor {
 
 #[cfg(test)]
 mod tests {
-    /// The sandbox binds the caller's own skill directory and no other
-    /// agent's. Nothing downstream fails if the wrong one is bound — the
-    /// session simply gains read access to skills its scope does not admit —
-    /// so this is the only place that catches it.
+    /// The sandbox binds the caller's own skill directory and the blob tree,
+    /// and nothing else. Nothing downstream fails if the wrong thing is
+    /// bound — the session simply gains read access it should not have — so
+    /// this is the only place that catches it.
     #[test]
-    fn the_sandbox_binds_only_the_calling_agents_skill_dir() {
+    fn the_sandbox_binds_only_the_calling_agents_skills_and_the_blob_tree() {
         let paths = baybo_workspace::WorkspacePaths::new(std::path::PathBuf::from("/ws"));
         let mine = baybo_model::AgentProfileId::parse("01JMINE").expect("valid id");
         let theirs = baybo_model::AgentProfileId::parse("01JTHEIRS").expect("valid id");
 
         assert_eq!(
             super::sandbox_readable_paths(&paths, &mine),
-            vec![paths.persona_skills_dir("01JMINE")],
+            vec![paths.persona_skills_dir("01JMINE"), paths.blobs_dir()],
         );
         assert!(
             !super::sandbox_readable_paths(&paths, &mine)
@@ -961,12 +981,23 @@ mod tests {
         // else, and gets that one rather than a workspace-wide tree.
         assert_eq!(
             super::sandbox_readable_paths(&paths, &baybo_model::AgentProfileId::builtin()),
-            vec![paths.persona_skills_dir(baybo_workspace::paths::BUILTIN_PERSONA_DIR)],
+            vec![
+                paths.persona_skills_dir(baybo_workspace::paths::BUILTIN_PERSONA_DIR),
+                paths.blobs_dir(),
+            ],
         );
         assert_ne!(
             super::sandbox_readable_paths(&paths, &theirs),
             super::sandbox_readable_paths(&paths, &mine),
         );
+
+        // The mask exists for what is NOT on this list. `blobs/` is a child
+        // of `state/`; binding the parent would expose `storage.db` — every
+        // transcript, the secrets rows, and every blob's read_token — plus
+        // the browser profile's cookies, to any shell command.
+        let bound = super::sandbox_readable_paths(&paths, &mine);
+        assert!(!bound.contains(&paths.state_dir()), "{bound:?}");
+        assert!(!bound.contains(&paths.root().to_path_buf()), "{bound:?}");
     }
 
     use super::*;
