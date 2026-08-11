@@ -159,6 +159,14 @@ returns spans rather than a string, so the sentence is not marked up in one
 place and written in another. A comment is narrated, never quoted: an agent's
 run report is hundreds of words that would bury every line around it.
 
+The drawer slides in before its first fetch answers, so the wait is on screen.
+It is filled with **placeholder rows in the real rows' geometry** rather than
+left empty or given a spinner — an empty frame that fills a moment later lands
+as two separate events, and a spinner throws the rows away and puts them back.
+The row frame is one constant shared by a real line and its placeholder,
+because a skeleton is only worth anything if nothing moves when it is replaced.
+Only the first load shows them: a refresh keeps the rows it already has.
+
 A settled-run line carries what the run took and cost — `run #1 done on #7 ·
 2m10s · $0.04`. Both numbers are **derived server-side** over the run's own
 cost window, by the same query the execution log uses, and arrive on the feed

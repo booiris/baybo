@@ -5,6 +5,35 @@ import { useAdminClient, useAuth } from '../../api/auth';
 import { fetchFeed } from './api';
 import { eventAgo, feedLine, feedTone, TONE_DOT, type FeedEntry } from './timelineModel';
 
+/// One row's frame, shared by a real line and by its placeholder — the
+/// placeholder is only worth anything if the rows do not move when it is
+/// replaced.
+const FEED_ROW = 'flex gap-2 px-3 py-2 border-b border-black/15 text-left';
+
+/// Ragged on purpose: sentences are not a column of equal bars, and equal
+/// bars read as a table that is about to arrive.
+const SKELETON_WIDTHS = ['72%', '54%', '83%', '46%', '66%', '58%', '77%'];
+
+/// The rows' geometry, before there are rows.
+///
+/// The panel slides in before its first fetch answers, so without these it
+/// arrives as an empty box and fills a moment later — the frame and its
+/// contents landing as two separate events.
+function FeedSkeleton() {
+  return (
+    <div role="status" className="flex flex-col">
+      <span className="sr-only">Loading this board’s activity…</span>
+      {SKELETON_WIDTHS.map((width, index) => (
+        <div key={index} aria-hidden className={`${FEED_ROW} motion-safe:animate-pulse`}>
+          <span className="mt-1 h-2 w-2 shrink-0 rounded-full bg-ink-soft/25" />
+          <span className="h-3 rounded-sm bg-ink-soft/15" style={{ width }} />
+          <span className="ml-auto h-3 w-5 shrink-0 rounded-sm bg-ink-soft/15" />
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export function ActivityDrawer({
   projectId,
   refreshKey,
@@ -63,6 +92,7 @@ export function ActivityDrawer({
             {error}
           </p>
         ) : null}
+        {loading && error === null ? <FeedSkeleton /> : null}
         {!loading && error === null && events.length === 0 ? (
           <p className="m-auto px-4 text-center font-mono text-[0.66rem] text-ink-soft">
             Nothing has happened on this board yet.
@@ -104,11 +134,10 @@ export function ActivityDrawer({
               </span>
             </>
           );
-          const shape = 'flex gap-2 px-3 py-2 border-b border-black/15 text-left';
           // A hire belongs to the board, so there is no card to open — it
           // renders as a plain row rather than a button that goes nowhere.
           return card == null ? (
-            <div key={`${event.created_at_ms}-${index}`} className={shape}>
+            <div key={`${event.created_at_ms}-${index}`} className={FEED_ROW}>
               {line}
             </div>
           ) : (
@@ -118,7 +147,7 @@ export function ActivityDrawer({
               onClick={() => {
                 onOpenIssue(card);
               }}
-              className={`${shape} hover:bg-brand/15`}
+              className={`${FEED_ROW} hover:bg-brand/15`}
             >
               {line}
             </button>

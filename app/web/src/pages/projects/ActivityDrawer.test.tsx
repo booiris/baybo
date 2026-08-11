@@ -116,6 +116,25 @@ describe('ActivityDrawer', () => {
     expect(onOpenIssue).toHaveBeenCalledWith(7);
   });
 
+  it('arrives with its rows in place rather than as an empty box', async () => {
+    let answer!: (outcome: unknown) => void;
+    feed.fetchFeed.mockReturnValue(
+      new Promise((resolve) => {
+        answer = resolve;
+      }),
+    );
+    render(
+      <ActivityDrawer projectId="p" refreshKey={0} onClose={vi.fn()} onOpenIssue={vi.fn()} />,
+    );
+    // The panel slides in before the first fetch answers, so the wait is
+    // seen — an empty frame that fills a moment later lands as two events.
+    expect(screen.getByRole('status')).toBeInTheDocument();
+
+    answer({ kind: 'ok', value: [entry('a', 4, { kind: 'opened' })] });
+    expect(await screen.findByRole('button', { name: /@dev-1 opened #4/ })).toBeInTheDocument();
+    expect(screen.queryByRole('status')).toBeNull();
+  });
+
   it('says so when the board has no history yet', async () => {
     feed.fetchFeed.mockResolvedValue({ kind: 'ok', value: [] });
     render(
