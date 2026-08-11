@@ -285,37 +285,6 @@ impl BashTool {
         }
     }
 
-    /// The calling agent's skill directory — the one tree a command may name
-    /// paths inside besides `work/`. It is bound read-only into the sandbox,
-    /// and running an installed skill's bundled script in place is the point.
-    /// Per call rather than per process because the agent decides it, and
-    /// another agent's tree is neither bound nor exempt.
-    /// The workspace-internal paths a command may name, beyond `work/`.
-    ///
-    /// **Must stay in step with `sandbox_readable_paths`** in the agent
-    /// crate's tool executor, which binds exactly these read-only over the
-    /// `$BAYBO_HOME` mask. The two are one decision expressed twice — the
-    /// crate boundary (agent depends on tools, not the reverse) is why —
-    /// and they fail in opposite, silent ways: a path bound there but not
-    /// exempted here is rejected before the sandbox is ever built, and one
-    /// exempted here but not bound there resolves to an empty tmpfs.
-    ///
-    /// - the caller's own `skills/`, so an installed skill's `scripts/` run
-    ///   in place;
-    /// - `state/blobs/`, so a `GetBlob` path can be handed to the program
-    ///   that consumes it.
-    ///
-    /// Read-only is the OS sandbox's job, not this check's: the guard is
-    /// lexical and cannot tell a read from a write. Under `permission =
-    /// free` there is no sandbox, so both roots are writable — the same
-    /// trade the skills exemption has always made.
-    fn nameable_workspace_roots(&self, ctx: &ToolContext) -> Vec<PathBuf> {
-        vec![
-            absolutise(&ctx.agent_id.skills_dir(&ctx.workspace_paths)),
-            absolutise(&ctx.workspace_paths.blobs_dir()),
-        ]
-    }
-
     /// Pin a fixed permission mode via a fresh (non-shared) handle. For callers
     /// that don't participate in hot-reload — mainly tests.
     #[cfg(test)]
@@ -722,7 +691,7 @@ impl Tool for BashTool {
                 &command,
                 &self.workspace_root,
                 &self.work_dir,
-                &self.nameable_workspace_roots(ctx),
+                &crate::shell_reachable_workspace_roots(&ctx.workspace_paths, &ctx.agent_id),
             )?;
         }
         // The bench profile has no work-dir jail, so a command with no explicit

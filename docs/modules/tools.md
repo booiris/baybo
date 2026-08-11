@@ -116,20 +116,25 @@ wearing one name. Three invariants:
   parent→subagent and cron-fire handoffs while leaving the real enumeration
   path open. If that ever needs closing, it belongs on `session export`.
 
-Reaching that path from a shell takes **two** cooperating changes, and each
-is silently useless without the other. `sandbox_readable_paths`
-(`crates/agent/src/runtime/tool_executor.rs`) binds
-`WorkspacePaths::blobs_dir()` (`<root>/state/blobs/`) back over the
-`$BAYBO_HOME` tmpfs mask, read-only — and `BashTool::nameable_workspace_roots`
-exempts the same directory from the tool-layer work-dir jail
-(`require_command_paths_within_work_dir`), which rejects any absolute token
-inside the workspace but outside `work/`. **The jail runs first**, on the path
-string, before a sandbox is ever built: with the bind alone, `ffmpeg -i <blob
-path>` comes back `InvalidParams` and the mount is never reached. The two
-lists are one decision expressed twice — the crate boundary (agent depends on
-tools, not the reverse) is why — so each side's doc comment names the other.
-Note the exemption is lexical and cannot distinguish read from write; under
-`permission = free` there is no sandbox and the tree is writable, the same
+Reaching that path from a shell needs **two gates to agree**, at different
+layers. `baybo_tools::shell_reachable_workspace_roots` is the single list
+both read: the caller's own `skills/` and `<root>/state/blobs/`.
+
+1. `BashTool` walks the command string and rejects any absolute token inside
+   the workspace but outside `work/` (`require_command_paths_within_work_dir`)
+   — everything on the list is exempt.
+2. The agent runtime binds the same entries read-only over the `$BAYBO_HOME`
+   tmpfs mask when it builds the sandbox.
+
+**The tool-layer check runs first**, before a process exists, so the two fail
+in opposite and equally silent ways: exempted but unbound resolves inside the
+empty mask (`No such file or directory`), bound but unexempted is refused on
+the string and the mount is never reached — `ffmpeg -i <blob path>` comes back
+`InvalidParams`. These were two independently maintained lists and drifted
+exactly that way, which is why the function exists instead of a comment asking
+the next editor to keep them in step. The exemption is lexical and cannot
+distinguish a read from a write, so read-only is the sandbox's doing; under
+`permission = free` there is no sandbox and both roots are writable, the same
 trade the `skills/` exemption has always made. Mount order is last-wins, so a child of a
 masked directory can be re-exposed for itself alone: verified end-to-end
 against real `bwrap`, a sandboxed shell reads a blob payload in full, gets
