@@ -120,6 +120,31 @@ mode collapsing the strip could introduce, and the badge is what rules it out.
 `boardFilter.ts` owns the list of narrowings (`restrictionCount`), because the
 badge and the Clear button must never disagree about what counts as filtered.
 
+## Activity drawer
+
+A **stream, not a stack of cards**: each entry is one flat row separated by a
+1px rule, never its own bordered surface. A row is a tone dot, one sentence,
+and a right-aligned relative time.
+
+The dot is the point. `timelineModel.eventTone` maps every entry to the board's
+six-colour vocabulary and `TONE_DOT` renders it — the same alphabet the card's
+own timeline rail uses, which is why both live in `timelineModel.ts` rather
+than in either component. The drawer is skimmed down its left edge before any
+of it is read, so a failed run and a hire have to be distinguishable without
+parsing either sentence.
+
+The sentence is `feedLine`, **not** `describeEvent` with the actor bolted on
+the front. `describeEvent` writes for a pane that is one card, so it can say
+"moved it to Review"; in a board-wide feed that names nothing. Every feed line
+names its card. Who acted, which card, and the one word that says how a run
+ended are bold; everything joining them is not — which is why `feedLine`
+returns spans rather than a string, so the sentence is not marked up in one
+place and written in another. A comment is narrated, never quoted: an agent's
+run report is hundreds of words that would bury every line around it.
+
+The drawer is **read-only**. Approvals appear here with a warn dot and are
+answered on the issue's own timeline; there are no action buttons in the feed.
+
 ## Dragging a card
 
 The drop target is decided by `pages/projects/dropTarget.ts`, not by one of

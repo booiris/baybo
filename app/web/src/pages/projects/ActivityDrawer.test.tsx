@@ -43,9 +43,38 @@ describe('ActivityDrawer', () => {
     render(
       <ActivityDrawer projectId="p" refreshKey={0} onClose={vi.fn()} onOpenIssue={vi.fn()} />,
     );
-    expect(await screen.findByText('commented')).toBeInTheDocument();
+    // Every line names its card: `describeEvent`'s "moved it to Review" is
+    // written for a pane that is one card, and names nothing in a feed.
+    expect(
+      await screen.findByRole('button', { name: /@dev-1 commented on #4/ }),
+    ).toBeInTheDocument();
     expect(screen.queryByText(/Root cause confirmed/)).not.toBeInTheDocument();
-    expect(screen.getByText(/moved it from/)).toBeInTheDocument();
+    expect(
+      screen.getByRole('button', { name: /@dev-1 moved #4 Todo → In Progress/ }),
+    ).toBeInTheDocument();
+  });
+
+  it('colours each line by what happened, so a failure is not a hire', async () => {
+    feed.fetchFeed.mockResolvedValue({
+      kind: 'ok',
+      value: [
+        entry('a', 9, { kind: 'run_settled', attempt: 3, status: 'failed', error: 'boom' }),
+        entry('b', 7, { kind: 'run_settled', attempt: 1, status: 'done' }),
+        entry('c', 8, { kind: 'blocked', reason: 'sandbox has no tmux' }),
+      ],
+    });
+    render(
+      <ActivityDrawer projectId="p" refreshKey={0} onClose={vi.fn()} onOpenIssue={vi.fn()} />,
+    );
+    await screen.findByRole('button', { name: /run #3 failed on #9 — boom/ });
+    // The whole point of the feed is being skimmed down its left edge before
+    // any of it is read.
+    const dots = screen.getByRole('complementary').querySelectorAll('span[aria-hidden]');
+    expect([...dots].map((dot) => dot.className)).toEqual([
+      expect.stringContaining('bg-err'),
+      expect.stringContaining('bg-ok'),
+      expect.stringContaining('bg-warn'),
+    ]);
   });
 
   it('shows a hire, which belongs to the board and opens no card', async () => {
@@ -66,9 +95,11 @@ describe('ActivityDrawer', () => {
     render(
       <ActivityDrawer projectId="p" refreshKey={0} onClose={vi.fn()} onOpenIssue={onOpenIssue} />,
     );
-    const row = await screen.findByText('hired @tester');
-    expect(screen.getByText('@lead')).toBeInTheDocument();
-    await userEvent.click(row);
+    const named = await screen.findByText('@tester');
+    expect(screen.getByRole('complementary').textContent).toContain('@lead hired @tester');
+    // No card to open, so it is not a button that goes nowhere.
+    expect(screen.queryByRole('button', { name: /hired/ })).toBeNull();
+    await userEvent.click(named);
     expect(onOpenIssue).not.toHaveBeenCalled();
   });
 
@@ -81,7 +112,7 @@ describe('ActivityDrawer', () => {
     render(
       <ActivityDrawer projectId="p" refreshKey={0} onClose={vi.fn()} onOpenIssue={onOpenIssue} />,
     );
-    await userEvent.click(await screen.findByText(/opened this issue/));
+    await userEvent.click(await screen.findByRole('button', { name: /@dev-1 opened #7/ }));
     expect(onOpenIssue).toHaveBeenCalledWith(7);
   });
 

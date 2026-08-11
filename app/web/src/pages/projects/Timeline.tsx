@@ -20,6 +20,7 @@ import {
   eventShape,
   eventTime,
   eventTone,
+  TONE_DOT,
   pendingApprovals,
   type IssueEvent,
   type PendingApproval as PendingApprovalRow,
@@ -29,15 +30,6 @@ import {
 /// How tall the composer may grow before it scrolls instead. The chat
 /// composer's number, so the two boxes behave the same.
 const COMPOSER_MAX_PX = 200;
-
-const TONE_DOT: Record<Tone, string> = {
-  ok: 'bg-ok',
-  err: 'bg-err',
-  warn: 'bg-warn',
-  info: 'bg-info',
-  brand: 'bg-brand-hover',
-  muted: 'bg-ink-soft',
-};
 
 /// One node on the rail. The dot is a real element rather than a `::before`
 /// so its colour can come from the entry it belongs to.

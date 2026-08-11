@@ -21,6 +21,18 @@ export function eventShape(event: IssueEvent): EventShape {
 /// cannot mean a warning in one place and work-about-to-start in another.
 export type Tone = 'ok' | 'err' | 'warn' | 'info' | 'brand' | 'muted';
 
+/// The vocabulary as classes. Lives with `eventTone` rather than in either
+/// component, because the card's rail and the board's feed are two readers of
+/// one alphabet — a second copy is how amber starts meaning two things.
+export const TONE_DOT: Record<Tone, string> = {
+  ok: 'bg-ok',
+  err: 'bg-err',
+  warn: 'bg-warn',
+  info: 'bg-info',
+  brand: 'bg-brand-hover',
+  muted: 'bg-ink-soft',
+};
+
 /// What colour an entry's dot is. The timeline is skimmed down its rail
 /// before it is read, so a failure and a hire must be distinguishable
 /// without parsing either sentence.
@@ -251,14 +263,104 @@ export function feedActorLabel(entry: FeedEntry): string {
   }
 }
 
-/// What a feed line says. A comment's own words are deliberately *not* the
-/// line: the feed is a list of things that happened, and an agent's
-/// run report is hundreds of words that would bury every line around it.
-/// The card's timeline is where the text belongs.
-export function describeFeedEntry(entry: FeedEntry): string {
-  if (entry.body.kind === 'hired') {
-    return `hired @${entry.body.agent.handle}`;
+/// What colour a **feed** line's dot is. The board-level entries have no
+/// `IssueEventBody` to ask, so the feed needs its own door onto the same
+/// vocabulary rather than a second one beside it.
+export function feedTone(entry: FeedEntry): Tone {
+  if (entry.body.kind === 'hired') return 'brand';
+  return eventTone(entry.body);
+}
+
+/// A run of text, and whether it is the part the eye should land on.
+///
+/// The feed is skimmed, so who acted, which card, and the one word that says
+/// how it went are set in bold and everything joining them is not. A plain
+/// string could not carry that, and marking it up in the component would put
+/// the sentence in two places.
+export type Span = { text: string; strong?: boolean };
+
+function who(entry: FeedEntry): Span[] {
+  return [{ text: feedActorLabel(entry), strong: true }];
+}
+
+function card(number: number | null | undefined): Span[] {
+  return number == null ? [] : [{ text: `#${number}`, strong: true }];
+}
+
+function join(...parts: (Span[] | Span | string)[]): Span[] {
+  const spans: Span[] = [];
+  for (const part of parts) {
+    if (typeof part === 'string') spans.push({ text: part });
+    else if (Array.isArray(part)) spans.push(...part);
+    else spans.push(part);
   }
-  if (entry.body.kind === 'comment') return 'commented';
-  return describeEvent(entry.body) ?? 'commented';
+  return spans;
+}
+
+/// What a feed line says.
+///
+/// Not `describeEvent` with the actor bolted on the front. That one writes
+/// for a card's own timeline, where "it" is unambiguous because the whole
+/// pane is one card — in a board-wide feed "moved it to Review" names
+/// nothing. Every line here names its card.
+///
+/// A comment's own words are deliberately not the line either: an agent's run
+/// report is hundreds of words that would bury every line around it. The
+/// card's timeline is where the text belongs.
+export function feedLine(entry: FeedEntry): Span[] {
+  const body = entry.body;
+  const at = card(entry.number);
+  switch (body.kind) {
+    case 'hired':
+      return join(who(entry), ' hired ', { text: `@${body.agent.handle}`, strong: true });
+    case 'comment':
+      return join(who(entry), ' commented on ', at);
+    case 'opened':
+      return join(who(entry), ' opened ', at);
+    case 'moved':
+      return join(
+        who(entry),
+        ' moved ',
+        at,
+        ` ${COLUMN_LABEL[body.from]} → ${COLUMN_LABEL[body.to]}`,
+      );
+    case 'assigned': {
+      const to = body.to;
+      if (to == null) return join(who(entry), ' unassigned ', at);
+      return join(who(entry), ' assigned ', { text: `@${to.handle}`, strong: true }, ' → ', at);
+    }
+    case 'run_started':
+      return join(`run #${body.attempt} started on `, at);
+    case 'run_settled':
+      return join(
+        `run #${body.attempt} `,
+        { text: body.status, strong: true },
+        ' on ',
+        at,
+        body.error != null && body.error.length > 0 ? ` — ${body.error}` : '',
+      );
+    case 'blocked':
+      return join(who(entry), ' blocked ', at, `: ${body.reason}`);
+    case 'unblocked':
+      return join(who(entry), ' unblocked ', at);
+    case 'cancelled':
+      return join(who(entry), ' cancelled ', at);
+    case 'approval_requested':
+      return join('approval waiting on ', at, `: ${body.tool} — ${body.summary}`);
+    case 'approval_resolved':
+      return join(`approval ${DECISION_LABEL[body.decision]} on `, at);
+    case 'stage_completed':
+      return join(`stage ${body.stage} complete on `, at);
+    case 'budget_exhausted':
+      return join(
+        'daily budget exhausted — ',
+        `${usd(body.spent_micros)} of ${usd(body.limit_micros)} spent`,
+      );
+    case 'budget_restored':
+      return join('budget restored — ', at, ' released');
+    default: {
+      const said = describeEvent(body);
+      return join(who(entry), ' · ', said ?? 'acted', at.length > 0 ? ' · ' : '', at);
+    }
+  }
 }

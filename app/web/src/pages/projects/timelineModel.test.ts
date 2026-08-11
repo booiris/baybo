@@ -8,8 +8,10 @@ import {
   eventShape,
   eventTime,
   eventTone,
+  feedLine,
+  feedTone,
 } from './timelineModel';
-import type { IssueEvent, IssueEventBody } from './timelineModel';
+import type { FeedEntry, IssueEvent, IssueEventBody } from './timelineModel';
 
 const DEV_ID = '01JC3KQ4Z8AAAAAAAAAAAAAAAA';
 
@@ -228,5 +230,64 @@ describe('eventTime', () => {
     expect(older).toMatch(/\d{1,2}:\d{2}/);
     expect(older).toMatch(/Jul/);
     expect(today).not.toMatch(/Aug/);
+  });
+});
+
+describe('feedLine', () => {
+  function feed(body: FeedEntry['body'], number: number | null = 7): FeedEntry {
+    return {
+      ...(number == null ? {} : { number }),
+      actor: { kind: 'agent', id: DEV_ID, handle: 'dev-1' },
+      body,
+      created_at_ms: 0,
+    } as FeedEntry;
+  }
+  const said = (entry: FeedEntry) => feedLine(entry).map((span) => span.text).join('');
+  const bold = (entry: FeedEntry) =>
+    feedLine(entry)
+      .filter((span) => span.strong === true)
+      .map((span) => span.text);
+
+  it('names the card, because a board-wide feed has no "it"', () => {
+    // `describeEvent` writes for a pane that is one card, so it can say
+    // "moved it to Review". Ten of those in a row name nothing.
+    expect(describeEvent({ kind: 'moved', from: 'todo', to: 'in_progress' })).toContain('it');
+    expect(said(feed({ kind: 'moved', from: 'todo', to: 'in_progress' }))).toBe(
+      '@dev-1 moved #7 Todo → In Progress',
+    );
+    expect(said(feed({ kind: 'opened' }))).toBe('@dev-1 opened #7');
+    expect(said(feed({ kind: 'blocked', reason: 'sandbox has no tmux' }))).toBe(
+      '@dev-1 blocked #7: sandbox has no tmux',
+    );
+  });
+
+  it('bolds who acted, which card, and how a run ended', () => {
+    // What the eye lands on when the drawer is skimmed rather than read.
+    expect(bold(feed({ kind: 'run_settled', attempt: 3, status: 'failed', error: 'boom' }))).toEqual(
+      ['failed', '#7'],
+    );
+    expect(said(feed({ kind: 'run_settled', attempt: 3, status: 'failed', error: 'boom' }))).toBe(
+      'run #3 failed on #7 — boom',
+    );
+    expect(
+      bold(feed({ kind: 'assigned', from: null, to: { id: DEV_ID, handle: 'qa-2' } })),
+    ).toEqual(['@dev-1', '@qa-2', '#7']);
+  });
+
+  it('leaves the card out of the lines that have none', () => {
+    // A hire is a fact about the board. So is running out of budget.
+    const hire = feed({ kind: 'hired', agent: { id: DEV_ID, handle: 'tester' } }, null);
+    expect(said(hire)).toBe('@dev-1 hired @tester');
+    expect(feedTone(hire)).toBe('brand');
+    expect(
+      said(feed({ kind: 'budget_exhausted', spent_micros: 5_000_000, limit_micros: 5_000_000 }, null)),
+    ).toContain('daily budget exhausted');
+  });
+
+  it('never pours a comment into the feed', () => {
+    // An agent's run report is hundreds of words; it would bury every line
+    // around it. The card's own timeline is where the text belongs.
+    const report = 'Root cause confirmed. '.repeat(40);
+    expect(said(feed({ kind: 'comment', text: report }))).toBe('@dev-1 commented on #7');
   });
 });

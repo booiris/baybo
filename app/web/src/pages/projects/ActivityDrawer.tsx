@@ -3,7 +3,7 @@ import { RiCloseLine } from 'react-icons/ri';
 
 import { useAdminClient, useAuth } from '../../api/auth';
 import { fetchFeed } from './api';
-import { describeFeedEntry, eventAgo, feedActorLabel, type FeedEntry } from './timelineModel';
+import { eventAgo, feedLine, feedTone, TONE_DOT, type FeedEntry } from './timelineModel';
 
 export function ActivityDrawer({
   projectId,
@@ -57,38 +57,58 @@ export function ActivityDrawer({
           <RiCloseLine />
         </button>
       </header>
-      <div className="flex-1 overflow-y-auto overscroll-none p-2 flex flex-col gap-1">
+      <div className="flex-1 overflow-y-auto overscroll-none flex flex-col">
         {error !== null ? (
-          <p className="border-2 border-err text-err rounded-md px-2 py-1 font-mono text-[0.66rem] break-words">
+          <p className="m-2 border-2 border-err text-err rounded-md px-2 py-1 font-mono text-[0.66rem] break-words">
             {error}
           </p>
         ) : null}
         {!loading && error === null && events.length === 0 ? (
-          <p className="m-auto text-center font-mono text-[0.66rem] text-ink-soft">
+          <p className="m-auto px-4 text-center font-mono text-[0.66rem] text-ink-soft">
             Nothing has happened on this board yet.
           </p>
         ) : null}
         {events.map((event, index) => {
           const card = event.number;
+          // A stream, not a stack of cards. Each line is one sentence with a
+          // tone dot in front of it, so a failure and a hire are told apart
+          // down the left edge before either is read — the same alphabet the
+          // card's own rail uses.
           const line = (
             <>
-              <div className="flex items-baseline gap-1.5 font-mono text-[0.6rem] text-ink-soft">
-                {card != null ? <span className="font-bold text-ink">#{card}</span> : null}
-                <span>{feedActorLabel(event)}</span>
-                <span className="ml-auto tabular-nums">{eventAgo(event.created_at_ms, now)}</span>
-              </div>
-              <p className="font-mono text-[0.66rem] leading-snug break-words">
-                {describeFeedEntry(event)}
-              </p>
+              <span
+                aria-hidden
+                className={`mt-1 h-2 w-2 shrink-0 rounded-full ${TONE_DOT[feedTone(event)]}`}
+              />
+              <span className="min-w-0 font-mono text-[0.66rem] leading-snug break-words">
+                {/* The plain runs stay bare text nodes. Wrapped in spans they
+                    each become their own contribution to the accessible name,
+                    which is trimmed per element — the row announced itself as
+                    "@dev-1opened#7", one run-on token. */}
+                {feedLine(event).map((span, at) =>
+                  span.strong === true ? (
+                    <b key={at} className="font-bold">
+                      {span.text}
+                    </b>
+                  ) : (
+                    span.text
+                  ),
+                )}
+              </span>
+              {/* The time is right-aligned away from the sentence, but the
+                  accessible name has no columns — without this it announces
+                  "#7" and "2h" as "#72h". */}
+              <span className="sr-only">, </span>
+              <span className="ml-auto shrink-0 font-mono text-[0.56rem] text-ink-soft tabular-nums">
+                {eventAgo(event.created_at_ms, now)}
+              </span>
             </>
           );
+          const shape = 'flex gap-2 px-3 py-2 border-b border-black/15 text-left';
           // A hire belongs to the board, so there is no card to open — it
           // renders as a plain row rather than a button that goes nowhere.
           return card == null ? (
-            <div
-              key={`${event.created_at_ms}-${index}`}
-              className="border-2 border-black/15 rounded-md px-2 py-1.5 bg-surface"
-            >
+            <div key={`${event.created_at_ms}-${index}`} className={shape}>
               {line}
             </div>
           ) : (
@@ -98,7 +118,7 @@ export function ActivityDrawer({
               onClick={() => {
                 onOpenIssue(card);
               }}
-              className="text-left border-2 border-black/15 hover:border-black rounded-md px-2 py-1.5 bg-surface"
+              className={`${shape} hover:bg-brand/15`}
             >
               {line}
             </button>
