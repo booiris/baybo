@@ -135,8 +135,9 @@ ink send circle on the right; at rest it holds a moderate width, and focus
 stretches it toward the screen edges — a small gutter stays — on the keyboard's
 beat).
 
-The plus opens `AttachMenuPanel` — two flat rows (Photos → the `PhotosPicker`,
-Files → a `.fileImporter`) — a HAND-ROLLED panel, `ModelMenuPanel`'s sibling,
+The plus opens `AttachMenuPanel` — flat rows (Photos → the `PhotosPicker`,
+Files → a `.fileImporter`, plus Paste when the clipboard holds an image, so the
+panel is two rows tall or three) — a HAND-ROLLED panel, `ModelMenuPanel`'s sibling,
 and NOT the stock `Menu` it shipped as first. A SwiftUI `Menu` is a `UIMenu`: it
 dims the whole screen, lifts its anchor view into a system layer and puts the
 bubble where it decides. This one has to leave the pill exactly where it is,
@@ -169,14 +170,18 @@ the same reason `setComposerTop` publishes nothing at all.
 Its FLOOR is the dock's top edge, `anchorGap` below the panel's bottom — not the
 `+`'s top edge, which is the shape this shipped as and the bug: the `+` sinks
 INTO the dock as those rows stack above it, so against a 4-tile staged strip 68
-of the panel's 92pt drew behind the strip with the Files row hidden and
-untappable, and behind an approval card nothing showed at all. `box` works in
-the DOCK's own coordinate space (`AttachMenuPanel.dockSpace`, the space the `+`
-reports in), so its whole box is negative — it floats above `y = 0` — and the
-panel's own height arrives from the layout system through an alignment guide
-rather than a measurement fed back in. Measuring in one container and drawing in
-another is what put the live touch region ~14pt below the paint: the top of the
-Photos row dismissed the panel and the empty gap under it fired Files.
+of the panel's 92pt (two rows, as it then was) drew behind the strip with the
+Files row hidden and untappable, and behind an approval card nothing showed at
+all. `box` works in the DOCK's own coordinate space (`AttachMenuPanel.dockSpace`,
+the space the `+` reports in), so its whole box is negative — it floats above
+`y = 0`. Its height is `rowHeight × rows` COMPUTED, never measured: an `.offset`
+positions the panel, and an offset needs the height before the view lays out.
+That is why the shown rows are passed in (`sources`) rather than read off
+`AttachSource.allCases` — a conditional Paste row would otherwise be reserved
+space it does not use, floating the panel a whole row too high. Measuring in one
+container and drawing in another is what put the live touch region ~14pt below
+the paint: the top of the Photos row dismissed the panel and the empty gap under
+it fired Files.
 
 Constraints: white tint only, no `.interactive()` shimmer on the field, the pill
 is BORDERLESS — a soft ink shadow carries its boundary over the blank at-rest

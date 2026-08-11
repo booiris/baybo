@@ -282,6 +282,17 @@ without touching `app/ios` at all.
   `staged-` so a by-label query can't confuse a strip tile with a transcript
   card when this flag runs beside `-baybo-demo-attachments`.
 
+- **`-baybo-demo-paste`** (DEBUG, with `-baybo-open-chat`) swaps the composer's
+  clipboard for `DemoPasteboard` — one PNG, statelessly served, so every read
+  yields it again. It exists because the Paste row is *conditional*: it appears
+  only when `UIPasteboard.general` holds an image, and a UI test cannot seed the
+  real board. Unlike `-baybo-demo-compose`, which fakes the RESULT, this one
+  fakes only the clipboard and leaves the whole staging path real — so it is the
+  one end-to-end staging witness the UI tier has (both pickers being out of
+  process), covering the row's paint, the taller 3-row panel, and the fact that
+  the row is not one-shot. See
+  [attachments.md](attachments.md) § Paste is a third source.
+
 - **`-baybo-demo-keyboard`** raises the keyboard 2s in and drops it at 5s (record
   with `simctl io recordVideo`, extract frames with ffmpeg); the software
   keyboard only appears with Simulator.app running and hardware keyboard

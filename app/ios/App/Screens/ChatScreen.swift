@@ -142,7 +142,8 @@ struct ChatScreen: View {
             } panel: {
                 if attach.isOpen {
                     AttachMenuPanel(
-                        anchor: attach.anchor, isPresented: $attach.isOpen
+                        anchor: attach.anchor, sources: attach.sources,
+                        isPresented: $attach.isOpen
                     ) { source in
                         attach.pick = source
                     }

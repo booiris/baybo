@@ -4,8 +4,9 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 /// The native composer dock: autosizing field, attachment staging behind the
-/// inline `+` menu (Photos / Files), in-field send. The strip itself and every
-/// piece of work reading it live in `ComposerStaging`; this view renders them.
+/// inline `+` menu (Photos / Files, plus Paste when the clipboard holds an
+/// image), in-field send. The strip itself and every piece of work reading it
+/// live in `ComposerStaging`; this view renders them.
 /// Interaction contract preserved from the web composer:
 /// * staged picks count as a draft, so an attachment-only send works with an
 ///   empty field;
@@ -187,6 +188,16 @@ struct ComposerView: View {
             photoPicks = []
             staging.stage(photos: picks)
         }
+        // Paste is the one row with no picker to answer it, so `pickerBinding`
+        // cannot serve it: that binding retires `attach.pick` on a sheet's
+        // DISMISSAL, and a second tap on a row whose `pick` is already set
+        // publishes no change at all — the row would work exactly once. Clearing
+        // the request here, in the same turn, is what keeps it live.
+        .onChange(of: attach.pick) { _, pick in
+            guard pick == .paste else { return }
+            attach.pick = nil
+            staging.stagePasteboard()
+        }
         .onAppear {
             // One-shot for the Deck "Quick setup": seed the /deck request and
             // send it immediately, so the user lands in the conversation
@@ -268,7 +279,9 @@ struct ComposerView: View {
     private var plusButton: some View {
         Button {
             Haptics.tap()
-            withAnimation(AttachMenuPanel.fade) { attach.isOpen.toggle() }
+            withAnimation(AttachMenuPanel.fade) {
+                attach.toggle(pasteReady: staging.pasteReady)
+            }
         } label: {
             Image(systemName: "plus")
                 .font(.system(size: 22, weight: .light))
@@ -522,6 +535,11 @@ final class ComposerStaging: ObservableObject {
     /// The Rust core. Injected like `ChatStore`'s, so the staging machine can
     /// be driven with no gateway behind it.
     private let client: any BayboClientProtocol
+    /// The system clipboard. Injected for the same reason as the client, only
+    /// more so: `UIPasteboard.general` is process-global, and swift-testing runs
+    /// suites in PARALLEL — one suite's paste written to the real board would
+    /// surface as another's logic bug.
+    private let pasteboard: any PasteboardReading
     /// The dock's notice line while the STRIP is what put it there, with the
     /// tile it names when there is one — so it can be taken back when that tile
     /// leaves, and in either case when the conversation does. A pick REJECTED
@@ -536,9 +554,14 @@ final class ComposerStaging: ObservableObject {
     /// zombie still held — three at once on a cap of two.
     private var uploadsInFlight = 0
 
-    init(store: ChatStore, client: any BayboClientProtocol = Baybo.client) {
+    init(
+        store: ChatStore,
+        client: any BayboClientProtocol = Baybo.client,
+        pasteboard: any PasteboardReading = Pasteboards.launch()
+    ) {
         self.store = store
         self.client = client
+        self.pasteboard = pasteboard
         #if DEBUG
             // `-baybo-demo-compose`: seed the staged strip (see `DemoFrames`).
             // Here rather than on the composer's appear, so it is one-shot per
@@ -550,30 +573,41 @@ final class ComposerStaging: ObservableObject {
 
     // MARK: - Admission
 
-    /// Every admitted pick takes its slot in the strip NOW, before a single
-    /// byte is loaded. `send()` reads the staged array to decide whether the
-    /// message is ready, so a pick still inside `loadTransferable` would be
-    /// invisible to it: the message shipped with whichever refs happened to be
-    /// ready, the array was cleared, and the rest of the batch landed as ghost
-    /// tiles on the NEXT message.
     func stage(photos picks: [PhotosPickerItem]) {
-        var admitted: [(id: UUID, pick: PhotosPickerItem)] = []
+        admitThenLoad(picks) { id, pick in await self.loadPhoto(id: id, pick: pick) }
+    }
+
+    /// The drive every source whose bytes arrive LATER shares (a photo pick, a
+    /// paste): take all the slots first, then fill them in one at a time. Both
+    /// halves are load-bearing, and neither is the loader's business — which is
+    /// why they live here and not once per source.
+    ///
+    /// **Every admitted pick takes its slot in the strip NOW, before a single
+    /// byte is loaded.** `send()` reads the staged array to decide whether the
+    /// message is ready, so a pick still inside its load would be invisible to
+    /// it: the message shipped with whichever refs happened to be ready, the
+    /// array was cleared, and the rest of the batch landed as ghost tiles on the
+    /// NEXT message.
+    ///
+    /// **Sequential, and the handle lands before the body runs.** A load
+    /// materialises the whole encoded pick, and ten at once is ten full-size
+    /// `Data`s alive together. A task started on the main actor doesn't run until
+    /// this turn ends, so `work` is on the tile before its own body can touch
+    /// anything — a ✕ tapped mid-load always has something to cancel.
+    private func admitThenLoad<Pick>(
+        _ picks: [Pick], load: @escaping @MainActor (UUID, Pick) async -> Void
+    ) {
+        var admitted: [(id: UUID, pick: Pick)] = []
         for pick in picks {
             guard let id = admitPhoto() else { break }
             admitted.append((id, pick))
         }
         guard !admitted.isEmpty else { return }
         Task {
-            // Sequential: `loadTransferable` materialises the whole encoded
-            // pick, and ten at once is ten full-size `Data`s alive together.
             for entry in admitted {
-                let load = Task { await self.loadPhoto(id: entry.id, pick: entry.pick) }
-                // A task started on the main actor doesn't run until this turn
-                // ends, so the handle is on the tile before its own body can
-                // touch anything — a ✕ tapped mid-load always has something to
-                // cancel.
-                self.update(entry.id) { $0.work = load }
-                await load.value
+                let work = Task { await load(entry.id, entry.pick) }
+                self.update(entry.id) { $0.work = work }
+                await work.value
             }
         }
     }
@@ -585,6 +619,50 @@ final class ComposerStaging: ObservableObject {
             staged.append(item)
         }
         pumpUploads()
+    }
+
+    /// Is there an image on the clipboard? Read on the `+`'s tap to decide
+    /// whether the panel offers a Paste row at all — a presence probe over
+    /// `types(forItemSet:)`, which is documented not to notify the user, so
+    /// asking costs nothing and no "Allow Paste?" alert can come of it.
+    var pasteReady: Bool { !pasteboard.imageItemIndices().isEmpty }
+
+    /// The Paste row. The clipboard's shape is known up front — which items hold
+    /// an image, without pulling a byte — so `admitThenLoad` can take the slots
+    /// before any bytes are read, exactly as a photo batch does; then each image
+    /// is pulled and handed to `acceptPhoto`, which is where a pasted image and a
+    /// picked one become the same thing.
+    ///
+    /// Nothing dismisses this row (there is no picker behind it), so the caller
+    /// clears `AttachMenu.pick` itself.
+    func stagePasteboard() {
+        let indices = pasteboard.imageItemIndices()
+        guard !indices.isEmpty else {
+            // The board can empty (or turn into plain text) between the panel
+            // opening and the row being tapped. Nothing was admitted, so no tile
+            // can own the line.
+            publishUnownedNotice(Lang.shared.t("chat.pasteNoImage"))
+            return
+        }
+        admitThenLoad(indices) { id, index in await self.loadPasted(id: id, index: index) }
+    }
+
+    /// Pull ONE clipboard item's bytes and fill its tile in. The read happens
+    /// off the main actor on purpose: for content copied in another app it can
+    /// raise the system "Allow Paste?" alert, and the read blocks the thread it
+    /// is on until that is answered — on the main actor that is the whole
+    /// composer, frozen mid-paste.
+    private func loadPasted(id: UUID, index: Int) async {
+        guard holds(id) else { return }
+        let reader = pasteboard
+        let pasted = await Task.detached(priority: .userInitiated) {
+            reader.image(at: index)
+        }.value
+        guard let pasted else {
+            drop(id, notice: Lang.shared.t("chat.attachFailed"))
+            return
+        }
+        await acceptPhoto(id: id, data: pasted.data, declaredMime: pasted.mime)
     }
 
     /// A photo pick's slot in the strip, before PhotosUI has delivered a byte

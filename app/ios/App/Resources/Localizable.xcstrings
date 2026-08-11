@@ -290,6 +290,23 @@
         }
       }
     },
+    "chat.attachPaste": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Paste"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "粘贴"
+          }
+        }
+      }
+    },
     "chat.attachPhotos": {
       "extractionState": "stale",
       "localizations": {
@@ -643,6 +660,23 @@
           "stringUnit": {
             "state": "translated",
             "value": "离线"
+          }
+        }
+      }
+    },
+    "chat.pasteNoImage": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "No image on the clipboard"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "剪贴板里没有图片"
           }
         }
       }

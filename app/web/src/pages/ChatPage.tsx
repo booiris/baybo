@@ -8,6 +8,7 @@ import {
   useRef,
   useState,
   type ChangeEvent,
+  type ClipboardEvent,
   type FormEvent,
   type KeyboardEvent,
   type MouseEvent as ReactMouseEvent,
@@ -356,6 +357,46 @@ function attachmentKind(mime: string): WireAttachment['kind'] {
   if (mime.startsWith('image/')) return 'image';
   if (mime.startsWith('audio/')) return 'audio';
   return 'file';
+}
+
+/** The clipboard as the paste rule reads it — structural, so the rule is
+ *  testable without a real `DataTransfer` (jsdom's is a stub). */
+export interface PastedClipboard {
+  items: ArrayLike<{ kind: string; getAsFile: () => File | null }>;
+  getData: (type: string) => string;
+}
+
+/** Files a paste should stage as attachments, in clipboard order — empty when
+ *  the paste is an ordinary text paste that must fall through to the textarea.
+ *
+ *  **Real text always wins.** A rich-text range copied out of Safari, Excel or
+ *  Numbers carries a bitmap of the selection ALONGSIDE the text, so keying on
+ *  "has a file" alone would swallow the paste the user actually meant and
+ *  attach a screenshot of it instead. A clipboard with no plain text and a file
+ *  on it — a copied screenshot, an image copied off a web page, a file copied
+ *  in Finder — is the paste this feature is for. */
+export function clipboardAttachments(data: PastedClipboard): File[] {
+  if (data.getData('text/plain').length > 0) return [];
+  const files: File[] = [];
+  for (let i = 0; i < data.items.length; i += 1) {
+    const item = data.items[i];
+    if (item.kind !== 'file') continue;
+    const file = item.getAsFile();
+    if (file !== null) files.push(file);
+  }
+  return files;
+}
+
+/** A display name for a pasted file that has none. A copied bitmap arrives as
+ *  an anonymous blob in some browsers, and `filename` is what the composer
+ *  chip shows and what rides the wire to the agent — the gateway heals a blank
+ *  one to absent, which renders a titleless card. The extension comes from the
+ *  mime subtype (`image/png` → `.png`), never from a second mime table. */
+export function pastedFilename(mime: string, index: number): string {
+  const subtype = mime.startsWith('image/') ? mime.slice('image/'.length).split('+')[0] : '';
+  const ext = /^[a-z0-9]+$/.test(subtype) ? `.${subtype}` : '';
+  const suffix = index > 0 ? `-${index + 1}` : '';
+  return `pasted-image${suffix}${ext}`;
 }
 
 export type ComposerAction = 'noop' | 'stop' | 'direct' | 'park';
@@ -2449,6 +2490,36 @@ export function ChatPage() {
     [uploadAttachment],
   );
 
+  /** Whether a file can be staged at all: the blob POST rides the operator's
+   *  admin bearer, so without one (or without a live socket to send the message
+   *  on afterwards) every upload would land in `error`. Shared by the attach
+   *  button and the paste handler so the two cannot drift. */
+  const canAttach = adminToken !== null && adminToken.length > 0 && status.state === 'connected';
+
+  /** Paste-to-attach: a clipboard carrying files and no text stages them
+   *  through the same `uploadAttachment` pipeline as the file picker, so the
+   *  thumbnail, the send gate and the wire record are the picker's. The default
+   *  is prevented ONLY when a file was actually taken — a text paste has to
+   *  reach the textarea untouched. Gated on the same connection/bearer
+   *  condition as the attach button: without them the POST would go out with
+   *  an empty bearer and every chip would land in `error`. */
+  const handleComposerPaste = useCallback(
+    (e: ClipboardEvent<HTMLTextAreaElement>) => {
+      if (!canAttach) return;
+      const files = clipboardAttachments(e.clipboardData);
+      if (files.length === 0) return;
+      e.preventDefault();
+      files.forEach((file, index) => {
+        const named =
+          file.name.length > 0
+            ? file
+            : new File([file], pastedFilename(file.type, index), { type: file.type });
+        void uploadAttachment(named);
+      });
+    },
+    [canAttach, uploadAttachment],
+  );
+
   const removeAttachment = useCallback((localId: string) => {
     setAttachments((prev) => {
       const target = prev.find((a) => a.localId === localId);
@@ -3312,6 +3383,7 @@ export function ChatPage() {
                   handleComposerChange(e.target.value, e.target.selectionStart ?? e.target.value.length)
                 }
                 onKeyDown={handleComposerKey}
+                onPaste={handleComposerPaste}
                 onMouseDown={() => inputHistory.reset()}
                 // Caret moves (click/arrow) re-evaluate whether it's still on the
                 // slash token, so the popup tracks the caret in both directions.
@@ -3342,7 +3414,7 @@ export function ChatPage() {
                   <button
                     type="button"
                     onClick={() => fileInputRef.current?.click()}
-                    disabled={!adminToken || status.state !== 'connected'}
+                    disabled={!canAttach}
                     className="group shrink-0 h-7 w-7 flex items-center justify-center bg-surface text-ink-soft hover:text-ink border-2 border-black rounded-md shadow-brutal-xs hover:bg-canvas hover:-translate-y-px active:translate-x-[1px] active:translate-y-[1px] active:shadow-none disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer transition-[transform,box-shadow,background-color,color] duration-150"
                     title="Attach image or file"
                     aria-label="Attach image or file"

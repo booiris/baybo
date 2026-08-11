@@ -169,6 +169,147 @@ struct ComposerStagingTests {
         #expect(StagedAttachment.sniffMime(Self.ftyp("qt  ")) == StagedAttachment.fallbackMime)
     }
 
+    // MARK: - paste
+
+    /// The Paste row's whole implementation: a clipboard image becomes the same
+    /// thing a PhotosPicker pick becomes. It goes through `acceptPhoto`, so it
+    /// inherits the byte cap, the byte-first mime election, the spool, the
+    /// thumbnail and the upload pump rather than re-deriving any of them — and
+    /// the assertion that proves it is the upload streaming off a path under the
+    /// composer's own spool directory, never bytes across the FFI.
+    @Test func aPastedImageStagesLikeAPickedOne() async throws {
+        let fixture = Fixture(pasteboard: FakePasteboard([.image(Self.smallPNG())]))
+
+        fixture.staging.stagePasteboard()
+
+        #expect(fixture.staging.staged.count == 1)
+        #expect(await waitUntil { fixture.client.blobUploadCalls.count == 1 })
+        let call = try #require(fixture.client.blobUploadCalls.first)
+        #expect(call.path.hasPrefix(StagedAttachment.spoolDirectory.path))
+        #expect(call.mimeType == "image/png")
+        #expect(await waitUntil { StagedAttachment.blocker(fixture.staging.staged) == nil })
+        let ref = try #require(fixture.staging.staged.first?.attachmentRef)
+        #expect(ref.kind == .image)
+        // A pasted image has no name of its own, exactly like a photo pick —
+        // the gateway's `attachment.<ext>` fallback is what titles its card.
+        #expect(ref.filename == nil)
+        #expect(fixture.store.notice == nil)
+    }
+
+    /// The clipboard's declared flavour is a HINT, not the answer. `acceptPhoto`
+    /// sniffs the bytes first, so a board that mislabels a JPEG still stores the
+    /// mime the provider will actually be handed.
+    @Test func theBytesOutrankWhateverTheClipboardCalledThem() async throws {
+        let jpeg = try #require(
+            UIImage(data: Self.smallPNG())?.jpegData(compressionQuality: 0.8))
+        let fixture = Fixture(pasteboard: FakePasteboard([.image(jpeg, mime: "image/png")]))
+
+        fixture.staging.stagePasteboard()
+
+        #expect(await waitUntil { StagedAttachment.blocker(fixture.staging.staged) == nil })
+        #expect(fixture.staging.staged.first?.mime == "image/jpeg")
+    }
+
+    /// A multi-item paste admits every tile UP FRONT — the same invariant the
+    /// photo batch has, and for the same reason: `send()` reads the strip to
+    /// decide readiness, so a tile appended after its bytes arrive is invisible
+    /// to a send fired mid-paste and lands as a ghost on the next message. The
+    /// bytes are then pulled one item at a time, so a ten-screenshot paste never
+    /// holds ten full-size `Data`s at once.
+    @Test func everyPastedImageTakesItsSlotBeforeAnyBytesAreRead() async throws {
+        let fixture = Fixture(
+            pasteboard: FakePasteboard([.image(Self.smallPNG()), .text, .image(Self.smallPNG())]))
+        fixture.client.holdBlobUploads()
+
+        fixture.staging.stagePasteboard()
+
+        // Two tiles, synchronously — the text item is not one of them.
+        #expect(fixture.staging.staged.count == 2)
+        #expect(StagedAttachment.blocker(fixture.staging.staged) == .waiting)
+        #expect(await waitUntil { fixture.pasteboard.imageReads == [0, 2] })
+    }
+
+    /// The strip's cap is the strip's, whichever door a pick comes through: a
+    /// paste of more images than there is room for admits up to the cap and says
+    /// why. The over-cap line names no tile (the pick never became one), so only
+    /// leaving the conversation can take it back.
+    @Test func aPasteOverTheCapAdmitsWhatFitsAndSaysSo() async throws {
+        let items = Array(
+            repeating: FakePasteboard.Item.image(Self.smallPNG()),
+            count: ChatStore.maxStagedAttachments + 3)
+        let fixture = Fixture(pasteboard: FakePasteboard(items))
+        fixture.client.holdBlobUploads()
+
+        fixture.staging.stagePasteboard()
+
+        #expect(fixture.staging.staged.count == ChatStore.maxStagedAttachments)
+        #expect(fixture.store.notice != nil)
+        let notice = fixture.store.notice
+        fixture.staging.remove(try #require(fixture.staging.staged.first?.id))
+        #expect(fixture.store.notice == notice, "no tile owns an over-cap line")
+        fixture.store.leaveChat()
+        #expect(fixture.store.notice == nil)
+    }
+
+    /// The board can change between the panel opening and the row being tapped:
+    /// the user copies plain text, or clears it. Nothing is admitted, so the
+    /// line has no tile to own it either.
+    @Test func pastingWithNoImageOnTheBoardStagesNothingAndSaysWhy() async throws {
+        let pasteboard = FakePasteboard([.image(Self.smallPNG())])
+        let fixture = Fixture(pasteboard: pasteboard)
+        pasteboard.replace(with: [.text])
+
+        fixture.staging.stagePasteboard()
+
+        #expect(fixture.staging.staged.isEmpty)
+        #expect(fixture.store.notice == Lang.shared.t("chat.pasteNoImage"))
+        #expect(pasteboard.imageReads.isEmpty, "presence is decided without pulling bytes")
+    }
+
+    /// A flavour that is declared and does not decode. The tile has to go — it
+    /// carries no blob and would block the send forever — and, unlike the case
+    /// above, it HAS a tile, so the line dies with it.
+    @Test func aPastedImageThatWontDecodeDropsItsTile() async throws {
+        let fixture = Fixture(pasteboard: FakePasteboard([.undecodable]))
+
+        fixture.staging.stagePasteboard()
+        #expect(fixture.staging.staged.count == 1)
+
+        #expect(await waitUntil { fixture.staging.staged.isEmpty })
+        #expect(fixture.store.notice == Lang.shared.t("chat.attachFailed"))
+        #expect(fixture.client.blobUploadCalls.isEmpty)
+    }
+
+    /// The ✕ during a paste, which is the removal race on the one path where the
+    /// bytes are read AFTER the tile exists. The pick that is gone must reach
+    /// neither the strip nor the notice line; the rest of the batch carries on.
+    @Test func removingATileMidPasteStaysSilentAndDoesNotStallTheBatch() async throws {
+        let fixture = Fixture(
+            pasteboard: FakePasteboard([.undecodable, .image(Self.smallPNG())]))
+
+        fixture.staging.stagePasteboard()
+        #expect(fixture.staging.staged.count == 2)
+        fixture.staging.remove(try #require(fixture.staging.staged.first?.id))
+
+        #expect(await waitUntil { fixture.client.blobUploadCalls.count == 1 })
+        #expect(fixture.staging.staged.count == 1)
+        #expect(fixture.store.notice == nil, "a removed pick's failure names nothing")
+    }
+
+    /// Whether the Paste row is offered at all — a presence probe, and it must
+    /// stay one: the real reader answers it from `types(forItemSet:)`, which
+    /// Apple documents as not notifying the user, while pulling bytes can raise
+    /// the system "Allow Paste?" alert.
+    @Test func pasteReadinessIsDecidedWithoutReadingAnyBytes() {
+        let pasteboard = FakePasteboard([.text])
+        let fixture = Fixture(pasteboard: pasteboard)
+        #expect(!fixture.staging.pasteReady)
+
+        pasteboard.replace(with: [.text, .image(Self.smallPNG())])
+        #expect(fixture.staging.pasteReady)
+        #expect(pasteboard.imageReads.isEmpty)
+    }
+
     // MARK: - the send gate
 
     /// A pick takes its slot in the strip the moment it is ADMITTED, not when
@@ -810,14 +951,16 @@ struct ComposerStagingTests {
 private final class Fixture {
     let temp = TempSupportDir()
     let client = FakeBayboClient()
+    let pasteboard: FakePasteboard
     let store: ChatStore
     let staging: ComposerStaging
 
-    init() {
+    init(pasteboard: FakePasteboard = FakePasteboard()) {
+        self.pasteboard = pasteboard
         let sessionId = "s-compose"
         store = ChatStore(
             sessionId: sessionId, client: client, index: temp.makeIndex(),
-            outbox: temp.makeOutbox(sessionId: sessionId))
+            outbox: temp.makeOutbox(sessionId: sessionId), pasteboard: pasteboard)
         // The SESSION's strip, not one built beside it: which object the
         // composer renders — and what its lifetime is tied to — is half of
         // what these tests are about.

@@ -26,6 +26,11 @@ struct AttachMenuPanel: View {
     /// The `+`'s own frame in the DOCK's coordinate space (`dockSpace`), which
     /// is what gives the panel its column.
     let anchor: CGRect
+    /// The rows actually shown — NOT `AttachSource.allCases`. Paste is offered
+    /// only when there is an image on the clipboard, and the panel is positioned
+    /// by an offset computed from its height, so the height has to come from the
+    /// rows that will really be drawn (see `AttachMenu.toggle`).
+    let sources: [AttachSource]
     @Binding var isPresented: Bool
     let onPick: (AttachSource) -> Void
 
@@ -41,7 +46,7 @@ struct AttachMenuPanel: View {
     /// every face in this chrome is a fixed size (`Theme.mono(14)`, `.system(
     /// size: 16)`) rather than a Dynamic Type style, so the rows cannot grow.
     static let rowHeight: CGFloat = 46
-    static var panelHeight: CGFloat { rowHeight * CGFloat(AttachSource.allCases.count) }
+    static func panelHeight(rows: Int) -> CGFloat { rowHeight * CGFloat(rows) }
     /// The panel's beat, shared by everything that raises or drops it: the `+`,
     /// a row, the scrim.
     static let fade: Animation = .easeOut(duration: 0.15)
@@ -51,7 +56,7 @@ struct AttachMenuPanel: View {
     static let dockSpace = "baybo.chat.dock"
 
     var body: some View {
-        let box = Self.box(anchor: anchor)
+        let box = Self.box(anchor: anchor, rows: sources.count)
         return panel
             // `.offset`, NOT `.alignmentGuide`: a guide is only consulted by a
             // container that resolves that alignment, and `.overlay(alignment:)`
@@ -74,17 +79,17 @@ struct AttachMenuPanel: View {
     /// a 4-tile strip that rule left 68 of the panel's 92pt behind the strip,
     /// with the Files row completely hidden and untappable; behind an approval
     /// card it left nothing visible at all.
-    static func box(anchor: CGRect) -> CGRect {
+    static func box(anchor: CGRect, rows: Int) -> CGRect {
         CGRect(
             x: max(0, anchor.minX),
-            y: -(panelHeight + anchorGap),
+            y: -(panelHeight(rows: rows) + anchorGap),
             width: panelWidth,
-            height: panelHeight)
+            height: panelHeight(rows: rows))
     }
 
     private var panel: some View {
         VStack(alignment: .leading, spacing: 0) {
-            ForEach(AttachSource.allCases, id: \.self) { source in
+            ForEach(sources, id: \.self) { source in
                 row(source)
             }
         }
@@ -143,18 +148,28 @@ struct AttachMenuScrim: View {
     }
 }
 
-/// Which picker a panel row asks for. The panel reports the pick and nothing
+/// Which source a panel row asks for. The panel reports the pick and nothing
 /// else: the pickers stay modifiers on `ComposerView`, where their selection
 /// cap reads the strip's free slots and their results feed `ComposerStaging`,
 /// so no staging state comes up here.
 enum AttachSource: CaseIterable {
     case photos
     case files
+    /// Whatever image is on the system clipboard. Unlike the two above it has no
+    /// picker: nothing out of process answers it, so `ComposerView` clears the
+    /// request itself and `ComposerStaging` reads the board.
+    case paste
+
+    /// The rows every panel has. `paste` is conditional — a row that reports
+    /// "nothing to paste" is a row the user learns to ignore — so the shown set
+    /// is decided per opening (`AttachMenu.toggle`), not by `allCases`.
+    static let always: [AttachSource] = [.photos, .files]
 
     @MainActor var title: String {
         switch self {
         case .photos: return Lang.shared.t("chat.attachPhotos")
         case .files: return Lang.shared.t("chat.attachFiles")
+        case .paste: return Lang.shared.t("chat.attachPaste")
         }
     }
 
@@ -162,6 +177,7 @@ enum AttachSource: CaseIterable {
         switch self {
         case .photos: return "photo.on.rectangle"
         case .files: return "folder"
+        case .paste: return "doc.on.clipboard"
         }
     }
 }
@@ -172,8 +188,15 @@ enum AttachSource: CaseIterable {
 @MainActor
 final class AttachMenu: ObservableObject {
     @Published var isOpen = false
-    /// The row the panel picked, cleared by the picker that answers it.
+    /// The row the panel picked, cleared by the picker that answers it (or, for
+    /// `.paste`, by the composer's own handler — nothing dismisses it).
     @Published var pick: AttachSource?
+    /// The rows THIS opening shows, snapshotted by `toggle`. Deliberately not
+    /// recomputed while the panel is up: the `+` republishes its anchor on every
+    /// tick of the focus and keyboard animations, and a row appearing or
+    /// vanishing mid-`fade` would change `panelHeight` under the offset that is
+    /// already positioning the panel.
+    @Published private(set) var sources: [AttachSource] = AttachSource.always
     /// The `+`'s frame in the DOCK's coordinate space (`AttachMenuPanel
     /// .dockSpace`), reported by `ComposerView` per layout tick. Deliberately
     /// not `.global`: the panel is laid out in that same space, and the two
@@ -181,6 +204,19 @@ final class AttachMenu: ObservableObject {
     /// enough that the top of a row was scrim and the empty gap under the panel
     /// fired a picker.
     private(set) var anchor: CGRect = .zero
+
+    /// The `+`. Raising the panel is also when its row set is decided, which is
+    /// why this is a method and not a bare `isOpen.toggle()`: `pasteReady` is a
+    /// clipboard probe, and it has to be taken ONCE, here, rather than by a
+    /// `body` that re-runs on every keyboard tick.
+    func toggle(pasteReady: Bool) {
+        if isOpen {
+            isOpen = false
+            return
+        }
+        sources = pasteReady ? AttachSource.always + [.paste] : AttachSource.always
+        isOpen = true
+    }
 
     /// Republish the anchor only while the panel is UP. The `+` moves on every
     /// tick of the focus and keyboard animations, and nothing is anchored to
