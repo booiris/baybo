@@ -86,16 +86,20 @@ describe('AgentProfile', () => {
 
   it('lists each model once, the default one standing for "not pinned"', async () => {
     renderProfile(agent('dev-1'));
-    const picker = await screen.findByLabelText('llm');
-    const rows = [...picker.querySelectorAll('option')].map((o) => [o.textContent, o.value]);
+    // The trigger names what it is set to — an unpinned agent shows the
+    // default's own row, because that row *is* the unpinned choice.
+    const trigger = await screen.findByLabelText('llm: deepseek');
+    await userEvent.click(trigger);
+
     // No separate "default" row beside the model it resolves to: the two are
     // indistinguishable until the default moves, and reading `deepseek` twice
     // is worse than losing that distinction.
-    expect(rows).toEqual([
-      ['deepseek', ''],
-      ['gpt-5', 'gpt-5'],
-    ]);
-    expect(picker).toHaveValue('');
+    // The trigger carries `aria-haspopup`; everything else here is a row.
+    const rows = screen
+      .getAllByRole('button')
+      .filter((one) => !one.hasAttribute('aria-haspopup') && one.closest('[style]') !== null)
+      .map((one) => one.textContent);
+    expect(rows).toEqual(['deepseek', 'gpt-5']);
   });
 
   it('says who added it, and notes a hirer who has since gone', () => {

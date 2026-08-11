@@ -12,6 +12,7 @@ import {
   type ModelPool,
 } from './teamModel';
 import { Avatar, AVATAR_BOX, runNote, type AvatarRun } from './Avatar';
+import { Picker, type PickerOption } from './Picker';
 import type { Portrait } from './portrait';
 
 /// Seats on a board. Mirrors `MAX_TEAM_AGENTS`; the server is the judge, so
@@ -25,6 +26,21 @@ const MAX_AGENTS = 16;
 const fieldLabel = 'font-mono text-[0.6rem] font-bold uppercase tracking-[0.12em] text-ink-soft';
 const fieldBox =
   'border-2 border-black rounded-md bg-canvas px-2.5 py-[7px] font-mono text-[0.74rem]';
+
+/// A field whose value is chosen rather than typed. Same box as the rest of
+/// the form, opened by a press — not a native `<select>`, which draws an
+/// operating-system menu in the middle of a hand-drawn modal.
+const pickerField = {
+  className: 'w-full',
+  triggerClassName: `${fieldBox} w-full justify-between text-left`,
+  panelClassName: 'left-0',
+};
+
+const FRAMEWORKS: PickerOption[] = [
+  { value: 'baybo', label: 'native' },
+  { value: 'claude', label: 'claude' },
+  { value: 'codex', label: 'codex' },
+];
 
 export function TeamStrip({
   team,
@@ -183,6 +199,7 @@ function HireAgentForm({
   const [busy, setBusy] = useState(false);
   const client = useAdminClient();
   const problem = handleProblem(name);
+  const models = llmOptions(pool);
 
   useEffect(() => {
     let canceled = false;
@@ -281,33 +298,31 @@ function HireAgentForm({
           <div className="grid grid-cols-2 gap-3">
             <label className="flex flex-col gap-1">
               <span className={fieldLabel}>Framework</span>
-              <select
+              <Picker
+                {...pickerField}
+                label="Framework"
                 value={framework}
-                onChange={(event) => {
-                  setFramework(event.target.value as Agent['framework']);
+                disabled={busy}
+                options={FRAMEWORKS}
+                onPick={(next) => {
+                  setFramework(next as Agent['framework']);
                 }}
-                className={fieldBox}
               >
-                <option value="baybo">native</option>
-                <option value="claude">claude</option>
-                <option value="codex">codex</option>
-              </select>
+                {FRAMEWORKS.find((one) => one.value === framework)?.label ?? framework}
+              </Picker>
             </label>
             <label className="flex flex-col gap-1">
               <span className={fieldLabel}>llm</span>
-              <select
+              <Picker
+                {...pickerField}
+                label="llm"
                 value={llm}
-                onChange={(event) => {
-                  setLlm(event.target.value);
-                }}
-                className={fieldBox}
+                disabled={busy || pool === null}
+                options={models}
+                onPick={setLlm}
               >
-                {llmOptions(pool).map((option) => (
-                  <option key={option.label} value={option.value}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
+                {models.find((one) => one.value === llm)?.label ?? '…'}
+              </Picker>
             </label>
           </div>
           {error !== null ? (

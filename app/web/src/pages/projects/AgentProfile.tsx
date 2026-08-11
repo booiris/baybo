@@ -5,6 +5,7 @@ import { RiCloseLine } from 'react-icons/ri';
 import { useAdminClient } from '../../api/auth';
 import { fetchModelPool, setAgentModel } from './api';
 import { COLUMN_LABEL, type Agent, type Issue, type IssueRun } from './boardModel';
+import { Picker } from './Picker';
 import { llmOptions, llmSelected, workingAgentIds, type ModelPool } from './teamModel';
 
 export function AgentProfile({
@@ -47,6 +48,8 @@ export function AgentProfile({
   const [pinError, setPinError] = useState<string | null>(null);
   const [pool, setPool] = useState<ModelPool>(null);
   const client = useAdminClient();
+  const models = llmOptions(pool);
+  const showing = llmSelected(agent.llm, pool);
 
   useEffect(() => {
     let canceled = false;
@@ -165,12 +168,17 @@ export function AgentProfile({
           </h3>
           <label className="block mt-1">
             <span className="font-mono text-[0.58rem] text-ink-soft">llm</span>
-            <select
-              aria-label="llm"
+            {/* Pool-only: a pin outside it is a teammate that fails every
+                time it is woken, so the picker never offers one. */}
+            <Picker
+              label="llm"
+              className="w-full mt-0.5"
+              triggerClassName="w-full justify-between text-left border-2 border-black rounded-md bg-surface px-1.5 py-0.5 font-mono text-[0.66rem]"
+              panelClassName="left-0"
+              value={showing}
               disabled={readOnly || pinning || pool === null}
-              value={llmSelected(agent.llm, pool)}
-              onChange={(event) => {
-                const picked = event.target.value;
+              options={models}
+              onPick={(picked) => {
                 setPinning(true);
                 void setAgentModel(client, agent.id, picked).then((outcome) => {
                   setPinning(false);
@@ -178,16 +186,9 @@ export function AgentProfile({
                   if (outcome.kind === 'ok') onChanged();
                 });
               }}
-              className="w-full mt-0.5 border-2 border-black rounded-md bg-surface px-1.5 py-0.5 font-mono text-[0.66rem] disabled:opacity-50"
             >
-              {/* Pool-only: a pin outside it is a teammate that fails every
-                  time it is woken, so the picker never offers one. */}
-              {llmOptions(pool).map((option) => (
-                <option key={option.label} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
+              {models.find((one) => one.value === showing)?.label ?? showing}
+            </Picker>
           </label>
           {pinError == null ? null : (
             <p className="mt-1 font-mono text-[0.58rem] text-err break-words">{pinError}</p>

@@ -173,6 +173,27 @@ describe('TeamStrip', () => {
     expect(screen.getByRole('button', { name: 'Create agent' })).toBeDisabled();
   });
 
+  it('picks framework and llm by press, not by an OS menu', async () => {
+    const { onHire } = renderStrip();
+    await userEvent.click(screen.getByRole('button', { name: /Add an agent/ }));
+    await userEvent.type(screen.getByLabelText(/Name/), 'qa');
+    await userEvent.type(screen.getByLabelText(/Role/), 'Tests things.');
+
+    // Both fields name what they are set to, and open the board's own panel.
+    await userEvent.click(screen.getByLabelText('Framework: native'));
+    await userEvent.click(screen.getByRole('button', { name: 'codex' }));
+    await userEvent.click(screen.getByLabelText('llm: deepseek'));
+    await userEvent.click(screen.getByRole('button', { name: 'gpt-5' }));
+
+    await userEvent.click(screen.getByRole('button', { name: 'Create agent' }));
+    expect(onHire).toHaveBeenCalledWith({
+      name: 'qa',
+      role: 'Tests things.',
+      framework: 'codex',
+      llm: 'gpt-5',
+    });
+  });
+
   it('closes the form once the hire lands', async () => {
     const { onHire } = renderStrip();
     await userEvent.click(screen.getByRole('button', { name: /Add an agent/ }));

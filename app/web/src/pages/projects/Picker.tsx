@@ -37,6 +37,8 @@ export function Picker({
   onPick,
   options,
   triggerClassName = '',
+  className = '',
+  panelClassName = '',
   title,
   children,
 }: {
@@ -48,6 +50,13 @@ export function Picker({
   /// The trigger's own skin — a status pill, a bordered chip. The caret is
   /// added here, so callers style the value and not the affordance.
   triggerClassName?: string;
+  /// The wrapper. A chip in a row wants none of this; a form field wants
+  /// `w-full`, since a field that does not fill its row is not a field.
+  className?: string;
+  /// The panel. Anchored to the trigger's right edge by default, which is
+  /// what a chip wants; a full-width field adds `left-0` so the panel spans
+  /// the same width as the thing it belongs to.
+  panelClassName?: string;
   title?: string;
   children: ReactNode;
 }) {
@@ -62,7 +71,7 @@ export function Picker({
   useDismiss({ open, root, trigger, onDismiss: close });
 
   return (
-    <div ref={root} className="relative inline-flex shrink-0">
+    <div ref={root} className={`relative inline-flex shrink-0 ${className}`}>
       <button
         ref={trigger}
         type="button"
@@ -90,7 +99,7 @@ export function Picker({
           style={{ maxHeight: PANEL_MAX_PX }}
           className={`absolute right-0 z-30 min-w-[170px] overflow-y-auto overscroll-contain border-2 border-black rounded-md bg-surface shadow-brutal py-1 ${
             above ? 'bottom-[calc(100%+4px)]' : 'top-[calc(100%+4px)]'
-          }`}
+          } ${panelClassName}`}
         >
           {options.map((option) => {
             const picked = option.value === value;

@@ -92,7 +92,12 @@ In the chat view the **thread sits on `surface`** (`#fffdf7`) while all **side p
   status panel lists the board's own pills in column order and the assignee
   panel lists faces. Deliberately **not** `role="listbox"`: the options are
   ordinary buttons reachable by Tab, and claiming the role without arrow-key
-  roving would advertise an interaction that is not there.
+  roving would advertise an interaction that is not there. It stretches: a
+  chip in a row takes the default, a **form field** passes `className="w-full"`
+  and `panelClassName="left-0"` so the trigger fills its row and the panel
+  spans the same width. Every chosen value on the board goes through it — the
+  issue rail, the create modal's chip row, and the new-agent form's framework
+  and llm — so no screen here draws an operating-system menu.
 
 ### Popovers
 
