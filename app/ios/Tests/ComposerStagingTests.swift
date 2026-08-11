@@ -169,6 +169,147 @@ struct ComposerStagingTests {
         #expect(StagedAttachment.sniffMime(Self.ftyp("qt  ")) == StagedAttachment.fallbackMime)
     }
 
+    // MARK: - paste
+
+    /// The Paste row's whole implementation: a clipboard image becomes the same
+    /// thing a PhotosPicker pick becomes. It goes through `acceptPhoto`, so it
+    /// inherits the byte cap, the byte-first mime election, the spool, the
+    /// thumbnail and the upload pump rather than re-deriving any of them — and
+    /// the assertion that proves it is the upload streaming off a path under the
+    /// composer's own spool directory, never bytes across the FFI.
+    @Test func aPastedImageStagesLikeAPickedOne() async throws {
+        let fixture = ComposerFixture(pasteboard: FakePasteboard([.image(Self.smallPNG())]))
+
+        fixture.staging.stagePasteboard()
+
+        #expect(fixture.staging.staged.count == 1)
+        #expect(await waitUntil { fixture.client.blobUploadCalls.count == 1 })
+        let call = try #require(fixture.client.blobUploadCalls.first)
+        #expect(call.path.hasPrefix(StagedAttachment.spoolDirectory.path))
+        #expect(call.mimeType == "image/png")
+        #expect(await waitUntil { StagedAttachment.blocker(fixture.staging.staged) == nil })
+        let ref = try #require(fixture.staging.staged.first?.attachmentRef)
+        #expect(ref.kind == .image)
+        // A pasted image has no name of its own, exactly like a photo pick —
+        // the gateway's `attachment.<ext>` fallback is what titles its card.
+        #expect(ref.filename == nil)
+        #expect(fixture.store.notice == nil)
+    }
+
+    /// The clipboard's declared flavour is a HINT, not the answer. `acceptPhoto`
+    /// sniffs the bytes first, so a board that mislabels a JPEG still stores the
+    /// mime the provider will actually be handed.
+    @Test func theBytesOutrankWhateverTheClipboardCalledThem() async throws {
+        let jpeg = try #require(
+            UIImage(data: Self.smallPNG())?.jpegData(compressionQuality: 0.8))
+        let fixture = ComposerFixture(pasteboard: FakePasteboard([.image(jpeg, mime: "image/png")]))
+
+        fixture.staging.stagePasteboard()
+
+        #expect(await waitUntil { StagedAttachment.blocker(fixture.staging.staged) == nil })
+        #expect(fixture.staging.staged.first?.mime == "image/jpeg")
+    }
+
+    /// A multi-item paste admits every tile UP FRONT — the same invariant the
+    /// photo batch has, and for the same reason: `send()` reads the strip to
+    /// decide readiness, so a tile appended after its bytes arrive is invisible
+    /// to a send fired mid-paste and lands as a ghost on the next message. The
+    /// bytes are then pulled one item at a time, so a ten-screenshot paste never
+    /// holds ten full-size `Data`s at once.
+    @Test func everyPastedImageTakesItsSlotBeforeAnyBytesAreRead() async throws {
+        let fixture = ComposerFixture(
+            pasteboard: FakePasteboard([.image(Self.smallPNG()), .text, .image(Self.smallPNG())]))
+        fixture.client.holdBlobUploads()
+
+        fixture.staging.stagePasteboard()
+
+        // Two tiles, synchronously — the text item is not one of them.
+        #expect(fixture.staging.staged.count == 2)
+        #expect(StagedAttachment.blocker(fixture.staging.staged) == .waiting)
+        #expect(await waitUntil { fixture.pasteboard.imageReads == [0, 2] })
+    }
+
+    /// The strip's cap is the strip's, whichever door a pick comes through: a
+    /// paste of more images than there is room for admits up to the cap and says
+    /// why. The over-cap line names no tile (the pick never became one), so only
+    /// leaving the conversation can take it back.
+    @Test func aPasteOverTheCapAdmitsWhatFitsAndSaysSo() async throws {
+        let items = Array(
+            repeating: FakePasteboard.Item.image(Self.smallPNG()),
+            count: ChatStore.maxStagedAttachments + 3)
+        let fixture = ComposerFixture(pasteboard: FakePasteboard(items))
+        fixture.client.holdBlobUploads()
+
+        fixture.staging.stagePasteboard()
+
+        #expect(fixture.staging.staged.count == ChatStore.maxStagedAttachments)
+        #expect(fixture.store.notice != nil)
+        let notice = fixture.store.notice
+        fixture.staging.remove(try #require(fixture.staging.staged.first?.id))
+        #expect(fixture.store.notice == notice, "no tile owns an over-cap line")
+        fixture.store.leaveChat()
+        #expect(fixture.store.notice == nil)
+    }
+
+    /// The board can change between the panel opening and the row being tapped:
+    /// the user copies plain text, or clears it. Nothing is admitted, so the
+    /// line has no tile to own it either.
+    @Test func pastingWithNoImageOnTheBoardStagesNothingAndSaysWhy() async throws {
+        let pasteboard = FakePasteboard([.image(Self.smallPNG())])
+        let fixture = ComposerFixture(pasteboard: pasteboard)
+        pasteboard.replace(with: [.text])
+
+        fixture.staging.stagePasteboard()
+
+        #expect(fixture.staging.staged.isEmpty)
+        #expect(fixture.store.notice == Lang.shared.t("chat.pasteNoImage"))
+        #expect(pasteboard.imageReads.isEmpty, "presence is decided without pulling bytes")
+    }
+
+    /// A flavour that is declared and does not decode. The tile has to go — it
+    /// carries no blob and would block the send forever — and, unlike the case
+    /// above, it HAS a tile, so the line dies with it.
+    @Test func aPastedImageThatWontDecodeDropsItsTile() async throws {
+        let fixture = ComposerFixture(pasteboard: FakePasteboard([.undecodable]))
+
+        fixture.staging.stagePasteboard()
+        #expect(fixture.staging.staged.count == 1)
+
+        #expect(await waitUntil { fixture.staging.staged.isEmpty })
+        #expect(fixture.store.notice == Lang.shared.t("chat.attachFailed"))
+        #expect(fixture.client.blobUploadCalls.isEmpty)
+    }
+
+    /// The ✕ during a paste, which is the removal race on the one path where the
+    /// bytes are read AFTER the tile exists. The pick that is gone must reach
+    /// neither the strip nor the notice line; the rest of the batch carries on.
+    @Test func removingATileMidPasteStaysSilentAndDoesNotStallTheBatch() async throws {
+        let fixture = ComposerFixture(
+            pasteboard: FakePasteboard([.undecodable, .image(Self.smallPNG())]))
+
+        fixture.staging.stagePasteboard()
+        #expect(fixture.staging.staged.count == 2)
+        fixture.staging.remove(try #require(fixture.staging.staged.first?.id))
+
+        #expect(await waitUntil { fixture.client.blobUploadCalls.count == 1 })
+        #expect(fixture.staging.staged.count == 1)
+        #expect(fixture.store.notice == nil, "a removed pick's failure names nothing")
+    }
+
+    /// Whether the Paste row is offered at all — a presence probe, and it must
+    /// stay one: the real reader answers it from `types(forItemSet:)`, which
+    /// Apple documents as not notifying the user, while pulling bytes can raise
+    /// the system "Allow Paste?" alert.
+    @Test func pasteReadinessIsDecidedWithoutReadingAnyBytes() {
+        let pasteboard = FakePasteboard([.text])
+        let fixture = ComposerFixture(pasteboard: pasteboard)
+        #expect(!fixture.staging.pasteReady)
+
+        pasteboard.replace(with: [.text, .image(Self.smallPNG())])
+        #expect(fixture.staging.pasteReady)
+        #expect(pasteboard.imageReads.isEmpty)
+    }
+
     // MARK: - the send gate
 
     /// A pick takes its slot in the strip the moment it is ADMITTED, not when
@@ -301,7 +442,7 @@ struct ComposerStagingTests {
     /// owner: it was view state that died with the view, and its spools (up to
     /// 100 MiB each, ten to a strip) stayed on disk for good.
     @Test func everySpoolTheStripWasHoldingGoesWhenTheChatDoes() async throws {
-        let fixture = Fixture()
+        let fixture = ComposerFixture()
         var paths: [String] = []
         for _ in 0..<2 {
             let id = try #require(fixture.staging.admitPhoto())
@@ -328,7 +469,7 @@ struct ComposerStagingTests {
     /// the failed-upload blocker exists to prevent. Only leaving the
     /// conversation reclaims (`AppStore.chatPath` → `ChatStore.leaveChat`).
     @Test func aPresentationOverTheChatIsNotLeavingIt() async throws {
-        let fixture = Fixture()
+        let fixture = ComposerFixture()
         fixture.client.holdBlobUploads()
         let id = try #require(fixture.staging.admitPhoto())
         await fixture.staging.acceptPhoto(id: id, data: Self.smallPNG(), declaredMime: "image/png")
@@ -364,7 +505,7 @@ struct ComposerStagingTests {
     /// The composer frame is rebuilt constantly (every cover, every keyboard
     /// beat); the strip is not. One conversation, one strip.
     @Test func theStripIsOwnedByTheSessionNotTheComposerFrame() {
-        let fixture = Fixture()
+        let fixture = ComposerFixture()
         #expect(fixture.store.staging === fixture.staging)
         #expect(fixture.store.staging === fixture.store.staging)
     }
@@ -393,7 +534,7 @@ struct ComposerStagingTests {
     /// Leaving mid-upload stops the work rather than letting it finish into a
     /// strip nobody can see.
     @Test func leavingCancelsWorkStillReadingTheStrip() async throws {
-        let fixture = Fixture()
+        let fixture = ComposerFixture()
         fixture.client.holdBlobUploads()
         let id = try #require(fixture.staging.admitPhoto())
         await fixture.staging.acceptPhoto(id: id, data: Self.smallPNG(), declaredMime: "image/png")
@@ -415,7 +556,7 @@ struct ComposerStagingTests {
     /// fired, so seconds after a ✕ the dock announced "Send failed: …" for an
     /// attachment that was no longer on screen.
     @Test func aPickRemovedWhileItsBytesLoadPublishesNoNotice() async throws {
-        let fixture = Fixture()
+        let fixture = ComposerFixture()
         let id = try #require(fixture.staging.admitPhoto())
         fixture.staging.remove(id)
 
@@ -431,7 +572,7 @@ struct ComposerStagingTests {
     /// IS still in the strip speaks up and frees its slot. The discriminator is
     /// the removal, not a swallowed error path.
     @Test func aPickStillInTheStripReportsItsLoadFailure() async throws {
-        let fixture = Fixture()
+        let fixture = ComposerFixture()
         let id = try #require(fixture.staging.admitPhoto())
 
         await fixture.staging.acceptPhoto(id: id, data: Data([0, 1, 2, 3]), declaredMime: nil)
@@ -446,7 +587,7 @@ struct ComposerStagingTests {
     /// a read error — which the unguarded notice then showed the user for a
     /// tile they had just dismissed.
     @Test func removingATileMidUploadKeepsItsSpoolAndItsSilence() async throws {
-        let fixture = Fixture()
+        let fixture = ComposerFixture()
         fixture.client.holdBlobUploads()
         let id = try #require(fixture.staging.admitPhoto())
         await fixture.staging.acceptPhoto(id: id, data: Self.smallPNG(), declaredMime: "image/png")
@@ -473,7 +614,7 @@ struct ComposerStagingTests {
     /// The control: an upload that fails while its tile is still in the strip
     /// marks it `.error` — retryable on tap, blocking the send — and says so.
     @Test func aFailedUploadOnALiveTileReportsAndStaysRetryable() async throws {
-        let fixture = Fixture()
+        let fixture = ComposerFixture()
         fixture.client.holdBlobUploads()
         let id = try #require(fixture.staging.admitPhoto())
         await fixture.staging.acceptPhoto(id: id, data: Self.smallPNG(), declaredMime: "image/png")
@@ -492,7 +633,7 @@ struct ComposerStagingTests {
 
     /// One staged photo whose upload has failed: the state that puts a red line
     /// in the dock, offers the retry, and blocks the send.
-    private func stageAFailedUpload(_ fixture: Fixture) async throws -> UUID {
+    private func stageAFailedUpload(_ fixture: ComposerFixture) async throws -> UUID {
         fixture.client.holdBlobUploads()
         let id = try #require(fixture.staging.admitPhoto())
         await fixture.staging.acceptPhoto(id: id, data: Self.smallPNG(), declaredMime: "image/png")
@@ -508,7 +649,7 @@ struct ComposerStagingTests {
     /// not left "Send failed: request timed out" in red over an empty strip
     /// until the user dismissed it by hand.
     @Test func theXOnAFailedTileTakesItsNoticeWithIt() async throws {
-        let fixture = Fixture()
+        let fixture = ComposerFixture()
         let id = try await stageAFailedUpload(fixture)
         #expect(fixture.store.notice != nil)
 
@@ -521,7 +662,7 @@ struct ComposerStagingTests {
     /// Same for the send gate's own line — it names the tile holding the
     /// message up, so removing that tile clears the block and the line at once.
     @Test func theXOnTheBlockingTileClearsTheSendGatesNotice() async throws {
-        let fixture = Fixture()
+        let fixture = ComposerFixture()
         let id = try await stageAFailedUpload(fixture)
         let blocker = try #require(StagedAttachment.blocker(fixture.staging.staged))
         fixture.staging.noteBlocked(blocker)
@@ -536,7 +677,7 @@ struct ComposerStagingTests {
     /// failed approval land on it too — so a ✕ may only take back what the
     /// STRIP put there.
     @Test func aNoticeRaisedSinceSurvivesTheX() async throws {
-        let fixture = Fixture()
+        let fixture = ComposerFixture()
         let id = try await stageAFailedUpload(fixture)
         fixture.store.notice = Lang.shared.t("chat.modelFailed")
 
@@ -549,7 +690,7 @@ struct ComposerStagingTests {
     /// too: coming back to a red "Send failed" over a dock with nothing in it
     /// is the same dead end one tile down.
     @Test func leavingTheChatTakesTheStripsNoticeWithIt() async throws {
-        let fixture = Fixture()
+        let fixture = ComposerFixture()
         _ = try await stageAFailedUpload(fixture)
         #expect(fixture.store.notice != nil)
 
@@ -564,7 +705,7 @@ struct ComposerStagingTests {
     /// the next visit opened on "you can attach at most 10 files" in red over
     /// an EMPTY strip, naming a tile that never existed.
     @Test func leavingTakesTheLineAnOverCapPickLeftBehind() throws {
-        let fixture = Fixture()
+        let fixture = ComposerFixture()
         for _ in 0..<ChatStore.maxStagedAttachments {
             _ = try #require(fixture.staging.admitPhoto())
         }
@@ -584,7 +725,7 @@ struct ComposerStagingTests {
     /// Same for a Files pick whose size can't even be read: it never becomes a
     /// tile, and the line saying so must not outlive the strip it never joined.
     @Test func leavingTakesTheLineAnUnreadableFilesPickLeftBehind() {
-        let fixture = Fixture()
+        let fixture = ComposerFixture()
         fixture.staging.stage(files: [Self.missingFile])
         #expect(fixture.staging.staged.isEmpty)
         #expect(fixture.store.notice == Lang.shared.t("chat.attachFailed"))
@@ -597,7 +738,7 @@ struct ComposerStagingTests {
     /// And when the Files browser hands back a failure instead of URLs there is
     /// no pick at all behind the line — still the strip's to take back.
     @Test func leavingTakesThePickersOwnFailureWithIt() {
-        let fixture = Fixture()
+        let fixture = ComposerFixture()
         fixture.staging.notePickerFailed()
         #expect(fixture.store.notice == Lang.shared.t("chat.attachFailed"))
 
@@ -616,7 +757,7 @@ struct ComposerStagingTests {
     /// three at once on a cap of two, and the zombie's 100ms progress ticker
     /// still paying a main-actor hop per tick.
     @Test func aRemovedTilesUploadKeepsItsSlotUntilItLands() async throws {
-        let fixture = Fixture()
+        let fixture = ComposerFixture()
         fixture.client.holdBlobUploads()
         var ids: [UUID] = []
         for _ in 0..<4 {
@@ -653,7 +794,7 @@ struct ComposerStagingTests {
     /// Every staged pick uploads off a PATH — the encoded bytes never cross the
     /// FFI, so a 100 MiB pick is never held whole in memory.
     @Test func aStagedPickUploadsOffItsPath() async throws {
-        let fixture = Fixture()
+        let fixture = ComposerFixture()
         let id = try #require(fixture.staging.admitPhoto())
         await fixture.staging.acceptPhoto(id: id, data: Self.smallPNG(), declaredMime: "image/png")
         #expect(await waitUntil { fixture.client.blobUploadCalls.count == 1 })
@@ -801,37 +942,5 @@ struct ComposerStagingTests {
         let row = index.rows.first { $0.id == "s1" }
         #expect(row?.preview?.contains(Self.pdfName) == true)
         #expect(row?.userText == "what changed in the release?")
-    }
-}
-
-/// One staging machine over a fake core, plus the store whose notice line it
-/// writes and the support root the two hang off (deleted with the fixture).
-@MainActor
-private final class Fixture {
-    let temp = TempSupportDir()
-    let client = FakeBayboClient()
-    let store: ChatStore
-    let staging: ComposerStaging
-
-    init() {
-        let sessionId = "s-compose"
-        store = ChatStore(
-            sessionId: sessionId, client: client, index: temp.makeIndex(),
-            outbox: temp.makeOutbox(sessionId: sessionId))
-        // The SESSION's strip, not one built beside it: which object the
-        // composer renders — and what its lifetime is tied to — is half of
-        // what these tests are about.
-        staging = store.staging
-    }
-
-    /// A staged pick's spool path, read through a CALL so no copy of the item —
-    /// and so no second reference to its `SpoolFile` — survives in the test's
-    /// own scope to keep the file alive past what is being asserted.
-    func spoolPath(_ index: Int = 0) -> String? {
-        staging.staged[index].source?.url.path
-    }
-
-    func work(_ index: Int = 0) -> Task<Void, Never>? {
-        staging.staged[index].work
     }
 }

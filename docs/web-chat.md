@@ -201,11 +201,23 @@ Key invariant: because the stop button only appears when `!hasContent`, typing a
 
 The textarea is `rows={1}` and auto-grows in a `useLayoutEffect` keyed on `composer` (~line 1222): it resets `height` to `auto`, then sets it to `min(scrollHeight, 200)` px — single-line when idle, growing to a 200px cap for multi-paragraph drafts, then internal scroll. The placeholder reads `Message Baybo…  (Shift+Enter for newline)` when connected, else `Waiting for connection…`.
 
+The textarea's third event is `onPaste` → `handleComposerPaste`, which turns a pasted image or file into a staged attachment; it lives with the rest of the attachment plumbing below (§ Attachments).
+
 ### Attachments: upload, previews, removal
 
-The attach button (`RiAttachmentLine`, ~line 2460) clicks a hidden `<input type="file" multiple>` (`fileInputRef`). It is disabled when there is no admin token or the WS is not connected.
+The attach button (`RiAttachmentLine`, ~line 2460) clicks a hidden `<input type="file" multiple>` (`fileInputRef`). It is disabled on `!canAttach` — no admin token, or the WS is not connected — the same predicate the paste handler below gates on, extracted so the two cannot drift.
 
 `handleFilePick` (~line 1692) iterates the picked `File`s, calls `uploadAttachment` per file, then resets `e.target.value = ''` so re-picking the same file still fires `change`.
+
+**Paste is a second ingest into the same pipeline.** `handleComposerPaste` (`onPaste` on the textarea) hands `e.clipboardData` to the pure `clipboardAttachments` and uploads whatever comes back — a copied screenshot, an image copied off a web page, a file copied in Finder. Three rules, all of them in the pure function so they are unit-tested (`app/web/src/pages/composerPaste.test.ts`) without a real `DataTransfer`:
+
+- **Real text always wins.** A rich-text range copied out of Safari, Excel or Numbers carries a bitmap of the selection *alongside* the text, so keying on "the clipboard has a file" alone would swallow the paste the user meant and attach a picture of it instead. A non-empty `text/plain` means the paste falls through untouched.
+- **`preventDefault()` only when a file was actually taken.** Calling it unconditionally breaks ordinary text paste into the composer.
+- **A nameless blob gets a synthetic name** (`pastedFilename` → `pasted-image.png`, `pasted-image-2.png`, …, extension from the mime subtype). `filename` is what the chip shows and what rides `WireAttachment` to the agent, and the gateway heals a *blank* one to absent, which renders a titleless card.
+
+Nothing else changes: `uploadAttachment` already derives the mime, the `previewUrl` thumbnail and the send gate.
+
+The two clients' caps differ legitimately — iOS bounds its strip at `ChatStore.maxStagedAttachments` (10, with a notice), web bounds nothing client-side, and the per-message cap (`MAX_MESSAGE_BATCH_ATTACHMENTS`) is the gateway's. The affordance differs on purpose too. iOS gets an explicit **Paste** row in the composer's `+` panel, which works for every clipboard shape, plus a responder-chain hook so long-press → Paste on the field works for an **image-only** clipboard — a SwiftUI `TextField` ignores an image paste outright, and once the board also carries text the field wins the paste and no ancestor can outrank it. See [app/ios/docs/attachments.md](../app/ios/docs/attachments.md) § Paste is a third source. Web has no such split: the browser hands the whole clipboard to one handler, which is why the text-wins rule above is a decision the web code gets to make and iOS's field makes for it. What the two owe each other is the produced `WireAttachment`, not the gesture.
 
 `uploadAttachment` (~line 1652) immediately pushes a `PendingAttachment` (`status: 'uploading'`) with a fresh `localId` (`crypto.randomUUID()`). For `image/*` mimes it sets `previewUrl = URL.createObjectURL(file)` for an instant local thumbnail (no upload round-trip). It then `POST`s the raw file body to `${baseUrl}/v1/blobs` with headers `Authorization: Bearer <adminToken>` and `content-type: <mime>` (the admin listener resolves the bearer to `AuthedClient::Web`, bypassing pairing). On success it stores the returned content-addressed `blob_id` and flips `status: 'ready'`; on any failure `status: 'error'`. Mime defaults to `application/octet-stream` when the file reports none.
 

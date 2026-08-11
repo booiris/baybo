@@ -174,7 +174,8 @@ final class ChatStore: ObservableObject {
     /// was the frame's therefore lost mid-upload picks to a tap on a transcript
     /// image. What "the user actually left" means is `AppStore.chatPath`
     /// (`leaveChat` below), exactly as it is for audio.
-    private(set) lazy var staging = ComposerStaging(store: self, client: client)
+    private(set) lazy var staging = ComposerStaging(
+        store: self, client: client, pasteboard: pasteboard)
     /// A tapped file attachment, materialised on disk and awaiting presentation.
     @Published var filePreview: FilePreview?
     /// A long-pressed attachment awaiting the system share sheet.
@@ -234,6 +235,9 @@ final class ChatStore: ObservableObject {
     /// mirror). Confirmation is two-stage: the echo proves transport, an
     /// ordinal-stamped row (sync/backfill) proves durability. See sync-v2.
     private let outbox: OutboxStore
+    /// The system clipboard, held only to hand on to `staging` (which is lazy,
+    /// so it cannot take it as an init argument).
+    private let pasteboard: any PasteboardReading
     /// The pending-approval state machine; `pendingApprovals` is its published
     /// mirror.
     private var approvals = ApprovalQueue()
@@ -314,12 +318,14 @@ final class ChatStore: ObservableObject {
         sessionId: String,
         client: any BayboClientProtocol,
         index: SessionIndex,
-        outbox: OutboxStore
+        outbox: OutboxStore,
+        pasteboard: any PasteboardReading = Pasteboards.launch()
     ) {
         self.sessionId = sessionId
         self.client = client
         self.index = index
         self.outbox = outbox
+        self.pasteboard = pasteboard
         let listed = index.contains(sessionId: sessionId)
         self.listed = listed
         connState = listed ? .connecting : .draft

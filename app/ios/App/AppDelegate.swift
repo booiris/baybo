@@ -2,9 +2,14 @@ import UIKit
 import UserNotifications
 
 /// The app delegate: APNs registration and device-token delivery, memory-
-/// pressure eviction, and the notification-center callbacks for foreground
-/// presentation and taps.
-final class AppDelegate: NSObject, UIApplicationDelegate {
+/// pressure eviction, the notification-center callbacks for foreground
+/// presentation and taps — and the tail of the responder chain, which is where
+/// an image paste the composer field declined gets caught (see `paste(_:)`).
+///
+/// `UIResponder`, not `NSObject`, for that last reason alone: as an `NSObject`
+/// the delegate is not in the chain at all, and there is no other ancestor to
+/// hang the hook on — SwiftUI owns every view between the field and the window.
+final class AppDelegate: UIResponder, UIApplicationDelegate {
     /// Whether iOS has delivered a device token this launch; foreground re-arms
     /// registration while it hasn't (APNs registration can fail transiently at
     /// launch and iOS never retries on its own).
@@ -63,6 +68,28 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         didFailToRegisterForRemoteNotificationsWithError error: Error
     ) {
         NSLog("baybo: APNs registration failed: %@", error.localizedDescription)
+    }
+
+    /// The composer field's Paste, for a clipboard it cannot use.
+    ///
+    /// UIKit asks the FIRST RESPONDER whether it can paste and, only if it says
+    /// no, walks up the chain looking for someone who can. A SwiftUI `TextField`
+    /// says no exactly when the clipboard holds no text — i.e. for the copied
+    /// screenshot this exists to catch — and the walk then ends here.
+    ///
+    /// **Never delegate `paste:` to `super`.** `UIResponder`'s default answers
+    /// YES for any action the class merely IMPLEMENTS, so a blanket `super` call
+    /// would claim every paste in the app, including the plain text ones the
+    /// field handles perfectly, and route them into an attachment strip.
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        if action == #selector(paste(_:)) {
+            return ComposerPasteTarget.shared.canPaste
+        }
+        return super.canPerformAction(action, withSender: sender)
+    }
+
+    override func paste(_ sender: Any?) {
+        ComposerPasteTarget.shared.paste()
     }
 
     /// Under memory pressure, drop every idle (offscreen, not-pushed) chat store

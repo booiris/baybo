@@ -142,7 +142,8 @@ struct ChatScreen: View {
             } panel: {
                 if attach.isOpen {
                     AttachMenuPanel(
-                        anchor: attach.anchor, isPresented: $attach.isOpen
+                        anchor: attach.anchor, sources: attach.sources,
+                        isPresented: $attach.isOpen
                     ) { source in
                         attach.pick = source
                     }
@@ -202,6 +203,11 @@ struct ChatScreen: View {
             ModelCatalog.shared.refreshIfNeeded()
             store.refreshModelPin()
             SessionIndex.shared.enterSession(store.sessionId)
+            // Where the responder chain's paste hook (`AppDelegate`) sends an
+            // image. Registered on the SCREEN, not on the composer: every
+            // `fullScreenCover` over the chat tears the dock's `.safeAreaInset`
+            // down and puts it straight back, and this screen is what stays.
+            ComposerPasteTarget.shared.attach(store.staging)
             #if DEBUG
                 store.startDemoFramesIfRequested()
                 store.startDemoAttachmentsIfRequested()
@@ -217,6 +223,7 @@ struct ChatScreen: View {
         .onDisappear {
             host.bridge.detachCurrent(store)
             SessionIndex.shared.leaveSession(store.sessionId)
+            ComposerPasteTarget.shared.detach(store.staging)
         }
     }
 

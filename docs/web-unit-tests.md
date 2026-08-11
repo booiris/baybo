@@ -1,6 +1,6 @@
 # Web unit tests (`app/web`)
 
-The dashboard's vitest suite — **34 files, 560 tests** — and the conventions that
+The dashboard's vitest suite — **36 files, 597 tests** — and the conventions that
 keep it fast, deterministic, and dependency-light. Read this before adding a
 `.test.ts` under `app/web/src`.
 
@@ -75,6 +75,8 @@ unit under test; the pure core it delegates to is.
   a future edit knows what contract the test is defending:
   - the TUI (`crates/tui/src/app.rs`) for the composer ring, slash completion, and
     send-vs-park (`inputHistory`, `slashCompletion`, `composerSend`);
+  - `app/ios`'s own composer for the paste rule (`composerPaste`) — the two clients
+    owe each other the produced `WireAttachment`, not the gesture;
   - the Rust cron semantics for `cronActions`;
   - the sync protocol (`docs/sync-protocol.md`) for the cursor and thread merge
     (`syncCursor`, `syncApply`, `turnSync`).
@@ -164,6 +166,7 @@ says `pass`, not `skipping`, before trusting it.
 | `pages/chat/mathDelimiters.port.test.ts` (3) | the `mathDelimiters` pair + `syncCursor.ts` ⇄ `transcript/cursor.ts` | Each web copy stays byte-identical to its `app/ios/web` original past the header — the only gate on a module duplicated across two pnpm projects. The cursor is here because web and device run the ONE sync loop: a rebase-dirty rule that holds on only one client loses rows. |
 | `pages/sessionPatch.test.ts` (6) | `ChatPage.tsx` — `applySessionPatch` | Archive merges in place (the row stays in state so a sparse unarchive patch has something to land on) while `hidden` still removes the row; cron grouping + group pin survive an unrelated patch. |
 | `pages/composerSend.test.ts` (6) | `ChatPage.tsx` — `decideComposerAction` | send / park / stop / noop rule; a non-empty queue never stalls an idle submit (the regression). |
+| `pages/composerPaste.test.ts` (12) | `ChatPage.tsx` — `clipboardAttachments`, `pastedFilename` | Paste-to-attach: a file-only clipboard stages, and a clipboard carrying real TEXT stays a text paste even when a bitmap of the selection rides along (Safari / Excel / Numbers) — the inversion would eat the paste and attach a picture of it. Plus the synthetic name a nameless blob gets, since `filename` rides the wire to the agent. |
 | `pages/slashCompletion.test.ts` (8) | `ChatPage.tsx` — `applySlashCompletion`, `caretOnSlashToken` | Slash Tab-completion replaces the command token, lands the caret past the trailing space, preserves args. |
 | `pages/syncApply.test.ts` (6) | `ChatPage.tsx` — `transcriptItemToRow`, `applySyncMerge`, `applySyncReplace` | Row keying by server id; REPLACE re-overlays an unconfirmed optimistic send; MERGE appends + reconciles by `platform_msg_id`, no dup bubbles. |
 | `pages/turnSync.test.ts` (21) | `ChatPage.tsx` — `applyTurnState`, `routeInboundFrame` | Server-authoritative `turn_state`: the Working box opens/closes only from the server, never inferred from replayed steps. |
