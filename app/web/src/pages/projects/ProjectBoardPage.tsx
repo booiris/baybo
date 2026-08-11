@@ -5,7 +5,6 @@ import {
   DragOverlay,
   KeyboardSensor,
   PointerSensor,
-  closestCorners,
   useDroppable,
   useSensor,
   useSensors,
@@ -66,6 +65,7 @@ import {
   resolveDrop,
   runIndicator,
 } from './boardModel';
+import { boardCollisionDetection } from './dropTarget';
 import { Avatar } from './Avatar';
 import { generatedPortrait, useTeamPortraits, type Portrait } from './portrait';
 import { writeLastProjectId } from './lastProject';
@@ -413,7 +413,7 @@ export function ProjectBoardPage() {
       <div className="relative flex-1 min-h-0 flex">
         <DndContext
           sensors={sensors}
-          collisionDetection={closestCorners}
+          collisionDetection={boardCollisionDetection}
           onDragStart={onDragStart}
           onDragOver={onDragOver}
           onDragEnd={(event) => {

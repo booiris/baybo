@@ -120,6 +120,30 @@ mode collapsing the strip could introduce, and the badge is what rules it out.
 `boardFilter.ts` owns the list of narrowings (`restrictionCount`), because the
 badge and the Clear button must never disagree about what counts as filtered.
 
+## Dragging a card
+
+The drop target is decided by `pages/projects/dropTarget.ts`, not by one of
+dnd-kit's built-in strategies, for two reasons that both showed up as "the card
+is most of the way in and nothing happens".
+
+`useSortable` registers a **droppable under the same id as the draggable**, so
+the slot a card was lifted out of stays in the running and sits at exactly the
+height the dragged rect is at — it wins every distance measure until the card
+has fully cleared its old column. `resolveDrop` refuses a card landing on
+itself, so this never produced a wrong drop, only a dead drag. The active id is
+excluded from the candidates.
+
+Targeting is then **cursor-first** (`pointerWithin`, falling back to
+`rectIntersection` for the keyboard sensor, which has no cursor). The trade is
+worth naming: the cursor sits wherever the card was grabbed, so a card held by
+its far edge leads its own outline. The aim is the cursor.
+
+Two seams belong to no card — the 8px between cards and the column's side
+padding — and a column hit means "append to the end", so leaving them to the
+column would flick the preview to the bottom on every boundary swept past. In a
+seam the nearest card by centre wins instead. Below the last card is the one
+place the column is the honest answer, and it stays that way.
+
 ## Iconography
 
 - **Library:** [Remix Icon](https://remixicon.com/) (via `react-icons/ri`).
