@@ -635,7 +635,13 @@ final class ComposerStaging: ObservableObject {
     ///
     /// Nothing dismisses this row (there is no picker behind it), so the caller
     /// clears `AttachMenu.pick` itself.
-    func stagePasteboard() {
+    ///
+    /// `authorized` says the system has ALREADY attributed this read to the user
+    /// — it came from iOS's own Paste command (`ComposerPasteTarget`) rather
+    /// than from a button of ours — which is the whole difference between a
+    /// silent read and an "Allow Paste?" alert, and it changes how the bytes are
+    /// pulled below.
+    func stagePasteboard(authorized: Bool = false) {
         let indices = pasteboard.imageItemIndices()
         guard !indices.isEmpty else {
             // The board can empty (or turn into plain text) between the panel
@@ -644,20 +650,30 @@ final class ComposerStaging: ObservableObject {
             publishUnownedNotice(Lang.shared.t("chat.pasteNoImage"))
             return
         }
-        admitThenLoad(indices) { id, index in await self.loadPasted(id: id, index: index) }
+        admitThenLoad(indices) { id, index in
+            await self.loadPasted(id: id, index: index, authorized: authorized)
+        }
     }
 
-    /// Pull ONE clipboard item's bytes and fill its tile in. The read happens
-    /// off the main actor on purpose: for content copied in another app it can
-    /// raise the system "Allow Paste?" alert, and the read blocks the thread it
-    /// is on until that is answered — on the main actor that is the whole
-    /// composer, frozen mid-paste.
-    private func loadPasted(id: UUID, index: Int) async {
+    /// Pull ONE clipboard item's bytes and fill its tile in.
+    ///
+    /// The two ways to read, and why there are two. An UNAUTHORISED read — our
+    /// own Paste row, which iOS does not count as user intent — can raise the
+    /// system "Allow Paste?" alert, and the read BLOCKS the thread it is on
+    /// until that is answered; on the main actor that is the whole composer,
+    /// frozen mid-paste, so it goes to a detached task. An AUTHORISED one (iOS's
+    /// own Paste command) is silent, and stays on the main actor deliberately:
+    /// the permission belongs to the interaction, and hopping threads to read it
+    /// later is how you land outside the window it granted.
+    private func loadPasted(id: UUID, index: Int, authorized: Bool) async {
         guard holds(id) else { return }
         let reader = pasteboard
-        let pasted = await Task.detached(priority: .userInitiated) {
-            reader.image(at: index)
-        }.value
+        let pasted =
+            authorized
+            ? reader.image(at: index)
+            : await Task.detached(priority: .userInitiated) {
+                reader.image(at: index)
+            }.value
         guard let pasted else {
             drop(id, notice: Lang.shared.t("chat.attachFailed"))
             return

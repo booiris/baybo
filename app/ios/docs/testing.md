@@ -290,7 +290,15 @@ without touching `app/ios` at all.
   fakes only the clipboard and leaves the whole staging path real — so it is the
   one end-to-end staging witness the UI tier has (both pickers being out of
   process), covering the row's paint, the taller 3-row panel, and the fact that
-  the row is not one-shot. See
+  the row is not one-shot. It also drives the OTHER entry point,
+  `testLongPressPasteReachesTheResponderChain` — the only case that can see
+  UIKit walk past the text field to `AppDelegate`, which the unit tier cannot
+  (it asks the delegate directly and stays green even if nothing reaches it).
+  That case empties `UIPasteboard.general` first, and that is load-bearing: the
+  walk only continues when the FIELD declines, and Simulator.app syncs the host
+  Mac's clipboard by default, so a developer's last copy would otherwise let the
+  field take the paste. It passed on a virgin device and failed on the same
+  device an hour later before that line existed. See
   [attachments.md](attachments.md) § Paste is a third source.
 
 - **`-baybo-demo-keyboard`** raises the keyboard 2s in and drops it at 5s (record

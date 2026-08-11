@@ -35,6 +35,58 @@ protocol PasteboardReading: Sendable {
     func image(at index: Int) -> PastedImage?
 }
 
+/// The composer the SYSTEM's own Paste command routes an image to.
+///
+/// Long-pressing the composer field offers Paste whatever the clipboard holds —
+/// iOS puts that item there, and it is there even for an empty board — but
+/// SwiftUI's `TextField` only ever inserts text, so on an image it does nothing.
+/// The only place to catch that is the responder chain: UIKit asks the first
+/// responder for `canPerformAction(paste:)` and, when it says NO, keeps walking
+/// up. `AppDelegate` is the chain's terminus, and it has no idea which
+/// conversation is on screen — so the open chat registers its strip here.
+///
+/// **This catches image-ONLY clipboards, by construction and not by choice.**
+/// When the board also carries text (or a URL — a rich-text range with an inline
+/// image is the usual shape), the field answers YES, *it* becomes the target,
+/// it inserts the text, and nothing above it is ever asked. An ancestor can
+/// never outrank the first responder. Handling that case means owning the first
+/// responder, i.e. replacing the field with a `UITextView` subclass — a
+/// deliberate non-goal here; the `+` panel's Paste row is the affordance that
+/// works for every clipboard shape.
+@MainActor
+final class ComposerPasteTarget {
+    static let shared = ComposerPasteTarget()
+
+    /// Weak: the strip belongs to the session registry, and a chat that is torn
+    /// down while still registered must not be kept alive by this.
+    private weak var staging: ComposerStaging?
+
+    func attach(_ staging: ComposerStaging) {
+        self.staging = staging
+    }
+
+    /// Only the registrant can clear the slot. SwiftUI does not promise that a
+    /// leaving screen's `onDisappear` runs before the arriving screen's
+    /// `onAppear`, and unconditionally clearing on the way out would then blank
+    /// a target the next chat had already claimed.
+    func detach(_ staging: ComposerStaging) {
+        guard self.staging === staging else { return }
+        self.staging = nil
+    }
+
+    /// Whether the chain should claim `paste:` at all. False with no composer on
+    /// screen and false for a clipboard holding no image — which is what keeps
+    /// this from swallowing an ordinary text paste that the field declined for
+    /// some other reason.
+    var canPaste: Bool { staging?.pasteReady == true }
+
+    func paste() {
+        // The system's own Paste command IS the user intent iOS looks for, so
+        // the read that follows is authorised and silent.
+        staging?.stagePasteboard(authorized: true)
+    }
+}
+
 /// Which clipboard the app runs against. `SystemPasteboard` everywhere but a
 /// headless UI run: the real board cannot be seeded from a UI test, and the
 /// Paste row does not even appear unless one holds an image, so the whole

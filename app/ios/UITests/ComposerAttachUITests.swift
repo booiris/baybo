@@ -1,3 +1,4 @@
+import UIKit
 import XCTest
 
 /// Headless drive of the composer's attachment surface: the `+` panel and the
@@ -193,6 +194,60 @@ final class ComposerAttachUITests: BayboUITestCase {
             waitFor(timeout: 5) { tiles.count >= 2 },
             "a second Paste must stage a second tile — the row staged \(tiles.count)")
         attachScreenshot(app, name: "composer-paste-staged")
+    }
+
+    /// The one claim no unit test can make: that UIKit really does walk PAST the
+    /// SwiftUI text field, up the responder chain, to `AppDelegate` — which is
+    /// the entire mechanism behind long-press → Paste for an image.
+    ///
+    /// `ComposerPasteTargetTests` asks the delegate directly, so it would stay
+    /// green if the delegate were never reached (not in the chain at all, which
+    /// is what it was as an `NSObject`; or outranked by the field). Only driving
+    /// the system's own menu proves the walk.
+    ///
+    /// **The real clipboard must be emptied first, and that is not hygiene — it
+    /// is the precondition the mechanism runs on.** The walk only continues past
+    /// the field when the field DECLINES, i.e. when there is no text to paste.
+    /// Simulator.app syncs the host Mac's clipboard by default, so whatever the
+    /// developer last copied lands here: with text on the board the field takes
+    /// the paste, inserts it, and this case fails while the feature is fine.
+    /// (Found the hard way — it passed on a virgin device and failed on the same
+    /// device an hour later.) The runner shares the device pasteboard with the
+    /// app, so it can clear it directly; the app itself reads the injected
+    /// `-baybo-demo-paste` board, which is what still answers for the image.
+    ///
+    /// Per `docs/testing.md`, system chrome appearing is timing-dependent —
+    /// hence the existence assertion on the menu item before the tap, so a
+    /// missed menu fails here instead of passing vacuously.
+    func testLongPressPasteReachesTheResponderChain() throws {
+        UIPasteboard.general.items = []
+        let app = launch(["-baybo-open-chat", Self.demoPasteArg])
+        // The element TYPE SwiftUI picks for a vertical `TextField` is not
+        // contractual (it has been both across versions), so take whichever of
+        // the two is actually there.
+        XCTAssertTrue(
+            app.textFields.firstMatch.waitForExistence(timeout: 10)
+                || app.textViews.firstMatch.waitForExistence(timeout: 5),
+            "the composer field must exist")
+        let field =
+            app.textViews.firstMatch.exists ? app.textViews.firstMatch : app.textFields.firstMatch
+
+        field.press(forDuration: 1.0)
+        let paste = app.menuItems[Self.pasteRow].firstMatch
+        let fallback = app.buttons[Self.pasteRow].firstMatch
+        let item = paste.waitForExistence(timeout: 5) ? paste : fallback
+        try XCTSkipUnless(
+            item.waitForExistence(timeout: 5),
+            "the system edit menu never appeared — chrome, not the feature")
+
+        item.tap()
+
+        let staged = tile(app, Self.stagedImage)
+        XCTAssertTrue(
+            staged.waitForExistence(timeout: 5),
+            "the field declined the paste and nothing above it caught it — "
+                + "AppDelegate is not in the responder chain")
+        attachScreenshot(app, name: "composer-paste-longpress")
     }
 
     /// Poll a condition the accessibility tree only satisfies after an async
