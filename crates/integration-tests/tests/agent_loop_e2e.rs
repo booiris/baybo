@@ -4888,3 +4888,81 @@ async fn a_turn_that_churns_one_file_is_told_it_made_no_progress() {
 
     harness.shutdown().await;
 }
+
+/// The tool set a call offered is recorded beside what the model saw, as a
+/// resolvable reference rather than an inline copy.
+///
+/// Two things have to hold together or the Tools tab in the trace viewer
+/// shows nothing: the span has to carry the reference, and the row it names
+/// has to be in the store. The inline check is the same span-bloat guard the
+/// `input_messages` reference carries — a schema copy per call would be the
+/// largest thing in the `spans` table.
+#[tokio::test(start_paused = true)]
+async fn an_llm_span_records_its_tool_set_by_reference() {
+    use baybo_store::TurnStore;
+    use baybo_trace::{SpanKind, TraceStore};
+
+    let tool = Arc::new(RecordingTool::new("echo_tool"));
+    let manifest = tool.manifest();
+    let mut harness = AgentTestHarness::builder()
+        .with_tool(tool.clone() as Arc<dyn Tool>, manifest)
+        .build();
+
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("nothing to call".into())]);
+    harness.send_text("hi").await.unwrap();
+    harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    let turns = harness.turn_store.list_all().await.unwrap();
+    let mut refs = Vec::new();
+    let mut span_rows = Vec::new();
+    for turn in &turns {
+        for step in harness
+            .trace_store
+            .list_steps_by_turn(&turn.id)
+            .await
+            .unwrap()
+        {
+            let step = baybo_trace::Step::from_row(step).unwrap();
+            for row in harness
+                .trace_store
+                .list_spans_by_step(&step.id)
+                .await
+                .unwrap()
+            {
+                span_rows.push(row.data.clone());
+                let span = baybo_trace::Span::from_row(row).unwrap();
+                if let SpanKind::LlmCall { begin, .. } = span.kind {
+                    refs.push(begin.tools);
+                }
+            }
+        }
+    }
+
+    let reference = refs
+        .pop()
+        .expect("an LlmCall span")
+        .expect("the span records its tool set");
+    assert!(reference.count > 0, "the call offered tools");
+    assert!(
+        !span_rows.iter().any(|d| d.contains("parameters_schema")),
+        "a span inlined the tool schemas — the reference exists to keep them out"
+    );
+
+    let stored = harness
+        .trace_store
+        .load_tool_set(&reference.hash)
+        .await
+        .unwrap()
+        .expect("the referenced set is in the store");
+    let set = baybo_trace::LlmToolSet::from_row(stored).unwrap();
+    assert_eq!(set.tools.len(), reference.count);
+    assert!(
+        set.tools.iter().any(|t| t.name == "echo_tool"),
+        "the registered tool must be in the recorded set: {:?}",
+        set.tools.iter().map(|t| &t.name).collect::<Vec<_>>()
+    );
+
+    harness.shutdown().await;
+}

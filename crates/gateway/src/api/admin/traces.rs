@@ -18,6 +18,10 @@
 //!   `ToolCallOutput::Persisted` (by `tool_use_id`) references unresolved;
 //!   the client resolves them against the message log it already has from the
 //!   overview call.
+//! * `GET /v1/traces/tool-sets/{hash}` — the tool definitions an `LlmCall`
+//!   span's `tools.hash` names. Session-scoped only in spirit: the set is
+//!   content-addressed and shared across spans, so it is fetched once per
+//!   hash rather than shipped inside every span.
 //!
 //! The three per-session endpoints stay untyped `serde_json::Value` because
 //! the columnar Step/Span tree is polymorphic and re-mirroring the
@@ -47,6 +51,7 @@ pub fn routes() -> OpenApiRouter<AdminState> {
         .routes(routes!(get_trace))
         .routes(routes!(get_trace_lineage))
         .routes(routes!(get_turn_trace))
+        .routes(routes!(get_tool_set))
 }
 
 #[utoipa::path(
@@ -257,5 +262,44 @@ async fn get_turn_trace(
         "started_at": turn_trace.turn.started_at,
         "ended_at": turn_trace.turn.ended_at,
         "steps": steps,
+    })))
+}
+
+#[utoipa::path(
+    get,
+    path = "/traces/tool-sets/{hash}",
+    tag = "traces",
+    params(
+        ("hash" = String, Path, description = "Content hash from an LlmCall span's `tools.hash`"),
+    ),
+    responses(
+        (
+            status = 200,
+            description = "The tool definitions an LLM call offered the model: `{ hash, tools: [{ name, description, parameters_schema }] }`. Content-addressed and shared by every span that offered the same set, so a client fetches each hash once and caches it. Untyped JSON, consistent with the rest of the per-session traces family.",
+            body = serde_json::Value,
+            content_type = "application/json",
+        ),
+        (status = 400, description = "Malformed hash", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "No stored tool set for that hash", body = ErrorBody),
+    )
+)]
+async fn get_tool_set(
+    State(state): State<AdminState>,
+    Path(hash): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    let parsed: baybo_model::ToolSetHash = hash
+        .parse()
+        .map_err(|e| GatewayError::BadRequest(format!("invalid tool set hash: {e}")))?;
+    let set = state
+        .query_api
+        .load_tool_set(&parsed)
+        .await
+        .map_err(|e| GatewayError::Trace(e.to_string()))?
+        .ok_or_else(|| GatewayError::NotFound(format!("tool set {parsed}")))?;
+
+    Ok(Json(json!({
+        "hash": parsed,
+        "tools": set.tools,
     })))
 }

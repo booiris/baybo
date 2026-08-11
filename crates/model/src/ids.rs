@@ -195,6 +195,80 @@ ulid_newtype! {
     TaskId
 }
 
+/// Content address of one serialized tool-definition set.
+///
+/// An `LlmCall` span references the tool set it offered the model by this
+/// hash instead of embedding it: the set is session-stable and tens of KB,
+/// so an inline copy per call would dwarf the span that carries it. The
+/// digest itself is computed by `baybo-trace`, which owns the definitions
+/// and their canonical serialization.
+///
+/// Only a 64-char lowercase-hex digest is representable — [`FromStr`]
+/// rejects anything else, so a value arriving from a URL path or a stored
+/// row cannot smuggle in a free-form string.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ToolSetHash(String);
+
+/// Length of a hex-rendered SHA-256 digest.
+const TOOL_SET_HASH_LEN: usize = 64;
+
+impl ToolSetHash {
+    /// Render a raw SHA-256 digest as the canonical lowercase hex form.
+    pub fn from_digest(digest: &[u8; 32]) -> Self {
+        use fmt::Write as _;
+        let mut out = String::with_capacity(TOOL_SET_HASH_LEN);
+        for byte in digest {
+            // Infallible: `String`'s `Write` never errors.
+            let _ = write!(out, "{byte:02x}");
+        }
+        Self(out)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ToolSetHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Why a string is not a tool-set hash. Distinct from `ulid::DecodeError`
+/// so the gateway can map it to a 400 with a message that names the shape.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("expected a {TOOL_SET_HASH_LEN}-char lowercase hex digest")]
+pub struct ToolSetHashParseError;
+
+impl FromStr for ToolSetHash {
+    type Err = ToolSetHashParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.len() != TOOL_SET_HASH_LEN
+            || !s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return Err(ToolSetHashParseError);
+        }
+        Ok(Self(s.to_owned()))
+    }
+}
+
+impl TryFrom<String> for ToolSetHash {
+    type Error = ToolSetHashParseError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<ToolSetHash> for String {
+    fn from(value: ToolSetHash) -> Self {
+        value.0
+    }
+}
+
 /// Identifier for a parallel-tool batch within a `Step`.
 ///
 /// Spans sharing the same `ParallelGroup` were dispatched concurrently;
@@ -268,6 +342,37 @@ mod tests {
         let a = TurnId::new();
         let b = TurnId::new();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn tool_set_hash_round_trips_as_a_bare_string() {
+        let hash = ToolSetHash::from_digest(&[0xab; 32]);
+        assert_eq!(hash.as_str().len(), TOOL_SET_HASH_LEN);
+        let s = serde_json::to_string(&hash).unwrap();
+        assert!(s.starts_with("\"abab"), "expected a hex string, got {s}");
+        let back: ToolSetHash = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, hash);
+    }
+
+    #[test]
+    fn tool_set_hash_rejects_anything_but_lowercase_hex() {
+        for bad in [
+            "",
+            "not-a-hash",
+            &"a".repeat(TOOL_SET_HASH_LEN - 1),
+            &"a".repeat(TOOL_SET_HASH_LEN + 1),
+            &"A".repeat(TOOL_SET_HASH_LEN),
+            &"g".repeat(TOOL_SET_HASH_LEN),
+        ] {
+            assert_eq!(
+                bad.parse::<ToolSetHash>(),
+                Err(ToolSetHashParseError),
+                "{bad:?} should not parse as a tool-set hash"
+            );
+        }
+        // Deserialization goes through the same gate, so a hand-edited row
+        // cannot reintroduce a free-form string.
+        assert!(serde_json::from_str::<ToolSetHash>("\"nope\"").is_err());
     }
 
     #[test]

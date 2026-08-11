@@ -513,6 +513,7 @@ mod tests {
                 provider_config_hash: String::new(),
                 input_messages: LlmCallInputs::empty(),
                 temperature: None,
+                tools: None,
             },
             result: None,
         }

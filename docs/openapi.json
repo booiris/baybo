@@ -4410,6 +4410,65 @@
         }
       }
     },
+    "/v1/traces/tool-sets/{hash}": {
+      "get": {
+        "tags": [
+          "traces"
+        ],
+        "operationId": "get_tool_set",
+        "parameters": [
+          {
+            "name": "hash",
+            "in": "path",
+            "description": "Content hash from an LlmCall span's `tools.hash`",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The tool definitions an LLM call offered the model: `{ hash, tools: [{ name, description, parameters_schema }] }`. Content-addressed and shared by every span that offered the same set, so a client fetches each hash once and caches it. Untyped JSON, consistent with the rest of the per-session traces family.",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed hash",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No stored tool set for that hash",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/traces/{session_id}": {
       "get": {
         "tags": [

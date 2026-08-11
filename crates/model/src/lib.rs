@@ -36,7 +36,10 @@ pub use external_agent::{
 pub use fingerprint::FileFingerprint;
 pub use folder::{FolderId, FolderSummary, MAX_FOLDER_NAME_LEN};
 pub use governance::{ArtifactSource, ExtensionKind, ExtensionManifest, TrustLevel};
-pub use ids::{CostRecordId, ParallelGroup, SessionId, SpanId, StepId, TaskId, TurnId};
+pub use ids::{
+    CostRecordId, ParallelGroup, SessionId, SpanId, StepId, TaskId, ToolSetHash,
+    ToolSetHashParseError, TurnId,
+};
 pub use llm_entry_name::LlmEntryName;
 pub use message::{
     BlobRef, ChatMessage, ContentBlock, MessageMetadata, MessageSource, Role, SHA256_PREFIX,

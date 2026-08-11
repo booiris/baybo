@@ -8,9 +8,9 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use baybo_model::{SpanId, StepId, TurnId};
+use baybo_model::{SpanId, StepId, ToolSetHash, TurnId};
 use baybo_store::trace::Result;
-use baybo_store::{SpanEventRow, SpanRow, StepRow, TraceStore};
+use baybo_store::{SpanEventRow, SpanRow, StepRow, ToolSetRow, TraceStore};
 use parking_lot::Mutex;
 
 use crate::{LifecycleState, Span, Step};
@@ -23,6 +23,7 @@ pub struct MemoryTraceStore {
     steps: Mutex<HashMap<StepId, StepRow>>,
     spans: Mutex<HashMap<SpanId, SpanRow>>,
     span_events: Mutex<HashMap<SpanId, Vec<SpanEventRow>>>,
+    tool_sets: Mutex<HashMap<ToolSetHash, ToolSetRow>>,
 }
 
 impl MemoryTraceStore {
@@ -135,6 +136,20 @@ impl TraceStore for MemoryTraceStore {
             .filter(|r| Span::from_row((*r).clone()).is_ok_and(|s| step_ids.contains(&s.step_id)))
             .count();
         Ok((step_ids.len(), spans))
+    }
+
+    async fn save_tool_set(&self, set: &ToolSetRow) -> Result<()> {
+        // `entry` mirrors the backend's INSERT OR IGNORE: the hash keys the
+        // body, so the first write wins and repeats are no-ops.
+        self.tool_sets
+            .lock()
+            .entry(set.hash.clone())
+            .or_insert_with(|| set.clone());
+        Ok(())
+    }
+
+    async fn load_tool_set(&self, hash: &ToolSetHash) -> Result<Option<ToolSetRow>> {
+        Ok(self.tool_sets.lock().get(hash).cloned())
     }
 
     async fn append_span_event(&self, event: &SpanEventRow) -> Result<()> {

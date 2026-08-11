@@ -6,8 +6,11 @@
 //! contract sits alongside every other one. Callers convert at the
 //! boundary via these helpers.
 
-use crate::{Result, Span, SpanEvent, Step, TraceError};
-use baybo_store::{SpanEventRow, SpanRow, StepRow};
+use baybo_model::ToolSetHash;
+use sha2::{Digest, Sha256};
+
+use crate::{LlmToolSet, Result, Span, SpanEvent, Step, TraceError};
+use baybo_store::{SpanEventRow, SpanRow, StepRow, ToolSetRow};
 
 impl Step {
     pub fn to_row(&self) -> Result<StepRow> {
@@ -52,6 +55,31 @@ impl SpanEvent {
     pub fn from_row(row: SpanEventRow) -> Result<SpanEvent> {
         serde_json::from_str(&row.data)
             .map_err(|e| TraceError::Storage(format!("deserialize span_event: {e}")))
+    }
+}
+
+impl LlmToolSet {
+    /// Serialize once and key the row by the digest of those very bytes,
+    /// so the hash can never name a body that was serialized differently.
+    ///
+    /// The digest covers the serialized JSON — `serde_json` emits struct
+    /// fields in declaration order and object keys in the order the
+    /// schema `Value` holds them, which is deterministic for a given tool
+    /// registry. That is all the dedup needs; the hash is a storage key,
+    /// not a security boundary.
+    pub fn to_row(&self) -> Result<ToolSetRow> {
+        let data = serde_json::to_string(self)
+            .map_err(|e| TraceError::Storage(format!("serialize tool set: {e}")))?;
+        let digest: [u8; 32] = Sha256::digest(data.as_bytes()).into();
+        Ok(ToolSetRow {
+            hash: ToolSetHash::from_digest(&digest),
+            data,
+        })
+    }
+
+    pub fn from_row(row: ToolSetRow) -> Result<LlmToolSet> {
+        serde_json::from_str(&row.data)
+            .map_err(|e| TraceError::Storage(format!("deserialize tool set: {e}")))
     }
 }
 

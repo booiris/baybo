@@ -22,10 +22,10 @@ use std::sync::Arc;
 use baybo_cost::{CostError, CostStore, CostSummary, TimeRange};
 use baybo_model::{
     CallReason, ExternalAgentKind, Lineage, LineageKind, MicroUsd, Session, SessionId, SpanId,
-    StepId, SubagentBackendTag, TriggerKind, TurnId,
+    StepId, SubagentBackendTag, ToolSetHash, TriggerKind, TurnId,
 };
 use baybo_session::{SessionError, SessionStore, StoredMessage};
-use baybo_trace::{Span, SpanEvent, Step, TraceError, TraceStore};
+use baybo_trace::{LlmToolSet, Span, SpanEvent, Step, TraceError, TraceStore};
 use baybo_turn::{Turn, TurnError, TurnInputKind, TurnLifecycle, TurnStatus, TurnStatusKind};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -1372,6 +1372,29 @@ impl QueryApi {
         })
     }
 
+    // ── 13b. load_tool_set ──────────────────────────────────────
+
+    /// Resolve the `tools` reference on an `LlmCall` span into the
+    /// definitions that call offered the model.
+    ///
+    /// Deliberately its own call rather than inlined into
+    /// [`Self::load_turn_trace`]: every span in a session points at the
+    /// same set, so folding it into the turn tree would ship the same
+    /// tens of KB once per span. `None` when the hash is unknown — a
+    /// span recorded before the set was stored, or a row a trace delete
+    /// removed.
+    pub async fn load_tool_set(&self, hash: &ToolSetHash) -> Result<Option<LlmToolSet>> {
+        let Some(row) = self
+            .trace
+            .load_tool_set(hash)
+            .await
+            .map_err(TraceError::from)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(LlmToolSet::from_row(row)?))
+    }
+
     /// Walk every span in `turns`, hydrating both persisted LLM input slices and
     /// transcript-backed tool outputs into their legacy inline API shapes.
     /// Skips the work entirely if no span needs hydration; reads the log once
@@ -2309,6 +2332,18 @@ mod tests {
         ) -> baybo_store::trace::Result<Vec<baybo_store::SpanEventRow>> {
             Err(baybo_store::StorageError::Storage("boom".into()))
         }
+        async fn save_tool_set(
+            &self,
+            _: &baybo_store::ToolSetRow,
+        ) -> baybo_store::trace::Result<()> {
+            Ok(())
+        }
+        async fn load_tool_set(
+            &self,
+            _: &baybo_model::ToolSetHash,
+        ) -> baybo_store::trace::Result<Option<baybo_store::ToolSetRow>> {
+            Err(baybo_store::StorageError::Storage("boom".into()))
+        }
     }
 
     /// Hands back row bytes verbatim, the way `SqliteTraceStore` does — its
@@ -2386,6 +2421,18 @@ mod tests {
             _: &baybo_model::SpanId,
         ) -> baybo_store::trace::Result<Vec<baybo_store::SpanEventRow>> {
             Ok(Vec::new())
+        }
+        async fn save_tool_set(
+            &self,
+            _: &baybo_store::ToolSetRow,
+        ) -> baybo_store::trace::Result<()> {
+            Ok(())
+        }
+        async fn load_tool_set(
+            &self,
+            _: &baybo_model::ToolSetHash,
+        ) -> baybo_store::trace::Result<Option<baybo_store::ToolSetRow>> {
+            Ok(None)
         }
     }
 
@@ -2944,6 +2991,7 @@ mod tests {
                                 suffix: vec![instruction.clone()],
                             },
                             temperature: None,
+                            tools: None,
                         },
                         result: None,
                     },
@@ -3167,6 +3215,7 @@ mod tests {
                                 suffix: vec![],
                             },
                             temperature: None,
+                            tools: None,
                         },
                         result: None,
                     },
@@ -3317,6 +3366,7 @@ mod tests {
                                 suffix: vec![],
                             },
                             temperature: None,
+                            tools: None,
                         },
                         result: None,
                     },
@@ -3405,6 +3455,7 @@ mod tests {
                                 suffix: vec![],
                             },
                             temperature: None,
+                            tools: None,
                         },
                         result: None,
                     },
@@ -3609,6 +3660,7 @@ mod tests {
                         provider_config_hash: "h".into(),
                         input_messages: LlmCallInputs::empty(),
                         temperature: None,
+                        tools: None,
                     },
                     result: None,
                 },
@@ -3788,6 +3840,7 @@ mod tests {
                                 suffix: vec![],
                             },
                             temperature: None,
+                            tools: None,
                         },
                         result: None,
                     },

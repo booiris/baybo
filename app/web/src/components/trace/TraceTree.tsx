@@ -134,14 +134,18 @@ export interface TraceTreeProps {
 
 // ── Text projections used for the text filter ────────────────────────
 
+// Ids are part of every projection so a pasted step/span id narrows the tree
+// to that one row (the page then selects and scrolls to it). Turn rows have
+// carried their id since the start; steps and spans had no way to be found by
+// the identifier every deep link, log line, and API response quotes.
 function spanText(span: Span): string {
   const v = spanVisualOf(span).label;
-  if (span.kind.kind === 'llm_call') return `${v} ${span.kind.begin.model_id}`;
-  return `${v} ${span.kind.begin.tool_name}`;
+  const what = span.kind.kind === 'llm_call' ? span.kind.begin.model_id : span.kind.begin.tool_name;
+  return `${v} ${what} ${span.id}`;
 }
 
 function stepText(rs: ReplayStep): string {
-  return `${stepVisual(rs.step.kind.kind).label} ${rs.step.kind.kind} ${stepSummaryText(rs.step, rs.spans)}`;
+  return `${stepVisual(rs.step.kind.kind).label} ${rs.step.kind.kind} ${stepSummaryText(rs.step, rs.spans)} ${rs.step.id}`;
 }
 
 function turnText(label: string, turn: TraceTurnSummary): string {
@@ -274,8 +278,19 @@ function TokenBadge({ input, output }: { input: number; output: number }) {
 
 // ── Span leaf row ────────────────────────────────────────────────────
 
+/** The `#3` / `#3.2` position marker. Rendered as its own dim column so it
+ *  reads as an index rather than as part of the title. */
+function OrderMark({ label }: { label: string }) {
+  return (
+    <span className="shrink-0 w-8 text-right font-mono text-[0.65rem] font-bold text-ink-soft tabular-nums">
+      {label}
+    </span>
+  );
+}
+
 function SpanRow({
   span,
+  order,
   selected,
   interjected,
   maxMs,
@@ -286,6 +301,8 @@ function SpanRow({
   onSelect,
 }: {
   span: Span;
+  /** Position in storage order: `<step>.<span>`, both 1-based. */
+  order: string;
   selected: boolean;
   interjected: boolean;
   maxMs: number;
@@ -297,16 +314,22 @@ function SpanRow({
 }) {
   const visual = spanVisualOf(span);
   const ms = durationMs(span);
+  const tokens = sumLlmTokens([span]);
 
   let title = '';
   let subtitle = visual.label;
   if (span.kind.kind === 'llm_call') {
     title = span.kind.begin.model_id;
     if (span.kind.result) {
-      const cached = span.kind.result.cached_input_tokens ?? 0;
-      subtitle = `${span.kind.result.input_tokens ?? 0} in / ${span.kind.result.output_tokens ?? 0} out${
-        cached > 0 ? ` (${cached} cached)` : ''
-      }`;
+      // Usage stays in the always-visible subtitle rather than moving to the
+      // `TokenBadge` column: that column is `hidden lg:`, so a narrow window
+      // would drop a span's token figures entirely.
+      const cached = tokens.cached + tokens.cacheCreate;
+      const parts = [`${tokens.input.toLocaleString()} in / ${tokens.output.toLocaleString()} out`];
+      if (cached > 0) parts.push(`${cached.toLocaleString()} cached`);
+      const toolCount = span.kind.begin.tools?.count ?? 0;
+      if (toolCount > 0) parts.push(`${toolCount} tools`);
+      subtitle = parts.join(' · ');
     } else {
       subtitle = 'in flight';
     }
@@ -321,6 +344,7 @@ function SpanRow({
 
   return (
     <div {...rowInteractive(onSelect)} className={rowShell(selected, stripeClass(visual), tint, dim)} style={{ paddingLeft: indent }}>
+      <OrderMark label={order} />
       <Glyph ch={visual.glyph} accent={visual.accent} />
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2 min-w-0">
@@ -354,6 +378,7 @@ function SpanRow({
 
 function StepRow({
   rs,
+  order,
   selected,
   open,
   hasSpans,
@@ -366,6 +391,8 @@ function StepRow({
   onSelect,
 }: {
   rs: ReplayStep;
+  /** 1-based position among the turn's steps, in storage order. */
+  order: number;
   selected: boolean;
   open: boolean;
   hasSpans: boolean;
@@ -386,6 +413,7 @@ function StepRow({
   return (
     <div {...rowInteractive(onSelect)} className={rowShell(selected, stripeClass(visual), tint, dim)} style={{ paddingLeft: indent }}>
       {hasSpans ? <Chevron open={open} onClick={onToggle} /> : <span className="shrink-0 w-5" />}
+      <OrderMark label={`#${order}`} />
       <Glyph ch={visual.glyph} accent={visual.accent} />
       <div className="flex-1 min-w-0">
         <div className="font-bold uppercase tracking-wide text-[0.78rem] truncate">{visual.label}</div>
@@ -949,7 +977,10 @@ function TurnSubtree({
             </div>
           )}
 
-          {trace?.steps.map((rs) => {
+          {/* `stepIndex` / `spanIndex` are the position in the array the API
+              returned, which IS the stored order (`ORDER BY started_at` on both
+              queries) — so a filtered-out row does not renumber its siblings. */}
+          {trace?.steps.map((rs, stepIndex) => {
             // A step that hosts a surviving subagent must stay, or the child
             // is unreachable behind an ancestor the filter dropped.
             const stepHostsChild = rs.spans.some((sp) => spanHostsVisibleChild(sp.id, ctx));
@@ -970,6 +1001,7 @@ function TurnSubtree({
               <div key={rs.step.id} data-step-id={rs.step.id}>
                 <StepRow
                   rs={rs}
+                  order={stepIndex + 1}
                   selected={stepSelected}
                   open={stepOpen}
                   hasSpans={hasSpans}
@@ -984,7 +1016,7 @@ function TurnSubtree({
                   onSelect={onStepClick}
                 />
                 {stepOpen &&
-                  rs.spans.map((span) => {
+                  rs.spans.map((span, spanIndex) => {
                     if (
                       ctx.filtering &&
                       !showAllChildren &&
@@ -998,6 +1030,7 @@ function TurnSubtree({
                       <div key={span.id}>
                         <SpanRow
                           span={span}
+                          order={`${stepIndex + 1}.${spanIndex + 1}`}
                           selected={ctx.selectedSpanId === span.id}
                           interjected={ctx.interjectionSpanIds.has(span.id)}
                           maxMs={maxSpanMs}
