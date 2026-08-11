@@ -82,6 +82,15 @@ describe('AgentProfile', () => {
     expect(screen.getByText('1')).toBeInTheDocument();
   });
 
+  it('calls an unpinned llm "default", the same word the hire form uses', async () => {
+    renderProfile(agent('dev-1'));
+    // One constant behind both screens: this option and the new-agent form's
+    // are the same claim about what an empty pin means.
+    const picker = await screen.findByLabelText('llm');
+    expect(picker).toHaveValue('');
+    expect(picker.querySelector('option[value=""]')?.textContent).toBe('default');
+  });
+
   it('says who added it, and notes a hirer who has since gone', () => {
     renderProfile(agent('qa'));
     expect(screen.getByText(/you added it/)).toBeInTheDocument();
