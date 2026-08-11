@@ -651,7 +651,11 @@ only the profile id is available. Existing project personas keep their older
 unprefixed ids in the flat layout; they remain readable and are not moved
 behind the operator's back.
 
-- Handles are derived from the display name and then permanent, and unique only
+- An agent's **name is its handle** — `validate_agent_name` is
+  `AgentHandle::parse`, enforced on `ProjectManager::hire`, which is the one
+  door both the operator's form and the lead's `ProjectAgentCreate` come
+  through. There is no second, prettier name to drift against. Handles are
+  permanent, and unique only
   *within* a board — `@dev-1` here and `@dev-1` there are different agents.
   Permanence is the schema's, not this crate's: `idx_agent_profiles_handle`
   keeps it unique and reserved, and the `agent_profiles_team_is_insert_only`

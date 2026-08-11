@@ -182,12 +182,11 @@ existing git repo.
   the board, coordinates, and cannot be removed.
 - Clicking any avatar (team strip, card face, timeline, execution log)
   slides out the **agent profile panel** (same layer as the activity
-  drawer, mutually exclusive; no dedicated route in v1): display name
-  from `IDENTITY.md` beside the `@handle` derived from it — **both
-  immutable**, since a handle frozen against a name that drifts would
-  leave the roster and every mention naming different things, so the
-  IDENTITY editor below refuses a write that moves the `Name:` line and
-  so does the agent's own `Edit` — birth audit line
+  drawer, mutually exclusive; no dedicated route in v1): its name from
+  `IDENTITY.md`, which **is** its `@handle` and is immutable — one word
+  for one teammate, so nothing can drift against anything; the IDENTITY
+  editor below refuses a write that moves the `Name:` line and so does
+  the agent's own `Edit` — birth audit line
   (`created_by` — user-created or hired by the lead), live run state
   shared with the board's status frames, assigned issues, recent runs
   with transcript links, the **llm pin editor** (`profile.llm`; empty
@@ -196,9 +195,10 @@ existing git repo.
   self-edits), and the user-only **Remove from project** tombstone
   action. Only the lead's panel carries a chat button; other agents are
   reached by @mention in issue comments (no DM in v1).
-- The team strip ends in a dashed **＋ (new agent)**: a small form —
-  display name (the only moment it is chosen), immutable `@handle`
-  derived from it, a one-line role
+- The team strip ends in a dashed **＋ (new agent)**: a small form — the
+  name, which is the `@handle` itself and the only moment it is chosen
+  (handle grammar, refused in the form and again on the server), a
+  one-line role
   description that seeds `SOUL.md`, optional framework
   (native/claude/codex) and llm pin. Unlike `ProjectAgentCreate` (which
   deliberately exposes neither knob), the user form may set framework and
@@ -491,7 +491,10 @@ announces which of these will happen before sending.
      disagree). `list()` filters `project_id IS NULL` in SQL so no caller
      can leak a teammate into the global roster. `@handle` is its own
      grammar — narrower than the id's in every direction, because it is
-     typed from memory — derived from the display name and then permanent.
+     typed from memory — and it is the agent's name, not derived from a
+     separate one: `validate_agent_name` is `AgentHandle::parse`, on the
+     one door both the operator's hire and `ProjectAgentCreate` come
+     through. Permanent once given.
    - **Removal is a tombstone**, the third exception to this repo's
      hard-delete rule and for a reason the other two don't share:
      `issues.assignee`, `issue_runs.agent_id` and every timeline `actor`

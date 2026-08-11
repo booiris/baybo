@@ -34,7 +34,7 @@ impl Tool for ProjectAgentCreateTool {
 
     fn description(&self) -> String {
         format!(
-            r#"Add a new agent to this project's team, so there is somebody to assign work that nobody here can do. Returns its `@handle`, which is derived from the name. Neither can be changed afterwards — not by you, not by the operator, not by the agent itself — so name it as it should be addressed for good.
+            r#"Add a new agent to this project's team, so there is somebody to assign work that nobody here can do. The name you give it **is** its `@handle`, and it can never be changed afterwards — not by you, not by the operator, not by the agent itself — so name it as it should be addressed for good.
 
 Hiring is not free and it is not reversible from your side: only the operator can remove an agent, and a handle stays reserved on this board forever. Ask an existing teammate first. Hire when the gap is a real capability the team lacks, not a momentary queue — a board is capped at {MAX_TEAM_AGENTS} agents.
 
@@ -48,7 +48,7 @@ The `role` becomes the new agent's own soul: write what it is for, in its own te
             "properties": {
                 "name": {
                     "type": "string",
-                    "description": "Display name, e.g. \"Test Engineer\". Its `@handle` is derived from this, and both are permanent.",
+                    "description": "The agent's handle, and its name: lowercase letters, digits and '-', starting with a letter, e.g. \"test-engineer\". Permanent. If it is taken, a number is appended.",
                 },
                 "role": {
                     "type": "string",

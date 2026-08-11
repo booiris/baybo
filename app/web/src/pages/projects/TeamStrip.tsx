@@ -4,7 +4,7 @@ import { RiAddLine } from 'react-icons/ri';
 import { useAdminClient } from '../../api/auth';
 import { fetchModelPool } from './api';
 import type { Agent, IssueRun } from './boardModel';
-import { previewHandle, queuedAgentIds, workingAgentIds } from './teamModel';
+import { handleProblem, queuedAgentIds, workingAgentIds } from './teamModel';
 import { Avatar, AVATAR_BOX, runNote, type AvatarRun } from './Avatar';
 import type { Portrait } from './portrait';
 
@@ -174,7 +174,7 @@ function HireAgentForm({
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const client = useAdminClient();
-  const handle = previewHandle(name);
+  const problem = handleProblem(name);
 
   useEffect(() => {
     let canceled = false;
@@ -237,29 +237,27 @@ function HireAgentForm({
         </div>
 
         <div className="px-4 pb-4 flex flex-col gap-2.5">
+          {/* One field, not a name and a preview of the handle derived from
+              it. The name *is* the handle, so the operator types the thing
+              they are about to be stuck with instead of reading it back. */}
           <label className="flex flex-col gap-1">
-            <span className={fieldLabel}>Name</span>
+            <span className={fieldLabel}>
+              Name · this is its @handle, and neither ever changes
+            </span>
             <input
               autoFocus
               value={name}
               onChange={(event) => {
                 setName(event.target.value);
               }}
-              placeholder="Test Engineer"
-              className={`${fieldBox} font-sans`}
+              placeholder="test-engineer"
+              aria-invalid={problem !== null}
+              className={`${fieldBox} ${problem === null ? '' : 'border-err'}`}
             />
+            {problem === null ? null : (
+              <span className="font-mono text-[0.6rem] text-err">{problem}</span>
+            )}
           </label>
-          {/* The handle is a field of its own rather than a sentence under
-              the name. It is the thing that is permanent, and the operator
-              should read the one they are about to be stuck with. */}
-          <div className="flex flex-col gap-1">
-            <span className={fieldLabel}>
-              @handle · from the name, and never changes afterwards
-            </span>
-            <output className={`${fieldBox} ${handle === null ? 'text-ink-soft' : 'font-bold'}`}>
-              {handle === null ? '@…' : `@${handle}`}
-            </output>
-          </div>
           <label className="flex flex-col gap-1">
             <span className={fieldLabel}>Role · one line, and it seeds the agent’s own soul</span>
             <textarea
@@ -319,7 +317,7 @@ function HireAgentForm({
           </p>
           <button
             type="submit"
-            disabled={busy || name.trim() === '' || role.trim() === ''}
+            disabled={busy || name.trim() === '' || role.trim() === '' || problem !== null}
             // Dark on gold. White on this brand fails contrast, which is why
             // the design system says to pair it with ink.
             className="ml-auto shrink-0 border-2 border-black rounded-md px-3 py-1 font-mono text-[0.68rem] font-bold bg-brand text-ink disabled:opacity-50"

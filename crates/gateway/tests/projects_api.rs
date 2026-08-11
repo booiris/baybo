@@ -441,14 +441,14 @@ async fn a_board_staffs_itself_through_its_own_roster() {
     assert_eq!(items.len(), 1, "a new board comes with its lead");
     assert_eq!(items[0]["handle"], "lead");
     assert_eq!(items[0]["lead"], true);
-    assert_eq!(items[0]["name"], "Lead");
+    assert_eq!(items[0]["name"], "lead", "an agent's name is its handle");
     assert!(items[0].get("hired_by").is_none(), "nobody hired the lead");
     let lead_id = items[0]["id"].as_str().expect("id").to_owned();
 
     let hired = post(
         &router,
         &format!("/v1/projects/{p}/agents"),
-        json!({ "name": "Test Engineer", "role": "Writes the tests." }),
+        json!({ "name": "test-engineer", "role": "Writes the tests." }),
         StatusCode::CREATED,
     )
     .await;
@@ -477,7 +477,7 @@ async fn a_board_staffs_itself_through_its_own_roster() {
     post(
         &router,
         &format!("/v1/projects/{p}/agents"),
-        json!({ "name": "Roleless", "role": "  " }),
+        json!({ "name": "roleless", "role": "  " }),
         StatusCode::BAD_REQUEST,
     )
     .await;
@@ -487,13 +487,13 @@ async fn a_board_staffs_itself_through_its_own_roster() {
 /// and the handle never moves — so the name must not either, through any of
 /// the doors onto the `Name:` line of the agent's own `IDENTITY.md`.
 #[tokio::test]
-async fn a_hired_agent_keeps_the_name_its_handle_came_from() {
+async fn a_hired_agents_name_is_its_handle_and_neither_can_be_rewritten() {
     let (router, _tg) = router().await;
     let p = open_project(&router, "naming").await;
     let hired = post(
         &router,
         &format!("/v1/projects/{p}/agents"),
-        json!({ "name": "Test Engineer", "role": "Writes the tests." }),
+        json!({ "name": "test-engineer", "role": "Writes the tests." }),
         StatusCode::CREATED,
     )
     .await;
@@ -503,7 +503,7 @@ async fn a_hired_agent_keeps_the_name_its_handle_came_from() {
     let refused = put(
         &router,
         &format!("/v1/agents/{id}/name"),
-        json!({ "name": "Aster" }),
+        json!({ "name": "aster" }),
         StatusCode::BAD_REQUEST,
     )
     .await;
@@ -524,11 +524,11 @@ async fn a_hired_agent_keeps_the_name_its_handle_came_from() {
     )
     .await;
     let body = identity["content"].as_str().expect("content");
-    assert!(body.contains("* **Name:** Test Engineer"), "{body}");
+    assert!(body.contains("* **Name:** test-engineer"), "{body}");
     put(
         &router,
         &format!("/v1/agents/{id}/identity"),
-        json!({ "content": body.replace("Test Engineer", "Aster"), "version": identity["version"] }),
+        json!({ "content": body.replace("test-engineer", "aster"), "version": identity["version"] }),
         StatusCode::BAD_REQUEST,
     )
     .await;
@@ -549,7 +549,8 @@ async fn a_hired_agent_keeps_the_name_its_handle_came_from() {
         .iter()
         .find(|m| m["id"] == json!(id))
         .expect("still on the team");
-    assert_eq!(member["name"], "Test Engineer");
+    // One word for one teammate: the name is the handle.
+    assert_eq!(member["name"], "test-engineer");
     assert_eq!(member["handle"], "test-engineer");
 }
 
@@ -560,7 +561,7 @@ async fn a_removed_teammate_leaves_the_roster_but_not_the_record() {
     let hired = post(
         &router,
         &format!("/v1/projects/{p}/agents"),
-        json!({ "name": "Dev", "role": "Writes code." }),
+        json!({ "name": "dev", "role": "Writes code." }),
         StatusCode::CREATED,
     )
     .await;
@@ -786,7 +787,7 @@ async fn a_hire_reaches_the_feed_but_the_boards_own_lead_does_not() {
     post(
         &router,
         &format!("/v1/projects/{p}/agents"),
-        json!({ "name": "Test Engineer", "role": "Writes the tests." }),
+        json!({ "name": "test-engineer", "role": "Writes the tests." }),
         StatusCode::CREATED,
     )
     .await;

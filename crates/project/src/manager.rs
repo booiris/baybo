@@ -99,8 +99,6 @@ pub struct IssueRunLog {
     pub total: Spend,
 }
 
-const LEAD_DISPLAY_NAME: &str = "Lead";
-
 const LEAD_DESCRIPTION: &str =
     "Coordinates this project's board: triages Backlog, assigns work, and staffs the team.";
 
@@ -1354,7 +1352,7 @@ impl ProjectManager {
             &self.paths,
             id.as_str(),
             baybo_workspace::prompt::PROJECT_LEAD_SOUL_TEMPLATE,
-            LEAD_DISPLAY_NAME,
+            LEAD_HANDLE,
         )
         .await
         .map_err(|e| anyhow::anyhow!("materialise the project lead's persona: {e}"))?;
@@ -1417,15 +1415,9 @@ impl ProjectManager {
                 ),
             ));
         }
-        let base = AgentHandle::derive(&name).ok_or_else(|| {
-            ProjectError::invalid(
-                "name",
-                format!(
-                    "{name:?} has no letters or digits to make a handle from — \
-                     an agent has to be addressable as @something"
-                ),
-            )
-        })?;
+        // `validate_agent_name` already refused anything this could reject.
+        let base =
+            AgentHandle::parse(&name).map_err(|e| ProjectError::invalid("name", e.reason))?;
 
         let id = AgentProfileId::generate_project();
         let soul =
@@ -2174,20 +2166,22 @@ fn validate_budget(budget: Option<baybo_model::MicroUsd>) -> Result<Option<baybo
     Ok(budget)
 }
 
+/// An agent's name **is** its handle.
+///
+/// It used to be a display name that a handle was derived from — "Test
+/// Engineer" becoming `@test-engineer`. Two names for one teammate bought
+/// nothing: every surface on the board addresses agents by handle, so the
+/// display name only ever appeared beside the handle it produced, and the
+/// operator had to be shown a preview of a slug they did not type to know
+/// what they were about to be stuck with.
+///
+/// Enforced here rather than in the form because this is the door both
+/// hirings come through — the operator's and the lead's own
+/// `ProjectAgentCreate`. A rule kept in the form would be a rule the lead
+/// does not have, and the roster would carry both spellings.
 fn validate_agent_name(name: &str) -> Result<String> {
     let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return Err(ProjectError::invalid("name", "must not be empty"));
-    }
-    if trimmed.chars().count() > baybo_model::MAX_AGENT_PROFILE_NAME_CHARS {
-        return Err(ProjectError::invalid(
-            "name",
-            format!(
-                "longer than {} characters",
-                baybo_model::MAX_AGENT_PROFILE_NAME_CHARS
-            ),
-        ));
-    }
+    AgentHandle::parse(trimmed).map_err(|e| ProjectError::invalid("name", e.reason))?;
     Ok(trimmed.to_owned())
 }
 

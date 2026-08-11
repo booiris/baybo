@@ -181,9 +181,10 @@ async fn a_new_project_comes_with_a_lead() {
     )
     .await
     .expect("identity");
+    // The lead's name is its handle too — one word for one teammate.
     assert_eq!(
         baybo_workspace::display_name(&identity).as_deref(),
-        Some("Lead")
+        Some("lead")
     );
 
     let global = f.agents.list().await.expect("global roster");
@@ -259,7 +260,7 @@ async fn a_hire_gets_a_handle_a_soul_and_a_name() {
 
     let hired = f
         .manager
-        .hire(&p.id, new_member("Test Engineer"), Some(lead.clone()))
+        .hire(&p.id, new_member("test-engineer"), Some(lead.clone()))
         .await
         .expect("hire");
     assert_eq!(
@@ -308,14 +309,14 @@ async fn a_taken_handle_is_numbered_rather_than_reused() {
 
     let first = f
         .manager
-        .hire(&p.id, new_member("QA"), None)
+        .hire(&p.id, new_member("qa"), None)
         .await
         .expect("hire");
     assert_eq!(first.team.as_ref().map(|t| t.handle.as_str()), Some("qa"));
 
     let second = f
         .manager
-        .hire(&p.id, new_member("QA"), None)
+        .hire(&p.id, new_member("qa"), None)
         .await
         .expect("hire");
     assert_eq!(
@@ -329,7 +330,7 @@ async fn a_taken_handle_is_numbered_rather_than_reused() {
         .expect("remove");
     let third = f
         .manager
-        .hire(&p.id, new_member("QA"), None)
+        .hire(&p.id, new_member("qa"), None)
         .await
         .expect("hire");
     assert_eq!(third.team.as_ref().map(|t| t.handle.as_str()), Some("qa-3"));
@@ -362,7 +363,7 @@ async fn hiring_refuses_a_nameless_agent_and_a_full_team() {
         (
             baybo_project::NewTeamMember {
                 role: "  ".to_owned(),
-                ..new_member("Roleless")
+                ..new_member("roleless")
             },
             "a missing role",
         ),
@@ -373,13 +374,13 @@ async fn hiring_refuses_a_nameless_agent_and_a_full_team() {
 
     for n in 1..baybo_project::MAX_TEAM_AGENTS {
         f.manager
-            .hire(&p.id, new_member(&format!("Dev {n}")), None)
+            .hire(&p.id, new_member(&format!("dev-{n}")), None)
             .await
             .unwrap_or_else(|e| panic!("hire {n}: {e}"));
     }
     let refused = f
         .manager
-        .hire(&p.id, new_member("One Too Many"), None)
+        .hire(&p.id, new_member("one-too-many"), None)
         .await
         .expect_err("the cap holds");
     assert!(
@@ -414,7 +415,7 @@ async fn the_lead_cannot_be_removed_and_neither_can_a_busy_agent() {
 
     let dev = f
         .manager
-        .hire(&p.id, new_member("Dev"), None)
+        .hire(&p.id, new_member("dev"), None)
         .await
         .expect("hire");
     f.manager
@@ -465,7 +466,7 @@ async fn removal_is_scoped_to_the_board_that_asks() {
         .expect("p");
     let outsider = f
         .manager
-        .hire(&theirs.id, new_member("Dev"), None)
+        .hire(&theirs.id, new_member("dev"), None)
         .await
         .expect("hire");
 

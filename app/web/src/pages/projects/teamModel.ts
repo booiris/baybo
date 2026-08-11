@@ -29,25 +29,19 @@ export function handleOf(team: Agent[], agentId: string): string {
 /// Longest handle the grammar accepts. Mirrors `MAX_AGENT_HANDLE_CHARS`.
 const MAX_HANDLE_CHARS = 32;
 
-/// What the server will most likely derive as this name's `@handle`.
+
+/// Why this name cannot be an agent's, or null when it can.
 ///
-/// A **preview**, not the answer: `AgentHandle::derive`
-/// (`crates/model/src/agent_profile.rs`) is the authority, and on a
-/// collision the server appends a number this cannot know about. Shown
-/// anyway because the handle is permanent, and committing to one sight
-/// unseen is worse than committing to one that might gain a `-2`.
-export function previewHandle(name: string): string | null {
-  let slug = '';
-  for (const ch of name) {
-    if (/[a-zA-Z0-9]/.test(ch)) {
-      slug += ch.toLowerCase();
-    } else if (slug !== '' && !slug.endsWith('-')) {
-      slug += '-';
-    }
-  }
-  slug = slug.replace(/^-+/, '').replace(/-+$/, '').slice(0, MAX_HANDLE_CHARS);
-  slug = slug.replace(/-+$/, '');
-  // The grammar refuses a leading digit and an empty slug.
-  if (slug === '' || /^[0-9]/.test(slug)) return null;
-  return slug;
+/// A name **is** a handle — the server's `AgentHandle::parse`, mirrored here
+/// so the form can refuse before the round trip rather than after it. The
+/// server is still the judge: it also settles collisions, which no client can
+/// know about.
+export function handleProblem(name: string): string | null {
+  const value = name.trim();
+  if (value === '') return null;
+  if (!/^[a-z]/.test(value)) return 'has to start with a lowercase letter';
+  if (!/^[a-z0-9-]*$/.test(value)) return 'lowercase letters, digits and “-” only';
+  if (value.endsWith('-')) return 'cannot end with “-”';
+  if (value.length > MAX_HANDLE_CHARS) return `at most ${MAX_HANDLE_CHARS} characters`;
+  return null;
 }

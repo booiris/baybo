@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { Agent, IssueRun } from './boardModel';
-import { handleOf, previewHandle, workingAgentIds } from './teamModel';
+import { handleOf, handleProblem, workingAgentIds } from './teamModel';
 
 function run(agentId: string, status: IssueRun['status']): IssueRun {
   return {
@@ -47,19 +47,25 @@ describe('handleOf', () => {
   });
 });
 
-describe('previewHandle', () => {
-  it('slugifies a display name the way the server will', () => {
-    expect(previewHandle('Test Engineer')).toBe('test-engineer');
-    expect(previewHandle('Robin')).toBe('robin');
-    expect(previewHandle('  Dev   One  ')).toBe('dev-one');
-    expect(previewHandle('QA/2')).toBe('qa-2');
+describe('handleProblem', () => {
+  it('accepts what the server accepts', () => {
+    expect(handleProblem('test-engineer')).toBeNull();
+    expect(handleProblem('qa2')).toBeNull();
+    expect(handleProblem('  robin  ')).toBeNull();
   });
 
-  it('has no answer where the grammar has none', () => {
-    // The server refuses these too; showing a guess that cannot become a
-    // handle is worse than showing the plain rule instead.
-    expect(previewHandle('')).toBeNull();
-    expect(previewHandle('!!!')).toBeNull();
-    expect(previewHandle('42nd')).toBeNull();
+  it('says nothing about an empty box, which is not yet wrong', () => {
+    // The submit button is what refuses an empty name. Shouting at a field
+    // the operator has not typed in is noise.
+    expect(handleProblem('')).toBeNull();
+  });
+
+  it('refuses each way the grammar can be broken, in its own words', () => {
+    expect(handleProblem('Test Engineer')).toMatch(/lowercase letter/);
+    expect(handleProblem('42nd')).toMatch(/lowercase letter/);
+    expect(handleProblem('test engineer')).toMatch(/digits and/);
+    expect(handleProblem('qa/2')).toMatch(/digits and/);
+    expect(handleProblem('dev-')).toMatch(/end with/);
+    expect(handleProblem('d'.repeat(33))).toMatch(/32 characters/);
   });
 });

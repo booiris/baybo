@@ -135,7 +135,7 @@ describe('TeamStrip', () => {
 
     const submit = screen.getByRole('button', { name: 'Create agent' });
     expect(submit).toBeDisabled();
-    await userEvent.type(screen.getByLabelText(/Name/), 'QA');
+    await userEvent.type(screen.getByLabelText(/Name/), 'qa');
     expect(submit).toBeDisabled();
     await userEvent.type(screen.getByLabelText(/Role/), 'Tests things.');
     await userEvent.click(submit);
@@ -143,7 +143,7 @@ describe('TeamStrip', () => {
     // The user form carries framework and LLM pin — the two knobs the lead's
     // own hiring tool deliberately does not get.
     expect(onHire).toHaveBeenCalledWith({
-      name: 'QA',
+      name: 'qa',
       role: 'Tests things.',
       framework: 'baybo',
     });
@@ -160,20 +160,21 @@ describe('TeamStrip', () => {
     expect(screen.queryByRole('button', { name: 'Create agent' })).not.toBeInTheDocument();
   });
 
-  it('shows the handle the name is about to buy, before it is permanent', async () => {
+  it('refuses a name that cannot be a handle, before asking the server', async () => {
     renderStrip();
     await userEvent.click(screen.getByRole('button', { name: /Add an agent/ }));
-    // Its own field, not a sentence under the name: the handle is the part
-    // that can never be changed afterwards.
-    expect(screen.getByText('@…')).toBeInTheDocument();
     await userEvent.type(screen.getByLabelText(/Name/), 'Test Engineer');
-    expect(screen.getByText('@test-engineer')).toBeInTheDocument();
+
+    // The name *is* the handle now, so there is no slug to preview — there is
+    // a rule, and the field says which part of it was broken.
+    expect(screen.getByText(/lowercase letter/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Create agent' })).toBeDisabled();
   });
 
   it('closes the form once the hire lands', async () => {
     const { onHire } = renderStrip();
     await userEvent.click(screen.getByRole('button', { name: /Add an agent/ }));
-    await userEvent.type(screen.getByLabelText(/Name/), 'QA');
+    await userEvent.type(screen.getByLabelText(/Name/), 'qa');
     await userEvent.type(screen.getByLabelText(/Role/), 'Tests things.');
     await userEvent.click(screen.getByRole('button', { name: 'Create agent' }));
 

@@ -161,7 +161,7 @@ async fn an_agent_opens_assigns_and_starts_work_by_handle() {
         .call(
             "ProjectAgentCreate",
             &ctx,
-            json!({ "name": "Test Engineer", "role": "Writes the tests." }),
+            json!({ "name": "test-engineer", "role": "Writes the tests." }),
         )
         .await;
     assert_eq!(hired["handle"], "@test-engineer");
@@ -214,7 +214,7 @@ async fn a_handle_that_is_not_on_this_board_does_not_resolve() {
     let (mine, lead) = f.open("mine").await;
     let (theirs, _) = f.open("theirs").await;
     f.manager
-        .hire(&theirs, member("Outsider"), None)
+        .hire(&theirs, member("outsider"), None)
         .await
         .expect("hire");
 
@@ -241,7 +241,7 @@ async fn a_comment_says_whether_anybody_will_read_it() {
     f.call(
         "ProjectAgentCreate",
         &ctx,
-        json!({ "name": "Dev", "role": "Codes." }),
+        json!({ "name": "dev", "role": "Codes." }),
     )
     .await;
     f.call("IssueCreate", &ctx, json!({ "title": "unowned" }))
@@ -342,7 +342,7 @@ async fn the_triage_filter_finds_the_cards_nobody_is_on() {
     f.call(
         "ProjectAgentCreate",
         &ctx,
-        json!({ "name": "Dev", "role": "Codes." }),
+        json!({ "name": "dev", "role": "Codes." }),
     )
     .await;
     for (title, priority) in [("low one", "low"), ("urgent one", "urgent")] {
@@ -391,7 +391,7 @@ async fn a_departed_teammate_is_still_named_on_the_timeline_an_agent_reads() {
         .call(
             "ProjectAgentCreate",
             &ctx,
-            json!({ "name": "Test Engineer", "role": "Writes the tests." }),
+            json!({ "name": "test-engineer", "role": "Writes the tests." }),
         )
         .await;
     assert_eq!(hired["handle"], "@test-engineer");
@@ -762,7 +762,7 @@ async fn the_triage_read_says_who_is_free_and_what_is_stuck() {
     f.call(
         "ProjectAgentCreate",
         &ctx,
-        json!({ "name": "Dev", "role": "Codes." }),
+        json!({ "name": "dev", "role": "Codes." }),
     )
     .await;
 
