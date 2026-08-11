@@ -19,7 +19,7 @@ import {
   verticalListSortingStrategy,
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { RiAddLine, RiArchiveLine, RiLoader4Line } from 'react-icons/ri';
+import { RiAddLine, RiArchiveLine, RiLoader4Line, RiSettings3Line } from 'react-icons/ri';
 
 import { useAdminClient, useAuth } from '../../api/auth';
 import { IconButton } from '../../components/IconButton';
@@ -395,11 +395,13 @@ export function ProjectBoardPage() {
             onClick={() => {
               setShowSettings(true);
             }}
-            // The group's tracking is trailing letter-spacing, which on a
-            // one-glyph button is padding down the right-hand side only.
-            className={`${HEADER_ACTION} ${HEADER_ACTION_OFF} tracking-normal`}
+            className={`${HEADER_ACTION} ${HEADER_ACTION_OFF}`}
           >
-            ⚙
+            {/* Sized against the button, not against the group's label text.
+                A 10px word is legible because the word is read whole; a 10px
+                glyph is a smudge. 16px keeps the button within a pixel of the
+                two beside it, so the group still reads as one row. */}
+            <RiSettings3Line aria-hidden className="text-base" />
           </button>
         </div>
       </header>
