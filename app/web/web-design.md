@@ -239,6 +239,18 @@ than as the edge of one. The board's other small round furniture (the team
 strip's status dot, the profile header's) already sits at 1px, so this is the
 existing idiom for things this size, not an exception to the language.
 
+The **team strip** in the board header is faces and nothing else — 26px, a live
+status dot on every one (green working, grey idle), a gold halo on the lead, a
+dashed `＋` at the end. The handle rides in the tooltip: sixteen named pills are
+wider than the header they sit in, and the face is what the operator already
+recognises on every card. Removal is not on the strip; it is on the profile the
+face opens, where it asks twice.
+
+`Avatar`'s `run` distinguishes **`null` from `'idle'`** — `null` is "this caller
+does not track run state" and draws no dot, `'idle'` is "tracked, nothing
+running". A roster where only the busy have a dot cannot be told from one whose
+dots failed to load.
+
 Who draws what is resolved once per page in `pages/projects/portrait.ts`:
 `useTeamPortraits(team)` fetches the roster's uploaded blobs (bearer-gated, so
 they arrive as object URLs via `api/blobs.ts`) and falls back to the generated

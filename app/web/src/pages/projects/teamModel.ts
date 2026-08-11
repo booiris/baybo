@@ -6,6 +6,22 @@ export function workingAgentIds(activeRuns: IssueRun[]): Set<string> {
   );
 }
 
+/// Agents with a run waiting on a free slot, and none of their own going.
+///
+/// Separate from [`workingAgentIds`] rather than a second status on one map:
+/// an agent can have a queued run on one card while working another, and the
+/// strip must show that as working — the dimmed queued face means "this
+/// teammate is idle *and* has something waiting", which is a different thing
+/// to see.
+export function queuedAgentIds(activeRuns: IssueRun[]): Set<string> {
+  const working = workingAgentIds(activeRuns);
+  return new Set(
+    activeRuns
+      .filter((run) => run.status === 'queued' && !working.has(run.agent_id))
+      .map((run) => run.agent_id),
+  );
+}
+
 export function handleOf(team: Agent[], agentId: string): string {
   return team.find((agent) => agent.id === agentId)?.handle ?? agentId;
 }

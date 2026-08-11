@@ -322,6 +322,7 @@ export function ProjectBoardPage() {
         <TeamStrip
           team={team}
           activeRuns={activeRuns}
+          portrait={portrait}
           readOnly={archived}
           hireOpen={hireOpen}
           onHireClosed={() => {
@@ -340,19 +341,6 @@ export function ProjectBoardPage() {
             pushToast('ok', `@${outcome.value.handle} joined the project`);
             setRefreshKey((key) => key + 1);
             return null;
-          }}
-          onRemove={(agent) => {
-            void removeAgent(client, projectId, agent.id).then((outcome) => {
-              if (outcome.kind === 'unauthorized') {
-                logout();
-                return;
-              }
-              pushToast(
-                outcome.kind === 'ok' ? 'ok' : 'err',
-                outcome.kind === 'ok' ? `@${agent.handle} left the project` : outcome.message,
-              );
-              setRefreshKey((key) => key + 1);
-            });
           }}
         />
         <div className="ml-auto flex items-center gap-2">

@@ -5,6 +5,11 @@ import userEvent from '@testing-library/user-event';
 import { TeamStrip } from './TeamStrip';
 import type { Agent, IssueRun } from './boardModel';
 
+/// The board resolves faces once and hands them down; the strip must not go
+/// looking for its own.
+const portrait = (agentId: string | null | undefined) =>
+  agentId == null ? null : `data:face/${agentId}`;
+
 vi.mock('../../api/auth', () => ({
   useAdminClient: () => ({}),
   useAuth: () => ({ token: 't', baseUrl: 'http://x', logout: vi.fn() }),
@@ -36,42 +41,34 @@ function renderStrip(
   overrides: Partial<Parameters<typeof TeamStrip>[0]> = {},
 ): {
   onHire: ReturnType<typeof vi.fn>;
-  onRemove: ReturnType<typeof vi.fn>;
   onOpenProfile: ReturnType<typeof vi.fn>;
 } {
   const onHire = vi.fn().mockResolvedValue(null);
-  const onRemove = vi.fn();
   const onOpenProfile = vi.fn();
   render(
     <TeamStrip
       team={TEAM}
       activeRuns={[]}
+      portrait={portrait}
       readOnly={false}
       onHire={onHire}
-      onRemove={onRemove}
       onOpenProfile={onOpenProfile}
       {...overrides}
     />,
   );
-  return { onHire, onRemove, onOpenProfile };
+  return { onHire, onOpenProfile };
 }
 
 describe('TeamStrip', () => {
-  it('shows every handle and lets only non-leads be removed', async () => {
-    const { onRemove } = renderStrip();
-    expect(screen.getByText('@lead')).toBeInTheDocument();
-    expect(screen.getByText('@dev-1')).toBeInTheDocument();
-
-    expect(
-      screen.queryByRole('button', { name: /Remove @lead/ }),
-    ).not.toBeInTheDocument();
-
-    // Two clicks: removal is a tombstone, and the pill's trash sits under
-    // the cursor on the way to everything else in the strip.
-    await userEvent.click(screen.getByRole('button', { name: /Remove @dev-1/ }));
-    expect(onRemove).not.toHaveBeenCalled();
-    await userEvent.click(screen.getByRole('button', { name: /Confirm removing @dev-1/ }));
-    expect(onRemove).toHaveBeenCalledWith(expect.objectContaining({ handle: 'dev-1' }));
+  it('draws a face for every member, from the board’s own lookup', () => {
+    renderStrip();
+    // Faces, not named pills: sixteen handles is wider than the header, and
+    // the avatar is what the operator already recognises on every card.
+    for (const handle of ['lead', 'dev-1']) {
+      const seat = screen.getByRole('button', { name: `Open @${handle}'s profile` });
+      expect(seat.querySelector('img')).toHaveAttribute('src', `data:face/id-${handle}`);
+    }
+    expect(screen.queryByText('@dev-1')).not.toBeInTheDocument();
   });
 
   it('opens a profile from any handle, including the lead\'s', async () => {
@@ -82,9 +79,8 @@ describe('TeamStrip', () => {
 
   it('offers no writes on an archived board', () => {
     renderStrip({ readOnly: true });
-    expect(screen.getByText('@dev-1')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Open @dev-1's profile/ })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /Add an agent/ })).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /Remove/ })).not.toBeInTheDocument();
   });
 
   it('marks the agents that are running, and not the queued ones', () => {
@@ -102,9 +98,9 @@ describe('TeamStrip', () => {
       <TeamStrip
         team={TEAM}
         activeRuns={runs}
+        portrait={portrait}
         readOnly
         onHire={vi.fn()}
-        onRemove={vi.fn()}
         onOpenProfile={vi.fn()}
       />,
     );
@@ -114,9 +110,9 @@ describe('TeamStrip', () => {
       <TeamStrip
         team={TEAM}
         activeRuns={[{ ...runs[0], status: 'running' }]}
+        portrait={portrait}
         readOnly
         onHire={vi.fn()}
-        onRemove={vi.fn()}
         onOpenProfile={vi.fn()}
       />,
     );
@@ -129,9 +125,9 @@ describe('TeamStrip', () => {
       <TeamStrip
         team={TEAM}
         activeRuns={[]}
+        portrait={portrait}
         readOnly={false}
         onHire={onHire}
-        onRemove={vi.fn()}
         onOpenProfile={vi.fn()}
       />,
     );

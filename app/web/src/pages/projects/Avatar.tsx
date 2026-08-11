@@ -9,7 +9,12 @@
 /// decided *here* is only how it is framed. The operator and the board are
 /// not agents, get no portrait, and keep a monogram.
 
-export type AvatarRun = 'queued' | 'running' | 'held' | null;
+/// `null` and `'idle'` are not the same answer. `null` is "this caller is not
+/// tracking run state" — a comment's author, an execution-log row — and draws
+/// no status dot at all. `'idle'` is "tracked, and there is nothing running",
+/// which the team strip has to show: a roster where only the busy have a dot
+/// cannot be told from one where the dot failed to load.
+export type AvatarRun = 'queued' | 'running' | 'held' | 'idle' | null;
 
 const SIZE = {
   sm: 'w-[18px] h-[18px] text-[0.46rem]',
@@ -27,18 +32,27 @@ function initialsOf(handle: string): string {
   return (parts[0][0] + second).toUpperCase();
 }
 
-function titleOf(handle: string, run: AvatarRun): string {
-  const who = handle === 'you' ? 'you' : `@${handle}`;
+/// How a run state reads in a tooltip. Exported because a caller with a
+/// richer sentence than `@handle` still has to say the state the same way —
+/// two spellings of "working" is how the strip and the card start disagreeing
+/// about what the ring means.
+export function runNote(run: AvatarRun): string {
   switch (run) {
     case 'running':
-      return `${who} — working`;
+      return ' — working';
     case 'queued':
-      return `${who} — queued, waiting for a free slot`;
+      return ' — queued, waiting for a free slot';
     case 'held':
-      return `${who} — held, the project is over its daily budget`;
+      return ' — held, the project is over its daily budget';
+    case 'idle':
+      return ' — idle';
     default:
-      return who;
+      return '';
   }
+}
+
+function titleOf(handle: string, run: AvatarRun): string {
+  return `${handle === 'you' ? 'you' : `@${handle}`}${runNote(run)}`;
 }
 
 export function Avatar({
@@ -46,6 +60,7 @@ export function Avatar({
   src = null,
   run = null,
   size = 'md',
+  title,
 }: {
   /// A bare handle (no `@`), or the literal `you` for the operator. Names the
   /// chip; the picture comes from `src`.
@@ -55,11 +70,15 @@ export function Avatar({
   src?: string | null;
   run?: AvatarRun;
   size?: keyof typeof SIZE;
+  /// A fuller sentence than `@handle`, from a caller that has one. It goes
+  /// here rather than on a wrapper: nested `title`s mean the tooltip depends
+  /// on which pixel the cursor is over.
+  title?: string;
 }) {
   const working = run === 'running';
   return (
     <span
-      title={titleOf(handle, run)}
+      title={title ?? titleOf(handle, run)}
       style={src === null ? { background: INK, color: '#faf6ec' } : undefined}
       className={`relative inline-flex shrink-0 items-center justify-center rounded-full border border-black font-mono font-bold ${
         SIZE[size]
