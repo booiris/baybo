@@ -1883,6 +1883,8 @@ forwards_everything_else! {
     set_issue_branch(id: &IssueId, branch: &str) -> StoreResult<bool>;
     list_runs(issue: &IssueId) -> StoreResult<Vec<IssueRunRow>>;
     run_spend(issue: &IssueId) -> StoreResult<Vec<baybo_store::project::RunSpend>>;
+    settled_run_facts(runs: &[baybo_model::IssueRunId])
+        -> StoreResult<Vec<baybo_store::project::SettledRunFacts>>;
     board_activity(since: DateTime<Utc>)
         -> StoreResult<Vec<(ProjectId, baybo_store::project::BoardActivity)>>;
     active_runs(project: &ProjectId) -> StoreResult<Vec<IssueRunRow>>;

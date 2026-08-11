@@ -9,7 +9,7 @@ use baybo_store::StorageError;
 use baybo_store::project::{
     AttentionCounts, BoardActivity, IssueActor, IssueEventRow, IssuePriority, IssueRow,
     IssueRunRow, IssueStatus, IssueUpdate, NewIssue, NewIssueEvent, NewIssueRun, ProjectRow,
-    ProjectStore, ProjectUpdate, Result, RunSpend, RunStatus, RunTrigger, Spend,
+    ProjectStore, ProjectUpdate, Result, RunSpend, RunStatus, RunTrigger, SettledRunFacts, Spend,
 };
 
 pub struct SqliteProjectStore {
@@ -1096,6 +1096,63 @@ impl ProjectStore for SqliteProjectStore {
             .collect())
     }
 
+    async fn settled_run_facts(&self, runs: &[IssueRunId]) -> Result<Vec<SettledRunFacts>> {
+        if runs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<String> = runs.iter().map(|id| id.as_str().to_string()).collect();
+        let rows = self
+            .pool
+            .interact("issue_runs.settled_facts", move |conn| {
+                let holes = std::iter::repeat_n("?", ids.len())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                // The window is `run_spend`'s, verbatim — one derivation, so
+                // the feed and the execution log cannot price a run
+                // differently. Timestamps are microseconds on this table.
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT r.id, \
+                            (r.settled_at - r.started_at) / 1000, \
+                            COALESCE(SUM(c.input_tokens), 0), \
+                            COALESCE(SUM(c.output_tokens), 0), \
+                            COALESCE(SUM(c.cost_usd), 0) \
+                     FROM issue_runs r \
+                     LEFT JOIN cost_records c \
+                       ON c.session_id = r.session_id \
+                      AND c.timestamp >= r.started_at \
+                      AND (r.settled_at IS NULL OR c.timestamp < r.settled_at) \
+                     WHERE r.id IN ({holes}) \
+                     GROUP BY r.id"
+                ))?;
+                Ok(stmt
+                    .query_map(rusqlite::params_from_iter(ids.iter()), |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?)
+            })
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(id, duration_ms, input_tokens, output_tokens, cost)| SettledRunFacts {
+                    run_id: IssueRunId::from(id),
+                    duration_ms,
+                    spend: Spend {
+                        input_tokens,
+                        output_tokens,
+                        cost: baybo_model::MicroUsd::from_micros(cost),
+                    },
+                },
+            )
+            .collect())
+    }
+
     async fn board_activity(
         &self,
         since: chrono::DateTime<chrono::Utc>,
@@ -2160,6 +2217,65 @@ mod tests {
             "the live run does not inherit its predecessor's calls"
         );
         assert_eq!(by_run[&second.id].output_tokens, 9);
+
+        // The feed asks the same question by run rather than by card, and
+        // must get the same answer — two derivations of one number is how
+        // the feed and the execution log start disagreeing about what a
+        // card cost.
+        let facts: std::collections::HashMap<_, _> = store
+            .settled_run_facts(&[first.id.clone(), second.id.clone()])
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.run_id.clone(), row))
+            .collect();
+        assert_eq!(facts[&first.id].spend, by_run[&first.id]);
+        assert_eq!(facts[&second.id].spend, by_run[&second.id]);
+
+        // Milliseconds. The column is microseconds, so the divide is the
+        // whole test: without it every duration reads a thousand times long.
+        let settled = store.get_run(&first.id).await.unwrap().unwrap();
+        let expected = (settled.settled_at.expect("settled").timestamp_micros()
+            - settled.started_at.expect("started").timestamp_micros())
+            / 1000;
+        assert_eq!(facts[&first.id].duration_ms, Some(expected));
+        assert!(
+            facts[&second.id].duration_ms.is_none(),
+            "a run still in flight has not taken any length of time yet"
+        );
+    }
+
+    #[tokio::test]
+    async fn settled_run_facts_reads_nothing_for_a_run_nobody_claimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(dir.path().join("test.db")).await.unwrap();
+        let store = SqliteProjectStore::new(pool.clone());
+
+        let p = project("01JUNCLAIMED", "unclaimed");
+        store.create_project(&p).await.unwrap();
+        let issue = store
+            .create_issue(&new_issue(&p.id, "never ran", IssueStatus::Todo))
+            .await
+            .unwrap();
+        let run = store.enqueue_run(&new_run(&issue)).await.unwrap();
+        store
+            .settle_run(&run.id, RunStatus::Cancelled, Some("called off"))
+            .await
+            .unwrap();
+
+        let facts = store
+            .settled_run_facts(std::slice::from_ref(&run.id))
+            .await
+            .unwrap();
+        // No window, so no duration — `None`, not `0`, which would render as
+        // a run that finished instantly.
+        assert_eq!(facts[0].duration_ms, None);
+        assert_eq!(facts[0].spend.cost, baybo_model::MicroUsd::from_micros(0));
+
+        assert!(
+            store.settled_run_facts(&[]).await.unwrap().is_empty(),
+            "an empty page asks nothing"
+        );
     }
 
     #[tokio::test]

@@ -7140,8 +7140,26 @@ export interface operations {
                         items: {
                             actor: components["schemas"]["ActorDto"];
                             body: components["schemas"]["FeedBodyDto"];
+                            /**
+                             * Format: int64
+                             * @description What the run cost, in micro-USD. **Absent, not zero** — a run that
+                             *     billed nothing is a real answer and must not read as "unpriced".
+                             */
+                            cost_micros?: number | null;
                             /** Format: int64 */
                             created_at_ms: number;
+                            /**
+                             * Format: int64
+                             * @description How long the run took, on a line that settled one.
+                             *
+                             *     Lives on the feed entry rather than in the stored event because it is
+                             *     **derived** over the run's cost window, like the execution log's
+                             *     numbers and by the same query — a copy frozen into the timeline entry
+                             *     would be written before the run's last cost record necessarily is.
+                             *     Absent on every other kind of line, and on a settled run whose row is
+                             *     gone.
+                             */
+                            duration_ms?: number | null;
                             /**
                              * Format: int64
                              * @description The card this concerns. Absent on board-level entries.

@@ -518,6 +518,15 @@ pub trait ProjectStore: Send + Sync {
     /// nobody claimed has no window and reads zero.
     async fn run_spend(&self, issue: &IssueId) -> Result<Vec<RunSpend>>;
 
+    /// The same derivation as [`Self::run_spend`], addressed by run rather
+    /// than by card and carrying the run's duration with it.
+    ///
+    /// Batched because its caller is the board-wide feed: a page of it can
+    /// name runs on a dozen different cards, and asking per card would turn
+    /// one screen into a dozen round trips. Runs that do not exist are
+    /// simply absent from the result.
+    async fn settled_run_facts(&self, runs: &[IssueRunId]) -> Result<Vec<SettledRunFacts>>;
+
     /// Every board's live working count and spend since `since`, in one
     /// pass. One query rather than one per board: the switcher's dropdown
     /// asks about all of them at once, and a per-row read is the shape
@@ -775,6 +784,21 @@ impl std::iter::Sum for Spend {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunSpend {
     pub run_id: IssueRunId,
+    pub spend: Spend,
+}
+
+/// What one finished run took and cost.
+///
+/// Derived, never stored — same reason as [`ProjectStore::run_spend`], and
+/// the same window. Freezing either number onto the run row or into its
+/// timeline entry would put a third copy beside the ledger, and the copy
+/// would be written before the run's last cost record necessarily is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettledRunFacts {
+    pub run_id: IssueRunId,
+    /// `None` on a run no executor ever claimed, which has no window and so
+    /// no duration — not zero, which would read as "instant".
+    pub duration_ms: Option<i64>,
     pub spend: Spend,
 }
 

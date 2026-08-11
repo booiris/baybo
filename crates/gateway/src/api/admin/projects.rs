@@ -633,6 +633,20 @@ pub struct FeedEntryDto {
     pub actor: ActorDto,
     pub body: FeedBodyDto,
     pub created_at_ms: i64,
+    /// How long the run took, on a line that settled one.
+    ///
+    /// Lives on the feed entry rather than in the stored event because it is
+    /// **derived** over the run's cost window, like the execution log's
+    /// numbers and by the same query — a copy frozen into the timeline entry
+    /// would be written before the run's last cost record necessarily is.
+    /// Absent on every other kind of line, and on a settled run whose row is
+    /// gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
+    /// What the run cost, in micro-USD. **Absent, not zero** — a run that
+    /// billed nothing is a real answer and must not read as "unpriced".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_micros: Option<i64>,
 }
 
 /// A feed line's payload: either a card's timeline entry, or one of the
@@ -1527,7 +1541,7 @@ async fn project_feed(
     let cards: Vec<IssueEventRow> = rows
         .iter()
         .filter_map(|entry| match entry {
-            baybo_project::FeedEntry::Card(row) => Some(row.clone()),
+            baybo_project::FeedEntry::Card { row, .. } => Some(row.clone()),
             baybo_project::FeedEntry::Hired { .. } => None,
         })
         .collect();
@@ -1548,13 +1562,15 @@ async fn project_feed(
     let items = rows
         .into_iter()
         .map(|entry| match entry {
-            baybo_project::FeedEntry::Card(row) => {
+            baybo_project::FeedEntry::Card { row, settled } => {
                 let dto = IssueEventDto::with_handles(row, &handles);
                 FeedEntryDto {
                     number: Some(dto.number),
                     actor: dto.actor,
                     body: FeedBodyDto::Card(dto.body),
                     created_at_ms: dto.created_at_ms,
+                    duration_ms: settled.as_ref().and_then(|facts| facts.duration_ms),
+                    cost_micros: settled.as_ref().map(|facts| facts.cost_micros),
                 }
             }
             baybo_project::FeedEntry::Hired {
@@ -1573,6 +1589,8 @@ async fn project_feed(
                     agent: agent_ref(&agent, &handles),
                 }),
                 created_at_ms: at.timestamp_millis(),
+                duration_ms: None,
+                cost_micros: None,
             },
         })
         .collect();

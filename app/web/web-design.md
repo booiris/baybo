@@ -142,6 +142,16 @@ returns spans rather than a string, so the sentence is not marked up in one
 place and written in another. A comment is narrated, never quoted: an agent's
 run report is hundreds of words that would bury every line around it.
 
+A settled-run line carries what the run took and cost — `run #1 done on #7 ·
+2m10s · $0.04`. Both numbers are **derived server-side** over the run's own
+cost window, by the same query the execution log uses, and arrive on the feed
+entry rather than in the stored event: a run's cost is not a column anywhere,
+because a session is shared by every run the same agent does on a card and only
+the window attributes a call. A copy frozen into the timeline entry at settle
+time would also be written before the run's last cost record necessarily is.
+Absent is not zero on either — a run nobody claimed has no window, and `0s ·
+$0.00` would report that as instant and free.
+
 The drawer is **read-only**. Approvals appear here with a warn dot and are
 answered on the issue's own timeline; there are no action buttons in the feed.
 

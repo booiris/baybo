@@ -4847,9 +4847,25 @@
                           "body": {
                             "$ref": "#/components/schemas/FeedBodyDto"
                           },
+                          "cost_micros": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ],
+                            "format": "int64",
+                            "description": "What the run cost, in micro-USD. **Absent, not zero** — a run that\nbilled nothing is a real answer and must not read as \"unpriced\"."
+                          },
                           "created_at_ms": {
                             "type": "integer",
                             "format": "int64"
+                          },
+                          "duration_ms": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ],
+                            "format": "int64",
+                            "description": "How long the run took, on a line that settled one.\n\nLives on the feed entry rather than in the stored event because it is\n**derived** over the run's cost window, like the execution log's\nnumbers and by the same query — a copy frozen into the timeline entry\nwould be written before the run's last cost record necessarily is.\nAbsent on every other kind of line, and on a settled run whose row is\ngone."
                           },
                           "number": {
                             "type": [

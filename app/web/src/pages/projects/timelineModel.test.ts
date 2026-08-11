@@ -274,6 +274,23 @@ describe('feedLine', () => {
     ).toEqual(['@dev-1', '@qa-2', '#7']);
   });
 
+  it('carries what a settled run took and cost, and omits either when unpriced', () => {
+    // Derived server-side over the run's own cost window — the feed is
+    // handed the numbers rather than deriving a second opinion of them.
+    const settled = {
+      ...feed({ kind: 'run_settled', attempt: 1, status: 'done' }),
+      duration_ms: 130_000,
+      cost_micros: 40_000,
+    } as FeedEntry;
+    expect(said(settled)).toBe('run #1 done on #7 · 2m10s · $0.04');
+
+    // Absent is not zero: a run nobody claimed has no window, and "0s · $0.00"
+    // would report that as a run that finished instantly having spent nothing.
+    expect(said(feed({ kind: 'run_settled', attempt: 2, status: 'cancelled' }))).toBe(
+      'run #2 cancelled on #7',
+    );
+  });
+
   it('leaves the card out of the lines that have none', () => {
     // A hire is a fact about the board. So is running out of budget.
     const hire = feed({ kind: 'hired', agent: { id: DEV_ID, handle: 'tester' } }, null);

@@ -1,6 +1,14 @@
 import type { components, paths } from '../../api/schema';
 
-import { COLUMN_LABEL, unsettledRun, type Agent, type IssueStatus, type RunStatus } from './boardModel';
+import {
+  COLUMN_LABEL,
+  formatDuration,
+  unsettledRun,
+  type Agent,
+  type IssueStatus,
+  type RunStatus,
+} from './boardModel';
+import { formatUsd } from './budgetModel';
 import { handleOf } from './teamModel';
 
 export type IssueEvent = components['schemas']['IssueEventDto'];
@@ -337,6 +345,10 @@ export function feedLine(entry: FeedEntry): Span[] {
         { text: body.status, strong: true },
         ' on ',
         at,
+        // Derived server-side over the run's own cost window, so the feed
+        // and the execution log cannot price the same run differently.
+        entry.duration_ms == null ? '' : ` · ${formatDuration(entry.duration_ms)}`,
+        entry.cost_micros == null ? '' : ` · ${formatUsd(entry.cost_micros)}`,
         body.error != null && body.error.length > 0 ? ` — ${body.error}` : '',
       );
     case 'blocked':

@@ -1,12 +1,13 @@
 //! Project and issue lifecycle: validation, workdir materialisation, and
 //! the board's write surface.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use baybo_model::{
-    AgentFramework, AgentHandle, AgentProfileId, IssueId, MAX_PROJECT_NAME_CHARS, ProjectId,
-    SessionId, TeamMembership,
+    AgentFramework, AgentHandle, AgentProfileId, IssueId, IssueRunId, MAX_PROJECT_NAME_CHARS,
+    ProjectId, SessionId, TeamMembership,
 };
 use baybo_store::AgentProfileStore;
 use baybo_store::project::{
@@ -37,7 +38,16 @@ pub const LEAD_HANDLE: &str = "lead";
 /// rather than written to any card's timeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FeedEntry {
-    Card(IssueEventRow),
+    Card {
+        row: IssueEventRow,
+        /// What the run took and cost, on the entries that settled one.
+        ///
+        /// Attached here rather than left to the caller: it is derived over
+        /// the run's own cost window, and a caller holding the store would
+        /// re-derive it — differently, the second time. `None` on every
+        /// other kind of entry, and on a settled run whose row is gone.
+        settled: Option<SettledRun>,
+    },
     Hired {
         agent: AgentProfileId,
         /// Absent when a person did the hiring — the lead's own arrival
@@ -48,11 +58,25 @@ pub enum FeedEntry {
     },
 }
 
+/// What a settled run took and cost, as a feed line says it.
+///
+/// The two resolved numbers, not the store's whole `SettledRunFacts`: the
+/// feed does not show token counts and has no use for the run id it already
+/// has, and a port that hands over the record instead of the answer invites
+/// its caller to compute a different one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettledRun {
+    /// `None` on a run no executor claimed — not zero, which reads as a run
+    /// that finished instantly.
+    pub duration_ms: Option<i64>,
+    pub cost_micros: i64,
+}
+
 impl FeedEntry {
     /// When it happened — the one thing both kinds are ordered by.
     pub fn at(&self) -> DateTime<Utc> {
         match self {
-            Self::Card(row) => row.created_at,
+            Self::Card { row, .. } => row.created_at,
             Self::Hired { at, .. } => *at,
         }
     }
@@ -1903,7 +1927,42 @@ impl ProjectManager {
         // rewriting itself.
         let hires = self.agents.list_team_history(project).await?;
 
-        let mut merged: Vec<FeedEntry> = cards.into_iter().map(FeedEntry::Card).collect();
+        // One batched derivation for the whole page. A page names runs on a
+        // dozen different cards, so asking per card would turn one screen
+        // into a dozen round trips.
+        let settled: Vec<IssueRunId> = cards
+            .iter()
+            .filter_map(|row| match &row.body {
+                IssueEventBody::RunSettled { run_id, .. } => Some(run_id.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut facts: HashMap<IssueRunId, SettledRun> = self
+            .store
+            .settled_run_facts(&settled)
+            .await?
+            .into_iter()
+            .map(|one| {
+                (
+                    one.run_id,
+                    SettledRun {
+                        duration_ms: one.duration_ms,
+                        cost_micros: one.spend.cost.into_micros(),
+                    },
+                )
+            })
+            .collect();
+
+        let mut merged: Vec<FeedEntry> = cards
+            .into_iter()
+            .map(|row| {
+                let settled = match &row.body {
+                    IssueEventBody::RunSettled { run_id, .. } => facts.remove(run_id),
+                    _ => None,
+                };
+                FeedEntry::Card { row, settled }
+            })
+            .collect();
         merged.extend(
             hires
                 .into_iter()

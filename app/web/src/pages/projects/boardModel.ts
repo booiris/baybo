@@ -209,12 +209,18 @@ export function runIndicator(
   return run.status === 'running' ? 'running' : 'queued';
 }
 
-export function runDuration(run: IssueRun, now: number): string | null {
-  if (run.started_at_ms == null) return null;
-  const end = run.settled_at_ms ?? now;
-  const seconds = Math.max(0, Math.round((end - run.started_at_ms) / 1000));
+/// How long something took. One spelling, because the execution log measures
+/// it from a run's own timestamps and the activity feed is handed it already
+/// derived — two formatters would give the same run two lengths.
+export function formatDuration(ms: number): string {
+  const seconds = Math.max(0, Math.round(ms / 1000));
   if (seconds < 60) return `${seconds}s`;
   return `${Math.floor(seconds / 60)}m${String(seconds % 60).padStart(2, '0')}s`;
+}
+
+export function runDuration(run: IssueRun, now: number): string | null {
+  if (run.started_at_ms == null) return null;
+  return formatDuration((run.settled_at_ms ?? now) - run.started_at_ms);
 }
 
 // Unknown future states remain unsettled rather than hiding active work.
