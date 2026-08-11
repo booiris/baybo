@@ -85,11 +85,6 @@
       "count": 3
     }
   },
-  "src/pages/TraceSessionPage.tsx": {
-    "@typescript-eslint/no-unnecessary-condition": {
-      "count": 1
-    }
-  },
   "src/pages/TracesPage.tsx": {
     "@typescript-eslint/no-unnecessary-condition": {
       "count": 6

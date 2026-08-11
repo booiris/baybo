@@ -120,6 +120,37 @@ opened), which keeps a page visit at one request and a reader who never opens th
 tab at zero. See [`modules/trace.md`](modules/trace.md) for why the definitions
 are not inlined into the span.
 
+### The context matrix
+
+An `LlmCall` span's detail panel also carries a **Context** tab: a grid of
+cells, one per fixed slice of tokens, coloured by which part of the assembled
+context it belongs to — system prompt, tool definitions, skills, recalled
+memory, each message kind, tool results, attachments. When the span's model is
+still served by a configured client the grid covers that model's whole context
+window, so the unfilled cells are the headroom the call had left; when it is
+not (the trace outlives the config) the grid is the input alone rather than an
+invented window.
+
+`GET /v1/traces/{session_id}/spans/{span_id}/context` computes it, because the
+split needs a tokenizer *and* the ordinal-referenced input slice the client
+holds only as a pointer. It is the most expensive read on this page — it
+resolves both of the references the per-turn tree leaves alone — so it is
+fetched only when the tab is opened, cached per span, and deliberately **not**
+refreshed on the poll tick: a live span has no usage to report yet, and
+re-tokenizing a growing transcript every two seconds would make the most
+expensive read the most frequent one.
+
+**The total is exact and the split is not.** The provider bills one number for
+the whole prompt; the per-part figures come from `tiktoken`, which is a ~10%
+approximation off OpenAI models. `buildContextGrid`
+(`components/trace/contextGrid.ts`) therefore uses the segments only for
+proportions and applies them to the recorded `input_tokens`, so the headline
+agrees with the Metadata tab; every per-part number is prefixed `≈`, and a
+drift above 15% is stated outright. Cells are allocated by largest remainder so
+they sum to exactly the grid, with a floor of one cell for any non-zero part —
+rounding a real 0.4% contributor away is how a context view quietly stops
+mentioning the thing someone opened it to find.
+
 ### Subagent lineage
 
 `GET /v1/traces/{session_id}/lineage` returns every subagent session descended from this one, flattened, each row carrying its attach point (`parent_span_id` — the parent's `spawn_subagent` tool-call span), its backend (`external_agent`, absent for in-process children), and its turn summaries. It refreshes on the same tick as the overview, so a subagent spawned mid-turn appears without a manual reload.
