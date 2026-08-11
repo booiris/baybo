@@ -443,6 +443,11 @@ export function ProjectBoardPage() {
           </div>
 
           <DragOverlay>
+            {/* No width here on purpose. dnd-kit sizes the overlay wrapper to
+                the rect it measured on the card that was picked up, so `w-full`
+                is the picked-up card's own width at every viewport. A literal
+                one (this was `w-[200px]`) makes the card snap narrower the
+                instant it leaves the column and snap back on release. */}
             {dragging !== null ? <IssueCard issue={dragging} team={team} overlay /> : null}
           </DragOverlay>
         </DndContext>
@@ -842,7 +847,7 @@ function IssueCard({
   return (
     <article
       className={`bg-surface border-2 border-black rounded-md shadow-brutal-xs px-2.5 py-2 flex flex-col gap-1.5 cursor-pointer ${
-        overlay ? 'rotate-2 shadow-brutal w-[200px]' : ''
+        overlay ? 'rotate-2 shadow-brutal w-full h-full' : ''
       } ${cancelled ? 'opacity-55' : ''}`}
     >
       <div className="flex items-center gap-1.5 font-mono text-[0.6rem] text-ink-soft">
