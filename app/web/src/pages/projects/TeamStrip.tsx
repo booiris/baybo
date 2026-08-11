@@ -60,9 +60,7 @@ export function TeamStrip({
           key={agent.id}
           agent={agent}
           portrait={portrait}
-          run={
-            working.has(agent.id) ? 'running' : queued.has(agent.id) ? 'queued' : 'idle'
-          }
+          run={working.has(agent.id) ? 'running' : queued.has(agent.id) ? 'queued' : null}
           onOpen={() => {
             onOpenProfile(agent);
           }}
@@ -140,6 +138,10 @@ function TeamMemberChip({
         handle={agent.handle}
         src={portrait(agent.id)}
         run={run}
+        // The strip is the board's live roster, so every seat carries the
+        // dot — one that only appeared on the busy could not be told from
+        // one that failed to load.
+        dot
         size="lg"
         title={`${agent.name} (@${agent.handle})${runNote(run)}\n${agent.description}`}
       />

@@ -9,12 +9,9 @@
 /// decided *here* is only how it is framed. The operator and the board are
 /// not agents, get no portrait, and keep a monogram.
 
-/// `null` and `'idle'` are not the same answer. `null` is "this caller is not
-/// tracking run state" — a comment's author, an execution-log row — and draws
-/// no status dot at all. `'idle'` is "tracked, and there is nothing running",
-/// which the team strip has to show: a roster where only the busy have a dot
-/// cannot be told from one where the dot failed to load.
-export type AvatarRun = 'queued' | 'running' | 'held' | 'idle' | null;
+/// What this agent's run is doing, or `null` for nothing running. Whether a
+/// dot is drawn is `dot`'s to say, not this — see it below.
+export type AvatarRun = 'queued' | 'running' | 'held' | null;
 
 /// A face's footprint. Exported because anything that has to line up with one
 /// — the team strip's `＋` seat — must take the number from here: written out
@@ -53,8 +50,6 @@ export function runNote(run: AvatarRun): string {
       return ' — queued, waiting for a free slot';
     case 'held':
       return ' — held, the project is over its daily budget';
-    case 'idle':
-      return ' — idle';
     default:
       return '';
   }
@@ -69,6 +64,7 @@ export function Avatar({
   src = null,
   run = null,
   size = 'md',
+  dot = false,
   title,
 }: {
   /// A bare handle (no `@`), or the literal `you` for the operator. Names the
@@ -79,6 +75,13 @@ export function Avatar({
   src?: string | null;
   run?: AvatarRun;
   size?: keyof typeof SIZE;
+  /// Draw the live-state dot even with nothing running — grey for idle.
+  ///
+  /// Asked for rather than assumed, because most callers have no run data at
+  /// all: a comment's author, a picker's options. A grey dot there would be
+  /// this component claiming "idle" on their behalf, which they never said.
+  /// A run state implies a dot; this is how the team strip gets one without.
+  dot?: boolean;
   /// A fuller sentence than `@handle`, from a caller that has one. It goes
   /// here rather than on a wrapper: nested `title`s mean the tooltip depends
   /// on which pixel the cursor is over.
@@ -115,7 +118,7 @@ export function Avatar({
           }}
         />
       ) : null}
-      {run === null ? null : (
+      {!dot && run === null ? null : (
         <span
           aria-hidden
           className={`absolute -right-[3px] -bottom-[3px] w-[9px] h-[9px] rounded-full border border-canvas ${

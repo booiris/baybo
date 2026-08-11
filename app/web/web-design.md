@@ -263,10 +263,12 @@ wider than the header they sit in, and the face is what the operator already
 recognises on every card. Removal is not on the strip; it is on the profile the
 face opens, where it asks twice.
 
-`Avatar`'s `run` distinguishes **`null` from `'idle'`** — `null` is "this caller
-does not track run state" and draws no dot, `'idle'` is "tracked, nothing
-running". A roster where only the busy have a dot cannot be told from one whose
-dots failed to load.
+Whether an avatar carries that dot is the caller's `dot`, not something
+`Avatar` infers from `run`. Most callers have no run data at all — a comment's
+author, a picker's option — and a grey dot there would be the component
+announcing "idle" on their behalf. The strip asks for one on every seat,
+because a roster where only the busy have a dot cannot be told from one whose
+dots failed to load; a live run turns it green wherever it appears.
 
 Who draws what is resolved once per page in `pages/projects/portrait.ts`:
 `useTeamPortraits(team)` fetches the roster's uploaded blobs (bearer-gated, so

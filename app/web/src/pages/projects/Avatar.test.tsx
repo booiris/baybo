@@ -39,4 +39,24 @@ describe('Avatar', () => {
     expect(container.querySelector('[class*="animate-spin"]')).not.toBeNull();
     expect(screen.getByTitle('@dev-1 — working').className).not.toContain('overflow-hidden');
   });
+
+  it('draws no status dot for a caller that never said anything about runs', () => {
+    // A comment's author, a picker's option. A grey dot on those would be
+    // this component announcing "idle" on their behalf — they have no run
+    // data at all, and the roster is the only place that does.
+    const { container } = render(<Avatar handle="dev-1" src={generatedPortrait(DEV_1)} />);
+    expect(container.querySelector('[class*="rounded-full"][class*="bg-ink-soft"]')).toBeNull();
+  });
+
+  it('draws a grey one when asked, and turns it green on a live run', () => {
+    const idle = render(<Avatar handle="dev-1" src={generatedPortrait(DEV_1)} dot />);
+    expect(
+      idle.container.querySelector('[class*="rounded-full"][class*="bg-ink-soft"]'),
+    ).not.toBeNull();
+
+    const live = render(
+      <Avatar handle="dev-2" src={generatedPortrait(DEV_1)} dot run="running" />,
+    );
+    expect(live.container.querySelector('[class*="bg-ok"]')).not.toBeNull();
+  });
 });
