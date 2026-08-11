@@ -592,11 +592,16 @@ final class SessionIndex: ObservableObject {
     /// the DELETE resolves. The mirror goes FIRST, ahead of the row guard: the
     /// user asked for this conversation to be gone, and a row that a racing merge
     /// already dropped (deleted from another client while the confirm was up)
-    /// must still take its transcript with it rather than strand the file.
+    /// must still take its transcript with it rather than strand the file. The
+    /// composer's unsent draft goes the same way and for the same reason —
+    /// deleting a conversation cannot leave its half-written message behind,
+    /// with no row left to reach it from.
     func beginHide(_ sessionId: String) {
         pendingMutations[sessionId] = .hidden
         mutationEpoch += 1
         TranscriptStore.delete(sessionId: sessionId, in: supportDirectory)
+        DraftStore.delete(sessionId: sessionId, in: supportDirectory)
+        onSessionsRemoved?([sessionId])
         guard let idx = rows.firstIndex(where: { $0.id == sessionId }) else { return }
         hiddenBackups[sessionId] = rows[idx]
         rows.remove(at: idx)
@@ -618,7 +623,9 @@ final class SessionIndex: ObservableObject {
         for sessionId in targets {
             pendingMutations[sessionId] = .hidden
             TranscriptStore.delete(sessionId: sessionId, in: supportDirectory)
+            DraftStore.delete(sessionId: sessionId, in: supportDirectory)
         }
+        onSessionsRemoved?(targets)
         mutationEpoch += 1
         for row in rows where targets.contains(row.id) {
             hiddenBackups[row.id] = row
@@ -846,16 +853,33 @@ final class SessionIndex: ObservableObject {
         // rows still staged in `pendingMutations` are owned by beginHide /
         // rollBackHide, and a draft (never a row) is never considered here.
         let survivors = Set(merged.map(\.id))
+        var dropped: Set<String> = []
         for row in rows
         where !survivors.contains(row.id) && pendingMutations[row.id] == nil {
             TranscriptStore.delete(sessionId: row.id, in: supportDirectory)
+            DraftStore.delete(sessionId: row.id, in: supportDirectory)
+            dropped.insert(row.id)
         }
+        if !dropped.isEmpty { onSessionsRemoved?(dropped) }
         rows = merged
         save()
     }
 
     /// Logout / rebind: the rows belong to the old gateway — drop them, their
-    /// transcript mirrors, and any staged mutations against it.
+    /// transcript mirrors, their unsent composer drafts, and any staged
+    /// mutations against it.
+    /// Called with every session whose durable per-session state this registry
+    /// has just deleted — a local delete, a delete performed on another client
+    /// and learned in a merge, or an unbind.
+    ///
+    /// It exists because deleting the files is only half of it. A resident
+    /// `ChatStore` holds the composer's draft IN MEMORY and writes it back on
+    /// its next flush, so a row-less draft reappears on disk — and a draft with
+    /// no row is exactly what `AppStore.startNewChat` resumes, which would land
+    /// the compose button in a conversation the server has deleted. The registry
+    /// cannot reach the stores, so `AppStore` listens.
+    var onSessionsRemoved: ((Set<String>) -> Void)?
+
     func removeAll() {
         rows = []
         pendingMutations = [:]
@@ -870,6 +894,7 @@ final class SessionIndex: ObservableObject {
         save()
         TranscriptStore.deleteAll(in: supportDirectory)
         OutboxStore.deleteAll(in: supportDirectory)
+        DraftStore.deleteAll(in: supportDirectory)
     }
 
     // MARK: - Persistence

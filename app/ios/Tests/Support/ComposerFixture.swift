@@ -19,7 +19,8 @@ final class ComposerFixture {
         let sessionId = "s-compose"
         store = ChatStore(
             sessionId: sessionId, client: client, index: temp.makeIndex(),
-            outbox: temp.makeOutbox(sessionId: sessionId), pasteboard: pasteboard)
+            outbox: temp.makeOutbox(sessionId: sessionId), pasteboard: pasteboard,
+            supportDirectory: temp.url)
         // The SESSION's strip, not one built beside it: which object the
         // composer renders — and what its lifetime is tied to — is half of
         // what these tests are about.

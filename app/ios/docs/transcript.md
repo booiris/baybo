@@ -167,7 +167,10 @@ the line (`ChatStore.notice`'s setter clears the flag), and the visit retracts i
 
 `TranscriptWebView` is a reparenting shim (`makeUIView` returns the host's webview,
 `dismantleUIView` only unparents). `prewarmTranscriptHost` boots the webview at home so
-the first open is warm; `startNewChat` adopts that prewarmed draft.
+the first open is warm; `startNewChat` adopts that prewarmed draft — unless an UNSENT
+new-chat draft is waiting on disk, which it re-opens instead (see
+[attachments.md](attachments.md#compose-returns-to-the-draft-it-left): a draft session has
+no row anywhere, so its uuid is the only handle to what the user typed).
 `ChatScreen.onDisappear` calls `detachCurrent` (flush mirror + detach), so the offscreen
 frame-buffering contract above is unchanged.
 

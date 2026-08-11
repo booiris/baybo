@@ -167,15 +167,29 @@ final class ChatStore: ObservableObject {
     /// the conversation on screen, and `ChatScreen.onAppear` re-aims it through
     /// `TranscriptBridge.retarget` on every entry).
     private(set) var chatOpen = true
-    /// The composer's staged attachment strip. Owned by the SESSION, not by the
+    /// The composer's unsent DRAFT for this conversation — what the user typed
+    /// and the staged attachment strip. Owned by the SESSION, not by the
     /// composer frame: `ChatScreen` docks the composer in a `.safeAreaInset`,
     /// and every `fullScreenCover` it presents — the image viewer, the video
-    /// player — tears that inset down and puts it back. A strip whose lifetime
+    /// player — tears that inset down and puts it back. A draft whose lifetime
     /// was the frame's therefore lost mid-upload picks to a tap on a transcript
-    /// image. What "the user actually left" means is `AppStore.chatPath`
-    /// (`leaveChat` below), exactly as it is for audio.
-    private(set) lazy var staging = ComposerStaging(
-        store: self, client: client, pasteboard: pasteboard)
+    /// image. Beyond the frame it is `DraftStore` that carries it, so leaving
+    /// the conversation and relaunching the app both give it back.
+    ///
+    /// Materialised on first use and held in an explicit optional rather than a
+    /// `lazy var`: `flushDraft` runs for every resident store when the app
+    /// leaves the foreground, and a `lazy var` there would build the machine for
+    /// conversations nobody has opened — reading their drafts off disk and
+    /// starting the uploads those still owe.
+    private var composerDraft: ComposerStaging?
+    var staging: ComposerStaging {
+        if let composerDraft { return composerDraft }
+        let made = ComposerStaging(
+            store: self, sessionId: sessionId, client: client, pasteboard: pasteboard,
+            supportDirectory: supportDirectory)
+        composerDraft = made
+        return made
+    }
     /// A tapped file attachment, materialised on disk and awaiting presentation.
     @Published var filePreview: FilePreview?
     /// A long-pressed attachment awaiting the system share sheet.
@@ -235,9 +249,13 @@ final class ChatStore: ObservableObject {
     /// mirror). Confirmation is two-stage: the echo proves transport, an
     /// ordinal-stamped row (sync/backfill) proves durability. See sync-v2.
     private let outbox: OutboxStore
-    /// The system clipboard, held only to hand on to `staging` (which is lazy,
-    /// so it cannot take it as an init argument).
+    /// The system clipboard, held only to hand on to `staging` (built on first
+    /// use, so it cannot take it as an init argument).
     private let pasteboard: any PasteboardReading
+    /// Where durable per-session state lives, held for the same reason: the
+    /// composer's draft (`DraftStore`) is a sibling of the transcript mirror and
+    /// the outbox under this root.
+    private let supportDirectory: URL
     /// The pending-approval state machine; `pendingApprovals` is its published
     /// mirror.
     private var approvals = ApprovalQueue()
@@ -319,13 +337,15 @@ final class ChatStore: ObservableObject {
         client: any BayboClientProtocol,
         index: SessionIndex,
         outbox: OutboxStore,
-        pasteboard: any PasteboardReading = Pasteboards.launch()
+        pasteboard: any PasteboardReading = Pasteboards.launch(),
+        supportDirectory: URL = SessionIndex.supportDirectory()
     ) {
         self.sessionId = sessionId
         self.client = client
         self.index = index
         self.outbox = outbox
         self.pasteboard = pasteboard
+        self.supportDirectory = supportDirectory
         let listed = index.contains(sessionId: sessionId)
         self.listed = listed
         connState = listed ? .connecting : .draft
@@ -451,8 +471,13 @@ final class ChatStore: ObservableObject {
     }
 
     /// Binding teardown (logout/rebind): cancel timers and drop the global pump
-    /// deliberately, so the disconnected callback does not fire.
+    /// deliberately, so the disconnected callback does not fire. The composer's
+    /// draft machine is retired for the same reason `evict` does it — an upload
+    /// Task can keep it alive past this store, and `SessionIndex.removeAll` is
+    /// about to delete every draft on disk.
     func disconnect() async {
+        composerDraft?.retire()
+        composerDraft = nil
         retryTask?.cancel()
         retryTask = nil
         debounceTask?.cancel()
@@ -481,7 +506,16 @@ final class ChatStore: ObservableObject {
     /// the session mints a fresh one that re-subscribes, and the transcript
     /// mirror + gateway history replay make that a cheap catch-up. The generation
     /// bump mutes any late sink callback that raced the unsubscribe.
+    ///
+    /// The composer's draft machine is RETIRED first — written out, then made
+    /// inert and dropped. Re-opening the conversation builds a fresh one that
+    /// reads the draft back off disk; the old one can outlive this store (an
+    /// upload Task holds it strongly, and the call itself is not cancellable),
+    /// and two live machines over one draft directory is how a sent draft comes
+    /// back from the dead. See `ComposerStaging.retire`.
     func evict() async {
+        composerDraft?.retire()
+        composerDraft = nil
         retryTask?.cancel()
         retryTask = nil
         debounceTask?.cancel()
@@ -500,16 +534,38 @@ final class ChatStore: ObservableObject {
     }
 
     /// The user left this conversation: its `.session` route dropped off
-    /// `AppStore.chatPath`. Whatever was staged in the composer can never ride a
-    /// send from here again, so its work is cancelled and its spools reclaimed
-    /// (up to 100 MiB a pick, ten to a strip). A cover or a sheet OVER the chat
-    /// is emphatically NOT this — see `staging`. The visit closes FIRST, so
-    /// everything the teardown below stirs up can only retract a line, never
-    /// raise one.
+    /// `AppStore.chatPath`. A cover or a sheet OVER the chat is emphatically NOT
+    /// this — see `staging`. The visit closes FIRST, so everything the teardown
+    /// below stirs up can only retract a line, never raise one.
+    ///
+    /// Nothing unsent is discarded here. Walking away from a half-written
+    /// message is not the same as deciding against it, and the conversation is
+    /// one tap away — so the composer's draft is FLUSHED to disk rather than
+    /// cleared, and the next visit (this run or the next launch) opens on it.
+    /// Only sending it discards it (`ComposerStaging.discardDraft`).
     func leaveChat() {
         chatOpen = false
-        staging.clear()
+        composerDraft?.leaveConversation()
         retractNotice()
+    }
+
+    /// Write the composer's unsent draft now — the app is leaving the
+    /// foreground, or this store is about to be dropped. A no-op for a
+    /// conversation whose composer was never built, and for one whose draft has
+    /// not changed since the last write.
+    func flushDraft() {
+        composerDraft?.flushDraft()
+    }
+
+    /// The conversation is being deleted: its half-written message goes with it,
+    /// in memory as well as on disk. The in-memory half is the load-bearing one
+    /// — `AppStore.requestDelete` also EVICTS this store, and an eviction
+    /// flushes, so a machine still holding the draft would write it back over
+    /// the file `SessionIndex.beginHide` had just deleted (and the resurrected
+    /// one, having no row, would then read as an unsent new-chat draft).
+    func discardDraft() {
+        composerDraft?.discardDraft()
+        DraftStore.delete(sessionId: sessionId, in: supportDirectory)
     }
 
     /// The dock's line dies with the VISIT, whoever raised it. The strip retracts
