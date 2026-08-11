@@ -62,6 +62,7 @@ impl TitleRunner {
             provider_config_hash: String::new(),
             input_messages: LlmCallInputs::Inline(messages),
             temperature: request.temperature,
+            tools: None,
         };
 
         let recorder_inner = Arc::clone(&recorder);

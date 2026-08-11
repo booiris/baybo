@@ -1031,6 +1031,17 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     PRIMARY KEY (span_id, seq)
                 );
 
+                -- Tool definitions an `LlmCall` span offered the model,
+                -- content-addressed so a session-stable set is stored once
+                -- instead of on every span that saw it (tens of KB each —
+                -- inline copies would dwarf the spans referencing them).
+                -- `hash` is the digest of `data`, so writes are INSERT OR
+                -- IGNORE and rows are immutable.
+                CREATE TABLE IF NOT EXISTS llm_tool_sets (
+                    hash            TEXT    PRIMARY KEY,
+                    data            TEXT    NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS cron_jobs (
                     id              TEXT    PRIMARY KEY,
                     user_id         TEXT    NOT NULL,

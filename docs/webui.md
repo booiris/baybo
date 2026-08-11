@@ -92,6 +92,34 @@ The per-session trace page (`app/web/src/pages/TraceSessionPage.tsx`) refreshes 
 
 The live-subagent clause matters for external agents: the parent's `spawn_subagent` span sits pending for the whole child run, and once the parent turn goes terminal nothing else would hold the page on the fast tier — so a streaming child would fall to 10s, or stop refreshing entirely. `liveSessions` (`components/trace/traceForest.ts`) counts only `pending`/`in_progress`, deliberately **not** `stuck`: a stuck subagent is not producing anything new and must not pin the fast tier forever.
 
+### Row order, and jumping to an id
+
+Step and span rows carry their position in **storage order** — `#3` on a step,
+`#3.2` on its second span — read off the arrays the API returns, which the
+backend orders by `started_at` (`ORDER BY started_at` on both the step and the
+span query). It is the index in the returned array, not a running count of
+rendered rows, so an active filter never renumbers what survives it.
+
+The tree's filter box doubles as a **go-to-id**: step and span ids are part of
+every row's search projection, and pasting one (a 26-char ULID, either case)
+selects that node, scrolls to it, and clears the filter. The filter is the entry
+point on purpose — it already eager-loads every turn's tree, which is what lets
+an id resolve anywhere in the session rather than only in the turn that happens
+to be open. `resolveJumpTarget` (`components/trace/traceTreeModel.ts`) does the
+lookup; text that is not id-shaped stays an ordinary filter.
+
+### The tool set behind an LLM call
+
+An `LlmCall` span's detail panel gains a **Tools** tab listing every tool the
+model was offered on that call, with its description and JSON schema. The span
+stores only `{ hash, count }`; `GET /v1/traces/tool-sets/{hash}` returns the
+definitions and the page caches them by hash. That cache is deliberately **not**
+cleared on a session switch — the hash is the digest of the body, so the same
+hash is the same set by construction. The fetch is lazy (it fires when the tab is
+opened), which keeps a page visit at one request and a reader who never opens the
+tab at zero. See [`modules/trace.md`](modules/trace.md) for why the definitions
+are not inlined into the span.
+
 ### Subagent lineage
 
 `GET /v1/traces/{session_id}/lineage` returns every subagent session descended from this one, flattened, each row carrying its attach point (`parent_span_id` — the parent's `spawn_subagent` tool-call span), its backend (`external_agent`, absent for in-process children), and its turn summaries. It refreshes on the same tick as the overview, so a subagent spawned mid-turn appears without a manual reload.

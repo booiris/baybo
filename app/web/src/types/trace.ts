@@ -162,6 +162,34 @@ export interface LlmCallBegin {
   provider_config_hash: string;
   input_messages: LlmCallInputs;
   temperature?: number | null;
+  /**
+   * The tool set this call offered the model. A reference, not the
+   * definitions: every span in a session points at the same tens-of-KB set,
+   * so the schemas live in one content-addressed row and the client fetches
+   * them once per hash from `GET /v1/traces/tool-sets/{hash}`. Absent on
+   * calls that offered no tools (compression, title generation, the progress
+   * observer) and on spans recorded before the field existed.
+   */
+  tools?: LlmToolSetRef | null;
+}
+
+/** Mirrors `baybo_trace::LlmToolSetRef`. */
+export interface LlmToolSetRef {
+  hash: string;
+  count: number;
+}
+
+/** One tool as the model was shown it (`baybo_trace::LlmToolDefinition`). */
+export interface LlmToolDefinition {
+  name: string;
+  description: string;
+  parameters_schema: unknown;
+}
+
+/** Body of `GET /v1/traces/tool-sets/{hash}`. */
+export interface LlmToolSet {
+  hash: string;
+  tools: LlmToolDefinition[];
 }
 
 export interface LlmToolCallRecord {

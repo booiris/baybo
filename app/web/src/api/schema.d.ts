@@ -1016,6 +1016,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/traces/tool-sets/{hash}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_tool_set"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/traces/{session_id}": {
         parameters: {
             query?: never;
@@ -6122,6 +6138,56 @@ export interface operations {
             };
             /** @description Unauthorized */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_tool_set: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Content hash from an LlmCall span's `tools.hash` */
+                hash: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The tool definitions an LLM call offered the model: `{ hash, tools: [{ name, description, parameters_schema }] }`. Content-addressed and shared by every span that offered the same set, so a client fetches each hash once and caches it. Untyped JSON, consistent with the rest of the per-session traces family. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Malformed hash */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No stored tool set for that hash */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

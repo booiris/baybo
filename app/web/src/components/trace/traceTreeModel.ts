@@ -173,6 +173,90 @@ export function findStep(trace: TurnTrace | undefined, stepId: string): ReplaySt
 }
 
 /**
+ * Whether a filter string is a bare trace id rather than search text.
+ *
+ * Step and span ids are ULIDs: 26 characters of Crockford base32, which
+ * excludes I / L / O / U. Ordinary search words are shorter, lowercase, or
+ * contain excluded letters, so the shape is a reliable discriminator — and
+ * being wrong is harmless either way, since a "jump" that resolves to
+ * nothing simply stays a text filter.
+ */
+const ULID_RE = /^[0-9ABCDEFGHJKMNPQRSTVWXYZ]{26}$/;
+
+export function looksLikeTraceId(text: string): boolean {
+  return ULID_RE.test(text.trim().toUpperCase());
+}
+
+/** The node a pasted id names, across every loaded turn. */
+export interface JumpTarget {
+  turnId: string;
+  stepId: string;
+  spanId: string | null;
+}
+
+/**
+ * Resolve a pasted step/span id to the turn that holds it.
+ *
+ * Searches every loaded turn rather than the selected one: an id is pasted
+ * precisely when the reader does not know where it lives. A text filter
+ * forces every turn's tree to load, which is what makes this reach the whole
+ * session rather than the turns that happened to be expanded.
+ */
+export function resolveJumpTarget(
+  traces: Map<string, TurnTrace>,
+  rawId: string,
+): JumpTarget | null {
+  const id = rawId.trim().toUpperCase();
+  if (!looksLikeTraceId(id)) return null;
+  for (const [turnId, trace] of traces) {
+    const span = findSpan(trace, id);
+    if (span) return { turnId, stepId: span.stepId, spanId: id };
+    if (findStep(trace, id)) return { turnId, stepId: id, spanId: null };
+  }
+  return null;
+}
+
+/**
+ * Where a node sits in the order the trace store returns.
+ *
+ * `steps` come back ordered by `started_at` within their turn and `spans`
+ * likewise within their step (`ORDER BY started_at` in both queries), so a
+ * node's position in the array it arrived in IS its recorded order. Numbers
+ * are 1-based for display: step `#3`, its second span `#3.2`.
+ */
+export interface StepOrder {
+  step: number;
+  stepTotal: number;
+}
+
+export interface SpanOrder extends StepOrder {
+  span: number;
+  spanTotal: number;
+}
+
+export function stepOrder(trace: TurnTrace | undefined, stepId: string): StepOrder | null {
+  if (!trace) return null;
+  const i = trace.steps.findIndex((rs) => rs.step.id === stepId);
+  return i < 0 ? null : { step: i + 1, stepTotal: trace.steps.length };
+}
+
+export function spanOrder(trace: TurnTrace | undefined, spanId: string): SpanOrder | null {
+  if (!trace) return null;
+  for (let i = 0; i < trace.steps.length; i++) {
+    const j = trace.steps[i].spans.findIndex((s) => s.id === spanId);
+    if (j >= 0) {
+      return {
+        step: i + 1,
+        stepTotal: trace.steps.length,
+        span: j + 1,
+        spanTotal: trace.steps[i].spans.length,
+      };
+    }
+  }
+  return null;
+}
+
+/**
  * Whether a turn's trace is an external agent (claude/codex) whose
  * internal loop is opaque — it records no step/span tree ever, so its
  * transcript is the trace.

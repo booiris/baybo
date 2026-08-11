@@ -4,6 +4,8 @@ import type {
   ChatMessage,
   LifecycleState,
   LineageSession,
+  LlmToolDefinition,
+  LlmToolSet,
   SessionMessageRow,
   Span,
   Step,
@@ -239,6 +241,47 @@ function step(
   };
 }
 
+/** One fixed set, as in production: a session offers the same tools on every
+ *  call, so every mock span references the same hash. */
+const MOCK_TOOL_SET_HASH = 'a'.repeat(64);
+
+const MOCK_TOOL_SET: LlmToolDefinition[] = [
+  {
+    name: 'bash',
+    description: 'Run a shell command in the workspace.',
+    parameters_schema: {
+      type: 'object',
+      properties: {
+        command: { type: 'string', description: 'The command to run' },
+        timeout_ms: { type: 'integer', description: 'Kill after this long' },
+      },
+      required: ['command'],
+    },
+  },
+  {
+    name: 'read_file',
+    description: 'Read a file from the workspace.',
+    parameters_schema: {
+      type: 'object',
+      properties: { path: { type: 'string' } },
+      required: ['path'],
+    },
+  },
+  {
+    name: 'web_search',
+    description: 'Search the web and return result snippets.',
+    parameters_schema: {
+      type: 'object',
+      properties: { query: { type: 'string' }, limit: { type: 'integer' } },
+      required: ['query'],
+    },
+  },
+];
+
+export function getMockToolSet(hash: string): LlmToolSet | null {
+  return hash === MOCK_TOOL_SET_HASH ? { hash, tools: MOCK_TOOL_SET } : null;
+}
+
 function llmSpan(
   stepId: string,
   model: string,
@@ -262,6 +305,7 @@ function llmSpan(
         provider_config_hash: 'mock-hash',
         input_messages: messages,
         temperature: 0.7,
+        tools: { hash: MOCK_TOOL_SET_HASH, count: MOCK_TOOL_SET.length },
       },
       result: {
         output_content: output,

@@ -14,13 +14,23 @@ import {
 } from 'react-icons/ri';
 import { IconButton } from '../components/IconButton';
 import { Button } from '../components/Button';
+import { SearchBox } from '../components/SearchBox';
 import { useAdminClient, useAuth } from '../api/auth';
-import { getMockTraceLineage, getMockTurnTrace, getMockTraceOverview, useMockMode } from '../api/mock';
+import {
+  getMockTraceLineage,
+  getMockToolSet,
+  getMockTurnTrace,
+  getMockTraceOverview,
+  useMockMode,
+} from '../api/mock';
 import type {
   TurnStatusKind,
   ExternalAgentKind,
   LineageSession,
   LlmCallInputs,
+  LlmToolDefinition,
+  LlmToolSet,
+  LlmToolSetRef,
   TurnTrace,
   ReplayStep,
   SecretKind,
@@ -45,6 +55,8 @@ import {
   externalAgentLabel,
   formatDuration,
   formatTime,
+  formatTok,
+  sumLlmTokens,
   turnDurationMs,
   transcriptInputText,
   turnInputText,
@@ -63,6 +75,7 @@ import { buildForest, liveSessions, sessionIsLive } from '../components/trace/tr
 import { mergeOverviewPage, pollCursor } from '../components/trace/overviewSync';
 import type { TranscriptNode } from '../components/trace/transcriptModel';
 import { buildTranscriptNodes } from '../components/trace/transcriptModel';
+import type { SpanOrder, StepOrder } from '../components/trace/traceTreeModel';
 import {
   findSpan,
   findStep,
@@ -70,13 +83,22 @@ import {
   neededTurnIds,
   partitionTranscript,
   resolveExpanded,
+  resolveJumpTarget,
+  spanOrder,
+  stepOrder,
   traceHasPendingSpan,
 } from '../components/trace/traceTreeModel';
+import { scrollToAnchor } from '../components/trace/scrollToAnchor';
 
 const POLL_ACTIVE_MS = 2_000;
 const POLL_TERMINAL_MS = 10_000;
 
-type DetailTab = 'io' | 'meta' | 'events';
+type DetailTab = 'io' | 'meta' | 'tools' | 'events';
+
+/** Tool sets resolved by hash. One entry serves every span of a session — the
+ *  set is stable across its calls, which is why the span carries a reference
+ *  rather than the schemas. */
+type ToolSetCache = Map<string, LlmToolDefinition[]>;
 
 // ── Right-hand detail panel (per-kind) ───────────────────────────────
 
@@ -261,18 +283,26 @@ function SubagentLink({ childId, onDrillIn }: { childId: string; onDrillIn: (id:
   );
 }
 
-function MetaTab({ span }: { span: Span }) {
+function MetaTab({ span, order }: { span: Span; order: SpanOrder | null }) {
   const ms = durationMs(span);
   const visual = spanVisual(span.kind.kind);
   const baseRows: [string, ReactNode][] = [
     ['Span ID', <code className="break-all">{span.id}</code>],
     ['Step ID', <code className="break-all">{span.step_id}</code>],
+  ];
+  if (order) {
+    baseRows.push([
+      'Order',
+      `step #${order.step} of ${order.stepTotal} · span #${order.span} of ${order.spanTotal}`,
+    ]);
+  }
+  baseRows.push(
     ['Kind', visual.label],
     ['Status', <OutcomeBadge state={span.outcome} />],
     ['Duration', formatDuration(ms)],
     ['Started', new Date(span.started_at).toLocaleString()],
     ['Ended', span.ended_at != null ? new Date(span.ended_at).toLocaleString() : '—'],
-  ];
+  );
   if (span.parallel_group != null && span.parallel_group !== '') {
     baseRows.push(['Parallel group', <code className="break-all">{span.parallel_group}</code>]);
   }
@@ -299,6 +329,12 @@ function MetaTab({ span }: { span: Span }) {
         }
       }
     }
+    if (span.kind.begin.tools) {
+      baseRows.push(
+        ['Tools offered', span.kind.begin.tools.count.toLocaleString()],
+        ['Tool set', <code className="break-all">{span.kind.begin.tools.hash}</code>],
+      );
+    }
   } else if (span.kind.kind === 'tool_call') {
     baseRows.push(
       ['Tool name', span.kind.begin.tool_name],
@@ -322,6 +358,82 @@ function MetaTab({ span }: { span: Span }) {
         </div>
       ))}
     </dl>
+  );
+}
+
+/**
+ * What the model was allowed to call on this iteration — the other half of
+ * "what did the LLM see", beside the input messages.
+ *
+ * The schemas are fetched by hash rather than shipped inside the span (a
+ * session-stable set would otherwise be re-sent per call), so this renders a
+ * loading state on first open and is instant for every span afterwards.
+ */
+function ToolsTab({
+  reference,
+  tools,
+  loading,
+}: {
+  reference: LlmToolSetRef;
+  tools: LlmToolDefinition[] | undefined;
+  loading: boolean;
+}) {
+  const [query, setQuery] = useState('');
+  const q = query.trim().toLowerCase();
+  const shown = useMemo(
+    () =>
+      q === ''
+        ? (tools ?? [])
+        : (tools ?? []).filter(
+            (t) => t.name.toLowerCase().includes(q) || t.description.toLowerCase().includes(q),
+          ),
+    [tools, q],
+  );
+
+  if (tools == null) {
+    return loading ? (
+      <div className="text-ink-soft text-[0.85rem] italic flex items-center gap-2">
+        <RiLoader4Line className="animate-spin" /> Loading {reference.count} tool
+        {reference.count === 1 ? '' : 's'}…
+      </div>
+    ) : (
+      <div className="text-ink-soft text-[0.85rem]">
+        The {reference.count} tool{reference.count === 1 ? '' : 's'} this call offered are no longer
+        stored (set <code className="break-all">{reference.hash.slice(0, 12)}</code>).
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center gap-2">
+        <SearchBox
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="Filter tools…"
+          className="min-w-0 !px-3"
+        />
+        <span className="shrink-0 font-mono text-[0.75rem] text-ink-soft">
+          {shown.length === tools.length ? tools.length : `${shown.length}/${tools.length}`}
+        </span>
+      </div>
+      {shown.map((t) => (
+        <details key={t.name} className="border-2 border-black rounded-md bg-canvas">
+          <summary className="cursor-pointer px-3 py-2">
+            <span className="font-mono font-bold text-[0.85rem] text-brand break-all">{t.name}</span>
+            {t.description !== '' && (
+              <div className="mt-1 text-[0.78rem] text-ink-soft whitespace-pre-wrap break-words">
+                {t.description}
+              </div>
+            )}
+          </summary>
+          <pre className="border-t-2 border-black px-3 py-2 whitespace-pre-wrap break-all font-mono text-[0.75rem] bg-gray-50">
+            {safeJson(t.parameters_schema)}
+          </pre>
+        </details>
+      ))}
+      {shown.length === 0 && <div className="text-ink-soft text-[0.85rem] italic">No match.</div>}
+    </div>
   );
 }
 
@@ -471,24 +583,35 @@ function EventsTab({ events }: { events: SpanEvent[] }) {
 
 function SpanDetailPanel({
   span,
+  order,
   messageLog,
   tab,
   onTabChange,
   onJumpToLlm,
   onDrillIn,
+  toolSets,
+  loadingToolSets,
 }: {
   span: Span;
+  order: SpanOrder | null;
   messageLog: SessionMessageRow[];
   tab: DetailTab;
   onTabChange: (t: DetailTab) => void;
   onJumpToLlm: (id: string) => void;
   onDrillIn: (id: string) => void;
+  toolSets: ToolSetCache;
+  loadingToolSets: Set<string>;
 }) {
   const visual = spanVisual(span.kind.kind);
   const Icon = visual.icon;
   const events = span.events ?? [];
   const eventCount = events.length;
   const ms = durationMs(span);
+  const toolSetRef = span.kind.kind === 'llm_call' ? (span.kind.begin.tools ?? null) : null;
+  // A tab the current span doesn't have must not leave the panel blank when
+  // the selection moves (the tab is a sticky URL param).
+  const shownTab: DetailTab =
+    (tab === 'tools' && toolSetRef == null) || (tab === 'events' && eventCount === 0) ? 'io' : tab;
 
   return (
     <div className="flex-1 min-h-0 flex flex-col">
@@ -507,9 +630,10 @@ function SpanDetailPanel({
           </div>
         </div>
         <div className="flex px-4 gap-6 relative top-[3px]">
-          {(['io', 'meta', 'events'] as const).map((t) => {
+          {(['io', 'meta', 'tools', 'events'] as const).map((t) => {
             if (t === 'events' && eventCount === 0) return null;
-            const active = t === tab;
+            if (t === 'tools' && toolSetRef == null) return null;
+            const active = t === shownTab;
             return (
               <button
                 type="button"
@@ -519,7 +643,13 @@ function SpanDetailPanel({
                   active ? 'border-brand text-ink' : 'border-transparent text-ink-soft hover:text-ink'
                 }`}
               >
-                {t === 'io' ? 'I/O Data' : t === 'meta' ? 'Metadata' : `Events (${eventCount})`}
+                {t === 'io'
+                  ? 'I/O Data'
+                  : t === 'meta'
+                    ? 'Metadata'
+                    : t === 'tools'
+                      ? `Tools (${toolSetRef?.count ?? 0})`
+                      : `Events (${eventCount})`}
               </button>
             );
           })}
@@ -527,7 +657,7 @@ function SpanDetailPanel({
       </div>
 
       <div className="flex-1 overflow-y-scroll p-5">
-        {tab === 'io' &&
+        {shownTab === 'io' &&
           (span.kind.kind === 'llm_call' ? (
             <LlmCallDetail span={span} messageLog={messageLog} />
           ) : (
@@ -538,8 +668,15 @@ function SpanDetailPanel({
               onDrillIn={onDrillIn}
             />
           ))}
-        {tab === 'meta' && <MetaTab span={span} />}
-        {tab === 'events' && <EventsTab events={events} />}
+        {shownTab === 'meta' && <MetaTab span={span} order={order} />}
+        {shownTab === 'tools' && toolSetRef != null && (
+          <ToolsTab
+            reference={toolSetRef}
+            tools={toolSets.get(toolSetRef.hash)}
+            loading={loadingToolSets.has(toolSetRef.hash)}
+          />
+        )}
+        {shownTab === 'events' && <EventsTab events={events} />}
       </div>
     </div>
   );
@@ -549,10 +686,12 @@ function SpanDetailPanel({
 
 function StepDetail({
   rs,
+  order,
   turnId,
   onSelectSpan,
 }: {
   rs: ReplayStep;
+  order: StepOrder | null;
   turnId: string;
   onSelectSpan: (turnId: string, spanId: string) => void;
 }) {
@@ -560,6 +699,7 @@ function StepDetail({
   const visual = stepVisual(step.kind.kind);
   const Icon = visual.icon;
   const ms = durationMs(step);
+  const tokens = sumLlmTokens(spans);
   const failureReason =
     step.outcome.outcome === 'failed'
       ? step.outcome.reason
@@ -574,7 +714,9 @@ function StepDetail({
           <Icon className={`${visual.accent} text-xl`} />
         </div>
         <div className="min-w-0">
-          <h3 className="font-bold uppercase tracking-wider leading-tight text-[1rem] truncate">{visual.label}</h3>
+          <h3 className="font-bold uppercase tracking-wider leading-tight text-[1rem] truncate">
+            {order ? `${visual.label} #${order.step}` : visual.label}
+          </h3>
           <div className="text-ink-soft text-[0.8rem] font-mono flex items-center gap-2">
             <OutcomeBadge state={step.outcome} /> • {formatDuration(ms)}
           </div>
@@ -585,6 +727,46 @@ function StepDetail({
         <section>
           <h4 className="font-bold uppercase tracking-wider text-[0.8rem] mb-2 border-b-2 border-black pb-1">Summary</h4>
           <div className="font-mono text-[0.85rem] text-ink-soft break-all">{stepSummaryText(step, spans)}</div>
+        </section>
+
+        <section>
+          <h4 className="font-bold uppercase tracking-wider text-[0.8rem] mb-2 border-b-2 border-black pb-1">
+            Usage
+          </h4>
+          <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 font-mono text-[0.85rem]">
+            <dt className="font-bold text-ink-soft">Step ID</dt>
+            <dd className="break-all">
+              <code>{step.id}</code>
+            </dd>
+            {order && (
+              <>
+                <dt className="font-bold text-ink-soft">Order</dt>
+                <dd>
+                  #{order.step} of {order.stepTotal}
+                </dd>
+              </>
+            )}
+            <dt className="font-bold text-ink-soft">Duration</dt>
+            <dd>{formatDuration(ms)}</dd>
+            <dt className="font-bold text-ink-soft">Input tokens</dt>
+            <dd>{tokens.input.toLocaleString()}</dd>
+            <dt className="font-bold text-ink-soft">Output tokens</dt>
+            <dd>{tokens.output.toLocaleString()}</dd>
+            {(tokens.cached > 0 || tokens.cacheCreate > 0) && (
+              <>
+                <dt className="font-bold text-ink-soft">Cache reads</dt>
+                <dd>{tokens.cached.toLocaleString()}</dd>
+                {tokens.cacheCreate > 0 && (
+                  <>
+                    <dt className="font-bold text-ink-soft">Cache writes</dt>
+                    <dd>{tokens.cacheCreate.toLocaleString()}</dd>
+                  </>
+                )}
+              </>
+            )}
+            <dt className="font-bold text-ink-soft">Total tokens</dt>
+            <dd className="text-brand font-bold">{(tokens.input + tokens.output).toLocaleString()}</dd>
+          </dl>
         </section>
 
         {failureReason != null && (
@@ -604,10 +786,11 @@ function StepDetail({
               Spans ({spans.length})
             </h4>
             <div className="space-y-2">
-              {spans.map((s) => {
+              {spans.map((s, i) => {
                 const sv = spanVisualOf(s);
                 const SvIcon = sv.icon;
                 const title = s.kind.kind === 'llm_call' ? s.kind.begin.model_id : s.kind.begin.tool_name;
+                const spanTokens = sumLlmTokens([s]);
                 return (
                   <button
                     key={s.id}
@@ -615,6 +798,9 @@ function StepDetail({
                     onClick={() => onSelectSpan(turnId, s.id)}
                     className="w-full text-left flex items-center gap-3 px-3 py-2 border-2 border-black rounded-md bg-white hover:bg-gray-50 hover:shadow-brutal-xs transition-all"
                   >
+                    <span className="shrink-0 font-mono text-[0.7rem] font-bold text-ink-soft tabular-nums">
+                      {order ? `${order.step}.${i + 1}` : `#${i + 1}`}
+                    </span>
                     <div className={`w-8 h-8 rounded-full border-2 border-black flex items-center justify-center shrink-0 ${sv.bg}`}>
                       <SvIcon className={`${sv.accent} text-base`} />
                     </div>
@@ -622,6 +808,11 @@ function StepDetail({
                       <div className="font-bold text-[0.85rem] truncate">{title}</div>
                       <div className="text-[0.72rem] text-ink-soft font-mono">{sv.label}</div>
                     </div>
+                    {spanTokens.input + spanTokens.output > 0 && (
+                      <span className="shrink-0 font-mono text-[0.7rem] text-ink-soft tabular-nums">
+                        ↑{formatTok(spanTokens.input)} ↓{formatTok(spanTokens.output)}
+                      </span>
+                    )}
                     <OutcomeBadge state={s.outcome} />
                   </button>
                 );
@@ -1099,6 +1290,8 @@ export function TraceSessionPage() {
   const [loadingChildren, setLoadingChildren] = useState<Set<string>>(() => new Set());
   const [turnTraces, setTurnTraces] = useState<Map<string, TurnTrace>>(() => new Map());
   const [loadingTurns, setLoadingTurns] = useState<Set<string>>(() => new Set());
+  const [toolSets, setToolSets] = useState<ToolSetCache>(() => new Map());
+  const [loadingToolSets, setLoadingToolSets] = useState<Set<string>>(() => new Set());
   const [userToggles, setUserToggles] = useState<Map<string, boolean>>(() => new Map());
   const [overviewLoading, setOverviewLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -1277,6 +1470,47 @@ export function TraceSessionPage() {
       cancelled = true;
     };
   }, [client, isMock, logout, sessionId, refreshKey]);
+
+  // Resolve an `LlmCall` span's tool-set reference. Keyed by content hash, so
+  // one fetch serves every span of every session on this page — and the cache
+  // deliberately survives a session switch, since the same hash is the same
+  // set by construction.
+  const fetchToolSet = useCallback(
+    async (hash: string) => {
+      const key = `tools:${hash}`;
+      if (inFlight.current.has(key)) return;
+      inFlight.current.add(key);
+      setLoadingToolSets((prev) => new Set(prev).add(hash));
+      try {
+        if (isMock) {
+          const mock = getMockToolSet(hash);
+          if (mock) setToolSets((prev) => new Map(prev).set(hash, mock.tools));
+          return;
+        }
+        const { data, error: apiError, response } = await client.GET('/v1/traces/tool-sets/{hash}', {
+          params: { path: { hash } },
+        });
+        if (response.status === 401) {
+          logout();
+          return;
+        }
+        // A 404 means the set was never stored (or was pruned). Non-fatal —
+        // the tab says so rather than the page failing.
+        if (apiError || !response.ok) return;
+        setToolSets((prev) => new Map(prev).set(hash, (data as unknown as LlmToolSet).tools));
+      } catch {
+        // Ditto: a tool-set fetch failure must not blank the panel.
+      } finally {
+        inFlight.current.delete(key);
+        setLoadingToolSets((prev) => {
+          const next = new Set(prev);
+          next.delete(hash);
+          return next;
+        });
+      }
+    },
+    [client, isMock, logout],
+  );
 
   const forest = useMemo(() => buildForest(lineage), [lineage]);
 
@@ -1722,6 +1956,41 @@ export function TraceSessionPage() {
 
   const handleManualRefresh = useCallback(() => setRefreshKey((k) => k + 1), []);
 
+  // A pasted step/span id is "take me there", not a search term. The text
+  // filter is the entry point on purpose: it already forces every turn's tree
+  // to load, which is what lets an id resolve anywhere in the session rather
+  // than only in the turn that happens to be open. Once it resolves, select
+  // the node, scroll to it, and drop the filter so the tree comes back.
+  useEffect(() => {
+    const target = resolveJumpTarget(turnTraces, filterRaw);
+    if (!target) return;
+    setFilterRaw('');
+    setFilter('');
+    updateUrl({
+      turn: target.turnId,
+      span: target.spanId,
+      step: target.spanId == null ? target.stepId : null,
+      msg: null,
+      child: null,
+    });
+    scrollToAnchor(`[data-step-id="${target.stepId}"]`, 'center');
+  }, [filterRaw, turnTraces, updateUrl]);
+
+  // The tool definitions behind the selected span's reference, fetched only
+  // when its tab is open: one session's spans share a single set, so this is
+  // one request per page visit — and zero for a reader who never looks.
+  const selectedToolSetHash = useMemo(() => {
+    if (tabParam !== 'tools' || spanIdParam == null) return null;
+    const found = findSpan(activeTurnTrace, spanIdParam)?.span;
+    if (found == null || found.kind.kind !== 'llm_call') return null;
+    return found.kind.begin.tools?.hash ?? null;
+  }, [activeTurnTrace, spanIdParam, tabParam]);
+
+  useEffect(() => {
+    if (selectedToolSetHash == null || toolSets.has(selectedToolSetHash)) return;
+    void fetchToolSet(selectedToolSetHash);
+  }, [selectedToolSetHash, toolSets, fetchToolSet]);
+
   if (overviewLoading && !overview) {
     return (
       <div className="p-5 text-ink-soft text-[0.95rem] flex items-center gap-2">
@@ -1862,14 +2131,22 @@ export function TraceSessionPage() {
           {selectedSpan ? (
             <SpanDetailPanel
               span={selectedSpan}
+              order={spanOrder(activeTurnTrace, selectedSpan.id)}
               messageLog={activeMessageLog}
               tab={tabParam}
               onTabChange={(t) => updateUrl({ tab: t })}
               onJumpToLlm={handleJumpToLlm}
               onDrillIn={handleDrillIntoChild}
+              toolSets={toolSets}
+              loadingToolSets={loadingToolSets}
             />
           ) : selectedStepRs ? (
-            <StepDetail rs={selectedStepRs} turnId={activeTurnId} onSelectSpan={handleSelectSpan} />
+            <StepDetail
+              rs={selectedStepRs}
+              order={stepOrder(activeTurnTrace, selectedStepRs.step.id)}
+              turnId={activeTurnId}
+              onSelectSpan={handleSelectSpan}
+            />
           ) : selectedMessage ? (
             <TranscriptNodePanel node={selectedMessage} externalAgent={activeExternalAgent} />
           ) : selectedChild ? (

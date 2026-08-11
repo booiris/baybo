@@ -1769,6 +1769,18 @@ impl AgentLoop {
             })
             .collect();
 
+        // Mirrored off the wire list rather than re-read from the registry:
+        // the trace has to record what this request actually carried, and a
+        // second registry read could disagree with it.
+        let trace_tool_defs: Vec<baybo_trace::LlmToolDefinition> = tool_defs
+            .iter()
+            .map(|td| baybo_trace::LlmToolDefinition {
+                name: td.name.clone(),
+                description: td.description.clone(),
+                parameters_schema: td.parameters_schema.clone(),
+            })
+            .collect();
+
         // Coalesce adjacent same-role user/assistant messages *only* on the
         // wire to the LLM. Skill reminders are stored as standalone
         // `Role::User` entries, which would otherwise produce back-to-back
@@ -1788,6 +1800,19 @@ impl AgentLoop {
 
         let input_messages = self.context_manager.build_call_input_marker().await;
 
+        // What the model was allowed to call, recorded beside what it was
+        // shown. Stored content-addressed, so a session-stable list costs
+        // one row rather than one copy per call. A failure to persist it
+        // must not fail the turn — the span keeps everything else and the
+        // detail panel simply has no tool list for that call.
+        let tools = match span_recorder.record_tool_set(trace_tool_defs).await {
+            Ok(reference) => Some(reference),
+            Err(e) => {
+                warn!(error = %e, "failed to record the LLM tool set");
+                None
+            }
+        };
+
         let cancel = cancel_token.clone();
         crate::runtime::scope::with_llm_span(
             span_recorder.as_ref(),
@@ -1799,6 +1824,7 @@ impl AgentLoop {
                 provider_config_hash: String::new(),
                 input_messages,
                 temperature: None,
+                tools,
             },
             Some((cancel_token, baybo_turn::CancelReason::ParentCancelled)),
             |span| async move {

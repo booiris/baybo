@@ -6,7 +6,7 @@
 //! but never nest. LLM ↔ tool pairing is by `ToolCallOrigin`, not by
 //! tree structure.
 
-use baybo_model::{ChatMessage, ContentBlock, ParallelGroup, SpanId, StepId};
+use baybo_model::{ChatMessage, ContentBlock, ParallelGroup, SpanId, StepId, ToolSetHash};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use serde_json::Value;
@@ -114,6 +114,53 @@ pub struct LlmCallBegin {
     pub input_messages: LlmCallInputs,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
+    /// The tool set this call offered the model, as a reference into the
+    /// content-addressed `llm_tool_sets` table. `None` when the call
+    /// offered no tools (compression, title generation, the progress
+    /// observer) and on spans recorded before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<LlmToolSetRef>,
+}
+
+/// Reference from an `LlmCall` span to the tool set it offered.
+///
+/// A reference rather than the definitions themselves for the same reason
+/// [`LlmCallInputs::Persisted`] exists: the set is session-stable and runs
+/// to tens of KB, so an inline copy on every call would be the dominant
+/// term in the `spans` table. `count` rides along so a reader can see how
+/// many tools were on offer without resolving the set.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LlmToolSetRef {
+    pub hash: ToolSetHash,
+    pub count: usize,
+}
+
+/// One tool as the model was shown it. Mirrors the provider-facing
+/// definition rather than the internal `Tool` trait — the trace records
+/// what went out on the wire.
+///
+/// `parameters_schema` is a `Value` for the same reason
+/// `ToolCallBegin.params` is: tool schemas are genuinely dynamic. That is
+/// the documented boundary, not a new one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LlmToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub parameters_schema: Value,
+}
+
+/// The full set of definitions one [`LlmToolSetRef`] points at — the
+/// entity stored in `llm_tool_sets`, keyed by the hash of its own
+/// canonical serialization.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LlmToolSet {
+    pub tools: Vec<LlmToolDefinition>,
+}
+
+impl LlmToolSet {
+    pub fn new(tools: Vec<LlmToolDefinition>) -> Self {
+        Self { tools }
+    }
 }
 
 /// Source of the `input_messages` for an `LlmCall` span.
@@ -473,6 +520,7 @@ mod tests {
                 provider_config_hash: "cfg-hash".into(),
                 input_messages: LlmCallInputs::empty(),
                 temperature: Some(0.7),
+                tools: None,
             },
             result: None,
         }

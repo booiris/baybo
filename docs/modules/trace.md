@@ -35,7 +35,7 @@ pub enum StepKind {
 
 pub enum SpanKind {
     LlmCall {
-        begin: LlmCallBegin,            // model_id, provider, provider_config_hash, input_messages, temperature
+        begin: LlmCallBegin,            // model_id, provider, provider_config_hash, input_messages, temperature, tools
         result: Option<LlmCallResult>,  // output_content, thinking, tool_calls, *_tokens (None while Pending)
     },
     ToolCall {
@@ -118,9 +118,36 @@ retains the uncapped serialized length. `QueryApi::replay` resolves references
 server-side, while the per-turn web endpoint leaves them compact and
 `resolveToolCallOutput` resolves them against the overview's one transcript log.
 
+### The tool set an LlmCall offered, by content address
+
+`LlmCallBegin.tools` records **what the model was allowed to call**, the other
+half of "what did the LLM see" beside `input_messages`. It is an
+`Option<LlmToolSetRef> { hash: ToolSetHash, count: usize }` — a reference, for
+the same reason `LlmCallInputs::Persisted` is one. A session's tool list is
+session-stable by construction (`tool_definitions_for_session` filters on the
+channel and the trigger, both fixed for the session, which is also what keeps
+prompt caching alive) and runs to tens of KB of JSON schema. Inlining it per
+call would make the schemas the largest thing in the `spans` table.
+
+The definitions live in `llm_tool_sets(hash TEXT PRIMARY KEY, data TEXT)`,
+keyed by the SHA-256 of their own serialized body — so writes are
+`INSERT OR IGNORE`, rows are immutable, and the same set never stores twice.
+`SpanRecorder::record_tool_set` serializes, hashes, and memoises the hashes it
+has already written, which collapses one store write per LLM call into one per
+distinct set. `None` means the call genuinely offered no tools (compression,
+title generation, the progress observer all send an empty list) or predates the
+field.
+
+`QueryApi::load_tool_set` resolves a hash, and `GET /v1/traces/tool-sets/{hash}`
+exposes it. Deliberately **not** folded into the per-turn tree: every span in a
+turn names the same set, so inlining it there would re-ship those tens of KB per
+span. The web viewer fetches lazily when the span detail's Tools tab is opened
+and caches by hash, which makes it one request per page visit and zero for a
+reader who never looks.
+
 ### Single-table persistence
 
-Step and Span lifecycle writes go to the canonical tables (`steps`, `spans`, `span_events`). Each row stores the entity as a single JSON `data` blob; queryable fields (`turn_id`, `step_id`, `started_at`, `ended_at`) surface as `GENERATED ALWAYS AS (json_extract(...)) VIRTUAL` columns that SQLite keeps in lockstep with `data` automatically. There is no two-side write contract — adding a new field is a serde change in `baybo-trace`, no schema migration. New indexed lookups need a new generated column; that is the only schema change vector.
+Step and Span lifecycle writes go to the canonical tables (`steps`, `spans`, `span_events`, plus the content-addressed `llm_tool_sets` above). Each row stores the entity as a single JSON `data` blob; queryable fields (`turn_id`, `step_id`, `started_at`, `ended_at`) surface as `GENERATED ALWAYS AS (json_extract(...)) VIRTUAL` columns that SQLite keeps in lockstep with `data` automatically. There is no two-side write contract — adding a new field is a serde change in `baybo-trace`, no schema migration. New indexed lookups need a new generated column; that is the only schema change vector.
 
 The earlier two-layer WAL (`trace_events` table mirroring every begin/end) was removed once it became clear no reader consumed it: recovery scans `spans` directly, and there is no replay / OTel-export path yet that would benefit from the append-only log. If one lands later, the WAL can come back together with its consumer.
 
@@ -193,7 +220,7 @@ as the close time.
 
 - Depends on `baybo-turn` (for `CancelReason`) and `baybo-model` (for `TurnId`, `SessionId`, `ChatMessage`, `ContentBlock`, `SecretKind`, etc.). No dependency on `baybo-storage`.
 - IDs use ULID newtypes (`StepId`, `SpanId`); `SpanEvent` uses a `(span_id, seq)` compound key
-- Storage uses columnar schema: `steps` / `spans` / `span_events` (one row per entity); the `Turn > Step > Span` parent chain is encoded by foreign keys, not by embedded child lists
+- Storage uses columnar schema: `steps` / `spans` / `span_events` (one row per entity) plus `llm_tool_sets` (one row per distinct tool set, keyed by its own digest); the `Turn > Step > Span` parent chain is encoded by foreign keys, not by embedded child lists
 - Trace deletes are hard `DELETE FROM` — no `deleted_at` tombstone column (see [storage.md](./storage.md#hard-delete-everywhere-but-cron_jobs))
 - `SpanRecorder` holds locks only for short critical sections, never across `await`
 - `test_support::MemoryTraceStore` is gated behind the `test-support` feature so it never ships in release builds. Downstream test crates pull it in via `baybo-trace = { workspace = true, features = ["test-support"] }`.

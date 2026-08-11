@@ -45,5 +45,5 @@ pub use session::{DreamCandidate, SessionMessageAppendOutcome, SessionStore, Sto
 pub use session_folder::{SessionFolderRow, SessionFolderStore};
 pub use skill_risk::{AssessmentJob, AssessmentJobStatus, RiskLevel, RiskVerdict, SkillRiskStore};
 pub use task::{TaskPatch, TaskStore};
-pub use trace::{SpanEventRow, SpanRow, StepRow, TraceStore};
+pub use trace::{SpanEventRow, SpanRow, StepRow, ToolSetRow, TraceStore};
 pub use turn::{SessionTurnStats, TurnRow, TurnStore};
