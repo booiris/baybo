@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { RiCloseLine, RiEqualizerLine, RiSearchLine } from 'react-icons/ri';
 
 import { useDismiss } from '../../components/useDismiss';
@@ -19,6 +19,60 @@ import {
 
 const ANYONE = '';
 const UNASSIGNED = 'unassigned';
+
+/// The search box, on a local draft.
+///
+/// The filter lives in the URL, so a plain controlled value here is a round
+/// trip: keystroke → `setSearchParams` → navigation → re-parse → back in as
+/// `value`. An IME composes *inside* the field over many keystrokes, and if
+/// that round trip lands one render late React writes the stale value back
+/// over the half-composed candidate — the candidate window drops, or a bare
+/// pinyin letter is left behind. The draft is what the field shows; the URL is
+/// told when the composition ends.
+function SearchField({ value, onChange }: { value: string; onChange: (text: string) => void }) {
+  const [draft, setDraft] = useState(value);
+  const composing = useRef(false);
+
+  // Follow the URL when it moves on its own — Clear, a pasted link, the back
+  // button — but never while the IME owns the field.
+  useEffect(() => {
+    if (!composing.current) setDraft(value);
+  }, [value]);
+
+  const publish = (text: string) => {
+    setDraft(text);
+    if (!composing.current) onChange(text);
+  };
+
+  return (
+    <label className="flex items-center gap-1.5 border-2 border-black rounded-md bg-canvas px-2 py-1">
+      <RiSearchLine aria-hidden className="text-ink-soft text-xs shrink-0" />
+      <input
+        // The panel opens ready to type: search is the one control here that
+        // is reached for mid-thought rather than set and left.
+        autoFocus
+        type="search"
+        value={draft}
+        aria-label="Filter cards by title or number"
+        placeholder="Title or #number"
+        onCompositionStart={() => {
+          composing.current = true;
+        }}
+        onCompositionEnd={(event) => {
+          // Chrome fires this before the input event that carries the
+          // committed text and Safari after, so publish from both and let the
+          // two agree rather than depending on the order.
+          composing.current = false;
+          publish(event.currentTarget.value);
+        }}
+        onChange={(event) => {
+          publish(event.target.value);
+        }}
+        className="w-full min-w-0 bg-transparent font-mono text-[0.68rem] outline-none"
+      />
+    </label>
+  );
+}
 
 function assigneeValue(filter: AssigneeFilter): string {
   switch (filter.kind) {
@@ -89,22 +143,12 @@ export function BoardFilterMenu({
 
       {open ? (
         <div className="absolute right-0 top-[calc(100%+6px)] z-40 w-[250px] bg-surface border-2 border-black rounded-md shadow-brutal p-3 flex flex-col gap-2.5">
-          <label className="flex items-center gap-1.5 border-2 border-black rounded-md bg-canvas px-2 py-1">
-            <RiSearchLine aria-hidden className="text-ink-soft text-xs shrink-0" />
-            <input
-              // The panel opens ready to type: search is the one control here
-              // that is reached for mid-thought rather than set and left.
-              autoFocus
-              type="search"
-              value={filter.text}
-              aria-label="Filter cards by title or number"
-              placeholder="Title or #number"
-              onChange={(event) => {
-                onChange({ ...filter, text: event.target.value });
-              }}
-              className="w-full min-w-0 bg-transparent font-mono text-[0.68rem] outline-none"
-            />
-          </label>
+          <SearchField
+            value={filter.text}
+            onChange={(text) => {
+              onChange({ ...filter, text });
+            }}
+          />
 
           <label className="flex flex-col gap-1 font-mono text-[0.62rem] text-ink-soft">
             Assignee
