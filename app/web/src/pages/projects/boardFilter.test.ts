@@ -7,8 +7,8 @@ import {
   boardFilterParams,
   filterBoard,
   isDefault,
-  isRestrictive,
   matches,
+  restrictionCount,
   parseBoardFilter,
   type BoardFilter,
 } from './boardFilter';
@@ -121,19 +121,30 @@ describe('filterBoard', () => {
   });
 });
 
-describe('isRestrictive / isDefault', () => {
+describe('restrictionCount / isDefault', () => {
   it('treats hiding cancelled as narrowing, and showing them as the default', () => {
     const hidden = filter({ showCancelled: false });
-    // Still not "restrictive": that word means the search/assignee/blocked
-    // filters, which is what the empty-column copy keys on.
-    expect(isRestrictive(hidden)).toBe(false);
+    expect(restrictionCount(hidden)).toBe(1);
     expect(isDefault(hidden)).toBe(false);
     expect(isDefault(filter())).toBe(true);
   });
 
   it('ignores whitespace in the search box', () => {
-    expect(isRestrictive(filter({ text: '   ' }))).toBe(false);
-    expect(isRestrictive(filter({ text: ' a ' }))).toBe(true);
+    expect(restrictionCount(filter({ text: '   ' }))).toBe(0);
+    expect(restrictionCount(filter({ text: ' a ' }))).toBe(1);
+  });
+
+  it('counts each narrowing separately, because the menu badge shows the number', () => {
+    expect(
+      restrictionCount(
+        filter({
+          text: 'parser',
+          assignee: { kind: 'handle', handle: 'dev-1' },
+          blockedOnly: true,
+          showCancelled: false,
+        }),
+      ),
+    ).toBe(4);
   });
 });
 

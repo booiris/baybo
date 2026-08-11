@@ -52,6 +52,9 @@ import {
   findIssue,
   groupByStatus,
   hasDeliverable,
+  HEADER_ACTION,
+  HEADER_ACTION_OFF,
+  HEADER_ACTION_ON,
   liveCount,
   moveAnnouncement,
   statusOf,
@@ -72,7 +75,7 @@ import { ActivityDrawer } from './ActivityDrawer';
 import { AgentProfile } from './AgentProfile';
 import { LeadPanel } from './LeadPanel';
 import { ProjectSettings } from './ProjectSettings';
-import { BoardFilterBar } from './BoardFilterBar';
+import { BoardFilterMenu } from './BoardFilterMenu';
 import { boardFilterParams, filterBoard, parseBoardFilter } from './boardFilter';
 import type { BoardFilter } from './boardFilter';
 import { TeamStrip } from './TeamStrip';
@@ -354,14 +357,21 @@ export function ProjectBoardPage() {
           }}
         />
         <div className="ml-auto flex items-center gap-2">
+          <BoardFilterMenu
+            filter={filter}
+            team={team}
+            onChange={(next: BoardFilter) => {
+              setParams(boardFilterParams(next), { replace: true });
+            }}
+          />
           <button
             type="button"
             aria-pressed={rightPanel === 'lead'}
             onClick={() => {
               setRightPanel((open) => (open === 'lead' ? null : 'lead'));
             }}
-            className={`border-2 border-black rounded-md px-2 py-0.5 font-mono text-[0.62rem] font-bold uppercase tracking-wider ${
-              rightPanel === 'lead' ? 'bg-brand text-ink' : 'bg-surface'
+            className={`${HEADER_ACTION} ${
+              rightPanel === 'lead' ? HEADER_ACTION_ON : HEADER_ACTION_OFF
             }`}
           >
             Chat with lead
@@ -372,8 +382,8 @@ export function ProjectBoardPage() {
             onClick={() => {
               setRightPanel((open) => (open === 'activity' ? null : 'activity'));
             }}
-            className={`border-2 border-black rounded-md px-2 py-0.5 font-mono text-[0.62rem] font-bold uppercase tracking-wider ${
-              rightPanel === 'activity' ? 'bg-brand text-ink' : 'bg-surface'
+            className={`${HEADER_ACTION} ${
+              rightPanel === 'activity' ? HEADER_ACTION_ON : HEADER_ACTION_OFF
             }`}
           >
             Activity
@@ -385,20 +395,14 @@ export function ProjectBoardPage() {
             onClick={() => {
               setShowSettings(true);
             }}
-            className="border-2 border-black rounded-md bg-surface px-2 py-0.5 font-mono text-[0.62rem] font-bold"
+            // The group's tracking is trailing letter-spacing, which on a
+            // one-glyph button is padding down the right-hand side only.
+            className={`${HEADER_ACTION} ${HEADER_ACTION_OFF} tracking-normal`}
           >
             ⚙
           </button>
         </div>
       </header>
-
-      <BoardFilterBar
-        filter={filter}
-        team={team}
-        onChange={(next: BoardFilter) => {
-          setParams(boardFilterParams(next), { replace: true });
-        }}
-      />
 
       {error != null ? (
         <div className="m-4 bg-white border-[3px] border-err text-err rounded-md shadow-brutal-sm px-4 py-3 font-mono text-sm break-words">

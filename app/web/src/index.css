@@ -187,6 +187,17 @@
     overflow: hidden;
     margin: 0;
   }
+
+  /* Tailwind v3's preflight gave buttons `cursor: pointer`; v4 dropped it, so
+     a `<button>` shows an arrow unless it asks for the hand itself. Half the
+     buttons in here duly say `cursor-pointer` and half were written after the
+     upgrade and do not — which is not a per-component decision, so it is
+     answered once here. `:not(:disabled)` keeps a dead control looking dead,
+     and any `cursor-*` utility still wins from the utilities layer. */
+  button:not(:disabled),
+  [role='button']:not(:disabled) {
+    cursor: pointer;
+  }
 }
 
 /* Global tinted scrollbar: every scroll area blends into the warm canvas

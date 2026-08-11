@@ -1,5 +1,7 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useRef, useState, type ReactNode } from 'react';
 import { RiArrowDownSLine } from 'react-icons/ri';
+
+import { useDismiss } from '../../components/useDismiss';
 
 export type PickerOption = {
   value: string;
@@ -54,27 +56,10 @@ export function Picker({
   const root = useRef<HTMLDivElement | null>(null);
   const trigger = useRef<HTMLButtonElement | null>(null);
   const current = options.find((option) => option.value === value);
-
-  useEffect(() => {
-    if (!open) return;
-    function onPointerDown(event: MouseEvent) {
-      if (root.current?.contains(event.target as Node) === true) return;
-      setOpen(false);
-    }
-    function onKeyDown(event: KeyboardEvent) {
-      if (event.key !== 'Escape') return;
-      // Owned here, or the rail's other layers close along with the panel.
-      event.stopPropagation();
-      setOpen(false);
-      trigger.current?.focus();
-    }
-    document.addEventListener('mousedown', onPointerDown);
-    document.addEventListener('keydown', onKeyDown);
-    return () => {
-      document.removeEventListener('mousedown', onPointerDown);
-      document.removeEventListener('keydown', onKeyDown);
-    };
-  }, [open]);
+  const close = useCallback(() => {
+    setOpen(false);
+  }, []);
+  useDismiss({ open, root, trigger, onDismiss: close });
 
   return (
     <div ref={root} className="relative inline-flex shrink-0">

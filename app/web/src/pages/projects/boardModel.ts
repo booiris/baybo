@@ -52,6 +52,16 @@ export const STATUS_PILL: Record<IssueStatus, string> = {
   done: 'border-ok/50 bg-ok/15 text-ok font-bold',
 };
 
+/// The board header's action group — filter, lead chat, activity, settings.
+/// One skin, because four buttons sitting in a row are read as a set and a
+/// hand-copied class string is how a set stops being one.
+export const HEADER_ACTION =
+  'inline-flex items-center gap-1 border-2 border-black rounded-md px-2 py-0.5 font-mono text-[0.62rem] font-bold uppercase tracking-wider transition-colors';
+export const HEADER_ACTION_ON = 'bg-brand text-ink';
+/// The hover was missing entirely: these were the only buttons on the board
+/// that gave no sign of being live until they were pressed.
+export const HEADER_ACTION_OFF = 'bg-surface hover:bg-brand/25';
+
 export const PRIORITIES: readonly IssuePriority[] = [
   'urgent',
   'high',

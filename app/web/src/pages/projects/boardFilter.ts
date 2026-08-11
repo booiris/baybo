@@ -32,14 +32,24 @@ const PARAM_CANCELLED = 'cancelled';
 
 const UNASSIGNED = 'unassigned';
 
-export function isRestrictive(filter: BoardFilter): boolean {
-  return (
-    filter.text.trim() !== '' || filter.assignee.kind !== 'anyone' || filter.blockedOnly
-  );
+/// Every way the board can be narrowed, in one list. The menu's badge counts
+/// these and its Clear button appears on them; written twice, the badge would
+/// eventually say 0 next to a board that is hiding cards.
+function restrictions(filter: BoardFilter): boolean[] {
+  return [
+    filter.text.trim() !== '',
+    filter.assignee.kind !== 'anyone',
+    filter.blockedOnly,
+    !filter.showCancelled,
+  ];
+}
+
+export function restrictionCount(filter: BoardFilter): number {
+  return restrictions(filter).filter(Boolean).length;
 }
 
 export function isDefault(filter: BoardFilter): boolean {
-  return !isRestrictive(filter) && filter.showCancelled;
+  return restrictionCount(filter) === 0;
 }
 
 function matchesText(issue: Issue, text: string): boolean {

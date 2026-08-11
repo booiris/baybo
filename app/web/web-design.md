@@ -76,7 +76,8 @@ In the chat view the **thread sits on `surface`** (`#fffdf7`) while all **side p
 
 - **Standard Button:** Large, bold uppercase text, black border, brand background for primary.
 - **Icon Button:** Square or circular, 2px border, used for compact actions.
-- **Interaction:** Buttons often "push down" (translate 2px/2px) on active state, removing the shadow to simulate a physical press.
+- **Interaction:** Buttons often "push down" (translate 2px/2px) on active state, removing the shadow to simulate a physical press. Every button also needs a **hover** state — on a flat cream surface with no gradients or elevation, hover is the only thing that separates a live control from a printed label.
+- **The pointer cursor is global, not per-button.** Tailwind v3's preflight gave `button` `cursor: pointer`; v4 dropped it, so a `<button>` shows an arrow unless it asks. Half this codebase's buttons carry a hand-written `cursor-pointer` and half were written after the upgrade and silently lost it. `index.css` answers it once in `@layer base` for `button`/`[role=button]` that are not `:disabled` — new buttons should not repeat it, and a `cursor-*` utility still overrides it from the utilities layer.
 
 ### Inputs
 
@@ -92,6 +93,32 @@ In the chat view the **thread sits on `surface`** (`#fffdf7`) while all **side p
   panel lists faces. Deliberately **not** `role="listbox"`: the options are
   ordinary buttons reachable by Tab, and claiming the role without arrow-key
   roving would advertise an interaction that is not there.
+
+### Popovers
+
+A popover is a `relative` wrapper, a trigger, and an absolutely-positioned
+`border-2 border-black rounded-md bg-surface shadow-brutal` panel offset
+`calc(100%+6px)` from the trigger — never an OS menu and never a modal. It
+closes through `components/useDismiss.ts`, which owns two rules the panels kept
+getting wrong on their own: Escape is **stopped** (these open inside surfaces
+that close on Escape themselves, so one press would otherwise collapse the
+whole stack), and the focus goes back to the trigger instead of onto the body.
+The chat sidebar's own menus predate the hook and still hand-roll it.
+
+## Board header
+
+Everything that acts on the **whole board** lives in the header's right-hand
+group — filter, the lead chat, activity, settings — and the board itself
+starts directly under it. There is no second toolbar row: a strip that existed
+to hold four filter controls cost every board 30px of column height to show
+controls that are set once and then looked past.
+
+`BoardFilterMenu` is that collapse. The trigger goes gold and carries a count
+of active narrowings, so a board holding cards back always says so from the
+header — a hidden filter that silently empties a column is the one failure
+mode collapsing the strip could introduce, and the badge is what rules it out.
+`boardFilter.ts` owns the list of narrowings (`restrictionCount`), because the
+badge and the Clear button must never disagree about what counts as filtered.
 
 ## Iconography
 

@@ -150,6 +150,7 @@ describe('ProjectBoardPage', () => {
     renderBoard();
     await screen.findByText('Cancelled one');
 
+    await userEvent.click(screen.getByLabelText('Filter the board'));
     await userEvent.click(screen.getByLabelText('Hide cancelled'));
     expect(screen.queryByText('Cancelled one')).not.toBeInTheDocument();
     const backlog = screen.getByRole('heading', { name: 'Backlog' }).parentElement;
@@ -190,11 +191,23 @@ describe('ProjectBoardPage', () => {
     await screen.findByText('Wire the board');
     const before = client.GET.mock.calls.length;
 
+    await userEvent.click(screen.getByLabelText('Filter the board'));
     await userEvent.type(screen.getByLabelText(/Filter cards by title/), 'blocked');
     await screen.findByText('Blocked one');
     expect(screen.queryByText('Wire the board')).not.toBeInTheDocument();
     expect(client.GET.mock.calls.length).toBe(before);
     expect(rerender).toBeTypeOf('function');
+  });
+
+  it('says from the header how many ways the board is being narrowed', async () => {
+    renderBoard('?q=blocked&blocked=1');
+    await screen.findByText('Blocked one');
+
+    // Collapsing the strip into a button is only safe if a board that is
+    // holding cards back cannot look like one that is not.
+    const trigger = screen.getByLabelText('Filter the board (2 active)');
+    expect(trigger.className).toContain('bg-brand');
+    expect(trigger.textContent).toContain('2');
   });
 
   it('narrows the board from the URL without refetching it', async () => {
