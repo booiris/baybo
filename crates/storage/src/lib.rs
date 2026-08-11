@@ -62,7 +62,7 @@ impl Store {
             // outside tests that pass `:memory:`-style placeholders.
             _ => std::path::PathBuf::from("."),
         };
-        let blob_root = parent_dir.join("blobs");
+        let blob_root = parent_dir.join(baybo_workspace::paths::BLOBS_SUBDIR);
         let pool = sqlite::SqlitePool::open(path).await?;
         let blob = sqlite::SqliteBlobStore::open(pool.clone(), &blob_root).await?;
         let agent_profile = sqlite::SqliteAgentProfileStore::open(pool.clone()).await?;

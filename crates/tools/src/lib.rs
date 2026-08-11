@@ -30,6 +30,7 @@ pub use approval::{
     ResourceAccess,
 };
 pub(crate) use baybo_model::FileFingerprint;
+pub use builtin::paths::shell_reachable_workspace_roots;
 pub use builtin::read::READ_TOOL_NAME;
 pub use builtin::write::WRITE_TOOL_NAME;
 

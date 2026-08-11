@@ -130,7 +130,7 @@ ENVIRONMENT:
 const SANDBOXED_ISOLATION: &str = r#"SANDBOX: The shell has read+write access to the workspace and `$HOME`, with the FHS roots (`/usr`, `/bin`, `/etc`, …) readable; nothing outside that union exists. The usual credential directories under `$HOME` (ssh, aws, gnupg, gh, gcloud, docker, kube, and Baybo's own state dir) are masked and read as empty, and `/dev` is minimal. Network is enabled."#;
 
 #[cfg(not(feature = "bench-bash"))]
-const SANDBOXED_WORK_DIR_SCOPE: &str = r#"WORK-DIR SCOPE: Inside the workspace, Bash may only name {{work_dir}} (read+write) and `skills/` (read+execute, never write). Every other path under the workspace root is rejected up front, `cwd` included — reach those through `Read`/`Edit`/`Write` instead. Paths outside the workspace are unaffected by this rule.
+const SANDBOXED_WORK_DIR_SCOPE: &str = r#"WORK-DIR SCOPE: Inside the workspace, Bash may only name {{work_dir}} (read+write), `skills/` (read+execute, never write), and blob payload paths returned by `GetBlob` (read-only). Every other path under the workspace root is rejected up front, `cwd` included — reach those through `Read`/`Edit`/`Write` instead. Paths outside the workspace are unaffected by this rule.
 
 SCRATCH: Put disposable/intermediate files (probe scripts, one-off downloads, temp build output) under {{work_tmp_dir}} — it is swept automatically after {{work_tmp_ttl_days}} days. Deliverables the user should keep belong elsewhere under {{work_dir}}."#;
 
@@ -283,15 +283,6 @@ impl BashTool {
             process_manager,
             permission: Arc::new(LivePermissionMode::new(BashPermissionMode::default())),
         }
-    }
-
-    /// The calling agent's skill directory — the one tree a command may name
-    /// paths inside besides `work/`. It is bound read-only into the sandbox,
-    /// and running an installed skill's bundled script in place is the point.
-    /// Per call rather than per process because the agent decides it, and
-    /// another agent's tree is neither bound nor exempt.
-    fn skill_root(&self, ctx: &ToolContext) -> PathBuf {
-        absolutise(&ctx.agent_id.skills_dir(&ctx.workspace_paths))
     }
 
     /// Pin a fixed permission mode via a fresh (non-shared) handle. For callers
@@ -700,7 +691,7 @@ impl Tool for BashTool {
                 &command,
                 &self.workspace_root,
                 &self.work_dir,
-                &self.skill_root(ctx),
+                &crate::shell_reachable_workspace_roots(&ctx.workspace_paths, &ctx.agent_id),
             )?;
         }
         // The bench profile has no work-dir jail, so a command with no explicit
@@ -1256,8 +1247,8 @@ fn require_within_work_dir(
         return Err(ToolError::InvalidParams(format!(
             "Bash {label} `{}` is inside the workspace but outside the work \
              directory. Only `{}` is writable for shell operations (your own \
-             skill directory is bound read-only so installed skill scripts can \
-             run in place) — move the action under `{}/` or use \
+             skill directory and blob payload paths from `GetBlob` are also \
+             nameable, read-only) — move the action under `{}/` or use \
              Read/Edit/Write for the read-only workspace subtrees (personas/, \
              config/, state/, logs/, .key/).",
             path.display(),
@@ -1286,7 +1277,7 @@ fn require_command_paths_within_work_dir(
     command: &str,
     workspace_root: &Path,
     work_dir: &Path,
-    skill_root: &Path,
+    exempt_roots: &[PathBuf],
 ) -> crate::Result<()> {
     for sub in split_into_subcommands(command) {
         for tok in sub {
@@ -1295,7 +1286,7 @@ fn require_command_paths_within_work_dir(
             };
             for word in words {
                 let p = Path::new(&word);
-                if p.is_absolute() && p.starts_with(skill_root) {
+                if p.is_absolute() && exempt_roots.iter().any(|root| p.starts_with(root)) {
                     continue;
                 }
                 require_within_work_dir(p, workspace_root, work_dir, "command argument")?;
@@ -4525,6 +4516,36 @@ mod tests {
         );
     }
 
+    /// A `GetBlob` answer must survive this guard. The OS sandbox binds
+    /// `state/blobs/` read-only, but this check runs *first* and rejects on
+    /// the path string, so without the exemption the bind is unreachable and
+    /// the whole point of handing out a payload path is lost.
+    #[tokio::test]
+    async fn accepts_blob_payload_paths_the_sandbox_binds_read_only() {
+        let out = BashTool::for_test()
+            .execute(
+                json!({ "command": "file /tmp/state/blobs/1f/deadbeef.jpg" }),
+                &ctx_with(None),
+            )
+            .await;
+        assert!(
+            !matches!(out, Err(ToolError::InvalidParams(_))),
+            "blob payload path must not be rejected by the work-dir guard: {out:?}"
+        );
+        // Its siblings under `state/` stay out of reach.
+        let err = BashTool::for_test()
+            .execute(
+                json!({ "command": "cat /tmp/state/storage.db" }),
+                &ctx_with(None),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidParams(_)),
+            "exempting blobs/ must not open the rest of state/: {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn accepts_paths_under_work_dir_and_outside_workspace() {
         // `/tmp/work/foo` (inside work) and `/etc/hosts` (outside the
@@ -4638,7 +4659,9 @@ mod tests {
     fn require_command_paths_within_work_dir_walks_subcommands() {
         let ws = Path::new("/tmp");
         let work = Path::new("/tmp/work");
-        let skills = WorkspacePaths::new("/tmp").persona_skills_dir("01JCUSTOM");
+        let paths = WorkspacePaths::new("/tmp");
+        let skills = paths.persona_skills_dir("01JCUSTOM");
+        let exempt = vec![skills.clone(), paths.blobs_dir()];
 
         // Clean command — no offending paths.
         assert!(
@@ -4646,7 +4669,7 @@ mod tests {
                 "ls /tmp/work && cat /etc/hosts",
                 ws,
                 work,
-                &skills
+                &exempt
             )
             .is_ok()
         );
@@ -4654,7 +4677,7 @@ mod tests {
         // Quoted path inside the workspace but outside work — caught
         // after `shell_words::split` unquotes the token.
         let err =
-            require_command_paths_within_work_dir(r#"ls "/tmp/profile/foo""#, ws, work, &skills)
+            require_command_paths_within_work_dir(r#"ls "/tmp/profile/foo""#, ws, work, &exempt)
                 .unwrap_err();
         assert!(matches!(err, ToolError::InvalidParams(ref m) if m.contains("/tmp/profile/foo")));
 
@@ -4663,7 +4686,7 @@ mod tests {
             "git status | tee /tmp/logs/out",
             ws,
             work,
-            &skills,
+            &exempt,
         )
         .unwrap_err();
         assert!(matches!(err, ToolError::InvalidParams(ref m) if m.contains("/tmp/logs/out")));
@@ -4677,7 +4700,7 @@ mod tests {
                 &format!("python {} auth-status", script.display()),
                 ws,
                 work,
-                &skills
+                &exempt
             )
             .is_ok()
         );
