@@ -116,10 +116,15 @@ function TeamMemberChip({
       type="button"
       aria-label={`Open @${agent.handle}'s profile`}
       onClick={onOpen}
-      // The lead's halo is a ring, not padding. Padding grew that one seat to
-      // 30px in a row of 26px ones, which `items-center` then centred rather
-      // than aligned; a ring is drawn outside the box without occupying any.
-      className={`shrink-0 rounded-full hover:brightness-95 ${
+      // `flex`, because a `<button>` is inline-block by default and the face
+      // inside it is inline — so the button got a line box, and a line box
+      // reserves room under the baseline for descenders. The seat came out
+      // taller than the 26px face it holds, and the row stopped lining up.
+      //
+      // The lead's halo is a ring rather than padding for the same reason in
+      // the other direction: a ring is drawn outside the box without
+      // occupying any, so that seat is 26px like every other.
+      className={`flex shrink-0 rounded-full hover:brightness-95 ${
         agent.lead ? 'ring-2 ring-brand' : ''
       }`}
     >
