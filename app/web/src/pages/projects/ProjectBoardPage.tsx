@@ -612,6 +612,12 @@ function BoardColumn({
   // `isOver` only fires for the column's own droppable — hovering a card
   // inside it does not. `activeOver` is what the operator experiences as
   // "this is where it will land", so the outline follows that instead.
+  //
+  // This says *which column*, and that is all it says. Where in the column is
+  // already answered, exactly, by the dragged card itself: `onDragOver` moves
+  // it into place and it renders there at 40% while the drag is live. A dashed
+  // slot used to sit under the list saying the same thing less truthfully — it
+  // was pinned to the column's end whatever the real insertion point was.
   const targeted = isOver || activeOver === status;
 
   return (
@@ -666,11 +672,7 @@ function BoardColumn({
             />
           ))}
         </SortableContext>
-        {targeted ? (
-          // The dashed slot: where the card lands if it is let go now.
-          <div className="shrink-0 h-9 border-2 border-dashed border-brand-hover rounded-md" />
-        ) : null}
-        {issues.length === 0 && !targeted ? (
+        {issues.length === 0 ? (
           <p className="m-auto text-center font-mono text-[0.62rem] text-ink-soft leading-snug">
             {total === 0 ? (
               <>

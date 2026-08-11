@@ -144,6 +144,14 @@ column would flick the preview to the bottom on every boundary swept past. In a
 seam the nearest card by centre wins instead. Below the last card is the one
 place the column is the honest answer, and it stays that way.
 
+**Two pieces of feedback, not three.** Which column it will land in is the
+column's brand outline and `bg-brand/15` tint; where in that column is the
+dragged card itself, which `onDragOver` moves into position and renders at 40%
+for the length of the drag. There is deliberately no dashed placeholder: the
+one that used to sit under each column's list was pinned to the column's end
+regardless of the real insertion point, so on any drop that was not an append
+it contradicted the preview sitting a few cards above it.
+
 ## Iconography
 
 - **Library:** [Remix Icon](https://remixicon.com/) (via `react-icons/ri`).
