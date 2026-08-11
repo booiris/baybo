@@ -2,11 +2,13 @@ import { useSearchParams } from 'react-router-dom';
 import type { components } from './schema';
 import type {
   ChatMessage,
+  ContextSegment,
   LifecycleState,
   LineageSession,
   LlmToolDefinition,
   LlmToolSet,
   SessionMessageRow,
+  SpanContext,
   Span,
   Step,
   StepKind,
@@ -280,6 +282,35 @@ const MOCK_TOOL_SET: LlmToolDefinition[] = [
 
 export function getMockToolSet(hash: string): LlmToolSet | null {
   return hash === MOCK_TOOL_SET_HASH ? { hash, tools: MOCK_TOOL_SET } : null;
+}
+
+/** A context shaped like a real one: a heavy system prompt, a tool set that
+ *  costs more than anyone expects, one oversized tool result, and enough small
+ *  pieces that the grid's rounding has something to do. */
+export function getMockSpanContext(spanId: string): SpanContext {
+  const segments: ContextSegment[] = [
+    { part: 'tools', label: `${MOCK_TOOL_SET.length} tool definitions`, tokens: 9_120, index: 0 },
+    { part: 'system_prompt', label: 'System prompt', tokens: 6_480, index: 0 },
+    { part: 'skills', label: 'Skills', tokens: 2_310, index: 1 },
+    { part: 'memory', label: 'Recalled memory', tokens: 880, index: 2 },
+    { part: 'user', label: 'User message', tokens: 64, index: 3 },
+    { part: 'assistant', label: 'Assistant', tokens: 512, index: 4 },
+    { part: 'tool_result', label: 'bash result', tokens: 14_900, index: 5 },
+    { part: 'tool_result', label: 'read_file result', tokens: 3_240, index: 6 },
+    { part: 'assistant', label: 'Assistant', tokens: 410, index: 7 },
+    { part: 'agent', label: 'Agent framing', tokens: 190, index: 8 },
+    { part: 'media', label: '1 image(s)', tokens: 1_105, index: 9 },
+  ];
+  return {
+    span_id: spanId,
+    model_id: 'claude-sonnet-4-6',
+    // Deliberately a little off the sum: that gap is real, and the panel is
+    // supposed to show it rather than pretend the estimate is the total.
+    reported_input_tokens: 40_120,
+    estimated_total_tokens: segments.reduce((n, s) => n + s.tokens, 0),
+    context_window: 200_000,
+    segments,
+  };
 }
 
 function llmSpan(

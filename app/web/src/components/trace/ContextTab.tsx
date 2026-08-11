@@ -1,0 +1,241 @@
+/**
+ * Where an LLM call's context went, as a matrix of cells.
+ *
+ * The provider reports one number for the whole prompt, which answers "what
+ * did this cost" and not "what is eating my window". This draws the split: one
+ * cell per fixed slice of tokens, coloured by the part it belongs to, laid out
+ * against the model's context window when one is known so the free space is
+ * visible too.
+ *
+ * The **total is exact** (the provider's own `input_tokens`) and the **split
+ * is an estimate** — tiktoken is not Anthropic's tokenizer. The two are kept
+ * visibly apart: the headline is the reported figure, every per-part number
+ * carries a `≈`, and the drift against the estimate is stated rather than
+ * hidden by silently showing one number in place of the other.
+ */
+import { useMemo } from 'react';
+import { RiLoader4Line } from 'react-icons/ri';
+import type { ContextPart, SpanContext } from '../../types/trace';
+import { formatTok } from './traceFormat';
+import { buildContextGrid, largestSegments } from './contextGrid';
+
+/** Colour + label per context part.
+ *
+ *  Hues follow the tree's existing vocabulary where the concepts line up —
+ *  tools orange, memory blue, model output green — so a reader who has learnt
+ *  the tree does not learn a second key. The related pairs share a hue at two
+ *  strengths: standing instructions (system prompt / skills) violet, tool
+ *  definitions and their results orange, recalled memory and attached media
+ *  blue. */
+const PART_VISUALS: Record<ContextPart, { label: string; cell: string }> = {
+  system_prompt: { label: 'System prompt', cell: 'bg-violet' },
+  skills: { label: 'Skills', cell: 'bg-violet/50' },
+  tools: { label: 'Tool definitions', cell: 'bg-warn' },
+  tool_result: { label: 'Tool results', cell: 'bg-warn/50' },
+  memory: { label: 'Recalled memory', cell: 'bg-info' },
+  media: { label: 'Attachments', cell: 'bg-info/50' },
+  user: { label: 'User messages', cell: 'bg-brand' },
+  cron: { label: 'Cron', cell: 'bg-magenta' },
+  assistant: { label: 'Assistant', cell: 'bg-ok' },
+  agent: { label: 'Agent framing', cell: 'bg-ink-soft' },
+};
+
+const FREE_CELL = 'bg-black/10';
+const LARGEST_SHOWN = 8;
+
+function pct(share: number): string {
+  if (share <= 0) return '0%';
+  return share < 0.001 ? '<0.1%' : `${(share * 100).toFixed(share < 0.1 ? 1 : 0)}%`;
+}
+
+export function ContextTab({
+  context,
+  loading,
+  onRetry,
+}: {
+  context: SpanContext | undefined;
+  loading: boolean;
+  onRetry: () => void;
+}) {
+  const grid = useMemo(
+    () =>
+      context
+        ? buildContextGrid(
+            context.segments,
+            context.reported_input_tokens ?? context.estimated_total_tokens,
+            context.context_window ?? null,
+          )
+        : null,
+    [context],
+  );
+  const largest = useMemo(
+    () => (context ? largestSegments(context.segments, LARGEST_SHOWN) : []),
+    [context],
+  );
+
+  if (context == null || grid == null) {
+    return loading ? (
+      <div className="text-ink-soft text-[0.85rem] italic flex items-center gap-2">
+        <RiLoader4Line className="animate-spin" /> Measuring the context…
+      </div>
+    ) : (
+      <div className="space-y-3">
+        <div className="text-ink-soft text-[0.85rem]">
+          The context for this call could not be reconstructed.
+        </div>
+        <button
+          type="button"
+          onClick={onRetry}
+          className="border-2 border-black rounded-md px-3 py-1 text-[0.8rem] font-bold uppercase tracking-wider bg-white hover:bg-gray-50 cursor-pointer"
+        >
+          Retry
+        </button>
+      </div>
+    );
+  }
+
+  const used = context.reported_input_tokens ?? context.estimated_total_tokens;
+  const measured = context.reported_input_tokens != null;
+  // Only worth stating when it is big enough to change a reading. tiktoken
+  // runs within ~10% of Anthropic's tokenizer, so a 3% gap is the tool
+  // working, not a discrepancy the reader has to account for.
+  const drift =
+    measured && context.estimated_total_tokens > 0
+      ? Math.abs(used - context.estimated_total_tokens) / context.estimated_total_tokens
+      : 0;
+
+  const cells: { key: string; className: string; title: string }[] = [];
+  for (const category of grid.categories) {
+    const visual = PART_VISUALS[category.part];
+    for (let i = 0; i < category.cells; i++) {
+      cells.push({
+        key: `${category.part}-${i}`,
+        className: visual.cell,
+        title: `${visual.label} · ≈${category.tokens.toLocaleString()} tokens (${pct(category.share)})`,
+      });
+    }
+  }
+  for (let i = 0; i < grid.freeCells; i++) {
+    cells.push({
+      key: `free-${i}`,
+      className: FREE_CELL,
+      title:
+        grid.freeTokens != null
+          ? `Free · ${grid.freeTokens.toLocaleString()} tokens left in the window`
+          : 'Free',
+    });
+  }
+
+  return (
+    <div className="space-y-5">
+      <section>
+        <div className="flex items-baseline justify-between gap-3 flex-wrap">
+          <h4 className="font-bold uppercase tracking-wider text-[0.8rem]">Context</h4>
+          <div className="font-mono text-[0.8rem]">
+            <span className="font-bold">{used.toLocaleString()}</span>
+            {context.context_window != null && (
+              <span className="text-ink-soft"> / {context.context_window.toLocaleString()}</span>
+            )}
+            <span className="text-ink-soft"> tokens</span>
+            {context.context_window != null && context.context_window > 0 && (
+              <span className="ml-2 text-brand font-bold">
+                {pct(used / context.context_window)} full
+              </span>
+            )}
+          </div>
+        </div>
+        <div className="mt-2 flex flex-wrap gap-[2px] border-2 border-black rounded-md p-2 bg-canvas">
+          {cells.map((c) => (
+            <span
+              key={c.key}
+              title={c.title}
+              className={`h-2.5 w-2.5 rounded-[1px] ${c.className}`}
+            />
+          ))}
+        </div>
+        <p className="mt-1 font-mono text-[0.65rem] text-ink-soft">
+          one cell ≈ {formatTok(grid.tokensPerCell)} tokens
+          {context.context_window == null && ' · no context window known for this model'}
+        </p>
+      </section>
+
+      <section>
+        <dl className="grid grid-cols-[auto_1fr_auto_auto] gap-x-3 gap-y-1.5 items-center font-mono text-[0.8rem]">
+          {grid.categories
+            .filter((c) => c.cells > 0 || c.tokens > 0)
+            .map((category) => {
+              const visual = PART_VISUALS[category.part];
+              return (
+                <div key={category.part} className="contents">
+                  <span
+                    className={`h-3 w-3 rounded-[2px] border border-black/40 ${visual.cell}`}
+                  />
+                  <dt className="truncate">{visual.label}</dt>
+                  <dd className="tabular-nums text-right">
+                    ≈{category.tokens.toLocaleString()}
+                  </dd>
+                  <dd className="tabular-nums text-right text-ink-soft w-12">
+                    {pct(category.share)}
+                  </dd>
+                </div>
+              );
+            })}
+          {grid.freeTokens != null && (
+            <div className="contents">
+              <span className={`h-3 w-3 rounded-[2px] border border-black/40 ${FREE_CELL}`} />
+              <dt className="truncate text-ink-soft">Free</dt>
+              <dd className="tabular-nums text-right text-ink-soft">
+                {grid.freeTokens.toLocaleString()}
+              </dd>
+              <dd className="tabular-nums text-right text-ink-soft w-12">
+                {pct(grid.freeTokens / grid.scale)}
+              </dd>
+            </div>
+          )}
+        </dl>
+      </section>
+
+      {largest.length > 0 && (
+        <section>
+          <h4 className="font-bold uppercase tracking-wider text-[0.8rem] mb-2 border-b-2 border-black pb-1">
+            Largest pieces
+          </h4>
+          <div className="space-y-1">
+            {largest.map((segment, i) => {
+              const visual = PART_VISUALS[segment.part];
+              const share =
+                context.estimated_total_tokens > 0
+                  ? segment.tokens / context.estimated_total_tokens
+                  : 0;
+              return (
+                <div
+                  key={`${segment.part}-${segment.index}-${i}`}
+                  className="flex items-center gap-2 font-mono text-[0.78rem]"
+                >
+                  <span
+                    className={`h-2.5 w-2.5 rounded-[1px] shrink-0 border border-black/40 ${visual.cell}`}
+                  />
+                  <span className="flex-1 min-w-0 truncate">{segment.label}</span>
+                  <span className="shrink-0 tabular-nums">
+                    ≈{segment.tokens.toLocaleString()}
+                  </span>
+                  <span className="shrink-0 tabular-nums text-ink-soft w-12 text-right">
+                    {pct(share)}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      )}
+
+      <p className="text-[0.72rem] text-ink-soft italic leading-snug">
+        {measured
+          ? 'The total is what the provider billed. The split is a tiktoken estimate — accurate enough for proportions, not for accounting.'
+          : 'This call recorded no usage, so both the total and the split are tiktoken estimates.'}
+        {drift > 0.15 &&
+          ` The estimate came to ${context.estimated_total_tokens.toLocaleString()}, ${pct(drift)} off the billed total.`}
+      </p>
+    </div>
+  );
+}

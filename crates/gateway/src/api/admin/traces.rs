@@ -22,6 +22,11 @@
 //!   span's `tools.hash` names. Session-scoped only in spirit: the set is
 //!   content-addressed and shared across spans, so it is fetched once per
 //!   hash rather than shipped inside every span.
+//! * `GET /v1/traces/{session_id}/spans/{span_id}/context` — where one LLM
+//!   call's input tokens went, split per context part. Resolves both of the
+//!   references the per-turn tree leaves alone (the ordinal input slice and
+//!   the tool-set hash) and tokenizes the result, so it is the one place
+//!   that pays for both at once — hence its own lazy endpoint.
 //!
 //! The three per-session endpoints stay untyped `serde_json::Value` because
 //! the columnar Step/Span tree is polymorphic and re-mirroring the
@@ -52,6 +57,7 @@ pub fn routes() -> OpenApiRouter<AdminState> {
         .routes(routes!(get_trace_lineage))
         .routes(routes!(get_turn_trace))
         .routes(routes!(get_tool_set))
+        .routes(routes!(get_span_context))
 }
 
 #[utoipa::path(
@@ -301,5 +307,66 @@ async fn get_tool_set(
     Ok(Json(json!({
         "hash": parsed,
         "tools": set.tools,
+    })))
+}
+
+#[utoipa::path(
+    get,
+    path = "/traces/{session_id}/spans/{span_id}/context",
+    tag = "traces",
+    params(
+        ("session_id" = String, Path, description = "Session whose transcript the span's input references"),
+        ("span_id" = String, Path, description = "LlmCall span whose context to break down"),
+    ),
+    responses(
+        (
+            status = 200,
+            description = "Where one LLM call's input tokens went: `{ model_id, reported_input_tokens, estimated_total_tokens, context_window, segments: [{ part, label, tokens, index }] }`. `reported_input_tokens` is what the provider billed and is exact; the per-segment split is a tiktoken ESTIMATE (see docs/modules/context.md), so a client scales the segments onto the reported total rather than presenting them as measured. `context_window` is null when no configured client serves that model any more.",
+            body = serde_json::Value,
+            content_type = "application/json",
+        ),
+        (status = 400, description = "Invalid span id, or a span that sends no model input", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "No such span", body = ErrorBody),
+    )
+)]
+async fn get_span_context(
+    State(state): State<AdminState>,
+    Path((session_id, span_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>> {
+    let parsed_span: baybo_model::SpanId = span_id
+        .parse()
+        .map_err(|e| GatewayError::BadRequest(format!("invalid span id: {e}")))?;
+    let typed_session = baybo_model::SessionId::from(session_id.as_str());
+
+    let input = state
+        .query_api
+        .load_span_input(&typed_session, &parsed_span)
+        .await
+        .map_err(|e| match e {
+            baybo_query::QueryError::NotFound(what) => GatewayError::NotFound(what),
+            // A tool span has no model input to break down — a client bug,
+            // not a server failure.
+            baybo_query::QueryError::Unsupported(why) => GatewayError::BadRequest(why),
+            other => GatewayError::Trace(other.to_string()),
+        })?;
+
+    let breakdown =
+        baybo_context::context_breakdown(&input.model_id, &input.messages, &input.tools);
+    // Snapshot the pool behind its reload lock, and drop the guard before
+    // serializing — a hot reload swapping the pool mid-response must not
+    // block on this handler.
+    let context_window = {
+        let pool = state.llm_pool.read().clone();
+        pool.context_window_for_model(&input.model_id)
+    };
+
+    Ok(Json(json!({
+        "span_id": parsed_span.to_string(),
+        "model_id": input.model_id,
+        "reported_input_tokens": input.reported_input_tokens,
+        "estimated_total_tokens": breakdown.estimated_total_tokens,
+        "context_window": context_window,
+        "segments": breakdown.segments,
     })))
 }

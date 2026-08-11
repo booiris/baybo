@@ -1064,6 +1064,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/traces/{session_id}/spans/{span_id}/context": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_span_context"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/traces/{session_id}/turns/{turn_id}": {
         parameters: {
             query?: never;
@@ -6268,6 +6284,58 @@ export interface operations {
             };
             /** @description Unauthorized */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_span_context: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Session whose transcript the span's input references */
+                session_id: string;
+                /** @description LlmCall span whose context to break down */
+                span_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Where one LLM call's input tokens went: `{ model_id, reported_input_tokens, estimated_total_tokens, context_window, segments: [{ part, label, tokens, index }] }`. `reported_input_tokens` is what the provider billed and is exact; the per-segment split is a tiktoken ESTIMATE (see docs/modules/context.md), so a client scales the segments onto the reported total rather than presenting them as measured. `context_window` is null when no configured client serves that model any more. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Invalid span id, or a span that sends no model input */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such span */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

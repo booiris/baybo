@@ -17,6 +17,7 @@ import { Button } from '../components/Button';
 import { SearchBox } from '../components/SearchBox';
 import { useAdminClient, useAuth } from '../api/auth';
 import {
+  getMockSpanContext,
   getMockTraceLineage,
   getMockToolSet,
   getMockTurnTrace,
@@ -31,6 +32,7 @@ import type {
   LlmToolDefinition,
   LlmToolSet,
   LlmToolSetRef,
+  SpanContext,
   TurnTrace,
   ReplayStep,
   SecretKind,
@@ -47,6 +49,7 @@ import { MessageList } from '../components/trace/MessageList';
 import { renderWithSanitizeChips, SanitizeChip } from '../components/trace/SanitizeChip';
 import { TraceTree } from '../components/trace/TraceTree';
 import { TraceOverviewBar } from '../components/trace/TraceOverviewBar';
+import { ContextTab } from '../components/trace/ContextTab';
 import type { TraceGroup } from '../components/trace/traceFormat';
 import { TurnAnchors } from '../components/trace/TurnAnchors';
 import {
@@ -93,12 +96,16 @@ import { scrollToAnchor } from '../components/trace/scrollToAnchor';
 const POLL_ACTIVE_MS = 2_000;
 const POLL_TERMINAL_MS = 10_000;
 
-type DetailTab = 'io' | 'meta' | 'tools' | 'events';
+type DetailTab = 'io' | 'meta' | 'tools' | 'context' | 'events';
 
 /** Tool sets resolved by hash. One entry serves every span of a session — the
  *  set is stable across its calls, which is why the span carries a reference
  *  rather than the schemas. */
 type ToolSetCache = Map<string, LlmToolDefinition[]>;
+
+/** Context breakdowns by span id. Unlike a tool set this is per call, so it
+ *  is keyed by span rather than by content. */
+type SpanContextCache = Map<string, SpanContext>;
 
 // ── Right-hand detail panel (per-kind) ───────────────────────────────
 
@@ -335,7 +342,7 @@ function MetaTab({ span, order }: { span: Span; order: SpanOrder | null }) {
         ['Tool set', <code className="break-all">{span.kind.begin.tools.hash}</code>],
       );
     }
-  } else if (span.kind.kind === 'tool_call') {
+  } else {
     baseRows.push(
       ['Tool name', span.kind.begin.tool_name],
       ['Tool artifact', <code className="break-all">{span.kind.begin.tool_artifact_hash}</code>],
@@ -591,6 +598,9 @@ function SpanDetailPanel({
   onDrillIn,
   toolSets,
   loadingToolSets,
+  spanContexts,
+  loadingContexts,
+  onRetryContext,
 }: {
   span: Span;
   order: SpanOrder | null;
@@ -601,6 +611,9 @@ function SpanDetailPanel({
   onDrillIn: (id: string) => void;
   toolSets: ToolSetCache;
   loadingToolSets: Set<string>;
+  spanContexts: SpanContextCache;
+  loadingContexts: Set<string>;
+  onRetryContext: (spanId: string) => void;
 }) {
   const visual = spanVisual(span.kind.kind);
   const Icon = visual.icon;
@@ -610,8 +623,13 @@ function SpanDetailPanel({
   const toolSetRef = span.kind.kind === 'llm_call' ? (span.kind.begin.tools ?? null) : null;
   // A tab the current span doesn't have must not leave the panel blank when
   // the selection moves (the tab is a sticky URL param).
+  const isLlmCall = span.kind.kind === 'llm_call';
   const shownTab: DetailTab =
-    (tab === 'tools' && toolSetRef == null) || (tab === 'events' && eventCount === 0) ? 'io' : tab;
+    (tab === 'tools' && toolSetRef == null) ||
+    (tab === 'context' && !isLlmCall) ||
+    (tab === 'events' && eventCount === 0)
+      ? 'io'
+      : tab;
 
   return (
     <div className="flex-1 min-h-0 flex flex-col">
@@ -630,9 +648,10 @@ function SpanDetailPanel({
           </div>
         </div>
         <div className="flex px-4 gap-6 relative top-[3px]">
-          {(['io', 'meta', 'tools', 'events'] as const).map((t) => {
+          {(['io', 'meta', 'context', 'tools', 'events'] as const).map((t) => {
             if (t === 'events' && eventCount === 0) return null;
             if (t === 'tools' && toolSetRef == null) return null;
+            if (t === 'context' && !isLlmCall) return null;
             const active = t === shownTab;
             return (
               <button
@@ -647,9 +666,11 @@ function SpanDetailPanel({
                   ? 'I/O Data'
                   : t === 'meta'
                     ? 'Metadata'
-                    : t === 'tools'
-                      ? `Tools (${toolSetRef?.count ?? 0})`
-                      : `Events (${eventCount})`}
+                    : t === 'context'
+                      ? 'Context'
+                      : t === 'tools'
+                        ? `Tools (${toolSetRef?.count ?? 0})`
+                        : `Events (${eventCount})`}
               </button>
             );
           })}
@@ -674,6 +695,13 @@ function SpanDetailPanel({
             reference={toolSetRef}
             tools={toolSets.get(toolSetRef.hash)}
             loading={loadingToolSets.has(toolSetRef.hash)}
+          />
+        )}
+        {shownTab === 'context' && isLlmCall && (
+          <ContextTab
+            context={spanContexts.get(span.id)}
+            loading={loadingContexts.has(span.id)}
+            onRetry={() => onRetryContext(span.id)}
           />
         )}
         {shownTab === 'events' && <EventsTab events={events} />}
@@ -1292,6 +1320,8 @@ export function TraceSessionPage() {
   const [loadingTurns, setLoadingTurns] = useState<Set<string>>(() => new Set());
   const [toolSets, setToolSets] = useState<ToolSetCache>(() => new Map());
   const [loadingToolSets, setLoadingToolSets] = useState<Set<string>>(() => new Set());
+  const [spanContexts, setSpanContexts] = useState<SpanContextCache>(() => new Map());
+  const [loadingContexts, setLoadingContexts] = useState<Set<string>>(() => new Set());
   const [userToggles, setUserToggles] = useState<Map<string, boolean>>(() => new Map());
   const [overviewLoading, setOverviewLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -1505,6 +1535,48 @@ export function TraceSessionPage() {
         setLoadingToolSets((prev) => {
           const next = new Set(prev);
           next.delete(hash);
+          return next;
+        });
+      }
+    },
+    [client, isMock, logout],
+  );
+
+  // Break down one call's context. Server-side because the split needs a
+  // tokenizer, and the input it tokenizes is the ordinal-referenced slice the
+  // client holds only as a pointer. Cached per span and fetched only when the
+  // tab is opened — it resolves both of the references the turn tree leaves
+  // alone, so it is the most expensive read on this page.
+  const fetchSpanContext = useCallback(
+    async (owner: string, spanId: string) => {
+      const key = `context:${spanId}`;
+      if (inFlight.current.has(key)) return;
+      inFlight.current.add(key);
+      setLoadingContexts((prev) => new Set(prev).add(spanId));
+      try {
+        if (isMock) {
+          const mock = getMockSpanContext(spanId);
+          setSpanContexts((prev) => new Map(prev).set(spanId, mock));
+          return;
+        }
+        const { data, error: apiError, response } = await client.GET(
+          '/v1/traces/{session_id}/spans/{span_id}/context',
+          { params: { path: { session_id: owner, span_id: spanId } } },
+        );
+        if (response.status === 401) {
+          logout();
+          return;
+        }
+        // Non-fatal: the tab offers a retry rather than the page failing.
+        if (apiError || !response.ok) return;
+        setSpanContexts((prev) => new Map(prev).set(spanId, data as unknown as SpanContext));
+      } catch {
+        // Ditto.
+      } finally {
+        inFlight.current.delete(key);
+        setLoadingContexts((prev) => {
+          const next = new Set(prev);
+          next.delete(spanId);
           return next;
         });
       }
@@ -1991,6 +2063,22 @@ export function TraceSessionPage() {
     void fetchToolSet(selectedToolSetHash);
   }, [selectedToolSetHash, toolSets, fetchToolSet]);
 
+  // Same lazy shape for the context breakdown, keyed by span. A live span is
+  // deliberately NOT refetched on the poll tick: it has no usage to report
+  // yet, and re-tokenizing a growing transcript every two seconds would make
+  // the most expensive read on the page the most frequent one.
+  const selectedContextSpan = useMemo(() => {
+    if (tabParam !== 'context' || spanIdParam == null || activeTurnEntry == null) return null;
+    const found = findSpan(activeTurnTrace, spanIdParam)?.span;
+    if (found == null || found.kind.kind !== 'llm_call') return null;
+    return { owner: activeTurnEntry.sessionId, spanId: spanIdParam };
+  }, [activeTurnEntry, activeTurnTrace, spanIdParam, tabParam]);
+
+  useEffect(() => {
+    if (selectedContextSpan == null || spanContexts.has(selectedContextSpan.spanId)) return;
+    void fetchSpanContext(selectedContextSpan.owner, selectedContextSpan.spanId);
+  }, [selectedContextSpan, spanContexts, fetchSpanContext]);
+
   if (overviewLoading && !overview) {
     return (
       <div className="p-5 text-ink-soft text-[0.95rem] flex items-center gap-2">
@@ -2139,6 +2227,11 @@ export function TraceSessionPage() {
               onDrillIn={handleDrillIntoChild}
               toolSets={toolSets}
               loadingToolSets={loadingToolSets}
+              spanContexts={spanContexts}
+              loadingContexts={loadingContexts}
+              onRetryContext={(spanId) =>
+                void fetchSpanContext(activeTurnEntry?.sessionId ?? sessionId, spanId)
+              }
             />
           ) : selectedStepRs ? (
             <StepDetail

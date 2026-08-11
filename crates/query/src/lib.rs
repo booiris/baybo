@@ -25,7 +25,9 @@ use baybo_model::{
     StepId, SubagentBackendTag, ToolSetHash, TriggerKind, TurnId,
 };
 use baybo_session::{SessionError, SessionStore, StoredMessage};
-use baybo_trace::{LlmToolSet, Span, SpanEvent, Step, TraceError, TraceStore};
+use baybo_trace::{
+    LlmCallInputs, LlmToolSet, Span, SpanEvent, SpanKind, Step, TraceError, TraceStore,
+};
 use baybo_turn::{Turn, TurnError, TurnInputKind, TurnLifecycle, TurnStatus, TurnStatusKind};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -438,6 +440,22 @@ pub struct LineageSessionSummary {
 pub struct TurnTrace {
     pub turn: Turn,
     pub steps: Vec<ReplayStep>,
+}
+
+/// What one `LlmCall` span actually sent, with every reference resolved —
+/// the input to a context breakdown or an export.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpanInput {
+    pub model_id: String,
+    /// The exact slice the model saw, `Persisted` references rehydrated.
+    pub messages: Vec<baybo_model::ChatMessage>,
+    /// The tool set the call offered. Empty both when the call offered no
+    /// tools and when its set is no longer stored — the two are the same
+    /// thing to a reader of the input.
+    pub tools: Vec<baybo_trace::LlmToolDefinition>,
+    /// What the provider billed for the whole prompt. `None` while the span
+    /// is pending, or when it failed before a usage report.
+    pub reported_input_tokens: Option<usize>,
 }
 
 // ── QueryApi ────────────────────────────────────────────────────────
@@ -1393,6 +1411,106 @@ impl QueryApi {
             return Ok(None);
         };
         Ok(Some(LlmToolSet::from_row(row)?))
+    }
+
+    // ── 13c. load_span_input ────────────────────────────────────
+
+    /// Everything one `LlmCall` span sent to the model: the exact message
+    /// slice (references hydrated) and the tool set it offered.
+    ///
+    /// Assembled per span rather than served with the turn tree because
+    /// both halves are large and shared — the turn endpoint deliberately
+    /// leaves `Persisted` inputs as ordinal pointers and tool sets as
+    /// hashes. A consumer that needs the resolved text of ONE call (a
+    /// context breakdown, an export) asks for it here.
+    ///
+    /// `session_id` is the session whose transcript the reference points
+    /// into — a span records its ordinals against the log of the session
+    /// that ran it, so a subagent's span resolves against the subagent's
+    /// own log.
+    pub async fn load_span_input(
+        &self,
+        session_id: &SessionId,
+        span_id: &SpanId,
+    ) -> Result<SpanInput> {
+        let span = Span::from_row(
+            self.trace
+                .load_span(span_id)
+                .await
+                .map_err(TraceError::from)?
+                .ok_or_else(|| QueryError::NotFound(format!("span {span_id}")))?,
+        )?;
+        let SpanKind::LlmCall { begin, result } = &span.kind else {
+            return Err(QueryError::Unsupported(format!(
+                "span {span_id} is a {}, which sends no model input",
+                span.kind.tag()
+            )));
+        };
+        let model_id = begin.model_id.clone();
+        let tools_ref = begin.tools.clone();
+        let reported_input_tokens = result.as_ref().map(|r| r.input_tokens);
+
+        // Hydration walks a turn tree, so hand it a tree of exactly this
+        // span. Reusing it (rather than re-deriving the "active as of
+        // ordinal N" filter here) is what keeps the `prefix_len` tripwire
+        // and the epoch guard on this path too — a second implementation
+        // would be a second place for them to be forgotten.
+        let step = Step::from_row(
+            self.trace
+                .load_step(&span.step_id)
+                .await
+                .map_err(TraceError::from)?
+                .ok_or_else(|| QueryError::NotFound(format!("step {}", span.step_id)))?,
+        )?;
+        let turn = self
+            .turns
+            .get(&step.turn_id)
+            .await?
+            .ok_or_else(|| QueryError::NotFound(format!("turn {}", step.turn_id)))?;
+        let mut turns = [ReplayTurn {
+            turn,
+            steps: vec![ReplayStep {
+                step,
+                spans: vec![span],
+            }],
+        }];
+        self.hydrate_persisted_trace_data(session_id, &mut turns)
+            .await?;
+
+        let [ReplayTurn { steps, .. }] = turns;
+        let messages = match steps
+            .into_iter()
+            .next()
+            .and_then(|s| s.spans.into_iter().next())
+        {
+            Some(Span {
+                kind: SpanKind::LlmCall { begin, .. },
+                ..
+            }) => match begin.input_messages {
+                LlmCallInputs::Inline(messages) => messages,
+                // Unreachable: hydration collapses every `Persisted` to
+                // `Inline`. Treated as an empty input rather than a panic —
+                // this is a read path over durable history.
+                LlmCallInputs::Persisted { .. } => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+
+        let tools = match tools_ref {
+            Some(reference) => self
+                .load_tool_set(&reference.hash)
+                .await?
+                .map(|set| set.tools)
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+
+        Ok(SpanInput {
+            model_id,
+            messages,
+            tools,
+            reported_input_tokens,
+        })
     }
 
     /// Walk every span in `turns`, hydrating both persisted LLM input slices and
@@ -3874,6 +3992,209 @@ mod tests {
             matches!(begin.input_messages, LlmCallInputs::Persisted { .. }),
             "load_turn_trace must preserve Persisted refs; got {:?}",
             begin.input_messages
+        );
+    }
+
+    /// `load_span_input` resolves BOTH of the references the per-turn tree
+    /// leaves alone: the ordinal input slice and the tool-set hash.
+    ///
+    /// It reaches the transcript through the same `hydrate_persisted_trace_data`
+    /// the turn/replay paths use, so the `prefix_len` tripwire and the epoch
+    /// guard cover this path too. A second, hand-rolled "active as of ordinal N"
+    /// filter here would be a second place for them to be forgotten.
+    #[tokio::test]
+    async fn load_span_input_resolves_the_transcript_slice_and_the_tool_set() {
+        use baybo_model::{ChatMessage, ContentBlock, SpanId, StepId};
+        use baybo_trace::{
+            LifecycleState, LlmCallBegin, LlmCallInputs, LlmCallResult, LlmToolDefinition,
+            LlmToolSet, Span, SpanKind, Step, StepKind, TraceStore,
+        };
+
+        let session_store = Arc::new(MemSessionStore::default());
+        let s = make_session("span-input-1");
+        session_store.save(&s).await.unwrap();
+        for text in ["you are a bot", "what broke the build?"] {
+            session_store
+                .append_session_message(
+                    &s.id,
+                    &ChatMessage::agent_context(vec![ContentBlock::Text(text.into())]),
+                )
+                .await
+                .unwrap();
+        }
+        let last = session_store
+            .latest_session_ordinal(&s.id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let turn_store = Arc::new(MemoryTurnStore::new());
+        let lifecycle = Arc::new(TurnLifecycle::new(turn_store));
+        let turn = lifecycle
+            .start_turn(s.id.clone(), TriggerKind::User, user_input(), None)
+            .await
+            .unwrap();
+        lifecycle.start(&turn.id).await.unwrap();
+
+        let trace_store: Arc<dyn TraceStore> = Arc::new(MemoryTraceStore::new());
+        let tool_set = LlmToolSet::new(vec![LlmToolDefinition {
+            name: "bash".into(),
+            description: "runs a command".into(),
+            parameters_schema: serde_json::json!({ "type": "object" }),
+        }]);
+        let tool_row = tool_set.to_row().unwrap();
+        trace_store.save_tool_set(&tool_row).await.unwrap();
+
+        let step_id = StepId::new();
+        let now = Utc::now();
+        trace_store
+            .save_step(
+                &Step {
+                    id: step_id,
+                    turn_id: turn.id,
+                    kind: StepKind::LlmIteration,
+                    started_at: now,
+                    ended_at: None,
+                    outcome: LifecycleState::Pending,
+                }
+                .to_row()
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let span_id = SpanId::new();
+        trace_store
+            .save_span(
+                &Span {
+                    id: span_id,
+                    step_id,
+                    kind: SpanKind::LlmCall {
+                        begin: LlmCallBegin {
+                            model_id: "claude".into(),
+                            provider: "anthropic".into(),
+                            provider_config_hash: String::new(),
+                            input_messages: LlmCallInputs::Persisted {
+                                last_ordinal: last,
+                                prefix_len: 2,
+                                suffix: vec![],
+                            },
+                            temperature: None,
+                            tools: Some(baybo_trace::LlmToolSetRef {
+                                hash: tool_row.hash.clone(),
+                                count: 1,
+                            }),
+                        },
+                        result: Some(LlmCallResult {
+                            input_tokens: 4_242,
+                            ..Default::default()
+                        }),
+                    },
+                    parallel_group: None,
+                    started_at: now,
+                    ended_at: None,
+                    outcome: LifecycleState::Pending,
+                    events: vec![],
+                }
+                .to_row()
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let api = QueryApi::new(
+            session_store,
+            lifecycle,
+            trace_store,
+            Arc::new(MemoryCostStore::default()),
+        );
+        let input = api.load_span_input(&s.id, &span_id).await.unwrap();
+
+        assert_eq!(input.model_id, "claude");
+        assert_eq!(input.reported_input_tokens, Some(4_242));
+        assert_eq!(
+            input.messages.len(),
+            2,
+            "the ordinal reference must rehydrate to the transcript slice"
+        );
+        assert_eq!(input.tools.len(), 1);
+        assert_eq!(input.tools[0].name, "bash");
+    }
+
+    /// A tool span has no model input, so asking for one is a client bug —
+    /// surfaced as `Unsupported` (which the gateway maps to a 400) rather
+    /// than as an empty breakdown that reads like "this call sent nothing".
+    #[tokio::test]
+    async fn load_span_input_rejects_a_span_that_sends_no_model_input() {
+        use baybo_model::{SpanId, StepId};
+        use baybo_trace::{
+            LifecycleState, Span, SpanKind, Step, StepKind, ToolCallBegin, TraceStore,
+        };
+
+        let session_store = Arc::new(MemSessionStore::default());
+        let s = make_session("span-input-2");
+        session_store.save(&s).await.unwrap();
+        let turn_store = Arc::new(MemoryTurnStore::new());
+        let lifecycle = Arc::new(TurnLifecycle::new(turn_store));
+        let turn = lifecycle
+            .start_turn(s.id.clone(), TriggerKind::User, user_input(), None)
+            .await
+            .unwrap();
+
+        let trace_store: Arc<dyn TraceStore> = Arc::new(MemoryTraceStore::new());
+        let step_id = StepId::new();
+        let now = Utc::now();
+        trace_store
+            .save_step(
+                &Step {
+                    id: step_id,
+                    turn_id: turn.id,
+                    kind: StepKind::LlmIteration,
+                    started_at: now,
+                    ended_at: None,
+                    outcome: LifecycleState::Pending,
+                }
+                .to_row()
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let span_id = SpanId::new();
+        trace_store
+            .save_span(
+                &Span {
+                    id: span_id,
+                    step_id,
+                    kind: SpanKind::ToolCall {
+                        begin: ToolCallBegin {
+                            tool_name: "bash".into(),
+                            tool_artifact_hash: String::new(),
+                            triggered_by: None,
+                            params: serde_json::json!({}),
+                        },
+                        result: None,
+                    },
+                    parallel_group: None,
+                    started_at: now,
+                    ended_at: None,
+                    outcome: LifecycleState::Pending,
+                    events: vec![],
+                }
+                .to_row()
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let api = QueryApi::new(
+            session_store,
+            lifecycle,
+            trace_store,
+            Arc::new(MemoryCostStore::default()),
+        );
+        let err = api.load_span_input(&s.id, &span_id).await.unwrap_err();
+        assert!(
+            matches!(err, QueryError::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
         );
     }
 }
