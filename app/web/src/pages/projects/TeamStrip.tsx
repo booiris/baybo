@@ -20,6 +20,13 @@ const fieldLabel = 'font-mono text-[0.6rem] font-bold uppercase tracking-[0.12em
 const fieldBox =
   'border-2 border-black rounded-md bg-canvas px-2.5 py-[7px] font-mono text-[0.74rem]';
 
+/// No pin — the agent follows whatever `default-llm` is at the time.
+///
+/// Not the default's name: the pool lists it too, so two options would read
+/// `gpt` while meaning different things — one that keeps following the
+/// default when it moves, one frozen to the model it happens to be today.
+const UNPINNED_LLM = '—';
+
 export function TeamStrip({
   team,
   activeRuns,
@@ -288,7 +295,7 @@ function HireAgentForm({
               </select>
             </label>
             <label className="flex flex-col gap-1">
-              <span className={fieldLabel}>LLM pin · optional</span>
+              <span className={fieldLabel}>llm</span>
               <select
                 value={llm}
                 onChange={(event) => {
@@ -296,7 +303,7 @@ function HireAgentForm({
                 }}
                 className={fieldBox}
               >
-                <option value="">default-llm{pool === null ? '' : ` (${pool.defaultName})`}</option>
+                <option value="">{UNPINNED_LLM}</option>
                 {(pool?.names ?? []).map((model) => (
                   <option key={model} value={model}>
                     {model}
