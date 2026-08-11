@@ -22,7 +22,8 @@ struct ChatStoreModelTests {
         }
         return ChatStore(
             sessionId: Self.sessionId, client: client, index: index,
-            outbox: temp.makeOutbox(sessionId: Self.sessionId))
+            outbox: temp.makeOutbox(sessionId: Self.sessionId),
+            supportDirectory: temp.url)
     }
 
     private func call(_ llm: String?, _ model: String?, _ effort: String? = nil)

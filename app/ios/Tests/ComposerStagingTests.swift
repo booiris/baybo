@@ -438,10 +438,27 @@ struct ComposerStagingTests {
     // MARK: - the strip's lifetime
 
     /// Leaving a conversation with picks still in it — the back button on a
-    /// strip that was never sent. Nothing swept this before the strip had an
-    /// owner: it was view state that died with the view, and its spools (up to
-    /// 100 MiB each, ten to a strip) stayed on disk for good.
-    @Test func everySpoolTheStripWasHoldingGoesWhenTheChatDoes() async throws {
+    /// strip that was never sent — keeps them. Walking away from a half-written
+    /// message is not deciding against it, and the conversation is one tap away.
+    @Test func leavingTheChatKeepsTheStrip() async throws {
+        let fixture = ComposerFixture()
+        for _ in 0..<2 {
+            let id = try #require(fixture.staging.admitPhoto())
+            await fixture.staging.acceptPhoto(
+                id: id, data: Self.smallPNG(), declaredMime: "image/png")
+        }
+        #expect(await waitUntil { StagedAttachment.blocker(fixture.staging.staged) == nil })
+
+        fixture.store.leaveChat()
+
+        #expect(fixture.staging.staged.count == 2)
+    }
+
+    /// Sending is the one thing that discards, and every spool the strip was
+    /// holding goes with it. Nothing swept this before the strip had an owner:
+    /// it was view state that died with the view, and its spools (up to 100 MiB
+    /// each, ten to a strip) stayed on disk for good.
+    @Test func everySpoolTheStripWasHoldingGoesWhenTheMessageDoes() async throws {
         let fixture = ComposerFixture()
         var paths: [String] = []
         for _ in 0..<2 {
@@ -453,7 +470,7 @@ struct ComposerStagingTests {
         #expect(await waitUntil { StagedAttachment.blocker(fixture.staging.staged) == nil })
         #expect(paths.allSatisfy { FileManager.default.fileExists(atPath: $0) })
 
-        fixture.store.leaveChat()
+        fixture.staging.discardDraft()
 
         #expect(fixture.staging.staged.isEmpty)
         #expect(paths.allSatisfy { !FileManager.default.fileExists(atPath: $0) })
@@ -466,8 +483,11 @@ struct ComposerStagingTests {
     /// reclaiming on the composer's own teardown cancelled every staged upload
     /// and emptied the strip because the user tapped an image in the transcript
     /// — the message then shipped MINUS its attachments, which is exactly what
-    /// the failed-upload blocker exists to prevent. Only leaving the
-    /// conversation reclaims (`AppStore.chatPath` → `ChatStore.leaveChat`).
+    /// the failed-upload blocker exists to prevent.
+    ///
+    /// Neither leaving reclaims any more, but the two are still not the same
+    /// thing: leaving ends the VISIT (`AppStore.chatPath` → `ChatStore.leaveChat`
+    /// → the notice line), and a cover does not.
     @Test func aPresentationOverTheChatIsNotLeavingIt() async throws {
         let fixture = ComposerFixture()
         fixture.client.holdBlobUploads()
@@ -491,8 +511,13 @@ struct ComposerStagingTests {
         #expect(!work.isCancelled, "nor cancel the upload it is holding")
         #expect(FileManager.default.fileExists(atPath: path))
 
-        // Backing out to the list is the one that means it.
+        // Backing out to the list does not empty it either — but it does close
+        // the visit, and the send that follows is what reclaims.
         fixture.store.leaveChat()
+
+        #expect(fixture.staging.staged.count == 1)
+        #expect(!work.isCancelled, "the upload runs on; its blob is still wanted")
+        fixture.staging.discardDraft()
 
         #expect(fixture.staging.staged.isEmpty)
         #expect(work.isCancelled)
@@ -531,9 +556,10 @@ struct ComposerStagingTests {
         #expect(AppStore.sessionIds([.archived, .cronJobs]).isEmpty)
     }
 
-    /// Leaving mid-upload stops the work rather than letting it finish into a
-    /// strip nobody can see.
-    @Test func leavingCancelsWorkStillReadingTheStrip() async throws {
+    /// Leaving mid-upload lets it finish. The blob is still wanted — the pick is
+    /// still in the draft, and the next visit opens on a tile that is already
+    /// ready to send instead of one that has to be uploaded again.
+    @Test func leavingLetsAnUploadFinish() async throws {
         let fixture = ComposerFixture()
         fixture.client.holdBlobUploads()
         let id = try #require(fixture.staging.admitPhoto())
@@ -542,6 +568,25 @@ struct ComposerStagingTests {
         let work = try #require(fixture.work())
 
         fixture.store.leaveChat()
+        #expect(!work.isCancelled)
+
+        fixture.client.releaseBlobUploads()
+        await work.value
+        #expect(StagedAttachment.blocker(fixture.staging.staged) == nil)
+    }
+
+    /// Sending mid-upload stops the work rather than letting it finish into a
+    /// strip nobody can see: the message went without that pick's blob, so no
+    /// message will ever reference it.
+    @Test func sendingCancelsWorkStillReadingTheStrip() async throws {
+        let fixture = ComposerFixture()
+        fixture.client.holdBlobUploads()
+        let id = try #require(fixture.staging.admitPhoto())
+        await fixture.staging.acceptPhoto(id: id, data: Self.smallPNG(), declaredMime: "image/png")
+        #expect(await waitUntil { fixture.client.blobUploadCalls.count == 1 })
+        let work = try #require(fixture.work())
+
+        fixture.staging.discardDraft()
         #expect(work.isCancelled)
 
         fixture.client.releaseBlobUploads()
@@ -686,9 +731,10 @@ struct ComposerStagingTests {
         #expect(fixture.store.notice == Lang.shared.t("chat.modelFailed"))
     }
 
-    /// Leaving the conversation empties the strip, so it takes the strip's line
-    /// too: coming back to a red "Send failed" over a dock with nothing in it
-    /// is the same dead end one tile down.
+    /// Leaving the conversation ends the visit, and the strip's line ends with
+    /// it: the failure it announced is stale by the time the user comes back,
+    /// the tile it named still carries its own red retry affordance, and
+    /// `noteBlocked` raises the line again the moment a send runs into it.
     @Test func leavingTheChatTakesTheStripsNoticeWithIt() async throws {
         let fixture = ComposerFixture()
         _ = try await stageAFailedUpload(fixture)
@@ -718,7 +764,7 @@ struct ComposerStagingTests {
 
         fixture.store.leaveChat()
 
-        #expect(fixture.staging.staged.isEmpty)
+        #expect(fixture.staging.staged.count == ChatStore.maxStagedAttachments, "the draft stays")
         #expect(fixture.store.notice == nil, "no tile to name, so nothing to come back to")
     }
 

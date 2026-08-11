@@ -245,6 +245,16 @@ final class AppStore: ObservableObject {
         // out from under the suites. The unit tests drive their own stores with
         // injected clients and temp support dirs.
         if Self.runningUnderTest { return }
+        // Deleting a conversation's durable files is only half of it: a resident
+        // store holds that conversation's composer draft IN MEMORY and writes it
+        // back on its next flush. Registered ahead of the fixture returns below —
+        // a delete performed on another client arrives through an ordinary list
+        // merge, which needs no fixture at all.
+        SessionIndex.shared.onSessionsRemoved = { [weak self] sessionIds in
+            for sessionId in sessionIds {
+                self?.chatStores[sessionId]?.discardDraft()
+            }
+        }
         // The chat list's live unread/recency source: connection-global
         // `SessionActivity` pings land here for ANY session, subscribed or not.
         Baybo.client.setSessionListSink(sink: SessionActivityHandler())
@@ -486,6 +496,16 @@ final class AppStore: ObservableObject {
         if route == .home {
             prewarmTranscriptHost()
             prewarmDeckHost()
+        }
+    }
+
+    /// The app is leaving the foreground. Every resident conversation's unsent
+    /// draft goes to disk NOW rather than on the composer's debounce, because a
+    /// suspended process is one the system may never resume — and the user did
+    /// not throw the message away, they switched apps.
+    func willLeaveForeground() {
+        for store in chatStores.values {
+            store.flushDraft()
         }
     }
 
@@ -900,11 +920,61 @@ final class AppStore: ObservableObject {
 
     /// Compose: mint or reuse a local draft id. The durable gateway row is
     /// created on first send, so abandoned drafts do not pollute the session list.
+    ///
+    /// A new chat left UNSENT with something in its composer is re-opened rather
+    /// than replaced. It has to be: a draft session has no registry row and no
+    /// gateway row, so its uuid is the only handle that exists anywhere, and
+    /// minting a fresh one would strand what the user wrote in a conversation
+    /// nothing on the device can ever name again. Emptying the composer retires
+    /// the draft (`DraftStore.write` deletes an empty one), and the next compose
+    /// mints exactly as before — which is also why at most one can ever be
+    /// waiting.
     func startNewChat() async -> String? {
-        let sessionId = prewarmedDraftId ?? newChatSessionId()
-        prewarmedDraftId = nil
+        let sessionId: String
+        if let unsent = unsentDraftSessionId() {
+            sessionId = unsent
+        } else {
+            sessionId = prewarmedDraftId ?? newChatSessionId()
+            prewarmedDraftId = nil
+        }
         await activateSession(sessionId, ensureListed: false)
         return nil
+    }
+
+    private func unsentDraftSessionId() -> String? {
+        Self.unsentDraftSessionId(in: SessionIndex.supportDirectory()) {
+            SessionIndex.shared.contains(sessionId: $0)
+        }
+    }
+
+    /// The new-chat draft waiting to be resumed, if there is one: a session with
+    /// a draft on disk that has never been SENT from. Newest wins, for the case
+    /// a previous build (or a crash mid-compose) left more than one behind.
+    ///
+    /// "Never sent from" takes two proofs, not one. A registry row is the
+    /// ordinary one — a row means the conversation exists, and it is reachable
+    /// from the list, where its own draft comes back on the tap. But the row is
+    /// written by `ChatStore.dispatchSend` only AFTER `ensureRemoteSession()`
+    /// succeeds, so a first send made OFFLINE leaves the conversation row-less
+    /// with a message queued in its outbox; type one more line into it and
+    /// compose would re-open the conversation you just sent to, believing it new.
+    /// A persisted outbox is that second proof, and it is exactly as durable as
+    /// the draft it is being compared against.
+    ///
+    /// Not `private`, and takes its inputs rather than reading the singletons:
+    /// `startNewChat` is its only production caller, but `AppStore.init` refuses
+    /// to boot under test (`runningUnderTest`), so a test drives the decision
+    /// directly against a temp support root.
+    static func unsentDraftSessionId(
+        in supportDirectory: URL, isListed: (String) -> Bool
+    ) -> String? {
+        let sent = Set(OutboxStore.pendingSessionIds(in: supportDirectory))
+        return DraftStore.sessionIds(in: supportDirectory)
+            .filter { !isListed($0) && !sent.contains($0) }
+            .max {
+                DraftStore.modified(sessionId: $0, in: supportDirectory)
+                    < DraftStore.modified(sessionId: $1, in: supportDirectory)
+            }
     }
 
     /// The Deck empty-board CTA. First tap: open a fresh chat on the Chats
@@ -1095,6 +1165,9 @@ final class AppStore: ObservableObject {
         if let store = chatStores[sessionId], isEvictable(sessionId, store) {
             Task { await evictStore(sessionId, store) }
         }
+        // Also drops the conversation's unsent composer draft — including the
+        // resident store's in-memory copy, over `onSessionsRemoved`, which the
+        // eviction above would otherwise flush back to disk.
         SessionIndex.shared.beginHide(sessionId)
         pumpSessionMutation(sessionId)
     }

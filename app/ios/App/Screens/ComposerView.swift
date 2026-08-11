@@ -5,8 +5,15 @@ import UniformTypeIdentifiers
 
 /// The native composer dock: autosizing field, attachment staging behind the
 /// inline `+` menu (Photos / Files, plus Paste when the clipboard holds an
-/// image), in-field send. The strip itself and every piece of work reading it
-/// live in `ComposerStaging`; this view renders them.
+/// image), in-field send. The typed text, the strip and every piece of work
+/// reading one live in `ComposerStaging`; this view renders them.
+///
+/// Nothing unsent is this view's `@State`. The field's text belongs to the
+/// CONVERSATION, exactly as the strip does — see `ComposerStaging` — because
+/// this frame is torn down and rebuilt for reasons that have nothing to do with
+/// the user abandoning what they wrote: every `fullScreenCover` over the chat
+/// takes the dock's `.safeAreaInset` with it, and backing out to the list must
+/// give the draft back on the way in.
 /// Interaction contract preserved from the web composer:
 /// * staged picks count as a draft, so an attachment-only send works with an
 ///   empty field;
@@ -32,7 +39,6 @@ struct ComposerView: View {
     /// and over this dock's own rows, so the screen is what presents it (as an
     /// overlay on the dock). This side reports the anchor and answers the pick.
     @ObservedObject private var attach: AttachMenu
-    @State private var text = ""
     @State private var photoPicks: [PhotosPickerItem] = []
     @FocusState private var focused: Bool
 
@@ -41,6 +47,9 @@ struct ComposerView: View {
         _staging = ObservedObject(wrappedValue: store.staging)
         _attach = ObservedObject(wrappedValue: attach)
     }
+
+    /// `ComposerDraftUITests` addresses the field by this.
+    static let fieldIdentifier = "composer.field"
 
     private static let inputHitSlop: CGFloat = 10
     private static let plusSize = CGSize(width: 46, height: 48)
@@ -51,7 +60,8 @@ struct ComposerView: View {
     private static let tileCorner: CGFloat = 10
 
     private var hasDraft: Bool {
-        !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !staging.staged.isEmpty
+        !staging.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || !staging.staged.isEmpty
     }
 
     var body: some View {
@@ -101,9 +111,14 @@ struct ComposerView: View {
                 // the row's 48pt (17pt body ≈ 22pt line), so the cursor sits
                 // vertically centered despite the .bottom stack alignment;
                 // extra lines still grow upward.
-                TextField(lang.t("chat.placeholder"), text: $text, axis: .vertical)
+                TextField(lang.t("chat.placeholder"), text: $staging.text, axis: .vertical)
                     .lineLimit(1...6)
                     .font(.system(size: 17))
+                    // A stable handle for the draft smokes: the element TYPE
+                    // SwiftUI backs a vertical field with is not contractual,
+                    // and the only other thing to match on is its VALUE, which
+                    // is exactly what those tests are asserting about.
+                    .accessibilityIdentifier(Self.fieldIdentifier)
                     .focused($focused)
                     .padding(.vertical, 13)
                     .background {
@@ -203,9 +218,14 @@ struct ComposerView: View {
             // send it immediately, so the user lands in the conversation
             // already working. Clear `initialDraft` FIRST so a re-appear can't
             // double-send.
-            if let seed = store.initialDraft, text.isEmpty {
+            //
+            // The empty-field gate can only ever see an empty field: this seed
+            // rides a session `startCardDraft` minted for it, and a fresh uuid
+            // has no draft on disk. It stays because a seeded prompt landing
+            // BEHIND something the user typed would be worse than not sending.
+            if let seed = store.initialDraft, staging.text.isEmpty {
                 store.initialDraft = nil
-                text = seed
+                staging.text = seed
                 send()
             }
         }
@@ -452,7 +472,7 @@ struct ComposerView: View {
             staging.noteBlocked(blocker)
             return
         }
-        let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let body = staging.text.trimmingCharacters(in: .whitespacesAndNewlines)
         let refs = staging.staged.compactMap(\.attachmentRef)
         guard !body.isEmpty || !refs.isEmpty else { return }
         // Guard the write: an unconditional `store.notice = nil` publishes an
@@ -462,8 +482,11 @@ struct ComposerView: View {
             store.notice = nil
         }
         store.send(text: body, attachments: refs)
-        staging.clear()
+        // The UIKit half FIRST: `discardDraft` empties the model, and a live
+        // IME composition that is still in the input session would re-commit
+        // into the freshly cleared field on the next input turn.
         clearField()
+        staging.discardDraft()
     }
 
     /// Clear the field deterministically, INCLUDING a live CJK IME composition.
@@ -475,8 +498,8 @@ struct ComposerView: View {
     /// over the responder chain, `unmarkText()` to finalize+drop the composition
     /// FIRST (it commits, so ordering matters), then empty the document
     /// imperatively so the reset can't lose a race with the field's own edit
-    /// up-sync; mirror `text` so `hasDraft`/send-gating stay in lockstep. No
-    /// responder is resigned — the keyboard stays up.
+    /// up-sync; mirror `staging.text` so `hasDraft`/send-gating stay in
+    /// lockstep. No responder is resigned — the keyboard stays up.
     private func clearField() {
         if let input = Self.focusedTextInput() {
             input.unmarkText()
@@ -486,7 +509,7 @@ struct ComposerView: View {
                 input.replace(range, withText: "")
             }
         }
-        text = ""
+        staging.text = ""
     }
 
     /// The current first responder if it is a text input, found via the
@@ -502,13 +525,14 @@ struct ComposerView: View {
     }
 }
 
-/// The composer's staging machine: the strip of picks between the picker and
-/// `AttachmentRef`, and every piece of work still reading one.
+/// The composer's unsent DRAFT for one conversation: what the user typed, the
+/// strip of picks between the picker and `AttachmentRef`, and every piece of
+/// work still reading one.
 ///
 /// Owned by the SESSION (`ChatStore.staging`) rather than by the composer's
 /// frame: the work outlives the frame that started it — a photo's delivery, an
 /// upload, a ✕ that lands in the middle of either — and that lifetime is what
-/// the whole file is about. Three invariants carry it:
+/// the whole file is about. Four invariants carry it:
 /// * **the strip is the truth.** Work that finishes writes state or raises a
 ///   notice only while its tile is still in `staged`; there is no parallel
 ///   bookkeeping that can drift from what the user can see. The one exception
@@ -518,16 +542,36 @@ struct ComposerView: View {
 ///   `SpoolFile`, unlinked when the last holder lets go — so removing a tile
 ///   cannot pull the file out from under the upload that is reading it, and
 ///   the conversation going away cannot leave the bytes behind.
-/// * **the strip ends with the CONVERSATION, not with the frame.** `ChatScreen`
-///   docks the composer in a `.safeAreaInset`, and every `fullScreenCover` over
-///   the chat — the image viewer, the video player — tears that inset down and
-///   puts it straight back. Reclaiming on the composer's teardown therefore
-///   cancelled three mid-flight uploads and emptied the strip because the user
-///   tapped an image in the transcript. `AppStore.chatPath` is the signal that
-///   means they left (`ChatStore.leaveChat`), exactly as it is for audio.
+/// * **a draft outlives the frame AND the process.** `ChatScreen` docks the
+///   composer in a `.safeAreaInset`, and every `fullScreenCover` over the chat
+///   — the image viewer, the video player — tears that inset down and puts it
+///   straight back; backing out to the list drops the frame for good. None of
+///   that is the user discarding what they wrote, so none of it takes it away:
+///   the text and the strip persist through `DraftStore` and come back on the
+///   next visit, whether that is a second later or after a relaunch.
+/// * **only the send discards.** `discardDraft` is the one path that empties
+///   the strip, empties the field and deletes the draft off disk; leaving the
+///   conversation merely flushes (`leaveConversation`). Everything else — an
+///   LRU eviction, a jetsam, backgrounding — is a checkpoint, not a discard.
 @MainActor
 final class ComposerStaging: ObservableObject {
+    /// What the user has typed and not sent. `ComposerView`'s field binds
+    /// straight to it: a mirrored `@State` copy would have to be reconciled on
+    /// every mount, and the mount edges are exactly where the draft is at risk.
+    @Published var text: String = "" {
+        didSet {
+            guard text != oldValue else { return }
+            scheduleDraftSave()
+        }
+    }
     @Published private(set) var staged: [StagedAttachment] = []
+
+    /// How long typing settles before the draft reaches disk. Long enough that
+    /// a burst of keystrokes is one write; short enough that an unannounced
+    /// death costs a word. Every exit the app can SEE coming — leaving the
+    /// conversation, backgrounding, an eviction, a send — flushes instead of
+    /// waiting it out.
+    static let draftSaveDebounce: Duration = .milliseconds(400)
 
     /// Only ever written to (`notice`), and weakly: an upload can outlive the
     /// screen that started it, and the store belongs to the session registry.
@@ -553,22 +597,247 @@ final class ComposerStaging: ObservableObject {
     /// is on SCREEN let a completing upload start two more against a slot the
     /// zombie still held — three at once on a cap of two.
     private var uploadsInFlight = 0
+    /// Which conversation's draft this is, and where drafts live. Both are
+    /// needed off the `store` reference, which is weak and may already be gone
+    /// when a late upload finishes and writes the draft back.
+    private let sessionId: String
+    private let supportDirectory: URL
+    /// The pending debounced write, or nil.
+    private var draftSaveTask: Task<Void, Never>?
+    /// Whether anything has changed since the last write. Without it every
+    /// navigation away from every conversation would touch the disk to
+    /// re-persist nothing.
+    private var draftDirty = false
+    /// Set while this machine is writing to its OWN published state — seeding
+    /// from disk, emptying after a send — so the edit doesn't schedule a write
+    /// of what was just read, or of what is about to be deleted.
+    private var draftSavesSuspended = false
+    /// Set by `retire()`: this machine no longer speaks for the conversation and
+    /// must never touch its draft again.
+    private var retired = false
 
     init(
         store: ChatStore,
+        sessionId: String,
         client: any BayboClientProtocol = Baybo.client,
-        pasteboard: any PasteboardReading = Pasteboards.launch()
+        pasteboard: any PasteboardReading = Pasteboards.launch(),
+        supportDirectory: URL = SessionIndex.supportDirectory()
     ) {
         self.store = store
+        self.sessionId = sessionId
         self.client = client
         self.pasteboard = pasteboard
+        self.supportDirectory = supportDirectory
+        restoreDraft()
         #if DEBUG
             // `-baybo-demo-compose`: seed the staged strip (see `DemoFrames`).
             // Here rather than on the composer's appear, so it is one-shot per
             // conversation: a re-appear would otherwise refill a strip whose
-            // emptiness is exactly what the smoke is checking.
-            staged = StagedAttachment.demoStagedIfRequested()
+            // emptiness is exactly what the smoke is checking. It only ever
+            // ADDS to a restored strip — an empty seed must not erase a draft.
+            staged.append(contentsOf: StagedAttachment.demoStagedIfRequested())
         #endif
+    }
+
+    // MARK: - The draft on disk
+
+    /// Write the draft NOW rather than at the end of the debounce. Called
+    /// wherever the app can see the composer going away — leaving the
+    /// conversation, backgrounding, this store being evicted — so what reaches
+    /// disk is never a keystroke behind what is on screen.
+    func flushDraft() {
+        guard draftDirty, !retired else { return }
+        draftSaveTask?.cancel()
+        draftSaveTask = nil
+        writeDraft()
+    }
+
+    /// This machine is being dropped while its conversation lives on — an LRU
+    /// eviction, a memory warning. Write what it has, then go INERT: cancel the
+    /// work still reading the strip and refuse every later write.
+    ///
+    /// Going inert is the load-bearing half. An upload Task captures this object
+    /// strongly and `blob_upload_file` has no cancellation hook, so the machine
+    /// outlives the `ChatStore` that owned it for as long as anything is still on
+    /// the wire — while re-opening the conversation builds a SECOND machine over
+    /// the same `drafts/<session id>/`. The zombie's terminal write
+    /// (`upload`'s `if holds(id)`) passes, because the tile is still on ITS
+    /// strip, and would put a draft the live machine has since sent or cleared
+    /// straight back on disk.
+    func retire() {
+        flushDraft()
+        retired = true
+        draftSaveTask?.cancel()
+        draftSaveTask = nil
+        for item in staged {
+            item.work?.cancel()
+        }
+    }
+
+    /// The user left the conversation. Nothing is taken away — walking away is
+    /// not discarding, which is the whole feature — but two things do end with
+    /// the visit: the strip's own notice line (it names a pick the next visit
+    /// shows again, and the failure it announced is stale by then; `noteBlocked`
+    /// re-raises it on the next send attempt) and the pending write.
+    func leaveConversation() {
+        retractStripNotice()
+        flushDraft()
+    }
+
+    private func scheduleDraftSave() {
+        guard !draftSavesSuspended, !retired else { return }
+        draftDirty = true
+        draftSaveTask?.cancel()
+        draftSaveTask = Task { [weak self] in
+            try? await Task.sleep(for: Self.draftSaveDebounce)
+            guard !Task.isCancelled, let self else { return }
+            self.draftSaveTask = nil
+            self.writeDraft()
+        }
+    }
+
+    /// The one choke point, so the `retired` refusal cannot be routed around —
+    /// the debounce's Task resumes as its own main-actor job and would otherwise
+    /// reach here without passing `flushDraft`'s guard.
+    private func writeDraft() {
+        guard !retired else { return }
+        draftDirty = false
+        DraftStore.write(snapshotDraft(), sessionId: sessionId, in: supportDirectory)
+    }
+
+    /// Suppress draft writes for the duration of an edit this machine is making
+    /// to its own state — a seed read off disk, or the emptying a send does
+    /// right before deleting the file.
+    private func withoutDraftSaves(_ body: () -> Void) {
+        let previous = draftSavesSuspended
+        draftSavesSuspended = true
+        body()
+        draftSavesSuspended = previous
+    }
+
+    /// The draft as it stands, having first kept on disk whatever each pick
+    /// still needs to be sent from a LATER process.
+    private func snapshotDraft() -> Draft {
+        guard !staged.isEmpty else { return Draft(text: text, attachments: []) }
+        let directory = DraftStore.prepareDirectory(for: sessionId, in: supportDirectory)
+        return Draft(text: text, attachments: staged.compactMap { retain($0, in: directory) })
+    }
+
+    /// Keep what this pick needs to come back in a later process, and describe
+    /// it.
+    ///
+    /// A pick that reached its blob needs only its thumbnail: `AttachmentRef` is
+    /// the whole message from there on, and its bytes are the gateway's. One
+    /// that has NOT needs the bytes as well, because nothing else holds them —
+    /// which is the offline case, where every upload fails and the picks would
+    /// otherwise vanish from a draft that still shows the text that went with
+    /// them.
+    ///
+    /// `nil` for a pick there is nothing to keep — it stays on the strip, and
+    /// only the DRAFT cannot carry it. Three ways, all of them narrow: a photo
+    /// whose bytes PhotosUI has not delivered yet holds neither a blob nor a
+    /// file and no later process can ask the picker again (the window is one
+    /// `loadTransferable` wide); a spool that could be neither linked nor
+    /// copied; and a Files pick whose bookmark could not be minted when it was
+    /// admitted, inside the access bracket it arrived under.
+    private func retain(_ item: StagedAttachment, in directory: URL) -> DraftAttachment? {
+        var isImage = false
+        if case .image(let thumbnail) = item.preview {
+            isImage = true
+            if let thumbnail {
+                Self.writeThumbnail(
+                    thumbnail,
+                    to: DraftStore.thumbURL(pickId: item.id.uuidString, in: directory))
+            }
+        }
+
+        var blobId: String?
+        if case .ready(let id) = item.state { blobId = id }
+
+        var bookmark: Data?
+        if blobId == nil {
+            switch item.source {
+            case .spooled(let file):
+                guard
+                    Self.retainSource(
+                        file.url,
+                        at: DraftStore.sourceURL(pickId: item.id.uuidString, in: directory))
+                else { return nil }
+            case .scoped:
+                bookmark = item.bookmark
+                guard bookmark != nil else { return nil }
+            case nil:
+                return nil
+            }
+        }
+
+        return DraftAttachment(
+            id: item.id.uuidString, isImage: isImage, mime: item.mime,
+            filename: item.filename, byteCount: item.byteCount, blobId: blobId,
+            bookmark: bookmark)
+    }
+
+    /// The tile image, at the size it is already downsampled to (256px through
+    /// ImageIO). It is the only copy of a landed pick the draft keeps, and it
+    /// costs tens of KB against the 100 MiB the pick itself can weigh.
+    private static func writeThumbnail(_ image: UIImage, to url: URL) {
+        guard !FileManager.default.fileExists(atPath: url.path),
+            let data = image.jpegData(compressionQuality: 0.8)
+        else { return }
+        try? data.write(to: url, options: .atomic)
+    }
+
+    /// Give the draft its own name for the pick's spool. A HARD LINK, not a
+    /// copy: it is O(1), it adds no second copy of a 100 MiB pick, and it means
+    /// the bytes survive both `SpoolFile.deinit` and the launch sweep that
+    /// reclaims a dead run's temp directory. Already linked is the common case
+    /// — the record is rewritten on every change to the strip.
+    private static func retainSource(_ spool: URL, at destination: URL) -> Bool {
+        let manager = FileManager.default
+        if manager.fileExists(atPath: destination.path) { return true }
+        if (try? manager.linkItem(at: spool, to: destination)) != nil { return true }
+        return (try? manager.copyItem(at: spool, to: destination)) != nil
+    }
+
+    /// Seed this conversation's composer from the draft on disk. Runs in `init`
+    /// — before the first frame, so the field is never briefly empty — and
+    /// re-queues every restored pick that still owes an upload.
+    private func restoreDraft() {
+        var lost = 0
+        withoutDraftSaves {
+            guard let draft = DraftStore.read(sessionId: sessionId, in: supportDirectory)
+            else { return }
+            text = draft.text
+            let directory = DraftStore.directory(for: sessionId, in: supportDirectory)
+            for record in draft.attachments {
+                guard let item = StagedAttachment.restored(record, from: directory) else {
+                    lost += 1
+                    continue
+                }
+                staged.append(item)
+            }
+            pumpUploads()
+        }
+        guard lost > 0 else { return }
+        // A pick whose document the user moved or deleted between visits.
+        //
+        // Both halves are outside the suppression above, and neither is
+        // optional. The RECORD still names the dead pick, and a seed dirties
+        // nothing — so without a write the stale entry survives every visit,
+        // re-raising an unactionable line forever; worse, a draft whose picks
+        // ALL died is now an empty record that no longer deletes itself, which
+        // is exactly what `startNewChat` resumes, so compose would land on that
+        // dead session every time. And the LINE has to be deferred a turn twice
+        // over: this machine is built lazily off `ChatStore.staging`, whose
+        // first toucher is `ComposerView.init` — inside a view update, on an
+        // object SwiftUI is already rendering — and `ChatScreen.onAppear`'s
+        // `connectIfNeeded()` clears `notice` on its way out, which would wipe
+        // a line raised any earlier.
+        draftDirty = true
+        flushDraft()
+        Task { @MainActor [weak self] in
+            self?.publishUnownedNotice(Lang.shared.t("chat.draftAttachmentsLost"))
+        }
     }
 
     // MARK: - Admission
@@ -618,6 +887,7 @@ final class ComposerStaging: ObservableObject {
             guard let item = makeFileItem(url) else { continue }
             staged.append(item)
         }
+        scheduleDraftSave()
         pumpUploads()
     }
 
@@ -687,6 +957,7 @@ final class ComposerStaging: ObservableObject {
         guard admitSlot() else { return nil }
         let item = StagedAttachment.pendingPhoto()
         staged.append(item)
+        scheduleDraftSave()
         return item.id
     }
 
@@ -723,7 +994,10 @@ final class ComposerStaging: ObservableObject {
         let mime = StagedAttachment.mimeType(forExtension: url.pathExtension)
         return StagedAttachment(
             preview: .file(name: name, mime: mime), source: .scoped(url), mime: mime,
-            filename: name, byteCount: byteCount)
+            filename: name, byteCount: byteCount,
+            // Minted here, inside the access bracket the pick arrives under, and
+            // carried for the tile's whole life — see `StagedAttachment.bookmark`.
+            bookmark: try? url.bookmarkData())
     }
 
     // MARK: - A photo's bytes
@@ -779,6 +1053,7 @@ final class ComposerStaging: ObservableObject {
             $0.mime = mime
             $0.byteCount = byteCount
         }
+        scheduleDraftSave()
         pumpUploads()
     }
 
@@ -831,21 +1106,40 @@ final class ComposerStaging: ObservableObject {
         guard let idx = staged.firstIndex(where: { $0.id == id }) else { return }
         let removed = staged.remove(at: idx)
         removed.work?.cancel()
+        scheduleDraftSave()
     }
 
-    /// The strip empties on send and when the user leaves the conversation
-    /// (`ChatStore.leaveChat`). Work still in flight is cancelled — no message
-    /// can reference its blob any more — and each spool is unlinked as its last
-    /// holder lets go, so a 100 MiB photo never outlives the strip it was
-    /// staged in. Whatever line the strip put on the dock goes too: it named a
-    /// tile and there are no tiles left, or it named a pick that never became
-    /// one and there is no longer anything for it to explain.
-    func clear() {
-        for item in staged {
-            item.work?.cancel()
+    /// The draft is over: the field empties, the strip empties, and the record
+    /// and every byte it was keeping leave the disk. Work still in flight is
+    /// cancelled (no message will reference its blob now) and each spool is
+    /// unlinked as its last holder lets go, so a 100 MiB photo never outlives
+    /// the strip it was staged in. Whatever line the strip put on the dock goes
+    /// too: it named a tile and there are no tiles left, or it named a pick that
+    /// never became one and there is no longer anything for it to explain.
+    ///
+    /// Exactly two things end a draft, and this is both of them: **the message
+    /// was sent**, and **the conversation was deleted**. The in-memory half
+    /// matters as much as the file in the second case — `AppStore.requestDelete`
+    /// evicts the store, and an eviction FLUSHES, so a machine still holding the
+    /// draft would write it straight back after `SessionIndex.beginHide`
+    /// deleted it. The resurrected file has no row to reach it from, which also
+    /// makes it look exactly like an unsent new-chat draft to `startNewChat`.
+    ///
+    /// Leaving the conversation is emphatically NOT this — see
+    /// `leaveConversation`.
+    func discardDraft() {
+        withoutDraftSaves {
+            for item in staged {
+                item.work?.cancel()
+            }
+            staged.removeAll()
+            text = ""
         }
-        staged.removeAll()
         retractStripNotice()
+        draftSaveTask?.cancel()
+        draftSaveTask = nil
+        draftDirty = false
+        DraftStore.delete(sessionId: sessionId, in: supportDirectory)
     }
 
     /// Is this pick still on screen? Every terminal write and every failure
@@ -983,6 +1277,11 @@ final class ComposerStaging: ObservableObject {
             publishNotice(
                 String(format: Lang.shared.t("chat.sendFailed"), bayboErrorText(error)), for: id)
         }
+        // Either outcome changes what the draft has to keep: a landed pick gives
+        // its retained bytes back, a failed one still owes them. Guarded on the
+        // tile, so a zombie upload finishing after the send that cleared the
+        // draft can't write one back.
+        if holds(id) { scheduleDraftSave() }
     }
 
     /// A tap on a failed tile. The claim happens on the CURRENT array element
@@ -995,6 +1294,7 @@ final class ComposerStaging: ObservableObject {
         update(id) { claimed = $0.claimRetry() }
         guard claimed else { return }
         retractNotice(for: id)
+        scheduleDraftSave()
         pumpUploads()
     }
 
@@ -1103,7 +1403,10 @@ struct StagedAttachment: Identifiable {
         case failed
     }
 
-    let id = UUID()
+    /// Assigned once and never changed, but a `var` so a pick restored from a
+    /// draft keeps the id its persisted files are named after — a fresh one
+    /// would orphan the thumbnail and the retained bytes on the next write.
+    var id = UUID()
     var preview: Preview
     /// `nil` only on a photo tile PhotosUI has not delivered yet: the pick
     /// takes its slot in the strip before its bytes exist.
@@ -1113,6 +1416,12 @@ struct StagedAttachment: Identifiable {
     /// Validated at staging (`wireSize`), so the wire field is never a
     /// saturating conversion of a size the card's progress denominator reads.
     var byteCount: UInt32
+    /// A Files pick's security-scoped bookmark, minted ONCE when the pick is
+    /// admitted (or resolved back out of a draft). Not re-derived per draft
+    /// write: `url.bookmarkData()` fails for a document that has since become
+    /// unreachable, and a `retain` that re-minted would then silently drop from
+    /// the record a pick whose tile is still on the strip.
+    var bookmark: Data?
     var state: State = .queued
     /// Whatever is currently reading this pick — the PhotosUI delivery, or its
     /// upload. Removing the tile cancels it rather than deleting the file out
@@ -1247,11 +1556,86 @@ struct StagedAttachment: Identifiable {
     static func spool(_ data: Data, id: UUID, mime: String) throws -> SpoolFile {
         try FileManager.default.createDirectory(
             at: spoolDirectory, withIntermediateDirectories: true)
-        let ext = UTType(mimeType: mime)?.preferredFilenameExtension
-        let name = ext.map { "\(id.uuidString).\($0)" } ?? id.uuidString
-        let url = spoolDirectory.appendingPathComponent(name)
+        let url = spoolDirectory.appendingPathComponent(spoolName(id: id, mime: mime))
         try data.write(to: url, options: .atomic)
         return SpoolFile(url: url)
+    }
+
+    private static func spoolName(id: UUID, mime: String) -> String {
+        let ext = UTType(mimeType: mime)?.preferredFilenameExtension
+        return ext.map { "\(id.uuidString).\($0)" } ?? id.uuidString
+    }
+
+    /// Put a pick a `Draft` was holding back on the strip.
+    ///
+    /// A retained source is HARD-LINKED back into THIS run's spool directory and
+    /// handed over as an ordinary `SpoolFile`, so a restored pick is
+    /// indistinguishable from a fresh one — same ownership, same reclamation,
+    /// same upload path — and, crucially, nothing on the strip ever holds a path
+    /// under `drafts/`. That is what lets `DraftStore` prune whenever it likes:
+    /// the upload streaming a restored pick is reading its own spool, and
+    /// unlinking one name of a hard-linked inode takes no byte from the other.
+    ///
+    /// `nil` when the pick can no longer be sent at all: a bookmark whose
+    /// document the user moved or deleted, or retained bytes that went missing
+    /// under the app. The caller counts those and says so.
+    static func restored(_ record: DraftAttachment, from directory: URL) -> StagedAttachment? {
+        guard let id = UUID(uuidString: record.id) else { return nil }
+        let preview: Preview =
+            record.isImage
+            ? .image(
+                UIImage(contentsOfFile: DraftStore.thumbURL(pickId: record.id, in: directory).path))
+            : .file(name: record.filename ?? "", mime: record.mime)
+
+        var source: Source?
+        var state: State = .queued
+        if let blobId = record.blobId {
+            // On the gateway already: the ref is the whole message, so there is
+            // nothing local left to hold and nothing to re-upload.
+            state = .ready(blobId: blobId)
+        } else if let bookmark = record.bookmark {
+            guard let url = resolveBookmark(bookmark) else { return nil }
+            source = .scoped(url)
+        } else {
+            guard
+                let spool = relink(
+                    DraftStore.sourceURL(pickId: record.id, in: directory), mime: record.mime)
+            else { return nil }
+            source = .spooled(spool)
+        }
+
+        return StagedAttachment(
+            id: id, preview: preview, source: source, mime: record.mime,
+            filename: record.filename, byteCount: record.byteCount, bookmark: record.bookmark,
+            state: state)
+    }
+
+    /// The spool name is a FRESH uuid, not the pick's own. A restored pick keeps
+    /// its id (its persisted files are named after it), so deriving the spool
+    /// path from it would put two `ComposerStaging`s of one session — the live
+    /// one and a retired one an in-flight upload is keeping alive — on the same
+    /// path with two independent `SpoolFile`s, and the first `deinit` would
+    /// unlink the file the other is streaming. A spool name only has to be
+    /// unique.
+    private static func relink(_ retained: URL, mime: String) -> SpoolFile? {
+        let manager = FileManager.default
+        guard manager.fileExists(atPath: retained.path),
+            (try? manager.createDirectory(at: spoolDirectory, withIntermediateDirectories: true))
+                != nil
+        else { return nil }
+        let url = spoolDirectory.appendingPathComponent(spoolName(id: UUID(), mime: mime))
+        guard
+            (try? manager.linkItem(at: retained, to: url)) != nil
+                || (try? manager.copyItem(at: retained, to: url)) != nil
+        else { return nil }
+        return SpoolFile(url: url)
+    }
+
+    /// A stale bookmark still resolves; iOS only wants it rewritten, which the
+    /// next draft write does anyway (it re-bookmarks from the resolved URL).
+    private static func resolveBookmark(_ data: Data) -> URL? {
+        var stale = false
+        return try? URL(resolvingBookmarkData: data, bookmarkDataIsStale: &stale)
     }
 
     static let spoolRoot = FileManager.default.temporaryDirectory

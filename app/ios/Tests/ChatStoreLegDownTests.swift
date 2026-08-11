@@ -21,7 +21,8 @@ struct ChatStoreLegDownTests {
         index.touch(sessionId: Self.sessionId)
         let store = ChatStore(
             sessionId: Self.sessionId, client: client, index: index,
-            outbox: temp.makeOutbox(sessionId: Self.sessionId))
+            outbox: temp.makeOutbox(sessionId: Self.sessionId),
+            supportDirectory: temp.url)
         store.legDownDelay = .milliseconds(30)
         return store
     }
@@ -66,7 +67,8 @@ struct ChatStoreLegDownTests {
         let index = temp.makeIndex()
         let store = ChatStore(
             sessionId: "s-draft", client: client, index: index,
-            outbox: temp.makeOutbox(sessionId: "s-draft"))
+            outbox: temp.makeOutbox(sessionId: "s-draft"),
+            supportDirectory: temp.url)
         store.legDownDelay = .milliseconds(30)
 
         store.connectIfNeeded()

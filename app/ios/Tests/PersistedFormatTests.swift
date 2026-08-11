@@ -21,6 +21,7 @@ struct PersistedFormatTests {
     /// installed base as the keys are.
     private static let indexFile = "sessions.json"
     private static let outboxDirectory = "outbox"
+    private static let draftsDirectory = "drafts"
 
     private let temp = TempSupportDir()
 
@@ -140,5 +141,66 @@ struct PersistedFormatTests {
             #expect(json.contains(key), "the outbox file lost the \(key) key")
         }
         #expect(json.contains("\"sending\""), "the state is the enum's raw string")
+    }
+
+    // MARK: - the composer's unsent draft
+
+    /// A draft is the one durable file here that the app CANNOT rebuild from the
+    /// gateway — the gateway has never heard of it — so a renamed key or a moved
+    /// directory silently throws away a message the user was in the middle of
+    /// writing. The layout is spelled out for the same reason the other two are.
+    @Test func aDraftOnDiskDecodesWithItsAttachments() throws {
+        try write(
+            """
+            {"text":"look at this",
+             "attachments":[{"id":"11111111-2222-3333-4444-555555555555","isImage":true,
+                             "mime":"image/png","filename":"shot.png","byteCount":12,
+                             "blobId":"sha256:abc.tok"},
+                            {"id":"22222222-3333-4444-5555-666666666666","isImage":false,
+                             "mime":"application/pdf","filename":"review.pdf","byteCount":34,
+                             "bookmark":"Ym9va21hcms="}]}
+            """, to: "\(Self.draftsDirectory)/\(Self.sessionId)/draft.json")
+
+        let draft = try #require(DraftStore.read(sessionId: Self.sessionId, in: temp.url))
+        #expect(draft.text == "look at this")
+        let attachment = try #require(draft.attachments.first)
+        #expect(attachment.id == "11111111-2222-3333-4444-555555555555")
+        #expect(attachment.isImage)
+        #expect(attachment.mime == "image/png")
+        #expect(attachment.filename == "shot.png")
+        #expect(attachment.byteCount == 12)
+        #expect(attachment.blobId == "sha256:abc.tok")
+        #expect(attachment.bookmark == nil, "an absent optional stays absent")
+        // The Files half. A bookmark is the only handle to the USER's own
+        // document — nothing else in the record can re-open it — and it rides
+        // as base64, which is what `Data` decodes from.
+        let scoped = try #require(draft.attachments.last)
+        #expect(scoped.blobId == nil)
+        #expect(scoped.bookmark == Data("bookmark".utf8))
+    }
+
+    @Test func aDraftIsWrittenInTheSameShapeItReads() throws {
+        DraftStore.write(
+            Draft(
+                text: "look at this",
+                attachments: [
+                    DraftAttachment(
+                        id: "11111111-2222-3333-4444-555555555555", isImage: true,
+                        mime: "image/png", filename: "shot.png", byteCount: 12,
+                        blobId: "sha256:abc.tok", bookmark: nil),
+                    DraftAttachment(
+                        id: "22222222-3333-4444-5555-666666666666", isImage: false,
+                        mime: "application/pdf", filename: "review.pdf", byteCount: 34,
+                        blobId: nil, bookmark: Data("bookmark".utf8)),
+                ]),
+            sessionId: Self.sessionId, in: temp.url)
+
+        let json = try read("\(Self.draftsDirectory)/\(Self.sessionId)/draft.json")
+        for key in ["\"text\"", "\"attachments\"", "\"id\"", "\"isImage\"", "\"mime\"",
+                    "\"filename\"", "\"byteCount\"", "\"blobId\"", "\"bookmark\""]
+        {
+            #expect(json.contains(key), "the draft file lost the \(key) key")
+        }
+        #expect(json.contains("\"Ym9va21hcms=\""), "a bookmark is base64, as Data reads it")
     }
 }

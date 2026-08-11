@@ -45,7 +45,8 @@ struct ImageViewerContentTests {
         let index = temp.makeIndex()
         store = ChatStore(
             sessionId: Self.sessionId, client: client, index: index,
-            outbox: temp.makeOutbox(sessionId: Self.sessionId))
+            outbox: temp.makeOutbox(sessionId: Self.sessionId),
+            supportDirectory: temp.url)
     }
 
     // MARK: - The election

@@ -37,7 +37,8 @@ struct ChatStoreStrandedSendTests {
         // up a DRAFT.
         outbox.beginSend(platformMsgId: Self.msgId, text: "hello", attachments: [])
         store = ChatStore(
-            sessionId: Self.sessionId, client: client, index: index, outbox: outbox)
+            sessionId: Self.sessionId, client: client, index: index, outbox: outbox,
+            supportDirectory: temp.url)
     }
 
     /// The directory scan is how a session with no registry row is found at all.
@@ -110,7 +111,8 @@ struct ChatStoreQuietOutboxTests {
         let index = temp.makeIndex()
         let store = ChatStore(
             sessionId: "s-quiet", client: client, index: index,
-            outbox: temp.makeOutbox(sessionId: "s-quiet"))
+            outbox: temp.makeOutbox(sessionId: "s-quiet"),
+            supportDirectory: temp.url)
 
         store.resumePersistedSends()
 
@@ -130,7 +132,8 @@ struct ChatStoreQuietOutboxTests {
         outbox.beginSend(platformMsgId: "msg-1", text: "hello", attachments: [])
         outbox.markFailed(platformMsgId: "msg-1")
         let store = ChatStore(
-            sessionId: "s-dead", client: client, index: index, outbox: outbox)
+            sessionId: "s-dead", client: client, index: index, outbox: outbox,
+            supportDirectory: temp.url)
 
         store.resumePersistedSends()
 
@@ -164,7 +167,8 @@ struct ChatStoreDraftRecoveryTests {
         outbox = temp.makeOutbox(sessionId: Self.sessionId)
         // No registry row and no gateway session — the store comes up a DRAFT.
         store = ChatStore(
-            sessionId: Self.sessionId, client: client, index: index, outbox: outbox)
+            sessionId: Self.sessionId, client: client, index: index, outbox: outbox,
+            supportDirectory: temp.url)
     }
 
     /// `send` mints its own idempotency key, so the sole entry is read
