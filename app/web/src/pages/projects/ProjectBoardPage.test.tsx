@@ -224,6 +224,38 @@ describe('ProjectBoardPage', () => {
     expect(await screen.findByTitle('2 live')).toBeInTheDocument();
   });
 
+  it('slides the panel in, and back out on a press anywhere else', async () => {
+    renderBoard();
+    await screen.findByText('Wire the board');
+    await userEvent.click(screen.getByRole('button', { name: 'Activity' }));
+
+    const panel = (await screen.findByRole('complementary')).parentElement;
+    expect(panel?.className).toContain('transition-transform');
+    await waitFor(() => {
+      expect(panel?.className).toContain('translate-x-0');
+    });
+
+    // A press outside is one of the three ways it leaves, and it leaves the
+    // way it arrived — the parent's unmount waits for the slide.
+    await userEvent.click(screen.getByRole('heading', { name: 'Backlog' }));
+    expect(panel?.className).toContain('translate-x-full');
+    await waitFor(() => {
+      expect(screen.queryByRole('complementary')).toBeNull();
+    });
+  });
+
+  it('closes the panel on Escape', async () => {
+    renderBoard();
+    await screen.findByText('Wire the board');
+    await userEvent.click(screen.getByRole('button', { name: 'Activity' }));
+    await screen.findByRole('complementary');
+
+    await userEvent.keyboard('{Escape}');
+    await waitFor(() => {
+      expect(screen.queryByRole('complementary')).toBeNull();
+    });
+  });
+
   it('floats a side panel over the board instead of docking it', async () => {
     renderBoard();
     await screen.findByText('Wire the board');

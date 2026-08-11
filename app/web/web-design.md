@@ -120,6 +120,23 @@ mode collapsing the strip could introduce, and the badge is what rules it out.
 `boardFilter.ts` owns the list of narrowings (`restrictionCount`), because the
 badge and the Clear button must never disagree about what counts as filtered.
 
+## The board's right-hand layer
+
+The activity drawer and the agent profile share one layer, are mutually
+exclusive, and never navigate away from the board. `FloatingPanel` owns how
+they arrive and leave: they **slide in** from the right (180ms, `motion-reduce`
+respected) and leave the same way on **✕, Escape, or a press anywhere outside**
+— the three the design specifies, kept in one place because both panels are
+reached from the same avatars and buttons.
+
+Two details the shape depends on. The panel mounts off-screen and moves on the
+next frame, since one that mounts at its resting place has nothing to
+transition from. And the parent's unmount waits out the slide, which means a
+panel replaced mid-slide — a second avatar pressed while the first profile is
+still leaving — must not take its replacement down with it: the profile panel
+is keyed by agent id so the outgoing instance unmounts and cancels its own
+pending close.
+
 ## Activity drawer
 
 A **stream, not a stack of cards**: each entry is one flat row separated by a

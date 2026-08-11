@@ -23,6 +23,7 @@ import { RiAddLine, RiArchiveLine, RiLoader4Line, RiSettings3Line } from 'react-
 
 import { useAdminClient, useAuth } from '../../api/auth';
 import { IconButton } from '../../components/IconButton';
+import { useDismiss } from '../../components/useDismiss';
 import {
   fetchActiveRuns,
   fetchTeam,
@@ -438,52 +439,64 @@ export function ProjectBoardPage() {
           </DragOverlay>
         </DndContext>
         {showActivity ? (
-          <FloatingPanel>
-            <ActivityDrawer
-              projectId={projectId}
-              refreshKey={refreshKey}
-              onClose={() => {
-                setShowActivity(false);
-              }}
-              onOpenIssue={openIssue}
-            />
+          <FloatingPanel
+            onDismiss={() => {
+              setShowActivity(false);
+            }}
+          >
+            {(leave) => (
+              <ActivityDrawer
+                projectId={projectId}
+                refreshKey={refreshKey}
+                onClose={leave}
+                onOpenIssue={openIssue}
+              />
+            )}
           </FloatingPanel>
         ) : null}
         {profileOf !== null && !showActivity
           ? (() => {
               const agent = team.find((row) => row.id === profileOf);
               return agent === undefined ? null : (
-                <FloatingPanel>
-                  <AgentProfile
-                    agent={agent}
-                    team={team}
-                    issues={Object.values(board).flat()}
-                    activeRuns={activeRuns}
-                    readOnly={archived}
-                    projectId={projectId}
-                    onChanged={() => {
-                      setRefreshKey((key) => key + 1);
-                    }}
-                    onClose={() => {
-                      setProfileOf(null);
-                    }}
-                    onRemove={(row) => {
-                      setProfileOf(null);
-                      void removeAgent(client, projectId, row.id).then((outcome) => {
-                        if (outcome.kind === 'unauthorized') {
-                          logout();
-                          return;
-                        }
-                        pushToast(
-                          outcome.kind === 'ok' ? 'ok' : 'err',
-                          outcome.kind === 'ok'
-                            ? `@${row.handle} left the project`
-                            : outcome.message,
-                        );
+                <FloatingPanel
+                  // A fresh panel per agent: pressing another avatar while
+                  // one is open must switch to it, not have the outgoing
+                  // panel's pending unmount close its replacement.
+                  key={agent.id}
+                  onDismiss={() => {
+                    setProfileOf(null);
+                  }}
+                >
+                  {(leave) => (
+                    <AgentProfile
+                      agent={agent}
+                      team={team}
+                      issues={Object.values(board).flat()}
+                      activeRuns={activeRuns}
+                      readOnly={archived}
+                      projectId={projectId}
+                      onChanged={() => {
                         setRefreshKey((key) => key + 1);
-                      });
-                    }}
-                  />
+                      }}
+                      onClose={leave}
+                      onRemove={(row) => {
+                        setProfileOf(null);
+                        void removeAgent(client, projectId, row.id).then((outcome) => {
+                          if (outcome.kind === 'unauthorized') {
+                            logout();
+                            return;
+                          }
+                          pushToast(
+                            outcome.kind === 'ok' ? 'ok' : 'err',
+                            outcome.kind === 'ok'
+                              ? `@${row.handle} left the project`
+                              : outcome.message,
+                          );
+                          setRefreshKey((key) => key + 1);
+                        });
+                      }}
+                    />
+                  )}
                 </FloatingPanel>
               );
             })()
@@ -733,9 +746,65 @@ function SubIssueRing({ progress }: { progress: { done: number; total: number } 
   );
 }
 
-function FloatingPanel({ children }: { children: React.ReactNode }) {
+/// How long the panel takes to arrive, and to leave.
+const PANEL_SLIDE_MS = 180;
+
+/// The board's right-hand layer: the activity drawer and the agent profile,
+/// which share it and are mutually exclusive.
+///
+/// It slides in rather than appearing, and it leaves on ✕, on Escape, and on
+/// a press anywhere outside it. One home for all three, because both panels
+/// are reached from the same places and a rule kept in each would be the same
+/// rule only until one of them changed.
+///
+/// `children` is a function so ✕ leaves the way the other two do. Handed the
+/// parent's `onDismiss` directly it would unmount on the spot, and a panel
+/// that slides in but blinks out reads as a bug.
+function FloatingPanel({
+  onDismiss,
+  children,
+}: {
+  onDismiss: () => void;
+  children: (leave: () => void) => React.ReactNode;
+}) {
+  const root = useRef<HTMLDivElement>(null);
+  const [shown, setShown] = useState(false);
+  const [leaving, setLeaving] = useState(false);
+  const timer = useRef<number | null>(null);
+
+  // Mounted off-screen and moved on the next frame: a panel that mounts
+  // already at its resting place has nothing to transition from.
+  useEffect(() => {
+    const frame = requestAnimationFrame(() => {
+      setShown(true);
+    });
+    return () => {
+      cancelAnimationFrame(frame);
+      if (timer.current !== null) window.clearTimeout(timer.current);
+    };
+  }, []);
+
+  const leave = useCallback(() => {
+    if (timer.current !== null) return;
+    setLeaving(true);
+    // The unmount is the parent's and has to wait for the slide. The cleanup
+    // above cancels it, so a panel replaced mid-slide — another avatar
+    // pressed — does not take the one that replaced it down with it.
+    timer.current = window.setTimeout(onDismiss, PANEL_SLIDE_MS);
+  }, [onDismiss]);
+
+  useDismiss({ open: !leaving, root, onDismiss: leave });
+
   return (
-    <div className="absolute inset-y-0 right-0 z-30 flex shadow-brutal">{children}</div>
+    <div
+      ref={root}
+      style={{ transitionDuration: `${PANEL_SLIDE_MS}ms` }}
+      className={`absolute inset-y-0 right-0 z-30 flex shadow-brutal transition-transform ease-out motion-reduce:transition-none ${
+        shown && !leaving ? 'translate-x-0' : 'translate-x-full'
+      }`}
+    >
+      {children(leave)}
+    </div>
   );
 }
 

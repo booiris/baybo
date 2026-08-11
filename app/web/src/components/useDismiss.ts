@@ -21,7 +21,10 @@ export function useDismiss({
   open: boolean;
   /// The panel and its trigger together: a press inside this is not outside.
   root: RefObject<HTMLElement | null>;
-  trigger: RefObject<HTMLElement | null>;
+  /// Where Escape puts the focus back. Absent on a panel that was not opened
+  /// from a control of its own — a card's avatar opens the agent profile and
+  /// is gone from under the cursor by the time Escape is pressed.
+  trigger?: RefObject<HTMLElement | null>;
   onDismiss: () => void;
 }): void {
   useEffect(() => {
@@ -34,7 +37,7 @@ export function useDismiss({
       if (event.key !== 'Escape') return;
       event.stopPropagation();
       onDismiss();
-      trigger.current?.focus();
+      trigger?.current?.focus();
     }
     document.addEventListener('mousedown', onPointerDown);
     document.addEventListener('keydown', onKeyDown);
