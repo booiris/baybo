@@ -22,15 +22,15 @@ mod store;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
-pub use baybo_store::{SpanEventRow, SpanRow, StepRow, TraceStore};
+pub use baybo_store::{SpanEventRow, SpanRow, StepRow, ToolSetRow, TraceStore};
 pub use error::TraceError;
 pub use event::{SPAN_EVENT_TEXT_MAX_BYTES, SpanEvent, SpanEventKind, ToolEventPayload};
 pub use outcome::{LifecycleOutcome, LifecycleState};
 pub use recorder::{SpanRecorder, TraceEvent, TraceEventStream};
 pub use span::{
-    LlmCallBegin, LlmCallInputs, LlmCallResult, LlmToolCallRecord, PersistedToolCallOutput, Span,
-    SpanFinalize, SpanHandle, SpanKind, ToolCallBegin, ToolCallOrigin, ToolCallOutput,
-    ToolCallResult,
+    LlmCallBegin, LlmCallInputs, LlmCallResult, LlmToolCallRecord, LlmToolDefinition, LlmToolSet,
+    LlmToolSetRef, PersistedToolCallOutput, Span, SpanFinalize, SpanHandle, SpanKind,
+    ToolCallBegin, ToolCallOrigin, ToolCallOutput, ToolCallResult,
 };
 pub use step::{CompressionTrigger, Step, StepHandle, StepKind};
 

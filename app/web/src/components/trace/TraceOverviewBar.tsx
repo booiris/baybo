@@ -167,12 +167,14 @@ export function TraceOverviewBar({
   const tokens = useMemo(() => {
     let input = 0;
     let output = 0;
+    let cached = 0;
     for (const j of overview.turns) {
       const t = summaryTokens(j);
       input += t.input;
       output += t.output;
+      cached += t.cached + t.cacheCreate;
     }
-    return { input, output };
+    return { input, output, cached };
   }, [overview]);
 
   const dur = overallDuration(overview.turns);
@@ -200,6 +202,9 @@ export function TraceOverviewBar({
         <Stat label="spans" value={String(spanCount)} />
         <Stat label="↑" value={formatTok(tokens.input)} />
         <Stat label="↓" value={formatTok(tokens.output)} />
+        {/* Cache reads and writes are a breakdown of `↑`, never an addend —
+            shown so a session's cache hit rate is legible at a glance. */}
+        {tokens.cached > 0 && <Stat label="cache" value={formatTok(tokens.cached)} />}
         {dur !== null && <Stat label="dur" value={formatDuration(dur)} />}
         {failCells.length > 0 && <Stat label="fail" value={String(failCells.length)} accent="text-err" />}
         {loadingTurns.size > 0 && (

@@ -1,3 +1,4 @@
+pub mod breakdown;
 pub mod budget;
 pub mod calibration;
 pub mod compressor;
@@ -6,6 +7,7 @@ pub mod prompts;
 pub mod tokenizer;
 mod transcript_repair;
 
+pub use breakdown::{ContextBreakdown, ContextPart, ContextSegment, context_breakdown};
 pub use budget::TokenBudget;
 pub use calibration::TokenCalibration;
 pub use compressor::{CompressOutput, parse_summary_response};

@@ -162,6 +162,78 @@ export interface LlmCallBegin {
   provider_config_hash: string;
   input_messages: LlmCallInputs;
   temperature?: number | null;
+  /**
+   * The tool set this call offered the model. A reference, not the
+   * definitions: every span in a session points at the same tens-of-KB set,
+   * so the schemas live in one content-addressed row and the client fetches
+   * them once per hash from `GET /v1/traces/tool-sets/{hash}`. Absent on
+   * calls that offered no tools (compression, title generation, the progress
+   * observer) and on spans recorded before the field existed.
+   */
+  tools?: LlmToolSetRef | null;
+}
+
+/** Mirrors `baybo_trace::LlmToolSetRef`. */
+export interface LlmToolSetRef {
+  hash: string;
+  count: number;
+}
+
+/** One tool as the model was shown it (`baybo_trace::LlmToolDefinition`). */
+export interface LlmToolDefinition {
+  name: string;
+  description: string;
+  parameters_schema: unknown;
+}
+
+/** Body of `GET /v1/traces/tool-sets/{hash}`. */
+export interface LlmToolSet {
+  hash: string;
+  tools: LlmToolDefinition[];
+}
+
+/**
+ * Which part of the assembled context a segment belongs to (mirrors
+ * `baybo_context::ContextPart`). Derived server-side from the `(role, source)`
+ * pair each message carries, never re-guessed here.
+ */
+export type ContextPart =
+  | 'system_prompt'
+  | 'tools'
+  | 'skills'
+  | 'memory'
+  | 'user'
+  | 'cron'
+  | 'assistant'
+  | 'tool_result'
+  | 'agent'
+  | 'media';
+
+/** One piece of the context, in the order the model saw it. */
+export interface ContextSegment {
+  part: ContextPart;
+  label: string;
+  tokens: number;
+  index: number;
+}
+
+/**
+ * Body of `GET /v1/traces/{session_id}/spans/{span_id}/context`.
+ *
+ * `reported_input_tokens` is what the provider billed and is exact;
+ * the per-segment split is a tiktoken **estimate** (tiktoken is not
+ * Anthropic's tokenizer), so the viewer scales the segments onto the
+ * reported total rather than presenting them as measured.
+ * `context_window` is null when no configured client serves that model any
+ * more — the trace outlives the config.
+ */
+export interface SpanContext {
+  span_id: string;
+  model_id: string;
+  reported_input_tokens?: number | null;
+  estimated_total_tokens: number;
+  context_window?: number | null;
+  segments: ContextSegment[];
 }
 
 export interface LlmToolCallRecord {

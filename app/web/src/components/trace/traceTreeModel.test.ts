@@ -16,9 +16,14 @@ import {
   findStep,
   isExternalAgentTurn,
   isTurnLive,
+  looksLikeTraceId,
   neededTurnIds,
   partitionTranscript,
   resolveExpanded,
+  resolveJumpTarget,
+  resolveOrdinalTarget,
+  spanOrder,
+  stepOrder,
   traceHasPendingSpan,
   turnLabels,
   turnFailed,
@@ -431,5 +436,150 @@ describe('partitionTranscript', () => {
     // The explicit NaN branch: an unplaceable row still shows up somewhere
     // rather than silently disappearing from the transcript.
     expect(byTurn(partitionTranscript([mkRow(1, 'not-a-timestamp')], turns))).toEqual({ c: [1] });
+  });
+});
+
+describe('order', () => {
+  const trace = mkTrace('turn', [
+    mkStep('step-a', { outcome: 'ok' }, [mkSpan('span-a1', 'step-a', { outcome: 'ok' })]),
+    mkStep('step-b', { outcome: 'ok' }, [
+      mkSpan('span-b1', 'step-b', { outcome: 'ok' }),
+      mkSpan('span-b2', 'step-b', { outcome: 'ok' }),
+    ]),
+  ]);
+
+  it('numbers a step by its position among the turn steps', () => {
+    expect(stepOrder(trace, 'step-b')).toEqual({ step: 2, stepTotal: 2 });
+  });
+
+  it('numbers a span within its own step, carrying the step position', () => {
+    expect(spanOrder(trace, 'span-b2')).toEqual({ step: 2, stepTotal: 2, span: 2, spanTotal: 2 });
+  });
+
+  it('has no number for an id the trace does not hold', () => {
+    expect(stepOrder(trace, 'nope')).toBeNull();
+    expect(spanOrder(trace, 'nope')).toBeNull();
+    expect(stepOrder(undefined, 'step-a')).toBeNull();
+    expect(spanOrder(undefined, 'span-a1')).toBeNull();
+  });
+});
+
+describe('looksLikeTraceId', () => {
+  it('accepts a ULID in either case', () => {
+    expect(looksLikeTraceId('01JQ8Z3M4N5P6Q7R8S9T0VWXYZ')).toBe(true);
+    expect(looksLikeTraceId('  01jq8z3m4n5p6q7r8s9t0vwxyz  ')).toBe(true);
+  });
+
+  it('rejects ordinary search text', () => {
+    // The discriminator has to keep hands off real queries: a word, a tool
+    // name, a partial id — none of these should hijack the filter into a jump.
+    for (const text of ['bash', 'read_file', 'failed', '01JQ8Z3M4N', '']) {
+      expect(looksLikeTraceId(text)).toBe(false);
+    }
+  });
+
+  it('rejects the letters Crockford base32 excludes', () => {
+    // I/L/O/U never appear in a ULID, so a 26-char string containing one is
+    // some other identifier — treating it as a jump target would search for a
+    // node that cannot exist.
+    expect(looksLikeTraceId('01JQ8Z3M4N5P6Q7R8S9T0VWXYI')).toBe(false);
+  });
+});
+
+describe('resolveJumpTarget', () => {
+  const ID_SPAN = '01JQ8Z3M4N5P6Q7R8S9T0VWXYZ';
+  const ID_STEP = '01JQ8Z3M4N5P6Q7R8S9T0VWXY0';
+  const traces = new Map([
+    ['turn-1', mkTrace('turn-1', [mkStep('other-step', { outcome: 'ok' }, [])])],
+    [
+      'turn-2',
+      mkTrace('turn-2', [mkStep(ID_STEP, { outcome: 'ok' }, [mkSpan(ID_SPAN, ID_STEP, { outcome: 'ok' })])]),
+    ],
+  ]);
+
+  it('finds a span in a turn other than the selected one', () => {
+    // The whole point: an id is pasted precisely when the reader does not
+    // know which turn holds it.
+    expect(resolveJumpTarget(traces, ID_SPAN)).toEqual({
+      turnId: 'turn-2',
+      stepId: ID_STEP,
+      spanId: ID_SPAN,
+    });
+  });
+
+  it('finds a step, and reports no span for it', () => {
+    expect(resolveJumpTarget(traces, ID_STEP)).toEqual({
+      turnId: 'turn-2',
+      stepId: ID_STEP,
+      spanId: null,
+    });
+  });
+
+  it('normalizes a pasted lowercase id', () => {
+    expect(resolveJumpTarget(traces, ID_SPAN.toLowerCase())?.spanId).toBe(ID_SPAN);
+  });
+
+  it('leaves a plain search term alone', () => {
+    expect(resolveJumpTarget(traces, 'bash')).toBeNull();
+  });
+
+  it('is null for an id no loaded turn holds', () => {
+    // Not an error: the turn may still be loading, and the effect re-runs
+    // when it lands.
+    expect(resolveJumpTarget(traces, '01JQ8Z3M4N5P6Q7R8S9T0VWXY1')).toBeNull();
+  });
+});
+
+describe('resolveOrdinalTarget', () => {
+  const trace = mkTrace('turn', [
+    mkStep('step-a', { outcome: 'ok' }, [mkSpan('span-a1', 'step-a', { outcome: 'ok' })]),
+    mkStep('step-b', { outcome: 'ok' }, [
+      mkSpan('span-b1', 'step-b', { outcome: 'ok' }),
+      mkSpan('span-b2', 'step-b', { outcome: 'ok' }),
+    ]),
+  ]);
+
+  it('resolves the marker the tree prints on a step row', () => {
+    expect(resolveOrdinalTarget(trace, '#2')).toEqual({ stepId: 'step-b', spanId: null });
+  });
+
+  it('resolves a span marker to the span, carrying its step', () => {
+    expect(resolveOrdinalTarget(trace, '#2.2')).toEqual({
+      stepId: 'step-b',
+      spanId: 'span-b2',
+    });
+  });
+
+  it('tolerates surrounding whitespace from a paste', () => {
+    expect(resolveOrdinalTarget(trace, '  #1  ')).toEqual({ stepId: 'step-a', spanId: null });
+  });
+
+  it('leaves a bare number alone so searching for content still works', () => {
+    // Someone typing `2` is looking for text, not navigating. The `#` is what
+    // makes the intent explicit.
+    expect(resolveOrdinalTarget(trace, '2')).toBeNull();
+    expect(resolveOrdinalTarget(trace, '2.2')).toBeNull();
+  });
+
+  it('refuses #0 rather than silently selecting the last row', () => {
+    // `Number('0') - 1` is -1, and `Array.at(-1)` is the LAST element — a
+    // marker nothing prints, resolving to a row the reader did not ask for.
+    expect(resolveOrdinalTarget(trace, '#0')).toBeNull();
+    expect(resolveOrdinalTarget(trace, '#1.0')).toBeNull();
+  });
+
+  it('is null for a position the turn does not have', () => {
+    expect(resolveOrdinalTarget(trace, '#9')).toBeNull();
+    expect(resolveOrdinalTarget(trace, '#1.5')).toBeNull();
+  });
+
+  it('rejects malformed markers instead of guessing', () => {
+    for (const text of ['#', '#1.', '#1.2.3', '#a', '#1a', '']) {
+      expect(resolveOrdinalTarget(trace, text)).toBeNull();
+    }
+  });
+
+  it('is null without a loaded trace', () => {
+    expect(resolveOrdinalTarget(undefined, '#1')).toBeNull();
   });
 });

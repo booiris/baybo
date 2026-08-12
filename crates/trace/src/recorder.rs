@@ -5,15 +5,18 @@
 //!
 //! See `docs/modules/trace.md` for the design.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
-use baybo_model::{ParallelGroup, SessionId, SpanId, StepId, TurnId};
+use baybo_model::{ParallelGroup, SessionId, SpanId, StepId, ToolSetHash, TurnId};
 use chrono::Utc;
+use parking_lot::Mutex;
 use tokio::sync::broadcast;
 
 use crate::{
-    LifecycleOutcome, LifecycleState, Span, SpanEvent, SpanEventKind, SpanFinalize, SpanHandle,
-    SpanKind, Step, StepHandle, StepKind, TraceError,
+    LifecycleOutcome, LifecycleState, LlmToolDefinition, LlmToolSet, LlmToolSetRef, Span,
+    SpanEvent, SpanEventKind, SpanFinalize, SpanHandle, SpanKind, Step, StepHandle, StepKind,
+    TraceError,
 };
 use baybo_store::TraceStore;
 
@@ -116,6 +119,10 @@ pub struct SpanRecorder {
     user_id: String,
     trace_store: Arc<dyn TraceStore>,
     stream: TraceEventStream,
+    /// Tool sets this recorder has already persisted. The set a session
+    /// offers is stable across its calls, so this collapses one store
+    /// write per LLM call into one per distinct set.
+    saved_tool_sets: Mutex<HashSet<ToolSetHash>>,
 }
 
 impl SpanRecorder {
@@ -136,6 +143,7 @@ impl SpanRecorder {
             user_id,
             trace_store,
             stream,
+            saved_tool_sets: Mutex::new(HashSet::new()),
         }
     }
 
@@ -145,6 +153,31 @@ impl SpanRecorder {
 
     pub fn stream(&self) -> &TraceEventStream {
         &self.stream
+    }
+
+    /// Persist the tool definitions a call is about to offer the model and
+    /// return the reference to put on its `LlmCall` span.
+    ///
+    /// The set is stored content-addressed and shared by every span that
+    /// offered it, so the caller records a hash instead of tens of KB of
+    /// schema per call. Repeat sets skip the store entirely — the tool
+    /// list is session-stable, so after the first call this is a hash and
+    /// a lock.
+    pub async fn record_tool_set(&self, tools: Vec<LlmToolDefinition>) -> Result<LlmToolSetRef> {
+        let count = tools.len();
+        let row = LlmToolSet::new(tools).to_row()?;
+        // Two callers can both miss the memo and both write; that costs one
+        // redundant no-op INSERT (the row is immutable and keyed by its own
+        // digest), which is cheaper than holding a lock across the await.
+        let known = self.saved_tool_sets.lock().contains(&row.hash);
+        if !known {
+            self.trace_store.save_tool_set(&row).await?;
+            self.saved_tool_sets.lock().insert(row.hash.clone());
+        }
+        Ok(LlmToolSetRef {
+            hash: row.hash,
+            count,
+        })
     }
 
     // ── Step lifecycle ────────────────────────────────────────────
@@ -339,6 +372,7 @@ fn finalize_span_kind(kind: &mut SpanKind, finalize: SpanFinalize, span_id: &Spa
 mod tests {
     use super::*;
     use crate::test_support::MemoryTraceStore;
+    use baybo_store::trace::Result as StoreResult;
 
     fn make_recorder() -> SpanRecorder {
         SpanRecorder::new(
@@ -357,6 +391,7 @@ mod tests {
                 provider_config_hash: "h".into(),
                 input_messages: crate::LlmCallInputs::empty(),
                 temperature: None,
+                tools: None,
             },
             result: None,
         }
@@ -510,5 +545,126 @@ mod tests {
         .unwrap();
         let ev = rx.recv().await.unwrap();
         assert!(matches!(ev, TraceEvent::SpanEventEmitted(_)));
+    }
+
+    fn tool(name: &str) -> LlmToolDefinition {
+        LlmToolDefinition {
+            name: name.into(),
+            description: format!("does {name}"),
+            parameters_schema: serde_json::json!({ "type": "object" }),
+        }
+    }
+
+    /// Counts saves so the memo can be observed, and forwards everything
+    /// else to a real in-memory store.
+    #[derive(Default)]
+    struct CountingToolSetStore {
+        inner: MemoryTraceStore,
+        saves: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl TraceStore for CountingToolSetStore {
+        async fn save_step(&self, step: &crate::StepRow) -> StoreResult<()> {
+            self.inner.save_step(step).await
+        }
+        async fn load_step(&self, id: &StepId) -> StoreResult<Option<crate::StepRow>> {
+            self.inner.load_step(id).await
+        }
+        async fn list_steps_by_turn(&self, id: &TurnId) -> StoreResult<Vec<crate::StepRow>> {
+            self.inner.list_steps_by_turn(id).await
+        }
+        async fn list_unfinished_steps(&self) -> StoreResult<Vec<crate::StepRow>> {
+            self.inner.list_unfinished_steps().await
+        }
+        async fn save_span(&self, span: &crate::SpanRow) -> StoreResult<()> {
+            self.inner.save_span(span).await
+        }
+        async fn load_span(&self, id: &SpanId) -> StoreResult<Option<crate::SpanRow>> {
+            self.inner.load_span(id).await
+        }
+        async fn list_spans_by_step(&self, id: &StepId) -> StoreResult<Vec<crate::SpanRow>> {
+            self.inner.list_spans_by_step(id).await
+        }
+        async fn list_spans_by_turn(&self, id: &TurnId) -> StoreResult<Vec<crate::SpanRow>> {
+            self.inner.list_spans_by_turn(id).await
+        }
+        async fn trace_counts_by_turn(&self, id: &TurnId) -> StoreResult<(usize, usize)> {
+            self.inner.trace_counts_by_turn(id).await
+        }
+        async fn save_tool_set(&self, set: &crate::ToolSetRow) -> StoreResult<()> {
+            self.saves
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.save_tool_set(set).await
+        }
+        async fn load_tool_set(
+            &self,
+            hash: &ToolSetHash,
+        ) -> StoreResult<Option<crate::ToolSetRow>> {
+            self.inner.load_tool_set(hash).await
+        }
+        async fn append_span_event(&self, event: &crate::SpanEventRow) -> StoreResult<()> {
+            self.inner.append_span_event(event).await
+        }
+        async fn list_span_events(&self, id: &SpanId) -> StoreResult<Vec<crate::SpanEventRow>> {
+            self.inner.list_span_events(id).await
+        }
+        async fn list_span_events_for_spans(
+            &self,
+            ids: &[SpanId],
+        ) -> StoreResult<Vec<crate::SpanEventRow>> {
+            self.inner.list_span_events_for_spans(ids).await
+        }
+    }
+
+    /// The whole point of the content address: a session that offers the
+    /// same tools on every call stores them once. Without the memo this
+    /// would write tens of KB per LLM call.
+    #[tokio::test]
+    async fn a_repeated_tool_set_is_stored_once() {
+        let store = Arc::new(CountingToolSetStore::default());
+        let rec = SpanRecorder::new(
+            SessionId::from("cli-test"),
+            "user-test".to_string(),
+            Arc::clone(&store) as Arc<dyn TraceStore>,
+            TraceEventStream::new(),
+        );
+
+        let tools = vec![tool("bash"), tool("read")];
+        let first = rec.record_tool_set(tools.clone()).await.unwrap();
+        let second = rec.record_tool_set(tools).await.unwrap();
+
+        assert_eq!(first.hash, second.hash);
+        assert_eq!(first.count, 2);
+        assert_eq!(
+            store.saves.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the second call should have been served by the memo"
+        );
+        let stored = store.load_tool_set(&first.hash).await.unwrap().unwrap();
+        assert_eq!(LlmToolSet::from_row(stored).unwrap().tools.len(), 2);
+    }
+
+    /// A different tool set is a different row — otherwise a session whose
+    /// available tools changed mid-run (a channel switch, a cron fire's
+    /// extra tool) would resolve to the wrong list.
+    #[tokio::test]
+    async fn a_changed_tool_set_gets_its_own_address() {
+        let store = Arc::new(CountingToolSetStore::default());
+        let rec = SpanRecorder::new(
+            SessionId::from("cli-test"),
+            "user-test".to_string(),
+            Arc::clone(&store) as Arc<dyn TraceStore>,
+            TraceEventStream::new(),
+        );
+
+        let a = rec.record_tool_set(vec![tool("bash")]).await.unwrap();
+        let b = rec
+            .record_tool_set(vec![tool("bash"), tool("read")])
+            .await
+            .unwrap();
+
+        assert_ne!(a.hash, b.hash);
+        assert_eq!(store.saves.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 }

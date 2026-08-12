@@ -592,6 +592,8 @@ POST   /v1/cron/:id/restore             out of the recycle bin, with the status 
 GET    /v1/traces                       ?status=&since=&until=&limit=&cursor=  filtered session-summary list
 GET    /v1/traces/:session_id           session overview (message log + turn summaries)
 GET    /v1/traces/:session_id/turns/:turn_id  per-turn step/span tree
+GET    /v1/traces/tool-sets/:hash       tool definitions an LlmCall span's `tools.hash` names
+GET    /v1/traces/:session_id/spans/:span_id/context  where one LLM call's input tokens went
 
 GET    /v1/skills
 GET    /v1/tools

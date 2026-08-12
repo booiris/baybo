@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   RiArrowDownSLine,
   RiArrowRightSLine,
@@ -43,11 +43,18 @@ function previewLine(blocks: ContentBlock[], toolNames: Map<string, string>): st
 function ClippedText({
   text,
   kindHint,
+  expanded = false,
 }: {
   text: string;
   kindHint?: SecretKind;
+  /** Start unclipped because someone was sent here. Still collapsible after —
+   *  this sets the initial state, it does not lock it. */
+  expanded?: boolean;
 }) {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(expanded);
+  useEffect(() => {
+    if (expanded) setOpen(true);
+  }, [expanded]);
   if (text.length <= TEXT_CLIP_THRESHOLD) {
     return (
       <pre className="whitespace-pre-wrap break-words font-mono text-[0.85rem] leading-relaxed text-ink">
@@ -76,10 +83,14 @@ function ContentBlockView({
   block,
   kindHint,
   toolNames,
+  expanded = false,
 }: {
   block: ContentBlock;
   kindHint?: SecretKind;
   toolNames: Map<string, string>;
+  /** This block's message is the target of a jump, so show its contents
+   *  rather than the header someone has to click again. */
+  expanded?: boolean;
 }) {
   // Tool / structured blocks default-collapsed (they're noisy).
   const isStructured =
@@ -89,10 +100,13 @@ function ContentBlockView({
     'Image' in block ||
     'Audio' in block ||
     'File' in block;
-  const [open, setOpen] = useState(!isStructured);
+  const [open, setOpen] = useState(!isStructured || expanded);
+  useEffect(() => {
+    if (expanded) setOpen(true);
+  }, [expanded]);
 
   if ('Text' in block) {
-    return <ClippedText text={block.Text} kindHint={kindHint} />;
+    return <ClippedText text={block.Text} kindHint={kindHint} expanded={expanded} />;
   }
 
   let label = '';
@@ -162,12 +176,18 @@ function ContentBlockView({
 
 function MessageCard({
   message,
+  index,
   isCurrentInput,
+  focused,
   kindHint,
   toolNames,
 }: {
   message: ChatMessage;
+  /** Position in the whole input, so a caller that knows only a message
+   *  number (the context breakdown) can scroll to this card. */
+  index: number;
   isCurrentInput: boolean;
+  focused: boolean;
   kindHint?: SecretKind;
   toolNames: Map<string, string>;
 }) {
@@ -177,9 +197,19 @@ function MessageCard({
   // tool results that triggered this LLM call — is open by default.
   // Prior turns and system boilerplate start collapsed.
   const [open, setOpen] = useState(message.role !== 'system' && isCurrentInput);
+  // A card someone was sent to opens itself: landing on a collapsed header
+  // after a jump looks like the jump missed.
+  useEffect(() => {
+    if (focused) setOpen(true);
+  }, [focused]);
 
   return (
-    <div className="border-2 border-black rounded-md bg-white shadow-brutal-xs">
+    <div
+      data-msg-index={index}
+      className={`border-2 rounded-md bg-white shadow-brutal-xs ${
+        focused ? 'border-brand ring-2 ring-brand' : 'border-black'
+      }`}
+    >
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
@@ -204,7 +234,13 @@ function MessageCard({
       {open && (
         <div className="px-3 pb-3 pt-1 space-y-2 border-t border-black/20">
           {message.content.map((c, i) => (
-            <ContentBlockView key={i} block={c} kindHint={kindHint} toolNames={toolNames} />
+            <ContentBlockView
+              key={i}
+              block={c}
+              kindHint={kindHint}
+              toolNames={toolNames}
+              expanded={focused}
+            />
           ))}
         </div>
       )}
@@ -216,6 +252,7 @@ export function MessageList({
   messages,
   kindHint,
   foldHistory = true,
+  focusIndex = null,
 }: {
   messages: ChatMessage[];
   kindHint?: SecretKind;
@@ -226,6 +263,10 @@ export function MessageList({
    * where every turn should render as its own visible card.
    */
   foldHistory?: boolean;
+  /** Message to reveal and highlight — the target of a jump from the context
+   *  breakdown. Folded history is force-opened when the target is inside it,
+   *  or the jump would scroll to an element that is not mounted. */
+  focusIndex?: number | null;
 }) {
   // Build a lookup so ToolResult blocks can show the tool name they
   // pair with — the wire only carries `tool_use_id` on results.
@@ -252,6 +293,9 @@ export function MessageList({
   }, [messages, foldHistory]);
 
   const [showHistory, setShowHistory] = useState(false);
+  useEffect(() => {
+    if (focusIndex != null && focusIndex < currentInputStart) setShowHistory(true);
+  }, [focusIndex, currentInputStart]);
 
   if (messages.length === 0) {
     return <div className="text-ink-soft text-[0.85rem]">No messages.</div>;
@@ -286,7 +330,9 @@ export function MessageList({
               <MessageCard
                 key={`prior-${i}`}
                 message={m}
+                index={i}
                 isCurrentInput={false}
+                focused={focusIndex === i}
                 kindHint={kindHint}
                 toolNames={toolNames}
               />
@@ -297,7 +343,9 @@ export function MessageList({
         <MessageCard
           key={`current-${i}`}
           message={m}
+          index={currentInputStart + i}
           isCurrentInput={true}
+          focused={focusIndex === currentInputStart + i}
           kindHint={kindHint}
           toolNames={toolNames}
         />
