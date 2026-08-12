@@ -110,7 +110,11 @@ final class AppStore: ObservableObject {
 
     /// Leave search, restoring the tab that was showing before it.
     func exitSearch() {
-        homeTab = tabBeforeSearch
+        // The same instant switch a tab-bar tap gets (`searchAwareSelection`):
+        // leaving through ✕ must not animate a bar back in over the field.
+        var instant = Transaction()
+        instant.disablesAnimations = true
+        withTransaction(instant) { homeTab = tabBeforeSearch }
     }
 
     /// Search results waiting to be parked on: `sessionId -> ordinal`.

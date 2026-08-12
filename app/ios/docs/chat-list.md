@@ -66,12 +66,28 @@ clients is a bug on one of them. The index itself is documented in
 `TabRole.search`, and on iOS 26 the system lifts a search-role tab OUT of the
 glass pill and floats it as its own detached circle at the trailing edge. On
 18–25 the role degrades to an ordinary tab item, so no version branch is needed.
+**Entering and leaving search switches WITHOUT animation**
+(`searchAwareSelection` in `HomeTabView`, and `exitSearch()` for the ✕). The
+native bar's hide/show is animated, and for the length of that animation it is on
+screen at the same time as the field replacing it — the four-tab pill and its
+search circle fading out under a field already opening. Disabling the transaction
+removes the window: the bar is gone by the time the field appears. Scoped to the
+search edges only, so every other tab switch keeps the Liquid Glass selection
+morph. It also cut the focus delay noted below — the transition was most of it.
+
+In the SETTLED search state both halves of the bar are hidden, verified
+separately: the four-tab pill and the detached search circle each report
+`isHittable == false` (they linger in the accessibility tree, which is why
+`SearchUITests` asserts hittability rather than existence).
+
 **The field takes the tab bar's place.** Selecting search hides the native bar
 (`.toolbar(.hidden, for: .tabBar)`, driven by `homeTab == .search`) and
 `SearchScreen` docks its own field there via `.safeAreaInset(edge: .bottom)`,
 with a ✕ circle trailing it. The field animates from the search circle's own
-footprint (`circleDiameter`, 62pt) out to full width, so the detached circle
-reads as stretching into a field — the Telegram shape. A `safeAreaInset` rather
+footprint out to full width, so the detached circle reads as stretching into a
+field. **Entry only** — the exit leaves immediately; holding the tab swap for a
+reverse animation was tried and dropped, since the native bar returns on its own
+schedule regardless and the wait bought nothing but a slower exit. A `safeAreaInset` rather
 than an overlay so the results list insets itself and its last card never parks
 under the field.
 

@@ -99,23 +99,13 @@ struct SearchScreen: View {
             Button {
                 query = ""
                 focused = false
-                // Retract FIRST, swap the tab after. Two separate problems live
-                // here, and the second one is why this is a timer rather than
-                // `withAnimation`'s completion:
-                //
-                // Inline, `exitSearch()` tore this screen down mid-animation and
-                // the field vanished instead of retracting. Moved to the
-                // completion, it fired early enough that the tab bar was back
-                // WHILE the field was still collapsing — and the bar's own search
-                // circle then sat directly under the retracting field, two
-                // magnifiers stacked. Holding the swap for the animation's own
-                // duration is the only version where the bar returns to an empty
-                // bottom.
-                withAnimation(Self.morph) { expanded = false }
-                Task {
-                    try? await Task.sleep(for: .seconds(Self.morphSeconds))
-                    appStore.exitSearch()
-                }
+                // Leaves immediately — no retraction. Holding the tab swap for a
+                // reverse animation was tried and dropped: the native bar comes
+                // back on its own schedule regardless (verified by holding the
+                // swap for the animation's full duration and watching it return
+                // anyway), so the wait bought a slower exit and nothing else.
+                expanded = false
+                appStore.exitSearch()
             } label: {
                 Image(systemName: "xmark")
                     .font(.system(size: 13, weight: .semibold))
@@ -152,15 +142,6 @@ struct SearchScreen: View {
         return .spring(response: 0.42, dampingFraction: 0.82)
     }()
 
-    /// How long [`morph`] takes, as a NUMBER — the exit has to hold the tab swap
-    /// for exactly this long, and an `Animation` cannot be asked its duration.
-    /// Keep the two in step.
-    private static let morphSeconds: Double = {
-        #if DEBUG
-            if slowMorph { return SLOW_MORPH_SECONDS }
-        #endif
-        return 0.42
-    }()
 
     #if DEBUG
         /// `-baybo-demo-slow-morph`: stretch the open/close so it can be SAMPLED

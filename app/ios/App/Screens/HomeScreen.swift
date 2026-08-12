@@ -20,7 +20,7 @@ struct HomeTabView: View {
     @ObservedObject private var lang = Lang.shared
 
     var body: some View {
-        TabView(selection: $store.homeTab) {
+        TabView(selection: searchAwareSelection) {
             ForEach(AppStore.HomeTab.allCases, id: \.self) { tab in
                 // `role` is what separates search from the rest: on iOS 26 the
                 // system lifts a `.search` tab OUT of the glass pill and floats
@@ -52,6 +52,31 @@ struct HomeTabView: View {
         #if DEBUG
             .task { await demoTabCycleIfRequested() }
         #endif
+    }
+
+    /// The tab selection, with ONE special case: entering or leaving search
+    /// switches without animation.
+    ///
+    /// The native bar's hide/show is animated, and for the length of that
+    /// animation it is on screen at the same time as the search field replacing
+    /// it — the four-tab pill and its search circle fading out under a field
+    /// already opening. Disabling the transaction removes the window entirely:
+    /// the bar is gone by the time the field appears.
+    ///
+    /// Scoped to the search edges, so every other tab switch keeps the system's
+    /// Liquid Glass selection morph.
+    private var searchAwareSelection: Binding<AppStore.HomeTab> {
+        Binding(
+            get: { store.homeTab },
+            set: { next in
+                guard next == .search || store.homeTab == .search else {
+                    store.homeTab = next
+                    return
+                }
+                var instant = Transaction()
+                instant.disablesAnimations = true
+                withTransaction(instant) { store.homeTab = next }
+            })
     }
 
     @ViewBuilder private func content(for tab: AppStore.HomeTab) -> some View {
