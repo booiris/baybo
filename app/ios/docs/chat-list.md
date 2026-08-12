@@ -75,6 +75,18 @@ reads as stretching into a field — the Telegram shape. A `safeAreaInset` rathe
 than an overlay so the results list insets itself and its last card never parks
 under the field.
 
+**The field carries no magnifier glyph, and that is not an oversight.** It
+coexists with the native tab bar for the length of the bar's own hide/show
+animation — entering AND leaving — and the bar's search circle sits at exactly
+that end of the screen, so a glyph in the field put two magnifiers one above the
+other. The bar's timing is not the app's to control (it returns on its own
+schedule, not on the tab swap — verified by holding the swap for the animation's
+full duration and watching the bar come back anyway), so the fix is to stop
+drawing the duplicate rather than to sequence them. The placeholder reads
+"Search"; the glyph was decoration. The field's CONTENTS also fade with the
+stretch, so the shrinking pill empties out instead of carrying text into a 48pt
+circle.
+
 ✕ calls `exitSearch()`, which returns to `tabBeforeSearch` — the tab search was
 opened FROM, recorded in `homeTab`'s `willSet`. Returning to a hardcoded `.chats`
 would be a different bug wearing the same clothes, and `SearchUITests` enters

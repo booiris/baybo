@@ -17,6 +17,8 @@ import SwiftUI
 /// the whole TabView, so the conversation covers the shell and this tab stays
 /// selected underneath it — backing out returns here with the query and results
 /// still on screen.
+private let SLOW_MORPH_SECONDS: Double = 4
+
 struct SearchScreen: View {
     @EnvironmentObject private var appStore: AppStore
     @ObservedObject private var lang = Lang.shared
@@ -97,13 +99,21 @@ struct SearchScreen: View {
             Button {
                 query = ""
                 focused = false
-                // Leave only once the field has collapsed back into the circle.
-                // `exitSearch()` swaps the tab, which tears this screen down —
-                // called inline it ate the whole exit animation, so the field
-                // vanished instead of retracting.
-                withAnimation(Self.morph) {
-                    expanded = false
-                } completion: {
+                // Retract FIRST, swap the tab after. Two separate problems live
+                // here, and the second one is why this is a timer rather than
+                // `withAnimation`'s completion:
+                //
+                // Inline, `exitSearch()` tore this screen down mid-animation and
+                // the field vanished instead of retracting. Moved to the
+                // completion, it fired early enough that the tab bar was back
+                // WHILE the field was still collapsing — and the bar's own search
+                // circle then sat directly under the retracting field, two
+                // magnifiers stacked. Holding the swap for the animation's own
+                // duration is the only version where the bar returns to an empty
+                // bottom.
+                withAnimation(Self.morph) { expanded = false }
+                Task {
+                    try? await Task.sleep(for: .seconds(Self.morphSeconds))
                     appStore.exitSearch()
                 }
             } label: {
@@ -137,23 +147,32 @@ struct SearchScreen: View {
     /// one and a linear ramp beside it reads as a different app.
     private static let morph: Animation = {
         #if DEBUG
-            // `-baybo-demo-slow-morph`: stretch it to 4s so the expansion can be
-            // SAMPLED headlessly. A spring at 0.42s gives a screenshot harness
-            // one usable frame if it is lucky; this gives it as many as it wants,
-            // which is how the leftward direction was verified.
-            if ProcessInfo.processInfo.arguments.contains("-baybo-demo-slow-morph") {
-                return .linear(duration: 4)
-            }
+            if slowMorph { return .linear(duration: SLOW_MORPH_SECONDS) }
         #endif
         return .spring(response: 0.42, dampingFraction: 0.82)
     }()
 
+    /// How long [`morph`] takes, as a NUMBER — the exit has to hold the tab swap
+    /// for exactly this long, and an `Animation` cannot be asked its duration.
+    /// Keep the two in step.
+    private static let morphSeconds: Double = {
+        #if DEBUG
+            if slowMorph { return SLOW_MORPH_SECONDS }
+        #endif
+        return 0.42
+    }()
+
+    #if DEBUG
+        /// `-baybo-demo-slow-morph`: stretch the open/close so it can be SAMPLED
+        /// headlessly. A 0.42s spring gives a screenshot harness one usable frame
+        /// if it is lucky; this gives it as many as it wants, which is how the
+        /// leftward direction — and the stacked-magnifier overlap — were caught.
+        private static let slowMorph = ProcessInfo.processInfo.arguments
+            .contains("-baybo-demo-slow-morph")
+    #endif
+
     private var field: some View {
         HStack(spacing: 8) {
-            Image(systemName: "magnifyingglass")
-                .font(.system(size: 15, weight: .medium))
-                .foregroundStyle(Theme.inkSoft)
-
             TextField(
                 "", text: $query,
                 prompt: Text(verbatim: lang.t("search.placeholder"))
@@ -178,6 +197,17 @@ struct SearchScreen: View {
                 .accessibilityLabel(Text(verbatim: lang.t("search.clear")))
             }
         }
+        // NO magnifier glyph in here, deliberately. The field coexists with the
+        // native tab bar for the length of the bar's own hide/show animation —
+        // entering AND leaving — and the bar carries a search circle at exactly
+        // this end of the screen, so a second magnifier put two of them one above
+        // the other. The bar's timing is not ours to control, so the fix is to
+        // stop drawing the duplicate rather than to try to sequence them. The
+        // placeholder reads "Search"; the glyph was decoration.
+        //
+        // The contents still fade with the stretch, so the shrinking pill empties
+        // out instead of carrying text into a 48pt circle.
+        .opacity(expanded ? 1 : 0)
         .padding(.horizontal, 14)
         .frame(height: Self.fieldHeight)
         // Clip the CONTENT (before the glass, so the shadow is untouched): mid
