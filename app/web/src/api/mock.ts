@@ -298,7 +298,7 @@ export function getMockSpanContext(spanId: string): SpanContext {
     { part: 'tool_result', label: 'bash result', tokens: 14_900, index: 5 },
     { part: 'tool_result', label: 'read_file result', tokens: 3_240, index: 6 },
     { part: 'assistant', label: 'Assistant', tokens: 410, index: 7 },
-    { part: 'agent', label: 'Agent framing', tokens: 190, index: 8 },
+    { part: 'agent', label: 'Agent-injected', tokens: 190, index: 8 },
     { part: 'media', label: '1 image(s)', tokens: 1_105, index: 9 },
   ];
   return {

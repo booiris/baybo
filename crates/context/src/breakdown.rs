@@ -140,7 +140,7 @@ fn label_for(part: ContextPart) -> String {
         ContextPart::Cron => "Cron".to_string(),
         ContextPart::Assistant => "Assistant".to_string(),
         ContextPart::ToolResult => "Tool result".to_string(),
-        ContextPart::Agent => "Agent framing".to_string(),
+        ContextPart::Agent => "Agent-injected".to_string(),
         ContextPart::Tools | ContextPart::Media => part.as_str().to_string(),
     }
 }

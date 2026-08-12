@@ -151,6 +151,23 @@ they sum to exactly the grid, with a floor of one cell for any non-zero part —
 rounding a real 0.4% contributor away is how a context view quietly stops
 mentioning the thing someone opened it to find.
 
+**One scaling site, one denominator.** The panel shows the same numbers twice —
+a legend by part, and a "largest pieces" list by individual segment — so both
+read from `ContextGrid.segments`, which `buildContextGrid` scales once. Scaling
+in two places is exactly how the legend and the list first came to print two
+different figures for one tool set. For the same reason every percentage is a
+share of **what was sent**, never of the window: a part that is 33% of the input
+and 5% of the window has to pick one, or the two lists cannot be read against
+each other. The window appears only as the headline's "% full" and as the free
+cells, and the free legend row deliberately prints no percentage at all.
+
+Repeated labels carry their position (`#12 read_file result`): five `read_file`
+calls produce five identically-named segments, and without the index there is no
+way to tell which one is the 40k one. Each legend row also carries a tooltip
+saying what falls into that part — "Agent-injected" in particular is a catch-all
+(an invoked skill's body, a subagent task prompt or its finished notification,
+compaction instructions) whose name cannot carry that on its own.
+
 ### Subagent lineage
 
 `GET /v1/traces/{session_id}/lineage` returns every subagent session descended from this one, flattened, each row carrying its attach point (`parent_span_id` — the parent's `spawn_subagent` tool-call span), its backend (`external_agent`, absent for in-process children), and its turn summaries. It refreshes on the same tick as the overview, so a subagent spawned mid-turn appears without a manual reload.
