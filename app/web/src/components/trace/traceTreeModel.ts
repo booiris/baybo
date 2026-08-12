@@ -217,6 +217,35 @@ export function resolveJumpTarget(
 }
 
 /**
+ * Resolve the position marker the tree prints on its own rows — `#3` for a
+ * step, `#3.2` for its second span — back to the node it names.
+ *
+ * Scoped to one turn because that is what the numbers are scoped to: `#3` is
+ * the third step *of this turn*, and the same marker exists in every other
+ * turn. The `#` is required so an ordinary search for `3` stays a text
+ * filter; a reader typing a bare number is looking for content, not
+ * navigating.
+ */
+export function resolveOrdinalTarget(
+  trace: TurnTrace | undefined,
+  text: string,
+): { stepId: string; spanId: string | null } | null {
+  const raw = text.trim();
+  if (trace == null || !raw.startsWith('#')) return null;
+  // Positive integers only. `#0` would otherwise index -1, and `.at(-1)` is
+  // the LAST element — a marker nothing prints, silently selecting the wrong
+  // row.
+  const parts = raw.slice(1).split('.');
+  if (parts.length > 2 || parts.some((p) => !/^[1-9]\d*$/.test(p))) return null;
+
+  const step = trace.steps.at(Number(parts[0]) - 1);
+  if (step == null) return null;
+  if (parts.length === 1) return { stepId: step.step.id, spanId: null };
+  const span = step.spans.at(Number(parts[1]) - 1);
+  return span == null ? null : { stepId: step.step.id, spanId: span.id };
+}
+
+/**
  * Where a node sits in the order the trace store returns.
  *
  * `steps` come back ordered by `started_at` within their turn and `spans`

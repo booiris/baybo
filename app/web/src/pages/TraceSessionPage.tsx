@@ -50,6 +50,7 @@ import { renderWithSanitizeChips, SanitizeChip } from '../components/trace/Sanit
 import { TraceTree } from '../components/trace/TraceTree';
 import { TraceOverviewBar } from '../components/trace/TraceOverviewBar';
 import { ContextTab } from '../components/trace/ContextTab';
+import type { ScaledSegment } from '../components/trace/contextGrid';
 import type { TraceGroup } from '../components/trace/traceFormat';
 import { TurnAnchors } from '../components/trace/TurnAnchors';
 import {
@@ -87,6 +88,7 @@ import {
   partitionTranscript,
   resolveExpanded,
   resolveJumpTarget,
+  resolveOrdinalTarget,
   spanOrder,
   stepOrder,
   traceHasPendingSpan,
@@ -118,7 +120,15 @@ function sanitizeKindHint(events: SpanEvent[] | undefined): SecretKind | undefin
   return undefined;
 }
 
-function LlmCallDetail({ span, messageLog }: { span: Span; messageLog: SessionMessageRow[] }) {
+function LlmCallDetail({
+  span,
+  messageLog,
+  focusIndex,
+}: {
+  span: Span;
+  messageLog: SessionMessageRow[];
+  focusIndex: number | null;
+}) {
   if (span.kind.kind !== 'llm_call') return null;
   const { begin, result } = span.kind;
   const hint = sanitizeKindHint(span.events);
@@ -142,7 +152,7 @@ function LlmCallDetail({ span, messageLog }: { span: Span; messageLog: SessionMe
         <h4 className="font-bold uppercase tracking-wider text-[0.8rem] mb-2 border-b-2 border-black pb-1">
           Input messages
         </h4>
-        <MessageList messages={inputMessages} kindHint={hint} />
+        <MessageList messages={inputMessages} kindHint={hint} focusIndex={focusIndex} />
       </section>
 
       {result && (
@@ -601,6 +611,8 @@ function SpanDetailPanel({
   spanContexts,
   loadingContexts,
   onRetryContext,
+  focusedMessage,
+  onJumpToPiece,
 }: {
   span: Span;
   order: SpanOrder | null;
@@ -614,6 +626,8 @@ function SpanDetailPanel({
   spanContexts: SpanContextCache;
   loadingContexts: Set<string>;
   onRetryContext: (spanId: string) => void;
+  focusedMessage: number | null;
+  onJumpToPiece: (segment: ScaledSegment) => void;
 }) {
   const visual = spanVisual(span.kind.kind);
   const Icon = visual.icon;
@@ -680,7 +694,7 @@ function SpanDetailPanel({
       <div className="flex-1 overflow-y-scroll p-5">
         {shownTab === 'io' &&
           (span.kind.kind === 'llm_call' ? (
-            <LlmCallDetail span={span} messageLog={messageLog} />
+            <LlmCallDetail span={span} messageLog={messageLog} focusIndex={focusedMessage} />
           ) : (
             <ToolCallDetail
               span={span}
@@ -702,6 +716,7 @@ function SpanDetailPanel({
             context={spanContexts.get(span.id)}
             loading={loadingContexts.has(span.id)}
             onRetry={() => onRetryContext(span.id)}
+            onJump={onJumpToPiece}
           />
         )}
         {shownTab === 'events' && <EventsTab events={events} />}
@@ -1322,6 +1337,11 @@ export function TraceSessionPage() {
   const [loadingToolSets, setLoadingToolSets] = useState<Set<string>>(() => new Set());
   const [spanContexts, setSpanContexts] = useState<SpanContextCache>(() => new Map());
   const [loadingContexts, setLoadingContexts] = useState<Set<string>>(() => new Set());
+  // Which input message the context breakdown sent the reader to. Deliberately
+  // NOT a URL param: it is a scroll position inside one tab, not a selection
+  // anything else needs to agree with, and parking it in the URL would leave a
+  // stale highlight behind every later navigation.
+  const [focusedMessage, setFocusedMessage] = useState<number | null>(null);
   const [userToggles, setUserToggles] = useState<Map<string, boolean>>(() => new Map());
   const [overviewLoading, setOverviewLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -2034,7 +2054,13 @@ export function TraceSessionPage() {
   // than only in the turn that happens to be open. Once it resolves, select
   // the node, scroll to it, and drop the filter so the tree comes back.
   useEffect(() => {
-    const target = resolveJumpTarget(turnTraces, filterRaw);
+    // Two ways to name a node: its id (from a log line or a deep link), or
+    // the `#3` / `#3.2` marker the tree prints on its own rows. The id can
+    // come from anywhere in the session; the marker is scoped to the turn
+    // whose rows carry it, which is the one on screen.
+    const byId = resolveJumpTarget(turnTraces, filterRaw);
+    const byOrdinal = byId ? null : resolveOrdinalTarget(activeTurnTrace, filterRaw);
+    const target = byId ?? (byOrdinal ? { turnId: activeTurnId, ...byOrdinal } : null);
     if (!target) return;
     setFilterRaw('');
     setFilter('');
@@ -2046,7 +2072,7 @@ export function TraceSessionPage() {
       child: null,
     });
     scrollToAnchor(`[data-step-id="${target.stepId}"]`, 'center');
-  }, [filterRaw, turnTraces, updateUrl]);
+  }, [filterRaw, turnTraces, activeTurnTrace, activeTurnId, updateUrl]);
 
   // The tool definitions behind the selected span's reference, fetched only
   // when its tab is open: one session's spans share a single set, so this is
@@ -2078,6 +2104,37 @@ export function TraceSessionPage() {
     if (selectedContextSpan == null || spanContexts.has(selectedContextSpan.spanId)) return;
     void fetchSpanContext(selectedContextSpan.owner, selectedContextSpan.spanId);
   }, [selectedContextSpan, spanContexts, fetchSpanContext]);
+
+  // A message index belongs to one span's input; carrying it across a
+  // selection change would highlight an unrelated message.
+  useEffect(() => setFocusedMessage(null), [spanIdParam]);
+
+  // Open the piece a "largest pieces" row names. The tool set is not a message
+  // and has no position in the input, so it goes to the tab that does hold it.
+  const handleJumpToPiece = useCallback(
+    (segment: ScaledSegment) => {
+      if (segment.part === 'tools') {
+        updateUrl({ tab: 'tools' });
+        return;
+      }
+      setFocusedMessage(segment.index);
+      updateUrl({ tab: 'io' });
+      // `start`, not `center`: centering puts the MIDDLE of the element at the
+      // middle of the viewport, and a jumped-to message is exactly the one big
+      // enough to be worth jumping to — a 40k-char tool result centred lands
+      // the reader somewhere near its end. Its top edge is where it begins.
+      //
+      // Twice, because the card grows after it is found: revealing folded
+      // history mounts the cards above it, and the target then opens its own
+      // structured blocks and unclips its text. The first call gets there; the
+      // second re-aligns once that settling has changed the scroll extent,
+      // which otherwise clamps a near-the-bottom target short of its top.
+      const anchor = `[data-msg-index="${segment.index}"]`;
+      scrollToAnchor(anchor);
+      window.setTimeout(() => scrollToAnchor(anchor), 120);
+    },
+    [updateUrl],
+  );
 
   if (overviewLoading && !overview) {
     return (
@@ -2232,6 +2289,8 @@ export function TraceSessionPage() {
               onRetryContext={(spanId) =>
                 void fetchSpanContext(activeTurnEntry?.sessionId ?? sessionId, spanId)
               }
+              focusedMessage={focusedMessage}
+              onJumpToPiece={handleJumpToPiece}
             />
           ) : selectedStepRs ? (
             <StepDetail

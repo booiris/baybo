@@ -100,13 +100,22 @@ backend orders by `started_at` (`ORDER BY started_at` on both the step and the
 span query). It is the index in the returned array, not a running count of
 rendered rows, so an active filter never renumbers what survives it.
 
-The tree's filter box doubles as a **go-to-id**: step and span ids are part of
-every row's search projection, and pasting one (a 26-char ULID, either case)
-selects that node, scrolls to it, and clears the filter. The filter is the entry
-point on purpose — it already eager-loads every turn's tree, which is what lets
-an id resolve anywhere in the session rather than only in the turn that happens
-to be open. `resolveJumpTarget` (`components/trace/traceTreeModel.ts`) does the
-lookup; text that is not id-shaped stays an ordinary filter.
+The tree's filter box doubles as a **jump box**, two ways:
+
+- **By id** — step and span ids are part of every row's search projection, so
+  pasting one (a 26-char ULID, either case) selects that node, scrolls to it,
+  and clears the filter. The filter is the entry point on purpose: it already
+  eager-loads every turn's tree, which is what lets an id resolve anywhere in
+  the session rather than only in the turn that happens to be open.
+- **By marker** — `#3` or `#3.2`, the position the tree prints on its own rows,
+  resolved within the turn on screen (which is what those numbers are scoped
+  to). The `#` is required so a bare `3` stays a text search: someone typing a
+  number is looking for content, not navigating. `#0` is refused rather than
+  silently resolving to the last row via a negative index.
+
+`resolveJumpTarget` / `resolveOrdinalTarget`
+(`components/trace/traceTreeModel.ts`) do the lookups; anything neither matches
+stays an ordinary filter.
 
 ### The tool set behind an LLM call
 
@@ -163,10 +172,33 @@ cells, and the free legend row deliberately prints no percentage at all.
 
 Repeated labels carry their position (`#12 read_file result`): five `read_file`
 calls produce five identically-named segments, and without the index there is no
-way to tell which one is the 40k one. Each legend row also carries a tooltip
-saying what falls into that part — "Agent-injected" in particular is a catch-all
-(an invoked skill's body, a subagent task prompt or its finished notification,
-compaction instructions) whose name cannot carry that on its own.
+way to tell which one is the 40k one. **That position is also the way in** —
+clicking it opens the piece it names: a message scrolls into view in the I/O
+tab (unfolding the "earlier messages" block and expanding the card if the target
+is inside them, or the jump lands on something not mounted), and the tool set,
+which is not a message and has no position of its own, opens the Tools tab
+instead.
+
+**One explanation surface, no popups.** Hovering a grid cell or a legend row
+names the part and what it holds in a **reserved line under the legend**, and
+dims every cell that is not that part so the reader sees where it sits in the
+matrix. Nothing in this area carries a native `title`: the panel is a scroll
+container, so an absolutely-positioned bubble clips at its edges; the `title`
+delay is long enough to read as nothing happening; and while both existed they
+fired together, the line immediately and the popup a second later with the same
+words. The line has a fixed min-height so nothing reflows as the pointer moves.
+"Agent-injected" is the part that most needs the explanation — a catch-all
+holding an invoked skill's body, a subagent task prompt or its finished
+notification, and compaction instructions.
+
+The one `title` left in the panel is on the `#N` jump button, because it names
+an **action** rather than a thing on screen, and a button that does not say
+where it goes is worse than a tooltip.
+
+The legend carries **both** denominators when a window is known: share of the
+input (what is eating the prompt) and share of the window (what it costs in
+room). Free has no share of the input — it is not part of it — so that cell is a
+dash and its real number sits under the column that measures it.
 
 ### Subagent lineage
 
