@@ -2704,23 +2704,6 @@
         }
       }
     },
-    "search.hint": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Type 2+ characters to search every conversation"
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "输入 2 个以上字符，搜索全部对话"
-          }
-        }
-      }
-    },
     "search.more": {
       "extractionState": "manual",
       "localizations": {

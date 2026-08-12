@@ -55,6 +55,15 @@ struct SearchScreen: View {
                 return
             }
             withAnimation(Self.morph) { expanded = true }
+            // The keyboard will NOT arrive with this. Measured on 26.5: SwiftUI
+            // does not APPLY the focus until ~700ms after the tab change, and the
+            // keyboard then follows within ~40ms — so it is the focus handoff
+            // that is slow, not the keyboard. Disabling the stretch entirely and
+            // deferring this to the next runloop each changed nothing, which
+            // places it in the TabView page transition rather than anything here.
+            // The stretch stays immediate on purpose: syncing it to the keyboard
+            // would buy visual synchrony at the price of ~700ms of dead bottom
+            // bar right after the tap.
             if query.isEmpty { focused = true }
         }
         .onDisappear { model.cancel() }
@@ -178,7 +187,11 @@ struct SearchScreen: View {
             LazyVStack(alignment: .leading, spacing: 10) {
                 switch model.phase {
                 case .idle:
-                    hint(lang.t("search.hint"))
+                    // Nothing. The placeholder in the field already says what to
+                    // do, and a second instruction floating over an empty screen
+                    // is the app talking to itself. `.empty` / `.failed` below
+                    // stay: those are ANSWERS to a query, not instructions.
+                    EmptyView()
                 case .loading:
                     // Deliberately no spinner-over-blank: `scheduleSearch` keeps
                     // the previous results on screen while a new query is in

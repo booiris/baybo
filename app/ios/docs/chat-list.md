@@ -96,6 +96,21 @@ with the results gone, which is the whole reason the flag exists.
 back from a conversation, and raising the keyboard over results they just
 navigated back to is not what they asked for.
 
+**The keyboard lands well after the field opens, and that is not jank.** Measured
+on 26.5 across repeated entries: SwiftUI does not APPLY the focus until ~700ms
+after the tab change (steady, ±20ms), and the keyboard follows within ~40ms of
+that — so the slow part is the focus handoff, not the keyboard. Disabling the
+stretch entirely and deferring the focus request to the next runloop each changed
+nothing, which places the cost in the `TabView` page transition rather than in
+anything this screen does. The stretch is deliberately left immediate: syncing it
+to `keyboardWillShow` would make the two move together at the price of ~700ms of
+dead bottom bar right after the tap. Note the measurement is simulator-only — a
+device may well be faster.
+
+The idle state draws **nothing**: the field's placeholder is the only instruction
+it needs. `.empty` / `.failed` still render, because those are answers to a query
+rather than instructions.
+
 **Scope is the gateway's default and is not configurable from the client:**
 hidden sessions stay lost, archived ones stay archived, and cron *workspaces* —
 fire sessions that are not conversations of their own — are excluded

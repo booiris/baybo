@@ -29,20 +29,28 @@ final class SearchUITests: BayboUITestCase {
 
     func testTheTabBarOffersSearchAndItShowsTheField() {
         let app = launchSearch()
-        _ = openSearch(app)
-        XCTAssertTrue(app.staticTexts["Type 2+ characters to search every conversation"].exists)
+        let field = openSearch(app)
+        XCTAssertTrue(field.isHittable, "the field must be reachable, not merely laid out")
+        // Idle draws nothing but the field — the placeholder is the only
+        // instruction, so there is no hint element to assert on.
+        XCTAssertFalse(app.buttons["search.hit.demo-1.2"].exists)
     }
 
     /// One character is a legitimate query the index can answer and a useless one
-    /// to answer, so the screen stays on its hint rather than listing everything.
+    /// to answer — it matches nearly every conversation — so nothing is searched.
+    ///
+    /// Asserted on the RESULTS, not on a hint: the idle screen draws no text of
+    /// its own, and `-baybo-demo-search` answers any query of 2+ characters, so
+    /// "no cards" is exactly "no search ran".
     func testASingleCharacterDoesNotSearch() {
         let app = launchSearch()
         let field = openSearch(app)
         field.tap()
         field.typeText("d")
 
-        let hint = app.staticTexts["Type 2+ characters to search every conversation"]
-        XCTAssertTrue(hint.exists, "one character must not run a search")
+        XCTAssertFalse(
+            app.buttons["search.hit.demo-1.2"].waitForExistence(timeout: 2),
+            "one character must not run a search")
     }
 
     func testTypingShowsGroupedResults() {
