@@ -17,6 +17,7 @@ import { useMemo, useState } from 'react';
 import { RiLoader4Line } from 'react-icons/ri';
 import type { ContextPart, SpanContext } from '../../types/trace';
 import { formatTok } from './traceFormat';
+import type { ScaledSegment } from './contextGrid';
 import { buildContextGrid, largestSegments } from './contextGrid';
 
 /** Colour + label per context part.
@@ -81,6 +82,10 @@ const PART_VISUALS: Record<ContextPart, { label: string; cell: string; hint: str
 };
 
 const FREE_CELL = 'bg-black/10';
+
+/** What the reserved explanation line is describing. `'free'` is not a
+ *  `ContextPart` — nothing was sent for it — but it is hoverable all the same. */
+type HoverTarget = ContextPart | 'free';
 const LARGEST_SHOWN = 8;
 
 function pct(share: number): string {
@@ -92,12 +97,16 @@ export function ContextTab({
   context,
   loading,
   onRetry,
+  onJump,
 }: {
   context: SpanContext | undefined;
   loading: boolean;
   onRetry: () => void;
+  /** Open the piece a row names: a message in the I/O tab, or — for the tool
+   *  set, which is not a message and has no index of its own — the Tools tab. */
+  onJump: (segment: ScaledSegment) => void;
 }) {
-  const [hovered, setHovered] = useState<ContextPart | null>(null);
+  const [hovered, setHovered] = useState<HoverTarget | null>(null);
   const grid = useMemo(
     () =>
       context
@@ -136,6 +145,8 @@ export function ContextTab({
   }
 
   const used = context.reported_input_tokens ?? context.estimated_total_tokens;
+  const windowSize = context.context_window ?? 0;
+  const hasWindow = windowSize > 0;
   const measured = context.reported_input_tokens != null;
   // Only worth stating when it is big enough to change a reading. tiktoken
   // runs within ~10% of Anthropic's tokenizer, so a 3% gap is the tool
@@ -145,27 +156,33 @@ export function ContextTab({
       ? Math.abs(used - context.estimated_total_tokens) / context.estimated_total_tokens
       : 0;
 
-  const cells: { key: string; className: string; title: string }[] = [];
+  const cells: { key: string; className: string; part: HoverTarget }[] = [];
   for (const category of grid.categories) {
     const visual = PART_VISUALS[category.part];
     for (let i = 0; i < category.cells; i++) {
-      cells.push({
-        key: `${category.part}-${i}`,
-        className: visual.cell,
-        title: `${visual.label} · ≈${category.tokens.toLocaleString()} tokens (${pct(category.share)})`,
-      });
+      cells.push({ key: `${category.part}-${i}`, className: visual.cell, part: category.part });
     }
   }
   for (let i = 0; i < grid.freeCells; i++) {
-    cells.push({
-      key: `free-${i}`,
-      className: FREE_CELL,
-      title:
-        grid.freeTokens != null
-          ? `Free · ${grid.freeTokens.toLocaleString()} tokens left in the window`
-          : 'Free',
-    });
+    cells.push({ key: `free-${i}`, className: FREE_CELL, part: 'free' });
   }
+
+  // What the reserved line says. Hovering a cell or a legend row names the
+  // part and what it holds; with nothing hovered it says how to ask.
+  const hoveredCategory =
+    hovered !== 'free' && hovered != null
+      ? grid.categories.find((c) => c.part === hovered)
+      : undefined;
+  const explanation =
+    hovered === 'free'
+      ? grid.freeTokens != null
+        ? `Free · ${grid.freeTokens.toLocaleString()} tokens still available in this model's window.`
+        : 'Free.'
+      : hovered != null
+        ? `${PART_VISUALS[hovered].label}${
+            hoveredCategory ? ` · ≈${hoveredCategory.tokens.toLocaleString()} tokens` : ''
+          } — ${PART_VISUALS[hovered].hint}`
+        : 'Hover a cell or a part to see what it holds.';
 
   return (
     <div className="space-y-5">
@@ -189,8 +206,11 @@ export function ContextTab({
           {cells.map((c) => (
             <span
               key={c.key}
-              title={c.title}
-              className={`h-2.5 w-2.5 rounded-[1px] ${c.className}`}
+              onMouseEnter={() => setHovered(c.part)}
+              onMouseLeave={() => setHovered(null)}
+              className={`h-2.5 w-2.5 rounded-[1px] ${c.className} ${
+                hovered != null && hovered !== c.part ? 'opacity-30' : ''
+              }`}
             />
           ))}
         </div>
@@ -206,9 +226,16 @@ export function ContextTab({
             list below can be read against each other. The window shows up as
             the headline's "% full" and as the free cells, not as a second
             percentage. */}
-        <div className="mb-1 flex items-baseline justify-between font-mono text-[0.65rem] uppercase tracking-wider text-ink-soft">
-          <span>Part</span>
-          <span>share of input</span>
+        {/* Two denominators, both spelled out, because both answer a real
+            question: "what is eating my prompt" is a share of the input, and
+            "how much room does this cost me" is a share of the window. Naming
+            only one and leaving the other implicit is what made the Free row
+            unreadable — it has no share of the input at all. */}
+        <div className="mb-1 flex items-baseline gap-3 font-mono text-[0.65rem] uppercase tracking-wider text-ink-soft">
+          <span className="flex-1">Part</span>
+          <span className="w-16 text-right">tokens</span>
+          <span className="w-12 text-right">of input</span>
+          {hasWindow && <span className="w-14 text-right">of window</span>}
         </div>
         {/* Real rows, not a CSS grid of `display: contents` wrappers. A
             `contents` element generates no box at all, so it has no hit area
@@ -224,7 +251,6 @@ export function ContextTab({
               return (
                 <div
                   key={category.part}
-                  title={visual.hint}
                   onMouseEnter={() => setHovered(category.part)}
                   onMouseLeave={() => setHovered(null)}
                   className={`flex items-center gap-3 py-0.5 px-1 -mx-1 rounded cursor-help ${
@@ -235,26 +261,42 @@ export function ContextTab({
                     className={`h-3 w-3 shrink-0 rounded-[2px] border border-black/40 ${visual.cell}`}
                   />
                   <span className="flex-1 min-w-0 truncate">{visual.label}</span>
-                  <span className="shrink-0 tabular-nums text-right">
+                  <span className="shrink-0 tabular-nums text-right w-16">
                     ≈{category.tokens.toLocaleString()}
                   </span>
                   <span className="shrink-0 tabular-nums text-right text-ink-soft w-12">
                     {pct(category.share)}
                   </span>
+                  {hasWindow && (
+                    <span className="shrink-0 tabular-nums text-right text-ink-soft w-14">
+                      {pct(category.tokens / windowSize)}
+                    </span>
+                  )}
                 </div>
               );
             })}
           {grid.freeTokens != null && (
-            <div className="flex items-center gap-3 py-0.5 px-1 -mx-1">
+            <div
+              onMouseEnter={() => setHovered('free')}
+              onMouseLeave={() => setHovered(null)}
+              className={`flex items-center gap-3 py-0.5 px-1 -mx-1 rounded cursor-help ${
+                hovered === 'free' ? 'bg-black/5' : ''
+              }`}
+            >
               <span className={`h-3 w-3 shrink-0 rounded-[2px] border border-black/40 ${FREE_CELL}`} />
               <span className="flex-1 min-w-0 truncate text-ink-soft">Free</span>
-              <span className="shrink-0 tabular-nums text-right text-ink-soft">
+              <span className="shrink-0 tabular-nums text-right text-ink-soft w-16">
                 {grid.freeTokens.toLocaleString()}
               </span>
-              {/* No percentage: this one is a share of the WINDOW, and printing
-                  it in the same column as the shares above invites exactly the
-                  comparison that does not hold. */}
-              <span className="shrink-0 tabular-nums text-right text-ink-soft w-12">left</span>
+              {/* Free has no share of the input — it is not part of it. The
+                  dash says so; the number it does have lives under the column
+                  that actually measures it. */}
+              <span className="shrink-0 tabular-nums text-right text-ink-soft w-12">—</span>
+              {hasWindow && (
+                <span className="shrink-0 tabular-nums text-right text-ink-soft w-14">
+                  {pct(grid.freeTokens / windowSize)}
+                </span>
+              )}
             </div>
           )}
         </div>
@@ -263,7 +305,7 @@ export function ContextTab({
             its edges, and the native `title` delay is long enough to read as
             "nothing happened". Fixed height, so nothing reflows on hover. */}
         <p className="mt-2 min-h-[2.5rem] text-[0.72rem] leading-snug text-ink-soft border-t border-black/10 pt-1.5">
-          {hovered != null ? PART_VISUALS[hovered].hint : 'Hover a part to see what falls into it.'}
+          {explanation}
         </p>
       </section>
 
@@ -279,17 +321,27 @@ export function ContextTab({
                 <div
                   key={`${segment.part}-${segment.index}-${i}`}
                   className="flex items-center gap-2 font-mono text-[0.78rem]"
-                  title={`${visual.label} · message #${segment.index + 1} of the input`}
                 >
                   <span
                     className={`h-2.5 w-2.5 rounded-[1px] shrink-0 border border-black/40 ${visual.cell}`}
                   />
                   {/* The position, because the labels repeat: five `read_file`
                       calls produce five identically-named rows, and without
-                      this there is no way to tell which one is the 40k one. */}
-                  <span className="shrink-0 tabular-nums text-ink-soft w-8 text-right">
+                      this there is no way to tell which one is the 40k one.
+                      It is also the way in — clicking opens that exact piece
+                      in the tab that holds it. */}
+                  <button
+                    type="button"
+                    onClick={() => onJump(segment)}
+                    title={
+                      segment.part === 'tools'
+                        ? 'Open the tool definitions'
+                        : `Open message #${segment.index + 1} in I/O Data`
+                    }
+                    className="shrink-0 tabular-nums w-8 text-right text-brand-hover font-bold hover:underline cursor-pointer"
+                  >
                     #{segment.index + 1}
-                  </span>
+                  </button>
                   <span className="flex-1 min-w-0 truncate">{segment.label}</span>
                   <span className="shrink-0 tabular-nums">
                     ≈{segment.tokens.toLocaleString()}

@@ -1232,7 +1232,7 @@ export function TraceTree(props: TraceTreeProps) {
         <div className="flex items-center gap-2 flex-wrap">
           <SearchBox
             className="h-8"
-            placeholder="Filter by kind, tool, model…"
+            placeholder="Filter, or jump: #3 · #3.2 · a step/span id"
             value={filterRaw}
             onChange={(e) => onFilterRawChange(e.target.value)}
           />

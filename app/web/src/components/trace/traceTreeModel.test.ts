@@ -21,6 +21,7 @@ import {
   partitionTranscript,
   resolveExpanded,
   resolveJumpTarget,
+  resolveOrdinalTarget,
   spanOrder,
   stepOrder,
   traceHasPendingSpan,
@@ -526,5 +527,59 @@ describe('resolveJumpTarget', () => {
     // Not an error: the turn may still be loading, and the effect re-runs
     // when it lands.
     expect(resolveJumpTarget(traces, '01JQ8Z3M4N5P6Q7R8S9T0VWXY1')).toBeNull();
+  });
+});
+
+describe('resolveOrdinalTarget', () => {
+  const trace = mkTrace('turn', [
+    mkStep('step-a', { outcome: 'ok' }, [mkSpan('span-a1', 'step-a', { outcome: 'ok' })]),
+    mkStep('step-b', { outcome: 'ok' }, [
+      mkSpan('span-b1', 'step-b', { outcome: 'ok' }),
+      mkSpan('span-b2', 'step-b', { outcome: 'ok' }),
+    ]),
+  ]);
+
+  it('resolves the marker the tree prints on a step row', () => {
+    expect(resolveOrdinalTarget(trace, '#2')).toEqual({ stepId: 'step-b', spanId: null });
+  });
+
+  it('resolves a span marker to the span, carrying its step', () => {
+    expect(resolveOrdinalTarget(trace, '#2.2')).toEqual({
+      stepId: 'step-b',
+      spanId: 'span-b2',
+    });
+  });
+
+  it('tolerates surrounding whitespace from a paste', () => {
+    expect(resolveOrdinalTarget(trace, '  #1  ')).toEqual({ stepId: 'step-a', spanId: null });
+  });
+
+  it('leaves a bare number alone so searching for content still works', () => {
+    // Someone typing `2` is looking for text, not navigating. The `#` is what
+    // makes the intent explicit.
+    expect(resolveOrdinalTarget(trace, '2')).toBeNull();
+    expect(resolveOrdinalTarget(trace, '2.2')).toBeNull();
+  });
+
+  it('refuses #0 rather than silently selecting the last row', () => {
+    // `Number('0') - 1` is -1, and `Array.at(-1)` is the LAST element — a
+    // marker nothing prints, resolving to a row the reader did not ask for.
+    expect(resolveOrdinalTarget(trace, '#0')).toBeNull();
+    expect(resolveOrdinalTarget(trace, '#1.0')).toBeNull();
+  });
+
+  it('is null for a position the turn does not have', () => {
+    expect(resolveOrdinalTarget(trace, '#9')).toBeNull();
+    expect(resolveOrdinalTarget(trace, '#1.5')).toBeNull();
+  });
+
+  it('rejects malformed markers instead of guessing', () => {
+    for (const text of ['#', '#1.', '#1.2.3', '#a', '#1a', '']) {
+      expect(resolveOrdinalTarget(trace, text)).toBeNull();
+    }
+  });
+
+  it('is null without a loaded trace', () => {
+    expect(resolveOrdinalTarget(undefined, '#1')).toBeNull();
   });
 });
