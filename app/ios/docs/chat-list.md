@@ -75,13 +75,16 @@ removes the window: the bar is gone by the time the field appears. Scoped to the
 search edges only, so every other tab switch keeps the Liquid Glass selection
 morph. It also cut the focus delay noted below — the transition was most of it.
 
-In the SETTLED search state both halves of the bar are hidden, verified
-separately: the four-tab pill and the detached search circle each report
-`isHittable == false` (they linger in the accessibility tree, which is why
-`SearchUITests` asserts hittability rather than existence).
+**`.toolbar(.hidden, for: .tabBar)` goes on the tab's CONTENT, never on the
+`TabView`.** On the `TabView` it silently does nothing. That mistake shipped
+here once and hid behind a weak test: the bar was still laid out, the keyboard
+covered most of it, and ~37pt protruded BELOW the keyboard as a dark strip
+(measured — keyboard ends at y=816, the bar ran to y=853). `isHittable` could
+not see it, because a covered element is unhittable whether or not it is
+hidden, so `SearchUITests` asserts the bar does not EXIST while searching.
 
-**The field takes the tab bar's place.** Selecting search hides the native bar
-(`.toolbar(.hidden, for: .tabBar)`, driven by `homeTab == .search`) and
+**The field takes the tab bar's place.** The search tab's content carries
+`.toolbar(.hidden, for: .tabBar)` and
 `SearchScreen` docks its own field there via `.safeAreaInset(edge: .bottom)`,
 with a ✕ circle trailing it. The field animates from the search circle's own
 footprint out to full width, so the detached circle reads as stretching into a

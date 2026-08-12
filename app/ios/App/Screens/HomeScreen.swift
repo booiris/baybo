@@ -32,13 +32,6 @@ struct HomeTabView: View {
                 }
             }
         }
-        // Search takes the bottom over: the native bar hides and `SearchScreen`
-        // docks its own field where the bar was, so the trailing circle reads as
-        // stretching into a field. The documented "bar pops back in after the
-        // transition" glitch is NOT this: that one is a pushed screen on an inner
-        // stack hiding the bar and revealing it on the POP. Here nothing is
-        // pushed — the bar hides and returns on tab SELECTION, in place.
-        .toolbar(store.homeTab == .search ? .hidden : .visible, for: .tabBar)
         .tint(Theme.ink)
         // The shell must not ride the keyboard. Two things type into it and
         // NEITHER wants that: the rename editor floats at the app root and owns
@@ -117,7 +110,15 @@ struct HomeTabView: View {
             // refactor touching every pushed screen's chrome, not a modifier on
             // this tab. It has nothing to do with the deployment target:
             // `#available(iOS 26.0, *)` was TRUE in every one of those runs.
+            // `.toolbar(.hidden, for: .tabBar)` belongs on the tab's CONTENT,
+            // never on the TabView — on the TabView it silently does nothing,
+            // and the bar merely sat UNDER the keyboard with ~37pt of itself
+            // protruding below it (measured: keyboard ends at y=816, the bar runs
+            // to y=853). That protruding strip was the dark band under the
+            // keyboard. `isHittable` cannot catch this — the keyboard covering
+            // the bar makes it unhittable whether or not it is hidden.
             SearchScreen()
+                .toolbar(.hidden, for: .tabBar)
         }
     }
 

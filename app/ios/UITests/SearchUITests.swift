@@ -85,13 +85,17 @@ final class SearchUITests: BayboUITestCase {
         XCTAssertTrue(app.tabBars.buttons["Deck"].firstMatch.isSelected)
 
         _ = openSearch(app)
-        // The bar is gone while searching — the field stands in its place.
-        // `isHittable`, not `exists`: a hidden bar can linger in the
-        // accessibility tree, and what would actually be a bug is it still
-        // taking taps from under the field.
+        // `exists`, NOT `isHittable`. This assertion used to check hittability
+        // and passed against a bar that was never hidden at all: the keyboard
+        // covers it, and a covered element is unhittable whether or not it is
+        // hidden. `.toolbar(.hidden, for: .tabBar)` was on the TabView instead of
+        // the tab's CONTENT, where it does nothing — the bar sat under the
+        // keyboard with ~37pt protruding below it (keyboard ends at y=816, the
+        // bar ran to y=853) and that strip was visible as a dark band. Only
+        // absence from the tree distinguishes hidden from covered.
         XCTAssertFalse(
-            app.tabBars.buttons["Deck"].firstMatch.isHittable,
-            "the hidden tab bar must not still be tappable under the search field")
+            app.tabBars.buttons["Deck"].firstMatch.exists,
+            "the tab bar must be GONE while searching, not merely covered")
 
         let exit = app.buttons["search.exit"]
         XCTAssertTrue(exit.waitForExistence(timeout: 5))
