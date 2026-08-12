@@ -26,6 +26,7 @@ export const en = {
       videoPlay: "Play video",
       videoDownload: "Download video",
       recoverFailed: "Couldn't reload history: {{error}}",
+      jumpNotFound: "Couldn't reach that message — it's further back than this thread has loaded.",
       retrySend: "Send failed — tap to retry",
       copied: "Copied",
       stopped: "Stopped",

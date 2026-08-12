@@ -174,6 +174,18 @@ export function transcriptItemToRow(item: TranscriptRowItem): Row | null {
 /// page size (server-clamped to 1..200), so one fetch loads up to 50 rows.
 const HISTORY_PAGE_LIMIT = 50;
 
+/// How many pages a search-hit jump may spend reaching its ordinal — about 600
+/// DISPLAYED rows (an agentic turn persists hundreds of invisible tool rows per
+/// visible one, so this reaches far deeper into a transcript than the ordinal
+/// arithmetic suggests).
+///
+/// A cap and not a "load until found": each page is a serial round trip, on the
+/// relay leg a Noise tunnel exchange, and the reader is watching the thread grow
+/// under them the whole time. Past this the honest answer is to stop where we
+/// got to and say so — they are already further back than they started, which is
+/// worth something, whereas a minute of silent paging is not.
+const JUMP_PAGE_BUDGET = 12;
+
 /// Sync page size, elected per call site (docs/sync-protocol.md): one UI page
 /// for a baseline / cold open (`since` absent — a newest-page REPLACE by
 /// definition), the server hard cap when merging a difference into an
@@ -2608,6 +2620,12 @@ const MessageRow = memo(function MessageRow({
       </time>
     ) : null;
 
+  // The bloom is declared before BOTH branches: the message index only ever
+  // offers the user's own sends, but a search hit lands on agent prose just as
+  // often, and a jump that scrolls without marking its target reads as a jump
+  // that did nothing.
+  const ring = flash !== 0 ? <span key={flash} className="jump-ring" aria-hidden="true" /> : null;
+
   if (m.role === "assistant") {
     return (
       <div className="msg-group assistant" data-row-id={m.id}>
@@ -2616,9 +2634,13 @@ const MessageRow = memo(function MessageRow({
         ))}
         {m.content && (
           <div className="msg assistant">
+            {ring}
             <MarkdownBody text={m.content} />
           </div>
         )}
+        {/* An attachment-only reply has no prose div to host the ring, so the
+            group carries it — the one case where there is nothing narrower. */}
+        {!m.content && ring}
         {timeEl}
       </div>
     );
@@ -2637,11 +2659,6 @@ const MessageRow = memo(function MessageRow({
       </button>
     ) : null;
   const hasText = m.content.length > 0;
-  // The ring needs a POSITIONED host: `.msg-group` is unpositioned, so parented
-  // there it would escape to the initial containing block and paint a
-  // full-viewport rectangle. Rides the same last-bubble rule as the send chrome.
-  const ring = flash !== 0 ? <span key={flash} className="jump-ring" aria-hidden="true" /> : null;
-
   return (
     <div className="msg-group user" data-row-id={m.id}>
       {attachments.map((a, i) => {
@@ -2842,6 +2859,12 @@ export function Transcript({
   // (`before_ordinal`). `null` = unknown / nothing older to page to.
   const oldestOrdinal = useRef<number | null>(restoredSplit.oldestOrdinal);
   const [hasMoreOlder, setHasMoreOlder] = useState<boolean>(restoredSplit.hasMoreOlder);
+  // Mirror of `hasMoreOlder` for the jump loop, which re-evaluates INSIDE the
+  // frame handler that just called `setHasMoreOlder` — the state it would close
+  // over there is a render behind, and reading it stale is the difference
+  // between stopping at the top of the thread and paging past it forever.
+  const hasMoreOlderRef = useRef(restoredSplit.hasMoreOlder);
+  hasMoreOlderRef.current = hasMoreOlder;
   const [loadingOlder, setLoadingOlder] = useState(false);
   // Compaction boundaries (`{ ordinal, at }[]`), the authoritative set carried
   // on every `sync_page`. Seeds the pre-compaction divider; restored from the
@@ -2907,6 +2930,10 @@ export function Transcript({
   // Which row the jump ring is blooming around, and the replay nonce that lets
   // it bloom again on a repeat jump to the same row (see MessageRow's `flash`).
   const [flash, setFlash] = useState({ id: "", nonce: 0 });
+  // A search hit whose row is not loaded yet: the ordinal to reach and how many
+  // more pages may be spent reaching it. A ref, not state — the loop is driven
+  // by frames landing, and re-rendering on each step would buy nothing.
+  const pendingJump = useRef<{ ordinal: number; pagesLeft: number } | null>(null);
   const jumpSettleTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   useEffect(() => () => clearTimeout(jumpSettleTimer.current), []);
 
@@ -3435,6 +3462,7 @@ export function Transcript({
     // Only advance the cursor on a non-empty page; an empty page leaves it put.
     if (newOldest !== null) oldestOrdinal.current = newOldest;
     setHasMoreOlder(more);
+    hasMoreOlderRef.current = more;
   }, []);
 
   // Fold the mirror's withheld older rows into the thread (see
@@ -3710,6 +3738,7 @@ export function Transcript({
           deferredHead.current = [];
           oldestOrdinal.current = frame.oldest_ordinal;
           setHasMoreOlder(frame.has_more_older);
+          hasMoreOlderRef.current = frame.has_more_older;
         }
         if (!turnActiveRef.current) clearStreaming();
       } else {
@@ -4177,6 +4206,7 @@ export function Transcript({
     handleBottomInset,
     jumpToLatest,
     jumpToMessage,
+    jumpToOrdinal,
     handleOutlineLoadOlder,
     handleOutlineHereRequested,
     handleSyncRequested,
@@ -4189,6 +4219,7 @@ export function Transcript({
     handleBottomInset,
     jumpToLatest,
     jumpToMessage,
+    jumpToOrdinal,
     handleOutlineLoadOlder,
     handleOutlineHereRequested,
     handleSyncRequested,
@@ -4209,6 +4240,7 @@ export function Transcript({
         bottomInset: (px) => handlersRef.current.handleBottomInset(px),
         jumpToLatest: () => handlersRef.current.jumpToLatest(),
         jumpToMessage: (rowId) => handlersRef.current.jumpToMessage(rowId),
+        jumpToOrdinal: (ordinal) => handlersRef.current.jumpToOrdinal(ordinal),
         outlineLoadOlder: () => handlersRef.current.handleOutlineLoadOlder(),
         outlineHereRequested: () => handlersRef.current.handleOutlineHereRequested(),
         syncRequested: () => handlersRef.current.handleSyncRequested(),
@@ -4246,6 +4278,68 @@ export function Transcript({
   // Imperative rather than an effect keyed on the target — the same row can be
   // asked for twice, and the second ask must scroll on the tap, not on a render
   // that identical state never triggers.
+  /// A search hit the thread has not paged in yet: keep paging backward until
+  /// the ordinal is covered, then jump. `pagesLeft` is the hard cap.
+  ///
+  /// The window MUST stay contiguous and tail-anchored — there is no
+  /// `hasMoreNewer` and every live frame appends to the end, so a window that
+  /// stopped short of the newest edge would weld the next reply onto an ancient
+  /// row. Paging backward is the only way to reach an old row that keeps that
+  /// invariant: it is exactly what the reader's own scroll-up does, just driven.
+  function jumpToOrdinal(ordinal: number) {
+    pendingJump.current = { ordinal, pagesLeft: JUMP_PAGE_BUDGET };
+    advancePendingJump();
+  }
+
+  /// One step of the paging loop, re-entered from the `messages` effect below —
+  /// NOT a `for` loop: `requestHistory` allows one request at a time and its
+  /// reply lands asynchronously in the frame switch, so the only correct shape
+  /// is "try, fire one page, be called again when it lands".
+  function advancePendingJump() {
+    const pending = pendingJump.current;
+    if (pending === null) return;
+
+    const target = messagesRef.current.find((r) => rowCoverageOrdinal(r) === pending.ordinal);
+    if (target !== undefined) {
+      pendingJump.current = null;
+      jumpToMessage(target.id);
+      return;
+    }
+
+    const floor = oldestOrdinal.current;
+    // Below the floor: the rows are simply not loaded yet, so page for them.
+    // `floor === null` means nothing durable is rendered at all (a cold open
+    // whose first page has not landed) — hold, and the effect will re-enter.
+    if (floor !== null && pending.ordinal >= floor) {
+      // Inside the loaded window and still not found: the ordinal names a row
+      // this view does not render at all. Paging can only ever load rows
+      // FURTHER BACK, so no number of pages will produce it — stop now rather
+      // than dragging the reader through the whole history to fail anyway.
+      giveUpPendingJump();
+      return;
+    }
+    if (!hasMoreOlderRef.current) {
+      // The top of the thread, with the ordinal never covered.
+      if (floor !== null) giveUpPendingJump();
+      return;
+    }
+    if (pending.pagesLeft <= 0) {
+      giveUpPendingJump();
+      return;
+    }
+    // Decrement per REQUEST, not per re-entry: this is what bounds the loop
+    // when a page comes back empty. `prependOlder` advances the floor only on a
+    // non-empty page while `hasMoreOlder` can stay true, so "floor moved" is not
+    // a termination condition anyone can rely on — the budget is.
+    pending.pagesLeft -= 1;
+    loadOlder();
+  }
+
+  function giveUpPendingJump() {
+    pendingJump.current = null;
+    appendNotice(t("chat.jumpNotFound"));
+  }
+
   function jumpToMessage(rowId: string) {
     const node = document.querySelector(`[data-row-id="${CSS.escape(rowId)}"]`);
     if (node === null) {
@@ -4283,6 +4377,20 @@ export function Transcript({
       settled?.scrollIntoView({ block: "start", behavior: "instant" });
     }, JUMP_SETTLE_MS);
   }
+
+  // The pending-jump loop's re-entry point. Every way a row can arrive — the
+  // first paint, a `history_page` prepend, a `sync_page` REPLACE — ends in a
+  // `messages` change, so watching that covers them all without the frame
+  // switch having to know the loop exists. A no-op whenever nothing is pending,
+  // which is almost always.
+  //
+  // Deliberately NOT keyed on the request landing: a REPLACE can rebuild the
+  // thread under the loop, and re-deriving from whatever is now rendered is the
+  // only reading that survives that.
+  useEffect(() => {
+    if (pendingJump.current !== null) advancePendingJump();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [messages]);
 
   // The sheet is native, but only this tree knows which sends are in it (the
   // optimistic bubble exists here before any echo, `/stop` echoes are filtered

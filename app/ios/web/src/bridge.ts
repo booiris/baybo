@@ -92,6 +92,12 @@ type BayboGlobal = {
   /// A row of the native message-index sheet was tapped — park that user
   /// message under the header veil. `rowId` is an `OutlineEntry.id`.
   jumpToMessage(rowId: string): void;
+  /// A native search result was tapped. Addressed BY ORDINAL, never by row id:
+  /// a user row is keyed by its `platform_msg_id` with the ordinal carried
+  /// beside it, so building `m<ordinal>` would resolve only agent rows and
+  /// silently miss every user-authored hit. The thread pages backward on its own
+  /// if the row is not loaded yet (see `JUMP_PAGE_BUDGET`).
+  jumpToOrdinal(ordinal: number): void;
   /// The sheet's "load earlier" row — runs the transcript's own backward
   /// paging, which grows the outline when the prepend lands.
   outlineLoadOlder(): void;
@@ -562,6 +568,9 @@ export type TranscriptEvents = {
   syncRequested(): void;
   /// A message-index row was tapped — park that user message under the veil.
   jumpToMessage(rowId: string): void;
+  /// A search hit was tapped — park the row at `ordinal`, paging backward for
+  /// it first if the thread has not loaded that far yet.
+  jumpToOrdinal(ordinal: number): void;
   /// The index sheet's "load earlier" row — page the thread backwards.
   outlineLoadOlder(): void;
   /// The index sheet is opening — answer with the reader's current position.
@@ -578,6 +587,7 @@ type Buffered =
   | { kind: "jumpToLatest" }
   | { kind: "syncRequested" }
   | { kind: "jumpToMessage"; rowId: string }
+  | { kind: "jumpToOrdinal"; ordinal: number }
   | { kind: "outlineLoadOlder" }
   | { kind: "outlineHereRequested" };
 
@@ -627,6 +637,7 @@ function deliver(e: TranscriptEvents, item: Buffered): void {
   // new command into "scroll to the bottom" — and the type checker cannot see
   // it. `bridge.test.ts` pins this.
   else if (item.kind === "jumpToMessage") e.jumpToMessage(item.rowId);
+  else if (item.kind === "jumpToOrdinal") e.jumpToOrdinal(item.ordinal);
   else if (item.kind === "outlineLoadOlder") e.outlineLoadOlder();
   else if (item.kind === "outlineHereRequested") e.outlineHereRequested();
   else e.jumpToLatest();
@@ -706,6 +717,9 @@ window.baybo = {
   },
   jumpToMessage(rowId) {
     dispatch({ kind: "jumpToMessage", rowId });
+  },
+  jumpToOrdinal(ordinal) {
+    dispatch({ kind: "jumpToOrdinal", ordinal });
   },
   outlineLoadOlder() {
     dispatch({ kind: "outlineLoadOlder" });

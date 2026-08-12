@@ -6,11 +6,13 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::api::{
-    ChatSessionSummary, CronJobStatus, CronJobSummary, DeckCardInfo, DeckLayoutEntryInput,
-    DeckSnapshotInfo, DeckView, LlmModelCatalog, LlmModelInfo, SessionModelPin,
+    ChatSearchGroup, ChatSearchHit, ChatSearchResults, ChatSessionSummary, CronJobStatus,
+    CronJobSummary, DeckCardInfo, DeckLayoutEntryInput, DeckSnapshotInfo, DeckView,
+    LlmModelCatalog, LlmModelInfo, SessionModelPin,
 };
 
 const PATH_CHAT_SESSIONS: &str = "/v1/chat/sessions";
+const PATH_CHAT_SEARCH: &str = "/v1/chat/search";
 const PATH_CRON: &str = "/v1/cron";
 const PATH_LLM_MODELS: &str = "/v1/llm/models";
 const PATH_DECK: &str = "/v1/deck";
@@ -403,6 +405,40 @@ struct SyncPageFrame {
     /// shape is unchanged; the webview reads it as an optional field.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     compaction_points: Vec<CompactionPoint>,
+}
+
+/// `GET /v1/chat/search` — the gateway's grouped result set.
+///
+/// Every field past `groups` decodes tolerantly: an older gateway that predates
+/// a key must degrade to a usable result rather than blanking the whole search.
+#[derive(Deserialize)]
+struct WireSearchResults {
+    #[serde(default)]
+    groups: Vec<WireSearchGroup>,
+    #[serde(default)]
+    truncated: bool,
+}
+
+#[derive(Deserialize)]
+struct WireSearchGroup {
+    session_id: String,
+    #[serde(default)]
+    session_title: Option<String>,
+    #[serde(default)]
+    hits: Vec<WireSearchHit>,
+    #[serde(default)]
+    total_hits: i64,
+}
+
+#[derive(Deserialize)]
+struct WireSearchHit {
+    ordinal: i64,
+    role: String,
+    #[serde(default)]
+    text: String,
+    created_at: String,
+    #[serde(default)]
+    superseded_by: Option<i64>,
 }
 
 /// `GET /v1/chat/sessions/{id}/messages?platform_msg_id=…` — the per-send
@@ -918,6 +954,47 @@ pub(crate) async fn lookup_message<C: GatewayJsonClient + Sync>(
     client.get_json(&path).await
 }
 
+/// Full-text search over the owner's transcripts (`GET /v1/chat/search`).
+///
+/// Only `q` is sent, so the gateway's defaults stand: no hidden sessions (the
+/// user asked to lose those), no archived ones, and no cron workspaces. That is
+/// byte-for-byte the scope app/web's search panel asks for — search is one
+/// protocol implemented twice, and the two must not drift.
+///
+/// `limit` is deliberately not sent either: the server default (20
+/// conversations) is what fills a result list, and the scan window that decides
+/// `truncated` is the server's regardless.
+pub(crate) async fn search_messages<C: GatewayJsonClient + Sync>(
+    client: &C,
+    query: &str,
+) -> Result<ChatSearchResults, String> {
+    let path = format!("{PATH_CHAT_SEARCH}?q={}", percent_encode_query(query));
+    let wire: WireSearchResults = client.get_json(&path).await?;
+    Ok(ChatSearchResults {
+        truncated: wire.truncated,
+        groups: wire
+            .groups
+            .into_iter()
+            .map(|group| ChatSearchGroup {
+                session_id: group.session_id,
+                session_title: group.session_title,
+                total_hits: group.total_hits,
+                hits: group
+                    .hits
+                    .into_iter()
+                    .map(|hit| ChatSearchHit {
+                        ordinal: hit.ordinal,
+                        role: hit.role,
+                        text: hit.text,
+                        created_at: hit.created_at,
+                        superseded_by: hit.superseded_by,
+                    })
+                    .collect(),
+            })
+            .collect(),
+    })
+}
+
 /// Percent-encode a query value (everything outside RFC 3986 unreserved).
 /// `platform_msg_id`s are native-minted UUIDs today, but a retry payload
 /// round-trips through the webview — encode defensively.
@@ -1352,6 +1429,96 @@ mod tests {
             assert_eq!(err, "invalid session_id");
             assert!(client.calls.lock().is_empty(), "{bad} must not be sent");
         }
+    }
+
+    /// A CJK query is the normal case here, and it must survive the query
+    /// string intact — the index makes every Han codepoint its own token, so a
+    /// mangled byte is not a degraded search, it is a different one.
+    #[tokio::test]
+    async fn a_search_percent_encodes_a_cjk_query() {
+        let client = RecordingClient::new(r#"{"groups":[],"truncated":false}"#);
+        search_messages(&client, "数据库 迁移")
+            .await
+            .expect("search");
+
+        assert_eq!(
+            client.only_call().path,
+            "/v1/chat/search?q=%E6%95%B0%E6%8D%AE%E5%BA%93%20%E8%BF%81%E7%A7%BB"
+        );
+    }
+
+    /// Only `q` goes on the wire. Every scope flag is the gateway's default, and
+    /// sending one from here would silently diverge from app/web's panel, which
+    /// sends `q` alone.
+    #[tokio::test]
+    async fn a_search_sends_only_the_query() {
+        let client = RecordingClient::new(r#"{"groups":[],"truncated":false}"#);
+        search_messages(&client, "hello").await.expect("search");
+
+        let call = client.only_call();
+        assert_eq!(call.path, "/v1/chat/search?q=hello");
+        assert_eq!(call.method, "GET");
+    }
+
+    /// A hostile query is quoted into a literal phrase server-side, so nothing
+    /// here needs to sanitize it — but it must still reach the gateway byte-for
+    /// -byte rather than being cut short by an unescaped `&` or `#`.
+    #[tokio::test]
+    async fn a_search_query_cannot_smuggle_extra_parameters() {
+        let client = RecordingClient::new(r#"{"groups":[],"truncated":false}"#);
+        search_messages(&client, "a&include_hidden=true#x")
+            .await
+            .expect("search");
+
+        assert_eq!(
+            client.only_call().path,
+            "/v1/chat/search?q=a%26include_hidden%3Dtrue%23x"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_search_carries_every_group_field_through() {
+        let client = RecordingClient::new(
+            r#"{"groups":[{"session_id":"s1","session_title":"迁移计划",
+                 "total_hits":7,
+                 "hits":[{"ordinal":12,"role":"user","text":"数据库迁移怎么做",
+                          "created_at":"2026-08-12T03:04:05Z","superseded_by":40},
+                         {"ordinal":13,"role":"assistant","text":"先备份",
+                          "created_at":"2026-08-12T03:04:09Z"}]}],
+               "truncated":true}"#,
+        );
+        let results = search_messages(&client, "迁移").await.expect("search");
+
+        assert!(results.truncated);
+        let group = &results.groups[0];
+        assert_eq!(group.session_id, "s1");
+        assert_eq!(group.session_title.as_deref(), Some("迁移计划"));
+        assert_eq!(group.total_hits, 7);
+        assert_eq!(group.hits.len(), 2);
+        assert_eq!(group.hits[0].ordinal, 12);
+        assert_eq!(group.hits[0].role, "user");
+        assert_eq!(group.hits[0].text, "数据库迁移怎么做");
+        assert_eq!(group.hits[0].created_at, "2026-08-12T03:04:05Z");
+        assert_eq!(group.hits[0].superseded_by, Some(40));
+        assert_eq!(group.hits[1].superseded_by, None);
+    }
+
+    /// An older gateway that omits the optional keys must degrade to a usable
+    /// result, never to a decode error that blanks the whole search.
+    #[tokio::test]
+    async fn a_search_tolerates_a_gateway_without_the_optional_fields() {
+        let client = RecordingClient::new(
+            r#"{"groups":[{"session_id":"s1",
+                 "hits":[{"ordinal":1,"role":"user","created_at":"2026-08-12T03:04:05Z"}]}]}"#,
+        );
+        let results = search_messages(&client, "x").await.expect("search");
+
+        assert!(!results.truncated);
+        let group = &results.groups[0];
+        assert_eq!(group.session_title, None);
+        assert_eq!(group.total_hits, 0);
+        assert_eq!(group.hits[0].text, "");
+        assert_eq!(group.hits[0].superseded_by, None);
     }
 
     #[tokio::test]

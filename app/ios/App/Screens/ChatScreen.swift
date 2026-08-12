@@ -11,6 +11,9 @@ struct ChatScreen: View {
     @ObservedObject private var bridge: TranscriptBridge
     private let host: TranscriptHost
     private let webView: WKWebView
+    /// Only for the one-shot search jump (`takePendingJump`) — the conversation
+    /// itself is driven by `store`.
+    @EnvironmentObject private var appStore: AppStore
     @Environment(\.dismiss) private var dismiss
     /// The hand-rolled model menu (`ModelMenuPanel`) — state lives here
     /// because the panel overlays the TRANSCRIPT, not just the header bar.
@@ -203,6 +206,15 @@ struct ChatScreen: View {
             ModelCatalog.shared.refreshIfNeeded()
             store.refreshModelPin()
             SessionIndex.shared.enterSession(store.sessionId)
+            // A search result routed here: park the transcript on the matched
+            // message. Consumed on APPEAR rather than issued at the call site, so
+            // it survives a `TranscriptHost` rebuilt between the tap and this
+            // screen mounting — the queued JS would have gone with the old host.
+            // `takePendingJump` removes on read, so a later re-appear (a cover
+            // dismissing) can't re-park a reader who has moved on.
+            if let ordinal = appStore.takePendingJump(store.sessionId) {
+                bridge.jumpToOrdinal(ordinal)
+            }
             // Where the responder chain's paste hook (`AppDelegate`) sends an
             // image. Registered on the SCREEN, not on the composer: every
             // `fullScreenCover` over the chat tears the dock's `.safeAreaInset`

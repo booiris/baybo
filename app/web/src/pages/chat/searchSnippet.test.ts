@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { queryChunks, snippet, type Segment } from './searchSnippet';
+import vectors from './searchSnippetVectors.json';
 
 const plain = (segs: Segment[]) => segs.map((s) => s.text).join('');
 const matched = (segs: Segment[]) => segs.filter((s) => s.match).map((s) => s.text);
@@ -90,5 +91,43 @@ describe('snippet', () => {
       expect(snippet(text, query)).toBeInstanceOf(Array);
     }
     expect(plain(snippet('some text', '---'))).toBe('some text');
+  });
+});
+
+// The cross-end gate. `searchSnippetVectors.json` is the ONE contract the Swift
+// port (`app/ios/App/Core/SearchSnippet.swift`, checked by
+// `SearchSnippetVectorTests`) is held to, and this suite is what keeps the file
+// honest about the implementation above it. Two layers, deliberately: the
+// hand-written cases above pin the RULES, and the vectors pin the exact bytes
+// both ports must produce for them.
+//
+// Regenerate with `pnpm --filter baybo-web gen:snippet-vectors` when the rules
+// change — and expect the Swift suite to go red until it is ported too. That
+// red is the gate working.
+describe('shared vectors (see app/ios SearchSnippetVectorTests)', () => {
+  it('covers the grapheme cases a UTF-16 slice would get wrong', () => {
+    const names = vectors.map((v) => v.name).join('\n');
+    expect(names).toMatch(/ZWJ emoji/);
+    expect(names).toMatch(/surrogate-pair/);
+    expect(names).toMatch(/decomposed combining mark/);
+  });
+
+  for (const vector of vectors) {
+    it(`matches the vector: ${vector.name}`, () => {
+      expect(snippet(vector.text, vector.query)).toEqual(vector.segments);
+    });
+  }
+
+  // A window edge that split a surrogate pair would emit a lone surrogate:
+  // `JSON.stringify` produces it happily and a strict decoder rejects it, which
+  // is exactly the shape of the bug that bit the message index.
+  it('never emits a lone surrogate', () => {
+    for (const vector of vectors) {
+      const joined = plain(snippet(vector.text, vector.query));
+      for (const ch of joined) {
+        const cp = ch.codePointAt(0) ?? 0;
+        expect(cp >= 0xd800 && cp <= 0xdfff).toBe(false);
+      }
+    }
   });
 });

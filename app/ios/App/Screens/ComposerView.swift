@@ -512,16 +512,11 @@ struct ComposerView: View {
         staging.text = ""
     }
 
-    /// The current first responder if it is a text input, found via the
-    /// responder chain (`sendAction(to: nil)` targets the first responder).
-    /// Keyed on the `UITextInput` PROTOCOL, never a concrete UITextView class,
-    /// so it survives SwiftUI's private multiline-field backing across iOS
-    /// versions.
+    /// The current first responder if it is a text input. Lives in
+    /// `FocusedTextInput` because `SearchScreen` needs the same probe (to skip a
+    /// request while a composition is open).
     private static func focusedTextInput() -> UITextInput? {
-        FirstResponderCapture.found = nil
-        UIApplication.shared.sendAction(
-            #selector(UIResponder.baybo_captureFirstResponder), to: nil, from: nil, for: nil)
-        return FirstResponderCapture.found as? UITextInput
+        FocusedTextInput.current
     }
 }
 
@@ -1693,15 +1688,3 @@ struct StagedAttachment: Identifiable {
     }()
 }
 
-/// One-shot sink for the responder-chain first-responder probe below.
-private enum FirstResponderCapture {
-    static weak var found: UIResponder?
-}
-
-extension UIResponder {
-    /// Action target for `sendAction(to: nil)`: only the current first
-    /// responder receives it, so it records itself for `focusedTextInput()`.
-    @objc fileprivate func baybo_captureFirstResponder() {
-        FirstResponderCapture.found = self
-    }
-}

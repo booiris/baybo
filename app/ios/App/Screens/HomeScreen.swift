@@ -22,18 +22,32 @@ struct HomeTabView: View {
     var body: some View {
         TabView(selection: $store.homeTab) {
             ForEach(AppStore.HomeTab.allCases, id: \.self) { tab in
-                Tab(lang.t(tab.labelKey), systemImage: tab.icon, value: tab) {
+                // `role` is what separates search from the rest: on iOS 26 the
+                // system lifts a `.search` tab OUT of the glass pill and floats
+                // it as its own trailing circle, which is the shape this bar is
+                // meant to have. On 18–25 the role is honoured as an ordinary
+                // tab item, so nothing needs a version branch here.
+                Tab(lang.t(tab.labelKey), systemImage: tab.icon, value: tab, role: tab.role) {
                     content(for: tab)
                 }
             }
         }
+        // Search takes the bottom over: the native bar hides and `SearchScreen`
+        // docks its own field where the bar was, so the trailing circle reads as
+        // stretching into a field. The documented "bar pops back in after the
+        // transition" glitch is NOT this: that one is a pushed screen on an inner
+        // stack hiding the bar and revealing it on the POP. Here nothing is
+        // pushed — the bar hides and returns on tab SELECTION, in place.
+        .toolbar(store.homeTab == .search ? .hidden : .visible, for: .tabBar)
         .tint(Theme.ink)
-        // Nothing in this shell takes typed input — the composer lives inside a
-        // pushed `ChatScreen`, and the deck's webview already ignores every
-        // region. The one keyboard that can rise over it belongs to the rename
-        // editor floating at the app root, and that dialog owns its own
-        // avoidance; without this opt-out the whole shell (the glass tab bar
-        // first) would slide up behind the scrim while the user types.
+        // The shell must not ride the keyboard. Two things type into it and
+        // NEITHER wants that: the rename editor floats at the app root and owns
+        // its own avoidance (without this opt-out the whole shell — the glass tab
+        // bar first — slides up behind its scrim), and the search tab pins its
+        // field to the top, where the keyboard cannot reach it. Search's RESULTS
+        // do run under the keyboard, which is what a scroll view is for, and it
+        // dismisses interactively. The chat composer is out of scope entirely: it
+        // lives inside a pushed `ChatScreen` that covers this whole view.
         .ignoresSafeArea(.keyboard)
         #if DEBUG
             .task { await demoTabCycleIfRequested() }
@@ -56,8 +70,32 @@ struct HomeTabView: View {
             section { DeckScreen() }
         case .projects:
             section { PlaceholderScreen(icon: tab.icon, titleKey: tab.labelKey) }
+        case .search:
+            // No `section` wrapper: this screen's field IS its header, and the
+            // shared wordmark stacked above a search field is one header too many.
+            //
+            // NOT `.searchable`, and NOT the iOS 26 "tab bar morphs into a
+            // search field" treatment — that needs a navigation bar to host the
+            // field, and THIS SHELL HAS NONE ANYWHERE.
+            //
+            // `RootView` applies `.toolbar(.hidden, for: .navigationBar)` to
+            // `HomeTabView`, and that propagates into nested stacks. Measured on
+            // 26.5: `.searchable` on the tab content, on an inner NavigationStack
+            // with the bar hidden, with the bar forced `.visible`, and on the
+            // TabView itself — the field appeared in the accessibility tree in
+            // none of them. The decisive probe was `.navigationTitle` on that
+            // inner stack: it did not render either, so the bar itself never
+            // exists to be relocated from.
+            //
+            // Reaching the native morph therefore means dropping the shell-wide
+            // hide and hiding per destination instead. That is a `RootView`
+            // refactor touching every pushed screen's chrome, not a modifier on
+            // this tab. It has nothing to do with the deployment target:
+            // `#available(iOS 26.0, *)` was TRUE in every one of those runs.
+            SearchScreen()
         }
     }
+
 
     /// Non-chat sections: content under the shared wordmark header.
     private func section<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
@@ -94,7 +132,16 @@ extension AppStore.HomeTab {
         case .projects: return "square.stack.3d.up"
         case .chats: return "message"
         case .settings: return "gearshape"
+        // The system supplies the glyph for a `.search` role tab; naming it
+        // here keeps the `Tab` initializer uniform and matches what it draws.
+        case .search: return "magnifyingglass"
         }
+    }
+
+    /// `.search` for the search tab, `nil` for the rest. The role is the whole
+    /// reason that one renders detached from the pill.
+    var role: TabRole? {
+        self == .search ? .search : nil
     }
 
     var labelKey: String {
@@ -103,6 +150,7 @@ extension AppStore.HomeTab {
         case .projects: return "home.tab.projects"
         case .chats: return "home.tab.chats"
         case .settings: return "home.tab.settings"
+        case .search: return "search.title"
         }
     }
 }

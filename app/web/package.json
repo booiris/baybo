@@ -11,7 +11,8 @@
     "test:watch": "vitest",
     "type-check": "tsc -b --noEmit",
     "lint": "eslint src",
-    "gen:api": "openapi-typescript ../../docs/openapi.json -o src/api/schema.d.ts"
+    "gen:api": "openapi-typescript ../../docs/openapi.json -o src/api/schema.d.ts",
+    "gen:snippet-vectors": "tsx scripts/gen-search-snippet-vectors.mjs"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",

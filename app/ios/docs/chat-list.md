@@ -54,6 +54,110 @@ that lists a conversation applies it** — this list, `CronGroupScreen`'s fires 
 can be named or its transcript can drift. A new session-listing screen wires it
 in too.
 
+## Searching conversations
+
+Full-text search over every conversation's prose, served by the gateway's
+`GET /v1/chat/search` — the same endpoint app/web's `SearchPanel` calls, so this
+is **one protocol implemented twice** and anything that differs between the two
+clients is a bug on one of them. The index itself is documented in
+[`docs/search.md`](../../../docs/search.md); nothing about it is iOS-specific.
+
+**Entry point: the tab bar's trailing circle.** `HomeTab.search` carries
+`TabRole.search`, and on iOS 26 the system lifts a search-role tab OUT of the
+glass pill and floats it as its own detached circle at the trailing edge. On
+18–25 the role degrades to an ordinary tab item, so no version branch is needed.
+**The field takes the tab bar's place.** Selecting search hides the native bar
+(`.toolbar(.hidden, for: .tabBar)`, driven by `homeTab == .search`) and
+`SearchScreen` docks its own field there via `.safeAreaInset(edge: .bottom)`,
+with a ✕ circle trailing it. The field animates from the search circle's own
+footprint (`circleDiameter`, 62pt) out to full width, so the detached circle
+reads as stretching into a field — the Telegram shape. A `safeAreaInset` rather
+than an overlay so the results list insets itself and its last card never parks
+under the field.
+
+✕ calls `exitSearch()`, which returns to `tabBeforeSearch` — the tab search was
+opened FROM, recorded in `homeTab`'s `willSet`. Returning to a hardcoded `.chats`
+would be a different bug wearing the same clothes, and `SearchUITests` enters
+from Deck specifically to catch it.
+
+The tab's content is `SearchScreen`, mounted WITHOUT the shared `section`
+wordmark header — the docked field is the only chrome it needs.
+
+**Opening a hit keeps the tab.** `openSearchResult` passes `keepTab: true`, the
+one exception to `activateSession`'s `homeTab = .chats` rule. It works because
+the push lands on the OUTER `NavigationStack` — the one that WRAPS the whole
+`TabView` — so the conversation covers the shell and the tab selection is simply
+preserved underneath it. Popping returns to the Search tab with its query and
+results intact. Without `keepTab` the back gesture would land on the chat list
+with the results gone, which is the whole reason the flag exists.
+
+`SearchScreen` focuses its field on ENTERING the tab, not on every `onAppear`: a
+`TabView` keeps its pages alive, so `onAppear` also fires when the reader comes
+back from a conversation, and raising the keyboard over results they just
+navigated back to is not what they asked for.
+
+**Scope is the gateway's default and is not configurable from the client:**
+hidden sessions stay lost, archived ones stay archived, and cron *workspaces* —
+fire sessions that are not conversations of their own — are excluded
+server-side. That last one is not cosmetic. Such a session is dropped by
+`/v1/chat/sessions` and 404s on the REST attach path, but the read path and the
+device channel's `Subscribe` both scope by CHANNEL only, so before
+`SearchScope::include_cron_workspaces` existed a hit there let the phone open,
+read and even post into a conversation no client can list.
+
+**`SearchModel` owns the querying**, apart from the view, so the three rules
+that are easy to get wrong are testable without a UI host:
+
+- a **300ms debounce** (longer than app/web's 200ms — that panel talks to
+  localhost, this one may cross a relay tunnel budgeted at 15s to first byte);
+- a **monotonic sequence** guard, because cancelling the task cannot un-send a
+  request already awaiting its answer and the relay leg can reorder two of them;
+- **no request while an input method has an open composition**
+  (`FocusedTextInput.isComposing`) — a Chinese keyboard puts the uncommitted
+  pinyin in the binding, so a naive debounce spends a tunnel round trip on
+  `shuju` and flashes "no matches" against a query nobody typed.
+
+Results stay on screen while the next query is in flight; only the first query
+blanks the view.
+
+**Excerpts are highlighted by `SearchSnippet`**, a port of app/web's
+`searchSnippet.ts` held to it byte-for-byte by shared vectors
+(`app/web/src/pages/chat/searchSnippetVectors.json`, checked here by
+`SearchSnippetVectorTests` and there by its own vitest suite; regenerate with
+`pnpm --filter baybo-web gen:snippet-vectors`). Both ports work in **grapheme
+cluster** space, which is what keeps a window edge from splitting an emoji ZWJ
+sequence or stranding a combining mark. A card's title prefers THIS device's row
+(`SessionHeadline`, the same rule the list's bold line uses) so one conversation
+is not called two different things two screens apart.
+
+### Jumping to a hit
+
+Each excerpt is its own button: with anchored jumping every hit is a distinct
+destination, so a card-wide tap target would show the reader the line they
+wanted and land them on a different one.
+
+The ordinal travels in `AppStore.pendingJump[sessionId]`, consumed once by
+`ChatScreen.onAppear` — **not** on the route (`ChatRoute` is `Hashable` and
+compared for equality in several places, so a payload would make one
+conversation two routes) and **not** by calling the bridge at the tap site (the
+queued JS would be lost if the `TranscriptHost` were rebuilt in between).
+
+`TranscriptBridge.jumpToOrdinal` addresses the row **by ordinal, never by row
+id**. A user row is keyed by its `platform_msg_id` with the ordinal carried
+beside it, so building `m<ordinal>` resolves agent rows and silently misses
+every user-authored hit — most of what a search finds. The web side resolves
+through `rowCoverageOrdinal`, which knows both shapes.
+
+The rest of the mechanism lives in
+[`transcript.md`](transcript.md#jumping-to-a-search-hit): the row usually is not
+loaded, and the window has no forward frontier, so reaching it means paging
+backward under a budget.
+
+**`superseded_by` is not a jump target.** It names the ordinal where a
+compaction's re-inserted rows begin — rows the display read excludes — while the
+superseded ORIGINAL still renders, so `ordinal` is always the address. See
+`docs/search.md`; the gateway's own doc comment used to say the opposite.
+
 ## Renaming a conversation
 
 `PUT /v1/chat/sessions/{id}/title` (`chat_set_title` over the active leg). Titles

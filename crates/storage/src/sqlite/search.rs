@@ -326,6 +326,7 @@ impl baybo_store::MessageSearchStore for SqliteMessageSearchStore {
         let session = scope.session.as_ref().map(|s| s.as_str().to_owned());
         let include_hidden = scope.include_hidden;
         let include_archived = scope.include_archived;
+        let include_cron_workspaces = scope.include_cron_workspaces;
         self.pool
             .interact("search.search_messages", move |conn| {
                 // `bm25` is ascending-better, so plain ORDER BY is best-first.
@@ -353,6 +354,21 @@ impl baybo_store::MessageSearchStore for SqliteMessageSearchStore {
                 // filters must stay INSIDE, or the limit would be applied before
                 // them and return short.
                 //
+                // The cron predicate mirrors the gateway's
+                // `is_hidden_cron_session`: a fire that is not a conversation of
+                // its own is unlistable and unattachable, so a hit there names
+                // something no client can open. `trigger_kind` is flat and is
+                // tested FIRST so the `json_extract` is reached only by the cron
+                // rows — `conversation` lives inside the `data` blob's trigger
+                // and is absent on every historical fire (serde default), which
+                // is what `COALESCE(..., 0)` reads as "not a conversation".
+                //
+                // `COALESCE(s.trigger_kind, '')` is load-bearing, not defensive:
+                // the join is LEFT, so a row whose session is missing yields NULL
+                // here, and a bare `s.trigger_kind = 'cron'` would make the whole
+                // predicate NULL — dropping exactly the rows the LEFT JOIN exists
+                // to keep findable.
+                //
                 // `compaction_inserted = 0` on the join: a compaction re-inserts
                 // the recent slice it keeps as fresh rows and indexes those too,
                 // so without it every kept message answers a search twice — once
@@ -371,8 +387,10 @@ impl baybo_store::MessageSearchStore for SqliteMessageSearchStore {
                            AND (?3 IS NULL OR x.session_id = ?3) \
                            AND (?4 OR COALESCE(s.hidden, 0) = 0) \
                            AND (?5 OR COALESCE(s.archived, 0) = 0) \
+                           AND (?6 OR NOT (COALESCE(s.trigger_kind, '') = 'cron' \
+                                AND COALESCE(json_extract(s.data, '$.trigger.conversation'), 0) = 0)) \
                          ORDER BY score \
-                         LIMIT ?6 \
+                         LIMIT ?7 \
                      ) f \
                      JOIN session_messages m \
                        ON m.session_id = f.session_id AND m.ordinal = f.ordinal \
@@ -385,6 +403,7 @@ impl baybo_store::MessageSearchStore for SqliteMessageSearchStore {
                     session,
                     include_hidden,
                     include_archived,
+                    include_cron_workspaces,
                     limit
                 ];
                 let rows = stmt.query_map(params, |row| {
@@ -872,6 +891,122 @@ mod tests {
             find(&SearchScope::default()).await,
             1,
             "unhiding restores it"
+        );
+    }
+
+    /// A cron fire that is not a conversation of its own — a one-shot's private
+    /// workspace, or any fire from before recurring fires became conversations
+    /// (no `conversation` key at all, serde default) — is unlistable and
+    /// unattachable, so a hit there names something no client can open. A
+    /// RECURRING fire is a real conversation and must stay findable.
+    #[tokio::test]
+    async fn cron_workspaces_drop_out_but_recurring_fires_stay() {
+        use baybo_model::{ChannelType, Session, SessionState, TriggerSource, User};
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = super::super::SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
+        let sessions = super::super::SqliteSessionStore::new(pool.clone());
+        let ch = ChannelType::from("owner");
+
+        let mk = async |id: &str, trigger: TriggerSource, text: &str| {
+            let sid = SessionId::from(id.to_string());
+            sessions
+                .save(&Session {
+                    id: sid.clone(),
+                    user: User {
+                        id: "u1".into(),
+                        name: None,
+                        channel: ch.clone(),
+                    },
+                    channel: ch.clone(),
+                    created_at: chrono::Utc::now(),
+                    last_active: chrono::Utc::now(),
+                    state: SessionState::default(),
+                    root_session_id: sid.clone(),
+                    trigger,
+                    lineage: None,
+                    hidden: false,
+                    pinned: false,
+                    archived: false,
+                    folder_id: None,
+                    title: None,
+                })
+                .await
+                .unwrap();
+            sessions
+                .append_session_message(
+                    &sid,
+                    &ChatMessage::cron_fire(vec![ContentBlock::Text(text.into())]),
+                )
+                .await
+                .unwrap();
+        };
+
+        let cron = |conversation: bool| TriggerSource::Cron {
+            cron_job_id: "job-1".into(),
+            origin_session_id: None,
+            conversation,
+            job_title: None,
+        };
+        mk("workspace", cron(false), "共同的检索词 一次性").await;
+        mk("recurring", cron(true), "共同的检索词 周期性").await;
+        mk("ordinary", TriggerSource::User, "共同的检索词 普通").await;
+
+        let store = SqliteMessageSearchStore::new(pool);
+        let ids = async |scope: &SearchScope| {
+            let mut out: Vec<String> = store
+                .search_messages("共同的检索词", scope, 10)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|hit| hit.session_id.as_str().to_owned())
+                .collect();
+            out.sort();
+            out
+        };
+
+        assert_eq!(
+            ids(&SearchScope::default()).await,
+            vec!["ordinary".to_string(), "recurring".to_string()],
+            "a one-shot / historical fire is not a conversation and must not surface"
+        );
+        assert_eq!(
+            ids(&SearchScope {
+                include_cron_workspaces: true,
+                ..SearchScope::default()
+            })
+            .await,
+            vec![
+                "ordinary".to_string(),
+                "recurring".to_string(),
+                "workspace".to_string()
+            ],
+            "the axis exists for an operator view that does want them"
+        );
+    }
+
+    /// The cron predicate must not eat the LEFT JOIN. A message whose `sessions`
+    /// row is missing has to stay findable (that is why the join is LEFT), and a
+    /// bare `s.trigger_kind = 'cron'` evaluates to NULL there — making the whole
+    /// `NOT (...)` NULL and silently dropping exactly the row the LEFT JOIN
+    /// exists to keep. `COALESCE(s.trigger_kind, '')` is what stops that.
+    #[tokio::test]
+    async fn a_row_with_no_session_survives_the_cron_predicate() {
+        // `search_store` deliberately writes no `sessions` row.
+        let store = search_store(&[ChatMessage::user(vec![ContentBlock::Text(
+            "无主的行".into(),
+        )])])
+        .await;
+        assert_eq!(
+            store
+                .search_messages("无主", &SearchScope::default(), 10)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "a hit whose session row is missing must stay findable"
         );
     }
 

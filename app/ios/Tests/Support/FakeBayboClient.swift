@@ -88,6 +88,10 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     private var syncOutcome: Result<String, Error> = .success(FakeBayboClient.emptySyncFrame)
     private var lookupResults: [String: MessageLookup] = [:]
     private var lookupError: Error?
+    /// Recorded search queries, in call order — what a debounce test asserts on.
+    private var searches: [String] = []
+    private var searchResults: [String: ChatSearchResults] = [:]
+    private var searchError: Error?
     private var approvalError: Error?
     private var sessionModelPin = SessionModelPin(llm: nil, model: nil, effort: nil)
     private var sessionModelError: Error?
@@ -109,6 +113,9 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     var connectedSessions: [String] { lock.withLock { connects } }
     var createdSessionIds: [String] { lock.withLock { createdSessions } }
     var lookupCalls: [LookupCall] { lock.withLock { lookups } }
+    /// Queries that reached the core, in order — a debounce or a
+    /// skip-while-composing assertion is a statement about THIS array.
+    var searchCalls: [String] { lock.withLock { searches } }
     var approvalCalls: [ApprovalCall] { lock.withLock { approvals } }
     var readOrdinals: [Int64] { lock.withLock { marksRead } }
     /// One entry per `chatMarkManyRead` call — the cron group's "mark all read"
@@ -214,6 +221,12 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
 
     func failLookup(with error: Error) { lock.withLock { lookupError = error } }
 
+    func stubSearch(_ query: String, with results: ChatSearchResults) {
+        lock.withLock { searchResults[query] = results }
+    }
+
+    func failSearch(with error: Error) { lock.withLock { searchError = error } }
+
     /// The session meta's pin answer for `chatSessionModel`.
     func answerSessionModel(llm: String?, model: String? = nil, effort: String? = nil) {
         lock.withLock { sessionModelPin = SessionModelPin(llm: llm, model: model, effort: effort) }
@@ -295,6 +308,16 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
             lookups.append(LookupCall(sessionId: sessionId, platformMsgId: platformMsgId))
             if let lookupError { return .failure(lookupError) }
             return .success(lookupResults[platformMsgId] ?? MessageLookup(found: false, ordinal: nil))
+        }
+        return try outcome.get()
+    }
+
+    func chatSearch(query: String) async throws -> ChatSearchResults {
+        let outcome: Result<ChatSearchResults, Error> = lock.withLock {
+            searches.append(query)
+            if let searchError { return .failure(searchError) }
+            return .success(
+                searchResults[query] ?? ChatSearchResults(groups: [], truncated: false))
         }
         return try outcome.get()
     }
