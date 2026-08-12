@@ -13,7 +13,7 @@
  * carries a `≈`, and the drift against the estimate is stated rather than
  * hidden by silently showing one number in place of the other.
  */
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import { RiLoader4Line } from 'react-icons/ri';
 import type { ContextPart, SpanContext } from '../../types/trace';
 import { formatTok } from './traceFormat';
@@ -97,6 +97,7 @@ export function ContextTab({
   loading: boolean;
   onRetry: () => void;
 }) {
+  const [hovered, setHovered] = useState<ContextPart | null>(null);
   const grid = useMemo(
     () =>
       context
@@ -209,42 +210,61 @@ export function ContextTab({
           <span>Part</span>
           <span>share of input</span>
         </div>
-        <dl className="grid grid-cols-[auto_1fr_auto_auto] gap-x-3 gap-y-1.5 items-center font-mono text-[0.8rem]">
+        {/* Real rows, not a CSS grid of `display: contents` wrappers. A
+            `contents` element generates no box at all, so it has no hit area
+            and can host neither a hover handler nor a `title` — the previous
+            shape promised an explanation (dotted underline and all) that could
+            never appear. Column alignment comes from the fixed widths instead,
+            which also makes this list match the one below it. */}
+        <div className="font-mono text-[0.8rem]">
           {grid.categories
             .filter((c) => c.cells > 0 || c.tokens > 0)
             .map((category) => {
               const visual = PART_VISUALS[category.part];
               return (
-                <div key={category.part} className="contents" title={visual.hint}>
+                <div
+                  key={category.part}
+                  title={visual.hint}
+                  onMouseEnter={() => setHovered(category.part)}
+                  onMouseLeave={() => setHovered(null)}
+                  className={`flex items-center gap-3 py-0.5 px-1 -mx-1 rounded cursor-help ${
+                    hovered === category.part ? 'bg-black/5' : ''
+                  }`}
+                >
                   <span
-                    className={`h-3 w-3 rounded-[2px] border border-black/40 ${visual.cell}`}
+                    className={`h-3 w-3 shrink-0 rounded-[2px] border border-black/40 ${visual.cell}`}
                   />
-                  <dt className="truncate cursor-help decoration-dotted underline underline-offset-2 decoration-black/25">
-                    {visual.label}
-                  </dt>
-                  <dd className="tabular-nums text-right">
+                  <span className="flex-1 min-w-0 truncate">{visual.label}</span>
+                  <span className="shrink-0 tabular-nums text-right">
                     ≈{category.tokens.toLocaleString()}
-                  </dd>
-                  <dd className="tabular-nums text-right text-ink-soft w-12">
+                  </span>
+                  <span className="shrink-0 tabular-nums text-right text-ink-soft w-12">
                     {pct(category.share)}
-                  </dd>
+                  </span>
                 </div>
               );
             })}
           {grid.freeTokens != null && (
-            <div className="contents" title="Room left in this model's context window.">
-              <span className={`h-3 w-3 rounded-[2px] border border-black/40 ${FREE_CELL}`} />
-              <dt className="truncate text-ink-soft">Free</dt>
-              <dd className="tabular-nums text-right text-ink-soft">
+            <div className="flex items-center gap-3 py-0.5 px-1 -mx-1">
+              <span className={`h-3 w-3 shrink-0 rounded-[2px] border border-black/40 ${FREE_CELL}`} />
+              <span className="flex-1 min-w-0 truncate text-ink-soft">Free</span>
+              <span className="shrink-0 tabular-nums text-right text-ink-soft">
                 {grid.freeTokens.toLocaleString()}
-              </dd>
+              </span>
               {/* No percentage: this one is a share of the WINDOW, and printing
                   it in the same column as the shares above invites exactly the
                   comparison that does not hold. */}
-              <dd className="tabular-nums text-right text-ink-soft w-12">left</dd>
+              <span className="shrink-0 tabular-nums text-right text-ink-soft w-12">left</span>
             </div>
           )}
-        </dl>
+        </div>
+        {/* A reserved line rather than a floating tooltip: the detail panel is
+            a scroll container, so an absolutely-positioned bubble would clip at
+            its edges, and the native `title` delay is long enough to read as
+            "nothing happened". Fixed height, so nothing reflows on hover. */}
+        <p className="mt-2 min-h-[2.5rem] text-[0.72rem] leading-snug text-ink-soft border-t border-black/10 pt-1.5">
+          {hovered != null ? PART_VISUALS[hovered].hint : 'Hover a part to see what falls into it.'}
+        </p>
       </section>
 
       {largest.length > 0 && (
