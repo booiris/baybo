@@ -62,11 +62,15 @@ describe('buildContextGrid', () => {
     expect(grid.scale).toBe(30_100);
   });
 
-  it('measures share against the window when there is one', () => {
+  it('sizes the grid to the window but still measures share against the input', () => {
+    // The window is what the CELLS span — that is how free space becomes
+    // visible. The percentages stay a share of what was sent, so the legend
+    // and the per-item list share one denominator.
     const grid = buildContextGrid([seg('tools', 100)], 50_000, 200_000);
     expect(grid.scale).toBe(200_000);
-    expect(grid.categories[0].share).toBeCloseTo(0.25, 5);
     expect(grid.freeTokens).toBe(150_000);
+    expect(grid.categories[0].share).toBeCloseTo(1, 5);
+    expect(grid.freeCells).toBeGreaterThan(grid.categories[0].cells);
   });
 
   it('falls back to the used total when a call somehow overflowed its window', () => {
@@ -99,19 +103,65 @@ describe('buildContextGrid', () => {
 });
 
 describe('largestSegments', () => {
+  const scaled = (part: ContextPart, tokens: number, index: number) => ({
+    ...seg(part, tokens, index),
+    share: 0,
+  });
+
   it('ranks individual pieces, not their categories', () => {
     // "one 15k bash result" and "tool results total 15k" are different
     // findings, and only the first tells you what to delete.
     const ranked = largestSegments(
-      [seg('tool_result', 5_000, 1), seg('tool_result', 15_000, 2), seg('user', 100, 3)],
+      [scaled('tool_result', 5_000, 1), scaled('tool_result', 15_000, 2), scaled('user', 100, 3)],
       2,
     );
     expect(ranked.map((s) => s.tokens)).toEqual([15_000, 5_000]);
   });
 
   it('does not mutate its input', () => {
-    const segments = [seg('user', 1, 0), seg('tools', 9, 1)];
+    const segments = [scaled('user', 1, 0), scaled('tools', 9, 1)];
     largestSegments(segments, 2);
     expect(segments.map((s) => s.part)).toEqual(['user', 'tools']);
+  });
+});
+
+describe('the legend and the per-item list agree', () => {
+  // Both used to scale independently — the legend onto the billed total, the
+  // item list not at all — so one tool set printed as two different numbers a
+  // few percent apart, in the same panel.
+  const segments = [
+    seg('tools', 9_000, 0),
+    seg('tool_result', 15_000, 1),
+    seg('tool_result', 3_000, 2),
+    seg('user', 100, 3),
+  ];
+  const grid = buildContextGrid(segments, 30_100, 200_000);
+
+  it('a category equals the sum of its own segments', () => {
+    for (const category of grid.categories) {
+      const fromSegments = grid.segments
+        .filter((s) => s.part === category.part)
+        .reduce((n, s) => n + s.tokens, 0);
+      // Both sides round independently, so allow the rounding itself.
+      expect(Math.abs(fromSegments - category.tokens)).toBeLessThanOrEqual(
+        grid.segments.filter((s) => s.part === category.part).length,
+      );
+    }
+  });
+
+  it('scales the segments onto the billed total too, not just the categories', () => {
+    const tools = grid.segments.find((s) => s.part === 'tools')!;
+    expect(tools.tokens).not.toBe(9_000);
+    expect(tools.tokens).toBe(Math.round((9_000 / 27_100) * 30_100));
+  });
+
+  it('measures every share against what was sent, never the window', () => {
+    // A part that is 33% of the input and 5% of the window has to pick one
+    // number, or the two lists cannot be read against each other.
+    const total = grid.categories.reduce((n, c) => n + c.share, 0);
+    expect(total).toBeCloseTo(1, 5);
+    const tools = grid.categories.find((c) => c.part === 'tools')!;
+    const toolsSegment = grid.segments.find((s) => s.part === 'tools')!;
+    expect(toolsSegment.share).toBeCloseTo(tools.share, 5);
   });
 });

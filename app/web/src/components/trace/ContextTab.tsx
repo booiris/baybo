@@ -27,17 +27,57 @@ import { buildContextGrid, largestSegments } from './contextGrid';
  *  strengths: standing instructions (system prompt / skills) violet, tool
  *  definitions and their results orange, recalled memory and attached media
  *  blue. */
-const PART_VISUALS: Record<ContextPart, { label: string; cell: string }> = {
-  system_prompt: { label: 'System prompt', cell: 'bg-violet' },
-  skills: { label: 'Skills', cell: 'bg-violet/50' },
-  tools: { label: 'Tool definitions', cell: 'bg-warn' },
-  tool_result: { label: 'Tool results', cell: 'bg-warn/50' },
-  memory: { label: 'Recalled memory', cell: 'bg-info' },
-  media: { label: 'Attachments', cell: 'bg-info/50' },
-  user: { label: 'User messages', cell: 'bg-brand' },
-  cron: { label: 'Cron', cell: 'bg-magenta' },
-  assistant: { label: 'Assistant', cell: 'bg-ok' },
-  agent: { label: 'Agent framing', cell: 'bg-ink-soft' },
+const PART_VISUALS: Record<ContextPart, { label: string; cell: string; hint: string }> = {
+  system_prompt: {
+    label: 'System prompt',
+    cell: 'bg-violet',
+    hint: "The leading system row — persona, identity, workspace — plus the notices that amend it when its sources change on disk mid-session.",
+  },
+  skills: {
+    label: 'Skills',
+    cell: 'bg-violet/50',
+    hint: 'The standing listing of invocable skills, and the notices that tell the model how the registry has changed since.',
+  },
+  tools: {
+    label: 'Tool definitions',
+    cell: 'bg-warn',
+    hint: 'Every tool this call offered the model: name, description, and JSON schema. See the Tools tab for the list.',
+  },
+  tool_result: {
+    label: 'Tool results',
+    cell: 'bg-warn/50',
+    hint: 'What the tools returned, carried forward as transcript.',
+  },
+  memory: {
+    label: 'Recalled memory',
+    cell: 'bg-info',
+    hint: 'Memories pulled from long-term storage and injected to inform this turn.',
+  },
+  media: {
+    label: 'Attachments',
+    cell: 'bg-info/50',
+    hint: 'Images, audio and files. Priced by the provider\u2019s own media rules (tiles, pages, seconds) rather than by a tokenizer, so this part is not an estimate in the same sense as the rest.',
+  },
+  user: {
+    label: 'User messages',
+    cell: 'bg-brand',
+    hint: 'What a human actually typed, mid-turn interjections included.',
+  },
+  cron: {
+    label: 'Cron',
+    cell: 'bg-magenta',
+    hint: "A scheduled job's framed prompt, or a one-shot fire's result delivered back into this conversation.",
+  },
+  assistant: {
+    label: 'Assistant',
+    cell: 'bg-ok',
+    hint: "The model's own output carried forward as history, thinking blocks included.",
+  },
+  agent: {
+    label: 'Agent-injected',
+    cell: 'bg-ink-soft',
+    hint: 'Everything else baybo puts in the conversation on the model\u2019s behalf: an invoked skill\u2019s body, a subagent task prompt or its finished notification, compaction instructions, framing reminders. Synthetic user-role rows a human never sent.',
+  },
 };
 
 const FREE_CELL = 'bg-black/10';
@@ -69,8 +109,8 @@ export function ContextTab({
     [context],
   );
   const largest = useMemo(
-    () => (context ? largestSegments(context.segments, LARGEST_SHOWN) : []),
-    [context],
+    () => (grid ? largestSegments(grid.segments, LARGEST_SHOWN) : []),
+    [grid],
   );
 
   if (context == null || grid == null) {
@@ -160,17 +200,28 @@ export function ContextTab({
       </section>
 
       <section>
+        {/* Every percentage on this panel is a share of what was SENT, never
+            of the window — one denominator, so the legend and the per-item
+            list below can be read against each other. The window shows up as
+            the headline's "% full" and as the free cells, not as a second
+            percentage. */}
+        <div className="mb-1 flex items-baseline justify-between font-mono text-[0.65rem] uppercase tracking-wider text-ink-soft">
+          <span>Part</span>
+          <span>share of input</span>
+        </div>
         <dl className="grid grid-cols-[auto_1fr_auto_auto] gap-x-3 gap-y-1.5 items-center font-mono text-[0.8rem]">
           {grid.categories
             .filter((c) => c.cells > 0 || c.tokens > 0)
             .map((category) => {
               const visual = PART_VISUALS[category.part];
               return (
-                <div key={category.part} className="contents">
+                <div key={category.part} className="contents" title={visual.hint}>
                   <span
                     className={`h-3 w-3 rounded-[2px] border border-black/40 ${visual.cell}`}
                   />
-                  <dt className="truncate">{visual.label}</dt>
+                  <dt className="truncate cursor-help decoration-dotted underline underline-offset-2 decoration-black/25">
+                    {visual.label}
+                  </dt>
                   <dd className="tabular-nums text-right">
                     ≈{category.tokens.toLocaleString()}
                   </dd>
@@ -181,15 +232,16 @@ export function ContextTab({
               );
             })}
           {grid.freeTokens != null && (
-            <div className="contents">
+            <div className="contents" title="Room left in this model's context window.">
               <span className={`h-3 w-3 rounded-[2px] border border-black/40 ${FREE_CELL}`} />
               <dt className="truncate text-ink-soft">Free</dt>
               <dd className="tabular-nums text-right text-ink-soft">
                 {grid.freeTokens.toLocaleString()}
               </dd>
-              <dd className="tabular-nums text-right text-ink-soft w-12">
-                {pct(grid.freeTokens / grid.scale)}
-              </dd>
+              {/* No percentage: this one is a share of the WINDOW, and printing
+                  it in the same column as the shares above invites exactly the
+                  comparison that does not hold. */}
+              <dd className="tabular-nums text-right text-ink-soft w-12">left</dd>
             </div>
           )}
         </dl>
@@ -203,24 +255,27 @@ export function ContextTab({
           <div className="space-y-1">
             {largest.map((segment, i) => {
               const visual = PART_VISUALS[segment.part];
-              const share =
-                context.estimated_total_tokens > 0
-                  ? segment.tokens / context.estimated_total_tokens
-                  : 0;
               return (
                 <div
                   key={`${segment.part}-${segment.index}-${i}`}
                   className="flex items-center gap-2 font-mono text-[0.78rem]"
+                  title={`${visual.label} · message #${segment.index + 1} of the input`}
                 >
                   <span
                     className={`h-2.5 w-2.5 rounded-[1px] shrink-0 border border-black/40 ${visual.cell}`}
                   />
+                  {/* The position, because the labels repeat: five `read_file`
+                      calls produce five identically-named rows, and without
+                      this there is no way to tell which one is the 40k one. */}
+                  <span className="shrink-0 tabular-nums text-ink-soft w-8 text-right">
+                    #{segment.index + 1}
+                  </span>
                   <span className="flex-1 min-w-0 truncate">{segment.label}</span>
                   <span className="shrink-0 tabular-nums">
                     ≈{segment.tokens.toLocaleString()}
                   </span>
                   <span className="shrink-0 tabular-nums text-ink-soft w-12 text-right">
-                    {pct(share)}
+                    {pct(segment.share)}
                   </span>
                 </div>
               );

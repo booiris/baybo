@@ -18,15 +18,25 @@ const NICE_STEPS = [1, 2, 5, 10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_
 
 export interface ContextCategory {
   part: ContextPart;
-  /** Estimated tokens across every segment of this part. */
+  /** Tokens across every segment of this part, scaled onto the billed total. */
   tokens: number;
-  /** Share of the whole context (window when known, otherwise the input). */
+  /** Share of what was sent. Every share in the panel uses this one
+   *  denominator — the window appears in the headline and as free cells, not
+   *  as a second percentage a reader has to reconcile against the first. */
   share: number;
   cells: number;
 }
 
+/** A segment with the same scaling its category got, so a per-item list and
+ *  the legend can never print two different numbers for one thing. */
+export interface ScaledSegment extends ContextSegment {
+  share: number;
+}
+
 export interface ContextGrid {
   categories: ContextCategory[];
+  /** Every segment, scaled — the numbers the categories are summed from. */
+  segments: ScaledSegment[];
   /** Cells left unfilled — the model's remaining window. Zero when no window
    *  is known, in which case the grid shows only what was sent. */
   freeCells: number;
@@ -69,23 +79,29 @@ export function buildContextGrid(
   const used = Math.max(0, usedTokens);
   const scale = contextWindow != null && contextWindow > used ? contextWindow : used;
 
+  // ONE scaling factor, applied to segments and categories alike. Scaling in
+  // two places is how the legend and the per-item list came to print two
+  // different numbers for the same tool set.
+  const factor = estimated > 0 ? used / estimated : 0;
+  const scaledSegments: ScaledSegment[] = segments.map((s) => ({
+    ...s,
+    tokens: Math.round(s.tokens * factor),
+    share: used > 0 ? (s.tokens * factor) / used : 0,
+  }));
+
   const byPart = new Map<ContextPart, number>();
   for (const segment of segments) {
     byPart.set(segment.part, (byPart.get(segment.part) ?? 0) + segment.tokens);
   }
-
-  // Estimated proportions, applied to the number that was actually billed.
   const scaled: { part: ContextPart; tokens: number }[] = [...byPart.entries()].map(
-    ([part, tokens]) => ({
-      part,
-      tokens: estimated > 0 ? (tokens / estimated) * used : 0,
-    }),
+    ([part, tokens]) => ({ part, tokens: tokens * factor }),
   );
   scaled.sort((a, b) => b.tokens - a.tokens);
 
   if (scale <= 0) {
     return {
       categories: [],
+      segments: scaledSegments,
       freeCells: 0,
       freeTokens: contextWindow != null ? contextWindow : null,
       tokensPerCell: 1,
@@ -101,13 +117,14 @@ export function buildContextGrid(
   const categories = allocateCells(scaled, usedCells).map(({ part, tokens, cells }) => ({
     part,
     tokens: Math.round(tokens),
-    share: tokens / scale,
+    share: used > 0 ? tokens / used : 0,
     cells,
   }));
 
   const spent = categories.reduce((n, c) => n + c.cells, 0);
   return {
     categories,
+    segments: scaledSegments,
     freeCells: Math.max(0, totalCells - spent),
     freeTokens: contextWindow != null ? Math.max(0, contextWindow - used) : null,
     tokensPerCell,
@@ -165,7 +182,10 @@ function allocateCells(
 
 /** The largest individual contributors, for the "what is actually big" list.
  *  Segments, not categories: "one 40k bash result" is a different finding
- *  from "tool results total 60k". */
-export function largestSegments(segments: ContextSegment[], limit: number): ContextSegment[] {
+ *  from "tool results total 60k".
+ *
+ *  Takes the grid's already-scaled segments, so these numbers are the same
+ *  ones the legend adds up. */
+export function largestSegments(segments: ScaledSegment[], limit: number): ScaledSegment[] {
   return [...segments].sort((a, b) => b.tokens - a.tokens).slice(0, limit);
 }
