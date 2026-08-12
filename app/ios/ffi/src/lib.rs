@@ -298,6 +298,25 @@ impl BayboClient {
         .await
     }
 
+    /// Rename `session_id` for the active binding
+    /// (`PUT /v1/chat/sessions/{id}/title`). Direct reaches it over REST, relay
+    /// through the Noise-protected API tunnel.
+    ///
+    /// A user rename is permanent in one further sense: the auto-titler writes
+    /// only into a conversation that has none (`set_title_if_absent`), so this
+    /// also settles the title against the machine.
+    pub async fn chat_set_title(
+        self: Arc<Self>,
+        session_id: String,
+        title: String,
+    ) -> Result<(), BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::set_title(&client, session_id, title).await
+        })
+        .await
+    }
+
     /// Pin or unpin a **cron group** — every fire of one scheduled job,
     /// collapsed into a single chat-list row (`docs/cron-groups.md`). Keyed by
     /// the JOB id, not a session: the group is a view over its fires, so the job

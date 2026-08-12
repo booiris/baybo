@@ -37,7 +37,8 @@ struct ChatStoreApprovalTests {
         index.touch(sessionId: Self.sessionId)
         store = ChatStore(
             sessionId: Self.sessionId, client: client, index: index,
-            outbox: temp.makeOutbox(sessionId: Self.sessionId))
+            outbox: temp.makeOutbox(sessionId: Self.sessionId),
+            supportDirectory: temp.url)
     }
 
     private func connect() async -> Bool {

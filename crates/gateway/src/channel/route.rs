@@ -106,7 +106,7 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
         std::sync::Arc::clone(&state.blob_store),
     );
 
-    // Captured before `sidecar.into_pump()` consumes `sidecar` below, so the
+    // Captured before `sidecar.shutdown()` consumes `sidecar` below, so the
     // disconnect log can pair with this attach by connection_id + lifetime.
     let connection_id = sidecar.connection_id();
     let attached_at = std::time::Instant::now();
@@ -124,7 +124,10 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
         .await
     {
         tracing::warn!(error = %e, "failed to send RegisterAck");
-        std::mem::drop(sidecar.into_pump());
+        // Dropped, not `shutdown().await`ed: the write side just failed, so
+        // there is nothing to flush and no reason to wait on the pump. The drop
+        // still detaches and aborts — that is `LegTeardown`'s whole point.
+        drop(sidecar);
         return;
     }
 
@@ -169,7 +172,7 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
             state.bot_reconciler.forget(&channel_type);
         }
     }
-    let _ = sidecar.into_pump().await;
+    sidecar.shutdown().await;
 
     tracing::info!(
         %channel_type,

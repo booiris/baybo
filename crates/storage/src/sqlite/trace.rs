@@ -11,9 +11,9 @@ use async_trait::async_trait;
 use rusqlite::OptionalExtension;
 
 use super::SqlitePool;
-use baybo_model::{SpanId, StepId, TurnId};
+use baybo_model::{SpanId, StepId, ToolSetHash, TurnId};
 use baybo_store::trace::Result;
-use baybo_store::{SpanEventRow, SpanRow, StepRow, TraceStore};
+use baybo_store::{SpanEventRow, SpanRow, StepRow, ToolSetRow, TraceStore};
 
 pub struct SqliteTraceStore {
     pool: SqlitePool,
@@ -210,6 +210,40 @@ impl TraceStore for SqliteTraceStore {
             .await
     }
 
+    async fn save_tool_set(&self, set: &ToolSetRow) -> Result<()> {
+        let hash = set.hash.to_string();
+        let data = set.data.clone();
+        self.pool
+            .interact("trace.save_tool_set", move |conn| {
+                // OR IGNORE, not OR REPLACE: the key IS the digest of the
+                // body, so a second write of the same hash carries the same
+                // bytes and rewriting them would only churn the page.
+                conn.execute(
+                    "INSERT OR IGNORE INTO llm_tool_sets (hash, data) VALUES (?1, ?2)",
+                    rusqlite::params![hash, data],
+                )?;
+                Ok(())
+            })
+            .await
+    }
+
+    async fn load_tool_set(&self, hash: &ToolSetHash) -> Result<Option<ToolSetRow>> {
+        let hash = hash.clone();
+        let key = hash.to_string();
+        self.pool
+            .interact("trace.load_tool_set", move |conn| {
+                let data = conn
+                    .query_row(
+                        "SELECT data FROM llm_tool_sets WHERE hash = ?1",
+                        rusqlite::params![key],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                Ok(data.map(|data| ToolSetRow { hash, data }))
+            })
+            .await
+    }
+
     async fn append_span_event(&self, event: &SpanEventRow) -> Result<()> {
         let span_id = event.span_id.to_string();
         let seq = event.seq as i64;
@@ -295,8 +329,8 @@ impl TraceStore for SqliteTraceStore {
 mod tests {
     use super::*;
     use baybo_trace::{
-        CompressionTrigger, LifecycleOutcome, LifecycleState, LlmCallInputs, Span, SpanEvent,
-        SpanEventKind, SpanKind, Step, StepKind, ToolCallOrigin,
+        CompressionTrigger, LifecycleOutcome, LifecycleState, LlmCallInputs, LlmToolDefinition,
+        LlmToolSet, Span, SpanEvent, SpanEventKind, SpanKind, Step, StepKind, ToolCallOrigin,
     };
     use chrono::Utc;
 
@@ -322,6 +356,7 @@ mod tests {
                     provider_config_hash: "h".into(),
                     input_messages: LlmCallInputs::empty(),
                     temperature: None,
+                    tools: None,
                 },
                 result: None,
             },
@@ -368,6 +403,45 @@ mod tests {
         store.save_step(&s.to_row().unwrap()).await.unwrap();
         let loaded = Step::from_row(store.load_step(&s.id).await.unwrap().unwrap()).unwrap();
         assert_eq!(loaded.id, s.id);
+    }
+
+    /// The row is keyed by the digest of its own body, so re-saving the
+    /// same set has to be a no-op rather than an error or a rewrite — the
+    /// agent calls this on every LLM call of every session.
+    #[tokio::test]
+    async fn tool_set_round_trips_and_repeat_saves_are_no_ops() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
+        let store = SqliteTraceStore::new(pool);
+
+        let set = LlmToolSet::new(vec![LlmToolDefinition {
+            name: "bash".into(),
+            description: "runs a command".into(),
+            parameters_schema: serde_json::json!({ "type": "object" }),
+        }]);
+        let row = set.to_row().unwrap();
+        store.save_tool_set(&row).await.unwrap();
+        store.save_tool_set(&row).await.unwrap();
+
+        let loaded = store.load_tool_set(&row.hash).await.unwrap().unwrap();
+        assert_eq!(loaded.hash, row.hash);
+        assert_eq!(LlmToolSet::from_row(loaded).unwrap(), set);
+    }
+
+    /// An `LlmCall` span whose `tools` hash has no row must read back as a
+    /// span with an unresolvable reference, not as a store error — trace
+    /// rows outlive nothing here, but a hand-pruned DB shouldn't 500.
+    #[tokio::test]
+    async fn an_unknown_tool_set_hash_reads_back_as_none() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
+        let store = SqliteTraceStore::new(pool);
+        let absent = ToolSetHash::from_digest(&[7; 32]);
+        assert!(store.load_tool_set(&absent).await.unwrap().is_none());
     }
 
     #[tokio::test]

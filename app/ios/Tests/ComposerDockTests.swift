@@ -33,14 +33,19 @@ struct ComposerDockTests {
     /// The dock as the screen builds it, in a container that leaves the panel
     /// somewhere to be drawn. The composer's rows are a plain block: what is
     /// under test is the chain, not the pill.
-    private static func harness(panelOpen: Bool, collapsed: Bool = false) -> some View {
+    private static func harness(
+        panelOpen: Bool, collapsed: Bool = false, sources: [AttachSource] = AttachSource.always
+    ) -> some View {
         VStack(spacing: 0) {
             Color.clear.frame(width: dockWidth, height: headroom)
             ComposerDock(collapsed: collapsed, jumpVisible: false) {
                 Theme.surface.frame(width: dockWidth, height: dockHeight)
             } panel: {
                 if panelOpen {
-                    AttachMenuPanel(anchor: plus, isPresented: .constant(true)) { _ in }
+                    AttachMenuPanel(
+                        anchor: plus, sources: sources,
+                        isPresented: .constant(true)
+                    ) { _ in }
                 }
             }
         }
@@ -88,8 +93,8 @@ struct ComposerDockTests {
 
     /// Where the panel lands in the HARNESS's space: `box()` is in dock space,
     /// whose origin is `headroom` points down.
-    private static var panelRect: CGRect {
-        AttachMenuPanel.box(anchor: plus).offsetBy(dx: 0, dy: headroom)
+    private static func panelRect(rows: Int = AttachSource.always.count) -> CGRect {
+        AttachMenuPanel.box(anchor: plus, rows: rows).offsetBy(dx: 0, dy: headroom)
     }
 
     private static func render(_ view: some View) -> UIImage {
@@ -104,15 +109,38 @@ struct ComposerDockTests {
 
     /// THE regression. An open panel must put ink where `box()` says it is.
     @Test func theOpenPanelPaintsAboveTheDock() {
-        let ink = Self.inkPixels(Self.render(Self.harness(panelOpen: true)), in: Self.panelRect)
+        let ink = Self.inkPixels(Self.render(Self.harness(panelOpen: true)), in: Self.panelRect())
         #expect(ink > 100, "the attach panel drew nothing in its own box (\(ink) ink pixels)")
     }
 
     /// …and the measurement is not vacuous: the same band is empty with the
     /// panel down, so the count above is the panel and not the harness.
     @Test func theSameBandIsEmptyWithThePanelDown() {
-        let ink = Self.inkPixels(Self.render(Self.harness(panelOpen: false)), in: Self.panelRect)
+        let ink = Self.inkPixels(Self.render(Self.harness(panelOpen: false)), in: Self.panelRect())
         #expect(ink == 0, "the closed dock painted \(ink) ink pixels above itself")
+    }
+
+    /// A Paste row makes the panel three rows tall, and the box that positions it
+    /// grows UPWARD from a fixed floor — so the extra row lands in the headroom,
+    /// not behind the dock. The band the two-row panel occupies is a subset of
+    /// this one, so the assertion is that the WHOLE taller box paints: a panel
+    /// still positioned for two rows would leave its top row outside it.
+    @Test func aThreeRowPanelPaintsInItsTallerBox() {
+        let sources = AttachSource.always + [.paste]
+        let rect = Self.panelRect(rows: sources.count)
+        #expect(rect.height == AttachMenuPanel.rowHeight * 3)
+        #expect(rect.minY >= 0, "a third row must fit the headroom, not fall off the bitmap")
+
+        let image = Self.render(Self.harness(panelOpen: true, sources: sources))
+        let ink = Self.inkPixels(image, in: rect)
+        #expect(ink > 100, "the three-row panel drew nothing in its own box (\(ink) ink pixels)")
+
+        // The top row's band alone — the strip a two-row panel would never reach.
+        let topRow = CGRect(
+            x: rect.minX, y: rect.minY,
+            width: rect.width, height: AttachMenuPanel.rowHeight)
+        let topInk = Self.inkPixels(image, in: topRow)
+        #expect(topInk > 0, "the panel is still positioned for two rows")
     }
 
     /// The collapse an expanded HTML preview asks for hides the dock — panel
@@ -120,7 +148,7 @@ struct ComposerDockTests {
     /// would take the panel with it in every other state too.
     @Test func aCollapsedDockShowsNothing() {
         let ink = Self.inkPixels(
-            Self.render(Self.harness(panelOpen: true, collapsed: true)), in: Self.panelRect)
+            Self.render(Self.harness(panelOpen: true, collapsed: true)), in: Self.panelRect())
         #expect(ink == 0, "a collapsed dock still painted \(ink) ink pixels")
     }
 }

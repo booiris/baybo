@@ -424,6 +424,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/chat/sessions/{session_id}/title": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["set_session_title"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/chat/sessions/{session_id}/unhide": {
         parameters: {
             query?: never;
@@ -1304,6 +1320,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/traces/tool-sets/{hash}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_tool_set"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/traces/{session_id}": {
         parameters: {
             query?: never;
@@ -1328,6 +1360,22 @@ export interface paths {
             cookie?: never;
         };
         get: operations["get_trace_lineage"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/traces/{session_id}/spans/{span_id}/context": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_span_context"];
         put?: never;
         post?: never;
         delete?: never;
@@ -3195,6 +3243,19 @@ export interface components {
              *     to unpin it back into the regular list.
              */
             pinned: boolean;
+        };
+        /** @description Request body for `PUT /v1/chat/sessions/{session_id}/title`. */
+        SetSessionTitleRequest: {
+            /**
+             * @description The conversation's new title. Interior whitespace is collapsed and the
+             *     ends trimmed; the result must be non-empty and at most
+             *     `baybo_model::MAX_SESSION_TITLE_LEN` characters, or the call is a 400.
+             *
+             *     There is no "clear it and let the model re-title" form: a cleared title
+             *     cannot be expressed on the wire, where an absent `SessionPatch.title`
+             *     already means "unchanged".
+             */
+            title: string;
         };
         /**
          * @description Wire DTO for slash command entries. Mirror of
@@ -5091,6 +5152,58 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ChatSyncResponse"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Session not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_session_title: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Session id to rename */
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetSessionTitleRequest"];
+            };
+        };
+        responses: {
+            /** @description Title updated */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Empty or over-long title */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
                 };
             };
             /** @description Unauthorized */
@@ -8245,6 +8358,56 @@ export interface operations {
             };
         };
     };
+    get_tool_set: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Content hash from an LlmCall span's `tools.hash` */
+                hash: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The tool definitions an LLM call offered the model: `{ hash, tools: [{ name, description, parameters_schema }] }`. Content-addressed and shared by every span that offered the same set, so a client fetches each hash once and caches it. Untyped JSON, consistent with the rest of the per-session traces family. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Malformed hash */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No stored tool set for that hash */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     get_trace: {
         parameters: {
             query?: {
@@ -8316,6 +8479,58 @@ export interface operations {
             };
             /** @description Unauthorized */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_span_context: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Session whose transcript the span's input references */
+                session_id: string;
+                /** @description LlmCall span whose context to break down */
+                span_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Where one LLM call's input tokens went: `{ model_id, reported_input_tokens, estimated_total_tokens, context_window, segments: [{ part, label, tokens, index }] }`. `reported_input_tokens` is what the provider billed and is exact; the per-segment split is a tiktoken ESTIMATE (see docs/modules/context.md), so a client scales the segments onto the reported total rather than presenting them as measured. `context_window` is null when no configured client serves that model any more. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Invalid span id, or a span that sends no model input */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such span */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

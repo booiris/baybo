@@ -50,7 +50,7 @@ use baybo_channels::{STOP_CANCELLED_REPLY_LINE, STOP_COMMAND_NAME, StampedEvent}
 use baybo_model::{
     AgentBinding, AgentFramework, ApprovalDecision, ChannelType, ChatMessage, ContentBlock,
     ControlEvent, ControlEventKind, FolderId, FolderSummary, LlmEntryName, Role, Session,
-    SessionId, ThinkingContent, TriggerSource, User,
+    SessionId, TOOL_RESULT_ERROR_PREFIX, ThinkingContent, TriggerSource, User,
 };
 use baybo_session::SessionError;
 use baybo_store::SearchScope;
@@ -77,6 +77,7 @@ pub fn routes() -> OpenApiRouter<AdminState> {
         .routes(routes!(set_session_model))
         .routes(routes!(set_session_pin))
         .routes(routes!(set_session_archive))
+        .routes(routes!(set_session_title))
         .routes(routes!(mark_session_read))
         .routes(routes!(mark_sessions_read))
         .routes(routes!(set_session_folder))
@@ -1844,6 +1845,75 @@ pub struct SetSessionArchiveRequest {
     pub archived: bool,
 }
 
+/// Request body for `PUT /v1/chat/sessions/{session_id}/title`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetSessionTitleRequest {
+    /// The conversation's new title. Interior whitespace is collapsed and the
+    /// ends trimmed; the result must be non-empty and at most
+    /// `baybo_model::MAX_SESSION_TITLE_LEN` characters, or the call is a 400.
+    ///
+    /// There is no "clear it and let the model re-title" form: a cleared title
+    /// cannot be expressed on the wire, where an absent `SessionPatch.title`
+    /// already means "unchanged".
+    pub title: String,
+}
+
+/// Map a session-argument failure onto its status. Kept apart from
+/// [`folder_err`] so a bad title reports as a title problem rather than
+/// borrowing the folder wording.
+fn session_title_err(e: SessionError) -> GatewayError {
+    match e {
+        SessionError::NotFound(m) => GatewayError::NotFound(m),
+        SessionError::InvalidArgument(m) => GatewayError::BadRequest(m),
+        other => GatewayError::Internal(format!("set session title: {other}")),
+    }
+}
+
+#[utoipa::path(
+    put,
+    path = "/chat/sessions/{session_id}/title",
+    tag = "chat",
+    params(
+        ("session_id" = String, Path, description = "Session id to rename"),
+    ),
+    request_body = SetSessionTitleRequest,
+    responses(
+        (status = 204, description = "Title updated"),
+        (status = 400, description = "Empty or over-long title", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Session not found", body = ErrorBody),
+    )
+)]
+async fn set_session_title(
+    State(state): State<AdminState>,
+    Path(session_id): Path<String>,
+    authed: Option<Extension<AuthedClient>>,
+    Json(req): Json<SetSessionTitleRequest>,
+) -> Result<axum::http::StatusCode> {
+    let authed = authed.as_ref().map(|ext| &ext.0);
+    let (sid, session) = load_scoped_chat_session(&state, &session_id, authed).await?;
+    // Targeted flat-column write — like `set_pinned`, it survives a
+    // concurrent `touch` (full-blob save) so the rename can't be clobbered.
+    let stored = state
+        .session_manager
+        .set_user_title(&sid, req.title)
+        .await
+        .map_err(session_title_err)?;
+    // Broadcast the STORED title, never the submitted one: the manager
+    // normalizes, and shipping the raw value would leave every other client
+    // showing something the next list refetch silently rewrites.
+    broadcast_session_patch(
+        &state,
+        &session.channel,
+        &sid,
+        SessionPatch {
+            title: Some(stored),
+            ..SessionPatch::default()
+        },
+    );
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
 /// Request body for `PUT /v1/chat/sessions/{session_id}/read`.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct MarkReadRequest {
@@ -3404,6 +3474,14 @@ fn control_event_item(ev: ControlEvent) -> ChatTranscriptItem {
 
 /// Concatenate the visible text of a model thinking block (redacted
 /// reasoning carries no display text and is skipped).
+///
+/// Segments are separated by a BLANK line. Each one is its own section and
+/// typically opens with a `**Headline**`; the client renders this as markdown,
+/// and CommonMark folds a lone newline into a space — which glues the headline
+/// onto the tail of the previous section's last sentence
+/// (`…I need!**Inspecting the repo**`). A multi-segment block only ever comes
+/// from the non-streaming completion path, so this reconstruction is the only
+/// place that boundary can be preserved or lost.
 fn thinking_text(content: &[ThinkingContent]) -> String {
     let mut out = String::new();
     for c in content {
@@ -3415,7 +3493,7 @@ fn thinking_text(content: &[ThinkingContent]) -> String {
             continue;
         }
         if !out.is_empty() {
-            out.push('\n');
+            out.push_str("\n\n");
         }
         out.push_str(part);
     }
@@ -3459,7 +3537,7 @@ fn tool_result_status(content: &str) -> String {
     let inner = inner.trim_start();
     if inner.starts_with("The user explicitly denied permission") {
         "denied".to_owned()
-    } else if inner.starts_with("Error:") {
+    } else if inner.starts_with(TOOL_RESULT_ERROR_PREFIX) {
         "error".to_owned()
     } else {
         "ok".to_owned()
@@ -4488,7 +4566,29 @@ mod tests {
                 text: "tl;dr".to_owned(),
             },
         ];
-        assert_eq!(thinking_text(&blocks), "step 1\ntl;dr");
+        assert_eq!(thinking_text(&blocks), "step 1\n\ntl;dr");
+    }
+
+    /// The shape the store is full of on the non-streaming path: a segment ends
+    /// mid-sentence and the next opens with a bold headline. A lone newline
+    /// between them is folded to a space by the client's markdown parser, which
+    /// renders `…I need!**Inspecting the repo**` — the headline swallowed by the
+    /// previous paragraph.
+    #[test]
+    fn thinking_text_separates_sections_with_a_blank_line() {
+        let blocks = vec![
+            ThinkingContent::Summary {
+                text: "I want to look at the globs I need!".to_owned(),
+            },
+            ThinkingContent::Summary {
+                text: "**Inspecting the repo**\n\nI need to inspect it.".to_owned(),
+            },
+        ];
+        assert!(
+            thinking_text(&blocks).contains("I need!\n\n**Inspecting the repo**"),
+            "got {:?}",
+            thinking_text(&blocks)
+        );
     }
 
     #[test]

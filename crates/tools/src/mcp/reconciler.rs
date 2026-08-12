@@ -12,6 +12,7 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use crate::approval::ResourceAccess;
+use crate::mcp::McpError;
 use crate::mcp::config::{McpFile, McpServerEntry, McpTransportConfig};
 use crate::mcp::embedded::EmbeddedMcpServer;
 use crate::mcp::runtime::McpRuntime;
@@ -36,15 +37,40 @@ const EMBEDDED_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// The probes themselves run concurrently, so this is the ceiling for the
 /// whole probe phase rather than a per-server cost that accumulates.
 ///
-/// This bounds the *probe* only. `connect_server` below is still unbounded, so
-/// a first-boot browser sidecar that spends minutes building its docker image
-/// or downloading Chrome before connecting its stdio transport continues to
-/// serialise the loop. That one is deliberately left alone: the timeout that
-/// would fix it is indistinguishable from a legitimately slow first boot, and
-/// the real fix is for the sidecar to connect its transport first and spawn the
-/// container in the background, the way the host path already backgrounds the
-/// Chrome download behind `GuardingTransport`.
+/// This bounds the *probe* only; the connect is bounded separately, and only
+/// for user entries — see [`USER_CONNECT_TIMEOUT`].
 const EMBEDDED_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Ceiling on connecting one **user** `.mcp.json` server.
+///
+/// `connect_server` is awaited inline by [`McpReconciler::tick`], which the run
+/// loop awaits in turn, so a connect that never returns does not fail one
+/// server — it stops the reconciler outright. Every later `.mcp.json` edit then
+/// becomes a silent no-op, including the ones `baybo mcp add/remove` makes,
+/// because nothing is left running to notice them. That is not hypothetical:
+/// it is what left a hand-edited config unread for six hours while the agent
+/// editing it had no way to tell.
+///
+/// The bound is generous because a cold stdio server is genuinely slow — `uv
+/// run --script` may resolve and install dependencies, `npx` may fetch a
+/// package — and a timeout that trips on a legitimate first boot would spawn,
+/// kill, and respawn it forever. Ninety seconds clears that while still
+/// letting a hung server cost one tick instead of the process's remaining
+/// uptime.
+///
+/// **Embedded servers are deliberately excluded.** The browser sidecar can
+/// spend minutes building a docker image or downloading Chrome before its
+/// transport answers, which is indistinguishable from a hang at this layer;
+/// the real fix there is for the sidecar to connect its transport first and
+/// background the heavy work, the way the host path already backgrounds the
+/// Chrome download behind `GuardingTransport`. Until then an embedded connect
+/// stays unbounded, and can still serialise the loop.
+///
+/// Timing out is safe to do bluntly: the spawned child is owned by the
+/// connect future, and `baybo_process::ManagedChild`'s `Drop` SIGKILLs its
+/// process group, so abandoning the future reaps the child rather than
+/// leaking one per attempt.
+const USER_CONNECT_TIMEOUT: Duration = Duration::from_secs(90);
 
 struct Connected {
     session: McpServerSession,
@@ -380,14 +406,26 @@ impl McpReconciler {
         // hand-edited `.mcp.json` could otherwise smuggle in an
         // `installed`-trust stdio command and run it at boot.
         entry.validate()?;
-        let session = connect_with_extra_env(
+        let connect = connect_with_extra_env(
             entry,
             &self.vault,
             &self.process_manager,
             extra_env,
             self.proxy.as_ref(),
-        )
-        .await?;
+        );
+        let session = if is_embedded {
+            connect.await?
+        } else {
+            tokio::time::timeout(USER_CONNECT_TIMEOUT, connect)
+                .await
+                .map_err(|_| {
+                    McpError::Connection(format!(
+                        "server did not complete its MCP handshake within {}s; \
+                         the child has been killed and the reconciler moved on",
+                        USER_CONNECT_TIMEOUT.as_secs()
+                    ))
+                })??
+        };
         let resources = resource_access_for(entry, is_embedded);
         let trust_level: baybo_model::TrustLevel = entry.trust_level.into();
 
@@ -549,6 +587,65 @@ mod tests {
 
     fn names<I: IntoIterator<Item = &'static str>>(names: I) -> HashSet<String> {
         names.into_iter().map(String::from).collect()
+    }
+
+    /// A user server whose handshake never answers must cost one tick, not
+    /// the reconciler.
+    ///
+    /// `connect_server` is awaited inline by `tick`, which the run loop awaits
+    /// in turn, so an unbounded connect stops reconciliation outright — and
+    /// silently, since nothing is left running to log. That is what left a
+    /// hand-edited `.mcp.json` unread for six hours: every later edit,
+    /// including the ones `baybo mcp add/remove` made, was a no-op against a
+    /// loop that had stopped turning.
+    ///
+    /// `sleep` is the minimal wedge: it holds its stdin open, so the
+    /// `initialize` write succeeds and the read for its reply never returns.
+    #[tokio::test(start_paused = true)]
+    async fn a_user_server_that_never_answers_does_not_wedge_the_tick() {
+        use baybo_security::EncryptionKey;
+        use baybo_security::test_support::MemorySecretStore;
+
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let root = workspace.path().to_path_buf();
+        McpFile {
+            version: 1,
+            servers: vec![McpServerEntry {
+                name: "wedged".into(),
+                transport: McpTransportConfig::Stdio {
+                    command: "sleep".into(),
+                    args: vec!["3000".into()],
+                },
+                trust_level: crate::mcp::config::TrustLevelConfig::Trusted,
+                capabilities: Vec::new(),
+                oauth: None,
+            }],
+        }
+        .write(&root)
+        .await
+        .expect("seed .mcp.json");
+
+        let reconciler = McpReconciler::from_config(McpReconcilerConfig {
+            workspace_root: root,
+            registry: Arc::new(ToolRegistry::new()),
+            vault: Arc::new(SecretVault::new(
+                EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec())
+                    .expect("test encryption key"),
+                Arc::new(MemorySecretStore::new()),
+            )),
+            process_manager: baybo_process::ProcessManager::transient(),
+            blob_store: None,
+            embedded: Vec::new(),
+            proxy: None,
+        });
+
+        // The assertion is simply that this returns. Before the timeout it
+        // would hang here forever, and so would every later tick.
+        let connected = reconciler.tick().await;
+        assert!(
+            connected.is_empty(),
+            "a server that never handshakes must not be reported as connected"
+        );
     }
 
     #[test]

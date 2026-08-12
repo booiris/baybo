@@ -142,7 +142,8 @@ struct ChatScreen: View {
             } panel: {
                 if attach.isOpen {
                     AttachMenuPanel(
-                        anchor: attach.anchor, isPresented: $attach.isOpen
+                        anchor: attach.anchor, sources: attach.sources,
+                        isPresented: $attach.isOpen
                     ) { source in
                         attach.pick = source
                     }
@@ -159,7 +160,7 @@ struct ChatScreen: View {
             ShareSheet(url: share.url)
         }
         .fullScreenCover(item: $store.viewedImage) { viewed in
-            ImageViewer(image: viewed.image, url: viewed.url) { store.viewedImage = nil }
+            ImageViewer(content: viewed.content, url: viewed.url) { store.viewedImage = nil }
         }
         .fullScreenCover(item: $store.videoPlayback) { playback in
             VideoPlayerScreen(url: playback.url)
@@ -202,6 +203,11 @@ struct ChatScreen: View {
             ModelCatalog.shared.refreshIfNeeded()
             store.refreshModelPin()
             SessionIndex.shared.enterSession(store.sessionId)
+            // Where the responder chain's paste hook (`AppDelegate`) sends an
+            // image. Registered on the SCREEN, not on the composer: every
+            // `fullScreenCover` over the chat tears the dock's `.safeAreaInset`
+            // down and puts it straight back, and this screen is what stays.
+            ComposerPasteTarget.shared.attach(store.staging)
             #if DEBUG
                 store.startDemoFramesIfRequested()
                 store.startDemoAttachmentsIfRequested()
@@ -217,6 +223,7 @@ struct ChatScreen: View {
         .onDisappear {
             host.bridge.detachCurrent(store)
             SessionIndex.shared.leaveSession(store.sessionId)
+            ComposerPasteTarget.shared.detach(store.staging)
         }
     }
 
@@ -308,6 +315,17 @@ struct ChatHeaderView: View {
         .padding(.horizontal, 24)
         .frame(height: Self.barHeight)
         .frame(maxWidth: .infinity)
+        // Keep the bar an accessibility CONTAINER. An offline session shows
+        // neither the model pill nor the index button, leaving the back chevron
+        // as the bar's ONLY focusable child — and SwiftUI then collapses the bar
+        // into that child, which inherits the bar's frame after the veil's
+        // `ignoresSafeArea` has stretched it over the status bar. The chevron
+        // reported (0, 0, 402, 108) instead of its own 42pt circle. Touching the
+        // GLYPH still worked, so nothing looked broken by hand — but a tap aimed
+        // at the element's CENTRE, which is what XCUITest does, landed on empty
+        // header and silently did nothing. That is how three back-chain UI tests
+        // died without a single line of navigation code changing.
+        .accessibilityElement(children: .contain)
         .background(alignment: .top) { veil }
         .animation(.easeOut(duration: 0.15), value: store.legDown)
         // On the STACK, not on the button: an `.animation(_:value:)` inside the

@@ -264,6 +264,32 @@ impl Tool for EditTool {
 mod tests {
     use super::*;
     use baybo_model::AgentProfileId;
+
+    /// The schema spells its parameter names inline, and `baybo-agent` reads
+    /// the same names back off a recorded `ToolUse` through the shared consts.
+    /// Two spellings of one name is exactly the drift worth a cheap guard.
+    #[test]
+    fn the_shared_arg_consts_match_the_schema() {
+        let schema = EditTool::new(WorkspacePaths::new("/tmp")).parameters_schema();
+        let required = schema["required"]
+            .as_array()
+            .expect("required is a list")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>();
+        for name in [
+            crate::TOOL_FILE_PATH_ARG,
+            crate::EDIT_OLD_STRING_ARG,
+            crate::EDIT_NEW_STRING_ARG,
+        ] {
+            assert!(required.contains(&name), "{name} missing from `required`");
+            assert!(
+                schema["properties"].get(name).is_some(),
+                "{name} missing from `properties`"
+            );
+        }
+    }
+
     use baybo_model::{ChannelType, User};
     use baybo_workspace::{IdentityKind, WorkspacePaths};
     use std::time::Duration;

@@ -7,9 +7,11 @@ struct SessionRow: Codable, Identifiable, Equatable {
     let id: String
     var createdAt: Date
     var lastActive: Date
-    /// Auto-generated conversation title (server-side, from the first user
-    /// question); nil until the title pass has run. The list's bold first line;
-    /// live-updated by a `SessionUpdated` patch (`SessionIndex.applyTitle`).
+    /// Conversation title: generated server-side from the first user question,
+    /// or set by a user rename (here — the row's long-press — or from the web);
+    /// nil until either has happened. The list's bold first line; live-updated
+    /// by a `SessionUpdated` patch (`SessionIndex.applyTitle`) and written
+    /// optimistically by `beginRename`, which is the only local write.
     var title: String?
     /// Second-line preview: the most-recent message regardless of author (user
     /// prompt or agent reply). Captured locally on send, reconciled to server
@@ -197,6 +199,22 @@ final class SessionIndex: ObservableObject {
     private var archiveBaselines: [String: Bool] = [:]
     /// Same idea as `archiveBaselines`, for the pin toggle.
     private var pinBaselines: [String: Bool] = [:]
+    /// In-flight rename intents — the LATEST title the user asked for, held per
+    /// session until its PUT resolves.
+    ///
+    /// A map of its own rather than a fourth `PendingMutation` case, for the
+    /// reason `pendingCronPins` is separate: `pendingMutations` holds ONE
+    /// desired state per session, so staging a rename there would silently
+    /// discard a pending archive/pin and vice versa. They are also different
+    /// KINDS of intent — archive, pin and hide are bits the user can flip back
+    /// by repeating the gesture, and a name is not.
+    private var pendingTitles: [String: String] = [:]
+    /// The title last acknowledged by the server, staged when a session's first
+    /// pending rename lands, so a chained failure rolls back to truth rather
+    /// than to the previous *attempt*. Optional because "had no title yet" is a
+    /// real baseline — rolling an untitled row back to some title would settle
+    /// it against the auto-titler on the strength of a rename that failed.
+    private var titleBaselines: [String: String?] = [:]
     /// Bumped on every mutation stage/resolve. A list fetch that STARTED
     /// before a mutation resolved is a stale snapshot even after the pending
     /// entry is gone — `merge` compares epochs and drops it.
@@ -410,14 +428,19 @@ final class SessionIndex: ObservableObject {
 
     /// A live `SessionUpdated` title patch reached the connection-global list
     /// sink (`SessionActivityHandler.onTitle`): swap the row's bold first line
-    /// in place. Title is server-authoritative and never mutated locally, so it
-    /// applies unconditionally for a known row; an unknown id waits for a REST
-    /// merge to surface it (the title is also carried on the summary).
+    /// in place. An unknown id waits for a REST merge to surface it (the title
+    /// is also carried on the summary).
+    ///
+    /// A staged rename beats it, like every other in-flight intent beats a
+    /// remote value. The patch that races one can only be OLDER — the auto
+    /// titler writes solely into a session with no title
+    /// (`set_title_if_absent`), so the one patch that can arrive mid-rename is a
+    /// generated title the user's PUT is about to overwrite server-side. Letting
+    /// it land would leave this device showing a name the gateway no longer
+    /// holds, until some later merge happened to correct it.
     func applyTitle(sessionId: String, title: String) {
-        guard let idx = rows.firstIndex(where: { $0.id == sessionId }), rows[idx].title != title
-        else { return }
-        rows[idx].title = title
-        save()
+        guard pendingTitles[sessionId] == nil else { return }
+        setTitle(sessionId, title: title)
     }
 
     /// A connection-global `SessionUpdated{approval_pending}` reached the list
@@ -516,16 +539,69 @@ final class SessionIndex: ObservableObject {
         setPinnedFlag(sessionId, pinned: pinned)
     }
 
+    /// Optimistic rename: the row's bold first line changes at once, and the
+    /// staged intent shields it from a racing merge — and from a stale
+    /// `SessionUpdated` title patch — until the PUT resolves. No-ops for a row
+    /// that is gone or has a delete in flight.
+    ///
+    /// `title` must already be `RenameTitle.normalized`: it is both what goes on
+    /// the wire and what the row renders, and the gateway stores the normalized
+    /// form, so anything else shows the user a title that rewrites itself when
+    /// the endpoint's own broadcast comes back.
+    func beginRename(_ sessionId: String, title: String) {
+        guard pendingMutations[sessionId] != .hidden,
+            let idx = rows.firstIndex(where: { $0.id == sessionId })
+        else { return }
+        if pendingTitles[sessionId] == nil {
+            titleBaselines[sessionId] = rows[idx].title
+        }
+        pendingTitles[sessionId] = title
+        setTitle(sessionId, title: title)
+    }
+
+    /// The title a rename is trying to land, or `nil` if none is in flight —
+    /// `AppStore.pumpRename`'s "is my ack still the current intent" test.
+    func pendingTitle(for sessionId: String) -> String? {
+        pendingTitles[sessionId]
+    }
+
+    /// The staged rename reached the server: remote truth takes over again.
+    func finishRename(_ sessionId: String) {
+        pendingTitles.removeValue(forKey: sessionId)
+        titleBaselines.removeValue(forKey: sessionId)
+    }
+
+    /// The rename PUT failed: rewind to the last server-acknowledged title —
+    /// including back to no title at all, which is why the baseline is optional
+    /// rather than an empty string (`""` is not a title the server can hold).
+    func rollBackRename(_ sessionId: String) {
+        pendingTitles.removeValue(forKey: sessionId)
+        guard let baseline = titleBaselines.removeValue(forKey: sessionId) else { return }
+        setTitle(sessionId, title: baseline)
+    }
+
+    private func setTitle(_ sessionId: String, title: String?) {
+        guard let idx = rows.firstIndex(where: { $0.id == sessionId }), rows[idx].title != title
+        else { return }
+        rows[idx].title = title
+        save()
+    }
+
     /// Optimistic delete (soft-hide): remove the row now — and its transcript
     /// mirror with it — and suppress the row's remote existence in `merge` until
     /// the DELETE resolves. The mirror goes FIRST, ahead of the row guard: the
     /// user asked for this conversation to be gone, and a row that a racing merge
     /// already dropped (deleted from another client while the confirm was up)
-    /// must still take its transcript with it rather than strand the file.
+    /// must still take its transcript with it rather than strand the file. The
+    /// composer's unsent draft goes the same way and for the same reason —
+    /// deleting a conversation cannot leave its half-written message behind,
+    /// with no row left to reach it from.
     func beginHide(_ sessionId: String) {
         pendingMutations[sessionId] = .hidden
         mutationEpoch += 1
         TranscriptStore.delete(sessionId: sessionId, in: supportDirectory)
+        DraftStore.delete(sessionId: sessionId, in: supportDirectory)
+        onSessionsRemoved?([sessionId])
         guard let idx = rows.firstIndex(where: { $0.id == sessionId }) else { return }
         hiddenBackups[sessionId] = rows[idx]
         rows.remove(at: idx)
@@ -547,7 +623,9 @@ final class SessionIndex: ObservableObject {
         for sessionId in targets {
             pendingMutations[sessionId] = .hidden
             TranscriptStore.delete(sessionId: sessionId, in: supportDirectory)
+            DraftStore.delete(sessionId: sessionId, in: supportDirectory)
         }
+        onSessionsRemoved?(targets)
         mutationEpoch += 1
         for row in rows where targets.contains(row.id) {
             hiddenBackups[row.id] = row
@@ -708,7 +786,10 @@ final class SessionIndex: ObservableObject {
             // Remote title is authoritative, but a live patch may have set it
             // before this (older) snapshot caught up — keep the local one when
             // the snapshot has none rather than blanking a title just shown.
-            let title = summary.title ?? mine?.title
+            // An in-flight rename beats both: it is a local intent the server
+            // has not answered yet, exactly like a staged pin (and staged the
+            // same way, per session rather than in `pendingMutations`).
+            let title = pendingTitles[summary.sessionId] ?? summary.title ?? mine?.title
 
             let archived: Bool
             if case .archived(let flag)? = pending {
@@ -772,16 +853,33 @@ final class SessionIndex: ObservableObject {
         // rows still staged in `pendingMutations` are owned by beginHide /
         // rollBackHide, and a draft (never a row) is never considered here.
         let survivors = Set(merged.map(\.id))
+        var dropped: Set<String> = []
         for row in rows
         where !survivors.contains(row.id) && pendingMutations[row.id] == nil {
             TranscriptStore.delete(sessionId: row.id, in: supportDirectory)
+            DraftStore.delete(sessionId: row.id, in: supportDirectory)
+            dropped.insert(row.id)
         }
+        if !dropped.isEmpty { onSessionsRemoved?(dropped) }
         rows = merged
         save()
     }
 
     /// Logout / rebind: the rows belong to the old gateway — drop them, their
-    /// transcript mirrors, and any staged mutations against it.
+    /// transcript mirrors, their unsent composer drafts, and any staged
+    /// mutations against it.
+    /// Called with every session whose durable per-session state this registry
+    /// has just deleted — a local delete, a delete performed on another client
+    /// and learned in a merge, or an unbind.
+    ///
+    /// It exists because deleting the files is only half of it. A resident
+    /// `ChatStore` holds the composer's draft IN MEMORY and writes it back on
+    /// its next flush, so a row-less draft reappears on disk — and a draft with
+    /// no row is exactly what `AppStore.startNewChat` resumes, which would land
+    /// the compose button in a conversation the server has deleted. The registry
+    /// cannot reach the stores, so `AppStore` listens.
+    var onSessionsRemoved: ((Set<String>) -> Void)?
+
     func removeAll() {
         rows = []
         pendingMutations = [:]
@@ -790,10 +888,13 @@ final class SessionIndex: ObservableObject {
         hiddenBackups = [:]
         archiveBaselines = [:]
         pinBaselines = [:]
+        pendingTitles = [:]
+        titleBaselines = [:]
         mutationEpoch += 1
         save()
         TranscriptStore.deleteAll(in: supportDirectory)
         OutboxStore.deleteAll(in: supportDirectory)
+        DraftStore.deleteAll(in: supportDirectory)
     }
 
     // MARK: - Persistence

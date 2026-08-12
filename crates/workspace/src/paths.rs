@@ -209,6 +209,17 @@ pub const WORK_TMP_SUBDIR: &str = "tmp";
 /// number.
 pub const WORK_TMP_TTL_DAYS: u64 = 7;
 
+/// Blob payload tree inside [`STATE_DIR`]: `<root>/state/blobs/`.
+///
+/// The name lives here, with the rest of the layout, because two unrelated
+/// places must agree on it and neither can see the other's derivation:
+/// `baybo-storage` anchors it to the sqlite file's parent (`Store::open`
+/// takes a bare db path, not a [`WorkspacePaths`]), while the agent runtime
+/// re-exposes the same directory through the sandbox's read-only bind. A
+/// literal in both would be a rename away from a sandbox that silently
+/// stops granting anything.
+pub const BLOBS_SUBDIR: &str = "blobs";
+
 // ---------------------------------------------------------------------------
 // Files inside `logs/` (not version-controlled)
 // ---------------------------------------------------------------------------
@@ -740,6 +751,11 @@ impl WorkspacePaths {
     /// Disposable scratch: `<root>/work/tmp/`. See [`WORK_TMP_SUBDIR`].
     pub fn work_tmp_dir(&self) -> PathBuf {
         self.work_dir().join(WORK_TMP_SUBDIR)
+    }
+
+    /// Blob payloads: `<root>/state/blobs/`. See [`BLOBS_SUBDIR`].
+    pub fn blobs_dir(&self) -> PathBuf {
+        self.state_dir().join(BLOBS_SUBDIR)
     }
 }
 

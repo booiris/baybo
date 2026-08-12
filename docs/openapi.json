@@ -2083,6 +2083,70 @@
         }
       }
     },
+    "/v1/chat/sessions/{session_id}/title": {
+      "put": {
+        "tags": [
+          "chat"
+        ],
+        "operationId": "set_session_title",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Session id to rename",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetSessionTitleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Title updated"
+          },
+          "400": {
+            "description": "Empty or over-long title",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Session not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/chat/sessions/{session_id}/unhide": {
       "post": {
         "tags": [
@@ -6439,6 +6503,65 @@
         }
       }
     },
+    "/v1/traces/tool-sets/{hash}": {
+      "get": {
+        "tags": [
+          "traces"
+        ],
+        "operationId": "get_tool_set",
+        "parameters": [
+          {
+            "name": "hash",
+            "in": "path",
+            "description": "Content hash from an LlmCall span's `tools.hash`",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The tool definitions an LLM call offered the model: `{ hash, tools: [{ name, description, parameters_schema }] }`. Content-addressed and shared by every span that offered the same set, so a client fetches each hash once and caches it. Untyped JSON, consistent with the rest of the per-session traces family.",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed hash",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No stored tool set for that hash",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/traces/{session_id}": {
       "get": {
         "tags": [
@@ -6526,6 +6649,74 @@
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/traces/{session_id}/spans/{span_id}/context": {
+      "get": {
+        "tags": [
+          "traces"
+        ],
+        "operationId": "get_span_context",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Session whose transcript the span's input references",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "span_id",
+            "in": "path",
+            "description": "LlmCall span whose context to break down",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Where one LLM call's input tokens went: `{ model_id, reported_input_tokens, estimated_total_tokens, context_window, segments: [{ part, label, tokens, index }] }`. `reported_input_tokens` is what the provider billed and is exact; the per-segment split is a tiktoken ESTIMATE (see docs/modules/context.md), so a client scales the segments onto the reported total rather than presenting them as measured. `context_window` is null when no configured client serves that model any more.",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid span id, or a span that sends no model input",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such span",
             "content": {
               "application/json": {
                 "schema": {
@@ -10374,6 +10565,19 @@
           "pinned": {
             "type": "boolean",
             "description": "`true` to pin this session to the top of the chat list, `false`\nto unpin it back into the regular list."
+          }
+        }
+      },
+      "SetSessionTitleRequest": {
+        "type": "object",
+        "description": "Request body for `PUT /v1/chat/sessions/{session_id}/title`.",
+        "required": [
+          "title"
+        ],
+        "properties": {
+          "title": {
+            "type": "string",
+            "description": "The conversation's new title. Interior whitespace is collapsed and the\nends trimmed; the result must be non-empty and at most\n`baybo_model::MAX_SESSION_TITLE_LEN` characters, or the call is a 400.\n\nThere is no \"clear it and let the model re-title\" form: a cleared title\ncannot be expressed on the wire, where an absent `SessionPatch.title`\nalready means \"unchanged\"."
           }
         }
       },

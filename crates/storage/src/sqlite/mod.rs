@@ -796,7 +796,9 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     -- and omitted from the DO UPDATE in `save`, so a concurrent
                     -- `touch` can't clobber it. NULL ⇒ nothing read yet.
                     read_cursor           INTEGER,
-                    -- Auto-generated conversation title; owned by set_title.
+                    -- Conversation title: generated on the first user turn
+                    -- (set_title_if_absent) or renamed by the user
+                    -- (set_title). Never written by a blob `save`.
                     title                 TEXT,
                     -- The agent profile this session's work belongs to: its
                     -- soul, skill overlay and memory partition. NULL ⇒ the
@@ -1094,6 +1096,17 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     seq             INTEGER NOT NULL,
                     data            TEXT    NOT NULL,
                     PRIMARY KEY (span_id, seq)
+                );
+
+                -- Tool definitions an `LlmCall` span offered the model,
+                -- content-addressed so a session-stable set is stored once
+                -- instead of on every span that saw it (tens of KB each —
+                -- inline copies would dwarf the spans referencing them).
+                -- `hash` is the digest of `data`, so writes are INSERT OR
+                -- IGNORE and rows are immutable.
+                CREATE TABLE IF NOT EXISTS llm_tool_sets (
+                    hash            TEXT    PRIMARY KEY,
+                    data            TEXT    NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS cron_jobs (

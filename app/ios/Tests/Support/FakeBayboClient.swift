@@ -337,6 +337,7 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     func chatListSessions() async throws -> [ChatSessionSummary] { throw Self.unsupported }
     func chatSetArchived(sessionId: String, archived: Bool) async throws { throw Self.unsupported }
     func chatSetPinned(sessionId: String, pinned: Bool) async throws { throw Self.unsupported }
+    func chatSetTitle(sessionId: String, title: String) async throws { throw Self.unsupported }
 
     func chatSetCronPinned(jobId: String, pinned: Bool) async throws { throw Self.unsupported }
 
@@ -462,8 +463,11 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
 
     func setDeckSink(sink: DeckSink) {}
 
+    /// Answers from the same seeded cache the cached-read paths use, so a test
+    /// that wants a tapped attachment to have bytes seeds one map, not two.
     func blobDownloadBytes(blobId: String, progress: BlobProgress?) async throws -> Data {
-        throw Self.unsupported
+        guard let data = cachedBlobs[blobId] else { throw Self.unsupported }
+        return data
     }
 
     func blobIsCached(blobId: String) async -> Bool { cachedBlobs[blobId] != nil }

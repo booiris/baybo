@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use baybo_model::{SpanId, StepId, TurnId};
+use baybo_model::{SpanId, StepId, ToolSetHash, TurnId};
 
 use crate::StorageError;
 
@@ -31,10 +31,19 @@ pub struct SpanEventRow {
     pub data: String,
 }
 
+/// Persistence row for one content-addressed tool-definition set. The
+/// serialized set IS the row: `hash` is the digest of `data`, so a repeat
+/// save of the same set is a no-op rather than an update.
+#[derive(Debug, Clone)]
+pub struct ToolSetRow {
+    pub hash: ToolSetHash,
+    pub data: String,
+}
+
 /// Persistence backend for the trace tables (`steps`, `spans`,
-/// `span_events`). Trades in rows; `baybo-trace` converts to/from its rich
-/// `Step` / `Span` / `SpanEvent` types at the boundary so the lifecycle
-/// recorder's logic stays in `baybo-trace`.
+/// `span_events`, `llm_tool_sets`). Trades in rows; `baybo-trace` converts
+/// to/from its rich `Step` / `Span` / `SpanEvent` types at the boundary so
+/// the lifecycle recorder's logic stays in `baybo-trace`.
 #[async_trait]
 pub trait TraceStore: Send + Sync {
     async fn save_step(&self, step: &StepRow) -> Result<()>;
@@ -57,6 +66,15 @@ pub trait TraceStore: Send + Sync {
     /// can run to hundreds of KB each, so counting via the list
     /// methods is prohibitively expensive.
     async fn trace_counts_by_turn(&self, turn_id: &TurnId) -> Result<(usize, usize)>;
+
+    /// Persist a tool-definition set under its own content address.
+    /// Idempotent: the same set saved twice writes once, so every span in
+    /// a session can point at it without re-storing the body.
+    async fn save_tool_set(&self, set: &ToolSetRow) -> Result<()>;
+    /// The set an `LlmCall` span's `tools` reference names. `None` when
+    /// the hash is unknown — a span older than the table, or a row that a
+    /// trace delete removed.
+    async fn load_tool_set(&self, hash: &ToolSetHash) -> Result<Option<ToolSetRow>>;
 
     async fn append_span_event(&self, event: &SpanEventRow) -> Result<()>;
     async fn list_span_events(&self, span_id: &SpanId) -> Result<Vec<SpanEventRow>>;

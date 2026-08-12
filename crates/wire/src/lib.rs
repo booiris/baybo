@@ -1097,7 +1097,10 @@ pub struct SessionPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub folder_id: Option<FolderChange>,
-    /// Generated conversation title; absent means no change.
+    /// Conversation title; absent means no change. Written either by the
+    /// first-turn title pass or by a user rename
+    /// (`PUT /v1/chat/sessions/:id/title`). There is no cleared form — a title
+    /// can only be replaced, never taken away.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional, type = "string"))]
     pub title: Option<String>,

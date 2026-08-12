@@ -38,12 +38,16 @@ pub use external_agent::{
 pub use fingerprint::FileFingerprint;
 pub use folder::{FolderId, FolderSummary, MAX_FOLDER_NAME_LEN};
 pub use governance::{ArtifactSource, ExtensionKind, ExtensionManifest, TrustLevel};
-pub use ids::{CostRecordId, ParallelGroup, SessionId, SpanId, StepId, TaskId, TurnId};
+pub use ids::{
+    CostRecordId, ParallelGroup, SessionId, SpanId, StepId, TaskId, ToolSetHash,
+    ToolSetHashParseError, TurnId,
+};
 pub use llm_entry_name::LlmEntryName;
 pub use message::{
     BlobRef, ChatMessage, ContentBlock, MediaBlock, MediaKind, MessageMetadata, MessageSource,
-    Role, SHA256_PREFIX, TOOL_OUTPUT_CLOSE_PREFIX, TOOL_OUTPUT_OPEN_PREFIX, ThinkingContent,
-    ToolResultMeta, blob_content_digest, prose_with_media,
+    Role, SHA256_PREFIX, TOOL_OUTPUT_CLOSE_PREFIX, TOOL_OUTPUT_OPEN_PREFIX,
+    TOOL_RESULT_ERROR_PREFIX, ThinkingContent, ToolResultMeta, blob_content_digest,
+    prose_with_media,
 };
 pub use model_tier::ModelTier;
 pub use money::{MicroUsd, usd_decimal_option};
@@ -55,7 +59,8 @@ pub use project::{
 pub use security_types::{PlaceholderId, SecretKind};
 pub use session::{
     BackgroundNotificationDelivery, BackgroundNotificationGroup, BackgroundNotificationState,
-    ChannelType, Lineage, LineageKind, Session, SessionState, TriggerKind, TriggerSource, User,
+    ChannelType, Lineage, LineageKind, MAX_SESSION_TITLE_LEN, Session, SessionState, TriggerKind,
+    TriggerSource, User,
 };
 pub use spawn_protocol::{
     BACKGROUND_DISPATCH_ACK_PREFIX, BACKGROUND_DISPATCH_YIELD_GUIDANCE,

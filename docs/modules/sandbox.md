@@ -296,6 +296,21 @@ workspace_root" check, since the writable surface is now wider than
 `workspace_root`. Non-existent denied paths are filtered at adapter
 build time so bwrap never sees a `--tmpfs <missing>` line.
 
+`spec::path_visibility(policy, workspace_root, readable_paths, path)`
+answers "is this host path reachable from inside?" for callers that need
+to tell an unmounted path apart from a missing file — the two are
+indistinguishable in the `ENOENT` a failed `execve` prints, and Bash uses
+the answer to annotate `exit 127` (see [`../permission.md`](../permission.md)).
+It is **three-valued**, and `None` means *cannot answer*, never "no": the
+Linux and macOS read-only root lists differ, so a path under a root only
+one backend exposes stays undecided rather than being wrongly reported
+invisible. `LINUX_RO_SYSTEM_ROOTS` / `MACOS_RO_SYSTEM_ROOTS` in `spec.rs`
+are the single source of truth, consumed by both the argv builders and
+this function. The check follows bwrap's last-wins mount order, so
+`workspace_root` and `readable_paths` are decided before `denied_paths`
+— a work dir nested inside a masked state dir is visible, exactly as the
+mount order makes it.
+
 `SandboxAdapter::with_readable_paths(paths)` adds **read-only** re-binds
 on top of that policy (filtered to existing paths at build time). The
 agent layer passes the calling agent's own skill directory,

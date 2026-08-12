@@ -194,10 +194,23 @@ pub trait SessionStore: Send + Sync {
     /// targeted UPDATE leaves the JSON `data` blob alone.
     async fn set_read_cursor(&self, session_id: &SessionId, ordinal: i64) -> Result<bool>;
 
-    /// Set or clear the session's auto-generated title. Implementations
-    /// must update only the flat `title` column so stale `save` calls cannot
-    /// clobber it.
+    /// Set or clear the session's title. Implementations must update only the
+    /// flat `title` column so stale `save` calls cannot clobber it.
+    ///
+    /// This overwrites unconditionally, so it is the *user*-initiated write
+    /// (rename). Machine-generated titles must go through
+    /// [`Self::set_title_if_absent`] instead.
     async fn set_title(&self, session_id: &SessionId, title: Option<&str>) -> Result<bool>;
+
+    /// Title the session only if it has none yet.
+    ///
+    /// `Ok(true)` means this call wrote the title; `Ok(false)` means the row
+    /// is missing or already titled and nothing changed. The test is part of
+    /// the UPDATE, not a prior read, because the auto-titler decides to run
+    /// from a `Session` snapshot taken before its LLM call and can only write
+    /// seconds later — by which time the user may have renamed the
+    /// conversation. Checking at write time is what makes a rename durable.
+    async fn set_title_if_absent(&self, session_id: &SessionId, title: &str) -> Result<bool>;
 
     /// Hard-delete the session.
     ///

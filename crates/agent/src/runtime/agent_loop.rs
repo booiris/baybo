@@ -8,7 +8,8 @@ use baybo_llm::{
 };
 use baybo_memory::{Memory, MemoryContext, MemoryScope};
 use baybo_model::{
-    ChatMessage, ContentBlock, LlmEntryName, MessageSource, ThinkingContent, TurnId,
+    ChatMessage, ContentBlock, LlmEntryName, MessageSource, TOOL_RESULT_ERROR_PREFIX,
+    ThinkingContent, TurnId,
 };
 use baybo_turn::{TurnInput, TurnInputKind, TurnLifecycle, TurnOutput};
 use futures::StreamExt;
@@ -24,6 +25,7 @@ use tracing::{debug, info, warn};
 
 use crate::runtime::compression::CompressionRunner;
 use crate::runtime::error_recovery::ErrorHandler;
+use crate::runtime::progress_ledger::{ProgressVerdict, TurnProgressLedger};
 use crate::runtime::progress_observer::{
     ObserverState, ProgressObserverRunner, build_observer_prompt, channel_wants_progress,
     should_fire_observer,
@@ -545,6 +547,12 @@ pub struct AgentLoop {
     /// row persists the fingerprint it observed — so a read survives actor
     /// eviction / process restart. Any gap fails closed (forces a re-read).
     read_tracker: ReadTracker,
+    /// Per-turn record of file mutations, used to tell the model when its
+    /// edits have cancelled out (see
+    /// [`crate::runtime::progress_ledger`]). Reset at the top of every turn:
+    /// "change this file back" is ordinary work when the user asked for it
+    /// between turns, and only becomes churn inside a single turn.
+    progress_ledger: TurnProgressLedger,
 }
 
 /// Construction bundle for [`AgentLoop`]. Every field maps 1:1 to a
@@ -682,6 +690,7 @@ impl AgentLoop {
             title_generation: None,
             title_sink,
             read_tracker: ReadTracker::default(),
+            progress_ledger: TurnProgressLedger::default(),
         }
     }
 
@@ -930,6 +939,10 @@ impl AgentLoop {
         let background_eligible =
             crate::runtime::background_jobs::background_eligible(session, turn_kind);
         self.context_manager.ensure_seeded().await;
+        // Churn is a within-turn property. Editing a file back to how it was
+        // is exactly what "undo that" means when the user asks between turns.
+        self.progress_ledger.clear();
+        self.context_manager.set_progress_observation(None);
 
         // Fire-and-forget at turn start so the title derives concurrently with
         // the answer (it needs only the question, already in context).
@@ -1237,6 +1250,11 @@ impl AgentLoop {
                 return Err(e);
             }
         };
+        // The observation has now ridden a request, so retire it. Leaving it
+        // mounted would re-raise, on every later iteration, an objection the
+        // model has already answered — and the tool loop below may well mount
+        // a fresh one, which must not be confused with this one.
+        self.context_manager.set_progress_observation(None);
 
         // If no tool calls, we have the final response.
         if response.tool_calls.is_empty() {
@@ -1497,7 +1515,7 @@ impl AgentLoop {
                     push_bounded_images(&mut llm_visible_images, llm_images.iter().cloned());
                     text.clone()
                 }
-                Ok(ToolOutput::Error(msg)) => format!("Error: {msg}"),
+                Ok(ToolOutput::Error(msg)) => format!("{TOOL_RESULT_ERROR_PREFIX} {msg}"),
                 Err(e) => {
                     if let Some(denied) = e.downcast_ref::<baybo_tools::ToolError>()
                         && matches!(denied, baybo_tools::ToolError::Denied { .. })
@@ -1509,7 +1527,7 @@ impl AgentLoop {
                             tool_call.name
                         )
                     } else {
-                        format!("Error: {e}")
+                        format!("{TOOL_RESULT_ERROR_PREFIX} {e}")
                     }
                 }
             };
@@ -1567,6 +1585,18 @@ impl AgentLoop {
                     .and_then(|p| self.read_tracker.get(std::path::Path::new(p)))
             })
             .flatten();
+            // Same three inputs the fingerprint above uses, read for a
+            // different question: not "what does the file look like now" but
+            // "has this turn's editing gone anywhere". A denial and a failure
+            // both count as "the file did not move" — a mid-turn `/stop`
+            // surfaces as `Denied`, so they are not reliably distinguishable.
+            if let Some(verdict) = self.progress_ledger.record(
+                &tool_call.name,
+                &tool_call.arguments,
+                tool_wrote_successfully(&executed.output),
+            ) {
+                self.note_no_progress(&verdict);
+            }
             let meta = (read_fingerprint.is_some()
                 || write_fingerprint.is_some()
                 || call_approval.is_some())
@@ -1605,6 +1635,38 @@ impl AgentLoop {
             .iter()
             .any(|tc| baybo_model::TASK_MUTATING_TOOL_NAMES.contains(&tc.name.as_str()));
         Ok(IterationOutcome::Continue { task_mutated })
+    }
+
+    /// Mount the no-progress observation for the next request and log the
+    /// fact once.
+    ///
+    /// Injected rather than enforced. The runtime knows the file is back where
+    /// it started, but not whether that is a mistake: a flag toggled on to
+    /// test and off again looks the same from here. So the model gets the fact
+    /// and stays in charge of the turn — which is also the only option that
+    /// helps, since the model in the incident this comes from reasoned
+    /// perfectly well once it had the missing fact, and killing its turn would
+    /// have told it nothing. `max_iterations` remains the hard backstop.
+    fn note_no_progress(&mut self, verdict: &ProgressVerdict) {
+        use baybo_context::prompts::no_progress;
+        let (kind, count) = match verdict {
+            ProgressVerdict::StateRevisited { edits, .. } => {
+                (no_progress::Kind::StateRevisited, *edits)
+            }
+            ProgressVerdict::AttemptRepeated { attempts, .. } => {
+                (no_progress::Kind::AttemptRepeated, *attempts)
+            }
+            ProgressVerdict::Futile { streak, .. } => (no_progress::Kind::Futile, *streak),
+        };
+        let path = verdict.path().display().to_string();
+        warn!(
+            path = %path,
+            count,
+            kind = ?kind,
+            "turn is churning a file without net progress; telling the model"
+        );
+        self.context_manager
+            .set_progress_observation(Some(no_progress::render(kind, &path, count)));
     }
 
     /// Call the LLM with retry on transient errors using `ErrorHandler`.
@@ -1712,6 +1774,18 @@ impl AgentLoop {
             })
             .collect();
 
+        // Mirrored off the wire list rather than re-read from the registry:
+        // the trace has to record what this request actually carried, and a
+        // second registry read could disagree with it.
+        let trace_tool_defs: Vec<baybo_trace::LlmToolDefinition> = tool_defs
+            .iter()
+            .map(|td| baybo_trace::LlmToolDefinition {
+                name: td.name.clone(),
+                description: td.description.clone(),
+                parameters_schema: td.parameters_schema.clone(),
+            })
+            .collect();
+
         // Coalesce adjacent same-role user/assistant messages *only* on the
         // wire to the LLM. Skill reminders are stored as standalone
         // `Role::User` entries, which would otherwise produce back-to-back
@@ -1731,6 +1805,19 @@ impl AgentLoop {
 
         let input_messages = self.context_manager.build_call_input_marker().await;
 
+        // What the model was allowed to call, recorded beside what it was
+        // shown. Stored content-addressed, so a session-stable list costs
+        // one row rather than one copy per call. A failure to persist it
+        // must not fail the turn — the span keeps everything else and the
+        // detail panel simply has no tool list for that call.
+        let tools = match span_recorder.record_tool_set(trace_tool_defs).await {
+            Ok(reference) => Some(reference),
+            Err(e) => {
+                warn!(error = %e, "failed to record the LLM tool set");
+                None
+            }
+        };
+
         let cancel = cancel_token.clone();
         crate::runtime::scope::with_llm_span(
             span_recorder.as_ref(),
@@ -1742,6 +1829,7 @@ impl AgentLoop {
                 provider_config_hash: String::new(),
                 input_messages,
                 temperature: None,
+                tools,
             },
             Some((cancel_token, baybo_turn::CancelReason::ParentCancelled)),
             |span| async move {
@@ -2369,6 +2457,22 @@ impl AgentLoop {
         // streamed as ephemeral `Reasoning` rather than answer `AnswerDelta`.
         let mut pending_reasoning = String::new();
 
+        // A provider splits one turn's reasoning into several thinking blocks,
+        // each a self-contained section that typically opens with its own
+        // `**Headline**`. The DELTA stream carries no separator between them —
+        // the boundary is the `ThinkingBlock` event that closes a section — so
+        // concatenating deltas verbatim glues the next headline onto the tail
+        // of the previous section's last sentence (`…I need!**Inspecting the
+        // repo**`). Every client re-assembles the deltas the same way, so the
+        // break has to be inserted here, once, rather than in each of them.
+        //
+        // `rig`'s `ReasoningDelta` carries an `id` that would mark the same
+        // boundary, but every provider hardcodes it to `None` (rig even
+        // asserts that in its own Anthropic test) — the block event is the only
+        // signal that actually arrives.
+        let mut reasoning_seen = false;
+        let mut reasoning_part_closed = false;
+
         loop {
             // Stop consuming the moment the turn is cancelled, falling through
             // to flush + return the partial. The stream drops on function exit,
@@ -2402,7 +2506,21 @@ impl AgentLoop {
                     // Raw accumulates into `thinking` for the response (sanitized
                     // wholesale at finalize); a parallel buffer streams it to the
                     // channel through the same leak boundary the answer text uses.
+                    //
+                    // The section break goes ONLY into the streamed copy. `thinking`
+                    // is echoed back to providers that stream reasoning as deltas
+                    // only, so it must stay byte-exact — and it is used solely when
+                    // no `ThinkingBlock` ever arrived, which is exactly the case
+                    // where no break is inserted, so the two cannot disagree.
                     thinking.push_str(&r);
+                    if reasoning_part_closed && reasoning_seen {
+                        // A blank line, not a lone newline: CommonMark folds a
+                        // single one into a space, which leaves the headline glued
+                        // exactly as before.
+                        pending_reasoning.push_str("\n\n");
+                    }
+                    reasoning_part_closed = false;
+                    reasoning_seen |= !r.is_empty();
                     pending_reasoning.push_str(&r);
                     let flush_to = safe_flush_boundary(&pending_reasoning);
                     if flush_to > 0 {
@@ -2411,7 +2529,14 @@ impl AgentLoop {
                             .await;
                     }
                 }
-                StreamEvent::ThinkingBlock(block) => thinking_blocks.push(block),
+                StreamEvent::ThinkingBlock(block) => {
+                    // Closes one thinking section. Arm the break rather than
+                    // emitting it now: a block can be the last thing in the turn
+                    // (and a `redacted_thinking` one arrives with no deltas at
+                    // all), and neither should leave a trailing blank line.
+                    thinking_blocks.push(block);
+                    reasoning_part_closed = true;
+                }
                 StreamEvent::Usage(u) => usage = u,
             }
         }
@@ -3053,11 +3178,17 @@ impl AgentLoop {
     /// — present in the running gateway, absent in tests / headless, so
     /// titles are only generated where something renders them); the session is
     /// a top-level user session (`TriggerSource::User`, no lineage — cron /
-    /// subagent skipped); it has no title yet (`session.title.is_none()`, the
-    /// durable once-only guard, self-healing across rehydration); this actor
-    /// hasn't already attempted one ([`Self::title_generation`] present, the
-    /// per-actor-lifetime guard); and the transcript has a text-bearing first
-    /// user question ([`first_user_question`]).
+    /// subagent skipped); it has no title yet (`session.title.is_none()`);
+    /// this actor hasn't already attempted one ([`Self::title_generation`]
+    /// present, the per-actor-lifetime guard); and the transcript has a
+    /// text-bearing first user question ([`first_user_question`]).
+    ///
+    /// The `session.title.is_none()` arm is only a cheap pre-filter. It reads
+    /// the actor's long-lived `Session` snapshot, which a rename (a targeted
+    /// column UPDATE from the gateway) never refreshes, so the authoritative
+    /// guard is the conditional write at the end of the spawned task —
+    /// `set_title_if_absent`. Losing that race costs one lite-model call and
+    /// nothing else.
     async fn maybe_generate_title(
         &mut self,
         session: &Session,
@@ -3105,8 +3236,13 @@ impl AgentLoop {
                 cancel_token,
             };
             match runner.run(question).await {
-                Ok(Some(title)) => match sessions.set_title(&session_id, Some(&title)).await {
-                    Ok(()) => title_sink.title_updated(&session_id, &title),
+                // Conditional write, not a plain set: the gate below ran
+                // before this LLM call, so the user may have renamed the
+                // conversation in the meantime. Staying silent on `false`
+                // keeps a generated title off every client's sidebar too.
+                Ok(Some(title)) => match sessions.set_title_if_absent(&session_id, &title).await {
+                    Ok(true) => title_sink.title_updated(&session_id, &title),
+                    Ok(false) => {}
                     Err(e) => warn!(
                         session_id = %session_id,
                         error = %e,

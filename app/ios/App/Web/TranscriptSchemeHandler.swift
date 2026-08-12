@@ -41,18 +41,25 @@ final class TranscriptSchemeHandler: NSObject, WKURLSchemeHandler {
         /// agent-authored page — inline style, no network, no images.
         static let demoHtmlBlobId = "sha256:" + String(repeating: "de", count: 32) + ".d0"
         private static let demoHtmlArg = "-baybo-demo-html"
+        /// Deliberately DARK, and it has to stay that way: the fixture's job is
+        /// to be a page that is not the transcript's own paper. It was white,
+        /// and a white agent page is exactly the one that hides how the frame
+        /// around it is painted — the full-screen preview reserved the home
+        /// indicator in `--color-paper` and nothing in any screenshot of this
+        /// document could show it. `HtmlPreviewUITests` now samples those
+        /// pixels, so a white page here would take that assertion with it.
         private static let demoHtmlDocument = #"""
             <!doctype html><html lang="en"><head><meta charset="utf-8">
             <meta name="viewport" content="width=device-width,initial-scale=1">
             <style>
-              body{margin:0;padding:18px;font:14px/1.5 -apple-system,system-ui,sans-serif;color:#1c1c1e;background:#fff}
-              h1{margin:0 0 2px;font-size:17px}p.sub{margin:0 0 18px;color:#8a8a8e;font-size:12px}
+              body{margin:0;padding:18px;font:14px/1.5 -apple-system,system-ui,sans-serif;color:#f2f2f7;background:#12141a}
+              h1{margin:0 0 2px;font-size:17px}p.sub{margin:0 0 18px;color:#9a9aa2;font-size:12px}
               .bars{display:flex;align-items:flex-end;gap:10px;height:150px}
-              .bar{flex:1;background:linear-gradient(180deg,#4c6ef5,#7048e8);border-radius:6px 6px 0 0;position:relative}
-              .bar span{position:absolute;bottom:-18px;left:0;right:0;text-align:center;font-size:11px;color:#8a8a8e}
+              .bar{flex:1;background:linear-gradient(180deg,#5b7cfa,#8b5cf6);border-radius:6px 6px 0 0;position:relative}
+              .bar span{position:absolute;bottom:-18px;left:0;right:0;text-align:center;font-size:11px;color:#9a9aa2}
               .row{display:flex;gap:12px;margin-top:32px}
-              .kpi{flex:1;border:1px solid #e5e5ea;border-radius:10px;padding:10px 12px}
-              .kpi b{display:block;font-size:20px}.kpi em{font-style:normal;font-size:11px;color:#8a8a8e}
+              .kpi{flex:1;border:1px solid #2a2d36;border-radius:10px;padding:10px 12px}
+              .kpi b{display:block;font-size:20px}.kpi em{font-style:normal;font-size:11px;color:#9a9aa2}
             </style></head><body>
             <h1>Quarterly sales</h1><p class="sub">2026 · thousands</p>
             <div class="bars">

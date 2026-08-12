@@ -10,6 +10,7 @@ pub mod cron;
 pub mod interjection;
 pub mod issue;
 pub mod line_diff;
+pub mod no_progress;
 pub mod recalled_memory;
 pub mod skills_update;
 pub mod soul;

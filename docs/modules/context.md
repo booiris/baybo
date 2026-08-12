@@ -68,6 +68,8 @@ ContextManager (struct)
     ├── interjection.rs    — wrap_interjections (mid-turn steering envelope)
     ├── recalled_memory.rs — wrap_recalled_memories (recall envelope)
     ├── tasks.rs           — render_task_list (transient checklist reminder)
+    ├── no_progress.rs     — render (transient "your edits cancelled out"
+    │                        observation; see agent.md → No-progress detection)
     ├── title.rs           — build_title_prompt (conversation-title pass)
     ├── cancelled_turn.rs  — /stop salvage marker (SUFFIX + strip_marker)
     ├── tool_output.rs     — cap_tool_output / spill (+ MAX cap)
@@ -411,6 +413,34 @@ Wiring contract:
 - `maybe_compress(model_id, chat)` is the single point that sets the calibration key. Pass `LlmCompletion::model_info().id` so `observe` and `adjust` key into the same bucket. Switching `model_id` between calls invalidates the baseline (the prior `actual_tokens` was tokenised by the old provider).
 - `TiktokenTokenizer::for_model(model)` only picks the BPE family — it stores no model id. Calibration granularity is decided by what the agent loop passes into `maybe_compress`, not by how the tokenizer was constructed.
 - Calibration state is in-memory only; cold start re-calibrates from scratch each process. The baseline is reset on every compression and re-anchored by the next main call.
+
+## Context breakdown (read side)
+
+`breakdown.rs` answers a different question from everything above: not *how
+much context is there* but *what is in it*. `context_breakdown(model_id,
+messages, tools)` splits one recorded LLM call into per-part token estimates —
+the system prompt, the tool definitions, the skill listing, recalled memories,
+each message, each tool result — for the trace viewer's context matrix
+(`GET /v1/traces/{session_id}/spans/{span_id}/context`).
+
+Two things it deliberately does not do:
+
+- **It does not classify by role.** `recalled_memory`, `skill_listing`, and
+  `system_prompt_update` all ride as framed `Role::User` rows on purpose (a
+  system row would re-assert itself on every later turn), so the mapping keys
+  off `MessageSource` first and falls back to the role. Reading the role alone
+  would file the three things most likely to be bloating a context under
+  "user". A tool result on a `Role::User` row — how providers without a tool
+  role take them — is caught by the block shape for the same reason.
+- **It does not claim to be the total.** The split is a `TiktokenTokenizer`
+  estimate with all the drift described above, so the endpoint returns it
+  beside the span's recorded `input_tokens` and the viewer scales the
+  proportions onto that exact figure. Media rides in its own `Media` part
+  rather than inside the text estimate, matching the calibration split.
+
+It is a pure function over already-recorded data, so it never participates in
+the baseline/calibration loop — a read of the trace must not move the live
+budget of anything.
 
 ## Collaboration
 

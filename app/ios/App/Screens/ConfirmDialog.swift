@@ -5,7 +5,7 @@ import UIKit
 /// folded onto one floating paper plate: bold mono title, soft mono
 /// hint, the practiced Cancel | commit pill row. Ink dims the field (never
 /// black, never blur — glass stays rationed to the composer surfaces); the
-/// commit is a single outline pill, red on a destructive action (`commitTint`).
+/// commit is a single outline pill in the destructive red.
 ///
 /// Hand-rolled on purpose: the stock `.confirmationDialog` left its
 /// `isPresented` binding latched true after a scrim dismiss inside the
@@ -31,11 +31,6 @@ struct ConfirmDialog: View {
     /// execution records it will clear). Nil for a body that takes no argument.
     var bodyArg: String?
     let commitKey: String
-    /// The commit pill's outline. Red is the destructive token and this dialog
-    /// is where the design system spends it — so a stop-and-decide that is NOT
-    /// destructive (the per-session resync) takes ink instead, rather than
-    /// teaching the field that red means "a dialog".
-    var commitTint: Color = Theme.err
     let onCancel: () -> Void
     let onConfirm: () -> Void
 
@@ -116,7 +111,13 @@ struct ConfirmDialog: View {
                 } label: {
                     Text(verbatim: lang.t(commitKey))
                 }
-                .buttonStyle(OutlinePillButtonStyle(color: commitTint))
+                // Red is the destructive token, and this dialog is now the only
+                // place the design system spends it: every remaining confirm
+                // takes something away. The commit that does NOT — the
+                // per-session resync — no longer asks at all, which is a better
+                // answer than a red-less dialog teaching the field that red just
+                // means "a dialog".
+                .buttonStyle(OutlinePillButtonStyle(color: Theme.err))
             }
             .padding(.top, 22)
         }

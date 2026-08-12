@@ -31,6 +31,7 @@ pub use approval::{
     ResourceAccess,
 };
 pub(crate) use baybo_model::FileFingerprint;
+pub use builtin::paths::shell_reachable_workspace_roots;
 pub use builtin::read::READ_TOOL_NAME;
 pub use builtin::write::WRITE_TOOL_NAME;
 
@@ -45,6 +46,13 @@ pub const TOOL_FILE_PATH_ARG: &str = "file_path";
 /// the recorded `ToolUse` to recover the copy of a persona file the model is
 /// holding, which is a newer baseline than the one its system prompt carries.
 pub const TOOL_CONTENT_ARG: &str = "content";
+
+/// The two parameters an `Edit` names its endpoints with. Shared for the same
+/// reason as [`TOOL_CONTENT_ARG`]: `baybo-agent` reads them back off the
+/// recorded `ToolUse` to tell an edit that advanced the file from one that put
+/// it back where it was.
+pub const EDIT_OLD_STRING_ARG: &str = "old_string";
+pub const EDIT_NEW_STRING_ARG: &str = "new_string";
 
 /// Tools that REWRITE the file at [`TOOL_FILE_PATH_ARG`]. A subset of
 /// [`READ_TRACKER_ANCHORING_TOOLS`], which also counts `Read` — the two answer
@@ -732,6 +740,15 @@ pub trait ExecSandbox: Send + Sync {
         Err(crate::ToolError::Execution(
             "detached spawn is not supported by this sandbox backend".into(),
         ))
+    }
+
+    /// Whether the host path `path` is reachable from inside this sandbox.
+    /// `None` means the backend cannot answer — callers MUST NOT render
+    /// that as either answer. Lets a caller tell "the sandbox never
+    /// mounted this" apart from "the file is genuinely missing", which
+    /// are indistinguishable from the `ENOENT` a failed `execve` prints.
+    fn path_is_visible(&self, _path: &Path) -> Option<bool> {
+        None
     }
 }
 

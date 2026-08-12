@@ -32,6 +32,9 @@ struct ArchivedScreen: View {
             header
         }
         .background(Theme.paper)
+        // Like the home shell: this screen takes no typed input, and the rename
+        // editor that can float over it owns its own keyboard avoidance.
+        .ignoresSafeArea(.keyboard)
         // The system nav bar is hidden (custom chrome), which also disables the
         // interactive pop — this presence-only host re-enables the edge swipe.
         .background(PopGestureEnabler().frame(width: 0, height: 0))
@@ -112,6 +115,10 @@ struct ArchivedScreen: View {
                     }
                     .tint(Theme.err)
                 }
+                // The long-press rides here too: archiving a conversation is a
+                // filing decision, not a decision to stop being able to rename
+                // or repair it (see `sessionContextMenu`).
+                .sessionContextMenu(row.id)
             }
         }
         .listStyle(.plain)

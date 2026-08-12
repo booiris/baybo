@@ -37,6 +37,48 @@ fn format_numbered_line(line_no: usize, line: &str) -> String {
     }
 }
 
+/// Turn a mid-read failure into a message that distinguishes the very
+/// different things it can mean.
+///
+/// The failing call is `next_line`, so a binary file surfaces as a *decode*
+/// verdict — "stream did not contain valid UTF-8" — formatted identically to
+/// the `File::open` ENOENT above it. An agent that guessed a path and got
+/// this back cannot tell "wrong path" from "right path, wrong tool", which is
+/// exactly the distinction it was probing for. The file has already been
+/// stat'd by this point, so saying that it is there and how big costs
+/// nothing.
+///
+/// The size gate matters: past [`MAX_FILE_BYTES`] the reader is a `take`, so
+/// a decode failure is equally likely to be the cut landing mid-codepoint in
+/// a perfectly good UTF-8 file. Calling that one "binary" would send the
+/// model to Bash for a file it could have read with a narrower window.
+///
+/// Neither message routes the model to `GetBlob`. It is keyed by `blob_id`
+/// while the caller arrived here holding a path, with no way back; and since
+/// `GetBlob` answers *with* payload paths, the likeliest arrival is a model
+/// that called it and then `Read` the image it got — so naming it would be
+/// advice already taken.
+fn decode_failure(path: &Path, total_size: u64, e: &std::io::Error) -> ToolError {
+    if e.kind() != std::io::ErrorKind::InvalidData {
+        return ToolError::Execution(format!("read {}: {e}", path.display()));
+    }
+    if total_size > MAX_FILE_BYTES {
+        return ToolError::Execution(format!(
+            "read {}: {total_size} bytes; the first {MAX_FILE_MIB} MiB are not valid UTF-8 — \
+             either the file is binary, or the {MAX_FILE_MIB} MiB cut split a multi-byte \
+             character. Retry with a `limit` that stops before the cut, or use Bash if it is \
+             a binary payload.",
+            path.display()
+        ));
+    }
+    ToolError::Execution(format!(
+        "read {}: exists ({total_size} bytes) but is not UTF-8 text — Read returns text \
+         only. Pass the path to whatever consumes the file (via Bash: `file`, `xxd`, \
+         ffmpeg, …).",
+        path.display()
+    ))
+}
+
 /// The exclusive last line index a `Read` with these params will emit —
 /// the same offset/limit defaulting [`paginate_numbered`] applies
 /// (default [`DEFAULT_LIMIT`], capped at [`MAX_LIMIT`]). Exported so a
@@ -200,7 +242,7 @@ impl Tool for ReadTool {
         while let Some(line) = reader
             .next_line()
             .await
-            .map_err(|e| ToolError::Execution(format!("read {}: {e}", p.file_path.display())))?
+            .map_err(|e| decode_failure(&p.file_path, total_size, &e))?
         {
             if idx >= end {
                 break;
@@ -370,6 +412,35 @@ mod tests {
             panic!();
         };
         assert!(s.contains("truncated"), "expected truncation marker: {s}");
+    }
+
+    #[tokio::test]
+    async fn a_binary_file_says_it_was_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let found = dir.path().join("photo.jpg");
+        tokio::fs::write(&found, [0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10])
+            .await
+            .unwrap();
+
+        let binary = ReadTool
+            .execute(json!({ "file_path": found }), &ctx())
+            .await
+            .unwrap_err()
+            .to_string();
+        let missing = ReadTool
+            .execute(
+                json!({ "file_path": dir.path().join("absent.jpg") }),
+                &ctx(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+        // The whole point: the two must not read alike. A guessed path that
+        // was RIGHT has to be distinguishable from one that was wrong.
+        assert!(binary.contains("exists (6 bytes)"), "{binary}");
+        assert!(binary.contains("not UTF-8 text"), "{binary}");
+        assert!(!missing.contains("exists"), "{missing}");
     }
 
     #[test]

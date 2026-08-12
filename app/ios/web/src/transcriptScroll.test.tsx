@@ -402,4 +402,73 @@ describe("a REPLACE under a reader parked in history", () => {
     expect(rowIds()).toEqual(items(950, 999).map((r) => r.id));
     expect(scrollTop).toBe(maxScroll());
   });
+
+  // The cost of keeping the head: the page re-cuts a turn the head already
+  // holds. A block cut at its START is flushed `turn_complete: true` — the
+  // accumulator only ever learns about a block's END — so the kept half and the
+  // page's half both claim to be whole turns, `sameContinuingTurn` declines, and
+  // one turn renders as two "Worked" cards. It is sticky: the pair persists into
+  // the mirror and `sanitizeRestoredRows` will not heal a head that says
+  // complete, so it comes back on every open.
+  describe("and the page re-cuts a turn the head still holds", () => {
+    const workRow = (id: string, callId: string): Row => ({
+      id,
+      role: "work",
+      steps: [{ kind: "tool", callId, label: `Bash(${callId})`, status: "ok" }],
+      active: false,
+      startedAt: 1_700_000_000_000,
+      elapsedMs: 4_000,
+      turnComplete: true,
+    });
+
+    const workItem = (id: string, callId: string): TranscriptRowItem => ({
+      id,
+      ordinal: Number(id.slice(1)),
+      kind: "work",
+      steps: [{ kind: "tool", call_id: callId, tool: "bash", tool_label: `Bash(${callId})`, tool_status: "ok" }],
+      work_started_at: "2026-08-09T10:00:02.000Z",
+      work_ended_at: "2026-08-09T10:00:06.000Z",
+      turn_complete: true,
+    });
+
+    /// A mirror whose newest rows END on the turn's block, with the answer that
+    /// closed it at an ordinal the page's window will claim.
+    const straddling: PersistedState = {
+      messages: [row(940), row(942), row(944), workRow("w946", "c1"), row(956)],
+      lastOrdinal: null,
+      oldestOrdinal: 940,
+      hasMoreOlder: true,
+    };
+
+    async function openStraddling(): Promise<void> {
+      render(
+        <I18nextProvider i18n={i18n}>
+          <Transcript restored={straddling} initialConnEpoch={0} />
+        </I18nextProvider>,
+      );
+      await settle();
+    }
+
+    it("joins the two halves into one card instead of stacking a second", async () => {
+      await openStraddling();
+      expect(document.querySelectorAll(".work-ladder")).toHaveLength(1);
+
+      await pushFrame(baseline([workItem("w950", "c2"), item(956)], 950));
+
+      expect(document.querySelectorAll(".work-ladder")).toHaveLength(1);
+      // The head's key survives, so the card re-times in place rather than
+      // remounting, and it carries both halves' steps.
+      expect(rowIds()).toEqual(["m940", "m942", "m944", "w946", "m956"]);
+    });
+
+    it("still refuses across a compaction watermark — those halves are two turns", async () => {
+      await openStraddling();
+      await pushFrame({
+        ...baseline([workItem("w950", "c2"), item(956)], 950),
+        compaction_points: [{ ordinal: 948, at: "2026-08-09T10:00:04.000Z" }],
+      });
+
+      expect(document.querySelectorAll(".work-ladder")).toHaveLength(2);
+    });
+  });
 });

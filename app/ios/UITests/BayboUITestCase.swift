@@ -1,3 +1,4 @@
+import UIKit
 import XCTest
 
 /// Shared launch + wait plumbing for the headless `-baybo-*` fixture smokes.
@@ -113,6 +114,15 @@ class BayboUITestCase: XCTestCase {
             "the demo download drive never reached ready")
     }
 
+    /// What a screenshot actually PAINTS, which every other assertion in these
+    /// suites is blind to: they read `exists` / `isHittable` / frames, all of
+    /// which a laid-out-but-invisible element satisfies perfectly (see the
+    /// `.clipped()` attach panel, and the paper band under a full-screen HTML
+    /// preview). Reach for it only when the claim really is about pixels.
+    func screenPixels() -> ScreenshotPixels? {
+        ScreenshotPixels(XCUIScreen.main.screenshot().image)
+    }
+
     /// Keep a shot of transient chrome — a presented sheet, a menu level — in
     /// the xcresult, which is the only way to see it from outside the runner
     /// (`xcrun xcresulttool export attachments`).
@@ -121,5 +131,70 @@ class BayboUITestCase: XCTestCase {
         shot.name = name
         shot.lifetime = .keepAlways
         add(shot)
+    }
+}
+
+/// One screenshot's pixels, read once.
+///
+/// Reading a point at a time through a 1x1 `CGContext` is fine for a handful of
+/// samples and hopeless for a scan, so a scan crops the column FIRST (free — no
+/// rasterisation) and rasterises that alone.
+struct ScreenshotPixels {
+    private let image: CGImage
+    let scale: CGFloat
+
+    init?(_ image: UIImage) {
+        guard let cgImage = image.cgImage else { return nil }
+        self.image = cgImage
+        scale = image.scale
+    }
+
+    /// Size in POINTS — screenshots are at the device's scale, and every caller
+    /// thinks in the units XCUITest frames are in.
+    var size: CGSize {
+        CGSize(width: CGFloat(image.width) / scale, height: CGFloat(image.height) / scale)
+    }
+
+    /// Rec. 601 luma at one point, 0...1. Nil outside the image.
+    func brightness(at point: CGPoint) -> CGFloat? {
+        let x = Int(point.x * scale)
+        let y = Int(point.y * scale)
+        guard x >= 0, y >= 0, x < image.width, y < image.height else { return nil }
+        return rows(column: x, from: y, height: 1)?.first
+    }
+
+    /// How much of a vertical line through `x` is BRIGHT, in points — the
+    /// height of whatever light thing the column crosses. Orientation-free by
+    /// construction: it counts rows rather than locating them, so it says
+    /// nothing about which way CoreGraphics stacked them.
+    func brightHeight(atX x: CGFloat, threshold: CGFloat = 0.5) -> CGFloat? {
+        let column = Int(x * scale)
+        guard column >= 0, column < image.width,
+            let luma = rows(column: column, from: 0, height: image.height)
+        else { return nil }
+        return CGFloat(luma.filter { $0 > threshold }.count) / scale
+    }
+
+    /// `height` pixels of one column, as luma.
+    private func rows(column: Int, from top: Int, height: Int) -> [CGFloat]? {
+        guard height > 0, top >= 0, top + height <= image.height,
+            let strip = image.cropping(
+                to: CGRect(x: column, y: top, width: 1, height: height))
+        else { return nil }
+        var pixels = [UInt8](repeating: 0, count: height * 4)
+        guard
+            let context = pixels.withUnsafeMutableBytes({ buffer in
+                CGContext(
+                    data: buffer.baseAddress, width: 1, height: height, bitsPerComponent: 8,
+                    bytesPerRow: 4, space: CGColorSpaceCreateDeviceRGB(),
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+            })
+        else { return nil }
+        context.draw(strip, in: CGRect(x: 0, y: 0, width: 1, height: height))
+        return (0..<height).map { row in
+            let i = row * 4
+            return (0.299 * CGFloat(pixels[i]) + 0.587 * CGFloat(pixels[i + 1])
+                + 0.114 * CGFloat(pixels[i + 2])) / 255
+        }
     }
 }

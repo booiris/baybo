@@ -2,17 +2,12 @@ use std::ffi::OsString;
 use std::path::Path;
 
 use crate::WorkspaceSymlinkMount;
-use crate::spec::{EnvPolicy, FilesystemPolicy, NetworkPolicy, SandboxSpec};
+use crate::spec::{
+    EnvPolicy, FilesystemPolicy, LINUX_RO_SYSTEM_ROOTS, MACOS_RO_SYSTEM_ROOTS, NetworkPolicy,
+    SandboxSpec,
+};
 
-const BWRAP_RO_ROOTS: &[&str] = &[
-    "/usr",
-    "/bin",
-    "/sbin",
-    "/lib",
-    "/lib64",
-    "/etc",
-    "/run/systemd/resolve",
-];
+const BWRAP_RO_ROOTS: &[&str] = LINUX_RO_SYSTEM_ROOTS;
 
 /// Why this path must never be handed to [`SandboxSpec::writable_paths`],
 /// or `None` if it is safe to bind.
@@ -475,16 +470,7 @@ pub fn render_sbpl_profile(
             // isolation: all sessions and other host processes see
             // the same `/tmp`.
             s.push_str("(allow file-read*\n");
-            for p in [
-                "/usr",
-                "/System",
-                "/Library",
-                "/private/var/db/dyld",
-                "/private/etc",
-                "/private/tmp",
-                "/bin",
-                "/sbin",
-            ] {
+            for p in MACOS_RO_SYSTEM_ROOTS {
                 s.push_str(&format!("  (subpath \"{}\")\n", sbpl_quote(Path::new(p))));
             }
             s.push_str(&format!(

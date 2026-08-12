@@ -162,6 +162,11 @@ export interface ChatMenuProps {
   canMoveToFolder: boolean;
   folders: Folder[];
   onMoveToFolder: (folderId: string | null) => void;
+  /** Open the row's inline title editor. Offered on cron fires too: a fire's
+   *  own row renders `session.title`, so the rename shows once its group is
+   *  expanded. (The collapsed group header is the cron job's title and is
+   *  unaffected — renaming a recurring conversation means editing the job.) */
+  onRename: () => void;
   onTogglePin: () => void;
   onHide: () => void;
   onClose: () => void;
@@ -174,6 +179,7 @@ export function ChatContextMenu({
   canMoveToFolder,
   folders,
   onMoveToFolder,
+  onRename,
   onTogglePin,
   onHide,
   onClose,
@@ -236,6 +242,14 @@ export function ChatContextMenu({
           <div className="my-1 border-t-2 border-black/10" />
         </>
       ) : null}
+      <MenuRow
+        icon={<RiEditLine />}
+        label="Rename"
+        onClick={() => {
+          onClose();
+          onRename();
+        }}
+      />
       <MenuRow
         icon={pinned ? <RiPushpin2Fill /> : <RiPushpin2Line />}
         label={pinned ? 'Unpin' : 'Pin to top'}

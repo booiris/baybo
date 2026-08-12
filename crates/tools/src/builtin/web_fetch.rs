@@ -60,13 +60,13 @@
 //! verbatim.
 
 use std::net::{IpAddr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use baybo_llm::{BilledChat, ChatRequest};
-use baybo_model::{ChatMessage, ContentBlock, blob_content_digest};
+use baybo_model::{ChatMessage, ContentBlock};
 use baybo_store::BlobStore;
 use dom_smoothie::Readability;
 use htmd::HtmlToMarkdown;
@@ -259,6 +259,22 @@ impl WebFetchTool {
         let blob_store: Arc<dyn BlobStore> =
             Arc::new(baybo_storage::test_support::MemoryBlobStore::new());
         Self::build(blob_store, true, true, None)
+    }
+
+    /// `for_testing`, but archiving into a real on-disk store so the
+    /// `raw_content_file=` path in the header is one that actually exists.
+    /// The in-memory fake keeps no files and answers `local_path` with
+    /// `None`, which is honest but leaves nothing for a path assertion to
+    /// be about.
+    #[cfg(test)]
+    async fn for_testing_on_disk(dir: &std::path::Path) -> Self {
+        let pool = baybo_storage::sqlite::SqlitePool::open(dir.join("storage.db"))
+            .await
+            .expect("test pool");
+        let store = baybo_storage::sqlite::SqliteBlobStore::open(pool, dir.join("blobs"))
+            .await
+            .expect("test blob store");
+        Self::build(Arc::new(store) as Arc<dyn BlobStore>, true, true, None)
     }
 
     #[cfg(test)]
@@ -514,11 +530,18 @@ Usage notes:
                 .put(rendered.as_bytes(), raw_mime, None)
                 .await
             {
-                Ok(blob_ref) => blob_local_path(
-                    &ctx.workspace_paths.state_dir(),
-                    &blob_ref.blob_id,
-                    raw_mime,
-                ),
+                // Ask the store where it put the bytes rather than
+                // reconstructing the path: that layout is a frozen
+                // persistence format `baybo-storage` owns, and a private
+                // mirror of it here is one upstream edit from advertising a
+                // file that does not exist.
+                Ok(blob_ref) => match self.blob_store.local_path(&blob_ref.blob_id).await {
+                    Ok(path) => path,
+                    Err(e) => {
+                        tracing::warn!(host = %host, error = %e, "WebFetch raw-blob path lookup failed");
+                        None
+                    }
+                },
                 Err(e) => {
                     tracing::warn!(host = %host, error = %e, "WebFetch raw-blob archive failed");
                     None
@@ -730,31 +753,6 @@ fn extract_article(raw_html: &str, host: &str) -> String {
     } else {
         format!("# {title}\n\n{body_md}")
     }
-}
-
-/// Mirror of `SqliteBlobStore::blob_path` + its private `mime_extension`
-/// table for the two MIME types this tool uses. The sqlite backend
-/// stores `text/markdown` as `<hex>.md` and `text/plain` as `<hex>.txt`
-/// under `<root>/<hex[..2]>/`; if that mapping ever changes upstream
-/// this helper must move with it. In-memory test backends keep no files
-/// on disk — the path is still computed (so the response header has a
-/// stable shape) but the file won't exist.
-fn blob_local_path(state_dir: &Path, blob_id: &str, mime: &str) -> Option<PathBuf> {
-    let hex = blob_content_digest(blob_id)?;
-    if hex.len() < 2 {
-        return None;
-    }
-    let ext = match mime {
-        RAW_BLOB_MIME_MARKDOWN => ".md",
-        RAW_BLOB_MIME_PLAIN => ".txt",
-        _ => "",
-    };
-    Some(
-        state_dir
-            .join("blobs")
-            .join(&hex[..2])
-            .join(format!("{hex}{ext}")),
-    )
 }
 
 /// Prefix the agent-visible reply with a one-line metadata header
@@ -1307,7 +1305,6 @@ mod tests {
     async fn raw_content_is_archived_before_summarisation() {
         use baybo_llm::test_support::StubLlm;
         use baybo_llm::{LlmResponse, TokenUsage};
-        use baybo_storage::test_support::MemoryBlobStore;
 
         let stub = Arc::new(StubLlm::new());
         stub.push_response(LlmResponse {
@@ -1331,8 +1328,8 @@ mod tests {
         ))
         .await;
 
-        let blob_store = Arc::new(MemoryBlobStore::new());
-        let tool = WebFetchTool::build(blob_store.clone() as Arc<dyn BlobStore>, true, true, None);
+        let dir = tempfile::tempdir().unwrap();
+        let tool = WebFetchTool::for_testing_on_disk(dir.path()).await;
 
         let llm = billed(stub.clone() as Arc<dyn LlmCompletion>);
         let mut tctx = ctx();
@@ -1352,24 +1349,36 @@ mod tests {
         assert_eq!(body, "summary reply");
 
         // Exactly one blob — the rendered markdown, not the summary.
-        assert_eq!(blob_store.len(), 1, "expected one archived blob");
-
-        // The path in the header carries the hex shard layout and the
-        // `.md` extension (HTML body archived as markdown).
-        let path_kv = header
-            .split_whitespace()
-            .find_map(|tok| tok.strip_prefix("raw_content_file="))
-            .expect("raw_content_file= missing from header");
-        let path = std::path::Path::new(path_kv);
-        let expected_prefix = tctx.workspace_paths.state_dir().join("blobs");
-        assert!(
-            path.starts_with(&expected_prefix),
-            "{path:?} not under {expected_prefix:?}"
-        );
+        let blobs_root = dir.path().join("blobs");
+        let mut shards = tokio::fs::read_dir(&blobs_root).await.unwrap();
+        let mut payloads = Vec::new();
+        while let Some(shard) = shards.next_entry().await.unwrap() {
+            if !shard.file_type().await.unwrap().is_dir() {
+                continue;
+            }
+            let mut files = tokio::fs::read_dir(shard.path()).await.unwrap();
+            while let Some(f) = files.next_entry().await.unwrap() {
+                payloads.push(f.path());
+            }
+        }
         assert_eq!(
-            path.extension().and_then(|e| e.to_str()),
+            payloads.len(),
+            1,
+            "expected one archived blob: {payloads:?}"
+        );
+
+        // The header path is the store's own — it points at the real
+        // payload, under the `.md` extension an HTML body archives as.
+        let archived = archived_path(header);
+        assert!(
+            archived.starts_with(&blobs_root),
+            "{archived:?} not under {blobs_root:?}"
+        );
+        assert_eq!(archived, payloads[0]);
+        assert_eq!(
+            archived.extension().and_then(|e| e.to_str()),
             Some("md"),
-            "expected .md extension, got {path:?}"
+            "expected .md extension, got {archived:?}"
         );
 
         // The captured LLM call saw the extracted markdown — and the
@@ -1511,19 +1520,34 @@ mod tests {
             get(|| async { ([(header::CONTENT_TYPE, "text/plain")], "raw <b>text</b>") }),
         ))
         .await;
-        let out = WebFetchTool::for_testing()
+        let dir = tempfile::tempdir().unwrap();
+        let out = WebFetchTool::for_testing_on_disk(dir.path())
+            .await
             .execute(json!({ "url": url_to(&server, "/") }), &ctx())
             .await
             .unwrap();
         let ToolOutput::Text(s) = out else { panic!() };
         let (header, body) = split_output(&s);
         assert!(header.contains("summarized=false"), "header: {header:?}");
-        // Plain text bodies archive under `.txt`.
-        assert!(
-            header.contains("raw_content_file=") && header.contains(".txt"),
-            "header missing raw_content_file path: {header:?}"
+        // Plain text bodies archive under `.txt`, at a path that resolves.
+        let archived = archived_path(header);
+        assert_eq!(archived.extension().and_then(|e| e.to_str()), Some("txt"));
+        assert_eq!(
+            tokio::fs::read_to_string(&archived).await.unwrap(),
+            "raw <b>text</b>"
         );
         assert_eq!(body, "raw <b>text</b>");
+    }
+
+    /// The `raw_content_file=` path from a response header. Panics with the
+    /// header when absent, since every test using it is asserting the
+    /// archive happened.
+    fn archived_path(header: &str) -> std::path::PathBuf {
+        header
+            .split_whitespace()
+            .find_map(|tok| tok.strip_prefix("raw_content_file="))
+            .unwrap_or_else(|| panic!("raw_content_file= missing from header: {header:?}"))
+            .into()
     }
 
     #[tokio::test]
@@ -1795,7 +1819,8 @@ mod tests {
         ))
         .await;
 
-        let tool = WebFetchTool::for_testing();
+        let dir = tempfile::tempdir().unwrap();
+        let tool = WebFetchTool::for_testing_on_disk(dir.path()).await;
 
         let llm = billed(stub.clone() as Arc<dyn LlmCompletion>);
         let mut tctx = ctx();
@@ -1812,11 +1837,11 @@ mod tests {
         };
         let (header, body) = split_output(&s);
         assert!(header.contains("summarized=true"), "header: {header:?}");
-        // HTML pages archive under `.md` (extract_article emits markdown).
-        assert!(
-            header.contains("raw_content_file=") && header.contains(".md"),
-            "header missing markdown raw_content_file: {header:?}"
-        );
+        // HTML pages archive under `.md` (extract_article emits markdown),
+        // at a path that resolves.
+        let archived = archived_path(header);
+        assert_eq!(archived.extension().and_then(|e| e.to_str()), Some("md"));
+        assert!(archived.exists(), "{archived:?} does not exist");
         assert_eq!(body, "Title is `Hello`.");
 
         let captured = stub.captured_requests();

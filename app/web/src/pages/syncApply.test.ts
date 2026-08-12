@@ -3,7 +3,11 @@ import type { components } from '../api/schema';
 import {
   applySyncMerge,
   applySyncReplace,
+  applyTurnState,
   compactionDividerKeys,
+  joinKeptHead,
+  pushToolStartedStep,
+  rowsAboveFloor,
   shouldAutoLoadOlder,
   syncSince,
   transcriptItemToRow,
@@ -86,6 +90,126 @@ describe('applySyncReplace (baseline / rebase REPLACE + overlay)', () => {
     const out = applySyncReplace(prev, page, new Set(['x']), null);
     expect(out).toHaveLength(1); // the page's persisted row stands alone
     expect(out[0].clientMsgId).toBe('x');
+  });
+
+  // The page is a SNAPSHOT. A reply persisted after it was taken arrives over
+  // the socket with its own ordinal, and that frame advances the cursor — so a
+  // REPLACE that drops the row loses it for good: a difference selects strictly
+  // `>` the cursor the row itself set. A cold open is the one path that runs a
+  // baseline, which is why this read as "the newest message never arrives".
+  it('keeps a live reply whose ordinal the page predates', () => {
+    const page = [
+      transcriptItemToRow(SID, msg(9, 'user', 'question')),
+      transcriptItemToRow(SID, msg(10, 'assistant', 'older answer')),
+    ];
+    const live: TranscriptRow = { key: `row-${SID}-m12`, role: 'assistant', text: 'the newest' };
+    const out = applySyncReplace([...page, live], page, new Set(), null);
+    expect(out.map((r) => r.text)).toEqual(['question', 'older answer', 'the newest']);
+  });
+
+  it('drops a stale row the page covers and disagrees with — that is what REPLACE means', () => {
+    const page = [transcriptItemToRow(SID, msg(10, 'assistant', 'the truth'))];
+    const stale: TranscriptRow = { key: `row-${SID}-m8`, role: 'assistant', text: 'rebased away' };
+    expect(applySyncReplace([stale], page, new Set(), null).map((r) => r.text)).toEqual([
+      'the truth',
+    ]);
+  });
+
+  it('keeps nothing twice when the page already carries the row', () => {
+    const page = [transcriptItemToRow(SID, msg(10, 'assistant', 'answer'))];
+    expect(applySyncReplace(page, page, new Set(), null)).toHaveLength(1);
+  });
+});
+
+// A rebase says only that the difference outran the server's limit and here is
+// the newest page instead — ordinals are not rewritten, so the pages a reader
+// scrolled up for are still true. Dropping them costs them the history AND the
+// round trips that fetched it, mid-read. iOS has kept it since af7372bc.
+describe('rowsAboveFloor — a rebase must not cost the reader the history they paged in', () => {
+  const none = new Set<string>();
+  const at = (ordinal: number): TranscriptRow => ({
+    key: `row-${SID}-m${ordinal}`,
+    role: 'assistant',
+    text: `r${ordinal}`,
+  });
+  const notice = (id: string): TranscriptRow => ({
+    key: `row-${SID}-n${id}`,
+    role: 'system',
+    text: '',
+    notice: { level: 'info', text: 'Stopped.' },
+  });
+
+  it('keeps everything before the first row the page covers', () => {
+    const rows = [at(10), at(20), at(30), at(40)];
+    expect(rowsAboveFloor(rows, 30, none).map((r) => r.key)).toEqual([
+      `row-${SID}-m10`,
+      `row-${SID}-m20`,
+    ]);
+  });
+
+  it('cuts by POSITION, so an ordinal-less notice stays with its neighbours', () => {
+    const rows = [at(10), notice('7'), at(30)];
+    expect(rowsAboveFloor(rows, 30, none).map((r) => r.key)).toEqual([
+      `row-${SID}-m10`,
+      `row-${SID}-n7`,
+    ]);
+  });
+
+  it('drops a row the rebuilt thread already carries — never twice', () => {
+    const rows = [at(10), at(20), at(30)];
+    const taken = new Set([`row-${SID}-m20`]);
+    expect(rowsAboveFloor(rows, 30, taken).map((r) => r.key)).toEqual([`row-${SID}-m10`]);
+  });
+
+  it('keeps nothing when the page reaches the whole thread', () => {
+    expect(rowsAboveFloor([at(30), at(40)], 30, none)).toEqual([]);
+  });
+});
+
+// The cost of keeping the head: the page re-cuts a turn the head still holds. A
+// block cut at its START is flushed `turn_complete: true` — `flush` only ever
+// learns about a block's END — so both halves claim to be whole turns and the
+// fold declines, rendering one turn as two cards.
+describe('joinKeptHead — a turn the page re-cut at its start is still one turn', () => {
+  const workRow = (ordinal: number, complete: boolean, callId: string): TranscriptRow => ({
+    key: `row-${SID}-w${ordinal}`,
+    role: 'system',
+    text: '',
+    kind: 'work',
+    workActive: false,
+    workComplete: complete,
+    workStartedAt: 1_000,
+    workEndedAt: 5_000,
+    steps: [{ key: `${ordinal}-0`, kind: 'tool', toolCallId: callId, tool: 'bash' }],
+  });
+
+  it('fuses the head half with the page half into one card', () => {
+    const head = [transcriptItemToRow(SID, msg(9, 'user', 'go')), workRow(10, true, 'c1')];
+    const rebuilt = [workRow(20, true, 'c2'), transcriptItemToRow(SID, msg(30, 'assistant', 'done'))];
+    const out = joinKeptHead(head, rebuilt, []);
+    expect(out.map((r) => r.key)).toEqual([
+      `row-${SID}-m9`,
+      `row-${SID}-w10`,
+      `row-${SID}-m30`,
+    ]);
+    expect(out[1].steps?.map((s) => s.toolCallId)).toEqual(['c1', 'c2']);
+  });
+
+  it('refuses across a compaction watermark — those halves are two turns', () => {
+    const head = [workRow(10, true, 'c1')];
+    const rebuilt = [workRow(20, true, 'c2')];
+    const points = [{ ordinal: 15, at: '2026-08-09T10:00:00.000Z' }];
+    expect(joinKeptHead(head, rebuilt, points)).toHaveLength(2);
+  });
+
+  it('leaves a head that does not end on a work block alone', () => {
+    const head = [workRow(10, true, 'c1'), transcriptItemToRow(SID, msg(12, 'assistant', 'answered'))];
+    const rebuilt = [workRow(20, true, 'c2')];
+    expect(joinKeptHead(head, rebuilt, []).map((r) => r.key)).toEqual([
+      `row-${SID}-w10`,
+      `row-${SID}-m12`,
+      `row-${SID}-w20`,
+    ]);
   });
 });
 
@@ -180,6 +304,73 @@ describe('applySyncMerge (difference append + dedup)', () => {
     expect([...compactionDividerKeys(out, points).keys()]).toEqual([`row-${SID}-w40`]);
     // No boundary between them ⇒ one turn the page edge cut, still one card.
     expect(applySyncMerge(prev, page, [])).toHaveLength(2);
+  });
+});
+
+// A sync that runs WHILE the turn is running (a revisit, a `Frame::Gap`) gets
+// back the gateway's partial reconstruction of that same turn, deliberately
+// stamped with the live turn's `started_at` so it lands on the open block. That
+// row is `workActive: false` like every REST row — adopting it wholesale closed
+// a block whose turn had not ended, and the next progress frame then found a
+// frozen tail and opened a SECOND card with no row between them. Nothing healed
+// it: `foldAdjacentWork` runs at the end of the merge, not on later live frames.
+describe('applySyncMerge — a mid-turn difference must not close the turn it is watching', () => {
+  const T = 1_700_000_000_000;
+
+  const partial = (ordinal: number, complete: boolean): TranscriptRow => ({
+    ...work(`row-${SID}-w${ordinal}`, complete),
+    workStartedAt: T,
+    workEndedAt: T + 5_000,
+    steps: [{ key: 'srv-0', kind: 'tool', toolCallId: 'c1', tool: 'bash', toolStatus: 'ok' }],
+  });
+
+  const live = (): TranscriptRow[] =>
+    pushToolStartedStep(applyTurnState([], true, T), 'c1', 'bash', 'Bash(ls)', true);
+
+  it('keeps the block live and unions the steps when the page says the turn continues', () => {
+    const out = applySyncMerge(live(), [partial(7, false)], []);
+    expect(out).toHaveLength(1);
+    expect(out[0].workActive).toBe(true);
+    expect(out[0].workComplete).toBe(false);
+    expect(out[0].steps?.map((s) => s.toolCallId)).toEqual(['c1']);
+  });
+
+  it('so a progress frame landing after it extends that block instead of forking a card', () => {
+    const merged = applySyncMerge(live(), [partial(7, false)], []);
+    const after = pushToolStartedStep(merged, 'c2', 'read', 'Read(x)', true);
+    expect(after.filter((r) => r.kind === 'work')).toHaveLength(1);
+    expect(after[0].steps?.map((s) => s.toolCallId)).toEqual(['c1', 'c2']);
+  });
+
+  it('still lets a COMPLETE page row supersede — that turn ended while frames were lost', () => {
+    const out = applySyncMerge(live(), [partial(7, true)], []);
+    expect(out).toHaveLength(1);
+    expect(out[0].workActive).toBe(false);
+    expect(out[0].key).toBe(`row-${SID}-w7`);
+  });
+});
+
+// A cold open applies the baseline REPLACE before the `subscribe_state` bundle
+// arrives, so `turn` is still null and the page's in-flight block stays closed.
+// A progress frame landing in that window used to fork a second card, because
+// `ensureWork`'s reuse test rejected the `null` tri-state. The server's own
+// cut-off flag answers the question the turn state cannot yet.
+describe('ensureWork — an unknown turn state must not fork the block the page just delivered', () => {
+  it('extends a cut-off block when the turn state is not known yet', () => {
+    const page = [transcriptItemToRow(SID, msg(6, 'user', 'go')), work(`row-${SID}-w7`, false)];
+    const rows = applySyncReplace([], page, new Set(), null);
+    const after = pushToolStartedStep(rows, 'c9', 'read', 'Read(x)', null);
+    expect(after.filter((r) => r.kind === 'work')).toHaveLength(1);
+    // The page's own step is still there — the frame extended that block.
+    expect(after.at(-1)?.steps).toHaveLength(2);
+    expect(after.at(-1)?.steps?.at(-1)?.toolCallId).toBe('c9');
+  });
+
+  it('but a COMPLETE block is a finished turn, and the frame opens its own card', () => {
+    const page = [transcriptItemToRow(SID, msg(6, 'user', 'go')), work(`row-${SID}-w7`, true)];
+    const rows = applySyncReplace([], page, new Set(), null);
+    const after = pushToolStartedStep(rows, 'c9', 'read', 'Read(x)', null);
+    expect(after.filter((r) => r.kind === 'work')).toHaveLength(2);
   });
 });
 

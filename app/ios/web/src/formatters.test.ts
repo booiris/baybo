@@ -5,6 +5,7 @@ import {
   formatBytes,
   formatTime,
   formatTimestampShort,
+  isVectorImage,
   isVideoAttachment,
   ordinalFromMessageId,
   rowOrdinal,
@@ -145,6 +146,28 @@ describe("isVideoAttachment", () => {
     ["an image", "image" as const, "image/png"],
   ])("rejects %s", (_why, kind, mime) => {
     expect(isVideoAttachment(attachment({ kind, mime_type: mime }))).toBe(false);
+  });
+});
+
+describe("isVectorImage", () => {
+  it("elects the pre-paint measurement path — an SVG has no pixels to ask for", () => {
+    expect(isVectorImage(attachment({ kind: "image", mime_type: "image/svg+xml" }))).toBe(true);
+  });
+
+  it("survives a mime carrying parameters", () => {
+    expect(
+      isVectorImage(attachment({ kind: "image", mime_type: "image/SVG+XML; charset=utf-8" })),
+    ).toBe(true);
+  });
+
+  it.each([
+    ["a raster image", "image" as const, "image/png"],
+    // A `.svg` the gateway bucketed as a plain file renders as a named chip, not
+    // an <img> — there is nothing to measure.
+    ["an svg sent as a file", "file" as const, "image/svg+xml"],
+    ["an audio blob", "audio" as const, "audio/mpeg"],
+  ])("rejects %s", (_why, kind, mime) => {
+    expect(isVectorImage(attachment({ kind, mime_type: mime }))).toBe(false);
   });
 });
 

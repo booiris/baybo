@@ -111,6 +111,7 @@ impl CompressionRunner {
                         // layer that knows which slice is persisted.
                         input_messages: input_marker.clone(),
                         temperature: request.temperature,
+                        tools: None,
                     };
                     // Whether the failure this attempt saw is worth a second
                     // call. Decided on the TYPED error inside the span body,

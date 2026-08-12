@@ -131,12 +131,52 @@ const OUTBOUND_BUFFER: usize = 64;
 
 /// Per-WebSocket connection state. One per accepted `/v1/channel-ws`
 /// client. Holds the channel-side handle, the outbound frame sender
-/// for control pushes, and the pump task handle.
+/// for control pushes, and the leg's teardown.
 pub(crate) struct Sidecar {
     pub channel: Arc<Channel>,
     pub connection: Arc<Connection>,
     frame_tx: mpsc::Sender<Frame>,
-    pump: JoinHandle<()>,
+    teardown: LegTeardown,
+}
+
+/// Ties a leg's cleanup to the [`Sidecar`]'s lifetime, so it happens on BOTH
+/// ways out: the graceful [`Sidecar::shutdown`], and a plain drop.
+///
+/// The plain drop is not hypothetical — it is how a relay chat leg normally
+/// ends. The device dedup aborts the stale leg's task
+/// (`LegDedup::install` → `stale.abort()`), and so does `legs.shutdown()` on a
+/// control-connection redial; an aborted task drops its `Sidecar` and never
+/// reaches any teardown method. Before this guard existed that left two things
+/// behind, both of them per-cold-start and both monotonic: the [`Connection`]
+/// stayed ATTACHED to its channel, a ghost subscriber the router keeps fanning
+/// frames at, and the outbound pump task merely DETACHED (tokio's behaviour for
+/// a dropped `JoinHandle`) — still owning the socket's write half, still
+/// writing keepalives at a peer that is gone.
+struct LegTeardown {
+    channel: Arc<Channel>,
+    connection_id: ConnectionId,
+    /// `None` once [`Self::wind_down`] has handed it over.
+    pump: Option<JoinHandle<()>>,
+}
+
+impl LegTeardown {
+    /// Detach now and give up the pump so the caller can await its own exit —
+    /// the graceful path. Leaves [`Drop`] nothing to do.
+    fn wind_down(&mut self) -> Option<JoinHandle<()>> {
+        self.channel.detach(self.connection_id);
+        self.pump.take()
+    }
+}
+
+impl Drop for LegTeardown {
+    fn drop(&mut self) {
+        // Detach is best-effort and idempotent, so the graceful path running it
+        // first is fine.
+        self.channel.detach(self.connection_id);
+        if let Some(pump) = self.pump.take() {
+            pump.abort();
+        }
+    }
 }
 
 /// Resolve the channel for `channel_type` from the registry, falling
@@ -207,10 +247,14 @@ impl Sidecar {
         let pump = tokio::spawn(pump_loop(sink, frame_rx));
 
         Self {
+            teardown: LegTeardown {
+                channel: Arc::clone(&channel),
+                connection_id: connection.id(),
+                pump: Some(pump),
+            },
             channel,
             connection,
             frame_tx,
-            pump,
         }
     }
 
@@ -258,15 +302,18 @@ impl Sidecar {
         true
     }
 
-    /// Detach the connection from its channel and return the pump
-    /// join handle so the caller can await its shutdown. Idempotent on
-    /// multiple calls because detach is best-effort.
-    pub(crate) fn into_pump(self) -> JoinHandle<()> {
-        let conn_id = self.connection.id();
-        self.channel.detach(conn_id);
+    /// Wind the leg down gracefully: detach from the channel, release the
+    /// outbound sender so [`pump_loop`] runs out of frames and exits on its own,
+    /// and await that exit (so its `close` reaches the wire). The abrupt
+    /// alternative — dropping the `Sidecar` — is [`LegTeardown`]'s job.
+    pub(crate) async fn shutdown(mut self) {
+        let pump = self.teardown.wind_down();
         drop(self.connection);
         drop(self.frame_tx);
-        self.pump
+        drop(self.teardown);
+        if let Some(pump) = pump {
+            let _ = pump.await;
+        }
     }
 }
 
@@ -707,6 +754,72 @@ mod tests {
         assert!(
             registry.get(&ct).is_some(),
             "lazy install must publish to the registry so a second connect hits the hot path",
+        );
+    }
+
+    /// A sink that reports its own destruction, so a test can tell an aborted
+    /// pump (the future is dropped, taking the sink with it) from a detached one
+    /// still parked on `recv`.
+    struct DropReportingSink(Arc<std::sync::atomic::AtomicBool>);
+
+    #[async_trait::async_trait]
+    impl super::FrameSink for DropReportingSink {
+        async fn send_frame(&mut self, _frame: &Frame) -> Result<(), ()> {
+            Ok(())
+        }
+        async fn close(&mut self) {}
+    }
+
+    impl Drop for DropReportingSink {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// An ABORTED leg never reaches [`Sidecar::shutdown`] — it just drops. That
+    /// is the normal end of a relay chat leg (the device dedup's
+    /// `stale.abort()` on the leg a dead process left behind, and
+    /// `legs.shutdown()` on a control redial), so the drop has to do the
+    /// cleanup.
+    ///
+    /// The detach is the load-bearing half. Leave the connection attached and
+    /// the channel keeps an `Arc<Connection>` whose `GatewaySink` holds clones
+    /// of BOTH outbound senders — so the pump and the translator never see
+    /// their channels close, and the pump goes on owning the socket's write
+    /// half and keepaliving at a peer that is gone. Once per cold start,
+    /// forever.
+    #[tokio::test]
+    async fn dropping_a_sidecar_detaches_it_and_kills_its_pump() {
+        let registry = Arc::new(ChannelRegistry::new());
+        super::super::boot::install_channel(&registry, ChannelType::owner()).expect("install");
+        let channel = registry.get(&ChannelType::owner()).expect("channel");
+        let sink_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let sidecar = super::Sidecar::build(
+            ChannelType::owner(),
+            Arc::clone(&channel),
+            DropReportingSink(Arc::clone(&sink_dropped)),
+            Arc::new(MemoryBlobStore::new()) as Arc<dyn BlobStore>,
+        );
+        assert_eq!(channel.connection_count(), 1, "fixture attaches");
+
+        drop(sidecar);
+
+        assert_eq!(
+            channel.connection_count(),
+            0,
+            "an aborted leg must not leave a ghost subscriber attached"
+        );
+        let mut waited = std::time::Duration::ZERO;
+        while !sink_dropped.load(std::sync::atomic::Ordering::SeqCst)
+            && waited < std::time::Duration::from_secs(2)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            waited += std::time::Duration::from_millis(10);
+        }
+        assert!(
+            sink_dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "the outbound pump must die with the leg, releasing the socket"
         );
     }
 

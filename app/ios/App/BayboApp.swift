@@ -20,6 +20,14 @@ struct BayboApp: App {
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
                 store.didBecomeActive()
+            } else {
+                // `!= .active`, unlike the leg teardown below: a composer draft
+                // costs a few hundred bytes to check-point and the phases that
+                // bounce back (a banner, Control Centre, the app-switcher peek)
+                // are also the ones a user force-quits from. Flushing on
+                // `.background` alone would lose the last keystrokes of every
+                // message abandoned that way.
+                store.willLeaveForeground()
             }
             // `.background`, not `!= .active`: suspension always passes through
             // active → inactive → background, but a notification banner, Control

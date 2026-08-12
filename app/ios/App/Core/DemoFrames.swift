@@ -42,28 +42,68 @@
             return cannedTurnArgs.contains(where: args.contains)
         }
 
+        /// How a demo image's bytes are drawn — which is also the whole reason
+        /// the last two exist. A raster carries its pixel count, so its box can
+        /// be read off the decoded element; a VECTOR carries none, and the two
+        /// ways of writing one fail in opposite directions. `.vectorDeclared`
+        /// (an SVG with `width`/`height` past the column) is reported by WebKit
+        /// at whatever size it is currently laid out at — measured inside the
+        /// loading tile, that is 192px, which the mirror then reserves forever.
+        /// `.vectorViewBox` (a bare `viewBox`) has no intrinsic width at all, so
+        /// a shrink-to-fit bubble gives it ZERO and it never appears. Both must
+        /// paint the full width of the column, on the first run and on a
+        /// relaunch.
+        private enum DemoImageKind {
+            case raster
+            case vectorDeclared
+            case vectorViewBox
+        }
+
         /// Natural pixel sizes the demo images decode to — a spread that makes a
         /// wrongly-reserved box obvious: a portrait that grows its row, a banner
         /// that shrinks it, a thumbnail under every cap, a square the height cap
-        /// clamps. The declared `size` is nominal (the fake bytes are a flat PNG).
-        private static let demoImageSizes: [(id: String, width: Int, height: Int)] = [
-            ("sha256:demoimg1.tok", 768, 1024),
-            ("sha256:demoimg2.tok", 1600, 400),
-            ("sha256:demoimg3.tok", 80, 60),
-            ("sha256:demoimg4.tok", 900, 900),
-        ]
+        /// clamps. The declared `size` is nominal (the fake bytes are a flat PNG
+        /// or a two-shape SVG).
+        private static let demoImageSizes:
+            [(id: String, width: Int, height: Int, kind: DemoImageKind)] = [
+                ("sha256:demoimg1.tok", 768, 1024, .raster),
+                ("sha256:demoimg2.tok", 1600, 400, .raster),
+                ("sha256:demoimg3.tok", 80, 60, .raster),
+                ("sha256:demoimg4.tok", 900, 900, .raster),
+                ("sha256:demoimg5.tok", 1200, 400, .vectorDeclared),
+                ("sha256:demoimg6.tok", 900, 300, .vectorViewBox),
+            ]
 
-        private static var demoImageAttachments: [[String: Any]] {
-            demoImageSizes.map {
-                [
-                    "kind": "image", "blob_id": $0.id, "mime_type": "image/png",
-                    "size": $0.width * $0.height * 4,
-                ]
+        private static func demoImageMime(_ kind: DemoImageKind) -> String {
+            kind == .raster ? "image/png" : "image/svg+xml"
+        }
+
+        /// Vectors are named so a screenshot says which spelling it is looking
+        /// at; the rasters stay nameless (the mime-fallback path).
+        private static func demoImageFilename(_ kind: DemoImageKind) -> String? {
+            switch kind {
+            case .raster: nil
+            case .vectorDeclared: "declared-size.svg"
+            case .vectorViewBox: "viewbox-only.svg"
             }
         }
 
-        /// `-baybo-demo-images` (DEBUG): one agent turn carrying the four images
-        /// above and a text row UNDER them — that row's y-position is the whole
+        private static var demoImageAttachments: [[String: Any]] {
+            demoImageSizes.map {
+                var attachment: [String: Any] = [
+                    "kind": "image", "blob_id": $0.id,
+                    "mime_type": demoImageMime($0.kind),
+                    "size": $0.width * $0.height * 4,
+                ]
+                if let filename = demoImageFilename($0.kind) {
+                    attachment["filename"] = filename
+                }
+                return attachment
+            }
+        }
+
+        /// `-baybo-demo-images` (DEBUG): one agent turn carrying the images above
+        /// and a text row UNDER them — that row's y-position is the whole
         /// test. A first run (empty mirror) paints the 12rem loading tiles, then
         /// each image releases to its real height and shoves the row around; the
         /// sizes it records mean a SECOND run of the same session reserves each
@@ -218,22 +258,36 @@
         private static let demoIndexStamp = ISO8601DateFormatter()
 
         /// Serve a demo image's bytes with no gateway and no blob leg: a flat PNG
-        /// at the declared pixel size, behind a delay long enough to screenshot
-        /// the layout BEFORE the bytes land — which is exactly the frame the
-        /// reserved box has to already be right in.
+        /// or a flat SVG at the declared size, behind a delay long enough to
+        /// screenshot the layout BEFORE the bytes land — which is exactly the
+        /// frame the reserved box has to already be right in.
         func serveDemoImageIfRequested(id: Int, blobId: String) -> Bool {
             guard let demo = Self.demoImageSizes.first(where: { $0.id == blobId }) else {
                 return false
             }
             Task { @MainActor in
                 try? await Task.sleep(for: .seconds(2))
-                guard let png = Self.demoImagePng(width: demo.width, height: demo.height) else {
-                    return
-                }
+                guard let bytes = Self.demoImageBytes(blobId: blobId) else { return }
                 pushDemoBlobResult(
-                    id: id, dataBase64: png.base64EncodedString(), mimeType: "image/png")
+                    id: id, dataBase64: bytes.base64EncodedString(),
+                    mimeType: Self.demoImageMime(demo.kind))
             }
             return true
+        }
+
+        /// The same bytes the transcript's `requestBlob` is served, for the paths
+        /// that read a blob NATIVELY rather than over the bridge — the tapped
+        /// image viewer being the only one, and the reason an SVG's viewer was
+        /// unreachable by any fixture.
+        static func demoImageBytes(blobId: String) -> Data? {
+            guard let demo = demoImageSizes.first(where: { $0.id == blobId }) else { return nil }
+            switch demo.kind {
+            case .raster: return demoImagePng(width: demo.width, height: demo.height)
+            case .vectorDeclared:
+                return demoImageSvg(width: demo.width, height: demo.height, declared: true)
+            case .vectorViewBox:
+                return demoImageSvg(width: demo.width, height: demo.height, declared: false)
+            }
         }
 
         /// Scale 1 is load-bearing: the renderer defaults to the screen's (3x),
@@ -252,6 +306,20 @@
                 diagonal.lineWidth = CGFloat(max(width, height)) / 40
                 diagonal.stroke()
             }.pngData()
+        }
+
+        /// The same flat diagram as the PNG, as vector art. `declared` picks
+        /// which of the two spellings this one is (see `DemoImageKind`); the
+        /// `viewBox` is on both, since art without one cannot scale at all.
+        private static func demoImageSvg(width: Int, height: Int, declared: Bool) -> Data {
+            let size = declared ? #"width="\#(width)" height="\#(height)" "# : ""
+            let svg = #"""
+                <svg xmlns="http://www.w3.org/2000/svg" \#(size)viewBox="0 0 \#(width) \#(height)">
+                  <rect width="100%" height="100%" fill="#d9d9d9"/>
+                  <path d="M0 0 L\#(width) \#(height)" stroke="#595959" stroke-width="\#(max(width, height) / 40)"/>
+                </svg>
+                """#
+            return Data(svg.utf8)
         }
 
         /// `-baybo-demo-download` (with `-baybo-demo-attachments`): push the

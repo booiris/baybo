@@ -21,7 +21,7 @@ pub use bootstrap::SandboxAvailability;
 pub use error::SandboxError;
 pub use spec::{
     Backend, EnvPolicy, FilesystemPolicy, NetworkPolicy, ResourceLimits, SandboxOutput,
-    SandboxSpec, StdinSource, default_sensitive_denylist,
+    SandboxSpec, StdinSource, default_sensitive_denylist, path_visibility,
 };
 
 #[async_trait]

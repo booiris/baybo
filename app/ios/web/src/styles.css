@@ -511,13 +511,19 @@ button {
   min-width: 0;
   flex-direction: column;
   overflow: hidden;
-  /* Frame and home-indicator inset, both scaled by the expansion: full screen
-     is full-bleed (no border, square corners) and clears the indicator; the
-     inline card is neither. Declared here rather than on `.is-maximized` so the
-     transition survives the class coming OFF. */
+  /* The frame, scaled by the expansion: full screen is full-bleed (no border,
+     square corners), the inline card is neither. Declared here rather than on
+     `.is-maximized` so the transition survives the class coming OFF.
+
+     Full screen deliberately runs the page UNDER the home indicator rather than
+     clearing it with `padding-bottom: env(safe-area-inset-bottom)`. Nothing on
+     this side can paint that strip in the page's own colour (opaque origin), so
+     the inset was a band of `--color-paper` below the iframe — a white bar under
+     every agent page that isn't white. An indicator sitting over the last ~34pt
+     of a scrollable page is the lesser cost, and it is what every other
+     full-screen web surface in the app does. */
   border: calc(1px - 1px * var(--html-preview-expansion)) solid var(--color-line);
   border-radius: calc(var(--radius) - var(--radius) * var(--html-preview-expansion));
-  padding-bottom: calc(env(safe-area-inset-bottom) * var(--html-preview-expansion));
   background: var(--color-paper);
   font-family: var(--font-mono);
   white-space: normal;
@@ -526,8 +532,7 @@ button {
   -webkit-touch-callout: none;
   transition:
     border-width var(--html-preview-morph),
-    border-radius var(--html-preview-morph),
-    padding-bottom var(--html-preview-morph);
+    border-radius var(--html-preview-morph);
 }
 /* The framing chrome: a surface-tinted bar under a hairline, so the agent's
    page reads as a document held INSIDE something rather than a rectangle of
@@ -684,8 +689,7 @@ html.html-preview-maximized body {
     height var(--html-preview-morph),
     transform var(--html-preview-morph),
     border-width var(--html-preview-morph),
-    border-radius var(--html-preview-morph),
-    padding-bottom var(--html-preview-morph);
+    border-radius var(--html-preview-morph);
 }
 .html-preview.is-maximized .html-preview-toolbar {
   padding-right: 0.5rem;

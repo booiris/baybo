@@ -1,3 +1,4 @@
+import UIKit
 import XCTest
 
 /// Headless drive of the composer's attachment surface: the `+` panel and the
@@ -15,6 +16,9 @@ final class ComposerAttachUITests: BayboUITestCase {
     private static let plusLabel = "Add attachment"
     private static let photosRow = "Photos"
     private static let filesRow = "Files"
+    private static let pasteRow = "Paste"
+    /// Mirrors `Pasteboards.demoPasteArg` — the app module is not importable here.
+    private static let demoPasteArg = "-baybo-demo-paste"
     private static let jumpToLatestLabel = "Jump to the latest message"
     /// The transcript's own attachments, driven to `ready`, so the chat has
     /// something to present full-screen over the composer.
@@ -136,6 +140,126 @@ final class ComposerAttachUITests: BayboUITestCase {
             photos.frame.intersects(jumpFrame), "the panel must clear the jump disc, not share it")
         XCTAssertFalse(files.frame.intersects(jumpFrame), "nor may its bottom row")
         attachScreenshot(app, name: "composer-plus-panel-jump")
+    }
+
+    /// The one entry point staging is reachable through in-process, which makes
+    /// it the only end-to-end witness this suite has: the pickers both run out
+    /// of process, so every other case here stops at the panel or starts from a
+    /// seeded strip.
+    ///
+    /// Two claims, and the second is the one the design most likely gets wrong.
+    /// The Paste row is offered only when the clipboard holds an image, so it is
+    /// the one row with no picker behind it — and `pickerBinding` retires
+    /// `AttachMenu.pick` on a picker's DISMISSAL. A row that leaves `pick` set
+    /// therefore works exactly ONCE and then goes dead, publishing no change on
+    /// the second tap. Tapping it twice for two tiles is what pins that.
+    ///
+    /// `-baybo-demo-paste` swaps in a one-image clipboard (`DemoPasteboard`):
+    /// the real board cannot be seeded from a UI test, and without an image on
+    /// it the row does not exist to tap.
+    func testPasteRowStagesAnImageEveryTime() {
+        let app = launch(["-baybo-open-chat", Self.demoPasteArg])
+        let photos = openPanel(app)
+        let paste = app.buttons[Self.pasteRow]
+        XCTAssertTrue(paste.exists, "a clipboard with an image must offer Paste")
+
+        // The taller panel must PAINT, not merely lay out — three rows move the
+        // whole box up by one row, and a `.clipped()` on the dock chain erased
+        // the two-row panel's paint once while every frame assertion stayed
+        // green (50b4e33f).
+        let shades = Self.distinctShades(
+            app.screenshot().image, in: paste.frame, window: app.windows.firstMatch.frame)
+        XCTAssertGreaterThan(
+            shades, 8, "the Paste row's band holds \(shades) distinct shades, i.e. it is blank")
+        XCTAssertGreaterThan(
+            paste.frame.minY, photos.frame.minY,
+            "Paste is the last row, nearest the +")
+        attachScreenshot(app, name: "composer-paste-row")
+
+        paste.tap()
+        let staged = tile(app, Self.stagedImage)
+        XCTAssertTrue(staged.waitForExistence(timeout: 5), "Paste must stage a tile")
+
+        // Again. Nothing dismissed the first request, so this is where a dead
+        // row shows up.
+        let plus = app.buttons[Self.plusLabel]
+        plus.tap()
+        let pasteAgain = app.buttons[Self.pasteRow]
+        XCTAssertTrue(pasteAgain.waitForExistence(timeout: 3), "the panel must reopen with Paste")
+        pasteAgain.tap()
+
+        let tiles = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "label == %@", Self.stagedImage))
+        XCTAssertTrue(
+            waitFor(timeout: 5) { tiles.count >= 2 },
+            "a second Paste must stage a second tile — the row staged \(tiles.count)")
+        attachScreenshot(app, name: "composer-paste-staged")
+    }
+
+    /// The one claim no unit test can make: that UIKit really does walk PAST the
+    /// SwiftUI text field, up the responder chain, to `AppDelegate` — which is
+    /// the entire mechanism behind long-press → Paste for an image.
+    ///
+    /// `ComposerPasteTargetTests` asks the delegate directly, so it would stay
+    /// green if the delegate were never reached (not in the chain at all, which
+    /// is what it was as an `NSObject`; or outranked by the field). Only driving
+    /// the system's own menu proves the walk.
+    ///
+    /// **The real clipboard must be emptied first, and that is not hygiene — it
+    /// is the precondition the mechanism runs on.** The walk only continues past
+    /// the field when the field DECLINES, i.e. when there is no text to paste.
+    /// Simulator.app syncs the host Mac's clipboard by default, so whatever the
+    /// developer last copied lands here: with text on the board the field takes
+    /// the paste, inserts it, and this case fails while the feature is fine.
+    /// (Found the hard way — it passed on a virgin device and failed on the same
+    /// device an hour later.) The runner shares the device pasteboard with the
+    /// app, so it can clear it directly; the app itself reads the injected
+    /// `-baybo-demo-paste` board, which is what still answers for the image.
+    ///
+    /// Per `docs/testing.md`, system chrome appearing is timing-dependent —
+    /// hence the existence assertion on the menu item before the tap, so a
+    /// missed menu fails here instead of passing vacuously.
+    func testLongPressPasteReachesTheResponderChain() throws {
+        UIPasteboard.general.items = []
+        let app = launch(["-baybo-open-chat", Self.demoPasteArg])
+        // The element TYPE SwiftUI picks for a vertical `TextField` is not
+        // contractual (it has been both across versions), so take whichever of
+        // the two is actually there.
+        XCTAssertTrue(
+            app.textFields.firstMatch.waitForExistence(timeout: 10)
+                || app.textViews.firstMatch.waitForExistence(timeout: 5),
+            "the composer field must exist")
+        let field =
+            app.textViews.firstMatch.exists ? app.textViews.firstMatch : app.textFields.firstMatch
+
+        field.press(forDuration: 1.0)
+        let paste = app.menuItems[Self.pasteRow].firstMatch
+        let fallback = app.buttons[Self.pasteRow].firstMatch
+        let item = paste.waitForExistence(timeout: 5) ? paste : fallback
+        try XCTSkipUnless(
+            item.waitForExistence(timeout: 5),
+            "the system edit menu never appeared — chrome, not the feature")
+
+        item.tap()
+
+        let staged = tile(app, Self.stagedImage)
+        XCTAssertTrue(
+            staged.waitForExistence(timeout: 5),
+            "the field declined the paste and nothing above it caught it — "
+                + "AppDelegate is not in the responder chain")
+        attachScreenshot(app, name: "composer-paste-longpress")
+    }
+
+    /// Poll a condition the accessibility tree only satisfies after an async
+    /// staging turn. `XCUIElementQuery.count` has no `waitForExistence`, and the
+    /// claim here is about how MANY tiles there are.
+    private func waitFor(timeout: TimeInterval, _ condition: () -> Bool) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+        return condition()
     }
 
     /// Open the `+` panel and hand back its first row.

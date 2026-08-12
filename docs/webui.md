@@ -92,6 +92,114 @@ The per-session trace page (`app/web/src/pages/TraceSessionPage.tsx`) refreshes 
 
 The live-subagent clause matters for external agents: the parent's `spawn_subagent` span sits pending for the whole child run, and once the parent turn goes terminal nothing else would hold the page on the fast tier — so a streaming child would fall to 10s, or stop refreshing entirely. `liveSessions` (`components/trace/traceForest.ts`) counts only `pending`/`in_progress`, deliberately **not** `stuck`: a stuck subagent is not producing anything new and must not pin the fast tier forever.
 
+### Row order, and jumping to an id
+
+Step and span rows carry their position in **storage order** — `#3` on a step,
+`#3.2` on its second span — read off the arrays the API returns, which the
+backend orders by `started_at` (`ORDER BY started_at` on both the step and the
+span query). It is the index in the returned array, not a running count of
+rendered rows, so an active filter never renumbers what survives it.
+
+The tree's filter box doubles as a **jump box**, two ways:
+
+- **By id** — step and span ids are part of every row's search projection, so
+  pasting one (a 26-char ULID, either case) selects that node, scrolls to it,
+  and clears the filter. The filter is the entry point on purpose: it already
+  eager-loads every turn's tree, which is what lets an id resolve anywhere in
+  the session rather than only in the turn that happens to be open.
+- **By marker** — `#3` or `#3.2`, the position the tree prints on its own rows,
+  resolved within the turn on screen (which is what those numbers are scoped
+  to). The `#` is required so a bare `3` stays a text search: someone typing a
+  number is looking for content, not navigating. `#0` is refused rather than
+  silently resolving to the last row via a negative index.
+
+`resolveJumpTarget` / `resolveOrdinalTarget`
+(`components/trace/traceTreeModel.ts`) do the lookups; anything neither matches
+stays an ordinary filter.
+
+### The tool set behind an LLM call
+
+An `LlmCall` span's detail panel gains a **Tools** tab listing every tool the
+model was offered on that call, with its description and JSON schema. The span
+stores only `{ hash, count }`; `GET /v1/traces/tool-sets/{hash}` returns the
+definitions and the page caches them by hash. That cache is deliberately **not**
+cleared on a session switch — the hash is the digest of the body, so the same
+hash is the same set by construction. The fetch is lazy (it fires when the tab is
+opened), which keeps a page visit at one request and a reader who never opens the
+tab at zero. See [`modules/trace.md`](modules/trace.md) for why the definitions
+are not inlined into the span.
+
+### The context matrix
+
+An `LlmCall` span's detail panel also carries a **Context** tab: a grid of
+cells, one per fixed slice of tokens, coloured by which part of the assembled
+context it belongs to — system prompt, tool definitions, skills, recalled
+memory, each message kind, tool results, attachments. When the span's model is
+still served by a configured client the grid covers that model's whole context
+window, so the unfilled cells are the headroom the call had left; when it is
+not (the trace outlives the config) the grid is the input alone rather than an
+invented window.
+
+`GET /v1/traces/{session_id}/spans/{span_id}/context` computes it, because the
+split needs a tokenizer *and* the ordinal-referenced input slice the client
+holds only as a pointer. It is the most expensive read on this page — it
+resolves both of the references the per-turn tree leaves alone — so it is
+fetched only when the tab is opened, cached per span, and deliberately **not**
+refreshed on the poll tick: a live span has no usage to report yet, and
+re-tokenizing a growing transcript every two seconds would make the most
+expensive read the most frequent one.
+
+**The total is exact and the split is not.** The provider bills one number for
+the whole prompt; the per-part figures come from `tiktoken`, which is a ~10%
+approximation off OpenAI models. `buildContextGrid`
+(`components/trace/contextGrid.ts`) therefore uses the segments only for
+proportions and applies them to the recorded `input_tokens`, so the headline
+agrees with the Metadata tab; every per-part number is prefixed `≈`, and a
+drift above 15% is stated outright. Cells are allocated by largest remainder so
+they sum to exactly the grid, with a floor of one cell for any non-zero part —
+rounding a real 0.4% contributor away is how a context view quietly stops
+mentioning the thing someone opened it to find.
+
+**One scaling site, one denominator.** The panel shows the same numbers twice —
+a legend by part, and a "largest pieces" list by individual segment — so both
+read from `ContextGrid.segments`, which `buildContextGrid` scales once. Scaling
+in two places is exactly how the legend and the list first came to print two
+different figures for one tool set. For the same reason every percentage is a
+share of **what was sent**, never of the window: a part that is 33% of the input
+and 5% of the window has to pick one, or the two lists cannot be read against
+each other. The window appears only as the headline's "% full" and as the free
+cells, and the free legend row deliberately prints no percentage at all.
+
+Repeated labels carry their position (`#12 read_file result`): five `read_file`
+calls produce five identically-named segments, and without the index there is no
+way to tell which one is the 40k one. **That position is also the way in** —
+clicking it opens the piece it names: a message scrolls into view in the I/O
+tab (unfolding the "earlier messages" block and expanding the card if the target
+is inside them, or the jump lands on something not mounted), and the tool set,
+which is not a message and has no position of its own, opens the Tools tab
+instead.
+
+**One explanation surface, no popups.** Hovering a grid cell or a legend row
+names the part and what it holds in a **reserved line under the legend**, and
+dims every cell that is not that part so the reader sees where it sits in the
+matrix. Nothing in this area carries a native `title`: the panel is a scroll
+container, so an absolutely-positioned bubble clips at its edges; the `title`
+delay is long enough to read as nothing happening; and while both existed they
+fired together, the line immediately and the popup a second later with the same
+words. The line has a fixed min-height so nothing reflows as the pointer moves.
+"Agent-injected" is the part that most needs the explanation — a catch-all
+holding an invoked skill's body, a subagent task prompt or its finished
+notification, and compaction instructions.
+
+The one `title` left in the panel is on the `#N` jump button, because it names
+an **action** rather than a thing on screen, and a button that does not say
+where it goes is worse than a tooltip.
+
+The legend carries **both** denominators when a window is known: share of the
+input (what is eating the prompt) and share of the window (what it costs in
+room). Free has no share of the input — it is not part of it — so that cell is a
+dash and its real number sits under the column that measures it.
+
 ### Subagent lineage
 
 `GET /v1/traces/{session_id}/lineage` returns every subagent session descended from this one, flattened, each row carrying its attach point (`parent_span_id` — the parent's `spawn_subagent` tool-call span), its backend (`external_agent`, absent for in-process children), and its turn summaries. It refreshes on the same tick as the overview, so a subagent spawned mid-turn appears without a manual reload.

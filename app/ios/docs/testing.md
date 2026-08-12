@@ -93,6 +93,46 @@ hit-testing (the stroke-only pill whose flanks were dead), UIKit swipe
 thresholds, presentation-binding lifecycles, the native↔web bridge round-trip.
 Everything else is 100x cheaper as a reducer test.
 
+### Typing into a SEEDED field: clear it yourself, never via the edit menu
+
+`typeText` **appends at the caret**. A field the app pre-filled (the rename
+editor seeds the current title) therefore needs an explicit clear, and reaching
+for the long-press edit menu's *Select All* to do it is a trap: that menu is
+system chrome whose appearance is timing-dependent — it showed for one case and
+not its sibling in the same run — and when it does not appear the typing lands
+appended to the seed. The test then drives a rename nobody asked for, and only an
+exact-match assertion catches it (a `contains` or a "the dialog closed" check
+goes green).
+
+Send `XCUIKeyboardKey.delete` once per existing character instead
+(`RenameMenuUITests.replaceText`), and do not tap the field first — a tap moves
+the caret into the middle of the text, where backspaces eat the wrong half. The
+dialog focuses the field itself and parks the caret at the end.
+
+### A tap lands on the element's CENTRE, so an a11y frame is a test surface
+
+`element.tap()` synthesises a touch at the middle of the element's
+**accessibility frame** — not on the pixels you can see. When the two disagree
+the button is dead to XCUITest and perfectly alive to a finger, which reads as
+"navigation is broken" and is nothing of the sort.
+
+It has already happened once. `ChatHeaderView`'s back chevron reported
+`(0, 0, 402, 108)` — the whole bar, status bar included — because an offline
+session renders neither the model pill nor the index button, leaving the chevron
+as the bar's ONLY focusable child; SwiftUI collapsed the bar into it, and the
+inherited frame was the one the veil's `ignoresSafeArea` had stretched. Every
+back tap landed on empty header. `CronExitUITests` (both cases) and
+`ArchiveFlowUITests.testDeepNavChainLeavesStackResponsive` failed for weeks with
+no navigation code involved. The fix is one line — `.accessibilityElement(children:
+.contain)` on the bar — and the general rule is: **a container whose visible
+children come and go must be declared a container**, or the last child standing
+inherits its geometry.
+
+Diagnose it by printing `app.debugDescription` and reading the frames, then
+confirm with a raw-coordinate tap (`app.coordinate(withNormalizedOffset: .zero)
+.withOffset(...)`): if the coordinate tap works and `element.tap()` does not, the
+frame is the bug.
+
 ## `BayboUITestCase` and the launch contract
 
 **`BayboUITestCase` is the base class and every smoke must use its `launch(_:)`.**
@@ -187,12 +227,23 @@ without touching `app/ios` at all.
 
 - **`-baybo-demo-images`** (DEBUG) — a file chip renders straight from the frame;
   the `image` kind needs bytes, so this flag serves its own: one agent turn
-  carrying four images of deliberately different aspect ratios (portrait / banner
-  / thumbnail / square) plus a text row UNDER them, and `ChatStore.requestBlob`
-  short-circuits the demo blob ids to a locally rendered PNG at the declared size
-  (2s delay, so the pre-decode frame is screenshot-able). That text row's
-  y-position is the test: run once (tiles → release → it moves), relaunch (sizes
-  restored → nothing moves).
+  carrying four rasters of deliberately different aspect ratios (portrait /
+  banner / thumbnail / square) and two wide SVGs, plus a text row UNDER them, and
+  `ChatStore.requestBlob` short-circuits the demo blob ids to a locally rendered
+  PNG or SVG at the declared size (2s delay, so the pre-decode frame is
+  screenshot-able). That text row's y-position is the test: run once (tiles →
+  release → it moves), relaunch (sizes restored → nothing moves).
+
+  The two vectors are both spellings of the same wide diagram because they fail
+  in opposite directions, and only one of them is a size question at all: an SVG
+  declaring `width`/`height` past the column reports the CLAMPED layout back as
+  its natural size (192px, measured inside the loading tile) and comes back a
+  third of the column on the next open, while a bare `viewBox` has no intrinsic
+  width and lays out at ZERO until something reserves a box for it.
+  `AttachmentImageUITests` drives both, plus the tap — `ChatStore.viewImage`
+  reads its blob NATIVELY rather than over the bridge, so `demoImageBytes` backs
+  that path too, and without it the image viewer is the one attachment surface no
+  fixture can reach.
 
   **The second run only works on an UNBOUND simulator** — a bound one's list
   merge keeps only remote rows, so the demo's local-only session is dropped from
@@ -231,6 +282,25 @@ without touching `app/ios` at all.
   `staged-` so a by-label query can't confuse a strip tile with a transcript
   card when this flag runs beside `-baybo-demo-attachments`.
 
+- **`-baybo-demo-paste`** (DEBUG, with `-baybo-open-chat`) swaps the composer's
+  clipboard for `DemoPasteboard` — one PNG, statelessly served, so every read
+  yields it again. It exists because the Paste row is *conditional*: it appears
+  only when `UIPasteboard.general` holds an image, and a UI test cannot seed the
+  real board. Unlike `-baybo-demo-compose`, which fakes the RESULT, this one
+  fakes only the clipboard and leaves the whole staging path real — so it is the
+  one end-to-end staging witness the UI tier has (both pickers being out of
+  process), covering the row's paint, the taller 3-row panel, and the fact that
+  the row is not one-shot. It also drives the OTHER entry point,
+  `testLongPressPasteReachesTheResponderChain` — the only case that can see
+  UIKit walk past the text field to `AppDelegate`, which the unit tier cannot
+  (it asks the delegate directly and stays green even if nothing reaches it).
+  That case empties `UIPasteboard.general` first, and that is load-bearing: the
+  walk only continues when the FIELD declines, and Simulator.app syncs the host
+  Mac's clipboard by default, so a developer's last copy would otherwise let the
+  field take the paste. It passed on a virgin device and failed on the same
+  device an hour later before that line existed. See
+  [attachments.md](attachments.md) § Paste is a third source.
+
 - **`-baybo-demo-keyboard`** raises the keyboard 2s in and drops it at 5s (record
   with `simctl io recordVideo`, extract frames with ffmpeg); the software
   keyboard only appears with Simulator.app running and hardware keyboard
@@ -258,6 +328,13 @@ without touching `app/ios` at all.
   header still existing (the pop did not fire) and the header being HITTABLE
   again (the preview really left, rather than the swipe doing nothing behind an
   `allowsHitTesting(false)` chrome layer).
+
+  **The demo document is dark on purpose.** It was white, which is the one colour
+  that cannot show how the frame around it is painted: the expanded preview
+  reserved the home indicator in `--color-paper`, and no screenshot of a white
+  page could ever show that band. The same suite now samples the screenshot's
+  bottom rows for brightness, so a white fixture would take that assertion with
+  it.
 
 - **`-baybo-demo-models`** (DEBUG, with `-baybo-open-chat`) seeds a canned model
   catalog into `ModelCatalog` — gpt-5.5 deliberately via TWO provider entries,

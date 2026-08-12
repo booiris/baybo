@@ -298,6 +298,8 @@ mod tests {
         assert!(registry.get_manifest("AttachFile").is_some());
         assert!(registry.get("PutBlob").is_some());
         assert!(registry.get_manifest("PutBlob").is_some());
+        assert!(registry.get("GetBlob").is_some());
+        assert!(registry.get_manifest("GetBlob").is_some());
     }
 
     #[test]
@@ -311,6 +313,7 @@ mod tests {
             "Glob",
             "Grep",
             "WebFetch",
+            "GetBlob",
             "Now",
             "SecretList",
             "SecretCheck",

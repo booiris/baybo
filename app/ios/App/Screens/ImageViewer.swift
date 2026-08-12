@@ -1,16 +1,53 @@
 import SwiftUI
 import UIKit
+import WebKit
 
-/// A chat image the user tapped, decoded and awaiting the full-screen viewer.
-/// Carries the `UIImage` so the viewer needs no second fetch, plus the same bytes
+/// A chat image the user tapped, ready for the full-screen viewer. Carries the
+/// decoded content so the viewer needs no second fetch, plus the same bytes
 /// materialised on disk under their real name — the share sheet hands over the
 /// FILE, so Save-to-Photos / Files / AirDrop get the original encoding and name
 /// rather than a re-encoded bitmap. Identified by blob id so
 /// `.fullScreenCover(item:)` re-presents when a different image is tapped.
 struct ViewedImage: Identifiable {
+    /// What the viewer has to show — the two are not the same medium.
+    ///
+    /// A raster blob decodes to a `UIImage` and zooms as pixels. A vector never
+    /// decodes at all: iOS has no SVG decoder in any public API (`UIImage(data:)`
+    /// answers nil and ImageIO does not carry the type — verified on iOS 26), so
+    /// for as long as this asked only `UIImage`, tapping an agent's SVG diagram
+    /// was a silent no-op. It keeps its own case rather than being rasterised on
+    /// the way in: resolution is the only thing a vector has over a PNG, and a
+    /// snapshot taken at one scale is exactly as soft, at 4x zoom, as the tile
+    /// the user tapped to get away from.
+    enum Content {
+        case raster(UIImage)
+        case vector(Data)
+    }
+
     let id: String
-    let image: UIImage
+    let content: Content
     let url: URL?
+}
+
+/// The one image mime iOS cannot decode, and the one whose pixels are a
+/// rendering decision rather than a property of the bytes.
+private let vectorImageMime = "image/svg+xml"
+
+extension ViewedImage.Content {
+    /// Raster first: `UIImage` decodes every format the OS knows, and the one it
+    /// does not know is the one that must not be rasterised anyway. Nil for
+    /// bytes that are neither — a blob that cannot be shown at all opens
+    /// nothing, rather than presenting an empty black screen.
+    init?(bytes: Data, mimeType: String) {
+        if let image = UIImage(data: bytes) {
+            self = .raster(image)
+            return
+        }
+        guard mimeType.split(separator: ";").first?.trimmingCharacters(in: .whitespaces)
+            .lowercased() == vectorImageMime
+        else { return nil }
+        self = .vector(bytes)
+    }
 }
 
 /// Full-screen viewer for a chat image: pinch to zoom, double-tap to toggle zoom
@@ -20,7 +57,7 @@ struct ViewedImage: Identifiable {
 /// fight it), and this matches the edge-to-edge chat-image feel the document
 /// previewer's white chrome does not.
 struct ImageViewer: View {
-    let image: UIImage
+    let content: ViewedImage.Content
     /// The image on disk under its real name — the share sheet's item. Absent
     /// only if writing it failed, in which case the share button is hidden rather
     /// than offering a dead action.
@@ -32,7 +69,7 @@ struct ImageViewer: View {
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            ZoomableImageView(image: image, onSingleTap: onClose)
+            zoomable
                 .ignoresSafeArea()
                 .opacity(shown ? 1 : 0)
             VStack {
@@ -59,6 +96,16 @@ struct ImageViewer: View {
         }
     }
 
+    /// Both media zoom, centre and close on a single tap; only the engine
+    /// underneath differs.
+    @ViewBuilder private var zoomable: some View {
+        switch content {
+        case .raster(let image):
+            ZoomableImageView(image: image, onSingleTap: onClose)
+        case .vector(let data):
+            ZoomableVectorView(data: data, onSingleTap: onClose)
+        }
+    }
 }
 
 /// Full-screen viewer chrome (image viewer, video player, file preview): a
@@ -211,5 +258,136 @@ private struct ZoomableImageView: UIViewRepresentable {
                     animated: true)
             }
         }
+    }
+}
+
+/// The vector half of the viewer: a WKWebView showing the SVG, fitted to the
+/// screen and pinch-zoomable by WebKit's own page zoom.
+///
+/// A web view rather than the scroll view above because ZOOM is the whole reason
+/// a chat image goes full screen, and WebKit re-renders vector art at each scale
+/// — a `UIImageView` can only scale whatever raster it was handed, which for an
+/// SVG would mean picking a resolution at open time and going soft past it.
+///
+/// The page is a data-URI `<img>`, never the SVG as the document itself. An SVG
+/// document runs its own `<script>`; an SVG inside an `<img>` cannot, by spec.
+/// These bytes are agent-authored, so the difference is the whole point — and
+/// the CSP (`default-src 'none'`) closes the network besides. The web view is
+/// built from a bare configuration with no message handlers, so it shares
+/// nothing with the transcript's bridge.
+private struct ZoomableVectorView: UIViewRepresentable {
+    let data: Data
+    let onSingleTap: () -> Void
+
+    /// `initial-scale=1` with the image fitted to the viewport IS the fit state,
+    /// so pinch-to-zoom and WebKit's double-tap both have a scale to come back
+    /// down to. The black field matches the raster viewer's.
+    private static let pageTemplate = #"""
+        <!doctype html>
+        <html>
+        <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=10, user-scalable=yes, viewport-fit=cover">
+        <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'">
+        <style>
+          html, body { margin: 0; height: 100%; background: #000; }
+          body { display: flex; align-items: center; justify-content: center; }
+          img {
+            max-width: 100%;
+            max-height: 100%;
+            -webkit-user-select: none;
+            -webkit-touch-callout: none;
+          }
+        </style>
+        </head>
+        <body><img src="data:image/svg+xml;base64,{{svg}}" alt=""></body>
+        </html>
+        """#
+
+    func makeUIView(context: Context) -> WKWebView {
+        let web = WKWebView(frame: .zero, configuration: WKWebViewConfiguration())
+        web.isOpaque = false
+        web.backgroundColor = .black
+        web.scrollView.backgroundColor = .black
+        web.scrollView.showsVerticalScrollIndicator = false
+        web.scrollView.showsHorizontalScrollIndicator = false
+        web.scrollView.contentInsetAdjustmentBehavior = .never
+        web.allowsLinkPreview = false
+
+        context.coordinator.webView = web
+
+        // The same two taps the raster viewer binds: double to zoom toward the
+        // point and back to fit, single to close (waiting for the double to
+        // fail so a zoom is never read as a dismiss).
+        //
+        // The double tap has to be OURS. WebKit's own is smart magnification —
+        // "zoom to the block under the finger" — and this page is one image
+        // fitted to the viewport, so it computes that there is nothing to do and
+        // a double tap does nothing at all. Ours drives the same scroll view its
+        // pinch does, so the two agree about where the zoom is.
+        let doubleTap = UITapGestureRecognizer(
+            target: context.coordinator, action: #selector(Coordinator.handleDoubleTap))
+        doubleTap.numberOfTapsRequired = 2
+        doubleTap.delegate = context.coordinator
+        web.addGestureRecognizer(doubleTap)
+        let singleTap = UITapGestureRecognizer(
+            target: context.coordinator, action: #selector(Coordinator.handleSingleTap))
+        singleTap.numberOfTapsRequired = 1
+        singleTap.delegate = context.coordinator
+        singleTap.require(toFail: doubleTap)
+        web.addGestureRecognizer(singleTap)
+
+        // `baseURL: nil` gives the page a unique opaque origin: no file system,
+        // no app-bundle resources, nothing else's storage.
+        web.loadHTMLString(
+            Self.pageTemplate.replacingOccurrences(
+                of: "{{svg}}", with: data.base64EncodedString()),
+            baseURL: nil)
+        return web
+    }
+
+    func updateUIView(_: WKWebView, context _: Context) {}
+
+    func makeCoordinator() -> Coordinator { Coordinator(onSingleTap: onSingleTap) }
+
+    final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+        /// The zoom is driven through the web view's own scroll view — the same
+        /// one its pinch moves — so nothing here has to model the page's scale
+        /// separately from WebKit's.
+        weak var webView: WKWebView?
+        private let onSingleTap: () -> Void
+        /// How far a double tap zooms in from fit, matching the raster viewer.
+        private static let doubleTapScale: CGFloat = 3
+
+        init(onSingleTap: @escaping () -> Void) { self.onSingleTap = onSingleTap }
+
+        @objc func handleSingleTap() { onSingleTap() }
+
+        @objc func handleDoubleTap(_ gr: UITapGestureRecognizer) {
+            guard let scroll = webView?.scrollView else { return }
+            if scroll.zoomScale > scroll.minimumZoomScale {
+                // Zoomed in → restore to fit.
+                scroll.setZoomScale(scroll.minimumZoomScale, animated: true)
+                return
+            }
+            let target = min(
+                scroll.maximumZoomScale, scroll.minimumZoomScale * Self.doubleTapScale)
+            // `zoom(to:)` wants the rect in the ZOOMING view's space (the page
+            // at scale 1), not the scroll view's — the two only agree while the
+            // page is unzoomed, which is exactly the branch that never needs it.
+            let point = gr.location(in: scroll.delegate?.viewForZooming?(in: scroll) ?? scroll)
+            let width = scroll.bounds.width / target
+            let height = scroll.bounds.height / target
+            scroll.zoom(
+                to: CGRect(
+                    x: point.x - width / 2, y: point.y - height / 2,
+                    width: width, height: height),
+                animated: true)
+        }
+
+        func gestureRecognizer(
+            _: UIGestureRecognizer,
+            shouldRecognizeSimultaneouslyWith _: UIGestureRecognizer
+        ) -> Bool { true }
     }
 }

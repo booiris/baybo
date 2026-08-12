@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::pin::Pin;
 
 use async_trait::async_trait;
@@ -164,6 +165,27 @@ pub trait BlobStore: Send + Sync {
 
     /// Return metadata only. Same not-found semantics as `get`.
     async fn stat(&self, blob_id: &str) -> Result<BlobMeta>;
+
+    /// Absolute path of the blob's payload on this host, for handing to a
+    /// process that needs a *file* rather than bytes — an external CLI, a
+    /// skill's script. `None` when the backend keeps no on-disk payload
+    /// (the in-memory fake, and any future remote store), which callers
+    /// must treat as "not available here", never as "not found".
+    ///
+    /// **Token gate (security-critical), same rule as [`open_at`]:** an
+    /// implementation MUST resolve through [`stat`] and never by deriving
+    /// the path from the bare hex digest. The payload is content-addressed,
+    /// so the digest alone names the file — which is exactly why deriving
+    /// from it would hand out a blob to a caller holding no read capability
+    /// for it. The default refuses rather than guessing.
+    ///
+    /// The returned file is the **canonical, shared** payload: every row
+    /// with the same digest resolves to it. Callers hand it out read-only.
+    /// Anything that might write belongs on a copy of its own.
+    async fn local_path(&self, blob_id: &str) -> Result<Option<PathBuf>> {
+        self.stat(blob_id).await?;
+        Ok(None)
+    }
 
     /// Hard-delete the metadata row and unlink the on-disk payload
     /// (when no other live row resolves to the same content path).

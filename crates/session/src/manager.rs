@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use baybo_model::{
     AgentBinding, ChannelType, ChatMessage, ControlEvent, ControlEventKind, FolderId,
-    FolderSummary, LlmEntryName, MAX_FOLDER_NAME_LEN, Role, Session, SessionId, SessionState,
-    TriggerSource, User,
+    FolderSummary, LlmEntryName, MAX_FOLDER_NAME_LEN, MAX_SESSION_TITLE_LEN, Role, Session,
+    SessionId, SessionState, TriggerSource, User,
 };
 use chrono::{DateTime, Duration, Utc};
 use tracing::{debug, warn};
@@ -79,6 +79,27 @@ fn validate_folder_name(name: String) -> Result<String> {
         )));
     }
     Ok(trimmed.to_owned())
+}
+
+/// Normalize and bound a user-submitted conversation title.
+///
+/// Collapses interior whitespace the same way the auto-titler's `sanitize_title`
+/// does, so a renamed conversation and a generated one hold the same shape — a
+/// title is rendered on one line in every client, and a stored `\n` would only
+/// show up as a layout bug on whichever surface forgets to strip it.
+fn validate_session_title(title: String) -> Result<String> {
+    let collapsed = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return Err(SessionError::InvalidArgument(
+            "conversation title cannot be empty".to_owned(),
+        ));
+    }
+    if collapsed.chars().count() > MAX_SESSION_TITLE_LEN {
+        return Err(SessionError::InvalidArgument(format!(
+            "conversation title exceeds {MAX_SESSION_TITLE_LEN} characters"
+        )));
+    }
+    Ok(collapsed)
 }
 
 /// Higher-level session management logic wrapping a `SessionStore`.
@@ -899,7 +920,9 @@ impl SessionManager {
         Ok(())
     }
 
-    /// Set or clear the session's auto-generated conversation title.
+    /// Set or clear the session's conversation title, overwriting whatever is
+    /// there. Callers writing a *machine*-generated title want
+    /// [`Self::set_title_if_absent`] instead, so a user rename wins.
     pub async fn set_title(&self, session_id: &SessionId, title: Option<&str>) -> Result<()> {
         let updated = self.store.set_title(session_id, title).await?;
         if !updated {
@@ -907,6 +930,25 @@ impl SessionManager {
         }
         debug!(session_id = %session_id, "set session title");
         Ok(())
+    }
+
+    /// Rename the conversation on the user's behalf. Returns the stored title,
+    /// which is the normalized form of `title` — callers broadcasting the
+    /// change must send back this value, not what the client submitted.
+    pub async fn set_user_title(&self, session_id: &SessionId, title: String) -> Result<String> {
+        let title = validate_session_title(title)?;
+        self.set_title(session_id, Some(&title)).await?;
+        Ok(title)
+    }
+
+    /// Title the session only if it has none. `Ok(true)` when this call wrote
+    /// it. Unlike [`Self::set_title`], a missing row is not an error: "another
+    /// writer got there first" and "the row is gone" are the same outcome for
+    /// the auto-titler, which is fire-and-forget.
+    pub async fn set_title_if_absent(&self, session_id: &SessionId, title: &str) -> Result<bool> {
+        let wrote = self.store.set_title_if_absent(session_id, title).await?;
+        debug!(session_id = %session_id, wrote, "auto-title session");
+        Ok(wrote)
     }
 
     /// Every chat-list folder, sibling-ordered. Drives `GET /v1/chat/folders`
@@ -1109,7 +1151,9 @@ impl SessionManager {
 mod tests {
     use std::sync::Arc;
 
-    use baybo_model::{ChannelType, FolderId, MAX_FOLDER_NAME_LEN, SessionId, User};
+    use baybo_model::{
+        ChannelType, FolderId, MAX_FOLDER_NAME_LEN, MAX_SESSION_TITLE_LEN, SessionId, User,
+    };
     use chrono::{Duration, Utc};
 
     use super::{SessionError, SessionManager, SessionStore};
@@ -1389,6 +1433,110 @@ mod tests {
                 .unwrap_err(),
             SessionError::NotFound(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn set_user_title_normalizes_and_returns_what_it_stored() {
+        let store = Arc::new(MemorySessionStore::new());
+        let mgr = SessionManager::new(store.clone(), Arc::new(MemorySessionFolderStore::new()));
+        let session = mgr
+            .create_session(test_user(), ChannelType::owner())
+            .await
+            .unwrap();
+
+        // A title is rendered on one line everywhere, so the stored form
+        // matches what the auto-titler's sanitizer would have produced.
+        let stored = mgr
+            .set_user_title(&session.id, "  Fix   the\nlogin\tredirect  ".to_owned())
+            .await
+            .unwrap();
+        assert_eq!(stored, "Fix the login redirect");
+        assert_eq!(
+            mgr.get(&session.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("Fix the login redirect")
+        );
+    }
+
+    #[tokio::test]
+    async fn set_user_title_rejects_blank_and_overlong() {
+        let store = Arc::new(MemorySessionStore::new());
+        let mgr = SessionManager::new(store.clone(), Arc::new(MemorySessionFolderStore::new()));
+        let session = mgr
+            .create_session(test_user(), ChannelType::owner())
+            .await
+            .unwrap();
+
+        for blank in ["", "   ", "\n\t "] {
+            assert!(
+                matches!(
+                    mgr.set_user_title(&session.id, blank.to_owned())
+                        .await
+                        .unwrap_err(),
+                    SessionError::InvalidArgument(_)
+                ),
+                "{blank:?} must not become a title"
+            );
+        }
+        assert!(matches!(
+            mgr.set_user_title(&session.id, "x".repeat(MAX_SESSION_TITLE_LEN + 1))
+                .await
+                .unwrap_err(),
+            SessionError::InvalidArgument(_)
+        ));
+        assert_eq!(
+            mgr.get(&session.id).await.unwrap().unwrap().title,
+            None,
+            "a rejected title must not have been written"
+        );
+
+        // Bounded in characters, not bytes: a CJK title at the cap fits, where
+        // a byte-length check would have rejected it three times over.
+        let cjk = "标".repeat(MAX_SESSION_TITLE_LEN);
+        assert_eq!(
+            mgr.set_user_title(&session.id, cjk.clone()).await.unwrap(),
+            cjk
+        );
+    }
+
+    #[tokio::test]
+    async fn set_title_if_absent_never_overwrites_a_rename() {
+        let store = Arc::new(MemorySessionStore::new());
+        let mgr = SessionManager::new(store.clone(), Arc::new(MemorySessionFolderStore::new()));
+        let session = mgr
+            .create_session(test_user(), ChannelType::owner())
+            .await
+            .unwrap();
+
+        assert!(mgr.set_title_if_absent(&session.id, "Auto").await.unwrap());
+        mgr.set_user_title(&session.id, "Mine".to_owned())
+            .await
+            .unwrap();
+        assert!(
+            !mgr.set_title_if_absent(&session.id, "Auto again")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            mgr.get(&session.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("Mine")
+        );
+        // A vanished row is "did not write", not an error — the auto pass is
+        // fire-and-forget and must not log a failure for a reaped session.
+        assert!(
+            !mgr.set_title_if_absent(&SessionId::from("nope"), "x")
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 {
   "id": "/",
-  "name": "Baybo Dashboard",
+  "name": "Baybo",
   "short_name": "Baybo",
   "description": "Chat with your Baybo agents and inspect their traces, cron jobs, background jobs, and spend.",
   "lang": "en",

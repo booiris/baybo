@@ -242,6 +242,16 @@ const JUMP_SETTLE_MS = 400;
 /// pathological session from growing the mirror without limit.
 const MAX_IMAGE_DIMS = 512;
 
+/// The one image type carrying no pixels of its own, and so the one whose size
+/// cannot be read off the element that shows it (`measureIntrinsicSize`).
+const VECTOR_IMAGE_MIME = "image/svg+xml";
+
+/// How long a vector's pre-paint measurement may hold its image back. The probe
+/// decodes a blob the real `<img>` is about to decode anyway, so it settles in
+/// the same frame in practice; this only exists because an image that never
+/// paints would be a far worse failure than one sized from its loading tile.
+const INTRINSIC_PROBE_TIMEOUT_MS = 2000;
+
 /// The transcript scrolls the WKWebView's MAIN FRAME (the document), not an
 /// inner `overflow:auto` div. A nested overflow scroller inside WKWebView owns
 /// an async scroll node that stays asleep until the first touch — a cold-start
@@ -1136,7 +1146,13 @@ export function mergeSyncPage(
     next.splice(at, 0, row);
     byId = new Map(next.map((r, i) => [r.id, i] as const));
   }
-  return next;
+  // The tail-append and re-home branches ask the fold guards themselves; the
+  // ordinal SPLICE above asks nothing, and `placeAt` always lands a row directly
+  // below an ordinal-bearing one — which may be a work block whose turn this row
+  // continues. Fold once at the end, as app/web's `applySyncMerge` does. A
+  // healthy page has no adjacency and `foldAdjacentWork` is idempotent, so the
+  // other two branches pass through unchanged.
+  return foldAdjacentWork(next, compactionPoints);
 }
 
 /// Apply a REPLACE page (a baseline, or a rebase) over the rendered thread: the
@@ -1195,6 +1211,20 @@ export function applySyncReplace(
   const keptSends = prev.filter(
     (r) => r.role === "user" && unconfirmedSends.has(r.id) && !pageIds.has(r.id),
   );
+  // Rows the page PREDATES. Its newest ordinal is the instant the server
+  // snapshotted it, and a durable row above that is one this page cannot be
+  // speaking about — a live reply that landed while the request was in flight.
+  // Dropping it is permanent, not a redraw: that frame already advanced the
+  // cursor to its own ordinal, a difference selects strictly `>`, and the cursor
+  // is max-wins — so no later sync can return the row, and on a cold open (the
+  // path that runs a baseline) the newest message simply never appears. This is
+  // `rowsAboveFloor`'s rule at the other edge: a REPLACE is authoritative
+  // between the page's oldest and newest ordinals, and silent outside them.
+  const ceiling = page.reduce((hi, r) => Math.max(hi, rowCoverageOrdinal(r) ?? hi), -Infinity);
+  const keptLive = prev.filter((r) => {
+    const ordinal = rowCoverageOrdinal(r);
+    return ordinal !== null && ordinal > ceiling && !pageIds.has(r.id);
+  });
   let rows = page;
   let carried = openWork;
   if (openWork.length > 0) {
@@ -1212,7 +1242,7 @@ export function applySyncReplace(
       carried = [];
     }
   }
-  return [...rows, ...keptSends, ...carried];
+  return [...rows, ...keptLive, ...keptSends, ...carried];
 }
 
 /// Restored rows re-enter with live-turn state INTACT: a work block that was
@@ -1496,12 +1526,17 @@ function useNearViewport(ref: RefObject<Element | null>): boolean {
 function AttachmentImage({
   attachment,
   connEpoch,
+  onIntrinsicSize,
 }: {
   attachment: WireAttachment;
   connEpoch: number;
+  /// A vector's measured size, handed up BEFORE its image paints so the bubble
+  /// can reserve the box first (`AttachmentBubble`).
+  onIntrinsicSize: (width: number, height: number) => void;
 }) {
   const { t } = useTranslation();
   const imageDims = useContext(ImageDimsContext);
+  const vector = isVectorImage(attachment);
   const [url, setUrl] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
   // True once the fetched image has actually decoded — the frame reserves a box
@@ -1521,31 +1556,61 @@ function AttachmentImage({
   useEffect(() => {
     if (!visible) return;
     let owned: string | null = null;
-    let cancelled = false;
+    let torndown = false;
+    // Read through a call, not the flag: the vector branch below checks it a
+    // SECOND time after an await, where the compiler — which cannot see the
+    // cleanup assign it — has already narrowed the bare flag to false and calls
+    // the check dead code.
+    const cancelled = () => torndown;
     failedRef.current = false;
     setFailed(false);
     setLoaded(false);
     setUrl(null);
     blobObjectUrl(attachment.blob_id, attachment.mime_type)
-      .then((u) => {
-        if (cancelled) {
+      .then(async (u) => {
+        if (cancelled()) {
           URL.revokeObjectURL(u);
           return;
         }
         owned = u;
+        // A vector is measured and sized BEFORE its image is handed over,
+        // never from its own `onLoad`: by then it is inside whatever box the
+        // bubble already picked, and WebKit would report that box back as the
+        // image's natural size (`measureIntrinsicSize`). The extra decode is a
+        // hit on the same blob the `<img>` below is about to decode.
+        if (vector) {
+          const dims = await measureIntrinsicSize(u);
+          // The cleanup below has already revoked `owned`; nothing to undo.
+          if (cancelled()) return;
+          if (dims !== null) {
+            imageDims?.record(blobContentDigest(attachment.blob_id), dims[0], dims[1]);
+            onIntrinsicSize(dims[0], dims[1]);
+          }
+        }
         setUrl(u);
       })
       .catch(() => {
-        if (!cancelled) {
+        if (!cancelled()) {
           failedRef.current = true;
           setFailed(true);
         }
       });
     return () => {
-      cancelled = true;
+      torndown = true;
       if (owned) URL.revokeObjectURL(owned);
     };
-  }, [attachment.blob_id, attachment.mime_type, attempt, visible]);
+    // `imageDims` and `onIntrinsicSize` are both identity-stable by
+    // construction (a memoized context value, a `useCallback` with no deps);
+    // anything less would refetch the blob on every re-render of the row.
+  }, [
+    attachment.blob_id,
+    attachment.mime_type,
+    attempt,
+    visible,
+    vector,
+    imageDims,
+    onIntrinsicSize,
+  ]);
 
   // A restored image can race ahead of its leg going live, so an early fetch
   // fails before native has a live session. Retry the moment a (re)connect
@@ -1606,9 +1671,16 @@ function AttachmentImage({
               // flashing a loading tile and then resizing (see
               // `AttachmentBubble`). A zero dimension is never recorded — the
               // reserved box divides by it.
-              const { naturalWidth: w, naturalHeight: h } = e.currentTarget;
-              if (w > 0 && h > 0) {
-                imageDims?.record(blobContentDigest(attachment.blob_id), w, h);
+              //
+              // Raster only. A vector reports back the box it is standing in
+              // rather than a size of its own, so it is measured before it gets
+              // here (`measureIntrinsicSize`) and recording again from the
+              // element would overwrite that truth with the layout.
+              if (!vector) {
+                const { naturalWidth: w, naturalHeight: h } = e.currentTarget;
+                if (w > 0 && h > 0) {
+                  imageDims?.record(blobContentDigest(attachment.blob_id), w, h);
+                }
               }
               setLoaded(true);
             }}
@@ -1637,6 +1709,16 @@ function AttachmentImage({
 /// Read once, at mount: a size recorded later belongs to an image that is already
 /// painted at its natural size, and re-reading would resize the bubble underneath
 /// it. The next open picks the entry up.
+///
+/// A VECTOR is the exception, and takes the same box by a different route: it
+/// gets measured before it paints (`measureIntrinsicSize`) and hands its size up
+/// here, so the box is reserved with nothing painted under it yet. Both halves
+/// of that matter. A vector carries no intrinsic width for this shrink-to-fit
+/// bubble to resolve, so without a reserved box an SVG written as a bare
+/// `viewBox` lays out at zero width — invisible, and untappable with it. And a
+/// stale entry from before it was measured this way (the mirror is on disk and
+/// outlives the fix) is corrected on the spot rather than sizing the bubble
+/// wrong for the life of the thread.
 function AttachmentBubble({
   attachment,
   connEpoch,
@@ -1652,9 +1734,16 @@ function AttachmentBubble({
   const isAudio = attachment.kind === "audio";
   const isVideo = isVideoAttachment(attachment);
   const imageDims = useContext(ImageDimsContext);
-  const [sized] = useState(() =>
+  const [sized, setSized] = useState(() =>
     isImage ? imageDims?.get(blobContentDigest(attachment.blob_id)) : undefined,
   );
+  // Identity-stable: `AttachmentImage` takes this as an effect dependency, and a
+  // fresh function per render would refetch the blob on every re-render.
+  const takeIntrinsicSize = useCallback((width: number, height: number) => {
+    setSized((prev) =>
+      prev !== undefined && prev[0] === width && prev[1] === height ? prev : [width, height],
+    );
+  }, []);
   const classes = [
     "attachment-bubble",
     isImage ? "" : isVideo ? "video" : "file",
@@ -1670,7 +1759,11 @@ function AttachmentBubble({
   return (
     <div className={classes} style={box}>
       {isImage ? (
-        <AttachmentImage attachment={attachment} connEpoch={connEpoch} />
+        <AttachmentImage
+          attachment={attachment}
+          connEpoch={connEpoch}
+          onIntrinsicSize={takeIntrinsicSize}
+        />
       ) : isVideo ? (
         <AttachmentVideo attachment={attachment} />
       ) : isAudio ? (
@@ -1687,6 +1780,53 @@ function AttachmentBubble({
 /// only image/audio specially) — so the tile is elected by mime here.
 export function isVideoAttachment(attachment: WireAttachment): boolean {
   return attachment.kind === "file" && attachment.mime_type.startsWith("video/");
+}
+
+/// An image with no pixel size of its own. Everything about how it is measured
+/// differs (`measureIntrinsicSize`), so it is asked once and answered here
+/// rather than by a mime comparison at each site. Parameters are stripped: the
+/// gateway sends a bare mime today, but `image/svg+xml; charset=utf-8` is a
+/// legal spelling of the same type and must not read as a raster blob.
+export function isVectorImage(attachment: WireAttachment): boolean {
+  return (
+    attachment.kind === "image" &&
+    attachment.mime_type.split(";")[0].trim().toLowerCase() === VECTOR_IMAGE_MIME
+  );
+}
+
+/// The size an image takes with NOTHING constraining it, read off a detached
+/// `Image` — one that is never inserted into the document, so no layout can
+/// colour the answer.
+///
+/// For a raster blob that is just its pixel count, which is why only vectors pay
+/// for this. But WebKit answers `naturalWidth` for an SVG with the size the
+/// element is laid out at RIGHT NOW: the same 1200x400 page measures 1200
+/// detached, 192 while it decodes inside the 12rem loading tile, and 358 once
+/// released into the reading column (all three measured). `AttachmentImage` used
+/// to record what its own `onLoad` saw — the tile's number — so the next open of
+/// the thread reserved a 192px box for a diagram that had rendered full width,
+/// and the image shrank to fit it. An SVG with no `width`/`height` at all is
+/// worse off still: it has no intrinsic width for a shrink-to-fit bubble to
+/// resolve, and lays out at ZERO until something hands it a definite box.
+function measureIntrinsicSize(url: string): Promise<[number, number] | null> {
+  return new Promise((resolve) => {
+    const probe = new Image();
+    const timer = window.setTimeout(() => {
+      probe.onload = null;
+      probe.onerror = null;
+      resolve(null);
+    }, INTRINSIC_PROBE_TIMEOUT_MS);
+    const settle = (dims: [number, number] | null) => {
+      window.clearTimeout(timer);
+      resolve(dims);
+    };
+    probe.onload = () => {
+      const { naturalWidth: w, naturalHeight: h } = probe;
+      settle(w > 0 && h > 0 ? [w, h] : null);
+    };
+    probe.onerror = () => settle(null);
+    probe.src = url;
+  });
 }
 
 /// Binary units, and only as much precision as disambiguates: `812 B`,
@@ -3539,7 +3679,28 @@ export function Transcript({
           if (head.length === 0) return rebuilt;
           // The seam is the same one scroll-up paging makes: a turn wider than
           // the page has a work block on both sides of it and must stay one card.
-          return foldAdjacentWork([...head, ...rebuilt], frame.compaction_points ?? []);
+          //
+          // With one difference the fold cannot see on its own. A kept head can
+          // only END on a work block when the row that CLOSED that turn — its
+          // answer bubble, or the notice that severed it — fell at or below the
+          // page's floor and so went to the page. The page then re-cut the same
+          // turn at its START, and `flush` flags a block cut at its start whole
+          // (`turn_complete: true`) exactly as it flags a real turn end, because
+          // the accumulator only ever learns about its END. The head's copy
+          // inherited that `true` (directly, or through `joinWorkHalves`), so
+          // `sameContinuingTurn` refuses and one turn renders as two cards — and
+          // it is STICKY: the pair persists into the mirror, and
+          // `sanitizeRestoredRows` will not heal a head that says complete.
+          // Restate the head half as what it now is, a block whose turn
+          // continues below, and let the ordinary guards adjudicate:
+          // `crossesCompaction` still refuses across a watermark, and `foldWork`
+          // takes `joinWorkHalves` so the card spans the real turn.
+          const last = head[head.length - 1];
+          const seam =
+            last.role === "work" && rowOrdinal(last.id) !== null && rebuilt[0]?.role === "work"
+              ? [...head.slice(0, -1), { ...last, turnComplete: false }]
+              : head;
+          return foldAdjacentWork([...seam, ...rebuilt], frame.compaction_points ?? []);
         });
         if (keepFloor === null) {
           // The page IS the thread now, and it brings its own paging window. Rows

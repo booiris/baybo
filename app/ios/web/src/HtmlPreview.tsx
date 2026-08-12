@@ -21,11 +21,11 @@ type Rect = { left: number; top: number; width: number; height: number };
 const MORPH_FALLBACK_MS = 400;
 
 /// How expanded the box is: 0 = the inline card, 1 = full screen. styles.css
-/// derives every non-rect difference between the two states from it (the safe
-/// areas it clears, its border, its corners), so writing it here is what makes
-/// the morph's end state the FINAL state. The class sets it too, but only at
-/// the far end — so a dismissal writes 0 one morph early and a drag rides it
-/// down with the finger.
+/// derives every non-rect difference between the two states from it (the status
+/// bar the chrome bar clears, its border, its corners), so writing it here is
+/// what makes the morph's end state the FINAL state. The class sets it too, but
+/// only at the far end — so a dismissal writes 0 one morph early and a drag
+/// rides it down with the finger.
 const EXPANSION_VAR = "--html-preview-expansion";
 const COLLAPSED = "0";
 /// How much of the morph's duration is still owed, as a fraction (styles.css
@@ -316,9 +316,9 @@ export function HtmlPreview({ blobId }: { blobId: string }) {
         root.style.setProperty(MORPH_SCALE_VAR, String(left));
       }
       // Collapse everything the two states differ by NOW, so the box lands
-      // already wearing its inline frame and insets. Left to the class flip,
-      // the page inside grew a home indicator's worth of height at the bottom
-      // the instant it landed.
+      // already wearing its inline frame and its chrome bar's inline height.
+      // Left to the class flip, the page inside jumped by the status bar's
+      // worth of height the instant it landed.
       root.style.setProperty(EXPANSION_VAR, COLLAPSED);
       // Hand the transition back to the stylesheet (the settle froze it, and a
       // drag may have pinned it off), then flush layout — a geometry change

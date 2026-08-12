@@ -161,6 +161,22 @@ impl LlmClientPool {
         self.entry_models.get(name).map(Vec::as_slice)
     }
 
+    /// Context window of whichever configured client serves `model_id`,
+    /// searched across every role a model can hold (entry default, pinned
+    /// override, lite).
+    ///
+    /// `None` is an ordinary answer, not an error: the trace outlives the
+    /// config, so a span can name a model this process no longer builds a
+    /// client for. Callers show what they know instead of guessing a window.
+    pub fn context_window_for_model(&self, model_id: &str) -> Option<usize> {
+        self.clients
+            .values()
+            .chain(self.overrides.values())
+            .chain(self.lite.values())
+            .find(|client| client.model_info().id == model_id)
+            .map(|client| client.model_info().context_window)
+    }
+
     /// Resolve a session's pin to a client. `name` picks the entry (`None` =
     /// default-llm, stranded name → default with a warn). `model` picks the
     /// model WITHIN that entry: `None` or the entry's default model returns

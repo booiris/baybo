@@ -8,10 +8,21 @@ import type {
   StepKind,
   TurnTrace,
 } from '../../types/trace';
-import { compressionTokens, stepSummaryText, turnInputText, turnOutputText } from './traceFormat';
+import {
+  compressionTokens,
+  stepSummaryText,
+  sumLlmTokens,
+  traceTokens,
+  turnInputText,
+  turnOutputText,
+} from './traceFormat';
 
 const T0 = '2026-01-01T00:00:00.000Z';
 const T1 = '2026-01-01T00:00:01.000Z';
+
+function llmBegin() {
+  return { model_id: 'm', provider: 'p', provider_config_hash: 'h', input_messages: [] };
+}
 
 function llmSpan(result: LlmCallResult): Span {
   return {
@@ -19,7 +30,7 @@ function llmSpan(result: LlmCallResult): Span {
     step_id: 'step-1',
     kind: {
       kind: 'llm_call',
-      begin: { model_id: 'm', provider: 'p', provider_config_hash: 'h', input_messages: [] },
+      begin: llmBegin(),
       result,
     },
     parallel_group: null,
@@ -187,5 +198,57 @@ describe('turnInputText / turnOutputText — meta steps riding the turn', () => 
     ]);
     expect(turnInputText(t, [])).toBeNull();
     expect(turnOutputText(t)).toBeNull();
+  });
+});
+
+describe('sumLlmTokens', () => {
+  const a = llmSpan({
+    input_tokens: 1_000,
+    output_tokens: 50,
+    cached_input_tokens: 600,
+    cache_creation_input_tokens: 100,
+  });
+  const b = { ...llmSpan({ input_tokens: 200, output_tokens: 10 }), id: 'span-2' };
+
+  it('adds each bucket across the spans', () => {
+    expect(sumLlmTokens([a, b])).toEqual({
+      input: 1_200,
+      output: 60,
+      cached: 600,
+      cacheCreate: 100,
+    });
+  });
+
+  it('treats a missing cache field as zero rather than dropping the span', () => {
+    // Spans written before the cache fields existed still carry usage; a
+    // step containing one must not report a hole in its totals.
+    expect(sumLlmTokens([b])).toEqual({ input: 200, output: 10, cached: 0, cacheCreate: 0 });
+  });
+
+  it('ignores an in-flight call, which has no usage yet', () => {
+    const pending: Span = {
+      ...a,
+      id: 'span-3',
+      ended_at: null,
+      outcome: { outcome: 'pending' },
+      kind: { kind: 'llm_call', begin: llmBegin(), result: null },
+    };
+    expect(sumLlmTokens([pending])).toEqual({ input: 0, output: 0, cached: 0, cacheCreate: 0 });
+  });
+
+  it('is what traceTokens rolls a whole turn up with', () => {
+    // The two used to be separate loops; a divergence would make a turn's
+    // header disagree with the sum of its own step badges.
+    const trace: TurnTrace = {
+      turn_id: 't',
+      session_id: 's',
+      turn_status_kind: 'completed',
+      turn_input_kind: 'user_chat',
+      steps: [
+        { step: step({ kind: 'llm_iteration' }), spans: [a] },
+        { step: { ...step({ kind: 'llm_iteration' }), id: 'step-2' }, spans: [b] },
+      ],
+    };
+    expect(traceTokens(trace)).toEqual(sumLlmTokens([a, b]));
   });
 });

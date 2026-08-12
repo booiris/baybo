@@ -36,7 +36,8 @@ struct ChatStoreOutboxTests {
         index.touch(sessionId: Self.sessionId)
         outbox = temp.makeOutbox(sessionId: Self.sessionId)
         store = ChatStore(
-            sessionId: Self.sessionId, client: client, index: index, outbox: outbox)
+            sessionId: Self.sessionId, client: client, index: index, outbox: outbox,
+            supportDirectory: temp.url)
     }
 
     private func entry() -> OutboxEntry? {

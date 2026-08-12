@@ -37,7 +37,8 @@ struct ChatStoreOutboxSweepTests {
         let clock = self.clock
         outbox = temp.makeOutbox(sessionId: Self.sessionId, now: { clock.now })
         store = ChatStore(
-            sessionId: Self.sessionId, client: client, index: index, outbox: outbox)
+            sessionId: Self.sessionId, client: client, index: index, outbox: outbox,
+            supportDirectory: temp.url)
     }
 
     private func entry() -> OutboxEntry? {

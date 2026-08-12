@@ -61,6 +61,18 @@ final class AppStore: ObservableObject {
         let name: String
     }
 
+    /// A conversation's rename, waiting on the editor dialog.
+    ///
+    /// The **seed** is snapshotted when the editor opens, like
+    /// `PendingCronGroupDelete`'s members: it is what decides whether an
+    /// untouched field commits anything (`RenameTitle.toCommit`), so re-deriving
+    /// it at the commit — after a live title patch or a list merge landed — could
+    /// turn "the user changed nothing" into a rename, or the reverse.
+    struct PendingRename: Equatable {
+        let sessionId: String
+        let seed: String
+    }
+
     /// A cron group's delete, waiting on the confirm dialog.
     ///
     /// The members are **snapshotted when the dialog opens**, and the confirm
@@ -137,9 +149,10 @@ final class AppStore: ObservableObject {
     @Published var confirmDeleteSession: String?
     /// The cron group a swipe-delete is asking to confirm, same host and reasons.
     @Published var confirmDeleteCronGroup: PendingCronGroupDelete?
-    /// The session the list's long-press resync is asking to confirm, same host
-    /// and reasons — and the only one of these whose commit is not destructive.
-    @Published var confirmResyncSession: String?
+    /// The conversation the list's long-press rename is editing — the one dialog
+    /// here that takes input rather than a decision, hosted at the app root for
+    /// the same latch/coverage reasons as the confirms.
+    @Published var renameSession: PendingRename?
     /// Job id → name, learned from the scheduled-jobs list. See
     /// `rememberCronJobTitles`.
     @Published private(set) var cronJobTitles: [String: String] = [:]
@@ -192,6 +205,10 @@ final class AppStore: ObservableObject {
     /// Sessions with an archive/hide request on the wire — the per-session
     /// serialization gate (`pumpSessionMutation`).
     private var sessionMutationsInFlight: Set<String> = []
+    /// Sessions with a rename on the wire — `pumpRename`'s gate. Its own set,
+    /// because a rename and an archive are independent requests that may fly at
+    /// the same time; sharing the gate would serialize two unrelated PUTs.
+    private var renamesInFlight: Set<String> = []
     /// `-baybo-open-home` (DEBUG): no gateway is bound, so archive/delete
     /// mutations resolve locally instead of failing + rolling back — the
     /// headless UI tests assert on the optimistic flip staying put.
@@ -228,6 +245,16 @@ final class AppStore: ObservableObject {
         // out from under the suites. The unit tests drive their own stores with
         // injected clients and temp support dirs.
         if Self.runningUnderTest { return }
+        // Deleting a conversation's durable files is only half of it: a resident
+        // store holds that conversation's composer draft IN MEMORY and writes it
+        // back on its next flush. Registered ahead of the fixture returns below —
+        // a delete performed on another client arrives through an ordinary list
+        // merge, which needs no fixture at all.
+        SessionIndex.shared.onSessionsRemoved = { [weak self] sessionIds in
+            for sessionId in sessionIds {
+                self?.chatStores[sessionId]?.discardDraft()
+            }
+        }
         // The chat list's live unread/recency source: connection-global
         // `SessionActivity` pings land here for ANY session, subscribed or not.
         Baybo.client.setSessionListSink(sink: SessionActivityHandler())
@@ -408,7 +435,16 @@ final class AppStore: ObservableObject {
                 return
             }
             if directBound {
-                await registerPushBestEffort()
+                // Detached, exactly as the foreground path runs it
+                // (`didBecomeActive`). Awaiting it here put TWO REST round trips
+                // (`GET /v1/push/params`, `POST /v1/push/register`, 30 s reply
+                // budget each on a 20 s connect budget) in front of the chat
+                // leg's warm-up, the chat list, the push-tap route and the
+                // stranded-send resume — on the one code path where none of
+                // them is on screen yet. Whether a given launch paid for it was
+                // a race with the APNs token callback, which is what made it
+                // feel intermittent. Nothing below needs its result.
+                Task { await registerPushBestEffort() }
                 preconnectDirectBestEffort()
             } else if paired != nil {
                 preconnectRelayBestEffort()
@@ -460,6 +496,16 @@ final class AppStore: ObservableObject {
         if route == .home {
             prewarmTranscriptHost()
             prewarmDeckHost()
+        }
+    }
+
+    /// The app is leaving the foreground. Every resident conversation's unsent
+    /// draft goes to disk NOW rather than on the composer's debounce, because a
+    /// suspended process is one the system may never resume — and the user did
+    /// not throw the message away, they switched apps.
+    func willLeaveForeground() {
+        for store in chatStores.values {
+            store.flushDraft()
         }
     }
 
@@ -874,11 +920,61 @@ final class AppStore: ObservableObject {
 
     /// Compose: mint or reuse a local draft id. The durable gateway row is
     /// created on first send, so abandoned drafts do not pollute the session list.
+    ///
+    /// A new chat left UNSENT with something in its composer is re-opened rather
+    /// than replaced. It has to be: a draft session has no registry row and no
+    /// gateway row, so its uuid is the only handle that exists anywhere, and
+    /// minting a fresh one would strand what the user wrote in a conversation
+    /// nothing on the device can ever name again. Emptying the composer retires
+    /// the draft (`DraftStore.write` deletes an empty one), and the next compose
+    /// mints exactly as before — which is also why at most one can ever be
+    /// waiting.
     func startNewChat() async -> String? {
-        let sessionId = prewarmedDraftId ?? newChatSessionId()
-        prewarmedDraftId = nil
+        let sessionId: String
+        if let unsent = unsentDraftSessionId() {
+            sessionId = unsent
+        } else {
+            sessionId = prewarmedDraftId ?? newChatSessionId()
+            prewarmedDraftId = nil
+        }
         await activateSession(sessionId, ensureListed: false)
         return nil
+    }
+
+    private func unsentDraftSessionId() -> String? {
+        Self.unsentDraftSessionId(in: SessionIndex.supportDirectory()) {
+            SessionIndex.shared.contains(sessionId: $0)
+        }
+    }
+
+    /// The new-chat draft waiting to be resumed, if there is one: a session with
+    /// a draft on disk that has never been SENT from. Newest wins, for the case
+    /// a previous build (or a crash mid-compose) left more than one behind.
+    ///
+    /// "Never sent from" takes two proofs, not one. A registry row is the
+    /// ordinary one — a row means the conversation exists, and it is reachable
+    /// from the list, where its own draft comes back on the tap. But the row is
+    /// written by `ChatStore.dispatchSend` only AFTER `ensureRemoteSession()`
+    /// succeeds, so a first send made OFFLINE leaves the conversation row-less
+    /// with a message queued in its outbox; type one more line into it and
+    /// compose would re-open the conversation you just sent to, believing it new.
+    /// A persisted outbox is that second proof, and it is exactly as durable as
+    /// the draft it is being compared against.
+    ///
+    /// Not `private`, and takes its inputs rather than reading the singletons:
+    /// `startNewChat` is its only production caller, but `AppStore.init` refuses
+    /// to boot under test (`runningUnderTest`), so a test drives the decision
+    /// directly against a temp support root.
+    static func unsentDraftSessionId(
+        in supportDirectory: URL, isListed: (String) -> Bool
+    ) -> String? {
+        let sent = Set(OutboxStore.pendingSessionIds(in: supportDirectory))
+        return DraftStore.sessionIds(in: supportDirectory)
+            .filter { !isListed($0) && !sent.contains($0) }
+            .max {
+                DraftStore.modified(sessionId: $0, in: supportDirectory)
+                    < DraftStore.modified(sessionId: $1, in: supportDirectory)
+            }
     }
 
     /// The Deck empty-board CTA. First tap: open a fresh chat on the Chats
@@ -976,20 +1072,42 @@ final class AppStore: ObservableObject {
         }
     }
 
-    /// Raise the resync confirm for a long-pressed row.
-    func promptResync(_ sessionId: String) {
+    /// Rebuild one conversation's transcript from the gateway — the per-session
+    /// escape hatch ([docs/transcript.md]). Nothing here is a server call: it
+    /// discards this device's local rendering and lets the cold path re-derive
+    /// it, so the store it materialises is the one the next visit would have
+    /// opened anyway.
+    ///
+    /// Committed straight off the menu row, with no confirm in front of it. It
+    /// takes nothing away that the gateway cannot hand back — the row, the
+    /// outbox and the server's copy are all untouched — so the honest cost of
+    /// tapping it by accident is one refetch, which is not a decision worth
+    /// stopping the user for.
+    func requestResync(_ sessionId: String) {
+        Haptics.tap()
+        chatStore(for: sessionId).resync(transcript: transcriptHost?.bridge)
+    }
+
+    /// Raise the rename editor for a long-pressed row, seeded with what the row
+    /// currently shows. No row, nothing to rename.
+    func promptRename(_ sessionId: String) {
+        guard let row = SessionIndex.shared.rows.first(where: { $0.id == sessionId })
+        else { return }
         withAnimation(ConfirmDialog.enterMotion) {
-            confirmResyncSession = sessionId
+            renameSession = PendingRename(
+                sessionId: sessionId,
+                seed: RenameTitle.seed(title: row.title, userText: row.userText))
         }
     }
 
-    /// Rebuild one conversation's transcript from the gateway, after the confirm
-    /// — the per-session escape hatch ([docs/transcript.md]). Nothing here is a
-    /// server call: it discards this device's local rendering and lets the cold
-    /// path re-derive it, so the store it materialises is the one the next visit
-    /// would have opened anyway.
-    func requestResync(_ sessionId: String) {
-        chatStore(for: sessionId).resync(transcript: transcriptHost?.bridge)
+    /// Rename, optimistically: the row's first line changes at once and the PUT
+    /// follows. `title` is already `RenameTitle.normalized`, so it is exactly
+    /// what the gateway will store — the patch it broadcasts back changes
+    /// nothing on this device, and every peer converges on the same string.
+    func requestRename(_ sessionId: String, title: String) {
+        sessionNotice = nil
+        SessionIndex.shared.beginRename(sessionId, title: title)
+        pumpRename(sessionId)
     }
 
     /// Archive or unarchive, optimistically: the row moves lists at once and
@@ -1047,6 +1165,9 @@ final class AppStore: ObservableObject {
         if let store = chatStores[sessionId], isEvictable(sessionId, store) {
             Task { await evictStore(sessionId, store) }
         }
+        // Also drops the conversation's unsent composer draft — including the
+        // resident store's in-memory copy, over `onSessionsRemoved`, which the
+        // eviction above would otherwise flush back to disk.
         SessionIndex.shared.beginHide(sessionId)
         pumpSessionMutation(sessionId)
     }
@@ -1141,6 +1262,49 @@ final class AppStore: ObservableObject {
                     SessionIndex.shared.rollBackHide(sessionId)
                     sessionNotice = Lang.shared.t("list.deleteFailed")
                 }
+            }
+        }
+    }
+
+    /// One in-flight rename per session, with `SessionIndex.pendingTitle`
+    /// holding the latest wanted name — `pumpSessionMutation`'s contract, for
+    /// the title.
+    ///
+    /// It needs the same serialization for a different failure: two renames of
+    /// one conversation racing can land out of order, and the loser there is not
+    /// a bit that self-corrects on the next flip but a name the user retyped,
+    /// left standing on the server while this device shows the newer one.
+    private func pumpRename(_ sessionId: String) {
+        guard !renamesInFlight.contains(sessionId),
+            let desired = SessionIndex.shared.pendingTitle(for: sessionId)
+        else { return }
+        #if DEBUG
+            // `-baybo-open-home` has no gateway to call; the demo asserts on the
+            // optimistic title staying put (mirrors the archive/pin demo mode).
+            if demoHomeMode {
+                SessionIndex.shared.finishRename(sessionId)
+                return
+            }
+        #endif
+        renamesInFlight.insert(sessionId)
+        Task { @MainActor in
+            do {
+                try await Baybo.client.chatSetTitle(sessionId: sessionId, title: desired)
+                renamesInFlight.remove(sessionId)
+                if SessionIndex.shared.pendingTitle(for: sessionId) == desired {
+                    SessionIndex.shared.finishRename(sessionId)
+                } else {
+                    pumpRename(sessionId)
+                }
+            } catch {
+                renamesInFlight.remove(sessionId)
+                NSLog("baybo: rename session: %@", bayboErrorText(error))
+                guard SessionIndex.shared.pendingTitle(for: sessionId) == desired else {
+                    pumpRename(sessionId)
+                    return
+                }
+                SessionIndex.shared.rollBackRename(sessionId)
+                sessionNotice = Lang.shared.t("list.renameFailed")
             }
         }
     }

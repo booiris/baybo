@@ -3,8 +3,8 @@ import SwiftUI
 /// One scheduled job's fires, pushed on the outer NavigationStack from its row
 /// in the chat list — the same shape as `ArchivedScreen` (covers the tab bar,
 /// pops with the edge swipe). Rows render with the main list's `SessionRowView`
-/// and keep its swipe actions, so a fire archives / deletes / pins exactly as
-/// any conversation does.
+/// and keep its gestures, so a fire archives / deletes / pins / resyncs exactly
+/// as any conversation does.
 ///
 /// A **group is a view, not an object** (`docs/cron-groups.md`): everything here
 /// is derived from `SessionRow.cronJobId`, and there is no folder row behind it —
@@ -52,6 +52,9 @@ struct CronGroupScreen: View {
             header
         }
         .background(Theme.paper)
+        // Like the home shell: no typed input here, and the rename editor that
+        // can float over it owns its own keyboard avoidance.
+        .ignoresSafeArea(.keyboard)
         // The system nav bar is hidden (custom chrome), which also disables the
         // interactive pop — this presence-only host re-enables the edge swipe.
         .background(PopGestureEnabler().frame(width: 0, height: 0))
@@ -125,7 +128,7 @@ struct CronGroupScreen: View {
                 .listRowBackground(Theme.paper)
                 .listRowSeparatorTint(Theme.line)
                 .listRowInsets(EdgeInsets(top: 0, leading: 24, bottom: 0, trailing: 24))
-                // A fire is an ordinary conversation — the main list's actions
+                // A fire is an ordinary conversation — the main list's swipes
                 // carry over verbatim. Archiving or pinning one lifts it OUT of
                 // the group (it renders in the archived screen / the pinned block
                 // instead), which is what keeps every row in exactly one place.
@@ -155,6 +158,13 @@ struct CronGroupScreen: View {
                     }
                     .tint(Theme.ink)
                 }
+                // …and so does the long-press: a fire is where the escape hatch
+                // is needed MOST (an unattended job's thread is the long,
+                // tool-heavy kind that drifts), and this screen is the only
+                // place one is listed. Rename comes with it — a fire's title is
+                // minted from the job's, and telling two of them apart is
+                // exactly what a hand-written name is for.
+                .sessionContextMenu(row.id)
             }
         }
         .listStyle(.plain)

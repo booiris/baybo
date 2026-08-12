@@ -185,7 +185,7 @@ async fn run_content_session<Si: BinarySink, So: BinarySource>(
     )
     .await;
 
-    let _ = sidecar.into_pump().await;
+    sidecar.shutdown().await;
     tracing::debug!(device = %super::short_hash(&device_id), "device content session closed");
     Ok(())
 }

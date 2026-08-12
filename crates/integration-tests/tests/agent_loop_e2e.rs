@@ -843,6 +843,124 @@ async fn reasoning_chunks_stream_as_reasoning_events() {
     harness.shutdown().await;
 }
 
+/// Collect every streamed `Reasoning` event into the single string a client
+/// builds by concatenating them — the exact assembly `ChatPage`'s
+/// `appendReasoningStep` and the iOS transcript's `reasoning` case both do.
+fn streamed_reasoning(outs: &[AgentOutput]) -> String {
+    outs.iter()
+        .filter_map(|o| match &o.event {
+            AgentEvent::Reasoning(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn thinking_block(text: &str) -> ContentBlock {
+    ContentBlock::Thinking {
+        id: None,
+        content: vec![ThinkingContent::Text {
+            text: text.to_owned(),
+            signature: None,
+        }],
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_closed_thinking_section_breaks_the_streamed_reasoning_into_paragraphs() {
+    let mut harness = AgentTestHarness::builder().build();
+
+    // The real Anthropic shape: deltas for one section, the block event that
+    // closes it, then deltas for the next — which open with their own bold
+    // headline and carry no separator of their own.
+    harness.stub_llm.push_stream(vec![
+        StreamEvent::Reasoning("I want to look at the globs I need!".into()),
+        StreamEvent::ThinkingBlock(thinking_block("I want to look at the globs I need!")),
+        StreamEvent::Reasoning("**Inspecting the repo**\n\nI need to inspect it.".into()),
+        StreamEvent::ThinkingBlock(thinking_block(
+            "**Inspecting the repo**\n\nI need to inspect it.",
+        )),
+        StreamEvent::Text("done".into()),
+    ]);
+
+    harness.send_text("ponder this").await.unwrap();
+    let outs = harness.drain_outputs(DRAIN_TIMEOUT).await;
+    let reasoning = streamed_reasoning(&outs);
+
+    assert!(
+        reasoning.contains("I need!\n\n**Inspecting the repo**"),
+        "a closed section must be separated from the next by a BLANK line — a lone \
+         newline is folded to a space by CommonMark and leaves the headline glued \
+         onto the previous sentence. Got: {reasoning:?}"
+    );
+    assert!(
+        !reasoning.starts_with('\n'),
+        "no leading break before the first section, got {reasoning:?}"
+    );
+    assert!(
+        !reasoning.ends_with("\n\n"),
+        "the block closing the LAST section must not leave a trailing blank line, \
+         got {reasoning:?}"
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_redacted_block_before_any_text_does_not_indent_the_first_section() {
+    let mut harness = AgentTestHarness::builder().build();
+
+    // `redacted_thinking` arrives as a block with no deltas ahead of it, so the
+    // break has to be armed by a closed section rather than by any block.
+    harness.stub_llm.push_stream(vec![
+        StreamEvent::ThinkingBlock(ContentBlock::Thinking {
+            id: None,
+            content: vec![ThinkingContent::Redacted {
+                data: "AAAA".into(),
+            }],
+        }),
+        StreamEvent::Reasoning("**Starting out**\n\nfirst thoughts".into()),
+        StreamEvent::Text("done".into()),
+    ]);
+
+    harness.send_text("ponder this").await.unwrap();
+    let outs = harness.drain_outputs(DRAIN_TIMEOUT).await;
+    let reasoning = streamed_reasoning(&outs);
+
+    assert_eq!(
+        reasoning.trim_end(),
+        "**Starting out**\n\nfirst thoughts",
+        "a redacted block ahead of the first delta must not push the trace down"
+    );
+
+    harness.shutdown().await;
+}
+
+/// The delta-only providers (DeepSeek and other OpenAI-compatible endpoints)
+/// never emit a `ThinkingBlock`, so their reasoning is synthesized from the
+/// accumulated text and echoed back on the next request. No block means no
+/// break is ever inserted, which is what keeps the streamed copy and the
+/// persisted one from diverging.
+#[tokio::test(start_paused = true)]
+async fn delta_only_reasoning_is_streamed_verbatim() {
+    let mut harness = AgentTestHarness::builder().build();
+
+    harness.stub_llm.push_stream(vec![
+        StreamEvent::Reasoning("first part.".into()),
+        StreamEvent::Reasoning("second part.".into()),
+        StreamEvent::Text("done".into()),
+    ]);
+
+    harness.send_text("ponder this").await.unwrap();
+    let outs = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    assert_eq!(
+        streamed_reasoning(&outs).trim_end(),
+        "first part.second part."
+    );
+
+    harness.shutdown().await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn reasoning_deltas_round_trip_as_thinking_block_on_tool_loop() {
     // DeepSeek thinking mode streams reasoning only as deltas (never a
@@ -4738,6 +4856,195 @@ async fn an_issue_run_executes_as_its_own_kind_of_turn() {
         run_turn.is_terminal(),
         "and it finished, so the waiter has an edge to settle on: {:?}",
         run_turn.status
+    );
+
+    harness.shutdown().await;
+}
+
+/// A turn whose edits cancel out must be told so, on the very next request.
+///
+/// This is the incident from session cddcfcdb-c5f8-43fc-bb83-01385d0a7b31
+/// reduced to its shape: the model edits a config file, then edits it straight
+/// back, and — before this — nothing anywhere in the runtime noticed. The unit
+/// tests cover the decision; this covers the wiring, which is the part that
+/// silently does nothing if the hook is misplaced.
+#[tokio::test(start_paused = true)]
+async fn a_turn_that_churns_one_file_is_told_it_made_no_progress() {
+    const CONFIG: &str = "/tmp/harness/.mcp.json";
+    // The wording of the observation this script earns: the fourth edit
+    // resubmits the second one verbatim, so the third churn signal is a
+    // repeat rather than a revisit.
+    const CHURN_PHRASE: &str = "already submitted earlier in this turn";
+    // Named `Edit` because that is what makes it a file mutation as far as
+    // the ledger is concerned (`baybo_tools::FILE_WRITING_TOOLS`).
+    let tool = Arc::new(RecordingTool::new("Edit"));
+    tool.set_response(ToolOutput::Text("replaced 1 occurrence(s)".into()));
+    let manifest = tool.manifest();
+
+    let mut harness = AgentTestHarness::builder()
+        .with_tool(tool.clone() as Arc<dyn Tool>, manifest)
+        .build();
+
+    let edit = |id: &str, old: &str, new: &str| {
+        StreamEvent::ToolCall(ToolCallInfo {
+            id: id.into(),
+            name: "Edit".into(),
+            arguments: json!({
+                "file_path": CONFIG,
+                "old_string": old,
+                "new_string": new,
+            }),
+            signature: None,
+        })
+    };
+
+    // Drop the server entry, put it back, drop it, put it back. Reverts two,
+    // three and four are the churn signals; the ledger stays quiet until the
+    // third. A fifth iteration carries whatever the model says next.
+    const FULL: &str = "servers: [netdata]";
+    const EMPTY: &str = "servers: []";
+    for (i, (old, new)) in [(FULL, EMPTY), (EMPTY, FULL), (FULL, EMPTY), (EMPTY, FULL)]
+        .into_iter()
+        .enumerate()
+    {
+        harness
+            .stub_llm
+            .push_stream(vec![edit(&format!("call-{i}"), old, new)]);
+    }
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("let me reconsider".into())]);
+
+    harness
+        .send_text("make the filter take effect")
+        .await
+        .unwrap();
+    let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    assert_eq!(tool.invocations().len(), 4, "every edit ran");
+
+    let captured = harness.stub_llm.captured_requests();
+    assert_eq!(captured.len(), 5, "five iterations");
+
+    let observation_in = |i: usize| -> bool {
+        captured[i]
+            .messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .any(|b| matches!(b, ContentBlock::Text(t) if t.contains(CHURN_PHRASE)))
+    };
+
+    assert!(
+        (0..4).all(|i| !observation_in(i)),
+        "one or two reverts are ordinary exploration — say nothing"
+    );
+    assert!(
+        observation_in(4),
+        "the request after the third churn signal must carry the observation"
+    );
+    let text = captured[4]
+        .messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter_map(|b| match b {
+            ContentBlock::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .find(|t| t.contains(CHURN_PHRASE))
+        .expect("the observation text");
+    assert!(text.contains(CONFIG), "it must name the file: {text}");
+
+    // The observation is never persisted: it is about one moment, and a
+    // stored copy would replay as history on every later turn.
+    let stored = harness
+        .session_manager
+        .load_active_session_messages(&harness.session.id)
+        .await
+        .expect("load transcript");
+    assert!(
+        !stored
+            .iter()
+            .flat_map(|m| &m.content)
+            .any(|b| matches!(b, ContentBlock::Text(t) if t.contains(CHURN_PHRASE))),
+        "the observation must not reach the transcript"
+    );
+
+    harness.shutdown().await;
+}
+
+/// The tool set a call offered is recorded beside what the model saw, as a
+/// resolvable reference rather than an inline copy.
+///
+/// Two things have to hold together or the Tools tab in the trace viewer
+/// shows nothing: the span has to carry the reference, and the row it names
+/// has to be in the store. The inline check is the same span-bloat guard the
+/// `input_messages` reference carries — a schema copy per call would be the
+/// largest thing in the `spans` table.
+#[tokio::test(start_paused = true)]
+async fn an_llm_span_records_its_tool_set_by_reference() {
+    use baybo_store::TurnStore;
+    use baybo_trace::{SpanKind, TraceStore};
+
+    let tool = Arc::new(RecordingTool::new("echo_tool"));
+    let manifest = tool.manifest();
+    let mut harness = AgentTestHarness::builder()
+        .with_tool(tool.clone() as Arc<dyn Tool>, manifest)
+        .build();
+
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("nothing to call".into())]);
+    harness.send_text("hi").await.unwrap();
+    harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    let turns = harness.turn_store.list_all().await.unwrap();
+    let mut refs = Vec::new();
+    let mut span_rows = Vec::new();
+    for turn in &turns {
+        for step in harness
+            .trace_store
+            .list_steps_by_turn(&turn.id)
+            .await
+            .unwrap()
+        {
+            let step = baybo_trace::Step::from_row(step).unwrap();
+            for row in harness
+                .trace_store
+                .list_spans_by_step(&step.id)
+                .await
+                .unwrap()
+            {
+                span_rows.push(row.data.clone());
+                let span = baybo_trace::Span::from_row(row).unwrap();
+                if let SpanKind::LlmCall { begin, .. } = span.kind {
+                    refs.push(begin.tools);
+                }
+            }
+        }
+    }
+
+    let reference = refs
+        .pop()
+        .expect("an LlmCall span")
+        .expect("the span records its tool set");
+    assert!(reference.count > 0, "the call offered tools");
+    assert!(
+        !span_rows.iter().any(|d| d.contains("parameters_schema")),
+        "a span inlined the tool schemas — the reference exists to keep them out"
+    );
+
+    let stored = harness
+        .trace_store
+        .load_tool_set(&reference.hash)
+        .await
+        .unwrap()
+        .expect("the referenced set is in the store");
+    let set = baybo_trace::LlmToolSet::from_row(stored).unwrap();
+    assert_eq!(set.tools.len(), reference.count);
+    assert!(
+        set.tools.iter().any(|t| t.name == "echo_tool"),
+        "the registered tool must be in the recorded set: {:?}",
+        set.tools.iter().map(|t| &t.name).collect::<Vec<_>>()
     );
 
     harness.shutdown().await;

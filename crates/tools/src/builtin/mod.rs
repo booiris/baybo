@@ -20,6 +20,7 @@
 //! | `WebFetch`   | implemented   |
 //! | `AttachFile` | implemented   |
 //! | `PutBlob`    | implemented   |
+//! | `GetBlob`    | implemented   |
 //! | everything else listed in `todo.rs` | stubbed  |
 
 use std::sync::Arc;
@@ -35,6 +36,7 @@ pub mod background_jobs;
 pub mod bash;
 mod blob_upload;
 pub mod edit;
+mod get_blob;
 pub mod glob_tool;
 pub mod grep;
 pub(crate) mod managed_repo;
@@ -136,6 +138,7 @@ pub fn default_tools(config: DefaultToolsConfig) -> Vec<(Arc<dyn Tool>, ToolMani
         ),
         attach_file::tool(blob_store.clone()),
         put_blob::tool(blob_store.clone()),
+        get_blob::tool(blob_store.clone()),
         trusted(NowTool, vec![]),
         trusted(secret::SecretAddTool, vec![]),
         trusted(secret::SecretListTool, vec![]),

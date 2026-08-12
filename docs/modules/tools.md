@@ -29,6 +29,7 @@ registered at runtime — not just `baybo-tools::builtin`.
 | `WebFetch`                                                                                                                                                                                                                                                            | implemented | renders the response as Markdown; when `prompt` is supplied, the agent layer has bound a side LLM into `ToolContext::lite_llm` (gateway/runtime path binds `Some`, argv-mode leaves `None`), AND the rendered content is at least `SUMMARY_MIN_CHARS` (2048 chars), runs a fixed-system extraction pass and returns the model's reply instead of the raw body. Shorter pages and LLM-less builds fall through to raw markdown — the prompt is silently ignored. |
 | `AttachFile`                                                                                                                                                                                                                                                            | implemented | streams a local file into `BlobStore`; the loop attaches it to the turn's final reply                                      |
 | `PutBlob`                                                                                                                                                                                                                                                                | implemented | owner-only; streams any local file into `BlobStore` and returns structured `blob_id` / MIME / size metadata without attaching it; accepts an optional use-case-specific cap up to 100 MiB |
+| `GetBlob`                                                                                                                                                                                                                                                                | implemented | the inverse of `PutBlob`: resolves a `blob_id` to the store's own payload path so an external process can open bytes the agent could previously only look at, returning `path` / `mime_type` / `size_bytes`. Writes nothing — the path is read-only, and the Bash sandbox re-binds `state/blobs/` read-only to make it openable. Unrestricted by channel (it *spends* a capability the caller already holds, where `PutBlob` mints one) |
 | `Now`                                                                                                                                                                                                                                                                 | implemented | returns the current UTC + host-local time so the LLM can anchor relative-time reasoning; no parameters, no capabilities |
 | `SecretAdd`, `SecretList`, `SecretCheck`                                                                                                                                                                                                                              | implemented | value-blind user-secret management (`builtin/secret.rs`); no delete tool — deletion is CLI-only. See [Secret access](#secret-access) |
 | `JobList`, `JobStop`                                                                                                                                                                                                                                                  | implemented | view and kill the conversation's in-flight background jobs (detached subagents and `Bash` commands) via `BackgroundJobControl`; they ignore `background_eligible` (observing is not creating) and report nothing in flight where no manager is wired |
@@ -75,6 +76,77 @@ gateway's blob download, gets refused there, and serves the bytes with no
 `Content-Type` at all. `AttachFile` skipped that check while `PutBlob` made it
 — exactly the drift a shared seam exists to prevent. Both name the parameter
 `mime_type`.
+
+`GetBlob` (`builtin::get_blob`) closes the other direction. Without it
+`BlobStore` is a **write-only port at the tool layer**: `AttachFile` and
+`PutBlob` mint capability ids, every other consumer in the system (the
+gateway's `GET /v1/blobs/{id}`, the LLM request builder, channel sidecars,
+deck's `ctx.fetchBlob`, iOS) can spend one, and the agent that mints them
+cannot — so an agent holding a user's photo saw the pixels and had no way to
+name the file for a subprocess.
+
+**It writes nothing, and it does one thing.** It answers with the store's own
+payload path — `{path, mime_type, size_bytes}` — and the Bash sandbox
+re-exposes that tree read-only (see below). It deliberately does not also
+deliver the image to the model's own vision input: that is a second, separate
+capability, and bolting it onto path resolution would make the tool two tools
+wearing one name. Three invariants:
+
+- **Resolve through `stat`, never by deriving a path from the digest.** The
+  trailing token on a `blob_id` is the store's only read capability and the
+  payload is named by the hex alone, so a hand-rolled derivation would drop
+  the gate — and a tool whose *answer is the path* is the worst place to drop
+  it. The derivation lives once, in `SqliteBlobStore::local_path`, behind the
+  same `stat` the security note on `BlobStore::open_at` mandates; the trait
+  default refuses rather than guessing, so a backend with no on-disk payload
+  (the in-memory fake, any future remote store) reports "not available here"
+  instead of inventing a path. `WebFetch`'s private `blob_local_path` mirror
+  of that layout is gone with it.
+- **Read-only is load-bearing, not a limitation to relax.** The payload is
+  content-addressed and shared by every row with the same digest, so one
+  in-place edit rewrites every blob referencing that content. The description
+  states the hazard — one shared copy — and stops there rather than
+  prescribing a copy-it-first recipe: under a sandbox the shell's own
+  `Read-only file system` teaches that at the moment it is needed, and under
+  `permission = free` there is no sandbox, which is exactly why the *reason*
+  is what the model is told.
+- **Cross-session reach is not gated here and should not be.** The `blobs`
+  table has no session column, and `baybo session export` is unscoped and
+  already reachable from Bash — a gate on this tool would break the legitimate
+  parent→subagent and cron-fire handoffs while leaving the real enumeration
+  path open. If that ever needs closing, it belongs on `session export`.
+
+Reaching that path from a shell needs **two gates to agree**, at different
+layers. `baybo_tools::shell_reachable_workspace_roots` is the single list
+both read: the caller's own `skills/` and `<root>/state/blobs/`.
+
+1. `BashTool` walks the command string and rejects any absolute token inside
+   the workspace but outside `work/` (`require_command_paths_within_work_dir`)
+   — everything on the list is exempt.
+2. The agent runtime binds the same entries read-only over the `$BAYBO_HOME`
+   tmpfs mask when it builds the sandbox.
+
+**The tool-layer check runs first**, before a process exists, so the two fail
+in opposite and equally silent ways: exempted but unbound resolves inside the
+empty mask (`No such file or directory`), bound but unexempted is refused on
+the string and the mount is never reached — `ffmpeg -i <blob path>` comes back
+`InvalidParams`. These were two independently maintained lists and drifted
+exactly that way, which is why the function exists instead of a comment asking
+the next editor to keep them in step. The exemption is lexical and cannot
+distinguish a read from a write, so read-only is the sandbox's doing; under
+`permission = free` there is no sandbox and both roots are writable, the same
+trade the `skills/` exemption has always made. Mount order is last-wins, so a child of a
+masked directory can be re-exposed for itself alone: verified end-to-end
+against real `bwrap`, a sandboxed shell reads a blob payload in full, gets
+`Read-only file system` on any write to it, and still sees `state/` as
+containing nothing but `blobs` — `storage.db` (every transcript, the secrets
+rows, and every blob's `read_token`) and the browser profile's cookies stay
+gone. That containment is the reason the bind is one subdirectory and not
+`state/`; `path_visibility` in `crates/sandbox/src/spec.rs` pins it.
+
+`GetBlob` deliberately does **not** declare `ExecCommand`: that is what builds
+a per-call sandbox, and the tool itself has no business inside one.
+
 Stubs exist so downstream can register them once their backing subsystem is
 ready without having to invent the tool name/schema at that point.
 
@@ -181,6 +253,19 @@ binary and never appear in or are editable via `.mcp.json`.
   and trusts the vendor; don't gate on the transport command." Embedded
   servers that *do* declare capabilities still get the transport-derived
   approval like any stdio server.
+- **A user server's connect is bounded (`USER_CONNECT_TIMEOUT`, 90s); an
+  embedded server's is not.** `connect_server` is awaited inline by
+  `tick`, which the run loop awaits in turn, so a connect that never
+  returns does not fail one server — it stops the reconciler outright,
+  and silently, because nothing is left running to log. Every later
+  `.mcp.json` edit is then a no-op, including the ones `baybo mcp
+  add/remove` makes. Timing out is safe to do bluntly: the child is owned
+  by the connect future and `ManagedChild::Drop` SIGKILLs its process
+  group, so abandoning the future reaps it. Embedded stays unbounded
+  because the browser sidecar's docker build / Chrome download is
+  indistinguishable from a hang at this layer — the real fix there is for
+  the sidecar to connect its transport first and background the heavy
+  work.
 
 The browser sidecar arrives as one of these embedded servers; see
 [`sidecars.md`](../sidecars.md) for the CDDM wrapper, security
@@ -295,6 +380,8 @@ unredacted. `manual` asks before every Bash command, then runs in the sandbox wh
 
 The permission is a shared, **hot-reloadable** `LivePermissionMode` handle: a `permission` config reload swaps it live, and `BashTool::description` is rendered per permission so the prompt the LLM sees matches the active isolation and approval policy.
 
+**The `baybo` self-CLI route is leading-position only.** A command whose first sub-command is the canonical absolute path of the running gateway binary runs unsandboxed — the sandbox masks `~/.baybo` and never mounts the binary's own directory, so a sandboxed `baybo …` is broken by construction. The route decides the fate of the *whole* `sh -c` string, so a baybo invocation found anywhere else in the line cannot be honoured: doing so would let `curl … | sh && /abs/baybo status` escape the sandbox. Such a line is instead **rejected** with an `InvalidParams` instruction naming the binary and telling the caller to split it into two Bash calls — under every permission mode, including `free`, so the accepted command shape does not change when the mode does. Silently sandboxing it (the previous behaviour) produced a bare `exit 127` that reads like a deleted binary. Bare-name and relative-path invocations keep their own rejection, which names the canonical absolute path.
+
 On a turn that is `ToolContext::background_eligible` (see [`agent.md`](agent.md) → *Background jobs*), `on_timeout=background` detaches over-budget Bash commands for both execution routes: sandboxed commands hand the sandbox backend's detached child to the background-job sink, while `permission=free` / self-CLI commands spawn an unsandboxed child in its own process group so `/stop` can cancel the whole tree. Commands with `secret_env` can background too, but the output files and completion notification tails are raw; the handoff logs and returns an explicit warning when secret env vars were injected.
 
 Separately, the **`bench-bash` Cargo feature** (off by default, compiled out of every prod build — see `bench/swe` + `bench/terminal-bench-1.0`) switches `BashTool` to a **bench profile**: raw exec with no OS sandbox, no uv shim, no work-dir jail, cwd inherited from the process, and a dedicated prompt — for running inside a disposable container where bwrap can't nest. It overrides `permission` and disables the judge. `permission=free` is the config counterpart that only drops the OS sandbox; the feature is the bench-only behavior hack.
@@ -324,7 +411,7 @@ All other tools (`Read`, `Write`, `Edit`, `Echo`, `Now`, `Secret*`, `JobList`, `
 
 The agent loop dispatches every tool call in one LLM response together. Each `Tool` declares whether it is safe to overlap its siblings via `fn concurrency(&self) -> ToolConcurrency` (default `Exclusive`). `ToolRegistry::concurrency(name)` exposes the lookup (unknown tools fail safe to `Exclusive`).
 
-- **`ToolConcurrency::Concurrent`** — safe to run alongside other concurrent calls; declared by the read-only builtins: `Read`, `Glob`, `Grep`, `WebFetch`, `Now`, `Skill`, `CronList`, `TaskGet`, `TaskList`, `SecretList`, `SecretCheck`. They read (filesystem, network, or a store) and mutate no shared state, so parallel calls within a turn cannot race. `AttachFile` and `PutBlob` stay exclusive — staging a blob to send or reference is an outward-facing write, kept on the clean "concurrent = pure read" side of the line.
+- **`ToolConcurrency::Concurrent`** — safe to run alongside other concurrent calls; declared by the read-only builtins: `Read`, `Glob`, `Grep`, `WebFetch`, `Now`, `Skill`, `CronList`, `TaskGet`, `TaskList`, `SecretList`, `SecretCheck`. They read (filesystem, network, or a store) and mutate no shared state, so parallel calls within a turn cannot race. `AttachFile` and `PutBlob` stay exclusive — staging a blob to send or reference is an outward-facing write, kept on the clean "concurrent = pure read" side of the line. `GetBlob` reads only (a `stat` and a path), so it joins the concurrent set.
 - **`ToolConcurrency::Exclusive`** (the default) — runs alone among pool calls. Every mutating builtin (`Write`, `Edit`, `MemoryDelete`, `Bash`, `SecretAdd`, `Cron{Create,Update,Delete,Pause,Resume}`, `DeckCard{Create,Update}`, `Skill{Install,Uninstall}`, `Task{Create,Update}`), every MCP/dynamic tool, and any tool the registry can't classify falls here. A tool with side effects must never overlap a reader (read-while-write race) or another writer.
 - **`ToolConcurrency::Independent`** — opts out of the pool: acquires no permit, so it neither waits for one nor blocks others (it can overlap even an `Exclusive` call) and is **not** counted against the cap. For tools that bound their own concurrency out-of-band. Today only `spawn_subagent`, capped per-root by its `SubagentDispatchLimiter` (default 8): a foreground spawn blocks on its child for the child's whole lifetime, so holding a shared permit would serialize the parent's fan-out — fan-out is meant to run in parallel, so it stays off the pool.
 

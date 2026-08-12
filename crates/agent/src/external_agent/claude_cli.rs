@@ -24,7 +24,7 @@ use super::probe::{
 };
 use super::{
     ExternalAgent, ExternalAgentError, ExternalAgentEvent, ExternalAgentRequest,
-    ExternalAgentStream, Result,
+    ExternalAgentStream, Result, mark_tool_error,
 };
 
 const AGENT_NAME: &str = "claude";
@@ -471,6 +471,11 @@ enum UserBlock {
         tool_use_id: String,
         #[serde(default)]
         content: ToolResultContent,
+        /// claude's own failure flag. Baybo persists no structured outcome
+        /// beside a `ToolResult`, so without this a failed CLI tool call
+        /// reads back identical to a successful one.
+        #[serde(default)]
+        is_error: bool,
     },
     #[serde(other)]
     Other,
@@ -539,9 +544,10 @@ impl UserBlock {
             Self::ToolResult {
                 tool_use_id,
                 content,
+                is_error,
             } => Some(ContentBlock::ToolResult {
                 tool_use_id,
-                content: content.into_string(),
+                content: mark_tool_error(content.into_string(), is_error),
                 // External-agent transcript projection; the read-before-write
                 // tracker is local to Baybo's own tools, not the CLI's.
                 meta: None,
@@ -841,6 +847,58 @@ mod tests {
                 assert_eq!(tool_use_id, "toolu_1");
                 assert_eq!(content, "ok");
             }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    /// Shape captured verbatim from `claude -p --output-format stream-json`
+    /// (claude-opus-5): the echo carries `is_error` beside the content. It was
+    /// unbound here, so a failed CLI tool call persisted a row identical to a
+    /// successful one — and session rows are never rewritten.
+    #[test]
+    fn a_failed_tool_result_is_marked_in_the_transcript() {
+        let line = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_01XizyHsqpwTBZTDUr885Dno","type":"tool_result","content":"bash: nope: command not found","is_error":true}]}}"#;
+        let StreamJsonEvent::User { message } =
+            serde_json::from_str::<StreamJsonEvent>(line).unwrap()
+        else {
+            panic!("expected User event");
+        };
+        let block = message
+            .content
+            .into_iter()
+            .next()
+            .expect("one block")
+            .into_content_block()
+            .expect("tool_result projects");
+        match block {
+            ContentBlock::ToolResult { content, .. } => {
+                assert_eq!(content, "Error: bash: nope: command not found");
+                // The gateway's reload-time status derivation keys off exactly
+                // this prefix; a bare `starts_with` here would pass on a
+                // marker it cannot read.
+                assert!(content.starts_with(baybo_model::TOOL_RESULT_ERROR_PREFIX));
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_successful_tool_result_is_left_verbatim() {
+        let line = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_1","type":"tool_result","content":"ok","is_error":false}]}}"#;
+        let StreamJsonEvent::User { message } =
+            serde_json::from_str::<StreamJsonEvent>(line).unwrap()
+        else {
+            panic!("expected User event");
+        };
+        let block = message
+            .content
+            .into_iter()
+            .next()
+            .expect("one block")
+            .into_content_block()
+            .expect("tool_result projects");
+        match block {
+            ContentBlock::ToolResult { content, .. } => assert_eq!(content, "ok"),
             other => panic!("expected ToolResult, got {other:?}"),
         }
     }

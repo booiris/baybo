@@ -273,9 +273,19 @@ registry wiring installs a type-level gate into the shared
 frame to the WS sink with
 [`rmp_serde::to_vec_named`](baybo_channels::wire::encode) —
 everything fans *in* to the mpsc, the pump is the only thing that
-touches the socket. On disconnect `Sidecar::into_pump()` detaches the
+touches the socket. On disconnect `Sidecar::shutdown()` detaches the
 connection from the channel and drops the last `frame_tx` clones, so the
 pump exits cleanly without a separate stop signal.
+
+A `Sidecar` that is never wound down that way — the relay chat leg's
+normal ending, since `LegDedup::install` and `legs.shutdown()` both
+**abort** the leg task — gets the same cleanup from the `LegTeardown`
+guard field's `Drop`, which detaches and then aborts the pump. Both
+halves matter: leaving the connection attached keeps an `Arc<Connection>`
+alive in the channel, and its `GatewaySink` holds clones of the very
+senders the pump and translator are waiting to see closed, so neither
+ever exits and the pump keeps the socket's write half and its keepalive
+running against a peer that is gone.
 
 ### Tool approval over the sidecar WS
 
@@ -582,6 +592,8 @@ POST   /v1/cron/:id/restore             out of the recycle bin, with the status 
 GET    /v1/traces                       ?status=&since=&until=&limit=&cursor=  filtered session-summary list
 GET    /v1/traces/:session_id           session overview (message log + turn summaries)
 GET    /v1/traces/:session_id/turns/:turn_id  per-turn step/span tree
+GET    /v1/traces/tool-sets/:hash       tool definitions an LlmCall span's `tools.hash` names
+GET    /v1/traces/:session_id/spans/:span_id/context  where one LLM call's input tokens went
 
 GET    /v1/skills
 GET    /v1/tools
@@ -782,7 +794,9 @@ The full frame set (see `crates/wire/src/lib.rs`):
   (server → client).
 - **Chat session signalling (the `owner` subscribed channel):** `SessionUpdated
   { session_id, patch }` (the `SessionPatch` carries Create/Hide/Unhide
-  plus `pinned` and `folder_id` changes), `SessionActivity { session_id,
+  plus `pinned`, `archived`, `folder_id`, `title` and `approval_pending`
+  changes; an absent field means "unchanged", so `title` can be replaced
+  but never cleared), `SessionActivity { session_id,
   source, at }`, `FoldersChanged { folders }` (a full folder-tree snapshot
   re-broadcast after any folder mutation).
 - **Deck (server → client, the `owner` subscribed channel):**

@@ -202,18 +202,23 @@ export function stripeClass(v: KindVisual): string {
   return v.stripe;
 }
 
-// Total input (incl. cache) and output tokens across the llm_call spans of a
-// step — for the rolled-up token badge on a collapsed/summary Step row.
-export function sumLlmTokens(spans: Span[]): { input: number; output: number } {
+// Token totals across a set of llm_call spans — one span (a span row), a
+// step's spans (its rolled-up badge), or a whole turn's (see `traceTokens`).
+// `input` already contains the cache buckets; see [`TurnTokenTotals`].
+export function sumLlmTokens(spans: Span[]): TurnTokenTotals {
   let input = 0;
   let output = 0;
+  let cached = 0;
+  let cacheCreate = 0;
   for (const s of spans) {
     if (s.kind.kind === 'llm_call' && s.kind.result) {
       input += s.kind.result.input_tokens ?? 0;
       output += s.kind.result.output_tokens ?? 0;
+      cached += s.kind.result.cached_input_tokens ?? 0;
+      cacheCreate += s.kind.result.cache_creation_input_tokens ?? 0;
     }
   }
-  return { input, output };
+  return { input, output, cached, cacheCreate };
 }
 
 /** Tokens a compaction consumed and produced. Cache reads and writes are part
@@ -430,21 +435,7 @@ export function turnTokens(summary: TraceTurnSummary, trace: TurnTrace | undefin
 // Derive token totals from a loaded TurnTrace's spans. Prefer `turnTokens`,
 // which falls back to the summary when the tree is empty.
 export function traceTokens(trace: TurnTrace): TurnTokenTotals {
-  let input = 0;
-  let output = 0;
-  let cached = 0;
-  let cacheCreate = 0;
-  for (const rs of trace.steps) {
-    for (const span of rs.spans) {
-      if (span.kind.kind === 'llm_call' && span.kind.result) {
-        input += span.kind.result.input_tokens ?? 0;
-        output += span.kind.result.output_tokens ?? 0;
-        cached += span.kind.result.cached_input_tokens ?? 0;
-        cacheCreate += span.kind.result.cache_creation_input_tokens ?? 0;
-      }
-    }
-  }
-  return { input, output, cached, cacheCreate };
+  return sumLlmTokens(trace.steps.flatMap((rs) => rs.spans));
 }
 
 // Flatten a message's content blocks into a single display string (text

@@ -567,6 +567,21 @@ impl SessionStore for SqliteSessionStore {
         Ok(affected > 0)
     }
 
+    async fn set_title_if_absent(&self, session_id: &SessionId, title: &str) -> Result<bool> {
+        let sid = session_id.as_str().to_string();
+        let value = title.to_string();
+        let affected = self
+            .pool
+            .interact("sessions.set_title_if_absent", move |conn| {
+                Ok(conn.execute(
+                    "UPDATE sessions SET title = ?2 WHERE id = ?1 AND title IS NULL",
+                    rusqlite::params![sid, value],
+                )?)
+            })
+            .await?;
+        Ok(affected > 0)
+    }
+
     async fn delete(&self, session_id: &SessionId) -> Result<bool> {
         let sid = session_id.as_str().to_string();
         self.pool
@@ -2932,6 +2947,55 @@ mod tests {
         assert!(
             !store
                 .set_title(&SessionId::from("nope"), Some("x"))
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn set_title_if_absent_yields_to_an_existing_title() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
+        let store = SqliteSessionStore::new(pool);
+        let s = make_root_session("title-cas");
+        store.save(&s).await.unwrap();
+
+        assert!(
+            store
+                .set_title_if_absent(&s.id, "Generated first")
+                .await
+                .unwrap(),
+            "an untitled row must accept the write"
+        );
+        assert_eq!(
+            store.get(&s.id).await.unwrap().unwrap().title.as_deref(),
+            Some("Generated first")
+        );
+
+        // The auto-titler losing to a rename: the row is already titled, so
+        // the late write must report that it did nothing and leave the user's
+        // name in place.
+        store
+            .set_title(&s.id, Some("Renamed by user"))
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .set_title_if_absent(&s.id, "Generated late")
+                .await
+                .unwrap(),
+            "a titled row must reject the auto write"
+        );
+        assert_eq!(
+            store.get(&s.id).await.unwrap().unwrap().title.as_deref(),
+            Some("Renamed by user")
+        );
+
+        assert!(
+            !store
+                .set_title_if_absent(&SessionId::from("nope"), "x")
                 .await
                 .unwrap()
         );

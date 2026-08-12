@@ -27,14 +27,20 @@ struct AttachMenuTests {
     private static let plusUnderStrip = CGRect(x: 40, y: 76, width: 46, height: 48)
     /// And under a blocked tool call, the tallest thing the dock ever carries.
     private static let plusUnderApproval = CGRect(x: 40, y: 200, width: 46, height: 48)
-    /// Two 46pt rows. Written out rather than read from `AttachMenuPanel` so a
-    /// row growing is a FAILURE here rather than a silently taller panel: the
-    /// panel is positioned by an offset that needs its height up front, so the
-    /// constant and the rows must not drift apart.
+    /// Two 46pt rows — Photos and Files, the panel every opening has. Written
+    /// out rather than read from `AttachMenuPanel` so a row growing is a FAILURE
+    /// here rather than a silently taller panel: the panel is positioned by an
+    /// offset that needs its height up front, so the constant and the rows must
+    /// not drift apart.
     private static let panelHeight: CGFloat = 92
+    /// …and three, when there is an image on the clipboard and Paste joins them.
+    private static let pastePanelHeight: CGFloat = 138
+
+    /// The rows an opening with an image on the clipboard shows.
+    private static let withPaste = AttachSource.always + [AttachSource.paste]
 
     @Test func theLeadingEdgeSitsOnThePlus() {
-        let box = AttachMenuPanel.box(anchor: Self.plus)
+        let box = AttachMenuPanel.box(anchor: Self.plus, rows: AttachSource.always.count)
         #expect(box.minX == Self.plus.minX)
         #expect(box.width == AttachMenuPanel.panelWidth)
     }
@@ -70,32 +76,60 @@ struct AttachMenuTests {
     /// first time `ChatScreen` diverged from it. Extracting the dock into its
     /// own store-free `View` is what would make it renderable here
     /// (`ImageRenderer`) — a refactor, not a test.
+    /// …and it clears it with the Paste row too, which is the case the row count
+    /// had to become an argument for: the box grows UPWARD from a fixed floor, so
+    /// a third row must eat into the headroom above and never into the gap below.
     @Test func theBottomEdgeClearsTheDock() {
         for anchor in [Self.plus, Self.plusUnderStrip, Self.plusUnderApproval] {
-            let box = AttachMenuPanel.box(anchor: anchor)
-            #expect(box.maxY == -AttachMenuPanel.anchorGap)
-            #expect(box.maxY < 0)
-            #expect(box.height == Self.panelHeight)
+            for rows in [AttachSource.always, Self.withPaste] {
+                let box = AttachMenuPanel.box(anchor: anchor, rows: rows.count)
+                #expect(box.maxY == -AttachMenuPanel.anchorGap)
+                #expect(box.maxY < 0)
+                #expect(box.height == AttachMenuPanel.rowHeight * CGFloat(rows.count))
+            }
         }
     }
 
-    /// The panel's height must be exactly the rows it is built from, because
-    /// the offset that positions it is computed from the constant rather than
-    /// from the laid-out view.
+    /// The panel's height must be exactly the rows it is built from, because the
+    /// offset that positions it is computed from the count rather than from the
+    /// laid-out view. Deriving it from `AttachSource.allCases` is the bug this
+    /// replaces: Paste is conditional, so a two-row panel would have been
+    /// positioned for three and floated a whole row too high.
     @Test func theHeightIsTheRowsItIsBuiltFrom() {
-        #expect(AttachMenuPanel.panelHeight == Self.panelHeight)
-        #expect(
-            AttachMenuPanel.panelHeight
-                == AttachMenuPanel.rowHeight * CGFloat(AttachSource.allCases.count))
+        #expect(AttachMenuPanel.panelHeight(rows: AttachSource.always.count) == Self.panelHeight)
+        #expect(AttachMenuPanel.panelHeight(rows: Self.withPaste.count) == Self.pastePanelHeight)
+        #expect(AttachMenuPanel.panelHeight(rows: 0) == 0)
+    }
+
+    /// Paste is offered only when there is something to paste — and the row set
+    /// is snapshotted as the panel goes UP, never recomputed under it.
+    @Test func pasteJoinsTheRowsOnlyWhenTheClipboardHasAnImage() {
+        let menu = AttachMenu()
+        #expect(menu.sources == AttachSource.always)
+
+        menu.toggle(pasteReady: false)
+        #expect(menu.isOpen)
+        #expect(menu.sources == AttachSource.always)
+
+        menu.toggle(pasteReady: true)
+        #expect(!menu.isOpen)
+        // Closing must not re-shape the panel that is still fading out.
+        #expect(menu.sources == AttachSource.always)
+
+        menu.toggle(pasteReady: true)
+        #expect(menu.isOpen)
+        #expect(menu.sources == Self.withPaste)
+        #expect(menu.sources.last == .paste)
     }
 
     /// Focusing the field animates the pill's padding from 40 to 14: the panel
     /// follows the `+` sideways, which is the whole reason the anchor is
     /// measured at all.
     @Test func thePanelFollowsThePlusSideways() {
-        let resting = AttachMenuPanel.box(anchor: Self.plus)
+        let rows = AttachSource.always.count
+        let resting = AttachMenuPanel.box(anchor: Self.plus, rows: rows)
         let focused = AttachMenuPanel.box(
-            anchor: Self.plus.offsetBy(dx: -26, dy: 0))
+            anchor: Self.plus.offsetBy(dx: -26, dy: 0), rows: rows)
         #expect(focused.minX == resting.minX - 26)
     }
 
@@ -103,9 +137,9 @@ struct AttachMenuTests {
     /// strip all move the `+` within the dock; none of them may pull the panel
     /// into the dock behind them.
     @Test func thePanelDoesNotFollowThePlusDown() {
-        let resting = AttachMenuPanel.box(anchor: Self.plus)
-        let sunk = AttachMenuPanel.box(
-            anchor: Self.plusUnderApproval)
+        let rows = AttachSource.always.count
+        let resting = AttachMenuPanel.box(anchor: Self.plus, rows: rows)
+        let sunk = AttachMenuPanel.box(anchor: Self.plusUnderApproval, rows: rows)
         #expect(sunk.minY == resting.minY)
         #expect(sunk.maxY == resting.maxY)
     }
@@ -113,7 +147,7 @@ struct AttachMenuTests {
     /// A `+` at or left of the dock's leading edge (nothing real, but a frame
     /// arriving before layout settles is) must not push the panel off-screen.
     @Test func aDegenerateAnchorClampsToZero() {
-        let box = AttachMenuPanel.box(anchor: .zero)
+        let box = AttachMenuPanel.box(anchor: .zero, rows: AttachSource.always.count)
         #expect(box.minX == 0)
         #expect(box.maxY == -AttachMenuPanel.anchorGap)
     }
