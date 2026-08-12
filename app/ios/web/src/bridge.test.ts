@@ -61,6 +61,7 @@ function recorder(): { log: string[]; events: TranscriptEvents } {
       jumpToLatest: () => log.push("jump"),
       syncRequested: () => log.push("sync"),
       jumpToMessage: (rowId) => log.push(`jumpToMessage:${rowId}`),
+      jumpToOrdinal: (ordinal) => log.push(`jumpToOrdinal:${ordinal}`),
       outlineLoadOlder: () => log.push("outlineLoadOlder"),
       outlineHereRequested: () => log.push("outlineHere"),
     },
@@ -327,12 +328,18 @@ describe("the pre-subscribe buffer", () => {
   it("replays each index command as ITSELF, never as the jumpToLatest fall-through", async () => {
     const bridge = await loadBridge();
     window.baybo.jumpToMessage("m42");
+    window.baybo.jumpToOrdinal(42);
     window.baybo.outlineLoadOlder();
     window.baybo.requestOutlineHere();
 
     const { log, events } = recorder();
     bridge.subscribeTranscript(events);
-    expect(log).toEqual(["jumpToMessage:m42", "outlineLoadOlder", "outlineHere"]);
+    expect(log).toEqual([
+      "jumpToMessage:m42",
+      "jumpToOrdinal:42",
+      "outlineLoadOlder",
+      "outlineHere",
+    ]);
     expect(log).not.toContain("jump");
   });
 

@@ -198,9 +198,16 @@ them would make search go progressively blind as sessions age: the longest conve
 most worth searching, would be the emptiest. This is also what makes search useful to the agent —
 it is how it recovers detail compaction threw away.
 
-Because the chat view renders `superseded_by IS NULL`, a hit on a superseded row has no home in the
-rendered conversation. Results resolve to the ordinal named by `superseded_by`, annotated as
-compacted.
+**A superseded hit is still on screen, and `superseded_by` is not a jump target.** The display read
+filters `compaction_inserted = 0`, *not* `superseded_by IS NULL` (`load_active_session_messages_tail`):
+"the still-present superseded originals render, the re-injected compaction copies are hidden". So a
+hit's own `ordinal` is the address to navigate to. `superseded_by` names the ordinal where that
+compaction's re-inserted rows begin — rows carrying `compaction_inserted = 1`, which the display read
+excludes — so aiming a jump there can only ever miss. And because `apply_session_compaction` points
+*every* row active at that moment at the same ordinal, in a compacted conversation most hits carry
+it: labelling them "compacted, not on screen" would be both wrong and ubiquitous. What the field
+actually reports is that the model's context was rewritten after this row — a fact about the LLM's
+window, not about what the user can see.
 
 ## The three paths
 
@@ -269,6 +276,7 @@ pub struct SearchScope {
     pub channel: Option<ChannelType>,   // None reaches every channel, subagent runs included
     pub include_hidden: bool,           // default false
     pub include_archived: bool,
+    pub include_cron_workspaces: bool,  // default false
 }
 ```
 
@@ -285,6 +293,31 @@ owner, 排除 hidden  (default)   128   {"owner": 128}
 **Half of the owner-channel hits are in sessions the user hid** (257 → 128), and a quarter of the
 whole index sits in hidden sessions. That is why `hidden` is joined rather than stored: hiding a
 conversation takes effect on the next query, with no reindex and no fingerprint bump.
+
+`include_cron_workspaces` is the axis the other three do not cover, and it exists because the corpus
+is wider than any client's list. A cron fire that is **not a conversation of its own** — a one-shot's
+private workspace, or any fire from before recurring fires became conversations — is dropped by
+`/v1/chat/sessions` (`is_hidden_cron_session`) and 404s on the REST attach path. Its prose is still
+indexed (`MessageSource::Cron` is searchable), so without this flag search returns conversations no
+client can list, and the phone can then subscribe to and even post into them — the read path
+(`load_scoped_chat_session`) and the device channel's `Subscribe` both scope by channel **only**.
+A *recurring* fire is a real conversation and is never affected.
+
+The predicate mirrors `is_hidden_cron_session` in SQL:
+
+```sql
+AND (?6 OR NOT (COALESCE(s.trigger_kind, '') = 'cron'
+     AND COALESCE(json_extract(s.data, '$.trigger.conversation'), 0) = 0))
+```
+
+`trigger_kind` is flat and is tested first so the `json_extract` is reached only by cron rows;
+`conversation` lives in the `data` blob and is absent on every historical fire, which the
+`COALESCE(..., 0)` reads as "not a conversation". **`COALESCE(s.trigger_kind, '')` is load-bearing:**
+the join is `LEFT`, so a row whose session is missing yields `NULL` there, and a bare
+`s.trigger_kind = 'cron'` makes the whole predicate `NULL` — dropping exactly the rows the `LEFT`
+join exists to keep findable. `a_row_with_no_session_survives_the_cron_predicate` pins it.
+
+This is query-side: **it does not bump `SEGMENTER_FINGERPRINT` and triggers no rebuild.**
 
 ### The prefix `*`
 

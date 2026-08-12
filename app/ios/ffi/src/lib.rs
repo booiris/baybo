@@ -30,10 +30,10 @@ use crate::core::WireAttachment;
 
 pub use api::{
     ApnsEnvironment, ApprovalDecision, AttachmentKind, AttachmentRef, BayboError, BlobProgress,
-    BlobServeOutcome, ChatSessionSummary, ClientConfig, CronJobStatus, CronJobSummary,
-    DeckCardInfo, DeckLayoutEntryInput, DeckSink, DeckSnapshotInfo, DeckView, FrameSink,
-    LlmModelCatalog, LlmModelInfo, MessageLookup, PairAbortListener, PairChallenge, PairTarget,
-    PairedSummary, SessionListSink, SessionModelPin,
+    BlobServeOutcome, ChatSearchGroup, ChatSearchHit, ChatSearchResults, ChatSessionSummary,
+    ClientConfig, CronJobStatus, CronJobSummary, DeckCardInfo, DeckLayoutEntryInput, DeckSink,
+    DeckSnapshotInfo, DeckView, FrameSink, LlmModelCatalog, LlmModelInfo, MessageLookup,
+    PairAbortListener, PairChallenge, PairTarget, PairedSummary, SessionListSink, SessionModelPin,
 };
 use apns::ApnsState;
 use binding::{ActiveLeg, active_leg};
@@ -759,6 +759,28 @@ impl BayboClient {
                 found: response.found,
                 ordinal: response.ordinal,
             })
+        })
+        .await
+    }
+
+    /// Full-text search over the owner's transcripts (`GET /v1/chat/search`),
+    /// grouped by conversation and ranked best-first.
+    ///
+    /// Scope is the gateway's default and is not configurable from here: hidden
+    /// sessions stay lost, archived ones stay archived, and cron workspaces —
+    /// fires that are not conversations of their own — are excluded server-side,
+    /// because a hit there names a session no client can list and the device
+    /// channel would happily let the phone post into it.
+    ///
+    /// The caller owns debounce and staleness; this is a plain request. Direct
+    /// reaches it over REST, relay through the Noise-protected API tunnel.
+    pub async fn chat_search(
+        self: Arc<Self>,
+        query: String,
+    ) -> Result<ChatSearchResults, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::search_messages(&client, &query).await
         })
         .await
     }

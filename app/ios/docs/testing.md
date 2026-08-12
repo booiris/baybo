@@ -196,6 +196,17 @@ without touching `app/ios` at all.
   gesture, so it cannot reproduce anything about how a pin FEELS; drive
   `.swipeActions` from XCUITest for that.
 
+- **`-baybo-demo-search`** (with `-baybo-open-home`) answers every search with
+  canned hits over the demo rows, so the search surface is drivable with no
+  gateway. Without it every state on that screen is the failure page.
+
+- **`-baybo-demo-slow-morph`** stretches the search field's open from a 0.42s
+  spring to a 4s linear ramp, so the expansion can be SAMPLED with plain
+  screenshots instead of reconstructed from video frames. This is what verified
+  the field grows LEFTWARD out of the tab bar's search circle rather than
+  rightward from the leading edge — a distinction no end-state screenshot can
+  make, and one the first implementation got backwards.
+
 - **`-baybo-demo-tabs`** cycles the tab selection on a timer so the native Liquid
   Glass tab morph is recordable (`simctl io recordVideo` + ffmpeg montage; the
   glass morph needs a 26+ sim — an 18.x sim records the classic bar).

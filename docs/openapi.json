@@ -5528,7 +5528,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "Set when compaction replaced this row in the active transcript, to the\nordinal that replaced it. The chat view renders only live rows, so such a\nhit exists in history but not on screen: clients label it, and a\njump-to-message navigates here rather than to `ordinal`, which is not on\nscreen to navigate to. Carried as the ordinal rather than a bool so that\nremains possible without another round trip."
+            "description": "Set when compaction stamped this row: the ordinal where that\ncompaction's re-inserted rows begin. Every row active at that moment\npoints at the same one, so in a compacted conversation most hits carry\nit.\n\n**Do not navigate here, and do not label the hit \"not on screen\".** The\ndisplay read filters `compaction_inserted = 0`, NOT `superseded_by IS\nNULL` (`load_active_session_messages_tail`), so the superseded original\nstill renders and `ordinal` is the address to jump to — while this\nordinal names a re-injected machinery row that the display read excludes,\nso aiming a jump at it can only ever miss. What it actually reports is\nthat the model's context was rewritten after this row: a fact about the\nLLM's window, not about what the user can see."
           },
           "text": {
             "type": "string",

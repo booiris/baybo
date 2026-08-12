@@ -1044,15 +1044,28 @@ html.html-preview-maximized body {
   gap: 0.35rem;
   min-width: 0;
 }
-.msg-group.user {
-  align-items: flex-end;
-  /* Where a message-index jump parks its target: clear of the native header veil
-     (--thread-top-inset is .chat-log's own padding-top) plus the same 12px of air
-     the veil's fade ends on. Declared here rather than computed at the scroll
-     call site so the clearance has ONE source of truth. */
+/* Where a jump parks its target: clear of the native header veil
+   (--thread-top-inset is .chat-log's own padding-top) plus the same 12px of air
+   the veil's fade ends on. Declared here rather than computed at the scroll call
+   site so the clearance has ONE source of truth.
+   Both sides: the message index only offers the user's own sends, but a SEARCH
+   hit lands on agent prose just as often, and a reply parked under the veil is
+   the same bug for either author. */
+.msg-group.user,
+.msg-group.assistant {
   scroll-margin-top: calc(var(--thread-top-inset) + 12px);
 }
-.msg-group.assistant { align-items: flex-start; }
+.msg-group.user { align-items: flex-end; }
+.msg-group.assistant {
+  align-items: flex-start;
+  /* Positioned so an attachment-only reply — which has no prose div — can host
+     the jump ring. Unpositioned, the ring's `inset: -4px` escapes to the initial
+     containing block and paints a full-viewport rectangle. */
+  position: relative;
+}
+/* The ordinary assistant host for the ring: the prose block, so the bloom hugs
+   the reply rather than the whole group. */
+.msg.assistant { position: relative; }
 /* The message's clock, tucked under its last bubble — the group's align-items
    sides it (agent bottom-left, user bottom-right). Mono + tabular so a column of
    times doesn't jitter, and pulled up tight against the bubble: the group gap is

@@ -181,6 +181,71 @@ pub struct ChatSessionSummary {
     pub cron_group_pinned: bool,
 }
 
+/// One matching message inside a [`ChatSearchGroup`], mirroring the gateway's
+/// `ChatSearchHit` (`GET /v1/chat/search`).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ChatSearchHit {
+    /// Where this message sits in the session's transcript — the jump address.
+    ///
+    /// This is the ordinal to navigate to even when [`Self::superseded_by`] is
+    /// set: the display read filters `compaction_inserted = 0`, so a superseded
+    /// ORIGINAL still renders. Note the transcript keys a user row by its
+    /// `platform_msg_id`, not by `m<ordinal>`, so a jump must resolve BY ordinal
+    /// (`rowCoverageOrdinal`) rather than by building a row id — building one
+    /// silently misses every user-authored hit.
+    pub ordinal: i64,
+    /// `"user"` / `"assistant"` — the gateway's `Role::as_str`, passed through
+    /// rather than parsed: this side only labels it.
+    pub role: String,
+    /// The ORIGINAL prose, never the segmented index text. Highlight by
+    /// substring — a phrase of unigrams matches exactly the substring typed, so
+    /// a client-side match agrees with what the index matched.
+    pub text: String,
+    /// RFC 3339, parsed on the Swift side for the excerpt's timestamp.
+    pub created_at: String,
+    /// Set when compaction stamped this row: the ordinal where that compaction's
+    /// re-inserted rows begin. **Not a jump target and not a "hidden" marker** —
+    /// those rows carry `compaction_inserted = 1` and never render, while this
+    /// hit's own `ordinal` does. Every row active at a compaction points at the
+    /// same ordinal, so in a compacted conversation most hits carry it; it says
+    /// the model's context was rewritten after this row, nothing about what the
+    /// user can see. Carried so a client that wants to reason about compaction
+    /// can, not so it can label the hit.
+    pub superseded_by: Option<i64>,
+}
+
+/// One conversation's matches, collapsed into a single result card.
+///
+/// Grouped rather than listed flat because one chatty conversation would
+/// otherwise fill the result set — measured on real data, a single conversation
+/// took 15 of 30 slots and hid 10 others. The gateway groups over a window much
+/// wider than it returns, so this cannot be reproduced client-side.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ChatSearchGroup {
+    pub session_id: String,
+    /// The gateway's title, `None` before the title pass has run. The card
+    /// prefers this device's own list row (same headline rule as the chat list)
+    /// so one conversation is not named two different things in two places.
+    pub session_title: Option<String>,
+    /// Best-matching excerpts, best first, at most 3 (the gateway's cap).
+    pub hits: Vec<ChatSearchHit>,
+    /// Total matches in this conversation — equal to `hits.len()` at or under
+    /// the cap, larger above it, so a card can say "and N more" without a second
+    /// call.
+    pub total_hits: i64,
+}
+
+/// A whole result set for one query (`GET /v1/chat/search`).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ChatSearchResults {
+    /// Conversations, best match first; a conversation ranks by its best hit.
+    pub groups: Vec<ChatSearchGroup>,
+    /// The query matched more than the gateway's scan window, so some
+    /// conversations are missing and `total_hits` undercounts. There is no
+    /// cursor by design — a search box refines the query, it does not page.
+    pub truncated: bool,
+}
+
 /// One selectable LLM entry for the chat header's model picker — a `baybo.json`
 /// entry, narrowed from the gateway's `LlmModelEntry`. `name` is the entry name
 /// (what a session pin references); the picker lists it by name and offers the

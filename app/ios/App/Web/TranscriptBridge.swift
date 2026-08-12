@@ -286,6 +286,22 @@ final class TranscriptBridge: NSObject, ObservableObject {
         call("jumpToMessage", jsonLiteral(rowId))
     }
 
+    /// Park the transcript on a search hit, addressed BY ORDINAL.
+    ///
+    /// Not a row id: a user row is keyed by its `platform_msg_id` with the
+    /// ordinal carried beside it, so building `m<ordinal>` here would resolve
+    /// agent rows and silently miss every user-authored hit — most of what a
+    /// search finds.
+    ///
+    /// Fire-and-forget, and deliberately stateful on the far side. `call`'s
+    /// pending queue covers "the webview has not loaded yet", but the ordinary
+    /// case is a webview that IS loaded and simply has not paged back far
+    /// enough — so the web side holds the request and pages toward it, giving up
+    /// against its own budget. Nothing here waits on the outcome.
+    func jumpToOrdinal(_ ordinal: Int64) {
+        call("jumpToOrdinal", String(ordinal))
+    }
+
     /// Page one more screen of older rows into the thread, so the index can
     /// reach further back than the thread currently holds.
     func outlineLoadOlder() {

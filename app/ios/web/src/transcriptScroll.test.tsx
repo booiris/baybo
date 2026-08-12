@@ -93,6 +93,15 @@ function installLayout(): void {
       window.dispatchEvent(new Event("scroll"));
     },
   });
+  // jsdom ships no `scrollIntoView` at all, so a jump throws rather than
+  // scrolling. Model it the way the fake layout already models everything else:
+  // a row's position IS its index, so parking one at the top of the viewport is
+  // a scrollTop write — which also makes the landing assertable.
+  Element.prototype.scrollIntoView = function (this: Element): void {
+    const i = rowIndex(this);
+    if (i < 0) return;
+    document.documentElement.scrollTop = i * ROW_H;
+  };
   realRect = Element.prototype.getBoundingClientRect;
   Element.prototype.getBoundingClientRect = function (this: Element): DOMRect {
     const i = rowIndex(this);
@@ -470,5 +479,179 @@ describe("a REPLACE under a reader parked in history", () => {
 
       expect(document.querySelectorAll(".work-ladder")).toHaveLength(2);
     });
+  });
+});
+
+/// Jump-to-ordinal — the search-hit landing.
+///
+/// The window has no `hasMoreNewer` and every live frame appends to the end, so
+/// reaching an old row can only ever mean paging BACKWARD until it is covered.
+/// That loop is reply-driven (one `requestHistory` may be in flight at a time),
+/// which makes its termination the whole risk: `prependOlder` advances the floor
+/// only on a NON-EMPTY page while `hasMoreOlder` can stay true, so "the floor
+/// moved" is not a condition anything may rely on.
+describe("jump to a search hit's ordinal", () => {
+  function fetches(): number[] {
+    return posts()
+      .filter((p) => p.type === "fetchHistory")
+      .map((p) => p.beforeOrdinal as number);
+  }
+
+  async function jumpTo(ordinal: number): Promise<void> {
+    await act(async () => {
+      window.baybo.jumpToOrdinal(ordinal);
+    });
+    await settle();
+  }
+
+  function ringedRowId(): string | null {
+    const ring = document.querySelector(".jump-ring");
+    return ring?.closest("[data-row-id]")?.getAttribute("data-row-id") ?? null;
+  }
+
+  it("jumps straight to a row already loaded, without asking for a page", async () => {
+    await open(60, 999);
+    await jumpTo(970);
+
+    expect(fetches()).toEqual([]);
+    expect(ringedRowId()).toBe("m970");
+  });
+
+  // The trap a naive port walks into. A user row is keyed by its
+  // `platform_msg_id`, NOT `m<ordinal>` — the ordinal rides beside the id — so
+  // resolving a hit by building `m${ordinal}` finds agent rows and silently
+  // misses every user-authored one, which is most of what people search for.
+  it("resolves a USER row by its ordinal, not by a reconstructed row id", async () => {
+    await open(60, 999);
+    await jumpTo(930);
+
+    await pushFrame({
+      kind: "history_page",
+      rows: [
+        {
+          id: "pm-abc",
+          ordinal: 930,
+          kind: "message",
+          role: "user",
+          text: "数据库迁移怎么做",
+          platform_msg_id: "pm-abc",
+          created_at: "2026-08-01T00:00:00Z",
+        },
+        ...items(931, 939),
+      ],
+      oldest_ordinal: 930,
+      has_more: true,
+    });
+
+    // The row is addressed by `platform_msg_id`; nothing named `m930` exists,
+    // so a jump that built one would find no anchor and quietly do nothing.
+    expect(rowIds()).toContain("pm-abc");
+    expect(rowIds()).not.toContain("m930");
+    expect(ringedRowId()).toBe("pm-abc");
+  });
+
+  it("pages backward until the ordinal is covered, then jumps", async () => {
+    await open(60, 999);
+    await jumpTo(900);
+
+    // One page asked for, from the current floor.
+    expect(fetches()).toEqual([940]);
+    expect(ringedRowId()).toBeNull();
+
+    await pushFrame({
+      kind: "history_page",
+      rows: items(890, 939),
+      oldest_ordinal: 890,
+      has_more: true,
+    });
+
+    // Covered now — it lands rather than asking for another page.
+    expect(fetches()).toEqual([940]);
+    expect(ringedRowId()).toBe("m900");
+  });
+
+  it("keeps paging across several pages before it lands", async () => {
+    await open(60, 999);
+    await jumpTo(850);
+
+    await pushFrame({
+      kind: "history_page",
+      rows: items(890, 939),
+      oldest_ordinal: 890,
+      has_more: true,
+    });
+    expect(ringedRowId()).toBeNull();
+    expect(fetches()).toEqual([940, 890]);
+
+    await pushFrame({
+      kind: "history_page",
+      rows: items(840, 889),
+      oldest_ordinal: 840,
+      has_more: true,
+    });
+    expect(ringedRowId()).toBe("m850");
+  });
+
+  it("stops at the top of the thread and says so, rather than asking forever", async () => {
+    await open(60, 999);
+    await jumpTo(1);
+
+    await pushFrame({
+      kind: "history_page",
+      rows: items(930, 939),
+      oldest_ordinal: 930,
+      has_more: false,
+    });
+
+    expect(fetches()).toEqual([940]);
+    expect(document.querySelectorAll(".bubble.notice")).toHaveLength(1);
+    expect(ringedRowId()).toBeNull();
+  });
+
+  // The infinite loop this design can actually produce: an empty page leaves the
+  // floor PUT (`prependOlder`'s own rule) while `has_more` stays true, so every
+  // re-entry sees the same un-covered ordinal and the same "there is more" —
+  // forever. Only the budget stops it.
+  it("is bounded when empty pages keep claiming there is more", async () => {
+    await open(60, 999);
+    await jumpTo(1);
+
+    for (let i = 0; i < 30; i++) {
+      await pushFrame({
+        kind: "history_page",
+        rows: [],
+        oldest_ordinal: null,
+        has_more: true,
+      });
+    }
+
+    // JUMP_PAGE_BUDGET pages, and not one more.
+    expect(fetches()).toHaveLength(12);
+    expect(fetches().every((o) => o === 940)).toBe(true);
+    expect(document.querySelectorAll(".bubble.notice")).toHaveLength(1);
+  });
+
+  // An ordinal INSIDE the loaded window that renders no row (a tool row, say)
+  // can never be produced by paging — paging only ever loads rows further back.
+  // Asking for pages anyway would drag the reader through the whole history to
+  // fail at the end of it.
+  it("gives up on an ordinal inside the window that renders no row", async () => {
+    await open(60, 999);
+    await jumpTo(935);
+
+    // The page covers 930-939 but omits 935 — the shape a tool row leaves, since
+    // the display read emits only the rows a reader can see.
+    await pushFrame({
+      kind: "history_page",
+      rows: [...items(930, 934), ...items(936, 939)],
+      oldest_ordinal: 930,
+      has_more: true,
+    });
+
+    // Below the floor it would page; at or above it, paging can only ever load
+    // rows FURTHER BACK, so no number of pages produces this one. Stop at one.
+    expect(fetches()).toEqual([940]);
+    expect(document.querySelectorAll(".bubble.notice")).toHaveLength(1);
+    expect(ringedRowId()).toBeNull();
   });
 });

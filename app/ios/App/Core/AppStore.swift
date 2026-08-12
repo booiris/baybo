@@ -31,6 +31,11 @@ final class AppStore: ObservableObject {
         case projects
         case chats
         case settings
+        /// Full-text search over every conversation. Carries `TabRole.search`,
+        /// which on iOS 26 the system renders as a SEPARATED circle trailing the
+        /// tab pill rather than as a fifth item inside it; on 18–25 it is an
+        /// ordinary tab. Last in `allCases` because that is the bar's order.
+        case search
     }
 
     /// One entry on the outer NavigationStack over the home shell: a pushed
@@ -91,7 +96,42 @@ final class AppStore: ObservableObject {
     @Published var route: Route = .launching
     @Published var landingView: LandingView = .menu
     /// The selected home section (the bottom menu bar's current tab).
-    @Published var homeTab: HomeTab = .chats
+    @Published var homeTab: HomeTab = .chats {
+        willSet {
+            // Remember where we came FROM, so ✕ returns there. Only on the way
+            // in — re-entering search from search must not overwrite it.
+            if newValue == .search && homeTab != .search { tabBeforeSearch = homeTab }
+        }
+    }
+
+    /// Which tab the user was on when they opened search, so the search field's
+    /// ✕ can put them back rather than guessing `.chats`.
+    var tabBeforeSearch: HomeTab = .chats
+
+    /// Leave search, restoring the tab that was showing before it.
+    func exitSearch() {
+        // The same instant switch a tab-bar tap gets (`searchAwareSelection`):
+        // leaving through ✕ must not animate a bar back in over the field.
+        var instant = Transaction()
+        instant.disablesAnimations = true
+        withTransaction(instant) { homeTab = tabBeforeSearch }
+    }
+
+    /// Search results waiting to be parked on: `sessionId -> ordinal`.
+    ///
+    /// Written by `openSearchResult` just before the push and consumed ONCE by
+    /// `ChatScreen` when it appears. Not `@Published` and not on the route: it
+    /// is a one-shot instruction, not view state, and putting it on `ChatRoute`
+    /// (which is `Hashable` and compared for equality in several places) would
+    /// turn one conversation into two distinct routes.
+    var pendingJump: [String: Int64] = [:]
+
+    /// Take the pending jump for a session, if any. Removing on read is what
+    /// makes it one-shot: a later re-appear (a cover dismissing, a tab switch)
+    /// must not re-park the reader on a message they have already left.
+    func takePendingJump(_ sessionId: String) -> Int64? {
+        pendingJump.removeValue(forKey: sessionId)
+    }
     /// The NavigationStack path over the chat list. A session opened from the
     /// list/compose/push resets it to `[.session(id)]`; one opened from the
     /// archived screen appends, so the pop chain runs chat → archived → list.
@@ -405,6 +445,7 @@ final class AppStore: ObservableObject {
                 case "deck": homeTab = .deck
                 case "projects": homeTab = .projects
                 case "settings": homeTab = .settings
+                case "search": homeTab = .search
                 default: homeTab = .chats
                 }
             }
@@ -690,6 +731,30 @@ final class AppStore: ObservableObject {
     func openArchived() {
         guard !chatPath.contains(.archived) else { return }
         chatPath.append(.archived)
+    }
+
+    /// Open a conversation from a search result, parking it on the matched
+    /// message.
+    ///
+    /// `keepTab` is what makes the results survive the round trip. The push
+    /// lands on the OUTER NavigationStack, which WRAPS the whole TabView, so the
+    /// conversation covers the shell and the tab selection is simply preserved
+    /// underneath it — popping returns to the Search tab with its query and
+    /// results still there. Forcing `.chats` (which every other open does, and
+    /// rightly: a conversation belongs to Chats) would strand them.
+    ///
+    /// The ordinal rides in `pendingJump` rather than on the route: `ChatRoute`
+    /// is `Hashable` and several places compare `.session(id)` for equality, so
+    /// a payload would make the same conversation two different routes and let
+    /// it stack. `ChatScreen` consumes the entry when it appears — re-issuing on
+    /// appear, rather than calling the bridge here, is also what survives the
+    /// `TranscriptHost` being rebuilt between this call and the screen mounting.
+    func openSearchResult(sessionId: String, ordinal: Int64) {
+        pendingJump[sessionId] = ordinal
+        Task {
+            await activateSession(
+                sessionId, ensureListed: true, appendToPath: true, keepTab: true)
+        }
     }
 
     /// The ☰ menu's second entry: push the live scheduled jobs. Guarded like
@@ -1033,7 +1098,8 @@ final class AppStore: ObservableObject {
     /// keeps the reset path even for an archived session — backing out lands on
     /// the main list, and the row stays reachable via the ☰ menu.
     private func activateSession(
-        _ sessionId: String, ensureListed: Bool, appendToPath: Bool = false
+        _ sessionId: String, ensureListed: Bool, appendToPath: Bool = false,
+        keepTab: Bool = false
     ) async {
         if ensureListed {
             SessionIndex.shared.touch(sessionId: sessionId)
@@ -1041,7 +1107,11 @@ final class AppStore: ObservableObject {
         _ = transcriptHost(for: sessionId)
         // A conversation always belongs to the Chats section — backing out of it
         // must land on the list, whatever tab launched the compose/push.
-        homeTab = .chats
+        //
+        // `keepTab` is the one exception: a SEARCH hit's conversation should back
+        // out to the results that found it, and since this push covers the whole
+        // TabView, leaving the selection alone is all that takes.
+        if !keepTab { homeTab = .chats }
         if appendToPath {
             if chatPath.last != .session(sessionId) {
                 chatPath.append(.session(sessionId))

@@ -605,10 +605,53 @@ The jump is web-side:
 - and let `onScroll` own `showJump` — which is also how "back to the newest edge" comes
   free, as the existing jump-to-latest circle.
 
-Landing clearance is `.msg-group.user`'s `scroll-margin-top`, not arithmetic at the call
-site. The arrival ring mounts inside `.bubble.user` (or the last `.attachment-bubble`)
-because `.msg-group` is unpositioned, and replays off a NONCE — a boolean would
-`Object.is`-bail a repeat jump to the same row.
+Landing clearance is `scroll-margin-top` on `.msg-group.user` AND
+`.msg-group.assistant`, not arithmetic at the call site. The arrival ring mounts inside
+`.bubble.user` (or the last `.attachment-bubble`), and for an agent row inside
+`.msg.assistant`, because `.msg-group` is unpositioned; it replays off a NONCE — a boolean
+would `Object.is`-bail a repeat jump to the same row. Both sides carry the clearance and
+the ring because a SEARCH hit lands on agent prose as often as on a user send, even though
+the message index only ever offers the latter.
+
+### Jumping to a search hit
+
+`jumpToOrdinal(ordinal)` is the search entry (`bridge.ts` → `Transcript.tsx`), and it
+differs from `jumpToMessage` in two ways that matter.
+
+**It addresses by ordinal, never by row id.** A user row is keyed by its
+`platform_msg_id` with the ordinal carried beside it, so `m${ordinal}` resolves agent rows
+and silently misses every user-authored hit. Resolution goes through `rowCoverageOrdinal`,
+which knows both shapes.
+
+**The row is usually not loaded, so it pages for it.** The window is tail-anchored with
+only a BACKWARD frontier — there is `oldestOrdinal` + `hasMoreOlder`, no `newestOrdinal`
+and no `hasMoreNewer` — and every live frame appends to the end. A window that stopped
+short of the newest edge would weld the next reply onto an ancient row, so paging backward
+until the ordinal is covered is the only way to reach it that keeps the invariant. It is
+exactly what the reader's own scroll-up does, just driven.
+
+The loop is **reply-driven, not a `for` loop**: `requestHistory` allows one request in
+flight and its reply lands in the frame switch, so a `pendingJump` ref is re-evaluated
+from a `useEffect` on `messages` — which covers the first paint, a `history_page` prepend
+and a `sync_page` REPLACE alike, without the frame switch knowing the loop exists.
+
+Three termination conditions, and the third is the one that bites:
+
+1. **covered** — jump, clear the ref;
+2. **at or above the floor but no row** — an ordinal inside the loaded window that renders
+   nothing (a tool row). Paging only ever loads rows FURTHER BACK, so no number of pages
+   produces it: stop immediately rather than dragging the reader through the whole history
+   to fail at the end of it;
+3. **`JUMP_PAGE_BUDGET` spent** — `prependOlder` advances the floor only on a NON-EMPTY
+   page while `hasMoreOlder` can stay true, so "the floor moved" is not a condition
+   anything may rely on and an empty-page loop would spin forever. The budget is
+   decremented per REQUEST and is the only thing that bounds it.
+
+Giving up appends a notice and leaves the reader where the paging got to — further back
+than they started, which is worth something. `transcriptScroll.test.tsx` pins all three,
+including the spin.
+
+**`superseded_by` is not a jump target** — see [`chat-list.md`](chat-list.md#jumping-to-a-hit).
 
 ### Two traps
 

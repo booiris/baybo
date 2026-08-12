@@ -169,12 +169,19 @@ pub struct ChatSearchHit {
     /// client-side match agrees with what the index matched.
     pub text: String,
     pub created_at: DateTime<Utc>,
-    /// Set when compaction replaced this row in the active transcript, to the
-    /// ordinal that replaced it. The chat view renders only live rows, so such a
-    /// hit exists in history but not on screen: clients label it, and a
-    /// jump-to-message navigates here rather than to `ordinal`, which is not on
-    /// screen to navigate to. Carried as the ordinal rather than a bool so that
-    /// remains possible without another round trip.
+    /// Set when compaction stamped this row: the ordinal where that
+    /// compaction's re-inserted rows begin. Every row active at that moment
+    /// points at the same one, so in a compacted conversation most hits carry
+    /// it.
+    ///
+    /// **Do not navigate here, and do not label the hit "not on screen".** The
+    /// display read filters `compaction_inserted = 0`, NOT `superseded_by IS
+    /// NULL` (`load_active_session_messages_tail`), so the superseded original
+    /// still renders and `ordinal` is the address to jump to — while this
+    /// ordinal names a re-injected machinery row that the display read excludes,
+    /// so aiming a jump at it can only ever miss. What it actually reports is
+    /// that the model's context was rewritten after this row: a fact about the
+    /// LLM's window, not about what the user can see.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub superseded_by: Option<i64>,
 }
@@ -963,6 +970,13 @@ async fn search_messages(
         session: query.session_id.clone().map(SessionId::from),
         include_hidden: query.include_hidden,
         include_archived: query.include_archived,
+        // Policy, not a knob: this route answers "find a conversation I can
+        // open", and a cron workspace is precisely the session that cannot be
+        // opened — `/v1/chat/sessions` drops it and the attach path 404s it. No
+        // query param exposes this; an operator view that wants fire transcripts
+        // is a different product with a different scope, and turning it on is a
+        // query-side change with no reindex.
+        include_cron_workspaces: false,
     };
     let limit = query
         .limit
