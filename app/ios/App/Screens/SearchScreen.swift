@@ -274,6 +274,13 @@ struct SearchScreen: View {
 
             ForEach(group.hits.prefix(Self.excerptsPerCard), id: \.ordinal) { hit in
                 Button {
+                    // Drop focus BEFORE the push. Otherwise the field is still
+                    // first responder when the conversation covers it, UIKit
+                    // restores it on the pop, and the keyboard re-presents itself
+                    // over the results — grey snapshot first, live keyboard a
+                    // beat later. Nobody coming back from a conversation asked
+                    // for a keyboard; the results are what they came back to.
+                    focused = false
                     appStore.openSearchResult(sessionId: group.sessionId, ordinal: hit.ordinal)
                 } label: {
                     excerpt(hit)

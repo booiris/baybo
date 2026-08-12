@@ -122,6 +122,12 @@ preserved underneath it. Popping returns to the Search tab with its query and
 results intact. Without `keepTab` the back gesture would land on the chat list
 with the results gone, which is the whole reason the flag exists.
 
+**Tapping a result drops focus first.** The field is otherwise still first
+responder when the conversation covers it, and UIKit restores first responder on
+the pop — so coming back re-presented the keyboard over the results, visibly as a
+grey snapshot followed by the live keyboard. `SearchUITests` asserts
+`app.keyboards.count == 0` after the round trip.
+
 `SearchScreen` focuses its field on ENTERING the tab, not on every `onAppear`: a
 `TabView` keeps its pages alive, so `onAppear` also fires when the reader comes
 back from a conversation, and raising the keyboard over results they just

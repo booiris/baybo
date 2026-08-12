@@ -132,5 +132,12 @@ final class SearchUITests: BayboUITestCase {
         XCTAssertTrue(
             app.buttons["search.hit.demo-1.2"].exists,
             "the query and its results must survive the round trip")
+        // And NO keyboard. The field is first responder when the conversation is
+        // pushed, and UIKit restores first responder on the pop — so without
+        // dropping focus at the tap, coming back re-presents the keyboard over
+        // the results (visibly: a grey snapshot, then the live keyboard).
+        XCTAssertEqual(
+            app.keyboards.count, 0,
+            "coming back from a conversation must not raise the keyboard")
     }
 }
