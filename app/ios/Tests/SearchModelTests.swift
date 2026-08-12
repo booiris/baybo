@@ -122,6 +122,30 @@ final class SearchModelTests: XCTestCase {
         XCTAssertEqual(client.searchCalls, ["数据"])
     }
 
+    /// The commit itself must be searched.
+    ///
+    /// Reported from a device: with a Chinese keyboard, typing two letters and
+    /// tapping a candidate searched NOTHING, while three letters or an English
+    /// keyboard worked. The composition flag is read synchronously when the
+    /// binding changes, and on the commit's own change UIKit has not cleared
+    /// `markedTextRange` yet — so the one change that carries the committed text
+    /// was the one being thrown away, and nothing retried afterwards.
+    func testTheCommitIsSearchedEvenWhenTheFlagIsStillSetAsItArrives() async {
+        let client = FakeBayboClient()
+        var composing = true
+        let model = model(client, composing: { composing })
+
+        // The candidate is tapped: the binding takes 数据 while the input session
+        // still reports a composition, which clears a beat later.
+        model.update(query: "数据")
+        composing = false
+        await settle()
+
+        XCTAssertEqual(
+            client.searchCalls, ["数据"],
+            "the committed text must reach the gateway")
+    }
+
     /// Cancelling the in-flight task cannot un-send a request that is already
     /// awaiting its answer, and the relay leg can reorder two of them. The last
     /// query issued is the only one allowed to write the phase.

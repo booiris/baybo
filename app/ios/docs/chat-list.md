@@ -161,7 +161,13 @@ that are easy to get wrong are testable without a UI host:
 - **no request while an input method has an open composition**
   (`FocusedTextInput.isComposing`) — a Chinese keyboard puts the uncommitted
   pinyin in the binding, so a naive debounce spends a tunnel round trip on
-  `shuju` and flashes "no matches" against a query nobody typed.
+  `shuju` and flashes "no matches" against a query nobody typed. **The check runs
+  after the debounce, not when the binding changes**: tapping a candidate updates
+  the binding to 数据 while UIKit has still not cleared `markedTextRange`, so
+  checking at the change threw away the one change carrying the committed text
+  and nothing retried — two letters plus a candidate searched nothing, while
+  three letters or an English keyboard worked. By the time the debounce is up the
+  flag is clear.
 
 Results stay on screen while the next query is in flight; only the first query
 blanks the view.

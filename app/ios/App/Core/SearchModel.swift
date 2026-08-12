@@ -72,14 +72,31 @@ final class SearchModel: ObservableObject {
             phase = .idle
             return
         }
-        // A CJK keyboard puts the UNCOMMITTED pinyin in the binding, so a naive
-        // debounce searches for `shuju`, finds nothing, and flashes "No matches"
-        // before 数据 ever lands — one wasted tunnel round trip per word, against
-        // a query the user never typed. Committing the candidate fires another
-        // change, and that is the one worth spending a request on.
+        task = Task { [weak self] in
+            try? await Task.sleep(for: self?.debounce ?? Self.defaultDebounce)
+            if Task.isCancelled { return }
+            await self?.fire(trimmed, seq: seq)
+        }
+    }
+
+    /// The debounce has elapsed: decide whether this query is worth a round trip
+    /// and, if so, take it.
+    private func fire(_ text: String, seq: Int) async {
+        // The composition is checked HERE, after the debounce — NOT when the
+        // binding changed.
         //
-        // Note this leaves `phase` ALONE rather than resetting it: mid-composition
-        // is not a new state, it is the absence of one.
+        // A CJK keyboard puts the uncommitted pinyin in the binding, and
+        // searching that costs a tunnel round trip and flashes "no matches"
+        // against a query nobody typed. But checking at the moment of the change
+        // threw away the one change that mattered: tapping a candidate updates
+        // the binding to 数据 while UIKit has STILL not cleared
+        // `markedTextRange`, so the commit itself read as "composing", was
+        // skipped, and nothing retried afterwards. Reported from a device as
+        // two letters plus a candidate searching nothing while three letters or
+        // an English keyboard worked.
+        //
+        // By the time the debounce is up the commit has landed and the flag is
+        // clear, so the same check now admits exactly what it should.
         guard !isComposing() else { return }
 
         #if DEBUG
@@ -87,7 +104,7 @@ final class SearchModel: ObservableObject {
             // demo rows, so the search surface is drivable headlessly. There is
             // no gateway in that mode, and a screen whose every state is an
             // error page cannot smoke-test a result card or a jump.
-            if let demo = Self.demoResults(for: trimmed) {
+            if let demo = Self.demoResults(for: text) {
                 phase = .ok(groups: demo.groups, truncated: demo.truncated)
                 return
             }
@@ -97,12 +114,7 @@ final class SearchModel: ObservableObject {
         // stay up while the next answer is in flight — on a relay leg the wait is
         // long enough that clearing would read as "your results vanished".
         if case .ok = phase {} else { phase = .loading }
-
-        task = Task { [weak self] in
-            try? await Task.sleep(for: self?.debounce ?? Self.defaultDebounce)
-            if Task.isCancelled { return }
-            await self?.run(trimmed, seq: seq)
-        }
+        await run(text, seq: seq)
     }
 
     #if DEBUG
