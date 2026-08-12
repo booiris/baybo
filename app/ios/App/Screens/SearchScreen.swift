@@ -43,7 +43,12 @@ struct SearchScreen: View {
             // `safeAreaInset` rather than an overlay so the results list insets
             // itself and its last card is never parked under the field.
             .safeAreaInset(edge: .bottom, spacing: 0) { bottomBar }
-            .background(Theme.paper)
+            // Paints through the home-indicator strip, which the hidden tab bar
+            // is no longer covering. Belt and braces: the SETTLED state measured
+            // identical with and without it (sampled bottom rows, 250-254 either
+            // way), so this is for the window while the bar animates out, which a
+            // screenshot cannot sample.
+            .background(Theme.paper.ignoresSafeArea())
         // Focus on ENTERING the tab, not once per mount: a TabView keeps its
         // pages alive, so `onAppear` also fires when the reader comes back from
         // a conversation — and raising the keyboard over the results they just
@@ -91,11 +96,19 @@ struct SearchScreen: View {
 
             Button {
                 query = ""
-                withAnimation(Self.morph) { expanded = false }
-                appStore.exitSearch()
+                focused = false
+                // Leave only once the field has collapsed back into the circle.
+                // `exitSearch()` swaps the tab, which tears this screen down —
+                // called inline it ate the whole exit animation, so the field
+                // vanished instead of retracting.
+                withAnimation(Self.morph) {
+                    expanded = false
+                } completion: {
+                    appStore.exitSearch()
+                }
             } label: {
                 Image(systemName: "xmark")
-                    .font(.system(size: 16, weight: .semibold))
+                    .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(Theme.ink)
                     // Square on the field's height, so the two sit on one line
                     // instead of the circle towering over the pill.
