@@ -627,6 +627,27 @@ announces which of these will happen before sending.
      one, so its execution history would describe work on a board it no
      longer touches).
 
+6. **Attachments.** ✅ **Shipped**, and wider than decision 13's one-line
+   promise: the create modal's footer attach exists, and so does attaching
+   to a card's **description** on the detail page and to any **comment**.
+   Any file type, not images only — which forced the download affordance
+   the dashboard had never had (chat renders a non-image as a dead chip
+   with no way to get the bytes back, so "parity with chat" would have
+   meant a PDF you could attach and never open).
+
+   The design is in [`docs/modules/project.md`](../modules/project.md#attachments);
+   the three decisions worth carrying here are that the server reads a
+   file's type and size **off the blob store** rather than from the client
+   (they are what the context budget spends), that nothing stores a
+   `kind` because the mime already answers it, and that markdown-embedded
+   refs were never viable — `react-markdown` blanks the URL scheme and an
+   agent's wholesale `description` rewrite would orphan them anyway.
+
+   An issue run is handed its card's files as real content blocks, capped,
+   so an agent **looks at** a mockup instead of reading its filename; an
+   agent hands files back through `IssueComment`. iOS is untouched, because
+   there is no board there to touch.
+
 ## What is still not built
 
 Everything in "Pages and interactions" above now exists. Three things

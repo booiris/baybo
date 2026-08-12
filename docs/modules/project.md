@@ -41,7 +41,8 @@ every door leads through it.
 | `settle.rs` | The settle chokepoint: the ledger row, the invalidation, and the timeline entry, as one sequence |
 | `runs.rs` | The two run predicates (`triggers_run`, `accepts_runs`), the ledger entry, which earlier run a run continues, and `RunOutcome` |
 | `dispatch.rs` | Turning a recorded row into an `IssueRunEvent` the executor can run |
-| `brief.rs` | The brief a run is handed: the card, and what has been said on it since |
+| `brief.rs` | The brief a run is handed: the card, what has been said on it since, and which of its files fit |
+| `attachments.rs` | The one door a file gets onto a card through: blob ids in, stored attachments out |
 | `comments.rs` | `comment_delivery` — what a comment does besides being recorded |
 | `actors.rs` | What an agent-facing surface calls the somebody a timeline entry names |
 | `mentions.rs` | `@handle` scanning, and when a mention is a handover |
@@ -534,6 +535,64 @@ so it gets the same trigger, the same timeline entry and the same refusals for
 an agent that cannot run. In the *commenter's* name, not the operator's. A
 mention on somebody else's card is a question, never a reassignment: treating it
 otherwise would let a passing remark take work away from whoever is doing it.
+
+**A comment may be nothing but files.** "Here, look at this" under a screenshot
+is a real thing to say, so the emptiness rule is *no text and no files* rather
+than no text. Everything downstream is unchanged by it: a file-only comment
+mentions nobody, so it reassigns nothing, and it wakes the assignee exactly as a
+worded one does — being handed a screenshot is being asked to look at it.
+
+### Attachments
+
+A file hangs on a card's **description** (`issues.attachments`, a JSON column)
+or on **one comment** (`IssueEventBody::Comment.attachments`, riding the
+timeline body that was already JSON). Both hold `IssueAttachment` — a blob id,
+its mime, its size, and the name it was uploaded under.
+
+Three things are decided once, here, and the reasons are what keep them decided:
+
+- **A caller names blobs, never attachments.** `attachments::resolve` is the
+  only constructor: it `stat`s each id and takes the mime and the size *off the
+  store*, keeping only the client's filename. Those two numbers are what the
+  context budget spends when the file reaches a model, so a caller's word for
+  them is an under-pricing hole. Blob ids reach the manager as a *parameter*
+  rather than as something a caller fills in on `IssueUpdate`, for exactly this
+  reason — and stated exactly, because the type does not enforce it:
+  `IssueUpdate` still carries a `pub attachments` field, since the store has to
+  be told what to write, and `update_issue` **overwrites** it from the ids it
+  was handed. A caller that sets it is ignored rather than refused; the field's
+  own doc says so. What holds is that nothing a caller writes there reaches the
+  row. What does not is a compile error for trying.
+- **There is no stored `kind`.** Image / audio / file falls out of the mime
+  (`baybo_model::MediaKind::of_mime`), so no discriminator can disagree with the
+  bytes it describes. The web derives the same split on its own side to choose
+  between a thumbnail and a chip — two readings of one rule, one per side of the
+  wire, neither with a second copy.
+- **Markdown-embedded refs were never an option.** `react-markdown` blanks any
+  `src` outside its scheme allowlist and an `<img>` cannot carry the bearer
+  `GET /v1/blobs/{id}` requires, so an embedded ref renders as nothing, silently
+  — and `IssueUpdate`'s `description` is a wholesale replace, so the first agent
+  edit would orphan every reference in it. Files are their own field, drawn
+  beside the prose.
+
+What a **run** sees: `brief.rs` names every file on the card and in its comment
+window in the prose, and carries up to `MAX_BRIEF_MEDIA` of them as real
+`ContentBlock`s — so an image is *looked at* rather than read as a filename, and
+a PDF arrives as a native document. The card's own files come first and in full
+(they are the specification); the rest of the budget goes to the conversation
+newest-first. A brief that could not carry them all says so, because a text
+budget (`COMMENT_BUDGET`) cannot bound this: a picture is nearly free in bytes
+and thousands of tokens in price.
+
+The probes behind those blocks are `baybo_tools::blob_media`, shared with the
+gateway's chat ingest — one home for which cap an image probe gets and when it
+is worth taking, since a third copy is where those drift.
+
+Uploads are stamped `project:<project_id>` (`baybo_store::project_uploader_identity`).
+**Nothing reclaims them yet**, and that is not why they are stamped:
+`uploader_identity` is written once and can never be filled in later, while a
+board has no hard delete at all for a reclaimer to hang off. Stamping keeps the
+door open; claiming it buys something today would be false.
 
 ### What the executor may do
 

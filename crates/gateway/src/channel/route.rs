@@ -957,6 +957,13 @@ async fn enforce_pairing(
 /// agent-facing `Vec<ContentBlock>`. Empty text drops the leading
 /// `Text` block so a "media-only" message doesn't carry a phantom
 /// empty string.
+///
+/// The *kind* comes off the wire here rather than off the mime, unlike
+/// every other producer: a sidecar's declaration is the only signal for a
+/// channel whose mime is `application/octet-stream`. Everything the
+/// context budget spends — dimensions, duration, pages, bytes — is probed
+/// through [`baybo_tools::blob_media`], which is also what the board's run
+/// brief uses, so the two ingests cannot drift on what a probe costs.
 async fn wire_to_content_blocks(
     content: String,
     attachments: Vec<WireAttachment>,
@@ -976,9 +983,10 @@ async fn wire_to_content_blocks(
                 // tiles an image by its PIXEL grid and bills per tile, so
                 // the dimensions are the price and the payload's byte
                 // count bounds nothing.
-                let (width, height) = probe_image_dimensions(blob_store, &blob.blob_id)
-                    .await
-                    .unzip();
+                let (width, height) =
+                    baybo_tools::blob_media::probe_image_dimensions(blob_store, &blob.blob_id)
+                        .await
+                        .unzip();
                 ContentBlock::Image {
                     blob,
                     mime_type: att.mime_type,
@@ -993,9 +1001,10 @@ async fn wire_to_content_blocks(
                 // would let a caller under-price its own upload. The wire
                 // value survives only as the display fallback for a
                 // container we can't read.
-                let duration_ms = probe_audio_duration_ms(blob_store, &blob.blob_id)
-                    .await
-                    .or(att.duration_ms);
+                let duration_ms =
+                    baybo_tools::blob_media::probe_audio_duration_ms(blob_store, &blob.blob_id)
+                        .await
+                        .or(att.duration_ms);
                 ContentBlock::Audio {
                     blob,
                     mime_type: att.mime_type,
@@ -1004,13 +1013,18 @@ async fn wire_to_content_blocks(
                 }
             }
             AttachmentKind::File => {
-                let page_count =
-                    probe_pdf_page_count(blob_store, &blob.blob_id, &att.mime_type).await;
+                let page_count = baybo_tools::blob_media::probe_pdf_page_count(
+                    blob_store,
+                    &blob.blob_id,
+                    &att.mime_type,
+                )
+                .await;
                 // Server-derived like the page count, and for the same
                 // reason: a text-like file is delivered as inlined prompt
                 // text, so its bytes ARE its price. `att.size` is the
                 // client's claim about the same blob and is not used.
-                let size_bytes = stat_blob_size(blob_store, &blob.blob_id).await;
+                let size_bytes =
+                    baybo_tools::blob_media::stat_blob_size(blob_store, &blob.blob_id).await;
                 ContentBlock::File {
                     filename: file_display_name(att.filename.as_deref(), &att.mime_type),
                     blob,
@@ -1023,101 +1037,6 @@ async fn wire_to_content_blocks(
         });
     }
     blocks
-}
-
-/// Byte length of a stored blob, straight off the metadata row. The wire
-/// carries a `size` too, but it is the sender's word for it and the
-/// context budget spends the number.
-async fn stat_blob_size(blob_store: &dyn BlobStore, blob_id: &str) -> Option<u32> {
-    match blob_store.stat(blob_id).await {
-        Ok(meta) => u32::try_from(meta.size).ok(),
-        Err(e) => {
-            tracing::debug!(%blob_id, error = %e, "attachment stat failed; size unknown");
-            None
-        }
-    }
-}
-
-/// Read a blob for probing, refusing anything the delivery path would
-/// reject on size. `stat` first so an oversize payload is never pulled
-/// into memory.
-///
-/// `max_bytes` is the DELIVERY cap of the arm being probed, not a shared
-/// worst case: above it the LLM layer always stubs the block, so a fact
-/// recovered from those bytes would be a price charged for something that
-/// costs the stub. Reading the wider of the two caps charged an 8-16 MiB
-/// PDF its full page price for a block that can never be delivered.
-async fn probe_bytes(blob_store: &dyn BlobStore, blob_id: &str, max_bytes: u64) -> Option<Vec<u8>> {
-    match blob_store.stat(blob_id).await {
-        Ok(meta) if meta.size <= max_bytes => {}
-        Ok(meta) => {
-            tracing::debug!(%blob_id, size = meta.size, limit = max_bytes, "attachment too large to probe");
-            return None;
-        }
-        Err(e) => {
-            tracing::debug!(%blob_id, error = %e, "attachment stat failed; skipping probe");
-            return None;
-        }
-    }
-    blob_store.get(blob_id).await.ok()
-}
-
-/// Pages in an inbound PDF, probed here because ingest is the one moment
-/// the bytes are in hand and the `ContentBlock` that outlives them is all
-/// the context budget ever sees. A provider bills a native document per
-/// PAGE, and byte count is not a stand-in — measured, real documents run
-/// 10 to 4,007 bytes per page.
-async fn probe_pdf_page_count(
-    blob_store: &dyn BlobStore,
-    blob_id: &str,
-    mime_type: &str,
-) -> Option<u32> {
-    if !baybo_llm::delivers_pdf_document(mime_type) {
-        return None;
-    }
-    let bytes = probe_bytes(
-        blob_store,
-        blob_id,
-        baybo_llm::MAX_PDF_DOCUMENT_BYTES as u64,
-    )
-    .await?;
-    // `spawn_blocking`: a whole-payload parse is CPU-bound, and a panic
-    // inside it surfaces as a `JoinError` instead of unwinding the reactor.
-    tokio::task::spawn_blocking(move || baybo_llm::media_probe::pdf_page_count(&bytes))
-        .await
-        .ok()
-        .flatten()
-}
-
-async fn probe_audio_duration_ms(blob_store: &dyn BlobStore, blob_id: &str) -> Option<u32> {
-    let bytes = probe_bytes(
-        blob_store,
-        blob_id,
-        baybo_llm::MAX_AUDIO_DOCUMENT_BYTES as u64,
-    )
-    .await?;
-    tokio::task::spawn_blocking(move || baybo_llm::media_probe::audio_duration_ms(&bytes))
-        .await
-        .ok()
-        .flatten()
-        .filter(|ms| *ms > 0)
-}
-
-/// Pixel dimensions of an inbound image, probed here for the same reason
-/// the page count is: a provider bills an image per tile of its pixel
-/// grid, and the `ContentBlock` that outlives the bytes is all the
-/// context budget ever sees.
-async fn probe_image_dimensions(blob_store: &dyn BlobStore, blob_id: &str) -> Option<(u32, u32)> {
-    let bytes = probe_bytes(
-        blob_store,
-        blob_id,
-        baybo_llm::MAX_IMAGE_DOCUMENT_BYTES as u64,
-    )
-    .await?;
-    tokio::task::spawn_blocking(move || baybo_llm::media_probe::image_dimensions(&bytes))
-        .await
-        .ok()
-        .flatten()
 }
 
 /// A `File` block's filename is the only label the transcript card has,

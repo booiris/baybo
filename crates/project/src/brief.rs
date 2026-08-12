@@ -3,9 +3,13 @@
 
 use std::sync::Arc;
 
-use baybo_model::AgentProfileId;
-use baybo_store::AgentProfileStore;
-use baybo_store::project::{IssueEventBody, IssueEventRow, IssueRow, IssueRunRow, ProjectStore};
+use baybo_model::{AgentProfileId, MediaBlock};
+use baybo_store::project::{
+    IssueAttachment, IssueEventBody, IssueEventRow, IssueRow, IssueRunRow, ProjectStore,
+};
+use baybo_store::{AgentProfileStore, BlobStore};
+
+use crate::attachments::describe;
 
 use crate::actors;
 use crate::runs::{ever_ran, session_run_before};
@@ -44,6 +48,7 @@ pub(crate) struct Said {
 pub(crate) struct Comment {
     by: String,
     text: String,
+    attachments: Vec<IssueAttachment>,
 }
 
 const SAID_SINCE_LAST_RUN: &str = "\n\nSaid since your last run:\n";
@@ -58,32 +63,87 @@ work and not yours — read what is already in the tree before you add to it."#;
 
 const COMMENT_BUDGET: usize = 16_000;
 
+const FILES_ON_THE_CARD: &str = "\n\nFiles on this card:\n";
+
+const SOME_FILES_NOT_SHOWN: &str = r#"
+
+Not every file above could be shown to you — the ones listed but not
+attached are on the card, and the operator can point you at any of them."#;
+
+const FILES_ALREADY_SEEN: &str = r#"
+
+The card's own files are unchanged since your last run, so they are not
+attached again — they are already earlier in this conversation."#;
+
+/// How many files a brief may carry as real content.
+///
+/// A separate rule from [`COMMENT_BUDGET`], because the two measure
+/// different things: that one counts the BYTES of rendered text, and a
+/// picture contributes almost none of those while costing thousands of
+/// real tokens (a provider bills an image per tile of its pixel grid). A
+/// card with forty screenshots is under the text budget and over every
+/// context window. The neighbouring number is the agent loop's own
+/// `MAX_LLM_IMAGES_PER_ITERATION`.
+const MAX_BRIEF_MEDIA: usize = 8;
+
 const EARLIER_COMMENTS_TRIMMED: &str =
     "(earlier comments are not repeated here — the card itself has all of them)";
 
 /// One comment as the brief reads it. Newlines inside it are indented, so
-/// a line of somebody's prose can never be read as the next speaker.
+/// a line of somebody's prose can never be read as the next speaker — which
+/// is also why a file list is appended as one flat clause rather than as
+/// its own lines.
 fn comment_line(comment: &Comment) -> String {
-    format!("- {}: {}\n", comment.by, comment.text.replace('\n', "\n  "))
+    let mut said = comment.text.clone();
+    if !comment.attachments.is_empty() {
+        let named = comment
+            .attachments
+            .iter()
+            .map(describe)
+            .collect::<Vec<_>>()
+            .join(", ");
+        if said.is_empty() {
+            said = format!("[attached {named}]");
+        } else {
+            said.push_str(&format!(" [attached {named}]"));
+        }
+    }
+    format!("- {}: {}\n", comment.by, said.replace('\n', "\n  "))
 }
 
-fn comment_block(comments: &[Comment]) -> String {
-    let lines: Vec<String> = comments.iter().map(comment_line).collect();
+/// How many of the newest comments fit the prose budget.
+///
+/// Extracted so the *files* can be selected from the same set the prose is:
+/// a comment trimmed out of the block is a comment whose attachment nothing
+/// names, and delivering that attachment anyway put a picture in front of
+/// the model with no sentence to say where it came from.
+fn kept_comments(comments: &[Comment]) -> usize {
     let mut kept = 0usize;
     let mut spent = 0usize;
-    for line in lines.iter().rev() {
+    for line in comments
+        .iter()
+        .map(comment_line)
+        .collect::<Vec<_>>()
+        .iter()
+        .rev()
+    {
         if kept > 0 && spent + line.len() > COMMENT_BUDGET {
             break;
         }
         spent += line.len();
         kept += 1;
     }
+    kept
+}
+
+fn comment_block(comments: &[Comment]) -> String {
+    let kept = kept_comments(comments);
     let mut block = String::new();
-    if kept < lines.len() {
+    if kept < comments.len() {
         block.push_str(&format!("- {EARLIER_COMMENTS_TRIMMED}\n"));
     }
-    for line in &lines[lines.len() - kept..] {
-        block.push_str(line);
+    for comment in &comments[comments.len() - kept..] {
+        block.push_str(&comment_line(comment));
     }
     block
 }
@@ -94,6 +154,12 @@ pub(crate) fn issue_brief(issue: &IssueRow, said: &Said) -> String {
     } else {
         format!("{}\n\n{}", issue.title, issue.description)
     };
+    if !issue.attachments.is_empty() {
+        brief.push_str(FILES_ON_THE_CARD);
+        for attachment in &issue.attachments {
+            brief.push_str(&format!("- {}\n", describe(attachment)));
+        }
+    }
     if said.inherited_worktree {
         brief.push_str(INHERITED_WORKTREE);
     }
@@ -104,7 +170,115 @@ pub(crate) fn issue_brief(issue: &IssueRow, said: &Said) -> String {
         });
         brief.push_str(&comment_block(&said.comments));
     }
+    // Two different reasons a named file is not attached below, and they must
+    // not be reported as one: files the model already has from an earlier run
+    // of this same conversation, and files the budget could not fit.
+    let already_seen = if card_files_are_new(issue, said) {
+        0
+    } else {
+        issue.attachments.len()
+    };
+    if already_seen > 0 {
+        brief.push_str(FILES_ALREADY_SEEN);
+    }
+    if delivered(issue, said).len() + already_seen < named(issue, said).len() {
+        brief.push_str(SOME_FILES_NOT_SHOWN);
+    }
     brief
+}
+
+/// The comments this brief actually prints, newest-first budget applied.
+fn spoken(said: &Said) -> &[Comment] {
+    let kept = kept_comments(&said.comments);
+    &said.comments[said.comments.len() - kept..]
+}
+
+/// Every file this brief names, card first and then the conversation in
+/// reading order. Only the comments that survived the prose budget count:
+/// a file nothing names is a file this brief did not mention.
+fn named<'a>(issue: &'a IssueRow, said: &'a Said) -> Vec<&'a IssueAttachment> {
+    issue
+        .attachments
+        .iter()
+        .chain(spoken(said).iter().flat_map(|c| c.attachments.iter()))
+        .collect()
+}
+
+/// Whether the card's own files are new to the transcript this run opens.
+///
+/// A run continues a session, so everything an earlier run of the same agent
+/// was shown is **still in front of the model**. Re-sending the card's
+/// screenshots on every run does not remind it of anything; it pays the
+/// image price again, per run, in one conversation.
+///
+/// The signal is the row's own `updated_at` against the window's boundary,
+/// because nothing records which files a previous run delivered. It errs
+/// towards sending: any edit to the card re-sends its files, so a mockup
+/// added between two runs always arrives, and only a genuinely unchanged
+/// card is skipped.
+fn card_files_are_new(issue: &IssueRow, said: &Said) -> bool {
+    match said.window {
+        BriefWindow::WholeCard => true,
+        BriefWindow::SinceItsLastRun(since) => issue.updated_at > since,
+    }
+}
+
+/// The files this brief carries as real content, out of everything it
+/// names.
+///
+/// The card's own files come first and in full: they are the specification,
+/// and a run that cannot see the mockup it was asked to build is not
+/// cheaper, it is wrong. What is left of the budget goes to the
+/// conversation **newest-first**, because the useful screenshot on a busy
+/// card is the one somebody just posted, not the one from nine comments
+/// ago — then reading order is restored, so the agent sees them in the
+/// order they were said.
+///
+/// Nothing is ever *hidden* by this: `issue_brief` names every file either
+/// way, and says plainly when it could not show them all.
+fn delivered<'a>(issue: &'a IssueRow, said: &'a Said) -> Vec<&'a IssueAttachment> {
+    let from_card: Vec<&IssueAttachment> = if card_files_are_new(issue, said) {
+        issue.attachments.iter().take(MAX_BRIEF_MEDIA).collect()
+    } else {
+        Vec::new()
+    };
+    let room_left = MAX_BRIEF_MEDIA.saturating_sub(from_card.len());
+    let said_files: Vec<&IssueAttachment> = spoken(said)
+        .iter()
+        .flat_map(|c| c.attachments.iter())
+        .collect();
+    let kept_from = said_files.len().saturating_sub(room_left);
+    from_card
+        .into_iter()
+        .chain(said_files[kept_from..].iter().copied())
+        .collect()
+}
+
+/// The files a brief carries as real content, each priced from its own
+/// bytes.
+///
+/// Returned apart from the prose rather than as one `Vec` whose first
+/// element happens to be text: the prompt framing wraps the prose and only
+/// the prose, and a shape that has to *find* the text block is a shape that
+/// will one day frame a picture.
+pub(crate) async fn issue_brief_media(
+    blobs: &Arc<dyn BlobStore>,
+    issue: &IssueRow,
+    said: &Said,
+) -> Vec<MediaBlock> {
+    let mut blocks = Vec::new();
+    for attachment in delivered(issue, said) {
+        blocks.push(
+            baybo_tools::blob_media::probed_block(
+                blobs.as_ref(),
+                attachment.blob_id.clone(),
+                attachment.mime_type.clone(),
+                Some(crate::attachments::name_of(attachment)),
+            )
+            .await,
+        );
+    }
+    blocks
 }
 
 fn brief_window(run: &IssueRunRow, runs: &[IssueRunRow]) -> BriefWindow {
@@ -179,9 +353,10 @@ async fn attributed(
     spoken
         .into_iter()
         .filter_map(|event| match event.body {
-            IssueEventBody::Comment { text } => Some(Comment {
+            IssueEventBody::Comment { text, attachments } => Some(Comment {
                 by: actors::label(&event.actor, &known),
                 text,
+                attachments,
             }),
             _ => None,
         })
@@ -203,6 +378,7 @@ mod tests {
             number: 7,
             title: "wire the importer".to_owned(),
             description: "it should skip rows with no id".to_owned(),
+            attachments: Vec::new(),
             status: IssueStatus::InProgress,
             priority: IssuePriority::None,
             assignee: None,
@@ -222,6 +398,16 @@ mod tests {
         Comment {
             by: by.to_owned(),
             text: text.to_owned(),
+            attachments: Vec::new(),
+        }
+    }
+
+    fn file(name: &str, mime: &str) -> IssueAttachment {
+        IssueAttachment {
+            blob_id: format!("sha256:{name}.token"),
+            mime_type: mime.to_owned(),
+            size: 1_024,
+            filename: Some(name.to_owned()),
         }
     }
 
@@ -533,5 +719,157 @@ mod tests {
             "a line inside somebody's comment must not read as the next speaker:\n{brief}"
         );
         assert!(brief.contains("- @qa: agreed\n"), "{brief}");
+    }
+
+    fn with_files(comments: Vec<Comment>) -> Said {
+        Said {
+            window: BriefWindow::WholeCard,
+            inherited_worktree: false,
+            comments,
+        }
+    }
+
+    #[test]
+    fn the_cards_own_files_are_named_with_their_type_and_weight() {
+        let mut issue = card();
+        issue.attachments = vec![file("mockup.png", "image/png")];
+        let brief = issue_brief(&issue, &with_files(Vec::new()));
+        assert!(
+            brief.contains("Files on this card:\n- mockup.png (image/png, 1 KB)"),
+            "{brief}"
+        );
+    }
+
+    #[test]
+    fn a_comment_that_is_only_a_file_still_says_something() {
+        let issue = card();
+        let mut only_a_file = said(actors::OPERATOR, "");
+        only_a_file.attachments = vec![file("trace.log", "text/plain")];
+        let brief = issue_brief(&issue, &with_files(vec![only_a_file]));
+        assert!(
+            brief.contains("- the operator: [attached trace.log (text/plain, 1 KB)]"),
+            "an attachment-only comment must not read as an empty line:\n{brief}"
+        );
+    }
+
+    #[test]
+    fn the_cards_files_keep_their_place_when_the_conversation_is_busy() {
+        let mut issue = card();
+        issue.attachments = vec![file("spec.png", "image/png")];
+        // Ten comment files against a budget of eight, with one already
+        // spent by the card: the card's own file survives and the newest
+        // seven of theirs come with it.
+        let comments: Vec<Comment> = (0..10)
+            .map(|i| {
+                let mut c = said("@dev-1", "here");
+                c.attachments = vec![file(&format!("shot-{i}.png"), "image/png")];
+                c
+            })
+            .collect();
+        let said = with_files(comments);
+
+        let carried: Vec<&str> = delivered(&issue, &said)
+            .iter()
+            .filter_map(|a| a.filename.as_deref())
+            .collect();
+        assert_eq!(
+            carried,
+            vec![
+                "spec.png",
+                "shot-3.png",
+                "shot-4.png",
+                "shot-5.png",
+                "shot-6.png",
+                "shot-7.png",
+                "shot-8.png",
+                "shot-9.png"
+            ],
+            "the card's own file is the specification and is never the one dropped; \
+             what is dropped is the OLDEST of the conversation"
+        );
+        assert_eq!(named(&issue, &said).len(), 11);
+
+        let brief = issue_brief(&issue, &said);
+        assert!(
+            brief.contains("Not every file above could be shown to you"),
+            "a brief that quietly showed eight of eleven files would be lying:\n{brief}"
+        );
+        assert!(
+            brief.contains("shot-0.png"),
+            "a file that could not be carried is still NAMED, so the agent knows it exists:\n{brief}"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_cards_files_are_not_sent_twice_into_one_transcript() {
+        let mut issue = card();
+        issue.attachments = vec![file("mockup.png", "image/png")];
+        // A follow-up run continues the SAME session, so what the first run
+        // was shown is still in front of the model. Re-attaching it pays the
+        // image price a second time and reminds it of nothing.
+        let follow_up = Said {
+            window: BriefWindow::SinceItsLastRun(issue.updated_at + Duration::seconds(1)),
+            inherited_worktree: false,
+            comments: Vec::new(),
+        };
+        assert!(
+            delivered(&issue, &follow_up).is_empty(),
+            "the card's files were already delivered into this transcript"
+        );
+        let brief = issue_brief(&issue, &follow_up);
+        assert!(brief.contains("mockup.png"), "still named: {brief}");
+        assert!(
+            brief.contains("already earlier in this conversation"),
+            "{brief}"
+        );
+        assert!(
+            !brief.contains("Not every file above could be shown"),
+            "a file the model already has was not withheld, and saying so would be wrong:\n{brief}"
+        );
+
+        // But an edit to the card re-sends them: nothing records which files
+        // a previous run delivered, so a changed card errs towards sending.
+        let after_an_edit = Said {
+            window: BriefWindow::SinceItsLastRun(issue.updated_at - Duration::seconds(1)),
+            inherited_worktree: false,
+            comments: Vec::new(),
+        };
+        assert_eq!(delivered(&issue, &after_an_edit).len(), 1);
+    }
+
+    #[test]
+    fn a_file_on_a_comment_the_budget_dropped_is_not_delivered_unannounced() {
+        let issue = card();
+        // One comment big enough to spend the whole prose budget, so the
+        // older one is trimmed out of the block entirely.
+        let mut old = said("@dev-1", "here is the first screenshot");
+        old.attachments = vec![file("old.png", "image/png")];
+        let mut huge = said("@dev-2", &"x".repeat(COMMENT_BUDGET + 1));
+        huge.attachments = vec![file("new.png", "image/png")];
+        let said = with_files(vec![old, huge]);
+
+        let brief = issue_brief(&issue, &said);
+        assert!(
+            !brief.contains("old.png"),
+            "its whole line was trimmed, so nothing in the prose names it:\n{brief}"
+        );
+        let carried: Vec<&str> = delivered(&issue, &said)
+            .iter()
+            .filter_map(|a| a.filename.as_deref())
+            .collect();
+        assert_eq!(
+            carried,
+            vec!["new.png"],
+            "a picture delivered with no sentence to say where it came from is worse \
+             than one left out"
+        );
+    }
+
+    #[test]
+    fn a_card_within_the_budget_says_nothing_about_trimming() {
+        let mut issue = card();
+        issue.attachments = vec![file("one.png", "image/png")];
+        let brief = issue_brief(&issue, &with_files(Vec::new()));
+        assert!(!brief.contains("Not every file"), "{brief}");
     }
 }

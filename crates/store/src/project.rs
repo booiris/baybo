@@ -151,6 +151,33 @@ pub struct ProjectUpdate {
     pub max_parallel_issue_runs: usize,
 }
 
+/// A file hung on a card — on its description, or on one comment.
+///
+/// Only `blob_id` and `filename` ever come from a client. `mime_type` and
+/// `size` are read back off [`crate::BlobStore::stat`] at the write door, for
+/// the reason [`baybo_model::ContentBlock`] gives for its own probed fields:
+/// they are what the context budget spends when the file reaches a model, so
+/// the uploader's word for them is not good enough.
+///
+/// There is no `kind` field. Which of image / audio / file this is falls out
+/// of `mime_type` (`kind_of_mime`), so no stored discriminator can ever
+/// disagree with the bytes it describes.
+///
+/// `Eq`, because [`IssueEventBody`] is — and that is why this is its own
+/// small type rather than a [`baybo_model::ContentBlock`], which is only
+/// `PartialEq`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueAttachment {
+    /// Capability id from the blob store: `sha256:<64hex>.<read token>`.
+    pub blob_id: String,
+    pub mime_type: String,
+    pub size: u32,
+    /// The name the file was uploaded under. `None` for a paste, which
+    /// genuinely has none — not to spare a caller from passing one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+}
+
 /// One row of `issues`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssueRow {
@@ -160,6 +187,8 @@ pub struct IssueRow {
     pub number: i64,
     pub title: String,
     pub description: String,
+    /// Files hung on the description. Ordered as the uploader added them.
+    pub attachments: Vec<IssueAttachment>,
     pub status: IssueStatus,
     pub priority: IssuePriority,
     /// Who is on it. `None` is unclaimed work — which is also why an
@@ -203,6 +232,15 @@ pub struct IssueRow {
 pub struct IssueUpdate {
     pub title: Option<String>,
     pub description: Option<String>,
+    /// Full replace, like `description`: the client sends the list it wants
+    /// to end up with, so removing the last attachment is `Some(vec![])` and
+    /// not an absence that could be read as "leave them alone".
+    ///
+    /// Written by `ProjectManager::update_issue` from the blob ids it was
+    /// handed, and by nothing else — resolving an id into one of these is
+    /// what the manager is for. Setting it on a patch handed to the manager
+    /// is overwritten.
+    pub attachments: Option<Vec<IssueAttachment>>,
     pub priority: Option<IssuePriority>,
     /// `Some(None)` detaches from the parent; `None` leaves it alone.
     pub parent: Option<Option<IssueId>>,
@@ -219,6 +257,7 @@ impl IssueUpdate {
     pub fn is_empty(&self) -> bool {
         self.title.is_none()
             && self.description.is_none()
+            && self.attachments.is_none()
             && self.priority.is_none()
             && self.parent.is_none()
             && self.stage.is_none()
@@ -235,6 +274,7 @@ pub struct NewIssue {
     pub project_id: ProjectId,
     pub title: String,
     pub description: String,
+    pub attachments: Vec<IssueAttachment>,
     pub status: IssueStatus,
     pub priority: IssuePriority,
     pub assignee: Option<AgentProfileId>,
@@ -292,6 +332,13 @@ pub enum IssueEventBody {
     /// Said by a person or an agent. The only entry a human writes.
     Comment {
         text: String,
+        /// Files hung on this comment. `#[serde(default)]` is not
+        /// decoration: `event_from_raw` turns any failed deserialize into a
+        /// hard error and the timeline query collects into one `Result`, so
+        /// a body written before this field existed would take out the whole
+        /// card's timeline, brief and board feed — not just its own row.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<IssueAttachment>,
     },
     Opened,
     Moved {

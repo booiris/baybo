@@ -10,11 +10,11 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use baybo_model::{AgentProfileId, ProjectId};
-use baybo_project::{NewIssueRequest, NewProject, ProjectError};
+use baybo_project::{AttachmentRequest, NewIssueRequest, NewProject, ProjectError};
 use baybo_store::project::{
-    DEFAULT_MAX_PARALLEL_ISSUE_RUNS, IssueActor, IssueEventBody, IssueEventRow, IssuePriority,
-    IssueRow, IssueRunRow, IssueStatus, IssueUpdate, ProjectRow, ProjectUpdate, RunStatus,
-    RunTrigger,
+    DEFAULT_MAX_PARALLEL_ISSUE_RUNS, IssueActor, IssueAttachment, IssueEventBody, IssueEventRow,
+    IssuePriority, IssueRow, IssueRunRow, IssueStatus, IssueUpdate, ProjectRow, ProjectUpdate,
+    RunStatus, RunTrigger,
 };
 
 use crate::api::dto::{ErrorBody, ListResponse};
@@ -243,6 +243,61 @@ impl From<IssuePriorityDto> for IssuePriority {
     }
 }
 
+/// A file on a card — on its description, or on one comment.
+///
+/// No `kind`: which of image / file this is falls out of `mime_type`, and
+/// the client is the only side that has to make that call (it decides
+/// between a thumbnail and a chip). A stored discriminator would be a
+/// second answer that could disagree with the bytes.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct IssueAttachmentDto {
+    /// Capability id from `POST /v1/blobs`. Possession is the read right,
+    /// so this is as sensitive as the file it names.
+    pub blob_id: String,
+    pub mime_type: String,
+    pub size: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+}
+
+impl From<IssueAttachment> for IssueAttachmentDto {
+    fn from(a: IssueAttachment) -> Self {
+        Self {
+            blob_id: a.blob_id,
+            mime_type: a.mime_type,
+            size: a.size,
+            filename: a.filename,
+        }
+    }
+}
+
+/// What a client may say about a file it is hanging on a card: which blob,
+/// and what to call it. The type and the size are read off the store — see
+/// `baybo_project::AttachmentRequest`, which this maps onto.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct IssueAttachmentRequest {
+    /// Full blob id from `POST /v1/blobs`.
+    pub blob_id: String,
+    #[serde(default)]
+    pub filename: Option<String>,
+}
+
+impl From<IssueAttachmentRequest> for AttachmentRequest {
+    fn from(a: IssueAttachmentRequest) -> Self {
+        Self {
+            blob_id: a.blob_id,
+            filename: a.filename,
+        }
+    }
+}
+
+fn requested(attachments: Vec<IssueAttachmentRequest>) -> Vec<AttachmentRequest> {
+    attachments
+        .into_iter()
+        .map(AttachmentRequest::from)
+        .collect()
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct IssueDto {
     /// The human address, unique within its project: `#3`.
@@ -250,6 +305,9 @@ pub struct IssueDto {
     pub project_id: String,
     pub title: String,
     pub description: String,
+    /// Files hung on the description.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<IssueAttachmentDto>,
     pub status: IssueStatusDto,
     pub priority: IssuePriorityDto,
     /// The agent on it, if any. In Progress always has one.
@@ -327,6 +385,11 @@ impl From<IssueRow> for IssueDto {
             project_id: row.project_id.to_string(),
             title: row.title,
             description: row.description,
+            attachments: row
+                .attachments
+                .into_iter()
+                .map(IssueAttachmentDto::from)
+                .collect(),
             status: row.status.into(),
             priority: row.priority.into(),
             assignee: row.assignee.map(|a| a.to_string()),
@@ -482,6 +545,8 @@ fn agent_ref(id: &AgentProfileId, handles: &ActorHandles) -> AgentRefDto {
 pub enum IssueEventBodyDto {
     Comment {
         text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<IssueAttachmentDto>,
     },
     Opened,
     Moved {
@@ -574,7 +639,13 @@ impl IssueEventBodyDto {
                 spent_micros,
                 limit_micros,
             },
-            IssueEventBody::Comment { text } => Self::Comment { text },
+            IssueEventBody::Comment { text, attachments } => Self::Comment {
+                text,
+                attachments: attachments
+                    .into_iter()
+                    .map(IssueAttachmentDto::from)
+                    .collect(),
+            },
             IssueEventBody::Opened => Self::Opened,
             IssueEventBody::Moved { from, to } => Self::Moved {
                 from: from.into(),
@@ -686,7 +757,11 @@ impl IssueEventDto {
 /// A comment being posted.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct NewCommentBody {
+    /// May be empty when `attachments` is not: "here, look at this" with a
+    /// screenshot under it is a real thing to say on a card.
     pub text: String,
+    #[serde(default)]
+    pub attachments: Vec<IssueAttachmentRequest>,
 }
 
 /// One execution of an issue.
@@ -830,6 +905,10 @@ pub struct CreateIssueRequest {
     pub title: String,
     #[serde(default)]
     pub description: String,
+    /// Files to hang on the description, uploaded to `POST /v1/blobs`
+    /// first. Refused if a blob id names nothing the store has.
+    #[serde(default)]
+    pub attachments: Vec<IssueAttachmentRequest>,
     /// Which column the card opens in. Defaults to the backlog.
     #[serde(default)]
     pub status: Option<IssueStatusDto>,
@@ -856,6 +935,10 @@ pub struct UpdateIssueRequest {
     pub title: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
+    /// Full replace of the description's files: the list to end up with.
+    /// An absent key leaves them alone, `[]` removes them all.
+    #[serde(default)]
+    pub attachments: Option<Vec<IssueAttachmentRequest>>,
     #[serde(default)]
     pub priority: Option<IssuePriorityDto>,
     /// An explicit `null` unassigns; an absent key leaves the assignee.
@@ -1090,6 +1173,7 @@ async fn create_issue(
             NewIssueRequest {
                 title: req.title,
                 description: req.description,
+                attachments: requested(req.attachments),
                 status: req.status.unwrap_or(IssueStatusDto::Backlog).into(),
                 priority: req.priority.unwrap_or_default().into(),
                 assignee: parse_assignee(req.assignee)?,
@@ -1174,6 +1258,7 @@ async fn update_issue(
                 .id,
         )),
     };
+    let attachments = req.attachments.map(requested);
     let row = state
         .project_manager
         .update_issue(
@@ -1183,6 +1268,10 @@ async fn update_issue(
             IssueUpdate {
                 title: req.title,
                 description: req.description,
+                // Left unset on purpose: the manager fills it from the
+                // blob ids passed beside this patch, which is the only
+                // door a file gets onto a card through.
+                attachments: None,
                 priority: req.priority.map(IssuePriority::from),
                 assignee: req.assignee.map(parse_assignee).transpose()?,
                 blocked_reason: req.blocked_reason,
@@ -1190,6 +1279,7 @@ async fn update_issue(
                 parent,
                 stage: req.stage,
             },
+            attachments.as_deref(),
         )
         .await
         .map_err(project_err)?;
@@ -1653,7 +1743,13 @@ async fn create_comment(
     let id = parse_project_id(&project_id)?;
     let entry = state
         .project_manager
-        .comment(&id, number, IssueActor::User, &req.text)
+        .comment(
+            &id,
+            number,
+            IssueActor::User,
+            &req.text,
+            &requested(req.attachments),
+        )
         .await
         .map_err(project_err)?;
     // No handles to resolve, and no lookup to spend on finding that out:

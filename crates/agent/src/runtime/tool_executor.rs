@@ -1415,6 +1415,7 @@ mod tests {
                 projects: Arc::new(baybo_project::ProjectManager::new(
                     Arc::clone(&store.project),
                     Arc::clone(&store.agent_profile),
+                    Arc::clone(&store.blob),
                     paths_for_board,
                     Arc::new(baybo_project::NoopProjectEvents),
                     baybo_project::no_dispatch(),

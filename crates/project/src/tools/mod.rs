@@ -144,6 +144,22 @@ fn render_issue(issue: &IssueRow, team: &[baybo_store::AgentProfileRow]) -> Valu
     if let Some(branch) = issue.branch.as_ref() {
         obj.insert("branch".into(), json!(branch));
     }
+    // The card's own files, named the same way the run brief names them. An
+    // operator's attachment is otherwise invisible to a lookup: the brief
+    // mentions it once, and `IssueGet` — where an agent goes when the brief
+    // has scrolled past — would not.
+    if !issue.attachments.is_empty() {
+        obj.insert(
+            "attachments".into(),
+            json!(
+                issue
+                    .attachments
+                    .iter()
+                    .map(crate::attachments::describe)
+                    .collect::<Vec<_>>()
+            ),
+        );
+    }
     Value::Object(obj)
 }
 

@@ -1,4 +1,5 @@
 pub mod approval;
+pub mod blob_media;
 pub mod builtin;
 pub mod error;
 pub mod mcp;

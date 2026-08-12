@@ -338,6 +338,11 @@ const ADD_COLUMNS: &[AddColumn] = &[
         definition: "TEXT",
     },
     AddColumn {
+        table: "issues",
+        column: "attachments",
+        definition: "TEXT NOT NULL DEFAULT '[]'",
+    },
+    AddColumn {
         table: "sessions",
         column: "parent_span_id",
         definition: "TEXT",
@@ -1364,6 +1369,11 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     number         INTEGER NOT NULL,
                     title          TEXT    NOT NULL,
                     description    TEXT    NOT NULL DEFAULT '',
+                    -- Files hung on the description, as a JSON array of
+                    -- `IssueAttachment`. A blob store id is a capability,
+                    -- so this column holds read tokens: it is as sensitive
+                    -- as the bytes it points at.
+                    attachments    TEXT    NOT NULL DEFAULT '[]',
                     status         TEXT    NOT NULL,
                     priority       TEXT    NOT NULL DEFAULT 'none',
                     -- Who is on it. An agent profile id, or NULL for work

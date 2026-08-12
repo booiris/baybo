@@ -71,6 +71,7 @@ mod tests {
             number: 1,
             title: "step".into(),
             description: String::new(),
+            attachments: Vec::new(),
             status,
             priority: IssuePriority::None,
             assignee: None,

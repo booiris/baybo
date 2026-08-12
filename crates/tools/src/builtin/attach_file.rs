@@ -281,30 +281,31 @@ fn media_block(
     mime_type: String,
     probed: ProbedMedia,
 ) -> ContentBlock {
-    if mime_type.starts_with("image/") {
-        ContentBlock::Image {
+    // The same reading `blob_media` and the board's brief use — one answer to
+    // "which block is this", next to the enum it chooses between, rather than
+    // a `starts_with` per producer that a `IMAGE/PNG` would split.
+    match baybo_model::MediaKind::of_mime(&mime_type) {
+        baybo_model::MediaKind::Image => ContentBlock::Image {
             blob,
             mime_type,
             filename: Some(filename),
             width: probed.width,
             height: probed.height,
-        }
-    } else if mime_type.starts_with("audio/") {
-        ContentBlock::Audio {
+        },
+        baybo_model::MediaKind::Audio => ContentBlock::Audio {
             blob,
             mime_type,
             filename: Some(filename),
             duration_ms: probed.duration_ms,
-        }
-    } else {
-        ContentBlock::File {
+        },
+        baybo_model::MediaKind::File => ContentBlock::File {
             blob,
             filename,
             mime_type,
             duration_ms: probed.duration_ms,
             page_count: probed.page_count,
             size_bytes: probed.size_bytes,
-        }
+        },
     }
 }
 

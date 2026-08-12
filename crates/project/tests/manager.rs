@@ -18,6 +18,7 @@ struct Fixture {
     store: Arc<dyn baybo_store::project::ProjectStore>,
     dispatched: Arc<parking_lot::Mutex<Vec<IssueRunRow>>>,
     agents: Arc<dyn baybo_store::AgentProfileStore>,
+    blobs: Arc<dyn baybo_store::BlobStore>,
     paths: WorkspacePaths,
     _workspace: tempfile::TempDir,
 }
@@ -66,6 +67,7 @@ async fn fixture() -> Fixture {
         manager: ProjectManager::new(
             Arc::clone(&store.project),
             Arc::clone(&store.agent_profile),
+            Arc::clone(&store.blob),
             paths.clone(),
             Arc::new(baybo_project::NoopProjectEvents),
             {
@@ -74,6 +76,7 @@ async fn fixture() -> Fixture {
             },
         ),
         agents: Arc::clone(&store.agent_profile),
+        blobs: Arc::clone(&store.blob),
         store: Arc::clone(&store.project),
         dispatched,
         paths,
@@ -117,6 +120,7 @@ fn new_issue(title: &str) -> NewIssueRequest {
     NewIssueRequest {
         title: title.to_owned(),
         description: String::new(),
+        attachments: Vec::new(),
         status: IssueStatus::Backlog,
         priority: IssuePriority::None,
         assignee: None,
@@ -733,7 +737,7 @@ async fn a_patch_that_sets_nothing_is_refused() {
 
     let refused = f
         .manager
-        .update_issue(&p.id, 1, IssueActor::User, IssueUpdate::default())
+        .update_issue(&p.id, 1, IssueActor::User, IssueUpdate::default(), None)
         .await
         .expect_err("an empty patch is a caller mistake, not a no-op write");
     assert!(matches!(refused, ProjectError::Invalid { .. }));
@@ -748,6 +752,7 @@ async fn a_patch_that_sets_nothing_is_refused() {
                 blocked_reason: Some(Some("   ".into())),
                 ..Default::default()
             },
+            None,
         )
         .await
         .expect("update");
@@ -817,6 +822,7 @@ async fn in_progress_needs_somebody_on_it() {
                 assignee: Some(Some(dev.clone())),
                 ..Default::default()
             },
+            None,
         )
         .await
         .expect("assign");
@@ -837,6 +843,7 @@ async fn in_progress_needs_somebody_on_it() {
                 assignee: Some(None),
                 ..Default::default()
             },
+            None,
         )
         .await
         .expect_err("unassigning in-flight work recreates the zombie");
@@ -1052,6 +1059,7 @@ async fn assigning_work_already_in_flight_starts_it_and_never_twice() {
                 assignee: Some(Some(other)),
                 ..Default::default()
             },
+            None,
         )
         .await
         .expect("reassign");
@@ -1097,6 +1105,7 @@ async fn reassigning_live_work_starts_the_new_agent() {
                 assignee: Some(Some(other.clone())),
                 ..Default::default()
             },
+            None,
         )
         .await
         .expect("hand it to dev-2");
@@ -1140,6 +1149,7 @@ async fn a_cancelled_card_never_starts_a_run() {
                 cancelled: Some(true),
                 ..Default::default()
             },
+            None,
         )
         .await
         .expect("cancel the card");
@@ -1154,6 +1164,7 @@ async fn a_cancelled_card_never_starts_a_run() {
                 assignee: Some(Some(other)),
                 ..Default::default()
             },
+            None,
         )
         .await
         .expect("reassign the cancelled card");
@@ -1189,6 +1200,7 @@ async fn a_cancelled_card_never_starts_a_run() {
                 cancelled: Some(false),
                 ..Default::default()
             },
+            None,
         )
         .await
         .expect("revive it");
@@ -1201,6 +1213,7 @@ async fn a_cancelled_card_never_starts_a_run() {
                 assignee: Some(Some(dev)),
                 ..Default::default()
             },
+            None,
         )
         .await
         .expect("hand it back to somebody");
@@ -1241,6 +1254,7 @@ async fn retry_is_refused_on_a_card_the_board_has_finished_with() {
                 cancelled: Some(true),
                 ..Default::default()
             },
+            None,
         )
         .await
         .expect("cancel the card");
@@ -1301,6 +1315,7 @@ async fn the_retry_refusals_say_exactly_what_the_button_predicts() {
                 cancelled: Some(true),
                 ..Default::default()
             },
+            None,
         )
         .await
         .expect("cancel");
@@ -1335,6 +1350,7 @@ async fn the_retry_refusals_say_exactly_what_the_button_predicts() {
                 cancelled: Some(true),
                 ..Default::default()
             },
+            None,
         )
         .await
         .expect("cancel");
@@ -1394,7 +1410,7 @@ async fn an_agent_that_moved_off_baybo_stops_getting_runs() {
     );
 
     f.manager
-        .comment(&p.id, 1, IssueActor::User, "@dev-1 pick this back up")
+        .comment(&p.id, 1, IssueActor::User, "@dev-1 pick this back up", &[])
         .await
         .expect("comment");
     assert!(
@@ -1502,6 +1518,7 @@ async fn the_boot_sweep_calls_off_a_run_whose_card_was_cancelled() {
                 cancelled: Some(true),
                 ..Default::default()
             },
+            None,
         )
         .await
         .expect("cancel it while the process is down");
@@ -1545,6 +1562,7 @@ async fn the_boot_sweep_calls_off_a_run_whose_card_was_cancelled() {
                 cancelled: Some(false),
                 ..Default::default()
             },
+            None,
         )
         .await
         .expect("revive");
@@ -1557,6 +1575,7 @@ async fn the_boot_sweep_calls_off_a_run_whose_card_was_cancelled() {
                 assignee: Some(Some(other)),
                 ..Default::default()
             },
+            None,
         )
         .await
         .expect("staff it again");
@@ -1604,6 +1623,7 @@ async fn a_run_called_off_after_it_started_is_not_told_it_never_did() {
                 cancelled: Some(true),
                 ..Default::default()
             },
+            None,
         )
         .await
         .expect("cancel #1");
@@ -1921,6 +1941,7 @@ async fn a_board_that_cannot_read_its_holds_still_reports_what_it_re_drove() {
     let manager = ProjectManager::new(
         Arc::new(HeldRunsUnreadable(Arc::clone(&f.store))),
         Arc::clone(&f.agents),
+        Arc::clone(&f.blobs),
         f.paths.clone(),
         Arc::new(baybo_project::NoopProjectEvents),
         {
@@ -1969,6 +1990,7 @@ async fn the_board_writes_its_own_history() {
                 assignee: Some(Some(dev.clone())),
                 ..Default::default()
             },
+            None,
         )
         .await
         .expect("assign");
@@ -1988,6 +2010,7 @@ async fn the_board_writes_its_own_history() {
             issue.number,
             IssueActor::User,
             "  check the reconnect path  ",
+            &[],
         )
         .await
         .expect("comment");
@@ -2005,7 +2028,7 @@ async fn the_board_writes_its_own_history() {
     assert!(
         matches!(
             &timeline[3].body,
-            baybo_store::project::IssueEventBody::Comment { text } if text == "check the reconnect path"
+            baybo_store::project::IssueEventBody::Comment { text, .. } if text == "check the reconnect path"
         ),
         "a comment is stored trimmed: {:?}",
         timeline[3].body
@@ -2029,7 +2052,7 @@ async fn an_empty_comment_is_refused_rather_than_recorded() {
 
     let err = f
         .manager
-        .comment(&project.id, issue.number, IssueActor::User, "   \n  ")
+        .comment(&project.id, issue.number, IssueActor::User, "   \n  ", &[])
         .await
         .expect_err("whitespace is not a comment");
     assert!(matches!(err, ProjectError::Invalid { .. }), "{err:?}");
@@ -2068,7 +2091,13 @@ async fn a_comment_on_live_work_starts_a_run_and_a_comment_on_parked_work_does_n
         .expect("create parked")
         .into_issue();
     f.manager
-        .comment(&project.id, parked.number, IssueActor::User, "some day")
+        .comment(
+            &project.id,
+            parked.number,
+            IssueActor::User,
+            "some day",
+            &[],
+        )
         .await
         .expect("comment");
     assert!(
@@ -2091,7 +2120,13 @@ async fn a_comment_on_live_work_starts_a_run_and_a_comment_on_parked_work_does_n
         .expect("create live")
         .into_issue();
     f.manager
-        .comment(&project.id, live.number, IssueActor::User, "have a look")
+        .comment(
+            &project.id,
+            live.number,
+            IssueActor::User,
+            "have a look",
+            &[],
+        )
         .await
         .expect("comment");
 
@@ -2129,7 +2164,7 @@ async fn a_comment_while_a_run_is_queued_does_not_start_a_second() {
 
     for text in ["also this", "and this"] {
         f.manager
-            .comment(&project.id, issue.number, IssueActor::User, text)
+            .comment(&project.id, issue.number, IssueActor::User, text, &[])
             .await
             .expect("comment");
     }
@@ -2228,6 +2263,7 @@ async fn a_worktree_holding_uncommitted_work_survives_being_finished() {
                 cancelled: Some(true),
                 ..Default::default()
             },
+            None,
         )
         .await
         .expect("cancel it");
@@ -2572,6 +2608,7 @@ async fn a_released_hold_never_lands_on_a_card_the_board_has_finished_with() {
                         cancelled: Some(true),
                         ..Default::default()
                     },
+                    None,
                 )
                 .await
                 .expect("cancel it");
@@ -2788,6 +2825,7 @@ async fn finishing_a_stage_wakes_the_parent_once() {
                 title: Some("review the design (again)".into()),
                 ..IssueUpdate::default()
             },
+            None,
         )
         .await
         .expect("retitle");
@@ -2841,6 +2879,7 @@ async fn a_cancelled_parent_is_not_woken_by_its_last_step() {
                 cancelled: Some(true),
                 ..Default::default()
             },
+            None,
         )
         .await
         .expect("call the plan off");
@@ -2928,6 +2967,7 @@ async fn a_cancelled_step_opens_its_stage() {
                 cancelled: Some(true),
                 ..IssueUpdate::default()
             },
+            None,
         )
         .await
         .expect("cancel #3");
@@ -3025,6 +3065,7 @@ async fn a_later_stage_finishing_early_is_announced_but_wakes_nobody() {
                 title: Some("write the release note (final)".into()),
                 ..IssueUpdate::default()
             },
+            None,
         )
         .await
         .expect("retitle the finished step");
@@ -3090,6 +3131,7 @@ async fn sub_issues_do_not_nest() {
                 parent: Some(Some(child.id.clone())),
                 ..IssueUpdate::default()
             },
+            None,
         )
         .await
         .expect_err("a parent cannot become a child");
@@ -3108,6 +3150,7 @@ async fn sub_issues_do_not_nest() {
                 parent: Some(Some(child.id.clone())),
                 ..IssueUpdate::default()
             },
+            None,
         )
         .await
         .expect_err("self-parenting");
@@ -3152,6 +3195,7 @@ async fn a_parent_from_another_board_does_not_resolve() {
                 parent: Some(Some(outsider.id)),
                 ..IssueUpdate::default()
             },
+            None,
         )
         .await
         .expect_err("another board's card is not a parent here");
@@ -3185,6 +3229,7 @@ async fn a_move_must_name_its_whole_destination_column() {
                 cancelled: Some(true),
                 ..IssueUpdate::default()
             },
+            None,
         )
         .await
         .expect("cancel");
@@ -3364,6 +3409,7 @@ async fn a_failed_run_stops_counting_once_somebody_acts_on_it() {
                 blocked_reason: Some(Some("waiting on upstream".to_owned())),
                 ..IssueUpdate::default()
             },
+            None,
         )
         .await
         .expect("block");
@@ -3384,6 +3430,7 @@ async fn a_failed_run_stops_counting_once_somebody_acts_on_it() {
                 blocked_reason: Some(None),
                 ..IssueUpdate::default()
             },
+            None,
         )
         .await
         .expect("unblock");
@@ -3468,7 +3515,7 @@ async fn a_boards_unread_count_is_what_happened_since_you_looked() {
         .into_issue();
 
     f.manager
-        .comment(&p.id, 1, IssueActor::User, "any progress?")
+        .comment(&p.id, 1, IssueActor::User, "any progress?", &[])
         .await
         .expect("comment");
     assert!(
@@ -3486,6 +3533,7 @@ async fn a_boards_unread_count_is_what_happened_since_you_looked() {
             1,
             IssueActor::Agent(dev.clone()),
             "blocked on the API",
+            &[],
         )
         .await
         .expect("comment");
@@ -3586,7 +3634,13 @@ async fn a_mention_on_an_unowned_card_hands_it_over() {
     f.dispatched.lock().clear();
 
     f.manager
-        .comment(&p.id, 1, IssueActor::User, "@dev-1 could you take this?")
+        .comment(
+            &p.id,
+            1,
+            IssueActor::User,
+            "@dev-1 could you take this?",
+            &[],
+        )
         .await
         .expect("comment");
 
@@ -3636,6 +3690,7 @@ async fn a_mention_hands_the_card_over_in_the_commenters_name() {
             1,
             IssueActor::Agent(lead.clone()),
             "@dev-1 take this",
+            &[],
         )
         .await
         .expect("comment");
@@ -3697,7 +3752,7 @@ async fn a_mention_never_takes_a_card_off_its_owner() {
         .into_issue();
 
     f.manager
-        .comment(&p.id, 1, IssueActor::User, "@dev-2 what do you think?")
+        .comment(&p.id, 1, IssueActor::User, "@dev-2 what do you think?", &[])
         .await
         .expect("comment");
     let issue = f.manager.get_issue(&p.id, 1).await.expect("issue");
@@ -3720,7 +3775,7 @@ async fn a_mention_of_a_stranger_still_records_the_comment() {
         .into_issue();
 
     f.manager
-        .comment(&p.id, 1, IssueActor::User, "@nobody-here please look")
+        .comment(&p.id, 1, IssueActor::User, "@nobody-here please look", &[])
         .await
         .expect("a typo in a mention is not a reason to lose the comment");
     assert!(
@@ -3737,7 +3792,7 @@ async fn a_mention_of_a_stranger_still_records_the_comment() {
             .await
             .expect("timeline")
             .iter()
-            .any(|e| matches!(&e.body, baybo_store::project::IssueEventBody::Comment { text } if text.contains("nobody-here")))
+            .any(|e| matches!(&e.body, baybo_store::project::IssueEventBody::Comment { text, .. } if text.contains("nobody-here")))
     );
 }
 
@@ -4092,7 +4147,7 @@ async fn a_comment_the_run_was_already_told_about_does_not_start_a_second_one() 
     // Said while the run was still queued — a held run can sit there a day.
     // The dispatcher reads the brief afterwards, so this is in it.
     f.manager
-        .comment(&p.id, 1, IssueActor::User, "start with the CSV path")
+        .comment(&p.id, 1, IssueActor::User, "start with the CSV path", &[])
         .await
         .expect("comment");
     f.dispatched.lock().clear();
@@ -4138,7 +4193,13 @@ async fn a_comment_left_while_the_checkout_was_being_cut_is_still_picked_up() {
     // the ordering is the clock's to prove, not the scheduler's.
     let briefed_at = Utc::now() - chrono::Duration::milliseconds(1);
     f.manager
-        .comment(&p.id, 1, IssueActor::User, "also handle the empty case")
+        .comment(
+            &p.id,
+            1,
+            IssueActor::User,
+            "also handle the empty case",
+            &[],
+        )
         .await
         .expect("comment");
     f.dispatched.lock().clear();
@@ -4175,6 +4236,7 @@ async fn a_run_does_not_wake_itself_on_its_own_progress_note() {
             1,
             IssueActor::Agent(dev.clone()),
             "halfway through the importer",
+            &[],
         )
         .await
         .expect("the run says where it has got to");
@@ -4192,7 +4254,13 @@ async fn somebody_elses_comment_during_a_run_does_start_a_follow_up() {
     let (f, p, _dev, run) = card_being_worked().await;
 
     f.manager
-        .comment(&p.id, 1, IssueActor::User, "also handle the empty case")
+        .comment(
+            &p.id,
+            1,
+            IssueActor::User,
+            "also handle the empty case",
+            &[],
+        )
         .await
         .expect("comment");
 
@@ -4208,7 +4276,7 @@ async fn a_run_somebody_stopped_is_left_stopped() {
     let (f, p, _dev, run) = card_being_worked().await;
 
     f.manager
-        .comment(&p.id, 1, IssueActor::User, "actually, stop")
+        .comment(&p.id, 1, IssueActor::User, "actually, stop", &[])
         .await
         .expect("comment");
 
@@ -4346,6 +4414,7 @@ async fn a_run_whose_checkout_cannot_be_cut_says_so_instead_of_shimmering() {
     let (dispatch, _rx) = baybo_project::dispatch::build(baybo_project::DispatchConfig {
         store: Arc::clone(&f.store),
         agents: Arc::clone(&f.agents),
+        blobs: Arc::clone(&f.blobs),
         events: Arc::new(RecordingEvents(tx)),
         paths: f.paths.clone(),
         user_id: "owner".to_owned(),
@@ -4400,7 +4469,7 @@ async fn a_brief_names_who_said_each_thing_on_the_card() {
         (IssueActor::Agent(dev), "picking this up"),
     ] {
         f.manager
-            .comment(&p.id, 1, actor, text)
+            .comment(&p.id, 1, actor, text, &[])
             .await
             .expect("comment");
     }
@@ -4410,6 +4479,7 @@ async fn a_brief_names_who_said_each_thing_on_the_card() {
     let (dispatch, mut prepared) = baybo_project::dispatch::build(baybo_project::DispatchConfig {
         store: Arc::clone(&f.store),
         agents: Arc::clone(&f.agents),
+        blobs: Arc::clone(&f.blobs),
         events: Arc::new(RecordingEvents(tx)),
         paths: f.paths.clone(),
         user_id: "owner".to_owned(),
@@ -4711,6 +4781,7 @@ async fn the_board_does_not_start_work_somebody_stopped() {
                 blocked_reason: Some(Some("waiting on the operator".into())),
                 ..IssueUpdate::default()
             },
+            None,
         )
         .await
         .expect("block");
@@ -4742,6 +4813,7 @@ async fn the_board_does_not_start_work_somebody_stopped() {
                 blocked_reason: Some(None),
                 ..IssueUpdate::default()
             },
+            None,
         )
         .await
         .expect("unblock");
@@ -4864,6 +4936,7 @@ async fn staffing_a_card_the_lead_was_asked_about_starts_it() {
                 assignee: Some(Some(dev.clone())),
                 ..IssueUpdate::default()
             },
+            None,
         )
         .await
         .expect("assign");
@@ -5087,4 +5160,191 @@ async fn the_sweep_drives_on_its_first_tick_and_stops_when_told_to() {
         .await
         .expect("the driver stops on the shutdown signal rather than outliving it")
         .expect("no panic");
+}
+
+/// Store bytes and get the id that names them, the way an operator's upload
+/// or an agent's `PutBlob` would.
+async fn stored_blob(f: &Fixture, bytes: &[u8], mime: &str) -> String {
+    f.blobs
+        .put(bytes, mime, None)
+        .await
+        .expect("blob store accepts the bytes")
+        .blob_id
+}
+
+#[tokio::test]
+async fn a_card_carries_its_files_and_the_server_reads_their_type_off_the_store() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(new_project("Files"))
+        .await
+        .expect("create");
+    let blob = stored_blob(&f, b"\x89PNG\r\n\x1a\n", "image/png").await;
+
+    let issue = f
+        .manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                attachments: vec![baybo_project::AttachmentRequest {
+                    blob_id: blob.clone(),
+                    filename: Some("mockup.png".to_owned()),
+                }],
+                ..new_issue("Redesign the header")
+            },
+        )
+        .await
+        .expect("create")
+        .into_issue();
+
+    assert_eq!(issue.attachments.len(), 1);
+    let stored = &issue.attachments[0];
+    assert_eq!(stored.blob_id, blob);
+    assert_eq!(stored.filename.as_deref(), Some("mockup.png"));
+    assert_eq!(
+        stored.mime_type, "image/png",
+        "the type comes off the store, not off anything a caller said"
+    );
+    assert_eq!(stored.size, 8, "and so does the size");
+
+    // And it survives the round trip through sqlite's JSON column.
+    let read = f
+        .manager
+        .get_issue(&p.id, issue.number)
+        .await
+        .expect("read back");
+    assert_eq!(read.attachments, issue.attachments);
+}
+
+#[tokio::test]
+async fn a_file_the_store_never_saw_is_refused_rather_than_recorded() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(new_project("Files"))
+        .await
+        .expect("create");
+
+    let refused = f
+        .manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                attachments: vec![baybo_project::AttachmentRequest {
+                    // Well-formed and never stored: a card must not be opened
+                    // pointing at bytes nobody has.
+                    blob_id: format!("sha256:{}.{}", "a".repeat(64), "b".repeat(32)),
+                    filename: Some("ghost.pdf".to_owned()),
+                }],
+                ..new_issue("Ghost")
+            },
+        )
+        .await;
+
+    assert!(
+        matches!(
+            refused,
+            Err(baybo_project::ProjectError::Invalid { field, .. }) if field == "attachments"
+        ),
+        "expected a refusal naming the field, got {refused:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_comment_may_be_nothing_but_a_file_but_never_nothing_at_all() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(new_project("Files"))
+        .await
+        .expect("create");
+    let issue = f
+        .manager
+        .create_issue(&p.id, IssueActor::User, new_issue("Look at this"))
+        .await
+        .expect("create")
+        .into_issue();
+    let blob = stored_blob(&f, b"screenshot", "image/png").await;
+
+    let entry = f
+        .manager
+        .comment(
+            &p.id,
+            issue.number,
+            IssueActor::User,
+            "",
+            &[baybo_project::AttachmentRequest {
+                blob_id: blob.clone(),
+                filename: Some("here.png".to_owned()),
+            }],
+        )
+        .await
+        .expect("\"here\" plus a picture is a real thing to say on a card");
+
+    match entry.body {
+        baybo_store::project::IssueEventBody::Comment { text, attachments } => {
+            assert_eq!(text, "");
+            assert_eq!(attachments.len(), 1);
+            assert_eq!(attachments[0].blob_id, blob);
+            assert_eq!(attachments[0].mime_type, "image/png");
+        }
+        other => panic!("expected a comment, got {other:?}"),
+    }
+
+    let empty = f
+        .manager
+        .comment(&p.id, issue.number, IssueActor::User, "   ", &[])
+        .await;
+    assert!(
+        matches!(
+            empty,
+            Err(baybo_project::ProjectError::Invalid { field, .. }) if field == "text"
+        ),
+        "no text and no files is still nothing to say, got {empty:?}"
+    );
+}
+
+#[tokio::test]
+async fn removing_a_cards_last_file_is_a_write_and_not_a_no_op() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(new_project("Files"))
+        .await
+        .expect("create");
+    let blob = stored_blob(&f, b"doc", "application/pdf").await;
+    let issue = f
+        .manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                attachments: vec![baybo_project::AttachmentRequest {
+                    blob_id: blob,
+                    filename: Some("spec.pdf".to_owned()),
+                }],
+                ..new_issue("Spec")
+            },
+        )
+        .await
+        .expect("create")
+        .into_issue();
+
+    // An empty list is a *present* value meaning "no files" — a patch that
+    // otherwise sets nothing, which the emptiness guard must not reject.
+    let after = f
+        .manager
+        .update_issue(
+            &p.id,
+            issue.number,
+            IssueActor::User,
+            IssueUpdate::default(),
+            Some(&[]),
+        )
+        .await
+        .expect("clearing the list is a real edit");
+    assert!(after.attachments.is_empty());
 }

@@ -5,6 +5,7 @@ import type { FeedEntry, IssueEvent } from './timelineModel';
 
 export type CreateIssueRequest = components['schemas']['CreateIssueRequest'];
 export type UpdateIssueRequest = components['schemas']['UpdateIssueRequest'];
+export type IssueAttachmentRequest = components['schemas']['IssueAttachmentRequest'];
 
 export type Outcome<T> =
   | { kind: 'ok'; value: T }
@@ -313,11 +314,12 @@ export async function postComment(
   projectId: string,
   number: number,
   text: string,
+  attachments: IssueAttachmentRequest[] = [],
 ): Promise<Outcome<IssueEvent>> {
   try {
     const { data, error, response } = await client.POST(
       '/v1/projects/{project_id}/issues/{number}/comments',
-      { params: { path: { project_id: projectId, number } }, body: { text } },
+      { params: { path: { project_id: projectId, number } }, body: { text, attachments } },
     );
     if (response.status === 401) return { kind: 'unauthorized' };
     if (error !== undefined) return failure(response.status, error.error);

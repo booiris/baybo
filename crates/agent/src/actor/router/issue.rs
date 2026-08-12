@@ -87,6 +87,7 @@ impl Router {
             run_id: run_id.clone(),
             number: event.run.number,
             brief: event.brief.clone(),
+            files: event.files.clone(),
             checkout: checkout.to_string_lossy().into_owned(),
         };
         match mailbox.send(trigger).await {
@@ -408,6 +409,7 @@ mod tests {
                         assignee: Some(Some(to.clone())),
                         ..Default::default()
                     },
+                    None,
                 )
                 .await
                 .expect("reassign");
@@ -427,6 +429,7 @@ mod tests {
         let projects = Arc::new(ProjectManager::new(
             Arc::clone(&store.project),
             Arc::clone(&store.agent_profile),
+            Arc::clone(&store.blob),
             paths,
             Arc::new(baybo_project::NoopProjectEvents),
             {
@@ -465,6 +468,7 @@ mod tests {
                 NewIssueRequest {
                     title: "wire the importer".to_owned(),
                     description: String::new(),
+                    attachments: Vec::new(),
                     status: IssueStatus::InProgress,
                     priority: IssuePriority::None,
                     assignee: Some(agent),
@@ -553,6 +557,7 @@ mod tests {
             briefed_at: run.created_at,
             run: run.clone(),
             brief: "wire the importer".to_owned(),
+            files: Vec::new(),
             checkout: PathBuf::from("/tmp/does-not-matter"),
             user_id: "u1".to_owned(),
             channel: ChannelType::tui(),
@@ -582,6 +587,7 @@ mod tests {
                 1,
                 IssueActor::User,
                 "also handle the empty case",
+                &[],
             )
             .await
             .expect("comment");
@@ -871,6 +877,7 @@ mod tests {
                 1,
                 IssueActor::User,
                 "start with the CSV path",
+                &[],
             )
             .await
             .expect("comment");
@@ -937,6 +944,7 @@ mod tests {
                 1,
                 IssueActor::User,
                 "start with the CSV path",
+                &[],
             )
             .await
             .expect("comment");
@@ -957,6 +965,7 @@ mod tests {
                 1,
                 IssueActor::User,
                 "also handle the empty case",
+                &[],
             )
             .await
             .expect("comment");

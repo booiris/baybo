@@ -4693,6 +4693,7 @@ async fn an_issue_run_executes_as_its_own_kind_of_turn() {
             run_id: run_id.clone(),
             number: 7,
             brief: "Fix the WS reconnect storm\n\nThe timer never clears.".into(),
+            files: Vec::new(),
             checkout: "/ws/work/projects/p/7".into(),
         })
         .await

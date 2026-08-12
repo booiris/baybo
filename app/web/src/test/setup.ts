@@ -11,6 +11,14 @@ import { cleanup } from '@testing-library/react';
 // it is the environment that is incomplete, not the component.
 Element.prototype.scrollIntoView = () => {};
 
+// Same story: jsdom keeps no object-URL store, so `createObjectURL` is simply
+// absent and a component that previews a picked file throws where a browser
+// would show a thumbnail. The counter makes each URL distinct, which is what
+// a test asserting "this one was revoked" needs.
+let objectUrls = 0;
+URL.createObjectURL = () => `blob:test/${String(++objectUrls)}`;
+URL.revokeObjectURL = () => {};
+
 afterEach(() => {
   cleanup();
 });

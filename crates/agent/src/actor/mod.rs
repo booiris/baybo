@@ -107,6 +107,12 @@ pub enum AgentMessage {
         run_id: baybo_model::IssueRunId,
         number: i64,
         brief: String,
+        /// The card's files, already resolved into the blocks a model is
+        /// handed — probed on the dispatcher's own task, because the probes
+        /// need a `BlobStore` this crate does not have and are a whole-payload
+        /// parse this loop must not run. Apart from `brief` because the prompt
+        /// framing wraps the prose and nothing else.
+        files: Vec<baybo_model::MediaBlock>,
         /// The worktree cut for this issue. Carried to the model because
         /// the Bash tool's description is rendered once per process and
         /// names the workspace work dir — nothing else would tell the run
@@ -486,11 +492,12 @@ impl AgentActor {
                 run_id,
                 number,
                 brief,
+                files,
                 checkout,
             } => {
                 debug!(session_id = %session_id, %run_id, number, "received issue run");
                 if let Err(e) = self
-                    .dispatch_issue_run(&run_id, number, &brief, &checkout)
+                    .dispatch_issue_run(&run_id, number, &brief, files, &checkout)
                     .await
                 {
                     // A cancelled run is not a failed one — the operator
@@ -665,15 +672,18 @@ impl AgentActor {
         run_id: &baybo_model::IssueRunId,
         number: i64,
         brief: &str,
+        files: Vec<baybo_model::MediaBlock>,
         checkout: &str,
     ) -> anyhow::Result<()> {
         let turn_input = TurnInput::IssueRun {
             run_id: run_id.clone(),
-            brief: vec![baybo_model::ContentBlock::Text(brief.to_string())],
+            // The turn records the brief as written; the context gets the
+            // framed spelling of the same thing. Same ordering either way.
+            brief: baybo_model::prose_with_media(brief.to_string(), &files),
         };
         self.volatile
             .agent_loop
-            .append_issue_brief(number, checkout, brief)
+            .append_issue_brief(number, checkout, brief, &files)
             .await?;
         self.run_agent_loop(turn_input, None, None, None, None, None)
             .await?;

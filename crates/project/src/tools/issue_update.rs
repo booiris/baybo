@@ -149,6 +149,10 @@ Two of these do more than edit a row:
         let update = IssueUpdate {
             title: p.title,
             description: p.description,
+            // The manager fills this from blob ids, and this tool takes
+            // none: an agent hangs files on a comment, where the timeline
+            // records who put them there and why.
+            attachments: None,
             parent,
             stage: p.stage,
             priority: p.priority.as_deref().map(parse_priority).transpose()?,
@@ -172,7 +176,7 @@ Two of these do more than edit a row:
                 .map_err(project_err)?
         } else {
             self.manager
-                .update_issue(&project, p.number, actor(ctx), update)
+                .update_issue(&project, p.number, actor(ctx), update, None)
                 .await
                 .map_err(project_err)?
         };

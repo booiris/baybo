@@ -3,6 +3,7 @@
 
 mod actors;
 mod approvals;
+mod attachments;
 mod brief;
 mod budget;
 mod comments;
@@ -20,6 +21,7 @@ pub mod tools;
 pub mod worktree;
 
 pub use approvals::TimelineApprovalGate;
+pub use attachments::{AttachmentRequest, MAX_ISSUE_ATTACHMENTS};
 pub use comments::CommentDelivery;
 pub use dispatch::{DispatchConfig, IssueRunEvent};
 pub use error::{ProjectError, Result};

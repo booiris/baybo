@@ -161,6 +161,7 @@ mod tests {
             number: 1,
             title: "Wire it".into(),
             description: String::new(),
+            attachments: Vec::new(),
             status,
             priority: baybo_store::project::IssuePriority::None,
             assignee: agent("dev-1"),

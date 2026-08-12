@@ -103,6 +103,11 @@ Putting an issue straight into `in_progress` with an assignee starts that agent 
                 NewIssueRequest {
                     title: p.title,
                     description: p.description,
+                    // Not exposed on this tool: an agent opening a card
+                    // describes work, and a file it wants on that card is
+                    // one `IssueComment` away with the timeline entry to
+                    // say why it is there.
+                    attachments: Vec::new(),
                     status: p
                         .status
                         .as_deref()

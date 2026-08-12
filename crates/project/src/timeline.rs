@@ -49,6 +49,7 @@ mod tests {
             number: 1,
             title: "Wire it".into(),
             description: String::new(),
+            attachments: Vec::new(),
             status: IssueStatus::Backlog,
             priority: IssuePriority::None,
             assignee: None,

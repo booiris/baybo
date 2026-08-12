@@ -2205,15 +2205,21 @@ impl AgentLoop {
     /// row. Seeds the system prompt first so a fresh cron session never lands
     /// the fire ahead of `messages[0]`.
     /// Append a board issue's brief as the run's input row.
+    /// Append the card a run was handed. `files` are the card's own
+    /// attachments, already resolved into blocks: they follow the framed
+    /// prose rather than being wrapped by it, so the framing's contract —
+    /// that the instruction is the tail of the *text* — still holds with a
+    /// picture in the message.
     pub async fn append_issue_brief(
         &mut self,
         number: i64,
         checkout: &str,
         brief: &str,
+        files: &[baybo_model::MediaBlock],
     ) -> anyhow::Result<()> {
         self.context_manager.ensure_seeded().await;
         let framed = baybo_context::prompts::issue::frame_issue_brief(number, checkout, brief);
-        let msg = ChatMessage::issue_brief(vec![ContentBlock::Text(framed)]);
+        let msg = ChatMessage::issue_brief(baybo_model::prose_with_media(framed, files));
         self.context_manager.append(&msg).await;
         Ok(())
     }

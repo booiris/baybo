@@ -623,6 +623,7 @@ pub async fn build_managers(
         baybo_project::dispatch::build(baybo_project::DispatchConfig {
             store: stores.project.clone(),
             agents: stores.agent_profile.clone(),
+            blobs: stores.blob.clone(),
             events: Arc::clone(&project_events),
             paths: baybo_workspace::WorkspacePaths::new(workspace_paths.root().to_path_buf()),
             user_id: baybo_gateway::auth::OWNER_USER_ID.to_string(),
@@ -632,6 +633,7 @@ pub async fn build_managers(
     let project_manager = Arc::new(baybo_project::ProjectManager::new(
         stores.project.clone(),
         stores.agent_profile.clone(),
+        stores.blob.clone(),
         baybo_workspace::WorkspacePaths::new(workspace_paths.root().to_path_buf()),
         project_events,
         issue_dispatch,

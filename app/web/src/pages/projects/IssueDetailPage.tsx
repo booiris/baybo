@@ -21,6 +21,7 @@ import {
   moveIssue,
   patchIssue,
   postComment,
+  type IssueAttachmentRequest,
 } from './api';
 import {
   COLUMN_LABEL,
@@ -35,6 +36,14 @@ import {
   type IssuePriority,
   type IssueStatus,
 } from './boardModel';
+import {
+  AttachButton,
+  AttachmentTray,
+  MAX_ISSUE_ATTACHMENTS,
+  anyUploading,
+  readyRequests,
+  useAttachmentDraft,
+} from './Attachments';
 import { MarkdownEditor } from './MarkdownEditor';
 import { Avatar } from './Avatar';
 import { useTeamPortraits } from './portrait';
@@ -301,11 +310,22 @@ export function IssueDetailPage() {
 
   useBoardStream(projectId, number, bumpRefresh);
 
+  // What the URL asks for right now, readable from inside a promise that was
+  // started before it changed.
+  const currentCard = useRef(`${projectId}:${String(number)}`);
+  currentCard.current = `${projectId}:${String(number)}`;
+
   const apply = useCallback(
     async (body: Parameters<typeof patchIssue>[3]) => {
       setSaving(true);
+      const wrote = `${projectId}:${String(number)}`;
       const outcome = await patchIssue(client, projectId, number, body);
       setSaving(false);
+      // The page does not unmount when the route parameter changes, so a save
+      // for the card you just left can answer while the next one is on screen
+      // — and the row it carries would replace it, leaving the previous card's
+      // title and description sitting at the new card's URL until reload.
+      if (wrote !== `${currentCard.current}`) return;
       if (outcome.kind === 'unauthorized') {
         logout();
         return;
@@ -410,9 +430,9 @@ export function IssueDetailPage() {
   }, [client, logout, number, projectId]);
 
   const comment = useCallback(
-    async (text: string) => {
+    async (text: string, attachments: IssueAttachmentRequest[]) => {
       setSaving(true);
-      const outcome = await postComment(client, projectId, number, text);
+      const outcome = await postComment(client, projectId, number, text, attachments);
       setSaving(false);
       if (outcome.kind === 'unauthorized') {
         logout();
@@ -497,6 +517,55 @@ export function IssueDetailPage() {
     },
     [apply, issue],
   );
+
+  // A file lands on the card the moment its upload finishes, rather than
+  // waiting for the description editor to blur: the two are edited
+  // independently, and an operator who attaches a screenshot and navigates
+  // away should not lose it because they never clicked into the prose.
+  //
+  // The draft is seeded **once per card**, not from every `issue` the page
+  // re-reads: `apply` sets a fresh `issue` on each save, and re-adopting
+  // from that would wipe an upload still in flight beside it.
+  const files = useAttachmentDraft(projectId);
+  const adopt = files.adopt;
+  const seededFor = files.seededFor;
+  const card = `${projectId}:${String(number)}`;
+  // The card the loaded row IS, which is not always the one the URL asks
+  // for: this page does not unmount when the route parameter changes, so
+  // between `#7` becoming `#8` and the fetch answering, `issue` is still
+  // #7. Seeding then would hand #8's draft #7's files, and the save below
+  // would write them onto #8 — a probe caught exactly that.
+  const loaded = issue == null ? null : `${issue.project_id}:${String(issue.number)}`;
+  useEffect(() => {
+    if (issue == null || loaded !== card || seededFor === card) return;
+    adopt(card, issue.attachments ?? []);
+  }, [card, loaded, issue, adopt, seededFor]);
+
+  // What the draft settled on, and what the card says, as one comparable
+  // string each — a save is owed exactly when they differ. Driving it off
+  // the *ids* rather than off an add/remove callback is what makes an
+  // upload that lands seconds after the pick save itself.
+  const draftRequests = readyRequests(files.attachments);
+  const draftIds = draftRequests.map((a) => a.blob_id).join(',');
+  const savedIds = (issue?.attachments ?? []).map((a) => a.blob_id).join(',');
+  const settling = anyUploading(files.attachments);
+  const pending = useRef(draftRequests);
+  pending.current = draftRequests;
+  useEffect(() => {
+    // `seededFor` is the guard, and it is state rather than a ref for the
+    // reason `useAttachmentDraft` spells out: on the commit where the card
+    // first loads, a ref would already say "seeded" while the draft still
+    // read empty — and this would save that emptiness over the card's files.
+    if (issue == null || loaded !== card || seededFor !== card || settling || draftIds === savedIds)
+      return;
+    // From the ref, so the saved list keeps each file's NAME — rebuilding it
+    // from `draftIds` would send bare blob ids and rename every file on the
+    // card to nothing on the first unrelated save.
+    void apply({ attachments: pending.current });
+    // Keyed on the ids rather than on the request objects: `readyRequests`
+    // builds a fresh array every render, so depending on it would save on
+    // every keystroke anywhere on the page.
+  }, [card, loaded, draftIds, savedIds, settling, issue, apply, seededFor]);
 
   const moreRoot = useRef<HTMLDivElement | null>(null);
 
@@ -701,6 +770,30 @@ export function IssueDetailPage() {
             }}
           />
 
+          {/* Under the editor, not inside it. Milkdown owns a ProseMirror
+              document, and a blob-backed image is not something its markdown
+              serialiser could round-trip — the files are the card's, beside
+              its prose. Paste and drop are wired on the wrapper so dropping a
+              screenshot anywhere over the description works. */}
+          {/* The files first, the control that adds them under them — the
+              same order the composers use. `gap` on a flex column and a tray
+              that renders null when empty means a card with no files pays no
+              height for the arrangement. */}
+          <div
+            className="mt-2 flex shrink-0 flex-col gap-2"
+            onPaste={files.onPaste}
+            onDrop={files.onDrop}
+            onDragOver={files.onDragOver}
+          >
+            <AttachmentTray attachments={files.attachments} onRemove={files.remove} />
+            <AttachButton
+              subtle
+              onPick={files.add}
+              disabled={saving}
+              full={files.attachments.length >= MAX_ISSUE_ATTACHMENTS}
+            />
+          </div>
+
           <SubIssues
             projectId={projectId}
             children={children}
@@ -720,8 +813,8 @@ export function IssueDetailPage() {
             issue={issue}
             runs={runs}
             busy={saving}
-            onComment={(text) => {
-              void comment(text);
+            onComment={(text, attachments) => {
+              void comment(text, attachments);
             }}
             team={agents}
             portrait={portrait}

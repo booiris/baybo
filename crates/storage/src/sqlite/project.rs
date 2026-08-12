@@ -7,9 +7,10 @@ use rusqlite::OptionalExtension;
 use super::SqlitePool;
 use baybo_store::StorageError;
 use baybo_store::project::{
-    AttentionCounts, BoardActivity, IssueActor, IssueEventRow, IssuePriority, IssueRow,
-    IssueRunRow, IssueStatus, IssueUpdate, NewIssue, NewIssueEvent, NewIssueRun, ProjectRow,
-    ProjectStore, ProjectUpdate, Result, RunSpend, RunStatus, RunTrigger, SettledRunFacts, Spend,
+    AttentionCounts, BoardActivity, IssueActor, IssueAttachment, IssueEventRow, IssuePriority,
+    IssueRow, IssueRunRow, IssueStatus, IssueUpdate, NewIssue, NewIssueEvent, NewIssueRun,
+    ProjectRow, ProjectStore, ProjectUpdate, Result, RunSpend, RunStatus, RunTrigger,
+    SettledRunFacts, Spend,
 };
 
 pub struct SqliteProjectStore {
@@ -79,7 +80,7 @@ const PROJECT_COLUMNS: &str = "id, name, description, workdir, daily_budget_micr
 
 const ISSUE_COLUMNS: &str = "id, project_id, number, title, description, status, priority, \
      assignee, position, blocked_reason, branch, parent_issue_id, stage, source_key, \
-     cancelled_at, created_at, updated_at";
+     cancelled_at, created_at, updated_at, attachments";
 
 const RUN_COLUMNS: &str = "id, issue_id, project_id, number, agent_id, session_id, trigger, \
      status, attempt, error, created_at, started_at, settled_at";
@@ -187,6 +188,7 @@ type RawIssue = (
     Option<i64>,
     i64,
     i64,
+    String,
 );
 
 fn read_raw_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawProject> {
@@ -223,7 +225,13 @@ fn read_raw_issue(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawIssue> {
         row.get(14)?,
         row.get(15)?,
         row.get(16)?,
+        row.get(17)?,
     ))
+}
+
+fn encode_attachments(attachments: &[IssueAttachment]) -> Result<String> {
+    serde_json::to_string(attachments)
+        .map_err(|e| StorageError::Storage(format!("issues.attachments could not encode: {e}")))
 }
 
 fn ts(column: &str, us: i64) -> Result<chrono::DateTime<chrono::Utc>> {
@@ -291,6 +299,7 @@ fn issue_from_raw(raw: RawIssue) -> Result<IssueRow> {
         cancelled_at,
         created_at,
         updated_at,
+        attachments,
     ) = raw;
     Ok(IssueRow {
         id: IssueId::from(id),
@@ -299,6 +308,12 @@ fn issue_from_raw(raw: RawIssue) -> Result<IssueRow> {
         number,
         title,
         description,
+        // Fail-closed like every other field here, and safe to be: every
+        // field `IssueAttachment` grows after this ships must carry
+        // `#[serde(default)]`, exactly as the comment body's does — the
+        // discipline is what keeps an old row readable, not leniency here.
+        attachments: serde_json::from_str(&attachments)
+            .map_err(|e| StorageError::Storage(format!("issues.attachments is not a list: {e}")))?,
         status: IssueStatus::parse(&status)
             .ok_or_else(|| StorageError::Storage(format!("issues.status unknown: {status}")))?,
         priority: IssuePriority::parse(&priority)
@@ -536,6 +551,7 @@ impl ProjectStore for SqliteProjectStore {
             .map(|id| id.as_str().to_string());
         let stage = new.stage;
         let source_key = new.source_key.clone();
+        let attachments = encode_attachments(&new.attachments)?;
         let created_at = super::time::to_us(new.created_at);
         let raw = self
             .pool
@@ -556,9 +572,9 @@ impl ProjectStore for SqliteProjectStore {
                 tx.execute(
                     "INSERT INTO issues (id, project_id, number, title, description, status, \
                      priority, assignee, position, blocked_reason, parent_issue_id, stage, \
-                     source_key, cancelled_at, created_at, updated_at) \
+                     source_key, cancelled_at, created_at, updated_at, attachments) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?11, ?13, NULL, \
-                             ?12, ?12)",
+                             ?12, ?12, ?14)",
                     rusqlite::params![
                         id,
                         project,
@@ -572,7 +588,8 @@ impl ProjectStore for SqliteProjectStore {
                         parent_issue_id,
                         stage,
                         created_at,
-                        source_key
+                        source_key,
+                        attachments
                     ],
                 )?;
                 let raw = tx.query_row(
@@ -603,6 +620,16 @@ impl ProjectStore for SqliteProjectStore {
             .interact("issues.update", move |conn| {
                 let title = update.title.clone();
                 let description = update.description.clone();
+                // Encoded here rather than beside `description` because a
+                // full replace and a COALESCE are different questions: the
+                // absent case must leave the column alone, and `'[]'` is a
+                // perfectly good *present* value meaning "no files".
+                let attachments = update
+                    .attachments
+                    .as_deref()
+                    .map(encode_attachments)
+                    .transpose()
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
                 let priority = update.priority.map(|p| p.as_str());
                 let (set_blocked, blocked) = match &update.blocked_reason {
                     Some(value) => (true, value.clone()),
@@ -632,6 +659,7 @@ impl ProjectStore for SqliteProjectStore {
                     "UPDATE issues SET \
                        title          = COALESCE(?3, title), \
                        description    = COALESCE(?4, description), \
+                       attachments    = COALESCE(?16, attachments), \
                        priority       = COALESCE(?5, priority), \
                        assignee       = CASE WHEN ?6 THEN ?7 ELSE assignee END, \
                        blocked_reason = CASE WHEN ?8 THEN ?9 ELSE blocked_reason END, \
@@ -655,7 +683,8 @@ impl ProjectStore for SqliteProjectStore {
                         now,
                         set_parent,
                         parent,
-                        stage
+                        stage,
+                        attachments
                     ],
                 )?)
             })
@@ -1405,6 +1434,7 @@ mod tests {
             project_id: project.clone(),
             title: title.to_owned(),
             description: String::new(),
+            attachments: Vec::new(),
             status,
             priority: IssuePriority::None,
             assignee: None,
@@ -1439,6 +1469,7 @@ mod tests {
             IssueEventBody::Opened,
             IssueEventBody::Comment {
                 text: "start with the store".into(),
+                attachments: Vec::new(),
             },
             IssueEventBody::Moved {
                 from: IssueStatus::Backlog,
@@ -1531,6 +1562,7 @@ mod tests {
                 IssueActor::User,
                 IssueEventBody::Comment {
                     text: "before".into(),
+                    attachments: Vec::new(),
                 },
             ))
             .await
@@ -1541,6 +1573,7 @@ mod tests {
                 IssueActor::User,
                 IssueEventBody::Comment {
                     text: "after".into(),
+                    attachments: Vec::new(),
                 },
             ))
             .await
@@ -2058,6 +2091,7 @@ mod tests {
             project_id: p.id.clone(),
             title: title.to_owned(),
             description: String::new(),
+            attachments: Vec::new(),
             status: IssueStatus::Backlog,
             priority: IssuePriority::None,
             assignee: Some(AgentProfileId::parse("dev-1").unwrap()),

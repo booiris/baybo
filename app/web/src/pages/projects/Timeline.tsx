@@ -2,6 +2,16 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { RiSendPlane2Line } from 'react-icons/ri';
 
 import { MarkdownBody } from '../ChatPage';
+import type { IssueAttachmentRequest } from './api';
+import {
+  AttachButton,
+  AttachmentList,
+  AttachmentTray,
+  MAX_ISSUE_ATTACHMENTS,
+  anyUploading,
+  readyRequests,
+  useAttachmentDraft,
+} from './Attachments';
 import { Avatar } from './Avatar';
 import { caretPoint, type CaretPoint } from './caret';
 import { generatedPortrait, type Portrait } from './portrait';
@@ -70,6 +80,7 @@ function Comment({
   portrait: Portrait;
 }) {
   const text = event.body.kind === 'comment' ? event.body.text : '';
+  const attachments = event.body.kind === 'comment' ? (event.body.attachments ?? []) : [];
   // The operator's own words carry the chat page's amber user bubble; an
   // agent's report is surface. Rendering both identically made a timeline
   // where you could not tell what you had asked for from what came back.
@@ -101,7 +112,16 @@ function Comment({
             mine ? 'bg-brand/60' : 'bg-surface'
           }`}
         >
-          <MarkdownBody text={text} />
+          {/* Files sit under the prose rather than inside it: an attachment
+              is not markdown, and `react-markdown` blanks any `src` outside
+              its own scheme allowlist — an embedded blob ref renders as
+              nothing at all, silently. */}
+          {text.length > 0 ? <MarkdownBody text={text} /> : null}
+          {attachments.length > 0 ? (
+            <div className={text.length > 0 ? 'mt-2' : ''}>
+              <AttachmentList attachments={attachments} />
+            </div>
+          ) : null}
         </div>
       </div>
     </li>
@@ -228,7 +248,7 @@ export function Timeline({
   events: IssueEvent[];
   issue: Issue;
   runs: IssueRun[];
-  onComment: (text: string) => void;
+  onComment: (text: string, attachments: IssueAttachmentRequest[]) => void;
   onResolveApproval: (callId: string, decision: 'approve' | 'approve_always' | 'deny') => void;
   team?: Agent[];
   /// Resolved faces from the page that owns the roster. Left alone, every
@@ -237,7 +257,17 @@ export function Timeline({
   portrait?: Portrait;
   busy: boolean;
 }) {
+  const files = useAttachmentDraft(issue.project_id);
   const [draft, setDraft] = useState('');
+  // A card change does not unmount this pane, so both halves of a half-written
+  // comment would otherwise follow the operator to the next card — and the
+  // attachment half would be POSTED there on the next send, silently putting
+  // one card's screenshot on another.
+  const clearDraft = files.clear;
+  useEffect(() => {
+    setDraft('');
+    clearDraft();
+  }, [issue.project_id, issue.number, clearDraft]);
   const [caret, setCaret] = useState(0);
   // Esc closes the picker without closing anything else. Cleared whenever the
   // caret moves onto a different mention, so dismissing one does not silence
@@ -291,11 +321,18 @@ export function Timeline({
     });
   }
   function send() {
-    onComment(draft.trim());
+    onComment(draft.trim(), readyRequests(files.attachments));
     setDraft('');
+    files.clear();
   }
   const now = Date.now();
   const trimmed = draft.trim();
+  // A comment may be nothing but files — "here, look at this" under a
+  // screenshot is a real thing to say, and the server accepts it. What it
+  // may not be is empty, or still uploading.
+  const uploading = anyUploading(files.attachments);
+  const sendable =
+    !busy && !uploading && (trimmed.length > 0 || readyRequests(files.attachments).length > 0);
   // Approvals render where they happened rather than hoisted above the
   // history: a decision pulled out of its run loses the run it belonged to.
   const asks = approvalAsks(events);
@@ -373,6 +410,13 @@ export function Timeline({
           className="pointer-events-none absolute -inset-x-2 -bottom-5 -top-16 bg-linear-to-t from-surface from-45% to-transparent"
         />
         <div className="relative border-2 border-black rounded-2xl bg-white shadow-brutal">
+          {/* Above the box, where the chat composer puts its own: what you
+              have attached belongs with what you have typed, not down among
+              the controls that act on it. Renders nothing when empty, so an
+              ordinary comment loses no height to it. */}
+          <div className="px-3 pt-2.5 empty:hidden">
+            <AttachmentTray attachments={files.attachments} onRemove={files.remove} />
+          </div>
           <div className="relative">
             <textarea
               ref={box}
@@ -387,6 +431,9 @@ export function Timeline({
               onSelect={(event) => {
                 setCaret(event.currentTarget.selectionStart);
               }}
+              onPaste={files.onPaste}
+              onDrop={files.onDrop}
+              onDragOver={files.onDragOver}
               onKeyDown={(event) => {
                 if (event.key === 'Escape' && candidates.length > 0) {
                   event.preventDefault();
@@ -398,7 +445,7 @@ export function Timeline({
                   complete(candidates[0].handle);
                   return;
                 }
-                if (event.key === 'Enter' && !event.shiftKey && trimmed.length > 0) {
+                if (event.key === 'Enter' && !event.shiftKey && sendable) {
                   event.preventDefault();
                   send();
                 }
@@ -438,12 +485,18 @@ export function Timeline({
               </ul>
             )}
           </div>
-          <div className="flex items-center justify-end gap-2 px-2.5 pb-2 pt-0.5">
+          <div className="flex items-center gap-2 px-2.5 pb-2 pt-0.5">
+            <AttachButton
+              onPick={files.add}
+              disabled={busy}
+              full={files.attachments.length >= MAX_ISSUE_ATTACHMENTS}
+            />
+            <span className="flex-1" />
             <button
               type="button"
               aria-label="Comment"
               title={hint}
-              disabled={trimmed.length === 0 || busy}
+              disabled={!sendable}
               onClick={send}
               className="shrink-0 h-8 w-8 flex items-center justify-center bg-brand text-ink border-2 border-black rounded-full shadow-brutal-xs hover:bg-brand-hover active:translate-x-[1px] active:translate-y-[1px] active:shadow-none disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
             >

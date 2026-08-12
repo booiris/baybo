@@ -41,9 +41,9 @@ pub use governance::{ArtifactSource, ExtensionKind, ExtensionManifest, TrustLeve
 pub use ids::{CostRecordId, ParallelGroup, SessionId, SpanId, StepId, TaskId, TurnId};
 pub use llm_entry_name::LlmEntryName;
 pub use message::{
-    BlobRef, ChatMessage, ContentBlock, MessageMetadata, MessageSource, Role, SHA256_PREFIX,
-    TOOL_OUTPUT_CLOSE_PREFIX, TOOL_OUTPUT_OPEN_PREFIX, ThinkingContent, ToolResultMeta,
-    blob_content_digest,
+    BlobRef, ChatMessage, ContentBlock, MediaBlock, MediaKind, MessageMetadata, MessageSource,
+    Role, SHA256_PREFIX, TOOL_OUTPUT_CLOSE_PREFIX, TOOL_OUTPUT_OPEN_PREFIX, ThinkingContent,
+    ToolResultMeta, blob_content_digest, prose_with_media,
 };
 pub use model_tier::ModelTier;
 pub use money::{MicroUsd, usd_decimal_option};

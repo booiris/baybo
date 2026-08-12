@@ -6,6 +6,13 @@ import { botttsFace } from '../../components/botttsFace';
 import { Timeline } from './Timeline';
 import type { Agent, Issue } from './boardModel';
 
+// The composer uploads attachments, so it reads the operator's bearer. These
+// tests are about what the timeline renders, not about the network.
+vi.mock('../../api/auth', () => ({
+  useAdminClient: () => ({}),
+  useAuth: () => ({ token: 't', baseUrl: 'http://gw', logout: vi.fn() }),
+}));
+
 const TEAM: Agent[] = [
   {
     id: '01JDEV',
@@ -135,7 +142,7 @@ describe('Timeline', () => {
     await userEvent.type(box, '   look at the retry path   ');
     await userEvent.click(screen.getByRole('button', { name: 'Comment' }));
 
-    expect(onComment).toHaveBeenCalledWith('look at the retry path');
+    expect(onComment).toHaveBeenCalledWith('look at the retry path', []);
     expect(box).toHaveValue('');
   });
 

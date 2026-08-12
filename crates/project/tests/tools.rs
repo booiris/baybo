@@ -25,6 +25,7 @@ async fn fixture() -> Fixture {
     let manager = Arc::new(ProjectManager::new(
         Arc::clone(&store.project),
         Arc::clone(&store.agent_profile),
+        Arc::clone(&store.blob),
         paths.clone(),
         Arc::new(baybo_project::NoopProjectEvents),
         baybo_project::no_dispatch(),
@@ -108,6 +109,7 @@ async fn every_board_tool_is_scoped_to_its_own_session() {
             baybo_project::NewIssueRequest {
                 title: "somebody else's card".to_owned(),
                 description: String::new(),
+                attachments: Vec::new(),
                 status: baybo_store::project::IssueStatus::Backlog,
                 priority: baybo_store::project::IssuePriority::None,
                 assignee: None,
@@ -464,6 +466,7 @@ async fn a_timeline_never_renders_another_boards_handle() {
             baybo_store::project::IssueActor::Agent(their_lead.clone()),
             baybo_store::project::IssueEventBody::Comment {
                 text: "passing through".to_owned(),
+                attachments: Vec::new(),
             },
         )
         .await;
@@ -633,6 +636,7 @@ mod approvals {
         let manager = Arc::new(ProjectManager::new(
             Arc::clone(&store.project),
             Arc::clone(&store.agent_profile),
+            Arc::clone(&store.blob),
             paths,
             Arc::new(baybo_project::NoopProjectEvents),
             baybo_project::no_dispatch(),
@@ -655,6 +659,7 @@ mod approvals {
                 baybo_project::NewIssueRequest {
                     title: "needs a hand".to_owned(),
                     description: String::new(),
+                    attachments: Vec::new(),
                     status: baybo_store::project::IssueStatus::InProgress,
                     priority: baybo_store::project::IssuePriority::None,
                     assignee: Some(lead.clone()),
@@ -732,6 +737,7 @@ mod approvals {
         let manager = Arc::new(ProjectManager::new(
             Arc::clone(&store.project),
             Arc::clone(&store.agent_profile),
+            Arc::clone(&store.blob),
             paths,
             Arc::new(baybo_project::NoopProjectEvents),
             baybo_project::no_dispatch(),

@@ -40,6 +40,25 @@ pub fn deck_uploader_identity(card_id: &str) -> String {
     format!("{DECK_UPLOADER_PREFIX}{card_id}")
 }
 
+/// Uploader-identity prefix stamped on every blob a kanban board owns: the
+/// files an operator hangs on a card's description or on one of its
+/// comments.
+///
+/// **Nothing reclaims these yet, and that is not why they are stamped.**
+/// `uploader_identity` is written once at upload and the index over it is
+/// partial, so a blob stored without one can never be attributed later —
+/// while a board has no hard delete at all today ([`crate::project`] has no
+/// `delete`, and archiving does not cascade), so there is no lifecycle
+/// event a reclaimer could hang off. Stamping now is what keeps that door
+/// open; claiming it buys anything today would be false.
+pub const PROJECT_UPLOADER_PREFIX: &str = "project:";
+
+/// The `uploader_identity` for a blob hung on a card of project
+/// `project_id`. See [`PROJECT_UPLOADER_PREFIX`].
+pub fn project_uploader_identity(project_id: &str) -> String {
+    format!("{PROJECT_UPLOADER_PREFIX}{project_id}")
+}
+
 /// Algorithm prefix on every minted `BlobRef::blob_id`. Re-exported from
 /// [`baybo_model`] (its single source of truth, next to `BlobRef`) so existing
 /// `baybo_store::SHA256_PREFIX` / `baybo_store::blob::SHA256_PREFIX` callers are

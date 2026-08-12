@@ -137,6 +137,7 @@ mod tests {
             number,
             title: format!("card {number}"),
             description: String::new(),
+            attachments: Vec::new(),
             status,
             priority: IssuePriority::None,
             assignee: Some(AgentProfileId::parse("dev-1".to_owned()).expect("agent")),

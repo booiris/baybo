@@ -4965,6 +4965,13 @@
                             ],
                             "description": "The agent on it, if any. In Progress always has one."
                           },
+                          "attachments": {
+                            "type": "array",
+                            "items": {
+                              "$ref": "#/components/schemas/IssueAttachmentDto"
+                            },
+                            "description": "Files hung on the description."
+                          },
                           "blocked_reason": {
                             "type": [
                               "string",
@@ -8116,6 +8123,13 @@
             ],
             "description": "The agent to put on it. Required when opening straight into\nIn Progress."
           },
+          "attachments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/IssueAttachmentRequest"
+            },
+            "description": "Files to hang on the description, uploaded to `POST /v1/blobs`\nfirst. Refused if a blob id names nothing the store has."
+          },
           "description": {
             "type": "string"
           },
@@ -8658,6 +8672,54 @@
           }
         }
       },
+      "IssueAttachmentDto": {
+        "type": "object",
+        "description": "A file on a card — on its description, or on one comment.\n\nNo `kind`: which of image / file this is falls out of `mime_type`, and\nthe client is the only side that has to make that call (it decides\nbetween a thumbnail and a chip). A stored discriminator would be a\nsecond answer that could disagree with the bytes.",
+        "required": [
+          "blob_id",
+          "mime_type",
+          "size"
+        ],
+        "properties": {
+          "blob_id": {
+            "type": "string",
+            "description": "Capability id from `POST /v1/blobs`. Possession is the read right,\nso this is as sensitive as the file it names."
+          },
+          "filename": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mime_type": {
+            "type": "string"
+          },
+          "size": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "IssueAttachmentRequest": {
+        "type": "object",
+        "description": "What a client may say about a file it is hanging on a card: which blob,\nand what to call it. The type and the size are read off the store — see\n`baybo_project::AttachmentRequest`, which this maps onto.",
+        "required": [
+          "blob_id"
+        ],
+        "properties": {
+          "blob_id": {
+            "type": "string",
+            "description": "Full blob id from `POST /v1/blobs`."
+          },
+          "filename": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
       "IssueDto": {
         "type": "object",
         "required": [
@@ -8679,6 +8741,13 @@
               "null"
             ],
             "description": "The agent on it, if any. In Progress always has one."
+          },
+          "attachments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/IssueAttachmentDto"
+            },
+            "description": "Files hung on the description."
           },
           "blocked_reason": {
             "type": [
@@ -8770,6 +8839,12 @@
               "kind"
             ],
             "properties": {
+              "attachments": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/IssueAttachmentDto"
+                }
+              },
               "kind": {
                 "type": "string",
                 "enum": [
@@ -9863,8 +9938,15 @@
           "text"
         ],
         "properties": {
+          "attachments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/IssueAttachmentRequest"
+            }
+          },
           "text": {
-            "type": "string"
+            "type": "string",
+            "description": "May be empty when `attachments` is not: \"here, look at this\" with a\nscreenshot under it is a real thing to say on a card."
           }
         }
       },
@@ -10750,6 +10832,16 @@
               "null"
             ],
             "description": "An explicit `null` unassigns; an absent key leaves the assignee."
+          },
+          "attachments": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/IssueAttachmentRequest"
+            },
+            "description": "Full replace of the description's files: the list to end up with.\nAn absent key leaves them alone, `[]` removes them all."
           },
           "blocked_reason": {
             "type": [

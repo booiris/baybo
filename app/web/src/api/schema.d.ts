@@ -2173,6 +2173,11 @@ export interface components {
              *     In Progress.
              */
             assignee?: string | null;
+            /**
+             * @description Files to hang on the description, uploaded to `POST /v1/blobs`
+             *     first. Refused if a blob id names nothing the store has.
+             */
+            attachments?: components["schemas"]["IssueAttachmentRequest"][];
             description?: string;
             /**
              * Format: int64
@@ -2420,9 +2425,40 @@ export interface components {
             handle: string;
             id: string;
         };
+        /**
+         * @description A file on a card — on its description, or on one comment.
+         *
+         *     No `kind`: which of image / file this is falls out of `mime_type`, and
+         *     the client is the only side that has to make that call (it decides
+         *     between a thumbnail and a chip). A stored discriminator would be a
+         *     second answer that could disagree with the bytes.
+         */
+        IssueAttachmentDto: {
+            /**
+             * @description Capability id from `POST /v1/blobs`. Possession is the read right,
+             *     so this is as sensitive as the file it names.
+             */
+            blob_id: string;
+            filename?: string | null;
+            mime_type: string;
+            /** Format: int32 */
+            size: number;
+        };
+        /**
+         * @description What a client may say about a file it is hanging on a card: which blob,
+         *     and what to call it. The type and the size are read off the store — see
+         *     `baybo_project::AttachmentRequest`, which this maps onto.
+         */
+        IssueAttachmentRequest: {
+            /** @description Full blob id from `POST /v1/blobs`. */
+            blob_id: string;
+            filename?: string | null;
+        };
         IssueDto: {
             /** @description The agent on it, if any. In Progress always has one. */
             assignee?: string | null;
+            /** @description Files hung on the description. */
+            attachments?: components["schemas"]["IssueAttachmentDto"][];
             /**
              * @description Why work stopped. A badge on the card — blocked work stays in
              *     whichever column it was in.
@@ -2472,6 +2508,7 @@ export interface components {
         };
         /** @description What one timeline entry says. */
         IssueEventBodyDto: {
+            attachments?: components["schemas"]["IssueAttachmentDto"][];
             /** @enum {string} */
             kind: "comment";
             text: string;
@@ -2913,6 +2950,11 @@ export interface components {
         };
         /** @description A comment being posted. */
         NewCommentBody: {
+            attachments?: components["schemas"]["IssueAttachmentRequest"][];
+            /**
+             * @description May be empty when `attachments` is not: "here, look at this" with a
+             *     screenshot under it is a real thing to say on a card.
+             */
             text: string;
         };
         ProjectDto: {
@@ -3340,6 +3382,11 @@ export interface components {
         UpdateIssueRequest: {
             /** @description An explicit `null` unassigns; an absent key leaves the assignee. */
             assignee?: string | null;
+            /**
+             * @description Full replace of the description's files: the list to end up with.
+             *     An absent key leaves them alone, `[]` removes them all.
+             */
+            attachments?: components["schemas"]["IssueAttachmentRequest"][] | null;
             blocked_reason?: string | null;
             cancelled?: boolean | null;
             description?: string | null;
@@ -7212,6 +7259,8 @@ export interface operations {
                         items: {
                             /** @description The agent on it, if any. In Progress always has one. */
                             assignee?: string | null;
+                            /** @description Files hung on the description. */
+                            attachments?: components["schemas"]["IssueAttachmentDto"][];
                             /**
                              * @description Why work stopped. A badge on the card — blocked work stays in
                              *     whichever column it was in.

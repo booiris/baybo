@@ -886,6 +886,7 @@ async fn a_timeline_names_agents_by_handle_even_after_they_leave() {
             baybo_store::project::IssueActor::Agent(dev.clone()),
             baybo_store::project::IssueEventBody::Comment {
                 text: "on it".to_owned(),
+                attachments: Vec::new(),
             },
         )
         .await;
@@ -958,6 +959,7 @@ async fn a_timeline_will_not_name_an_agent_from_another_board() {
             ),
             baybo_store::project::IssueEventBody::Comment {
                 text: "wrong board".to_owned(),
+                attachments: Vec::new(),
             },
         )
         .await;

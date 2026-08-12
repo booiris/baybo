@@ -3,6 +3,14 @@ import { useEffect, useState } from 'react';
 import { Button } from '../../components/Button';
 import { useAdminClient, useAuth } from '../../api/auth';
 import { createIssue } from './api';
+import {
+  AttachButton,
+  AttachmentTray,
+  MAX_ISSUE_ATTACHMENTS,
+  anyUploading,
+  readyRequests,
+  useAttachmentDraft,
+} from './Attachments';
 import { Avatar } from './Avatar';
 import { Picker } from './Picker';
 import {
@@ -75,16 +83,21 @@ export function CreateIssueModal({
   }, [onClose]);
 
   const picked = agents.find((agent) => agent.id === assignee);
+  const files = useAttachmentDraft(projectId);
+  // A card must not be opened pointing at bytes that are still on their way:
+  // the request carries blob ids, and an id that does not exist yet is a 400.
+  const uploading = anyUploading(files.attachments);
   const needsAssignee = status === 'in_progress' && assignee.length === 0;
   const willEnqueue = status === 'in_progress' && assignee.length > 0;
 
   async function submit() {
-    if (submitting || title.trim().length === 0 || needsAssignee) return;
+    if (submitting || title.trim().length === 0 || needsAssignee || uploading) return;
     setSubmitting(true);
     setError(null);
     const outcome = await createIssue(client, projectId, {
       title,
       description,
+      attachments: readyRequests(files.attachments),
       status,
       priority,
       ...(assignee.length > 0 ? { assignee } : {}),
@@ -102,6 +115,7 @@ export function CreateIssueModal({
     if (keepOpen) {
       setTitle('');
       setDescription('');
+      files.clear();
       return;
     }
     onCreated();
@@ -154,7 +168,11 @@ export function CreateIssueModal({
             onChange={(event) => {
               setDescription(event.target.value);
             }}
+            onPaste={files.onPaste}
+            onDrop={files.onDrop}
+            onDragOver={files.onDragOver}
           />
+          <AttachmentTray attachments={files.attachments} onRemove={files.remove} />
           {/* Status, priority, assignee, parent — the design's order, and the
               board's own vocabulary in each: the status pill's column colour,
               the priority's tone, the assignee's face. */}
@@ -259,6 +277,13 @@ export function CreateIssueModal({
         </div>
 
         <div className="flex items-center gap-3 px-4 py-3 border-t-2 border-black bg-canvas">
+          {/* The attach control the design spec's create-modal footer has
+              always named. Paste and drop reach the same draft. */}
+          <AttachButton
+            onPick={files.add}
+            disabled={submitting}
+            full={files.attachments.length >= MAX_ISSUE_ATTACHMENTS}
+          />
           <label className="flex items-center gap-1.5 font-mono text-[0.66rem] text-ink-soft cursor-pointer">
             <input
               type="checkbox"
@@ -272,12 +297,12 @@ export function CreateIssueModal({
           <Button
             className="ml-auto !px-4 !py-1.5 !text-[0.78rem]"
             variant="primary"
-            disabled={submitting || title.trim().length === 0 || needsAssignee}
+            disabled={submitting || title.trim().length === 0 || needsAssignee || uploading}
             onClick={() => {
               void submit();
             }}
           >
-            {submitting ? 'Creating…' : 'Create issue ⌘↵'}
+            {submitting ? 'Creating…' : uploading ? 'Uploading…' : 'Create issue ⌘↵'}
           </Button>
         </div>
       </div>

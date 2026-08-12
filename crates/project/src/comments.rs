@@ -58,6 +58,7 @@ mod tests {
             number: 1,
             title: "Wire it".into(),
             description: String::new(),
+            attachments: Vec::new(),
             status,
             priority: IssuePriority::None,
             assignee: assigned.then(|| AgentProfileId::parse("dev-1".to_owned()).expect("agent")),

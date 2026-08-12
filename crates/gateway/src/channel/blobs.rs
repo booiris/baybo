@@ -27,7 +27,7 @@ use super::state::WsChannelState;
 use crate::auth::AuthedClient;
 
 pub(crate) use baybo_store::blob::MAX_BLOB_BYTES;
-use baybo_store::blob::deck_uploader_identity;
+use baybo_store::blob::{deck_uploader_identity, project_uploader_identity};
 const DEFAULT_BLOB_MIME: &str = "application/octet-stream";
 const HEADER_CONTENT_SHA256: &str = "x-baybo-content-sha256";
 const DEVICE_UPLOAD_IDENTITY_PREFIX: &str = "device:";
@@ -37,6 +37,13 @@ const DEVICE_UPLOAD_IDENTITY_PREFIX: &str = "device:";
 /// `activePick.cardId` (the shell's port→card map, unforgeable by card JS), and
 /// the identity is a GC/diagnostic marker, never an access-control boundary.
 const HEADER_DECK_CARD: &str = "x-baybo-deck-card";
+
+/// The dashboard uploading a file for a card's description or comment sends
+/// this so the blob is stamped `project:<project_id>` rather than left
+/// unattributed. Trusted exactly like [`HEADER_DECK_CARD`] is, and for the
+/// same reason: the identity is a GC/diagnostic marker, never an access
+/// gate — a wrong value here mislabels a blob and grants nothing.
+const HEADER_PROJECT: &str = "x-baybo-project";
 
 /// Sidecar-supplied originator identity. The sidecar fills these in
 /// from the inbound platform event so the gateway can run the same
@@ -146,6 +153,17 @@ async fn authorize_upload(
     }
 }
 
+/// The `uploader_identity` for an upload that names a board, or `None` for
+/// the ordinary session-scoped upload that names nothing.
+fn project_upload_identity(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(HEADER_PROJECT)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(project_uploader_identity)
+}
+
 /// The `uploader_identity` a device upload is stamped with. A picker upload for
 /// a deck card carries `x-baybo-deck-card: <card_id>` and is stamped
 /// `deck:<card_id>` so card purge reclaims it (see [`HEADER_DECK_CARD`]); every
@@ -183,7 +201,10 @@ async fn upload(
     // session-scoped and bypasses the gate (same as on the WS side).
     let uploader_identity = match authorize_upload(state.pairing.as_ref(), &authed, &headers).await
     {
-        UploadAuth::Bypass => None,
+        // The web dashboard's own uploads land here. They are otherwise
+        // unattributed — which is permanent, since `uploader_identity` is
+        // written once — so a board upload says which board it is for.
+        UploadAuth::Bypass => project_upload_identity(&headers),
         UploadAuth::Approved {
             channel_type,
             bot_id,

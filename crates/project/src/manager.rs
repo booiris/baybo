@@ -9,16 +9,17 @@ use baybo_model::{
     AgentFramework, AgentHandle, AgentProfileId, IssueId, IssueRunId, MAX_PROJECT_NAME_CHARS,
     ProjectId, SessionId, TeamMembership,
 };
-use baybo_store::AgentProfileStore;
 use baybo_store::project::{
     DEFAULT_MAX_PARALLEL_ISSUE_RUNS, IssueActor, IssueEventBody, IssueEventRow, IssuePriority,
     IssueRow, IssueRunRow, IssueStatus, IssueUpdate, NewIssue, NewIssueEvent, ProjectRow,
     ProjectStore, ProjectUpdate, RunStatus, RunTrigger, Spend,
 };
+use baybo_store::{AgentProfileStore, BlobStore};
 use baybo_workspace::WorkspacePaths;
 use chrono::{DateTime, Utc};
 
 use crate::CommentDelivery;
+use crate::attachments::{self, AttachmentRequest};
 use crate::budget::Headroom;
 use crate::error::{ProjectError, Result};
 use crate::events::ProjectEvents;
@@ -200,6 +201,10 @@ pub struct NewProject {
 pub struct NewIssueRequest {
     pub title: String,
     pub description: String,
+    /// Files to hang on the description, by blob id. Resolved against the
+    /// blob store before the row is written, so a card is never opened
+    /// pointing at bytes that are not there.
+    pub attachments: Vec<AttachmentRequest>,
     pub status: IssueStatus,
     pub priority: IssuePriority,
     pub assignee: Option<AgentProfileId>,
@@ -244,6 +249,11 @@ impl Opened {
 pub struct ProjectManager {
     store: Arc<dyn ProjectStore>,
     agents: Arc<dyn AgentProfileStore>,
+    /// Where a card's files live. Held so that "is this a valid
+    /// attachment" is answered *here*, on the path both the operator's
+    /// REST write and an agent's tool call already pass through — rather
+    /// than at each door, which is how two doors get two answers.
+    blobs: Arc<dyn BlobStore>,
     paths: WorkspacePaths,
     /// Where a board change is announced to whoever is watching it.
     events: Arc<dyn ProjectEvents>,
@@ -286,6 +296,7 @@ impl ProjectManager {
     pub fn new(
         store: Arc<dyn ProjectStore>,
         agents: Arc<dyn AgentProfileStore>,
+        blobs: Arc<dyn BlobStore>,
         paths: WorkspacePaths,
         events: Arc<dyn ProjectEvents>,
         dispatch: RunDispatch,
@@ -293,6 +304,7 @@ impl ProjectManager {
         Self {
             store,
             agents,
+            blobs,
             paths,
             events,
             dispatch,
@@ -1013,17 +1025,24 @@ impl ProjectManager {
     }
 
     /// Say something on an issue, and reach whoever should hear it.
+    ///
+    /// A comment may be nothing but files. "Here" with a screenshot under it
+    /// is a real thing to say on a card, and refusing it would push the
+    /// operator into typing a word they do not mean just to get the picture
+    /// delivered.
     pub async fn comment(
         &self,
         project: &ProjectId,
         number: i64,
         actor: IssueActor,
         text: &str,
+        attachments: &[AttachmentRequest],
     ) -> Result<IssueEventRow> {
         self.writable_project(project).await?;
         let issue = self.get_issue(project, number).await?;
         let text = text.trim();
-        if text.is_empty() {
+        let attachments = attachments::resolve(&self.blobs, attachments).await?;
+        if text.is_empty() && attachments.is_empty() {
             return Err(ProjectError::invalid("text", "a comment cannot be empty"));
         }
         let entry = self
@@ -1035,6 +1054,7 @@ impl ProjectManager {
                 actor: actor.clone(),
                 body: IssueEventBody::Comment {
                     text: text.to_owned(),
+                    attachments,
                 },
             })
             .await?;
@@ -1051,6 +1071,7 @@ impl ProjectManager {
                             assignee: Some(Some(assignee)),
                             ..IssueUpdate::default()
                         },
+                        None,
                     )
                     .await
                 {
@@ -1631,6 +1652,7 @@ impl ProjectManager {
     ) -> Result<Opened> {
         self.writable_project(project).await?;
         let title = validate_issue_title(&new.title)?;
+        let attachments = attachments::resolve(&self.blobs, &new.attachments).await?;
         if let Some(assignee) = new.assignee.as_ref() {
             self.validate_assignee(project, assignee).await?;
         }
@@ -1651,6 +1673,7 @@ impl ProjectManager {
                 project_id: project.clone(),
                 title,
                 description: new.description.trim().to_owned(),
+                attachments,
                 status: new.status,
                 priority: new.priority,
                 assignee: new.assignee,
@@ -1686,15 +1709,28 @@ impl ProjectManager {
         Ok(Opened::Created(issue))
     }
 
+    /// Edit a card. `attachments` replaces the description's file list
+    /// wholesale — `Some(&[])` clears it, `None` leaves it alone.
+    ///
+    /// It is a parameter rather than a field on `update` because a caller
+    /// may not name a stored attachment: only blob ids go in, and what
+    /// comes out is whatever [`crate::attachments::resolve`] could vouch
+    /// for. `update.attachments` is this method's own output and is
+    /// overwritten.
     pub async fn update_issue(
         &self,
         project: &ProjectId,
         number: i64,
         actor: IssueActor,
         update: IssueUpdate,
+        attachments: Option<&[AttachmentRequest]>,
     ) -> Result<IssueRow> {
         self.writable_project(project).await?;
-        if update.is_empty() {
+        let attachments = match attachments {
+            Some(requested) => Some(attachments::resolve(&self.blobs, requested).await?),
+            None => None,
+        };
+        if update.is_empty() && attachments.is_none() {
             return Err(ProjectError::invalid("update", "sets no field"));
         }
         if let Some(Some(parent_id)) = update.parent.as_ref() {
@@ -1719,6 +1755,7 @@ impl ProjectManager {
                 .map(validate_issue_title)
                 .transpose()?,
             description: update.description.map(|d| d.trim().to_owned()),
+            attachments,
             blocked_reason: update.blocked_reason.map(|reason| {
                 reason.and_then(|r| {
                     let trimmed = r.trim();

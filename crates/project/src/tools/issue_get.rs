@@ -129,7 +129,25 @@ fn named_agents(entry: &IssueEventRow) -> Vec<AgentProfileId> {
 
 fn narrate(body: &IssueEventBody, known: &[baybo_store::AgentProfileRow]) -> String {
     match body {
-        IssueEventBody::Comment { text } => text.clone(),
+        // The files are named, not dropped: a comment whose whole point was
+        // the screenshot under it would otherwise read as an empty line, and
+        // an operator's file older than this tool's timeline window would be
+        // invisible to the agent that went looking for it.
+        IssueEventBody::Comment { text, attachments } => match attachments.as_slice() {
+            [] => text.clone(),
+            files => {
+                let named = files
+                    .iter()
+                    .map(crate::attachments::describe)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if text.is_empty() {
+                    format!("attached {named}")
+                } else {
+                    format!("{text}\n(attached: {named})")
+                }
+            }
+        },
         IssueEventBody::Opened => "opened the issue".to_owned(),
         IssueEventBody::Moved { from, to } => {
             format!("moved it from {} to {}", from.as_str(), to.as_str())

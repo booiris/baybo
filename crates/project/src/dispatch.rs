@@ -9,14 +9,14 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use baybo_model::ChannelType;
-use baybo_store::AgentProfileStore;
+use baybo_model::{ChannelType, MediaBlock};
 use baybo_store::project::{IssueActor, IssueRunRow, ProjectStore, RunStatus};
+use baybo_store::{AgentProfileStore, BlobStore};
 use baybo_workspace::WorkspacePaths;
 use chrono::{DateTime, Utc};
 use tokio::sync::mpsc;
 
-use crate::brief::{comments_for_brief, issue_brief};
+use crate::brief::{comments_for_brief, issue_brief, issue_brief_media};
 use crate::events::ProjectEvents;
 use crate::manager::RunDispatch;
 use crate::worktree;
@@ -28,7 +28,13 @@ pub struct IssueRunEvent {
     /// The brief the assignee is asked to work on — the card and what has
     /// been said on it, assembled here so the executor never has to read
     /// the board.
+    ///
     pub brief: String,
+    /// The card's files, as the blocks a model is handed — so a run sees a
+    /// mockup rather than reading its filename. Kept apart from
+    /// [`brief`](Self::brief) because the prompt framing wraps the prose
+    /// and nothing else, and typed as media so nothing else can be put here.
+    pub files: Vec<MediaBlock>,
     /// The instant [`brief`](Self::brief) was read off the card.
     ///
     /// The boundary between what this run was told and what it was not, and
@@ -53,6 +59,9 @@ pub struct DispatchConfig {
     /// to. The board's own store: an agent on another project is named by
     /// its id rather than by a handle this board never issued.
     pub agents: Arc<dyn AgentProfileStore>,
+    /// Where a card's files live. The brief resolves them here rather than
+    /// naming blob ids the executor would have to spend.
+    pub blobs: Arc<dyn BlobStore>,
     /// The same hook the manager announces through. A dispatcher settles
     /// the runs it cannot prepare, and a settle nobody hears leaves the
     /// card shimmering — which is the outcome settling here exists to
@@ -72,26 +81,16 @@ const RUN_QUEUE_DEPTH: usize = 64;
 /// board write that produced the next.
 pub fn build(config: DispatchConfig) -> (RunDispatch, mpsc::Receiver<IssueRunEvent>) {
     let (tx, rx) = mpsc::channel(RUN_QUEUE_DEPTH);
-    let DispatchConfig {
-        store,
-        agents,
-        events,
-        paths,
-        user_id,
-        channel,
-    } = config;
+    // One `Arc` for the whole config rather than one per field: every run
+    // clones this into its own task, and the alternative grows another clone
+    // line each time a dispatcher learns to look something up.
+    let config = Arc::new(config);
 
     let dispatch = Arc::new(move |run: IssueRunRow| {
-        let store = Arc::clone(&store);
-        let agents = Arc::clone(&agents);
-        let events = Arc::clone(&events);
+        let config = Arc::clone(&config);
         let tx = tx.clone();
-        let paths = paths.clone();
-        let user_id = user_id.clone();
-        let channel = channel.clone();
         tokio::spawn(async move {
-            if let Some(event) =
-                prepare(&store, &agents, &events, &paths, run, user_id, channel).await
+            if let Some(event) = prepare(&config, run).await
                 && let Err(e) = tx.send(event).await
             {
                 tracing::warn!(error = %e, "issue run could not reach its executor");
@@ -102,15 +101,16 @@ pub fn build(config: DispatchConfig) -> (RunDispatch, mpsc::Receiver<IssueRunEve
     (dispatch, rx)
 }
 
-async fn prepare(
-    store: &Arc<dyn ProjectStore>,
-    agents: &Arc<dyn AgentProfileStore>,
-    events: &Arc<dyn ProjectEvents>,
-    paths: &WorkspacePaths,
-    run: IssueRunRow,
-    user_id: String,
-    channel: ChannelType,
-) -> Option<IssueRunEvent> {
+async fn prepare(config: &DispatchConfig, run: IssueRunRow) -> Option<IssueRunEvent> {
+    let DispatchConfig {
+        store,
+        agents,
+        blobs,
+        events,
+        paths,
+        user_id,
+        channel,
+    } = config;
     // The brief is read at dispatch, not at enqueue: a comment left while
     // the run was queued is part of what it should work on.
     let issue = match store.get_issue(&run.project_id, run.number).await {
@@ -130,6 +130,7 @@ async fn prepare(
     let briefed_at = Utc::now();
     let said = comments_for_brief(store, agents, &run).await;
     let brief = issue_brief(&issue, &said);
+    let files = issue_brief_media(blobs, &issue, &said).await;
 
     let checkout = match worktree::prepare_for_issue(store, paths, &issue).await {
         Ok(root) => root,
@@ -158,9 +159,10 @@ async fn prepare(
     Some(IssueRunEvent {
         run,
         brief,
+        files,
         briefed_at,
         checkout,
-        user_id,
-        channel,
+        user_id: user_id.clone(),
+        channel: channel.clone(),
     })
 }
