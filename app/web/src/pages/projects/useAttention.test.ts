@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  attentionElsewhere,
   attentionFor,
   attentionSummary,
-  boardsNeedingAttention,
+  needsAttention,
   type ProjectAttention,
 } from './useAttention';
 
@@ -19,14 +20,27 @@ function board(overrides: Partial<ProjectAttention> = {}): ProjectAttention {
   };
 }
 
-describe('boardsNeedingAttention', () => {
-  it('counts boards, not the things on them', () => {
+describe('needsAttention', () => {
+  it('is a yes or a no, never a tally the rail cannot discharge', () => {
     const boards = [
       board({ approvals: 3, held: 2 }),
       board({ project_id: '01JB', name: 'Beta', failed: 4 }),
     ];
-    expect(boardsNeedingAttention(boards)).toBe(2);
-    expect(boardsNeedingAttention([])).toBe(0);
+    expect(needsAttention(boards)).toBe(true);
+    expect(needsAttention([])).toBe(false);
+  });
+});
+
+describe('attentionElsewhere', () => {
+  it('ignores the board the operator is already on', () => {
+    const boards = [board({ unread: 2 })];
+    expect(attentionElsewhere(boards, '01JA')).toBe(false);
+    expect(attentionElsewhere(boards, '01JB')).toBe(true);
+  });
+
+  it('counts every board when none is open', () => {
+    expect(attentionElsewhere([board({ held: 1 })], null)).toBe(true);
+    expect(attentionElsewhere([], null)).toBe(false);
   });
 });
 

@@ -1889,7 +1889,9 @@ forwards_everything_else! {
     list_children(parent: &IssueId) -> StoreResult<Vec<IssueRow>>;
     hold_run(id: &IssueRunId) -> StoreResult<bool>;
     release_run(id: &IssueRunId) -> StoreResult<bool>;
-    mark_project_read(id: &ProjectId, at: DateTime<Utc>) -> StoreResult<bool>;
+    mark_issue_read(issue: &IssueId, at: DateTime<Utc>) -> StoreResult<bool>;
+    card_signals(project: &ProjectId)
+        -> StoreResult<std::collections::HashMap<IssueId, baybo_store::project::CardSignals>>;
     set_project_archived(id: &ProjectId, archived: bool) -> StoreResult<bool>;
     list_issues(project: &ProjectId) -> StoreResult<Vec<IssueRow>>;
     get_issue(project: &ProjectId, number: i64) -> StoreResult<Option<IssueRow>>;
@@ -2344,6 +2346,92 @@ async fn a_board_over_budget_records_the_work_it_is_not_doing() {
         held.body
     );
     assert_eq!(held.actor, IssueActor::System);
+}
+
+/// The sweep that settles a hold on a dead card used to sit *below* both of
+/// the gates that stop a board — `release_holds` returns early on an
+/// exhausted budget, and `promotions` returns early on `parallelism == 0`.
+/// So the two deliberate ways to pause a board also paused the only thing
+/// that could clear a hold the operator had already cancelled, and the
+/// board's badge stayed lit on a row nothing would ever start.
+#[tokio::test]
+async fn a_hold_on_a_cancelled_card_is_called_off_even_on_a_stopped_board() {
+    let f = fixture().await;
+    let project = f
+        .manager
+        .create_project(NewProject {
+            daily_budget: Some(baybo_model::MicroUsd::ZERO),
+            ..new_project("Paused and skint")
+        })
+        .await
+        .expect("p");
+    let dev = seed_agent(&f, &project.id, "dev-1", AgentFramework::Baybo).await;
+    let issue = f
+        .manager
+        .create_issue(
+            &project.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev),
+                ..new_issue("called off after it was held")
+            },
+        )
+        .await
+        .expect("create")
+        .into_issue();
+
+    assert_eq!(
+        f.manager.attention(&[]).await.expect("attention")[0].1.held,
+        1
+    );
+
+    f.manager
+        .update_issue(
+            &project.id,
+            issue.number,
+            IssueActor::User,
+            IssueUpdate {
+                cancelled: Some(true),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("cancel the card");
+
+    // Both gates shut: the budget is spent, and the board starts nothing on
+    // its own.
+    f.manager
+        .update_project(
+            &project.id,
+            ProjectUpdate {
+                name: project.name.clone(),
+                description: String::new(),
+                daily_budget: Some(baybo_model::MicroUsd::ZERO),
+                max_parallel_issue_runs: 0,
+            },
+        )
+        .await
+        .expect("stop the board");
+
+    f.manager.drive(&project.id).await;
+
+    let runs = f
+        .manager
+        .list_runs(&project.id, issue.number)
+        .await
+        .expect("runs");
+    assert_eq!(runs[0].status, RunStatus::Cancelled);
+    assert!(
+        f.manager
+            .attention(&[])
+            .await
+            .expect("attention")
+            .iter()
+            .all(|(_, c)| c.held == 0),
+        "a hold nothing will ever start is not work waiting for a slot"
+    );
 }
 
 #[tokio::test]
@@ -3552,7 +3640,10 @@ async fn a_boards_unread_count_is_what_happened_since_you_looked() {
         2
     );
 
-    f.manager.mark_read(&p.id).await.expect("mark read");
+    f.manager
+        .mark_issue_read(&p.id, 1)
+        .await
+        .expect("mark read");
     assert!(
         f.manager
             .attention(&[])
@@ -3571,8 +3662,11 @@ async fn the_boards_own_traffic_is_never_unread() {
         .await
         .expect("p");
     let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
-    f.manager.mark_read(&p.id).await.expect("mark read");
 
+    // No read stamp anywhere in this test on purpose: a card nobody has
+    // opened has no cursor, so every event on it is a candidate. What keeps
+    // the count at zero is the predicate, not a cursor placed ahead of the
+    // traffic.
     f.manager
         .create_issue(
             &p.id,
@@ -3599,6 +3693,240 @@ async fn the_boards_own_traffic_is_never_unread() {
             .iter()
             .all(|(_, c)| c.unread == 0),
         "run and column traffic is not something waiting on a person"
+    );
+}
+
+/// The whole point of moving the cursor onto the card: reading the question
+/// asked on one card must not silence the one asked on another. The board
+/// cursor this replaced could only clear both or neither.
+#[tokio::test]
+async fn reading_one_card_leaves_every_other_cards_count_alone() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(new_project("Two questions"))
+        .await
+        .expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    for title in ["first", "second"] {
+        f.manager
+            .create_issue(
+                &p.id,
+                IssueActor::User,
+                NewIssueRequest {
+                    assignee: Some(dev.clone()),
+                    status: IssueStatus::Todo,
+                    ..new_issue(title)
+                },
+            )
+            .await
+            .expect("create");
+    }
+    for number in [1, 2] {
+        f.manager
+            .comment(
+                &p.id,
+                number,
+                IssueActor::Agent(dev.clone()),
+                "which way?",
+                &[],
+            )
+            .await
+            .expect("comment");
+    }
+
+    let signals = f.manager.board_cards(&p.id).await.expect("board");
+    let unread = |number: i64| {
+        let row = signals
+            .rows
+            .iter()
+            .find(|row| row.number == number)
+            .expect("row");
+        signals.signals(&row.id).unread
+    };
+    assert_eq!(unread(1), 1);
+    assert_eq!(unread(2), 1);
+    assert_eq!(
+        f.manager.attention(&[]).await.expect("attention")[0]
+            .1
+            .unread,
+        2,
+        "the board's count is the sum of its cards'"
+    );
+
+    f.manager
+        .mark_issue_read(&p.id, 1)
+        .await
+        .expect("mark read");
+
+    let signals = f.manager.board_cards(&p.id).await.expect("board");
+    let unread = |number: i64| {
+        let row = signals
+            .rows
+            .iter()
+            .find(|row| row.number == number)
+            .expect("row");
+        signals.signals(&row.id).unread
+    };
+    assert_eq!(unread(1), 0);
+    assert_eq!(unread(2), 1, "#2 was never opened");
+    assert_eq!(
+        f.manager.attention(&[]).await.expect("attention")[0]
+            .1
+            .unread,
+        1
+    );
+}
+
+/// The operator's own drag into Review used to make their own board
+/// announce itself back at them: the `moved` arm carried no actor filter
+/// while the `comment` arm did.
+#[tokio::test]
+async fn your_own_drag_into_review_is_not_news_to_you() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(new_project("Tidying up"))
+        .await
+        .expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                assignee: Some(dev.clone()),
+                status: IssueStatus::Todo,
+                ..new_issue("mine to file")
+            },
+        )
+        .await
+        .expect("create");
+
+    f.manager
+        .move_issue(&p.id, 1, IssueActor::User, IssueStatus::Review, &[1])
+        .await
+        .expect("file it myself");
+    assert!(
+        f.manager
+            .attention(&[])
+            .await
+            .expect("attention")
+            .iter()
+            .all(|(_, c)| c.unread == 0),
+        "you filed it; nobody is handing it back to you"
+    );
+
+    // Back out of Review first: `move_issue` to the column a card is
+    // already in writes no `Moved` row, so re-filing it as the agent would
+    // otherwise test nothing.
+    f.manager
+        .move_issue(&p.id, 1, IssueActor::User, IssueStatus::Todo, &[1])
+        .await
+        .expect("take it back");
+    f.manager
+        .move_issue(&p.id, 1, IssueActor::Agent(dev), IssueStatus::Review, &[1])
+        .await
+        .expect("handed back");
+    assert_eq!(
+        f.manager.attention(&[]).await.expect("attention")[0]
+            .1
+            .unread,
+        1,
+        "an agent handing it back is"
+    );
+}
+
+/// A rail dot reading "1 failed" always has a card admitting to it: the
+/// count is the card's own predicate AND "you have not looked since". It can
+/// therefore go quiet while the card still wears its badge — and never the
+/// reverse, which is the reading that would send an operator to a board
+/// where every card says zero.
+#[tokio::test]
+async fn a_failed_run_marks_its_card_and_the_board_together() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(new_project("Failures"))
+        .await
+        .expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    let issue = f
+        .manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                assignee: Some(dev.clone()),
+                status: IssueStatus::InProgress,
+                ..new_issue("will fail")
+            },
+        )
+        .await
+        .expect("create")
+        .into_issue();
+
+    let board = f.manager.board_cards(&p.id).await.expect("board");
+    assert!(!board.signals(&issue.id).last_run_failed);
+
+    let run = f
+        .manager
+        .list_runs(&p.id, issue.number)
+        .await
+        .expect("runs")[0]
+        .id
+        .clone();
+    f.store_settle(&run, RunStatus::Failed).await;
+
+    let board = f.manager.board_cards(&p.id).await.expect("board");
+    assert!(board.signals(&issue.id).last_run_failed);
+    assert_eq!(
+        f.manager.attention(&[]).await.expect("attention")[0]
+            .1
+            .failed,
+        1
+    );
+
+    // Reading is what puts the RAIL out: its mark is a pointer, and one that
+    // survives being followed is noise. The card is still broken, and the
+    // board still says so — a failure is discharged by acting, and only the
+    // "come and look" is discharged by looking.
+    f.manager
+        .mark_issue_read(&p.id, issue.number)
+        .await
+        .expect("mark read");
+    assert!(
+        f.manager
+            .attention(&[])
+            .await
+            .expect("attention")
+            .is_empty(),
+        "following the pointer puts it out"
+    );
+    let board = f.manager.board_cards(&p.id).await.expect("board");
+    assert!(
+        board.signals(&issue.id).last_run_failed,
+        "the card is still broken, and the board still says so"
+    );
+
+    // Failing AGAIN is news again, off the same cursor — no second rule.
+    let again = f
+        .manager
+        .retry_run(&p.id, issue.number)
+        .await
+        .expect("retry");
+    let board = f.manager.board_cards(&p.id).await.expect("board");
+    assert!(
+        !board.signals(&issue.id).last_run_failed,
+        "the newest run is no longer the failed one"
+    );
+    f.store_settle(&again.id, RunStatus::Failed).await;
+    assert_eq!(
+        f.manager.attention(&[]).await.expect("attention")[0]
+            .1
+            .failed,
+        1,
+        "a fresh failure relights it without being read again"
     );
 }
 

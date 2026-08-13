@@ -308,11 +308,6 @@ const ADD_COLUMNS: &[AddColumn] = &[
         definition: "INTEGER",
     },
     AddColumn {
-        table: "projects",
-        column: "read_at",
-        definition: "INTEGER",
-    },
-    AddColumn {
         table: "issues",
         column: "parent_issue_id",
         definition: "TEXT",
@@ -341,6 +336,11 @@ const ADD_COLUMNS: &[AddColumn] = &[
         table: "issues",
         column: "attachments",
         definition: "TEXT NOT NULL DEFAULT '[]'",
+    },
+    AddColumn {
+        table: "issues",
+        column: "read_at",
+        definition: "INTEGER",
     },
     AddColumn {
         table: "sessions",
@@ -1359,11 +1359,6 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     -- `DEFAULT_MAX_PARALLEL_ISSUE_RUNS` rather than to a SQL
                     -- default that would be the number's second home.
                     max_parallel_issue_runs INTEGER,
-                    -- When the operator last looked at this board. The only
-                    -- read state in the feature, and it exists because the
-                    -- two signals that need it — an agent's comment, a card
-                    -- arriving in Review — leave no other trace when read.
-                    read_at     INTEGER,
                     archived_at INTEGER,
                     created_at  INTEGER NOT NULL,
                     updated_at  INTEGER NOT NULL
@@ -1410,6 +1405,12 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     -- and a research issue that produced a report and no
                     -- code should show no branch anywhere.
                     branch         TEXT,
+                    -- When the operator last opened this card. The only read
+                    -- state in the feature: an agent's comment and a card
+                    -- arriving in Review leave no other trace when read, and
+                    -- it lives per card rather than per board so that opening
+                    -- one card cannot silence a question asked on another.
+                    read_at        INTEGER,
                     cancelled_at   INTEGER,
                     created_at     INTEGER NOT NULL,
                     updated_at     INTEGER NOT NULL

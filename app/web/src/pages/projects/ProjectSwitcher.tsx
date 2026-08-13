@@ -4,7 +4,12 @@ import { RiArrowDownSLine } from 'react-icons/ri';
 
 import type { Project } from './boardModel';
 import { CreateProjectForm } from './CreateProjectForm';
-import { attentionFor, useAttention, type ProjectAttention } from './useAttention';
+import {
+  attentionElsewhere,
+  attentionFor,
+  useAttention,
+  type ProjectAttention,
+} from './useAttention';
 import { activityFor, burnIsNearLimit, useBoardActivity } from './useBoardActivity';
 import { formatUsd } from './budgetModel';
 
@@ -30,6 +35,12 @@ export function ProjectSwitcher({
   const activity = useBoardActivity(open, refreshKey);
   const root = useRef<HTMLDivElement>(null);
   const archivedCount = projects.filter((project) => project.archived_at_ms != null).length;
+  // The rail's dot says something is lit; only this dropdown says which
+  // board. Without a mark of its own the trigger reads as inert chrome, and
+  // an operator on a quiet board has nothing on screen telling them the
+  // answer is one click away — so the dot they can see stays lit through
+  // everything they do, which is exactly how "it won't clear" is produced.
+  const elsewhere = attentionElsewhere(waiting, current?.id ?? null);
   // Archived boards sort to the tail rather than staying in the server's
   // recency order: they are shown on request, and a recently-touched
   // archived board landing mid-list reads as live work.
@@ -73,6 +84,14 @@ export function ProjectSwitcher({
         }}
       >
         {current?.name ?? 'Projects'}
+        {elsewhere ? (
+          <span
+            role="status"
+            aria-label="Another board is waiting on you"
+            title="Another board is waiting on you"
+            className="w-2 h-2 shrink-0 rounded-full border border-black bg-err"
+          />
+        ) : null}
         <RiArrowDownSLine />
       </button>
 

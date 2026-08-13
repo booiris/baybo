@@ -15,11 +15,7 @@ import {
 } from 'react-icons/ri';
 import type { IconType } from 'react-icons';
 import { useAuth } from '../api/auth';
-import {
-  attentionSummary,
-  boardsNeedingAttention,
-  useAttention,
-} from '../pages/projects/useAttention';
+import { attentionSummary, needsAttention, useAttention } from '../pages/projects/useAttention';
 import { installPrompt } from '../pwa/registerSW';
 
 // Global app rail (replaces the old text sidebar): a solid amber, icon-only
@@ -75,27 +71,29 @@ export function IconRail({ version }: { version?: string }) {
 
       <nav className="flex flex-col items-center gap-3">
         {DESTINATIONS.map(({ to, label, Icon }) => {
-          // Boards, not items. The entry opens exactly one board, so a
-          // total across boards would be a number clicking it cannot
-          // discharge; the switcher dropdown is how the others are reached.
-          const boards = to === '/projects' ? boardsNeedingAttention(waiting) : 0;
+          // A dot, not a count. The entry opens exactly one board, so any
+          // number here is one the click cannot discharge — it said "3"
+          // and stayed at "3" through everything the operator did on the
+          // board it actually opened. The countable form of this signal
+          // lives on the cards, where each number is one card away from
+          // being cleared.
+          const lit = to === '/projects' && needsAttention(waiting);
           return (
             <NavLink
               key={to}
               to={to}
-              title={boards > 0 ? `${label} — ${attentionSummary(waiting)}` : label}
+              title={lit ? `${label} — ${attentionSummary(waiting)}` : label}
               className={({ isActive }) =>
                 `relative ${railBtn} ${isActive ? railActive : railIdle}`
               }
             >
               <Icon className="text-lg" />
-              {boards > 0 ? (
+              {lit ? (
                 <span
+                  role="status"
                   aria-label={attentionSummary(waiting)}
-                  className="absolute -top-1 -right-1 min-w-[1rem] h-4 px-1 rounded-full border-2 border-black bg-err text-white font-mono text-[0.55rem] font-bold leading-[0.75rem] tabular-nums"
-                >
-                  {boards}
-                </span>
+                  className="absolute -top-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-2 border-black bg-err"
+                />
               ) : null}
             </NavLink>
           );

@@ -792,6 +792,78 @@ the queue and can refuse a prompt the timeline still lists.
 A prompt from an ordinary session passes straight through — the trigger lookup
 says it belongs to no issue.
 
+### Attention: four signals, two contracts
+
+`attention()` answers one question per board — is anything waiting on the
+operator — as four counts: `approvals`, `held`, `failed`, `unread`. They divide
+on **what discharges them**, and the split is the whole design:
+
+- `approvals` and `held` clear by **acting**. Answer the prompt, give the board
+  budget. Looking at them changes nothing a query could see, which is exactly
+  why they need no stored state.
+- `unread` clears by **reading**.
+- `failed` is **both**, and is the only signal read by two rules. The *card* is
+  broken until somebody acts — retry, finish, cancel, block — and wears its
+  badge that whole time; nothing retries by itself, so a badge a glance could
+  clear would take the board's own record of what is broken with it. The
+  *rail's* mark is only a pointer, and a pointer that survives being followed
+  is noise: it stays lit after the operator has read the failure, with nothing
+  left to do about it but act on a card they may be deliberately leaving until
+  tomorrow. So the board's count drops a failure once that card has been
+  opened, while the card goes on saying so. A card that fails *again* relights
+  the rail off the same cursor — one rule, not two.
+
+The cursor is `issues.read_at`, one per card, moved by `mark_issue_read` and by
+nothing else. Per card and not per board: an operator who reads the question
+asked on #3 has not read the one asked on #7, and the board-level stamp this
+replaced could only clear both or neither — it was fired by the board page's
+load effect, so it also swallowed everything written between that page's
+fetches and the POST landing.
+
+Three SQL predicates in `crates/storage/src/sqlite/project.rs` are the single
+home of these rules:
+
+- `UNREAD_EVENT_PREDICATE` — an agent's comment, or an agent moving the card
+  into Review, newer than that card's `read_at`. The actor filter covers both
+  arms: the operator's own words and their own tidying are not news to them.
+- `FAILED_CARD_PREDICATE` — a live card whose newest run failed. Both
+  `card_signals()` (the badge) and `attention()` read it.
+- `UNSEEN_FAILURE_PREDICATE` — and that run settled after `read_at`.
+  `attention()` alone adds it; the card's badge must not.
+
+The two failure predicates read the same run by construction: the `newest_run!`
+macro is where "newest" is spelled, so `status` and `settled_at` cannot come to
+be read off different rows.
+
+`card_signals()` reads per card and `attention()` per board, so on any live
+board the `unread` count is the sum of its cards' and the `failed` count is the
+number of cards wearing the marker **that the operator has not opened since it
+broke**. The two therefore disagree by design, in one direction only: the rail
+can go quiet while the board still shows a failure. The reverse — a rail dot
+outliving a board on which every card reads zero — is the drift these constants
+exist to prevent; written twice, they would eventually disagree, and the badge
+would be pointing at nothing the operator could find.
+
+`attention()` alone excludes archived boards — the whole board, not row by row.
+`card_signals()` does not, because it is already scoped to the one board its
+caller asked for, and a shelved board's cards should still say what happened on
+them while the operator is reading it. So a shelved board's cards can carry
+counts the rail deliberately does not: shelving is the operator saying nothing
+here is waiting on them.
+
+`ProjectManager::board_cards` is the one door for anything that draws a card
+face: it hands over `BoardCards`, which is the rows **plus** the resolved
+`CardSignals`. Callers never receive the runs and the recipe — "did this card's
+newest run fail" is a rule with one home, and a caller holding the ingredients
+would answer it a second time and differently.
+
+A hold whose card stopped accepting runs is settled by `call_off_dead_holds`,
+which `drive` calls **above** every gate under it. `release_holds` returns early
+on an exhausted budget and `promotions` returns early on
+`max_parallel_issue_runs == 0`, so both deliberate ways to stop a board used to
+also stop the only sweep that could clear a hold on a card the operator had
+already cancelled.
+
 ### Tools
 
 Six tools an agent working a board can call: `IssueList`, `IssueGet`,
@@ -835,7 +907,7 @@ signal would refetch every column to learn that somebody said something.
   every one of those writes starts with, the sweeps included (through
   `resume_project_runs`). Three writes do not ask, and each is deliberate:
   `set_project_archived`, or a board could never be restored; the operator's
-  bookkeeping (`mark_read`, `cancel_run` — stopping work and noting it was seen
+  bookkeeping (`mark_issue_read`, `cancel_run` — stopping work and noting it was seen
   are not additions to the board); and `record_event`, which describes work
   already under way rather than starting any.
 - **Archiving is reversible, so it settles nothing.** A run recorded before a

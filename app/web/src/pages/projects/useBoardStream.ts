@@ -10,7 +10,12 @@ export function wantsRefresh(
 ): boolean {
   if (frame.kind !== 'project_changed') return false;
   if (frame.project_id !== projectId) return false;
-  if (issueNumber === null) return frame.scope !== 'timeline';
+  // The board takes timeline frames too. It used to skip them on the
+  // grounds that it draws no timeline — true until a card started carrying
+  // its own unread count, which changes on exactly those frames and on no
+  // other. Skipping them left the one number that says "an agent is asking
+  // you something" stale for as long as the operator kept looking at it.
+  if (issueNumber === null) return true;
   return frame.issue_number === undefined || frame.issue_number === issueNumber;
 }
 

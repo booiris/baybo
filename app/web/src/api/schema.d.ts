@@ -1144,6 +1144,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/projects/{project_id}/issues/{number}/read": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["mark_issue_read"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/projects/{project_id}/issues/{number}/runs": {
         parameters: {
             query?: never;
@@ -1186,22 +1202,6 @@ export interface paths {
         get?: never;
         put?: never;
         post: operations["retry_run"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/projects/{project_id}/read": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["mark_project_read"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2526,6 +2526,12 @@ export interface components {
             created_at_ms: number;
             description: string;
             /**
+             * @description This card's newest run failed and the card is still live. The board
+             *     shows it, because a failure that leaves the card looking untouched
+             *     is a badge pointing at something the operator cannot find.
+             */
+            last_run_failed: boolean;
+            /**
              * Format: int64
              * @description The human address, unique within its project: `#3`.
              */
@@ -2551,6 +2557,13 @@ export interface components {
             status: components["schemas"]["IssueStatusDto"];
             sub_issues?: null | components["schemas"]["SubIssueProgress"];
             title: string;
+            /**
+             * Format: int64
+             * @description What has happened on this card since the operator last opened it:
+             *     agents' comments, and an agent moving it into Review. `0` on a card
+             *     with nothing new — which is every card, a moment after it is read.
+             */
+            unread: number;
             /** Format: int64 */
             updated_at_ms: number;
         };
@@ -7393,6 +7406,12 @@ export interface operations {
                             created_at_ms: number;
                             description: string;
                             /**
+                             * @description This card's newest run failed and the card is still live. The board
+                             *     shows it, because a failure that leaves the card looking untouched
+                             *     is a badge pointing at something the operator cannot find.
+                             */
+                            last_run_failed: boolean;
+                            /**
                              * Format: int64
                              * @description The human address, unique within its project: `#3`.
                              */
@@ -7418,6 +7437,13 @@ export interface operations {
                             status: components["schemas"]["IssueStatusDto"];
                             sub_issues?: null | components["schemas"]["SubIssueProgress"];
                             title: string;
+                            /**
+                             * Format: int64
+                             * @description What has happened on this card since the operator last opened it:
+                             *     agents' comments, and an agent moving it into Review. `0` on a card
+                             *     with nothing new — which is every card, a moment after it is read.
+                             */
+                            unread: number;
                             /** Format: int64 */
                             updated_at_ms: number;
                         }[];
@@ -7838,6 +7864,47 @@ export interface operations {
             };
         };
     };
+    mark_issue_read: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project id */
+                project_id: string;
+                /** @description Issue number */
+                number: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Noted; this card's unread count resets */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unknown project or issue */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     list_issue_runs: {
         parameters: {
             query?: never;
@@ -7983,45 +8050,6 @@ export interface operations {
             };
             /** @description A run is already in flight, or the project is archived */
             409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
-    mark_project_read: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Project id */
-                project_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Noted; the board's unread count resets */
-            204: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description Unauthorized */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            /** @description Unknown project */
-            404: {
                 headers: {
                     [name: string]: unknown;
                 };

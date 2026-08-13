@@ -22,6 +22,8 @@ function issue(overrides: Partial<Issue> = {}): Issue {
     assignee: 'dev-1',
     created_at_ms: 0,
     updated_at_ms: 0,
+    unread: 0,
+    last_run_failed: false,
     ...overrides,
   };
 }
@@ -75,7 +77,14 @@ const client = {
     }
     throw new Error(`unexpected GET ${path}`);
   }),
-  POST: vi.fn(async () => ({ data: RUNS[0], error: undefined, response: ok })),
+  // Typed args rather than `() =>`: the assertions below read
+  // `POST.mock.calls` to tell the read stamp apart from a retry, and an
+  // argument-less mock types those calls as empty tuples.
+  POST: vi.fn(async (_path: string, _init?: unknown) => ({
+    data: RUNS[0],
+    error: undefined,
+    response: ok,
+  })),
   PATCH: vi.fn(),
 };
 
@@ -133,16 +142,48 @@ describe('IssueDetailPage execution log', () => {
   });
 
   it('reports the board’s work rather than commanding it', async () => {
-    // Nothing on this page starts a run any more. Work begins by moving the
-    // card, putting somebody on it, commenting, a stage barrier, or the
-    // board taking it off the top of Todo.
+    // Nothing on this page starts a run out of nowhere. Work begins by
+    // moving the card, putting somebody on it, commenting, a stage barrier,
+    // or the board taking it off the top of Todo — and, on a card whose
+    // newest run failed, by pressing Run again.
     renderIssue(issue(), [run('failed')]);
 
     expect(await screen.findByText('failed')).toBeInTheDocument();
-    for (const gone of ['Retry', 'Run it now', 'Run it again', 'Start now']) {
+    for (const gone of ['Run again', 'Run it now', 'Start now']) {
       expect(screen.queryByRole('button', { name: gone })).toBeNull();
     }
-    expect(client.POST).not.toHaveBeenCalled();
+    // The one POST opening a card makes is the read stamp, which starts
+    // nothing.
+    for (const [path] of client.POST.mock.calls) {
+      expect(path).toBe('/v1/projects/{project_id}/issues/{number}/read');
+    }
+  });
+
+  it('marks the card read on open, and only this card', async () => {
+    renderIssue(issue());
+
+    await screen.findByText('failed');
+    const reads = client.POST.mock.calls.filter(
+      ([path]) => path === '/v1/projects/{project_id}/issues/{number}/read',
+    );
+    expect(reads).toHaveLength(1);
+    expect(reads[0][1]).toMatchObject({
+      params: { path: { project_id: PROJECT_ID, number: 7 } },
+    });
+  });
+
+  it('offers Run again on a card whose newest run failed, and runs it', async () => {
+    // Gated on the same fact the board's badge counts, so the button is
+    // present exactly when the thing it clears is being counted.
+    renderIssue(issue({ last_run_failed: true }), [run('failed')]);
+
+    const button = await screen.findByRole('button', { name: /run again/i });
+    await userEvent.click(button);
+
+    expect(client.POST).toHaveBeenCalledWith(
+      '/v1/projects/{project_id}/issues/{number}/runs/retry',
+      { params: { path: { project_id: PROJECT_ID, number: 7 } } },
+    );
   });
 
   it('still stops a run that is going', async () => {

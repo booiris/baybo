@@ -418,14 +418,39 @@ export async function setProjectArchived(
   }
 }
 
-export async function markProjectRead(
+/// Note that the operator has opened this card. Per card, never per board:
+/// reading the question asked on #3 is not reading the one asked on #7.
+export async function markIssueRead(
   client: AdminClient,
   projectId: string,
+  number: number,
 ): Promise<Outcome<null>> {
   try {
-    const { error, response } = await client.POST('/v1/projects/{project_id}/read', {
-      params: { path: { project_id: projectId } },
-    });
+    const { error, response } = await client.POST(
+      '/v1/projects/{project_id}/issues/{number}/read',
+      { params: { path: { project_id: projectId, number } } },
+    );
+    if (response.status === 401) return { kind: 'unauthorized' };
+    if (error !== undefined) return failure(response.status, error.error);
+    if (!response.ok) return failure(response.status, undefined);
+    return { kind: 'ok', value: null };
+  } catch (e) {
+    return { kind: 'failed', message: networkMessage(e) };
+  }
+}
+
+/// Run this card's failed run again. The one action that discharges the
+/// board's `failed` count without destroying or hiding the card.
+export async function retryRun(
+  client: AdminClient,
+  projectId: string,
+  number: number,
+): Promise<Outcome<null>> {
+  try {
+    const { error, response } = await client.POST(
+      '/v1/projects/{project_id}/issues/{number}/runs/retry',
+      { params: { path: { project_id: projectId, number } } },
+    );
     if (response.status === 401) return { kind: 'unauthorized' };
     if (error !== undefined) return failure(response.status, error.error);
     if (!response.ok) return failure(response.status, undefined);

@@ -184,6 +184,17 @@ export function BoardFilterMenu({
           <label className="flex items-center gap-1.5 font-mono text-[0.68rem] cursor-pointer">
             <input
               type="checkbox"
+              checked={filter.failedOnly}
+              onChange={(event) => {
+                onChange({ ...filter, failedOnly: event.target.checked });
+              }}
+            />
+            Failed run only
+          </label>
+
+          <label className="flex items-center gap-1.5 font-mono text-[0.68rem] cursor-pointer">
+            <input
+              type="checkbox"
               checked={!filter.showCancelled}
               onChange={(event) => {
                 onChange({ ...filter, showCancelled: !event.target.checked });

@@ -10,6 +10,7 @@ export type BoardFilter = {
   text: string;
   assignee: AssigneeFilter;
   blockedOnly: boolean;
+  failedOnly: boolean;
   showCancelled: boolean;
 };
 
@@ -22,12 +23,14 @@ export const EMPTY_FILTER: BoardFilter = {
   text: '',
   assignee: { kind: 'anyone' },
   blockedOnly: false,
+  failedOnly: false,
   showCancelled: true,
 };
 
 const PARAM_TEXT = 'q';
 const PARAM_ASSIGNEE = 'assignee';
 const PARAM_BLOCKED = 'blocked';
+const PARAM_FAILED = 'failed';
 const PARAM_CANCELLED = 'cancelled';
 
 const UNASSIGNED = 'unassigned';
@@ -40,6 +43,7 @@ function restrictions(filter: BoardFilter): boolean[] {
     filter.text.trim() !== '',
     filter.assignee.kind !== 'anyone',
     filter.blockedOnly,
+    filter.failedOnly,
     !filter.showCancelled,
   ];
 }
@@ -74,6 +78,7 @@ function matchesAssignee(issue: Issue, filter: AssigneeFilter, team: Agent[]): b
 export function matches(issue: Issue, filter: BoardFilter, team: Agent[]): boolean {
   if (!filter.showCancelled && issue.cancelled_at_ms != null) return false;
   if (filter.blockedOnly && issue.blocked_reason == null) return false;
+  if (filter.failedOnly && !issue.last_run_failed) return false;
   if (!matchesAssignee(issue, filter.assignee, team)) return false;
   return matchesText(issue, filter.text);
 }
@@ -98,6 +103,7 @@ export function parseBoardFilter(params: URLSearchParams): BoardFilter {
     text: params.get(PARAM_TEXT) ?? '',
     assignee,
     blockedOnly: params.get(PARAM_BLOCKED) === '1',
+    failedOnly: params.get(PARAM_FAILED) === '1',
     // Absent means shown: hiding is the deliberate act, so it is the one
     // that has to be written down in the URL.
     showCancelled: params.get(PARAM_CANCELLED) !== '0',
@@ -113,6 +119,7 @@ export function boardFilterParams(filter: BoardFilter): URLSearchParams {
     params.set(PARAM_ASSIGNEE, `@${filter.assignee.handle}`);
   }
   if (filter.blockedOnly) params.set(PARAM_BLOCKED, '1');
+  if (filter.failedOnly) params.set(PARAM_FAILED, '1');
   if (!filter.showCancelled) params.set(PARAM_CANCELLED, '0');
   return params;
 }

@@ -125,6 +125,40 @@ mode collapsing the strip could introduce, and the badge is what rules it out.
 `boardFilter.ts` owns the list of narrowings (`restrictionCount`), because the
 badge and the Clear button must never disagree about what counts as filtered.
 
+## Where a notification is a number and where it is a dot
+
+Two levels, and the difference is whether the thing you press can discharge
+what it shows.
+
+The **rail's Projects entry carries a bare red dot**. It used to carry a
+count of boards, and a count there is a promise the click cannot keep: the
+entry opens exactly one board — the last one visited — so the number
+survived everything the operator did on the board they actually landed on,
+which is what "the red dot won't go away" always turned out to mean. The
+switcher's own trigger wears a second dot when a board *other* than the open
+one is lit, because that dropdown is the only thing on screen that says
+which board; its rows keep their per-board counts.
+
+The **card carries the number**, top-right of its header row, in the same red
+pill the rail used to wear. Every number there is one card away from zero:
+opening the card stamps `issues.read_at` and the count goes. It counts an
+agent's comments and an agent handing the card back into Review — never the
+operator's own, since your own words and your own tidying are not news to
+you.
+
+A card whose newest run failed says so on its face (`✕ Run failed`, the
+Blocked badge's shape in the error tone) and is reachable through the filter
+menu's **Failed run only**. That marker is not a read cursor and no amount of
+looking clears it — its detail page's **Run again** is what does. Before it
+existed the rail counted failures on a board where no card admitted to one,
+so finding the card the badge meant took opening them one at a time.
+
+`useAttention` is one module-level store with one timer and an
+`invalidateAttention(client)` — not a `useState` + `setInterval` per
+component. The minute-long poll used to be the *only* refresh, so a signal
+the operator had just discharged stayed on screen for up to a minute; every
+act that clears one now asks the server again.
+
 ## A card's three properties
 
 Status, priority and assignee are set in two places — the issue page's rail and

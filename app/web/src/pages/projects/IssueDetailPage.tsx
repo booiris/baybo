@@ -7,12 +7,13 @@ import {
   type ReactNode,
 } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import { RiArrowLeftLine, RiGitMergeLine, RiLoader4Line } from 'react-icons/ri';
+import { RiArrowLeftLine, RiGitMergeLine, RiLoader4Line, RiRefreshLine } from 'react-icons/ri';
 
 import { useAdminClient, useAuth } from '../../api/auth';
 import {
   cancelRun,
   fetchTeam,
+  markIssueRead,
   resolveApproval,
   fetchIssue,
   fetchIssueRuns,
@@ -21,6 +22,7 @@ import {
   moveIssue,
   patchIssue,
   postComment,
+  retryRun,
   type IssueAttachmentRequest,
 } from './api';
 import {
@@ -52,6 +54,7 @@ import { SubIssues } from './SubIssues';
 import { Timeline } from './Timeline';
 import type { IssueEvent } from './timelineModel';
 import { useBoardStream } from './useBoardStream';
+import { invalidateAttention } from './useAttention';
 import { formatTokens, formatUsd } from './budgetModel';
 import { handleOf } from './teamModel';
 import {
@@ -235,6 +238,10 @@ export function IssueDetailPage() {
   /// Whether this card has already been dropped at the foot of its timeline.
   /// Reset per card, so opening a second one lands the same way.
   const landed = useRef(false);
+  /// Whether this card's read cursor has been moved. Reset per card, like
+  /// `landed`, and for the same reason: opening a card is the act that
+  /// reads it, and a refresh is not a second opening.
+  const stamped = useRef(false);
 
   // A card opens at the foot of its own history — the newest entries and the
   // composer — rather than at a title you have already read. Once per card,
@@ -243,6 +250,7 @@ export function IssueDetailPage() {
   // reading back through it. Before paint, so it lands rather than jumps.
   useEffect(() => {
     landed.current = false;
+    stamped.current = false;
     draftDescription.current = '';
     descriptionTouched.current = false;
   }, [projectId, number]);
@@ -297,6 +305,21 @@ export function IssueDetailPage() {
       setTitle((current) => (current === previousTitle ? outcome.value.title : current));
       setError(null);
       setLoading(false);
+      // The stamp rides the tail of a load that actually put the timeline on
+      // screen, never the mount. Every early return above is a card the
+      // operator has not read, and the cursor is irreversible — a stamp on a
+      // failed load buries the very comments the badge existed to point at.
+      // Once per card: an agent commenting into an open card raises the count
+      // again, and the operator has not read that one either.
+      if (timelineOutcome.kind === 'ok' && !stamped.current) {
+        stamped.current = true;
+        void markIssueRead(client, projectId, number).then(() => {
+          // The rail's dot is the same fact read from further away. Without
+          // this it trails the card by a poll interval, which is what made
+          // it look like a dot nothing could clear.
+          invalidateAttention(client);
+        });
+      }
     }
     void load();
     return () => {
@@ -304,11 +327,21 @@ export function IssueDetailPage() {
     };
   }, [client, logout, number, projectId, refreshKey]);
 
-  const bumpRefresh = useCallback(() => {
+  /// Refetch this card, and ask the badge again.
+  ///
+  /// The two go together everywhere on this page. Every write here can move
+  /// one of the four counts behind the rail's dot — an answer discharges an
+  /// approval, a stop discharges a held run, a cancel or a block discharges
+  /// a failure — and bumping only the local refresh is how a dot outlives
+  /// the act that cleared it. An answered approval is the case that has no
+  /// other way home: it emits no board frame at all, so nothing else would
+  /// ever ask.
+  const refetch = useCallback(() => {
     setRefreshKey((key) => key + 1);
-  }, []);
+    invalidateAttention(client);
+  }, [client]);
 
-  useBoardStream(projectId, number, bumpRefresh);
+  useBoardStream(projectId, number, refetch);
 
   // What the URL asks for right now, readable from inside a promise that was
   // started before it changed.
@@ -372,9 +405,9 @@ export function IssueDetailPage() {
         return;
       }
       setError(null);
-      setRefreshKey((key) => key + 1);
+      refetch();
     },
-    [client, logout, projectId],
+    [client, logout, projectId, refetch],
   );
 
   const relocate = useCallback(
@@ -426,8 +459,28 @@ export function IssueDetailPage() {
       return;
     }
     setError(null);
-    setRefreshKey((key) => key + 1);
-  }, [client, logout, number, projectId]);
+    refetch();
+  }, [client, logout, number, projectId, refetch]);
+
+  /// The one action that discharges a failed card without destroying or
+  /// hiding it. The endpoint shipped with the feature and nothing in the
+  /// dashboard had ever called it, so an operator staring at a lit badge
+  /// could only reach zero by finishing, cancelling or blocking the card.
+  const runAgain = useCallback(async () => {
+    setSaving(true);
+    const outcome = await retryRun(client, projectId, number);
+    setSaving(false);
+    if (outcome.kind === 'unauthorized') {
+      logout();
+      return;
+    }
+    if (outcome.kind === 'failed') {
+      setError(outcome.message);
+      return;
+    }
+    setError(null);
+    refetch();
+  }, [client, logout, number, projectId, refetch]);
 
   const comment = useCallback(
     async (text: string, attachments: IssueAttachmentRequest[]) => {
@@ -462,9 +515,9 @@ export function IssueDetailPage() {
         return;
       }
       setError(null);
-      setRefreshKey((key) => key + 1);
+      refetch();
     },
-    [client, logout, number, projectId],
+    [client, logout, number, projectId, refetch],
   );
 
   /// Put somebody on a step without leaving the parent. Goes through the
@@ -484,9 +537,9 @@ export function IssueDetailPage() {
         return;
       }
       setError(null);
-      setRefreshKey((key) => key + 1);
+      refetch();
     },
-    [client, logout, projectId],
+    [client, logout, projectId, refetch],
   );
 
   /// Leaving a field is what saves it. With no Save button the write has to
@@ -1103,6 +1156,21 @@ export function IssueDetailPage() {
                 ))}
               </ul>
             )}
+            {/* Gated on the same fact the board's badge and the card's own
+                marker read, so the button is present exactly when the
+                thing it clears is being counted. */}
+            {issue.last_run_failed ? (
+              <button
+                type="button"
+                disabled={saving}
+                onClick={() => {
+                  void runAgain();
+                }}
+                className="mt-2 inline-flex items-center gap-1 border-2 border-black rounded-md bg-surface px-2 py-0.5 font-mono text-[0.62rem] font-bold hover:bg-brand/25 disabled:opacity-50"
+              >
+                <RiRefreshLine aria-hidden /> Run again
+              </button>
+            ) : null}
           </section>
 
           {/* Shown even at zero: "this card has cost nothing yet" is an

@@ -12,9 +12,9 @@ use utoipa_axum::routes;
 use baybo_model::{AgentProfileId, ProjectId};
 use baybo_project::{AttachmentRequest, NewIssueRequest, NewProject, ProjectError};
 use baybo_store::project::{
-    DEFAULT_MAX_PARALLEL_ISSUE_RUNS, IssueActor, IssueAttachment, IssueEventBody, IssueEventRow,
-    IssuePriority, IssueRow, IssueRunRow, IssueStatus, IssueUpdate, ProjectRow, ProjectUpdate,
-    RunStatus, RunTrigger,
+    BoardCards, DEFAULT_MAX_PARALLEL_ISSUE_RUNS, IssueActor, IssueAttachment, IssueEventBody,
+    IssueEventRow, IssuePriority, IssueRow, IssueRunRow, IssueStatus, IssueUpdate, ProjectRow,
+    ProjectUpdate, RunStatus, RunTrigger,
 };
 
 use crate::api::dto::{ErrorBody, ListResponse};
@@ -34,7 +34,7 @@ pub fn routes() -> OpenApiRouter<AdminState> {
         .routes(routes!(project_feed))
         .routes(routes!(projects_attention))
         .routes(routes!(projects_activity))
-        .routes(routes!(mark_project_read))
+        .routes(routes!(mark_issue_read))
         .routes(routes!(resolve_approval))
         .routes(routes!(create_comment))
         .routes(routes!(list_active_runs))
@@ -62,7 +62,7 @@ pub(super) fn project_err(e: ProjectError) -> GatewayError {
 async fn on_board(state: &AdminState, project: &ProjectId, row: IssueRow) -> Result<IssueDto> {
     let board = state
         .project_manager
-        .list_issues(project)
+        .board_cards(project)
         .await
         .map_err(project_err)?;
     Ok(IssueDto::on_board(row, &board))
@@ -335,6 +335,14 @@ pub struct IssueDto {
     /// stuck.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sub_issues: Option<SubIssueProgress>,
+    /// What has happened on this card since the operator last opened it:
+    /// agents' comments, and an agent moving it into Review. `0` on a card
+    /// with nothing new — which is every card, a moment after it is read.
+    pub unread: i64,
+    /// This card's newest run failed and the card is still live. The board
+    /// shows it, because a failure that leaves the card looking untouched
+    /// is a badge pointing at something the operator cannot find.
+    pub last_run_failed: bool,
     /// Present once the issue is cancelled. The row is never deleted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancelled_at_ms: Option<i64>,
@@ -351,14 +359,23 @@ pub struct SubIssueProgress {
 
 impl IssueDto {
     /// Build one card against the board it lives on.
-    pub fn on_board(row: IssueRow, board: &[IssueRow]) -> Self {
+    ///
+    /// Takes the whole [`BoardCards`] rather than the rows, so the two
+    /// signals arrive already resolved. A caller handed the rows and the
+    /// runs would answer "did this card's newest run fail" a second time,
+    /// and the board's badge and the card's face would then be two
+    /// answers to one question.
+    pub fn on_board(row: IssueRow, board: &BoardCards) -> Self {
+        let signals = board.signals(&row.id);
         let parent = row.parent_issue_id.as_ref().and_then(|id| {
             board
+                .rows
                 .iter()
                 .find(|issue| &issue.id == id)
                 .map(|issue| issue.number)
         });
         let children: Vec<IssueRow> = board
+            .rows
             .iter()
             .filter(|issue| issue.parent_issue_id.as_ref() == Some(&row.id))
             .cloned()
@@ -373,6 +390,8 @@ impl IssueDto {
         Self {
             parent,
             sub_issues,
+            unread: signals.unread as i64,
+            last_run_failed: signals.last_run_failed,
             ..Self::from(row)
         }
     }
@@ -399,6 +418,11 @@ impl From<IssueRow> for IssueDto {
             parent: None,
             stage: row.stage,
             sub_issues: None,
+            // A card built without its board is a card nobody is looking
+            // at yet — the two signals are derived over the board, and
+            // guessing them here is how they would drift.
+            unread: 0,
+            last_run_failed: false,
             cancelled_at_ms: row.cancelled_at.map(|t| t.timestamp_millis()),
             created_at_ms: row.created_at.timestamp_millis(),
             updated_at_ms: row.updated_at.timestamp_millis(),
@@ -1134,10 +1158,11 @@ async fn list_issues(
     let id = parse_project_id(&project_id)?;
     let board = state
         .project_manager
-        .list_issues(&id)
+        .board_cards(&id)
         .await
         .map_err(project_err)?;
     let items = board
+        .rows
         .iter()
         .cloned()
         .map(|row| IssueDto::on_board(row, &board))
@@ -1464,23 +1489,26 @@ pub struct ProjectAttentionDto {
 
 #[utoipa::path(
     post,
-    path = "/projects/{project_id}/read",
+    path = "/projects/{project_id}/issues/{number}/read",
     tag = "projects",
-    params(("project_id" = String, Path, description = "Project id")),
+    params(
+        ("project_id" = String, Path, description = "Project id"),
+        ("number" = i64, Path, description = "Issue number"),
+    ),
     responses(
-        (status = 204, description = "Noted; the board's unread count resets"),
+        (status = 204, description = "Noted; this card's unread count resets"),
         (status = 401, description = "Unauthorized", body = ErrorBody),
-        (status = 404, description = "Unknown project", body = ErrorBody),
+        (status = 404, description = "Unknown project or issue", body = ErrorBody),
     )
 )]
-async fn mark_project_read(
+async fn mark_issue_read(
     State(state): State<AdminState>,
-    Path(project_id): Path<String>,
+    Path((project_id, number)): Path<(String, i64)>,
 ) -> Result<StatusCode> {
     let id = parse_project_id(&project_id)?;
     state
         .project_manager
-        .mark_read(&id)
+        .mark_issue_read(&id, number)
         .await
         .map_err(project_err)?;
     Ok(StatusCode::NO_CONTENT)

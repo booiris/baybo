@@ -37,6 +37,8 @@ const ISSUE: Issue = {
   assignee: 'dev-1',
   position: 0,
   stage: 0,
+  unread: 0,
+  last_run_failed: false,
   created_at_ms: 0,
   updated_at_ms: 0,
 };

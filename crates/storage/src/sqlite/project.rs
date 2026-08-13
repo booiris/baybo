@@ -7,9 +7,9 @@ use rusqlite::OptionalExtension;
 use super::SqlitePool;
 use baybo_store::StorageError;
 use baybo_store::project::{
-    AttentionCounts, BoardActivity, IssueActor, IssueAttachment, IssueEventRow, IssuePriority,
-    IssueRow, IssueRunRow, IssueStatus, IssueUpdate, NewIssue, NewIssueEvent, NewIssueRun,
-    ProjectRow, ProjectStore, ProjectUpdate, Result, RunSpend, RunStatus, RunTrigger,
+    AttentionCounts, BoardActivity, CardSignals, IssueActor, IssueAttachment, IssueEventRow,
+    IssuePriority, IssueRow, IssueRunRow, IssueStatus, IssueUpdate, NewIssue, NewIssueEvent,
+    NewIssueRun, ProjectRow, ProjectStore, ProjectUpdate, Result, RunSpend, RunStatus, RunTrigger,
     SettledRunFacts, Spend,
 };
 
@@ -76,11 +76,86 @@ fn event_from_raw(raw: RawEvent) -> Result<IssueEventRow> {
 }
 
 const PROJECT_COLUMNS: &str = "id, name, description, workdir, daily_budget_micros, \
-     max_parallel_issue_runs, read_at, archived_at, created_at, updated_at";
+     max_parallel_issue_runs, archived_at, created_at, updated_at";
 
 const ISSUE_COLUMNS: &str = "id, project_id, number, title, description, status, priority, \
      assignee, position, blocked_reason, branch, parent_issue_id, stage, source_key, \
      cancelled_at, created_at, updated_at, attachments";
+
+/// What "unread" means, written once. An agent's comment, or an agent
+/// moving the card into Review, since the operator last opened *that card*.
+///
+/// The actor filter covers both arms deliberately: the operator's own words
+/// are not news to them, and without it a board they tidied up by dragging
+/// their own finished cards into Review would announce itself back at them.
+///
+/// Written against `issue_events e` joined to its `issues i`; binds
+/// `:review`. The card badge and the board's `attention` count are two
+/// readings of this one line — if they ever disagree, a rail dot outlives a
+/// board on which every card reads zero.
+const UNREAD_EVENT_PREDICATE: &str = "e.created_at > COALESCE(i.read_at, 0) \
+     AND e.actor LIKE 'agent:%' \
+     AND (e.kind = 'comment' \
+          OR (e.kind = 'moved' AND json_extract(e.body, '$.to') = :review))";
+
+/// One column off the card's newest run, by the one ordering every reader
+/// of "the newest run" must share. A macro so that the two predicates below
+/// read `status` and `settled_at` off the *same row* by construction: they
+/// answer "did it fail" and "has the operator seen that failure", and two
+/// orderings that drifted apart would answer them about different runs.
+///
+/// Written against `issues i`.
+macro_rules! newest_run {
+    ($column:literal) => {
+        concat!(
+            "(SELECT r.",
+            $column,
+            " FROM issue_runs r WHERE r.issue_id = i.id \
+             ORDER BY r.created_at DESC, r.id DESC LIMIT 1)"
+        )
+    };
+}
+
+/// A live card whose newest run failed, written once. Written against
+/// `issues i`; binds `:done` and `:failed`.
+///
+/// This is the card's **state**, and it clears only by acting — retry,
+/// finish, cancel, block. Nothing retries by itself, so a badge that a
+/// glance could clear would take the board's own record of what is broken
+/// with it. The badge on the card reads exactly this.
+///
+/// It is not, on its own, what lights the rail: see
+/// [`UNSEEN_FAILURE_PREDICATE`].
+const FAILED_CARD_PREDICATE: &str = concat!(
+    "i.status <> :done AND i.cancelled_at IS NULL \
+     AND i.blocked_reason IS NULL \
+     AND ",
+    newest_run!("status"),
+    " = :failed"
+);
+
+/// Whether a failure is also **news** — the newest run settled after the
+/// operator last opened the card.
+///
+/// The rail's mark is a pointer ("something over there wants you"), not a
+/// tally of what is broken, and a pointer that survives being followed is
+/// noise: the operator opens the card, reads the failure, and the mark is
+/// still lit with nothing left to do about it but act on a card they may
+/// deliberately be leaving for tomorrow. So `attention` counts a failure
+/// only until it has been seen, on the same `read_at` cursor as
+/// [`UNREAD_EVENT_PREDICATE`], while the card keeps wearing
+/// [`FAILED_CARD_PREDICATE`]'s badge until it is actually dealt with.
+///
+/// The two therefore disagree on purpose, and only in the safe direction:
+/// the rail goes quiet while the board still shows the failure. The
+/// dangerous direction — a lit rail over a board on which every card reads
+/// zero — is what [`UNREAD_EVENT_PREDICATE`] warns about, and this cannot
+/// produce it.
+///
+/// A card that fails *again* relights by itself: the new run's `settled_at`
+/// clears the same cursor. That is the whole rule, not a second one.
+const UNSEEN_FAILURE_PREDICATE: &str =
+    concat!(newest_run!("settled_at"), " > COALESCE(i.read_at, 0)");
 
 const RUN_COLUMNS: &str = "id, issue_id, project_id, number, agent_id, session_id, trigger, \
      status, attempt, error, created_at, started_at, settled_at";
@@ -165,7 +240,6 @@ type RawProject = (
     Option<i64>,
     Option<i64>,
     Option<i64>,
-    Option<i64>,
     i64,
     i64,
 );
@@ -202,7 +276,6 @@ fn read_raw_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawProject> {
         row.get(6)?,
         row.get(7)?,
         row.get(8)?,
-        row.get(9)?,
     ))
 }
 
@@ -254,7 +327,6 @@ fn project_from_raw(raw: RawProject) -> Result<ProjectRow> {
         workdir,
         daily_budget_micros,
         max_parallel_issue_runs,
-        read_at,
         archived_at,
         created_at,
         updated_at,
@@ -273,7 +345,6 @@ fn project_from_raw(raw: RawProject) -> Result<ProjectRow> {
         max_parallel_issue_runs: max_parallel_issue_runs
             .and_then(|n| usize::try_from(n).ok())
             .unwrap_or(baybo_store::project::DEFAULT_MAX_PARALLEL_ISSUE_RUNS),
-        read_at: ts_opt("projects.read_at", read_at)?,
         archived_at: ts_opt("projects.archived_at", archived_at)?,
         created_at: ts("projects.created_at", created_at)?,
         updated_at: ts("projects.updated_at", updated_at)?,
@@ -392,8 +463,8 @@ impl ProjectStore for SqliteProjectStore {
                 conn.execute(
                     "INSERT INTO projects \
                      (id, name, description, workdir, daily_budget_micros, \
-                      max_parallel_issue_runs, read_at, archived_at, created_at, updated_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, ?7, ?8)",
+                      max_parallel_issue_runs, archived_at, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8)",
                     rusqlite::params![
                         id,
                         name,
@@ -463,23 +534,84 @@ impl ProjectStore for SqliteProjectStore {
         Ok(baybo_model::MicroUsd::from_micros(micros))
     }
 
-    async fn mark_project_read(
+    async fn mark_issue_read(
         &self,
-        id: &ProjectId,
+        issue: &IssueId,
         at: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool> {
-        let id = id.as_str().to_string();
+        let issue = issue.as_str().to_string();
         let at = super::time::to_us(at);
         let affected = self
             .pool
-            .interact("projects.mark_read", move |conn| {
+            .interact("issues.mark_read", move |conn| {
                 Ok(conn.execute(
-                    "UPDATE projects SET read_at = MAX(COALESCE(read_at, 0), ?2) WHERE id = ?1",
-                    rusqlite::params![id, at],
+                    "UPDATE issues SET read_at = MAX(COALESCE(read_at, 0), ?2) WHERE id = ?1",
+                    rusqlite::params![issue, at],
                 )?)
             })
             .await?;
         Ok(affected > 0)
+    }
+
+    async fn card_signals(
+        &self,
+        project: &ProjectId,
+    ) -> Result<std::collections::HashMap<IssueId, CardSignals>> {
+        let project = project.as_str().to_string();
+        let review_status = IssueStatus::Review.as_str();
+        let failed_status = RunStatus::Failed.as_str();
+        let done_status = IssueStatus::Done.as_str();
+        let rows = self
+            .pool
+            .interact("issues.card_signals", move |conn| {
+                let mut signals: std::collections::HashMap<String, CardSignals> =
+                    std::collections::HashMap::new();
+
+                {
+                    let mut stmt = conn.prepare(&format!(
+                        "SELECT e.issue_id, COUNT(*) FROM issue_events e \
+                         JOIN issues i ON i.id = e.issue_id \
+                         WHERE i.project_id = :project AND {UNREAD_EVENT_PREDICATE} \
+                         GROUP BY e.issue_id"
+                    ))?;
+                    let rows = stmt.query_map(
+                        rusqlite::named_params! {
+                            ":project": project,
+                            ":review": review_status,
+                        },
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                    )?;
+                    for row in rows {
+                        let (issue, count) = row?;
+                        signals.entry(issue).or_default().unread += count.max(0) as usize;
+                    }
+                }
+
+                {
+                    let mut stmt = conn.prepare(&format!(
+                        "SELECT i.id FROM issues i \
+                         WHERE i.project_id = :project AND {FAILED_CARD_PREDICATE}"
+                    ))?;
+                    let rows = stmt.query_map(
+                        rusqlite::named_params! {
+                            ":project": project,
+                            ":done": done_status,
+                            ":failed": failed_status,
+                        },
+                        |row| row.get::<_, String>(0),
+                    )?;
+                    for row in rows {
+                        signals.entry(row?).or_default().last_run_failed = true;
+                    }
+                }
+                Ok(signals.into_iter().collect::<Vec<_>>())
+            })
+            .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(issue, signals)| (IssueId::from(issue), signals))
+            .collect())
     }
 
     async fn set_project_archived(&self, id: &ProjectId, archived: bool) -> Result<bool> {
@@ -720,41 +852,46 @@ impl ProjectStore for SqliteProjectStore {
                 }
 
                 {
-                    let mut stmt = conn.prepare(
+                    // Both halves: the card is broken (`FAILED_CARD_PREDICATE`)
+                    // AND the operator has not looked since it broke. The board
+                    // shows the first on the card; only the second is worth a
+                    // mark in the rail.
+                    let mut stmt = conn.prepare(&format!(
                         "SELECT i.project_id, COUNT(*) FROM issues i \
                          JOIN projects p ON p.id = i.project_id \
-                         WHERE i.status <> ?1 AND i.cancelled_at IS NULL \
-                           AND i.blocked_reason IS NULL AND p.archived_at IS NULL \
-                           AND (SELECT r.status FROM issue_runs r \
-                                WHERE r.issue_id = i.id \
-                                ORDER BY r.created_at DESC, r.id DESC LIMIT 1) = ?2 \
-                         GROUP BY i.project_id",
+                         WHERE p.archived_at IS NULL AND {FAILED_CARD_PREDICATE} \
+                           AND {UNSEEN_FAILURE_PREDICATE} \
+                         GROUP BY i.project_id"
+                    ))?;
+                    let rows = stmt.query_map(
+                        rusqlite::named_params! {
+                            ":done": done_status,
+                            ":failed": failed_status,
+                        },
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
                     )?;
-                    for row in stmt
-                        .query_map(rusqlite::params![done_status, failed_status], |row| {
-                            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-                        })?
-                    {
+                    for row in rows {
                         let (project, count) = row?;
                         counts.entry(project).or_default().1 += count.max(0) as usize;
                     }
                 }
 
                 {
-                    let mut stmt = conn.prepare(
-                        "SELECT e.project_id, COUNT(*) FROM issue_events e \
-                         JOIN projects p ON p.id = e.project_id \
-                         WHERE p.archived_at IS NULL \
-                           AND e.created_at > COALESCE(p.read_at, 0) \
-                           AND ( \
-                             (e.kind = 'comment' AND e.actor LIKE 'agent:%') \
-                             OR (e.kind = 'moved' \
-                                 AND json_extract(e.body, '$.to') = ?1)) \
-                         GROUP BY e.project_id",
+                    // Joined through `issues` rather than read off
+                    // `issue_events.project_id`, because the cursor this
+                    // compares against lives on the card.
+                    let mut stmt = conn.prepare(&format!(
+                        "SELECT i.project_id, COUNT(*) FROM issue_events e \
+                         JOIN issues i ON i.id = e.issue_id \
+                         JOIN projects p ON p.id = i.project_id \
+                         WHERE p.archived_at IS NULL AND {UNREAD_EVENT_PREDICATE} \
+                         GROUP BY i.project_id"
+                    ))?;
+                    let rows = stmt.query_map(
+                        rusqlite::named_params! { ":review": review_status },
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
                     )?;
-                    for row in stmt.query_map(rusqlite::params![review_status], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-                    })? {
+                    for row in rows {
                         let (project, count) = row?;
                         counts.entry(project).or_default().2 += count.max(0) as usize;
                     }
@@ -1410,7 +1547,6 @@ mod tests {
             workdir: format!("/tmp/{id}"),
             daily_budget: None,
             max_parallel_issue_runs: DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
-            read_at: None,
             archived_at: None,
             created_at: now,
             updated_at: now,

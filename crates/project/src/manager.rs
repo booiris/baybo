@@ -10,9 +10,9 @@ use baybo_model::{
     ProjectId, SessionId, TeamMembership,
 };
 use baybo_store::project::{
-    DEFAULT_MAX_PARALLEL_ISSUE_RUNS, IssueActor, IssueEventBody, IssueEventRow, IssuePriority,
-    IssueRow, IssueRunRow, IssueStatus, IssueUpdate, NewIssue, NewIssueEvent, ProjectRow,
-    ProjectStore, ProjectUpdate, RunStatus, RunTrigger, Spend,
+    BoardCards, DEFAULT_MAX_PARALLEL_ISSUE_RUNS, IssueActor, IssueEventBody, IssueEventRow,
+    IssuePriority, IssueRow, IssueRunRow, IssueStatus, IssueUpdate, NewIssue, NewIssueEvent,
+    ProjectRow, ProjectStore, ProjectUpdate, RunStatus, RunTrigger, Spend,
 };
 use baybo_store::{AgentProfileStore, BlobStore};
 use baybo_workspace::WorkspacePaths;
@@ -524,12 +524,40 @@ impl ProjectManager {
         // and promote into all of them. The critical section is a handful
         // of queries with no long await in it.
         let _driving = self.driving.lock().await;
+        self.call_off_dead_holds(project).await;
         match self.promotions(project).await {
             Ok(moved) => moved,
             Err(e) => {
                 tracing::error!(%project, error = %e, "could not drive the board");
                 0
             }
+        }
+    }
+
+    /// Settle every hold whose card stopped accepting runs.
+    ///
+    /// Runs above every gate below it, and unconditionally.
+    /// [`release_holds`](Self::release_holds) bails on an exhausted budget
+    /// and [`promotions`](Self::promotions) bails on
+    /// `max_parallel_issue_runs == 0`, so both of the ways an operator
+    /// deliberately stops a board — spend the day's budget, set parallelism
+    /// to zero — used to also stop the only sweep that settles a hold on a
+    /// card they had already cancelled. A run nothing will ever start is
+    /// not work waiting for a slot; left held it keeps the board's badge
+    /// lit with something no operator action can discharge.
+    async fn call_off_dead_holds(&self, project: &ProjectId) {
+        let held = match self.store.held_runs(project).await {
+            Ok(held) => held,
+            Err(e) => {
+                tracing::error!(%project, error = %e, "could not read the board's held runs");
+                return;
+            }
+        };
+        for run in &held {
+            // The card, when there is one, is of no use here: what this
+            // call is for is its other half — a run whose card stopped
+            // accepting work is settled on the way past.
+            let _ = self.live_card(run).await;
         }
     }
 
@@ -1352,7 +1380,6 @@ impl ProjectManager {
                 .unwrap_or(DEFAULT_MAX_PARALLEL_ISSUE_RUNS),
             // Never read, so a board's first agent comment is unread even
             // if it lands before anybody opens it.
-            read_at: None,
             archived_at: None,
             created_at: now,
             updated_at: now,
@@ -1926,13 +1953,31 @@ impl ProjectManager {
         Ok(out)
     }
 
-    /// Note that the operator has looked at this board.
-    pub async fn mark_read(&self, project: &ProjectId) -> Result<()> {
-        self.get_project(project).await?;
+    /// Note that the operator has opened this card.
+    ///
+    /// Per card, never per board: an operator who reads the question asked
+    /// on #3 has not read the one asked on #7, and a board-wide stamp is
+    /// how the badge used to swallow both.
+    pub async fn mark_issue_read(&self, project: &ProjectId, number: i64) -> Result<()> {
+        let issue = self.get_issue(project, number).await?;
         self.store
-            .mark_project_read(project, chrono::Utc::now())
+            .mark_issue_read(&issue.id, chrono::Utc::now())
             .await?;
+        self.events.timeline_changed(project, number);
         Ok(())
+    }
+
+    /// The board's cards with every card's signals resolved.
+    ///
+    /// The one door for anything that draws a card face. Callers get the
+    /// resolved [`CardSignals`](baybo_store::project::CardSignals) rather
+    /// than the rows plus a recipe: "this card's newest run failed" is a
+    /// rule with one home, and a caller holding the runs would answer it a
+    /// second time and differently.
+    pub async fn board_cards(&self, project: &ProjectId) -> Result<BoardCards> {
+        let rows = self.list_issues(project).await?;
+        let signals = self.store.card_signals(project).await?;
+        Ok(BoardCards::new(rows, signals))
     }
 
     /// The whole board's activity, newest first. Two sources merged here

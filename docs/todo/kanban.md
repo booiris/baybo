@@ -565,18 +565,41 @@ announces which of these will happen before sending.
      *card* rather than an index, because an index is only meaningful
      against the list it was resolved on.
 
-   - **Attention badge.** ✅ `GET /v1/projects/attention` and a count on the
-     rail's Projects entry. It counts **boards, not items** — the entry
-     opens exactly one board (decision 12), so a total across boards is a
-     number clicking it cannot discharge; the switcher dropdown carries each
-     board's own counts. Three signals, all of them things only a person can
-     unstick: a tool call parked on an approval prompt, a run held on
-     budget, a live card whose newest run failed. **Nothing marks it read**
-     — each clears when the operator does the thing they were going to do
-     anyway — which is what keeps it free of a read cursor, a `seen_at`, or
-     any new durable state at all. The two signals that *would* need read
-     state (an agent's comment, a card arriving in Review) are left out
-     rather than approximated.
+   - **Attention badge.** ✅ `GET /v1/projects/attention`, and a plain **red
+     dot** on the rail's Projects entry. Not a count: the entry opens exactly
+     one board (decision 12), so any number there is one the click cannot
+     discharge — it said "3" and stayed at "3" through everything the
+     operator did on the board it actually opened. The countable form of the
+     signal lives **on the cards**, where each number is one card away from
+     being cleared; the switcher dropdown still carries each board's own
+     total, and its trigger wears a dot of its own when a board *other* than
+     the open one is lit, because that dropdown is the only thing that says
+     which board.
+
+     Four signals on two contracts. `approvals` and `held` clear when the
+     operator does the thing they were going to do anyway; `unread` — an
+     agent's comment, an agent moving a card into Review — clears by being
+     read. The cursor is `issues.read_at`, **per card**, stamped when the card
+     is opened. This supersedes the original decision to leave both read-state
+     signals out rather than approximate them: the approximation that made it
+     a bad trade was a board-level cursor, which clears the question asked on
+     #7 because the operator opened #3.
+
+     `failed` sits on **both** contracts, deliberately. The card is broken
+     until somebody acts on it, and says so the whole time; the rail's mark is
+     only a pointer, and a pointer that survives being followed is noise — the
+     operator opens the card, reads the failure, and the mark is still lit over
+     a card they may be deliberately leaving until tomorrow. So the rail reads
+     `failed` through the same `read_at` cursor and the card does not, and a
+     card that fails again relights the rail off that same cursor. The two
+     disagree in one direction only: the rail can go quiet over a board that
+     still shows the failure, never the reverse.
+
+     A `failed` card wears the marker on its own face and has a **Run again**
+     button on its detail page (the retry endpoint had shipped with nothing
+     calling it), plus a `failed` narrowing in the board filter. The badge
+     had been counting failures on a board where no card admitted to one,
+     which is the shape every "the dot won't clear" report actually had.
 
      **Push is deliberately not part of this**, and not because of one
      predicate. The iOS Projects tab is a placeholder, a push payload can

@@ -129,8 +129,6 @@ pub struct ProjectRow {
     /// the column existed resolves to [`DEFAULT_MAX_PARALLEL_ISSUE_RUNS`] at the
     /// storage edge rather than making every reader decide again.
     pub max_parallel_issue_runs: usize,
-    /// When the operator last looked at this board. `None` means never.
-    pub read_at: Option<DateTime<Utc>>,
     /// Soft archive. There is no hard delete in any production path.
     pub archived_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
@@ -515,7 +513,17 @@ pub trait ProjectStore: Send + Sync {
 
     async fn release_run(&self, id: &IssueRunId) -> Result<bool>;
 
-    async fn mark_project_read(&self, id: &ProjectId, at: DateTime<Utc>) -> Result<bool>;
+    /// Note that the operator has opened this card. Monotonic: a slow
+    /// request must not rewind the cursor and resurrect a badge that was
+    /// already cleared.
+    async fn mark_issue_read(&self, issue: &IssueId, at: DateTime<Utc>) -> Result<bool>;
+
+    /// Every card on this board that has something waiting on it. Cards
+    /// with nothing waiting are absent rather than present with zeroes.
+    async fn card_signals(
+        &self,
+        project: &ProjectId,
+    ) -> Result<std::collections::HashMap<IssueId, CardSignals>>;
 
     async fn set_project_archived(&self, id: &ProjectId, archived: bool) -> Result<bool>;
 
@@ -725,13 +733,59 @@ pub struct AttentionCounts {
     pub approvals: usize,
     /// Runs recorded but not started, because the board is over budget.
     pub held: usize,
-    /// Since the operator last looked: agents' comments and cards arriving
-    /// in Review. Unlike the other three this is time-based, because
-    /// reading either of them changes nothing a query could see.
+    /// The sum of every card's [`CardSignals::unread`] on this board.
+    /// Unlike the other three this is time-based, because reading an
+    /// agent's comment changes nothing a query could otherwise see.
     pub unread: usize,
     /// Live cards whose newest run failed. Nothing retries by itself, so
     /// these sit until somebody looks.
     pub failed: usize,
+}
+
+/// What one card carries beyond its own row: the two signals derived over
+/// its events and its runs.
+///
+/// Both live here rather than being re-derived per caller, because the
+/// board's `attention` counts and the card's own badge have to be two views
+/// of one predicate — a rail dot saying "3 failed" over a board on which no
+/// card admits to failing is the exact drift this type exists to prevent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CardSignals {
+    /// Events on this card the operator has not opened it since: an
+    /// agent's comment, or an agent moving it into Review. The operator's
+    /// own actions never count — their own words are not news to them.
+    pub unread: usize,
+    /// This card's newest run failed and the card is still live. Cleared
+    /// by retrying, by finishing, by cancelling, or by blocking it —
+    /// never by looking, which is what separates it from `unread`.
+    pub last_run_failed: bool,
+}
+
+/// One board's cards with every card's signals already resolved.
+///
+/// The rows and the signals travel together because a caller holding only
+/// the rows would have to ask what "this card's run failed" means, and that
+/// question has exactly one home: [`ProjectStore::card_signals`].
+#[derive(Debug, Clone, Default)]
+pub struct BoardCards {
+    pub rows: Vec<IssueRow>,
+    signals: std::collections::HashMap<IssueId, CardSignals>,
+}
+
+impl BoardCards {
+    pub fn new(
+        rows: Vec<IssueRow>,
+        signals: std::collections::HashMap<IssueId, CardSignals>,
+    ) -> Self {
+        Self { rows, signals }
+    }
+
+    /// A card with nothing waiting on it has no row in the map, rather
+    /// than a row of zeroes — so absent has to read as quiet, not as
+    /// missing.
+    pub fn signals(&self, issue: &IssueId) -> CardSignals {
+        self.signals.get(issue).copied().unwrap_or_default()
+    }
 }
 
 /// What a board is doing right now, for the switcher's dropdown. Two

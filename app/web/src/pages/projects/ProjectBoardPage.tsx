@@ -28,7 +28,6 @@ import {
   fetchActiveRuns,
   fetchTeam,
   hireAgent,
-  markProjectRead,
   removeAgent,
   fetchIssues,
   fetchProject,
@@ -78,6 +77,7 @@ import { ProjectSettings } from './ProjectSettings';
 import { BoardFilterMenu } from './BoardFilterMenu';
 import { boardFilterParams, filterBoard, parseBoardFilter } from './boardFilter';
 import type { BoardFilter } from './boardFilter';
+import { invalidateAttention } from './useAttention';
 import { TeamStrip } from './TeamStrip';
 import { handleOf } from './teamModel';
 import { ToastStack, useToasts } from './Toasts';
@@ -160,7 +160,10 @@ export function ProjectBoardPage() {
       setActiveRuns(runsOutcome.kind === 'ok' ? runsOutcome.value : []);
       setLoading(false);
       writeLastProjectId(projectId);
-      void markProjectRead(client, projectId);
+      // Nothing is marked read here. Opening a board is not reading the
+      // question asked on one of its cards, and a stamp at this point also
+      // covered everything written between the fetches above and the POST
+      // landing — swallowing items that were never rendered.
     }
     void load();
     return () => {
@@ -176,7 +179,12 @@ export function ProjectBoardPage() {
     null,
     useCallback(() => {
       setRefreshKey((key) => key + 1);
-    }, []),
+      // The board's counts and the rail's dot are the same facts read
+      // twice. Without this the dot trailed the board it describes by up
+      // to a poll interval, which is how a signal the operator had just
+      // discharged read as one that would not clear.
+      invalidateAttention(client);
+    }, [client]),
   );
 
   const sensors = useSensors(
@@ -837,6 +845,14 @@ function BranchChip({ branch }: { branch: string }) {
   );
 }
 
+/// What the card's number means, spelled out where it is hovered. The
+/// badge counts an agent's comments *and* an agent moving the card into
+/// Review, so "messages" alone would be a lie on a card that has only been
+/// handed back.
+function unreadTitle(unread: number): string {
+  return `${unread} new since you opened this card`;
+}
+
 function IssueCard({
   issue,
   run = null,
@@ -876,6 +892,19 @@ function IssueCard({
         >
           {updatedAgo(issue.updated_at_ms, Date.now())}
         </span>
+        {issue.unread > 0 ? (
+          // The board's only count, and the corner the eye lands on. It is
+          // the countable half of the rail's dot: every number here is one
+          // card away from being cleared, which is the whole reason the
+          // rail's own number became a dot.
+          <span
+            title={unreadTitle(issue.unread)}
+            aria-label={unreadTitle(issue.unread)}
+            className="shrink-0 min-w-[1rem] h-4 px-1 rounded-full border-2 border-black bg-err text-white text-[0.55rem] font-bold leading-[0.75rem] text-center tabular-nums"
+          >
+            {issue.unread}
+          </span>
+        ) : null}
       </div>
       <p
         className={`font-mono text-[0.76rem] font-bold leading-snug line-clamp-2 ${
@@ -890,6 +919,19 @@ function IssueCard({
           title={issue.blocked_reason}
         >
           ⚑ Blocked
+        </span>
+      ) : null}
+      {issue.last_run_failed ? (
+        // A failed run leaves the card exactly where it was, wearing
+        // nothing — so the board's badge counted failures on a board where
+        // no card admitted to one, and finding them meant opening cards one
+        // at a time. It wears the Blocked badge's shape in the error tone,
+        // because both say the same thing: this card has stopped.
+        <span
+          className="self-start border border-err/50 bg-err/10 text-err rounded px-1.5 font-mono text-[0.56rem] font-bold uppercase"
+          title="This card's newest run failed. Open it to retry."
+        >
+          ✕ Run failed
         </span>
       ) : null}
       {hasDeliverable(issue) && issue.branch != null ? <BranchChip branch={issue.branch} /> : null}

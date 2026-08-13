@@ -5018,6 +5018,8 @@
                           "priority",
                           "position",
                           "stage",
+                          "unread",
+                          "last_run_failed",
                           "created_at_ms",
                           "updated_at_ms"
                         ],
@@ -5065,6 +5067,10 @@
                           "description": {
                             "type": "string"
                           },
+                          "last_run_failed": {
+                            "type": "boolean",
+                            "description": "This card's newest run failed and the card is still live. The board\nshows it, because a failure that leaves the card looking untouched\nis a badge pointing at something the operator cannot find."
+                          },
                           "number": {
                             "type": "integer",
                             "format": "int64",
@@ -5110,6 +5116,11 @@
                           },
                           "title": {
                             "type": "string"
+                          },
+                          "unread": {
+                            "type": "integer",
+                            "format": "int64",
+                            "description": "What has happened on this card since the operator last opened it:\nagents' comments, and an agent moving it into Review. `0` on a card\nwith nothing new — which is every card, a moment after it is read."
                           },
                           "updated_at_ms": {
                             "type": "integer",
@@ -5732,6 +5743,60 @@
         }
       }
     },
+    "/v1/projects/{project_id}/issues/{number}/read": {
+      "post": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "mark_issue_read",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "number",
+            "in": "path",
+            "description": "Issue number",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Noted; this card's unread count resets"
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown project or issue",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/projects/{project_id}/issues/{number}/runs": {
       "get": {
         "tags": [
@@ -5927,50 +5992,6 @@
           },
           "409": {
             "description": "A run is already in flight, or the project is archived",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/projects/{project_id}/read": {
-      "post": {
-        "tags": [
-          "projects"
-        ],
-        "operationId": "mark_project_read",
-        "parameters": [
-          {
-            "name": "project_id",
-            "in": "path",
-            "description": "Project id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "204": {
-            "description": "Noted; the board's unread count resets"
-          },
-          "401": {
-            "description": "Unauthorized",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Unknown project",
             "content": {
               "application/json": {
                 "schema": {
@@ -8922,6 +8943,8 @@
           "priority",
           "position",
           "stage",
+          "unread",
+          "last_run_failed",
           "created_at_ms",
           "updated_at_ms"
         ],
@@ -8969,6 +8992,10 @@
           "description": {
             "type": "string"
           },
+          "last_run_failed": {
+            "type": "boolean",
+            "description": "This card's newest run failed and the card is still live. The board\nshows it, because a failure that leaves the card looking untouched\nis a badge pointing at something the operator cannot find."
+          },
           "number": {
             "type": "integer",
             "format": "int64",
@@ -9014,6 +9041,11 @@
           },
           "title": {
             "type": "string"
+          },
+          "unread": {
+            "type": "integer",
+            "format": "int64",
+            "description": "What has happened on this card since the operator last opened it:\nagents' comments, and an agent moving it into Review. `0` on a card\nwith nothing new — which is every card, a moment after it is read."
           },
           "updated_at_ms": {
             "type": "integer",

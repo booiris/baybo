@@ -25,10 +25,19 @@ describe('wantsRefresh', () => {
     expect(wantsRefresh(changed({ scope: 'project' }), 'p1', null)).toBe(true);
   });
 
-  it('does not drag the board through a refetch because somebody commented', () => {
-    expect(wantsRefresh(changed({ scope: 'timeline', issue_number: 7 }), 'p1', null)).toBe(false);
+  it('refreshes the board when somebody comments, because a card counts that', () => {
+    // The board used to skip timeline frames on the grounds that it draws
+    // no timeline. It draws an unread count now, and that count moves on
+    // these frames and on no others — skipping them left the one number
+    // saying "an agent is asking you something" stale for as long as the
+    // operator kept looking at it.
+    expect(wantsRefresh(changed({ scope: 'timeline', issue_number: 7 }), 'p1', null)).toBe(true);
     expect(wantsRefresh(changed({ scope: 'timeline', issue_number: 7 }), 'p1', 7)).toBe(true);
     expect(wantsRefresh(changed({ scope: 'timeline', issue_number: 8 }), 'p1', 7)).toBe(false);
+  });
+
+  it('still ignores another board entirely', () => {
+    expect(wantsRefresh(changed({ scope: 'timeline', issue_number: 7 }), 'p2', null)).toBe(false);
   });
 
   it('refreshes a card only for its own number — but never ignores a board-wide change', () => {
