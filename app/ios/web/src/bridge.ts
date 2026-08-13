@@ -213,9 +213,6 @@ export type OutlinePost = {
   /// Older pages remain on the server — the sheet says `24+`, not `24`.
   hasMoreOlder: boolean;
   loadingOlder: boolean;
-  /// Whether the affordance is worth showing at all. The web decides, because
-  /// it is the only layer that can count.
-  available: boolean;
 };
 
 const OUTLINE_DEBOUNCE_MS = 250;
@@ -268,6 +265,24 @@ export function resendOutline(state: OutlinePost): void {
 /// on, so the sheet opens scrolled to it. `null` when nothing is above the fold.
 export function postOutlineHere(rowId: string | null): void {
   postSafe({ type: "outlineHere", rowId });
+}
+
+/// The header's `Subagents` entry, which shows only for a conversation that has
+/// children. The transcript reads that off a rendered `spawn_subagent` work step
+/// — no request, and it holds up offline — and mirrors the verdict here. Native
+/// ORs it with its own bounded list pull, which covers a spawn that scrolled out
+/// of the loaded window before this tree ever saw it.
+///
+/// Guarded, not debounced: the transcript re-derives on every commit but the
+/// value changes at most once per session, so the redundant posts are all this
+/// has to drop — and the one that does change must go out on the frame it
+/// changed, as the outline's first post does.
+let subagentsLastPosted: boolean | undefined;
+
+export function postSubagents(present: boolean): void {
+  if (present === subagentsLastPosted) return;
+  subagentsLastPosted = present;
+  postSafe({ type: "subagents", present });
 }
 
 /// The composer's send button is native and flips to a stop affordance while a
@@ -669,6 +684,13 @@ window.baybo = {
     outlinePending = null;
     outlineLastJson = "";
     outlinePosted = false;
+    // `undefined`, not `false`: the new tree's first verdict must reach native
+    // even when it matches the outgoing session's. The hazard is the FALSE
+    // NEGATIVE — native clears its own flag on every retarget/`ready` and
+    // latches only on `true`, so a guard still holding `true` from the
+    // outgoing conversation would swallow the incoming one's `true` and leave
+    // a chat that HAS subagents without the header entry.
+    subagentsLastPosted = undefined;
     connEpoch = payload.connEpoch;
     initPayload = payload;
     window.dispatchEvent(new Event(HTML_PREVIEW_COLLAPSE_EVENT));

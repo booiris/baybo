@@ -12,6 +12,7 @@ import {
   foldMidTurnNoticeIn,
   severTerminalNoticeIn,
   freezeActiveWork,
+  hasSubagentSpawn,
   hasUntimedWork,
   holdsUserSend,
   isStopAckNotice,
@@ -268,6 +269,7 @@ describe("wireStepToWork — the subscribe_state shape", () => {
     expect(wireStepToWork({ kind: "tool", call_id: "call-9", tool: "Bash", label: "Bash(ls)" })).toEqual({
       kind: "tool",
       callId: "call-9",
+      tool: "Bash",
       label: "Bash(ls)",
       status: "running",
       summary: undefined,
@@ -300,6 +302,7 @@ describe("restStepToWork — the REST shape (tool_* names)", () => {
     ).toEqual({
       kind: "tool",
       callId: "c1",
+      tool: "Bash",
       label: "Bash(ls)",
       status: "error",
       summary: "exit 1",
@@ -1655,6 +1658,43 @@ describe("outlineEntries — the message index's model", () => {
     } finally {
       vi.unstubAllEnvs();
     }
+  });
+});
+
+describe("hasSubagentSpawn — what lights the header's Subagents entry", () => {
+  const spawn = tool({ callId: "c9", tool: "spawn_subagent", label: "audit the sync loop" });
+
+  it("is false for a thread whose work is ordinary tool calls", () => {
+    const rows: Row[] = [
+      { id: "p1", role: "user", content: "ship it" },
+      work({ id: "w1", steps: [{ kind: "reasoning", text: "thinking" }, tool({ tool: "bash" })] }),
+    ];
+    expect(hasSubagentSpawn(rows)).toBe(false);
+  });
+
+  it("is true once any block ran the spawn tool", () => {
+    const rows: Row[] = [
+      work({ id: "w1", steps: [tool({ tool: "read" })] }),
+      work({ id: "w2", steps: [spawn] }),
+    ];
+    expect(hasSubagentSpawn(rows)).toBe(true);
+  });
+
+  // The gateway's label is pulled from the call INPUT — for a spawn it names the
+  // errand — so the display string can never stand in for the tool name.
+  it("reads the tool name, NOT the label the step renders", () => {
+    expect(hasSubagentSpawn([work({ id: "w1", steps: [spawn] })])).toBe(true);
+    expect(
+      hasSubagentSpawn([
+        work({ id: "w1", steps: [tool({ tool: "bash", label: "spawn_subagent" })] }),
+      ]),
+    ).toBe(false);
+  });
+
+  // A mirror written before the step carried its tool name — the native side's
+  // own list pull is what covers that conversation until a sync re-delivers it.
+  it("is false for a step that carries no tool name at all", () => {
+    expect(hasSubagentSpawn([work({ id: "w1", steps: [tool({ tool: undefined })] })])).toBe(false);
   });
 });
 

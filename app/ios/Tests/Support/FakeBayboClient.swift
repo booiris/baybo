@@ -88,6 +88,9 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     private var syncOutcome: Result<String, Error> = .success(FakeBayboClient.emptySyncFrame)
     private var lookupResults: [String: MessageLookup] = [:]
     private var lookupError: Error?
+    private var subagentList = ChatSubagentList(items: [], hasMoreOlder: false)
+    private var subagentListError: Error?
+    private var subagentListCalls: [String] = []
     /// Recorded search queries, in call order — what a debounce test asserts on.
     private var searches: [String] = []
     private var searchResults: [String: ChatSearchResults] = [:]
@@ -349,6 +352,33 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     func chatFetchHistory(sessionId: String, beforeOrdinal: Int64?, limit: UInt32?) async throws
         -> String
     {
+        throw Self.unsupported
+    }
+
+    // The subagent read surface. `chatListSubagents` is programmable because the
+    // read-only page's polling loop retires itself on what it returns; the two
+    // transcript pulls follow `chatFetchHistory` and stay unsupported until a
+    // test needs them.
+    func chatListSubagents(sessionId: String, before: SubagentCursor?) async throws
+        -> ChatSubagentList
+    {
+        let outcome: Result<ChatSubagentList, Error> = lock.withLock {
+            subagentListCalls.append(sessionId)
+            if let subagentListError { return .failure(subagentListError) }
+            return .success(subagentList)
+        }
+        return try outcome.get()
+    }
+
+    func chatFetchSubagentHistory(
+        sessionId: String, beforeOrdinal: Int64?, limit: UInt32?
+    ) async throws -> String {
+        throw Self.unsupported
+    }
+
+    func chatFetchSubagentSync(
+        sessionId: String, sinceOrdinal: Int64?, limit: UInt32
+    ) async throws -> String {
         throw Self.unsupported
     }
 

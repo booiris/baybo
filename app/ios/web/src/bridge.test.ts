@@ -186,7 +186,6 @@ describe("postOutline — the message index mirror", () => {
       ],
       hasMoreOlder: true,
       loadingOlder: false,
-      available: true,
     };
   }
 
@@ -209,7 +208,6 @@ describe("postOutline — the message index mirror", () => {
         ],
         hasMoreOlder: true,
         loadingOlder: false,
-        available: true,
       },
     ]);
   });
@@ -259,6 +257,46 @@ describe("postOutline — the message index mirror", () => {
       { type: "outlineHere", rowId: "pm-9" },
       { type: "outlineHere", rowId: null },
     ]);
+  });
+});
+
+describe("postSubagents — the header's Subagents entry", () => {
+  function subagentPosts(): Record<string, unknown>[] {
+    return posted.filter((m) => m.type === "subagents");
+  }
+
+  it("posts the verdict flat, in the shape native parses", async () => {
+    const bridge = await loadBridge();
+    window.baybo.init(initPayload(SESSION_A));
+    bridge.postSubagents(false);
+    bridge.postSubagents(true);
+    expect(subagentPosts()).toEqual([
+      { type: "subagents", present: false },
+      { type: "subagents", present: true },
+    ]);
+  });
+
+  it("drops a repost of the value native already holds — the transcript re-derives on every commit", async () => {
+    const bridge = await loadBridge();
+    window.baybo.init(initPayload(SESSION_A));
+    bridge.postSubagents(true);
+    bridge.postSubagents(true);
+    bridge.postSubagents(true);
+    expect(subagentPosts()).toEqual([{ type: "subagents", present: true }]);
+  });
+
+  // One WKWebView serves every conversation: without the reset, session B's
+  // `false` is compared against A's and never posts, leaving a Subagents button
+  // on a conversation that has none.
+  it("re-posts after init even when the verdict is unchanged", async () => {
+    const bridge = await loadBridge();
+    window.baybo.init(initPayload(SESSION_A));
+    bridge.postSubagents(false);
+    expect(subagentPosts()).toHaveLength(1);
+
+    window.baybo.init(initPayload(SESSION_B));
+    bridge.postSubagents(false);
+    expect(subagentPosts()).toHaveLength(2);
   });
 });
 

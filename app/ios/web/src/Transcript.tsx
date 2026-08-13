@@ -33,6 +33,7 @@ import {
   postOutline,
   postOutlineHere,
   postRunState,
+  postSubagents,
   postSyncRequest,
   previewFile,
   queryAudioState,
@@ -86,6 +87,7 @@ export function wireStepToWork(s: WireWorkStepFrame): WorkStep {
     return {
       kind: "tool",
       callId: s.call_id ?? "",
+      tool: s.tool,
       label: s.label || s.tool || "",
       status: s.status ?? "running",
       summary: s.summary || undefined,
@@ -108,6 +110,7 @@ export function restStepToWork(s: NonNullable<TranscriptRowItem["steps"]>[number
       // "" only for a row the gateway persisted before it sent `call_id`;
       // `workStepKey` falls back to content-keying for those.
       callId: s.call_id ?? "",
+      tool: s.tool,
       label: s.tool_label || s.tool || "",
       status: s.tool_status ?? "",
       summary: s.tool_summary || undefined,
@@ -238,11 +241,6 @@ const LAZY_ATTACHMENT_ROOT_MARGIN = "400px 0px";
 /// one — native truncates to its own (shorter) width; this only keeps a pasted
 /// wall of text out of every bridge message the sheet's list rides on.
 const OUTLINE_TEXT_CAP = 160;
-
-/// Fewer of the user's own sends than this and the index sheet isn't worth a
-/// header button — a thread that short is faster to scroll than to index.
-/// `hasMoreOlder` overrides it: the unloaded pages hold more.
-const OUTLINE_MIN_ENTRIES = 3;
 
 /// Delay before `jumpToMessage`'s one-shot correction pass. The jump drags
 /// never-decoded images into the lazy band and they shove the target down as
@@ -574,6 +572,20 @@ export function outlineEntries(rows: Row[]): OutlineEntry[] {
     });
   }
   return out;
+}
+
+/// The tool that mints a child session — `baybo_model::SPAWN_SUBAGENT_TOOL_NAME`.
+const SPAWN_SUBAGENT_TOOL = "spawn_subagent";
+
+/// Whether the loaded rows show this conversation spawning a subagent — what
+/// lights the header's `Subagents` entry. Read off the rendered rows rather
+/// than asked for over the network, so a restored mirror answers it offline.
+export function hasSubagentSpawn(rows: Row[]): boolean {
+  return rows.some(
+    (row) =>
+      row.role === "work" &&
+      row.steps.some((s) => s.kind === "tool" && s.tool === SPAWN_SUBAGENT_TOOL),
+  );
 }
 
 /// Identity of a work step for dedup when folding two representations of the
@@ -3844,6 +3856,7 @@ export function Transcript({
         pushWorkStep({
           kind: "tool",
           callId: frame.call_id,
+          tool: frame.tool,
           label: frame.label || frame.tool,
           status: "running",
         });
@@ -4398,12 +4411,7 @@ export function Transcript({
   // the identity guard, so every re-derive just posts.
   const outline = useMemo(() => outlineEntries(messages), [messages]);
   const outlinePost = useMemo<OutlinePost>(
-    () => ({
-      entries: outline,
-      hasMoreOlder,
-      loadingOlder,
-      available: outline.length >= OUTLINE_MIN_ENTRIES || hasMoreOlder,
-    }),
+    () => ({ entries: outline, hasMoreOlder, loadingOlder }),
     [outline, hasMoreOlder, loadingOlder],
   );
   // Read by `jumpToMessage`'s self-heal, which fires off a bridge event rather
@@ -4413,6 +4421,20 @@ export function Transcript({
   useEffect(() => {
     postOutline(outlinePost);
   }, [outlinePost]);
+
+  // The header's `Subagents` entry, from the rows already on screen — no request,
+  // and right offline. LATCHED for the session, which the `key={sessionId}` mount
+  // scopes: a REPLACE rebuilds the thread from the newest page and backward paging
+  // starts there, so the spawning turn leaves the loaded window routinely — the
+  // child it minted does not leave with it.
+  const spawnedRef = useRef(false);
+  const hasSubagents = useMemo(() => {
+    spawnedRef.current ||= hasSubagentSpawn(messages);
+    return spawnedRef.current;
+  }, [messages]);
+  useEffect(() => {
+    postSubagents(hasSubagents);
+  }, [hasSubagents]);
 
   // The button itself is native (a liquid-glass circle above the composer) —
   // mirror the visibility over the bridge; taps come back via the

@@ -6,12 +6,17 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::api::{
-    ChatSearchGroup, ChatSearchHit, ChatSearchResults, ChatSessionSummary, CronJobStatus,
-    CronJobSummary, DeckCardInfo, DeckLayoutEntryInput, DeckSnapshotInfo, DeckView,
-    LlmModelCatalog, LlmModelInfo, SessionModelPin,
+    ChatSearchGroup, ChatSearchHit, ChatSearchResults, ChatSessionSummary, ChatSubagentList,
+    ChatSubagentStatus, ChatSubagentSummary, CronJobStatus, CronJobSummary, DeckCardInfo,
+    DeckLayoutEntryInput, DeckSnapshotInfo, DeckView, LlmModelCatalog, LlmModelInfo,
+    SessionModelPin, SubagentCursor,
 };
 
 const PATH_CHAT_SESSIONS: &str = "/v1/chat/sessions";
+/// The read-only door onto a subagent child's transcript. A child session is
+/// invisible to `/v1/chat/sessions` (its channel is `subagent`, not `owner`),
+/// so its reads ride their own lineage-scoped path space.
+const PATH_CHAT_SUBAGENTS: &str = "/v1/chat/subagents";
 const PATH_CHAT_SEARCH: &str = "/v1/chat/search";
 const PATH_CRON: &str = "/v1/cron";
 const PATH_LLM_MODELS: &str = "/v1/llm/models";
@@ -405,6 +410,51 @@ struct SyncPageFrame {
     /// shape is unchanged; the webview reads it as an optional field.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     compaction_points: Vec<CompactionPoint>,
+}
+
+/// `GET /v1/chat/sessions/{id}/subagents` — the gateway's `ChatSubagentList`.
+/// The route SKIPS what a child has none of (`subagent_type`, `task`,
+/// `started_at`, `ended_at`); the sheet is a display surface, so a key that is
+/// absent costs one row its detail rather than blanking the whole listing.
+#[derive(Deserialize)]
+struct WireSubagentList {
+    #[serde(default)]
+    items: Vec<WireSubagentSummary>,
+    #[serde(default)]
+    has_more_older: bool,
+}
+
+#[derive(Deserialize)]
+struct WireSubagentSummary {
+    session_id: String,
+    #[serde(default)]
+    subagent_type: Option<String>,
+    backend: String,
+    /// The errand the parent authored, stamped onto the child's title at spawn
+    /// — absent on a child spawned before that stamp existed.
+    #[serde(default)]
+    task: Option<String>,
+    status: WireSubagentStatus,
+    created_at: String,
+    #[serde(default)]
+    started_at: Option<String>,
+    #[serde(default)]
+    ended_at: Option<String>,
+}
+
+/// The gateway's `ChatSubagentStatus`. `Unknown` is both its own drift arm and
+/// this side's: a gateway that grows a status must cost one row its label, not
+/// fail the listing's decode.
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WireSubagentStatus {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+    #[serde(other)]
+    Unknown,
 }
 
 /// `GET /v1/chat/search` — the gateway's grouped result set.
@@ -886,8 +936,45 @@ pub(crate) async fn fetch_history_page<C: GatewayJsonClient + Sync>(
     before_ordinal: Option<i64>,
     limit: Option<u32>,
 ) -> Result<String, String> {
+    history_page(
+        client,
+        PATH_CHAT_SESSIONS,
+        session_id,
+        before_ordinal,
+        limit,
+    )
+    .await
+}
+
+/// A child's backward transcript page (`GET /v1/chat/subagents/{id}`). The
+/// route answers the same DTO as its owner-session twin, and the frame feeds
+/// the same transcript bundle — the read-only page differs by which door it
+/// came through, nothing else.
+pub(crate) async fn fetch_subagent_history_page<C: GatewayJsonClient + Sync>(
+    client: &C,
+    session_id: String,
+    before_ordinal: Option<i64>,
+    limit: Option<u32>,
+) -> Result<String, String> {
+    history_page(
+        client,
+        PATH_CHAT_SUBAGENTS,
+        session_id,
+        before_ordinal,
+        limit,
+    )
+    .await
+}
+
+async fn history_page<C: GatewayJsonClient + Sync>(
+    client: &C,
+    base: &str,
+    session_id: String,
+    before_ordinal: Option<i64>,
+    limit: Option<u32>,
+) -> Result<String, String> {
     validate_path_segment(&session_id, "session_id")?;
-    let mut path = format!("{PATH_CHAT_SESSIONS}/{session_id}");
+    let mut path = format!("{base}/{}", percent_encode(&session_id));
     let mut first_query = true;
     if let Some(before) = before_ordinal {
         append_query(&mut path, &mut first_query, "before_ordinal", before);
@@ -915,8 +1002,37 @@ pub(crate) async fn fetch_sync<C: GatewayJsonClient + Sync>(
     since_ordinal: Option<i64>,
     limit: u32,
 ) -> Result<String, String> {
+    sync_page(client, PATH_CHAT_SESSIONS, session_id, since_ordinal, limit).await
+}
+
+/// The same forward-recovery pull against a child (`GET
+/// /v1/chat/subagents/{id}/sync`) — what the read-only page polls while the
+/// child it is showing has not ended, cheap because it is a cursor difference.
+pub(crate) async fn fetch_subagent_sync<C: GatewayJsonClient + Sync>(
+    client: &C,
+    session_id: String,
+    since_ordinal: Option<i64>,
+    limit: u32,
+) -> Result<String, String> {
+    sync_page(
+        client,
+        PATH_CHAT_SUBAGENTS,
+        session_id,
+        since_ordinal,
+        limit,
+    )
+    .await
+}
+
+async fn sync_page<C: GatewayJsonClient + Sync>(
+    client: &C,
+    base: &str,
+    session_id: String,
+    since_ordinal: Option<i64>,
+    limit: u32,
+) -> Result<String, String> {
     validate_path_segment(&session_id, "session_id")?;
-    let mut path = format!("{PATH_CHAT_SESSIONS}/{session_id}/sync");
+    let mut path = format!("{base}/{}/sync", percent_encode(&session_id));
     let mut first_query = true;
     if let Some(since) = since_ordinal {
         append_query(&mut path, &mut first_query, "since_ordinal", since);
@@ -936,6 +1052,60 @@ pub(crate) async fn fetch_sync<C: GatewayJsonClient + Sync>(
     serde_json::to_string(&frame).map_err(|e| format!("encode sync page: {e}"))
 }
 
+/// A session's direct subagent children, ascending
+/// (`GET /v1/chat/sessions/{id}/subagents`).
+///
+/// One bounded listing, never a page: the route caps what it returns and
+/// reports how many older children the cap dropped, so there is no cursor to
+/// follow. `session_id` is a parent — an owner conversation, or a child being
+/// drilled into for its own children.
+pub(crate) async fn list_subagents<C: GatewayJsonClient + Sync>(
+    client: &C,
+    session_id: String,
+    before: Option<SubagentCursor>,
+) -> Result<ChatSubagentList, String> {
+    validate_path_segment(&session_id, "session_id")?;
+    let mut path = format!(
+        "{PATH_CHAT_SESSIONS}/{}/subagents",
+        percent_encode(&session_id)
+    );
+    // Both halves or neither: the gateway ignores a partial cursor, which
+    // would silently page from somewhere the caller did not mean.
+    if let Some(cursor) = before {
+        validate_path_segment(&cursor.session_id, "before_id")?;
+        path.push_str(&format!(
+            "?before_created_at={}&before_id={}",
+            percent_encode(&cursor.created_at),
+            percent_encode(&cursor.session_id)
+        ));
+    }
+    let list: WireSubagentList = client.get_json(&path).await?;
+    Ok(ChatSubagentList {
+        has_more_older: list.has_more_older,
+        items: list
+            .items
+            .into_iter()
+            .map(|child| ChatSubagentSummary {
+                session_id: child.session_id,
+                subagent_type: child.subagent_type,
+                backend: child.backend,
+                task: child.task,
+                status: match child.status {
+                    WireSubagentStatus::Pending => ChatSubagentStatus::Pending,
+                    WireSubagentStatus::Running => ChatSubagentStatus::Running,
+                    WireSubagentStatus::Completed => ChatSubagentStatus::Completed,
+                    WireSubagentStatus::Failed => ChatSubagentStatus::Failed,
+                    WireSubagentStatus::Cancelled => ChatSubagentStatus::Cancelled,
+                    WireSubagentStatus::Unknown => ChatSubagentStatus::Unknown,
+                },
+                created_at: child.created_at,
+                started_at: child.started_at,
+                ended_at: child.ended_at,
+            })
+            .collect(),
+    })
+}
+
 /// Per-send durability point lookup: does a persisted row carry this
 /// `platform_msg_id`? Consumed natively by the outbox (never the webview).
 pub(crate) async fn lookup_message<C: GatewayJsonClient + Sync>(
@@ -949,7 +1119,7 @@ pub(crate) async fn lookup_message<C: GatewayJsonClient + Sync>(
     }
     let path = format!(
         "{PATH_CHAT_SESSIONS}/{session_id}/messages?platform_msg_id={}",
-        percent_encode_query(platform_msg_id)
+        percent_encode(platform_msg_id)
     );
     client.get_json(&path).await
 }
@@ -968,7 +1138,7 @@ pub(crate) async fn search_messages<C: GatewayJsonClient + Sync>(
     client: &C,
     query: &str,
 ) -> Result<ChatSearchResults, String> {
-    let path = format!("{PATH_CHAT_SEARCH}?q={}", percent_encode_query(query));
+    let path = format!("{PATH_CHAT_SEARCH}?q={}", percent_encode(query));
     let wire: WireSearchResults = client.get_json(&path).await?;
     Ok(ChatSearchResults {
         truncated: wire.truncated,
@@ -995,10 +1165,12 @@ pub(crate) async fn search_messages<C: GatewayJsonClient + Sync>(
     })
 }
 
-/// Percent-encode a query value (everything outside RFC 3986 unreserved).
-/// `platform_msg_id`s are native-minted UUIDs today, but a retry payload
-/// round-trips through the webview — encode defensively.
-fn percent_encode_query(value: &str) -> String {
+/// Percent-encode a URL value (everything outside RFC 3986 unreserved) — the
+/// unreserved set is literal in a query value and in a path segment alike, so
+/// both positions ride this. `platform_msg_id`s are native-minted UUIDs today,
+/// but a retry payload round-trips through the webview, and a subagent child
+/// id is whatever the gateway's listing said — encode defensively.
+fn percent_encode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
         match byte {
@@ -1428,6 +1600,197 @@ mod tests {
                 .expect_err("must reject {bad}");
             assert_eq!(err, "invalid session_id");
             assert!(client.calls.lock().is_empty(), "{bad} must not be sent");
+        }
+    }
+
+    /// The gateway's `ChatSubagentList`, verbatim — including the keys it SKIPS
+    /// on a child that has nothing to put in them (`subagent_type`, `task`,
+    /// `started_at`, `ended_at`).
+    const SUBAGENT_LIST: &str = r#"{
+        "items":[
+            {"session_id":"c1","subagent_type":"explorer","backend":"baybo","task":"Find every caller","status":"completed","created_at":"2026-08-13T01:00:00Z","started_at":"2026-08-13T01:00:01Z","ended_at":"2026-08-13T01:02:00Z"},
+            {"session_id":"c2","backend":"codex","status":"pending","created_at":"2026-08-13T01:03:00Z"}
+        ],
+        "has_more_older":true
+    }"#;
+
+    #[tokio::test]
+    async fn list_subagents_reads_the_children_off_the_parents_path() {
+        let client = RecordingClient::new(SUBAGENT_LIST);
+        let list = list_subagents(&client, "s1".to_string(), None)
+            .await
+            .expect("subagents");
+
+        let call = client.only_call();
+        assert_eq!(call.method, "GET");
+        assert_eq!(call.path, "/v1/chat/sessions/s1/subagents");
+        assert!(list.has_more_older);
+
+        let first = &list.items[0];
+        assert_eq!(first.session_id, "c1");
+        assert_eq!(first.subagent_type.as_deref(), Some("explorer"));
+        assert_eq!(first.backend, "baybo");
+        assert_eq!(first.task.as_deref(), Some("Find every caller"));
+        assert_eq!(first.status, ChatSubagentStatus::Completed);
+        assert_eq!(first.created_at, "2026-08-13T01:00:00Z");
+        assert_eq!(first.started_at.as_deref(), Some("2026-08-13T01:00:01Z"));
+        assert_eq!(first.ended_at.as_deref(), Some("2026-08-13T01:02:00Z"));
+
+        // A child that has not opened a turn yet still owes the sheet a row.
+        let second = &list.items[1];
+        assert_eq!(second.backend, "codex");
+        assert_eq!(second.subagent_type, None);
+        assert_eq!(second.task, None);
+        assert_eq!(second.status, ChatSubagentStatus::Pending);
+        assert_eq!(second.started_at, None);
+        assert_eq!(second.ended_at, None);
+    }
+
+    /// A status this build has never heard of costs that ONE row its label. A
+    /// strict decode would cost the whole sheet.
+    #[tokio::test]
+    async fn an_unrecognized_subagent_status_reads_as_unknown() {
+        let client = RecordingClient::new(
+            r#"{"items":[{"session_id":"c1","backend":"baybo","status":"evaporated","created_at":"2026-08-13T01:00:00Z"}],"older_omitted":0}"#,
+        );
+        let list = list_subagents(&client, "s1".to_string(), None)
+            .await
+            .expect("subagents");
+        assert_eq!(list.items[0].status, ChatSubagentStatus::Unknown);
+    }
+
+    #[tokio::test]
+    async fn list_subagents_reads_an_empty_body_as_an_empty_listing() {
+        let client = RecordingClient::new("{}");
+        let list = list_subagents(&client, "s1".to_string(), None)
+            .await
+            .expect("subagents");
+        assert!(list.items.is_empty());
+        assert!(!list.has_more_older);
+    }
+
+    /// A child's transcript rides its OWN path space — `/v1/chat/sessions/{id}`
+    /// 404s a child (it is not on the `owner` channel) — and comes back as the
+    /// same frame the transcript bundle already consumes.
+    #[tokio::test]
+    async fn a_subagent_history_page_rides_the_subagent_path() {
+        let client = RecordingClient::new(
+            r#"{"transcript":[{"id":"h1"}],"has_more":true,"oldest_ordinal":4,"newest_ordinal":9}"#,
+        );
+        let frame = fetch_subagent_history_page(&client, "c1".to_string(), Some(10), Some(20))
+            .await
+            .expect("history");
+
+        let json: serde_json::Value = serde_json::from_str(&frame).expect("parse");
+        assert_eq!(json["kind"], KIND_HISTORY_PAGE);
+        assert_eq!(json["rows"][0]["id"], "h1");
+        assert_eq!(
+            client.only_call().path,
+            "/v1/chat/subagents/c1?before_ordinal=10&limit=20"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_subagent_history_page_without_params_has_no_query_string() {
+        let client = RecordingClient::new(
+            r#"{"transcript":[],"has_more":false,"oldest_ordinal":null,"newest_ordinal":null}"#,
+        );
+        fetch_subagent_history_page(&client, "c1".to_string(), None, None)
+            .await
+            .expect("history");
+        assert_eq!(client.only_call().path, "/v1/chat/subagents/c1");
+    }
+
+    #[tokio::test]
+    async fn a_subagent_sync_query_opens_with_a_question_mark_then_ampersands() {
+        let client = RecordingClient::new(SYNC_RESPONSE);
+        let frame = fetch_subagent_sync(&client, "c1".to_string(), Some(12), 50)
+            .await
+            .expect("sync");
+
+        let json: serde_json::Value = serde_json::from_str(&frame).expect("parse");
+        assert_eq!(json["kind"], KIND_SYNC_PAGE);
+        assert_eq!(json["since_ordinal"], 12);
+        assert_eq!(
+            client.only_call().path,
+            "/v1/chat/subagents/c1/sync?since_ordinal=12&limit=50"
+        );
+    }
+
+    /// The child page opens on a baseline pull, so the REPLACE marker matters
+    /// here exactly as much as on the parent: cursor absent from the QUERY,
+    /// explicit null in the FRAME.
+    #[tokio::test]
+    async fn a_baseline_subagent_sync_carries_only_the_limit_and_a_null_cursor() {
+        let client = RecordingClient::new(SYNC_RESPONSE);
+        let frame = fetch_subagent_sync(&client, "c1".to_string(), None, 30)
+            .await
+            .expect("sync");
+
+        assert!(
+            frame.contains(r#""since_ordinal":null"#),
+            "the baseline marker must survive as a literal null: {frame}"
+        );
+        assert_eq!(
+            client.only_call().path,
+            "/v1/chat/subagents/c1/sync?limit=30"
+        );
+    }
+
+    /// A child id is whatever the gateway's listing said, and it reaches all
+    /// three routes as a path segment.
+    #[tokio::test]
+    async fn the_subagent_routes_percent_encode_the_child_id() {
+        let child = "c 1%2";
+
+        let client = RecordingClient::new(SUBAGENT_LIST);
+        list_subagents(&client, child.to_string(), None)
+            .await
+            .expect("subagents");
+        assert_eq!(
+            client.only_call().path,
+            "/v1/chat/sessions/c%201%252/subagents"
+        );
+
+        let client = RecordingClient::new(r#"{"transcript":[],"has_more":false}"#);
+        fetch_subagent_history_page(&client, child.to_string(), None, None)
+            .await
+            .expect("history");
+        assert_eq!(client.only_call().path, "/v1/chat/subagents/c%201%252");
+
+        let client = RecordingClient::new(SYNC_RESPONSE);
+        fetch_subagent_sync(&client, child.to_string(), None, 30)
+            .await
+            .expect("sync");
+        assert_eq!(
+            client.only_call().path,
+            "/v1/chat/subagents/c%201%252/sync?limit=30"
+        );
+    }
+
+    /// An empty id would target the collection route rather than a child, and a
+    /// path character would retarget the request outright.
+    #[tokio::test]
+    async fn the_subagent_routes_reject_an_id_that_could_escape_its_path_segment() {
+        for bad in ["", "a/b", "a?b", "a#b", "../sessions/s1"] {
+            let client = RecordingClient::empty();
+            assert!(
+                list_subagents(&client, bad.to_string(), None).await.is_err(),
+                "{bad:?} must be rejected"
+            );
+            assert!(
+                fetch_subagent_history_page(&client, bad.to_string(), None, None)
+                    .await
+                    .is_err(),
+                "{bad:?} must be rejected"
+            );
+            assert!(
+                fetch_subagent_sync(&client, bad.to_string(), None, 30)
+                    .await
+                    .is_err(),
+                "{bad:?} must be rejected"
+            );
+            assert!(client.calls.lock().is_empty(), "{bad:?} must not be sent");
         }
     }
 

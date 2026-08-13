@@ -180,13 +180,18 @@ struct MessageIndexSheet: View {
             .listRowInsets(Self.rowInsets)
     }
 
-    /// Reachable only if the last entry vanishes under an open sheet. The sheet
-    /// stays open — a panel that closes itself under your finger reads as a
-    /// crash.
+    /// The normal state of a new conversation, now that the header button is
+    /// permanent — it used to be reachable only if the last entry vanished
+    /// under an open sheet. The sheet stays open either way: a panel that
+    /// closes itself under your finger reads as a crash.
+    ///
+    /// A DECODE FAILURE says so instead. Both leave the list empty, but only
+    /// one of them is the reader's own doing, and telling someone with a full
+    /// thread that they have never sent a message is the worse lie.
     private var emptyState: some View {
         VStack {
             Spacer()
-            Text(verbatim: lang.t("chat.indexEmpty"))
+            Text(verbatim: lang.t(bridge.outlineFailed ? "chat.indexUnavailable" : "chat.indexEmpty"))
                 .font(Theme.mono(13))
                 .foregroundStyle(Theme.inkSoft)
             Spacer()

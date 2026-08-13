@@ -318,6 +318,13 @@ export type WorkStep =
   | {
       kind: "tool";
       callId: string;
+      /// The tool's own name, kept beside the display `label` because the two
+      /// are not the same string: the gateway's label is pulled from the call's
+      /// INPUT (a path, a command, a subagent's errand), so nothing else on a
+      /// rendered step names the tool that ran. Read by `hasSubagentSpawn`.
+      /// Absent on a step a lone `tool_completed` minted (no start to name it)
+      /// and on a mirror written before this existed.
+      tool?: string;
       label: string;
       status: string;
       summary?: string;

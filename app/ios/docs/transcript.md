@@ -216,7 +216,7 @@ delivering other traffic is left alone and only this connect fails.
 `queryFileState` / `downloadFile` / `previewFile` / `shareFile` / `viewImage` /
 `audioToggle` / `audioSeek` / `queryAudioState` / `playVideo` / `requestVideoPoster` /
 `retry` / `openUrl` / `copy` / `log` / `jumpVisible` / `runState` / `outline` /
-`outlineHere` / `htmlPreviewMaximized`.
+`outlineHere` / `subagents` / `htmlPreviewMaximized`.
 
 (The blob/file/audio/video messages are covered in [attachments.md](attachments.md).)
 
@@ -655,8 +655,10 @@ including the spin.
 
 ### Two traps
 
-1. The five `@Published` outline mirrors reset in BOTH `retarget(to:)` and `case "ready"`
-   (one webview, every conversation).
+1. The `@Published` outline mirrors — plus `subagentsPresent`, which rides the same
+   reset — clear in BOTH `retarget(to:)` and `case "ready"` (one webview, every
+   conversation). The header entry they drive is PERMANENT for the index and
+   presence-gated for subagents; neither is gated on thread length any more.
 2. `deliver()` in `bridge.ts` ends in a bare `else e.jumpToLatest()`, so every new
    `Buffered` variant needs its own `else if` **ABOVE** it or the command silently becomes
    "scroll to the bottom" — TypeScript cannot see it; `bridge.test.ts` pins it.
