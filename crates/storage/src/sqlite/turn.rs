@@ -5,7 +5,7 @@ use rusqlite::types::Value;
 use super::SqlitePool;
 use baybo_model::{SessionId, TurnId};
 use baybo_store::turn::Result;
-use baybo_store::{SessionTurnStats, StorageError, TurnRow, TurnStore};
+use baybo_store::{SessionTurnBounds, SessionTurnStats, StorageError, TurnRow, TurnStore};
 
 pub struct SqliteTurnStore {
     pool: SqlitePool,
@@ -275,6 +275,75 @@ impl TurnStore for SqliteTurnStore {
             .await
     }
 
+    async fn session_turn_bounds(
+        &self,
+        session_ids: &[SessionId],
+    ) -> Result<Vec<SessionTurnBounds>> {
+        if session_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let keys: Vec<String> = session_ids.iter().map(|s| s.as_str().to_string()).collect();
+        let raw: Vec<(String, i64, Option<i64>, i64, String)> = self
+            .pool
+            .interact("turns.session_turn_bounds", move |conn| {
+                let placeholders = super::in_placeholders(keys.len());
+                // `MIN(COALESCE(started_at, created_at))` because a queued turn
+                // has no start yet but has already begun costing the user wall
+                // clock. `MAX(ended_at)` is only meaningful once nothing is
+                // open, which `open_turns` decides — SQLite's MAX skips NULLs,
+                // so without that guard a still-running child would report the
+                // end of its previous turn as its own.
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT session_id, \
+                            MIN(COALESCE(started_at, created_at)), \
+                            MAX(ended_at), \
+                            SUM(ended_at IS NULL), \
+                            (SELECT t2.status_kind FROM turns t2 \
+                              WHERE t2.session_id = turns.session_id \
+                              ORDER BY t2.created_at DESC, t2.id DESC LIMIT 1) \
+                     FROM turns WHERE session_id IN ({placeholders}) \
+                     GROUP BY session_id"
+                ))?;
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(keys.iter()), |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, Option<i64>>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, String>(4)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
+
+        Ok(raw
+            .into_iter()
+            .filter_map(
+                |(session_id, first_us, last_end_us, open_turns, latest_status_kind)| {
+                    let live = open_turns > 0;
+                    Some(SessionTurnBounds {
+                        session_id: SessionId::from(session_id),
+                        // An out-of-range stamp drops the row rather than
+                        // failing the whole listing: this feeds a display
+                        // surface, and one corrupt child must not blank the
+                        // parent's list.
+                        first_started_at: super::time::from_us(first_us)?,
+                        last_ended_at: if live {
+                            None
+                        } else {
+                            last_end_us.and_then(super::time::from_us)
+                        },
+                        live,
+                        latest_status_kind,
+                    })
+                },
+            )
+            .collect())
+    }
+
     async fn count_by_status_kind(&self, status_kind: &str) -> Result<usize> {
         let status_kind = status_kind.to_string();
         self.pool
@@ -380,6 +449,94 @@ mod tests {
 
     async fn create(store: &SqliteTurnStore, turn: &Turn) {
         store.create(&turn.to_row().unwrap()).await.unwrap();
+    }
+
+    /// The subagent list surface polls this while its sheet is open, for up to
+    /// a hundred children at once — hence one grouped query rather than a
+    /// per-child read. The load-bearing rule is that an OPEN turn erases the
+    /// session's end: a `MAX(ended_at)` that skipped NULLs would report the
+    /// previous turn's end as the current one's, and a running child's clock
+    /// would appear to have stopped.
+    #[tokio::test]
+    async fn session_turn_bounds_groups_liveness_and_wall_clock() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
+        let store = SqliteTurnStore::new(pool);
+
+        // A settled child: one completed turn.
+        let mut done = test_turn();
+        done.session_id = SessionId::from("child-done");
+        done.start().unwrap();
+        done.complete(baybo_turn::TurnOutput::Message {
+            content: vec![ContentBlock::Text("ok".into())],
+            ordinal: None,
+        })
+        .unwrap();
+        create(&store, &done).await;
+
+        // A running child: one completed turn AND one still open.
+        let mut first = test_turn();
+        first.session_id = SessionId::from("child-live");
+        first.start().unwrap();
+        first
+            .complete(baybo_turn::TurnOutput::Message {
+                content: vec![ContentBlock::Text("ok".into())],
+                ordinal: None,
+            })
+            .unwrap();
+        create(&store, &first).await;
+        let mut open = test_turn();
+        open.session_id = SessionId::from("child-live");
+        open.start().unwrap();
+        create(&store, &open).await;
+
+        // A child whose actor never opened a turn is simply absent.
+        let bounds = store
+            .session_turn_bounds(&[
+                SessionId::from("child-done"),
+                SessionId::from("child-live"),
+                SessionId::from("child-unstarted"),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(bounds.len(), 2, "no rows ⇒ no entry: {bounds:?}");
+
+        let by_id: std::collections::HashMap<String, &SessionTurnBounds> = bounds
+            .iter()
+            .map(|b| (b.session_id.as_str().to_string(), b))
+            .collect();
+
+        let settled = by_id["child-done"];
+        assert!(!settled.live);
+        assert!(
+            settled.last_ended_at.is_some(),
+            "a settled child has an end"
+        );
+        assert_eq!(settled.latest_status_kind, "completed");
+
+        let running = by_id["child-live"];
+        assert!(running.live, "one open turn keeps the session live");
+        assert!(
+            running.last_ended_at.is_none(),
+            "an open turn erases the session's end: {running:?}"
+        );
+        assert_eq!(
+            running.first_started_at,
+            first.started_at.unwrap(),
+            "the clock runs from the EARLIEST turn, not the open one: {running:?}"
+        );
+
+        // Unknown ids and an empty request are both empty answers, not errors.
+        assert!(store.session_turn_bounds(&[]).await.unwrap().is_empty());
+        assert!(
+            store
+                .session_turn_bounds(&[SessionId::from("nobody")])
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     async fn load(store: &SqliteTurnStore, id: &TurnId) -> Option<Turn> {

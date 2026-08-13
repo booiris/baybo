@@ -408,6 +408,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/chat/sessions/{session_id}/subagents": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_subagents"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/chat/sessions/{session_id}/sync": {
         parameters: {
             query?: never;
@@ -464,6 +480,38 @@ export interface paths {
             cookie?: never;
         };
         get: operations["slash_manifest"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/chat/subagents/{session_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_subagent"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/chat/subagents/{session_id}/sync": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["sync_subagent"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1578,6 +1626,53 @@ export interface components {
         };
         ChatSessionsList: {
             items: components["schemas"]["ChatSessionSummary"][];
+        };
+        /** @description Response from `GET /v1/chat/sessions/{session_id}/subagents`. */
+        ChatSubagentList: {
+            /**
+             * @description Older children exist below `items[0]`. The client pages back by sending
+             *     that row's `created_at` + `session_id` as the cursor.
+             */
+            has_more_older: boolean;
+            /**
+             * @description Ascending by `created_at` — the transcript's own direction, so the
+             *     newest (usually the running one) is last.
+             */
+            items: components["schemas"]["ChatSubagentSummary"][];
+        };
+        /**
+         * @description How a child's work ended, as far as its turn rows can say.
+         * @enum {string}
+         */
+        ChatSubagentStatus: "pending" | "running" | "completed" | "failed" | "cancelled" | "unknown";
+        /** @description One direct subagent child of a session. */
+        ChatSubagentSummary: {
+            /** @description `"baybo"`, or the external agent's name (`"claude"` / `"codex"`). */
+            backend: string;
+            /** Format: date-time */
+            created_at: string;
+            /**
+             * Format: date-time
+             * @description When its last turn ended; `None` while anything is still open. Sent as
+             *     a pair with `started_at` rather than a precomputed duration so a client
+             *     can tick a running child's clock without polling for it.
+             */
+            ended_at?: string | null;
+            session_id: string;
+            /**
+             * Format: date-time
+             * @description When its first turn began. `None` until one opens.
+             */
+            started_at?: string | null;
+            status: components["schemas"]["ChatSubagentStatus"];
+            /** @description Profile the parent spawned (`explorer`, `general-purpose`, …). */
+            subagent_type?: string | null;
+            /**
+             * @description The errand the parent authored, stamped onto the child's title at
+             *     spawn. `None` for children spawned before that stamp existed — the
+             *     client falls back to the profile name.
+             */
+            task?: string | null;
         };
         /**
          * @description Response from `GET /v1/chat/sessions/{session_id}/sync` — the one
@@ -4307,6 +4402,56 @@ export interface operations {
             };
         };
     };
+    list_subagents: {
+        parameters: {
+            query?: {
+                /**
+                 * @description Keyset cursor: return children strictly OLDER than this
+                 *     `(created_at, session_id)` pair. Both or neither — a timestamp alone
+                 *     cannot separate the siblings one turn's fan-out mints in the same
+                 *     microsecond.
+                 */
+                before_created_at?: string | null;
+                before_id?: string | null;
+            };
+            header?: never;
+            path: {
+                /** @description Parent session id. Either an owner-chat conversation or a readable subagent child (drilling from a child into its own children). */
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Direct subagent children, ascending */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatSubagentList"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Session not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     sync_session: {
         parameters: {
             query?: {
@@ -4472,6 +4617,114 @@ export interface operations {
             };
             /** @description Unauthorized */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_subagent: {
+        parameters: {
+            query?: {
+                /**
+                 * @description Return only rows whose `ordinal` is strictly less than this
+                 *     value. Omit on the initial fetch; pass the lowest ordinal from
+                 *     the prior page to scroll further back. Maps to a primary-key
+                 *     range scan over the `session_messages` active index.
+                 */
+                before_ordinal?: number | null;
+                /**
+                 * @description Maximum rows to return. Defaults to
+                 *     [`DEFAULT_HISTORY_LIMIT`], clamped to [`MAX_HISTORY_LIMIT`].
+                 */
+                limit?: number | null;
+            };
+            header?: never;
+            path: {
+                /** @description Subagent child session id */
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Child detail + transcript slice */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatSessionDetail"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Session not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    sync_subagent: {
+        parameters: {
+            query?: {
+                /**
+                 * @description Highest coverage watermark the client holds for this session.
+                 *     Omit for the newest-page baseline (cold start, fresh install,
+                 *     no local cursor).
+                 */
+                since_ordinal?: number | null;
+                /**
+                 * @description Maximum transcript rows to return, counted in *emitted* rows.
+                 *     Defaults to [`DEFAULT_HISTORY_LIMIT`], clamped to
+                 *     [`MAX_HISTORY_LIMIT`]. A difference larger than this rebases.
+                 */
+                limit?: number | null;
+            };
+            header?: never;
+            path: {
+                /** @description Subagent child session id */
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Forward-recovery pull for a child transcript */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatSyncResponse"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Session not found */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -2592,3 +2592,374 @@ async fn chat_search_respects_the_hidden_flag() {
         "include_hidden must still reach it"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Subagent read surface
+//
+// The predicate is the whole security story of this feature: a paired device
+// reaches these routes over both legs with no extra wiring, so a scope bug
+// ships the moment it merges. Each test below is one way in.
+// ---------------------------------------------------------------------------
+
+/// Seed a session on `channel` with the given trigger, bypassing the REST
+/// surface (which only ever mints owner-channel user sessions).
+async fn seed_root(
+    tg: &baybo_gateway::test_support::TestGateway,
+    channel: ChannelType,
+    trigger: baybo_model::TriggerSource,
+) -> baybo_model::Session {
+    let mut root = tg
+        .deps
+        .session_manager
+        .create_session(
+            User {
+                id: "owner".into(),
+                name: None,
+                channel: channel.clone(),
+            },
+            channel,
+        )
+        .await
+        .unwrap();
+    root.trigger = trigger;
+    tg.deps.session_manager.store().save(&root).await.unwrap();
+    root
+}
+
+/// Spawn a subagent child of `parent`, the way `resolve_child_session` does.
+async fn seed_child(
+    tg: &baybo_gateway::test_support::TestGateway,
+    parent: &baybo_model::Session,
+    task: &str,
+) -> baybo_model::Session {
+    let child_channel = ChannelType::from(baybo_model::SUBAGENT_CHANNEL_TAG);
+    let mut child = tg
+        .deps
+        .session_manager
+        .create_spawned_session(
+            User {
+                id: parent.user.id.clone(),
+                name: None,
+                channel: child_channel.clone(),
+            },
+            child_channel,
+            parent,
+            baybo_model::Lineage {
+                parent_session_id: parent.id.clone(),
+                parent_turn_id: baybo_model::TurnId::new(),
+                parent_span_id: None,
+                kind: baybo_model::LineageKind::Subagent,
+            },
+        )
+        .await
+        .unwrap();
+    child.state.subagent_type = Some("explorer".into());
+    tg.deps.session_manager.store().save(&child).await.unwrap();
+    // Through the setter, like the spawner: `save` omits the `title` column.
+    tg.deps
+        .session_manager
+        .store()
+        .set_title_if_absent(&child.id, task)
+        .await
+        .unwrap();
+    child.title = Some(task.into());
+    tg.deps
+        .session_manager
+        .append_session_message(
+            &child.id,
+            &ChatMessage::agent_context(vec![ContentBlock::Text(task.into())]),
+        )
+        .await
+        .unwrap();
+    child
+}
+
+fn one_shot_cron() -> baybo_model::TriggerSource {
+    baybo_model::TriggerSource::Cron {
+        cron_job_id: "job-1".into(),
+        origin_session_id: None,
+        // A one-shot fire: a private workspace the chat list drops and the
+        // attach path 404s.
+        conversation: false,
+        job_title: None,
+    }
+}
+
+#[tokio::test]
+async fn a_subagent_child_is_listed_and_readable_under_an_owner_root() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let router = build_router(build_admin_state(&tg));
+
+    let root = seed_root(&tg, ChannelType::owner(), baybo_model::TriggerSource::User).await;
+    let child = seed_child(&tg, &root, "search the sync protocol").await;
+
+    let list = get(
+        &router,
+        &format!("/v1/chat/sessions/{}/subagents", root.id),
+        StatusCode::OK,
+    )
+    .await;
+    let items = list["items"].as_array().expect("items");
+    assert_eq!(items.len(), 1, "the child is listed: {list:?}");
+    assert_eq!(items[0]["session_id"], child.id.as_str());
+    assert_eq!(items[0]["task"], "search the sync protocol");
+    assert_eq!(items[0]["subagent_type"], "explorer");
+    assert_eq!(items[0]["backend"], "baybo");
+    // No turn rows yet — spawned, nothing opened.
+    assert_eq!(items[0]["status"], "pending");
+
+    // And the child's own transcript reads back, with the errand as its head.
+    let detail = get(
+        &router,
+        &format!("/v1/chat/subagents/{}", child.id),
+        StatusCode::OK,
+    )
+    .await;
+    let transcript = detail["transcript"].as_array().expect("transcript");
+    assert_eq!(
+        transcript.first().map(|r| &r["role"]),
+        Some(&Value::from("user")),
+        "the parent's errand leads the child's thread: {detail:?}"
+    );
+
+    // The plain chat route must NOT have grown a second door to the same row.
+    get(
+        &router,
+        &format!("/v1/chat/sessions/{}", child.id),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_grandchild_is_readable_through_its_own_parent() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let router = build_router(build_admin_state(&tg));
+
+    let root = seed_root(&tg, ChannelType::owner(), baybo_model::TriggerSource::User).await;
+    let child = seed_child(&tg, &root, "plan it").await;
+    let grandchild = seed_child(&tg, &child, "look that up").await;
+
+    // Drilling one level down asks the listing about an id that is NOT on the
+    // owner channel — the recursive case the list route has to admit.
+    let list = get(
+        &router,
+        &format!("/v1/chat/sessions/{}/subagents", child.id),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        list["items"][0]["session_id"],
+        grandchild.id.as_str(),
+        "a child lists its own children: {list:?}"
+    );
+
+    get(
+        &router,
+        &format!("/v1/chat/subagents/{}", grandchild.id),
+        StatusCode::OK,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_subagent_under_a_non_owner_root_is_not_readable() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let router = build_router(build_admin_state(&tg));
+
+    let root = seed_root(&tg, ChannelType::tui(), baybo_model::TriggerSource::User).await;
+    let child = seed_child(&tg, &root, "not yours").await;
+
+    get(
+        &router,
+        &format!("/v1/chat/subagents/{}", child.id),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    get(
+        &router,
+        &format!("/v1/chat/subagents/{}/sync", child.id),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    get(
+        &router,
+        &format!("/v1/chat/sessions/{}/subagents", root.id),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+}
+
+/// The hole a bare `root.channel == owner` predicate leaves open. A cron job
+/// scheduled from an owner conversation fires on the owner channel, but a
+/// one-shot fire is a private workspace no client can open — so its subagents
+/// must not become a side door into it.
+#[tokio::test]
+async fn a_subagent_under_a_hidden_one_shot_cron_fire_is_not_readable() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let router = build_router(build_admin_state(&tg));
+
+    let fire = seed_root(&tg, ChannelType::owner(), one_shot_cron()).await;
+    let child = seed_child(&tg, &fire, "errand inside a private fire").await;
+
+    // NOTE: `GET /v1/chat/sessions/{id}` still serves the fire session itself
+    // by id — only the LISTING drops it. The subagent route is deliberately
+    // stricter than that: nothing hands a client a one-shot fire's id, so
+    // admitting its children would be exposure with no legitimate caller.
+    get(
+        &router,
+        &format!("/v1/chat/subagents/{}", child.id),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    get(
+        &router,
+        &format!("/v1/chat/sessions/{}/subagents", fire.id),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+}
+
+/// A RECURRING fire is a first-class conversation the user can open, so its
+/// subagents are readable. Same predicate, opposite answer — this is what
+/// keeps the cron guard from being a blanket "no cron ever".
+#[tokio::test]
+async fn a_subagent_under_a_recurring_cron_conversation_is_readable() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let router = build_router(build_admin_state(&tg));
+
+    let fire = seed_root(
+        &tg,
+        ChannelType::owner(),
+        baybo_model::TriggerSource::Cron {
+            cron_job_id: "job-1".into(),
+            origin_session_id: None,
+            conversation: true,
+            job_title: None,
+        },
+    )
+    .await;
+    let child = seed_child(&tg, &fire, "errand inside a recurring fire").await;
+
+    get(
+        &router,
+        &format!("/v1/chat/subagents/{}", child.id),
+        StatusCode::OK,
+    )
+    .await;
+}
+
+/// A child whose parent row is gone has no provable root, so it is refused —
+/// the walk must not fall through to "no lineage left ⇒ this is the root".
+#[tokio::test]
+async fn a_subagent_with_a_missing_parent_row_is_not_readable() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let router = build_router(build_admin_state(&tg));
+
+    let root = seed_root(&tg, ChannelType::owner(), baybo_model::TriggerSource::User).await;
+    let child = seed_child(&tg, &root, "orphan").await;
+    tg.deps.session_manager.store().delete(&root.id).await.ok();
+
+    get(
+        &router,
+        &format!("/v1/chat/subagents/{}", child.id),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+}
+
+/// An ordinary conversation must not be readable through the subagent route
+/// just because the caller knows its id — that route is for children only.
+#[tokio::test]
+async fn an_ordinary_session_is_not_readable_through_the_subagent_route() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let router = build_router(build_admin_state(&tg));
+
+    let root = seed_root(&tg, ChannelType::owner(), baybo_model::TriggerSource::User).await;
+
+    get(
+        &router,
+        &format!("/v1/chat/subagents/{}", root.id),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+}
+
+/// The cap used to DROP the oldest children and report a count nobody could
+/// act on. A long agentic conversation leaves hundreds behind, so the listing
+/// pages instead — and the cursor carries the id as well as the timestamp,
+/// because one turn's fan-out mints siblings inside the same microsecond.
+#[tokio::test]
+async fn a_parents_children_page_back_past_the_first_page() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let router = build_router(build_admin_state(&tg));
+
+    let root = seed_root(&tg, ChannelType::owner(), baybo_model::TriggerSource::User).await;
+    // More than one page, and enough of them minted back-to-back that
+    // same-microsecond siblings are likely.
+    let mut minted = Vec::new();
+    for i in 0..55 {
+        minted.push(seed_child(&tg, &root, &format!("errand {i}")).await);
+    }
+
+    let first = get(
+        &router,
+        &format!("/v1/chat/sessions/{}/subagents", root.id),
+        StatusCode::OK,
+    )
+    .await;
+    let page = first["items"].as_array().expect("items");
+    assert_eq!(page.len(), 50, "a full page, not the whole list");
+    assert_eq!(first["has_more_older"], true);
+
+    // Newest last: the running one is where the sheet lands.
+    let newest = page.last().expect("a row")["session_id"].as_str().unwrap();
+    assert_eq!(newest, minted.last().unwrap().id.as_str());
+
+    // Page back from the oldest row this page carries.
+    let oldest = &page[0];
+    let cursor_at = oldest["created_at"].as_str().expect("created_at");
+    let cursor_id = oldest["session_id"].as_str().expect("session_id");
+    let second = get(
+        &router,
+        &format!(
+            "/v1/chat/sessions/{}/subagents?before_created_at={}&before_id={}",
+            root.id,
+            urlencoding_encode(cursor_at),
+            cursor_id
+        ),
+        StatusCode::OK,
+    )
+    .await;
+    let older = second["items"].as_array().expect("items");
+    assert_eq!(older.len(), 5, "the remainder: {second:?}");
+    assert_eq!(second["has_more_older"], false);
+
+    // The two pages must not overlap and must not skip anyone.
+    let mut seen: Vec<&str> = older
+        .iter()
+        .chain(page.iter())
+        .map(|r| r["session_id"].as_str().unwrap())
+        .collect();
+    let total = seen.len();
+    seen.sort_unstable();
+    seen.dedup();
+    assert_eq!(seen.len(), total, "pages overlap");
+    assert_eq!(total, minted.len(), "pages skip a child");
+}
+
+/// Percent-encode the `+`/`:` in an RFC 3339 stamp so it survives the query
+/// string — the client does the same.
+fn urlencoding_encode(raw: &str) -> String {
+    raw.chars()
+        .map(|c| match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
+            other => other
+                .to_string()
+                .as_bytes()
+                .iter()
+                .map(|b| format!("%{b:02X}"))
+                .collect::<String>(),
+        })
+        .collect()
+}
