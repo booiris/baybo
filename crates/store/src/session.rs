@@ -250,6 +250,43 @@ pub trait SessionStore: Send + Sync {
         parent_session_id: &SessionId,
     ) -> Result<Vec<(SessionId, LineageKind)>>;
 
+    /// One page of a parent's direct lineage children, NEWEST FIRST, as whole
+    /// rows.
+    ///
+    /// [`Self::list_lineage_children`] hands back ids, which costs the caller a
+    /// load per child — unaffordable for a surface that polls while it is on
+    /// screen and that a long agentic conversation can hand hundreds of rows.
+    /// `before` is a keyset cursor `(created_at, id)`; the id tie-break is not
+    /// decoration, because one turn's fan-out mints several children inside the
+    /// same microsecond and a bare timestamp cursor would skip or repeat them.
+    ///
+    /// The default implementation is the naive load-each so in-memory fakes
+    /// need no update; the sqlite backend overrides it with one indexed query.
+    async fn list_lineage_children_page(
+        &self,
+        parent_session_id: &SessionId,
+        before: Option<(DateTime<Utc>, SessionId)>,
+        limit: usize,
+    ) -> Result<Vec<Session>> {
+        let ids = self.list_lineage_children(parent_session_id).await?;
+        let mut out = Vec::new();
+        for (id, _) in ids {
+            if let Some(session) = self.get(&id).await? {
+                out.push(session);
+            }
+        }
+        out.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.id.as_str().cmp(a.id.as_str()))
+        });
+        if let Some((at, id)) = before {
+            out.retain(|s| (s.created_at, s.id.as_str()) < (at, id.as_str()));
+        }
+        out.truncate(limit);
+        Ok(out)
+    }
+
     /// Append one message to the session's transcript log. The store
     /// assigns the next ordinal and returns it so callers can stamp
     /// it onto live channel frames (see `Frame::Message.ordinal`),

@@ -693,6 +693,32 @@ impl ActorSubagentSpawner {
                     child.id,
                 )));
             }
+            // The only place the task text reaches the session row: it exists
+            // otherwise solely inside the spawn request and the trace span
+            // label, so the surface that lists a parent's children
+            // (`/v1/chat/sessions/{id}/subagents`) would have nothing to name
+            // them by.
+            //
+            // Through the SETTER, not the struct field: `save`'s DO UPDATE
+            // deliberately omits `title` (it belongs to the targeted setters so
+            // a stale in-memory `Session` cannot clobber a rename), and
+            // `create_spawned_session` has already inserted the row — so
+            // assigning `child.title` here would be silently dropped.
+            // Best-effort: a child with no title still lists under its profile
+            // name, which is not worth failing a spawn over.
+            child.title = Some(request.task_summary.clone());
+            if let Err(e) = self
+                .session_manager
+                .store()
+                .set_title_if_absent(&child.id, &request.task_summary)
+                .await
+            {
+                warn!(
+                    session_id = %child.id,
+                    error = %e,
+                    "failed to stamp subagent task title",
+                );
+            }
             Ok(child)
         }
     }

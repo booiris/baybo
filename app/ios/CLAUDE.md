@@ -130,6 +130,9 @@ was tried and failed, and several name a bug that shipped once already.
 - [`docs/deck.md`](docs/deck.md) — the iOS half of Deck;
   [`docs/modules/deck.md`](../../docs/modules/deck.md) is the design's source of
   truth.
+- [`docs/subagents.md`](docs/subagents.md) — the header's `Subagents` entry, the
+  three GET-only gateway routes behind it, the lineage-scoped readability
+  predicate, and the read-only child transcript (second webview, no mirror).
 
 ## Known gaps / follow-ups
 

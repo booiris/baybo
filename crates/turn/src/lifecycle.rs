@@ -420,6 +420,17 @@ impl TurnLifecycle {
             .max())
     }
 
+    /// Turn bounds for a bounded list of sessions, one grouped store query —
+    /// see [`baybo_store::TurnStore::session_turn_bounds`]. A pass-through:
+    /// this carries no lifecycle state of its own, but the store handle lives
+    /// here and callers (the subagent list surface) hold a `TurnLifecycle`.
+    pub async fn session_turn_bounds(
+        &self,
+        session_ids: &[baybo_model::SessionId],
+    ) -> Result<Vec<baybo_store::SessionTurnBounds>> {
+        Ok(self.store.session_turn_bounds(session_ids).await?)
+    }
+
     /// Direct children of `parent_turn_id` (one level). Used by `/stop`'s
     /// subtree walk to stamp `UserStopped` on (and back-stop the cancellation
     /// of) in-flight descendant turns such as foreground subagents. Foreground

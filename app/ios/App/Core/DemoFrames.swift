@@ -261,24 +261,20 @@
         /// or a flat SVG at the declared size, behind a delay long enough to
         /// screenshot the layout BEFORE the bytes land — which is exactly the
         /// frame the reserved box has to already be right in.
-        func serveDemoImageIfRequested(id: Int, blobId: String) -> Bool {
-            guard let demo = Self.demoImageSizes.first(where: { $0.id == blobId }) else {
-                return false
-            }
-            Task { @MainActor in
-                try? await Task.sleep(for: .seconds(2))
-                guard let bytes = Self.demoImageBytes(blobId: blobId) else { return }
-                pushDemoBlobResult(
-                    id: id, dataBase64: bytes.base64EncodedString(),
-                    mimeType: Self.demoImageMime(demo.kind))
-            }
-            return true
-        }
 
         /// The same bytes the transcript's `requestBlob` is served, for the paths
         /// that read a blob NATIVELY rather than over the bridge — the tapped
         /// image viewer being the only one, and the reason an SVG's viewer was
         /// unreachable by any fixture.
+        /// The declared mime for a demo image, or `nil` when the blob is not
+        /// one. Keyed by blob id rather than handing out a `DemoImageKind`:
+        /// that enum is private to this file, and a private type reached from
+        /// another one crashes the compiler on a linkage check rather than
+        /// failing to typecheck.
+        static func demoImageMime(blobId: String) -> String? {
+            demoImageSizes.first(where: { $0.id == blobId }).map { demoImageMime($0.kind) }
+        }
+
         static func demoImageBytes(blobId: String) -> Data? {
             guard let demo = demoImageSizes.first(where: { $0.id == blobId }) else { return nil }
             switch demo.kind {
@@ -292,7 +288,7 @@
 
         /// Scale 1 is load-bearing: the renderer defaults to the screen's (3x),
         /// which would decode three times the size the box was reserved at.
-        private static func demoImagePng(width: Int, height: Int) -> Data? {
+        static func demoImagePng(width: Int, height: Int) -> Data? {
             let size = CGSize(width: width, height: height)
             let format = UIGraphicsImageRendererFormat.default()
             format.scale = 1
@@ -391,7 +387,7 @@
             "duration_ms": 203_000,
         ]
 
-        private static let demoVideoAttachment: [String: Any] = [
+        static let demoVideoAttachment: [String: Any] = [
             "kind": "file", "blob_id": "sha256:demovideo.tok",
             "mime_type": "video/mp4", "size": 24_804_352,
             "filename": "landing-flow-capture.mp4",
@@ -571,17 +567,6 @@
         /// Serve the demo video's poster with no gateway: a flat 1280×720 PNG
         /// plus a fake duration, so the downloaded tile (poster + play disc +
         /// duration chip) is screenshot-verifiable headlessly.
-        func serveDemoVideoPosterIfRequested(id: Int, blobId: String) -> Bool {
-            guard blobId == Self.demoVideoAttachment["blob_id"] as? String else { return false }
-            Task { @MainActor in
-                try? await Task.sleep(for: .milliseconds(600))
-                guard let png = Self.demoImagePng(width: 1280, height: 720) else { return }
-                pushDemoVideoPoster(
-                    id: id, dataBase64: png.base64EncodedString(),
-                    width: 1280, height: 720, durationMs: 83_000)
-            }
-            return true
-        }
 
         /// `-baybo-demo-attachments` (DEBUG): one short agent turn carrying the
         /// file chips above plus the audio card and video tile, so the

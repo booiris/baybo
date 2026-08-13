@@ -7,7 +7,7 @@ final class TranscriptHost {
     let webView: WKWebView
     private let navigationPolicy = TranscriptNavigationPolicy()
 
-    init(store: ChatStore) {
+    init(store: any TranscriptTarget) {
         let bridge = TranscriptBridge(store: store)
         self.bridge = bridge
 

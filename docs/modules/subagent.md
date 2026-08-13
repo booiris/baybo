@@ -86,3 +86,10 @@ Four profiles are compiled into the binary via `include_str!` (`builtin/*.md`) a
 | `workspace` | `WorkspacePaths::agents_dir()` resolves the `<workspace>/agents/` profile directory (a standalone git repo, created and `git init`-ed by `ensure_layout`) |
 
 External (`claude` / `codex`) subagent backends are documented in [`../external-agents.md`](../external-agents.md).
+
+Reading a child session back — the three GET-only `/v1/chat/subagents` routes,
+the lineage-scoped readability predicate they admit on, and why the child
+transcript needs `seed_as_user` to have a visible task at all — is documented in
+[`../../app/ios/docs/subagents.md`](../../app/ios/docs/subagents.md). Note that
+`resolve_child_session` stamps `child.title = task_summary` for that surface: it
+is the only place the task text reaches the session row.

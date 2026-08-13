@@ -49,8 +49,8 @@ use baybo_channels::wire::{
 use baybo_channels::{STOP_CANCELLED_REPLY_LINE, STOP_COMMAND_NAME, StampedEvent};
 use baybo_model::{
     AgentBinding, AgentFramework, ApprovalDecision, ChannelType, ChatMessage, ContentBlock,
-    ControlEvent, ControlEventKind, FolderId, FolderSummary, LlmEntryName, Role, Session,
-    SessionId, TOOL_RESULT_ERROR_PREFIX, ThinkingContent, TriggerSource, User,
+    ControlEvent, ControlEventKind, FolderId, FolderSummary, LineageKind, LlmEntryName, Role,
+    Session, SessionId, TOOL_RESULT_ERROR_PREFIX, ThinkingContent, TriggerSource, User,
 };
 use baybo_session::SessionError;
 use baybo_store::SearchScope;
@@ -73,6 +73,9 @@ pub fn routes() -> OpenApiRouter<AdminState> {
         .routes(routes!(search_messages))
         .routes(routes!(get_session))
         .routes(routes!(sync_session))
+        .routes(routes!(list_subagents))
+        .routes(routes!(get_subagent))
+        .routes(routes!(sync_subagent))
         .routes(routes!(lookup_session_message))
         .routes(routes!(set_session_model))
         .routes(routes!(set_session_pin))
@@ -1254,19 +1257,39 @@ async fn get_session(
 ) -> Result<Json<ChatSessionDetail>> {
     let authed = authed.as_ref().map(|ext| &ext.0);
     let (sid, session) = load_scoped_chat_session(&state, &session_id, authed).await?;
+    session_detail(
+        &state,
+        sid,
+        session,
+        session_id,
+        query.before_ordinal,
+        query.limit,
+    )
+    .await
+}
 
-    let limit = query
-        .limit
+/// The read half of `GET /chat/sessions/{id}` and `GET /chat/subagents/{id}`.
+/// Only ADMISSION differs between those two routes; what they return must not,
+/// so the page is built once here rather than transcribed per route.
+async fn session_detail(
+    state: &AdminState,
+    sid: SessionId,
+    session: Session,
+    session_id: String,
+    before_ordinal: Option<i64>,
+    limit: Option<usize>,
+) -> Result<Json<ChatSessionDetail>> {
+    let limit = limit
         .unwrap_or(DEFAULT_HISTORY_LIMIT)
         .clamp(1, MAX_HISTORY_LIMIT);
-    let page = build_history_page(&state, &sid, &session, query.before_ordinal, limit).await?;
+    let page = build_history_page(state, &sid, &session, before_ordinal, limit).await?;
     // Session-level divider metadata, consumed only off the baseline/meta
     // fetch (`before_ordinal` absent) — the limit-1 open where the client
     // decides where to draw its pre-compaction dividers. Scroll-up backfill
     // pages discard it, so skip the lookup there rather than recomputing it
     // per page. Best-effort — a lookup failure just omits the dividers
     // rather than failing the load.
-    let compaction_points = if query.before_ordinal.is_none() {
+    let compaction_points = if before_ordinal.is_none() {
         state
             .session_manager
             .compaction_boundaries(&sid)
@@ -1401,6 +1424,7 @@ async fn build_history_page(
         in_flight_steps,
         &attachment_map,
         &compaction_watermarks(state, sid).await,
+        TranscriptAudience::of(session),
     );
     Ok(HistoryPage {
         transcript,
@@ -1432,13 +1456,24 @@ async fn sync_session(
 ) -> Result<Json<ChatSyncResponse>> {
     let authed = authed.as_ref().map(|ext| &ext.0);
     let (sid, session) = load_scoped_chat_session(&state, &session_id, authed).await?;
+    session_sync(&state, sid, session, query).await
+}
+
+/// The read half of `GET …/sync` for both route families — see
+/// [`session_detail`] for why the body is shared rather than transcribed.
+async fn session_sync(
+    state: &AdminState,
+    sid: SessionId,
+    session: Session,
+    query: SyncSessionQuery,
+) -> Result<Json<ChatSyncResponse>> {
     let limit = query
         .limit
         .unwrap_or(DEFAULT_HISTORY_LIMIT)
         .clamp(1, MAX_HISTORY_LIMIT);
 
     let rebased = if let Some(since) = query.since_ordinal {
-        match sync_difference(&state, &sid, since, limit).await? {
+        match sync_difference(state, &sid, since, limit, TranscriptAudience::of(&session)).await? {
             Some(response) => return Ok(Json(response)),
             // Difference exceeded the limit (in emitted rows) or the raw
             // scan bound — fall through to a newest-page rebase.
@@ -1450,7 +1485,7 @@ async fn sync_session(
         false
     };
 
-    let page = build_history_page(&state, &sid, &session, None, limit).await?;
+    let page = build_history_page(state, &sid, &session, None, limit).await?;
     Ok(Json(ChatSyncResponse {
         rows: page.transcript,
         // The tail scan starts at the newest persisted row, so the
@@ -1460,7 +1495,7 @@ async fn sync_session(
         rebased,
         oldest_ordinal: page.oldest_ordinal,
         has_more_older: page.has_more,
-        compaction_points: sync_compaction_points(&state, &sid).await,
+        compaction_points: sync_compaction_points(state, &sid).await,
     }))
 }
 
@@ -1506,6 +1541,7 @@ async fn sync_difference(
     sid: &SessionId,
     since: i64,
     limit: usize,
+    audience: TranscriptAudience,
 ) -> Result<Option<ChatSyncResponse>> {
     let scan_bound = limit.saturating_mul(SYNC_SCAN_BOUND_MULTIPLIER);
     let raw = state
@@ -1574,6 +1610,7 @@ async fn sync_difference(
         Vec::new(),
         &attachment_map,
         &compaction_watermarks(state, sid).await,
+        audience,
     );
     if transcript.len() > limit {
         return Ok(None);
@@ -1588,6 +1625,241 @@ async fn sync_difference(
         has_more_older: false,
         compaction_points: sync_compaction_points(state, sid).await,
     }))
+}
+
+/// Page size for a subagent listing. The fan-out limiter bounds CONCURRENT
+/// breadth, not the cumulative count — an overnight agentic conversation can
+/// leave hundreds of children behind — and this surface polls while it is on
+/// screen, so the page is a real cursor rather than a truncation.
+const SUBAGENT_PAGE: usize = 50;
+
+/// How a child's work ended, as far as its turn rows can say.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatSubagentStatus {
+    /// Spawned, but its actor has not opened a turn yet.
+    Pending,
+    /// At least one turn is still open.
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+    /// Terminal (its turns carry an end) under a `status_kind` this gateway
+    /// does not know — schema drift, reported rather than guessed at.
+    Unknown,
+}
+
+/// One direct subagent child of a session.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ChatSubagentSummary {
+    pub session_id: String,
+    /// Profile the parent spawned (`explorer`, `general-purpose`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_type: Option<String>,
+    /// `"baybo"`, or the external agent's name (`"claude"` / `"codex"`).
+    pub backend: String,
+    /// The errand the parent authored, stamped onto the child's title at
+    /// spawn. `None` for children spawned before that stamp existed — the
+    /// client falls back to the profile name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    pub status: ChatSubagentStatus,
+    pub created_at: DateTime<Utc>,
+    /// When its first turn began. `None` until one opens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    /// When its last turn ended; `None` while anything is still open. Sent as
+    /// a pair with `started_at` rather than a precomputed duration so a client
+    /// can tick a running child's clock without polling for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<DateTime<Utc>>,
+}
+
+/// Response from `GET /v1/chat/sessions/{session_id}/subagents`.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ChatSubagentList {
+    /// Ascending by `created_at` — the transcript's own direction, so the
+    /// newest (usually the running one) is last.
+    pub items: Vec<ChatSubagentSummary>,
+    /// Older children exist below `items[0]`. The client pages back by sending
+    /// that row's `created_at` + `session_id` as the cursor.
+    pub has_more_older: bool,
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct SubagentListQuery {
+    /// Keyset cursor: return children strictly OLDER than this
+    /// `(created_at, session_id)` pair. Both or neither — a timestamp alone
+    /// cannot separate the siblings one turn's fan-out mints in the same
+    /// microsecond.
+    #[serde(default)]
+    pub before_created_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub before_id: Option<String>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/chat/sessions/{session_id}/subagents",
+    tag = "chat",
+    params(
+        ("session_id" = String, Path, description = "Parent session id. Either an owner-chat conversation or a readable subagent child (drilling from a child into its own children)."),
+        SubagentListQuery,
+    ),
+    responses(
+        (status = 200, description = "Direct subagent children, ascending", body = ChatSubagentList),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Session not found", body = ErrorBody),
+    )
+)]
+async fn list_subagents(
+    State(state): State<AdminState>,
+    Path(session_id): Path<String>,
+    Query(query): Query<SubagentListQuery>,
+    authed: Option<Extension<AuthedClient>>,
+) -> Result<Json<ChatSubagentList>> {
+    let authed = authed.as_ref().map(|ext| &ext.0);
+    let (sid, _parent) = load_readable_parent_session(&state, &session_id, authed).await?;
+
+    // Both halves of the cursor or neither: a partial one would silently page
+    // from a different place than the client meant.
+    let before = match (query.before_created_at, query.before_id.as_deref()) {
+        (Some(at), Some(id)) => Some((at, SessionId::from(id))),
+        _ => None,
+    };
+    // Over-fetch by one to answer `has_more_older` without a COUNT, the same
+    // trick `build_history_page` uses.
+    let mut children = state
+        .session_manager
+        .store()
+        .list_lineage_children_page(&sid, before, SUBAGENT_PAGE + 1)
+        .await
+        .map_err(|e| GatewayError::Internal(format!("list subagent children: {e}")))?;
+    let has_more_older = children.len() > SUBAGENT_PAGE;
+    children.truncate(SUBAGENT_PAGE);
+    // The store pages NEWEST first (that is the direction a cursor walks); the
+    // sheet reads oldest-first like the transcript it belongs to.
+    children.reverse();
+
+    // One grouped query for every child's liveness and wall clock. The sheet
+    // polls while it is open, so a per-child turn read is not an option.
+    let bounds: HashMap<SessionId, baybo_store::SessionTurnBounds> = state
+        .turn_lifecycle
+        .session_turn_bounds(&children.iter().map(|s| s.id.clone()).collect::<Vec<_>>())
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "chat: subagent turn bounds failed");
+            Vec::new()
+        })
+        .into_iter()
+        .map(|b| (b.session_id.clone(), b))
+        .collect();
+
+    let items = children
+        .into_iter()
+        .map(|child| {
+            let bound = bounds.get(&child.id);
+            ChatSubagentSummary {
+                status: subagent_status(bound),
+                started_at: bound.map(|b| b.first_started_at),
+                ended_at: bound.and_then(|b| b.last_ended_at),
+                session_id: child.id.as_ref().to_string(),
+                subagent_type: child.state.subagent_type.clone(),
+                backend: subagent_backend_name(&child),
+                task: child.title.clone(),
+                created_at: child.created_at,
+            }
+        })
+        .collect();
+
+    Ok(Json(ChatSubagentList {
+        items,
+        has_more_older,
+    }))
+}
+
+/// `"baybo"` unless the child was tagged with an external backend at genesis.
+/// A missing tag reads as `baybo`: that is what a pre-tag child ran.
+fn subagent_backend_name(child: &Session) -> String {
+    match &child.state.subagent_backend {
+        Some(baybo_model::SubagentBackendTag::External { external_kind, .. }) => {
+            external_kind.as_str().to_owned()
+        }
+        _ => baybo_model::BAYBO_BACKEND_TAG.to_owned(),
+    }
+}
+
+fn subagent_status(bounds: Option<&baybo_store::SessionTurnBounds>) -> ChatSubagentStatus {
+    let Some(bounds) = bounds else {
+        return ChatSubagentStatus::Pending;
+    };
+    if bounds.live {
+        return ChatSubagentStatus::Running;
+    }
+    match bounds.latest_status_kind.as_str() {
+        "completed" => ChatSubagentStatus::Completed,
+        "failed" => ChatSubagentStatus::Failed,
+        "cancelled" => ChatSubagentStatus::Cancelled,
+        _ => ChatSubagentStatus::Unknown,
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/chat/subagents/{session_id}",
+    tag = "chat",
+    params(
+        ("session_id" = String, Path, description = "Subagent child session id"),
+        GetSessionQuery,
+    ),
+    responses(
+        (status = 200, description = "Child detail + transcript slice", body = ChatSessionDetail),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Session not found", body = ErrorBody),
+    )
+)]
+async fn get_subagent(
+    State(state): State<AdminState>,
+    Path(session_id): Path<String>,
+    Query(query): Query<GetSessionQuery>,
+    authed: Option<Extension<AuthedClient>>,
+) -> Result<Json<ChatSessionDetail>> {
+    let authed = authed.as_ref().map(|ext| &ext.0);
+    let (sid, session) = load_readable_subagent_session(&state, &session_id, authed).await?;
+    session_detail(
+        &state,
+        sid,
+        session,
+        session_id,
+        query.before_ordinal,
+        query.limit,
+    )
+    .await
+}
+
+#[utoipa::path(
+    get,
+    path = "/chat/subagents/{session_id}/sync",
+    tag = "chat",
+    params(
+        ("session_id" = String, Path, description = "Subagent child session id"),
+        SyncSessionQuery,
+    ),
+    responses(
+        (status = 200, description = "Forward-recovery pull for a child transcript", body = ChatSyncResponse),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Session not found", body = ErrorBody),
+    )
+)]
+async fn sync_subagent(
+    State(state): State<AdminState>,
+    Path(session_id): Path<String>,
+    Query(query): Query<SyncSessionQuery>,
+    authed: Option<Extension<AuthedClient>>,
+) -> Result<Json<ChatSyncResponse>> {
+    let authed = authed.as_ref().map(|ext| &ext.0);
+    let (sid, session) = load_readable_subagent_session(&state, &session_id, authed).await?;
+    session_sync(&state, sid, session, query).await
 }
 
 #[utoipa::path(
@@ -2761,6 +3033,98 @@ async fn load_scoped_chat_session(
     Ok((sid, session))
 }
 
+/// Bound on the lineage walk in [`load_readable_subagent_session`]. Mirrors
+/// `spawn_subagent`'s own depth-check cap and exists for the same reason: a
+/// corrupt chain must terminate the walk rather than spin. Real chains are
+/// three deep (`DEFAULT_MAX_SUBAGENT_DEPTH`).
+const MAX_LINEAGE_WALK_HOPS: u32 = 128;
+
+/// Load a subagent child session and admit it only if a client could already
+/// open the conversation it ultimately descends from.
+///
+/// Walking the lineage chain — rather than reading the denormalised
+/// `root_session_id` in one hop — is deliberate. That column is written at
+/// genesis and read by no query anywhere (`idx_sessions_root` was dropped in
+/// the 2026-07 audit for exactly that reason), so promoting it to a permission
+/// decision would make a single bad write a silent authorization bug with
+/// nothing to catch it. `parent_session_id` is indexed and is the same chain
+/// `spawn_subagent`'s depth cap already trusts.
+///
+/// The root must ALSO not be a hidden cron fire. Production fire sessions are
+/// minted on the cron job's own channel, so a job scheduled from an owner
+/// conversation yields an owner-channel fire session — and a one-shot fire is
+/// a private workspace the chat list drops and the attach path 404s. Testing
+/// only `channel == owner` would open a side door into a conversation no
+/// client is meant to reach. The rule is "the root is a session you could
+/// already open", not "the root is on the owner channel".
+///
+/// Every rejection returns the SAME `NotFound` body as an unknown id, for the
+/// reason [`load_scoped_chat_session`] documents.
+async fn load_readable_subagent_session(
+    state: &AdminState,
+    session_id: &str,
+    authed: Option<&AuthedClient>,
+) -> Result<(SessionId, Session)> {
+    let sid = SessionId::from(session_id);
+    let not_found = || GatewayError::NotFound(format!("subagent session {session_id}"));
+    let load = |id: SessionId| async move {
+        state
+            .session_manager
+            .get(&id)
+            .await
+            .map_err(|e| GatewayError::Internal(format!("load session: {e}")))
+    };
+
+    let child = load(sid.clone()).await?.ok_or_else(not_found)?;
+    // A session with no lineage is not a subagent, whatever else it is. This
+    // route must never become a second way to read an ordinary conversation.
+    match child.lineage.as_ref().map(|l| &l.kind) {
+        Some(LineageKind::Subagent) => {}
+        None => return Err(not_found()),
+    }
+
+    let mut root = child.clone();
+    for _ in 0..MAX_LINEAGE_WALK_HOPS {
+        let Some(lineage) = root.lineage.clone() else {
+            break;
+        };
+        root = load(lineage.parent_session_id)
+            .await?
+            .ok_or_else(not_found)?;
+    }
+    // Still parented after the cap ⇒ a cycle or a chain far beyond anything
+    // `spawn_subagent` can produce. Refuse rather than admit on a walk that
+    // never reached a root.
+    if root.lineage.is_some() {
+        return Err(not_found());
+    }
+    if root.channel != chat_list_channel(authed) || is_hidden_cron_session(&root) {
+        return Err(not_found());
+    }
+    Ok((sid, child))
+}
+
+/// Resolve a session that may be either an ordinary owner-chat conversation or
+/// a readable subagent child. Only the child LISTING needs this: drilling from
+/// a child into its own children asks the same question of an id that is not
+/// on the owner channel.
+/// A hidden one-shot cron fire is refused HERE as well, even though
+/// `load_scoped_chat_session` admits it: that route already serves the fire by
+/// id, but nothing ever hands a client one, and enumerating its children would
+/// be exposure with no legitimate caller. Falling through to the subagent path
+/// makes the refusal automatic — a fire session has no lineage, so it fails
+/// there — and returns the identical `NotFound` body.
+async fn load_readable_parent_session(
+    state: &AdminState,
+    session_id: &str,
+    authed: Option<&AuthedClient>,
+) -> Result<(SessionId, Session)> {
+    match load_scoped_chat_session(state, session_id, authed).await {
+        Ok((sid, session)) if !is_hidden_cron_session(&session) => Ok((sid, session)),
+        _ => load_readable_subagent_session(state, session_id, authed).await,
+    }
+}
+
 /// Batch form of [`load_scoped_chat_session`]'s scope check: one grouped
 /// flat-column query instead of a session load per id. Refuses the whole
 /// batch when any id is unknown or off the caller's chat channel —
@@ -3036,6 +3400,49 @@ fn in_flight_work_steps(events: Vec<StampedEvent>) -> Vec<ChatWorkStep> {
         .collect()
 }
 
+/// Whose transcript is being rebuilt.
+///
+/// Exactly one thing differs between the two, and it is not cosmetic: what an
+/// `agent_context` row — `Role::User` carrying `MessageSource::Agent`, so
+/// `from_user()` is false — is allowed to mean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscriptAudience {
+    /// The owner chat. `agent_context` is the HIDDEN-prompt channel here (the
+    /// background-notification prompt the agent writes to itself), so
+    /// surfacing one would put words in the user's mouth.
+    OwnerChat,
+    /// A subagent child, read through `/v1/chat/subagents/{id}`. Here
+    /// `agent_context` is the only row that ever opens a turn — the errand the
+    /// parent authored — and a child has no `from_user` rows at all, so
+    /// without this its transcript opens on a work block with no visible task.
+    ///
+    /// EVERY such row qualifies, not just the first: a `resume_session_id`
+    /// spawn appends another seed into the same child, and a first-only rule
+    /// would leave that second stretch headless. Nothing else can reach this
+    /// path — the compaction summary is also `agent_context` but the display
+    /// read filters `compaction_inserted = 0`, and a child is never
+    /// `background_eligible`, so it receives no notification prompt.
+    Subagent,
+}
+
+impl TranscriptAudience {
+    /// Derived from the session itself rather than passed by the caller: the
+    /// audience is a property of whose transcript this is, and a call site
+    /// that could name it wrongly is a call site that eventually will.
+    fn of(session: &Session) -> Self {
+        match session.lineage.as_ref().map(|l| &l.kind) {
+            Some(LineageKind::Subagent) => Self::Subagent,
+            None => Self::OwnerChat,
+        }
+    }
+
+    /// Whether an agent-authored `Role::User` row renders as a bubble and
+    /// opens a turn.
+    fn renders_seed_rows(self) -> bool {
+        matches!(self, Self::Subagent)
+    }
+}
+
 #[cfg(test)]
 fn reconstruct_transcript(
     tail: Vec<(i64, DateTime<Utc>, ChatMessage)>,
@@ -3051,6 +3458,7 @@ fn reconstruct_transcript(
         in_flight_steps,
         &attachments_by_ordinal,
         &[],
+        TranscriptAudience::OwnerChat,
     )
 }
 
@@ -3066,6 +3474,7 @@ fn reconstruct_transcript_with_attachments(
     // (the machinery between them is elided), so without a forced break here
     // they'd render as one card that swallows the pre-compaction divider.
     compaction_watermarks: &[i64],
+    audience: TranscriptAudience,
 ) -> Vec<ChatTranscriptItem> {
     // Merge message rows and out-of-band control events into one ordinal-ordered
     // stream: a control event with `after_ordinal = N` sorts right after the row
@@ -3183,7 +3592,7 @@ fn reconstruct_transcript_with_attachments(
             turn_started = None;
         }
         match msg.role {
-            Role::User if msg.from_user() => {
+            Role::User if msg.from_user() || audience.renders_seed_rows() => {
                 work.flush(&mut items, None, true);
                 turn_started = Some(created_at);
                 if let Some(item) = message_item(
@@ -3232,8 +3641,12 @@ fn reconstruct_transcript_with_attachments(
                         } => {
                             work.pending_tools.insert(id.clone(), work.steps.len());
                             work.steps.push(
-                                ChatWorkStep::tool(id.clone(), name.clone(), tool_label(input))
-                                    .stamped(created_at),
+                                ChatWorkStep::tool(
+                                    id.clone(),
+                                    name.clone(),
+                                    tool_label(name, input),
+                                )
+                                .stamped(created_at),
                             );
                         }
                         _ => {}
@@ -3511,10 +3924,22 @@ fn thinking_text(content: &[ThinkingContent]) -> String {
 /// (path / command / url / query). Stands in for the live `progress_label`,
 /// which needs the tool registry that isn't on the read path. `None` when
 /// nothing recognizable is present.
-fn tool_label(input: &serde_json::Value) -> Option<String> {
+fn tool_label(tool: &str, input: &serde_json::Value) -> Option<String> {
     const KEYS: [&str; 6] = ["command", "url", "path", "file_path", "query", "pattern"];
+    /// `spawn_subagent` carries none of the generic keys, so a delegation
+    /// rendered as a bare tool name with no hint of who was sent to do what.
+    /// Its `description` IS the errand — the same string the child session's
+    /// title is stamped with at spawn — and the profile name is the fallback.
+    /// Scoped to this one tool rather than added to `KEYS`: `description` is a
+    /// common parameter name and would relabel unrelated calls.
+    const SPAWN_KEYS: [&str; 2] = ["description", "subagent_type"];
     let obj = input.as_object()?;
-    for key in KEYS {
+    let keys: &[&str] = if tool == baybo_model::SPAWN_SUBAGENT_TOOL_NAME {
+        &SPAWN_KEYS
+    } else {
+        &KEYS
+    };
+    for key in keys.iter().copied() {
         if let Some(s) = obj.get(key).and_then(|v| v.as_str()) {
             let label = collapse_ws(s);
             if !label.is_empty() {
@@ -3625,6 +4050,139 @@ mod tests {
             created_at: ts(secs),
             platform_msg_id: String::new(),
         }
+    }
+
+    /// The rebuild a subagent read performs: the errand the parent authored is
+    /// an `agent_context` row, and the OWNER path is right to drop it (there it
+    /// is the agent's hidden self-prompt). On the subagent path dropping it
+    /// leaves a transcript that opens on a work block with no visible task.
+    #[test]
+    fn subagent_audience_renders_the_spawn_seed_as_a_user_bubble() {
+        let tail = vec![
+            (
+                1,
+                ts(10),
+                ChatMessage::agent_context(vec![text("search the sync protocol")]),
+            ),
+            (
+                2,
+                ts(14),
+                ChatMessage::assistant(vec![tool_use("t1", "grep", serde_json::json!({}))]),
+            ),
+            (3, ts(20), ChatMessage::assistant(vec![text("found three")])),
+        ];
+        let attachments = HashMap::new();
+
+        let owner = reconstruct_transcript_with_attachments(
+            tail.clone(),
+            Vec::new(),
+            None,
+            Vec::new(),
+            &attachments,
+            &[],
+            TranscriptAudience::OwnerChat,
+        );
+        assert!(
+            !owner.iter().any(|i| i.role == "user"),
+            "owner chat must keep an agent_context row hidden: {owner:?}"
+        );
+
+        let child = reconstruct_transcript_with_attachments(
+            tail,
+            Vec::new(),
+            None,
+            Vec::new(),
+            &attachments,
+            &[],
+            TranscriptAudience::Subagent,
+        );
+        let first = child.first().expect("child transcript is not empty");
+        assert_eq!(first.role, "user", "the errand leads the thread: {child:?}");
+        assert!(
+            first.text.contains("search the sync protocol"),
+            "the seed's text is the task: {first:?}"
+        );
+        // The seed also opens the turn, so the work block times from the
+        // errand rather than from its own first intermediate row.
+        let work = child
+            .iter()
+            .find(|i| matches!(i.kind, TranscriptItemKind::Work))
+            .expect("a work block");
+        assert_eq!(
+            work.work_started_at,
+            Some(ts(10)),
+            "work times from the seed, not from the tool row: {work:?}"
+        );
+    }
+
+    /// A `resume_session_id` spawn appends a SECOND seed into the same child.
+    /// A first-only rule would leave that stretch headless, which is why the
+    /// audience renders every such row rather than the first.
+    #[test]
+    fn subagent_audience_renders_a_resumed_seed_too() {
+        let tail = vec![
+            (
+                1,
+                ts(10),
+                ChatMessage::agent_context(vec![text("first errand")]),
+            ),
+            (2, ts(12), ChatMessage::assistant(vec![text("done")])),
+            (
+                3,
+                ts(30),
+                ChatMessage::agent_context(vec![text("second errand")]),
+            ),
+            (4, ts(33), ChatMessage::assistant(vec![text("done again")])),
+        ];
+        let attachments = HashMap::new();
+        let child = reconstruct_transcript_with_attachments(
+            tail,
+            Vec::new(),
+            None,
+            Vec::new(),
+            &attachments,
+            &[],
+            TranscriptAudience::Subagent,
+        );
+        let seeds: Vec<&str> = child
+            .iter()
+            .filter(|i| i.role == "user")
+            .map(|i| i.text.as_str())
+            .collect();
+        assert_eq!(
+            seeds,
+            vec!["first errand", "second errand"],
+            "both errands lead their own stretch: {child:?}"
+        );
+    }
+
+    #[test]
+    fn tool_label_names_the_subagent_errand() {
+        let input = serde_json::json!({
+            "subagent_type": "explorer",
+            "description": "search the sync protocol",
+            "prompt": "a long self-contained instruction",
+        });
+        assert_eq!(
+            tool_label(baybo_model::SPAWN_SUBAGENT_TOOL_NAME, &input).as_deref(),
+            Some("search the sync protocol"),
+            "a delegation step must say what was delegated"
+        );
+        // Falls back to the profile when the model omitted a description.
+        let bare = serde_json::json!({ "subagent_type": "planner" });
+        assert_eq!(
+            tool_label(baybo_model::SPAWN_SUBAGENT_TOOL_NAME, &bare).as_deref(),
+            Some("planner")
+        );
+        // The spawn keys are scoped to that tool — `description` is a common
+        // parameter name and must not relabel unrelated calls.
+        assert_eq!(
+            tool_label(
+                "cron_create",
+                &serde_json::json!({"description": "nightly"})
+            ),
+            None
+        );
     }
 
     #[test]
@@ -3749,6 +4307,7 @@ mod tests {
             Vec::new(),
             &attachments,
             &[],
+            TranscriptAudience::OwnerChat,
         );
         let fused_work = fused
             .iter()
@@ -3766,6 +4325,7 @@ mod tests {
             Vec::new(),
             &attachments,
             &[3],
+            TranscriptAudience::OwnerChat,
         );
         let work: Vec<&ChatTranscriptItem> = split
             .iter()
@@ -4601,15 +5161,18 @@ mod tests {
     #[test]
     fn tool_label_pulls_first_known_key() {
         assert_eq!(
-            tool_label(&serde_json::json!({"command": "ls -la"})).as_deref(),
+            tool_label("bash", &serde_json::json!({"command": "ls -la"})).as_deref(),
             Some("ls -la")
         );
         assert_eq!(
-            tool_label(&serde_json::json!({"path": "/a/b"})).as_deref(),
+            tool_label("read", &serde_json::json!({"path": "/a/b"})).as_deref(),
             Some("/a/b")
         );
-        assert_eq!(tool_label(&serde_json::json!({"other": "x"})), None);
-        assert_eq!(tool_label(&serde_json::json!("not an object")), None);
+        assert_eq!(tool_label("read", &serde_json::json!({"other": "x"})), None);
+        assert_eq!(
+            tool_label("read", &serde_json::json!("not an object")),
+            None
+        );
     }
 
     #[test]

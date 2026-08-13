@@ -2006,6 +2006,81 @@
         }
       }
     },
+    "/v1/chat/sessions/{session_id}/subagents": {
+      "get": {
+        "tags": [
+          "chat"
+        ],
+        "operationId": "list_subagents",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Parent session id. Either an owner-chat conversation or a readable subagent child (drilling from a child into its own children).",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "before_created_at",
+            "in": "query",
+            "description": "Keyset cursor: return children strictly OLDER than this\n`(created_at, session_id)` pair. Both or neither — a timestamp alone\ncannot separate the siblings one turn's fan-out mints in the same\nmicrosecond.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "before_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Direct subagent children, ascending",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatSubagentList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Session not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/chat/sessions/{session_id}/sync": {
       "get": {
         "tags": [
@@ -2210,6 +2285,160 @@
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/chat/subagents/{session_id}": {
+      "get": {
+        "tags": [
+          "chat"
+        ],
+        "operationId": "get_subagent",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Subagent child session id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "before_ordinal",
+            "in": "query",
+            "description": "Return only rows whose `ordinal` is strictly less than this\nvalue. Omit on the initial fetch; pass the lowest ordinal from\nthe prior page to scroll further back. Maps to a primary-key\nrange scan over the `session_messages` active index.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum rows to return. Defaults to\n[`DEFAULT_HISTORY_LIMIT`], clamped to [`MAX_HISTORY_LIMIT`].",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Child detail + transcript slice",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatSessionDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Session not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/chat/subagents/{session_id}/sync": {
+      "get": {
+        "tags": [
+          "chat"
+        ],
+        "operationId": "sync_subagent",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Subagent child session id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "since_ordinal",
+            "in": "query",
+            "description": "Highest coverage watermark the client holds for this session.\nOmit for the newest-page baseline (cold start, fresh install,\nno local cursor).",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum transcript rows to return, counted in *emitted* rows.\nDefaults to [`DEFAULT_HISTORY_LIMIT`], clamped to\n[`MAX_HISTORY_LIMIT`]. A difference larger than this rebases.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Forward-recovery pull for a child transcript",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatSyncResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Session not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -5759,6 +5988,95 @@
             "items": {
               "$ref": "#/components/schemas/ChatSessionSummary"
             }
+          }
+        }
+      },
+      "ChatSubagentList": {
+        "type": "object",
+        "description": "Response from `GET /v1/chat/sessions/{session_id}/subagents`.",
+        "required": [
+          "items",
+          "has_more_older"
+        ],
+        "properties": {
+          "has_more_older": {
+            "type": "boolean",
+            "description": "Older children exist below `items[0]`. The client pages back by sending\nthat row's `created_at` + `session_id` as the cursor."
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChatSubagentSummary"
+            },
+            "description": "Ascending by `created_at` — the transcript's own direction, so the\nnewest (usually the running one) is last."
+          }
+        }
+      },
+      "ChatSubagentStatus": {
+        "type": "string",
+        "description": "How a child's work ended, as far as its turn rows can say.",
+        "enum": [
+          "pending",
+          "running",
+          "completed",
+          "failed",
+          "cancelled",
+          "unknown"
+        ]
+      },
+      "ChatSubagentSummary": {
+        "type": "object",
+        "description": "One direct subagent child of a session.",
+        "required": [
+          "session_id",
+          "backend",
+          "status",
+          "created_at"
+        ],
+        "properties": {
+          "backend": {
+            "type": "string",
+            "description": "`\"baybo\"`, or the external agent's name (`\"claude\"` / `\"codex\"`)."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "ended_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When its last turn ended; `None` while anything is still open. Sent as\na pair with `started_at` rather than a precomputed duration so a client\ncan tick a running child's clock without polling for it."
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "started_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When its first turn began. `None` until one opens."
+          },
+          "status": {
+            "$ref": "#/components/schemas/ChatSubagentStatus"
+          },
+          "subagent_type": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Profile the parent spawned (`explorer`, `general-purpose`, …)."
+          },
+          "task": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The errand the parent authored, stamped onto the child's title at\nspawn. `None` for children spawned before that stamp existed — the\nclient falls back to the profile name."
           }
         }
       },

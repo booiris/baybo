@@ -246,6 +246,82 @@ pub struct ChatSearchResults {
     pub truncated: bool,
 }
 
+/// How far a subagent child got, mirroring the gateway's `ChatSubagentStatus`.
+/// Derived from the child's TURN rows, never its session row: nothing rewrites
+/// a child's session after creation, so its `last_active` sits on `created_at`
+/// forever.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum ChatSubagentStatus {
+    /// Spawned, but its actor has not opened a turn yet.
+    Pending,
+    /// At least one turn is still open — the sheet polls a child in this state.
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+    /// A status this build does not name. Both ends carry the arm on purpose: a
+    /// gateway that grows a status must cost one row its label, not blank the
+    /// whole sheet with a decode error.
+    ///
+    /// Do NOT read it as "terminal". The gateway only emits its own `Unknown`
+    /// after ruling out a live turn, but `#[serde(other)]` also lands here for
+    /// any FUTURE status string — including a non-terminal one — so a client
+    /// that treats this arm as an end state (the read-only page stops polling
+    /// on it) would freeze such a child mid-run until reopened.
+    Unknown,
+}
+
+/// One direct subagent child of a conversation, mirroring the gateway's
+/// `ChatSubagentSummary` (`GET /v1/chat/sessions/{id}/subagents`). Timestamps
+/// are RFC 3339 strings, like [`ChatSessionSummary`]'s.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ChatSubagentSummary {
+    /// The child's own session id — the argument to
+    /// [`crate::BayboClient::chat_fetch_subagent_history`], and to
+    /// [`crate::BayboClient::chat_list_subagents`] when drilling further down.
+    pub session_id: String,
+    /// Profile the parent spawned (`explorer`, `general-purpose`, …).
+    pub subagent_type: Option<String>,
+    /// `"baybo"` for an in-process child, else the external agent's name
+    /// (`"claude"` / `"codex"`).
+    pub backend: String,
+    /// The errand the parent authored. `None` for a child spawned before the
+    /// gateway stamped it onto the child's title — the row falls back to
+    /// `subagent_type`.
+    pub task: Option<String>,
+    pub status: ChatSubagentStatus,
+    pub created_at: String,
+    /// When its first turn began; `None` while [`ChatSubagentStatus::Pending`].
+    pub started_at: Option<String>,
+    /// When its last turn ended, `None` while anything is still open. A pair
+    /// rather than a precomputed duration, so a running child's clock ticks
+    /// without polling for it.
+    pub ended_at: Option<String>,
+}
+
+/// A session's direct subagent children (`GET /v1/chat/sessions/{id}/subagents`).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ChatSubagentList {
+    /// Ascending by creation — the transcript's own direction, so the newest
+    /// (usually the running one) is last.
+    pub items: Vec<ChatSubagentSummary>,
+    /// Older children exist below `items[0]`. The sheet pages back by handing
+    /// that row's `(created_at, session_id)` back as [`SubagentCursor`] — the
+    /// fan-out limiter bounds CONCURRENT breadth, not the cumulative count, so
+    /// an overnight conversation really can leave hundreds behind.
+    pub has_more_older: bool,
+}
+
+/// Keyset cursor into a parent's children: return those strictly OLDER than
+/// this row. The id rides along because one turn's fan-out mints siblings
+/// inside the same microsecond, which a timestamp alone cannot separate.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct SubagentCursor {
+    /// RFC 3339, verbatim from the row's `created_at`.
+    pub created_at: String,
+    pub session_id: String,
+}
+
 /// One selectable LLM entry for the chat header's model picker — a `baybo.json`
 /// entry, narrowed from the gateway's `LlmModelEntry`. `name` is the entry name
 /// (what a session pin references); the picker lists it by name and offers the
