@@ -2176,6 +2176,9 @@ impl BashTool {
         };
         tracing::warn!(
             target: "baybo::tools::bash",
+            session_id = %ctx.session_id,
+            turn_id = %ctx.turn_id,
+            span_id = %ctx.span_id,
             command_head = %command_head(command),
             command_len = command.len(),
             reason = %reason,
@@ -2195,6 +2198,9 @@ impl BashTool {
     fn notify_escape(&self, ctx: &ToolContext, command: &str, rationale: &str) {
         tracing::warn!(
             target: "baybo::tools::bash",
+            session_id = %ctx.session_id,
+            turn_id = %ctx.turn_id,
+            span_id = %ctx.span_id,
             command_head = %command_head(command),
             command_len = command.len(),
             rationale = %rationale,

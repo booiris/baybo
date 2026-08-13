@@ -952,8 +952,16 @@ impl ToolExecutor {
                     Ok(Ok(mut output)) => {
                         // Defensive sanitize before result flows into
                         // trace / memory / next LLM call.
+                        let span_id = span_handle.span_id.to_string();
                         self.security_gateway
-                            .sanitize_tool_output(&mut output)
+                            .sanitize_tool_output(
+                                &mut output,
+                                crate::security::ScanOrigin {
+                                    session_id: Some(session_id.as_str()),
+                                    tool: Some(&tool_name_owned),
+                                    span_id: Some(&span_id),
+                                },
+                            )
                             .await
                             .map_err(|e| anyhow::anyhow!("sanitize_tool_output: {e}"))?;
                         let success = !matches!(output, ToolOutput::Error(_));

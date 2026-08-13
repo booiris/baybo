@@ -61,9 +61,13 @@ impl SecurityGateway {
     /// Scan incoming content, mint placeholders for any matches, store real
     /// secrets in the vault, and rewrite `msg.content` in place.
     pub async fn sanitize_input(&self, msg: &mut Message, session: &mut Session) -> Result<()> {
+        let origin = ScanOrigin {
+            session_id: Some(session.id.as_str()),
+            ..Default::default()
+        };
         for block in &msg.content {
             if let ContentBlock::Text(text) = block {
-                self.log_injection_warnings("inbound", text);
+                self.log_injection_warnings("inbound", origin, text);
             }
         }
 
@@ -252,20 +256,24 @@ impl SecurityGateway {
     /// `ToolOutput::Error` (string leaves) and `ToolOutput::Json` (full
     /// recursive walk). Mints + vaults any new secrets and logs any
     /// prompt-injection markers observed.
-    pub async fn sanitize_tool_output(&self, output: &mut baybo_tools::ToolOutput) -> Result<()> {
+    pub async fn sanitize_tool_output(
+        &self,
+        output: &mut baybo_tools::ToolOutput,
+        origin: ScanOrigin<'_>,
+    ) -> Result<()> {
         let mut mints: Vec<Mint> = Vec::new();
         match output {
             baybo_tools::ToolOutput::Text(s) | baybo_tools::ToolOutput::Error(s) => {
-                self.log_injection_warnings("tool_output", s);
+                self.log_injection_warnings("tool_output", origin, s);
                 sanitize_string(s, &self.leak_detector, &self.minter, &mut mints);
             }
             baybo_tools::ToolOutput::Json(v) => {
-                self.log_injection_warnings_in_value("tool_output", v);
+                self.log_injection_warnings_in_value("tool_output", origin, v);
                 sanitize_value(v, &self.leak_detector, &self.minter, &mut mints);
             }
             baybo_tools::ToolOutput::WithAttachments { text, .. }
             | baybo_tools::ToolOutput::MultiModalText { text, .. } => {
-                self.log_injection_warnings("tool_output", text);
+                self.log_injection_warnings("tool_output", origin, text);
                 sanitize_string(text, &self.leak_detector, &self.minter, &mut mints);
             }
         }
@@ -277,16 +285,21 @@ impl SecurityGateway {
         Ok(())
     }
 
-    fn log_injection_warnings(&self, source: &'static str, text: &str) {
+    fn log_injection_warnings(&self, source: &'static str, origin: ScanOrigin<'_>, text: &str) {
         let mut summary = InjectionSummary::default();
         summary.add(&self.injection_detector.scan(text));
-        summary.emit(source);
+        summary.emit(source, origin);
     }
 
-    fn log_injection_warnings_in_value(&self, source: &'static str, value: &serde_json::Value) {
+    fn log_injection_warnings_in_value(
+        &self,
+        source: &'static str,
+        origin: ScanOrigin<'_>,
+        value: &serde_json::Value,
+    ) {
         let mut summary = InjectionSummary::default();
         self.accumulate_injection_warnings(value, &mut summary);
-        summary.emit(source);
+        summary.emit(source, origin);
     }
 
     fn accumulate_injection_warnings(
@@ -548,15 +561,21 @@ impl InjectionSummary {
             .join(",")
     }
 
-    fn emit(&self, source: &'static str) {
+    fn emit(&self, source: &'static str, origin: ScanOrigin<'_>) {
         let Some(max_severity) = self.max_severity else {
             return;
         };
         let rules = self.rules_summary();
+        let session_id = origin.session_id.unwrap_or("-");
+        let tool = origin.tool.unwrap_or("-");
+        let span_id = origin.span_id.unwrap_or("-");
         match max_severity {
             InjectionSeverity::Critical | InjectionSeverity::High => {
                 tracing::warn!(
                     source,
+                    session_id,
+                    tool,
+                    span_id,
                     rules = %rules,
                     severity = ?max_severity,
                     "prompt-injection markers detected"
@@ -565,6 +584,9 @@ impl InjectionSummary {
             InjectionSeverity::Medium => {
                 tracing::info!(
                     source,
+                    session_id,
+                    tool,
+                    span_id,
                     rules = %rules,
                     severity = ?max_severity,
                     "prompt-injection markers detected"
@@ -573,6 +595,9 @@ impl InjectionSummary {
             InjectionSeverity::Low => {
                 tracing::debug!(
                     source,
+                    session_id,
+                    tool,
+                    span_id,
                     rules = %rules,
                     severity = ?max_severity,
                     "prompt-injection markers detected"
@@ -580,6 +605,17 @@ impl InjectionSummary {
             }
         }
     }
+}
+
+/// Whose text is being scanned. Rides the injection log lines so a
+/// `Critical` detection can be tied to the session, tool call and span that
+/// produced it — the one line where attribution matters most is otherwise
+/// the one line without any.
+#[derive(Clone, Copy, Default)]
+pub struct ScanOrigin<'a> {
+    pub session_id: Option<&'a str>,
+    pub tool: Option<&'a str>,
+    pub span_id: Option<&'a str>,
 }
 
 fn sanitize_string(
