@@ -70,6 +70,7 @@ impl Router {
             lifecycle: Arc::clone(&self.turn_lifecycle),
             terminal_rx: self.turn_lifecycle.subscribe_lifecycle_events(),
             board: Arc::clone(&board),
+            shutdown: self.actor_parent_token.clone(),
         };
 
         let pins = super::resolve_spawn_pins(&session, &self.agent_profiles).await;
@@ -196,18 +197,33 @@ struct IssueRunWaiter {
     /// a settled run is written down, and whether it owes a follow-up, are
     /// the board's rules, and this crate only reports what it watched.
     board: Arc<ProjectManager>,
+    /// The process-wide parent token, kept apart from the actor's own: a
+    /// finished one-shot actor cancels *its* token too, so that firing says
+    /// nothing about why. This one only fires when the process is going
+    /// down — and an unfinished run must then stay unsettled, because any
+    /// terminal status written here would take the row out of reach of the
+    /// boot sweep (`requeue_unsettled`) that exists to hand it back out.
+    shutdown: CancellationToken,
 }
 
 impl IssueRunWaiter {
     async fn run(mut self, actor_token: CancellationToken) {
-        let outcome = self.await_run(actor_token).await;
+        let Some(outcome) = self.await_run(actor_token).await else {
+            info!(
+                run_id = %self.enqueued.id,
+                "issue run interrupted by shutdown; leaving it for the boot resume sweep"
+            );
+            return;
+        };
         info!(run_id = %self.enqueued.id, status = ?outcome.status, "issue run settled");
         self.board
             .finish_run(&self.enqueued, &self.checkout, self.briefed_at, outcome)
             .await;
     }
 
-    async fn await_run(&mut self, actor_token: CancellationToken) -> RunOutcome {
+    /// `None` is not an outcome: it says the process shut down under the run
+    /// and the row is the boot sweep's to requeue, so nothing gets settled.
+    async fn await_run(&mut self, actor_token: CancellationToken) -> Option<RunOutcome> {
         loop {
             tokio::select! {
                 event = self.terminal_rx.recv() => match event {
@@ -215,7 +231,8 @@ impl IssueRunWaiter {
                         let Some(kind) = ev.phase.terminal_status() else {
                             continue;
                         };
-                        return self.outcome_of_edge(&ev.turn_id, kind).await;
+                        let outcome = self.outcome_of_edge(&ev.turn_id, kind).await;
+                        return self.unless_shutdown_interrupted_it(outcome);
                     }
                     Ok(_) => continue,
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -225,12 +242,15 @@ impl IssueRunWaiter {
                             "issue waiter lagged on the lifecycle bus; reconciling via store"
                         );
                         if let Some(outcome) = self.reconcile().await {
-                            return outcome;
+                            return self.unless_shutdown_interrupted_it(outcome);
                         }
                         continue;
                     }
                     Err(broadcast::error::RecvError::Closed) => {
-                        return failed_outcome("lifecycle bus closed before the run finished");
+                        if self.shutdown.is_cancelled() {
+                            return None;
+                        }
+                        return Some(failed_outcome("lifecycle bus closed before the run finished"));
                     }
                 },
                 _ = actor_token.cancelled() => {
@@ -238,12 +258,28 @@ impl IssueRunWaiter {
                     // drained its event, or it died before opening a turn.
                     // The store says which.
                     if let Some(outcome) = self.reconcile().await {
-                        return outcome;
+                        return self.unless_shutdown_interrupted_it(outcome);
                     }
-                    return failed_outcome("the run stopped before producing anything");
+                    if self.shutdown.is_cancelled() {
+                        return None;
+                    }
+                    return Some(failed_outcome("the run stopped before producing anything"));
                 }
             }
         }
+    }
+
+    /// A completed or failed turn ended on its own and settles no matter
+    /// what; so does a cancel a human asked for — that was a decision, not
+    /// an interruption. But a *system* cancel observed while the process is
+    /// shutting down is the shutdown's own doing, and writing it down would
+    /// turn "restart the daemon" into "every in-flight run ends". Those runs
+    /// are left unsettled for the boot sweep instead.
+    fn unless_shutdown_interrupted_it(&self, outcome: RunOutcome) -> Option<RunOutcome> {
+        let interrupted = outcome.status == RunStatus::Cancelled
+            && !outcome.stopped_by_a_human
+            && self.shutdown.is_cancelled();
+        (!interrupted).then_some(outcome)
     }
 
     fn is_our_run(&self, ev: &TurnLifecycleEvent) -> bool {
@@ -695,6 +731,7 @@ mod tests {
             terminal_rx: lifecycle.subscribe_lifecycle_events(),
             lifecycle: Arc::clone(&lifecycle),
             board: Arc::clone(&board.projects),
+            shutdown: CancellationToken::new(),
         };
         let reconciled = waiter.reconcile().await.expect("the turn is terminal");
         assert_eq!(
@@ -978,6 +1015,7 @@ mod tests {
             terminal_rx: lifecycle.subscribe_lifecycle_events(),
             lifecycle: Arc::clone(&lifecycle),
             board: Arc::clone(&board.projects),
+            shutdown: CancellationToken::new(),
         };
         assert_eq!(
             waiter.reconcile().await,
@@ -987,7 +1025,10 @@ mod tests {
 
         let actor_token = CancellationToken::new();
         actor_token.cancel();
-        let outcome = waiter.await_run(actor_token).await;
+        let outcome = waiter
+            .await_run(actor_token)
+            .await
+            .expect("a lone actor death is an ending, not a shutdown");
         assert_eq!(
             outcome.status,
             RunStatus::Failed,
@@ -1006,6 +1047,126 @@ mod tests {
             "so the comment left during run #2 still starts something"
         );
         assert_eq!(dispatched[2].trigger, RunTrigger::Comment);
+    }
+
+    /// Opens the run's turn and leaves it mid-flight, the state a shutdown
+    /// finds a live run in.
+    async fn open_turn(
+        lifecycle: &TurnLifecycle,
+        run: &IssueRunRow,
+        session: &SessionId,
+    ) -> TurnId {
+        let turn = lifecycle
+            .start_turn(
+                session.clone(),
+                baybo_model::TriggerKind::Issue,
+                baybo_turn::TurnInput::IssueRun {
+                    run_id: run.id.clone(),
+                    brief: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("turn");
+        lifecycle.start(&turn.id).await.expect("start");
+        turn.id
+    }
+
+    fn waiter_for(
+        board: &Board,
+        run: &IssueRunRow,
+        session: &SessionId,
+        lifecycle: &Arc<TurnLifecycle>,
+        shutdown: &CancellationToken,
+    ) -> IssueRunWaiter {
+        IssueRunWaiter {
+            enqueued: run.clone(),
+            briefed_at: run.created_at,
+            checkout: PathBuf::from("/tmp/does-not-matter"),
+            session_id: session.clone(),
+            terminal_rx: lifecycle.subscribe_lifecycle_events(),
+            lifecycle: Arc::clone(lifecycle),
+            board: Arc::clone(&board.projects),
+            shutdown: shutdown.clone(),
+        }
+    }
+
+    fn cancelled_token() -> CancellationToken {
+        let token = CancellationToken::new();
+        token.cancel();
+        token
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_mid_run_leaves_the_row_for_the_boot_sweep() {
+        let (board, first) = mid_run().await;
+        let session = SessionId::from("sess-issue-1");
+        let lifecycle = Arc::new(TurnLifecycle::new(Arc::new(
+            baybo_turn::test_support::MemoryTurnStore::new(),
+        )));
+        open_turn(&lifecycle, &first, &session).await;
+
+        let shutdown = cancelled_token();
+        let mut waiter = waiter_for(&board, &first, &session, &lifecycle, &shutdown);
+        assert_eq!(
+            waiter.await_run(cancelled_token()).await,
+            None,
+            "a run the shutdown caught mid-turn settles nothing"
+        );
+        let runs = board.store.list_runs(&first.issue_id).await.expect("runs");
+        assert!(
+            runs.iter()
+                .any(|r| r.id == first.id && r.settled_at.is_none()),
+            "the row stays unsettled, which is what the boot sweep requeues"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_cancelled_turn_is_an_interruption_not_an_ending() {
+        let (board, first) = mid_run().await;
+        let session = SessionId::from("sess-issue-1");
+        let lifecycle = Arc::new(TurnLifecycle::new(Arc::new(
+            baybo_turn::test_support::MemoryTurnStore::new(),
+        )));
+        let turn = open_turn(&lifecycle, &first, &session).await;
+
+        // The shutdown's own cancel landed before the waiter looked: same
+        // restart, only the race resolved the other way.
+        lifecycle
+            .cancel(&turn, CancelReason::ParentCancelled, Vec::new())
+            .await
+            .expect("cancel");
+
+        let shutdown = cancelled_token();
+        let mut waiter = waiter_for(&board, &first, &session, &lifecycle, &shutdown);
+        assert_eq!(
+            waiter.await_run(cancelled_token()).await,
+            None,
+            "the shutdown cancelling the turn itself is not an ending either"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_human_cancel_settles_even_while_the_process_shuts_down() {
+        let (board, first) = mid_run().await;
+        let session = SessionId::from("sess-issue-1");
+        let lifecycle = Arc::new(TurnLifecycle::new(Arc::new(
+            baybo_turn::test_support::MemoryTurnStore::new(),
+        )));
+        let turn = open_turn(&lifecycle, &first, &session).await;
+        lifecycle
+            .cancel(&turn, CancelReason::OperatorCancel, Vec::new())
+            .await
+            .expect("cancel");
+
+        let shutdown = cancelled_token();
+        let mut waiter = waiter_for(&board, &first, &session, &lifecycle, &shutdown);
+        let outcome = waiter
+            .await_run(cancelled_token())
+            .await
+            .expect("a cancel the operator asked for is a decision, and it sticks");
+        assert_eq!(outcome.status, RunStatus::Cancelled);
+        assert!(outcome.stopped_by_a_human);
     }
 
     #[tokio::test]
