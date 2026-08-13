@@ -8,15 +8,25 @@
 // the shared vectors in `searchSnippetVectors.json`. Everything below works in
 // GRAPHEME CLUSTER space for that reason — see `graphemes`.
 
-/** Characters of prose either side of the match. Enough to recognise the
- *  moment, short enough that a result stays one glanceable card.
+/** Prose kept BEFORE the match.
+ *
+ *  Deliberately short, and the reason is the card rather than the prose: the
+ *  excerpt renders `line-clamp-2` in a 260px sidebar, which is ~34 full-width
+ *  CJK (or ~58 ASCII) characters. Anything longer than that in front of the
+ *  match pushes the highlight past the clamp, and the card shows a match the
+ *  reader cannot see — measured on live data at a 60-character lead, 10 of 13
+ *  results for one query rendered without the searched term on screen.
  *
  *  Counted in grapheme clusters, not UTF-16 code units: it is a reading-length
- *  budget, and it is the one number the Swift port has to agree with. */
-const SNIPPET_PAD = 60;
+ *  budget, and these are the numbers the Swift port has to agree with. */
+const LEAD_PAD = 12;
+
+/** And AFTER it — the rest of the same budget. Overflowing the clamp on this
+ *  side costs nothing: it is the side the reader never reaches. */
+const TRAIL_PAD = 108;
 
 /** Head shown when no term can be located — see `snippet`. */
-const HEAD_LEN = SNIPPET_PAD * 2;
+const HEAD_LEN = LEAD_PAD + TRAIL_PAD;
 
 /** A run of the message, flagged if it is one of the query's terms. */
 export interface Segment {
@@ -125,8 +135,8 @@ export function snippet(text: string, query: string): Segment[] {
 
   hits.sort((a, b) => a.at - b.at);
   const anchor = hits[0];
-  const from = Math.max(0, anchor.at - SNIPPET_PAD);
-  const to = Math.min(g.length, anchor.end + SNIPPET_PAD);
+  const from = Math.max(0, anchor.at - LEAD_PAD);
+  const to = Math.min(g.length, anchor.end + TRAIL_PAD);
 
   const segments: Segment[] = [];
   const push = (t: string, match: boolean) => {

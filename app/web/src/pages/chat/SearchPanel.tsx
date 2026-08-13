@@ -11,6 +11,7 @@ import { RiLoader4Line, RiSearchLine } from 'react-icons/ri';
 
 import { useAdminClient, useAuth } from '../../api/auth';
 import type { components } from '../../api/schema';
+import { jumpOrdinal } from './searchJump';
 import { snippet } from './searchSnippet';
 
 type Hit = components['schemas']['ChatSearchHit'];
@@ -70,7 +71,12 @@ function Excerpt({ hit, query }: { hit: Hit; query: string }) {
 
 /** One conversation's matches. Grouped rather than listed flat because a single
  *  chatty conversation would otherwise fill the whole result set — measured on
- *  real data, one took 15 of 30 slots and hid 10 other conversations. */
+ *  real data, one took 15 of 30 slots and hid 10 other conversations.
+ *
+ *  Each excerpt is its own click target, and the card is no longer one big
+ *  button: a result is a *place in a conversation*, and three hits in one
+ *  conversation are three different places. The title row keeps the
+ *  whole-card gesture, landing on the best-scoring hit. */
 function GroupCard({
   group,
   query,
@@ -80,32 +86,45 @@ function GroupCard({
   group: Group;
   query: string;
   active: boolean;
-  onOpen: (sessionId: string) => void;
+  onOpen: (sessionId: string, ordinal: number) => void;
 }) {
   const more = group.total_hits - group.hits.length;
+  // A group exists because a hit created it, so the server never sends an empty
+  // one; the length check is what keeps that a server invariant rather than a
+  // crash in the panel if it ever stops holding.
+  const bestOrdinal = group.hits.length > 0 ? jumpOrdinal(group.hits[0]) : 0;
   return (
-    <button
-      type="button"
-      onClick={() => onOpen(group.session_id)}
-      className={`w-full text-left px-2 py-2 border-2 rounded-md cursor-pointer flex flex-col gap-1.5 ${
+    <div
+      className={`w-full px-2 py-2 border-2 rounded-md flex flex-col gap-1.5 ${
         active ? 'bg-selected border-black' : 'bg-white border-black/20 hover:border-black'
       }`}
     >
-      <div className="flex items-baseline gap-2">
+      <button
+        type="button"
+        onClick={() => onOpen(group.session_id, bestOrdinal)}
+        className="flex items-baseline gap-2 text-left cursor-pointer"
+      >
         <span className="text-[0.75rem] font-bold truncate flex-1">
           {group.session_title ?? 'Untitled'}
         </span>
         <span className="text-[0.6rem] font-mono text-ink-soft shrink-0">
           {group.total_hits}
         </span>
-      </div>
+      </button>
       {group.hits.map((hit) => (
-        <Excerpt key={hit.ordinal} hit={hit} query={query} />
+        <button
+          key={hit.ordinal}
+          type="button"
+          onClick={() => onOpen(group.session_id, jumpOrdinal(hit))}
+          className="text-left cursor-pointer rounded-sm hover:bg-brand/20"
+        >
+          <Excerpt hit={hit} query={query} />
+        </button>
       ))}
       {more > 0 ? (
         <span className="text-[0.6rem] font-mono text-ink-soft">and {more} more</span>
       ) : null}
-    </button>
+    </div>
   );
 }
 
@@ -116,7 +135,7 @@ export function SearchPanel({
 }: {
   query: string;
   activeSessionId: string | null | undefined;
-  onOpen: (sessionId: string) => void;
+  onOpen: (sessionId: string, ordinal: number) => void;
 }) {
   const client = useAdminClient();
   const { logout } = useAuth();
