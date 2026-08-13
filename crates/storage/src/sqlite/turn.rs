@@ -522,9 +522,17 @@ mod tests {
             running.last_ended_at.is_none(),
             "an open turn erases the session's end: {running:?}"
         );
+        // Compared at STORAGE precision: the column is microseconds, while
+        // `Utc::now()` carries nanoseconds on Linux (and not on macOS), so a
+        // bare equality against the in-memory value passes on a Mac and fails
+        // in CI. Round-tripping the expectation states what is actually being
+        // asserted — that MIN picked the earliest turn — instead of asserting
+        // the clock's resolution.
+        let earliest =
+            crate::sqlite::time::from_us(crate::sqlite::time::to_us(first.started_at.unwrap()))
+                .expect("in range");
         assert_eq!(
-            running.first_started_at,
-            first.started_at.unwrap(),
+            running.first_started_at, earliest,
             "the clock runs from the EARLIEST turn, not the open one: {running:?}"
         );
 
