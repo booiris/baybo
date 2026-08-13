@@ -978,7 +978,7 @@ async fn chat_list_flags_a_session_parked_on_the_approval_gate() {
     );
     assert_eq!(
         parked.await.expect("gate task"),
-        baybo_tools::ApprovalDecision::Approve
+        baybo_tools::ApprovalOutcome::answered(baybo_tools::ApprovalDecision::Approve)
     );
     let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
     assert!(!flag_of(&list, &blocked), "resolved → the mark is gone");

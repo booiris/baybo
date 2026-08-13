@@ -388,8 +388,8 @@ struct AutoApproveGate;
 
 #[async_trait::async_trait]
 impl ApprovalGate for AutoApproveGate {
-    async fn request(&self, _req: ApprovalRequest) -> ApprovalDecision {
-        ApprovalDecision::Approve
+    async fn request(&self, _req: ApprovalRequest) -> baybo_tools::ApprovalOutcome {
+        baybo_tools::ApprovalOutcome::policy(ApprovalDecision::Approve)
     }
 }
 

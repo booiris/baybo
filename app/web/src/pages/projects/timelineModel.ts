@@ -62,6 +62,10 @@ export function eventTone(body: IssueEventBody): Tone {
     case 'budget_restored':
       return 'ok';
     case 'approval_resolved':
+      // How it resolved outranks what was decided: a window that expired or
+      // a prompt that died with its run is nobody saying no.
+      if (body.resolution === 'timed_out') return 'warn';
+      if (body.resolution === 'abandoned') return 'muted';
       return body.decision === 'deny' ? 'err' : 'ok';
     default:
       return 'muted';
@@ -176,7 +180,16 @@ export function describeEvent(body: IssueEventBody): string | null {
     case 'approval_requested':
       return `asked you to approve a ${body.tool} call: ${body.summary}`;
     case 'approval_resolved':
-      return `the ${DECISION_LABEL[body.decision]} was recorded`;
+      switch (body.resolution) {
+        case 'timed_out':
+          return 'nobody answered the approval in time — denied by default';
+        case 'abandoned':
+          return 'the approval prompt went away undecided — its run was interrupted';
+        case 'policy':
+          return `the ${DECISION_LABEL[body.decision]} came from standing policy, without a prompt`;
+        default:
+          return `the ${DECISION_LABEL[body.decision]} was recorded`;
+      }
     case 'stage_completed':
       return `stage ${body.stage} finished — every step in it is done or called off`;
     case 'budget_exhausted':
@@ -360,6 +373,8 @@ export function feedLine(entry: FeedEntry): Span[] {
     case 'approval_requested':
       return join('approval waiting on ', at, `: ${body.tool} — ${body.summary}`);
     case 'approval_resolved':
+      if (body.resolution === 'timed_out') return join('approval timed out on ', at);
+      if (body.resolution === 'abandoned') return join('approval abandoned on ', at);
       return join(`approval ${DECISION_LABEL[body.decision]} on `, at);
     case 'stage_completed':
       return join(`stage ${body.stage} complete on `, at);

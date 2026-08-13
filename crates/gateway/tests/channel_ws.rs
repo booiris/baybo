@@ -981,7 +981,7 @@ async fn approval_gate_marks_the_session_for_an_unsubscribed_client() {
     );
     assert_eq!(
         parked.await.expect("gate task"),
-        baybo_tools::ApprovalDecision::Deny
+        baybo_tools::ApprovalOutcome::answered(baybo_tools::ApprovalDecision::Deny)
     );
 
     let frame = recv_frame(&mut bystander, Duration::from_secs(2))

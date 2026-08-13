@@ -1088,7 +1088,7 @@ async fn answering_an_approval_has_to_name_a_card_on_this_board() {
     .await;
     assert_eq!(
         blocked.await.expect("the blocked call returns"),
-        baybo_model::ApprovalDecision::Approve
+        baybo_tools::ApprovalOutcome::answered(baybo_model::ApprovalDecision::Approve)
     );
 }
 
@@ -1143,7 +1143,7 @@ async fn park_approval(
     tg: &baybo_gateway::test_support::TestGateway,
     session: &baybo_model::SessionId,
     call_id: &str,
-) -> tokio::task::JoinHandle<baybo_model::ApprovalDecision> {
+) -> tokio::task::JoinHandle<baybo_tools::ApprovalOutcome> {
     let gate = tg
         .deps
         .channel_registry
@@ -1157,7 +1157,7 @@ async fn park_through(
     gate: std::sync::Arc<dyn baybo_tools::ApprovalGate>,
     session: &baybo_model::SessionId,
     call_id: &str,
-) -> tokio::task::JoinHandle<baybo_model::ApprovalDecision> {
+) -> tokio::task::JoinHandle<baybo_tools::ApprovalOutcome> {
     let channel = tg
         .deps
         .channel_registry
@@ -1227,7 +1227,7 @@ async fn answering_a_prompt_does_not_depend_on_its_timeline_entry() {
     .await;
     assert_eq!(
         blocked.await.expect("the blocked call returns"),
-        baybo_model::ApprovalDecision::Deny
+        baybo_tools::ApprovalOutcome::answered(baybo_model::ApprovalDecision::Deny)
     );
 }
 

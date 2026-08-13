@@ -26,9 +26,9 @@ use serde_json::Value;
 use uuid::Uuid;
 
 pub use approval::{
-    ApprovalDecision, ApprovalGate, ApprovalGateMap, ApprovalQueue, ApprovalRequest,
-    ApprovedResource, AutoDenyGate, ChannelApprovalGate, HostPattern, PendingEdge, PendingWatcher,
-    ResourceAccess,
+    ApprovalDecision, ApprovalGate, ApprovalGateMap, ApprovalOutcome, ApprovalQueue,
+    ApprovalRequest, ApprovalResolution, ApprovedResource, AutoDenyGate, ChannelApprovalGate,
+    HostPattern, PendingEdge, PendingWatcher, ResourceAccess,
 };
 pub(crate) use baybo_model::FileFingerprint;
 pub use builtin::paths::shell_reachable_workspace_roots;
@@ -635,7 +635,7 @@ impl ApprovalHandle {
             params_preview,
             description: None,
         };
-        let decision = self.gate.request(req).await;
+        let decision = self.gate.request(req).await.decision;
         *self.last_decision.lock() = Some(decision);
         decision
     }
@@ -684,7 +684,7 @@ impl ApprovalHandle {
             params_preview,
             description: None,
         };
-        let decision = self.gate.request(req).await;
+        let decision = self.gate.request(req).await.decision;
         *self.last_decision.lock() = Some(decision);
         if decision == ApprovalDecision::ApproveAlways {
             let mut cache = self.approved_cache.lock();
@@ -1084,13 +1084,13 @@ mod approval_handle_tests {
 
     #[async_trait]
     impl ApprovalGate for FixedGate {
-        async fn request(&self, req: ApprovalRequest) -> ApprovalDecision {
+        async fn request(&self, req: ApprovalRequest) -> ApprovalOutcome {
             assert_eq!(
                 req.tool_call_id.as_deref(),
                 Some("use-1"),
                 "prompt carries the tool call id"
             );
-            self.0
+            ApprovalOutcome::answered(self.0)
         }
     }
 

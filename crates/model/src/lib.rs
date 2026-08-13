@@ -25,7 +25,9 @@ pub use agent_profile::{
     InvalidAgentHandle, InvalidAgentProfileId, MAX_AGENT_HANDLE_CHARS, MAX_AGENT_PROFILE_ID_CHARS,
     MAX_AGENT_PROFILE_NAME_CHARS, TeamMembership,
 };
-pub use approval::{ApprovalDecision, ApprovedResource, HostPattern, ResourceAccess};
+pub use approval::{
+    ApprovalDecision, ApprovalResolution, ApprovedResource, HostPattern, ResourceAccess,
+};
 pub use control_event::{ControlEvent, ControlEventKind, control_event_row_id};
 pub use cost::{CallReason, CostRecord, CostSummary, TimeRange};
 pub use cron::{

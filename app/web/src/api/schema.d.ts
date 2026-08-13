@@ -1621,6 +1621,12 @@ export interface components {
          */
         ApprovalDecisionDto: "approve" | "approve_always" | "deny";
         /**
+         * @description Mirror of [`baybo_model::ApprovalResolution`]: how the prompt resolved —
+         *     a decision, an expired window, an abandoned prompt, or standing policy.
+         * @enum {string}
+         */
+        ApprovalResolutionDto: "answered" | "timed_out" | "abandoned" | "policy";
+        /**
          * @description One in-flight background job (detached subagent or `Bash` command),
          *     across all sessions — the cross-session twin of the `JobList` tool.
          */
@@ -2634,6 +2640,7 @@ export interface components {
             decision: components["schemas"]["ApprovalDecisionDto"];
             /** @enum {string} */
             kind: "approval_resolved";
+            resolution: components["schemas"]["ApprovalResolutionDto"];
         } | {
             /** @enum {string} */
             kind: "stage_completed";

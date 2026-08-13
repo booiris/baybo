@@ -7555,6 +7555,16 @@
           "deny"
         ]
       },
+      "ApprovalResolutionDto": {
+        "type": "string",
+        "description": "Mirror of [`baybo_model::ApprovalResolution`]: how the prompt resolved —\na decision, an expired window, an abandoned prompt, or standing policy.",
+        "enum": [
+          "answered",
+          "timed_out",
+          "abandoned",
+          "policy"
+        ]
+      },
       "BackgroundJob": {
         "type": "object",
         "description": "One in-flight background job (detached subagent or `Bash` command),\nacross all sessions — the cross-session twin of the `JobList` tool.",
@@ -9322,6 +9332,7 @@
             "required": [
               "call_id",
               "decision",
+              "resolution",
               "kind"
             ],
             "properties": {
@@ -9336,6 +9347,9 @@
                 "enum": [
                   "approval_resolved"
                 ]
+              },
+              "resolution": {
+                "$ref": "#/components/schemas/ApprovalResolutionDto"
               }
             }
           },

@@ -566,9 +566,9 @@ mod approvals {
 
     #[async_trait::async_trait]
     impl ApprovalGate for FixedGate {
-        async fn request(&self, req: ApprovalRequest) -> ApprovalDecision {
+        async fn request(&self, req: ApprovalRequest) -> baybo_tools::ApprovalOutcome {
             self.asked.lock().push(req.call_id);
-            self.decision
+            baybo_tools::ApprovalOutcome::answered(self.decision)
         }
     }
 
@@ -683,7 +683,7 @@ mod approvals {
         );
 
         let session = issue_session(&store, &project.id, issue.number, issue.id.clone()).await;
-        let decision = gate.request(request(&session, "c1")).await;
+        let decision = gate.request(request(&session, "c1")).await.decision;
 
         assert_eq!(decision, ApprovalDecision::Deny);
         assert_eq!(*asked.lock(), vec!["c1".to_owned()]);
@@ -719,9 +719,129 @@ mod approvals {
         );
         assert!(timeline.iter().any(|e| matches!(
             &e.body,
-            IssueEventBody::ApprovalResolved { call_id, decision }
-                if call_id == "c1" && *decision == ApprovalDecision::Deny
+            IssueEventBody::ApprovalResolved { call_id, decision, resolution }
+                if call_id == "c1"
+                    && *decision == ApprovalDecision::Deny
+                    && *resolution == baybo_model::ApprovalResolution::Answered
         )));
+    }
+
+    /// An inner gate that never answers — the shape of a prompt still parked
+    /// when its run is torn down.
+    struct ParkedGate;
+
+    #[async_trait::async_trait]
+    impl ApprovalGate for ParkedGate {
+        async fn request(&self, _req: ApprovalRequest) -> baybo_tools::ApprovalOutcome {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_prompt_dropped_undecided_closes_on_the_card_as_abandoned() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let paths = WorkspacePaths::new(workspace.path().to_path_buf());
+        tokio::fs::create_dir_all(paths.work_dir())
+            .await
+            .expect("work dir");
+        let store = baybo_storage::Store::open(workspace.path().join("storage.db"))
+            .await
+            .expect("store");
+        let manager = Arc::new(ProjectManager::new(
+            Arc::clone(&store.project),
+            Arc::clone(&store.agent_profile),
+            Arc::clone(&store.blob),
+            paths,
+            Arc::new(baybo_project::NoopProjectEvents),
+            baybo_project::no_dispatch(),
+        ));
+        let project = manager
+            .create_project(NewProject {
+                name: "Abandoning".to_owned(),
+                description: String::new(),
+                workdir: None,
+                daily_budget: None,
+                max_parallel_issue_runs: None,
+            })
+            .await
+            .expect("project");
+        let lead = manager.team(&project.id).await.expect("team")[0].id.clone();
+        let issue = manager
+            .create_issue(
+                &project.id,
+                baybo_store::project::IssueActor::User,
+                baybo_project::NewIssueRequest {
+                    title: "left waiting".to_owned(),
+                    description: String::new(),
+                    attachments: Vec::new(),
+                    status: baybo_store::project::IssueStatus::InProgress,
+                    priority: baybo_store::project::IssuePriority::None,
+                    assignee: Some(lead),
+                    parent: None,
+                    stage: 0,
+                    source_key: None,
+                },
+            )
+            .await
+            .expect("issue")
+            .into_issue();
+
+        let gate = baybo_project::TimelineApprovalGate::new(
+            Arc::new(ParkedGate),
+            Arc::clone(&manager),
+            Arc::clone(&store.session),
+        );
+        let session = issue_session(&store, &project.id, issue.number, issue.id.clone()).await;
+
+        let parked = tokio::spawn({
+            let req = request(&session, "c7");
+            async move { gate.request(req).await }
+        });
+        let requested = |timeline: &[baybo_store::project::IssueEventRow]| {
+            timeline.iter().any(|e| {
+                matches!(&e.body, IssueEventBody::ApprovalRequested { call_id, .. } if call_id == "c7")
+            })
+        };
+        for _ in 0..200 {
+            let timeline = manager
+                .timeline(&project.id, issue.number)
+                .await
+                .expect("timeline");
+            if requested(&timeline) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        // The run dies with the prompt still up: the request future is
+        // dropped undecided.
+        parked.abort();
+        let _ = parked.await;
+
+        let mut closed = false;
+        for _ in 0..200 {
+            let timeline = manager
+                .timeline(&project.id, issue.number)
+                .await
+                .expect("timeline");
+            closed = timeline.iter().any(|e| {
+                matches!(
+                    &e.body,
+                    IssueEventBody::ApprovalResolved { call_id, decision, resolution }
+                        if call_id == "c7"
+                            && *decision == ApprovalDecision::Deny
+                            && *resolution == baybo_model::ApprovalResolution::Abandoned
+                )
+            });
+            if closed {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            closed,
+            "a dropped prompt still closes its ledger entry, as abandoned"
+        );
     }
 
     #[tokio::test]
@@ -754,7 +874,8 @@ mod approvals {
 
         let decision = gate
             .request(request(&SessionId::from("not-an-issue".to_owned()), "c9"))
-            .await;
+            .await
+            .decision;
         assert_eq!(decision, ApprovalDecision::Approve);
         assert_eq!(*asked.lock(), vec!["c9".to_owned()]);
     }

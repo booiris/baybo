@@ -32,7 +32,9 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
-pub use baybo_model::approval::{ApprovalDecision, ApprovedResource, HostPattern, ResourceAccess};
+pub use baybo_model::approval::{
+    ApprovalDecision, ApprovalResolution, ApprovedResource, HostPattern, ResourceAccess,
+};
 
 // ---------------------------------------------------------------------------
 // Core types
@@ -71,13 +73,57 @@ pub struct ApprovalRequest {
     pub description: Option<String>,
 }
 
+/// What came back from a gate, and *how*. The decision alone is what the
+/// executor acts on; the resolution is what the ledgers downstream (the
+/// issue timeline, span events) need so a 300-second silence is not written
+/// down as a human saying no.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApprovalOutcome {
+    pub decision: ApprovalDecision,
+    pub resolution: ApprovalResolution,
+}
+
+impl ApprovalOutcome {
+    /// A decision somebody actually made on the approval surface.
+    pub fn answered(decision: ApprovalDecision) -> Self {
+        Self {
+            decision,
+            resolution: ApprovalResolution::Answered,
+        }
+    }
+
+    /// A standing rule decided without prompting anyone.
+    pub fn policy(decision: ApprovalDecision) -> Self {
+        Self {
+            decision,
+            resolution: ApprovalResolution::Policy,
+        }
+    }
+
+    /// The window expired with nobody answering. Fail-closed.
+    pub fn timed_out() -> Self {
+        Self {
+            decision: ApprovalDecision::Deny,
+            resolution: ApprovalResolution::TimedOut,
+        }
+    }
+
+    /// The prompt was torn down undecided. Fail-closed.
+    pub fn abandoned() -> Self {
+        Self {
+            decision: ApprovalDecision::Deny,
+            resolution: ApprovalResolution::Abandoned,
+        }
+    }
+}
+
 /// Implemented by channel-side UIs (or an auto-deny fallback) to resolve
 /// approval requests. Must be safe to call concurrently — a single agent turn
 /// may dispatch multiple tool calls in parallel, each going through this gate
 /// independently.
 #[async_trait]
 pub trait ApprovalGate: Send + Sync {
-    async fn request(&self, req: ApprovalRequest) -> ApprovalDecision;
+    async fn request(&self, req: ApprovalRequest) -> ApprovalOutcome;
 }
 
 // ---------------------------------------------------------------------------
@@ -90,8 +136,8 @@ pub struct AutoDenyGate;
 
 #[async_trait]
 impl ApprovalGate for AutoDenyGate {
-    async fn request(&self, _req: ApprovalRequest) -> ApprovalDecision {
-        ApprovalDecision::Deny
+    async fn request(&self, _req: ApprovalRequest) -> ApprovalOutcome {
+        ApprovalOutcome::policy(ApprovalDecision::Deny)
     }
 }
 
@@ -609,7 +655,7 @@ impl ChannelApprovalGate {
 
 #[async_trait]
 impl ApprovalGate for ChannelApprovalGate {
-    async fn request(&self, req: ApprovalRequest) -> ApprovalDecision {
+    async fn request(&self, req: ApprovalRequest) -> ApprovalOutcome {
         let call_id = req.call_id.clone();
         let (tx, rx) = oneshot::channel();
         let woken_for = req.clone();
@@ -632,8 +678,11 @@ impl ApprovalGate for ChannelApprovalGate {
         };
 
         match tokio::time::timeout(self.timeout, rx).await {
-            Ok(Ok(decision)) => decision,
-            _ => ApprovalDecision::Deny,
+            Ok(Ok(decision)) => ApprovalOutcome::answered(decision),
+            // The responder is gone with no decision: the queue entry was
+            // torn down under us (turn cancel, channel exit).
+            Ok(Err(_)) => ApprovalOutcome::abandoned(),
+            Err(_) => ApprovalOutcome::timed_out(),
         }
     }
 }
@@ -692,7 +741,7 @@ mod tests {
                 description: None,
             })
             .await;
-        assert_eq!(out, ApprovalDecision::Deny);
+        assert_eq!(out, ApprovalOutcome::policy(ApprovalDecision::Deny));
     }
 
     #[tokio::test]
@@ -737,8 +786,12 @@ mod tests {
             async move { gate.request(req("b")).await }
         });
         let (ra, rb) = (a.await.unwrap(), b.await.unwrap());
-        assert_eq!(ra, ApprovalDecision::Deny, "unanswered gate fails closed");
-        assert_eq!(rb, ApprovalDecision::Deny);
+        assert_eq!(
+            ra,
+            ApprovalOutcome::timed_out(),
+            "unanswered gate fails closed"
+        );
+        assert_eq!(rb, ApprovalOutcome::timed_out());
 
         let mut seen = woken.lock().clone();
         seen.sort();
@@ -789,7 +842,10 @@ mod tests {
 
         // Resolve from the consumer side.
         assert!(queue.resolve_head(ApprovalDecision::ApproveAlways));
-        assert_eq!(handle.await.unwrap(), ApprovalDecision::ApproveAlways);
+        assert_eq!(
+            handle.await.unwrap(),
+            ApprovalOutcome::answered(ApprovalDecision::ApproveAlways)
+        );
         assert!(queue.is_empty());
     }
 
@@ -878,7 +934,10 @@ mod tests {
         let task = tokio::spawn(async move { gate.request(req).await });
         tokio::task::yield_now().await;
         assert!(q.resolve_head(ApprovalDecision::Approve));
-        assert_eq!(task.await.unwrap(), ApprovalDecision::Approve);
+        assert_eq!(
+            task.await.unwrap(),
+            ApprovalOutcome::answered(ApprovalDecision::Approve)
+        );
         assert!(queue.is_empty());
     }
 
@@ -969,7 +1028,7 @@ mod tests {
             ChannelApprovalGate::new(queue.clone(), Arc::new(|_| {}), Duration::from_millis(30));
         assert_eq!(
             gate.request(mirror_req("c1", "s1")).await,
-            ApprovalDecision::Deny,
+            ApprovalOutcome::timed_out(),
             "an unanswered gate fails closed"
         );
         assert_eq!(
@@ -1022,7 +1081,10 @@ mod tests {
             q.resolve_by_call_id("c1", ApprovalDecision::Approve),
             Some(SessionId::from("s1"))
         );
-        assert_eq!(task.await.unwrap(), ApprovalDecision::Approve);
+        assert_eq!(
+            task.await.unwrap(),
+            ApprovalOutcome::answered(ApprovalDecision::Approve)
+        );
         assert_eq!(
             *seen.lock(),
             vec![

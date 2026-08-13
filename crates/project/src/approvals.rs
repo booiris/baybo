@@ -3,10 +3,10 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use baybo_model::{ApprovalDecision, SessionId};
+use baybo_model::{ApprovalDecision, ApprovalResolution, ProjectId, SessionId};
 use baybo_store::SessionStore;
 use baybo_store::project::{IssueActor, IssueEventBody};
-use baybo_tools::{ApprovalGate, ApprovalRequest};
+use baybo_tools::{ApprovalGate, ApprovalOutcome, ApprovalRequest};
 
 use crate::ProjectManager;
 
@@ -46,7 +46,7 @@ impl TimelineApprovalGate {
 
 #[async_trait]
 impl ApprovalGate for TimelineApprovalGate {
-    async fn request(&self, req: ApprovalRequest) -> ApprovalDecision {
+    async fn request(&self, req: ApprovalRequest) -> ApprovalOutcome {
         let Some((project, number)) = self.card(&req.session_id).await else {
             return self.inner.request(req).await;
         };
@@ -82,17 +82,86 @@ impl ApprovalGate for TimelineApprovalGate {
             )
             .await;
 
-        let decision = self.inner.request(req).await;
+        // If this future is dropped while the inner gate is still parked —
+        // the turn was cancelled, the process is shutting down — nothing
+        // after the `.await` runs, and the request the card announced would
+        // stay open on its timeline forever. The guard closes it as
+        // abandoned instead; it is disarmed on the ordinary path below.
+        let mut guard = AbandonGuard {
+            manager: Arc::clone(&self.manager),
+            project,
+            number,
+            actor,
+            call_id: Some(call_id),
+        };
 
-        self.manager
-            .record_event(
-                &project,
-                number,
-                actor,
-                IssueEventBody::ApprovalResolved { call_id, decision },
-            )
-            .await;
-        decision
+        let outcome = self.inner.request(req).await;
+
+        if let Some(call_id) = guard.disarm() {
+            self.manager
+                .record_event(
+                    &guard.project,
+                    guard.number,
+                    guard.actor.clone(),
+                    IssueEventBody::ApprovalResolved {
+                        call_id,
+                        decision: outcome.decision,
+                        resolution: outcome.resolution,
+                    },
+                )
+                .await;
+        }
+        outcome
+    }
+}
+
+/// Closes an announced approval on the issue timeline when the request
+/// future is dropped undecided. Best-effort by construction: `Drop` cannot
+/// await, so the write is spawned, and a runtime already past its task
+/// drain loses it — the failure mode is the status quo (an open request),
+/// never a wrong entry.
+struct AbandonGuard {
+    manager: Arc<ProjectManager>,
+    project: ProjectId,
+    number: i64,
+    actor: IssueActor,
+    /// `Some` while armed; [`Self::disarm`] takes it so the ordinary
+    /// resolution path writes its own event instead.
+    call_id: Option<String>,
+}
+
+impl AbandonGuard {
+    fn disarm(&mut self) -> Option<String> {
+        self.call_id.take()
+    }
+}
+
+impl Drop for AbandonGuard {
+    fn drop(&mut self) {
+        let Some(call_id) = self.call_id.take() else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let manager = Arc::clone(&self.manager);
+        let project = self.project.clone();
+        let number = self.number;
+        let actor = self.actor.clone();
+        handle.spawn(async move {
+            manager
+                .record_event(
+                    &project,
+                    number,
+                    actor,
+                    IssueEventBody::ApprovalResolved {
+                        call_id,
+                        decision: ApprovalDecision::Deny,
+                        resolution: ApprovalResolution::Abandoned,
+                    },
+                )
+                .await;
+        });
     }
 }
 

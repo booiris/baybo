@@ -711,7 +711,7 @@ impl ToolExecutor {
                     // future also unqueues it (the gate's RAII cleanup), so the
                     // prompt disappears everywhere rather than lingering.
                     let decision = tokio::select! {
-                        d = request => d,
+                        outcome = request => outcome.decision,
                         _ = cancel_for_gate.cancelled() => ApprovalDecision::Deny,
                     };
                     *approval_sink.lock() = Some(decision);

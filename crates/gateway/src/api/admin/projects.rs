@@ -533,6 +533,28 @@ impl From<ApprovalDecisionDto> for baybo_model::ApprovalDecision {
     }
 }
 
+/// Mirror of [`baybo_model::ApprovalResolution`]: how the prompt resolved —
+/// a decision, an expired window, an abandoned prompt, or standing policy.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalResolutionDto {
+    Answered,
+    TimedOut,
+    Abandoned,
+    Policy,
+}
+
+impl From<baybo_model::ApprovalResolution> for ApprovalResolutionDto {
+    fn from(resolution: baybo_model::ApprovalResolution) -> Self {
+        match resolution {
+            baybo_model::ApprovalResolution::Answered => Self::Answered,
+            baybo_model::ApprovalResolution::TimedOut => Self::TimedOut,
+            baybo_model::ApprovalResolution::Abandoned => Self::Abandoned,
+            baybo_model::ApprovalResolution::Policy => Self::Policy,
+        }
+    }
+}
+
 /// An agent as a timeline entry names it.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct AgentRefDto {
@@ -616,6 +638,7 @@ pub enum IssueEventBodyDto {
     ApprovalResolved {
         call_id: String,
         decision: ApprovalDecisionDto,
+        resolution: ApprovalResolutionDto,
     },
     StageCompleted {
         stage: i64,
@@ -644,9 +667,14 @@ impl IssueEventBodyDto {
                 tool,
                 summary,
             },
-            IssueEventBody::ApprovalResolved { call_id, decision } => Self::ApprovalResolved {
+            IssueEventBody::ApprovalResolved {
+                call_id,
+                decision,
+                resolution,
+            } => Self::ApprovalResolved {
                 call_id,
                 decision: decision.into(),
+                resolution: resolution.into(),
             },
             IssueEventBody::StageCompleted { stage } => Self::StageCompleted { stage },
             IssueEventBody::BudgetExhausted {

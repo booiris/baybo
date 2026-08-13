@@ -192,9 +192,27 @@ fn narrate(body: &IssueEventBody, known: &[baybo_store::AgentProfileRow]) -> Str
         IssueEventBody::ApprovalRequested { tool, summary, .. } => {
             format!("asked {OPERATOR} to approve a {tool} call: {summary}")
         }
-        IssueEventBody::ApprovalResolved { decision, .. } => {
-            format!("{OPERATOR} answered: {}", decision.as_str())
-        }
+        IssueEventBody::ApprovalResolved {
+            decision,
+            resolution,
+            ..
+        } => match resolution {
+            baybo_model::ApprovalResolution::Answered => {
+                format!("{OPERATOR} answered: {}", decision.as_str())
+            }
+            baybo_model::ApprovalResolution::TimedOut => {
+                "nobody answered within the approval window; the call was denied by default"
+                    .to_owned()
+            }
+            baybo_model::ApprovalResolution::Abandoned => {
+                "the prompt went away undecided — its run was interrupted before anyone answered"
+                    .to_owned()
+            }
+            baybo_model::ApprovalResolution::Policy => format!(
+                "resolved by standing policy without a prompt: {}",
+                decision.as_str()
+            ),
+        },
         IssueEventBody::StageCompleted { stage } => {
             // "or called off", because a cancelled step counts out of its
             // stage — an agent told the stage is "done" would go looking for

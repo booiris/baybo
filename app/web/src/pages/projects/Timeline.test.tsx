@@ -228,7 +228,12 @@ describe('pending approvals', () => {
             tool: 'Bash',
             summary: 'rm -rf build',
           }),
-          entry({ kind: 'approval_resolved', call_id: 'c1', decision: 'deny' }),
+          entry({
+            kind: 'approval_resolved',
+            call_id: 'c1',
+            decision: 'deny',
+            resolution: 'answered',
+          }),
         ]}
         issue={ISSUE}
         runs={[]}

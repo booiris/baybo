@@ -19,8 +19,8 @@ use serde_json::{Value, json};
 use baybo_llm::{BilledChat, BilledChatResponse};
 
 use crate::{
-    ApprovalDecision, ApprovalGate, ApprovalRequest, ExecSandbox, RunningChild, SandboxedOutput,
-    SpawnOpts, Tool, ToolContext, ToolManifest, ToolOutput,
+    ApprovalDecision, ApprovalGate, ApprovalOutcome, ApprovalRequest, ExecSandbox, RunningChild,
+    SandboxedOutput, SpawnOpts, Tool, ToolContext, ToolManifest, ToolOutput,
 };
 
 /// Binds a [`baybo_llm::BillableLlm`] to a throwaway system
@@ -279,9 +279,9 @@ impl FakeApprovalGate {
 
 #[async_trait]
 impl ApprovalGate for FakeApprovalGate {
-    async fn request(&self, req: ApprovalRequest) -> ApprovalDecision {
+    async fn request(&self, req: ApprovalRequest) -> ApprovalOutcome {
         self.requests.lock().push(req);
-        *self.decision.lock()
+        ApprovalOutcome::answered(*self.decision.lock())
     }
 }
 

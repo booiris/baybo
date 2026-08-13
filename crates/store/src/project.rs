@@ -394,11 +394,17 @@ pub enum IssueEventBody {
         summary: String,
     },
     /// …and what was decided. Also written when nobody decided: the gate
-    /// denies on timeout, and a card that stops explaining itself at the
-    /// prompt is the worst version of this feature.
+    /// denies on timeout, the prompt dies with its run, and a card that
+    /// stops explaining itself at the prompt is the worst version of this
+    /// feature.
     ApprovalResolved {
         call_id: String,
         decision: baybo_model::ApprovalDecision,
+        /// *How* it resolved — a decision, a timeout, an abandoned prompt.
+        /// Defaulted so entries written before the distinction existed read
+        /// as answered.
+        #[serde(default)]
+        resolution: baybo_model::ApprovalResolution,
     },
     /// Every non-cancelled child in one of this issue's stages reached
     /// Done.
