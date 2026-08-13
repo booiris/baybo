@@ -238,13 +238,20 @@ export function AttachButton({
   /// The draft is at the limit: the control stays visible and says why,
   /// rather than disappearing and leaving the operator looking for it.
   full?: boolean;
-  /// Drop the border and the raised surface.
+  /// Drop the border and the raised surface, and hang the box into the left
+  /// margin so the icon lines up with the prose above it.
   ///
   /// The bordered face belongs to a control sitting **inside** composer
   /// chrome — a modal footer, a composer pill — where it reads as one of a
   /// row of buttons. The description has no such chrome: its button sits
   /// bare on the page under the prose, where 2px of ink makes an optional
   /// affordance the loudest thing in the pane.
+  ///
+  /// Bare on the page is also why it is pulled left by half the gap the
+  /// centred icon leaves inside its own hit target ((28−14)/2): with a border
+  /// the box's edge is what the eye lines up, but without one there is
+  /// nothing to see except the glyph, and a glyph indented 7px from prose
+  /// that starts flush at the pane's edge reads as a mistake.
   subtle?: boolean;
 }) {
   const input = useRef<HTMLInputElement | null>(null);
@@ -270,7 +277,7 @@ export function AttachButton({
         onClick={() => input.current?.click()}
         className={`flex h-7 w-7 items-center justify-center rounded-md disabled:opacity-40 disabled:cursor-not-allowed ${
           subtle === true
-            ? 'text-ink-soft hover:bg-canvas hover:text-ink'
+            ? '-ml-1.75 text-ink-soft hover:bg-canvas hover:text-ink'
             : 'border-2 border-black bg-surface text-ink hover:bg-brand'
         }`}
       >
