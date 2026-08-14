@@ -166,6 +166,28 @@ const FAILED_CARD_PREDICATE: &str = concat!(
 const UNSEEN_FAILURE_PREDICATE: &str =
     concat!(newest_run!("settled_at"), " > COALESCE(i.read_at, 0)");
 
+/// What attributes one `cost_records` row to one run: the run's own
+/// claim→settle window on the session it worked in. Written against
+/// `issue_runs r` and `cost_records c`; timestamps are microseconds.
+///
+/// A window and not a stored `run_id`, because the id is not reachable
+/// where a cost row is written — the ledger sees an `Attribution` of
+/// user/session/turn/span and has never heard of a board. The window is
+/// only unambiguous because of two invariants that live elsewhere, and it
+/// silently double-counts if either is relaxed:
+///
+/// - `idx_issue_runs_live` allows at most one unsettled run per issue, so
+///   two windows on one session cannot overlap.
+/// - `Router::issue_session` mints one session per card **per agent**, so
+///   a session never spans two cards.
+///
+/// A run that was never claimed has a NULL `started_at`, which makes every
+/// comparison NULL: it matches nothing and reads zero rather than
+/// inheriting the session's whole history.
+const RUN_COST_WINDOW: &str = "c.session_id = r.session_id \
+     AND c.timestamp >= r.started_at \
+     AND (r.settled_at IS NULL OR c.timestamp < r.settled_at)";
+
 const RUN_COLUMNS: &str = "id, issue_id, project_id, number, agent_id, session_id, trigger, \
      status, attempt, error, created_at, started_at, settled_at";
 
@@ -1228,24 +1250,16 @@ impl ProjectStore for SqliteProjectStore {
         let rows = self
             .pool
             .interact("issue_runs.spend", move |conn| {
-                // The window bounds are what attribute a call to one run of
-                // a session several runs share. `started_at IS NULL` (never
-                // claimed) makes every comparison NULL, so such a run
-                // matches nothing and reads zero rather than inheriting the
-                // session's whole history.
-                let mut stmt = conn.prepare(
+                let mut stmt = conn.prepare(&format!(
                     "SELECT r.id, \
                             COALESCE(SUM(c.input_tokens), 0), \
                             COALESCE(SUM(c.output_tokens), 0), \
                             COALESCE(SUM(c.cost_usd), 0) \
                      FROM issue_runs r \
-                     LEFT JOIN cost_records c \
-                       ON c.session_id = r.session_id \
-                      AND c.timestamp >= r.started_at \
-                      AND (r.settled_at IS NULL OR c.timestamp < r.settled_at) \
+                     LEFT JOIN cost_records c ON {RUN_COST_WINDOW} \
                      WHERE r.issue_id = ?1 \
-                     GROUP BY r.id",
-                )?;
+                     GROUP BY r.id"
+                ))?;
                 Ok(stmt
                     .query_map(rusqlite::params![issue], |row| {
                         Ok((
@@ -1282,9 +1296,6 @@ impl ProjectStore for SqliteProjectStore {
                 let holes = std::iter::repeat_n("?", ids.len())
                     .collect::<Vec<_>>()
                     .join(",");
-                // The window is `run_spend`'s, verbatim — one derivation, so
-                // the feed and the execution log cannot price a run
-                // differently. Timestamps are microseconds on this table.
                 let mut stmt = conn.prepare(&format!(
                     "SELECT r.id, \
                             (r.settled_at - r.started_at) / 1000, \
@@ -1292,10 +1303,7 @@ impl ProjectStore for SqliteProjectStore {
                             COALESCE(SUM(c.output_tokens), 0), \
                             COALESCE(SUM(c.cost_usd), 0) \
                      FROM issue_runs r \
-                     LEFT JOIN cost_records c \
-                       ON c.session_id = r.session_id \
-                      AND c.timestamp >= r.started_at \
-                      AND (r.settled_at IS NULL OR c.timestamp < r.settled_at) \
+                     LEFT JOIN cost_records c ON {RUN_COST_WINDOW} \
                      WHERE r.id IN ({holes}) \
                      GROUP BY r.id"
                 ))?;
@@ -1441,8 +1449,14 @@ impl ProjectStore for SqliteProjectStore {
                 // Scoped to `queued`, so two dispatches of the same row
                 // resolve into one execution rather than two — the
                 // execution, not the work each dispatcher did to get here.
+                // `COALESCE`, so a run re-claimed after a restart keeps the
+                // instant it first started: that edge is what its spend is
+                // attributed by, and moving it forward would drop every call
+                // the run made before the process went down.
                 Ok(conn.execute(
-                    "UPDATE issue_runs SET status = 'running', session_id = ?2, started_at = ?3 \
+                    "UPDATE issue_runs \
+                     SET status = 'running', session_id = ?2, \
+                         started_at = COALESCE(started_at, ?3) \
                      WHERE id = ?1 AND status = 'queued'",
                     rusqlite::params![id, session, now],
                 )?)
@@ -1524,8 +1538,16 @@ impl ProjectStore for SqliteProjectStore {
     async fn requeue_unsettled(&self) -> Result<()> {
         self.pool
             .interact("issue_runs.requeue", move |conn| {
+                // `started_at` survives the roll-back. It is the instant the
+                // run was FIRST claimed, and it is the left edge of the
+                // window that attributes spend to this run
+                // ([`RUN_COST_WINDOW`]) — clearing it orphaned everything an
+                // interrupted run had already spent, money the board's own
+                // daily burn goes on counting. The price is that the run's
+                // duration then spans the downtime too, which is the honest
+                // number for a window that bills those hours.
                 conn.execute(
-                    "UPDATE issue_runs SET status = 'queued', started_at = NULL \
+                    "UPDATE issue_runs SET status = 'queued' \
                      WHERE settled_at IS NULL AND status = 'running'",
                     [],
                 )?;
@@ -2117,10 +2139,9 @@ mod tests {
             "the interrupted run keeps the session it was working in, so the \
              resumed run continues that transcript instead of opening a second"
         );
-        assert!(
-            orphan.started_at.is_none(),
-            "it has not started again — `claim_run` re-stamps that"
-        );
+        let first_claim = orphan
+            .started_at
+            .expect("the interrupted run keeps the instant it first started");
         assert!(
             swept
                 .iter()
@@ -2135,6 +2156,21 @@ mod tests {
         assert_eq!(store.active_runs(&p.id).await.unwrap().len(), 2);
 
         assert!(store.claim_run(&running.id, &session).await.unwrap());
+        // The re-claim must not move that edge: everything the run spent
+        // before the restart is attributed by it, and a fresh stamp would
+        // orphan all of it while the board's daily burn kept counting it.
+        let resumed = store
+            .active_runs(&p.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == running.id)
+            .unwrap();
+        assert_eq!(
+            resumed.started_at,
+            Some(first_claim),
+            "a resumed run keeps its original claim instant"
+        );
     }
 
     #[tokio::test]

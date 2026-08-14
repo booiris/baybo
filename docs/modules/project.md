@@ -208,6 +208,51 @@ letting `enqueue` do it silently. `enqueue` can only answer `None`, which
 `retry_run` reads as the dedupe guard, so the operator would be told the card
 already has a run when it has none and never will.
 
+### What a run cost
+
+A run's spend is **derived, never stored**: `RUN_COST_WINDOW`
+(`sqlite/project.rs`) attributes a `cost_records` row to the run whose
+claim→settle window on that session contains it, and the two readers —
+`run_spend` (a card's execution log) and `settled_run_facts` (the board
+feed's `run #1 done on #7 · 2m10s · $0.04`) — are the same predicate under
+two addressings. Reach them through `ProjectManager::run_log` /
+`ProjectManager::feed`; a caller that joins `issue_runs.session_id` to
+`cost_records` itself over-counts by a factor of however many attempts
+share the session (3.3× on a real board), because that is what a session
+*is* here.
+
+There is deliberately no `cost_records.run_id`. The id is not reachable
+where the row is written — the ledger sees an `Attribution` of
+user/session/turn/span and has never heard of a board — so the column
+would be NULL for every existing row and every reader would need the
+window anyway, which is two homes for one rule.
+
+The window is unambiguous **only** because of two invariants that live
+elsewhere, and it silently double-counts if either is relaxed:
+
+- `idx_issue_runs_live` permits at most one unsettled run per issue, so two
+  windows on one session cannot overlap.
+- `Router::issue_session` mints one session per card *per agent*, so a
+  session never spans two cards.
+
+Allow parallel runs on a card, or one session across cards, and
+`cost_records.run_id` becomes the right answer.
+
+`started_at` is therefore load-bearing beyond the timeline: it is the
+window's left edge. The process-start requeue leaves it alone and
+`claim_run` re-stamps it only when it is absent (`COALESCE`), so a run the
+daemon died under keeps everything it had already spent. The cost of that
+is a duration spanning the downtime — the honest number for a window that
+bills those hours.
+
+Two things the window does not see, both named here so they are not
+rediscovered as bugs: a **subagent** spawned by a run bills against its own
+session id, so it is invisible to `run_spend` *and* to the budget gate's
+`spend_since` (widening both together, via `sessions.root_session_id`, is
+the fix — widening one alone would make a card's total exceed its board's);
+and an **external-framework** agent's run would price at $0.00 with real
+tokens, which `can_host_a_session` currently makes unreachable.
+
 ### One dispatch per row — which is not guaranteed
 
 `claim_run` is scoped to
