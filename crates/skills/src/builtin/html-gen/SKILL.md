@@ -1,7 +1,7 @@
 ---
 name: html-gen
 version: 0.1.0
-description: "Create and publish a self-contained interactive HTML page in the iOS conversation. Use for visual explainers, diagrams, dashboards, mini apps, simulations, rich reports, or any request that is better experienced as a rendered webpage than plain text."
+description: "Create and publish an interactive HTML page in the iOS conversation, optionally loading a JavaScript library you publish alongside it. Use for visual explainers, diagrams, charts, dashboards, mini apps, simulations, rich reports, or any request that is better experienced as a rendered webpage than plain text."
 channels:
   - owner
 argument-hint: "[page request]"
@@ -9,6 +9,7 @@ allowed-tools:
   - Read
   - Write
   - Edit
+  - Bash
   - PutBlob
 ---
 
@@ -19,9 +20,10 @@ after the command as the request; if it is empty, ask what to build.
 
 ## Write the page
 
-Write one complete HTML document to an absolute path in the workspace,
-with all CSS and JavaScript inline and graphics as inline SVG or `data:`
-images.
+Write one complete HTML document to an absolute path in the workspace, with
+all CSS and your own JavaScript inline, graphics as inline SVG or `data:`
+images, and any library published as a blob (see "Bringing a JavaScript
+library" below — usually you need none).
 
 ### The sandbox it runs in
 
@@ -29,9 +31,9 @@ The document is served to an `<iframe sandbox="allow-scripts">` — no
 `allow-same-origin` — under exactly this response CSP:
 
 ```
-default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline';
-img-src data:; connect-src 'none'; frame-src 'none'; object-src 'none';
-base-uri 'none'; form-action 'none'
+default-src 'none'; script-src 'unsafe-inline' baybo-transcript://localhost/html-lib/;
+style-src 'unsafe-inline'; img-src data:; connect-src 'none'; frame-src 'none';
+object-src 'none'; base-uri 'none'; form-action 'none'
 ```
 
 **Treat anything not granted above as unavailable**, and never put a
@@ -49,8 +51,8 @@ nothing reads worse than no button at all. What that rules out:
   `URL.createObjectURL` output is not a permitted source — export a
   canvas with `toDataURL()`.
 - **No network at all.** `fetch`, `XMLHttpRequest`, `WebSocket`,
-  `EventSource` and `sendBeacon` are dead. The page must carry every byte
-  it needs.
+  `EventSource` and `sendBeacon` are dead. Apart from a `/html-lib/` script
+  you published yourself, the page must carry every byte it needs.
 - **No navigation or exit.** `window.open`, `target="_blank"`, external
   links, `<form>` submission and `<a download>` all do nothing.
 - **No storage.** The origin is opaque: cookies, `localStorage`,
@@ -81,6 +83,66 @@ nothing reads worse than no button at all. What that rules out:
 
 Include a viewport meta tag, keep controls keyboard-reachable, and label
 them so a screen reader can announce them.
+
+### Bringing a JavaScript library
+
+Nothing is provided for you. If a page genuinely needs a library, YOU obtain it
+and publish it, exactly as you publish the page:
+
+1. Download it to a file with a shell command — a specific version's minified
+   **UMD/IIFE** bundle (an ES module will not load here) from the project's own
+   distribution. Fetch it straight to disk and **never read it back**: these
+   files are hundreds of kilobytes of minified source, and nothing about them
+   is worth spending your context on.
+2. `PutBlob` it with `mime_type: "text/javascript"`.
+3. Reference the returned id as the script's source:
+
+```html
+<script src="/html-lib/sha256:…"
+        onload="draw()" onerror="failed()"></script>
+```
+
+`/html-lib/<blob id>` is the ONLY source the CSP's `script-src` admits besides
+your own inline code. A CDN URL will not load — there is no network — and the
+refusal is silent from the reader's side unless you handle `onerror`.
+
+**Reference it; do not paste it into the page.** Concatenating the library into
+the document would run — inline script is allowed — which is exactly why the
+mistake is easy to make and gives no error. But a library published on its own
+is content-addressed, so it is stored once and downloaded to a device once, no
+matter how many pages use it; a library pasted into each page is bytes the
+reader pulls again every single time.
+
+Three rules:
+
+- **Weigh it first.** A library is hundreds of kilobytes the reader waits for
+  and you have to be right about. Most pages want none: hand-written inline SVG
+  covers charts, diagrams and gauges, costs nothing, and cannot fail to load.
+- **Render first, fill in after.** Put the tag at the END of the body and give
+  whatever depends on it a visible placeholder. The bytes arrive while the page
+  is already on screen, so a document that waits before drawing anything shows
+  an empty card for that whole window.
+- **Always wire `onerror`.** The device can be offline the first time a blob is
+  needed. Replace the placeholder with a short plain-language line ("chart
+  unavailable"), and keep the rest of the page useful without it.
+
+#### If you do load a charting library
+
+- **Draw into a `<canvas>`** sized by its container, with `responsive: true`
+  and `maintainAspectRatio: false`. The card reflows live between its inline
+  and full-screen sizes; a fixed-size chart is wrong in one of them.
+- **Set `animation: false`** unless the motion carries meaning. The reader can
+  reload the card, and a chart that replays its entrance every time reads as
+  jank.
+- Legend and tooltips are drawn into the canvas, so they behave as documented.
+  Anything needing a font file does not — leave `font.family` on a system stack.
+
+**Say where the numbers came from.** A chart reads as far more authoritative
+than the same figures in a sentence — a reader cannot tell a measured series
+from one you inferred. Name the source next to the chart (the tool output, the
+file, the user's own message), and if a series is estimated, label it as
+estimated in the chart itself. A well-drawn chart of numbers you guessed at is
+the worst thing this skill can produce.
 
 ## Publish it
 
