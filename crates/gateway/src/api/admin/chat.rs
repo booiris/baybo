@@ -1424,7 +1424,6 @@ async fn build_history_page(
         in_flight_steps,
         &attachment_map,
         &compaction_watermarks(state, sid).await,
-        TranscriptAudience::of(session),
     );
     Ok(HistoryPage {
         transcript,
@@ -1473,7 +1472,7 @@ async fn session_sync(
         .clamp(1, MAX_HISTORY_LIMIT);
 
     let rebased = if let Some(since) = query.since_ordinal {
-        match sync_difference(state, &sid, since, limit, TranscriptAudience::of(&session)).await? {
+        match sync_difference(state, &sid, since, limit).await? {
             Some(response) => return Ok(Json(response)),
             // Difference exceeded the limit (in emitted rows) or the raw
             // scan bound — fall through to a newest-page rebase.
@@ -1541,7 +1540,6 @@ async fn sync_difference(
     sid: &SessionId,
     since: i64,
     limit: usize,
-    audience: TranscriptAudience,
 ) -> Result<Option<ChatSyncResponse>> {
     let scan_bound = limit.saturating_mul(SYNC_SCAN_BOUND_MULTIPLIER);
     let raw = state
@@ -1610,7 +1608,6 @@ async fn sync_difference(
         Vec::new(),
         &attachment_map,
         &compaction_watermarks(state, sid).await,
-        audience,
     );
     if transcript.len() > limit {
         return Ok(None);
@@ -3400,49 +3397,6 @@ fn in_flight_work_steps(events: Vec<StampedEvent>) -> Vec<ChatWorkStep> {
         .collect()
 }
 
-/// Whose transcript is being rebuilt.
-///
-/// Exactly one thing differs between the two, and it is not cosmetic: what an
-/// `agent_context` row — `Role::User` carrying `MessageSource::Agent`, so
-/// `from_user()` is false — is allowed to mean.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TranscriptAudience {
-    /// The owner chat. `agent_context` is the HIDDEN-prompt channel here (the
-    /// background-notification prompt the agent writes to itself), so
-    /// surfacing one would put words in the user's mouth.
-    OwnerChat,
-    /// A subagent child, read through `/v1/chat/subagents/{id}`. Here
-    /// `agent_context` is the only row that ever opens a turn — the errand the
-    /// parent authored — and a child has no `from_user` rows at all, so
-    /// without this its transcript opens on a work block with no visible task.
-    ///
-    /// EVERY such row qualifies, not just the first: a `resume_session_id`
-    /// spawn appends another seed into the same child, and a first-only rule
-    /// would leave that second stretch headless. Nothing else can reach this
-    /// path — the compaction summary is also `agent_context` but the display
-    /// read filters `compaction_inserted = 0`, and a child is never
-    /// `background_eligible`, so it receives no notification prompt.
-    Subagent,
-}
-
-impl TranscriptAudience {
-    /// Derived from the session itself rather than passed by the caller: the
-    /// audience is a property of whose transcript this is, and a call site
-    /// that could name it wrongly is a call site that eventually will.
-    fn of(session: &Session) -> Self {
-        match session.lineage.as_ref().map(|l| &l.kind) {
-            Some(LineageKind::Subagent) => Self::Subagent,
-            None => Self::OwnerChat,
-        }
-    }
-
-    /// Whether an agent-authored `Role::User` row renders as a bubble and
-    /// opens a turn.
-    fn renders_seed_rows(self) -> bool {
-        matches!(self, Self::Subagent)
-    }
-}
-
 #[cfg(test)]
 fn reconstruct_transcript(
     tail: Vec<(i64, DateTime<Utc>, ChatMessage)>,
@@ -3458,7 +3412,6 @@ fn reconstruct_transcript(
         in_flight_steps,
         &attachments_by_ordinal,
         &[],
-        TranscriptAudience::OwnerChat,
     )
 }
 
@@ -3474,7 +3427,6 @@ fn reconstruct_transcript_with_attachments(
     // (the machinery between them is elided), so without a forced break here
     // they'd render as one card that swallows the pre-compaction divider.
     compaction_watermarks: &[i64],
-    audience: TranscriptAudience,
 ) -> Vec<ChatTranscriptItem> {
     // Merge message rows and out-of-band control events into one ordinal-ordered
     // stream: a control event with `after_ordinal = N` sorts right after the row
@@ -3592,7 +3544,7 @@ fn reconstruct_transcript_with_attachments(
             turn_started = None;
         }
         match msg.role {
-            Role::User if msg.from_user() || audience.renders_seed_rows() => {
+            Role::User if msg.from_user() => {
                 work.flush(&mut items, None, true);
                 turn_started = Some(created_at);
                 if let Some(item) = message_item(
@@ -4052,110 +4004,6 @@ mod tests {
         }
     }
 
-    /// The rebuild a subagent read performs: the errand the parent authored is
-    /// an `agent_context` row, and the OWNER path is right to drop it (there it
-    /// is the agent's hidden self-prompt). On the subagent path dropping it
-    /// leaves a transcript that opens on a work block with no visible task.
-    #[test]
-    fn subagent_audience_renders_the_spawn_seed_as_a_user_bubble() {
-        let tail = vec![
-            (
-                1,
-                ts(10),
-                ChatMessage::agent_context(vec![text("search the sync protocol")]),
-            ),
-            (
-                2,
-                ts(14),
-                ChatMessage::assistant(vec![tool_use("t1", "grep", serde_json::json!({}))]),
-            ),
-            (3, ts(20), ChatMessage::assistant(vec![text("found three")])),
-        ];
-        let attachments = HashMap::new();
-
-        let owner = reconstruct_transcript_with_attachments(
-            tail.clone(),
-            Vec::new(),
-            None,
-            Vec::new(),
-            &attachments,
-            &[],
-            TranscriptAudience::OwnerChat,
-        );
-        assert!(
-            !owner.iter().any(|i| i.role == "user"),
-            "owner chat must keep an agent_context row hidden: {owner:?}"
-        );
-
-        let child = reconstruct_transcript_with_attachments(
-            tail,
-            Vec::new(),
-            None,
-            Vec::new(),
-            &attachments,
-            &[],
-            TranscriptAudience::Subagent,
-        );
-        let first = child.first().expect("child transcript is not empty");
-        assert_eq!(first.role, "user", "the errand leads the thread: {child:?}");
-        assert!(
-            first.text.contains("search the sync protocol"),
-            "the seed's text is the task: {first:?}"
-        );
-        // The seed also opens the turn, so the work block times from the
-        // errand rather than from its own first intermediate row.
-        let work = child
-            .iter()
-            .find(|i| matches!(i.kind, TranscriptItemKind::Work))
-            .expect("a work block");
-        assert_eq!(
-            work.work_started_at,
-            Some(ts(10)),
-            "work times from the seed, not from the tool row: {work:?}"
-        );
-    }
-
-    /// A `resume_session_id` spawn appends a SECOND seed into the same child.
-    /// A first-only rule would leave that stretch headless, which is why the
-    /// audience renders every such row rather than the first.
-    #[test]
-    fn subagent_audience_renders_a_resumed_seed_too() {
-        let tail = vec![
-            (
-                1,
-                ts(10),
-                ChatMessage::agent_context(vec![text("first errand")]),
-            ),
-            (2, ts(12), ChatMessage::assistant(vec![text("done")])),
-            (
-                3,
-                ts(30),
-                ChatMessage::agent_context(vec![text("second errand")]),
-            ),
-            (4, ts(33), ChatMessage::assistant(vec![text("done again")])),
-        ];
-        let attachments = HashMap::new();
-        let child = reconstruct_transcript_with_attachments(
-            tail,
-            Vec::new(),
-            None,
-            Vec::new(),
-            &attachments,
-            &[],
-            TranscriptAudience::Subagent,
-        );
-        let seeds: Vec<&str> = child
-            .iter()
-            .filter(|i| i.role == "user")
-            .map(|i| i.text.as_str())
-            .collect();
-        assert_eq!(
-            seeds,
-            vec!["first errand", "second errand"],
-            "both errands lead their own stretch: {child:?}"
-        );
-    }
-
     #[test]
     fn tool_label_names_the_subagent_errand() {
         let input = serde_json::json!({
@@ -4307,7 +4155,6 @@ mod tests {
             Vec::new(),
             &attachments,
             &[],
-            TranscriptAudience::OwnerChat,
         );
         let fused_work = fused
             .iter()
@@ -4325,7 +4172,6 @@ mod tests {
             Vec::new(),
             &attachments,
             &[3],
-            TranscriptAudience::OwnerChat,
         );
         let work: Vec<&ChatTranscriptItem> = split
             .iter()

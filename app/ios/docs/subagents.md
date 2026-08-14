@@ -69,35 +69,39 @@ Two things this deliberately does **not** do:
   rule is "the root must be a session you could already open", not "the root must
   be on the owner channel".
 
-## The transcript is headless without help
+## The transcript does not open on the errand, and cannot
 
 The prompt the parent writes for its child is persisted as
-`ChatMessage::agent_context` — `Role::User` but `MessageSource::Agent`, so
-`from_user()` is **false** and the reconstruction's `Role::User if
-msg.from_user()` arm never matches it. It falls into `_ => {}` and is dropped.
-Both backends do this (`append_spawned_prompt` for in-process,
-`run_external_agent_turn` for claude/codex), so **every** child transcript would
-otherwise open on a work block with no visible task.
+`ChatMessage::agent_context` — `Role::User` but `MessageSource::Agent` — so the
+reconstruction's `Role::User if msg.from_user()` arm drops it, exactly as it
+drops the same shape in an owner chat.
 
-`build_history_page` therefore takes a `seed_as_user` flag, set only on the
-subagent read path, which renders **every** `agent_context` row as a user bubble
-and stamps `turn_started` from it.
+An earlier version of this feature rendered those rows as user bubbles on the
+subagent path, on the reasoning that a child has no other user rows so anything
+`agent_context` there had to be the errand. **That is false on real data.** The
+live store's children carry three different things under that one identity:
 
-*Every*, not "the first" — deliberately:
+- the spawn seed;
+- **skill reminders** — `source = 'skill_listing'` only since 2026-08-04; every
+  row before that is plain `agent`, so the column cannot separate them
+  historically;
+- **compaction summaries** (`CONTINUATION_INTRO`), and they are NOT all hidden:
+  measured on the live store, 14 of them carry `compaction_inserted = 0` and 7
+  carry `1`, so the display read's filter does not remove them.
 
-- A `resume_session_id` spawn appends **another** seed into the same child, and
-  under a first-only rule that second stretch of conversation would be headless
-  again.
-- The other things that produce `agent_context` are either never persisted
-  (notification cue, task reminder, progress observation) or filtered out before
-  reconstruction ever sees them: the compaction summary is also `agent_context`,
-  but the display read's SQL carries `compaction_inserted = 0`, so it cannot
-  reach this code.
-- A child session can't receive a background-notification prompt — a subagent
-  turn ends with the child, so `background_eligible` is false for it.
+So the reader got the skills `<system-reminder>` as the first "user" bubble.
+Nothing in a row separates the errand from the machinery, and the schema's own
+comment says why that must not be guessed at from content: `source` exists
+precisely so the genuine prompt is told apart "without guessing by content".
 
-Do not generalize the flag to `owner` sessions. There, `agent_context` **is**
-the hidden-prompt channel, and rendering it would put words in the user's mouth.
+The errand reaches the reader another way — it is the row they tapped to get
+here, and the page's header repeats it — so nothing is lost by leaving the
+transcript to start at the first work block.
+
+Giving the seed its own `MessageSource` is the change that would make rendering
+it exact; it would apply to future spawns only, which is fine, because the
+header already covers the rest.
+
 
 ## Where the list's data comes from
 
@@ -264,9 +268,10 @@ the engine disagree about what is playing.
   resolved per `(channel, session)`; nothing registers one for `subagent`, so it
   falls to `AutoDenyGate` (fail-closed). The read-only page will show denied
   steps that no one denied. Pre-existing, not introduced here.
-- **"Worked Xs" on an external child undercounts.** Only a user row sets
-  `turn_started`, and an external child has none even with `seed_as_user` (its
-  seed is written by the spawner before any turn opens).
+- **"Worked Xs" on a child undercounts.** Only a `from_user` row sets
+  `turn_started`, and a child has none at all, so every work block times from
+  its own first intermediate row rather than from the turn's start — the first
+  LLM call's stretch is missing from the label.
 
 ## Two pre-existing bugs this feature makes visible
 
