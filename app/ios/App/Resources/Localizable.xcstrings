@@ -2976,23 +2976,6 @@
         }
       }
     },
-    "subagent.readOnly": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Read-only"
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "只读"
-          }
-        }
-      }
-    },
     "subagent.running": {
       "extractionState": "manual",
       "localizations": {

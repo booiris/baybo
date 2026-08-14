@@ -13,11 +13,9 @@ import SwiftUI
 struct SubagentSheet: View {
     let sessionId: String
     var client: any BayboClientProtocol = Baybo.client
-    /// The picked child. The screen stashes it and closes this sheet; the
-    /// child browser opens from `.onDisappear`, which is deterministic against
-    /// the dismissal where a guessed delay is not (`ChatScreen` makes the same
-    /// move for the message index).
-    let onPick: (ChatSubagentSummary) -> Void
+    /// The conversation these children were listed under, carried onto each
+    /// pushed level so a child's status can be re-read from it.
+    let parentSessionId: String
 
     @ObservedObject private var lang = Lang.shared
     @State private var items: [ChatSubagentSummary] = []
@@ -36,16 +34,44 @@ struct SubagentSheet: View {
 
     static let rowIdentifier = "subagent-row"
 
+    @State private var path: [SubagentRoute] = []
+
     var body: some View {
-        VStack(spacing: 0) {
-            grabber
-            titleRow
-            Rectangle()
-                .fill(Theme.line)
-                .frame(height: 1)
-            content
+        NavigationStack(path: $path) {
+            VStack(spacing: 0) {
+                grabber
+                titleRow
+                Rectangle()
+                    .fill(Theme.line)
+                    .frame(height: 1)
+                content
+            }
+            .toolbar(.hidden, for: .navigationBar)
+            // Pushed, not presented: the detail slides in OVER the list rather
+            // than waiting for it to collapse, and backing out is a native pop
+            // straight back to the list. (The earlier dismiss-then-present
+            // dance was copied from the message index, whose jump genuinely
+            // has to run against a cleared screen — this never did.)
+            .navigationDestination(for: SubagentRoute.self) { route in
+                SubagentScreen(
+                    summary: route.summary, parentSessionId: route.parentSessionId,
+                    client: client
+                )
+                .toolbar(.hidden, for: .navigationBar)
+                .navigationBarBackButtonHidden(true)
+            }
         }
-        .task { await load() }
+        .task {
+            // Before the await: the chat screen already fetched this list on
+            // open, so the common case paints on the first frame and the
+            // refresh below just reconciles.
+            if let seed = SubagentCache.shared.seed(for: sessionId) {
+                items = seed.items
+                hasMoreOlder = seed.hasMoreOlder
+                loaded = true
+            }
+            await load()
+        }
         .onAppear { startPolling() }
         .onDisappear { poll?.cancel() }
     }
@@ -85,9 +111,18 @@ struct SubagentSheet: View {
     /// Three states, and they must not be confused: still loading, genuinely
     /// empty (a conversation that never delegated, or whose only spawn scrolled
     /// out of the window that lit the header entry), and unreachable.
+    ///
+    /// The waiting state gets a SPINNER, not just the word. A bare line of grey
+    /// text on an otherwise blank sheet reads as "nothing here" — which is the
+    /// one thing it must not say while the answer is still in flight.
     private var emptyState: some View {
-        VStack {
+        VStack(spacing: 10) {
             Spacer()
+            if !loaded && !failed {
+                ProgressView()
+                    .controlSize(.small)
+                    .tint(Theme.inkSoft)
+            }
             Text(verbatim: lang.t(emptyStateKey))
                 .font(Theme.mono(13))
                 .foregroundStyle(Theme.inkSoft)
@@ -102,7 +137,10 @@ struct SubagentSheet: View {
                 loadOlderRow
             }
             ForEach(items, id: \.sessionId) { item in
-                Button { onPick(item) } label: { row(item) }
+                Button {
+                    path.append(
+                        SubagentRoute(summary: item, parentSessionId: sessionId))
+                } label: { row(item) }
                     .buttonStyle(.plain)
                     .accessibilityIdentifier(Self.rowIdentifier)
                     .listRowBackground(Theme.paper)
@@ -210,6 +248,8 @@ struct SubagentSheet: View {
             // older has been pulled in yet — once it has, the flag belongs to
             // the oldest page fetched, which `loadOlder` owns.
             if items.count <= list.items.count { hasMoreOlder = list.hasMoreOlder }
+            SubagentCache.shared.put(
+                sessionId: sessionId, items: list.items, hasMoreOlder: list.hasMoreOlder)
             failed = false
         } catch {
             // Keep whatever is on screen: a transient failure mid-poll must not
