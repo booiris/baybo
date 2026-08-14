@@ -66,6 +66,17 @@ describe('snippet', () => {
     expect(matched(snippet('list the sessions please', 'session'))).toEqual(['session']);
   });
 
+  // The card clamps the excerpt to two lines — ~34 full-width characters in the
+  // 260px sidebar — so a long lead-in renders a real hit with the searched term
+  // scrolled off the bottom. Measured at a symmetric 60-character pad: 10 of 13
+  // results for one live query showed no highlight at all.
+  it('keeps the highlight inside the two lines the card shows', () => {
+    const text = `${'背'.repeat(500)}检索${'尾'.repeat(500)}`;
+    const at = plain(snippet(text, '检索')).indexOf('检索');
+    expect(at).toBeGreaterThanOrEqual(0);
+    expect(at).toBeLessThan(20);
+  });
+
   it('elides both ends when the window is interior', () => {
     const text = `${'a'.repeat(200)}检索${'b'.repeat(200)}`;
     const segs = snippet(text, '检索');

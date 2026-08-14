@@ -16,11 +16,15 @@ import Foundation
 /// window edge from splitting an emoji ZWJ sequence or stranding a combining
 /// mark — and, on the JS side, from emitting a lone surrogate.
 enum SearchSnippet {
-    /// Clusters of prose either side of the match. Must equal the JS
-    /// `SNIPPET_PAD`; the vectors fail loudly if it drifts.
-    private static let pad = 60
+    /// Clusters of prose kept BEFORE the match — front-loaded so the highlight
+    /// survives the result card's line clamp; the full why lives on the JS
+    /// constants. Must equal the JS `LEAD_PAD` / `TRAIL_PAD`; the vectors fail
+    /// loudly if they drift.
+    private static let leadPad = 12
+    /// And AFTER it — the rest of the same budget.
+    private static let trailPad = 108
     /// Head shown when no term can be located.
-    private static let headLength = pad * 2
+    private static let headLength = leadPad + trailPad
 
     /// A run of the message, flagged when it is one of the query's terms.
     struct Segment: Equatable {
@@ -105,8 +109,8 @@ enum SearchSnippet {
             .map(\.element)
 
         let anchor = hits[0]
-        let from = max(0, anchor.at - pad)
-        let to = min(g.count, anchor.end + pad)
+        let from = max(0, anchor.at - leadPad)
+        let to = min(g.count, anchor.end + trailPad)
 
         var segments: [Segment] = []
         func push(_ t: String, _ match: Bool) {

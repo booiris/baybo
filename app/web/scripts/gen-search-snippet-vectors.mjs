@@ -33,7 +33,7 @@ const cases = [
   ['prefix widening still locates the typed prefix', 'list the sessions please', 'session'],
   ['no locatable term falls back to the head', 'résumé of the work', 'resume'],
   ['head fallback elides when longer than the head budget', 'a'.repeat(200), 'zzz'],
-  ['interior window elides both ends', `${'a'.repeat(100)}检索${'b'.repeat(100)}`, '检索'],
+  ['interior window elides both ends', `${'a'.repeat(100)}检索${'b'.repeat(200)}`, '检索'],
   ['punctuation-only query yields the head', 'some text', '---'],
   ['empty query yields the head', 'some text', ''],
   ['empty text', '', 'foo'],
@@ -41,10 +41,13 @@ const cases = [
   // gets wrong. A family emoji is ONE cluster of 7 code points; a flag is a
   // surrogate pair; NFD `é` is `e` + U+0301.
   ['ZWJ emoji sits exactly on the leading window edge', `${'👨‍👩‍👧‍👦'.repeat(70)}检索`, '检索'],
-  ['ZWJ emoji sits exactly on the trailing window edge', `检索${'👨‍👩‍👧‍👦'.repeat(70)}`, '检索'],
-  ['surrogate-pair flags around a match', `${'🇨🇳'.repeat(70)}检索${'🇯🇵'.repeat(70)}`, '检索'],
+  ['ZWJ emoji sits exactly on the trailing window edge', `检索${'👨‍👩‍👧‍👦'.repeat(120)}`, '检索'],
+  ['surrogate-pair flags around a match', `${'🇨🇳'.repeat(70)}检索${'🇯🇵'.repeat(120)}`, '检索'],
   ['emoji inside the matched term', '说说 🎉派对 的事', '🎉派对'],
-  ['decomposed combining mark (e+U+0301) stays with its base', `${'é'.repeat(70)}检索`, '检索'],
+  // Escaped, not a literal `é`: an NFC-normalizing editor pass silently turns
+  // the decomposed literal into the precomposed code point and the case stops
+  // testing anything. It happened once already.
+  ['decomposed combining mark (e+U+0301) stays with its base', `${'e\u0301'.repeat(70)}检索`, '检索'],
 ];
 
 const vectors = cases.map(([name, text, query]) => ({
