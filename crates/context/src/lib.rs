@@ -416,6 +416,10 @@ pub struct ContextManagerConfig {
     /// [`ContextManager::set_active_model_context_window`] once the
     /// owning `AgentLoop` resolves its LLM client.
     pub compression_threshold: f64,
+    /// Absolute ceiling on the active context, from
+    /// `agent.context.max_active_tokens`. `0` leaves the window share as
+    /// the only rule; otherwise the tighter of the two decides.
+    pub max_active_tokens: usize,
     pub calibration: Arc<TokenCalibration>,
     pub skill_registry: Arc<SkillRegistry>,
     /// Channel of the session (from the session row). Skills restricted
@@ -449,7 +453,7 @@ impl ContextManager {
             // installs the active model's `context_window` via
             // `set_active_model_context_window` before any compression
             // check runs.
-            budget: TokenBudget::new(0, config.compression_threshold),
+            budget: TokenBudget::new(0, config.compression_threshold, config.max_active_tokens),
             calibration: config.calibration,
             skill_registry: config.skill_registry,
             channel: config.channel,
@@ -2791,6 +2795,7 @@ mod tests {
             workspace: test_workspace(),
             keep_recent,
             compression_threshold: threshold,
+            max_active_tokens: 0,
             calibration: Arc::new(TokenCalibration::new()),
             skill_registry: Arc::new(SkillRegistry::new()),
             channel: baybo_model::ChannelType::owner(),
@@ -2819,6 +2824,7 @@ mod tests {
             workspace: test_workspace(),
             keep_recent: 5,
             compression_threshold: 0.75,
+            max_active_tokens: 0,
             calibration,
             skill_registry: Arc::new(SkillRegistry::new()),
             channel: baybo_model::ChannelType::owner(),
@@ -3213,6 +3219,7 @@ mod tests {
             workspace: Arc::clone(&workspace),
             keep_recent: 2,
             compression_threshold: 0.75,
+            max_active_tokens: 0,
             calibration: Arc::new(TokenCalibration::new()),
             skill_registry: Arc::new(SkillRegistry::new()),
             channel: baybo_model::ChannelType::owner(),
@@ -3283,6 +3290,7 @@ mod tests {
             workspace: Arc::clone(&workspace),
             keep_recent: 2,
             compression_threshold: 0.75,
+            max_active_tokens: 0,
             calibration: Arc::new(TokenCalibration::new()),
             skill_registry: Arc::new(SkillRegistry::new()),
             channel: baybo_model::ChannelType::owner(),
@@ -3335,6 +3343,7 @@ mod tests {
             workspace: Arc::clone(workspace),
             keep_recent: 2,
             compression_threshold: 0.75,
+            max_active_tokens: 0,
             calibration: Arc::new(TokenCalibration::new()),
             skill_registry: Arc::new(SkillRegistry::new()),
             channel: baybo_model::ChannelType::owner(),
@@ -3504,6 +3513,7 @@ mod tests {
             workspace: Arc::clone(&workspace),
             keep_recent: 2,
             compression_threshold: 0.75,
+            max_active_tokens: 0,
             calibration: Arc::new(TokenCalibration::new()),
             skill_registry: Arc::new(SkillRegistry::new()),
             channel: baybo_model::ChannelType::owner(),
@@ -4102,6 +4112,7 @@ mod tests {
             workspace: Arc::clone(&workspace),
             keep_recent: 2,
             compression_threshold: 0.75,
+            max_active_tokens: 0,
             calibration: Arc::new(TokenCalibration::new()),
             skill_registry: Arc::new(SkillRegistry::new()),
             channel: baybo_model::ChannelType::owner(),
@@ -4179,6 +4190,7 @@ mod tests {
             workspace: Arc::clone(&workspace),
             keep_recent: 2,
             compression_threshold: 0.75,
+            max_active_tokens: 0,
             calibration: Arc::new(TokenCalibration::new()),
             skill_registry: Arc::new(SkillRegistry::new()),
             channel: baybo_model::ChannelType::owner(),
@@ -5030,6 +5042,7 @@ mod tests {
             workspace: test_workspace(),
             keep_recent,
             compression_threshold: threshold,
+            max_active_tokens: 0,
             calibration: Arc::new(TokenCalibration::new()),
             skill_registry: registry,
             channel: baybo_model::ChannelType::owner(),

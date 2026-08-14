@@ -865,6 +865,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
 
     let max_iterations = graph.config.agent.max_iterations;
     let compression_threshold = graph.config.agent.context.compression_threshold;
+    let max_active_tokens = graph.config.agent.context.max_active_tokens;
     let keep_recent = graph.config.agent.context.keep_recent;
     let builtin_memory = graph.config.memory.builtin.enabled;
 
@@ -964,6 +965,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                         workspace: Arc::clone(&workspace_paths_arc),
                         keep_recent,
                         compression_threshold,
+                        max_active_tokens,
                         calibration: Arc::clone(&token_calibration),
                         skill_registry: Arc::clone(&skill_registry),
                         channel: session.channel.clone(),

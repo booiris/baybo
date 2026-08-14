@@ -491,6 +491,10 @@ impl AgentTestHarnessBuilder {
             workspace,
             keep_recent,
             compression_threshold,
+            // The harness drives compaction through the window share and a
+            // deliberately small stub window; an absolute cap on top would
+            // be a second trigger every such test has to reason about.
+            max_active_tokens: 0,
             calibration: Arc::clone(&token_calibration),
             skill_registry: Arc::clone(&skill_registry),
             channel: session.channel.clone(),

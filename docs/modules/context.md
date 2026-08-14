@@ -367,8 +367,11 @@ The context sent to the LLM is organized in descending priority:
 
 ## Constraints
 
-- `TokenBudget::max_tokens` is sourced from the active LLM client's `ModelInfo::context_window` — installed by `AgentLoop::from_config` via `ContextManager::set_active_model_context_window`. There is no separate configured cap; resize the model's `context_window` if you need headroom for output tokens.
+- `TokenBudget::max_tokens` is sourced from the active LLM client's `ModelInfo::context_window` — installed by `AgentLoop::from_config` via `ContextManager::set_active_model_context_window`. Resize the model's `context_window` if you need headroom for output tokens.
 - `agent.context.compression_threshold` ships at `0.65` (`crates/config/src/agent.rs`). Raising it leaves less headroom for the compaction's own output; lowering it compacts more often.
+- `agent.context.max_active_tokens` ships at `120_000` and is the **absolute** half of the same decision: `TokenBudget::compression_ceiling` is the *lesser* of the window share and this cap, and `0` turns the cap off. A share alone stopped bounding anything once providers began advertising million-token windows — 0.65 of 1,048,576 trips at 681K, and a measured board ran two sessions to 226K and 295K input tokens over ~200 calls each without ever compacting. What that costs is paid per call, not at the window: the long prefix is re-sent every iteration, so it is cache reads where the provider caches and full-price prefill plus tail latency where it does not. Both rules live in `compression_ceiling` and nowhere else, so the gate and the post-compaction savings check cannot disagree about what "too much context" means.
+
+  It is deliberately **not** an issue-run-only rule. Nothing about cache economics or prefill latency is particular to a board's runs; that is only where the runaway was measured. The visible consequence is that long chat conversations on a large-window model now compact where they previously did not.
 - `agent.context.keep_recent` is the message-count half of the pre-flight gate — how many non-system messages still count as a *short* conversation. It no longer sizes a kept tail: the verbatim slice after a summary is sized in tokens by `recent_slice_bounds`.
 
 ## Cost recording
