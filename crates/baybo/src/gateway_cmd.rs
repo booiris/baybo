@@ -32,6 +32,30 @@ use crate::boot;
 use crate::runtime;
 use crate::tracing_init::{TracingMode, init_tracing};
 
+/// Lets the janitor ask the boards to give back the build output under
+/// checkouts nobody is working in.
+///
+/// The adapter lives here, in the composition root, rather than in either
+/// crate: the janitor knows a cadence and would otherwise have to learn
+/// what a card is, and `baybo-project` would otherwise depend on a
+/// maintenance loop to be allowed to answer it.
+struct BoardBuildArtifacts(Arc<baybo_project::ProjectManager>);
+
+#[async_trait::async_trait]
+impl baybo_janitor::BuildArtifactSource for BoardBuildArtifacts {
+    async fn reclaim_idle(
+        &self,
+        idle_for: std::time::Duration,
+    ) -> baybo_janitor::ReclaimedArtifacts {
+        use baybo_project::BuildArtifacts;
+        let freed = self.0.reclaim_idle_build_artifacts(idle_for).await;
+        baybo_janitor::ReclaimedArtifacts {
+            dirs_removed: freed.dirs_removed,
+            bytes_freed: freed.bytes_freed,
+        }
+    }
+}
+
 /// Entry point — routes the parsed subcommand to the right handler.
 pub async fn run(cmd: GatewayCmd) -> anyhow::Result<()> {
     let config = boot::load_config().await?;
@@ -404,7 +428,10 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
 
     {
         let mut janitor = baybo_janitor::Janitor::new(workspace_paths.clone())
-            .with_pairing_store(graph.stores.channel_pairing.clone());
+            .with_pairing_store(graph.stores.channel_pairing.clone())
+            .with_build_artifacts(Arc::new(BoardBuildArtifacts(Arc::clone(
+                &graph.project_manager,
+            ))));
         if let Some(runtime) = sidecar_runtime.as_ref()
             && let Some(cache_root) = runtime.sidecars_cache_root()
         {

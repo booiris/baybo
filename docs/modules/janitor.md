@@ -2,9 +2,9 @@
 
 ## Overview
 
-The `janitor` crate (`baybo-janitor`) runs best-effort, cadence-driven maintenance **outside** the agent loop: three filesystem TTL sweeps and one database retention sweep. It does **not** do storage compaction (there is no `VACUUM`); the only table it touches is `channel_pairings`.
+The `janitor` crate (`baybo-janitor`) runs best-effort, cadence-driven maintenance **outside** the agent loop: four filesystem TTL sweeps, one database retention sweep, and one delegated reclaim it does not itself understand. It does **not** do storage compaction (there is no `VACUUM`); the only table it touches is `channel_pairings`.
 
-A single `Janitor` struct holds the `WorkspacePaths` plus two optional dependencies wired by builders — the pairing store and the sidecar-cache view. `Janitor::run(shutdown)` sweeps once at boot, then ticks every `TICK_INTERVAL` (12h) until `shutdown` resolves. Each sweep is best-effort: a failure in one is logged and the others still run.
+A single `Janitor` struct holds the `WorkspacePaths` plus three optional dependencies wired by builders — the pairing store, the sidecar-cache view, and the build-artifact source. `Janitor::run(shutdown)` sweeps once at boot, then ticks every `TICK_INTERVAL` (12h) until `shutdown` resolves. Each sweep is best-effort: a failure in one is logged and the others still run.
 
 ### Sweeps
 
@@ -13,12 +13,15 @@ A single `Janitor` struct holds the `WorkspacePaths` plus two optional dependenc
 | Log files | `LOG_FILE_TTL` = 30 days | `logs_dir()` + `channel_logs_dir()` (`is_log_file`) | every `TICK_INTERVAL` (12h) |
 | work/tmp scratch | `WORK_TMP_TTL` = 7 days (day count from `baybo_workspace::paths::WORK_TMP_TTL_DAYS`) | top-level entries of `work_tmp_dir()`; an entry is stale only when the **newest** mtime anywhere in its tree is past the TTL | every `TICK_INTERVAL` (12h) |
 | Pairing rows | `PAIRING_APPROVAL_TTL` = 7 days (approved) | `channel_pairings` via `ChannelPairingStore::purge_expired` | every `PAIRING_SWEEP_INTERVAL` (1h), plus once per 12h tick |
+| Tool spills | `TOOL_SPILL_TTL` = `WORK_TMP_TTL` (7 days) | top-level entries of `tool_spills_dir()`, same newest-mtime rule as work/tmp | every `TICK_INTERVAL` (12h) |
 | Sidecar cache | `SIDECAR_CACHE_TTL` = 7 days | `$XDG_CACHE_HOME/baybo/sidecars/` stale `<name>-<hash>` dirs | every `SIDECAR_SWEEP_INTERVAL` (24h) |
+| Build artifacts | `IDLE_CHECKOUT_TTL` = 3 days | delegated: whatever `BuildArtifactSource::reclaim_idle` decides is regenerable | every `TICK_INTERVAL` (12h) |
 
 ### Public surface
 
-- **`Janitor`** — `new(paths)`; builders `with_pairing_store(Arc<dyn ChannelPairingStore>)` and `with_sidecar_cache(SidecarCache)`; sweep entry points `sweep_once()`, `sweep_pairings_once(now)`, `sweep_sidecar_cache()`; and the `run(shutdown)` loop.
-- **`JanitorReport`** — per-sweep counts (`log_files_removed`, `work_tmp_removed`, `sidecar_dirs_removed`, `pairings_purged`).
+- **`Janitor`** — `new(paths)`; builders `with_pairing_store(Arc<dyn ChannelPairingStore>)`, `with_sidecar_cache(SidecarCache)` and `with_build_artifacts(Arc<dyn BuildArtifactSource>)`; sweep entry points `sweep_once()`, `sweep_pairings_once(now)`, `sweep_sidecar_cache()`; and the `run(shutdown)` loop.
+- **`JanitorReport`** — per-sweep counts (`log_files_removed`, `work_tmp_removed`, `tool_spills_removed`, `sidecar_dirs_removed`, `pairings_purged`, `build_dirs_removed`, `build_bytes_freed`).
+- **`BuildArtifactSource`** — one verb, `reclaim_idle(idle_for) -> ReclaimedArtifacts`. See below.
 - **`SidecarCache`** — `cache_root: PathBuf` + `live_dirs: HashSet<String>` (the `<name>-<hash>` set the running Baybo currently has materialised).
 - **`JanitorError`** — single `Filesystem { path, source }` variant.
 
@@ -51,20 +54,29 @@ because the Bash tool description quotes the same figure.
 
 The sidecar cache only accumulates cruft after a binary upgrade lands a fresh content hash (single-digit MB per upgrade), so it runs on its own 24h cadence (`SIDECAR_SWEEP_INTERVAL`) — every other 12h tick — via a `last_sidecar_sweep` sentinel. It removes only directories under `cache_root` that are **not** in `live_dirs` **and** older than the TTL; the TTL doubles as a safety margin against a concurrent older-version Baybo under the same UID still using a dir. Non-directory entries and the live set are always left alone.
 
+### The build-artifact sweep is a verb this crate calls, not a rule it owns
+
+A card parked in Review keeps its worktree deliberately — the branch is still being looked at — but the `target/` under it is not part of what anybody is looking at. On a real board two such cards held 5.66G of regenerable build output while `worktree::reclaim` waited for a Done that was in no hurry to arrive.
+
+The janitor supplies the cadence (12h) and the TTL (`IDLE_CHECKOUT_TTL`, 3 days) and **nothing else**. Which checkouts exist, whether one is between runs, and what inside it a build tool can make again are all `baybo-project`'s questions, reached through `BuildArtifactSource::reclaim_idle` — a verb, never a store. The trait is declared here so the dependency does not run the wrong way: the adapter that connects the two lives in the composition root (`gateway_cmd.rs`), so the janitor never learns what a card is and `baybo-project` never depends on a maintenance loop to be allowed to answer.
+
+Without `with_build_artifacts` the sweep is a no-op, which is the honest default for a workspace with no boards.
+
 ### Best-effort, fail-open, TTL-gated
 
 Every sweep swallows its own errors (`tracing::warn!` then continue) so one bad directory or a transient DB error can't stop the rest or crash the loop. All deletions are gated on an mtime older than the relevant TTL; nothing is removed on age alone without the TTL check. The `run` loop uses `MissedTickBehavior::Delay` so a slow sweep can't stack burst catch-up ticks.
 
 ## Constraints
 
-- Internal deps: `baybo-store` (the `ChannelPairingStore` trait for the pairing purge) and `baybo-workspace` (path resolution + the shared `walk::tree_stats` walker). It depends on the `baybo-store` **ports** crate, not `baybo-storage`.
-- Both DB-touching and sidecar sweeps are opt-in: without `with_pairing_store` the pairing sweep is skipped; without `with_sidecar_cache` the sidecar sweep is a no-op.
+- Internal deps: `baybo-store` (the `ChannelPairingStore` trait for the pairing purge) and `baybo-workspace` (path resolution + the shared `walk::tree_stats` walker). It depends on the `baybo-store` **ports** crate, not `baybo-storage`, and on no domain crate at all — the build-artifact sweep reaches its rules through a trait declared here and implemented elsewhere.
+- Every non-filesystem sweep is opt-in: without `with_pairing_store` the pairing sweep is skipped, without `with_sidecar_cache` the sidecar sweep is a no-op, and without `with_build_artifacts` no checkout is swept.
 
 ## Collaboration
 
 | Module | Role |
 |--------|------|
-| `gateway` | `crates/baybo/src/gateway_cmd.rs` constructs the `Janitor`, wires `with_pairing_store(graph.stores.channel_pairing)` and (when sidecars are active) `with_sidecar_cache`, and spawns `run` against the gateway shutdown signal. |
+| `gateway` | `crates/baybo/src/gateway_cmd.rs` constructs the `Janitor`, wires `with_pairing_store(graph.stores.channel_pairing)`, `with_build_artifacts(BoardBuildArtifacts(project_manager))` and (when sidecars are active) `with_sidecar_cache`, and spawns `run` against the gateway shutdown signal. |
+| `project` | Owns every rule about which checkout may give back which bytes (`artifacts.rs`); the janitor is the cadence that asks. |
 | `storage` | `SqliteChannelPairingStore::purge_expired` issues the `DELETE FROM channel_pairings` the pairing sweep drives |
 | `pairing` | Owns the `channel_pairings` rows the sweep reaps; `baybo-janitor` is the cadence that enforces their retention |
 | `workspace` | `WorkspacePaths` resolves `logs_dir` / `channel_logs_dir`; the sidecar cache root descends from `baybo_workspace::paths::baybo_cache_root()` and reaches the janitor via the gateway's `SidecarRuntime::sidecars_cache_root()` / `live_dir_names()` |

@@ -226,6 +226,82 @@ pub async fn prepare_for_issue(
     Ok(root)
 }
 
+/// Every checkout that exists on disk, as `(project, issue number)`.
+///
+/// The inverse of [`worktree_root`], and next to it so the two spellings of
+/// the layout cannot drift. Read from the filesystem rather than derived
+/// from the board because that is the question being asked — what is taking
+/// up space — and because a card list would miss exactly the orphans worth
+/// noticing.
+///
+/// Anything that is not a real directory is skipped, symlinks included: the
+/// per-issue `<number>.gitconfig` files are siblings of the `<number>`
+/// directories, and a link where a checkout belongs is not a checkout.
+pub async fn checkouts_on_disk(paths: &WorkspacePaths) -> Vec<(ProjectId, i64)> {
+    let mut found = Vec::new();
+    let root = paths.work_dir().join(WORKTREES_DIR);
+    let Ok(mut projects) = tokio::fs::read_dir(&root).await else {
+        return found;
+    };
+    while let Ok(Some(project_entry)) = projects.next_entry().await {
+        if !is_real_dir(&project_entry).await {
+            continue;
+        }
+        let Some(project) = project_entry
+            .file_name()
+            .to_str()
+            .map(str::to_owned)
+            .and_then(|name| ProjectId::parse(name).ok())
+        else {
+            continue;
+        };
+        let Ok(mut cards) = tokio::fs::read_dir(project_entry.path()).await else {
+            continue;
+        };
+        while let Ok(Some(card)) = cards.next_entry().await {
+            if !is_real_dir(&card).await {
+                continue;
+            }
+            if let Some(number) = card
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<i64>().ok())
+            {
+                found.push((project.clone(), number));
+            }
+        }
+    }
+    found
+}
+
+async fn is_real_dir(entry: &tokio::fs::DirEntry) -> bool {
+    // `symlink_metadata`, so a link to a directory reads as what it is.
+    tokio::fs::symlink_metadata(entry.path())
+        .await
+        .is_ok_and(|meta| meta.is_dir())
+}
+
+/// The worktree this path is the top of, if it is one at all. `None` for a
+/// directory that merely sits where a checkout belongs.
+pub async fn is_checkout(root: &Path) -> Option<PathBuf> {
+    let out = run(root, &["rev-parse", "--show-toplevel"]).await.ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let top = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    std::fs::canonicalize(top).ok()
+}
+
+/// Whether git itself ignores `name` inside this checkout — asked of git
+/// rather than assumed from the name, so a repository that tracks a
+/// directory the sweep would otherwise recognise keeps it.
+pub async fn is_ignored(root: &Path, name: &str) -> bool {
+    let Ok(out) = run(root, &["check-ignore", "--quiet", "--", name]).await else {
+        return false;
+    };
+    out.status.success()
+}
+
 /// The branch an existing worktree is actually on.
 pub async fn branch_of(root: &Path) -> Option<String> {
     if !root.join(".git").exists() {

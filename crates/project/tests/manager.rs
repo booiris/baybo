@@ -5856,3 +5856,94 @@ async fn removing_a_cards_last_file_is_a_write_and_not_a_no_op() {
         .expect("clearing the list is a real edit");
     assert!(after.attachments.is_empty());
 }
+
+/// Build output under a checkout nobody is working in is regenerable, and
+/// the sweep may take it — but only after every gate agrees.
+#[tokio::test]
+async fn an_idle_checkouts_build_output_is_reclaimed_and_a_busy_ones_is_not() {
+    use baybo_project::BuildArtifacts;
+
+    let f = fixture().await;
+    let project = f
+        .manager
+        .create_project(new_project("Artifacts"))
+        .await
+        .expect("create");
+    let dev = seed_agent(&f, &project.id, "dev-1", AgentFramework::Baybo).await;
+
+    // Two cards, each with a real checkout carrying a `target/` big enough
+    // to be worth reclaiming.
+    let mut roots = Vec::new();
+    for title in ["idle card", "busy card"] {
+        let issue = f
+            .manager
+            .create_issue(
+                &project.id,
+                IssueActor::User,
+                NewIssueRequest {
+                    status: IssueStatus::Review,
+                    assignee: Some(dev.clone()),
+                    ..new_issue(title)
+                },
+            )
+            .await
+            .expect("create issue")
+            .into_issue();
+        let root = baybo_project::worktree::worktree_root(&f.paths, &project.id, issue.number);
+        let branch = baybo_project::worktree::branch_name(issue.number, &issue.title);
+        baybo_project::worktree::ensure(std::path::Path::new(&project.workdir), &root, &branch)
+            .await
+            .expect("cut a worktree the way a run would");
+        let target = root.join("target");
+        tokio::fs::create_dir_all(&target).await.expect("target");
+        tokio::fs::write(target.join("blob.bin"), vec![0u8; 80 * 1024 * 1024])
+            .await
+            .expect("write build output");
+        // The repository has to agree the directory is ignorable, which is
+        // the gate that keeps a tracked `target/` alive.
+        tokio::fs::write(root.join(".gitignore"), "/target\n")
+            .await
+            .expect("gitignore");
+        roots.push((issue, root));
+    }
+
+    // The second card is mid-run: a queued row is one `git worktree add`
+    // away from a build.
+    let (busy_issue, busy_root) = &roots[1];
+    f.manager
+        .retry_run(&project.id, busy_issue.number)
+        .await
+        .expect("a run this card owes");
+
+    let freed = f
+        .manager
+        .reclaim_idle_build_artifacts(std::time::Duration::from_secs(0))
+        .await;
+
+    let (_, idle_root) = &roots[0];
+    assert!(
+        !idle_root.join("target").exists(),
+        "the idle checkout gives its build output back"
+    );
+    assert!(
+        idle_root.join(".gitignore").exists(),
+        "and nothing else in the tree is touched"
+    );
+    assert!(
+        busy_root.join("target").exists(),
+        "a card with a run owed keeps its cache — something is about to build in there"
+    );
+    assert_eq!(freed.dirs_removed, 1);
+    assert!(freed.bytes_freed >= 80 * 1024 * 1024);
+
+    // Nothing is idle *enough* under the real TTL.
+    let again = f
+        .manager
+        .reclaim_idle_build_artifacts(std::time::Duration::from_secs(3 * 86_400))
+        .await;
+    assert_eq!(
+        (again.dirs_removed, again.bytes_freed),
+        (0, 0),
+        "a checkout touched moments ago is not idle"
+    );
+}

@@ -312,6 +312,17 @@ impl ProjectManager {
         }
     }
 
+    /// The workspace this board's checkouts live under. Crate-internal:
+    /// the rules that read it — the worktree layout, the build-artifact
+    /// sweep — are this crate's, and nothing outside it gets a path.
+    pub(crate) fn paths(&self) -> &WorkspacePaths {
+        &self.paths
+    }
+
+    pub(crate) fn store(&self) -> &Arc<dyn ProjectStore> {
+        &self.store
+    }
+
     async fn dispatch_if_triggered(&self, transition: Transition, issue: &IssueRow) {
         let Some(trigger) = triggers_run(transition) else {
             return;

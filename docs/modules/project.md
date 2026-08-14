@@ -39,6 +39,7 @@ every door leads through it.
 | --- | --- |
 | `manager.rs` | `ProjectManager`: the whole write surface, the enqueue chokepoint, and the executor's port |
 | `settle.rs` | The settle chokepoint: the ledger row, the invalidation, and the timeline entry, as one sequence |
+| `artifacts.rs` | Which regenerable build output an idle checkout may give back, and the one verb that offers it |
 | `runs.rs` | The two run predicates (`triggers_run`, `accepts_runs`), the ledger entry, which earlier run a run continues, and `RunOutcome` |
 | `dispatch.rs` | Turning a recorded row into an `IssueRunEvent` the executor can run |
 | `brief.rs` | The brief a run is handed: the card, what has been said on it since, and which of its files fit |
@@ -207,6 +208,23 @@ still `Running`, skips them, and they wait for the next process start.
 letting `enqueue` do it silently. `enqueue` can only answer `None`, which
 `retry_run` reads as the dedupe guard, so the operator would be told the card
 already has a run when it has none and never will.
+
+### Giving the build output back
+
+A finished card's whole checkout goes (`reclaim_if_finished` → `worktree::reclaim`). A card that is merely *idle* keeps it, deliberately — the branch is still being looked at — and that is where the disk goes: two cards parked in Review held 5.66G of `target/`, every byte of it reproducible by running the build again.
+
+`artifacts.rs` owns which of those bytes may go, and hands the answer out as one verb, `BuildArtifacts::reclaim_idle_build_artifacts(idle_for)`. The maintenance loop that calls it (`baybo-janitor`, every 12h at a 3-day TTL) supplies the cadence and knows nothing else; the adapter between the two lives in the composition root, so neither crate depends on the other.
+
+Four gates, and all of them have to agree:
+
+- **Nothing owed.** `between_runs` — a `Held`, `Queued` or `Running` row all hold the issue's dedupe slot, and any of them means something is about to build in that tree.
+- **Idle for real.** `checkout_last_touched` is the card's `updated_at` or its newest run's settle, whichever is later. Deliberately *not* the driver's `already_asked` activity, which filters coordination runs out: that predicate asks whether the card changed since the lead looked, this one asks whether a shell ran in the tree, and the lead's wakes get a checkout like every other run.
+- **A name a build tool owns**, from an explicit list (`target`, `node_modules`, `.venv`, `__pycache__`) — not "anything git ignores", because a `.env`, a downloaded fixture and a half-written scratch file are all ignored too and none of them comes back. `dist/` and `build/` are absent on purpose: those can be the artefact the card exists to produce.
+- **git agrees**, per directory (`check-ignore`), so a repository that tracks one of those names keeps it.
+
+Then the path is canonicalised and re-checked for containment on every sweep (`admitted`), which is the c957e790 rule asked here for the reason it is asked on every tool call: the agent that worked this card can write inside `work/`, so it can turn any component of that path into a link somewhere else between one sweep and the next, and a recursive delete that trusted the layout would follow it.
+
+The result is counted, never announced on the card: a rebuilt cache is not something the operator has to be told about, and the janitor's own report is where a sweep says what it did.
 
 ### What a run cost
 
