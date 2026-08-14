@@ -98,11 +98,19 @@ const UNREAD_EVENT_PREDICATE: &str = "e.created_at > COALESCE(i.read_at, 0) \
      AND (e.kind = 'comment' \
           OR (e.kind = 'moved' AND json_extract(e.body, '$.to') = :review))";
 
-/// One column off the card's newest run, by the one ordering every reader
-/// of "the newest run" must share. A macro so that the two predicates below
-/// read `status` and `settled_at` off the *same row* by construction: they
-/// answer "did it fail" and "has the operator seen that failure", and two
-/// orderings that drifted apart would answer them about different runs.
+/// One column off the card's newest **work** run, by the one ordering every
+/// reader of "the newest run" must share. A macro so that the two
+/// predicates below read `status` and `settled_at` off the *same row* by
+/// construction: they answer "did it fail" and "has the operator seen that
+/// failure", and two orderings that drifted apart would answer them about
+/// different runs.
+///
+/// Coordination runs — the lead woken to triage, review or look at stalled
+/// work — are skipped: the board wakes the lead *because* of a card's
+/// state, and a wake that then became "the newest run" would clear the very
+/// failed badge that state is, without anybody acting on it. The literal
+/// list is pinned to [`RunTrigger::is_coordination`] by
+/// `coordination_triggers_match_the_enum` below.
 ///
 /// Written against `issues i`.
 macro_rules! newest_run {
@@ -111,6 +119,7 @@ macro_rules! newest_run {
             "(SELECT r.",
             $column,
             " FROM issue_runs r WHERE r.issue_id = i.id \
+             AND r.trigger NOT IN ('triage', 'review', 'stalled') \
              ORDER BY r.created_at DESC, r.id DESC LIMIT 1)"
         )
     };
@@ -1531,6 +1540,42 @@ impl ProjectStore for SqliteProjectStore {
 mod tests {
     use super::*;
     use baybo_store::project::{DEFAULT_MAX_PARALLEL_ISSUE_RUNS, IssueEventBody};
+
+    /// Pins `newest_run!`'s literal trigger list to the enum's own idea of
+    /// coordination, so a variant added to one cannot silently miss the
+    /// other.
+    #[test]
+    fn coordination_triggers_match_the_enum() {
+        let listed = ["triage", "review", "stalled"];
+        let probe = newest_run!("status");
+        for name in listed {
+            assert!(
+                probe.contains(&format!("'{name}'")),
+                "the macro's NOT IN list must carry {name}"
+            );
+            let trigger = RunTrigger::parse(name).expect("a listed trigger parses");
+            assert!(trigger.is_coordination(), "{name} claims coordination");
+        }
+        let coordination_count = [
+            RunTrigger::Started,
+            RunTrigger::Assigned,
+            RunTrigger::Retry,
+            RunTrigger::Comment,
+            RunTrigger::Promoted,
+            RunTrigger::Triage,
+            RunTrigger::StageBarrier,
+            RunTrigger::Review,
+            RunTrigger::Stalled,
+        ]
+        .into_iter()
+        .filter(|t| t.is_coordination())
+        .count();
+        assert_eq!(
+            coordination_count,
+            listed.len(),
+            "a coordination trigger exists that the SQL list does not name"
+        );
+    }
 
     async fn store() -> (tempfile::TempDir, SqliteProjectStore) {
         let dir = tempfile::tempdir().unwrap();

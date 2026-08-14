@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use baybo_model::{AgentProfileId, MediaBlock};
 use baybo_store::project::{
-    IssueAttachment, IssueEventBody, IssueEventRow, IssueRow, IssueRunRow, ProjectStore,
+    IssueAttachment, IssueEventBody, IssueEventRow, IssueRow, IssueRunRow, ProjectStore, RunTrigger,
 };
 use baybo_store::{AgentProfileStore, BlobStore};
 
@@ -89,6 +89,31 @@ const MAX_BRIEF_MEDIA: usize = 8;
 const EARLIER_COMMENTS_TRIMMED: &str =
     "(earlier comments are not repeated here — the card itself has all of them)";
 
+const TRIAGE_PREAMBLE: &str = r#"You are this board's lead, woken because this card sits in Todo with nobody on it. Staff it — assign a teammate with the board's tools, or take it yourself — or deliberately leave it unstaffed. Do not do the card's own work in this run."#;
+
+const REVIEW_PREAMBLE: &str = r#"You are this board's lead, woken because this card sits in Review with nothing running on it. Arrange the review: hand it to a reviewer (reassign and say what to check), or check it yourself, and once the verdict is in move the card onward — Done, or back for fixes with a comment saying what to fix."#;
+
+const STALLED_PREAMBLE: &str = r#"You are this board's lead, woken because this card sits in In Progress with no run working it and nothing queued. Decide what happens to it: wake its assignee with a comment asking for a status or the next step, restaff it, move it back to Todo, or block it with a reason. Do not do the card's own work in this run."#;
+
+/// The framing a coordination run opens with. An ordinary run is briefed by
+/// the card alone; the lead's wakes carry *why* it was woken, because the
+/// card itself does not say — the brief has no status line, and "staff
+/// this", "review this" and "this stalled" are three different asks over
+/// the same card.
+fn coordination_preamble(trigger: RunTrigger) -> Option<&'static str> {
+    match trigger {
+        RunTrigger::Triage => Some(TRIAGE_PREAMBLE),
+        RunTrigger::Review => Some(REVIEW_PREAMBLE),
+        RunTrigger::Stalled => Some(STALLED_PREAMBLE),
+        RunTrigger::Started
+        | RunTrigger::Assigned
+        | RunTrigger::Retry
+        | RunTrigger::Comment
+        | RunTrigger::Promoted
+        | RunTrigger::StageBarrier => None,
+    }
+}
+
 /// One comment as the brief reads it. Newlines inside it are indented, so
 /// a line of somebody's prose can never be read as the next speaker — which
 /// is also why a file list is appended as one flat clause rather than as
@@ -148,11 +173,16 @@ fn comment_block(comments: &[Comment]) -> String {
     block
 }
 
-pub(crate) fn issue_brief(issue: &IssueRow, said: &Said) -> String {
-    let mut brief = if issue.description.trim().is_empty() {
-        issue.title.clone()
+pub(crate) fn issue_brief(issue: &IssueRow, said: &Said, trigger: RunTrigger) -> String {
+    let mut brief = String::new();
+    if let Some(preamble) = coordination_preamble(trigger) {
+        brief.push_str(preamble);
+        brief.push_str("\n\n");
+    }
+    if issue.description.trim().is_empty() {
+        brief.push_str(&issue.title);
     } else {
-        format!("{}\n\n{}", issue.title, issue.description)
+        brief.push_str(&format!("{}\n\n{}", issue.title, issue.description));
     };
     if !issue.attachments.is_empty() {
         brief.push_str(FILES_ON_THE_CARD);
@@ -290,7 +320,13 @@ fn brief_window(run: &IssueRunRow, runs: &[IssueRunRow]) -> BriefWindow {
 
 fn inherits_a_worktree(run: &IssueRunRow, runs: &[IssueRunRow]) -> bool {
     runs.iter()
-        .filter(|candidate| candidate.id != run.id && ever_ran(candidate))
+        // Coordination runs do not count as somebody having *worked* the
+        // tree: the lead is briefed not to touch the card's own work, and
+        // counting its look would tell the assignee that the uncommitted
+        // changes in the checkout — its own WIP — belong to another agent.
+        .filter(|candidate| {
+            candidate.id != run.id && ever_ran(candidate) && !candidate.trigger.is_coordination()
+        })
         .max_by_key(|candidate| candidate.attempt)
         .is_some_and(|last| last.agent_id != run.agent_id)
 }
@@ -457,6 +493,7 @@ mod tests {
                 inherited_worktree: false,
                 comments: vec![said(actors::OPERATOR, "start with the CSV path")],
             },
+            RunTrigger::Started,
         );
         assert!(
             !brief.contains(INHERITED_WORKTREE),
@@ -488,6 +525,7 @@ mod tests {
                 inherited_worktree: false,
                 comments: vec![said(actors::OPERATOR, "also handle the empty case")],
             },
+            RunTrigger::Started,
         );
         assert!(
             brief.contains(SAID_SINCE_LAST_RUN.trim()),
@@ -542,6 +580,7 @@ mod tests {
                     said("@dev-1", "also handle the empty case"),
                 ],
             },
+            RunTrigger::Started,
         );
         assert!(
             brief.contains(SAID_ON_THE_CARD.trim()),
@@ -583,6 +622,7 @@ mod tests {
                 inherited_worktree: true,
                 comments: Vec::new(),
             },
+            RunTrigger::Started,
         );
         assert!(
             brief.contains(INHERITED_WORKTREE),
@@ -626,6 +666,7 @@ mod tests {
                 inherited_worktree: false,
                 comments,
             },
+            RunTrigger::Started,
         );
 
         assert!(
@@ -660,6 +701,7 @@ mod tests {
                     said("@qa", "also handle the empty case"),
                 ],
             },
+            RunTrigger::Started,
         );
         assert!(brief.contains("- the operator: start with the CSV path\n"));
         assert!(brief.contains("- @qa: also handle the empty case\n"));
@@ -681,6 +723,7 @@ mod tests {
                     said(actors::BOARD, "held the run: the project is out of budget"),
                 ],
             },
+            RunTrigger::Started,
         );
 
         // Who is asking is what says whether an answer is owed, and to whom:
@@ -712,6 +755,7 @@ mod tests {
                     said("@qa", "agreed"),
                 ],
             },
+            RunTrigger::Started,
         );
 
         assert!(
@@ -730,10 +774,31 @@ mod tests {
     }
 
     #[test]
+    fn a_coordination_brief_opens_with_why_the_lead_was_woken() {
+        let issue = card();
+        for (trigger, preamble) in [
+            (RunTrigger::Triage, TRIAGE_PREAMBLE),
+            (RunTrigger::Review, REVIEW_PREAMBLE),
+            (RunTrigger::Stalled, STALLED_PREAMBLE),
+        ] {
+            let brief = issue_brief(&issue, &with_files(Vec::new()), trigger);
+            assert!(
+                brief.starts_with(preamble),
+                "a {trigger:?} brief must open with its own preamble: {brief}"
+            );
+        }
+        let ordinary = issue_brief(&issue, &with_files(Vec::new()), RunTrigger::Started);
+        assert!(
+            ordinary.starts_with(&issue.title),
+            "an ordinary run is briefed by the card alone: {ordinary}"
+        );
+    }
+
+    #[test]
     fn the_cards_own_files_are_named_with_their_type_and_weight() {
         let mut issue = card();
         issue.attachments = vec![file("mockup.png", "image/png")];
-        let brief = issue_brief(&issue, &with_files(Vec::new()));
+        let brief = issue_brief(&issue, &with_files(Vec::new()), RunTrigger::Started);
         assert!(
             brief.contains("Files on this card:\n- mockup.png (image/png, 1 KB)"),
             "{brief}"
@@ -745,7 +810,7 @@ mod tests {
         let issue = card();
         let mut only_a_file = said(actors::OPERATOR, "");
         only_a_file.attachments = vec![file("trace.log", "text/plain")];
-        let brief = issue_brief(&issue, &with_files(vec![only_a_file]));
+        let brief = issue_brief(&issue, &with_files(vec![only_a_file]), RunTrigger::Started);
         assert!(
             brief.contains("- the operator: [attached trace.log (text/plain, 1 KB)]"),
             "an attachment-only comment must not read as an empty line:\n{brief}"
@@ -789,7 +854,7 @@ mod tests {
         );
         assert_eq!(named(&issue, &said).len(), 11);
 
-        let brief = issue_brief(&issue, &said);
+        let brief = issue_brief(&issue, &said, RunTrigger::Started);
         assert!(
             brief.contains("Not every file above could be shown to you"),
             "a brief that quietly showed eight of eleven files would be lying:\n{brief}"
@@ -816,7 +881,7 @@ mod tests {
             delivered(&issue, &follow_up).is_empty(),
             "the card's files were already delivered into this transcript"
         );
-        let brief = issue_brief(&issue, &follow_up);
+        let brief = issue_brief(&issue, &follow_up, RunTrigger::Started);
         assert!(brief.contains("mockup.png"), "still named: {brief}");
         assert!(
             brief.contains("already earlier in this conversation"),
@@ -848,7 +913,7 @@ mod tests {
         huge.attachments = vec![file("new.png", "image/png")];
         let said = with_files(vec![old, huge]);
 
-        let brief = issue_brief(&issue, &said);
+        let brief = issue_brief(&issue, &said, RunTrigger::Started);
         assert!(
             !brief.contains("old.png"),
             "its whole line was trimmed, so nothing in the prose names it:\n{brief}"
@@ -869,7 +934,7 @@ mod tests {
     fn a_card_within_the_budget_says_nothing_about_trimming() {
         let mut issue = card();
         issue.attachments = vec![file("one.png", "image/png")];
-        let brief = issue_brief(&issue, &with_files(Vec::new()));
+        let brief = issue_brief(&issue, &with_files(Vec::new()), RunTrigger::Started);
         assert!(!brief.contains("Not every file"), "{brief}");
     }
 }

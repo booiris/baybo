@@ -11,16 +11,20 @@
 //!   is right now, what should be running?", so running it twice on an
 //!   unchanged board promotes nothing the second time and a missed call
 //!   costs a delay rather than a card.
-//! - [`awaiting_triage`] is level-triggered too, but waking the lead does
-//!   not change what it looks at — an unassigned card the lead decided to
-//!   leave alone is still an unassigned card. [`already_triaged`] is what
+//! - The lead asks ([`awaiting_triage`], [`awaiting_review`],
+//!   [`stalled`]) are level-triggered too, but waking the lead does not
+//!   change what they look at — an unassigned card the lead decided to
+//!   leave alone is still an unassigned card. [`already_asked`] is what
 //!   stops that from being a loop that bills for the same question every
-//!   time a run ends anywhere on the board.
+//!   time a run ends anywhere on the board: the lead is asked again only
+//!   when the card has *changed* since it last looked.
 
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
-use baybo_store::project::{IssuePriority, IssueRow, IssueRunRow, IssueStatus, RunTrigger};
+use baybo_store::project::{
+    IssuePriority, IssueRow, IssueRunRow, IssueStatus, RunStatus, RunTrigger,
+};
 
 /// The cards that already have a run recorded against them, by number.
 ///
@@ -47,8 +51,18 @@ pub(crate) fn busy(runs: impl IntoIterator<Item = i64>) -> BTreeSet<i64> {
 fn is_waiting(issue: &IssueRow, busy: &BTreeSet<i64>) -> bool {
     issue.status == IssueStatus::Todo
         && issue.cancelled_at.is_none()
-        && issue.blocked_reason.is_none()
+        && board_may_start(issue)
         && !busy.contains(&issue.number)
+}
+
+/// Whether the board may start work on this card on its own authority.
+///
+/// A person dragging a blocked card into In Progress is overriding the
+/// block on purpose; the board promoting one, re-driving its parked run at
+/// boot, or releasing its held run would override it on nobody's. Every
+/// door the board opens *by itself* asks this; the operator's doors do not.
+pub(crate) fn board_may_start(issue: &IssueRow) -> bool {
+    issue.blocked_reason.is_none()
 }
 
 /// A waiting card somebody is on: the board can start it.
@@ -110,16 +124,116 @@ pub(crate) fn awaiting_triage(issues: &[IssueRow], busy: &BTreeSet<i64>) -> Vec<
     unstaffed
 }
 
-/// Whether the lead has already been asked about this card **as it stands**.
+/// Whether a card is one the lead can be asked about at all: live, not
+/// paused, not already being worked, and not the lead's own — a question
+/// about the lead's own card has no other party, its communication thread
+/// included.
+fn takes_a_lead_question(
+    issue: &IssueRow,
+    busy: &BTreeSet<i64>,
+    lead: &baybo_model::AgentProfileId,
+) -> bool {
+    issue.cancelled_at.is_none()
+        && board_may_start(issue)
+        && !busy.contains(&issue.number)
+        && issue.assignee.as_ref() != Some(lead)
+}
+
+/// The cards sitting in Review with nothing running on them, in the order
+/// the lead should be asked about them.
+pub(crate) fn awaiting_review(
+    issues: &[IssueRow],
+    busy: &BTreeSet<i64>,
+    lead: &baybo_model::AgentProfileId,
+) -> Vec<IssueRow> {
+    let mut waiting: Vec<IssueRow> = issues
+        .iter()
+        .filter(|i| i.status == IssueStatus::Review && takes_a_lead_question(i, busy, lead))
+        .cloned()
+        .collect();
+    waiting.sort_by(promotion_order);
+    waiting
+}
+
+/// The cards sitting in In Progress with no run working them and nothing
+/// queued — work that has silently stopped — in the order the lead should
+/// be asked about them.
 ///
-/// The comparison is against the card's own `updated_at` rather than a flag,
-/// because the honest question is "has anything changed since the lead
-/// looked?" — and a lead that read the card and decided to leave it
-/// unstaffed changed nothing, which is precisely the case that must not ask
-/// again. Editing the card, or moving it, makes it a new question.
-pub(crate) fn already_triaged(issue: &IssueRow, runs: &[IssueRunRow]) -> bool {
+/// The runs-dependent half of the stall question lives in
+/// [`newest_run_was_cancelled`], asked by the caller once it has the
+/// card's runs in hand.
+pub(crate) fn stalled(
+    issues: &[IssueRow],
+    busy: &BTreeSet<i64>,
+    lead: &baybo_model::AgentProfileId,
+) -> Vec<IssueRow> {
+    let mut stuck: Vec<IssueRow> = issues
+        .iter()
+        .filter(|i| i.status == IssueStatus::InProgress && takes_a_lead_question(i, busy, lead))
+        .cloned()
+        .collect();
+    stuck.sort_by(promotion_order);
+    stuck
+}
+
+/// A card whose newest run was **cancelled** is not stalled: a cancel is a
+/// decision — a human's stop, or the board calling a row off — and waking
+/// the lead to get the work going again would countermand it within one
+/// tick. The stop stands until somebody acts on the card, which makes it a
+/// new question.
+pub(crate) fn newest_run_was_cancelled(runs: &[IssueRunRow]) -> bool {
     runs.iter()
-        .any(|run| run.trigger == RunTrigger::Triage && run.created_at >= issue.updated_at)
+        .max_by_key(|run| run.created_at)
+        .is_some_and(|run| run.status == RunStatus::Cancelled)
+}
+
+/// When this card last changed in a way the lead has not seen: the card's
+/// own `updated_at`, or the settle of its newest *work* run, whichever is
+/// later. Coordination runs are excluded on both sides of the question —
+/// the lead looking at a card is not the card changing.
+fn last_activity(issue: &IssueRow, runs: &[IssueRunRow]) -> chrono::DateTime<chrono::Utc> {
+    runs.iter()
+        .filter(|run| !run.trigger.is_coordination())
+        .filter_map(|run| run.settled_at)
+        .max()
+        .map_or(issue.updated_at, |settled| settled.max(issue.updated_at))
+}
+
+/// How many times one question may be re-asked while the card row itself
+/// stands unchanged. Work runs settling re-raise a question (a reviewer's
+/// verdict is news), but the coordination machinery can *generate* that
+/// activity — the lead's wake comments, the assignee answers, the settle
+/// re-arms the wake — and each cycle bills two real runs. The cap is the
+/// mechanical bound the loop lacks: past it, only somebody editing, moving
+/// or restaffing the card makes it a question again.
+const MAX_ASKS_PER_CARD_STATE: usize = 2;
+
+/// Whether the lead has already been asked this question about this card
+/// **as it stands**.
+///
+/// The comparison is against the card's last activity rather than a flag,
+/// because the honest question is "has anything changed since the lead
+/// looked?" — and a lead that read the card and decided to leave it alone
+/// changed nothing, which is precisely the case that must not ask again.
+/// Editing the card, moving it, or a work run settling on it makes it a
+/// new question — up to [`MAX_ASKS_PER_CARD_STATE`] times.
+///
+/// An ask that failed without ever being claimed never reached the lead —
+/// that is the dispatcher dying before the brief was cut — so it does not
+/// count as the question having been asked. It still counts against the
+/// cap: a card whose checkout refuses to cut should not be retried every
+/// tick forever.
+pub(crate) fn already_asked(issue: &IssueRow, runs: &[IssueRunRow], question: RunTrigger) -> bool {
+    let activity = last_activity(issue, runs);
+    let asks = runs.iter().filter(|run| run.trigger == question);
+    let delivered = asks.clone().any(|run| {
+        run.created_at >= activity && !(run.status == RunStatus::Failed && !run.was_claimed())
+    });
+    delivered
+        || asks
+            .filter(|run| run.created_at >= issue.updated_at)
+            .count()
+            >= MAX_ASKS_PER_CARD_STATE
 }
 
 #[cfg(test)]
@@ -318,19 +432,19 @@ mod tests {
         let mut card = ready(1);
         card.assignee = None;
         assert!(
-            !already_triaged(&card, &[]),
+            !already_asked(&card, &[], RunTrigger::Triage),
             "a card nobody has looked at is a fresh question"
         );
 
         let asked = triage_run(&card, card.updated_at + Duration::seconds(1));
         assert!(
-            already_triaged(&card, std::slice::from_ref(&asked)),
+            already_asked(&card, std::slice::from_ref(&asked), RunTrigger::Triage),
             "a lead that read the card and left it alone must not be asked again"
         );
 
         card.updated_at = asked.created_at + Duration::seconds(1);
         assert!(
-            !already_triaged(&card, std::slice::from_ref(&asked)),
+            !already_asked(&card, std::slice::from_ref(&asked), RunTrigger::Triage),
             "but editing the card makes it a question the lead has not answered"
         );
 
@@ -339,8 +453,157 @@ mod tests {
             ..triage_run(&card, card.updated_at + Duration::seconds(1))
         };
         assert!(
-            !already_triaged(&card, &[asked, other]),
+            !already_asked(&card, &[asked, other], RunTrigger::Triage),
             "and a run that was not a triage is not an answer to one"
+        );
+    }
+
+    #[test]
+    fn a_work_run_settling_re_raises_the_question_and_the_leads_own_look_does_not() {
+        let card = ready(1);
+        let asked = triage_run(&card, card.updated_at + Duration::seconds(1));
+
+        let worked = IssueRunRow {
+            trigger: RunTrigger::Comment,
+            settled_at: Some(asked.created_at + Duration::seconds(10)),
+            ..triage_run(&card, card.updated_at)
+        };
+        assert!(
+            !already_asked(&card, &[asked.clone(), worked], RunTrigger::Triage),
+            "a work run settling after the lead looked is news the lead has not seen"
+        );
+
+        let looked_again = IssueRunRow {
+            trigger: RunTrigger::Review,
+            settled_at: Some(asked.created_at + Duration::seconds(10)),
+            ..triage_run(&card, card.updated_at)
+        };
+        assert!(
+            already_asked(&card, &[asked, looked_again], RunTrigger::Triage),
+            "but the lead's own coordination runs are not the card changing"
+        );
+    }
+
+    #[test]
+    fn review_and_stall_candidates_have_their_own_gates() {
+        let lead = AgentProfileId::parse("lead".to_owned()).expect("agent");
+        let dev = AgentProfileId::parse("dev-1".to_owned()).expect("agent");
+        let mut in_review = ready(1);
+        in_review.status = IssueStatus::Review;
+        in_review.assignee = Some(dev);
+        let mut leads_own = ready(2);
+        leads_own.status = IssueStatus::Review;
+        leads_own.assignee = Some(lead.clone());
+        let mut blocked = ready(3);
+        blocked.status = IssueStatus::Review;
+        blocked.blocked_reason = Some("waiting on the API".to_owned());
+
+        let picked = awaiting_review(&[in_review.clone(), leads_own, blocked], &busy([]), &lead);
+        assert_eq!(
+            picked.iter().map(|i| i.number).collect::<Vec<_>>(),
+            vec![1],
+            "the lead is asked about other people's review cards — not its own, not blocked ones"
+        );
+        assert!(
+            awaiting_review(&[in_review.clone()], &busy([1]), &lead).is_empty(),
+            "a review card somebody is already running on is not waiting on the lead"
+        );
+
+        let mut stuck = ready(4);
+        stuck.status = IssueStatus::InProgress;
+        let mut paused = ready(5);
+        paused.status = IssueStatus::InProgress;
+        paused.blocked_reason = Some("blocked on purpose".to_owned());
+        let mut leads_stall = ready(6);
+        leads_stall.status = IssueStatus::InProgress;
+        leads_stall.assignee = Some(lead.clone());
+        assert_eq!(
+            stalled(&[stuck.clone(), paused, leads_stall], &busy([]), &lead)
+                .iter()
+                .map(|i| i.number)
+                .collect::<Vec<_>>(),
+            vec![4],
+            "In Progress with nothing running is stalled; a block is its own explanation, \
+             and the lead's own card is a question with no other party"
+        );
+        assert!(
+            stalled(&[stuck], &busy([4]), &lead).is_empty(),
+            "a card with a run recorded against it is not stalled"
+        );
+    }
+
+    #[test]
+    fn a_stop_stands_and_dispatch_failures_do_not_mute_a_question_but_do_cap_it() {
+        let card = ready(1);
+        let stopped = IssueRunRow {
+            trigger: RunTrigger::Comment,
+            status: RunStatus::Cancelled,
+            settled_at: Some(card.updated_at + Duration::seconds(5)),
+            ..triage_run(&card, card.updated_at + Duration::seconds(1))
+        };
+        assert!(
+            newest_run_was_cancelled(std::slice::from_ref(&stopped)),
+            "a cancelled newest run is somebody's stop, not a silent stall"
+        );
+
+        // An ask the dispatcher failed before the brief was cut: settled,
+        // never claimed. It never reached the lead, so the question is
+        // still open —
+        let failed_ask = IssueRunRow {
+            status: RunStatus::Failed,
+            settled_at: Some(card.updated_at + Duration::seconds(2)),
+            ..triage_run(&card, card.updated_at + Duration::seconds(1))
+        };
+        assert!(
+            !already_asked(&card, std::slice::from_ref(&failed_ask), RunTrigger::Triage),
+            "an ask that died before its brief is not the lead having looked"
+        );
+        // — but a card that keeps refusing to dispatch is not retried
+        // forever: the attempts still count against the per-state cap.
+        let second_failed = IssueRunRow {
+            status: RunStatus::Failed,
+            settled_at: Some(card.updated_at + Duration::seconds(4)),
+            ..triage_run(&card, card.updated_at + Duration::seconds(3))
+        };
+        assert!(
+            already_asked(&card, &[failed_ask, second_failed], RunTrigger::Triage),
+            "two dead asks on an unchanged card stop the retry loop"
+        );
+    }
+
+    #[test]
+    fn the_ask_cap_holds_while_the_card_row_stands_unchanged() {
+        let card = ready(1);
+        let mut runs = Vec::new();
+        let mut at = card.updated_at;
+        // Two full ask-answer-activity cycles: the lead was asked, a work
+        // run settled afterwards (the machinery's own echo), twice over.
+        for _ in 0..2 {
+            at += Duration::seconds(1);
+            runs.push(IssueRunRow {
+                session_id: Some(baybo_model::SessionId::from("lead-look".to_owned())),
+                settled_at: Some(at + Duration::seconds(1)),
+                ..triage_run(&card, at)
+            });
+            at += Duration::seconds(2);
+            runs.push(IssueRunRow {
+                trigger: RunTrigger::Comment,
+                session_id: Some(baybo_model::SessionId::from("assignee-answer".to_owned())),
+                settled_at: Some(at + Duration::seconds(1)),
+                ..triage_run(&card, at)
+            });
+            at += Duration::seconds(2);
+        }
+        assert!(
+            already_asked(&card, &runs, RunTrigger::Triage),
+            "the machinery's own echo cannot re-raise the question a third time"
+        );
+
+        let mut edited = card.clone();
+        edited.updated_at = at + Duration::seconds(1);
+        assert!(
+            !already_asked(&edited, &runs, RunTrigger::Triage),
+            "but somebody changing the card resets the cap"
         );
     }
 }

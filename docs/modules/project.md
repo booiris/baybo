@@ -47,7 +47,7 @@ every door leads through it.
 | `actors.rs` | What an agent-facing surface calls the somebody a timeline entry names |
 | `mentions.rs` | `@handle` scanning, and when a mention is a handover |
 | `stages.rs` | Sub-issues, `is_finished`, the stage barrier's two questions, the progress ring |
-| `driver.rs` | Which Todo cards the board starts by itself, in what order, and when the lead is asked to staff one |
+| `driver.rs` | Which Todo cards the board starts by itself, in what order, and which cards the lead is asked about (staffing, review, stalled work) |
 | `budget.rs` | `Headroom` and the UTC-day window a daily ceiling measures |
 | `timeline.rs` | `diff_events` — an edit reduced to the entries worth writing |
 | `worktree.rs` | The per-issue git worktree: create, branch, resolve the commit identity, reclaim |
@@ -134,7 +134,7 @@ unambiguously its own.
 `enqueue` is the same door for the ordinary case, filling in the card's own
 assignee as the runner. A drag, a
 REST move, an assignment, a comment wake, a retry, a stage barrier, a promotion
-by the driver, a triage wake and an agent tool all arrive there, and it asks
+by the driver, the lead's wakes and an agent tool all arrive there, and it asks
 three questions once each:
 
 1. **Liveness** — `runs::accepts_runs`. A card the board has finished with —
@@ -157,8 +157,8 @@ Two predicates, not one, because they answer different questions:
 
 The distinction is not academic, and getting it wrong is the bug this crate has
 had twice. Only three of the doors into a run carry a transition — creating a
-card, editing one, moving one. A comment wake, a retry, a stage barrier and both
-of the driver's runs arrive at `enqueue` with nothing but a row, and a released
+card, editing one, moving one. A comment wake, a retry, a stage barrier, the
+driver's promotions and the lead's wakes arrive at `enqueue` with nothing but a row, and a released
 hold and a boot re-drive never reach `enqueue` at all. A cancellation rule enforced on the edge
 covers three doors and misses five — so it lives on the card, at the
 chokepoint, and each sweep asks it again for itself.
@@ -183,6 +183,14 @@ and a restore hands the same row back out rather than making the operator notice
 a called-off run and retry it. The slot it holds meanwhile blocks nothing,
 because every door that could enqueue against it is refused for the same reason
 the sweep is.
+
+A row on a **blocked card** gets the archive treatment, not the call-off: the
+block is somebody's decision to pause the card, and the sweep re-driving the
+run would override it on nobody's authority (`driver::board_may_start`, the
+same predicate that keeps the driver from promoting one and `release_holds`
+from releasing one). The unblock is the door that hands the row back out —
+`redrive_after_unblock` dispatches a parked `Queued` row directly and offers a
+`Held` one to the budget's own release pass rather than starting around it.
 
 At a **process start** the work is split in two. `requeue_unsettled` rolls every
 `running` row back to `Queued` in one statement and hands nothing back — an
@@ -385,17 +393,67 @@ whether an agent asks or the board acts. Note that the **web board sorts by
 `position` alone**, so on a column with mixed priorities the card the board
 takes next is not necessarily the one rendered at the top.
 
-**Triage.** A card that reaches Todo with nobody on it is work the board cannot
-start, so the lead is woken on that card with `RunTrigger::Triage` — the one run
-whose `agent_id` is not the card's assignee, because the question is *who should
-do this*. One card per pass: the lead reads the whole board when it is woken.
+**Asking the lead.** Some cards are not work the board can start — they are
+questions only the lead can answer, and the same pass that promotes asks them
+(`ask_the_lead`), one card per pass because the lead reads the whole board when
+it is woken. Three questions, in the order they matter, each its own trigger so
+the execution log says which was asked (`RunTrigger::is_coordination`):
 
-The spin this could obviously become is closed by `driver::already_triaged`,
-which compares the card's `updated_at` against its newest triage run. A lead
-that read the card and decided to leave it unstaffed changed nothing, so it is
-not asked again — and editing or moving the card makes it a new question. The
-guard is a comparison rather than a flag precisely so that "has anything changed
-since the lead looked?" has no second copy that could disagree.
+- **Review** — a card sitting in Review with nothing running on it and an
+  assignee that is not the lead. Arranging the review is the lead's to do, and
+  before this existed the handoff waited for a patrol cron: the review sat idle
+  up to a full schedule interval.
+- **Stalled** — a card sitting in In Progress with no run against it and
+  nothing queued: work that has silently stopped. A blocked card is not
+  stalled — the block is the explanation, recorded by somebody with the
+  authority to pause the card. Neither is a card whose newest run was
+  **cancelled** (`driver::newest_run_was_cancelled`): a cancel is a decision
+  — a human's stop, or the board calling a row off — and waking the lead
+  would countermand it within one tick. The stop stands until somebody acts
+  on the card.
+- **Triage** — a card that reached Todo with nobody on it: the board cannot
+  start it, so the question is *who should do this*.
+
+Cards whose assignee *is* the lead take no question at all
+(`driver::takes_a_lead_question`) — those are the lead's own, its
+communication thread included, and a question about them has no other party.
+
+These are the coordination runs — the ones whose `agent_id` is not the card's
+assignee — and the brief they are handed opens with *why* the lead was woken
+(`brief.rs`'s coordination preambles), because the card itself does not say.
+
+The spin this could obviously become is closed by `driver::already_asked`,
+which compares each question's newest run against the card's **last
+activity**: its `updated_at`, or the settle of its newest *work* run,
+whichever is later. A lead that read the card and left it alone changed
+nothing, so it is not asked again; editing the card, moving it, or a work run
+settling on it (a reviewer's verdict, say) makes it a new question. Coordination
+runs count on neither side — the lead looking at a card is not the card
+changing. The guard is a comparison rather than a flag precisely so that "has
+anything changed since the lead looked?" has no second copy that could
+disagree.
+
+Two refinements on that guard, both mechanical bounds the comparison alone
+does not give:
+
+- **The cap.** Work-run settles re-raise a question, but the coordination
+  machinery *generates* settles — the lead's wake comments, the assignee
+  answers, the settle re-arms the wake, two billed runs per cycle — so one
+  question is asked at most `MAX_ASKS_PER_CARD_STATE` (2) times while the
+  card row itself stands unchanged. Past the cap, only somebody editing,
+  moving or restaffing the card asks it again.
+- **A dead ask is not an ask.** A coordination run the dispatcher settled
+  `Failed` before it was ever claimed never put a brief in front of the
+  lead, so it does not satisfy the guard — the question stays open for the
+  next pass. It still counts against the cap, so a checkout that refuses to
+  cut is retried once, not every five seconds forever.
+
+`finish_run` runs its settle-and-follow-up sequence **under the driver's
+lock**. The gap between a run settling and its comment follow-up being
+enqueued is otherwise a window a drive tick can win: the just-settled card
+reads as stalled or as awaiting review, the lead's wake takes the card's one
+run slot, and the follow-up the settling run owes is refused — a swallowed
+nudge, with a billed lead run in its place.
 
 ### Stages and the barrier
 
@@ -518,16 +576,22 @@ predicate lives here rather than beside the executor, which can see neither:
   immediately *before* it reads, and the executor hands it back to `finish_run`.
   Stamped before rather than after so a comment racing the read is over-read
   rather than dropped.
-- **A comment the run's own agent wrote is not somebody asking for more.** An
-  agent posting progress through `IssueComment` would otherwise wake itself, and
-  then wake itself again on whatever the follow-up says.
+- **A comment by whoever would run next is not somebody asking for more.** The
+  follow-up this check decides runs as the card's **current assignee**, so
+  that is the profile the filter protects from waking itself — an agent
+  posting progress through `IssueComment` would otherwise wake itself, and
+  then wake itself again on whatever the follow-up says. For an ordinary run
+  the assignee *is* the run's agent; for a lead's coordination run they
+  differ, deliberately: the lead commenting "please continue" on a stalled
+  card is exactly somebody asking the assignee for more, and this filter is
+  what turns the lead's settle into the assignee's wake.
 
-  The key is the **agent profile**, because a timeline entry records only its
-  actor. One agent holding two live cards can comment from one onto the other
-  and have it skipped here. Narrowing that needs the authoring run recorded on
-  the event body — a stored-shape change — so until then the filter errs towards
-  a missed nudge rather than a run that answers its own note and wakes on the
-  answer.
+  The key is a **profile**, because a timeline entry records only its actor.
+  One agent holding two live cards can comment from one onto the other and
+  have it skipped here. Narrowing that needs the authoring run recorded on
+  the event body — a stored-shape change — so until then the filter errs
+  towards a missed nudge rather than a run that answers its own note and
+  wakes on the answer.
 
 An `@mention` on a card **nobody is on** is the commenter saying "you take
 this", and it is applied through `update_issue` — the same path a drag takes,

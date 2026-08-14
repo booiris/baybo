@@ -10392,7 +10392,9 @@
           "comment",
           "promoted",
           "triage",
-          "stage_barrier"
+          "stage_barrier",
+          "review",
+          "stalled"
         ]
       },
       "SessionKind": {

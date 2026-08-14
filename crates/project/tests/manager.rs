@@ -5300,6 +5300,186 @@ async fn staffing_a_card_the_lead_was_asked_about_starts_it() {
     assert_eq!(dispatched[1].agent_id, dev);
 }
 
+/// Settle a run the way the waiter would, with nothing left behind.
+async fn settle_clean(f: &Fixture, run: &baybo_store::project::IssueRunRow) {
+    f.manager
+        .finish_run(
+            run,
+            std::path::Path::new("/nonexistent/checkout"),
+            run.created_at,
+            baybo_project::RunOutcome {
+                status: RunStatus::Done,
+                error: None,
+                stopped_by_a_human: false,
+            },
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn a_card_sitting_in_review_wakes_the_lead_once() {
+    let f = fixture().await;
+    let (p, dev) = driven_board(&f, 3).await;
+    let lead = lead_of(&f, &p.id).await;
+
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::Review,
+                assignee: Some(dev),
+                ..new_issue("done, somebody look at it")
+            },
+        )
+        .await
+        .expect("card");
+    tick(&f, &p.id).await;
+
+    let asked = f.dispatched.lock().clone();
+    assert_eq!(asked.len(), 1, "the lead is woken to arrange the review");
+    assert_eq!(asked[0].trigger, RunTrigger::Review);
+    assert_eq!(asked[0].agent_id, lead);
+
+    // The lead reads it and leaves it alone, which is a legitimate answer.
+    settle_clean(&f, &asked[0]).await;
+    tick(&f, &p.id).await;
+    assert_eq!(
+        f.dispatched.lock().len(),
+        1,
+        "an unchanged review card is not the same question twice"
+    );
+
+    // The card changing under it is a new question.
+    f.manager
+        .update_issue(
+            &p.id,
+            1,
+            IssueActor::User,
+            IssueUpdate {
+                description: Some("the acceptance notes moved".to_owned()),
+                ..IssueUpdate::default()
+            },
+            None,
+        )
+        .await
+        .expect("edit");
+    tick(&f, &p.id).await;
+    let dispatched = f.dispatched.lock().clone();
+    assert_eq!(dispatched.len(), 2, "so the lead is asked again");
+    assert_eq!(dispatched[1].trigger, RunTrigger::Review);
+}
+
+#[tokio::test]
+async fn work_that_silently_stops_wakes_the_lead() {
+    let f = fixture().await;
+    let (p, dev) = driven_board(&f, 3).await;
+    let lead = lead_of(&f, &p.id).await;
+
+    queue_card(
+        &f,
+        &p.id,
+        "wire the importer",
+        Some(dev),
+        IssuePriority::None,
+    )
+    .await;
+    tick(&f, &p.id).await;
+    let worked = f.dispatched.lock()[0].clone();
+    assert_eq!(worked.trigger, RunTrigger::Promoted);
+
+    // The run ends without the card moving anywhere: In Progress, no run,
+    // nothing queued — the shape the hourly patrol used to catch.
+    settle_clean(&f, &worked).await;
+    tick(&f, &p.id).await;
+
+    let dispatched = f.dispatched.lock().clone();
+    assert_eq!(dispatched.len(), 2, "the lead is woken about the stall");
+    assert_eq!(dispatched[1].trigger, RunTrigger::Stalled);
+    assert_eq!(dispatched[1].agent_id, lead);
+
+    settle_clean(&f, &dispatched[1]).await;
+    tick(&f, &p.id).await;
+    assert_eq!(
+        f.dispatched.lock().len(),
+        2,
+        "and not woken again about a card it already looked at"
+    );
+}
+
+#[tokio::test]
+async fn a_blocked_cards_parked_run_waits_for_the_unblock() {
+    let f = fixture().await;
+    let (p, dev) = driven_board(&f, 3).await;
+
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev.clone()),
+                ..new_issue("started and then paused")
+            },
+        )
+        .await
+        .expect("card");
+    let started = f.dispatched.lock().clone();
+    assert_eq!(started.len(), 1, "entering In Progress started it");
+
+    f.manager
+        .update_issue(
+            &p.id,
+            1,
+            IssueActor::User,
+            IssueUpdate {
+                blocked_reason: Some(Some("waiting on the API".to_owned())),
+                ..IssueUpdate::default()
+            },
+            None,
+        )
+        .await
+        .expect("block");
+
+    assert_eq!(
+        f.manager.resume_unsettled_runs().await.expect("boot sweep"),
+        0,
+        "the boot sweep leaves a blocked card's queued run where it lies"
+    );
+    assert_eq!(
+        f.dispatched.lock().len(),
+        1,
+        "nothing re-drove it while the block stood"
+    );
+    tick(&f, &p.id).await;
+    assert_eq!(
+        f.dispatched.lock().len(),
+        1,
+        "and a blocked card is not a stall the lead gets woken about"
+    );
+
+    f.manager
+        .update_issue(
+            &p.id,
+            1,
+            IssueActor::User,
+            IssueUpdate {
+                blocked_reason: Some(None),
+                ..IssueUpdate::default()
+            },
+            None,
+        )
+        .await
+        .expect("unblock");
+    let dispatched = f.dispatched.lock().clone();
+    assert_eq!(dispatched.len(), 2, "the unblock hands the run back out");
+    assert_eq!(
+        dispatched[1].id, started[0].id,
+        "the same parked row, not a new attempt"
+    );
+    assert_eq!(dispatched[1].agent_id, dev);
+}
+
 /// Held runs are work the board already owes, so they take the next slots —
 /// and they have to be counted *as* slots, not released on top of them.
 ///

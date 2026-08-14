@@ -487,6 +487,8 @@ pub enum RunTriggerDto {
     Promoted,
     Triage,
     StageBarrier,
+    Review,
+    Stalled,
 }
 
 impl From<RunTrigger> for RunTriggerDto {
@@ -499,6 +501,8 @@ impl From<RunTrigger> for RunTriggerDto {
             RunTrigger::Promoted => Self::Promoted,
             RunTrigger::Triage => Self::Triage,
             RunTrigger::StageBarrier => Self::StageBarrier,
+            RunTrigger::Review => Self::Review,
+            RunTrigger::Stalled => Self::Stalled,
         }
     }
 }

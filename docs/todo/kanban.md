@@ -121,6 +121,35 @@ the behaviour was verified against its source (clone inspected 2026-08-05).
     already has a run, never starts work it cannot afford, and never
     preempts — priority decides who gets the *next* free slot, not who
     keeps one. A manual drag is unaffected by the ceiling: it is a command.
+18. **The board asks the lead; a patrol cron is not the mechanism**
+    (2026-08-14). The same sweep that promotes also wakes the lead about
+    the cards only it can answer for, one per pass, each with its own
+    trigger and a brief that opens with *why*: a card sitting in **Review**
+    with nothing running and a non-lead assignee (`RunTrigger::Review` —
+    arrange the review), a card in **In Progress** with no run and nothing
+    queued (`RunTrigger::Stalled` — work silently stopped), and the
+    existing unstaffed-Todo wake (`RunTrigger::Triage`). Asked once per
+    **card activity** — its `updated_at` or the settle of its newest work
+    run, whichever is later; the lead's own coordination runs count on
+    neither side — so a lead that leaves a card alone is not re-asked, and
+    a reviewer's verdict settling *is* a new question; at most twice per
+    unchanged card row, because the machinery's own comment-wake-settle
+    echo would otherwise re-arm the question it answers. The lead's own
+    cards take no question (no other party), and a card whose newest run
+    was **cancelled** is not "stalled" — a stop is a decision, not a
+    silence, and it stands until somebody acts on the card. This replaces the
+    operator-authored hourly patrol cron (which read the whole board each
+    tick, hand-checked these three shapes, and woke the lead by commenting
+    on the lead's own card — an O(N×transcript) chat thread); a cron
+    remains sensible only as a low-frequency fallback for what events
+    cannot see. Blocked cards are asked about by nobody: a block **parks**
+    a card's run everywhere the board acts on its own — the driver skips
+    it, the boot sweep leaves its queued row where it lies, the budget
+    release keeps its hold, the stage barrier wakes no blocked parent —
+    and the unblock hands the run back out (through the same liveness gate
+    as every other hand-back door). A parked row does not count against
+    the board's parallel slots: nothing is executing under it, and a few
+    long-blocked cards must not silence the whole board.
 
 ## Pages and interactions (`app/web`)
 

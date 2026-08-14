@@ -129,7 +129,7 @@ async fn prepare(config: &DispatchConfig, run: IssueRunRow) -> Option<IssueRunEv
     // side that over-reads rather than the side that drops it.
     let briefed_at = Utc::now();
     let said = comments_for_brief(store, agents, &run).await;
-    let brief = issue_brief(&issue, &said);
+    let brief = issue_brief(&issue, &said, run.trigger);
     let files = issue_brief_media(blobs, &issue, &said).await;
 
     let checkout = match worktree::prepare_for_issue(store, paths, &issue).await {

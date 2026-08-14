@@ -325,8 +325,9 @@ impl ProjectManager {
     }
 
     /// [`enqueue`](Self::enqueue) for a run whose runner is not the card's
-    /// assignee. Only [`RunTrigger::Triage`] is that today: the lead is
-    /// woken *on* a card precisely because nobody is on it.
+    /// assignee. The coordination triggers are that today
+    /// ([`RunTrigger::is_coordination`]): the lead is woken *on* a card
+    /// precisely because nobody is working it.
     async fn enqueue_as(
         &self,
         issue: &IssueRow,
@@ -358,11 +359,25 @@ impl ProjectManager {
         let run = match self.store.enqueue_run(&entry).await {
             Ok(run) => run,
             Err(baybo_store::StorageError::Conflict(reason)) => {
-                tracing::debug!(
-                    issue = issue.number,
-                    %reason,
-                    "issue already has a run in flight; not starting a second"
-                );
+                if trigger.is_coordination() {
+                    tracing::debug!(
+                        issue = issue.number,
+                        %reason,
+                        "issue already has a run in flight; not starting a second"
+                    );
+                } else {
+                    // A refused human command deserves more than a debug
+                    // line: the drag or assignment itself succeeded, so
+                    // nothing on the board says the run it implied was
+                    // swallowed — most likely by a live coordination run
+                    // holding the card's slot.
+                    tracing::info!(
+                        issue = issue.number,
+                        ?trigger,
+                        %reason,
+                        "issue already has a run in flight; not starting a second"
+                    );
+                }
                 return None;
             }
             Err(e) => {
@@ -444,6 +459,12 @@ impl ProjectManager {
             let Some(issue) = self.live_card(&run).await else {
                 continue;
             };
+            // …or blocked in between. The hold stays: budget is back, but
+            // the block is not the board's to override. The unblock hands
+            // the run to the next release pass.
+            if !crate::driver::board_may_start(&issue) {
+                continue;
+            }
             if !self.store.release_run(&run.id).await? {
                 continue;
             }
@@ -584,10 +605,24 @@ impl ProjectManager {
         if load.headroom.is_exhausted() {
             return Ok(0);
         }
-        let slots = row
-            .max_parallel_issue_runs
-            .saturating_sub(load.working.len());
         let issues = self.store.list_issues(project).await?;
+        // A queued run parked by a block is not load: nothing is executing
+        // and nothing will until the unblock, so counting it would let a
+        // handful of long-blocked cards silence the whole board —
+        // promotions and the lead's asks alike. Its card still lands in
+        // `busy` below, exactly like a held run: the slot the CARD holds is
+        // spent, it is the board's capacity that is not.
+        let blocked: std::collections::BTreeSet<i64> = issues
+            .iter()
+            .filter(|i| !crate::driver::board_may_start(i))
+            .map(|i| i.number)
+            .collect();
+        let executing = load
+            .working
+            .iter()
+            .filter(|run| run.status != RunStatus::Queued || !blocked.contains(&run.number))
+            .count();
+        let slots = row.max_parallel_issue_runs.saturating_sub(executing);
         // Held runs count here even though they do not count as load: a
         // card the budget parked has already spent its one run slot, and
         // promoting it would move it into In Progress on top of a run that
@@ -611,7 +646,7 @@ impl ProjectManager {
         // is on. A board with no capacity left says nothing rather than
         // queueing a question it cannot act on the answer to.
         if slots > moved {
-            self.ask_for_triage(project, &issues, &busy).await;
+            self.ask_the_lead(project, &issues, &busy).await;
         }
         Ok(moved)
     }
@@ -703,9 +738,10 @@ impl ProjectManager {
         }
         // The pre-checks passed and the enqueue still refused, so something
         // took the card's run slot between the load read and this write —
-        // most likely a comment waking its assignee. Loud, because the card
-        // is now in In Progress and no later pass will look at it again:
-        // recovering it is Retry, and somebody has to know to press it.
+        // most likely a comment waking its assignee. Still loud, though the
+        // stalled ask now catches the card once that interloping run
+        // settles: an In Progress card with nothing under it should not
+        // wait a whole run's length in silence.
         tracing::error!(
             project = %issue.project_id,
             issue = issue.number,
@@ -714,43 +750,66 @@ impl ProjectManager {
         false
     }
 
-    /// Wake the lead for the first card that reached Todo with nobody on
-    /// it, if there is one it has not already been asked about.
-    async fn ask_for_triage(
+    /// Wake the lead for the first card that needs its attention, if there
+    /// is one it has not already been asked about as the card stands.
+    ///
+    /// Three questions, in the order they matter: a card sitting in Review
+    /// (finishing work beats everything), work in In Progress that has
+    /// silently stopped, and a card that reached Todo with nobody on it.
+    /// One question per pass, whatever came of it: the lead reads the whole
+    /// board when it is woken, so a second card would be the same
+    /// conversation twice.
+    async fn ask_the_lead(
         &self,
         project: &ProjectId,
         issues: &[IssueRow],
         busy: &std::collections::BTreeSet<i64>,
     ) {
-        let unstaffed = crate::driver::awaiting_triage(issues, busy);
-        if unstaffed.is_empty() {
-            return;
-        }
         let Some(lead) = self.lead_of(project).await else {
             return;
         };
-        for issue in unstaffed {
-            let runs = match self.store.list_runs(&issue.id).await {
-                Ok(runs) => runs,
-                Err(e) => {
-                    tracing::error!(issue = issue.number, error = %e, "could not read a card's runs");
+        let questions = [
+            (
+                RunTrigger::Review,
+                crate::driver::awaiting_review(issues, busy, &lead),
+                "asked the lead to arrange a review",
+            ),
+            (
+                RunTrigger::Stalled,
+                crate::driver::stalled(issues, busy, &lead),
+                "asked the lead about a card whose work has stopped",
+            ),
+            (
+                RunTrigger::Triage,
+                crate::driver::awaiting_triage(issues, busy),
+                "asked the lead to staff an unassigned card",
+            ),
+        ];
+        for (question, candidates, told) in questions {
+            for issue in candidates {
+                let runs = match self.store.list_runs(&issue.id).await {
+                    Ok(runs) => runs,
+                    Err(e) => {
+                        tracing::error!(issue = issue.number, error = %e, "could not read a card's runs");
+                        continue;
+                    }
+                };
+                if question == RunTrigger::Stalled && crate::driver::newest_run_was_cancelled(&runs)
+                {
                     continue;
                 }
-            };
-            if crate::driver::already_triaged(&issue, &runs) {
-                continue;
+                if crate::driver::already_asked(&issue, &runs, question) {
+                    continue;
+                }
+                if self
+                    .enqueue_as(&issue, question, lead.clone())
+                    .await
+                    .is_some()
+                {
+                    tracing::info!(%project, issue = issue.number, "{told}");
+                }
+                return;
             }
-            if self
-                .enqueue_as(&issue, RunTrigger::Triage, lead.clone())
-                .await
-                .is_some()
-            {
-                tracing::info!(%project, issue = issue.number, "asked the lead to staff an unassigned card");
-            }
-            // One question per pass, whatever came of it: the lead reads the
-            // whole board when it is woken, so a second card would be the
-            // same conversation twice.
-            return;
         }
     }
 
@@ -844,6 +903,13 @@ impl ProjectManager {
         briefed_at: DateTime<Utc>,
         outcome: RunOutcome,
     ) {
+        // Under the driver's lock, because the gap between the settle and
+        // the follow-up enqueue below is otherwise a window a drive tick
+        // can win: the just-settled card reads as stalled (or as awaiting
+        // review), the lead's coordination run takes the card's one run
+        // slot, and the comment follow-up this run owes is refused —
+        // swallowing the nudge and billing a lead run in its place.
+        let _driving = self.driving.lock().await;
         if let Err(e) = crate::settle::settle_run(
             &self.store,
             &self.events,
@@ -921,8 +987,10 @@ impl ProjectManager {
     /// the brief nor a window bounded by the claim, so nothing would ever
     /// pick it up.
     ///
-    /// The run's own comments are skipped as well — an agent reporting
-    /// progress is not somebody asking it for more.
+    /// Comments by whoever would run next — the card's current assignee —
+    /// are skipped as well: an agent reporting progress is not somebody
+    /// asking it for more. A lead's coordination-run comment is, which is
+    /// how a lead's settle becomes the assignee's wake.
     async fn wake_after_run(
         &self,
         run: &IssueRunRow,
@@ -956,14 +1024,26 @@ impl ProjectManager {
         run: &IssueRunRow,
         briefed_at: DateTime<Utc>,
     ) -> bool {
-        // Keyed on the profile, not on the run that wrote it, because a
-        // timeline entry records only its actor. One agent holding two live
-        // cards can therefore comment from one onto the other and have it
-        // skipped here. Narrowing it needs the authoring run on the event
-        // body, which is a stored-shape change; until then this errs
+        // The follow-up this decides would run as the card's CURRENT
+        // assignee, so that is who the filter protects from waking itself:
+        // for an ordinary run the two are the same profile, and for a
+        // lead's coordination run they differ — which is exactly right,
+        // because the lead commenting "please continue" on a stalled card
+        // *is* somebody asking the assignee for more. Keyed on the profile,
+        // not on the run that wrote it, because a timeline entry records
+        // only its actor; narrowing it needs the authoring run on the event
+        // body, which is a stored-shape change. Until then this errs
         // towards a missed nudge rather than an agent that answers its own
         // progress note and wakes itself again on the answer.
-        let own = IssueActor::Agent(run.agent_id.clone());
+        let next_runner = match self.store.get_issue(&run.project_id, run.number).await {
+            Ok(Some(issue)) => issue.assignee,
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(run = %run.id, error = %e, "could not read the card a run finished on");
+                None
+            }
+        };
+        let own = IssueActor::Agent(next_runner.unwrap_or_else(|| run.agent_id.clone()));
         match self.store.events_since(&run.issue_id, briefed_at).await {
             Ok(events) => events
                 .iter()
@@ -972,6 +1052,55 @@ impl ProjectManager {
                 tracing::warn!(run = %run.id, error = %e, "could not check for comments left during the run");
                 false
             }
+        }
+    }
+
+    /// Hand back whatever the block parked. The boot sweep and the hold
+    /// release both leave a blocked card's run where it lies, so the
+    /// unblock is the door that hands it out again: a queued row goes
+    /// straight to the dispatcher (the same narrowed two-dispatchers race a
+    /// restore accepts), and a held one is offered to the budget's own
+    /// release pass rather than started around it.
+    async fn redrive_after_unblock(&self, issue: &IssueRow) {
+        let runs = match self.store.list_runs(&issue.id).await {
+            Ok(runs) => runs,
+            Err(e) => {
+                tracing::error!(issue = issue.number, error = %e, "could not read the unblocked card's runs");
+                return;
+            }
+        };
+        let Some(parked) = runs.into_iter().find(|run| run.settled_at.is_none()) else {
+            return;
+        };
+        // The same gates every other hand-back door asks, against the card
+        // as it is NOW: `live_card` calls a row on a finished card off (an
+        // unblock can ride the same update that cancels), and a concurrent
+        // re-block keeps the row parked. What this door does NOT close is
+        // two callers seeing the same Some→None edge and both dispatching —
+        // the store's update is unconditional, so unlike a restore there is
+        // no single-winner write; the claim still collapses execution and
+        // the loser settles visibly, per the documented dispatcher race.
+        let Some(card) = self.live_card(&parked).await else {
+            return;
+        };
+        if !crate::driver::board_may_start(&card) {
+            return;
+        }
+        match parked.status {
+            RunStatus::Queued => {
+                tracing::info!(
+                    issue = issue.number,
+                    run = %parked.id,
+                    "unblocked; handing its parked run back out"
+                );
+                (self.dispatch)(parked);
+            }
+            RunStatus::Held => {
+                if let Err(e) = self.release_held_runs(&issue.project_id).await {
+                    tracing::error!(issue = issue.number, error = %e, "could not release held runs after an unblock");
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1329,7 +1458,22 @@ impl ProjectManager {
         self.writable_project(project).await?;
         let mut count = 0;
         for run in self.store.active_runs(project).await? {
-            if run.status != RunStatus::Queued || self.live_card(&run).await.is_none() {
+            if run.status != RunStatus::Queued {
+                continue;
+            }
+            let Some(card) = self.live_card(&run).await else {
+                continue;
+            };
+            // A blocked card's row is left exactly where it is, like an
+            // archived board's: the block is somebody's decision to pause
+            // the card, and the boot sweep re-driving it would override
+            // that on nobody's authority. The unblock hands it back out.
+            if !crate::driver::board_may_start(&card) {
+                tracing::info!(
+                    issue = run.number,
+                    run = %run.id,
+                    "the card is blocked; leaving its queued run parked"
+                );
                 continue;
             }
             count += 1;
@@ -1808,6 +1952,9 @@ impl ProjectManager {
         self.dispatch_if_triggered(Transition::between(&before, &after), &after)
             .await;
         self.check_stage_barrier(&before, &after, actor).await;
+        if before.blocked_reason.is_some() && after.blocked_reason.is_none() {
+            self.redrive_after_unblock(&after).await;
+        }
         Ok(after)
     }
 
@@ -1847,8 +1994,15 @@ impl ProjectManager {
         )
         .await;
         // Nobody on the parent means nobody to wake. The event above still
-        // lands, so the operator sees the stage opened and can staff it.
-        if parent.assignee.is_some() && crate::stages::barrier_opens(&children, after.stage) {
+        // lands, so the operator sees the stage opened and can staff it —
+        // and a blocked parent is not woken either: the barrier opening is
+        // the board acting on its own, and the block is not its to
+        // override. The `StageCompleted` entry above is what survives for
+        // whoever lifts the block.
+        if parent.assignee.is_some()
+            && crate::driver::board_may_start(&parent)
+            && crate::stages::barrier_opens(&children, after.stage)
+        {
             self.enqueue(&parent, RunTrigger::StageBarrier).await;
         }
     }

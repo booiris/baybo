@@ -642,6 +642,14 @@ pub enum RunTrigger {
     /// emptied: a later stage emptying out of order is announced and wakes
     /// nobody.
     StageBarrier,
+    /// The lead was woken because this card sits in Review with nobody
+    /// working it — arranging the review is the lead's to do. Like
+    /// [`RunTrigger::Triage`], the runner is not the card's assignee.
+    Review,
+    /// The lead was woken because this card sits in In Progress with no run
+    /// working it and nothing queued — work that has silently stopped.
+    /// Like [`RunTrigger::Triage`], the runner is not the card's assignee.
+    Stalled,
 }
 
 impl RunTrigger {
@@ -654,6 +662,8 @@ impl RunTrigger {
             RunTrigger::Promoted => "promoted",
             RunTrigger::Triage => "triage",
             RunTrigger::StageBarrier => "stage_barrier",
+            RunTrigger::Review => "review",
+            RunTrigger::Stalled => "stalled",
         }
     }
 
@@ -666,8 +676,22 @@ impl RunTrigger {
             "promoted" => Some(RunTrigger::Promoted),
             "triage" => Some(RunTrigger::Triage),
             "stage_barrier" => Some(RunTrigger::StageBarrier),
+            "review" => Some(RunTrigger::Review),
+            "stalled" => Some(RunTrigger::Stalled),
             _ => None,
         }
+    }
+
+    /// Whether this run is the lead coordinating a card rather than the
+    /// card's own work — [`RunTrigger::Triage`], [`RunTrigger::Review`] and
+    /// [`RunTrigger::Stalled`]. A coordination run neither counts as the
+    /// card making progress nor re-raises the question it was itself the
+    /// answer to.
+    pub fn is_coordination(self) -> bool {
+        matches!(
+            self,
+            RunTrigger::Triage | RunTrigger::Review | RunTrigger::Stalled
+        )
     }
 }
 

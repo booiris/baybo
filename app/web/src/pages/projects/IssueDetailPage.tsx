@@ -124,6 +124,8 @@ const RUN_TRIGGER_LABEL: Record<IssueRun['trigger'], string> = {
   promoted: 'the board had room',
   triage: 'nobody assigned',
   stage_barrier: 'stage barrier',
+  review: 'awaiting review',
+  stalled: 'work stopped',
 };
 
 function RunRow({
