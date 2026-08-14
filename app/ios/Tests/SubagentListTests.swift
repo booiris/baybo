@@ -67,6 +67,12 @@ struct SubagentListTests {
     /// the plain ISO8601 formatter rejects outright — parsing only one of the
     /// two shapes would silently drop every duration on the sheet.
     @Test func dateParsesBothWireShapes() {
+        // NINE fractional digits is what the live gateway actually emits
+        // (`…T06:34:08.737132475Z`), so pin that shape rather than a tidier
+        // one nothing sends. `.withFractionalSeconds` takes any width.
+        let nanos = SubagentList.date("2026-08-11T06:34:08.737132475Z")
+        #expect(nanos != nil)
+        #expect(nanos == SubagentList.date("2026-08-11T06:34:08.737Z"))
         #expect(SubagentList.date("2026-08-13T03:04:05.123456Z") != nil)
         #expect(SubagentList.date("2026-08-13T03:04:05Z") != nil)
         #expect(SubagentList.date(nil) == nil)

@@ -23,10 +23,15 @@ final class TranscriptSchemeHandler: NSObject, WKURLSchemeHandler {
 
     private static let deckBlobPathPrefix = "/blob/"
     private static let htmlPreviewPathPrefix = "/html-preview/"
+    /// The one path a preview's `script-src` admits (see the response policy
+    /// below). Everything under it is a blob id, so a page can only run a script
+    /// somebody already put in the blob store and handed it the read token for.
+    private static let libraryPathPrefix = "/html-lib/"
     private static let deckBlobServeCap = 8 * 1024 * 1024
     private static let htmlPreviewServeCap = 16 * 1024 * 1024
+    private static let libraryServeCap = 8 * 1024 * 1024
     private static let htmlPreviewCSP =
-        "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none';"
+        "default-src 'none'; script-src 'unsafe-inline' baybo-transcript://localhost/html-lib/; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none';"
     private static let htmlPreviewPermissionsPolicy =
         "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), usb=(), web-share=(), xr-spatial-tracking=()"
     private static let htmlPreviewFailureDocument =
@@ -38,7 +43,10 @@ final class TranscriptSchemeHandler: NSObject, WKURLSchemeHandler {
         /// `notFound` and the reader would get the failure document. Gated on
         /// BOTH the exact id and the launch argument, so nothing reaches it
         /// without having asked. The bytes obey the same response CSP as any
-        /// agent-authored page — inline style, no network, no images.
+        /// agent-authored page — inline style, no network, no images beyond
+        /// `data:`. It draws its chart as inline SVG and loads nothing: a demo
+        /// session has no leg, so a `/html-lib/` blob could only ever fail, and
+        /// a fixture whose permanent state is an error teaches nobody anything.
         static let demoHtmlBlobId = "sha256:" + String(repeating: "de", count: 32) + ".d0"
         private static let demoHtmlArg = "-baybo-demo-html"
         /// Deliberately DARK, and it has to stay that way: the fixture's job is
@@ -53,21 +61,36 @@ final class TranscriptSchemeHandler: NSObject, WKURLSchemeHandler {
             <meta name="viewport" content="width=device-width,initial-scale=1">
             <style>
               body{margin:0;padding:18px;font:14px/1.5 -apple-system,system-ui,sans-serif;color:#f2f2f7;background:#12141a}
-              h1{margin:0 0 2px;font-size:17px}p.sub{margin:0 0 18px;color:#9a9aa2;font-size:12px}
-              .bars{display:flex;align-items:flex-end;gap:10px;height:150px}
-              .bar{flex:1;background:linear-gradient(180deg,#5b7cfa,#8b5cf6);border-radius:6px 6px 0 0;position:relative}
-              .bar span{position:absolute;bottom:-18px;left:0;right:0;text-align:center;font-size:11px;color:#9a9aa2}
-              .row{display:flex;gap:12px;margin-top:32px}
+              h1{margin:0 0 2px;font-size:17px}p.sub{margin:0 0 14px;color:#9a9aa2;font-size:12px}
+              svg{width:100%;height:auto;display:block}
+              .grid{stroke:#2a2d36;stroke-width:1}
+              .axis{fill:#9a9aa2;font:10px ui-monospace,SFMono-Regular,monospace}
+              .row{display:flex;gap:12px;margin-top:20px}
               .kpi{flex:1;border:1px solid #2a2d36;border-radius:10px;padding:10px 12px}
               .kpi b{display:block;font-size:20px}.kpi em{font-style:normal;font-size:11px;color:#9a9aa2}
             </style></head><body>
-            <h1>Quarterly sales</h1><p class="sub">2026 · thousands</p>
-            <div class="bars">
-              <div class="bar" style="height:45%"><span>Q1</span></div>
-              <div class="bar" style="height:70%"><span>Q2</span></div>
-              <div class="bar" style="height:58%"><span>Q3</span></div>
-              <div class="bar" style="height:92%"><span>Q4</span></div>
-            </div>
+            <h1>Quarterly sales</h1><p class="sub">2026 · thousands · sample data</p>
+            <svg viewBox="0 0 320 180" role="img" aria-label="Quarterly sales, rising from 93 to 190">
+              <line class="grid" x1="34" y1="150" x2="310" y2="150"/>
+              <line class="grid" x1="34" y1="115" x2="310" y2="115"/>
+              <line class="grid" x1="34" y1="80" x2="310" y2="80"/>
+              <line class="grid" x1="34" y1="45" x2="310" y2="45"/>
+              <line class="grid" x1="34" y1="10" x2="310" y2="10"/>
+              <text class="axis" x="0" y="153">0</text>
+              <text class="axis" x="0" y="83">100</text>
+              <text class="axis" x="0" y="13">200</text>
+              <path d="M34 85 L126 48 L218 66 L310 17 L310 150 L34 150 Z" fill="#8b5cf6" fill-opacity=".20"/>
+              <polyline points="34,85 126,48 218,66 310,17" fill="none" stroke="#8b5cf6" stroke-width="2.5"
+                stroke-linecap="round" stroke-linejoin="round"/>
+              <circle cx="34" cy="85" r="3" fill="#12141a" stroke="#8b5cf6" stroke-width="2"/>
+              <circle cx="126" cy="48" r="3" fill="#12141a" stroke="#8b5cf6" stroke-width="2"/>
+              <circle cx="218" cy="66" r="3" fill="#12141a" stroke="#8b5cf6" stroke-width="2"/>
+              <circle cx="310" cy="17" r="3" fill="#12141a" stroke="#8b5cf6" stroke-width="2"/>
+              <text class="axis" x="34" y="170" text-anchor="middle">Q1</text>
+              <text class="axis" x="126" y="170" text-anchor="middle">Q2</text>
+              <text class="axis" x="218" y="170" text-anchor="middle">Q3</text>
+              <text class="axis" x="310" y="170" text-anchor="middle">Q4</text>
+            </svg>
             <div class="row">
               <div class="kpi"><b>412</b><em>full year</em></div>
               <div class="kpi"><b>+18%</b><em>year over year</em></div>
@@ -117,6 +140,10 @@ final class TranscriptSchemeHandler: NSObject, WKURLSchemeHandler {
             startHtmlPreview(url: url, task: urlSchemeTask)
             return
         }
+        if dynamicRoute == .htmlPreview, url.path.hasPrefix(Self.libraryPathPrefix) {
+            startLibrary(url: url, task: urlSchemeTask)
+            return
+        }
         guard let root = Bundle.main.url(forResource: "transcript", withExtension: nil) else {
             NSLog("baybo: transcript bundle missing from app resources")
             urlSchemeTask.didFailWithError(URLError(.fileDoesNotExist))
@@ -163,6 +190,10 @@ final class TranscriptSchemeHandler: NSObject, WKURLSchemeHandler {
     private enum BlobResponse {
         case deck(contentType: String)
         case htmlPreview
+        /// A vendored library, fetched as a subresource OF a preview. It gets no
+        /// CSP of its own — a policy only governs a document — but it does need
+        /// the right MIME, or WebKit refuses to execute it under `nosniff`.
+        case library
     }
 
     private func startDeckBlob(url: URL, task: WKURLSchemeTask) {
@@ -192,6 +223,22 @@ final class TranscriptSchemeHandler: NSObject, WKURLSchemeHandler {
         startBlob(
             url: url, task: task, blobId: blobId,
             maxBytes: UInt64(Self.htmlPreviewServeCap), response: .htmlPreview)
+    }
+
+    /// A script a preview loads, addressed by blob id — the same id space, the
+    /// same transport and the same cache as the preview document itself.
+    ///
+    /// The product ships no libraries: whatever the page loads here is something
+    /// the agent put in the blob store, so this grants the page nothing it did
+    /// not already have (it can write arbitrary inline JavaScript regardless).
+    /// A bad or missing id fails the LOAD rather than answering empty, so the
+    /// page's `onerror` runs — an empty 200 would leave a `<script>` that
+    /// "loaded" and defined nothing.
+    private func startLibrary(url: URL, task: WKURLSchemeTask) {
+        startBlob(
+            url: url, task: task,
+            blobId: String(url.path.dropFirst(Self.libraryPathPrefix.count)),
+            maxBytes: UInt64(Self.libraryServeCap), response: .library)
     }
 
     private func startBlob(
@@ -241,7 +288,10 @@ final class TranscriptSchemeHandler: NSObject, WKURLSchemeHandler {
         response: BlobResponse
     ) {
         switch response {
-        case .deck:
+        // Both fail the LOAD rather than answering a body: deck imagery has a
+        // broken-image state of its own, and a library that answered 200 with a
+        // failure document would be executed as JavaScript.
+        case .deck, .library:
             task.didFailWithError(URLError(error))
         case .htmlPreview:
             finish(
@@ -260,6 +310,9 @@ final class TranscriptSchemeHandler: NSObject, WKURLSchemeHandler {
         switch response {
         case .deck(let contentType):
             headers["Content-Type"] = contentType
+        case .library:
+            headers["Content-Type"] = "text/javascript"
+            headers["X-Content-Type-Options"] = "nosniff"
         case .htmlPreview:
             headers["Content-Type"] = "text/html; charset=utf-8"
             headers["Content-Security-Policy"] = Self.htmlPreviewCSP

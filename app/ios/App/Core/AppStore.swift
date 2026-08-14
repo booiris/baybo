@@ -1421,6 +1421,9 @@ final class AppStore: ObservableObject {
         // A track from the departing binding must not keep playing (or hold
         // the Now Playing entry) into the landing screen / next binding.
         AudioPlayerCenter.shared.stop()
+        // The next binding's sessions are a different world; a seeded sheet
+        // must not paint the previous one's children for a frame.
+        SubagentCache.shared.clear()
         transcriptHost?.teardown()
         transcriptHost = nil
         prewarmedDraftId = nil

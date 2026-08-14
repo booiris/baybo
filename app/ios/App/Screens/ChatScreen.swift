@@ -27,11 +27,6 @@ struct ChatScreen: View {
     @State private var messageIndexOpen = false
     /// The header's subagent list (`SubagentSheet`).
     @State private var subagentsOpen = false
-    /// The child a sheet row picked, opened from the sheet's `.onDisappear` for
-    /// the same reason `pendingJump` is — deterministic against the dismissal
-    /// where a guessed delay is not.
-    @State private var pendingSubagent: ChatSubagentSummary?
-    @State private var openedSubagent: ChatSubagentSummary?
     /// The row a sheet tap picked. The jump runs from the sheet content's
     /// `.onDisappear`, not from the tap: that is deterministic against the
     /// dismissal where a guessed delay is not, so the ring blooms on a clear
@@ -175,35 +170,22 @@ struct ChatScreen: View {
         .fullScreenCover(item: $store.videoPlayback) { playback in
             VideoPlayerScreen(url: playback.url)
         }
-        .sheet(isPresented: $subagentsOpen) {
-            SubagentSheet(sessionId: store.sessionId) { picked in
-                pendingSubagent = picked
-                subagentsOpen = false
-            }
-            .presentationDetents([.fraction(0.55), .large])
-            .presentationDragIndicator(.hidden)
-            .presentationBackground(Theme.paper)
-            .presentationCornerRadius(Theme.radiusModal)
-            .onDisappear {
-                guard let picked = pendingSubagent else { return }
-                pendingSubagent = nil
-                openedSubagent = picked
-            }
-        }
+        // ONE sheet: the child transcript is PUSHED inside it, so the detail
+        // slides in over the list instead of waiting for it to collapse, and
+        // backing out is a native pop straight back to the list.
+        //
         // A `.sheet`, NOT a `fullScreenCover`: a cover fires this screen's
         // `onDisappear`, which detaches the parent transcript's bridge for as
         // long as it is up (`AppStore.chatPath`'s didSet says the same of the
         // image viewer). Reading a subagent that ran for half an hour would
         // overflow the parent's offscreen frame buffer and force a full
         // re-sync on the way back.
-        .sheet(item: $openedSubagent) { picked in
-            SubagentBrowser(root: picked, parentSessionId: store.sessionId) {
-                openedSubagent = nil
-            }
-            .presentationDetents([.large])
-            .presentationDragIndicator(.hidden)
-            .presentationBackground(Theme.paper)
-            .presentationCornerRadius(Theme.radiusModal)
+        .sheet(isPresented: $subagentsOpen) {
+            SubagentSheet(sessionId: store.sessionId, parentSessionId: store.sessionId)
+                .presentationDetents([.large])
+                .presentationDragIndicator(.hidden)
+                .presentationBackground(Theme.paper)
+                .presentationCornerRadius(Theme.radiusModal)
         }
         .sheet(isPresented: $messageIndexOpen) {
             MessageIndexSheet(bridge: bridge) { rowId in
@@ -249,11 +231,17 @@ struct ChatScreen: View {
             // invisible to it. One bounded request per open covers that; the
             // two are OR-ed, so an offline open still gets the web verdict.
             Task {
-                if let list = try? await Baybo.client.chatListSubagents(
-                    sessionId: store.sessionId, before: nil), !list.items.isEmpty
-                {
-                    bridge.noteSubagentsPresent()
-                }
+                guard
+                    let list = try? await Baybo.client.chatListSubagents(
+                        sessionId: store.sessionId, before: nil)
+                else { return }
+                // Keep the rows, not just the verdict: the sheet seeds from
+                // this, so opening it paints on the first frame instead of
+                // paying a second round trip for what was already fetched.
+                SubagentCache.shared.put(
+                    sessionId: store.sessionId, items: list.items,
+                    hasMoreOlder: list.hasMoreOlder)
+                if !list.items.isEmpty { bridge.noteSubagentsPresent() }
             }
             // A search result routed here: park the transcript on the matched
             // message. Consumed on APPEAR rather than issued at the call site, so

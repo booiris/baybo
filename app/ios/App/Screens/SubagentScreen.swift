@@ -1,42 +1,6 @@
+import Combine
 import SwiftUI
 import WebKit
-
-/// A subagent child's read-only transcript, and the recursive stack it lives in.
-///
-/// It renders in its OWN `WKWebView`, built when the browser opens and torn
-/// down when it closes, so the singleton `TranscriptHost` keeps serving the
-/// parent conversation untouched. That is not a first: `DeckHost` is a
-/// permanent second webview and `ImageViewer`'s `SvgImageWebView` already lives
-/// in a cover over the live transcript. The "one transcript webview" rule is a
-/// LATENCY decision (cold-booting the bundle per chat push), not a memory one.
-struct SubagentBrowser: View {
-    let root: ChatSubagentSummary
-    /// The conversation that spawned `root` — where its status is re-read.
-    let parentSessionId: String
-    var client: any BayboClientProtocol = Baybo.client
-    let onClose: () -> Void
-
-    @State private var path: [SubagentRoute] = []
-
-    var body: some View {
-        NavigationStack(path: $path) {
-            SubagentScreen(
-                summary: root, parentSessionId: parentSessionId, client: client,
-                onClose: onClose
-            )
-            .toolbar(.hidden, for: .navigationBar)
-            .navigationDestination(for: SubagentRoute.self) { route in
-                SubagentScreen(
-                    summary: route.summary, parentSessionId: route.parentSessionId,
-                    client: client, onClose: onClose
-                )
-                .toolbar(.hidden, for: .navigationBar)
-                .navigationBarBackButtonHidden(true)
-            }
-        }
-        .environment(\.subagentPath, $path)
-    }
-}
 
 /// One level of the drill-down. A child and the parent it was listed under
 /// travel together: a child's own status can only be re-read from its parent's
@@ -56,28 +20,27 @@ struct SubagentRoute: Hashable {
     }
 }
 
+
 struct SubagentScreen: View {
     let summary: ChatSubagentSummary
     let parentSessionId: String
     let client: any BayboClientProtocol
-    let onClose: () -> Void
 
     @StateObject private var store: SubagentReadStore
     @StateObject private var host: SubagentHost
     @ObservedObject private var lang = Lang.shared
     @State private var childrenOpen = false
-    @State private var pendingChild: ChatSubagentSummary?
+    /// The REST half of the entry's gate — see `hasChildren`.
+    @State private var childrenListed = false
     @Environment(\.dismiss) private var dismiss
-    @Environment(\.subagentPath) private var path
 
     init(
         summary: ChatSubagentSummary, parentSessionId: String,
-        client: any BayboClientProtocol, onClose: @escaping () -> Void
+        client: any BayboClientProtocol = Baybo.client
     ) {
         self.summary = summary
         self.parentSessionId = parentSessionId
         self.client = client
-        self.onClose = onClose
         // One instance, held twice: the view observes the STORE (a nested
         // `ObservableObject` republishes nothing through its owner, so a
         // binding reached via the host would never update the view), while the
@@ -93,27 +56,27 @@ struct SubagentScreen: View {
         ZStack(alignment: .top) {
             TranscriptWebView(webView: host.webView)
                 .ignoresSafeArea(.all, edges: [.top, .bottom])
-                .opacity(host.bridge.contentVisible ? 1 : 0)
-                .animation(.easeOut(duration: 0.15), value: host.bridge.contentVisible)
+                .opacity(host.contentVisible ? 1 : 0)
+                .animation(.easeOut(duration: 0.15), value: host.contentVisible)
 
             header
         }
         .background(Theme.paper)
+        // Hiding the navigation bar (custom chrome) also disables the
+        // interactive pop, so the left-edge swipe has to be handed back the
+        // same way `ChatScreen` does it. This screen is pushed inside the
+        // sheet's own `NavigationStack`, so the host finds a navigation
+        // controller in its parent chain and the recognizer takes effect.
+        .background(
+            PopGestureEnabler()
+                .frame(width: 0, height: 0)
+        )
         .sheet(isPresented: $childrenOpen) {
-            SubagentSheet(sessionId: summary.sessionId, client: client) { picked in
-                pendingChild = picked
-                childrenOpen = false
-            }
-            .presentationDetents([.fraction(0.55), .large])
-            .presentationDragIndicator(.hidden)
-            .presentationBackground(Theme.paper)
-            .presentationCornerRadius(Theme.radiusModal)
-            .onDisappear {
-                guard let picked = pendingChild else { return }
-                pendingChild = nil
-                path.wrappedValue.append(
-                    SubagentRoute(summary: picked, parentSessionId: summary.sessionId))
-            }
+            SubagentSheet(sessionId: summary.sessionId, parentSessionId: parentSessionId)
+                .presentationDetents([.large])
+                .presentationDragIndicator(.hidden)
+                .presentationBackground(Theme.paper)
+                .presentationCornerRadius(Theme.radiusModal)
         }
         .sheet(item: $store.filePreview) { preview in
             FilePreviewSheet(url: preview.url) { store.filePreview = nil }
@@ -127,16 +90,37 @@ struct SubagentScreen: View {
         .fullScreenCover(item: $store.videoPlayback) { playback in
             VideoPlayerScreen(url: playback.url)
         }
-        .onAppear { store.startPollingIfLive() }
+        .onAppear {
+            store.startPollingIfLive()
+            Task {
+                guard
+                    let list = try? await client.chatListSubagents(
+                        sessionId: summary.sessionId, before: nil)
+                else { return }
+                // Seeds the sheet too, so opening it paints on the first frame.
+                SubagentCache.shared.put(
+                    sessionId: summary.sessionId, items: list.items,
+                    hasMoreOlder: list.hasMoreOlder)
+                childrenListed = !list.items.isEmpty
+            }
+        }
         .onDisappear { store.stopPolling() }
     }
+
+    /// Shown only when this child delegated in turn — the parent entry's rule,
+    /// for the parent entry's reason: most children never spawn, and an entry
+    /// that always shows is one that mostly opens an empty sheet. Two sources
+    /// OR'd, exactly as one level up: what this page's own rows show (zero
+    /// network, correct offline) and one bounded list request on appear.
+    private var hasChildren: Bool { host.subagentsPresent || childrenListed }
 
     private var header: some View {
         HStack(spacing: 12) {
             Button {
-                // The deepest screen closes the whole browser; a pushed one
-                // pops back to the level above.
-                if path.wrappedValue.isEmpty { onClose() } else { dismiss() }
+                // One call covers both levels: inside a `NavigationStack` this
+                // pops to the list, and at the stack's root it dismisses the
+                // sheet back to the conversation.
+                dismiss()
             } label: {
                 Image(systemName: "chevron.left")
                     .font(.system(size: 18, weight: .semibold))
@@ -146,37 +130,40 @@ struct SubagentScreen: View {
             .glassSurface(interactive: true, in: .circle)
             .accessibilityLabel(Text(verbatim: lang.t("chat.back")))
 
-            VStack(alignment: .leading, spacing: 2) {
-                Text(
-                    verbatim: SubagentList.title(
-                        task: summary.task, subagentType: summary.subagentType,
-                        sessionId: summary.sessionId)
-                )
-                .font(Theme.mono(13))
-                .foregroundStyle(Theme.ink)
-                .lineLimit(1)
-                HStack(spacing: 6) {
-                    Text(verbatim: lang.t(SubagentList.statusKey(store.status)))
-                    Text(verbatim: lang.t("subagent.readOnly"))
-                }
-                .font(Theme.mono(10))
-                .foregroundStyle(Theme.inkSoft)
-            }
+            // The errand alone. Status and duration already read on the row
+            // that got here, and repeating them over the transcript that shows
+            // the same work is noise; "read-only" is answered by the absence of
+            // a composer, not by a label saying so.
+            Text(
+                verbatim: SubagentList.title(
+                    task: summary.task, subagentType: summary.subagentType,
+                    sessionId: summary.sessionId)
+            )
+            .font(Theme.mono(13))
+            .foregroundStyle(Theme.ink)
+            .lineLimit(1)
 
             Spacer(minLength: 0)
 
-            Button {
-                Haptics.tap()
-                childrenOpen = true
-            } label: {
-                Image(systemName: "point.3.connected.trianglepath.dotted")
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(Theme.ink)
-                    .frame(width: 42, height: 42)
+            // Gated exactly like the parent's, and for the same reason: most
+            // children never delegate, and an entry that always shows is an
+            // entry that mostly opens an empty sheet.
+            if hasChildren {
+                Button {
+                    Haptics.tap()
+                    childrenOpen = true
+                } label: {
+                    Image(systemName: "point.3.connected.trianglepath.dotted")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(Theme.ink)
+                        .frame(width: 42, height: 42)
+                }
+                .glassSurface(interactive: true, in: .circle)
+                .accessibilityLabel(Text(verbatim: lang.t("chat.subagents")))
+                .transition(.scale(scale: 0.7).combined(with: .opacity))
             }
-            .glassSurface(interactive: true, in: .circle)
-            .accessibilityLabel(Text(verbatim: lang.t("chat.subagents")))
         }
+        .animation(.easeOut(duration: 0.16), value: hasChildren)
         .padding(.horizontal, 24)
         .frame(height: ChatHeaderView.barHeight)
         .frame(maxWidth: .infinity)
@@ -201,12 +188,35 @@ struct SubagentScreen: View {
 final class SubagentHost: ObservableObject {
     let webView: WKWebView
     let bridge: TranscriptBridge
+    /// Mirrored off the bridge because the screen observes THIS object, not the
+    /// bridge inside it: reading `host.bridge.contentVisible` compiles and even
+    /// gives the right first value, but a nested `ObservableObject` republishes
+    /// nothing through its owner — so the `true` that arrives with the page's
+    /// `ready` never re-renders anything and the webview stays at `opacity(0)`
+    /// forever. That is a fully-loaded, fully-synced transcript behind a
+    /// transparent view: the page looks blank and nothing anywhere errors.
+    /// `ChatScreen` avoids it by observing the bridge directly, which this
+    /// screen cannot — its bridge is born with the host, inside a `StateObject`.
+    @Published private(set) var contentVisible = false
+    /// Mirrored for the same reason as `contentVisible` — a nested
+    /// `ObservableObject` republishes nothing through its owner, and a gate
+    /// read through one would latch without ever re-rendering the header.
+    @Published private(set) var subagentsPresent = false
+
     private let host: TranscriptHost
+    private var visibility: AnyCancellable?
+    private var delegation: AnyCancellable?
 
     init(store: SubagentReadStore) {
         host = TranscriptHost(store: store)
         webView = host.webView
         bridge = host.bridge
+        visibility = bridge.$contentVisible.sink { [weak self] visible in
+            self?.contentVisible = visible
+        }
+        delegation = bridge.$subagentsPresent.sink { [weak self] present in
+            self?.subagentsPresent = present
+        }
     }
 
     deinit {
@@ -221,13 +231,3 @@ final class SubagentHost: ObservableObject {
     }
 }
 
-private struct SubagentPathKey: EnvironmentKey {
-    static let defaultValue: Binding<[SubagentRoute]> = .constant([])
-}
-
-extension EnvironmentValues {
-    var subagentPath: Binding<[SubagentRoute]> {
-        get { self[SubagentPathKey.self] }
-        set { self[SubagentPathKey.self] = newValue }
-    }
-}

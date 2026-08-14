@@ -2708,18 +2708,26 @@ async fn a_subagent_child_is_listed_and_readable_under_an_owner_root() {
     // No turn rows yet — spawned, nothing opened.
     assert_eq!(items[0]["status"], "pending");
 
-    // And the child's own transcript reads back, with the errand as its head.
+    // The child's own transcript reads back. It does NOT open on the errand:
+    // the agent-authored spawn prompt is not a user bubble on any surface, for
+    // the reason the owner chat has always dropped it — `agent_context` is the
+    // agent's own channel, shared with skill reminders and compaction
+    // summaries, and no signal in the row separates them. The errand reaches
+    // the reader through the row that got them here and the page's header.
     let detail = get(
         &router,
         &format!("/v1/chat/subagents/{}", child.id),
         StatusCode::OK,
     )
     .await;
-    let transcript = detail["transcript"].as_array().expect("transcript");
-    assert_eq!(
-        transcript.first().map(|r| &r["role"]),
-        Some(&Value::from("user")),
-        "the parent's errand leads the child's thread: {detail:?}"
+    assert_eq!(detail["title"], "search the sync protocol");
+    assert!(
+        detail["transcript"]
+            .as_array()
+            .expect("transcript")
+            .iter()
+            .all(|r| r["role"] != "user"),
+        "an agent-authored prompt must not render as the user's: {detail:?}"
     );
 
     // The plain chat route must NOT have grown a second door to the same row.
