@@ -1230,6 +1230,16 @@ export function applySyncReplace(
   page: Row[],
   unconfirmedSends: ReadonlySet<string>,
 ): Row[] {
+  // A session's rows are never deleted (session data is core data), so an
+  // empty page against a thread that holds rows is always a stale read: a
+  // baseline the gateway served before this session's first row persisted
+  // (echo before persist, plus a new session's actor cold-spawn — the longest
+  // such window of any send). Applying it keeps every surviving row but
+  // RE-FILES them — the kept sets return behind the page, so an ordinal-less
+  // first send lands below the reply that outran it (and a row that lost its
+  // kept-set membership is deleted outright). The empty page carries nothing a
+  // rebuild could need; the thread it failed to describe is what's on screen.
+  if (page.length === 0 && prev.length > 0) return prev;
   const pageIds = new Set(page.map((r) => r.id));
   const openWork = prev.filter((r): r is WorkRow => r.role === "work" && r.active).slice(-1);
   const keptSends = prev.filter(
@@ -3610,14 +3620,30 @@ export function Transcript({
   const applySyncPage = useCallback(
     (frame: Extract<WireFrame, { kind: "sync_page" }>) => {
       setSyncInFlight(false);
-      // Every sync carries the authoritative boundary set (empty ⇒ never
-      // compacted), so a warm re-entry's difference sync refreshes the divider
-      // just like a baseline REPLACE does.
-      setCompactionPoints(frame.compaction_points ?? []);
       const replace = frame.rebased || frame.since_ordinal === null;
       const pageRows = frame.rows
         .map(transcriptItemToRow)
         .filter((r): r is Row => r !== null);
+      // `applySyncReplace` already refuses the row swap for an empty page over
+      // a non-empty thread (see its comment) — but the swap is not all a
+      // REPLACE does. Left to run, this branch would also null the paging
+      // floor, drop a not-yet-drained mirror head, clear the compaction
+      // dividers and hide the load-older affordance, all off a page that
+      // described nothing. Provably no-ops today (an empty page implies zero
+      // durable rows), so this is the same statement at the frame level: a
+      // REPLACE carrying no rows against a thread that has some is stale in
+      // its entirety, not just row-wise. `messagesRef` can lag a same-batch
+      // live append, so this fails OPEN — the applySyncReplace guard still
+      // protects the rows.
+      if (replace && pageRows.length === 0 && messagesRef.current.length > 0) {
+        advanceCursorFromSync(frame.next_cursor, frame.rebased);
+        markReadIfAdvanced();
+        return;
+      }
+      // Every sync carries the authoritative boundary set (empty ⇒ never
+      // compacted), so a warm re-entry's difference sync refreshes the divider
+      // just like a baseline REPLACE does.
+      setCompactionPoints(frame.compaction_points ?? []);
       // The prefix invariant `mergeSyncPage` merges under is checked when the
       // request is POSTED (`runSync`), and the thread grows during the round
       // trip — so a difference can land on a thread it is no longer a prefix
@@ -3802,6 +3828,18 @@ export function Transcript({
         }
         if (role === "user" && frame.platform_msg_id) {
           sentIds.current.add(frame.platform_msg_id);
+          // Reaching this append for an ordinal-less user frame means the echo
+          // beat `userSent` here — or `userSent` was lost (a retarget burst
+          // consumed by the outgoing tree). Either way the row this appends is
+          // the send's ONLY rendering, and like the optimistic bubble it is
+          // ordinal-less and pre-persist — so it needs the same REPLACE-overlay
+          // protection, or the send-time baseline (routinely empty for a first
+          // send) deletes it. The page carrying the id retires it, as always.
+          // A second paired device's echo enrols here too — knowingly: its row
+          // kept (and possibly re-filed below a narrow page) beats deleted,
+          // and the set is per-tree, never persisted, so the exposure ends at
+          // unmount.
+          if (ordinal === null) unconfirmedSends.current.add(frame.platform_msg_id);
         }
         if (role === "assistant") {
           // The terminal message is authoritative: it replaces the streamed

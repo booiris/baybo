@@ -358,6 +358,48 @@ describe("the pre-subscribe buffer", () => {
     expect(log).toEqual([]);
   });
 
+  // The re-keyed tree COMMITS asynchronously, and native's retarget burst (the
+  // outbox's replayed `userSent`s, the offscreen frame flush) follows init in
+  // the same main-actor turn — so with the old subscription left live, the
+  // outgoing tree consumed the new conversation's first message and it died at
+  // that tree's unmount, never re-buffered. This pins init detaching it.
+  it("detaches the outgoing tree on a cross-session init — the retarget burst waits for the NEW tree", async () => {
+    const bridge = await loadBridge();
+    window.baybo.init(initPayload(SESSION_A));
+    const treeA = recorder();
+    const offA = bridge.subscribeTranscript(treeA.events);
+
+    window.baybo.init(initPayload(SESSION_B));
+    window.baybo.userSent({ msgId: "pm-b", text: "first message", attachments: [] });
+    window.baybo.pushFrame("b-frame");
+    expect(treeA.log).toEqual([]);
+
+    const treeB = recorder();
+    bridge.subscribeTranscript(treeB.events);
+    expect(treeB.log).toEqual(["userSent:pm-b", "frame:b-frame"]);
+
+    // The old tree's unmount cleanup runs AFTER the new tree subscribed —
+    // identity-guarded, it must not tear down B's live subscription.
+    offA();
+    window.baybo.pushFrame("b-live");
+    expect(treeB.log).toEqual(["userSent:pm-b", "frame:b-frame", "frame:b-live"]);
+  });
+
+  // The counter-case that makes the detach conditional: a same-session re-init
+  // (the LRU evicted the native store and re-opening minted a fresh one) keeps
+  // the very same React tree — its key doesn't change, nothing remounts, and
+  // nobody would ever subscribe again. Detaching there would buffer forever.
+  it("keeps the live subscription across a same-session re-init", async () => {
+    const bridge = await loadBridge();
+    window.baybo.init(initPayload(SESSION_A));
+    const tree = recorder();
+    bridge.subscribeTranscript(tree.events);
+
+    window.baybo.init(initPayload(SESSION_A));
+    window.baybo.userSent({ msgId: "pm-1", text: "replayed", attachments: [] });
+    expect(tree.log).toEqual(["userSent:pm-1"]);
+  });
+
   // `deliver()` ends in a BARE `else e.jumpToLatest()`, so a command whose
   // `Buffered` variant has no explicit branch silently becomes "scroll to the
   // bottom" — and TypeScript cannot catch it (the union is exhausted by the

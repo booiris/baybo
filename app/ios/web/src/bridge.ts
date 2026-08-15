@@ -670,6 +670,17 @@ window.baybo = {
   init(payload) {
     // Native flushes the old mirror before retargeting; do not post stale state here.
     buffer.length = 0;
+    // A cross-session retarget re-keys the React tree, but that commit is
+    // ASYNCHRONOUS — until the new tree's subscribe effect runs, `events` is
+    // still the outgoing session's tree, and native's retarget burst (buffered
+    // frames, the outbox's replayed `userSent`s) follows this call in the same
+    // main-actor turn. Delivered to the old tree it is consumed there and dies
+    // at its unmount — never re-buffered — so the new conversation's first
+    // message simply never renders. Detach the stale subscriber so the burst
+    // buffers and drains at the new tree's subscription. Same-session re-inits
+    // (an LRU-evicted store re-created) must KEEP it: the key doesn't change,
+    // nothing remounts, and nobody would ever subscribe again.
+    if (initPayload !== null && initPayload.sessionId !== payload.sessionId) events = null;
     blobPending.clear();
     posterPending.clear();
     clearTimeout(persistTimer);

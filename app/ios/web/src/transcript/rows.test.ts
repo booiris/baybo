@@ -1423,7 +1423,12 @@ describe("applySyncReplace — the overlay keeps what the page cannot carry", ()
     expect(applySyncReplace(prev, page, owed()).map((r) => r.id)).toEqual(["m10", "m12"]);
   });
 
-  it("DROPS another client's live-echoed message — this device's outbox never owed it", () => {
+  // NOTE: the frame path now enrols EVERY ordinal-less user echo it appends —
+  // a second paired device's included, knowingly (kept-and-possibly-re-filed
+  // beats deleted) — so a rendered echo row reaches this not-owed state only
+  // through RETIREMENT (a page carried its pmid, or native's `sendConfirmed`),
+  // never on arrival. This pins the pure contract for that retired state.
+  it("DROPS an ordinal-less user row the kept set no longer holds", () => {
     const prev: Row[] = [{ id: "pm-laptop", role: "user", content: "sent from my laptop" }];
     expect(applySyncReplace(prev, [{ id: "m10", role: "assistant", content: "a" }], owed())).toEqual([
       { id: "m10", role: "assistant", content: "a" },
@@ -1466,6 +1471,37 @@ describe("applySyncReplace — the overlay keeps what the page cannot carry", ()
     // (C) the mount edge replays every send the outbox still owns; the guard
     // that makes it idempotent is the row being there to find.
     expect(holdsUserSend(rows, "pm-1")).toBe(true);
+    expect(rows.map((r) => r.id)).toEqual(["pm-1", "u-live", "m12"]);
+  });
+
+  // A session's rows are never deleted, so an empty page against a thread that
+  // holds rows is always a read the gateway served before this session's first
+  // row persisted. Applying it re-filed the survivors — kept sets return
+  // BEHIND the page — and deleted outright any row that had lost (or never
+  // gained) its kept-set membership, which is exactly the row an eaten
+  // `userSent` leaves behind: the echo-appended bubble.
+  it("treats an empty page against a non-empty thread as stale — nothing moves, owed or not", () => {
+    const prev: Row[] = [
+      { id: "pm-1", role: "user", content: "hi" }, // echo-appended: no membership
+      { id: "m12", role: "assistant", ordinal: 12, content: "there" },
+    ];
+    expect(applySyncReplace(prev, [], owed())).toBe(prev);
+  });
+
+  // The other interleaving of the end-to-end scar above: the answer arrives
+  // BEFORE the raced baseline's empty response does. The kept sets used to
+  // return behind the page — `[reply, first send]`, with the closed work card
+  // (ordinal-less, inactive: in neither set) deleted — and the order persisted
+  // into the mirror, past every later sync (the reply's ordinal outran the
+  // cursor) and every re-entry.
+  it("never re-files the first send below a reply the empty page predates", () => {
+    const owing = new Set<string>(["pm-1"]);
+    let rows: Row[] = [{ id: "pm-1", role: "user", content: "hi", sendState: "sending" }];
+    rows = rows.map((r) => (r.id === "pm-1" ? { ...r, sendState: undefined } : r)); // the echo
+    rows = [...rows, work({ id: "u-live", steps: [tool()], active: false })]; // turn ended
+    rows = [...rows, { id: "m12", role: "assistant", ordinal: 12, content: "there" }];
+
+    rows = applySyncReplace(rows, [], owing); // the raced baseline, landing LAST
     expect(rows.map((r) => r.id)).toEqual(["pm-1", "u-live", "m12"]);
   });
 });

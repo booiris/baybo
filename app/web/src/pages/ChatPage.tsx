@@ -5497,6 +5497,16 @@ export function applySyncReplace(
   unconfirmedSendIds: ReadonlySet<string>,
   turn: SessionView['turn'],
 ): TranscriptRow[] {
+  // A session's rows are never deleted, so an empty page against a thread that
+  // holds rows is always a stale read — a baseline served before this
+  // session's first row persisted (the gateway echoes an inbound before it
+  // writes it, and a fresh session's cursor stays null until a sync answers,
+  // so every sync on it is a baseline). Applying it would re-file the kept
+  // rows behind the page — an ordinal-less first send below the reply that
+  // outran it — and delete outright every ordinal-less row outside the kept
+  // sets (a clientMsgId-less echo append most of all). Mirrors the identical
+  // guard in app/ios/web's applySyncReplace.
+  if (page.length === 0 && prev.length > 0) return prev;
   const pageSendIds = new Set<string>();
   for (const row of page) {
     if (row.clientMsgId !== undefined) pageSendIds.add(row.clientMsgId);
