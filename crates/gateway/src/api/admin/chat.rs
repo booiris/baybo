@@ -3260,6 +3260,17 @@ fn last_user_preview(
 /// session) — the row then falls back to its title / user preview client-side.
 /// The window is bounded to [`LAST_MESSAGE_PREVIEW_SCAN`] rows so a long
 /// tool loop can't turn one preview into an unbounded tail read.
+/// The user-bubble predicate every chat surface shares: a genuine channel
+/// input ([`baybo_model::ChatMessage::from_user`]), or a spawned child's
+/// opening errand — the ONE agent-injected row that should render (see
+/// [`baybo_model::MessageSource::SubagentSeed`]; rows from before that
+/// variant existed are plain `agent` and stay hidden, deliberately —
+/// provenance, never content-sniffing, is what separates the errand from the
+/// skill-reminder machinery that shares its shape).
+fn renders_as_user_bubble(msg: &baybo_model::ChatMessage) -> bool {
+    msg.from_user() || msg.source() == baybo_model::MessageSource::SubagentSeed
+}
+
 fn last_message_preview(
     tail: &[(i64, chrono::DateTime<chrono::Utc>, baybo_model::ChatMessage)],
 ) -> Option<String> {
@@ -3268,7 +3279,7 @@ fn last_message_preview(
         // tool-free final assistant answer. Everything else (agent-injected
         // user rows, assistant work-block narration, tool results) renders no
         // bubble there, so it must not become a preview here.
-        let role = if msg.from_user() {
+        let role = if renders_as_user_bubble(msg) {
             "user"
         } else if matches!(msg.role, Role::Assistant) && !msg.has_tool_use() {
             "assistant"
@@ -3544,7 +3555,7 @@ fn reconstruct_transcript_with_attachments(
             turn_started = None;
         }
         match msg.role {
-            Role::User if msg.from_user() => {
+            Role::User if renders_as_user_bubble(&msg) => {
                 work.flush(&mut items, None, true);
                 turn_started = Some(created_at);
                 if let Some(item) = message_item(

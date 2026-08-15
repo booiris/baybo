@@ -452,7 +452,18 @@ final class TranscriptBridge: NSObject, ObservableObject {
     private func deliverInit() {
         guard let store else { return }
         shownSessionId = store.sessionId
-        let restored = TranscriptStore.read(sessionId: store.sessionId)
+        let restored: String?
+        if store.mirrored {
+            restored = TranscriptStore.read(sessionId: store.sessionId)
+        } else {
+            // A read-only page renders the server's CURRENT truth only. Delete
+            // rather than merely skip: installs that viewed this child against
+            // an old gateway already hold a mirror full of rows the fixed read
+            // path no longer serves, and nothing else would ever remove it.
+            TranscriptStore.delete(
+                sessionId: store.sessionId, in: SessionIndex.supportDirectory())
+            restored = nil
+        }
         // The in-app language override (falls back to the device language) —
         // the same source the native chrome renders from, so the two can't
         // diverge.
@@ -595,6 +606,12 @@ extension TranscriptBridge: WKScriptMessageHandler {
             // hatch just deleted, with exactly the state being thrown away.
             if discardPersist { break }
             // Persist is async and may arrive after the bridge retargets.
+            // A bridge whose target opted out of mirroring hosts only such
+            // targets (the subagent sheet's own webview), so drop the write for
+            // ANY session id — a late flush from the previously shown child
+            // must not mint a mirror either. deliverInit's delete is the
+            // backstop for a flush that slips through a mid-retarget nil store.
+            if let store, !store.mirrored { break }
             if let sessionId = (body["sessionId"] as? String) ?? store?.sessionId,
                 let state = body["state"],
                 let data = try? JSONSerialization.data(withJSONObject: state),

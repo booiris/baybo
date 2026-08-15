@@ -43,6 +43,15 @@ protocol TranscriptTarget: AnyObject {
 
     // MARK: - The send half
 
+    /// Whether this target's transcript may be persisted to (and restored
+    /// from) the on-disk mirror. `false` for the read-only subagent page: its
+    /// truth is a GET away, and a mirror is how a rendering the SERVER no
+    /// longer produces outlives the fix that removed it — a child page viewed
+    /// against an old gateway persisted the seed and skill-reminder bubbles,
+    /// and the restored copy could never heal (the cursor covers the thread,
+    /// so every later sync is an empty difference that deletes nothing).
+    var mirrored: Bool { get }
+
     func replayUnconfirmedSends(to transcript: any TranscriptSurface)
     func flushPendingSendConfirms(to transcript: any TranscriptSurface)
     func retrySend(msgId: String, text: String, attachments: [AttachmentRef])
@@ -57,6 +66,7 @@ protocol TranscriptTarget: AnyObject {
 /// (so nothing renders a send↔stop button). Anything that later needs real
 /// behaviour here belongs on the conforming type, where it can be seen.
 extension TranscriptTarget {
+    var mirrored: Bool { true }
     func replayUnconfirmedSends(to transcript: any TranscriptSurface) {}
     func flushPendingSendConfirms(to transcript: any TranscriptSurface) {}
     func retrySend(msgId: String, text: String, attachments: [AttachmentRef]) {}

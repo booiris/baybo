@@ -80,6 +80,7 @@ export type MessageSource =
   | 'system_prompt_update'
   | 'skill_listing'
   | 'skills_update'
+  | 'subagent_seed'
   | 'agent';
 
 export interface BlobRef {

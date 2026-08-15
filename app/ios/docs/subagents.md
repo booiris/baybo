@@ -69,19 +69,22 @@ Two things this deliberately does **not** do:
   rule is "the root must be a session you could already open", not "the root must
   be on the owner channel".
 
-## The transcript does not open on the errand, and cannot
+## The transcript opens on the errand — by provenance, never by guessing
 
-The prompt the parent writes for its child is persisted as
-`ChatMessage::agent_context` — `Role::User` but `MessageSource::Agent` — so the
-reconstruction's `Role::User if msg.from_user()` arm drops it, exactly as it
-drops the same shape in an owner chat.
+A NEW spawn's errand is persisted as `ChatMessage::subagent_seed`
+(`Role::User`, `MessageSource::SubagentSeed` — both backends: the baybo path's
+`append_spawned_prompt` and the external-agent path). The reconstruction's
+user-bubble arm (`renders_as_user_bubble`: `from_user()` OR `SubagentSeed`)
+renders exactly that row, so the child's page opens with the instruction it
+was given, the way a user turn opens a root session.
 
-An earlier version of this feature rendered those rows as user bubbles on the
-subagent path, on the reasoning that a child has no other user rows so anything
-`agent_context` there had to be the errand. **That is false on real data.** The
-live store's children carry three different things under that one identity:
+What it must NEVER do is render the errand by inference. An earlier version
+rendered every `agent_context` row as a user bubble on the subagent path, on
+the reasoning that a child has no other user rows so anything with that shape
+had to be the errand. **That is false on real data.** The live store's
+children carry three different things under that one identity:
 
-- the spawn seed;
+- the spawn seed (every spawn from before `SubagentSeed` existed);
 - **skill reminders** — `source = 'skill_listing'` only since 2026-08-04; every
   row before that is plain `agent`, so the column cannot separate them
   historically;
@@ -90,17 +93,13 @@ live store's children carry three different things under that one identity:
   carry `1`, so the display read's filter does not remove them.
 
 So the reader got the skills `<system-reminder>` as the first "user" bubble.
-Nothing in a row separates the errand from the machinery, and the schema's own
-comment says why that must not be guessed at from content: `source` exists
-precisely so the genuine prompt is told apart "without guessing by content".
-
-The errand reaches the reader another way — it is the row they tapped to get
-here, and the page's header repeats it — so nothing is lost by leaving the
-transcript to start at the first work block.
-
-Giving the seed its own `MessageSource` is the change that would make rendering
-it exact; it would apply to future spawns only, which is fine, because the
-header already covers the rest.
+Nothing in a row separates the errand from the machinery by shape, and the
+schema's own comment says why that must not be guessed at from content:
+`source` exists precisely so the genuine prompt is told apart "without
+guessing by content". `SubagentSeed` IS that signal — added 2026-08-16, so it
+applies to spawns from then on. A historical child (its seed indistinguishable
+from the machinery) still opens at the first work block, with the errand
+reachable as the row that got the reader here and the page's header.
 
 
 ## Where the list's data comes from
@@ -205,13 +204,22 @@ three audio calls. `ChatStore` implements it; so does the new
 
 ### No mirror, and why that is the endorsed direction
 
-The read-only host **declines the `persist` post**. The web side writes the
+Enforced through `TranscriptTarget.mirrored` (`false` here; the bridge gates
+BOTH halves on it). The `persist` post is declined — the web side writes the
 mirror under the session id the *page* reports, so a child would happily create
-`transcripts/<child id>.json` — and nothing would ever delete it. Every mirror
-deleter iterates existing chat-list rows, and a child session never has one. The
-transcript-mirror sweeper is explicitly forbidden in `docs/sync-and-outbox.md`;
-not creating the orphan is the only correct move. (`dropTranscriptMirror(_:)`
-exists as a per-id escape hatch if one ever slips through.)
+`transcripts/<child id>.json`, and nothing would ever delete it: every mirror
+deleter iterates existing chat-list rows, and a child session never has one.
+The transcript-mirror sweeper is explicitly forbidden in
+`docs/sync-and-outbox.md`; not creating the orphan is the only correct move.
+And `deliverInit` neither restores a mirror for an unmirrored target nor
+tolerates one: it DELETES any `transcripts/<child id>.json` it finds. That is
+not just orphan hygiene — a child page viewed against an old gateway persisted
+renderings the fixed read path no longer serves (the seed and skill-reminder
+bubbles), and a restored copy could never heal: the cursor covers the thread,
+so every later sync is an empty difference that removes nothing. The delete is
+what let installs poisoned that way self-heal on the next open. This section
+claimed the persist decline before the enforcement existed; the
+`TranscriptTarget` refactor had silently lost it.
 
 ### Liveness: polling, and what you will not see
 

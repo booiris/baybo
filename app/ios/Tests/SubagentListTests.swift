@@ -11,6 +11,20 @@ struct SubagentListTests {
         Date(timeIntervalSince1970: 1_700_000_000 + seconds)
     }
 
+    /// The bridge gates BOTH mirror halves (restore + persist) on this flag,
+    /// and a child page's stale mirror is unrecoverable by design — the cursor
+    /// covers the thread, so no sync ever removes a row an old gateway
+    /// rendered and a new one no longer serves. docs/subagents.md claimed the
+    /// persist decline while no enforcement existed; this pins the flag so a
+    /// refactor cannot silently lose it again.
+    @Test func aChildPageNeverMirrors() {
+        let store = SubagentReadStore(
+            sessionId: "subagent-1", parentSessionId: "s-parent",
+            status: .running, client: FakeBayboClient())
+        #expect(store.mirrored == false)
+        #expect(store.listed == false)
+    }
+
     /// The errand the parent authored is what names a row. A child spawned
     /// before the gateway stamped it has none, and falling back to the profile
     /// beats falling back to a uuid — but a row must never be blank, so the id

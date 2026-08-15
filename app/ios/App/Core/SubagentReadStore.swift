@@ -21,6 +21,11 @@ final class SubagentReadStore: ObservableObject, TranscriptTarget {
     /// only to decide whether to hold the first paint, and `false` is both true
     /// and the behaviour we want (fade in once the page reports `shown`).
     let listed = false
+    /// No mirror, enforced (docs/subagents.md always claimed it; the bridge
+    /// used to read/write one anyway): a child page rendered against an old
+    /// gateway would otherwise restore rows the fixed read path no longer
+    /// serves, forever — the cursor covers the thread, so no sync removes them.
+    let mirrored = false
 
     /// The child's state as its parent's listing last reported it. Drives the
     /// polling loop's stop condition and the page's header label.
