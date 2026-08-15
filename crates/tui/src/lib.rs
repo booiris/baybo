@@ -1637,6 +1637,7 @@ async fn dispatch_user_message(ctx: &LoopCtx, text: String) {
             metadata: MessageMetadata::default(),
         },
         platform_msg_id: String::new(),
+        bot_id: String::new(),
     };
     if let Err(e) = ctx.input.submit(msg).await {
         warn!("failed to forward TUI input: {e}");

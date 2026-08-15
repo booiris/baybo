@@ -1504,6 +1504,15 @@ describe("applySyncReplace — the overlay keeps what the page cannot carry", ()
     rows = applySyncReplace(rows, [], owing); // the raced baseline, landing LAST
     expect(rows.map((r) => r.id)).toEqual(["pm-1", "u-live", "m12"]);
   });
+
+  // A confirmed send is stamped AND (briefly, under a call-site ordering slip)
+  // still owed — the two kept sets must stay exclusive or the row renders
+  // twice under one React key.
+  it("emits a row exactly once when it is both owed and above the ceiling", () => {
+    const prev: Row[] = [{ id: "pm-1", role: "user", ordinal: 5, content: "hi" }];
+    const page: Row[] = [{ id: "m4", role: "assistant", ordinal: 4, content: "a" }];
+    expect(applySyncReplace(prev, page, owed("pm-1")).map((r) => r.id)).toEqual(["m4", "pm-1"]);
+  });
 });
 
 describe("clearAwaitingApproval", () => {

@@ -91,6 +91,13 @@ pub struct GatewayDeps {
     /// Bearer token for the admin TCP listener. Stored in the vault as
     /// `gateway.admin_token`.
     pub admin_token: String,
+    /// The ONE inbound-message dedup, shared by every channel listener
+    /// (direct, relay content, loopback) AND the router. One instance,
+    /// not per-listener: an outbox retry that lands on a different leg
+    /// than the original (direct -> relay failover) must still dedup,
+    /// and the router's gate-rejection un-record must reach the same
+    /// window the record went into.
+    pub inbound_dedup: Arc<baybo_channels::InboundDedup>,
     /// Shared ring buffer of recent tracing events surfaced by
     /// `/v1/logs`. Installed as a `tracing::Layer` at process init.
     pub log_buffer: Arc<LogBuffer>,

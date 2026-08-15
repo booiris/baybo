@@ -162,6 +162,12 @@ pub struct ManagerGraph {
     /// [`build_managers`] so both the router wiring and the reloader
     /// hold the same `Arc`.
     pub rate_limit: Arc<baybo_agent::router::LiveRateLimit>,
+    /// The one inbound-message dedup window, shared by every gateway
+    /// channel listener and the router (which un-records a key when its
+    /// gates reject the message — a rejected send persists nothing, so
+    /// a burned key would black-hole every retry of the same
+    /// `platform_msg_id`). Created here so both sides hold the same Arc.
+    pub inbound_dedup: Arc<baybo_channels::InboundDedup>,
     /// Config hot-reload orchestrator. Handed to `GatewayDeps` so admin
     /// endpoints + the SIGHUP handler can trigger a reload; owns the
     /// pricing-refresh loop. See `docs/config-hot-reload.md`.
@@ -366,6 +372,10 @@ pub async fn build_managers(
         config.cost.rate_limit.max_requests,
         std::time::Duration::from_secs(config.cost.rate_limit.window_secs),
     );
+
+    // See `ManagerGraph::inbound_dedup` — one window for every listener
+    // and the router's gate-rejection un-record.
+    let inbound_dedup = Arc::new(baybo_channels::InboundDedup::new());
 
     // Build one client per `config.llm` entry (default failure aborts
     // boot; non-default failures drop with a warn). Shared with the
@@ -765,6 +775,7 @@ pub async fn build_managers(
         llm_pool,
         cost_manager,
         rate_limit,
+        inbound_dedup,
         config_reloader,
         workspace,
         channels_registry,
@@ -1064,6 +1075,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         cron_trigger_rx,
         actor_parent_token: graph.actor_parent_token.clone(),
         rate_limit: Arc::clone(&graph.rate_limit),
+        inbound_dedup: Arc::clone(&graph.inbound_dedup),
     });
 
     RouterRunHandle {

@@ -1242,9 +1242,6 @@ export function applySyncReplace(
   if (page.length === 0 && prev.length > 0) return prev;
   const pageIds = new Set(page.map((r) => r.id));
   const openWork = prev.filter((r): r is WorkRow => r.role === "work" && r.active).slice(-1);
-  const keptSends = prev.filter(
-    (r) => r.role === "user" && unconfirmedSends.has(r.id) && !pageIds.has(r.id),
-  );
   // Rows the page PREDATES. Its newest ordinal is the instant the server
   // snapshotted it, and a durable row above that is one this page cannot be
   // speaking about — a live reply that landed while the request was in flight.
@@ -1259,6 +1256,18 @@ export function applySyncReplace(
     const ordinal = rowCoverageOrdinal(r);
     return ordinal !== null && ordinal > ceiling && !pageIds.has(r.id);
   });
+  const keptLiveIds = new Set(keptLive.map((r) => r.id));
+  // A row can hold BOTH a membership and a stamped above-ceiling ordinal only
+  // through a call-site ordering slip (the confirm handler retires before it
+  // stamps) — but keeping the two sets exclusive HERE makes a slip render as
+  // one bubble instead of two with duplicate keys.
+  const keptSends = prev.filter(
+    (r) =>
+      r.role === "user" &&
+      unconfirmedSends.has(r.id) &&
+      !pageIds.has(r.id) &&
+      !keptLiveIds.has(r.id),
+  );
   let rows = page;
   let carried = openWork;
   if (openWork.length > 0) {
@@ -3184,14 +3193,18 @@ export function Transcript({
   // `platform_msg_id`, so this stamp is the only thing that ever makes a send of
   // ours count as sync coverage (`rowCoverageOrdinal`).
   const markSent = useCallback((msgId: string, ordinal: number | null) => {
-    setMessages((rows) =>
-      rows.map((r) => {
+    setMessages((rows) => {
+      // Return the ORIGINAL array when nothing changed so React bails out of
+      // the re-render — `sendConfirmed` now calls this once per user row of
+      // every sync page, and the common case is a row already settled.
+      const next = rows.map((r) => {
         if (r.role !== "user" || r.id !== msgId) return r;
-        const next = ordinal ?? r.ordinal;
-        if (r.sendState === undefined && next === r.ordinal) return r;
-        return { ...r, sendState: undefined, ordinal: next };
-      }),
-    );
+        const stamped = ordinal ?? r.ordinal;
+        if (r.sendState === undefined && stamped === r.ordinal) return r;
+        return { ...r, sendState: undefined, ordinal: stamped };
+      });
+      return next.every((r, i) => r === rows[i]) ? rows : next;
+    });
   }, []);
 
   // Native's send Task errored — flip the still-sending bubble to the failed
@@ -4253,6 +4266,7 @@ export function Transcript({
     handleFrame,
     handleUserSent,
     markFailed,
+    markSent,
     handleConnEpoch,
     handleBottomInset,
     jumpToLatest,
@@ -4266,6 +4280,7 @@ export function Transcript({
     handleFrame,
     handleUserSent,
     markFailed,
+    markSent,
     handleConnEpoch,
     handleBottomInset,
     jumpToLatest,
@@ -4282,11 +4297,17 @@ export function Transcript({
         connEpoch: (epoch) => handlersRef.current.handleConnEpoch(epoch),
         userSent: (payload) => handlersRef.current.handleUserSent(payload),
         sendFailed: (msgId) => handlersRef.current.markFailed(msgId),
-        // Bookkeeping only — no re-render. The bubble already looks settled;
-        // what changes is that a REPLACE may now drop it in favour of the page's
-        // own copy.
-        sendConfirmed: (msgId) => {
+        // Retire the membership AND stamp the durable row's ordinal — the one
+        // mark nothing else can give this bubble: the echo never carries an
+        // ordinal, and the proof native acted on is often a point lookup that
+        // ships no page. Without the stamp, retiring the id leaves the row with
+        // NO keep predicate, and the next REPLACE whose page lacks it deletes
+        // the very bubble this call just proved durable. `markSent` files it
+        // under the ceiling rule (and clears any lingering send chrome —
+        // durability subsumes the echo).
+        sendConfirmed: (msgId, ordinal) => {
           unconfirmedSends.current.delete(msgId);
+          if (ordinal !== null) handlersRef.current.markSent(msgId, ordinal);
         },
         bottomInset: (px) => handlersRef.current.handleBottomInset(px),
         jumpToLatest: () => handlersRef.current.jumpToLatest(),

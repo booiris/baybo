@@ -753,6 +753,7 @@ async fn build_inbound_message(
             metadata: MessageMetadata::default(),
         },
         platform_msg_id: wire_msg.platform_msg_id,
+        bot_id: wire_msg.bot_id,
     })
 }
 
@@ -855,7 +856,7 @@ async fn resolve_inbound_session(
                 );
                 return None;
             }
-            if !enforce_pairing(
+            match enforce_pairing(
                 state,
                 sidecar,
                 channel_type,
@@ -864,7 +865,21 @@ async fn resolve_inbound_session(
             )
             .await
             {
-                return None;
+                PairingGate::Proceed => {}
+                // Answered: the pairing prompt went back to the user, so the
+                // key stays burned — a sidecar replay would only re-prompt.
+                PairingGate::Refused => return None,
+                // Transient: nothing answered, nothing persisted. Give the key
+                // back or the sidecar's long-poll replay of this message is
+                // swallowed forever (same rule as the router's gate bails).
+                PairingGate::Errored => {
+                    state.inbound_dedup.remove(
+                        channel_type,
+                        &wire_msg.bot_id,
+                        &wire_msg.platform_msg_id,
+                    );
+                    return None;
+                }
             }
             match super::slash::try_handle(
                 &state.session_resolver,
@@ -878,6 +893,8 @@ async fn resolve_inbound_session(
                     if let Err(e) = sidecar.send_frame(Frame::Message(reply)).await {
                         tracing::warn!(error = %e, "send slash reply failed");
                     }
+                    // Answered — the key stays burned deliberately, so a
+                    // replay doesn't re-run the command.
                     return None;
                 }
                 super::slash::SlashOutcome::PassThrough => {}
@@ -895,6 +912,13 @@ async fn resolve_inbound_session(
                         user_id = %wire_msg.user_id,
                         "resolve session id for inbound message failed; dropping",
                     );
+                    // Transient store failure: nothing persisted, so the key
+                    // must not stay burned (see the pairing Errored arm).
+                    state.inbound_dedup.remove(
+                        channel_type,
+                        &wire_msg.bot_id,
+                        &wire_msg.platform_msg_id,
+                    );
                     None
                 }
             }
@@ -902,21 +926,29 @@ async fn resolve_inbound_session(
     }
 }
 
-/// Pairing gate. Returns `true` if the inbound can proceed, `false`
-/// if it was dropped (refused or errored). On refusal the pairing
-/// code is posted back as a `Frame::Notice` so the sidecar surfaces
-/// it through its existing notice routing.
+/// Pairing gate verdict. The split between the two drop arms is what the
+/// caller's dedup handling keys on: `Refused` was ANSWERED (the pairing code
+/// went back as a `Frame::Notice`), `Errored` answered nothing.
+enum PairingGate {
+    Proceed,
+    Refused,
+    Errored,
+}
+
+/// Pairing gate. On refusal the pairing code is posted back as a
+/// `Frame::Notice` so the sidecar surfaces it through its existing notice
+/// routing.
 async fn enforce_pairing(
     state: &WsChannelState,
     sidecar: &Sidecar,
     channel_type: &ChannelType,
     bot_id: &str,
     user_id: &str,
-) -> bool {
+) -> PairingGate {
     use baybo_pairing::CheckOutcome;
 
     match state.pairing.check(channel_type, bot_id, user_id).await {
-        Ok(CheckOutcome::Approved) => true,
+        Ok(CheckOutcome::Approved) => PairingGate::Proceed,
         Ok(CheckOutcome::Pending { code }) => {
             tracing::warn!(
                 %channel_type,
@@ -941,7 +973,7 @@ async fn enforce_pairing(
             if let Err(e) = sidecar.send_frame(notice).await {
                 tracing::debug!(error = %e, "send pairing notice failed");
             }
-            false
+            PairingGate::Refused
         }
         Err(e) => {
             tracing::error!(
@@ -951,7 +983,7 @@ async fn enforce_pairing(
                 user_id_hash = %super::short_hash(user_id),
                 "pairing check failed; dropping message",
             );
-            false
+            PairingGate::Errored
         }
     }
 }

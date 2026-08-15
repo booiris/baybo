@@ -24,7 +24,6 @@ pub(crate) mod blobs;
 pub mod boot;
 pub mod bot_reconciler;
 pub mod control;
-pub(crate) mod dedup;
 pub(crate) mod device_content;
 pub(crate) mod device_pair;
 pub(crate) mod handshake;
@@ -44,7 +43,6 @@ pub(crate) mod work_steps;
 
 pub use bot_reconciler::ChannelBotReconciler;
 pub use control::{ChannelControlError, ChannelControlRegistry};
-pub use dedup::InboundDedup;
 pub use history::TuiHistoryStore;
 pub use route::routes;
 pub use session_resolver::ChannelSessionResolver;

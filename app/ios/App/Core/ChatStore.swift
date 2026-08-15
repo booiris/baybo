@@ -50,7 +50,14 @@ protocol TranscriptSurface: AnyObject {
     /// point lookup that never touches a frame, and even the sync-page proof is
     /// unreachable for an ordinary send, whose ordinal the turn's reply has
     /// already carried the cursor past.
-    func sendConfirmed(_ msgId: String)
+    ///
+    /// `ordinal` is the durable row's, when the proof carried one (a sync-page
+    /// row or the point lookup — both do). Retiring the id alone would leave
+    /// the row with NO keep predicate: the echo never stamps an ordinal, so the
+    /// next REPLACE whose page lacks the row (the point-lookup release ships no
+    /// page at all) would delete the very bubble the release just proved
+    /// durable. The stamp files it under the ceiling rule instead.
+    func sendConfirmed(_ msgId: String, ordinal: Int64?)
     func rebuildIfShowing(_ sessionId: String)
 }
 
@@ -331,6 +338,12 @@ final class ChatStore: ObservableObject, TranscriptTarget {
     private var sendRecoveryTask: Task<Void, Never>?
     private weak var bridge: TranscriptBridge?
     private var bufferedFrames: [String] = []
+    /// Durability releases that arrived while no bridge was attached — the
+    /// transcript half of `releaseDurable`, owed to the next mount edge. The
+    /// outbox half already ran, so nothing re-seeds these ids; without the
+    /// queue the live tree a same-session re-entry reuses would keep their
+    /// membership (and miss their ordinal stamp) forever.
+    private var pendingSendConfirms: [(platformMsgId: String, ordinal: Int64?)] = []
     /// Set when the offscreen buffer overflowed and was dropped: the next
     /// `attachBridge` asks the webview to run its sync loop (from its own
     /// durable cursor) rather than flushing a hole-punched stream. Frames
@@ -674,6 +687,14 @@ final class ChatStore: ObservableObject, TranscriptTarget {
         chatOpen = true
         self.bridge = bridge
         defer { media.attach(bridge) }
+        // Before the frame flush / sync branch: both are idempotent against a
+        // retired send (the replay skips ids the outbox no longer owes). Only
+        // onto a READY page — earlier, the calls would park in the bridge's
+        // `pending`, which the rebuild/crash reloads destroy; the not-ready
+        // case flushes from the bridge's `ready` handler instead.
+        if bridge.ready {
+            flushPendingSendConfirms(to: bridge)
+        }
         if needsSyncOnAttach {
             needsSyncOnAttach = false
             bufferedFrames.removeAll()
@@ -1300,7 +1321,8 @@ final class ChatStore: ObservableObject, TranscriptTarget {
         let rows = (frame["rows"] as? [[String: Any]]) ?? []
         for row in rows {
             if let pmid = row["platform_msg_id"] as? String, !pmid.isEmpty {
-                releaseDurable(platformMsgId: pmid)
+                releaseDurable(
+                    platformMsgId: pmid, ordinal: (row["ordinal"] as? NSNumber)?.int64Value)
             }
         }
         if (frame["rebased"] as? Bool) == true {
@@ -1316,9 +1338,43 @@ final class ChatStore: ObservableObject, TranscriptTarget {
     /// retires a send, precisely so a future release path cannot take the outbox
     /// half and forget the transcript half, stranding a bubble that a narrow
     /// page then welds below the newest answer.
-    private func releaseDurable(platformMsgId: String) {
+    ///
+    /// "Together" includes an offscreen release: an optional-chained
+    /// `bridge?.sendConfirmed` would retire the outbox half and silently drop
+    /// the transcript half whenever the chat is closed — and a same-session
+    /// re-entry reuses the live React tree, so the stranded membership (and the
+    /// never-stamped ordinal) would survive right into the next REPLACE. Queue
+    /// it instead; the next mount edge flushes. Gated on `ready`, not on the
+    /// bridge alone: a call before the page's `ready` parks in the bridge's own
+    /// `pending`, which the rebuild/crash reload paths destroy — the store
+    /// queue is the one place a confirm survives every reload.
+    ///
+    /// Accepted residual: the queue is memory-only, so an LRU eviction or a
+    /// process death between the outbox half and the next mount edge still
+    /// loses the transcript half. That window is a fraction of the one this
+    /// closes (every offscreen release), and it self-heals on the next sync
+    /// page carrying the row.
+    private func releaseDurable(platformMsgId: String, ordinal: Int64?) {
         outbox.confirmDurable(platformMsgId: platformMsgId)
-        bridge?.sendConfirmed(platformMsgId)
+        if let bridge, bridge.ready {
+            bridge.sendConfirmed(platformMsgId, ordinal: ordinal)
+        } else {
+            pendingSendConfirms.append((platformMsgId: platformMsgId, ordinal: ordinal))
+        }
+    }
+
+    /// Deliver (and drain) the queued transcript halves of offscreen releases.
+    /// Called from both mount edges — `attachBridge` for a retarget onto a
+    /// standing page, the bridge's `ready` for a fresh document — and from
+    /// tests, which is why it takes the surface protocol rather than reaching
+    /// for `self.bridge`.
+    func flushPendingSendConfirms(to transcript: any TranscriptSurface) {
+        guard !pendingSendConfirms.isEmpty else { return }
+        let confirms = pendingSendConfirms
+        pendingSendConfirms.removeAll()
+        for confirm in confirms {
+            transcript.sendConfirmed(confirm.platformMsgId, ordinal: confirm.ordinal)
+        }
     }
 
     /// After a rebased sync hid the floor: probe the key's durability directly.
@@ -1330,7 +1386,7 @@ final class ChatStore: ObservableObject, TranscriptTarget {
                 let lookup = try await client.chatLookupMessage(
                     sessionId: sessionId, platformMsgId: platformMsgId)
                 if lookup.found {
-                    releaseDurable(platformMsgId: platformMsgId)
+                    releaseDurable(platformMsgId: platformMsgId, ordinal: lookup.ordinal)
                 } else {
                     outbox.resumeSending(platformMsgId: platformMsgId)
                     startOutboxTimerIfNeeded()

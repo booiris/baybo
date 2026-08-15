@@ -11,6 +11,7 @@ final class DeckHost {
 
     let bridge: DeckBridge
     let webView: WKWebView
+    private let navigationPolicy = DeckNavigationPolicy()
 
     init(store: DeckStore) {
         let bridge = DeckBridge()
@@ -24,6 +25,8 @@ final class DeckHost {
             forURLScheme: TranscriptSchemeHandler.scheme)
 
         let webView = WKWebView(frame: .zero, configuration: config)
+        navigationPolicy.bridge = bridge
+        webView.navigationDelegate = navigationPolicy
         webView.isOpaque = false
         webView.backgroundColor = .white
         webView.scrollView.backgroundColor = .white
@@ -45,6 +48,18 @@ final class DeckHost {
         webView.configuration.userContentController
             .removeScriptMessageHandler(forName: DeckBridge.messageHandlerName)
         webView.removeFromSuperview()
+    }
+}
+
+/// The deck's whole navigation-delegate reason to exist: a visible-time
+/// WebContent death is the host's to recover (WebKit auto-reloads only
+/// offscreen views) — see `DeckBridge.contentProcessDied`.
+@MainActor
+private final class DeckNavigationPolicy: NSObject, WKNavigationDelegate {
+    weak var bridge: DeckBridge?
+
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        bridge?.contentProcessDied()
     }
 }
 

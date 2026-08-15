@@ -237,6 +237,7 @@ impl ActorSubagentSpawner {
                 metadata: MessageMetadata::default(),
             },
             platform_msg_id: String::new(),
+            bot_id: String::new(),
         };
         let child_session_id = child_session.id.clone();
         // Tier resolution: `model_tier` lookup, falling through to the
@@ -1189,9 +1190,10 @@ async fn run_external_agent(
         &session_manager,
         &child_session_id,
         // The task is the parent agent's instruction to the subagent, not a
-        // human channel input — agent-context, so it never renders as a user
-        // bubble in the child session's transcript.
-        ChatMessage::agent_context(vec![ContentBlock::Text(request.task.clone())]),
+        // human channel input — but it IS the child's opening errand, and the
+        // one agent-injected row its transcript should render (SubagentSeed,
+        // same as the baybo-backend path's `append_spawned_prompt`).
+        ChatMessage::subagent_seed(vec![ContentBlock::Text(request.task.clone())]),
     )
     .await;
 

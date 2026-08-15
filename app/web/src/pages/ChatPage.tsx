@@ -4002,7 +4002,10 @@ export function routeInboundFrame(
             ...prev,
             [sid]: {
               ...view,
-              transcript: finalizeMessage(view.transcript, role, frame.content, hasAttachments, frame.attachments),
+              transcript: finalizeMessage(
+                view.transcript, role, frame.content, hasAttachments, frame.attachments,
+                clientMsgId,
+              ),
             },
           };
         });
@@ -4837,12 +4840,19 @@ export function applyTurnState(
   return [...prev, newWorkRow(startedAt, prev.length)];
 }
 
-function finalizeMessage(
+export function finalizeMessage(
   prev: TranscriptRow[],
   role: 'user' | 'assistant',
   content: string,
   hasAttachments: boolean,
   attachments: WireAttachment[] = [],
+  // The echo fall-through's idempotency key. Without it the appended row is
+  // invisible to every protection and reconciliation that keys on
+  // `clientMsgId`: `applySyncReplace`'s kept set cannot overlay it, a re-echo
+  // appends a duplicate instead of matching in place, `applySyncMerge` cannot
+  // retire it against the durable row, and `confirmDurable` cannot clear its
+  // flags. Only the user-echo path has one to pass.
+  clientMsgId?: string,
 ): TranscriptRow[] {
   const details = attachments.length > 0 ? attachments : undefined;
   const last = prev[prev.length - 1];
@@ -4867,6 +4877,7 @@ function finalizeMessage(
       key: `msg-${prev.length}-${Date.now()}`,
       role,
       text: content,
+      clientMsgId,
       hasAttachments: hasAttachments || undefined,
       attachments: details,
       createdAt: new Date().toISOString(),

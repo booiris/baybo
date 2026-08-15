@@ -1284,6 +1284,7 @@ mod tests {
             let cron_store = Arc::new(InMemoryCronStore::new());
             let (trigger_tx, cron_trigger_rx) = mpsc::channel(16);
             let router = Router::from_config(RouterConfig {
+                inbound_dedup: std::sync::Arc::new(baybo_channels::InboundDedup::new()),
                 agent_profiles: Arc::clone(&agent_profiles)
                     as Arc<dyn baybo_store::AgentProfileStore>,
                 workspace: Arc::new(baybo_workspace::WorkspacePaths::new(

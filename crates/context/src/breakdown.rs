@@ -107,7 +107,11 @@ fn classify(message: &ChatMessage) -> ContextPart {
         MessageSource::SkillListing | MessageSource::SkillsUpdate => ContextPart::Skills,
         MessageSource::SystemPromptUpdate => ContextPart::SystemPrompt,
         MessageSource::Cron | MessageSource::CronNotification => ContextPart::Cron,
-        MessageSource::User | MessageSource::UserInterjection => ContextPart::User,
+        // The child's errand plays the user-turn part in its session, and
+        // that is what it should be billed/compressed as.
+        MessageSource::User | MessageSource::UserInterjection | MessageSource::SubagentSeed => {
+            ContextPart::User
+        }
         MessageSource::Agent => match message.role {
             Role::System => ContextPart::SystemPrompt,
             Role::Assistant => ContextPart::Assistant,

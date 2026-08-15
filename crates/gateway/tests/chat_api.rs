@@ -2708,12 +2708,12 @@ async fn a_subagent_child_is_listed_and_readable_under_an_owner_root() {
     // No turn rows yet — spawned, nothing opened.
     assert_eq!(items[0]["status"], "pending");
 
-    // The child's own transcript reads back. It does NOT open on the errand:
-    // the agent-authored spawn prompt is not a user bubble on any surface, for
-    // the reason the owner chat has always dropped it — `agent_context` is the
-    // agent's own channel, shared with skill reminders and compaction
-    // summaries, and no signal in the row separates them. The errand reaches
-    // the reader through the row that got them here and the page's header.
+    // The child's own transcript reads back. A HISTORICAL child (seeded as
+    // `agent_context`, the shape every spawn wrote before `SubagentSeed`
+    // existed) does NOT open on the errand: that source is the agent's own
+    // channel, shared with skill reminders and compaction summaries, and no
+    // signal in the row separates them. New spawns carry `SubagentSeed` and DO
+    // render — the sibling test below pins that split.
     let detail = get(
         &router,
         &format!("/v1/chat/subagents/{}", child.id),
@@ -2737,6 +2737,61 @@ async fn a_subagent_child_is_listed_and_readable_under_an_owner_root() {
         StatusCode::NOT_FOUND,
     )
     .await;
+}
+
+/// The errand IS the child's opening user bubble — when provenance says so.
+/// A new spawn writes `MessageSource::SubagentSeed` (both backends), and the
+/// read path renders exactly that row as the first user message, while the
+/// skill reminder sharing the same framed `Role::User` shape stays hidden.
+/// This is the split content-sniffing could never make (`c4f2ef10`).
+#[tokio::test]
+async fn a_new_spawns_errand_renders_and_the_skill_reminder_does_not() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let router = build_router(build_admin_state(&tg));
+
+    let root = seed_root(&tg, ChannelType::owner(), baybo_model::TriggerSource::User).await;
+    let child = seed_child(&tg, &root, "old-shape errand").await;
+    tg.deps
+        .session_manager
+        .append_session_message(
+            &child.id,
+            &ChatMessage::skill_listing(vec![ContentBlock::Text(
+                "<system-reminder>\nThe following skills are available".into(),
+            )]),
+        )
+        .await
+        .unwrap();
+    tg.deps
+        .session_manager
+        .append_session_message(
+            &child.id,
+            &ChatMessage::subagent_seed(vec![ContentBlock::Text(
+                "search the sync protocol".into(),
+            )]),
+        )
+        .await
+        .unwrap();
+
+    let detail = get(
+        &router,
+        &format!("/v1/chat/subagents/{}", child.id),
+        StatusCode::OK,
+    )
+    .await;
+    let transcript = detail["transcript"].as_array().expect("transcript");
+    let user_rows: Vec<_> = transcript.iter().filter(|r| r["role"] == "user").collect();
+    assert_eq!(
+        user_rows.len(),
+        1,
+        "exactly the seed renders — not the agent_context errand, not the reminder: {detail:?}"
+    );
+    assert_eq!(user_rows[0]["text"], "search the sync protocol");
+    assert!(
+        transcript
+            .iter()
+            .all(|r| !r["text"].as_str().unwrap_or("").contains("system-reminder")),
+        "the skill reminder must stay hidden: {detail:?}"
+    );
 }
 
 #[tokio::test]

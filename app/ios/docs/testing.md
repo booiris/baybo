@@ -215,6 +215,16 @@ without touching `app/ios` at all.
   (thinking → tool → streamed markdown → finalize) through the real bridge —
   screenshot the sim at ~3s/~6s/~12s.
 
+- **The webview crash reload needs no flag at all** — a simulator's WebContent
+  is a host macOS process. Launch a throwaway sim with
+  `-baybo-open-chat -baybo-demo-frames`, find the app's
+  `com.apple.WebKit.WebContent` instance (`pgrep -fl WebContent` filtered to
+  the booted runtime path), `kill -9` it, and verify with `log stream`
+  ("transcript web content process died; reloading" then "transcript bridge
+  ready") plus `simctl io booted screenshot` before/after — sampled at the
+  PIXEL level, because existence/hittability assertions are blind to paint.
+  Kill it three times inside 30s to watch the crash-loop budget give up.
+
 - **`-baybo-open-chat -baybo-demo-attachments`** pushes a short agent turn
   carrying three FILE attachments (long name / nameless blob / sub-KB) plus an
   audio card and a video tile, plus a user send carrying one file, so the

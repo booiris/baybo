@@ -528,6 +528,18 @@ back unchanged in the `SessionEvent::UserEcho` fan-out so the
 originating tab can reconcile its optimistic placeholder against the
 authoritative server row instead of double-rendering. Empty when the
 carrier didn't set one (older bundles, TUI, fixtures).
+`IncomingMessage.bot_id` rides beside it (empty on subscribed
+channels) because the two plus the channel type form the
+`InboundDedup` key — which lives in THIS crate (`src/dedup.rs`), as
+one process-wide instance shared by every gateway listener and the
+router: the gateway records the key before echoing, and the router
+UN-records it when its gates reject the message (a rejected send
+persists nothing, so a burned key would black-hole every retry of the
+same id — the client outbox retries under the same id by design). The
+Multiplexed inbound arm applies the same rule to its own transient
+drops (pairing-check error, session-resolve error); ANSWERED drops — a
+pairing prompt, a handled slash command — keep the key burned
+deliberately.
 
 ## Constraints
 

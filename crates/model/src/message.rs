@@ -299,10 +299,21 @@ pub enum MessageSource {
     /// `Role::User` row for the same reason [`MessageSource::SystemPromptUpdate`]
     /// does.
     SkillsUpdate,
-    /// Any other agent-originated row: the skill detail payload, a
-    /// spawned/subagent task prompt, the subagent-finished notification, summary
-    /// instructions, the system prompt, assistant output, tool results. Hidden
-    /// from chat surfaces.
+    /// The errand a parent agent handed a spawned subagent — the child
+    /// session's opening prompt. Agent-authored (so NOT [`Self::from_user`]:
+    /// no echo, no outbox, no idempotency key), but tracked distinctly because
+    /// it is the one agent-injected row a chat surface SHOULD render: the
+    /// child's transcript opens with the instruction it was given, exactly as
+    /// a user turn opens a root session. Everything else that shares the
+    /// framed `Role::User` shape (skill reminders, compaction summaries, the
+    /// detail payloads) stays hidden — provenance is the only thing that
+    /// separates the errand from that machinery, which is why guessing by
+    /// content was ripped out (`c4f2ef10`) and rows written before this
+    /// variant existed stay hidden as plain [`Self::Agent`].
+    SubagentSeed,
+    /// Any other agent-originated row: the skill detail payload, the
+    /// subagent-finished notification, summary instructions, the system
+    /// prompt, assistant output, tool results. Hidden from chat surfaces.
     Agent,
 }
 
@@ -319,6 +330,7 @@ impl MessageSource {
             MessageSource::SystemPromptUpdate => "system_prompt_update",
             MessageSource::SkillListing => "skill_listing",
             MessageSource::SkillsUpdate => "skills_update",
+            MessageSource::SubagentSeed => "subagent_seed",
             MessageSource::Agent => "agent",
         }
     }
@@ -337,6 +349,7 @@ impl std::str::FromStr for MessageSource {
             "system_prompt_update" => Ok(MessageSource::SystemPromptUpdate),
             "skill_listing" => Ok(MessageSource::SkillListing),
             "skills_update" => Ok(MessageSource::SkillsUpdate),
+            "subagent_seed" => Ok(MessageSource::SubagentSeed),
             "agent" => Ok(MessageSource::Agent),
             other => Err(format!("unknown message source: {other}")),
         }
@@ -473,6 +486,17 @@ impl ChatMessage {
             content,
             platform_msg_id: String::new(),
             source: MessageSource::SkillListing,
+        }
+    }
+
+    /// A spawned child session's opening errand — see
+    /// [`MessageSource::SubagentSeed`].
+    pub fn subagent_seed(content: Vec<ContentBlock>) -> Self {
+        Self {
+            role: Role::User,
+            content,
+            platform_msg_id: String::new(),
+            source: MessageSource::SubagentSeed,
         }
     }
 
@@ -795,6 +819,7 @@ mod tests {
                 | MessageSource::SystemPromptUpdate
                 | MessageSource::SkillListing
                 | MessageSource::SkillsUpdate
+                | MessageSource::SubagentSeed
                 | MessageSource::Agent => {}
             }
         }
@@ -807,6 +832,7 @@ mod tests {
             MessageSource::SystemPromptUpdate,
             MessageSource::SkillListing,
             MessageSource::SkillsUpdate,
+            MessageSource::SubagentSeed,
             MessageSource::Agent,
         ]
     }
