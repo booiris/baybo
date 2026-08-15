@@ -1079,6 +1079,7 @@ async fn session_activity_pulse_reaches_unsubscribed_tab() {
             metadata: baybo_model::MessageMetadata::default(),
         },
         platform_msg_id: String::new(),
+        bot_id: String::new(),
     };
     // No throttle wait needed: `SessionPulse` keys `last_sent` on
     // `(SessionId, ActivityKind)`, so this User pulse sits in a different

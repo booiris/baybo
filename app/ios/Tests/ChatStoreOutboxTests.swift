@@ -145,6 +145,50 @@ struct ChatStoreOutboxTests {
         #expect(client.transmissions.isEmpty, "a lookup is not a transmission")
     }
 
+    /// The transcript half of an OFFSCREEN release: with no ready bridge, the
+    /// confirm — durable ordinal included — parks in the store queue and the
+    /// next mount edge delivers it exactly once. The optional-chained bridge
+    /// call this replaces dropped it silently, stranding the webview's
+    /// REPLACE-overlay membership on a same-session re-entry.
+    @Test func anOffscreenReleaseQueuesTheConfirmForTheNextMountEdge() async {
+        enrol()
+        client.answerSync(with: syncPage())
+
+        store.requestSync(sinceOrdinal: nil, limit: 50)
+        #expect(await waitUntil { outbox.entries().isEmpty })
+
+        let surface = FakeTranscriptSurface()
+        store.flushPendingSendConfirms(to: surface)
+        #expect(
+            surface.confirmed == [
+                FakeTranscriptSurface.Confirmed(msgId: Self.msgId, ordinal: 42)
+            ])
+
+        // Drained: a second mount edge must not double-deliver.
+        store.flushPendingSendConfirms(to: surface)
+        #expect(surface.confirmed.count == 1)
+    }
+
+    /// The point-lookup release carries the looked-up ordinal. Without it the
+    /// released bubble has NO keep predicate — the echo never stamps one, and
+    /// this release ships no page — so the next REPLACE whose page lacks the
+    /// row would delete the very bubble the lookup just proved durable.
+    @Test func aPointLookupReleaseCarriesTheOrdinal() async {
+        enrol()
+        client.answerSync(with: rebasedEmptyPage())
+        client.answerLookup(platformMsgId: Self.msgId, found: true, ordinal: 7)
+
+        store.requestSync(sinceOrdinal: nil, limit: 50)
+        #expect(await waitUntil { outbox.entries().isEmpty })
+
+        let surface = FakeTranscriptSurface()
+        store.flushPendingSendConfirms(to: surface)
+        #expect(
+            surface.confirmed == [
+                FakeTranscriptSurface.Confirmed(msgId: Self.msgId, ordinal: 7)
+            ])
+    }
+
     /// The lookup proved the key absent: the retry machine resumes at once
     /// (`lastSentAt` zeroed) and the lookup consumed no transmission.
     @Test func aProvablyAbsentEntryResumesSending() async {

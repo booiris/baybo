@@ -2496,6 +2496,7 @@ fn user_input(harness: &AgentTestHarness, text: &str) -> AgentMessage {
             metadata: MessageMetadata::default(),
         },
         platform_msg_id: String::new(),
+        bot_id: String::new(),
     }))
 }
 

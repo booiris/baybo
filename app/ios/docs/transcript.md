@@ -146,6 +146,28 @@ Three things the hatch must NOT break, and how:
   prompts. Dropping one leaves a gate nobody can answer until it self-denies, so
   `resync` leaves the queue alone.
 
+### The crash reload (the hatch's involuntary twin)
+
+`webViewWebContentProcessDidTerminate` → `TranscriptBridge.contentProcessDied`
+runs the SAME document reload for a WebContent process that died under a
+**visible** webview — the one case WebKit does not auto-reload (an offscreen
+kill heals itself on re-attach). Without it, `ready` stays latched true and
+every `call()` silently no-ops against a blank page: bricked until a resync or
+an app restart. Two deliberate differences from `rebuildIfShowing`, both
+load-bearing:
+
+- **The mirror is NOT dropped and `discardPersist` stays false.** A late
+  `persist` from the dead process carries the freshest pre-crash state —
+  exactly what the mirror should hold and what the fresh `ready`'s init
+  restores. The resync hatch inverts this because *it* deleted the mirror
+  first.
+- **A crash-loop budget.** The kill is memory pressure and the reload rebuilds
+  the same footprint, so an uncapped handler would flicker forever while
+  hammering the gateway with mount-edge syncs. Three reloads per 30s window;
+  a real first paint (`shown`) re-arms it. Past the cap the transcript stays
+  blank until the user backs out or resyncs. (`DeckBridge.contentProcessDied`
+  is the deck webview's twin, budget included, re-armed on its `ready`.)
+
 The LEG is untouched — no unsubscribe, no redial. An in-flight turn keeps running
 and its frames keep arriving through the reload (they buffer in the bridge's
 `pending` and flush after the fresh `init`), so the rebuilt thread shows that

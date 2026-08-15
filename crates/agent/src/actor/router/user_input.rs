@@ -32,8 +32,18 @@ impl Router {
         let session_id = SessionId::from(incoming.message.session_id.as_str());
         let user_id = incoming.message.sender.id.clone();
         let channel = incoming.message.channel.clone();
+        let bot_id = incoming.bot_id.clone();
+        let platform_msg_id = incoming.platform_msg_id.clone();
         let result = self.route_incoming(incoming).await;
         if let Err(e) = &result {
+            // The channel layer recorded the dedup key BEFORE these gates ran
+            // (it must — the echo follows the record), and a rejected message
+            // persists nothing. Un-record it, or every retransmission of the
+            // same `platform_msg_id` is silently swallowed and the send is
+            // permanently unsendable — the client outbox retries under the
+            // same id by design. `/stop` never reaches here (handled, Ok).
+            self.inbound_dedup
+                .remove(&channel, &bot_id, &platform_msg_id);
             // A pre-actor rejection (rate limit, cost cap, sanitizer, store
             // error, route failure) otherwise sends nothing back: a
             // request/response client like `baybo prompt` then blocks for the
@@ -197,8 +207,36 @@ impl Router {
         let session_id = SessionId::from(first.message.session_id.as_str());
         let user_id = first.message.sender.id.clone();
         let channel = first.message.channel.clone();
+        let dedup_keys: Vec<(ChannelType, String, String)> = batch
+            .iter()
+            .map(|m| {
+                (
+                    m.message.channel.clone(),
+                    m.bot_id.clone(),
+                    m.platform_msg_id.clone(),
+                )
+            })
+            .collect();
         let result = self.route_incoming_batch(batch).await;
         if let Err(e) = &result {
+            // Same un-record as `handle_incoming`, for every row: a batch
+            // bail (size cap, rate limit, cost, store, route) rejected the
+            // whole group pre-persist. Two accepted imprecisions. (1) The
+            // slash-split route failure, where earlier rows may already have
+            // routed — `route_or_spawn` only fails while the supervisor is
+            // tearing down, and a re-admitted duplicate cannot run on a
+            // process that is exiting. (2) A sanitize-dropped row was already
+            // un-recorded in `route_incoming_batch`, and this second remove is
+            // NOT strictly idempotent: if a retry of that row re-recorded the
+            // key in the microseconds between drop and bail, this deletes the
+            // retry's live record, and a further duplicate could double-route.
+            // The client's retries run on 10s+ timers against a ms-scale
+            // window, and the row in question was security-rejected — the
+            // retry will be rejected again — so the compound race is accepted
+            // over threading a per-row drop set out of the routing path.
+            for (ch, bot, id) in &dedup_keys {
+                self.inbound_dedup.remove(ch, bot, id);
+            }
             let reply = OutgoingMessage {
                 session_id,
                 user_id,
@@ -270,6 +308,14 @@ impl Router {
                     session_id = %session_id,
                     error = %e,
                     "security gateway blocked a batched message; dropping it"
+                );
+                // Dropped with an Ok result — the batch choke point never
+                // sees this row, so its dedup key must be un-recorded here
+                // or it burns (see `handle_incoming`).
+                self.inbound_dedup.remove(
+                    &incoming.message.channel,
+                    &incoming.bot_id,
+                    &incoming.platform_msg_id,
                 );
                 continue;
             }
@@ -615,10 +661,210 @@ fn build_stop_notice(cancelled_turn: bool, background: &[(SessionId, InFlightJob
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use baybo_channels::{ChannelRegistry, InboundDedup, Message};
+    use baybo_cost::test_support::MemoryCostStore;
+    use baybo_cost::{CostManager, SpendingLimits};
+    use baybo_cron::CronStore;
+    use baybo_cron::test_support::InMemoryCronStore;
+    use baybo_model::User;
+    use baybo_security::test_support::MemorySecretStore;
+    use baybo_security::{EncryptionKey, LeakAction, LeakDetectionRule, LeakDetector, SecretVault};
+    use baybo_session::SessionManager;
+    use baybo_session::test_support::{MemorySessionFolderStore, MemorySessionStore};
+    use baybo_turn::TurnLifecycle;
+    use baybo_turn::test_support::MemoryTurnStore;
+    use chrono::Utc;
+    use parking_lot::Mutex;
+    use regex::Regex;
+    use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
+
+    use crate::actor::mailbox::{self, MailboxReceiver};
+    use crate::actor::router::{ActorSpawner, LiveRateLimit, RouterConfig};
+    use crate::actor::supervisor::AgentSupervisor;
+    use crate::security::SecurityGateway;
 
     fn text(s: &str) -> Vec<ContentBlock> {
         vec![ContentBlock::Text(s.to_string())]
+    }
+
+    fn incoming(platform_msg_id: &str) -> IncomingMessage {
+        IncomingMessage {
+            message: Message {
+                id: format!("id-{platform_msg_id}"),
+                session_id: SessionId::from("sess-1"),
+                channel: ChannelType::tui(),
+                sender: User {
+                    id: "u1".into(),
+                    name: None,
+                    channel: ChannelType::tui(),
+                },
+                content: text("hello"),
+                timestamp: Utc::now(),
+                reply_to: None,
+                metadata: MessageMetadata::default(),
+            },
+            platform_msg_id: platform_msg_id.to_string(),
+            bot_id: String::new(),
+        }
+    }
+
+    /// Router + shared dedup wired to memory stores and a fake actor spawner
+    /// (mailboxes kept alive so routing succeeds). `rate_limit_max` and the
+    /// leak `detector` are the two gates these tests trip.
+    struct RouterFixture {
+        router: Router,
+        dedup: Arc<InboundDedup>,
+        _mailboxes: Arc<Mutex<Vec<MailboxReceiver<AgentMessage>>>>,
+        _trigger_tx: mpsc::Sender<baybo_cron::CronTriggerEvent>,
+        _response_rx: mpsc::Receiver<AgentOutput>,
+    }
+
+    fn fixture(rate_limit_max: usize, detector: LeakDetector) -> RouterFixture {
+        let (response_tx, response_rx) = mpsc::channel(64);
+        let supervisor = AgentSupervisor::new(response_tx);
+        let sessions = Arc::new(SessionManager::new(
+            Arc::new(MemorySessionStore::new()),
+            Arc::new(MemorySessionFolderStore::new()),
+        ));
+        let mailboxes: Arc<Mutex<Vec<MailboxReceiver<AgentMessage>>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let mailboxes_for_closure = Arc::clone(&mailboxes);
+        let actor_spawner: ActorSpawner =
+            Arc::new(move |_session, _llm, _model, _effort, _tx, _token| {
+                let (sender, receiver) = mailbox::channel(16);
+                mailboxes_for_closure.lock().push(receiver);
+                sender
+            });
+        let key = EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec()).unwrap();
+        let vault = Arc::new(SecretVault::new(key, Arc::new(MemorySecretStore::new())));
+        let (trigger_tx, cron_trigger_rx) = mpsc::channel(16);
+        let dedup = Arc::new(InboundDedup::new());
+        let router = Router::from_config(RouterConfig {
+            session_manager: sessions,
+            supervisor,
+            channels: Arc::new(ChannelRegistry::new()),
+            security_gateway: Arc::new(SecurityGateway::new(Arc::new(detector), vault)),
+            cost_manager: CostManager::new(
+                Arc::new(MemoryCostStore::new()),
+                HashMap::new(),
+                SpendingLimits::default(),
+            ),
+            actor_spawner,
+            turn_lifecycle: Arc::new(TurnLifecycle::new(Arc::new(MemoryTurnStore::new()))),
+            cron_store: Arc::new(InMemoryCronStore::new()) as Arc<dyn CronStore>,
+            agent_profiles: Arc::new(baybo_store::test_support::MemoryAgentProfileStore::new()),
+            cron_trigger_rx,
+            actor_parent_token: CancellationToken::new(),
+            rate_limit: LiveRateLimit::new(rate_limit_max, Duration::from_secs(60)),
+            workspace: Arc::new(baybo_workspace::WorkspacePaths::new(
+                "/tmp/baybo-user-input-test",
+            )),
+            inbound_dedup: Arc::clone(&dedup),
+        });
+        RouterFixture {
+            router,
+            dedup,
+            _mailboxes: mailboxes,
+            _trigger_tx: trigger_tx,
+            _response_rx: response_rx,
+        }
+    }
+
+    /// The gate-rejection un-record, at the Router seam it lives on: the
+    /// channel layer records the dedup key BEFORE the gates run (the echo
+    /// follows the record), so a rejected send must give its key back — the
+    /// client outbox retries under the same `platform_msg_id` by design, and
+    /// a burned key makes the send permanently unsendable. The admitted
+    /// send's key must stay burned, or a retransmission double-runs a turn.
+    #[tokio::test]
+    async fn a_gate_rejected_send_releases_its_dedup_key() {
+        // One send per window: the second is the gate rejection under test.
+        let mut fx = fixture(1, LeakDetector::with_default_rules());
+        let ct = ChannelType::tui();
+
+        // The channel layer's half, simulated: record before routing.
+        assert!(fx.dedup.check_and_record(&ct, "", "msg-1"));
+        fx.router
+            .handle_incoming(incoming("msg-1"))
+            .await
+            .expect("first send is admitted and routed");
+
+        assert!(fx.dedup.check_and_record(&ct, "", "msg-2"));
+        let rejected = fx.router.handle_incoming(incoming("msg-2")).await;
+        assert!(
+            rejected.is_err(),
+            "second send trips the 1/window rate limit"
+        );
+
+        // The rejected key was given back; the routed one stays burned.
+        assert!(
+            fx.dedup.check_and_record(&ct, "", "msg-2"),
+            "a gate-rejected send's key must be re-admitted"
+        );
+        assert!(
+            !fx.dedup.check_and_record(&ct, "", "msg-1"),
+            "a routed send's key must stay recorded"
+        );
+    }
+
+    /// The batch choke point's un-record: a whole-group bail (here the rate
+    /// limit, checked once per row) must give EVERY row's key back.
+    #[tokio::test]
+    async fn a_gate_rejected_batch_releases_every_key() {
+        let mut fx = fixture(1, LeakDetector::with_default_rules());
+        let ct = ChannelType::tui();
+
+        assert!(fx.dedup.check_and_record(&ct, "", "msg-1"));
+        assert!(fx.dedup.check_and_record(&ct, "", "msg-2"));
+        let rejected = fx
+            .router
+            .handle_incoming_batch(vec![incoming("msg-1"), incoming("msg-2")])
+            .await;
+        assert!(
+            rejected.is_err(),
+            "a 2-row batch overruns the 1/window limit"
+        );
+
+        assert!(fx.dedup.check_and_record(&ct, "", "msg-1"));
+        assert!(fx.dedup.check_and_record(&ct, "", "msg-2"));
+    }
+
+    /// The per-row un-record inside the batch path: a security-dropped row is
+    /// discarded with an Ok result — the choke point never sees it — so its
+    /// key must be freed AT the drop, while the routed survivors stay burned.
+    #[tokio::test]
+    async fn a_security_dropped_batch_row_releases_only_its_own_key() {
+        let mut detector = LeakDetector::new();
+        detector.add_rule(LeakDetectionRule {
+            name: "block_test".into(),
+            pattern: Regex::new(r"TOP_SECRET_\w+").unwrap(),
+            action: LeakAction::Block,
+        });
+        let mut fx = fixture(100, detector);
+        let ct = ChannelType::tui();
+
+        let mut blocked = incoming("msg-blocked");
+        blocked.message.content = text("here is TOP_SECRET_DATA");
+
+        assert!(fx.dedup.check_and_record(&ct, "", "msg-blocked"));
+        assert!(fx.dedup.check_and_record(&ct, "", "msg-clean"));
+        fx.router
+            .handle_incoming_batch(vec![blocked, incoming("msg-clean")])
+            .await
+            .expect("the surviving row routes; the drop is per-row, not a bail");
+
+        assert!(
+            fx.dedup.check_and_record(&ct, "", "msg-blocked"),
+            "the dropped row's key must be freed"
+        );
+        assert!(
+            !fx.dedup.check_and_record(&ct, "", "msg-clean"),
+            "the routed row's key must stay recorded"
+        );
     }
 
     #[test]

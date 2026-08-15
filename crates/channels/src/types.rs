@@ -28,6 +28,13 @@ pub struct IncomingMessage {
     /// Empty when the inbound carrier didn't set one (older web
     /// bundles, TUI, fixtures).
     pub platform_msg_id: String,
+    /// The dedup key's third leg, carried so the router can UN-record
+    /// `(channel, bot_id, platform_msg_id)` when its gates reject the
+    /// message (nothing persisted => the key must not stay burned, or
+    /// every same-id retry is black-holed). Empty on subscribed
+    /// channels (web/iOS/TUI have no bot); a multiplexed sidecar's
+    /// upstream bot identity otherwise.
+    pub bot_id: String,
 }
 
 /// What a channel transport hands the router over the inbound intake

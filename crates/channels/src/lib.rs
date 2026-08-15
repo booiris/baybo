@@ -1,5 +1,6 @@
 mod channel;
 mod connection;
+mod dedup;
 mod error;
 mod kind;
 mod registry;
@@ -17,6 +18,7 @@ pub use wire;
 
 pub use channel::{ApprovalSurface, Channel, DispatchObserver, StampedEvent, SubscribedView};
 pub use connection::{Connection, ConnectionId, ConnectionSink, SendOutcome};
+pub use dedup::InboundDedup;
 pub use error::{ChannelError, ConnectionNotFoundError};
 pub use kind::ChannelKind;
 pub use registration::{Prompter, RegistrationResult};

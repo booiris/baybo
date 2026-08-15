@@ -525,6 +525,7 @@ fn build_incoming(session_id: &SessionId, prompt: &str) -> IncomingMessage {
             metadata: MessageMetadata::default(),
         },
         platform_msg_id: String::new(),
+        bot_id: String::new(),
     }
 }
 

@@ -237,6 +237,7 @@ impl ActorSubagentSpawner {
                 metadata: MessageMetadata::default(),
             },
             platform_msg_id: String::new(),
+            bot_id: String::new(),
         };
         let child_session_id = child_session.id.clone();
         // Tier resolution: `model_tier` lookup, falling through to the

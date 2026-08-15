@@ -44,6 +44,7 @@ protocol TranscriptTarget: AnyObject {
     // MARK: - The send half
 
     func replayUnconfirmedSends(to transcript: any TranscriptSurface)
+    func flushPendingSendConfirms(to transcript: any TranscriptSurface)
     func retrySend(msgId: String, text: String, attachments: [AttachmentRef])
     func markRead(ordinal: Int64)
     func setAgentRunning(_ running: Bool)
@@ -57,6 +58,7 @@ protocol TranscriptTarget: AnyObject {
 /// behaviour here belongs on the conforming type, where it can be seen.
 extension TranscriptTarget {
     func replayUnconfirmedSends(to transcript: any TranscriptSurface) {}
+    func flushPendingSendConfirms(to transcript: any TranscriptSurface) {}
     func retrySend(msgId: String, text: String, attachments: [AttachmentRef]) {}
     func markRead(ordinal: Int64) {}
     func setAgentRunning(_ running: Bool) {}

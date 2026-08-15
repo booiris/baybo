@@ -23,8 +23,11 @@ use parking_lot::Mutex;
 /// tuples retained. Tuned to absorb several seconds of bursty inbound
 /// across many bots without false positives. Per-process, not per-bot
 /// — channels with very chatty bots don't starve quieter peers because
-/// dedup keys are platform-scoped to each bot anyway.
-const DEFAULT_CAPACITY: usize = 4096;
+/// dedup keys are platform-scoped to each bot anyway. Doubled from 4096
+/// when the three per-listener instances merged into one process-wide
+/// window, so a bursty multiplexed bot can't evict a subscribed
+/// client's recent keys three times sooner than before.
+const DEFAULT_CAPACITY: usize = 8192;
 
 #[derive(Hash, Eq, PartialEq, Clone)]
 struct Key {
@@ -84,6 +87,32 @@ impl InboundDedup {
         }
         true
     }
+
+    /// Forget a recorded key so a retry can be admitted again. The router
+    /// calls this when a message it REJECTED (rate limit, cost cap,
+    /// sanitizer, route failure) will never persist: the record was made
+    /// before the gates ran, so leaving it would black-hole every
+    /// retransmission — and the client outbox retries under the same
+    /// `platform_msg_id` by design, so the send would be permanently
+    /// unsendable. Empty `msg_id` is a no-op, mirroring the
+    /// `check_and_record` opt-out. Removing from the FIFO too is
+    /// load-bearing: a set-only remove followed by a re-record would leave
+    /// a stale FIFO twin whose later eviction silently deletes the LIVE
+    /// set entry. `retain` is O(n), fine at gate-rejection rates.
+    pub fn remove(&self, channel_type: &ChannelType, bot_id: &str, msg_id: &str) {
+        if msg_id.is_empty() {
+            return;
+        }
+        let key = Key {
+            channel_type: channel_type.clone(),
+            bot_id: bot_id.to_owned(),
+            msg_id: msg_id.to_owned(),
+        };
+        let mut inner = self.inner.lock();
+        if inner.set.remove(&key) {
+            inner.fifo.retain(|k| k != &key);
+        }
+    }
 }
 
 impl Default for InboundDedup {
@@ -128,6 +157,41 @@ mod tests {
         let telegram = ChannelType::from("telegram");
         assert!(dedup.check_and_record(&weixin, "bot-1", "1"));
         assert!(dedup.check_and_record(&telegram, "bot-1", "1"));
+    }
+
+    #[test]
+    fn removed_key_is_admitted_again() {
+        let dedup = InboundDedup::new();
+        assert!(dedup.check_and_record(&ct(), "bot-1", "msg-A"));
+        assert!(!dedup.check_and_record(&ct(), "bot-1", "msg-A"));
+        dedup.remove(&ct(), "bot-1", "msg-A");
+        assert!(dedup.check_and_record(&ct(), "bot-1", "msg-A"));
+    }
+
+    #[test]
+    fn remove_is_scoped_and_empty_id_is_a_no_op() {
+        let dedup = InboundDedup::new();
+        assert!(dedup.check_and_record(&ct(), "bot-1", "msg-A"));
+        dedup.remove(&ct(), "bot-2", "msg-A"); // different bot — not ours
+        dedup.remove(&ct(), "bot-1", "msg-B"); // different id — not ours
+        dedup.remove(&ct(), "bot-1", ""); // opt-out shape
+        assert!(!dedup.check_and_record(&ct(), "bot-1", "msg-A"));
+    }
+
+    // The FIFO/set consistency `remove` must preserve: a set-only remove
+    // would leave a stale FIFO twin, and once the key is re-recorded that
+    // twin's eviction deletes the LIVE entry — re-admitting a duplicate.
+    #[test]
+    fn remove_then_rerecord_survives_eviction_pressure() {
+        let dedup = InboundDedup::with_capacity(3);
+        assert!(dedup.check_and_record(&ct(), "bot-1", "a"));
+        dedup.remove(&ct(), "bot-1", "a");
+        assert!(dedup.check_and_record(&ct(), "bot-1", "a"));
+        // Two more fills the window; the stale-twin bug would have "a"'s
+        // ghost evicted here, deleting the live entry.
+        assert!(dedup.check_and_record(&ct(), "bot-1", "b"));
+        assert!(dedup.check_and_record(&ct(), "bot-1", "c"));
+        assert!(!dedup.check_and_record(&ct(), "bot-1", "a"));
     }
 
     #[test]

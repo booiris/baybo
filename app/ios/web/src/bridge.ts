@@ -81,7 +81,7 @@ type BayboGlobal = {
   setConnEpoch(epoch: number): void;
   userSent(payload: UserSentPayload): void;
   sendFailed(msgId: string): void;
-  sendConfirmed(msgId: string): void;
+  sendConfirmed(msgId: string, ordinal: number | null): void;
   blobResult(payload: BlobResultPayload): void;
   fileState(payload: FileStatePayload): void;
   audioState(payload: AudioStatePayload): void;
@@ -571,8 +571,11 @@ export type TranscriptEvents = {
   sendFailed(msgId: string): void;
   /// The outbox released that send: the gateway has provably written it, so the
   /// transcript may stop overlaying its optimistic bubble across a REPLACE. The
-  /// return leg of `userSent` — nothing on this side can infer it.
-  sendConfirmed(msgId: string): void;
+  /// return leg of `userSent` — nothing on this side can infer it. `ordinal` is
+  /// the durable row's (the sync-page row or the point lookup carried it) so
+  /// the bubble gains the sync coverage its ordinal-less echo never gave it —
+  /// retiring the id alone would leave the row with no keep predicate at all.
+  sendConfirmed(msgId: string, ordinal: number | null): void;
   /// Native chrome covering the webview's bottom edge (composer + ridden
   /// keyboard), in CSS px. Streams per layout tick through keyboard
   /// animations.
@@ -597,7 +600,7 @@ type Buffered =
   | { kind: "epoch"; epoch: number }
   | { kind: "userSent"; payload: UserSentPayload }
   | { kind: "sendFailed"; msgId: string }
-  | { kind: "sendConfirmed"; msgId: string }
+  | { kind: "sendConfirmed"; msgId: string; ordinal: number | null }
   | { kind: "bottomInset"; px: number }
   | { kind: "jumpToLatest" }
   | { kind: "syncRequested" }
@@ -644,7 +647,7 @@ function deliver(e: TranscriptEvents, item: Buffered): void {
   else if (item.kind === "epoch") e.connEpoch(item.epoch);
   else if (item.kind === "userSent") e.userSent(item.payload);
   else if (item.kind === "sendFailed") e.sendFailed(item.msgId);
-  else if (item.kind === "sendConfirmed") e.sendConfirmed(item.msgId);
+  else if (item.kind === "sendConfirmed") e.sendConfirmed(item.msgId, item.ordinal);
   else if (item.kind === "bottomInset") e.bottomInset(item.px);
   else if (item.kind === "syncRequested") e.syncRequested();
   // Every kind needs its own branch ABOVE the terminal else: that else is a
@@ -720,8 +723,8 @@ window.baybo = {
   sendFailed(msgId) {
     dispatch({ kind: "sendFailed", msgId });
   },
-  sendConfirmed(msgId) {
-    dispatch({ kind: "sendConfirmed", msgId });
+  sendConfirmed(msgId, ordinal) {
+    dispatch({ kind: "sendConfirmed", msgId, ordinal: ordinal ?? null });
   },
   blobResult(payload) {
     settleBlob(payload);

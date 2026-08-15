@@ -116,3 +116,97 @@ describe("an echo-appended first send survives the raced baseline", () => {
     expect(rowIds()).toEqual(["m12", "pm-1"]);
   });
 });
+
+describe("a page-less release keeps the bubble it just proved durable", () => {
+  // The reconnect edge's point lookup releases the outbox WITHOUT any sync
+  // page delivering the durable row — the one retirement that used to strip
+  // the bubble of its membership while leaving it ordinal-less, i.e. with NO
+  // keep predicate at all. The ordinal now rides `sendConfirmed`, so the row
+  // gains sync coverage and the ceiling rule keeps it across a stale REPLACE
+  // served before the send persisted (an old conversation's reconnect baseline
+  // racing an in-flight send is the realistic shape).
+  it("stamps the confirmed ordinal, so a stale page that predates the send cannot delete it", async () => {
+    await mountFresh();
+
+    await pushFrame({
+      kind: "message",
+      role: "assistant",
+      ordinal: 4,
+      content: "an earlier answer",
+    });
+
+    await act(async () => {
+      window.baybo.userSent({ msgId: "pm-1", text: "a follow-up", attachments: [] });
+    });
+    await act(async () => {
+      window.baybo.sendConfirmed("pm-1", 5); // the point lookup: proof, no page
+    });
+
+    // The stale baseline: served before ordinal 5 persisted, so it carries
+    // only the old thread — and the membership is already retired.
+    await pushFrame({
+      kind: "sync_page",
+      since_ordinal: null,
+      rebased: false,
+      rows: [
+        {
+          id: "m4",
+          ordinal: 4,
+          kind: "message",
+          role: "assistant",
+          text: "an earlier answer",
+          created_at: "2026-08-15T00:00:00Z",
+        },
+      ],
+      next_cursor: 4,
+      oldest_ordinal: 4,
+      has_more_older: false,
+      compaction_points: [],
+    });
+
+    expect(rowIds()).toEqual(["m4", "pm-1"]);
+  });
+
+  // The deliberate contract for a proof that carried NO ordinal: membership
+  // retires, nothing is stamped, and the pre-ordinal behavior stands — a
+  // stale page lacking the row may drop it. Pinned so the null branch can't
+  // silently start stamping (or the non-null branch silently stop).
+  it("a null-ordinal confirm retires membership without stamping", async () => {
+    await mountFresh();
+
+    await pushFrame({
+      kind: "message",
+      role: "assistant",
+      ordinal: 4,
+      content: "an earlier answer",
+    });
+    await act(async () => {
+      window.baybo.userSent({ msgId: "pm-1", text: "a follow-up", attachments: [] });
+    });
+    await act(async () => {
+      window.baybo.sendConfirmed("pm-1", null);
+    });
+
+    await pushFrame({
+      kind: "sync_page",
+      since_ordinal: null,
+      rebased: false,
+      rows: [
+        {
+          id: "m4",
+          ordinal: 4,
+          kind: "message",
+          role: "assistant",
+          text: "an earlier answer",
+          created_at: "2026-08-15T00:00:00Z",
+        },
+      ],
+      next_cursor: 4,
+      oldest_ordinal: 4,
+      has_more_older: false,
+      compaction_points: [],
+    });
+
+    expect(rowIds()).toEqual(["m4"]);
+  });
+});

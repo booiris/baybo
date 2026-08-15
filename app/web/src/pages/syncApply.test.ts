@@ -5,6 +5,7 @@ import {
   applySyncReplace,
   applyTurnState,
   compactionDividerKeys,
+  finalizeMessage,
   joinKeptHead,
   pushToolStartedStep,
   rowsAboveFloor,
@@ -147,6 +148,27 @@ describe('applySyncReplace (baseline / rebase REPLACE + overlay)', () => {
       'just sent',
       'the reply',
     ]);
+  });
+});
+
+describe('finalizeMessage — the echo fall-through append', () => {
+  // The append arm used to mint a key and nothing else, so an echo-appended
+  // user row (this tab reloaded mid-send; a sibling tab sent) had no
+  // clientMsgId — invisible to the kept-set overlay, unmatchable by a
+  // re-echo, and unretirable by applySyncMerge's reconciliation.
+  it('carries the echo platform_msg_id as clientMsgId, and the overlay can then hold the row', () => {
+    const rows = finalizeMessage([], 'user', 'reloaded mid-send', false, [], 'client-uuid');
+    expect(rows[0].clientMsgId).toBe('client-uuid');
+
+    const page = [transcriptItemToRow(SID, msg(10, 'assistant', 'answer'))];
+    expect(
+      applySyncReplace(rows, page, new Set(['client-uuid']), null).map((r) => r.text),
+    ).toEqual(['answer', 'reloaded mid-send']);
+  });
+
+  it('a plain append without one stays clientMsgId-less (assistant rows never get one)', () => {
+    const rows = finalizeMessage([], 'assistant', 'an answer', false);
+    expect(rows[0].clientMsgId).toBeUndefined();
   });
 });
 

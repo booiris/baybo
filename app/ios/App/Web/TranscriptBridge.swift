@@ -16,7 +16,7 @@ final class TranscriptBridge: NSObject, ObservableObject {
 
     private weak var store: (any TranscriptTarget)?
     weak var webView: WKWebView?
-    private var ready = false
+    private(set) var ready = false
     private var pending: [String] = []
     /// Which conversation the mounted page is rendering. Held here rather than
     /// read off `store` because `store` is weak: the LRU can evict and
@@ -149,11 +149,59 @@ final class TranscriptBridge: NSObject, ObservableObject {
     /// the fresh `init`).
     func rebuildIfShowing(_ sessionId: String) {
         guard shownSessionId == sessionId else { return }
-        guard let webView, let url = TranscriptSchemeHandler.indexURL else { return }
+        // The mirror was just deleted; a late persist from the dying document
+        // would resurrect it.
         discardPersist = true
+        reloadDocument()
+    }
+
+    /// How many back-to-back deaths `contentProcessDied` will answer with a
+    /// reload before giving up. The kill is memory pressure, and the reload
+    /// rebuilds the same footprint — with no cap, a page that dies on every
+    /// load flickers forever while hammering the gateway with mount-edge
+    /// syncs. Past the cap the transcript stays blank until the user backs
+    /// out or resyncs; a successful first paint (`shown`) re-arms the budget.
+    private static let maxConsecutiveDeaths = 3
+    private static let deathWindowSeconds: TimeInterval = 30
+    private var consecutiveDeaths = 0
+    private var lastDeathAt = Date.distantPast
+
+    /// The WebContent process died under a VISIBLE webview — the one case
+    /// WebKit does NOT auto-reload (an offscreen kill heals itself on
+    /// re-attach: the reload's fresh `ready` re-inits and re-seeds). Without
+    /// this, `ready` stays latched true and every call() silently no-ops
+    /// against a blank page — the transcript is bricked until a resync or an
+    /// app restart. Same recovery as `rebuildIfShowing` minus the mirror drop:
+    /// the mirror is intact and IS what the fresh `ready`'s init restores
+    /// (which is also why `discardPersist` stays false here — a late persist
+    /// from the dead process carries the freshest pre-crash state, exactly
+    /// what the mirror should hold).
+    func contentProcessDied() {
+        let now = Date()
+        if now.timeIntervalSince(lastDeathAt) > Self.deathWindowSeconds {
+            consecutiveDeaths = 0
+        }
+        lastDeathAt = now
+        consecutiveDeaths += 1
+        guard consecutiveDeaths <= Self.maxConsecutiveDeaths else {
+            NSLog("baybo: transcript web content process died again; giving up on reloads")
+            return
+        }
+        NSLog("baybo: transcript web content process died; reloading")
+        reloadDocument()
+    }
+
+    /// The one reload body both hatches share, so a latch added to one reset
+    /// list cannot silently miss the other. What it deliberately does NOT
+    /// own is `discardPersist` — whether a late persist from the dying
+    /// document is welcome is the one load-bearing difference between the
+    /// callers, and it must stay visible at each call site.
+    private func reloadDocument() {
+        guard let webView, let url = TranscriptSchemeHandler.indexURL else { return }
         ready = false
         // Buffered calls target a document about to be destroyed — and one of
-        // them may be an `init` carrying the mirror we just threw away.
+        // them may be an `init` carrying state the new document must rebuild
+        // for itself.
         pending.removeAll()
         htmlPreviewMaximized = false
         webView.load(URLRequest(url: url))
@@ -211,9 +259,11 @@ final class TranscriptBridge: NSObject, ObservableObject {
     }
 
     /// The outbox released that send — it is durable, so the transcript may stop
-    /// overlaying its optimistic bubble across a REPLACE.
-    func sendConfirmed(_ msgId: String) {
-        call("sendConfirmed", jsonLiteral(msgId))
+    /// overlaying its optimistic bubble across a REPLACE. The durable row's
+    /// ordinal rides along (when the proof carried one) so the bubble gains
+    /// sync coverage the echo never gave it.
+    func sendConfirmed(_ msgId: String, ordinal: Int64?) {
+        call("sendConfirmed", "\(jsonLiteral(msgId)), \(ordinal.map(String.init) ?? "null")")
     }
 
     func blobResult(id: Int, dataBase64: String?, mimeType: String, error: String?) {
@@ -510,6 +560,11 @@ extension TranscriptBridge: WKScriptMessageHandler {
             jumpVisible = false
             resetOutline()
             contentVisible = store?.listed == false
+            // Queued durability confirms first, then the outbox replay: the
+            // confirm retires ids the replay must not re-seed, and neither may
+            // sit in `pending` where a rebuild/crash reload would destroy the
+            // transcript half of a release whose outbox half already committed.
+            store?.flushPendingSendConfirms(to: self)
             // After the flush, so the live frames that arrived during the load
             // keep their arrival order and the re-seeded bubbles land at the
             // tail — where an optimistic send always sits.
@@ -518,6 +573,9 @@ extension TranscriptBridge: WKScriptMessageHandler {
             htmlPreviewMaximized = false
         case "shown":
             // The transcript painted its first frame — fade the webview in.
+            // A real paint also proves the reloaded process is standing, so
+            // the crash-reload budget re-arms.
+            consecutiveDeaths = 0
             contentVisible = true
         case "sync":
             // The one forward-recovery pull: the webview posts its cursor

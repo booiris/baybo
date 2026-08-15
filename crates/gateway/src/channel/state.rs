@@ -18,12 +18,12 @@ use tokio::sync::mpsc;
 
 use super::bot_reconciler::ChannelBotReconciler;
 use super::control::ChannelControlRegistry;
-use super::dedup::InboundDedup;
 use super::history::TuiHistoryStore;
 use super::session_resolver::ChannelSessionResolver;
 use crate::auth::{AdminAuthState, ChannelTokenTable};
 use crate::log_buffer::LogBuffer;
 use crate::server::GatewayDeps;
+use baybo_channels::InboundDedup;
 use dashmap::DashMap;
 
 /// State bundle used only by the relay API tunnel's in-process HTTP forwarder.
@@ -155,7 +155,7 @@ impl WsChannelState {
                 auth: AdminAuthState::new(deps.admin_token.clone())
                     .with_device_store(deps.stores.device.clone()),
             },
-            inbound_dedup: Arc::new(InboundDedup::new()),
+            inbound_dedup: Arc::clone(&deps.inbound_dedup),
         }
     }
 }
