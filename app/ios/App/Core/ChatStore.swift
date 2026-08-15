@@ -1119,11 +1119,10 @@ final class ChatStore: ObservableObject, TranscriptTarget {
             // its in-flight guard, so we MUST reply. An empty baseline
             // `sync_page` clears it; otherwise the guard would stay set forever
             // and the connEpoch sync after the first send would be a no-op
-            // until reload. The empty REPLACE keeps the optimistic bubble
-            // because `applySyncReplace` overlays every send this outbox still
-            // owes — NOT because the bubble still shows send chrome. The
-            // gateway's echo lands before its write, so by the time a real page
-            // answers, that chrome is already gone.
+            // until reload. An optimistic bubble is safe here twice over:
+            // `applySyncPage` treats an empty REPLACE against a non-empty
+            // thread as stale outright, and `applySyncReplace` overlays every
+            // send this outbox still owes as the row-level backstop.
             retractResyncNotice()
             pushSynthesizedFrame([
                 "kind": "sync_page",

@@ -119,6 +119,35 @@ describe('applySyncReplace (baseline / rebase REPLACE + overlay)', () => {
     const page = [transcriptItemToRow(SID, msg(10, 'assistant', 'answer'))];
     expect(applySyncReplace(page, page, new Set(), null)).toHaveLength(1);
   });
+
+  // A session's rows are never deleted, so an empty page against a thread that
+  // holds rows is always a pre-persist read — the shape every fresh session's
+  // baseline can produce (the gateway echoes before it writes, and a null
+  // cursor keeps every sync a baseline). Applying it deleted every
+  // ordinal-less row outside the kept sets — the clientMsgId-less
+  // echo-appended user row most of all.
+  it('treats an empty page against a non-empty thread as stale — nothing moves', () => {
+    const prev: TranscriptRow[] = [
+      { key: 'echoed', role: 'user', text: 'first message' },
+      { key: `row-${SID}-m12`, role: 'assistant', text: 'the reply' },
+    ];
+    expect(applySyncReplace(prev, [], new Set(), null)).toBe(prev);
+  });
+
+  // The other half of the same hole: the kept sets return BEHIND the page, so
+  // an owed ordinal-less first send re-filed below the ordinal-bearing reply
+  // that outran it — [reply, user], permanent (the reply's ordinal advanced
+  // the cursor, differences select strictly `>`, nothing re-orders it).
+  it('never re-files an owed first send below a reply the empty page predates', () => {
+    const prev: TranscriptRow[] = [
+      { key: 'pending-x', role: 'user', text: 'just sent', pending: true, clientMsgId: 'x' },
+      { key: `row-${SID}-m12`, role: 'assistant', text: 'the reply' },
+    ];
+    expect(applySyncReplace(prev, [], new Set(['x']), null).map((r) => r.text)).toEqual([
+      'just sent',
+      'the reply',
+    ]);
+  });
 });
 
 // A rebase says only that the difference outran the server's limit and here is
