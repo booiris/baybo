@@ -439,6 +439,26 @@ export async function markIssueRead(
   }
 }
 
+/// Note that the operator has read the whole board, in one press. Every
+/// card's own cursor moves — the same stamp [`markIssueRead`] writes, on all
+/// of them at once — so this clears counts and nothing else.
+export async function markProjectRead(
+  client: AdminClient,
+  projectId: string,
+): Promise<Outcome<null>> {
+  try {
+    const { error, response } = await client.POST('/v1/projects/{project_id}/read', {
+      params: { path: { project_id: projectId } },
+    });
+    if (response.status === 401) return { kind: 'unauthorized' };
+    if (error !== undefined) return failure(response.status, error.error);
+    if (!response.ok) return failure(response.status, undefined);
+    return { kind: 'ok', value: null };
+  } catch (e) {
+    return { kind: 'failed', message: networkMessage(e) };
+  }
+}
+
 /// Run this card's failed run again. The one action that discharges the
 /// board's `failed` count without destroying or hiding the card.
 export async function retryRun(

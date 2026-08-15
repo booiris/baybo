@@ -19,7 +19,13 @@ import {
   verticalListSortingStrategy,
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { RiAddLine, RiArchiveLine, RiLoader4Line, RiSettings3Line } from 'react-icons/ri';
+import {
+  RiAddLine,
+  RiArchiveLine,
+  RiCheckDoubleLine,
+  RiLoader4Line,
+  RiSettings3Line,
+} from 'react-icons/ri';
 
 import { useAdminClient, useAuth } from '../../api/auth';
 import { IconButton } from '../../components/IconButton';
@@ -32,6 +38,7 @@ import {
   fetchIssues,
   fetchProject,
   fetchProjects,
+  markProjectRead,
   moveIssue,
 } from './api';
 import {
@@ -52,18 +59,22 @@ import {
   groupByStatus,
   hasDeliverable,
   HEADER_ACTION,
+  HEADER_ACTION_DEAD,
   HEADER_ACTION_OFF,
   HEADER_ACTION_ON,
+  hoistUnread,
   liveCount,
   moveAnnouncement,
   statusOf,
+  unreadTotal,
   updatedAgo,
   moveCard,
-  orderedNumbers,
   parseDragId,
+  persistedOrder,
   placementChanged,
   resolveDrop,
   runIndicator,
+  withPositions,
 } from './boardModel';
 import { boardCollisionDetection } from './dropTarget';
 import { Avatar } from './Avatar';
@@ -154,7 +165,15 @@ export function ProjectBoardPage() {
       }
       setError(null);
       setProject(projectOutcome.value);
-      setBoard(groupByStatus(issuesOutcome.value));
+      // The hoist is applied **here**, to the board itself, and not to the
+      // rendered view — so the order on screen is the order every drag is
+      // resolved in and the order a move writes. Held one layer up it was a
+      // second order that only existed while nothing was being dragged, and
+      // the switch between the two happened in the same commit as dnd-kit's
+      // drag start: a card jumped slots inside its own column before the
+      // first `over` resolved, and a 4px twitch on a card that had never
+      // moved posted a reorder.
+      setBoard(hoistUnread(groupByStatus(issuesOutcome.value)));
       if (listOutcome.kind === 'ok') setProjects(listOutcome.value);
       if (agentsOutcome.kind === 'ok') setTeam(agentsOutcome.value);
       setActiveRuns(runsOutcome.kind === 'ok' ? runsOutcome.value : []);
@@ -173,6 +192,8 @@ export function ProjectBoardPage() {
 
   // Move requests use the full column order, never this filtered view.
   const view = useMemo(() => filterBoard(board, filter, team), [board, filter, team]);
+
+  const unread = useMemo(() => unreadTotal(board), [board]);
 
   useBoardStream(
     projectId,
@@ -233,7 +254,7 @@ export function ProjectBoardPage() {
         event.over === null ? null : String(event.over.id),
       );
       const next = drop === null ? board : moveCard(board, drop);
-      if (!placementChanged(before, next, number)) {
+      if (drop === null || !placementChanged(before, next, number)) {
         setBoard(before);
         return;
       }
@@ -248,13 +269,13 @@ export function ProjectBoardPage() {
         return;
       }
       const from = statusOf(before, number);
-      const outcome = await moveIssue(
-        client,
-        projectId,
-        number,
-        issue.status,
-        orderedNumbers(next, issue.status),
-      );
+      // What the column stores, not what it shows: the hoist is a reading
+      // order and a move must not write it. `withPositions` keeps the client
+      // believing what it just asked the server to store, so a second drag
+      // before the refetch does not send slots the first one replaced.
+      const ordered = persistedOrder(next[issue.status], number, drop.before);
+      setBoard(withPositions(next, issue.status, ordered));
+      const outcome = await moveIssue(client, projectId, number, issue.status, ordered);
       if (outcome.kind === 'unauthorized') {
         logout();
         return;
@@ -287,6 +308,22 @@ export function ProjectBoardPage() {
     preDrag.current = null;
     if (before !== null) setBoard(before);
   }, []);
+
+  const markBoardRead = useCallback(async () => {
+    const outcome = await markProjectRead(client, projectId);
+    if (outcome.kind === 'unauthorized') {
+      logout();
+      return;
+    }
+    if (outcome.kind === 'failed') {
+      pushToast('err', `Mark read failed — ${outcome.message}`);
+      return;
+    }
+    // No toast on success: every badge on the board goes out at once, which
+    // says it better than a line of text does.
+    setRefreshKey((key) => key + 1);
+    invalidateAttention(client);
+  }, [client, logout, projectId, pushToast]);
 
   const openIssue = useCallback(
     (number: number) => {
@@ -352,6 +389,32 @@ export function ProjectBoardPage() {
           }}
         />
         <div className="ml-auto flex items-center gap-2">
+          <button
+            type="button"
+            disabled={unread === 0}
+            // No `aria-label`: it would replace the words on the button, so
+            // "click Mark read" would stop working by voice and the title
+            // below — the only place the reach of the press is spelled out —
+            // would go with it. Unlabelled, the name is the button's own
+            // text and the title becomes its description.
+            title="Clear the unread count on every card on this board — including cards the filter is hiding"
+            onClick={() => {
+              void markBoardRead();
+            }}
+            className={`${HEADER_ACTION} ${unread === 0 ? HEADER_ACTION_DEAD : HEADER_ACTION_OFF}`}
+          >
+            <RiCheckDoubleLine aria-hidden />
+            {/* The space is for the accessible name, not for the layout —
+                `gap-1` draws the gap and a whitespace-only text node makes no
+                flex item. Without it the button announces as "Mark read2". */}
+            Mark read{' '}
+            {unread > 0 ? (
+              // A number the press can empty, so it is allowed to be a
+              // number: the rail's own count became a dot precisely because
+              // clicking it could not.
+              <span className="rounded-full bg-ink text-brand px-1.5 tabular-nums">{unread}</span>
+            ) : null}
+          </button>
           <BoardFilterMenu
             filter={filter}
             team={team}

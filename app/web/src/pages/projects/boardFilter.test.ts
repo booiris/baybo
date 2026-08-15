@@ -92,6 +92,17 @@ describe('matches', () => {
     );
   });
 
+  it('narrows to what is new, on the card count and nothing else', () => {
+    expect(matches(issue(1), filter({ unreadOnly: true }), TEAM)).toBe(false);
+    expect(matches(issue(1, { unread: 2 }), filter({ unreadOnly: true }), TEAM)).toBe(true);
+    // A failed run is its own narrowing precisely because looking never
+    // clears it; folding it in here would hand this filter a card it
+    // cannot empty.
+    expect(matches(issue(1, { last_run_failed: true }), filter({ unreadOnly: true }), TEAM)).toBe(
+      false,
+    );
+  });
+
   it('narrows to blocked work', () => {
     expect(matches(issue(1), filter({ blockedOnly: true }), TEAM)).toBe(false);
     expect(
@@ -142,11 +153,12 @@ describe('restrictionCount / isDefault', () => {
         filter({
           text: 'parser',
           assignee: { kind: 'handle', handle: 'dev-1' },
+          unreadOnly: true,
           blockedOnly: true,
           showCancelled: false,
         }),
       ),
-    ).toBe(4);
+    ).toBe(5);
   });
 });
 
@@ -158,6 +170,7 @@ describe('the URL codec', () => {
       filter({ assignee: { kind: 'unassigned' } }),
       filter({ assignee: { kind: 'handle', handle: 'dev-1' } }),
       filter({ blockedOnly: true, showCancelled: true }),
+      filter({ unreadOnly: true }),
       // The hidden case is the one that actually writes a param now.
       filter({ showCancelled: false }),
       filter({

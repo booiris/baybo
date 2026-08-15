@@ -715,6 +715,80 @@ async fn a_run_can_be_stopped_and_started_again() {
     .await;
 }
 
+/// One press, and every card on the board comes back at zero.
+///
+/// The agent comments are planted through the store because the comment
+/// endpoint speaks as the operator, and the operator's own words are never
+/// unread — so a fixture built out of HTTP alone would assert nothing.
+#[tokio::test]
+async fn one_press_reads_every_card_on_the_board() {
+    let (router, tg) = router().await;
+    let p = open_project(&router, "reading").await;
+    seed_teammate(&tg, &p, "dev-1").await;
+    let project_id = baybo_model::ProjectId::parse(p.clone()).expect("project id");
+
+    for title in ["one", "two"] {
+        let number = open_issue(&router, &p, title).await;
+        let issue = tg
+            .deps
+            .stores
+            .project
+            .get_issue(&project_id, number)
+            .await
+            .expect("issue")
+            .expect("issue row");
+        tg.deps
+            .stores
+            .project
+            .append_event(&baybo_store::project::NewIssueEvent {
+                issue_id: issue.id,
+                project_id: project_id.clone(),
+                number,
+                actor: baybo_store::project::IssueActor::Agent(
+                    baybo_model::AgentProfileId::parse("dev-1").expect("agent id"),
+                ),
+                body: baybo_store::project::IssueEventBody::Comment {
+                    text: "which way?".into(),
+                    attachments: Vec::new(),
+                },
+            })
+            .await
+            .expect("agent comment");
+    }
+
+    let unread = |board: &Value| {
+        board["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|card| card["unread"].as_i64().expect("unread"))
+            .sum::<i64>()
+    };
+    let board = get(&router, &format!("/v1/projects/{p}/issues"), StatusCode::OK).await;
+    assert_eq!(unread(&board), 2);
+
+    post(
+        &router,
+        &format!("/v1/projects/{p}/read"),
+        json!({}),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+
+    let board = get(&router, &format!("/v1/projects/{p}/issues"), StatusCode::OK).await;
+    assert_eq!(unread(&board), 0, "every card, not the first one");
+
+    // A board that does not exist is a 404 rather than a quiet success on
+    // nothing: the press is one the operator has to be able to trust.
+    post(
+        &router,
+        "/v1/projects/01JGHOSTGHOSTGHOSTGHOSTGH/read",
+        json!({}),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+}
+
 async fn request(
     router: &axum::Router,
     method: &str,

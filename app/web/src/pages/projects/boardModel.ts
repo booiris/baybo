@@ -61,6 +61,11 @@ export const HEADER_ACTION_ON = 'bg-brand text-ink';
 /// The hover was missing entirely: these were the only buttons on the board
 /// that gave no sign of being live until they were pressed.
 export const HEADER_ACTION_OFF = 'bg-surface hover:bg-brand/25';
+/// The same button with nothing left to do — Mark read on a board that
+/// already reads zero. It stays in the group rather than disappearing:
+/// pressing it is what empties it, and a control that vanishes under the
+/// press that emptied it slides the next button into the one after that.
+export const HEADER_ACTION_DEAD = 'bg-surface text-ink-soft opacity-50';
 
 export const PRIORITIES: readonly IssuePriority[] = [
   'urgent',
@@ -91,6 +96,48 @@ export function groupByStatus(issues: Issue[]): Board {
 
 export function liveCount(column: Issue[]): number {
   return column.filter((issue) => issue.cancelled_at_ms == null).length;
+}
+
+/// What is waiting on the operator across the whole board — the sum the
+/// header's Mark-read button carries. Counted over every card the board
+/// holds, not over the filtered view, because that is what the press
+/// clears: a number that only counted what the filter let through would
+/// leave cards at zero on a board that still lights the rail.
+export function unreadTotal(board: Board): number {
+  return COLUMNS.reduce(
+    (total, status) => board[status].reduce((sum, issue) => sum + issue.unread, 0) + total,
+    0,
+  );
+}
+
+/// Cards with something new on top, everything else in the board's own
+/// order.
+///
+/// Applied **once, to the board the fetch produced**, rather than to the
+/// rendered view: one order, so what is on screen is what a drag is resolved
+/// in and what a move writes. Kept in the view it was a second order that
+/// existed only while nothing was being dragged, and the swap between the
+/// two landed in dnd-kit's own drag-start commit — a card changed slots
+/// inside its column before the first `over` resolved, so a 4px twitch
+/// posted a reorder of a column nobody had touched.
+///
+/// It writes no `position`, not even through a drag: the partition is
+/// stable, so the order the operator dragged their cards into survives
+/// inside each half and a card falls back into it as soon as it is read,
+/// and a move sends [`persistedOrder`] — the stored order with one card
+/// moved — rather than the order on screen.
+///
+/// A cancelled card is never lifted. Cancel is terminal, and floating a
+/// struck-through card over live work because somebody spoke on it before it
+/// was called off is the board arguing with itself.
+export function hoistUnread(board: Board): Board {
+  const isNew = (issue: Issue) => issue.unread > 0 && issue.cancelled_at_ms == null;
+  const view = emptyBoard();
+  for (const status of COLUMNS) {
+    const column = board[status];
+    view[status] = [...column.filter(isNew), ...column.filter((issue) => !isNew(issue))];
+  }
+  return view;
 }
 
 // Cards and columns share one DndContext, so their ids need namespaces.
@@ -186,8 +233,44 @@ export function moveCard(board: Board, drop: Drop): Board {
   return next;
 }
 
-export function orderedNumbers(board: Board, status: IssueStatus): number[] {
-  return board[status].map((issue) => issue.number);
+/// The order a move sends: the destination column in its **stored** order,
+/// with the card that moved lifted out and put back in front of the card it
+/// was dropped in front of.
+///
+/// Deliberately not the order on screen. The screen carries the unread
+/// hoist, and `position` is half of `(priority, position, number)` — the
+/// order the board itself takes work out of Todo by. Sending what is
+/// rendered would let an agent's comment re-rank a column *for good*, the
+/// next time anybody dragged anything in it, and the promise the hoist makes
+/// is that it never writes.
+///
+/// `before` is the anchor `resolveDrop` already resolved, and `null` means
+/// the end — the same two cases `moveCard` handles, answered here against
+/// stored order instead of rendered order.
+export function persistedOrder(column: Issue[], moved: number, before: number | null): number[] {
+  const stored = column
+    .filter((issue) => issue.number !== moved)
+    .sort((a, b) => (a.position === b.position ? a.number - b.number : a.position - b.position))
+    .map((issue) => issue.number);
+  const found = before === null ? -1 : stored.indexOf(before);
+  stored.splice(found === -1 ? stored.length : found, 0, moved);
+  return stored;
+}
+
+/// Write that order back onto the cards as their `position`.
+///
+/// The server has just been asked to store exactly this, index by index, so
+/// without it the client would go on believing the order it replaced — and a
+/// second drag in the same column before the board is refetched would send
+/// stale slots and undo the first move.
+export function withPositions(board: Board, status: IssueStatus, ordered: number[]): Board {
+  return {
+    ...board,
+    [status]: board[status].map((issue) => {
+      const at = ordered.indexOf(issue.number);
+      return at === -1 ? issue : { ...issue, position: at };
+    }),
+  };
 }
 
 export function placementChanged(before: Board, after: Board, number: number): boolean {

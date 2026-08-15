@@ -1,5 +1,5 @@
-import { describe, expect, it, vi } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 
@@ -37,7 +37,7 @@ function issue(number: number, overrides: Partial<Issue> = {}): Issue {
 
 const ISSUES: Issue[] = [
   issue(1, { title: 'Wire the board', position: 0, assignee: 'dev-1' }),
-  issue(2, { title: 'Blocked one', position: 1, blocked_reason: 'waiting on tmux' }),
+  issue(2, { title: 'Blocked one', position: 1, blocked_reason: 'waiting on tmux', unread: 2 }),
   issue(3, { title: 'Cancelled one', position: 2, cancelled_at_ms: 111 }),
   issue(4, {
     title: 'Under way',
@@ -67,6 +67,9 @@ const TEAM = [
 ];
 
 const ok = { status: 200, ok: true } as Response;
+const noContent = { status: 204, ok: true } as Response;
+
+let boardIsRead = false;
 
 function stubClient() {
   return {
@@ -78,7 +81,11 @@ function stubClient() {
         return { data: PROJECT, error: undefined, response: ok };
       }
       if (path === '/v1/projects/{project_id}/issues') {
-        return { data: { items: ISSUES }, error: undefined, response: ok };
+        // The board-wide read is the one action here whose whole point is
+        // that the board comes back different, so the refetch has to be
+        // able to answer with cleared cards rather than the same ones.
+        const items = boardIsRead ? ISSUES.map((row) => ({ ...row, unread: 0 })) : ISSUES;
+        return { data: { items }, error: undefined, response: ok };
       }
       if (path === '/v1/projects/{project_id}/runs') {
         return { data: { items: RUNS }, error: undefined, response: ok };
@@ -94,7 +101,13 @@ function stubClient() {
       }
       throw new Error(`unexpected GET ${path}`);
     }),
-    POST: vi.fn(),
+    POST: vi.fn(async (path: string) => {
+      if (path === '/v1/projects/{project_id}/read') {
+        boardIsRead = true;
+        return { data: undefined, error: undefined, response: noContent };
+      }
+      throw new Error(`unexpected POST ${path}`);
+    }),
     PATCH: vi.fn(),
   };
 }
@@ -122,6 +135,10 @@ function renderBoard(query = '') {
 }
 
 describe('ProjectBoardPage', () => {
+  beforeEach(() => {
+    boardIsRead = false;
+  });
+
   it('paints five columns and files each card under its own', async () => {
     renderBoard();
 
@@ -266,6 +283,56 @@ describe('ProjectBoardPage', () => {
     const panel = await screen.findByRole('complementary');
     expect(panel.parentElement?.className).toContain('absolute');
     expect(screen.getByText('Wire the board')).toBeInTheDocument();
+  });
+
+  it('lifts a card with something new to the top of its column', async () => {
+    renderBoard();
+    await screen.findByText('Wire the board');
+
+    // #2 sits under #1 by position, and what an agent said moves it up the
+    // column the operator is reading — without touching `position`, which
+    // is what a move writes.
+    const backlog = screen.getByRole('heading', { name: 'Backlog' }).closest('section');
+    const cards = within(backlog as HTMLElement).getAllByRole('article');
+    expect(cards[0].textContent).toContain('Blocked one');
+    expect(cards[1].textContent).toContain('Wire the board');
+  });
+
+  it('narrows to what is new from the filter menu', async () => {
+    renderBoard();
+    await screen.findByText('Wire the board');
+
+    await userEvent.click(screen.getByLabelText('Filter the board'));
+    await userEvent.click(screen.getByLabelText('Unread only'));
+    expect(screen.queryByText('Wire the board')).not.toBeInTheDocument();
+    expect(screen.getByText('Blocked one')).toBeInTheDocument();
+  });
+
+  it('shows only the cards with something new when asked', async () => {
+    renderBoard('?unread=1');
+    await screen.findByText('Blocked one');
+
+    expect(screen.queryByText('Wire the board')).not.toBeInTheDocument();
+    expect(screen.queryByText('Under way')).not.toBeInTheDocument();
+    // …and the header still admits the board is holding cards back.
+    expect(screen.getByLabelText('Filter the board (1 active)')).toBeInTheDocument();
+  });
+
+  it('reads the whole board in one press, and then has nothing left to do', async () => {
+    renderBoard();
+    await screen.findByText('Wire the board');
+
+    await userEvent.click(screen.getByRole('button', { name: 'Mark read 2' }));
+    expect(client.POST).toHaveBeenCalledWith('/v1/projects/{project_id}/read', {
+      params: { path: { project_id: PROJECT.id } },
+    });
+
+    // The button stays where it is rather than disappearing under the press
+    // that emptied it — the group behind it must not shuffle.
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Mark read' })).toBeDisabled();
+    });
+    expect(screen.queryByTitle(/new since you opened this card/)).toBeNull();
   });
 
   it('opens the assignee’s profile from the card without opening the card', async () => {

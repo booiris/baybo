@@ -524,6 +524,15 @@ pub trait ProjectStore: Send + Sync {
     /// already cleared.
     async fn mark_issue_read(&self, issue: &IssueId, at: DateTime<Utc>) -> Result<bool>;
 
+    /// The same stamp on every card of one board, for an operator who has
+    /// read the board rather than a card. Still one cursor per card —
+    /// nothing here makes `read_at` mean anything new — and monotonic for
+    /// the same reason. Every card is stamped, cancelled and finished ones
+    /// included: the cursor says "seen", and a card being over is not a
+    /// reason to go on counting what was said on it. Answers with the rows
+    /// it moved, which is what makes the monotonic guard observable.
+    async fn mark_project_read(&self, project: &ProjectId, at: DateTime<Utc>) -> Result<usize>;
+
     /// Every card on this board that has something waiting on it. Cards
     /// with nothing waiting are absent rather than present with zeroes.
     async fn card_signals(

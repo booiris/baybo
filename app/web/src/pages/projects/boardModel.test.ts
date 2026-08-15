@@ -13,17 +13,20 @@ import {
   emptyBoard,
   groupByStatus,
   hasDeliverable,
+  hoistUnread,
   moveAnnouncement,
   liveCount,
   moveCard,
-  orderedNumbers,
   parseDragId,
+  persistedOrder,
   placementChanged,
   runDuration,
   runIndicator,
   resolveDrop,
   resolveLanding,
+  unreadTotal,
   unsettledRun,
+  withPositions,
 } from './boardModel';
 
 function issue(number: number, overrides: Partial<Issue> = {}): Issue {
@@ -162,11 +165,51 @@ describe('moveCard', () => {
   });
 });
 
-describe('orderedNumbers + placementChanged', () => {
+describe('persistedOrder + placementChanged', () => {
   it('reports the destination contents a move request has to send', () => {
     const start = board({ backlog: [issue(1), issue(2), issue(3)] });
     const next = moveCard(start, { status: 'backlog', before: 1, issue: issue(3) });
-    expect(orderedNumbers(next, 'backlog')).toEqual([3, 1, 2]);
+    expect(persistedOrder(next.backlog, 3, 1)).toEqual([3, 1, 2]);
+  });
+
+  it('sends the stored order, never the hoisted one', () => {
+    // #3 is only at the top because somebody commented on it. A move must
+    // leave that where it is — `position` is half of the order the board
+    // takes work out of Todo by, so writing the hoist would let an agent
+    // re-rank the column for good.
+    const hoisted = board({
+      backlog: [
+        issue(3, { position: 2, unread: 1 }),
+        issue(1, { position: 0 }),
+        issue(2, { position: 1 }),
+      ],
+    });
+    const next = moveCard(hoisted, { status: 'backlog', before: 2, issue: issue(1) });
+    expect(next.backlog.map((i) => i.number)).toEqual([3, 1, 2]);
+    expect(persistedOrder(next.backlog, 1, 2)).toEqual([1, 2, 3]);
+  });
+
+  it('appends when the drop named no anchor, and when the anchor is gone', () => {
+    const column = [issue(1, { position: 0 }), issue(2, { position: 1 })];
+    expect(persistedOrder(column, 2, null)).toEqual([1, 2]);
+    expect(persistedOrder(column, 1, 99)).toEqual([2, 1]);
+  });
+
+  it('writes the order it just sent back onto the cards', () => {
+    // Otherwise a second drag before the refetch sends slots the first one
+    // already replaced, and undoes it.
+    const start = board({
+      backlog: [issue(3, { position: 2 }), issue(1, { position: 0 }), issue(2, { position: 1 })],
+    });
+    const settled = withPositions(start, 'backlog', [3, 1, 2]);
+    expect(settled.backlog.map((i) => [i.number, i.position])).toEqual([
+      [3, 0],
+      [1, 1],
+      [2, 2],
+    ]);
+    // A second drag reads the order the first one wrote. Off the stale
+    // slots this would come back [1, 2, 3] and undo it.
+    expect(persistedOrder(settled.backlog, 2, 3)).toEqual([2, 3, 1]);
   });
 
   it('spots a no-op so a drop that changed nothing costs no request', () => {
@@ -328,6 +371,67 @@ describe('moveAnnouncement', () => {
   it('says nothing when nobody is on the card', () => {
     // That drop bounces instead; the refusal is what speaks.
     expect(moveAnnouncement(card({ status: 'in_progress' }), 'todo', null)).toBeNull();
+  });
+});
+
+describe('unreadTotal', () => {
+  it('adds up the whole board, not the column the eye is on', () => {
+    expect(
+      unreadTotal(
+        board({
+          backlog: [issue(1, { unread: 2 }), issue(2)],
+          review: [issue(3, { status: 'review', unread: 1 })],
+        }),
+      ),
+    ).toBe(3);
+    expect(unreadTotal(board({ backlog: [issue(1), issue(2)] }))).toBe(0);
+  });
+});
+
+describe('hoistUnread', () => {
+  it('lifts what is new to the top of its own column', () => {
+    const view = hoistUnread(
+      board({
+        backlog: [issue(1), issue(2, { unread: 1 }), issue(3)],
+        todo: [issue(4, { status: 'todo', unread: 3 })],
+      }),
+    );
+    expect(view.backlog.map((i) => i.number)).toEqual([2, 1, 3]);
+    expect(view.todo.map((i) => i.number)).toEqual([4]);
+  });
+
+  it('keeps the order the operator gave the cards inside each half', () => {
+    // The hoist is a reading order laid over `position`, never a rewrite of
+    // it: two cards that are both new stay in the order they were dragged
+    // into, and so do two that are not.
+    const view = hoistUnread(
+      board({
+        backlog: [
+          issue(1),
+          issue(2, { unread: 1 }),
+          issue(3),
+          issue(4, { unread: 5 }),
+          issue(5),
+        ],
+      }),
+    );
+    expect(view.backlog.map((i) => i.number)).toEqual([2, 4, 1, 3, 5]);
+  });
+
+  it('never lifts a cancelled card over live work', () => {
+    // Cancel is terminal. A card called off after somebody spoke on it still
+    // carries the count, and floating it to the top of a column of live work
+    // is the board arguing with itself.
+    const view = hoistUnread(
+      board({ backlog: [issue(1), issue(2, { unread: 4, cancelled_at_ms: 99 })] }),
+    );
+    expect(view.backlog.map((i) => i.number)).toEqual([1, 2]);
+  });
+
+  it('leaves the board it was handed alone', () => {
+    const start = board({ backlog: [issue(1), issue(2, { unread: 1 })] });
+    hoistUnread(start);
+    expect(start.backlog.map((i) => i.number)).toEqual([1, 2]);
   });
 });
 

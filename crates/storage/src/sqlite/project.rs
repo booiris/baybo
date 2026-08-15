@@ -584,6 +584,30 @@ impl ProjectStore for SqliteProjectStore {
         Ok(affected > 0)
     }
 
+    async fn mark_project_read(
+        &self,
+        project: &ProjectId,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<usize> {
+        let project = project.as_str().to_string();
+        let at = super::time::to_us(at);
+        let affected = self
+            .pool
+            .interact("issues.mark_project_read", move |conn| {
+                Ok(conn.execute(
+                    // The guard is where `mark_issue_read`'s `MAX(...)` is:
+                    // both keep the cursor monotonic, and here it also makes
+                    // the row count mean "cards this actually moved" rather
+                    // than "cards on this board".
+                    "UPDATE issues SET read_at = ?2 \
+                     WHERE project_id = ?1 AND COALESCE(read_at, 0) < ?2",
+                    rusqlite::params![project, at],
+                )?)
+            })
+            .await?;
+        Ok(affected)
+    }
+
     async fn card_signals(
         &self,
         project: &ProjectId,
@@ -2721,6 +2745,77 @@ mod tests {
             store.spend_since(&p.id, since).await.unwrap(),
             spent,
             "a restart does not refund the board"
+        );
+    }
+
+    /// A board-wide stamp is still one cursor per card, and it only ever
+    /// moves forward. Two presses in flight at once are the ordinary case —
+    /// the older one landing second must not rewind the cards the newer one
+    /// cleared and light every badge back up.
+    #[tokio::test]
+    async fn a_late_board_read_never_rewinds_the_cards_it_finds() {
+        let (_dir, store) = store().await;
+        let dev = IssueActor::Agent(AgentProfileId::parse("dev-1").unwrap());
+        let p = project("01JREADALL", "Reading");
+        store.create_project(&p).await.unwrap();
+        let elsewhere = project("01JELSEWHERE", "Next door");
+        store.create_project(&elsewhere).await.unwrap();
+        // A finished card is stamped like any other: the cursor says "seen",
+        // and a card being over is not a reason to go on counting what was
+        // said on it.
+        for (project, title, status) in [
+            (&p.id, "one", IssueStatus::Backlog),
+            (&p.id, "two", IssueStatus::Done),
+            (&elsewhere.id, "theirs", IssueStatus::Backlog),
+        ] {
+            let issue = store
+                .create_issue(&new_issue(project, title, status))
+                .await
+                .unwrap();
+            store
+                .append_event(&event(
+                    &issue,
+                    dev.clone(),
+                    IssueEventBody::Comment {
+                        text: "which way?".into(),
+                        attachments: Vec::new(),
+                    },
+                ))
+                .await
+                .unwrap();
+        }
+        let unread = |project: &ProjectId| {
+            let store = &store;
+            let project = project.clone();
+            async move {
+                store
+                    .card_signals(&project)
+                    .await
+                    .unwrap()
+                    .values()
+                    .map(|signals| signals.unread)
+                    .sum::<usize>()
+            }
+        };
+        assert_eq!(unread(&p.id).await, 2);
+
+        let now = chrono::Utc::now();
+        assert_eq!(store.mark_project_read(&p.id, now).await.unwrap(), 2);
+        assert_eq!(unread(&p.id).await, 0);
+
+        assert_eq!(
+            store
+                .mark_project_read(&p.id, now - chrono::Duration::hours(1))
+                .await
+                .unwrap(),
+            0,
+            "a stamp older than the cursor moves nothing"
+        );
+        assert_eq!(unread(&p.id).await, 0, "and rewinds nothing either");
+        assert_eq!(
+            unread(&elsewhere.id).await,
+            1,
+            "the board next door was never stamped"
         );
     }
 }

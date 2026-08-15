@@ -35,6 +35,7 @@ pub fn routes() -> OpenApiRouter<AdminState> {
         .routes(routes!(projects_attention))
         .routes(routes!(projects_activity))
         .routes(routes!(mark_issue_read))
+        .routes(routes!(mark_project_read))
         .routes(routes!(resolve_approval))
         .routes(routes!(create_comment))
         .routes(routes!(list_active_runs))
@@ -1541,6 +1542,30 @@ async fn mark_issue_read(
     state
         .project_manager
         .mark_issue_read(&id, number)
+        .await
+        .map_err(project_err)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    post,
+    path = "/projects/{project_id}/read",
+    tag = "projects",
+    params(("project_id" = String, Path, description = "Project id")),
+    responses(
+        (status = 204, description = "Noted; every card on this board reads zero"),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Unknown project", body = ErrorBody),
+    )
+)]
+async fn mark_project_read(
+    State(state): State<AdminState>,
+    Path(project_id): Path<String>,
+) -> Result<StatusCode> {
+    let id = parse_project_id(&project_id)?;
+    state
+        .project_manager
+        .mark_project_read(&id)
         .await
         .map_err(project_err)?;
     Ok(StatusCode::NO_CONTENT)

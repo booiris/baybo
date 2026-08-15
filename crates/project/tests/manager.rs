@@ -1890,6 +1890,7 @@ forwards_everything_else! {
     hold_run(id: &IssueRunId) -> StoreResult<bool>;
     release_run(id: &IssueRunId) -> StoreResult<bool>;
     mark_issue_read(issue: &IssueId, at: DateTime<Utc>) -> StoreResult<bool>;
+    mark_project_read(project: &ProjectId, at: DateTime<Utc>) -> StoreResult<usize>;
     card_signals(project: &ProjectId)
         -> StoreResult<std::collections::HashMap<IssueId, baybo_store::project::CardSignals>>;
     set_project_archived(id: &ProjectId, archived: bool) -> StoreResult<bool>;
@@ -3776,6 +3777,127 @@ async fn reading_one_card_leaves_every_other_cards_count_alone() {
             .unread,
         1
     );
+}
+
+/// One press clears the board the operator is looking at, and stops at its
+/// edge. It is still the per-card cursor doing the work — every card gets
+/// its own stamp — so the board next door keeps everything it was holding.
+#[tokio::test]
+async fn one_press_reads_this_board_and_no_other() {
+    let f = fixture().await;
+    let here = f
+        .manager
+        .create_project(new_project("Here"))
+        .await
+        .expect("here");
+    let there = f
+        .manager
+        .create_project(new_project("There"))
+        .await
+        .expect("there");
+    let dev = seed_agent(&f, &here.id, "dev-1", AgentFramework::Baybo).await;
+    let neighbour = seed_agent(&f, &there.id, "dev-2", AgentFramework::Baybo).await;
+
+    for (project, agent) in [(&here.id, &dev), (&here.id, &dev), (&there.id, &neighbour)] {
+        let issue = f
+            .manager
+            .create_issue(project, IssueActor::User, new_issue("work"))
+            .await
+            .expect("create")
+            .into_issue();
+        f.manager
+            .comment(
+                project,
+                issue.number,
+                IssueActor::Agent(agent.clone()),
+                "which way?",
+                &[],
+            )
+            .await
+            .expect("comment");
+    }
+
+    let unread_on = |project: baybo_model::ProjectId| {
+        let manager = &f.manager;
+        async move {
+            let cards = manager.board_cards(&project).await.expect("board");
+            cards
+                .rows
+                .iter()
+                .map(|row| cards.signals(&row.id).unread)
+                .sum::<usize>()
+        }
+    };
+    assert_eq!(unread_on(here.id.clone()).await, 2);
+    assert_eq!(unread_on(there.id.clone()).await, 1);
+
+    f.manager
+        .mark_project_read(&here.id)
+        .await
+        .expect("mark the board read");
+    assert_eq!(unread_on(here.id.clone()).await, 0);
+    assert_eq!(
+        unread_on(there.id.clone()).await,
+        1,
+        "the board next door was not read"
+    );
+    // The rail and the cards are two readings of one predicate, so the press
+    // has to take both out together — a dot left over a board on which every
+    // card reads zero is the drift those constants exist to prevent.
+    let lit = f.manager.attention(&[]).await.expect("attention");
+    assert_eq!(
+        lit.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+        vec![there.id.clone()]
+    );
+
+    // The stamp says "seen up to here", not "stop counting": what an agent
+    // says next is news again, on the very card that was just cleared.
+    f.manager
+        .comment(&here.id, 1, IssueActor::Agent(dev), "one more thing", &[])
+        .await
+        .expect("comment");
+    assert_eq!(unread_on(here.id.clone()).await, 1);
+}
+
+/// Noting that something was seen is not an addition to the board, so it is
+/// one of the writes a shelved board still takes — the same exemption
+/// `mark_issue_read` has.
+#[tokio::test]
+async fn a_shelved_board_can_still_be_read() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(new_project("Shelved"))
+        .await
+        .expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    let issue = f
+        .manager
+        .create_issue(&p.id, IssueActor::User, new_issue("work"))
+        .await
+        .expect("create")
+        .into_issue();
+    f.manager
+        .comment(
+            &p.id,
+            issue.number,
+            IssueActor::Agent(dev),
+            "left you a note",
+            &[],
+        )
+        .await
+        .expect("comment");
+    f.manager
+        .set_project_archived(&p.id, true)
+        .await
+        .expect("archive");
+
+    f.manager
+        .mark_project_read(&p.id)
+        .await
+        .expect("a shelved board still takes the stamp");
+    let cards = f.manager.board_cards(&p.id).await.expect("board");
+    assert_eq!(cards.signals(&cards.rows[0].id).unread, 0);
 }
 
 /// The operator's own drag into Review used to make their own board

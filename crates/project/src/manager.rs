@@ -2132,6 +2132,29 @@ impl ProjectManager {
         Ok(())
     }
 
+    /// Note that the operator has read the whole board, in one press.
+    ///
+    /// This does not put back the per-board cursor the per-card one
+    /// replaced. That one was **automatic** — fired by the board page's load
+    /// effect, so merely arriving swallowed every question asked while the
+    /// page was still fetching. This one is an act: the operator says they
+    /// have seen it, on a board they are looking at, and it moves the same
+    /// per-card cursors nothing else moves.
+    ///
+    /// Archived boards take it, like [`Self::mark_issue_read`] and for the
+    /// same reason — noting that something was seen is not an addition to
+    /// the board.
+    pub async fn mark_project_read(&self, project: &ProjectId) -> Result<()> {
+        self.get_project(project).await?;
+        self.store
+            .mark_project_read(project, chrono::Utc::now())
+            .await?;
+        // Every card's face may have changed, so this is the board-wide
+        // frame rather than one card's timeline.
+        self.events.board_changed(project, None);
+        Ok(())
+    }
+
     /// The board's cards with every card's signals resolved.
     ///
     /// The one door for anything that draws a card face. Callers get the

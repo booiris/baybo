@@ -113,10 +113,10 @@ The chat sidebar's own menus predate the hook and still hand-roll it.
 ## Board header
 
 Everything that acts on the **whole board** lives in the header's right-hand
-group — filter, the lead chat, activity, settings — and the board itself
-starts directly under it. There is no second toolbar row: a strip that existed
-to hold four filter controls cost every board 30px of column height to show
-controls that are set once and then looked past.
+group — mark read, filter, the lead chat, activity, settings — and the board
+itself starts directly under it. There is no second toolbar row: a strip that
+existed to hold four filter controls cost every board 30px of column height to
+show controls that are set once and then looked past.
 
 `BoardFilterMenu` is that collapse. The trigger goes gold and carries a count
 of active narrowings, so a board holding cards back always says so from the
@@ -145,6 +145,39 @@ opening the card stamps `issues.read_at` and the count goes. It counts an
 agent's comments and an agent handing the card back into Review — never the
 operator's own, since your own words and your own tidying are not news to
 you.
+
+The **header carries the board's total**, on the Mark-read button, and it is
+allowed to be a number for the same reason the rail's is not: the press is
+what empties it. It counts every card the board holds, including the ones the
+filter is hiding, because that is what the press clears — a number that only
+counted what got through the filter would leave cards lit on a board the
+operator was told read zero. The button stays in the group when the total is
+zero, greyed and dead, rather than disappearing: it vanishes exactly when it
+is pressed, and a control that goes away under the press that emptied it
+slides the next button into the press after it.
+
+Two more ways to work through what is new, both of them view-only. The filter
+menu's **Unread only** narrows to cards carrying a count — it counts as a
+narrowing, so the header's badge admits to it like any other. And every column
+**hoists its unread cards to the top**, which is a reading order laid over
+`position` and never a rewrite of it: within each half the operator's own
+order survives intact, and a card falls back into it as soon as it is read.
+The lift happens on its own — the board refetches on a timeline frame
+precisely because that is when a count changes, so an agent's comment raises
+its card while the operator is looking at the column. That is the feature, not
+a side effect. It is applied to the board the fetch produced rather than to
+the rendered view, so there is only ever one column order and the drag uses
+it — see "Dragging a card". A **cancelled** card is never lifted: cancel is
+terminal, and floating a struck-through card over live work because somebody
+spoke on it before it was called off is the board arguing with itself.
+
+The press reaches further than "unread" sounds like it does, in two ways. The
+hover text carries one of them — it clears cards the filter is hiding. The
+other is not on screen anywhere: the same `read_at` cursor carries the rail's
+*unseen failure*, so one press also stops the rail counting failures nobody
+has opened. The cards keep their `✕ Run failed` marker, so this is the
+divergence that already exists, in its documented safe direction — the rail
+going quiet over a board that still shows the failure, never the reverse.
 
 A card whose newest run failed says so on its face (`✕ Run failed`, the
 Blocked badge's shape in the error tone) and is reachable through the filter
@@ -267,6 +300,36 @@ for the length of the drag. There is deliberately no dashed placeholder: the
 one that used to sit under each column's list was pinned to the column's end
 regardless of the real insertion point, so on any drop that was not an append
 it contradicted the preview sitting a few cards above it.
+
+**One order is rendered and dragged; a different one is written.** The unread
+hoist is applied to the board the fetch produced rather than to the rendered
+view, so the eye and `resolveDrop` are reading the same column and a drop
+lands where it was aimed. What the move *sends* is `persistedOrder`: the
+column in stored `position` order with the dragged card lifted out and put
+back in front of the anchor `resolveDrop` already resolved. So the hoist stays
+a reading order even across a drag — otherwise one drag in a column somebody
+had just commented on would bake that comment into `position`, which is half
+of `(priority, position, number)`, the order the board takes work out of Todo
+by. `withPositions` writes the sent order back onto the cards, so a second
+drag before the board refetches does not send slots the first one replaced.
+
+What this costs is the one drop the hoist will not let stand: a card dragged
+across the unread boundary — a read card above an unread one, or an unread one
+below a read one — moves in the stored order and then settles back where the
+hoist puts it on the next refetch. The hoist owns the top of a column for as
+long as anything in it is new, and the alternative is a comment permanently
+re-ranking a column. Every other drag, cross-column ones included, lands where
+it was aimed and stays.
+
+Two earlier shapes, both wrong, worth knowing about. Holding the hoist in the
+view and dropping it for the length of a drag put the un-hoist in the same
+batched commit as dnd-kit's own drag start, so a card could change slots
+inside its column before the first `over` resolved — and since `resolveDrop`'s
+insert-before/insert-after correction only cancels itself for an *adjacent*
+target, the leftover was a real one-slot move: a 4px twitch on a card nobody
+had dragged posted a reorder. Sending the rendered order instead is the other
+one, and it is the quieter of the two — nothing looks wrong at the time, and
+the column stays re-ranked after the cards are read.
 
 ## Iconography
 

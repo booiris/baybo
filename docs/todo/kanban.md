@@ -630,6 +630,18 @@ announces which of these will happen before sending.
      had been counting failures on a board where no card admitted to one,
      which is the shape every "the dot won't clear" report actually had.
 
+     Three ways to work through what is new, added once the counts were on
+     the cards and clearing them meant opening them one at a time. An
+     **Unread only** narrowing in the filter menu; every column **hoists its
+     unread cards to the top**, a reading order laid over `position` that
+     never rewrites it and that is dropped for the length of a drag; and a
+     **Mark read** button in the header, on `POST
+     /v1/projects/{project_id}/read`, carrying the board's own total because
+     the press is what empties it. That endpoint is *not* the board-level
+     read cursor this design threw out: it stamps the same per-card
+     `read_at`, one card at a time, and it fires because the operator asked
+     rather than because a page loaded — which was the whole defect.
+
      **Push is deliberately not part of this**, and not because of one
      predicate. The iOS Projects tab is a placeholder, a push payload can
      only address a session, and the tap handler touches that session into
@@ -730,7 +742,9 @@ remain, all recorded with their reasons rather than left to be re-derived:
 
 - Priority field exists (`urgent|high|medium|low|none`). It informs the
   lead's triage, the card face, and the order the board takes work out of
-  Todo (decision 17). It never reorders a column on its own.
+  Todo (decision 17). It never reorders a column on its own. Neither does
+  anything else that writes: the unread hoist added later is a **rendered**
+  order and touches no `position`.
 - No confirm dialog on drag; toasts + the timeline are the audit trail.
 - Board grouping v1 is status-only; list/table/gantt/swimlane views, label
   system, and custom properties are all out of v1.

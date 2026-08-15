@@ -173,6 +173,17 @@ export function BoardFilterMenu({
           <label className="flex items-center gap-1.5 font-mono text-[0.68rem] cursor-pointer">
             <input
               type="checkbox"
+              checked={filter.unreadOnly}
+              onChange={(event) => {
+                onChange({ ...filter, unreadOnly: event.target.checked });
+              }}
+            />
+            Unread only
+          </label>
+
+          <label className="flex items-center gap-1.5 font-mono text-[0.68rem] cursor-pointer">
+            <input
+              type="checkbox"
               checked={filter.blockedOnly}
               onChange={(event) => {
                 onChange({ ...filter, blockedOnly: event.target.checked });

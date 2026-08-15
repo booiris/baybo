@@ -452,9 +452,10 @@ Five things it will not do, each of which is a rule and not a coincidence:
 
 Ordering is `(priority, position, number)` — the same order `IssueList` already
 reads a column in, deliberately, so "what is next in Todo" has one answer
-whether an agent asks or the board acts. Note that the **web board sorts by
-`position` alone**, so on a column with mixed priorities the card the board
-takes next is not necessarily the one rendered at the top.
+whether an agent asks or the board acts. Note that the **web board renders in
+`position` order with unread cards lifted above it** (`hoistUnread`, a reading
+order that writes nothing), so on a column with mixed priorities the card the
+board takes next is not necessarily the one rendered at the top.
 
 **Asking the lead.** Some cards are not work the board can start — they are
 questions only the lead can answer, and the same pass that promotes asks them
@@ -936,16 +937,36 @@ on **what discharges them**, and the split is the whole design:
   *rail's* mark is only a pointer, and a pointer that survives being followed
   is noise: it stays lit after the operator has read the failure, with nothing
   left to do about it but act on a card they may be deliberately leaving until
-  tomorrow. So the board's count drops a failure once that card has been
-  opened, while the card goes on saying so. A card that fails *again* relights
-  the rail off the same cursor — one rule, not two.
+  tomorrow. So the board's count drops a failure once that card's cursor has
+  moved — opening it, or reading the whole board — while the card goes on
+  saying so. A card that fails *again* relights the rail off the same cursor —
+  one rule, not two.
 
-The cursor is `issues.read_at`, one per card, moved by `mark_issue_read` and by
-nothing else. Per card and not per board: an operator who reads the question
-asked on #3 has not read the one asked on #7, and the board-level stamp this
-replaced could only clear both or neither — it was fired by the board page's
-load effect, so it also swallowed everything written between that page's
-fetches and the POST landing.
+The cursor is `issues.read_at`, one per card, moved by `mark_issue_read` and
+`mark_project_read` and by nothing else. Per card and not per board: an
+operator who reads the question asked on #3 has not read the one asked on #7,
+and the board-level stamp this replaced could only clear both or neither — it
+was fired by the board page's load effect, so it also swallowed everything
+written between that page's fetches and the POST landing.
+
+`mark_project_read` does not put that stamp back. What made the old one a bad
+trade was that it was **automatic** — merely arriving on the board discharged
+every question on it. This one is an act the operator asks for, in one press,
+on a board in front of them, and it writes the same per-card cursors: a
+board-wide `read_at` column would still be a second cursor free to disagree
+with the first. Every card on the board is stamped, cancelled and finished ones
+included — the cursor says "seen", and a card being over is not a reason to go
+on counting what was said on it. The store answers with the rows it moved,
+which is what makes the monotonic guard testable; like `mark_issue_read`'s
+`bool`, nothing above the store reads it.
+
+Two consequences worth stating, because one press reaches further than
+"unread" sounds like it does. It clears the board's `failed` count as well —
+`UNSEEN_FAILURE_PREDICATE` rides this same cursor, so a failure nobody has
+opened stops lighting the rail (the cards keep their badges; this is the
+divergence below, in its documented safe direction). And it reaches cards the
+operator cannot currently see, since the board's filter is a client-side view
+and the stamp is not; the button says so on hover.
 
 Three SQL predicates in `crates/storage/src/sqlite/project.rs` are the single
 home of these rules:
@@ -964,7 +985,7 @@ be read off different rows.
 
 `card_signals()` reads per card and `attention()` per board, so on any live
 board the `unread` count is the sum of its cards' and the `failed` count is the
-number of cards wearing the marker **that the operator has not opened since it
+number of cards wearing the marker **whose cursor has not moved since they
 broke**. The two therefore disagree by design, in one direction only: the rail
 can go quiet while the board still shows a failure. The reverse — a rail dot
 outliving a board on which every card reads zero — is the drift these constants
@@ -1034,8 +1055,9 @@ signal would refetch every column to learn that somebody said something.
   every one of those writes starts with, the sweeps included (through
   `resume_project_runs`). Three writes do not ask, and each is deliberate:
   `set_project_archived`, or a board could never be restored; the operator's
-  bookkeeping (`mark_issue_read`, `cancel_run` — stopping work and noting it was seen
-  are not additions to the board); and `record_event`, which describes work
+  bookkeeping (`mark_issue_read`, `mark_project_read`, `cancel_run` — stopping
+  work and noting it was seen are not additions to the board); and
+  `record_event`, which describes work
   already under way rather than starting any.
 - **Archiving is reversible, so it settles nothing.** A run recorded before a
   board was shelved is left unsettled — not called off, as a finished card's is

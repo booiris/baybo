@@ -9,6 +9,7 @@ export type AssigneeFilter =
 export type BoardFilter = {
   text: string;
   assignee: AssigneeFilter;
+  unreadOnly: boolean;
   blockedOnly: boolean;
   failedOnly: boolean;
   showCancelled: boolean;
@@ -22,6 +23,7 @@ export type BoardFilter = {
 export const EMPTY_FILTER: BoardFilter = {
   text: '',
   assignee: { kind: 'anyone' },
+  unreadOnly: false,
   blockedOnly: false,
   failedOnly: false,
   showCancelled: true,
@@ -29,6 +31,7 @@ export const EMPTY_FILTER: BoardFilter = {
 
 const PARAM_TEXT = 'q';
 const PARAM_ASSIGNEE = 'assignee';
+const PARAM_UNREAD = 'unread';
 const PARAM_BLOCKED = 'blocked';
 const PARAM_FAILED = 'failed';
 const PARAM_CANCELLED = 'cancelled';
@@ -42,6 +45,7 @@ function restrictions(filter: BoardFilter): boolean[] {
   return [
     filter.text.trim() !== '',
     filter.assignee.kind !== 'anyone',
+    filter.unreadOnly,
     filter.blockedOnly,
     filter.failedOnly,
     !filter.showCancelled,
@@ -77,6 +81,10 @@ function matchesAssignee(issue: Issue, filter: AssigneeFilter, team: Agent[]): b
 
 export function matches(issue: Issue, filter: BoardFilter, team: Agent[]): boolean {
   if (!filter.showCancelled && issue.cancelled_at_ms != null) return false;
+  // The card's own count and nothing else. A failed run is a separate
+  // narrowing precisely because looking never clears it — folding it in here
+  // would give this one a card it cannot empty.
+  if (filter.unreadOnly && issue.unread === 0) return false;
   if (filter.blockedOnly && issue.blocked_reason == null) return false;
   if (filter.failedOnly && !issue.last_run_failed) return false;
   if (!matchesAssignee(issue, filter.assignee, team)) return false;
@@ -102,6 +110,7 @@ export function parseBoardFilter(params: URLSearchParams): BoardFilter {
   return {
     text: params.get(PARAM_TEXT) ?? '',
     assignee,
+    unreadOnly: params.get(PARAM_UNREAD) === '1',
     blockedOnly: params.get(PARAM_BLOCKED) === '1',
     failedOnly: params.get(PARAM_FAILED) === '1',
     // Absent means shown: hiding is the deliberate act, so it is the one
@@ -118,6 +127,7 @@ export function boardFilterParams(filter: BoardFilter): URLSearchParams {
   } else if (filter.assignee.kind === 'handle') {
     params.set(PARAM_ASSIGNEE, `@${filter.assignee.handle}`);
   }
+  if (filter.unreadOnly) params.set(PARAM_UNREAD, '1');
   if (filter.blockedOnly) params.set(PARAM_BLOCKED, '1');
   if (filter.failedOnly) params.set(PARAM_FAILED, '1');
   if (!filter.showCancelled) params.set(PARAM_CANCELLED, '0');
