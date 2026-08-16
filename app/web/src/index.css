@@ -391,8 +391,8 @@ ol.md-list > li::before {
   left: 0;
 }
 
-/* A timeline bubble is smaller than a chat message on purpose: the card's
-   history is skimmed beside its properties, not read full-width like a
+/* A timeline bubble's prose is smaller than a chat message's on purpose: the
+   card's history is skimmed beside its properties, not settled into like a
    conversation. Two classes rather than a utility, because `.chat-prose` is
    unlayered and would outrank any `text-*` on the same element — a plain
    utility here is a class that looks applied and never is. */

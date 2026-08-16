@@ -63,7 +63,11 @@ function Note({ event, now }: { event: IssueEvent; now: number }) {
       <RailDot tone={eventTone(event.body)} size="sm" top="12px" />
       <span className="font-bold text-ink">{actorLabel(event)}</span>
       <span className="min-w-0 break-words">{sentence}</span>
-      <span className="ml-auto shrink-0 tabular-nums text-[0.62rem] opacity-60">
+      {/* Trailing the sentence, the way a comment's time trails its header —
+          not flushed to the pane's far edge. A note is a dozen words and the
+          column is the width of a report, so `ml-auto` stranded every
+          timestamp a hand's width from the line it belonged to. */}
+      <span className="shrink-0 tabular-nums text-[0.62rem] opacity-60">
         {eventTime(event.created_at_ms, now)}
       </span>
     </li>
@@ -91,18 +95,14 @@ function Comment({
     <li className="relative flex gap-2.5 py-2 pl-3.5">
       <RailDot tone="muted" size="lg" top="14px" />
       <Avatar handle={who} src={portrait(event.actor.kind === 'agent' ? event.actor.id : null)} />
-      {/* Three quarters of the timeline, and a maximum rather than a width: a
-          run report is hundreds of words and needs the cap, while "ok" has no
-          business being stretched to meet it.
-          The cap sits on this column, not on the bubble inside it. A
-          percentage resolves against the containing block, and the bubble's
-          containing block is this column — which is a flex item sized by its
-          own content. Capping the bubble at a fraction of a box that was
-          measured *from* the bubble is circular, and browsers settle it by
-          squeezing the bubble inside a column that keeps the full width. The
-          column's own containing block is the row, which is block-level and
-          full width, so the fraction here means what it says. */}
-      <div className="min-w-0 max-w-3/4">
+      {/* Sized by what was said, and free to run the whole width the rail
+          leaves — where a long report's right edge lands on the composer's,
+          since the reading band and the box you answer it in share an edge.
+          No width and no cap: a flex item is its content's width until the
+          row runs out, which is the ceiling this wants. `min-w-0` is what
+          lets it shrink to that ceiling rather than a long unbroken token (a
+          path, a URL) pushing the column past the row. */}
+      <div className="min-w-0">
         <div className="flex items-baseline gap-2 font-mono text-[0.6rem] font-bold text-ink-soft">
           <span>{actorLabel(event)} · comment</span>
           <span className="tabular-nums font-normal">{eventTime(event.created_at_ms, now)}</span>
@@ -241,6 +241,7 @@ export function Timeline({
   runs,
   onComment,
   onResolveApproval,
+  contentRef,
   team = [],
   portrait = generatedPortrait,
   busy,
@@ -250,6 +251,10 @@ export function Timeline({
   runs: IssueRun[];
   onComment: (text: string, attachments: IssueAttachmentRequest[]) => void;
   onResolveApproval: (callId: string, decision: 'approve' | 'approve_always' | 'deny') => void;
+  /// Handed to whoever owns the scroller, so it can watch this block for the
+  /// height that lands late — a comment's attachment swapping its placeholder
+  /// for the real image, and the composer growing under a long draft.
+  contentRef?: (node: Element | null) => void;
   team?: Agent[];
   /// Resolved faces from the page that owns the roster. Left alone, every
   /// speaker gets the face generated from its id — right for an agent
@@ -345,7 +350,7 @@ export function Timeline({
     // list can absorb the slack and leave the composer at the foot even on a
     // card with two lines of history. `sticky` alone only pins once the page
     // is long enough to scroll.
-    <section className="mt-2 flex flex-1 flex-col border-t border-black/20 pt-4">
+    <section ref={contentRef} className="mt-2 flex flex-1 flex-col border-t border-black/20 pt-4">
       <h2 className="font-mono text-[0.62rem] font-bold uppercase tracking-[0.14em] text-ink-soft">
         Activity
       </h2>
@@ -355,10 +360,10 @@ export function Timeline({
           <p className="mt-2 font-mono text-[0.7rem] text-ink-soft">Nothing has happened yet.</p>
         ) : (
           <ul
-            // `pr-4` is the composer's own right inset — its 2px border plus its
-            // 14px padding — so a row's timestamp lands on the same line as the
-            // send button rather than 16px past it.
-            className="mt-2 ml-[5px] pr-4 border-l-2 border-black/20"
+            // No right inset: entries end where the composer does, and the gap
+            // to the rail's divider is the pane's own right padding — one
+            // number for the whole column rather than two that have to agree.
+            className="mt-2 ml-[5px] border-l-2 border-black/20"
           >
             {events.map((event) => {
               if (eventShape(event) === 'comment') {

@@ -24,6 +24,8 @@ import {
   runIndicator,
   resolveDrop,
   resolveLanding,
+  RUN_LOG_HEAD,
+  runLogView,
   unreadTotal,
   unsettledRun,
   withPositions,
@@ -265,6 +267,53 @@ describe('unsettledRun', () => {
       run(1, { attempt: 3, status: 'held' }),
     ];
     expect(unsettledRun(history)?.attempt).toBe(3);
+  });
+});
+
+describe('runLogView', () => {
+  /// A card's log as the endpoint ships it: newest first.
+  function history(count: number, overrides: Partial<IssueRun> = {}): IssueRun[] {
+    return Array.from({ length: count }, (_, index) =>
+      run(1, { attempt: count - index, status: 'done', ...overrides }),
+    );
+  }
+
+  it('leaves a short log alone, and offers no toggle for it', () => {
+    for (const count of [0, 1, RUN_LOG_HEAD, RUN_LOG_HEAD + 1]) {
+      const view = runLogView(history(count), false);
+      expect(view.shown).toHaveLength(count);
+      expect(view.foldable).toBe(false);
+      expect(view.hidden).toBe(0);
+    }
+  });
+
+  it('keeps the newest and counts what it holds back', () => {
+    const view = runLogView(history(12), false);
+    expect(view.shown.map((r) => r.attempt)).toEqual([12, 11, 10, 9, 8]);
+    expect(view.hidden).toBe(7);
+    expect(view.foldable).toBe(true);
+  });
+
+  it('says how many of the folded runs failed', () => {
+    const log = [...history(5), ...history(4, { status: 'failed' })];
+    const view = runLogView(log, false);
+    expect(view.hidden).toBe(4);
+    expect(view.hiddenFailed).toBe(4);
+  });
+
+  it('shows everything once expanded, and keeps the toggle to fold back', () => {
+    const view = runLogView(history(12), true);
+    expect(view.shown).toHaveLength(12);
+    expect(view.hidden).toBe(0);
+    expect(view.foldable).toBe(true);
+  });
+
+  it('never folds away a live run, wherever it sits', () => {
+    const log = [...history(8), run(1, { attempt: 1, status: 'running' })];
+    const view = runLogView(log, false);
+    expect(view.shown.at(-1)?.status).toBe('running');
+    expect(view.hidden).toBe(0);
+    expect(view.foldable).toBe(false);
   });
 });
 

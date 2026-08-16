@@ -42,6 +42,7 @@ import {
   RiStopFill,
 } from 'react-icons/ri';
 
+import { atBottom, useHoldBottomEdge } from '../components/scrollPin';
 import { useAdminClient, useAuth } from '../api/auth';
 import {
   ChatWs,
@@ -308,6 +309,11 @@ export function transcriptTailSignature(
  *  viewport, so scroll can never fire and the older-page load must be kicked
  *  off programmatically. See the underfill fallback effect. */
 const UNDERFILL_SLACK_PX = 4;
+
+/** A live work block's step list is its own small scroller inside the thread,
+ *  so it holds its newest line on a tighter slack than the thread's: a couple
+ *  of rows off the bottom of a 200px box is scroll-back, not the edge. */
+const STEP_LIST_SLACK_PX = 48;
 
 /** Soft cap on `views` map size. Past this, the oldest non-active
  *  bucket (by frame recency) is evicted: transcript + pendingApproval
@@ -626,8 +632,7 @@ export function ChatPage() {
   const transcriptScrollRef = useRef<HTMLDivElement | null>(null);
   const transcriptEndRef = useRef<HTMLDivElement | null>(null);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
-  const transcriptContentObserver = useRef<ResizeObserver | null>(null);
-  // True when the user is parked within 64px of the latest message. When
+  // True when the user is parked within `BOTTOM_SLACK_PX` of the latest message. When
   // false a new delta/message must *not* drag them back down — the user
   // is reading scroll-back. Re-asserts itself the moment they scroll back
   // to the bottom edge. Kept in a ref so the auto-scroll effect can
@@ -1931,11 +1936,9 @@ export function ChatPage() {
   const handleTranscriptScroll = useCallback(() => {
     const scroller = transcriptScrollRef.current;
     if (!scroller) return;
-    const slackPx = 64;
-    const atBottom =
-      scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <= slackPx;
-    pinnedToBottomRef.current = atBottom;
-    if (atBottom) setHasNewBelow(false);
+    const pinned = atBottom(scroller);
+    pinnedToBottomRef.current = pinned;
+    if (pinned) setHasNewBelow(false);
     // Trigger older-page fetch when the user is within 200px of the
     // top. The `loadOlder` callback no-ops if a request is already
     // in flight or `hasMore === false`, so emitting this on every
@@ -1974,32 +1977,11 @@ export function ChatPage() {
     loadOlder,
   ]);
 
-  // Hold the newest edge through height that lands AFTER the transcript commit.
-  // The bottom-pin below is keyed on the transcript array, and plenty of growth
-  // never touches it: an attachment thumbnail swapping its 96px placeholder for
-  // the real image (`AttachmentImage` fetches the blob itself, so the box has no
-  // reserved size), the webfont swap, KaTeX. On a cold open those all resolve
-  // after the first paint — so the reader was left above the newest message,
-  // with no pill to point at it either, since `transcriptTailSignature` never
-  // moved. A warm reload hid it: the bytes are already cached and land before
-  // the pin. Attached by ref callback because the observed box unmounts with the
-  // empty/loading branches. iOS holds the edge the same way (its `.chat-log`
-  // ResizeObserver, added for the same two causes).
-  const observeTranscriptContent = useCallback((node: HTMLDivElement | null) => {
-    transcriptContentObserver.current?.disconnect();
-    transcriptContentObserver.current = null;
-    if (node === null || typeof ResizeObserver === 'undefined') return;
-    const observer = new ResizeObserver(() => {
-      const scroller = transcriptScrollRef.current;
-      // Only while pinned: growth under a reader in scroll-back must not yank
-      // them down, and the browser already holds their position for it.
-      if (!scroller || !pinnedToBottomRef.current) return;
-      scroller.scrollTop = scroller.scrollHeight;
-    });
-    observer.observe(node);
-    transcriptContentObserver.current = observer;
-  }, []);
-  useEffect(() => () => transcriptContentObserver.current?.disconnect(), []);
+  // Hold the newest edge through height that lands AFTER the transcript commit —
+  // the bottom-pin below is keyed on the transcript array, and plenty of growth
+  // never touches it. The card's timeline holds its own edge the same way, and
+  // iOS holds `.chat-log`'s for the same two causes.
+  const observeTranscriptContent = useHoldBottomEdge(transcriptScrollRef, pinnedToBottomRef);
 
   const jumpToLatest = useCallback(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -6526,8 +6508,7 @@ function WorkMachineryRun({
   const handleScroll = useCallback(() => {
     const el = containerRef.current;
     if (!el) return;
-    const slackPx = 48;
-    pinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight <= slackPx;
+    pinnedRef.current = atBottom(el, STEP_LIST_SLACK_PX);
   }, []);
   useLayoutEffect(() => {
     if (!live || !pinnedRef.current) return;

@@ -318,6 +318,45 @@ export function unsettledRun<T extends { status: RunStatus }>(runs: readonly T[]
   return runs.find((run) => !SETTLED.has(run.status)) ?? null;
 }
 
+/// How many runs the execution log shows before the rest fold away. A run is
+/// two lines in a 340px rail, so a card that has been retried and commented on
+/// all week pushes its own totals off the bottom of the pane.
+export const RUN_LOG_HEAD = 5;
+
+export type RunLogView<T> = {
+  shown: readonly T[];
+  /// Runs the fold is holding back, and how many of those failed. A fold that
+  /// silently swallows a failure is the one thing collapsing this list could
+  /// break, so the toggle says so on its face.
+  hidden: number;
+  hiddenFailed: number;
+  /// Whether there is a fold to work at all — false on a short log, where the
+  /// toggle would be a control that does nothing.
+  foldable: boolean;
+};
+
+export function runLogView<T extends { status: RunStatus }>(
+  runs: readonly T[],
+  expanded: boolean,
+): RunLogView<T> {
+  // The log arrives newest-first, so the head already holds anything still
+  // running — and its Cancel button with it. Taken from where the live run
+  // actually is rather than assumed: folding away the only control that stops
+  // a running card is not a failure worth saving four rows for.
+  const live = runs.findIndex((run) => !SETTLED.has(run.status));
+  const head = Math.max(RUN_LOG_HEAD, live + 1);
+  const rest = runs.slice(head);
+  // Folding a single run is a row of history traded for a row of button.
+  const foldable = rest.length > 1;
+  if (!foldable || expanded) return { shown: runs, hidden: 0, hiddenFailed: 0, foldable };
+  return {
+    shown: runs.slice(0, head),
+    hidden: rest.length,
+    hiddenFailed: rest.filter((run) => run.status === 'failed').length,
+    foldable,
+  };
+}
+
 export function dropRejection(issue: Issue, target: IssueStatus): string | null {
   if (target === 'in_progress' && issue.assignee == null) {
     return `Assign an agent first — #${issue.number} is back in ${COLUMN_LABEL[issue.status]}`;

@@ -7,9 +7,16 @@ import {
   type ReactNode,
 } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import { RiArrowLeftLine, RiGitMergeLine, RiLoader4Line, RiRefreshLine } from 'react-icons/ri';
+import {
+  RiArrowDownLine,
+  RiArrowLeftLine,
+  RiGitMergeLine,
+  RiLoader4Line,
+  RiRefreshLine,
+} from 'react-icons/ri';
 
 import { useAdminClient, useAuth } from '../../api/auth';
+import { atBottom, useHoldBottomEdge } from '../../components/scrollPin';
 import {
   cancelRun,
   fetchTeam,
@@ -27,9 +34,11 @@ import {
 } from './api';
 import {
   COLUMN_LABEL,
+  RUN_LOG_HEAD,
   STATUS_PILL,
   assignableAgents,
   runDuration,
+  runLogView,
   tokensOf,
   unsettledRun,
   type Agent,
@@ -232,6 +241,8 @@ export function IssueDetailPage() {
   const portrait = useTeamPortraits(agents);
   const [runLog, setRunLog] = useState<RunLog | null>(null);
   const runs = runLog?.items ?? [];
+  const [allRuns, setAllRuns] = useState(false);
+  const runView = runLogView(runs, allRuns);
   const [events, setEvents] = useState<IssueEvent[]>([]);
   const [refreshKey, setRefreshKey] = useState(0);
   const [error, setError] = useState<string | null>(null);
@@ -252,33 +263,72 @@ export function IssueDetailPage() {
   const draftDescription = useRef('');
   const descriptionTouched = useRef(false);
   const pane = useRef<HTMLElement | null>(null);
-  /// Whether this card has already been dropped at the foot of its timeline.
-  /// Reset per card, so opening a second one lands the same way.
-  const landed = useRef(false);
-  /// Whether this card's read cursor has been moved. Reset per card, like
-  /// `landed`, and for the same reason: opening a card is the act that
-  /// reads it, and a refresh is not a second opening.
+  /// Whether the reader is parked at the foot of the card. The chat thread's
+  /// posture, and this pane is the same act: a card is read downwards and
+  /// answered at the bottom, so an arrival follows a reader who is already
+  /// there and leaves one who is not exactly where they were.
+  const pinned = useRef(true);
+  const [newBelow, setNewBelow] = useState(false);
+  /// What the foot of the timeline looked like last commit. A board frame
+  /// re-fetches the whole card, so a fresh `events` array is not by itself
+  /// news — only a different last entry is.
+  const tail = useRef('');
+  const holdTimelineEdge = useHoldBottomEdge(pane, pinned);
+  /// Whether this card's read cursor has been moved. Reset per card: opening a
+  /// card is the act that reads it, and a refresh is not a second opening.
   const stamped = useRef(false);
 
-  // A card opens at the foot of its own history — the newest entries and the
-  // composer — rather than at a title you have already read. Once per card,
-  // and never on a refresh: the timeline invalidates on every board frame,
-  // and re-anchoring there would yank the page out from under somebody
-  // reading back through it. Before paint, so it lands rather than jumps.
   useEffect(() => {
-    landed.current = false;
     stamped.current = false;
     draftDescription.current = '';
     descriptionTouched.current = false;
+    // A fresh card is read from its foot again, whatever posture the last one
+    // was left in. This pane is routed, not remounted, so none of this resets
+    // itself — including the unfolded execution log, which would otherwise
+    // open the next card's whole history because somebody read this one's.
+    pinned.current = true;
+    tail.current = '';
+    setNewBelow(false);
+    setAllRuns(false);
   }, [projectId, number]);
 
+  // A card opens at the foot of its own history — the newest entries and the
+  // composer — rather than at a title you have already read, and stays there
+  // as entries land. Before paint, so it lands rather than jumps. A reader in
+  // scroll-back is never yanked: what they get is the pill, and only when
+  // something actually arrived below them.
   useLayoutEffect(() => {
-    if (loading || issue === null || landed.current) return;
+    const signature = `${String(events.length)}|${events.at(-1)?.id ?? ''}`;
+    const moved = signature !== tail.current;
+    tail.current = signature;
+    if (loading || issue === null) return;
     const box = pane.current;
     if (box === null) return;
-    landed.current = true;
-    box.scrollTop = box.scrollHeight;
-  }, [loading, issue]);
+    if (pinned.current) {
+      box.scrollTop = box.scrollHeight;
+      setNewBelow(false);
+    } else if (moved) {
+      setNewBelow(true);
+    }
+  }, [loading, issue, events]);
+
+  const onPaneScroll = useCallback(() => {
+    const box = pane.current;
+    if (box === null) return;
+    pinned.current = atBottom(box);
+    if (pinned.current) setNewBelow(false);
+  }, []);
+
+  /// Smooth, unlike every other move this pane makes: the others are the page
+  /// holding an edge the reader never left, and this one is a "take me there"
+  /// they pressed.
+  const jumpToLatest = useCallback(() => {
+    const box = pane.current;
+    if (box === null) return;
+    box.scrollTo({ top: box.scrollHeight, behavior: 'smooth' });
+    pinned.current = true;
+    setNewBelow(false);
+  }, []);
 
   useEffect(() => {
     let canceled = false;
@@ -513,6 +563,10 @@ export function IssueDetailPage() {
         return;
       }
       setError(null);
+      // Sending is a "take me there" the same as pressing the pill: your own
+      // comment lands in view even if you had scrolled back up to write it.
+      pinned.current = true;
+      setNewBelow(false);
       setEvents((current) => [...current, outcome.value]);
     },
     [client, logout, number, projectId],
@@ -756,9 +810,15 @@ export function IssueDetailPage() {
       </header>
 
       <div className="flex-1 min-h-0 flex overflow-hidden bg-surface">
+        {/* Positioning context for the jump pill. It cannot live inside the
+            pane: an absolute box in a scroller is placed against the content
+            and scrolls away with it, and the composer it would sit above is
+            itself only stuck while the timeline is on screen. */}
+        <div className="relative flex flex-1 min-w-0">
         <main
           ref={pane}
-          className="flex flex-col flex-1 min-w-0 overflow-y-auto overscroll-none py-5 pl-18 pr-5"
+          onScroll={onPaneScroll}
+          className="flex flex-col flex-1 min-w-0 overflow-y-auto overscroll-none py-5 pl-20 pr-20"
         >
           {error != null ? (
             <div className="mb-4 bg-white border-2 border-err text-err rounded-md px-3 py-2 font-mono text-[0.78rem] break-words">
@@ -883,6 +943,7 @@ export function IssueDetailPage() {
             issue={issue}
             runs={runs}
             busy={saving}
+            contentRef={holdTimelineEdge}
             onComment={(text, attachments) => {
               void comment(text, attachments);
             }}
@@ -893,6 +954,19 @@ export function IssueDetailPage() {
             }}
           />
         </main>
+
+        {newBelow ? (
+          <button
+            type="button"
+            onClick={jumpToLatest}
+            title="Jump to the newest entry"
+            className="absolute bottom-32 left-1/2 z-30 flex -translate-x-1/2 items-center gap-1.5 border-2 border-black rounded-md bg-white px-3 py-1.5 font-mono text-[0.62rem] font-bold uppercase tracking-wider shadow-brutal-sm hover:bg-canvas"
+          >
+            <RiArrowDownLine className="text-sm" />
+            New activity
+          </button>
+        ) : null}
+        </div>
 
         <aside className="w-[340px] shrink-0 border-l-2 border-black bg-canvas p-3.5 flex flex-col gap-3.5 overflow-y-auto overscroll-none">
           <section className={railBox}>
@@ -1161,7 +1235,7 @@ export function IssueDetailPage() {
               </p>
             ) : (
               <ul className="mt-1.5 flex flex-col">
-                {runs.map((run) => (
+                {runView.shown.map((run) => (
                   <RunRow
                     key={run.attempt}
                     run={run}
@@ -1173,6 +1247,30 @@ export function IssueDetailPage() {
                 ))}
               </ul>
             )}
+            {/* The fold, and what it is holding. A hidden failure is the one
+                thing this collapse could cost, so the count of them rides on
+                the toggle in the error tone — the same reason the board's
+                filter trigger carries a badge. */}
+            {runView.foldable ? (
+              <button
+                type="button"
+                onClick={() => {
+                  setAllRuns((open) => !open);
+                }}
+                className="mt-1.5 w-full text-left font-mono text-[0.6rem] text-ink-soft hover:text-ink"
+              >
+                {allRuns ? (
+                  `Fold to the newest ${String(RUN_LOG_HEAD)}`
+                ) : (
+                  <>
+                    ＋{runView.hidden} earlier {runView.hidden === 1 ? 'run' : 'runs'}
+                    {runView.hiddenFailed > 0 ? (
+                      <span className="font-bold text-err"> · {runView.hiddenFailed} failed</span>
+                    ) : null}
+                  </>
+                )}
+              </button>
+            ) : null}
             {/* Gated on the same fact the board's badge and the card's own
                 marker read, so the button is present exactly when the
                 thing it clears is being counted. */}

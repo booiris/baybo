@@ -269,6 +269,30 @@ $0.00` would report that as instant and free.
 The drawer is **read-only**. Approvals appear here with a warn dot and are
 answered on the issue's own timeline; there are no action buttons in the feed.
 
+## Sticking to the newest edge
+
+The chat thread and a card's detail pane are read the same way — downwards, and
+answered at the bottom — so they hold their newest edge by one rule, and
+`components/scrollPin.ts` is where it lives. A surface is **pinned** while the
+reader is within `BOTTOM_SLACK_PX` of the bottom (`atBottom`); pinned, an
+arrival scrolls them to it, and un-pinned it does not touch their scroll and
+raises a pill instead — *New messages* in the thread, *New activity* on a card.
+Pressing the pill, or **sending**, re-pins: your own message is the one arrival
+always worth being taken to, wherever you were when you wrote it.
+
+Two details the posture depends on. Only a moved **tail** raises the pill: a
+board frame re-fetches a whole card and a scroll-up page prepends to a
+transcript, and neither is news below the reader. And `useHoldBottomEdge`
+watches the **content** box for height that lands after the commit — an
+attachment thumbnail is fetched by its own component, so a comment with a
+screenshot grows ~96px a beat after it renders, which on a cold open left the
+reader parked just above the newest entry with no pill to say so.
+
+The pill needs a positioning context outside the scroller: an absolute box
+inside one is placed against the content and scrolls away with it. On a card
+that is a wrapper around `<main>`, because the card's composer — unlike the
+thread's floating pill — is `sticky`, and on screen only while the timeline is.
+
 ## Dragging a card
 
 The drop target is decided by `pages/projects/dropTarget.ts`, not by one of

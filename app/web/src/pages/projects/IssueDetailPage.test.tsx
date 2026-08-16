@@ -1,10 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 
+import { installScrollBox } from '../../test/domGaps';
 import { IssueDetailPage } from './IssueDetailPage';
 import type { Issue, IssueRun } from './boardModel';
+import type { IssueEvent } from './timelineModel';
 
 
 const PROJECT_ID = '01JPROJECT';
@@ -55,8 +57,19 @@ const TEAM = [
 
 const ok = { status: 200, ok: true } as Response;
 
+function comment(id: string, text: string): IssueEvent {
+  return {
+    id,
+    number: 7,
+    actor: { kind: 'user' },
+    body: { kind: 'comment', text },
+    created_at_ms: 0,
+  };
+}
+
 let current: Issue = issue();
 let currentRuns: IssueRun[] = RUNS;
+let currentEvents: IssueEvent[] = [];
 
 const client = {
   GET: vi.fn(async (path: string) => {
@@ -70,7 +83,7 @@ const client = {
       return { data: { items: currentRuns }, error: undefined, response: ok };
     }
     if (path === '/v1/projects/{project_id}/issues/{number}/events') {
-      return { data: { items: [] }, error: undefined, response: ok };
+      return { data: { items: currentEvents }, error: undefined, response: ok };
     }
     if (path === '/v1/projects/{project_id}/agents') {
       return { data: { items: TEAM }, error: undefined, response: ok };
@@ -80,8 +93,10 @@ const client = {
   // Typed args rather than `() =>`: the assertions below read
   // `POST.mock.calls` to tell the read stamp apart from a retry, and an
   // argument-less mock types those calls as empty tuples.
-  POST: vi.fn(async (_path: string, _init?: unknown) => ({
-    data: RUNS[0],
+  POST: vi.fn(async (path: string, _init?: unknown) => ({
+    // A posted comment answers with the entry it created, and the page appends
+    // that to the timeline — hand back a run for it and the render throws.
+    data: path.endsWith('/comments') ? comment('evt-sent', 'looks right to me') : RUNS[0],
     error: undefined,
     response: ok,
   })),
@@ -124,9 +139,10 @@ vi.mock('../../api/auth', () => ({
   useAuth: () => auth,
 }));
 
-function renderIssue(row: Issue, runs: IssueRun[] = RUNS) {
+function renderIssue(row: Issue, runs: IssueRun[] = RUNS, events: IssueEvent[] = []) {
   current = row;
   currentRuns = runs;
+  currentEvents = events;
   return render(
     <MemoryRouter initialEntries={[`/projects/${PROJECT_ID}/issues/${row.number}`]}>
       <Routes>
@@ -204,6 +220,36 @@ describe('IssueDetailPage execution log', () => {
     expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull();
   });
 
+  it('folds a long log to its newest runs, and says what it is holding', async () => {
+    // A card retried all week owned the whole rail and pushed its own totals
+    // off the bottom of the pane. What the fold may not do is swallow a
+    // failure, so the count of them rides on the toggle.
+    const log = Array.from({ length: 12 }, (_, index) => {
+      const attempt = 12 - index;
+      const status =
+        attempt === 12 ? 'running' : attempt === 3 || attempt === 4 ? 'failed' : 'done';
+      return { ...run(status), attempt };
+    });
+    renderIssue(issue(), log);
+
+    const toggle = await screen.findByRole('button', { name: /7 earlier runs/ });
+    // A fold that swallows a failure is the one thing this could cost.
+    expect(toggle).toHaveTextContent('2 failed');
+    expect(screen.getByText('#12')).toBeInTheDocument();
+    expect(screen.getByText('#8')).toBeInTheDocument();
+    // Not `#7`: that is the card's own number, in the header above.
+    expect(screen.queryByText('#6')).toBeNull();
+    // The live run keeps its Cancel — folding away the only control that
+    // stops a running card is not a saving.
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeInTheDocument();
+
+    await userEvent.click(toggle);
+    expect(screen.getByText('#1')).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: /fold to the newest 5/i }));
+    expect(screen.queryByText('#1')).toBeNull();
+  });
+
   it('says why the log is empty instead of showing a bare heading', async () => {
     renderIssue(issue(), []);
 
@@ -230,6 +276,58 @@ describe('IssueDetailPage execution log', () => {
     expect(metaRow?.className).toContain('justify-end');
     // …and the status chip is on the other line, not sharing the row.
     expect(metaRow?.textContent).not.toContain('done');
+  });
+});
+
+describe('IssueDetailPage activity scrolling', () => {
+  // The chat thread's posture, in the pane a card is answered in. jsdom runs no
+  // layout, so the pane is handed one tall enough to scroll.
+  const PANE = { scrollHeight: 2000, clientHeight: 400 };
+  installScrollBox(PANE);
+
+  it('opens at the foot of the card, and follows the comment you send', async () => {
+    renderIssue(issue(), RUNS, [comment('evt-old', 'the first one')]);
+
+    const pane = await screen.findByRole('main');
+    await waitFor(() => {
+      expect(pane.scrollTop).toBe(PANE.scrollHeight);
+    });
+
+    // Read back up the card…
+    pane.scrollTop = 0;
+    fireEvent.scroll(pane);
+
+    // …and sending still takes you to what you sent, as it does in chat.
+    await userEvent.type(
+      screen.getByPlaceholderText(/Comment…/),
+      'looks right to me{Enter}',
+    );
+    await waitFor(() => {
+      expect(pane.scrollTop).toBe(PANE.scrollHeight);
+    });
+  });
+
+  it('raises a pill rather than yanking a reader who has scrolled back', async () => {
+    renderIssue(issue({ last_run_failed: true }), [run('failed')]);
+
+    const pane = await screen.findByRole('main');
+    await waitFor(() => {
+      expect(pane.scrollTop).toBe(PANE.scrollHeight);
+    });
+    pane.scrollTop = 0;
+    fireEvent.scroll(pane);
+
+    // An entry lands while they are up there — here through the refetch that
+    // Run again triggers, on the board it is an agent's own comment.
+    currentEvents = [comment('evt-new', 'ran it again')];
+    await userEvent.click(screen.getByRole('button', { name: /run again/i }));
+
+    const pill = await screen.findByRole('button', { name: /new activity/i });
+    expect(pane.scrollTop).toBe(0);
+
+    await userEvent.click(pill);
+    expect(pane.scrollTop).toBe(PANE.scrollHeight);
+    expect(screen.queryByRole('button', { name: /new activity/i })).toBeNull();
   });
 });
 
