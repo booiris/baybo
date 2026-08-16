@@ -118,7 +118,7 @@ was tried and failed, and several name a bug that shipped once already.
   supervisor (one loop owns dial/death/subscription state), the `LegDialer`
   seam, the send gate, the ack judgment, and the Swift `connState`
   continuations. Shaped by the 2026-08-16 cold-start send black hole; read it
-  before touching `ffi/src/transport.rs` or the ChatStore dial paths.
+  before touching `ffi/src/transport/` or the ChatStore dial paths.
 - [`docs/transcript.md`](docs/transcript.md) — the one reused WKWebView, store
   lifecycle and offscreen frame buffering, the native ⇄ web bridge, the keyboard
   inset, markdown/LaTeX rendering, and the message index.

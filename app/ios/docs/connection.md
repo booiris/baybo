@@ -1,7 +1,9 @@
 # Connection lifecycle
 
-*The chat-leg connection supervisor — governs `app/ios/ffi/src/transport.rs`
-(the supervisor, the pump, the dial seam), the per-leg dialers in
+*The chat-leg connection supervisor — governs `app/ios/ffi/src/transport/`
+(`mod.rs`: shared wire primitives + the seams + the `SessionRegistry` facade;
+`supervisor.rs`: the lifecycle actor; `pump.rs`: the hot path;
+`tests.rs`: the loopback suite), the per-leg dialers in
 `ffi/src/relay/chat.rs` / `ffi/src/direct/chat.rs`, and the Swift half of the
 state machine in `App/Core/ChatStore.swift` (connState, the dial
 continuations, the send paths).*
@@ -124,6 +126,26 @@ an orphan, and the dial child carries a send-on-drop report so a panic inside
 `establish` (foreign dial code has panicked before) can never strand the
 supervisor in `Dialing` with held replies.
 
+## What stays OUTSIDE the supervisor (and when that changes)
+
+The api legs (`relay/api.rs` + `leg_pool.rs`, direct's plain HTTPS) and the
+blob legs are deliberately NOT under the supervisor. The criterion is the
+failure model, not "is it a connection": the supervisor exists for the one
+class whose failure is SILENT and whose state is DISTRIBUTED — long-lived,
+server-side subscription state, a push direction, callback-driven recovery.
+Api/blob legs have none of that: every use is a caller-awaited
+request/response, so a dead leg fails the request in hand and the error
+propagates immediately; their correctness concern is replay convergence
+(`should_retry` / `ReplayPolicy`), which the supervisor cannot help with; and
+the pool has its own lifecycle (two-clock staleness, TTLs, `.background`
+invalidation) whose worst case is one failed request retried on a fresh leg.
+
+The rule: **if a leg ever grows push semantics, a subscription, or any
+cross-request server-side state, it moves under the supervisor** — do not
+grow a parallel set of fences. The one real coupling today is capacity, not
+lifecycle: parked api-pool legs and chat reconnects share relay connection
+slots (see `MAX_POOLED_LEGS`).
+
 ## The Swift half
 
 `connState` has four states and few writers on purpose:
@@ -148,7 +170,7 @@ shared — do not merge the entries.
 
 ## Testing
 
-`transport.rs`'s test module drives the real supervisor + pump against a
+`transport/tests.rs` drives the real supervisor + pump against a
 loopback WS server (`Server`), with two `#[cfg(test)]` seams on the message
 enum: `InjectProvenForTest` (a bystander riding the leg without a full
 connect — the server may be deliberately silent) and `AbortPumpForTest` (a
