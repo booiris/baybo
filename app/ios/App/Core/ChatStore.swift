@@ -321,6 +321,13 @@ final class ChatStore: ObservableObject, TranscriptTarget {
     private var generation = 0
     /// Last generation handed to a dial's sink.
     private var issuedGeneration = 0
+    /// Highest sink generation that has reported its pump dead. A dial whose
+    /// generation is ≤ this must not claim `.connected` on return: the leg it
+    /// subscribed on died while the success was still unwinding, and letting
+    /// the stale success land would erase the reconnect `pumpDisconnected`
+    /// armed — `.connected` has no other exit, so the store would be wedged
+    /// until relaunch (the cold-start send black hole of 2026-08-16).
+    private var lastDisconnectGeneration = 0
     private var retryTask: Task<Void, Never>?
     private var debounceTask: Task<Void, Never>?
     private var connectTask: Task<Void, Error>?
@@ -419,27 +426,50 @@ final class ChatStore: ObservableObject, TranscriptTarget {
                     sessionId: sessionId,
                     sink: Sink(store: self, generation: gen)
                 )
-                guard gen >= generation else { return }  // superseded by disconnect
-                // The subscribe is now accepted; only NOW mute older sinks. The
-                // server replays no history — the connEpoch bump drives the
-                // webview's sync loop (its `handleConnEpoch` → one forward pull).
-                generation = gen
-                connEpoch += 1
-                connState = .connected
-                bridge?.setConnEpoch(connEpoch)
-                // Reconcile the outbox against the reconnect: entries still
-                // lacking durability confirmation resend (sync-v2 send path).
-                reconcileOutboxOnConnect()
+                claimConnected(gen: gen)
             } catch {
-                guard gen >= generation else { return }
-                // The one place `offline` is set — a failed dial.
-                connState = .offline
-                scheduleRetry()
+                dialFailed(gen: gen)
+                guard gen >= generation else { return }  // superseded: swallowed
                 throw error
             }
         }
         connectTask = task
         return task
+    }
+
+    /// A dial's success continuation, shared by `startConnect` and the send
+    /// slow path — the ONE place `.connected` is written. The claim yields to
+    /// a disconnect that superseded the dial (`generation` moved past it) and
+    /// to a death report for the leg the dial subscribed on
+    /// (`lastDisconnectGeneration`): claiming there would erase the heal
+    /// `pumpDisconnected` wrote, and with the callback already consumed
+    /// nothing would ever exit `.connected` again. On yield the store stays
+    /// `.connecting` with the retry armed.
+    private func claimConnected(gen: Int, justSent: String? = nil) {
+        guard gen >= generation else { return }  // superseded by disconnect
+        guard gen > lastDisconnectGeneration else {
+            connState = .connecting
+            scheduleRetry()
+            return
+        }
+        // The subscribe is now accepted; only NOW mute older sinks. The
+        // server replays no history — the connEpoch bump drives the
+        // webview's sync loop (its `handleConnEpoch` → one forward pull).
+        generation = gen
+        connEpoch += 1
+        connState = .connected
+        bridge?.setConnEpoch(connEpoch)
+        // Reconcile the outbox against the reconnect: entries still
+        // lacking durability confirmation resend (sync-v2 send path).
+        reconcileOutboxOnConnect(justSent: justSent)
+    }
+
+    /// A dial's failure continuation — the one place `.offline` is set. A
+    /// superseded dial changes nothing: the newer dial owns the state.
+    private func dialFailed(gen: Int) {
+        guard gen >= generation else { return }
+        connState = .offline
+        scheduleRetry()
     }
 
     /// Foreground / visibility signal: debounce, then redial (a no-op when the
@@ -487,9 +517,14 @@ final class ChatStore: ObservableObject, TranscriptTarget {
         }
     }
 
-    /// The pump died on its own (peer closed / liveness lapse / Noise desync).
+    /// The pump died (its own exit, or a reaper delivering on the corpse's
+    /// behalf — the FFI guarantees this callback for every unsolicited death).
     private func pumpDisconnected(sessionId: String, generation: Int) {
-        guard sessionId == self.sessionId, generation >= self.generation else { return }
+        guard sessionId == self.sessionId else { return }
+        // Recorded before the mute guard: even a superseded sink's death report
+        // still tells a dial of that generation not to trust its success.
+        lastDisconnectGeneration = max(lastDisconnectGeneration, generation)
+        guard generation >= self.generation else { return }
         connState = .connecting
         scheduleRetry()
     }
@@ -868,9 +903,18 @@ final class ChatStore: ObservableObject, TranscriptTarget {
         attachments: [AttachmentRef]
     ) async throws {
         if connState == .connected {
-            try await client.chatSend(
-                sessionId: sessionId, text: text, msgId: msgId, attachments: attachments)
-            return
+            do {
+                try await client.chatSend(
+                    sessionId: sessionId, text: text, msgId: msgId, attachments: attachments)
+                return
+            } catch BayboError.NotConnected {
+                // The registry disowned the leg (dead pump, or a fresh leg the
+                // session never re-subscribed on) while this store still said
+                // `.connected`. Not a deferral: fall through to the
+                // dial-and-send path, which re-subscribes and carries this very
+                // message behind the Subscribe.
+                NSLog("baybo: send on a stale connected leg; redialing")
+            }
         }
 
         retryTask?.cancel()
@@ -890,16 +934,11 @@ final class ChatStore: ObservableObject, TranscriptTarget {
                 msgId: msgId,
                 attachments: attachments
             )
-            guard gen >= generation else { return }
-            generation = gen
-            connEpoch += 1
-            connState = .connected
-            bridge?.setConnEpoch(connEpoch)
-            reconcileOutboxOnConnect(justSent: msgId)
+            // On a fence yield the message itself is safe: the outbox still
+            // holds it and the retry's reconcile resends it.
+            claimConnected(gen: gen, justSent: msgId)
         } catch {
-            guard gen >= generation else { throw error }
-            connState = .offline
-            scheduleRetry()
+            dialFailed(gen: gen)
             throw error
         }
     }
@@ -1212,6 +1251,11 @@ final class ChatStore: ObservableObject, TranscriptTarget {
             do {
                 try await client.chatSend(
                     sessionId: sessionId, text: Self.stopCommand, msgId: msgId, attachments: [])
+            } catch BayboError.NotConnected {
+                // A stop that died on a stale leg must still exit `.connected`,
+                // or the redial that could deliver a retried stop never comes.
+                NSLog("baybo: stop on a stale connected leg; redialing")
+                legLost()
             } catch {
                 NSLog("baybo: stop: %@", bayboErrorText(error))
             }
@@ -1440,10 +1484,26 @@ final class ChatStore: ObservableObject, TranscriptTarget {
                 try await client.chatSend(
                     sessionId: sessionId, text: entry.text, msgId: entry.platformMsgId,
                     attachments: attachments)
+            } catch BayboError.NotConnected {
+                // The registry disowned the leg while the sweep still saw
+                // `.connected` — blind-resending into that verdict would just
+                // burn the transmission cap. Exit the state so the reconnect
+                // ladder redials; its reconcile resends this entry.
+                NSLog("baybo: outbox resend on a stale connected leg; redialing")
+                legLost()
             } catch {
                 NSLog("baybo: outbox resend: %@", bayboErrorText(error))
             }
         }
+    }
+
+    /// The registry's stale-leg verdict arrived on a believed-connected store:
+    /// exit `.connected` (its only other exit is the FFI death callback) and
+    /// arm the redial ladder.
+    private func legLost() {
+        guard connState == .connected else { return }
+        connState = .connecting
+        scheduleRetry()
     }
 
     private nonisolated static func toOutboxAttachment(_ ref: AttachmentRef) -> OutboxAttachment {

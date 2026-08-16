@@ -1775,7 +1775,9 @@ mod tests {
         for bad in ["", "a/b", "a?b", "a#b", "../sessions/s1"] {
             let client = RecordingClient::empty();
             assert!(
-                list_subagents(&client, bad.to_string(), None).await.is_err(),
+                list_subagents(&client, bad.to_string(), None)
+                    .await
+                    .is_err(),
                 "{bad:?} must be rejected"
             );
             assert!(

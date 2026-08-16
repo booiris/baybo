@@ -17,7 +17,7 @@ use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
 use crate::core::{Frame, MobileError, decode, encode, register_device_frame, user_message_frame};
 use crate::transport::{
-    ChatTransport, Connection, FrameCodec, SessionLeg, TransportError, UserFrameFn, WsStream,
+    Connection, FrameCodec, LegDialer, SessionLeg, TransportError, UserFrameFn, WsStream,
     recv_binary_handshake,
 };
 
@@ -38,17 +38,30 @@ impl FrameCodec for DirectCodec {
     }
 }
 
-impl ChatTransport for super::DirectSessions {
-    #[allow(clippy::manual_async_fn)]
-    fn establish(
-        &self,
-    ) -> impl std::future::Future<Output = Result<Connection, TransportError>> + Send {
-        async move {
-            // A precondition failure must not tear down a healthy live session on a
-            // foreground reconnect (matches the original, which only reset on a
-            // failed dial in `establish_ws`).
-            let http = self.http_client().map_err(TransportError::Precondition)?;
-            let ws = self.establish_ws(&http).await?;
+/// The direct leg's dialer — the OWNED establish seam the connection
+/// supervisor holds ([`LegDialer`]). Carries the shared authenticated-HTTP
+/// cache so each dial re-reads the current credentials.
+pub(crate) struct DirectDialer {
+    http: super::DirectHttpSlot,
+}
+
+impl DirectDialer {
+    pub(crate) fn new(http: super::DirectHttpSlot) -> Self {
+        Self { http }
+    }
+}
+
+impl LegDialer for DirectDialer {
+    fn establish(&self) -> futures_util::future::BoxFuture<'_, Result<Connection, TransportError>> {
+        Box::pin(async move {
+            // A precondition failure carries its own prose ("sign in first")
+            // instead of a dead-leg error, so the client can tell setup from
+            // network.
+            let http = self
+                .http
+                .http_client()
+                .map_err(TransportError::Precondition)?;
+            let ws = establish_ws(&http).await?;
 
             let codec: Box<dyn FrameCodec> = Box::new(DirectCodec);
 
@@ -66,20 +79,18 @@ impl ChatTransport for super::DirectSessions {
                 codec,
                 user_frame,
             })
-        }
+        })
     }
 }
 
-impl super::DirectSessions {
-    /// Complete the WS handshake as the admin-authenticated direct device.
-    async fn establish_ws(&self, http: &super::DirectHttp) -> Result<WsStream, TransportError> {
-        match dial_and_register(http).await {
-            Ok(ws) => Ok(ws),
-            Err(DialErr::Unauthorized) => {
-                Err(TransportError::Other(super::INVALID_TOKEN_CODE.to_string()))
-            }
-            Err(DialErr::Other(s)) => Err(TransportError::Other(s)),
+/// Complete the WS handshake as the admin-authenticated direct device.
+async fn establish_ws(http: &super::DirectHttp) -> Result<WsStream, TransportError> {
+    match dial_and_register(http).await {
+        Ok(ws) => Ok(ws),
+        Err(DialErr::Unauthorized) => {
+            Err(TransportError::Other(super::INVALID_TOKEN_CODE.to_string()))
         }
+        Err(DialErr::Other(s)) => Err(TransportError::Other(s)),
     }
 }
 

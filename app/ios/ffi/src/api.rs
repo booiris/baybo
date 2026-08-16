@@ -6,6 +6,7 @@
 
 use crate::binding::NOT_BOUND_MSG;
 use crate::direct::INVALID_TOKEN_CODE;
+use crate::transport::{NOT_CONNECTED_MSG, SESSION_CLOSED_MSG};
 
 /// The FFI error surface. `InvalidToken` and `NotBound` used to be string codes
 /// the webview matched on (`invalid_token` / the unbound prose); as enum variants
@@ -18,18 +19,28 @@ pub enum BayboError {
     /// The gateway rejected the admin Bearer token (HTTP 401).
     #[error("{}", INVALID_TOKEN_CODE)]
     InvalidToken,
+    /// The chat leg can't carry this session right now: no live pump, or the
+    /// session's subscription was proven on a leg that is no longer the live
+    /// one. Swift's send fast path matches this to fall through to the
+    /// dial-and-send slow path instead of trusting a stale `connected`.
+    #[error("{}", NOT_CONNECTED_MSG)]
+    NotConnected,
     /// Any other failure, carrying the leg's own prose verbatim.
     #[error("{message}")]
     Other { message: String },
 }
 
 impl BayboError {
-    /// Fold an internal `String` error into the FFI enum: the two stable codes
-    /// become their variants, everything else rides as prose.
+    /// Fold an internal `String` error into the FFI enum: the stable codes
+    /// become their variants, everything else rides as prose. The transport's
+    /// two dead-leg spellings collapse into one variant — for the caller they
+    /// mean the same thing: this send/connect did not reach the gateway, and
+    /// a redial is the recovery.
     pub(crate) fn from_msg(message: String) -> Self {
         match message.as_str() {
             INVALID_TOKEN_CODE => Self::InvalidToken,
             NOT_BOUND_MSG => Self::NotBound,
+            NOT_CONNECTED_MSG | SESSION_CLOSED_MSG => Self::NotConnected,
             _ => Self::Other { message },
         }
     }
@@ -719,6 +730,21 @@ mod tests {
             BayboError::from_msg(NOT_BOUND_MSG.to_string()),
             BayboError::NotBound
         ));
+    }
+
+    /// The dead-leg pair rides the same untyped-string seam: both transport
+    /// spellings must stringify to their bare codes and fold into
+    /// `NotConnected`, or Swift's send fast path stops falling through to the
+    /// dial-and-send slow path and a stale `connected` becomes a black hole
+    /// again.
+    #[test]
+    fn both_dead_leg_errors_fold_into_the_not_connected_variant() {
+        for err in [TransportError::NotConnected, TransportError::SessionClosed] {
+            assert!(matches!(
+                BayboError::from_msg(err.to_string()),
+                BayboError::NotConnected
+            ));
+        }
     }
 
     /// All three hops end to end, exactly as `chat_connect` runs them.
