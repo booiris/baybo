@@ -50,6 +50,7 @@ import {
   type IssueRun,
   type IssueStatus,
   type Project,
+  anchorOf,
   cardDragId,
   assignableAgents,
   columnDropId,
@@ -130,7 +131,12 @@ export function ProjectBoardPage() {
   const [hireOpen, setHireOpen] = useState(false);
 
   // onDragOver mutates the preview, so rollback needs the drag-start board.
+  // Non-null for exactly as long as a card is in the air, which is also what
+  // `dragging` says — the two are set and cleared together.
   const preDrag = useRef<Board | null>(null);
+  // A `project_changed` frame that arrived while a card was in the air, and
+  // has still to be answered.
+  const missedRefresh = useRef(false);
 
   useEffect(() => {
     let canceled = false;
@@ -195,18 +201,38 @@ export function ProjectBoardPage() {
 
   const unread = useMemo(() => unreadTotal(board), [board]);
 
+  const refetch = useCallback(() => {
+    setRefreshKey((key) => key + 1);
+    // The board's counts and the rail's dot are the same facts read
+    // twice. Without this the dot trailed the board it describes by up
+    // to a poll interval, which is how a signal the operator had just
+    // discharged read as one that would not clear.
+    invalidateAttention(client);
+  }, [client]);
+
   useBoardStream(
     projectId,
     null,
     useCallback(() => {
-      setRefreshKey((key) => key + 1);
-      // The board's counts and the rail's dot are the same facts read
-      // twice. Without this the dot trailed the board it describes by up
-      // to a poll interval, which is how a signal the operator had just
-      // discharged read as one that would not clear.
-      invalidateAttention(client);
-    }, [client]),
+      // Not under a card that is in the air. A refetch replaces every column
+      // wholesale — the cards re-key, and the unread hoist re-ranks the very
+      // column being dragged in — so the drop would resolve against a layout
+      // the operator never aimed at, and the rollback in `onDragEnd` would
+      // then write back a board from before the frame landed.
+      if (preDrag.current !== null) {
+        missedRefresh.current = true;
+        return;
+      }
+      refetch();
+    }, [refetch]),
   );
+
+  // The frame the drag held back, answered the moment it lands.
+  useEffect(() => {
+    if (dragging !== null || !missedRefresh.current) return;
+    missedRefresh.current = false;
+    refetch();
+  }, [dragging, refetch]);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
@@ -215,25 +241,37 @@ export function ProjectBoardPage() {
 
   const onDragStart = useCallback(
     (event: DragStartEvent) => {
-      preDrag.current = board;
       const target = parseDragId(String(event.active.id));
-      setDragging(target?.kind === 'card' ? findIssue(board, target.number) : null);
+      const card = target?.kind === 'card' ? findIssue(board, target.number) : null;
+      preDrag.current = card === null ? null : board;
+      setDragging(card);
     },
     [board],
   );
 
   // dnd-kit needs cross-column previews here to open the destination gap.
+  //
+  // Resolved against `board` from the closure rather than inside a `setBoard`
+  // updater: dnd-kit dispatches this from an effect keyed on the target, and
+  // reads the handler out of a ref it refreshes every commit, so the board
+  // here is the one that was just rendered. The updater form also ran
+  // `setDropInto` from inside a state updater, which React is free to call
+  // during render and more than once.
   const onDragOver = useCallback(
     (event: DragOverEvent) => {
-      const activeId = String(event.active.id);
       const overId = event.over === null ? null : String(event.over.id);
-      setBoard((current) => {
-        const drop = resolveDrop(filterBoard(current, filter, team), activeId, overId);
-        if (drop !== null) setDropInto(drop.status);
-        return drop === null ? current : moveCard(current, drop);
-      });
+      const drop = resolveDrop(filterBoard(board, filter, team), String(event.active.id), overId);
+      // A cursor over nothing keeps the preview — and the destination outline
+      // — where they were; only aiming somewhere new moves them.
+      if (drop === null) return;
+      setDropInto(drop.status);
+      const next = moveCard(board, drop);
+      // `moveCard` rebuilds the board unconditionally, so a resolution that
+      // reproduces the current order still costs a commit — and every commit
+      // during a drag re-measures every droppable.
+      if (placementChanged(board, next, drop.issue.number)) setBoard(next);
     },
-    [filter, team],
+    [board, filter, team],
   );
 
   const onDragEnd = useCallback(
@@ -253,8 +291,13 @@ export function ProjectBoardPage() {
         String(event.active.id),
         event.over === null ? null : String(event.over.id),
       );
+      // Released over nothing — the 12px between two columns, or off the board
+      // — keeps the preview instead of rolling it back. The preview is the
+      // promise the whole drag makes, and a card that visibly sits in Review
+      // for the length of a drag and then snaps home on release reads as the
+      // board having eaten the move. Escape still cancels.
       const next = drop === null ? board : moveCard(board, drop);
-      if (drop === null || !placementChanged(before, next, number)) {
+      if (!placementChanged(before, next, number)) {
         setBoard(before);
         return;
       }
@@ -273,7 +316,11 @@ export function ProjectBoardPage() {
       // order and a move must not write it. `withPositions` keeps the client
       // believing what it just asked the server to store, so a second drag
       // before the refetch does not send slots the first one replaced.
-      const ordered = persistedOrder(next[issue.status], number, drop.before);
+      const ordered = persistedOrder(
+        next[issue.status],
+        number,
+        drop === null ? anchorOf(next[issue.status], number) : drop.before,
+      );
       setBoard(withPositions(next, issue.status, ordered));
       const outcome = await moveIssue(client, projectId, number, issue.status, ordered);
       if (outcome.kind === 'unauthorized') {
@@ -285,6 +332,10 @@ export function ProjectBoardPage() {
         pushToast('err', `Move failed, rolled back — ${outcome.message}`, {
           label: 'Retry',
           run: () => {
+            // The drag-start board comes out of a ref this handler has already
+            // cleared, so a retry that does not hand it back falls straight
+            // out of the guard above and the button does nothing at all.
+            preDrag.current = before;
             void onDragEnd(event);
           },
         });
@@ -637,6 +688,11 @@ function BoardColumn({
   onCreate: () => void;
 }) {
   const { setNodeRef, isOver } = useDroppable({ id: columnDropId(status) });
+  // One array per set of cards rather than per render: `SortableContext` keys
+  // its whole context value off this, so a fresh one each render re-renders
+  // every card in the column, re-runs its layout effects, and permanently
+  // disables the sort animation (it compares the array by identity).
+  const items = useMemo(() => issues.map((issue) => cardDragId(issue.number)), [issues]);
   // `isOver` only fires for the column's own droppable — hovering a card
   // inside it does not. `activeOver` is what the operator experiences as
   // "this is where it will land", so the outline follows that instead.
@@ -649,7 +705,14 @@ function BoardColumn({
   const targeted = isOver || activeOver === status;
 
   return (
+    // The droppable is the whole column, header and borders included, not just
+    // the list under them. A cursor is over a droppable or it is over nothing
+    // (see `boardCollisionDetection`), and with the list alone answering, the
+    // full-width band across every column header was board that took no card:
+    // dragging to the top of a column — where the operator aims when they want
+    // it first — landed on a pixel with no answer.
     <section
+      ref={setNodeRef}
       className={`flex-1 min-w-[210px] flex flex-col border-2 rounded-md bg-canvas max-h-full ${
         targeted ? 'border-brand-hover shadow-brutal-sm' : 'border-black'
       }`}
@@ -678,15 +741,11 @@ function BoardColumn({
         </IconButton>
       </header>
       <div
-        ref={setNodeRef}
         className={`flex-1 min-h-[70px] overflow-y-auto overscroll-none flex flex-col gap-2 p-2 ${
           targeted ? 'bg-brand/15' : ''
         }`}
       >
-        <SortableContext
-          items={issues.map((issue) => cardDragId(issue.number))}
-          strategy={verticalListSortingStrategy}
-        >
+        <SortableContext items={items} strategy={verticalListSortingStrategy}>
           {issues.map((issue) => (
             <SortableIssueCard
               key={issue.number}

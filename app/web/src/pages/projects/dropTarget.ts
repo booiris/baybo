@@ -1,6 +1,5 @@
 import {
   pointerWithin,
-  rectIntersection,
   type ClientRect,
   type Collision,
   type CollisionDetection,
@@ -9,6 +8,8 @@ import {
 import { parseDragId } from './boardModel';
 
 type CollisionArgs = Parameters<CollisionDetection>[0];
+/// The point every rule here reads — see `aim`.
+type Aim = NonNullable<CollisionArgs['pointerCoordinates']>;
 
 function isCard(id: Collision['id']): boolean {
   return parseDragId(String(id))?.kind === 'card';
@@ -16,6 +17,21 @@ function isCard(id: Collision['id']): boolean {
 
 function hoist(winner: Collision, hits: Collision[]): Collision[] {
   return [winner, ...hits.filter((hit) => hit.id !== winner.id)];
+}
+
+/// Where the operator is aiming.
+///
+/// The cursor, and for the keyboard sensor — which moves a card with no cursor
+/// at all — the middle of the card itself. Answering *that* from the dragged
+/// rectangle rather than from a point is what crashed the board, so the
+/// rectangle gets one point out of it and every rule below reads the point.
+function aim(args: CollisionArgs): Aim {
+  const { pointerCoordinates, collisionRect } = args;
+  if (pointerCoordinates !== null) return pointerCoordinates;
+  return {
+    x: collisionRect.left + collisionRect.width / 2,
+    y: collisionRect.top + collisionRect.height / 2,
+  };
 }
 
 /// The card the cursor is nearest **within one column**, or null when the
@@ -80,18 +96,34 @@ function cardNearestPointer(args: CollisionArgs, column: ClientRect | undefined)
 /// column, and ordering needs the card. Hits are hoisted rather than filtered,
 /// so the column stays available behind it.
 ///
-/// `rectIntersection` is the keyboard sensor's path — it moves the card with
-/// no cursor at all, so `pointerWithin` finds nothing.
+/// **A point decides, always, and a point over nothing decides nothing.** The
+/// board used to fall back to `rectIntersection` — scoring by overlap with the
+/// dragged rectangle — whenever the cursor was over no droppable at all, and
+/// that rectangle rides the cursor, so it cannot see the board re-flow
+/// underneath it. Park the cursor in the 12px between two columns and the
+/// answer became a function of the preview it had just produced: moving the
+/// card to the target vacated its old slot, which promoted the card behind it
+/// into the rectangle's band, which flipped the answer back. dnd-kit fires
+/// `onDragOver` on every change of target and needs no pointer event to do it,
+/// so one mouse move into that band was worth 27 previews at ~5 commits each,
+/// and React threw "Maximum update depth exceeded" (#185) at 50.
+///
+/// Now a cursor over nothing simply holds the preview where it is. What that
+/// costs is bounded by the column droppable reaching from its top border to
+/// its bottom one, header included — see `BoardColumn` — so the only board
+/// that answers nothing is the gap between two columns and the margin around
+/// them. `onDragEnd` writes the preview rather than rolling it back, so a
+/// release there still lands where the card is shown.
 export const boardCollisionDetection: CollisionDetection = (args) => {
   const scoped: CollisionArgs = {
     ...args,
+    pointerCoordinates: aim(args),
     droppableContainers: args.droppableContainers.filter(
       (container) => container.id !== args.active.id,
     ),
   };
 
-  const under = pointerWithin(scoped);
-  const hits = under.length > 0 ? under : rectIntersection(scoped);
+  const hits = pointerWithin(scoped);
 
   const card = hits.find((hit) => isCard(hit.id));
   if (card !== undefined) return hoist(card, hits);

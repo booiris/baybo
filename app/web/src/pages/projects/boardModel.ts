@@ -257,6 +257,18 @@ export function persistedOrder(column: Issue[], moved: number, before: number | 
   return stored;
 }
 
+/// The anchor that leaves a card exactly where it already sits: the card it is
+/// in front of, or `null` at the end of the column.
+///
+/// It is what a drop released over nothing sends. `resolveDrop` answers with an
+/// anchor when the cursor is aimed at something; when it is aimed at nothing
+/// the preview on screen is the answer, and this reads that answer back out of
+/// it in the one shape [`persistedOrder`] accepts.
+export function anchorOf(column: Issue[], number: number): number | null {
+  const at = column.findIndex((issue) => issue.number === number);
+  return at === -1 ? null : (column[at + 1]?.number ?? null);
+}
+
 /// Write that order back onto the cards as their `position`.
 ///
 /// The server has just been asked to store exactly this, index by index, so

@@ -306,16 +306,53 @@ has fully cleared its old column. `resolveDrop` refuses a card landing on
 itself, so this never produced a wrong drop, only a dead drag. The active id is
 excluded from the candidates.
 
-Targeting is then **cursor-first** (`pointerWithin`, falling back to
-`rectIntersection` for the keyboard sensor, which has no cursor). The trade is
-worth naming: the cursor sits wherever the card was grabbed, so a card held by
-its far edge leads its own outline. The aim is the cursor.
+Targeting is **a point, always** — `pointerWithin`, and for the keyboard sensor,
+which has no cursor at all, the middle of the dragged card. The trade is worth
+naming: the cursor sits wherever the card was grabbed, so a card held by its far
+edge leads its own outline. The aim is the cursor.
 
 Two seams belong to no card — the 8px between cards and the column's side
 padding — and a column hit means "append to the end", so leaving them to the
 column would flick the preview to the bottom on every boundary swept past. In a
 seam the nearest card by centre wins instead. Below the last card is the one
 place the column is the honest answer, and it stays that way.
+
+**A point over nothing decides nothing, and the drop still lands.** Three rules
+hold that together, and the board crashed without them. The **column droppable
+is the whole `<section>`** — border, header, list — because a cursor is aimed at
+a droppable or at nothing, and with only the list answering, the band across
+every column header was board that took no card, which is exactly where a card
+headed for the front of a queue is aimed. What is still nobody's is the 12px
+between two columns and the margin around them; there the preview simply
+**holds** its last position. And a release over nothing **writes the preview**
+rather than rolling it back — the preview is the promise the drag makes, and a
+card that sat in Review for the length of a drag and then snapped home because
+the button came up over a seam reads as the board having eaten the move. Escape
+still cancels.
+
+The rule those replace was a fallback to `rectIntersection` whenever the cursor
+was over nothing, and it is worth knowing why it cannot come back. It scores by
+overlap with the **dragged rectangle**, which rides the cursor and therefore
+cannot see the board re-flow underneath it — so the answer became a function of
+the preview it had just produced. Moving the card to the target vacated its old
+slot, which promoted the card behind it into the rectangle's band, which flipped
+the answer back; dnd-kit fires `onDragOver` on every change of target and needs
+no pointer event to do it. One mouse move into that band was worth 27 previews
+at ~5 commits each, and React threw "Maximum update depth exceeded" (#185) at
+50 — the whole page, gone, mid-drag. `dragConvergence.test.ts` sweeps every
+layout, grab and pixel of the board for a target that is not a fixed point of
+that exchange, `boardDrag.test.tsx` drives the real page through the real
+dnd-kit over a faked layout, and both keep the old rule beside the new one so
+they cannot pass for the wrong reason.
+
+Two smaller things the same drag depends on. A `project_changed` frame that
+lands mid-drag is **held** until the card does: a refetch replaces every column
+wholesale, re-keys the cards and re-ranks the very column being dragged in, so
+answering it under a live drag resolves the drop against a layout nobody aimed
+at. And each column's `SortableContext` `items` is memoised on its cards rather
+than rebuilt per render — dnd-kit keys its whole context value off that array
+and compares it by identity, so a fresh one each render re-renders every card in
+the column and leaves the sort animation permanently switched off.
 
 **Two pieces of feedback, not three.** Which column it will land in is the
 column's brand outline and `bg-brand/15` tint; where in that column is the

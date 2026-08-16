@@ -5,6 +5,7 @@ import {
   type Issue,
   type IssueRun,
   type Project,
+  anchorOf,
   assignableAgents,
   updatedAgo,
   cardDragId,
@@ -212,6 +213,18 @@ describe('persistedOrder + placementChanged', () => {
     // A second drag reads the order the first one wrote. Off the stale
     // slots this would come back [1, 2, 3] and undo it.
     expect(persistedOrder(settled.backlog, 2, 3)).toEqual([2, 3, 1]);
+  });
+
+  it('reads an anchor back out of the preview when the drop named none', () => {
+    // Released over the seam between two columns: nothing was aimed at, so
+    // what gets written is where the card is already shown.
+    const previewed = board({ todo: [issue(5), issue(1), issue(6)] });
+    expect(anchorOf(previewed.todo, 1)).toBe(6);
+    expect(persistedOrder(previewed.todo, 1, anchorOf(previewed.todo, 1))).toEqual([5, 1, 6]);
+    // Last in the column, and a card that is not in it at all, both mean the
+    // end — which is the same thing `persistedOrder` does with a null anchor.
+    expect(anchorOf(previewed.todo, 6)).toBeNull();
+    expect(anchorOf(previewed.todo, 99)).toBeNull();
   });
 
   it('spots a no-op so a drop that changed nothing costs no request', () => {
