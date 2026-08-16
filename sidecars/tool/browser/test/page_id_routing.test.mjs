@@ -293,3 +293,60 @@ test("CDDM still gates structuredContent on the arg the sidecar passes", async (
             "the sidecar still needs experimentalStructuredContent for the page budget to see a page list",
     );
 });
+
+// This stays browser-free to verify startup is deferred until first use.
+test("the browser is deferred to the first tool call", async (t) => {
+    const { child, send, nextResponse, stderr } = startSidecar();
+    t.after(() => {
+        child.kill("SIGTERM");
+    });
+
+    send({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+            protocolVersion: "2024-11-05",
+            capabilities: {},
+            clientInfo: { name: "baybo-browser-test", version: "0.0.1" },
+        },
+    });
+    await nextResponse();
+    send({ jsonrpc: "2.0", method: "notifications/initialized" });
+
+    // The full tool list remains available before browser startup.
+    send({ jsonrpc: "2.0", id: 2, method: "tools/list" });
+    const listResp = await nextResponse();
+    assert.ok(
+        listResp.result.tools.some((x) => x.name === "navigate_page"),
+        "tools/list must be complete before any browser exists",
+    );
+
+    const bootLog = stderr();
+    assert.match(
+        bootLog,
+        /browser_start=deferred/,
+        "the boot summary must say the browser was not started",
+    );
+    assert.doesNotMatch(
+        bootLog,
+        /chrome-devtools-mcp ready: mode=/,
+        "the browser-target summary belongs to the start, not the boot",
+    );
+
+    // Park the first call until args name the final browser target.
+    send({
+        jsonrpc: "2.0",
+        id: 3,
+        method: "tools/call",
+        params: { name: "list_pages", arguments: {} },
+    });
+    const callResp = await nextResponse();
+    assert.equal(callResp.id, 3);
+    assert.equal(callResp.result.isError, true, "the parked call is reported as an error");
+    assert.match(
+        callResp.result.content[0].text,
+        /launched on first use, not at gateway boot/,
+        "the model is told why, and to retry",
+    );
+});
