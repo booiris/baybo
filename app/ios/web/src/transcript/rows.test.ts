@@ -860,9 +860,12 @@ describe("a cancelled turn's card says so", () => {
 });
 
 describe("sameTurnWorkIndex", () => {
+  const stray = (id: string, over: Partial<WorkRow> = {}): WorkRow =>
+    work({ id, steps: [{ kind: "status", text: "reading" }], ...over });
+
   it("finds the turn's block above its answer bubble", () => {
     const rows: Row[] = [work({ id: "w9", steps: [tool()] }), { id: "m12", role: "assistant", content: "a" }];
-    expect(sameTurnWorkIndex(rows, 10)).toBe(0);
+    expect(sameTurnWorkIndex(rows, stray("w10"))).toBe(0);
   });
 
   it("scans back over trailing notices too", () => {
@@ -871,12 +874,12 @@ describe("sameTurnWorkIndex", () => {
       { id: "m12", role: "assistant", content: "a" },
       { id: "n1", role: "notice", content: "note" },
     ];
-    expect(sameTurnWorkIndex(rows, 10)).toBe(0);
+    expect(sameTurnWorkIndex(rows, stray("w10"))).toBe(0);
   });
 
   it("refuses when the trailing answer is OLDER than the block (a genuinely later turn)", () => {
     const rows: Row[] = [work({ id: "w9", steps: [tool()] }), { id: "m5", role: "assistant", content: "a" }];
-    expect(sameTurnWorkIndex(rows, 10)).toBe(-1);
+    expect(sameTurnWorkIndex(rows, stray("w10"))).toBe(-1);
   });
 
   // The user row must BREAK the backward scan: it is the next turn's opening, so
@@ -890,7 +893,25 @@ describe("sameTurnWorkIndex", () => {
       { id: "m12", role: "assistant", content: "a" },
       { id: "pm-1", role: "user", content: "next" },
     ];
-    expect(sameTurnWorkIndex(rows, 10)).toBe(-1);
+    expect(sameTurnWorkIndex(rows, stray("w10"))).toBe(-1);
+  });
+
+  // A tool-free "thinking only" turn has no intermediate row to key off, so the
+  // gateway seeds its block from the ANSWER ROW itself — `w12` and `m12` are one
+  // turn. The strict `>` this used to demand is unsatisfiable there, which is
+  // how a whole class of turns kept re-homing to nothing and stranding a second
+  // "Worked" card under the reply.
+  it("accepts the answer whose ordinal the block SHARES, when told the block owns it", () => {
+    const rows: Row[] = [work({ id: "u-live", steps: [tool()] }), { id: "m12", role: "assistant", content: "a" }];
+    expect(sameTurnWorkIndex(rows, stray("w12"), true)).toBe(0);
+  });
+
+  // …and refuses it without that evidence. An ordinal can also be BORROWED — a
+  // block seeded from a progress event anchored at the row above it — and there
+  // the same equality means the opposite. Folding on it would weld two turns.
+  it("refuses a shared ordinal it was given no evidence for", () => {
+    const rows: Row[] = [work({ id: "u-live", steps: [tool()] }), { id: "m12", role: "assistant", content: "a" }];
+    expect(sameTurnWorkIndex(rows, stray("w12"))).toBe(-1);
   });
 });
 
@@ -1116,6 +1137,65 @@ describe("mergeSyncPage — a page that lands late is placed, not piled on the e
       work({ id: "w102", steps: [tool({ callId: "c1" })] }),
     ];
     expect(mergeSyncPage(rendered, page, []).map((r) => r.id)).toEqual(["m100", "pm-x", "w102", "m103"]);
+  });
+
+  // The reported `[work][reply][work]` shape, difference edition. A tool-free
+  // "thinking only" turn has no intermediate row, so the gateway seeds its block
+  // from the ANSWER ROW: `w12` and `m12` are one turn, and the page proves it by
+  // emitting the block above the bubble. The reply is already on screen (it
+  // arrived as a live frame), so the page's block has to re-home into the live
+  // card rather than pile up under the answer it belongs to.
+  it("re-homes a block that shares its own answer's ordinal into the live card", () => {
+    const rendered: Row[] = [
+      { id: "pm-1", role: "user", content: "explain" },
+      work({ id: "u-live", steps: [{ kind: "reasoning", text: "weighing" }], active: true }),
+      { id: "m12", role: "assistant", ordinal: 12, content: "the reply" },
+    ];
+    const page: Row[] = [
+      work({ id: "w12", steps: [{ kind: "reasoning", text: "weighing" }], turnComplete: true, elapsedMs: 3_000 }),
+      { id: "m12", role: "assistant", ordinal: 12, content: "the reply" },
+    ];
+    const out = mergeSyncPage(rendered, page, []);
+    expect(out.map((r) => r.id)).toEqual(["pm-1", "u-live", "m12"]);
+    expect(out[1]).toMatchObject({ elapsedMs: 3_000 });
+  });
+
+  // Same turn, but nothing on screen to re-home INTO (the reasoning never
+  // streamed here — another device's turn, or a reconnect that missed it). Then
+  // placement decides, and "just past the last row I am not older than" is the
+  // wrong answer twice over: it files the card below its own reply, and with the
+  // reply's twin ordinal excluded it climbs above the QUESTION instead. Anchor on
+  // the bubble.
+  it("files a block that owns its answer's ordinal directly above that answer", () => {
+    const rendered: Row[] = [
+      { id: "m8", role: "assistant", ordinal: 8, content: "older" },
+      { id: "pm-1", role: "user", content: "explain" },
+      { id: "m12", role: "assistant", ordinal: 12, content: "the reply" },
+    ];
+    const page: Row[] = [
+      work({ id: "w12", steps: [{ kind: "reasoning", text: "weighing" }], turnComplete: true }),
+      { id: "m12", role: "assistant", ordinal: 12, content: "the reply" },
+    ];
+    expect(mergeSyncPage(rendered, page, []).map((r) => r.id)).toEqual(["m8", "pm-1", "w12", "m12"]);
+  });
+
+  // The same equality, opposite meaning: a block whose ordinal is BORROWED from
+  // the row above it (seeded off a progress event anchored there — control
+  // events sort after their anchor, so the page emits the block BELOW the
+  // bubble) belongs to the NEXT turn. Folding it back would weld two turns into
+  // one card, which is the trade this whole rule is calibrated against.
+  it("appends a block that only borrowed the ordinal of the answer above it", () => {
+    const rendered: Row[] = [
+      work({ id: "u-live", steps: [tool({ callId: "c1" })] }),
+      { id: "m12", role: "assistant", ordinal: 12, content: "the reply" },
+    ];
+    const page: Row[] = [
+      { id: "m12", role: "assistant", ordinal: 12, content: "the reply" },
+      work({ id: "w12", steps: [{ kind: "status", text: "reading" }], turnComplete: true }),
+    ];
+    const out = mergeSyncPage(rendered, page, []);
+    expect(out.map((r) => r.id)).toEqual(["u-live", "m12", "w12"]);
+    expect((out[0] as WorkRow).steps).toHaveLength(1);
   });
 
   // Refuses to guess. Whether another device's durable row belongs above or
@@ -1442,6 +1522,67 @@ describe("applySyncReplace — the overlay keeps what the page cannot carry", ()
     ];
     const out = applySyncReplace(prev, [{ id: "m10", role: "assistant", content: "a" }], owed());
     expect(out.map((r) => r.id)).toEqual(["m10", "u-new"]);
+    // A page that ends on an ANSWER says the turn is over. With no block on the
+    // page to fold into we keep what we hold rather than delete it — but it
+    // stops being a live card, or it spins "Working" behind a settled reply for
+    // as long as the session lasts.
+    expect(out[1]).toMatchObject({ active: false });
+  });
+
+  // The `[work][reply][work]` duplicate, REPLACE edition: the offscreen buffer
+  // overflowed and ate the turn's `turn_state{inactive}`, so the block is still
+  // open here while the rebase page — which ends on that turn's answer — already
+  // carries the whole turn. Appending is what put a second card under the reply.
+  it("folds a stranded open block into the page's own block for that turn", () => {
+    // We streamed c1 before the buffer overflowed; the page holds the whole turn
+    // (persistence is the superset), and that shared step is the proof they are
+    // one turn.
+    const prev: Row[] = [work({ id: "u-live", steps: [tool({ callId: "c1" })], active: true })];
+    const page: Row[] = [
+      { id: "pm-1", role: "user", content: "go", ordinal: 9 },
+      work({
+        id: "w10",
+        steps: [tool({ callId: "c1" }), tool({ callId: "c2" })],
+        turnComplete: true,
+        elapsedMs: 4_000,
+      }),
+      { id: "m11", role: "assistant", ordinal: 11, content: "done" },
+    ];
+    const out = applySyncReplace(prev, page, owed());
+    expect(out.map((r) => r.id)).toEqual(["pm-1", "w10", "m11"]);
+    expect((out[1] as WorkRow).steps.map((s) => (s.kind === "tool" ? s.callId : s.kind))).toEqual(["c1", "c2"]);
+    expect(out[1]).toMatchObject({ active: false, elapsedMs: 4_000 });
+  });
+
+  // Adjacency is not evidence. A delivery turn carries no user row, so both kept
+  // sets are empty while its block is genuinely the NEXT turn's — and welding it
+  // into the card above would bury one turn inside another, permanently.
+  it("refuses to fold an open block that shares no step with the page's block", () => {
+    const prev: Row[] = [work({ id: "u-live", steps: [tool({ callId: "c9" })], active: true })];
+    const page: Row[] = [
+      work({ id: "w10", steps: [tool({ callId: "c1" })], turnComplete: true }),
+      { id: "m11", role: "assistant", ordinal: 11, content: "done" },
+    ];
+    const out = applySyncReplace(prev, page, owed());
+    expect(out.map((r) => r.id)).toEqual(["w10", "m11", "u-live"]);
+    expect((out[0] as WorkRow).steps).toHaveLength(1);
+    expect(out[2]).toMatchObject({ active: false });
+  });
+
+  // …but an owed send below the page proves a LATER turn, and that turn's block
+  // is genuinely live — it must keep its own card at the tail.
+  it("keeps the open block when an owed send proves it belongs to a later turn", () => {
+    const prev: Row[] = [
+      { id: "pm-2", role: "user", content: "next", sendState: "sending" },
+      work({ id: "u-live", steps: [tool({ callId: "c2" })], active: true }),
+    ];
+    const page: Row[] = [
+      work({ id: "w10", steps: [tool({ callId: "c1" })], turnComplete: true }),
+      { id: "m11", role: "assistant", ordinal: 11, content: "done" },
+    ];
+    const out = applySyncReplace(prev, page, owed("pm-2"));
+    expect(out.map((r) => r.id)).toEqual(["w10", "m11", "pm-2", "u-live"]);
+    expect(out[3]).toMatchObject({ active: true });
   });
 
   it("fuses the page's cut-off trailing block with the live one — one turn, one card", () => {

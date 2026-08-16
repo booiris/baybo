@@ -740,8 +740,7 @@ export function bundleAnswer(steps: WorkStep[]): BundleAnswer {
 /// Only the in-flight tail can be trailing prose. Mirrors the web chat's
 /// `dropInFlightAnswerStep`.
 export function dropInFlightAnswerStep(rows: Row[]): Row[] {
-  let i = rows.length - 1;
-  while (i >= 0 && rows[i].role === "notice") i--;
+  const i = lastBeforeNotices(rows);
   const row = i >= 0 ? rows[i] : undefined;
   if (row === undefined || row.role !== "work") return rows;
   const last = row.steps.length > 0 ? row.steps[row.steps.length - 1] : undefined;
@@ -790,8 +789,7 @@ export function freezeActiveWork(rows: Row[]): Row[] {
 /// `active:false` and its `elapsedMs` — `mutate` only appends steps — so a
 /// straggler never re-opens or re-times a settled card.
 export function openWorkIn(rows: Row[], mutate: (row: WorkRow) => WorkRow): Row[] {
-  let i = rows.length - 1;
-  while (i >= 0 && rows[i].role === "notice") i--;
+  const i = lastBeforeNotices(rows);
   const target = i >= 0 ? rows[i] : undefined;
   if (target && target.role === "work") {
     const next = [...rows];
@@ -987,24 +985,99 @@ export function foldAdjacentWork(rows: Row[], compactionPoints: CompactionPoint[
   return out;
 }
 
-/// Index in `rows` of the work block belonging to the SAME turn as a work row
-/// of durable ordinal `ord` that has ended up ABOVE the turn's answer bubble.
-/// Scan back over the trailing answer/notice run; accept the preceding work
-/// block only when that run carries an answer ordinal-above `ord`, so a
-/// genuinely later turn's block (its answer not yet on screen) is never
-/// mis-folded. `-1` when there is no such block. Used to re-home a durable
-/// progress `status` block the reopen path can strand below the reply.
-export function sameTurnWorkIndex(rows: Row[], ord: number): number {
+/// Ids of the work rows in a page whose ordinal is their OWN answer's — read off
+/// the page's ordering, never guessed from the row.
+///
+/// A block is keyed `w<ordinal>` off some row of its turn, and for a tool-free
+/// "thinking only" answer there IS no row but the answer itself: the gateway
+/// seeds the block from it (`work.ordinal = Some(ordinal)` on the assistant
+/// arm), so `w<N>` and `m<N>` are one turn and the block belongs ABOVE the
+/// bubble. But a block can also BORROW an ordinal it does not own — one seeded
+/// from a progress event, or from the page's last row when nothing of its turn
+/// has persisted yet — and that anchor belongs to the turn BEFORE it, so the
+/// same equality means the block belongs BELOW the bubble.
+///
+/// Same ordinal, opposite placement, and nothing on the row distinguishes them.
+/// The page does: it emits a block above the answer it owns and below the one it
+/// borrowed from. Both items are cut from the same source row, so a window that
+/// carries one carries the other.
+function blocksAboveTheirAnswer(pageRows: Row[]): Set<string> {
+  const answerAt = new Map<number, number>();
+  pageRows.forEach((r, i) => {
+    const ord = r.role === "assistant" ? rowCoverageOrdinal(r) : null;
+    if (ord !== null && !answerAt.has(ord)) answerAt.set(ord, i);
+  });
+  const owned = new Set<string>();
+  pageRows.forEach((r, i) => {
+    if (r.role !== "work") return;
+    const ord = rowOrdinal(r.id);
+    const at = ord === null ? undefined : answerAt.get(ord);
+    if (at !== undefined && at > i) owned.add(r.id);
+  });
+  return owned;
+}
+
+/// The thread has TWO tails, and confusing them is a bug with teeth.
+///
+/// `lastBeforeNotices` is the tail a live frame asks about — "what is the last
+/// row that isn't a trailing notice" — because a terminal notice keeps its own
+/// row beside the block it interrupts (`severTerminalNoticeIn`) and must not
+/// hide it. This is the scan `openWorkIn` runs, and it STOPS at an answer: a
+/// settled turn's card is behind its own bubble, and reaching past that bubble
+/// would let a later turn's frames rewrite a finished card.
+///
+/// `tailRunStart` is the tail a durable PLACEMENT asks about — "where does the
+/// trailing answer/notice run begin" — because a re-delivered block has to be
+/// weighed against the answer of the turn it belongs to. Only ordinal-carrying
+/// evidence may cross an answer this way.
+function lastBeforeNotices(rows: Row[]): number {
   let j = rows.length - 1;
-  let sawTurnAnswer = false;
-  while (j >= 0) {
-    const rj = rows[j];
-    if (rj.role !== "assistant" && rj.role !== "notice") break;
+  while (j >= 0 && rows[j].role === "notice") j--;
+  return j;
+}
+
+/// Index of the last row that is neither an answer nor a notice — i.e. the row
+/// just above the thread's trailing answer/notice run. `-1` when the whole list
+/// is that run. A user row ends the scan like any other: it opens the NEXT turn,
+/// so nothing below it belongs to what sits above.
+function tailRunStart(rows: Row[]): number {
+  let j = rows.length - 1;
+  while (j >= 0 && (rows[j].role === "assistant" || rows[j].role === "notice")) j--;
+  return j;
+}
+
+/// Index of the work block sitting directly above that trailing run — the block
+/// of the turn the run belongs to. `-1` when the run is not headed by one.
+function workBlockAboveTail(rows: Row[]): number {
+  const j = tailRunStart(rows);
+  return j >= 0 && rows[j].role === "work" ? j : -1;
+}
+
+/// Index in `rows` of the work block belonging to the SAME turn as `row`, a
+/// durable work row that has ended up BELOW its turn's answer bubble. Accept the
+/// block above the trailing answer/notice run only when that run carries the
+/// answer this block's ordinal points at, so a genuinely later turn's block (its
+/// answer not yet on screen) is never mis-folded. `-1` when there is no such
+/// block. Used to re-home a durable `status`/thinking-only block the reopen path
+/// can strand below the reply.
+///
+/// `ownsAnswerOrdinal` is the caller's evidence that this block's ordinal is its
+/// OWN answer's rather than one borrowed from the turn above
+/// (`blocksAboveTheirAnswer` reads it off the page's ordering) — the tool-free
+/// turn, whose block can only ever match its answer by EQUALITY. It defaults
+/// off: without that evidence, equality is not proof of anything, and folding on
+/// it would weld a later turn into the card above.
+export function sameTurnWorkIndex(rows: Row[], row: WorkRow, ownsAnswerOrdinal = false): number {
+  const ord = rowOrdinal(row.id);
+  if (ord === null) return -1;
+  const at = workBlockAboveTail(rows);
+  if (at < 0) return -1;
+  const sawTurnAnswer = rows.slice(at + 1).some((rj) => {
+    if (rj.role !== "assistant") return false;
     const oj = rowOrdinal(rj.id);
-    if (rj.role === "assistant" && oj !== null && oj > ord) sawTurnAnswer = true;
-    j--;
-  }
-  return sawTurnAnswer && j >= 0 && rows[j].role === "work" ? j : -1;
+    return oj !== null && (oj > ord || (ownsAnswerOrdinal && oj === ord));
+  });
+  return sawTurnAnswer ? at : -1;
 }
 
 /// Merge a DIFFERENCE sync page into the rendered thread: a row already held is
@@ -1034,6 +1107,7 @@ export function mergeSyncPage(
 ): Row[] {
   const next = [...prev];
   let byId = new Map(next.map((r, i) => [r.id, i] as const));
+  const ownsOrdinal = blocksAboveTheirAnswer(pageRows);
   /// Where a page row belongs: just past the last rendered row whose ordinal it
   /// is at or above — but ONLY when a durable row still sits below that point,
   /// which is the proof that this row really did land late. With nothing
@@ -1055,6 +1129,19 @@ export function mergeSyncPage(
   const placeAt = (row: Row): number => {
     const ord = rowCoverageOrdinal(row);
     if (ord === null) return next.length;
+    // A block that carries its OWN answer's ordinal (`blocksAboveTheirAnswer` —
+    // the tool-free turn) belongs directly ABOVE that bubble: "just past the
+    // last row I am not older than" files a turn's card below its own reply,
+    // which is the shape this whole function exists to prevent. Anchor on the
+    // bubble itself rather than merely excluding it from the scan — with its
+    // twin ordinal skipped, the scan lands on whatever ordinal-less row happens
+    // to precede it (a live send, a notice) and files the card above the
+    // question that produced it. With the answer not on screen there is nothing
+    // to sit above, and the ordinary scan is exactly right.
+    if (ownsOrdinal.has(row.id)) {
+      const answer = next.findIndex((r) => r.role === "assistant" && rowCoverageOrdinal(r) === ord);
+      if (answer >= 0) return answer;
+    }
     let at = 0;
     for (let i = 0; i < next.length; i++) {
       const held = rowCoverageOrdinal(next[i]);
@@ -1144,8 +1231,7 @@ export function mergeSyncPage(
     // holds an answer ordinal-above this block, so a genuinely later
     // turn's block (its answer not yet on screen) still appends.
     if (row.role === "work") {
-      const ord = rowOrdinal(row.id);
-      const at = ord !== null ? sameTurnWorkIndex(next, ord) : -1;
+      const at = sameTurnWorkIndex(next, row, ownsOrdinal.has(row.id));
       const target = at >= 0 ? next[at] : undefined;
       if (target && target.role === "work") {
         next[at] = reconcileWork(target, row);
@@ -1269,20 +1355,72 @@ export function applySyncReplace(
       !keptLiveIds.has(r.id),
   );
   let rows = page;
-  let carried = openWork;
-  if (openWork.length > 0) {
+  let carried: Row[] = openWork;
+  const live = openWork[0];
+  if (live !== undefined) {
     const tail = rows[rows.length - 1];
     if (tail && tail.role === "work" && sameContinuingTurn(tail)) {
       rows = [
         ...rows.slice(0, -1),
         {
           ...tail,
-          steps: mergeWorkSteps(tail.steps, openWork[0].steps),
+          steps: mergeWorkSteps(tail.steps, live.steps),
           active: true,
-          startedAt: tail.startedAt ?? openWork[0].startedAt,
+          startedAt: tail.startedAt ?? live.startedAt,
         },
       ];
       carried = [];
+    } else if (
+      keptLive.length === 0 &&
+      keptSends.length === 0 &&
+      rows.slice(tailRunStart(rows) + 1).some((r) => r.role === "assistant")
+    ) {
+      // The page ends on an ANSWER, not on this turn's open half: as far as the
+      // server is concerned the turn we are still holding open is over, and the
+      // page already carries its reconstruction ABOVE that bubble. Appending
+      // `carried` here is what put a second "Worked" card below the reply — the
+      // DIFFERENCE path has closed its trailing block on exactly this signal
+      // (`closeTrailingWork`) since it was written; REPLACE never did.
+      //
+      // Fold our steps back into the page's own block for that turn instead
+      // (`mergeWorkSteps` dedups, and the persisted side is the superset, so
+      // this is lossless), or — with no block to fold into — freeze what we hold
+      // so it cannot spin "Working" forever behind a settled reply.
+      //
+      // Only when nothing on screen outranks the page: a row the page predates
+      // (`keptLive` / `keptSends` — an owed send is how a LATER turn announces
+      // itself) proves the block belongs to that later turn, and it keeps its
+      // own live card at the tail.
+      //
+      // And only against POSITIVE evidence of the same turn — adjacency is not
+      // it. A turn with no user row (a background delivery) leaves both kept
+      // sets empty while its block is genuinely the next turn's, and joining
+      // there welds two turns into one card, which no later sync undoes. The
+      // evidence is overlap: a page that reconstructs the turn we watched holds
+      // every step we streamed (persistence is the superset), so the merge
+      // ABSORBS at least one of ours. Nothing absorbed means two turns.
+      const at = workBlockAboveTail(rows);
+      const above = at >= 0 ? rows[at] : undefined;
+      const target = above !== undefined && above.role === "work" ? above : undefined;
+      const fused = target !== undefined ? mergeWorkSteps(target.steps, live.steps) : undefined;
+      if (target !== undefined && fused !== undefined && fused.length < target.steps.length + live.steps.length) {
+        rows = [
+          ...rows.slice(0, at),
+          {
+            ...target,
+            steps: fused,
+            cancelled: (target.cancelled ?? false) || (live.cancelled ?? false),
+          },
+          ...rows.slice(at + 1),
+        ];
+        carried = [];
+      } else {
+        // No proof, so no join. Keep what we hold — those steps may be their
+        // only copy — but not as a live card: a block that spins "Working"
+        // behind a settled reply is the symptom, and nothing at the tail can
+        // close it once the page has moved past. An empty one was never work.
+        carried = live.steps.length === 0 ? [] : freezeActiveWork(carried);
+      }
     }
   }
   return [...rows, ...keptLive, ...keptSends, ...carried];
@@ -1420,8 +1558,7 @@ export function sanitizeRestoredRows(rows: Row[] | undefined): Row[] {
         // ordinal, so a mirror already corrupted by that bug self-corrects on
         // the next open instead of keeping the stray "Worked" card below the
         // reply forever (the reopen sync is a no-op once the cursor passed it).
-        const ord = rowOrdinal(r.id);
-        const at = ord !== null ? sameTurnWorkIndex(out, ord) : -1;
+        const at = sameTurnWorkIndex(out, r);
         const target = at >= 0 ? out[at] : undefined;
         if (target && target.role === "work") {
           out[at] = { ...target, steps: mergeWorkSteps(target.steps, r.steps), active: target.active || r.active };
@@ -3416,12 +3553,21 @@ export function Transcript({
       if (answer.kind === "recovered") setStreamingText(answer.text);
       else if (answer.kind === "superseded") setStreamingText("");
       setMessages((rows) => {
-        const last = rows[rows.length - 1];
-        const openBlock = last && last.role === "work" ? last : undefined;
+        // The tail is read PAST any trailing notice run, exactly as `openWorkIn`
+        // reads it: a terminal notice keeps its own row, and asking `rows[len-1]`
+        // instead would see the notice, miss both the block to rebuild and the
+        // answer the guard below turns on, and open a second card. It stops at an
+        // ANSWER, though — reaching past one would hand this bundle a settled
+        // turn's card to rewrite, which is a worse bug than the one it fixes.
+        const at = lastBeforeNotices(rows);
+        const tail = at >= 0 ? rows[at] : undefined;
+        const openBlock = tail && tail.role === "work" ? tail : undefined;
         if (workSteps.length === 0) {
           // Answer-only turn: no block, the streamed reply stands alone; drop a
           // stale empty/restored block if it's the tail.
-          return openBlock && openBlock.steps.length === 0 ? rows.slice(0, -1) : rows;
+          return openBlock && openBlock.steps.length === 0
+            ? [...rows.slice(0, at), ...rows.slice(at + 1)]
+            : rows;
         }
         // A stale finalization-window bundle: this turn's answer already landed
         // here (the tail is the committed reply) but the gateway still reports
@@ -3431,7 +3577,7 @@ export function Transcript({
         // reply (the [work][reply][work] split). A genuine next turn opens its
         // block from the live turn_state / reasoning / tool frames that follow,
         // not from this snapshot.
-        if (!openBlock && last && last.role === "assistant") return rows;
+        if (!openBlock && tail && tail.role === "assistant") return rows;
         // Re-open a block a prior restore froze (relaunch mid-turn) and replace
         // its steps; otherwise open a fresh one after the turn's user message.
         // Anchor `startedAt` to the server turn start (`startedMs`) when the
@@ -3443,7 +3589,7 @@ export function Transcript({
         // `rebuilt` is THE in-flight block — freeze any other still-active block
         // above it so re-opening one never leaves two live "Working" cards.
         return openBlock
-          ? [...freezeActiveWork(rows.slice(0, -1)), rebuilt]
+          ? [...freezeActiveWork(rows.slice(0, at)), rebuilt, ...rows.slice(at + 1)]
           : [...freezeActiveWork(rows), rebuilt];
       });
     },
@@ -3862,6 +4008,14 @@ export function Transcript({
           closeWork();
           clearStreaming();
           setAwaitingReply(false);
+          // The turn is over the moment its answer commits. Waiting for the
+          // server's `turn_state{active:false}` to say so leaves the latch — the
+          // one signal here with no self-healing cap — stuck true whenever that
+          // frame is lost (an offscreen buffer overflow drops it, and no
+          // `sync_page` carries turn state to rebuild it), and a stuck latch
+          // paints the `work-pending` box under the settled reply forever. The
+          // server's own frame follows and is idempotent.
+          setTurnActive(false);
           recordEndedTurn(activeTurnStart.current);
           activeTurnStart.current = null;
           if (cursorRef.current.rebaseDirty) runSync();
@@ -4504,7 +4658,13 @@ export function Transcript({
 
   // While the turn's work block is live it already signals activity; the bare
   // "Working" pending line only covers the gap before the first frame lands.
-  const lastRow = messages[messages.length - 1];
+  // Read past a trailing notice run, as every other live-frame tail reader does:
+  // a terminal notice landing beside a live block would otherwise read as "no
+  // block live" and paint the pending box a second time below it. NOT past an
+  // answer — `closeWork` freezes `rows[len-1]`, so a block this called live
+  // across its own bubble would be one nothing can ever close, and `running`
+  // would strand the composer on the stop button for the rest of the session.
+  const lastRow = messages[lastBeforeNotices(messages)];
   const workLive = lastRow !== undefined && lastRow.role === "work" && lastRow.active;
 
   // Mirror the turn's run state to native so the composer's send button flips to
