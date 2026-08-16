@@ -488,6 +488,34 @@ describe('dragging a card on the real board', () => {
     await release(foxtrot.x, foxtrot.y);
   }, 60000);
 
+  /// The board's main gesture, end to end: a card dragged out of one column
+  /// and dropped in another changes status, and the request says so.
+  it('changes a card\u2019s status when it is dropped in another column', async () => {
+    renderBoard();
+    await screen.findByText('Alpha');
+    grab('Bravo');
+    await settle();
+
+    const foxtrot = centre('Foxtrot');
+    fireEvent(document, pointer('pointermove', foxtrot.x, foxtrot.y));
+    await settle();
+    await release(foxtrot.x, foxtrot.y);
+
+    const posted = client.POST.mock.calls.filter(
+      ([path]) => path === '/v1/projects/{project_id}/issues/{number}/move',
+    );
+    console.info(`dropped inside Todo: rendered=${renderedColumns()} posted=${JSON.stringify(posted)}`);
+    expect(crashed()).toBeNull();
+    expect(renderedColumns()).toBe(
+      'Backlog[Alpha,Charlie] Todo[Echo,Bravo,Foxtrot,Golf] In Progress[Delta,Hotel]',
+    );
+    expect(posted).toHaveLength(1);
+    expect(posted[0][1]).toMatchObject({
+      params: { path: { number: 2 } },
+      body: { status: 'todo', ordered_numbers: [5, 2, 6, 7] },
+    });
+  }, 60000);
+
   /// Released over nothing, the preview is what gets written. A card that
   /// spent the whole drag sitting in Todo and then snapped back to Backlog
   /// because the button came up over a 12px seam reads as the board having
