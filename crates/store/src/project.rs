@@ -121,6 +121,8 @@ pub struct ProjectRow {
     /// ceiling — the default, because a board that stops working against a
     /// limit nobody chose is a board whose silence nobody can explain.
     pub daily_budget: Option<baybo_model::MicroUsd>,
+    /// Daily token ceiling over the same rows as [`Self::daily_budget`]; `None` is unlimited.
+    pub daily_budget_tokens: Option<i64>,
     /// How many runs this board may start **on its own** at once, by
     /// promoting Todo cards into In Progress. `0` turns the driver off and
     /// leaves promotion to whoever drags the card.
@@ -144,6 +146,8 @@ pub struct ProjectUpdate {
     pub description: String,
     /// Full-replace like the rest of this struct: `None` clears the ceiling.
     pub daily_budget: Option<baybo_model::MicroUsd>,
+    /// Full replacement; `None` clears the token ceiling.
+    pub daily_budget_tokens: Option<i64>,
     /// See [`ProjectRow::max_parallel_issue_runs`]. `0` stops the board driving
     /// itself.
     pub max_parallel_issue_runs: usize,
@@ -352,6 +356,12 @@ pub enum IssueEventBody {
         attempt: i64,
         trigger: RunTrigger,
     },
+    /// A process restart found this run in flight and requeued it.
+    RunInterrupted {
+        run_id: IssueRunId,
+        attempt: i64,
+        resumes: i64,
+    },
     RunSettled {
         run_id: IssueRunId,
         attempt: i64,
@@ -425,6 +435,16 @@ pub enum IssueEventBody {
         spent_micros: i64,
         limit_micros: i64,
     },
+    /// Token counterpart to [`Self::BudgetExhausted`], kept separate for wire-safe units.
+    TokenBudgetExhausted {
+        spent_tokens: i64,
+        limit_tokens: i64,
+    },
+    /// A token-budget hold was released and started.
+    TokenBudgetRestored {
+        spent_tokens: i64,
+        limit_tokens: i64,
+    },
 }
 
 impl IssueEventBody {
@@ -438,6 +458,7 @@ impl IssueEventBody {
             IssueEventBody::Moved { .. } => "moved",
             IssueEventBody::Assigned { .. } => "assigned",
             IssueEventBody::RunStarted { .. } => "run_started",
+            IssueEventBody::RunInterrupted { .. } => "run_interrupted",
             IssueEventBody::RunSettled { .. } => "run_settled",
             IssueEventBody::Blocked { .. } => "blocked",
             IssueEventBody::Unblocked => "unblocked",
@@ -449,6 +470,8 @@ impl IssueEventBody {
             IssueEventBody::StageCompleted { .. } => "stage_completed",
             IssueEventBody::BudgetExhausted { .. } => "budget_exhausted",
             IssueEventBody::BudgetRestored { .. } => "budget_restored",
+            IssueEventBody::TokenBudgetExhausted { .. } => "token_budget_exhausted",
+            IssueEventBody::TokenBudgetRestored { .. } => "token_budget_restored",
         }
     }
 }
@@ -485,11 +508,8 @@ pub trait ProjectStore: Send + Sync {
 
     async fn update_project(&self, id: &ProjectId, update: &ProjectUpdate) -> Result<bool>;
 
-    async fn spend_since(
-        &self,
-        project: &ProjectId,
-        since: DateTime<Utc>,
-    ) -> Result<baybo_model::MicroUsd>;
+    /// Return money and token spend from the same rows since `since`.
+    async fn spend_since(&self, project: &ProjectId, since: DateTime<Utc>) -> Result<Spend>;
 
     async fn attention(&self) -> Result<Vec<(ProjectId, AttentionCounts)>>;
 
@@ -617,7 +637,8 @@ pub trait ProjectStore: Send + Sync {
         error: Option<&str>,
     ) -> Result<bool>;
 
-    async fn requeue_unsettled(&self) -> Result<()>;
+    /// Atomically requeue in-flight runs and return their incremented resume counts.
+    async fn requeue_unsettled(&self) -> Result<Vec<IssueRunRow>>;
 }
 
 /// What caused a run to be enqueued. Shown verbatim in the execution log,
@@ -659,6 +680,8 @@ pub enum RunTrigger {
     /// working it and nothing queued — work that has silently stopped.
     /// Like [`RunTrigger::Triage`], the runner is not the card's assignee.
     Stalled,
+    /// Lead coordination triggered by a blocked card.
+    Blocked,
 }
 
 impl RunTrigger {
@@ -673,6 +696,7 @@ impl RunTrigger {
             RunTrigger::StageBarrier => "stage_barrier",
             RunTrigger::Review => "review",
             RunTrigger::Stalled => "stalled",
+            RunTrigger::Blocked => "blocked",
         }
     }
 
@@ -687,19 +711,16 @@ impl RunTrigger {
             "stage_barrier" => Some(RunTrigger::StageBarrier),
             "review" => Some(RunTrigger::Review),
             "stalled" => Some(RunTrigger::Stalled),
+            "blocked" => Some(RunTrigger::Blocked),
             _ => None,
         }
     }
 
-    /// Whether this run is the lead coordinating a card rather than the
-    /// card's own work — [`RunTrigger::Triage`], [`RunTrigger::Review`] and
-    /// [`RunTrigger::Stalled`]. A coordination run neither counts as the
-    /// card making progress nor re-raises the question it was itself the
-    /// answer to.
+    /// Whether this is lead coordination rather than the card's own work.
     pub fn is_coordination(self) -> bool {
         matches!(
             self,
-            RunTrigger::Triage | RunTrigger::Review | RunTrigger::Stalled
+            RunTrigger::Triage | RunTrigger::Review | RunTrigger::Stalled | RunTrigger::Blocked
         )
     }
 }
@@ -836,8 +857,8 @@ pub struct BoardActivity {
     /// In Progress column, because a run outlives its column — dragging a
     /// card out never kills it.
     pub working: usize,
-    /// Spend since the start of the caller's day.
-    pub burn: baybo_model::MicroUsd,
+    /// Spend since the caller's day began, using the budget gate's rows.
+    pub burn: Spend,
 }
 
 impl AttentionCounts {
@@ -870,14 +891,12 @@ pub struct IssueRunRow {
     pub status: RunStatus,
     /// 1 for an issue's first run, incrementing thereafter.
     pub attempt: i64,
+    /// Number of boot recoveries that requeued this run.
+    pub resumes: i64,
     /// Why it failed, when it did.
     pub error: Option<String>,
     pub created_at: DateTime<Utc>,
-    /// When an executor claimed it. **Not** "did this run start" — see
-    /// [`Self::was_claimed`]: the boot sweep clears this when it returns an
-    /// interrupted run to the queue, on the assumption that the next claim
-    /// re-stamps it, so a run the sweep called off instead of re-driving
-    /// reads as never started in the execution log even though it ran.
+    /// First claim time, retained across requeues so the spend window stays complete.
     pub started_at: Option<DateTime<Utc>>,
     pub settled_at: Option<DateTime<Utc>>,
 }
@@ -898,6 +917,13 @@ pub struct Spend {
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cost: baybo_model::MicroUsd,
+}
+
+impl Spend {
+    /// Total prompt and completion tokens; cached-token columns are input subsets.
+    pub fn tokens(self) -> i64 {
+        self.input_tokens + self.output_tokens
+    }
 }
 
 impl std::ops::Add for Spend {

@@ -187,6 +187,19 @@ Response is SSE; we parse `response.output_text.delta`, `response.reasoning*.del
 
 Tool-call return path: Responses API emits `response.function_call_arguments.delta` events; we accumulate per `call_id` (registered from `response.output_item.added`), finalise on `response.function_call_arguments.done` or `response.output_item.done` (item type `function_call`), surface as `StreamEvent::ToolCall`. Same shape the OpenAI variant already produces.
 
+## Billing: every call records $0 with real tokens
+
+`factory.rs` sets `pricing: ModelPricing::default()` and points at "the design doc" for the reason — this section is that reason, which until now it did not contain, and the omission is why the consequence went unnoticed for as long as it did.
+
+Subscription billing is account-level, not per-token, so there is no honest per-call dollar figure to record. Two independent paths both land on zero: the provider has no entry in `openrouter_prefix.rs`, so `openrouter::pricing_for` misses and `pricing_for_model` falls back to `flat_default_pricing` (zero); and the factory sets zero pricing on the `ModelInfo` regardless. `cost_records` rows are written with real `input_tokens`/`output_tokens` and `cost_usd = 0`.
+
+**The consequence, stated plainly: every gate that measures money is inert for this provider.**
+
+- `CostManager::check` — the global `cost.spending_limits` daily/monthly caps — never trips. Unfixed.
+- The kanban board's per-project **daily budget** (`projects.daily_budget_micros`) can never be reached, however low it is set. This one *is* addressed: a board carries a second, token-denominated ceiling (`projects.daily_budget_tokens`) over the same window, and stops when either is reached. See [`project.md`](project.md).
+
+The rejected alternative for both is the per-entry `pricing` override in `registry.rs`, which an operator can hand-write and which does reach this client. It is a made-up price for money that does not exist; it would make the meters move without making them mean anything.
+
 ## Error mapping
 
 | Source | baybo `LlmError` |

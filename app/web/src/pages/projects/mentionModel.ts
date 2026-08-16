@@ -30,8 +30,9 @@ export function applyMention(
   return { text: `${head}${inserted}${tail}`, caret: head.length + mention.length + 1 };
 }
 
+/// Describe a draft mention, including the blocked-card refusal.
 export function mentionHint(
-  issue: { assignee?: string | null },
+  issue: { assignee?: string | null; blocked_reason?: string | null },
   text: string,
   team: Agent[],
 ): string | null {
@@ -40,5 +41,8 @@ export function mentionHint(
   if (first === null) return null;
   const handle = first[2].replace(/-+$/, '');
   if (!team.some((agent) => agent.handle === handle)) return null;
+  if (issue.blocked_reason != null) {
+    return `Records only — a block has stopped this issue; @${handle} is not put on it until it is lifted.`;
+  }
   return `Sending this puts @${handle} on the issue.`;
 }

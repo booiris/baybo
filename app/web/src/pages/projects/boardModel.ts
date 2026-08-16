@@ -306,6 +306,11 @@ export function runDuration(run: IssueRun, now: number): string | null {
   return formatDuration((run.settled_at_ms ?? now) - run.started_at_ms);
 }
 
+/// Tokens counted by the board ceiling: input plus output.
+export function tokensOf(run: IssueRun): number {
+  return (run.input_tokens ?? 0) + (run.output_tokens ?? 0);
+}
+
 // Unknown future states remain unsettled rather than hiding active work.
 const SETTLED: ReadonlySet<RunStatus> = new Set<RunStatus>(['done', 'failed', 'cancelled']);
 

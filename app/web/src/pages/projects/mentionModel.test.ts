@@ -93,6 +93,17 @@ describe('mentionHint', () => {
     expect(mentionHint({ assignee: null }, '@dev-1 and @dev-2 look', TEAM)).toContain('@dev-1');
   });
 
+  it('refuses the handover on a card a block has stopped', () => {
+    const hint = mentionHint(
+      { assignee: null, blocked_reason: 'which goal wins?' },
+      '@dev-1 take this',
+      TEAM,
+    );
+    expect(hint).toContain('a block has stopped this issue');
+    expect(hint).toContain('@dev-1');
+    expect(hint).not.toContain('puts @dev-1 on the issue');
+  });
+
   it('says nothing for a handle nobody has', () => {
     expect(mentionHint({ assignee: null }, '@nobody look', TEAM)).toBeNull();
     expect(mentionHint({ assignee: null }, 'no mention', TEAM)).toBeNull();

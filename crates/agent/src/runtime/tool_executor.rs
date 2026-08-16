@@ -9,9 +9,10 @@ use baybo_model::{ContentBlock, ParallelGroup, SessionId, SpanId, TrustLevel, Tu
 
 use baybo_sandbox::{NetworkPolicy, SandboxRunner, default_sensitive_denylist};
 use baybo_tools::{
-    ApprovalDecision, ApprovalGateMap, ApprovalHandle, ApprovalRequest, ApprovedResource,
-    ExecSandbox, ReadTracker, ResourceAccess, ToolCapability, ToolContext, ToolError, ToolManifest,
-    ToolOutput, ToolRegistry, VirtualReadResolver, approval::preview_params,
+    ApprovalDecision, ApprovalGateMap, ApprovalHandle, ApprovalOutcome, ApprovalRequest,
+    ApprovedResource, ExecSandbox, ReadTracker, ResourceAccess, ToolCapability, ToolContext,
+    ToolError, ToolManifest, ToolOutput, ToolRegistry, VirtualReadResolver,
+    approval::preview_params, refusal_reason,
 };
 use baybo_trace::{
     LifecycleOutcome, PersistedToolCallOutput, SpanEventKind, SpanFinalize, SpanKind, SpanRecorder,
@@ -51,6 +52,36 @@ fn admits_repo(resolved: &Path, paths: &baybo_workspace::WorkspacePaths) -> Resu
         return Err("it is inside baybo's protected workspace data".to_owned());
     }
     Ok(())
+}
+
+const BAYBO_DEFAULT_STATE_DIR: &str = ".baybo";
+
+/// Permissive Bash root and the state trees masked within it.
+struct PermissiveScope {
+    extra_root: PathBuf,
+    denied: Vec<PathBuf>,
+}
+
+/// Mask live and default state roots; fall back when `$HOME` is absent.
+fn permissive_scope(
+    live_root: &Path,
+    home: Option<&Path>,
+    baybo_home: Option<&Path>,
+    fs_fallback_root: &Path,
+) -> PermissiveScope {
+    let mut state_roots = vec![baybo_workspace::absolutise(live_root)];
+    let default_state = baybo_home
+        .map(Path::to_path_buf)
+        .or_else(|| home.map(|h| h.join(BAYBO_DEFAULT_STATE_DIR)));
+    if let Some(default_state) = default_state {
+        state_roots.push(default_state);
+    }
+    PermissiveScope {
+        extra_root: home
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| fs_fallback_root.to_path_buf()),
+        denied: default_sensitive_denylist(home, &state_roots),
+    }
 }
 
 async fn board_handle(
@@ -640,7 +671,7 @@ impl ToolExecutor {
         // smaller. The pointer is resolved on read against the transcript row
         // `AgentLoop` appends after this returns.
         let output = crate::runtime::scope::with_span(
-            recorder.as_ref(),
+            recorder,
             step,
             turn_id,
             SpanKind::ToolCall {
@@ -665,7 +696,7 @@ impl ToolExecutor {
                 // and check them against the session's cached approvals.
                 // Also pull the tool's declared `max_timeout` (default
                 // 30 s) so the executor uses the right deadline below.
-                let (accesses, call_label, effective_timeout) = self
+                let (accesses, call_label, effective_timeout, output_source) = self
                     .tool_registry
                     .get(&tool_name_owned)
                     .map(|tool| {
@@ -673,9 +704,17 @@ impl ToolExecutor {
                             tool.accessed_resources(&params),
                             tool.call_label(&params),
                             tool.max_timeout(),
+                            tool.output_source(),
                         )
                     })
-                    .unwrap_or_else(|| (Vec::new(), None, Duration::from_secs(30)));
+                    .unwrap_or_else(|| {
+                        (
+                            Vec::new(),
+                            None,
+                            Duration::from_secs(30),
+                            baybo_tools::OutputSource::default(),
+                        )
+                    });
 
                 let uncovered: Vec<ResourceAccess> = {
                     let approved = approved_resources.lock();
@@ -710,10 +749,12 @@ impl ToolExecutor {
                     // for a turn that is already unwinding. Dropping the request
                     // future also unqueues it (the gate's RAII cleanup), so the
                     // prompt disappears everywhere rather than lingering.
-                    let decision = tokio::select! {
-                        outcome = request => outcome.decision,
-                        _ = cancel_for_gate.cancelled() => ApprovalDecision::Deny,
+                    let outcome = tokio::select! {
+                        outcome = request => outcome,
+                        // Cancellation abandons the unanswered prompt.
+                        _ = cancel_for_gate.cancelled() => ApprovalOutcome::abandoned(),
                     };
+                    let decision = outcome.decision;
                     *approval_sink.lock() = Some(decision);
                     for access in &uncovered {
                         let _ = recorder
@@ -745,7 +786,7 @@ impl ToolExecutor {
                         ApprovalDecision::Deny => {
                             return Err(anyhow::Error::new(ToolError::Denied {
                                 tool: tool_name_owned.clone(),
-                                reason: "user denied approval".to_string(),
+                                reason: refusal_reason(outcome.resolution).to_string(),
                             }));
                         }
                     }
@@ -785,14 +826,12 @@ impl ToolExecutor {
                 };
                 let sandbox: Option<Arc<dyn ExecSandbox>> = if uses_exec_command {
                     self.sandbox_runner.as_ref().map(|runner| {
-                        let home = std::env::var_os("HOME").map(PathBuf::from);
-                        let baybo_state = std::env::var_os("BAYBO_HOME")
-                            .map(PathBuf::from)
-                            .or_else(|| home.as_ref().map(|h| h.join(".baybo")));
-                        let extra_root =
-                            home.clone().unwrap_or_else(|| self.workspace_root.clone());
-                        let denied =
-                            default_sensitive_denylist(home.as_deref(), baybo_state.as_deref());
+                        let PermissiveScope { extra_root, denied } = permissive_scope(
+                            self.workspace_paths.root(),
+                            std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+                            std::env::var_os("BAYBO_HOME").map(PathBuf::from).as_deref(),
+                            &self.workspace_root,
+                        );
                         let readable = baybo_tools::shell_reachable_workspace_roots(
                             &self.workspace_paths,
                             agent_id,
@@ -960,6 +999,11 @@ impl ToolExecutor {
                                     session_id: Some(session_id.as_str()),
                                     tool: Some(&tool_name_owned),
                                     span_id: Some(&span_id),
+                                    provenance: crate::security::OutputProvenance::classify(
+                                        output_source,
+                                        &accesses,
+                                        ctx.checkout_root.as_deref(),
+                                    ),
                                 },
                             )
                             .await
@@ -1065,8 +1109,39 @@ impl ToolExecutor {
 
 #[cfg(test)]
 mod tests {
-    use super::{admits_repo, admits_worktree};
-    use std::path::Path;
+    use super::{admits_repo, admits_worktree, permissive_scope};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn the_mask_covers_the_live_workspace_not_just_the_default_location() {
+        let home = Path::new("/home/u");
+        let live = Path::new("/home/u/projects/baybo-ws");
+        let scope = permissive_scope(live, Some(home), None, Path::new("/unused"));
+        assert_eq!(scope.extra_root, home);
+        assert!(
+            scope.denied.contains(&live.to_path_buf()),
+            "the live workspace root is unmasked: {:?}",
+            scope.denied
+        );
+        assert!(
+            scope.denied.contains(&home.join(".baybo")),
+            "an operator who moved the workspace may still have state at the default location",
+        );
+        assert!(scope.denied.contains(&home.join(".ssh")));
+
+        let scope = permissive_scope(
+            live,
+            Some(home),
+            Some(Path::new("/srv/baybo")),
+            Path::new("/unused"),
+        );
+        assert!(scope.denied.contains(&PathBuf::from("/srv/baybo")));
+        assert!(scope.denied.contains(&live.to_path_buf()));
+
+        let scope = permissive_scope(live, None, None, Path::new("/ws/work"));
+        assert_eq!(scope.extra_root, Path::new("/ws/work"));
+        assert_eq!(scope.denied, vec![live.to_path_buf()]);
+    }
 
     #[test]
     fn a_worktree_that_resolves_outside_the_work_dir_is_not_bound() {
@@ -1310,6 +1385,7 @@ mod tests {
                 description: String::new(),
                 workdir: repo_dir.path().to_string_lossy().into_owned(),
                 daily_budget: None,
+                daily_budget_tokens: None,
                 max_parallel_issue_runs: baybo_store::project::DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
                 archived_at: None,
                 created_at: now,
@@ -1651,5 +1727,155 @@ mod tests {
             "the persisted row must fit the budget after escaping, got {serialized}"
         );
         assert!(truncated.is_some());
+    }
+
+    const GATED_TOOL: &str = "gated_exec";
+
+    struct GatedTool;
+
+    #[async_trait::async_trait]
+    impl baybo_tools::Tool for GatedTool {
+        fn name(&self) -> &str {
+            GATED_TOOL
+        }
+        fn description(&self) -> String {
+            "asks before it runs".to_owned()
+        }
+        fn parameters_schema(&self) -> Value {
+            json!({"type": "object", "properties": {}})
+        }
+        fn accessed_resources(&self, _params: &Value) -> Vec<ResourceAccess> {
+            vec![ResourceAccess::ExecCommand {
+                command: "x".to_owned(),
+            }]
+        }
+        async fn execute(
+            &self,
+            _params: Value,
+            _ctx: &ToolContext,
+        ) -> baybo_tools::Result<ToolOutput> {
+            Ok(ToolOutput::Text("ran".to_owned()))
+        }
+    }
+
+    struct FixedOutcomeGate(ApprovalOutcome);
+
+    #[async_trait::async_trait]
+    impl baybo_tools::ApprovalGate for FixedOutcomeGate {
+        async fn request(&self, _req: ApprovalRequest) -> ApprovalOutcome {
+            self.0
+        }
+    }
+
+    async fn gated_call_error(outcome: ApprovalOutcome) -> String {
+        let home = tempfile::tempdir().expect("tempdir");
+        let paths = baybo_workspace::WorkspacePaths::new(home.path().join(".baybo"));
+        std::fs::create_dir_all(paths.work_dir()).expect("work dir");
+        let sandbox_root = paths.work_dir().canonicalize().expect("canonical work dir");
+
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            Arc::new(GatedTool),
+            ToolManifest {
+                name: GATED_TOOL.to_owned(),
+                description: "asks before it runs".to_owned(),
+                trust_level: TrustLevel::Trusted,
+                parameters_schema: json!({"type": "object", "properties": {}}),
+                capabilities: vec![ToolCapability::ExecCommand],
+                channels: Vec::new(),
+            },
+        );
+
+        let gates = ApprovalGateMap::new();
+        gates.insert(
+            baybo_model::ChannelType::tui(),
+            Arc::new(FixedOutcomeGate(outcome)),
+        );
+
+        let key = baybo_security::EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec())
+            .expect("key");
+        let security_gateway = Arc::new(SecurityGateway::new(
+            Arc::new(baybo_security::LeakDetector::with_default_rules()),
+            Arc::new(baybo_security::SecretVault::new(
+                key,
+                Arc::new(baybo_security::test_support::MemorySecretStore::new()),
+            )),
+        ));
+
+        let executor = ToolExecutor::new(
+            Arc::new(registry),
+            Arc::new(gates),
+            security_gateway,
+            sandbox_root,
+            paths,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let session_id = SessionId::from("sess-gate");
+        let recorder = Arc::new(SpanRecorder::new(
+            session_id.clone(),
+            "u1".to_owned(),
+            Arc::new(baybo_trace::test_support::MemoryTraceStore::new()),
+            baybo_trace::TraceEventStream::default(),
+        ));
+        let step = recorder
+            .begin_step(TurnId::new(), baybo_trace::StepKind::LlmIteration)
+            .await
+            .expect("step");
+        let user = User {
+            id: "u1".to_owned(),
+            name: None,
+            channel: baybo_model::ChannelType::tui(),
+        };
+
+        let executed = executor
+            .execute(
+                GATED_TOOL,
+                json!({}),
+                &session_id,
+                &baybo_model::TriggerSource::User,
+                &baybo_model::AgentProfileId::generate(),
+                &user,
+                &Arc::new(Mutex::new(Vec::new())),
+                &recorder,
+                &step,
+                None,
+                "tool-use-1".to_owned(),
+                None,
+                None,
+                CancellationToken::new(),
+                None,
+                None,
+                false,
+                ReadTracker::default(),
+                None,
+            )
+            .await;
+        executed
+            .output
+            .expect_err("a denied gate must not let the tool run")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_gate_is_not_reported_to_the_model_as_a_human_no() {
+        let msg = gated_call_error(ApprovalOutcome::timed_out()).await;
+        assert!(msg.contains("expired"), "got {msg}");
+        assert!(!msg.contains("said no"), "got {msg}");
+        assert!(!msg.contains("user denied approval"), "got {msg}");
+    }
+
+    #[tokio::test]
+    async fn a_human_no_still_reads_as_a_human_no() {
+        let msg = gated_call_error(ApprovalOutcome::answered(ApprovalDecision::Deny)).await;
+        assert!(
+            msg.contains("a human saw this prompt and said no"),
+            "got {msg}"
+        );
     }
 }

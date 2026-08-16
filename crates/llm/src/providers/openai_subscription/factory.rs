@@ -92,8 +92,7 @@ impl LlmProviderFactory for OpenAiSubscriptionProviderFactory {
             context_window: defaults.context_window,
             supports_tools: true,
             supports_vision: defaults.supports_vision,
-            // Subscription billing is account-level, not per-token, so cost
-            // records land at $0 — see design doc.
+            // Subscription calls record tokens but no per-token cost.
             pricing: ModelPricing::default(),
         };
         Ok(LlmClient::new(

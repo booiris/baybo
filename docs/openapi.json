@@ -4104,6 +4104,14 @@
                             "format": "int64",
                             "description": "Daily spend ceiling in micro-USD. Absent means no limit."
                           },
+                          "daily_budget_tokens": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ],
+                            "format": "int64",
+                            "description": "Daily token ceiling in the same UTC window; absent means unlimited."
+                          },
                           "description": {
                             "type": "string"
                           },
@@ -4239,13 +4247,19 @@
                         "required": [
                           "project_id",
                           "working",
-                          "burn_micros"
+                          "burn_micros",
+                          "burn_tokens"
                         ],
                         "properties": {
                           "burn_micros": {
                             "type": "integer",
                             "format": "int64",
                             "description": "Spend since the start of your day, in micro-USD. Measured exactly as\nthe budget gate measures it, so the pair in the dropdown can never\naccuse the board of crossing a ceiling it did not."
+                          },
+                          "burn_tokens": {
+                            "type": "integer",
+                            "format": "int64",
+                            "description": "Tokens spent since the start of your day."
                           },
                           "project_id": {
                             "type": "string"
@@ -5961,7 +5975,7 @@
             }
           },
           "400": {
-            "description": "The issue has nobody on it, or the board has finished with it: a cancelled card has to be reopened and a done one moved back before it runs again",
+            "description": "The issue has nobody on it, a block has stopped it, or the board has finished with it: a blocked card has to be unblocked, a cancelled one reopened and a done one moved back before it runs again",
             "content": {
               "application/json": {
                 "schema": {
@@ -8455,6 +8469,14 @@
             "format": "int64",
             "description": "Daily spend ceiling in micro-USD (USD × 10^6). Omit for no limit;\n`0` pauses the board's agents without archiving it. Integer, never a\nfloat — a budget compared with rounding error is a budget that\ndisagrees with the ledger it is measured against."
           },
+          "daily_budget_tokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Daily token ceiling; omit for unlimited, or use `0` to pause agents."
+          },
           "description": {
             "type": "string"
           },
@@ -9230,6 +9252,30 @@
             "type": "object",
             "required": [
               "attempt",
+              "resumes",
+              "kind"
+            ],
+            "properties": {
+              "attempt": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "run_interrupted"
+                ]
+              },
+              "resumes": {
+                "type": "integer",
+                "format": "int64"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "attempt",
               "status",
               "kind"
             ],
@@ -9459,6 +9505,54 @@
                 "format": "int64"
               },
               "spent_micros": {
+                "type": "integer",
+                "format": "int64"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "spent_tokens",
+              "limit_tokens",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "token_budget_exhausted"
+                ]
+              },
+              "limit_tokens": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "spent_tokens": {
+                "type": "integer",
+                "format": "int64"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "spent_tokens",
+              "limit_tokens",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "token_budget_restored"
+                ]
+              },
+              "limit_tokens": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "spent_tokens": {
                 "type": "integer",
                 "format": "int64"
               }
@@ -10263,6 +10357,14 @@
             "format": "int64",
             "description": "Daily spend ceiling in micro-USD. Absent means no limit."
           },
+          "daily_budget_tokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Daily token ceiling in the same UTC window; absent means unlimited."
+          },
           "description": {
             "type": "string"
           },
@@ -10438,7 +10540,8 @@
           "triage",
           "stage_barrier",
           "review",
-          "stalled"
+          "stalled",
+          "blocked"
         ]
       },
       "SessionKind": {
@@ -11277,6 +11380,14 @@
             ],
             "format": "int64",
             "description": "Daily spend ceiling in micro-USD (USD × 10^6). Omit for no limit;\n`0` pauses the board's agents without archiving it. Integer, never a\nfloat — a budget compared with rounding error is a budget that\ndisagrees with the ledger it is measured against."
+          },
+          "daily_budget_tokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Daily token ceiling; omit for unlimited, or use `0` to pause agents."
           },
           "description": {
             "type": "string"

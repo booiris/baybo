@@ -63,10 +63,8 @@ export function activityFor(boards: BoardActivity[], projectId: string): BoardAc
 /// any later banner have to agree about when a board is nearly out.
 const WARN_AT = 0.95;
 
-export function burnIsNearLimit(
-  burnMicros: number,
-  budgetMicros: number | null | undefined,
-): boolean {
-  if (budgetMicros == null || budgetMicros <= 0) return false;
-  return burnMicros / budgetMicros >= WARN_AT;
+/// Apply the same near-limit threshold to either budget unit.
+export function burnIsNearLimit(used: number, ceiling: number | null | undefined): boolean {
+  if (ceiling == null || ceiling <= 0) return false;
+  return used / ceiling >= WARN_AT;
 }

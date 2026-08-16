@@ -1,6 +1,8 @@
 //! What happens when somebody says something on an issue.
 
-use baybo_store::project::{IssueRow, IssueStatus, RunStatus};
+use baybo_store::project::{
+    IssueActor, IssueEventBody, IssueEventRow, IssueRow, IssueStatus, RunStatus,
+};
 
 /// Where a comment goes besides the timeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9,6 +11,8 @@ pub enum CommentDelivery {
     /// nobody is working — the comment is history, and the composer says
     /// so before it is sent.
     RecordOnly,
+    /// Recorded while a block prevents delivery or assignment.
+    ParkedByABlock,
     /// Start a run: somebody is assigned, the work is live, and nothing is
     /// currently reading.
     Wake,
@@ -34,6 +38,9 @@ pub(crate) fn comment_delivery(issue: &IssueRow, live_run: Option<RunStatus>) ->
     if issue.assignee.is_none() || issue.cancelled_at.is_some() || !is_live_work(issue.status) {
         return CommentDelivery::RecordOnly;
     }
+    if !crate::driver::board_may_start(issue) {
+        return CommentDelivery::ParkedByABlock;
+    }
     match live_run {
         // A held run has not assembled its brief either — it is waiting on
         // the board's budget, not on work — so the comment lands in it.
@@ -42,6 +49,16 @@ pub(crate) fn comment_delivery(issue: &IssueRow, live_run: Option<RunStatus>) ->
         // A settled run is history; the issue is idle again.
         _ => CommentDelivery::Wake,
     }
+}
+
+/// Whether someone other than the next runner commented in this window.
+pub(crate) fn somebody_asked_for_more<'a>(
+    window: impl IntoIterator<Item = &'a IssueEventRow>,
+    next_runner: &IssueActor,
+) -> bool {
+    window
+        .into_iter()
+        .any(|e| matches!(e.body, IssueEventBody::Comment { .. }) && &e.actor != next_runner)
 }
 
 #[cfg(test)]
@@ -141,6 +158,33 @@ mod tests {
                 Some(RunStatus::Running)
             ),
             CommentDelivery::AfterCurrentRun
+        );
+    }
+
+    #[test]
+    fn nothing_is_woken_on_a_card_a_block_has_stopped() {
+        for live in [
+            None,
+            Some(RunStatus::Queued),
+            Some(RunStatus::Held),
+            Some(RunStatus::Running),
+            Some(RunStatus::Done),
+        ] {
+            let mut paused = issue(IssueStatus::InProgress, true);
+            paused.blocked_reason = Some("which of the two goals wins?".into());
+            assert_eq!(
+                comment_delivery(&paused, live),
+                CommentDelivery::ParkedByABlock,
+                "{live:?}"
+            );
+        }
+
+        let mut unassigned = issue(IssueStatus::InProgress, false);
+        unassigned.blocked_reason = Some("waiting on the operator".into());
+        assert_eq!(
+            comment_delivery(&unassigned, None),
+            CommentDelivery::RecordOnly,
+            "a card nobody is on is answered by who is missing, not by the block"
         );
     }
 }

@@ -6,7 +6,7 @@ use baybo_tools::{Tool, ToolConcurrency, ToolContext, ToolError, ToolOutput, Too
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{exec_err, parse_status, render_issue, scope, status_schema, usd};
+use super::{exec_err, parse_status, render_issue, scope, status_schema, tokens, usd};
 use crate::ProjectManager;
 
 pub const ISSUE_LIST_TOOL_NAME: &str = "IssueList";
@@ -147,12 +147,23 @@ Alongside them: `team`, where each member's `working_on` is what they have in fl
         if !held.is_empty() {
             board_facts.insert("held".into(), json!(held));
         }
-        if let Some((spent, limit)) = load.headroom.figures() {
+        if let Some(figures) = load.headroom.figures() {
+            // Render the figures in the constraining ceiling's unit.
+            let (spent, limit) = match figures {
+                crate::budget::Figures::Money {
+                    spent_micros,
+                    limit_micros,
+                } => (usd(spent_micros), usd(limit_micros)),
+                crate::budget::Figures::Tokens {
+                    spent_tokens,
+                    limit_tokens,
+                } => (tokens(spent_tokens), tokens(limit_tokens)),
+            };
             board_facts.insert(
                 "budget".into(),
                 json!({
-                    "spent": usd(spent),
-                    "limit": usd(limit),
+                    "spent": spent,
+                    "limit": limit,
                     "exhausted": load.headroom.is_exhausted(),
                 }),
             );

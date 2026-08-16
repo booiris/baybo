@@ -178,10 +178,23 @@ describe('commentHint', () => {
     );
   });
 
+  it('says a block has stopped the issue, whatever is recorded against it', () => {
+    for (const runs of [[], queued, live, held, settled]) {
+      const hint = commentHint(
+        { status: 'in_progress', assignee: DEV_1, blocked_reason: 'which goal wins?' },
+        runs,
+        team,
+      );
+      expect(hint).toContain('a block has stopped this issue');
+      expect(hint).toContain('@dev-1');
+      expect(hint).not.toContain('Starts a run');
+    }
+  });
+
   it('says a held run will read it, and why it has not started', () => {
     const hint = commentHint({ status: 'in_progress', assignee: DEV_1 }, held, team);
     expect(hint).toContain('held run starts');
-    expect(hint).toContain('daily budget');
+    expect(hint).toContain('daily ceilings');
   });
 });
 

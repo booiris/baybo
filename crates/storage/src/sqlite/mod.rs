@@ -487,6 +487,16 @@ const ADD_COLUMNS: &[AddColumn] = &[
         column: "max_parallel_issue_runs",
         definition: "INTEGER",
     },
+    AddColumn {
+        table: "projects",
+        column: "daily_budget_tokens",
+        definition: "INTEGER",
+    },
+    AddColumn {
+        table: "issue_runs",
+        column: "resumes",
+        definition: "INTEGER NOT NULL DEFAULT 0",
+    },
 ];
 
 /// Pool of sqlite connections.
@@ -1353,6 +1363,12 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     -- NULL is no ceiling. INTEGER, never REAL — see
                     -- `cost_records.cost_usd`.
                     daily_budget_micros INTEGER,
+                    -- Tokens this board's agents may spend per UTC day,
+                    -- over the same window and the same rows as
+                    -- `daily_budget_micros`. NULL is no ceiling. The meter
+                    -- that still measures something on a subscription
+                    -- plan, where every `cost_records.cost_usd` is 0.
+                    daily_budget_tokens INTEGER,
                     -- How many runs this board may start on its own by
                     -- promoting Todo cards. NULL on a row written before
                     -- the column existed, and resolved on the way out to
@@ -1442,6 +1458,13 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     trigger    TEXT    NOT NULL,
                     status     TEXT    NOT NULL,
                     attempt    INTEGER NOT NULL,
+                    -- How many process starts have found this run in flight
+                    -- and handed it back to the queue. Zero on a row written
+                    -- before the meter existed, which reads as never
+                    -- interrupted: the counter starts when the meter does,
+                    -- and back-filling it from timeline entries would be a
+                    -- second home for the rule that bounds it.
+                    resumes    INTEGER NOT NULL DEFAULT 0,
                     error      TEXT,
                     created_at INTEGER NOT NULL,
                     started_at INTEGER,

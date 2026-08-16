@@ -11,6 +11,8 @@
 
 /// What this agent's run is doing, or `null` for nothing running. Whether a
 /// dot is drawn is `dot`'s to say, not this — see it below.
+import { HELD_RUN_NOTE } from './budgetModel';
+
 export type AvatarRun = 'queued' | 'running' | 'held' | null;
 
 /// A face's footprint. Exported because anything that has to line up with one
@@ -49,7 +51,7 @@ export function runNote(run: AvatarRun): string {
     case 'queued':
       return ' — queued, waiting for a free slot';
     case 'held':
-      return ' — held, the project is over its daily budget';
+      return ` — held, ${HELD_RUN_NOTE}`;
     default:
       return '';
   }

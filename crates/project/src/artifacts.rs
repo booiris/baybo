@@ -222,6 +222,7 @@ mod tests {
             trigger: RunTrigger::Started,
             status,
             attempt: 1,
+            resumes: 0,
             error: None,
             created_at: Utc::now(),
             started_at: None,

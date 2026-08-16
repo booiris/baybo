@@ -174,6 +174,79 @@ async fn a_negative_run_ceiling_is_refused_rather_than_saturated() {
 }
 
 #[tokio::test]
+async fn both_daily_ceilings_survive_the_round_trip_and_can_be_cleared() {
+    let (router, _tg) = router().await;
+
+    let created = post(
+        &router,
+        "/v1/projects",
+        json!({ "name": "metered", "daily_budget_micros": 5_000_000, "daily_budget_tokens": 250_000 }),
+        StatusCode::CREATED,
+    )
+    .await;
+    assert_eq!(created["daily_budget_micros"], 5_000_000);
+    assert_eq!(created["daily_budget_tokens"], 250_000);
+
+    let id = created["id"].as_str().expect("id").to_owned();
+    let fetched = get(&router, &format!("/v1/projects/{id}"), StatusCode::OK).await;
+    assert_eq!(fetched["daily_budget_tokens"], 250_000);
+
+    // Updates replace both ceilings; omission clears one rather than setting zero.
+    let cleared = put(
+        &router,
+        &format!("/v1/projects/{id}"),
+        json!({ "name": "metered", "daily_budget_tokens": 1_000 }),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(cleared["daily_budget_tokens"], 1_000);
+    assert!(
+        cleared.get("daily_budget_micros").is_none(),
+        "an omitted money ceiling is gone, not zero: {cleared}"
+    );
+
+    let wiped = put(
+        &router,
+        &format!("/v1/projects/{id}"),
+        json!({ "name": "metered" }),
+        StatusCode::OK,
+    )
+    .await;
+    assert!(wiped.get("daily_budget_tokens").is_none(), "{wiped}");
+}
+
+#[tokio::test]
+async fn a_negative_token_ceiling_is_refused_on_both_doors() {
+    let (router, _tg) = router().await;
+
+    post(
+        &router,
+        "/v1/projects",
+        json!({ "name": "owing", "daily_budget_tokens": -1 }),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+
+    let id = open_project(&router, "solvent").await;
+    put(
+        &router,
+        &format!("/v1/projects/{id}"),
+        json!({ "name": "solvent", "daily_budget_tokens": -1 }),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+
+    let paused = put(
+        &router,
+        &format!("/v1/projects/{id}"),
+        json!({ "name": "solvent", "daily_budget_tokens": 0 }),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(paused["daily_budget_tokens"], 0);
+}
+
+#[tokio::test]
 async fn issues_are_numbered_per_project_and_never_cross_boards() {
     let (router, _tg) = router().await;
     let a = open_project(&router, "alpha").await;

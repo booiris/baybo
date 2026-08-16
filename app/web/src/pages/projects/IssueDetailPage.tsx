@@ -30,6 +30,7 @@ import {
   STATUS_PILL,
   assignableAgents,
   runDuration,
+  tokensOf,
   unsettledRun,
   type Agent,
   type Issue,
@@ -126,6 +127,7 @@ const RUN_TRIGGER_LABEL: Record<IssueRun['trigger'], string> = {
   stage_barrier: 'stage barrier',
   review: 'awaiting review',
   stalled: 'work stopped',
+  blocked: 'blocked, needs a decision',
 };
 
 function RunRow({
@@ -139,8 +141,14 @@ function RunRow({
 }) {
   const duration = runDuration(run, Date.now());
   const live = run.status === 'queued' || run.status === 'running' || run.status === 'held';
+  // Subscription-priced runs fall back to token usage.
+  const consumed = tokensOf(run);
   const cost =
-    run.cost_micros != null && run.cost_micros > 0 ? formatUsd(run.cost_micros) : null;
+    run.cost_micros != null && run.cost_micros > 0
+      ? formatUsd(run.cost_micros)
+      : consumed > 0
+        ? `${formatTokens(consumed)} tok`
+        : null;
   // A live run can be stopped; every run has a transcript once it has a
   // session to open. Nothing here starts one — work begins by moving the
   // card, putting somebody on it, commenting, a stage barrier, or the board
@@ -172,7 +180,14 @@ function RunRow({
         <div className="mt-1 flex items-center justify-end gap-2.5 text-ink-soft">
           {duration != null ? <span className="tabular-nums">{duration}</span> : null}
           {cost != null ? (
-            <span className="tabular-nums" title="What this run's model calls cost">
+            <span
+              className="tabular-nums"
+              title={
+                run.cost_micros != null && run.cost_micros > 0
+                  ? "What this run's model calls cost"
+                  : 'Tokens this run spent — its model calls were billed at $0'
+              }
+            >
               {cost}
             </span>
           ) : null}

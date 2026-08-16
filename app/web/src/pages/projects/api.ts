@@ -122,6 +122,7 @@ export async function createProject(
     description: string;
     workdir?: string;
     daily_budget_micros?: number;
+    daily_budget_tokens?: number;
     max_parallel_issue_runs?: number;
   },
 ): Promise<Outcome<Project>> {
@@ -382,6 +383,7 @@ export async function updateProject(
     name: string;
     description: string;
     daily_budget_micros?: number | null;
+    daily_budget_tokens?: number | null;
     max_parallel_issue_runs: number;
   },
 ): Promise<Outcome<Project>> {

@@ -7,7 +7,7 @@ use baybo_tools::{Tool, ToolConcurrency, ToolContext, ToolError, ToolOutput, Too
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{exec_err, project_err, render_issue, scope, usd};
+use super::{exec_err, project_err, render_issue, scope, tokens, usd};
 use crate::ProjectManager;
 use crate::actors::{OPERATOR, handle_of, label, named_agent};
 
@@ -162,6 +162,14 @@ fn narrate(body: &IssueEventBody, known: &[baybo_store::AgentProfileRow]) -> Str
         } => {
             format!("started run #{attempt} ({})", trigger.as_str())
         }
+        IssueEventBody::RunInterrupted {
+            attempt, resumes, ..
+        } => {
+            format!(
+                "run #{attempt} was interrupted before it finished (interruption {resumes}); the \
+                 board picked it up again"
+            )
+        }
         IssueEventBody::RunSettled {
             attempt,
             status,
@@ -234,6 +242,22 @@ fn narrate(body: &IssueEventBody, known: &[baybo_store::AgentProfileRow]) -> Str
             "started the held run: {} of {} spent today",
             usd(*spent_micros),
             usd(*limit_micros)
+        ),
+        IssueEventBody::TokenBudgetExhausted {
+            spent_tokens,
+            limit_tokens,
+        } => format!(
+            "held the run: the project has spent {} of its {} daily token budget",
+            tokens(*spent_tokens),
+            tokens(*limit_tokens)
+        ),
+        IssueEventBody::TokenBudgetRestored {
+            spent_tokens,
+            limit_tokens,
+        } => format!(
+            "started the held run: {} of {} spent today",
+            tokens(*spent_tokens),
+            tokens(*limit_tokens)
         ),
     }
 }

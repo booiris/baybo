@@ -2272,6 +2272,11 @@ export interface components {
              *     disagrees with the ledger it is measured against.
              */
             daily_budget_micros?: number | null;
+            /**
+             * Format: int64
+             * @description Daily token ceiling; omit for unlimited, or use `0` to pause agents.
+             */
+            daily_budget_tokens?: number | null;
             description?: string;
             /**
              * Format: int64
@@ -2617,6 +2622,13 @@ export interface components {
         } | {
             /** Format: int64 */
             attempt: number;
+            /** @enum {string} */
+            kind: "run_interrupted";
+            /** Format: int64 */
+            resumes: number;
+        } | {
+            /** Format: int64 */
+            attempt: number;
             error?: string | null;
             /** @enum {string} */
             kind: "run_settled";
@@ -2676,6 +2688,20 @@ export interface components {
             limit_micros: number;
             /** Format: int64 */
             spent_micros: number;
+        } | {
+            /** @enum {string} */
+            kind: "token_budget_exhausted";
+            /** Format: int64 */
+            limit_tokens: number;
+            /** Format: int64 */
+            spent_tokens: number;
+        } | {
+            /** @enum {string} */
+            kind: "token_budget_restored";
+            /** Format: int64 */
+            limit_tokens: number;
+            /** Format: int64 */
+            spent_tokens: number;
         };
         /** @description One entry on an issue's timeline. */
         IssueEventDto: {
@@ -3054,6 +3080,11 @@ export interface components {
              * @description Daily spend ceiling in micro-USD. Absent means no limit.
              */
             daily_budget_micros?: number | null;
+            /**
+             * Format: int64
+             * @description Daily token ceiling in the same UTC window; absent means unlimited.
+             */
+            daily_budget_tokens?: number | null;
             description: string;
             id: string;
             /**
@@ -3146,7 +3177,7 @@ export interface components {
          * @description Why a run was started.
          * @enum {string}
          */
-        RunTriggerDto: "started" | "assigned" | "retry" | "comment" | "promoted" | "triage" | "stage_barrier" | "review" | "stalled";
+        RunTriggerDto: "started" | "assigned" | "retry" | "comment" | "promoted" | "triage" | "stage_barrier" | "review" | "stalled" | "blocked";
         /**
          * @description Wire mirror of [`baybo_query::SessionKind`]. Coarse trigger/lineage
          *     label for the trace browser list view.
@@ -3540,6 +3571,11 @@ export interface components {
              *     disagrees with the ledger it is measured against.
              */
             daily_budget_micros?: number | null;
+            /**
+             * Format: int64
+             * @description Daily token ceiling; omit for unlimited, or use `0` to pause agents.
+             */
+            daily_budget_tokens?: number | null;
             description?: string;
             /**
              * Format: int64
@@ -6811,6 +6847,11 @@ export interface operations {
                              * @description Daily spend ceiling in micro-USD. Absent means no limit.
                              */
                             daily_budget_micros?: number | null;
+                            /**
+                             * Format: int64
+                             * @description Daily token ceiling in the same UTC window; absent means unlimited.
+                             */
+                            daily_budget_tokens?: number | null;
                             description: string;
                             id: string;
                             /**
@@ -6910,6 +6951,11 @@ export interface operations {
                              *     accuse the board of crossing a ceiling it did not.
                              */
                             burn_micros: number;
+                            /**
+                             * Format: int64
+                             * @description Tokens spent since the start of your day.
+                             */
+                            burn_tokens: number;
                             project_id: string;
                             /**
                              * @description Runs executing. Counted from runs, not from the In Progress column —
@@ -8044,7 +8090,7 @@ export interface operations {
                     "application/json": components["schemas"]["IssueRunDto"];
                 };
             };
-            /** @description The issue has nobody on it, or the board has finished with it: a cancelled card has to be reopened and a done one moved back before it runs again */
+            /** @description The issue has nobody on it, a block has stopped it, or the board has finished with it: a blocked card has to be unblocked, a cancelled one reopened and a done one moved back before it runs again */
             400: {
                 headers: {
                     [name: string]: unknown;

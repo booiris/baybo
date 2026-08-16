@@ -55,12 +55,7 @@ fn is_waiting(issue: &IssueRow, busy: &BTreeSet<i64>) -> bool {
         && !busy.contains(&issue.number)
 }
 
-/// Whether the board may start work on this card on its own authority.
-///
-/// A person dragging a blocked card into In Progress is overriding the
-/// block on purpose; the board promoting one, re-driving its parked run at
-/// boot, or releasing its held run would override it on nobody's. Every
-/// door the board opens *by itself* asks this; the operator's doors do not.
+/// Whether automatic board actions may start this card; operators may override blocks.
 pub(crate) fn board_may_start(issue: &IssueRow) -> bool {
     issue.blocked_reason.is_none()
 }
@@ -124,19 +119,34 @@ pub(crate) fn awaiting_triage(issues: &[IssueRow], busy: &BTreeSet<i64>) -> Vec<
     unstaffed
 }
 
-/// Whether a card is one the lead can be asked about at all: live, not
-/// paused, not already being worked, and not the lead's own — a question
-/// about the lead's own card has no other party, its communication thread
-/// included.
+/// Whether the lead may be asked about a live card it does not own.
 fn takes_a_lead_question(
     issue: &IssueRow,
-    busy: &BTreeSet<i64>,
+    in_flight: &BTreeSet<i64>,
     lead: &baybo_model::AgentProfileId,
 ) -> bool {
     issue.cancelled_at.is_none()
-        && board_may_start(issue)
-        && !busy.contains(&issue.number)
+        && !in_flight.contains(&issue.number)
         && issue.assignee.as_ref() != Some(lead)
+}
+
+/// Blocked live cards for lead review, in promotion order.
+pub(crate) fn blocked(
+    issues: &[IssueRow],
+    in_flight: &BTreeSet<i64>,
+    lead: &baybo_model::AgentProfileId,
+) -> Vec<IssueRow> {
+    let mut paused: Vec<IssueRow> = issues
+        .iter()
+        .filter(|i| {
+            !board_may_start(i)
+                && crate::runs::accepts_runs(i)
+                && takes_a_lead_question(i, in_flight, lead)
+        })
+        .cloned()
+        .collect();
+    paused.sort_by(promotion_order);
+    paused
 }
 
 /// The cards sitting in Review with nothing running on them, in the order
@@ -148,7 +158,11 @@ pub(crate) fn awaiting_review(
 ) -> Vec<IssueRow> {
     let mut waiting: Vec<IssueRow> = issues
         .iter()
-        .filter(|i| i.status == IssueStatus::Review && takes_a_lead_question(i, busy, lead))
+        .filter(|i| {
+            i.status == IssueStatus::Review
+                && board_may_start(i)
+                && takes_a_lead_question(i, busy, lead)
+        })
         .cloned()
         .collect();
     waiting.sort_by(promotion_order);
@@ -169,11 +183,62 @@ pub(crate) fn stalled(
 ) -> Vec<IssueRow> {
     let mut stuck: Vec<IssueRow> = issues
         .iter()
-        .filter(|i| i.status == IssueStatus::InProgress && takes_a_lead_question(i, busy, lead))
+        .filter(|i| {
+            i.status == IssueStatus::InProgress
+                && board_may_start(i)
+                && takes_a_lead_question(i, busy, lead)
+        })
         .cloned()
         .collect();
     stuck.sort_by(promotion_order);
     stuck
+}
+
+/// Whether the latest block was agent-authored.
+pub(crate) fn block_is_an_agents_question(events: &[baybo_store::project::IssueEventRow]) -> bool {
+    newest_block(events)
+        .is_some_and(|e| matches!(e.actor, baybo_store::project::IssueActor::Agent(_)))
+}
+
+pub(crate) fn blocked_at(
+    events: &[baybo_store::project::IssueEventRow],
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    newest_block(events).map(|e| e.created_at)
+}
+
+pub(crate) fn a_block_was_lifted(events: &[baybo_store::project::IssueEventRow]) -> bool {
+    events
+        .iter()
+        .any(|e| matches!(e.body, baybo_store::project::IssueEventBody::Unblocked))
+}
+
+/// When the block standing at `at` began, if any.
+pub(crate) fn block_standing_at(
+    events: &[baybo_store::project::IssueEventRow],
+    at: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let latest = events.iter().rev().find(|e| {
+        e.created_at <= at
+            && matches!(
+                e.body,
+                baybo_store::project::IssueEventBody::Blocked { .. }
+                    | baybo_store::project::IssueEventBody::Unblocked
+            )
+    })?;
+    matches!(
+        latest.body,
+        baybo_store::project::IssueEventBody::Blocked { .. }
+    )
+    .then_some(latest.created_at)
+}
+
+fn newest_block(
+    events: &[baybo_store::project::IssueEventRow],
+) -> Option<&baybo_store::project::IssueEventRow> {
+    events
+        .iter()
+        .rev()
+        .find(|e| matches!(e.body, baybo_store::project::IssueEventBody::Blocked { .. }))
 }
 
 /// A card whose newest run was **cancelled** is not stalled: a cancel is a
@@ -420,6 +485,7 @@ mod tests {
             trigger: RunTrigger::Triage,
             status: RunStatus::Done,
             attempt: 1,
+            resumes: 0,
             error: None,
             created_at: at,
             started_at: None,
@@ -533,6 +599,96 @@ mod tests {
     }
 
     #[test]
+    fn the_lead_is_asked_about_a_block_and_about_nothing_else_a_block_touches() {
+        let lead = AgentProfileId::parse("lead".to_owned()).expect("agent");
+        let paused = |number: i64, status: IssueStatus| {
+            let mut card = ready(number);
+            card.status = status;
+            card.blocked_reason = Some("the goal contradicts the Go spec".to_owned());
+            card
+        };
+
+        let working = paused(1, IssueStatus::InProgress);
+        let in_review = paused(2, IssueStatus::Review);
+        let mut leads_own = paused(3, IssueStatus::InProgress);
+        leads_own.assignee = Some(lead.clone());
+        let running = paused(4, IssueStatus::InProgress);
+        let mut cancelled = paused(5, IssueStatus::InProgress);
+        cancelled.cancelled_at = Some(Utc::now());
+        let live = ready(6);
+
+        let board = [
+            working,
+            in_review,
+            leads_own,
+            running,
+            cancelled,
+            live.clone(),
+        ];
+        assert_eq!(
+            numbers(&blocked(&board, &busy([4]), &lead)),
+            vec![1, 2],
+            "a block is the lead's question — unless it is the lead's own card, already being \
+             run, or on a card nobody is coming back to anyway"
+        );
+
+        assert!(
+            awaiting_review(&board, &busy([]), &lead).is_empty(),
+            "the gate split must not leak a blocked card into the review question"
+        );
+        assert!(
+            stalled(&board, &busy([]), &lead).is_empty(),
+            "…nor into the stall question"
+        );
+        assert!(
+            awaiting_triage(&board, &busy([])).is_empty(),
+            "…nor into triage, which still asks through `is_waiting`"
+        );
+        assert!(
+            blocked(&[live], &busy([]), &lead).is_empty(),
+            "and a card nothing has stopped is not a block to adjudicate"
+        );
+    }
+
+    #[test]
+    fn a_card_the_board_has_finished_with_is_not_a_block_to_adjudicate() {
+        let lead = AgentProfileId::parse("lead".to_owned()).expect("agent");
+        let stale = |number: i64, finish: &dyn Fn(&mut IssueRow)| {
+            let mut card = ready(number);
+            card.blocked_reason = Some("waiting on the API".to_owned());
+            finish(&mut card);
+            card
+        };
+
+        let done = stale(1, &|card: &mut IssueRow| card.status = IssueStatus::Done);
+        let cancelled = stale(2, &|card: &mut IssueRow| {
+            card.cancelled_at = Some(Utc::now())
+        });
+        assert!(
+            blocked(&[done, cancelled], &busy([]), &lead).is_empty(),
+            "a card no run can be started on is not a question the lead can answer"
+        );
+    }
+
+    #[test]
+    fn a_card_whose_only_run_the_block_itself_parked_is_still_the_leads_question() {
+        let lead = AgentProfileId::parse("lead".to_owned()).expect("agent");
+        let mut paused = ready(1);
+        paused.status = IssueStatus::InProgress;
+        paused.blocked_reason = Some("the goal contradicts the Go spec".to_owned());
+
+        assert_eq!(
+            numbers(&blocked(std::slice::from_ref(&paused), &busy([]), &lead)),
+            vec![1],
+            "a parked row is not work in flight, so it is not in the set at all"
+        );
+        assert!(
+            blocked(&[paused], &busy([1]), &lead).is_empty(),
+            "and a card something IS executing stays the executor's, not the lead's"
+        );
+    }
+
+    #[test]
     fn a_stop_stands_and_dispatch_failures_do_not_mute_a_question_but_do_cap_it() {
         let card = ready(1);
         let stopped = IssueRunRow {
@@ -604,6 +760,91 @@ mod tests {
         assert!(
             !already_asked(&edited, &runs, RunTrigger::Triage),
             "but somebody changing the card resets the cap"
+        );
+    }
+
+    fn entry(
+        body: baybo_store::project::IssueEventBody,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> baybo_store::project::IssueEventRow {
+        baybo_store::project::IssueEventRow {
+            id: baybo_model::IssueEventId::generate(),
+            issue_id: IssueId::generate(),
+            project_id: ProjectId::parse("proj-a".to_owned()).expect("id"),
+            number: 1,
+            actor: baybo_store::project::IssueActor::User,
+            body,
+            created_at: at,
+        }
+    }
+
+    fn block_entry(at: chrono::DateTime<chrono::Utc>) -> baybo_store::project::IssueEventRow {
+        entry(
+            baybo_store::project::IssueEventBody::Blocked {
+                reason: "which of the two goals wins?".to_owned(),
+            },
+            at,
+        )
+    }
+
+    fn unblock_entry(at: chrono::DateTime<chrono::Utc>) -> baybo_store::project::IssueEventRow {
+        entry(baybo_store::project::IssueEventBody::Unblocked, at)
+    }
+
+    #[test]
+    fn a_run_briefed_under_a_block_owes_the_window_that_block_opened() {
+        let landed = Utc::now();
+        let briefed = landed + Duration::minutes(5);
+        let events = vec![
+            block_entry(landed),
+            unblock_entry(briefed + Duration::minutes(1)),
+        ];
+
+        assert_eq!(
+            block_standing_at(&events, briefed),
+            Some(landed),
+            "the run was briefed under the block, so its window opens where the block did"
+        );
+        assert!(a_block_was_lifted(&events[1..]));
+    }
+
+    #[test]
+    fn a_card_unblocked_before_the_brief_owes_that_run_nothing() {
+        let landed = Utc::now();
+        let lifted = landed + Duration::minutes(1);
+        let events = vec![block_entry(landed), unblock_entry(lifted)];
+
+        assert_eq!(
+            block_standing_at(&events, lifted + Duration::minutes(1)),
+            None,
+            "the unblock handed that window over already; re-delivering it wakes the \
+             assignee on the answer it has been given"
+        );
+        assert_eq!(
+            block_standing_at(&events, landed - Duration::seconds(1)),
+            None,
+            "and nothing was blocked before the block landed"
+        );
+        assert!(!a_block_was_lifted(&events[..1]));
+    }
+
+    #[test]
+    fn the_block_a_moment_was_under_is_the_one_that_moment_answers_for() {
+        let first = Utc::now();
+        let briefed = first + Duration::minutes(5);
+        let events = vec![
+            block_entry(first),
+            unblock_entry(briefed - Duration::minutes(1)),
+            block_entry(briefed + Duration::minutes(1)),
+        ];
+        assert_eq!(
+            block_standing_at(&events, briefed),
+            None,
+            "the card was live when this run was briefed, whatever happened after"
+        );
+        assert_eq!(
+            block_standing_at(&events, briefed + Duration::minutes(2)),
+            Some(briefed + Duration::minutes(1))
         );
     }
 }

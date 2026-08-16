@@ -35,6 +35,19 @@ pub(crate) fn diff_events(before: &IssueRow, after: &IssueRow) -> Vec<IssueEvent
     out
 }
 
+/// Whether this event changed the card rather than only recording run bookkeeping.
+pub(crate) fn left_a_mark(body: &IssueEventBody) -> bool {
+    matches!(
+        body,
+        IssueEventBody::Comment { .. }
+            | IssueEventBody::Moved { .. }
+            | IssueEventBody::Assigned { .. }
+            | IssueEventBody::Blocked { .. }
+            | IssueEventBody::Unblocked
+            | IssueEventBody::Cancelled
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

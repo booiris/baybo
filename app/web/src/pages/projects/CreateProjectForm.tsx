@@ -4,7 +4,14 @@ import { useNavigate } from 'react-router-dom';
 import { Button } from '../../components/Button';
 import { useAdminClient, useAuth } from '../../api/auth';
 import { createProject } from './api';
-import { budgetHint, parseBudget } from './budgetModel';
+import {
+  BUDGET_REFUSAL,
+  TOKEN_BUDGET_REFUSAL,
+  budgetHint,
+  parseBudget,
+  parseTokenBudget,
+  tokenBudgetHint,
+} from './budgetModel';
 import { parallelIssueRunsHint, parseParallelIssueRuns } from './driverModel';
 import { writeLastProjectId } from './lastProject';
 
@@ -21,6 +28,7 @@ export function CreateProjectForm({ onDone }: { onDone?: () => void }) {
   const [description, setDescription] = useState('');
   const [workdir, setWorkdir] = useState('');
   const [budget, setBudget] = useState('');
+  const [tokenBudget, setTokenBudget] = useState('');
   const [parallelIssueRuns, setParallelIssueRuns] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -34,7 +42,13 @@ export function CreateProjectForm({ onDone }: { onDone?: () => void }) {
     const micros = parseBudget(budget);
     if (micros === undefined) {
       setSubmitting(false);
-      setError('Daily budget must be an amount in dollars, or empty for no ceiling.');
+      setError(BUDGET_REFUSAL);
+      return;
+    }
+    const tokens = parseTokenBudget(tokenBudget);
+    if (tokens === undefined) {
+      setSubmitting(false);
+      setError(TOKEN_BUDGET_REFUSAL);
       return;
     }
     const slots = parseParallelIssueRuns(parallelIssueRuns);
@@ -48,6 +62,7 @@ export function CreateProjectForm({ onDone }: { onDone?: () => void }) {
       description,
       ...(trimmedWorkdir.length > 0 ? { workdir: trimmedWorkdir } : {}),
       ...(micros === null ? {} : { daily_budget_micros: micros }),
+      ...(tokens === null ? {} : { daily_budget_tokens: tokens }),
       ...(slots === undefined ? {} : { max_parallel_issue_runs: slots }),
     });
     setSubmitting(false);
@@ -134,6 +149,24 @@ export function CreateProjectForm({ onDone }: { onDone?: () => void }) {
         />
         <p className="mt-1 text-[0.7rem] text-ink-soft leading-snug">
           {budgetHint(parseBudget(budget) ?? null)} You can change it later.
+        </p>
+      </div>
+      <div>
+        <label className={fieldLabel} htmlFor="project-token-budget">
+          Daily token budget — optional
+        </label>
+        <input
+          id="project-token-budget"
+          className={textInput}
+          value={tokenBudget}
+          inputMode="numeric"
+          onChange={(event) => {
+            setTokenBudget(event.target.value);
+          }}
+          placeholder="Leave empty for no ceiling"
+        />
+        <p className="mt-1 text-[0.7rem] text-ink-soft leading-snug">
+          {tokenBudgetHint(parseTokenBudget(tokenBudget) ?? null)} You can change it later.
         </p>
       </div>
       <div>

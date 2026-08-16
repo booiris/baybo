@@ -78,6 +78,8 @@ Because that gate is per-provider, the ESTIMATE caps at the ceiling rather than 
 
 `BoundBilledLlm` hands `ChatRequest::reasoning_effort` directly to the cost recorder on both completion and streaming paths. This dimension records the request value as issued; it does not infer provider defaults or rewrite it from model-specific clamping.
 
+`openai-subscription` prices every call at **$0 with real token counts**, and that is intentional rather than a gap in the snapshot: it has no entry in `openrouter_prefix.rs`, so `openrouter::pricing_for` returns `None` and `pricing_for_model` falls through to `flat_default_pricing`, whose default is zero. Any downstream gate that measures money — not tokens — is therefore inert for this provider; the same is true of any other provider missing from that table that does not override the default.
+
 ### Error handling
 
 Rate-limit retries are not handled in `llm`. They are managed by `AgentLoop` through `ErrorHandler`. Timeout is configurable at the HTTP client level; upper-layer Turn monitoring can mark long-running calls as `Stuck`.

@@ -112,6 +112,7 @@ fn driven_project(name: &str) -> NewProject {
         description: String::new(),
         workdir: None,
         daily_budget: None,
+        daily_budget_tokens: None,
         max_parallel_issue_runs: None,
     }
 }
@@ -677,6 +678,7 @@ async fn an_archived_project_is_read_only() {
                 name: "renamed".into(),
                 description: String::new(),
                 daily_budget: None,
+                daily_budget_tokens: None,
                 max_parallel_issue_runs: DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
             },
         )
@@ -1426,6 +1428,7 @@ async fn a_retry_on_a_held_run_blames_the_budget_when_there_is_still_no_room() {
         .manager
         .create_project(NewProject {
             daily_budget: Some(baybo_model::MicroUsd::ZERO),
+            daily_budget_tokens: None,
             ..new_project("Skint")
         })
         .await
@@ -1880,7 +1883,7 @@ forwards_everything_else! {
     get_project(id: &ProjectId) -> StoreResult<Option<ProjectRow>>;
     create_project(row: &ProjectRow) -> StoreResult<()>;
     update_project(id: &ProjectId, update: &ProjectUpdate) -> StoreResult<bool>;
-    spend_since(project: &ProjectId, since: DateTime<Utc>) -> StoreResult<baybo_model::MicroUsd>;
+    spend_since(project: &ProjectId, since: DateTime<Utc>) -> StoreResult<baybo_store::project::Spend>;
     attention() -> StoreResult<Vec<(ProjectId, AttentionCounts)>>;
     projects_for_sessions(sessions: &[SessionId]) -> StoreResult<Vec<(SessionId, ProjectId)>>;
     project_feed(project: &ProjectId, before: Option<DateTime<Utc>>, limit: usize)
@@ -1915,7 +1918,7 @@ forwards_everything_else! {
     get_run(id: &IssueRunId) -> StoreResult<Option<IssueRunRow>>;
     claim_run(id: &IssueRunId, session: &SessionId) -> StoreResult<bool>;
     settle_run(id: &IssueRunId, status: RunStatus, error: Option<&str>) -> StoreResult<bool>;
-    requeue_unsettled() -> StoreResult<()>;
+    requeue_unsettled() -> StoreResult<Vec<IssueRunRow>>;
 }
 
 #[tokio::test]
@@ -2293,6 +2296,7 @@ async fn a_board_over_budget_records_the_work_it_is_not_doing() {
         .manager
         .create_project(NewProject {
             daily_budget: Some(baybo_model::MicroUsd::ZERO),
+            daily_budget_tokens: None,
             ..new_project("Skint")
         })
         .await
@@ -2362,6 +2366,7 @@ async fn a_hold_on_a_cancelled_card_is_called_off_even_on_a_stopped_board() {
         .manager
         .create_project(NewProject {
             daily_budget: Some(baybo_model::MicroUsd::ZERO),
+            daily_budget_tokens: None,
             ..new_project("Paused and skint")
         })
         .await
@@ -2410,6 +2415,7 @@ async fn a_hold_on_a_cancelled_card_is_called_off_even_on_a_stopped_board() {
                 name: project.name.clone(),
                 description: String::new(),
                 daily_budget: Some(baybo_model::MicroUsd::ZERO),
+                daily_budget_tokens: None,
                 max_parallel_issue_runs: 0,
             },
         )
@@ -2442,6 +2448,7 @@ async fn a_raised_budget_releases_what_it_was_holding() {
         .manager
         .create_project(NewProject {
             daily_budget: Some(baybo_model::MicroUsd::ZERO),
+            daily_budget_tokens: None,
             ..new_project("Thawing")
         })
         .await
@@ -2469,6 +2476,7 @@ async fn a_raised_budget_releases_what_it_was_holding() {
                 name: project.name.clone(),
                 description: String::new(),
                 daily_budget: Some(baybo_model::MicroUsd::from_micros(5_000_000)),
+                daily_budget_tokens: None,
                 max_parallel_issue_runs: DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
             },
         )
@@ -2504,6 +2512,7 @@ async fn the_next_enqueue_releases_a_hold_the_budget_no_longer_justifies() {
         .manager
         .create_project(NewProject {
             daily_budget: Some(baybo_model::MicroUsd::ZERO),
+            daily_budget_tokens: None,
             ..new_project("Rollover")
         })
         .await
@@ -2531,6 +2540,7 @@ async fn the_next_enqueue_releases_a_hold_the_budget_no_longer_justifies() {
                 name: project.name.clone(),
                 description: String::new(),
                 daily_budget: Some(baybo_model::MicroUsd::from_micros(5_000_000)),
+                daily_budget_tokens: None,
                 max_parallel_issue_runs: DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
             },
         )
@@ -2585,6 +2595,7 @@ async fn touching_the_held_card_itself_releases_it() {
         .manager
         .create_project(NewProject {
             daily_budget: Some(baybo_model::MicroUsd::ZERO),
+            daily_budget_tokens: None,
             ..new_project("Stuck")
         })
         .await
@@ -2610,6 +2621,7 @@ async fn touching_the_held_card_itself_releases_it() {
                 name: project.name.clone(),
                 description: String::new(),
                 daily_budget: Some(baybo_model::MicroUsd::from_micros(5_000_000)),
+                daily_budget_tokens: None,
                 max_parallel_issue_runs: DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
             },
         )
@@ -2645,6 +2657,7 @@ async fn a_negative_budget_is_refused() {
                 name: project.name.clone(),
                 description: String::new(),
                 daily_budget: Some(baybo_model::MicroUsd::from_micros(-1)),
+                daily_budget_tokens: None,
                 max_parallel_issue_runs: DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
             },
         )
@@ -2664,6 +2677,7 @@ async fn a_released_hold_never_lands_on_a_card_the_board_has_finished_with() {
             .manager
             .create_project(NewProject {
                 daily_budget: Some(baybo_model::MicroUsd::ZERO),
+                daily_budget_tokens: None,
                 ..new_project("Skint")
             })
             .await
@@ -2716,6 +2730,7 @@ async fn a_released_hold_never_lands_on_a_card_the_board_has_finished_with() {
                     name: project.name.clone(),
                     description: String::new(),
                     daily_budget: Some(baybo_model::MicroUsd::from_micros(5_000_000)),
+                    daily_budget_tokens: None,
                     max_parallel_issue_runs: DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
                 },
             )
@@ -2769,6 +2784,7 @@ async fn the_boot_sweep_leaves_a_hold_held_while_the_board_is_still_broke() {
         .manager
         .create_project(NewProject {
             daily_budget: Some(baybo_model::MicroUsd::ZERO),
+            daily_budget_tokens: None,
             ..new_project("Still Skint")
         })
         .await
@@ -2823,6 +2839,253 @@ async fn a_board_with_no_ceiling_is_never_held() {
     assert_eq!(
         f.manager.list_runs(&project.id, 1).await.expect("runs")[0].status,
         RunStatus::Queued
+    );
+}
+
+#[tokio::test]
+async fn a_board_over_its_token_ceiling_records_the_work_it_is_not_doing() {
+    let f = fixture().await;
+    let project = f
+        .manager
+        .create_project(NewProject {
+            daily_budget: None,
+            daily_budget_tokens: Some(0),
+            ..new_project("Token plan")
+        })
+        .await
+        .expect("p");
+    let dev = seed_agent(&f, &project.id, "dev-1", AgentFramework::Baybo).await;
+
+    f.manager
+        .create_issue(
+            &project.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev),
+                ..new_issue("work there are no tokens for")
+            },
+        )
+        .await
+        .expect("create")
+        .into_issue();
+
+    assert!(
+        f.dispatched.lock().is_empty(),
+        "nothing was started against an exhausted token ceiling"
+    );
+    let runs = f.manager.list_runs(&project.id, 1).await.expect("runs");
+    assert_eq!(runs[0].status, RunStatus::Held, "but the run was recorded");
+
+    let timeline = f.manager.timeline(&project.id, 1).await.expect("timeline");
+    let held = timeline
+        .iter()
+        .find(|e| {
+            matches!(
+                e.body,
+                baybo_store::project::IssueEventBody::TokenBudgetExhausted { .. }
+            )
+        })
+        .expect("the timeline names the ceiling that actually held it");
+    assert!(
+        matches!(
+            held.body,
+            baybo_store::project::IssueEventBody::TokenBudgetExhausted {
+                spent_tokens: 0,
+                limit_tokens: 0
+            }
+        ),
+        "{:?}",
+        held.body
+    );
+    assert_eq!(held.actor, IssueActor::System);
+    assert!(
+        !timeline.iter().any(|e| matches!(
+            e.body,
+            baybo_store::project::IssueEventBody::BudgetExhausted { .. }
+        )),
+        "and does not also claim a money ceiling this board never set"
+    );
+}
+
+#[tokio::test]
+async fn raising_the_ceiling_that_was_not_the_reason_releases_nothing() {
+    let f = fixture().await;
+    let project = f
+        .manager
+        .create_project(NewProject {
+            daily_budget: Some(baybo_model::MicroUsd::from_micros(5_000_000)),
+            daily_budget_tokens: Some(0),
+            ..new_project("Mixed")
+        })
+        .await
+        .expect("p");
+    let dev = seed_agent(&f, &project.id, "dev-1", AgentFramework::Baybo).await;
+    f.manager
+        .create_issue(
+            &project.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev),
+                ..new_issue("held on tokens, not on money")
+            },
+        )
+        .await
+        .expect("create")
+        .into_issue();
+    assert!(f.dispatched.lock().is_empty(), "the token ceiling holds it");
+
+    f.manager
+        .update_project(
+            &project.id,
+            ProjectUpdate {
+                name: project.name.clone(),
+                description: String::new(),
+                daily_budget: Some(baybo_model::MicroUsd::from_micros(500_000_000)),
+                daily_budget_tokens: Some(0),
+                max_parallel_issue_runs: DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
+            },
+        )
+        .await
+        .expect("raise the money ceiling");
+    assert!(
+        f.dispatched.lock().is_empty(),
+        "money was never what was holding this run"
+    );
+    assert_eq!(
+        f.manager.list_runs(&project.id, 1).await.expect("runs")[0].status,
+        RunStatus::Held
+    );
+
+    f.manager
+        .update_project(
+            &project.id,
+            ProjectUpdate {
+                name: project.name.clone(),
+                description: String::new(),
+                daily_budget: Some(baybo_model::MicroUsd::from_micros(500_000_000)),
+                daily_budget_tokens: Some(1_000_000),
+                max_parallel_issue_runs: DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
+            },
+        )
+        .await
+        .expect("raise the one that was");
+
+    assert_eq!(f.dispatched.lock().len(), 1, "and now it runs");
+    assert!(
+        f.manager
+            .timeline(&project.id, 1)
+            .await
+            .expect("timeline")
+            .iter()
+            .any(|e| matches!(
+                e.body,
+                baybo_store::project::IssueEventBody::TokenBudgetRestored { .. }
+            )),
+        "the release is reported in the same unit the hold was"
+    );
+}
+
+#[tokio::test]
+async fn a_board_held_on_money_names_money_even_with_a_token_ceiling_set() {
+    let f = fixture().await;
+    let project = f
+        .manager
+        .create_project(NewProject {
+            daily_budget: Some(baybo_model::MicroUsd::ZERO),
+            daily_budget_tokens: Some(1_000_000),
+            ..new_project("Both")
+        })
+        .await
+        .expect("p");
+    let dev = seed_agent(&f, &project.id, "dev-1", AgentFramework::Baybo).await;
+    let issue = f
+        .manager
+        .create_issue(
+            &project.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev),
+                ..new_issue("held on money, not on tokens")
+            },
+        )
+        .await
+        .expect("create")
+        .into_issue();
+    assert!(f.dispatched.lock().is_empty());
+
+    let timeline = f.manager.timeline(&project.id, 1).await.expect("timeline");
+    assert!(
+        timeline.iter().any(|e| matches!(
+            e.body,
+            baybo_store::project::IssueEventBody::BudgetExhausted {
+                spent_micros: 0,
+                limit_micros: 0
+            }
+        )),
+        "the card names the ceiling that actually stopped it: {:?}",
+        timeline.iter().map(|e| e.body.kind()).collect::<Vec<_>>()
+    );
+    assert!(
+        !timeline.iter().any(|e| matches!(
+            e.body,
+            baybo_store::project::IssueEventBody::TokenBudgetExhausted { .. }
+        )),
+        "and never claims a token ceiling with 100% of itself left was exhausted"
+    );
+
+    let refused = f
+        .manager
+        .retry_run(&project.id, issue.number)
+        .await
+        .expect_err("still held");
+    let message = refused.to_string();
+    assert!(
+        message.contains("daily budget") && !message.contains("token"),
+        "the operator is pointed at the ceiling raising which would help: {message}"
+    );
+}
+
+#[tokio::test]
+async fn a_negative_token_ceiling_is_refused_on_the_way_in_and_on_the_way_back() {
+    let f = fixture().await;
+    let refused = f
+        .manager
+        .create_project(NewProject {
+            daily_budget_tokens: Some(-1),
+            ..new_project("Impossible")
+        })
+        .await
+        .expect_err("a board cannot open owing tokens");
+    assert!(
+        matches!(&refused, ProjectError::Invalid { field, .. } if *field == "daily_budget_tokens"),
+        "and the form is told which field to point at: {refused:?}"
+    );
+
+    let project = f
+        .manager
+        .create_project(new_project("Fine"))
+        .await
+        .expect("p");
+    let refused = f
+        .manager
+        .update_project(
+            &project.id,
+            ProjectUpdate {
+                name: project.name.clone(),
+                description: String::new(),
+                daily_budget: None,
+                daily_budget_tokens: Some(-1),
+                max_parallel_issue_runs: DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
+            },
+        )
+        .await
+        .expect_err("nor edited into one");
+    assert!(
+        matches!(&refused, ProjectError::Invalid { field, .. } if *field == "daily_budget_tokens"),
+        "{refused:?}"
     );
 }
 
@@ -3407,6 +3670,7 @@ async fn the_attention_count_is_what_only_the_operator_can_clear() {
         .manager
         .create_project(NewProject {
             daily_budget: Some(baybo_model::MicroUsd::ZERO),
+            daily_budget_tokens: None,
             ..new_project("Stuck")
         })
         .await
@@ -3446,6 +3710,7 @@ async fn the_attention_count_is_what_only_the_operator_can_clear() {
                 name: p.name.clone(),
                 description: String::new(),
                 daily_budget: Some(baybo_model::MicroUsd::from_micros(5_000_000)),
+                daily_budget_tokens: None,
                 max_parallel_issue_runs: DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
             },
         )
@@ -3547,6 +3812,7 @@ async fn an_archived_board_asks_for_nothing() {
         .manager
         .create_project(NewProject {
             daily_budget: Some(baybo_model::MicroUsd::ZERO),
+            daily_budget_tokens: None,
             ..new_project("Shelved")
         })
         .await
@@ -5009,6 +5275,7 @@ async fn set_ceiling(f: &Fixture, project: &ProjectRow, slots: usize) {
                 name: project.name.clone(),
                 description: project.description.clone(),
                 daily_budget: project.daily_budget,
+                daily_budget_tokens: None,
                 max_parallel_issue_runs: slots,
             },
         )
@@ -5024,6 +5291,7 @@ async fn set_budget(f: &Fixture, project: &ProjectRow, budget: Option<baybo_mode
                 name: project.name.clone(),
                 description: project.description.clone(),
                 daily_budget: budget,
+                daily_budget_tokens: None,
                 max_parallel_issue_runs: project.max_parallel_issue_runs,
             },
         )
@@ -5286,6 +5554,7 @@ async fn an_exhausted_budget_parks_the_driver_rather_than_filling_in_progress() 
                 name: p.name.clone(),
                 description: String::new(),
                 daily_budget: Some(baybo_model::MicroUsd::ZERO),
+                daily_budget_tokens: None,
                 max_parallel_issue_runs: 3,
             },
         )
@@ -5667,6 +5936,7 @@ async fn work_the_board_already_owes_takes_the_slots_a_rolled_over_budget_frees(
                 name: p.name.clone(),
                 description: p.description.clone(),
                 daily_budget: None,
+                daily_budget_tokens: None,
                 max_parallel_issue_runs: 2,
             },
         )
@@ -6067,5 +6337,1113 @@ async fn an_idle_checkouts_build_output_is_reclaimed_and_a_busy_ones_is_not() {
         (again.dirs_removed, again.bytes_freed),
         (0, 0),
         "a checkout touched moments ago is not idle"
+    );
+}
+
+#[tokio::test]
+async fn a_resumed_run_says_it_was_interrupted_and_never_says_it_started_twice() {
+    use baybo_store::project::IssueEventBody;
+
+    let f = fixture().await;
+    let p = f.manager.create_project(new_project("p")).await.expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev),
+                ..new_issue("interrupted")
+            },
+        )
+        .await
+        .expect("issue");
+    let run = f.manager.list_runs(&p.id, 1).await.expect("runs").remove(0);
+
+    let session = SessionId::from("issue-1");
+    assert!(
+        f.manager.start_run(&run, &session).await.expect("claim"),
+        "the first executor takes it"
+    );
+
+    assert_eq!(
+        f.manager.resume_unsettled_runs().await.expect("boot sweep"),
+        1,
+        "the process went down under it, so it is handed back out"
+    );
+    let handed_back = f.dispatched.lock().last().cloned().expect("re-dispatched");
+    assert_eq!(handed_back.resumes, 1);
+    assert!(
+        f.manager
+            .start_run(&handed_back, &session)
+            .await
+            .expect("re-claim"),
+        "and the next executor re-claims it"
+    );
+
+    let timeline = f.manager.timeline(&p.id, 1).await.expect("timeline");
+    let started: Vec<&IssueEventRow> = timeline
+        .iter()
+        .filter(|e| matches!(e.body, IssueEventBody::RunStarted { .. }))
+        .collect();
+    assert_eq!(
+        started.len(),
+        1,
+        "a re-claimed row is already on the card; saying `started` again is the duplicate this fixes"
+    );
+    let interrupted: Vec<&IssueEventRow> = timeline
+        .iter()
+        .filter(|e| matches!(e.body, IssueEventBody::RunInterrupted { .. }))
+        .collect();
+    assert_eq!(interrupted.len(), 1, "the interruption is what is new");
+    match (&started[0].body, &interrupted[0].body) {
+        (
+            IssueEventBody::RunStarted {
+                run_id: started_id, ..
+            },
+            IssueEventBody::RunInterrupted {
+                run_id: interrupted_id,
+                resumes,
+                ..
+            },
+        ) => {
+            assert_eq!(started_id, interrupted_id, "both address the same run");
+            assert_eq!(*resumes, 1);
+        }
+        other => panic!("unexpected bodies: {other:?}"),
+    }
+    assert_eq!(interrupted[0].actor, IssueActor::System);
+}
+
+#[tokio::test]
+async fn a_re_claimed_run_still_announces_that_it_is_running() {
+    let f = fixture().await;
+    let (tx, mut announced) = tokio::sync::mpsc::unbounded_channel();
+    let manager = ProjectManager::new(
+        Arc::clone(&f.store),
+        Arc::clone(&f.agents),
+        Arc::clone(&f.blobs),
+        f.paths.clone(),
+        Arc::new(RecordingEvents(tx)),
+        baybo_project::no_dispatch(),
+    );
+    let p = manager
+        .create_project(new_project("watched"))
+        .await
+        .expect("project");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev),
+                ..new_issue("interrupted")
+            },
+        )
+        .await
+        .expect("issue");
+
+    let run = manager.list_runs(&p.id, 1).await.expect("runs").remove(0);
+    let session = SessionId::from("issue-1");
+    manager
+        .start_run(&run, &session)
+        .await
+        .expect("the first executor takes it");
+    manager
+        .resume_unsettled_runs()
+        .await
+        .expect("the process went down under it");
+    let handed_back = manager.list_runs(&p.id, 1).await.expect("runs").remove(0);
+    assert_eq!(handed_back.resumes, 1, "this is the resumed row");
+
+    while announced.try_recv().is_ok() {}
+    manager
+        .start_run(&handed_back, &session)
+        .await
+        .expect("the next executor re-claims it");
+
+    let mut heard = Vec::new();
+    while let Ok(one) = announced.try_recv() {
+        heard.push(one);
+    }
+    assert!(
+        heard.contains(&format!("run {} #1", p.id)),
+        "the claim moved the row to running, and nothing else says so: {heard:?}"
+    );
+
+    let started = manager
+        .timeline(&p.id, 1)
+        .await
+        .expect("timeline")
+        .into_iter()
+        .filter(|e| {
+            matches!(
+                e.body,
+                baybo_store::project::IssueEventBody::RunStarted { .. }
+            )
+        })
+        .count();
+    assert_eq!(
+        started, 1,
+        "and the entry the card already carries is still not written twice"
+    );
+}
+
+#[tokio::test]
+async fn the_board_stops_resuming_a_run_it_has_already_resumed_twice() {
+    let f = fixture().await;
+    let p = f.manager.create_project(new_project("p")).await.expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev),
+                ..new_issue("wedged")
+            },
+        )
+        .await
+        .expect("issue");
+    let run = f.manager.list_runs(&p.id, 1).await.expect("runs").remove(0);
+    let session = SessionId::from("issue-1");
+    f.manager.start_run(&run, &session).await.expect("claim");
+    f.dispatched.lock().clear();
+
+    let mut re_driven = 0;
+    for _ in 0..3 {
+        re_driven += f.manager.resume_unsettled_runs().await.expect("boot sweep");
+        let live = f.manager.list_runs(&p.id, 1).await.expect("runs").remove(0);
+        if live.status == RunStatus::Queued {
+            f.manager
+                .start_run(&live, &session)
+                .await
+                .expect("re-claim");
+        }
+    }
+
+    assert_eq!(
+        re_driven, 2,
+        "two resurrections, and then the board stops paying for a third"
+    );
+    let settled = f.manager.list_runs(&p.id, 1).await.expect("runs").remove(0);
+    assert_eq!(settled.status, RunStatus::Failed);
+    assert!(
+        settled
+            .error
+            .as_deref()
+            .expect("the card is told why")
+            .contains("stopped resuming it"),
+        "the give-up says the board gave up, not that the run failed on its own: {:?}",
+        settled.error
+    );
+    assert!(
+        f.dispatched.lock().len() <= 2,
+        "and nothing went out on the pass that gave up"
+    );
+}
+
+#[tokio::test]
+async fn an_agent_blocking_a_card_wakes_the_lead_and_marks_it_unread() {
+    let f = fixture().await;
+    let (p, dev) = driven_board(&f, 3).await;
+    let lead = lead_of(&f, &p.id).await;
+
+    let card = f
+        .manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::Review,
+                assignee: Some(dev.clone()),
+                ..new_issue("the goal contradicts the Go spec")
+            },
+        )
+        .await
+        .expect("card")
+        .into_issue();
+    f.dispatched.lock().clear();
+
+    f.manager
+        .update_issue(
+            &p.id,
+            card.number,
+            IssueActor::Agent(dev),
+            IssueUpdate {
+                blocked_reason: Some(Some(
+                    "the card asks for behaviour the language spec forbids — which wins?"
+                        .to_owned(),
+                )),
+                ..IssueUpdate::default()
+            },
+            None,
+        )
+        .await
+        .expect("the agent refuses to code and asks");
+
+    tick(&f, &p.id).await;
+
+    let asked = f.dispatched.lock().clone();
+    assert_eq!(asked.len(), 1, "somebody has to answer a blocked card");
+    assert_eq!(asked[0].trigger, RunTrigger::Blocked);
+    assert_eq!(asked[0].agent_id, lead, "and that somebody is the lead");
+
+    let cards = f.manager.board_cards(&p.id).await.expect("board");
+    assert!(
+        cards.signals(&card.id).unread >= 1,
+        "an agent's block is news to the operator, exactly as an agent's move to Review is"
+    );
+}
+
+#[tokio::test]
+async fn a_blocked_card_is_asked_about_before_a_card_merely_waiting_for_review() {
+    let f = fixture().await;
+    let (p, dev) = driven_board(&f, 3).await;
+
+    for (number, title) in [(1, "waiting on a review"), (2, "stopped by a question")] {
+        f.manager
+            .create_issue(
+                &p.id,
+                IssueActor::User,
+                NewIssueRequest {
+                    status: IssueStatus::Review,
+                    assignee: Some(dev.clone()),
+                    ..new_issue(title)
+                },
+            )
+            .await
+            .expect("card");
+        assert_eq!(
+            number,
+            f.manager.list_issues(&p.id).await.expect("issues").len() as i64
+        );
+    }
+    f.manager
+        .update_issue(
+            &p.id,
+            2,
+            IssueActor::Agent(dev),
+            IssueUpdate {
+                blocked_reason: Some(Some(
+                    "which of the two contradictory goals wins?".to_owned(),
+                )),
+                ..IssueUpdate::default()
+            },
+            None,
+        )
+        .await
+        .expect("block");
+    f.dispatched.lock().clear();
+
+    tick(&f, &p.id).await;
+    let asked = f.dispatched.lock().clone();
+    assert_eq!(asked.len(), 1, "one question per pass");
+    assert_eq!(asked[0].number, 2);
+    assert_eq!(
+        asked[0].trigger,
+        RunTrigger::Blocked,
+        "review work is revisited by other machinery; a blocked card is not"
+    );
+}
+
+async fn block_as_agent(f: &Fixture, project: &ProjectId, number: i64, by: &AgentProfileId) {
+    f.manager
+        .update_issue(
+            project,
+            number,
+            IssueActor::Agent(by.clone()),
+            IssueUpdate {
+                blocked_reason: Some(Some(
+                    "the card asks for behaviour the Go spec forbids — which wins?".to_owned(),
+                )),
+                ..IssueUpdate::default()
+            },
+            None,
+        )
+        .await
+        .expect("block");
+}
+
+async fn unblock(f: &Fixture, project: &ProjectId, number: i64) {
+    f.manager
+        .update_issue(
+            project,
+            number,
+            IssueActor::User,
+            IssueUpdate {
+                blocked_reason: Some(None),
+                ..IssueUpdate::default()
+            },
+            None,
+        )
+        .await
+        .expect("unblock");
+}
+
+#[tokio::test]
+async fn a_block_that_landed_on_a_running_card_still_reaches_the_lead() {
+    let f = fixture().await;
+    let (p, dev) = driven_board(&f, 3).await;
+    let lead = lead_of(&f, &p.id).await;
+
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev.clone()),
+                ..new_issue("blocked while it was running")
+            },
+        )
+        .await
+        .expect("card");
+    let working = f.dispatched.lock().first().cloned().expect("started");
+    f.manager
+        .start_run(&working, &SessionId::from("issue-1"))
+        .await
+        .expect("the executor takes it");
+
+    block_as_agent(&f, &p.id, 1, &dev).await;
+    assert_eq!(
+        f.manager.resume_unsettled_runs().await.expect("boot sweep"),
+        0,
+        "the sweep requeues the row and then leaves it: the card is blocked"
+    );
+    f.dispatched.lock().clear();
+
+    tick(&f, &p.id).await;
+
+    let asked = f.dispatched.lock().clone();
+    assert_eq!(
+        asked.len(),
+        1,
+        "a blocked card is the one card nothing else on the board comes back to"
+    );
+    assert_eq!(asked[0].trigger, RunTrigger::Blocked);
+    assert_eq!(asked[0].agent_id, lead, "and the lead is who answers it");
+
+    let runs = f.manager.list_runs(&p.id, 1).await.expect("runs");
+    let parked = runs
+        .iter()
+        .find(|run| run.id == working.id)
+        .expect("the interrupted row is still in the log");
+    assert_eq!(
+        parked.status,
+        RunStatus::Cancelled,
+        "a card holds one unsettled run, so the row the block parked stood down for the question"
+    );
+    assert!(
+        parked
+            .error
+            .as_deref()
+            .is_some_and(|why| why.contains("stood down")),
+        "and the card says why rather than showing a bare cancel: {:?}",
+        parked.error
+    );
+    assert_eq!(
+        column_of(&f, &p.id, 1).await,
+        IssueStatus::InProgress,
+        "standing the run down is not the board giving the card up"
+    );
+
+    tick(&f, &p.id).await;
+    assert_eq!(
+        f.dispatched.lock().len(),
+        1,
+        "and the question is asked once, not on every tick"
+    );
+}
+
+#[tokio::test]
+async fn a_lead_that_cannot_run_costs_the_card_nothing() {
+    let f = fixture().await;
+    let (p, dev) = driven_board(&f, 3).await;
+    let lead = lead_of(&f, &p.id).await;
+
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev.clone()),
+                ..new_issue("blocked while it was running")
+            },
+        )
+        .await
+        .expect("card");
+    let working = f.dispatched.lock().first().cloned().expect("started");
+    f.manager
+        .start_run(&working, &SessionId::from("issue-1"))
+        .await
+        .expect("the executor takes it");
+    block_as_agent(&f, &p.id, 1, &dev).await;
+    assert_eq!(
+        f.manager.resume_unsettled_runs().await.expect("boot sweep"),
+        0,
+        "the sweep requeues the row and leaves it parked on the block"
+    );
+
+    f.agents
+        .update(
+            &lead,
+            &baybo_store::AgentProfileUpdate {
+                description: String::new(),
+                framework: AgentFramework::Codex,
+            },
+        )
+        .await
+        .expect("the operator moves the lead onto codex");
+    f.dispatched.lock().clear();
+
+    tick(&f, &p.id).await;
+
+    assert!(
+        f.dispatched.lock().is_empty(),
+        "a lead that cannot host a session answers no question"
+    );
+    let runs = f.manager.list_runs(&p.id, 1).await.expect("runs");
+    assert_eq!(runs.len(), 1, "and nothing was recorded in its place");
+    assert_eq!(runs[0].id, working.id);
+    assert_eq!(
+        runs[0].status,
+        RunStatus::Queued,
+        "so the card keeps the run the block parked: the stand-down is the last \
+         irreversible step, never the first"
+    );
+    assert!(runs[0].settled_at.is_none());
+}
+
+#[tokio::test]
+async fn a_budget_held_row_stands_down_for_the_block_question_too() {
+    let f = fixture().await;
+    let (p, dev) = driven_board(&f, 2).await;
+    let lead = lead_of(&f, &p.id).await;
+    set_budget(&f, &p, Some(baybo_model::MicroUsd::ZERO)).await;
+
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev.clone()),
+                ..new_issue("owed, and then blocked")
+            },
+        )
+        .await
+        .expect("card");
+    let held = f
+        .manager
+        .active_runs(&p.id)
+        .await
+        .expect("runs")
+        .into_iter()
+        .next()
+        .expect("the board recorded the work it owes");
+    assert_eq!(
+        held.status,
+        RunStatus::Held,
+        "the board has nothing to spend"
+    );
+    block_as_agent(&f, &p.id, 1, &dev).await;
+
+    f.store
+        .update_project(
+            &p.id,
+            &ProjectUpdate {
+                name: p.name.clone(),
+                description: p.description.clone(),
+                daily_budget: None,
+                daily_budget_tokens: None,
+                max_parallel_issue_runs: p.max_parallel_issue_runs,
+            },
+        )
+        .await
+        .expect("headroom");
+    f.dispatched.lock().clear();
+
+    tick(&f, &p.id).await;
+
+    let runs = f.manager.list_runs(&p.id, 1).await.expect("runs");
+    let stood_down = runs
+        .iter()
+        .find(|run| run.id == held.id)
+        .expect("the held row is still in the log");
+    assert_eq!(
+        stood_down.status,
+        RunStatus::Cancelled,
+        "the hold was the card's one unsettled row, and the question needs that slot"
+    );
+    assert!(
+        stood_down
+            .error
+            .as_deref()
+            .is_some_and(|why| why.contains("stood down")),
+        "and the card says why: {:?}",
+        stood_down.error
+    );
+    let asked = f.dispatched.lock().clone();
+    assert_eq!(asked.len(), 1, "so the lead is asked about the block");
+    assert_eq!(
+        (asked[0].trigger, &asked[0].agent_id),
+        (RunTrigger::Blocked, &lead)
+    );
+}
+
+#[tokio::test]
+async fn the_answer_left_while_a_card_was_blocked_reaches_its_assignee() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(new_project("Adjudicated"))
+        .await
+        .expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev.clone()),
+                ..new_issue("which version of the endpoint?")
+            },
+        )
+        .await
+        .expect("card");
+    let working = f.dispatched.lock().first().cloned().expect("started");
+    let briefed_at = Utc::now();
+    f.manager
+        .start_run(&working, &SessionId::from("issue-1"))
+        .await
+        .expect("the executor takes it");
+    block_as_agent(&f, &p.id, 1, &dev).await;
+
+    assert_eq!(
+        f.manager
+            .comment_delivery(&p.id, 1)
+            .await
+            .expect("delivery"),
+        baybo_project::CommentDelivery::ParkedByABlock,
+    );
+    f.manager
+        .comment(&p.id, 1, IssueActor::User, "use v2 of the endpoint", &[])
+        .await
+        .expect("the operator answers the question");
+    finish(&f, &working, briefed_at, done()).await;
+    assert_eq!(
+        f.dispatched.lock().len(),
+        1,
+        "nothing is woken while the block stands, not even the follow-up the run owes"
+    );
+
+    unblock(&f, &p.id, 1).await;
+
+    let dispatched = f.dispatched.lock().clone();
+    assert_eq!(
+        dispatched.len(),
+        2,
+        "so the unblock is the door that delivers what arrived while the card was parked"
+    );
+    assert_eq!(dispatched[1].trigger, RunTrigger::Comment);
+    assert_eq!(
+        dispatched[1].agent_id, dev,
+        "to the assignee, who is who was waiting for it"
+    );
+
+    unblock(&f, &p.id, 1).await;
+    assert_eq!(
+        f.dispatched.lock().len(),
+        2,
+        "and an unblock with nothing said under it starts nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_lead_lifting_a_block_mid_run_delivers_what_was_said_while_the_card_was_parked() {
+    let f = fixture().await;
+    let (p, dev) = driven_board(&f, 3).await;
+    let lead = lead_of(&f, &p.id).await;
+
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev.clone()),
+                ..new_issue("which version of the endpoint?")
+            },
+        )
+        .await
+        .expect("card");
+    let working = f.dispatched.lock().first().cloned().expect("started");
+    let briefed_at = Utc::now();
+    f.manager
+        .start_run(&working, &SessionId::from("issue-1"))
+        .await
+        .expect("the executor takes it");
+    block_as_agent(&f, &p.id, 1, &dev).await;
+    f.manager
+        .comment(&p.id, 1, IssueActor::User, "use v2 of the endpoint", &[])
+        .await
+        .expect("the operator answers the question");
+    finish(&f, &working, briefed_at, done()).await;
+
+    tick(&f, &p.id).await;
+    let ask = f
+        .dispatched
+        .lock()
+        .get(1)
+        .cloned()
+        .expect("the lead is woken");
+    assert_eq!(ask.trigger, RunTrigger::Blocked);
+    let lead_briefed_at = Utc::now();
+    f.manager
+        .start_run(&ask, &SessionId::from("lead-1"))
+        .await
+        .expect("the lead takes its question");
+    f.manager
+        .update_issue(
+            &p.id,
+            1,
+            IssueActor::Agent(lead.clone()),
+            IssueUpdate {
+                blocked_reason: Some(None),
+                ..IssueUpdate::default()
+            },
+            None,
+        )
+        .await
+        .expect("the lead lifts the block from inside its own run");
+    assert_eq!(
+        f.dispatched.lock().len(),
+        2,
+        "nothing may be enqueued behind a row that is still running"
+    );
+
+    finish(&f, &ask, lead_briefed_at, done()).await;
+
+    let dispatched = f.dispatched.lock().clone();
+    assert_eq!(
+        dispatched.len(),
+        3,
+        "so the settle of the run that lifted the block is what hands the answer over"
+    );
+    assert_eq!(dispatched[2].trigger, RunTrigger::Comment);
+    assert_eq!(
+        dispatched[2].agent_id, dev,
+        "to the assignee, who is who was waiting for it"
+    );
+
+    tick(&f, &p.id).await;
+    assert_eq!(
+        f.dispatched.lock().len(),
+        3,
+        "and once: the card is being worked again, not stalled"
+    );
+}
+
+#[tokio::test]
+async fn one_write_that_unblocks_and_starts_work_dispatches_one_run() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(new_project("Handed over"))
+        .await
+        .expect("p");
+    let first = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    let second = seed_agent(&f, &p.id, "dev-2", AgentFramework::Baybo).await;
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(first.clone()),
+                ..new_issue("blocked, then handed over")
+            },
+        )
+        .await
+        .expect("card");
+    let started = f.dispatched.lock().first().cloned().expect("started");
+    f.store_settle(&started.id, RunStatus::Done).await;
+    f.manager
+        .update_issue(
+            &p.id,
+            1,
+            IssueActor::User,
+            IssueUpdate {
+                blocked_reason: Some(Some("waiting on the operator".to_owned())),
+                ..IssueUpdate::default()
+            },
+            None,
+        )
+        .await
+        .expect("block");
+    f.dispatched.lock().clear();
+
+    f.manager
+        .update_issue(
+            &p.id,
+            1,
+            IssueActor::User,
+            IssueUpdate {
+                assignee: Some(Some(second.clone())),
+                blocked_reason: Some(None),
+                ..IssueUpdate::default()
+            },
+            None,
+        )
+        .await
+        .expect("one write hands the card over and lifts the block");
+
+    let dispatched = f.dispatched.lock().clone();
+    assert_eq!(
+        dispatched.len(),
+        1,
+        "a row this write itself recorded is not a row the block parked: {:?}",
+        dispatched.iter().map(|run| &run.id).collect::<Vec<_>>()
+    );
+    assert_eq!(dispatched[0].agent_id, second);
+    assert_eq!(dispatched[0].trigger, RunTrigger::Assigned);
+    assert_eq!(
+        f.manager.list_runs(&p.id, 1).await.expect("runs").len(),
+        2,
+        "and the ledger holds one row per run, as it always did"
+    );
+}
+
+#[tokio::test]
+async fn a_retry_does_not_start_a_run_a_block_has_stopped() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(new_project("Paused"))
+        .await
+        .expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev.clone()),
+                ..new_issue("stopped with a question on it")
+            },
+        )
+        .await
+        .expect("card");
+    let started = f.dispatched.lock().first().cloned().expect("started");
+    f.store_settle(&started.id, RunStatus::Done).await;
+    block_as_agent(&f, &p.id, 1, &dev).await;
+    f.dispatched.lock().clear();
+
+    match f.manager.retry_run(&p.id, 1).await {
+        Err(ProjectError::Invalid { field, reason }) => {
+            assert_eq!(field, "issue");
+            assert_eq!(
+                reason,
+                "this issue is blocked — lift the block before running it again"
+            );
+        }
+        other => panic!("a blocked card should have refused the retry: {other:?}"),
+    }
+    assert!(
+        f.dispatched.lock().is_empty(),
+        "and nothing went out on a card somebody stopped"
+    );
+    assert_eq!(
+        f.manager.list_runs(&p.id, 1).await.expect("runs").len(),
+        1,
+        "nor was a row recorded to sit there parked"
+    );
+
+    unblock(&f, &p.id, 1).await;
+    let again = f.manager.retry_run(&p.id, 1).await.expect("retry");
+    assert_eq!(
+        again.trigger,
+        RunTrigger::Retry,
+        "the one write that lifts the block is what makes the card runnable again"
+    );
+    assert_eq!(f.dispatched.lock().len(), 1);
+}
+
+#[tokio::test]
+async fn a_mention_puts_nobody_on_a_card_a_block_has_stopped() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(new_project("Paused"))
+        .await
+        .expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::Todo,
+                ..new_issue("nobody on it yet")
+            },
+        )
+        .await
+        .expect("card");
+    block_as_agent(&f, &p.id, 1, &dev).await;
+
+    f.manager
+        .comment(&p.id, 1, IssueActor::User, "@dev-1 can you take this?", &[])
+        .await
+        .expect("the mention is recorded like any other comment");
+
+    assert!(
+        f.manager
+            .get_issue(&p.id, 1)
+            .await
+            .expect("card")
+            .assignee
+            .is_none(),
+        "a passing mention does not staff a card somebody paused"
+    );
+    assert!(f.dispatched.lock().is_empty(), "and starts nothing");
+
+    unblock(&f, &p.id, 1).await;
+    f.manager
+        .comment(&p.id, 1, IssueActor::User, "@dev-1 can you take this?", &[])
+        .await
+        .expect("comment");
+    assert_eq!(
+        f.manager
+            .get_issue(&p.id, 1)
+            .await
+            .expect("card")
+            .assignee
+            .as_ref(),
+        Some(&dev),
+        "and the same words land the moment the block is gone"
+    );
+    assert_eq!(f.dispatched.lock().len(), 1, "waking whoever they named");
+}
+
+#[tokio::test]
+async fn the_leads_answer_on_a_card_it_left_blocked_starts_no_work() {
+    let f = fixture().await;
+    let (p, dev) = driven_board(&f, 3).await;
+    let lead = lead_of(&f, &p.id).await;
+
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::Review,
+                assignee: Some(dev.clone()),
+                ..new_issue("the goal contradicts the Go spec")
+            },
+        )
+        .await
+        .expect("card");
+    block_as_agent(&f, &p.id, 1, &dev).await;
+    f.dispatched.lock().clear();
+
+    tick(&f, &p.id).await;
+    let ask = f
+        .dispatched
+        .lock()
+        .first()
+        .cloned()
+        .expect("the lead is woken");
+    assert_eq!(ask.trigger, RunTrigger::Blocked);
+    let briefed_at = Utc::now();
+    f.manager
+        .start_run(&ask, &SessionId::from("lead-1"))
+        .await
+        .expect("the lead takes its question");
+
+    assert_eq!(
+        f.manager
+            .comment_delivery(&p.id, 1)
+            .await
+            .expect("delivery"),
+        baybo_project::CommentDelivery::ParkedByABlock,
+        "and the composer says so before anybody writes a word"
+    );
+    f.manager
+        .comment(
+            &p.id,
+            1,
+            IssueActor::Agent(lead.clone()),
+            "the spec wins — say so on the card and I will decide the rest",
+            &[],
+        )
+        .await
+        .expect("the lead hands it back, and leaves the block standing");
+    finish(&f, &ask, briefed_at, done()).await;
+
+    assert_eq!(
+        f.dispatched.lock().len(),
+        1,
+        "nothing but the question itself: a card the block stopped takes no work run"
+    );
+    let runs = f.manager.list_runs(&p.id, 1).await.expect("runs");
+    assert!(
+        runs.iter().all(|run| run.agent_id == lead),
+        "and the assignee was never put back on it: {runs:#?}"
+    );
+}
+
+#[tokio::test]
+async fn a_finished_card_that_still_carries_a_block_does_not_swallow_the_other_questions() {
+    let f = fixture().await;
+    let (p, dev) = driven_board(&f, 3).await;
+    let lead = lead_of(&f, &p.id).await;
+
+    for (number, title) in [(1, "blocked and then finished"), (2, "waiting on a review")] {
+        f.manager
+            .create_issue(
+                &p.id,
+                IssueActor::User,
+                NewIssueRequest {
+                    status: IssueStatus::Review,
+                    assignee: Some(dev.clone()),
+                    ..new_issue(title)
+                },
+            )
+            .await
+            .expect("card");
+        assert_eq!(
+            number,
+            f.manager.list_issues(&p.id).await.expect("issues").len() as i64
+        );
+    }
+    block_as_agent(&f, &p.id, 1, &dev).await;
+    f.manager
+        .move_issue(&p.id, 1, IssueActor::User, IssueStatus::Done, &[1])
+        .await
+        .expect("the operator finishes the card without lifting the block");
+    f.dispatched.lock().clear();
+
+    tick(&f, &p.id).await;
+
+    let asked = f.dispatched.lock().clone();
+    assert_eq!(asked.len(), 1, "the pass still asks its one question");
+    assert_eq!(
+        (asked[0].number, asked[0].trigger),
+        (2, RunTrigger::Review),
+        "a card no run can start on is not a question the lead can answer, \
+         and it does not get to stop the ones behind it"
+    );
+    assert_eq!(asked[0].agent_id, lead);
+}
+
+async fn leadless_board(f: &Fixture, name: &str) -> (ProjectRow, AgentProfileId) {
+    let now = Utc::now();
+    let row = ProjectRow {
+        id: ProjectId::generate(),
+        name: name.to_owned(),
+        description: String::new(),
+        workdir: f.paths.work_dir().join(name).display().to_string(),
+        daily_budget: None,
+        daily_budget_tokens: None,
+        max_parallel_issue_runs: 3,
+        archived_at: None,
+        created_at: now,
+        updated_at: now,
+    };
+    f.store.create_project(&row).await.expect("legacy board");
+    let dev = seed_agent(f, &row.id, "leader", AgentFramework::Baybo).await;
+    (row, dev)
+}
+
+#[tokio::test]
+async fn a_board_with_no_lead_is_given_one_before_it_is_asked_anything() {
+    let f = fixture().await;
+    let (p, dev) = leadless_board(&f, "predates-the-seed").await;
+    assert!(
+        f.manager
+            .team(&p.id)
+            .await
+            .expect("team")
+            .iter()
+            .all(|row| row
+                .team
+                .as_ref()
+                .is_none_or(|t| t.handle.as_str() != baybo_project::LEAD_HANDLE)),
+        "the control: this board has no coordinator at all"
+    );
+
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::Review,
+                assignee: Some(dev),
+                ..new_issue("waiting on a review nobody can arrange")
+            },
+        )
+        .await
+        .expect("card");
+    f.dispatched.lock().clear();
+
+    tick(&f, &p.id).await;
+
+    let seeded = lead_of(&f, &p.id).await;
+    let asked = f.dispatched.lock().clone();
+    assert_eq!(asked.len(), 1, "and the question it could not ask went out");
+    assert_eq!(asked[0].trigger, RunTrigger::Review);
+    assert_eq!(asked[0].agent_id, seeded);
+}
+
+#[tokio::test]
+async fn a_board_whose_lead_handle_is_reserved_says_so_once_instead_of_looping() {
+    let f = fixture().await;
+    let (p, dev) = driven_board(&f, 3).await;
+    let original = lead_of(&f, &p.id).await;
+    f.agents
+        .remove_from_team(&original)
+        .await
+        .expect("tombstone it");
+
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::Review,
+                assignee: Some(dev),
+                ..new_issue("waiting on a review nobody can arrange")
+            },
+        )
+        .await
+        .expect("card");
+    f.dispatched.lock().clear();
+
+    tick(&f, &p.id).await;
+    tick(&f, &p.id).await;
+
+    assert!(
+        f.dispatched.lock().is_empty(),
+        "there is nobody to ask, and the board says so rather than inventing one"
+    );
+    assert!(
+        f.manager
+            .team(&p.id)
+            .await
+            .expect("team")
+            .iter()
+            .all(|row| row
+                .team
+                .as_ref()
+                .is_none_or(|t| t.handle.as_str() != baybo_project::LEAD_HANDLE)),
+        "and no second lead was conjured"
     );
 }

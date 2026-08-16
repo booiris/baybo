@@ -82,6 +82,71 @@ describe('ProjectSettings', () => {
     });
   });
 
+  it('shows a stored token ceiling and saves it back as a count', async () => {
+    render(
+      <ProjectSettings
+        project={project({ daily_budget_tokens: 250_000 })}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      team={[]}
+      onOpenProfile={vi.fn()}
+      onAddAgent={vi.fn()}
+      />,
+    );
+    const box = screen.getByLabelText('Daily token budget');
+    expect(box).toHaveValue('250000');
+
+    await userEvent.clear(box);
+    await userEvent.type(box, '400000');
+    await userEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => {
+      expect(api.updateProject).toHaveBeenCalledWith(
+        client,
+        '01JP',
+        expect.objectContaining({ daily_budget_tokens: 400_000 }),
+      );
+    });
+  });
+
+  it('sends null when the token box is emptied, so that ceiling can be removed too', async () => {
+    render(
+      <ProjectSettings
+        project={project({ daily_budget_tokens: 250_000 })}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      team={[]}
+      onOpenProfile={vi.fn()}
+      onAddAgent={vi.fn()}
+      />,
+    );
+    await userEvent.clear(screen.getByLabelText('Daily token budget'));
+    await userEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => {
+      expect(api.updateProject).toHaveBeenCalledWith(
+        client,
+        '01JP',
+        expect.objectContaining({ daily_budget_tokens: null }),
+      );
+    });
+  });
+
+  it('refuses a token ceiling that is not a whole count, and saves nothing', async () => {
+    render(
+      <ProjectSettings
+        project={project()}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      team={[]}
+      onOpenProfile={vi.fn()}
+      onAddAgent={vi.fn()}
+      />,
+    );
+    await userEvent.type(screen.getByLabelText('Daily token budget'), '250k');
+    await userEvent.click(screen.getByRole('button', { name: 'Save' }));
+    expect(await screen.findByText(/whole number of tokens/)).toBeInTheDocument();
+    expect(api.updateProject).not.toHaveBeenCalled();
+  });
+
   it('shows the run ceiling and saves the number back', async () => {
     render(
       <ProjectSettings
@@ -165,6 +230,7 @@ describe('ProjectSettings', () => {
     );
     expect(screen.getByLabelText('Name')).toBeDisabled();
     expect(screen.getByLabelText('Daily budget')).toBeDisabled();
+    expect(screen.getByLabelText('Daily token budget')).toBeDisabled();
     expect(screen.queryByRole('button', { name: 'Save' })).not.toBeInTheDocument();
 
     await userEvent.click(screen.getByRole('button', { name: 'Unarchive' }));

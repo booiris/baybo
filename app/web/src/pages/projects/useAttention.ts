@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react';
 import { useAdminClient } from '../../api/auth';
 import type { AdminClient } from '../../api/client';
 import type { paths } from '../../api/schema';
+import { heldOnBudget } from './budgetModel';
 
 export type ProjectAttention =
   paths['/v1/projects/attention']['get']['responses'][200]['content']['application/json']['items'][number];
@@ -161,7 +162,7 @@ export function attentionSummary(boards: ProjectAttention[]): string {
   const failed = sum((b) => b.failed);
   const unread = sum((b) => b.unread);
   if (approvals > 0) parts.push(`${approvals} waiting on approval`);
-  if (held > 0) parts.push(`${held} held on budget`);
+  if (held > 0) parts.push(heldOnBudget(held));
   if (failed > 0) parts.push(`${failed} failed`);
   if (unread > 0) parts.push(`${unread} new since you looked`);
   const where = boards.length === 1 ? boards[0].name : `${boards.length} boards`;

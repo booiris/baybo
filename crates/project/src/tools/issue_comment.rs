@@ -50,7 +50,7 @@ impl Tool for IssueCommentTool {
     fn description(&self) -> String {
         r#"Say something on an issue's timeline. This is how you report what you found, ask its assignee a question, explain why you are blocked, or ask somebody to merge your branch — the card is what a person reads, and what the next run on that issue is told about.
 
-A comment on a card somebody is assigned to **reaches them**: if they are idle it wakes them, and if they are mid-run it is picked up when that run finishes. On an unassigned card, or one in Backlog or Done, it is recorded and nobody is woken. The result says which of those happened, so you know whether to expect an answer.
+A comment on a card somebody is assigned to **reaches them**: if they are idle it wakes them, and if they are mid-run it is picked up when that run finishes. On an unassigned card, one in Backlog or Done, or one that is blocked, it is recorded and nobody is woken. The result says which of those happened, so you know whether to expect an answer.
 
 To hand over a file you produced — a screenshot, a report, a diff — store it with `PutBlob` first and pass the blob id in `attachments`. They hang on the comment, so the operator can open them from the card and the next run on it is told they are there."#
             .to_string()
@@ -125,6 +125,9 @@ fn describe(delivery: CommentDelivery) -> &'static str {
     match delivery {
         CommentDelivery::RecordOnly => {
             "recorded only — nobody is assigned, or the issue is parked, so no one was woken"
+        }
+        CommentDelivery::ParkedByABlock => {
+            "recorded only — this issue is blocked, so nobody may be put on it until that is lifted"
         }
         CommentDelivery::Wake => "the assignee was woken and will read this",
         CommentDelivery::WaitsForQueuedRun => {

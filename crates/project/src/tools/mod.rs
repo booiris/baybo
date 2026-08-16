@@ -171,6 +171,11 @@ pub(super) fn usd(micros: i64) -> String {
     )
 }
 
+/// An exact token count with its unit.
+pub(super) fn tokens(count: i64) -> String {
+    format!("{count} tokens")
+}
+
 fn exec_err(e: impl std::fmt::Display) -> ToolError {
     ToolError::Execution(e.to_string())
 }

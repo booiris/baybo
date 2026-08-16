@@ -151,6 +151,133 @@ the behaviour was verified against its source (clone inspected 2026-08-05).
     the board's parallel slots: nothing is executing under it, and a few
     long-blocked cards must not silence the whole board.
 
+19. **A board has two daily ceilings, and money alone was never one**
+    (2026-08-15). The per-project daily *spend* limit measures nothing on a
+    subscription plan: `openai-subscription` is absent from the OpenRouter
+    prefix table, so `pricing_for` misses and the factory ships
+    `ModelPricing::default()` on purpose — subscription billing is
+    account-level, not per-token — and every `cost_records.cost_usd` for
+    such a board is `0`. `spend_since` therefore sums zero forever and a
+    money ceiling **can never be reached however low it is set**. A board
+    whose teammates pin an `openai-subscription` entry is an ordinary baybo
+    board; the framework gate says nothing about which LLM entry an agent
+    runs against, so this is the ordinary case rather than an exotic one.
+
+    So `projects.daily_budget_tokens` sits beside `daily_budget_micros`:
+    same UTC window, same rows, same `Held` → release-on-activity
+    machinery, and the board stops when **either** is reached. Both are
+    optional and both default to unset, because a board should work out of
+    the box.
+
+    Four things settled with it, each because the obvious alternative is
+    wrong in a way that only shows up later:
+
+    - **Tokens are `input_tokens + output_tokens`.** The cached and
+      cache-creation columns are *subsets* of `input_tokens`, not additions
+      to it — that is the stated convention `compute_cost_usd` depends on,
+      and the Anthropic adapter folds its natively-disjoint buckets into it
+      before the record is written. Summing all four charges a board twice
+      for its cached prefix, and every existing cost fixture seeds
+      `cached_input_tokens: 0`, so that bug would have shipped green.
+    - **One store read, not two.** `spend_since` widened to return `Spend`
+      rather than growing a parallel `tokens_since`, so there is one answer
+      to "what has this board burned today" and the two ceilings cannot come
+      to disagree about which rows are the board's. Restated because it is
+      the same lesson as the `IN (SELECT …)`-not-a-join rule above.
+    - **The hold names its ceiling**, through its own timeline variants
+      (`TokenBudgetExhausted`/`TokenBudgetRestored`) rather than a "which
+      unit" flag beside fields called `spent_micros` — a flag there would be
+      a lie on the wire, and every past row would have to be re-read to know
+      which unit it meant. When both ceilings are set, the one spoken in is
+      **whichever has least room left** (exhaustion first, then the tighter
+      fraction; ties to tokens), decided once in `speaks_money` and mirrored
+      by the switcher's meter client-side. The first cut of this said "a set
+      token ceiling always wins", which review caught: it stamped a
+      permanent `TokenBudgetExhausted` row on boards held by *money*,
+      claiming a ceiling was spent at 0% used. "Prefer the exhausted one"
+      alone is not the fix either — a release happens when neither is
+      exhausted, so it would report a card's hold and its release in
+      different units.
+    - **A hold is still just a hold.** No second `RunStatus`, no split in
+      the attention count: one `release_held_runs` pass frees both, and the
+      distinction lives only in the timeline entry and the wording around
+      it. What did change is that no sentence outside that entry may say
+      "over its daily budget" any more — an operator told that on a
+      token-limited board goes and raises a dollar figure that was never the
+      reason.
+
+    Explicitly **not** in scope, and said here rather than left unsaid: the
+    global `cost.spending_limits` gate has the identical defect and keeps
+    it. This is the board's ceiling only.
+
+20. **A sweep with no meter is a retry loop** (2026-08-15), from eleven
+    days of runtime data. The boot sweep re-drove run
+    `01M00C5EFKFDGDHJ05W076318T` across three restarts with no counter, no
+    age check and nothing on the card — its 25-second resurrection re-sent
+    ~347K input tokens before doing anything — and the DB held 98
+    `run_started` entries for 94 runs, two wedged runs carrying three
+    textually identical "started run #7" lines each. What follows from
+    that:
+
+    - **`issue_runs.resumes` is a column, not a count over events.** A
+      timeline append is explicitly allowed to fail without failing the
+      thing it describes, so a counter derived from `run_started` entries
+      undercounts on exactly the boot where the append failed — and the
+      loop comes back. It cannot ride `attempt`, which is the *issue's*
+      run counter and means something else. It is bumped inside the
+      requeue's own `UPDATE`, the one statement that observes an
+      interruption.
+    - **Two bounds, two shapes, because one meter cannot bound both.**
+      `MAX_RUN_RESUMES` bounds a row that ran and was interrupted;
+      `MAX_QUEUED_WAIT_HOURS` (from `created_at`) bounds a row nobody ever
+      claimed. `started_at` is the *first* claim, so an age read off it
+      would call off a run that executed an hour ago. The measured case
+      for the second is a row that sat queued 66h and was then executed
+      against a card blocked three days earlier.
+    - **No backoff.** The sweep fires once per process start, not on a
+      rate; a delay would only park the row and need a second thing to
+      come back for it, which is the invisible loop the bound ends.
+    - **The give-up settles `Failed`, not `Cancelled`.**
+      `driver::newest_run_was_cancelled` reads a cancel as a stop that
+      stands, so a cancel would keep the lead from ever being told.
+    - **`runs::verdict` is the one home** for "may the board hand this
+      recorded row out now?", asked by all four hand-out doors. Steady-state
+      dispatch and the boot sweep disagreeing about `blocked` is what let a
+      blocked card be executed at boot.
+    - **A re-claim says `RunInterrupted`, not a second `RunStarted`.** The
+      card is not given a run state for it: the row reads `queued` with a
+      session on it, and a card that says "running" through a gateway
+      outage cannot be fixed at all — nothing is serving that page.
+    - **The blocked wake is the highest-value one**, and it is the wake
+      decision 18 explicitly declined. A blocked card is invisible to the
+      promoter, the hold release and the boot sweep, so it is the one card
+      nothing ever comes back to; rglide #13 had an agent find the card's
+      goal contradicted the language spec, refuse to code, and block with
+      the question — and the DB has not one `unblocked` event in it. Scoped
+      to **agent-authored** blocks, read off the timeline: an operator's own
+      block is that operator saying stop, and adjudicating it would
+      countermand them within a tick and bill a lead run for it.
+    - **A board with no `@lead` is repaired, not warned at.** `lead_of` is
+      a string comparison that answers `None` silently; the `baybo` board
+      (created 2026-08-05, before the seed existed, its only teammate hired
+      as `@leader`, handles permanent) has had **zero** coordination runs
+      ever while rglide has 25. The driver seeds one on a miss. A board
+      whose lead was *removed* keeps the handle reserved forever and can
+      only be told so — once.
+    - **The executor may say a run failed, not that it produced nothing.**
+      Run `01KZXXP774BNEQKB1DWQAZBMGT` committed, commented and moved its
+      card to Review 23s before a SIGINT settled it "stopped before
+      producing anything", and the lead narrated an invented root cause
+      into the permanent timeline. The card's own answer is the board's,
+      and the real settle reason — provider text, or the `CancelReason`
+      behind a system cancel — now reaches the card, because the lead reads
+      the card and not the transcript.
+
+    Deferred deliberately: renaming `issue_runs.attempt` to a
+    run-sequence name. The column *is* a per-issue counter and the name is
+    wrong, but the rename is cosmetic and churns four files nothing else
+    needs to touch.
+
 ## Pages and interactions (`app/web`)
 
 New rail destination **Projects** (`components/IconRail.tsx` `DESTINATIONS`).
@@ -165,7 +292,8 @@ on the board header (`name ▾`); its dropdown lists projects with live
 working count and today's burn, ends in a "New project…" action and a
 "Show archived" toggle (archived projects are hidden by default; an
 archived board is read-only until unarchived). Create form: name,
-description, workdir (optional), daily budget, parallel runs. Workdir left empty →
+description, workdir (optional), daily budget, daily token budget, parallel
+runs. Workdir left empty →
 the server creates `<workspace>/work/<name>/`, git-initialises it, and
 stores that path (an existing non-empty `work/<name>` is an inline error,
 never silently reused); workdir filled → must be an absolute path to an

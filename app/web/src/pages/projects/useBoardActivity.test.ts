@@ -2,8 +2,13 @@ import { describe, expect, it } from 'vitest';
 
 import { activityFor, burnIsNearLimit, type BoardActivity } from './useBoardActivity';
 
-function board(projectId: string, working: number, burnMicros: number): BoardActivity {
-  return { project_id: projectId, working, burn_micros: burnMicros };
+function board(
+  projectId: string,
+  working: number,
+  burnMicros: number,
+  burnTokens = 0,
+): BoardActivity {
+  return { project_id: projectId, working, burn_micros: burnMicros, burn_tokens: burnTokens };
 }
 
 describe('activityFor', () => {
@@ -35,5 +40,10 @@ describe('burnIsNearLimit', () => {
     // ratio is meaningless and must not come back as Infinity.
     expect(burnIsNearLimit(0, 0)).toBe(false);
     expect(burnIsNearLimit(100, 0)).toBe(false);
+  });
+
+  it('reads a token ceiling the same way it reads a money one', () => {
+    expect(burnIsNearLimit(96_000, 100_000)).toBe(true);
+    expect(burnIsNearLimit(50_000, 100_000)).toBe(false);
   });
 });

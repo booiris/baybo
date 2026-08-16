@@ -129,8 +129,20 @@ const RUN_CALLED_OFF_INTERRUPTED: &str =
 
 const RUN_CANCELLED_BEFORE_STARTING: &str = "cancelled before it started";
 
-const HELD_RUN_REFUSAL: &str =
-    "this run is held — the project is over its daily budget, and starts as soon as there is room";
+const RUN_STOOD_DOWN_FOR_A_BLOCK: &str = r#"the card was blocked with a question, and this run stood down so the lead could be asked to answer it — the work starts again from the answer"#;
+
+const RETRY_ON_A_BLOCKED_CARD: &str =
+    "this issue is blocked — lift the block before running it again";
+
+fn held_run_refusal(figures: Option<crate::budget::Figures>) -> String {
+    let ceiling = match figures {
+        Some(crate::budget::Figures::Tokens { .. }) => "daily token budget",
+        _ => "daily budget",
+    };
+    format!(
+        "this run is held — the project is over its {ceiling}, and starts as soon as there is room"
+    )
+}
 
 fn framework_refusal(agent: &AgentProfileId, framework: AgentFramework) -> String {
     format!(
@@ -189,6 +201,8 @@ pub struct NewProject {
     /// of the box, and a limit the operator did not choose is a board that
     /// stops for a reason nobody can explain.
     pub daily_budget: Option<baybo_model::MicroUsd>,
+    /// Daily token ceiling. `None` is no ceiling.
+    pub daily_budget_tokens: Option<i64>,
     /// How many runs the board may start on its own. `None` takes
     /// [`DEFAULT_MAX_PARALLEL_ISSUE_RUNS`]; `Some(0)` opens a board that only
     /// ever runs what somebody drags.
@@ -265,6 +279,10 @@ pub struct ProjectManager {
     /// how much room a board has and then filling it is a read-then-write,
     /// and every run that settles asks the question again.
     driving: tokio::sync::Mutex<()>,
+    /// Boards where lead seeding failed.
+    leadless: parking_lot::Mutex<std::collections::HashSet<ProjectId>>,
+    /// Optional closer for prompts abandoned by settled runs.
+    prompts: parking_lot::Mutex<Option<Arc<dyn crate::CardPromptCloser>>>,
 }
 
 /// The seam between recording a run and executing it. A channel rather
@@ -309,7 +327,17 @@ impl ProjectManager {
             events,
             dispatch,
             driving: tokio::sync::Mutex::new(()),
+            leadless: parking_lot::Mutex::default(),
+            prompts: parking_lot::Mutex::default(),
         }
+    }
+
+    pub(crate) fn set_prompt_closer(&self, closer: Arc<dyn crate::CardPromptCloser>) {
+        *self.prompts.lock() = Some(closer);
+    }
+
+    fn prompt_closer(&self) -> Option<Arc<dyn crate::CardPromptCloser>> {
+        self.prompts.lock().clone()
     }
 
     /// The workspace this board's checkouts live under. Crate-internal:
@@ -323,11 +351,14 @@ impl ProjectManager {
         &self.store
     }
 
-    async fn dispatch_if_triggered(&self, transition: Transition, issue: &IssueRow) {
-        let Some(trigger) = triggers_run(transition) else {
-            return;
-        };
-        self.enqueue(issue, trigger).await;
+    /// Return the dispatched run so unblock handling can avoid a duplicate.
+    async fn dispatch_if_triggered(
+        &self,
+        transition: Transition,
+        issue: &IssueRow,
+    ) -> Option<IssueRunRow> {
+        let trigger = triggers_run(transition)?;
+        self.enqueue(issue, trigger).await
     }
 
     async fn enqueue(&self, issue: &IssueRow, trigger: RunTrigger) -> Option<IssueRunRow> {
@@ -345,21 +376,8 @@ impl ProjectManager {
         trigger: RunTrigger,
         agent: AgentProfileId,
     ) -> Option<IssueRunRow> {
-        if !crate::runs::accepts_runs(issue) {
-            tracing::debug!(
-                issue = issue.number,
-                ?trigger,
-                "the card is finished or cancelled; not starting a run on it"
-            );
-            return None;
-        }
-        if self.can_run(&agent).await != Some(true) {
-            tracing::debug!(
-                issue = issue.number,
-                ?trigger,
-                %agent,
-                "that agent cannot host an issue's session; not starting a run"
-            );
+        if let Some(why) = self.enqueue_refusal(issue, &agent).await {
+            tracing::debug!(issue = issue.number, ?trigger, %agent, "{why}");
             return None;
         }
         let entry = ledger_entry(issue, trigger, agent);
@@ -398,23 +416,15 @@ impl ProjectManager {
         };
         self.events.run_changed(&issue.project_id, issue.number);
 
-        if let (true, Some((spent_micros, limit_micros))) =
-            (headroom.is_exhausted(), headroom.figures())
-        {
+        // `Headroom` guarantees figures for an exhausted board.
+        if let (true, Some(figures)) = (headroom.is_exhausted(), headroom.figures()) {
             if let Err(e) = self.store.hold_run(&run.id).await {
                 // The hold failed, so the run is still `Queued` and will be
                 // started. Overspending by one run beats stranding it.
                 tracing::error!(issue = issue.number, error = %e, "could not hold a run over budget");
             } else {
-                self.record(
-                    issue,
-                    IssueActor::System,
-                    IssueEventBody::BudgetExhausted {
-                        spent_micros,
-                        limit_micros,
-                    },
-                )
-                .await;
+                self.record(issue, IssueActor::System, figures.exhausted())
+                    .await;
                 return Some(run);
             }
         }
@@ -422,9 +432,23 @@ impl ProjectManager {
         Some(run)
     }
 
+    /// Refusals checked before irreversible board changes; dedupe stays in storage.
+    async fn enqueue_refusal(
+        &self,
+        issue: &IssueRow,
+        agent: &AgentProfileId,
+    ) -> Option<&'static str> {
+        if !crate::runs::accepts_runs(issue) {
+            return Some("the card is finished or cancelled; not starting a run on it");
+        }
+        // Framework eligibility can change after assignment.
+        (self.can_run(agent).await != Some(true))
+            .then_some("that agent cannot host an issue's session; not starting a run")
+    }
+
     async fn headroom(&self, project: &ProjectId) -> Headroom {
-        let limit = match self.store.get_project(project).await {
-            Ok(Some(row)) => row.daily_budget,
+        let (money, tokens) = match self.store.get_project(project).await {
+            Ok(Some(row)) => (row.daily_budget, row.daily_budget_tokens),
             Ok(None) => return Headroom::Unlimited,
             Err(e) => {
                 tracing::error!(%project, error = %e, "could not read the project's budget");
@@ -432,15 +456,16 @@ impl ProjectManager {
             }
         };
         // No ceiling means no query. The common case costs nothing.
-        if limit.is_none() {
+        if money.is_none() && tokens.is_none() {
             return Headroom::Unlimited;
         }
+        // Both meters must use the same spend snapshot.
         match self
             .store
             .spend_since(project, crate::budget::day_start(chrono::Utc::now()))
             .await
         {
-            Ok(spent) => crate::budget::headroom(limit, spent),
+            Ok(spent) => crate::budget::headroom(money, tokens, spent),
             Err(e) => {
                 tracing::error!(%project, error = %e, "could not read the project's spend");
                 Headroom::Unlimited
@@ -464,33 +489,18 @@ impl ProjectManager {
         let held = self.store.held_runs(project).await?;
         let mut released = 0;
         for run in held {
-            // A hold outlives the write that recorded it, so the card may
-            // have been cancelled or finished in between — and its worktree
-            // reclaimed with it.
-            let Some(issue) = self.live_card(&run).await else {
+            // Re-check the card because holds outlive their enqueue write.
+            let Some(issue) = self.card_for(&run).await else {
                 continue;
             };
-            // …or blocked in between. The hold stays: budget is back, but
-            // the block is not the board's to override. The unblock hands
-            // the run to the next release pass.
-            if !crate::driver::board_may_start(&issue) {
-                continue;
-            }
             if !self.store.release_run(&run.id).await? {
                 continue;
             }
             released += 1;
             self.events.run_changed(project, run.number);
-            if let Some((spent_micros, limit_micros)) = figures {
-                self.record(
-                    &issue,
-                    IssueActor::System,
-                    IssueEventBody::BudgetRestored {
-                        spent_micros,
-                        limit_micros,
-                    },
-                )
-                .await;
+            if let Some(figures) = figures {
+                self.record(&issue, IssueActor::System, figures.restored())
+                    .await;
             }
             (self.dispatch)(run);
         }
@@ -589,7 +599,7 @@ impl ProjectManager {
             // The card, when there is one, is of no use here: what this
             // call is for is its other half — a run whose card stopped
             // accepting work is settled on the way past.
-            let _ = self.live_card(run).await;
+            let _ = self.card_for(run).await;
         }
     }
 
@@ -617,33 +627,21 @@ impl ProjectManager {
             return Ok(0);
         }
         let issues = self.store.list_issues(project).await?;
-        // A queued run parked by a block is not load: nothing is executing
-        // and nothing will until the unblock, so counting it would let a
-        // handful of long-blocked cards silence the whole board —
-        // promotions and the lead's asks alike. Its card still lands in
-        // `busy` below, exactly like a held run: the slot the CARD holds is
-        // spent, it is the board's capacity that is not.
-        let blocked: std::collections::BTreeSet<i64> = issues
-            .iter()
-            .filter(|i| !crate::driver::board_may_start(i))
-            .map(|i| i.number)
-            .collect();
-        let executing = load
-            .working
-            .iter()
-            .filter(|run| run.status != RunStatus::Queued || !blocked.contains(&run.number))
-            .count();
+        // Block-parked rows consume card slots but not execution capacity.
+        let cards: HashMap<i64, &IssueRow> = issues.iter().map(|i| (i.number, i)).collect();
+        let parked = |run: &IssueRunRow| {
+            cards
+                .get(&run.number)
+                .is_some_and(|card| crate::runs::parked_by_a_block(run, card))
+        };
+        let recorded = || load.working.iter().chain(load.held.iter());
+        let executing = load.working.iter().filter(|run| !parked(run)).count();
         let slots = row.max_parallel_issue_runs.saturating_sub(executing);
-        // Held runs count here even though they do not count as load: a
-        // card the budget parked has already spent its one run slot, and
-        // promoting it would move it into In Progress on top of a run that
-        // is deliberately not executing.
-        let busy = crate::driver::busy(
-            load.working
-                .iter()
-                .chain(load.held.iter())
-                .map(|run| run.number),
-        );
+        // Held and block-parked rows still consume their card's run slot.
+        let busy = crate::driver::busy(recorded().map(|run| run.number));
+        // Lead questions care about execution, not merely a recorded row.
+        let in_flight =
+            crate::driver::busy(recorded().filter(|run| !parked(run)).map(|run| run.number));
 
         let slate = crate::driver::slate(&issues, &busy, slots);
         let mut moved = 0;
@@ -657,7 +655,7 @@ impl ProjectManager {
         // is on. A board with no capacity left says nothing rather than
         // queueing a question it cannot act on the answer to.
         if slots > moved {
-            self.ask_the_lead(project, &issues, &busy).await;
+            self.ask_the_lead(project, &issues, &in_flight).await;
         }
         Ok(moved)
     }
@@ -675,19 +673,15 @@ impl ProjectManager {
     /// refused is stranded: it is no longer in Todo, so no later pass looks
     /// at it again.
     async fn promote(&self, issue: &IssueRow) -> bool {
-        // `is_promotable` established that somebody is on the card. Whether
-        // that somebody can still host a session is a different question,
-        // and its answer changes under the board's feet — an operator can
-        // move an agent to a framework that cannot run issues long after it
-        // was assigned.
+        // Check every pre-write refusal before the irreversible move.
         let Some(assignee) = issue.assignee.clone() else {
             return false;
         };
-        if self.can_run(&assignee).await != Some(true) {
+        if let Some(why) = self.enqueue_refusal(issue, &assignee).await {
             tracing::debug!(
                 issue = issue.number,
                 %assignee,
-                "the card is ready but its assignee cannot host a run; leaving it in Todo"
+                "{why}; leaving the card in Todo"
             );
             return false;
         }
@@ -764,35 +758,34 @@ impl ProjectManager {
     /// Wake the lead for the first card that needs its attention, if there
     /// is one it has not already been asked about as the card stands.
     ///
-    /// Three questions, in the order they matter: a card sitting in Review
-    /// (finishing work beats everything), work in In Progress that has
-    /// silently stopped, and a card that reached Todo with nobody on it.
-    /// One question per pass, whatever came of it: the lead reads the whole
-    /// board when it is woken, so a second card would be the same
-    /// conversation twice.
     async fn ask_the_lead(
         &self,
         project: &ProjectId,
         issues: &[IssueRow],
-        busy: &std::collections::BTreeSet<i64>,
+        in_flight: &std::collections::BTreeSet<i64>,
     ) {
-        let Some(lead) = self.lead_of(project).await else {
+        let Some(lead) = self.coordinator(project).await else {
             return;
         };
         let questions = [
             (
+                RunTrigger::Blocked,
+                crate::driver::blocked(issues, in_flight, &lead),
+                "asked the lead about a card a block has stopped",
+            ),
+            (
                 RunTrigger::Review,
-                crate::driver::awaiting_review(issues, busy, &lead),
+                crate::driver::awaiting_review(issues, in_flight, &lead),
                 "asked the lead to arrange a review",
             ),
             (
                 RunTrigger::Stalled,
-                crate::driver::stalled(issues, busy, &lead),
+                crate::driver::stalled(issues, in_flight, &lead),
                 "asked the lead about a card whose work has stopped",
             ),
             (
                 RunTrigger::Triage,
-                crate::driver::awaiting_triage(issues, busy),
+                crate::driver::awaiting_triage(issues, in_flight),
                 "asked the lead to staff an unassigned card",
             ),
         ];
@@ -812,14 +805,86 @@ impl ProjectManager {
                 if crate::driver::already_asked(&issue, &runs, question) {
                     continue;
                 }
+                if question == RunTrigger::Blocked {
+                    // Block authorship lives only on the timeline.
+                    if !self.block_is_a_question(&issue).await {
+                        continue;
+                    }
+                    // Preflight before settling the card's only row.
+                    if let Some(why) = self.enqueue_refusal(&issue, &lead).await {
+                        tracing::debug!(
+                            issue = issue.number,
+                            %lead,
+                            "{why}; leaving the card's parked run where it is"
+                        );
+                        continue;
+                    }
+                    self.stand_down_for_the_question(&issue, &runs).await;
+                }
                 if self
                     .enqueue_as(&issue, question, lead.clone())
                     .await
                     .is_some()
                 {
                     tracing::info!(%project, issue = issue.number, "{told}");
+                    return;
                 }
-                return;
+            }
+        }
+    }
+
+    /// Settle a block-parked row after the caller preflights the lead run.
+    async fn stand_down_for_the_question(&self, issue: &IssueRow, runs: &[IssueRunRow]) {
+        let Some(parked) = crate::runs::unsettled(runs) else {
+            return;
+        };
+        if !crate::runs::parked_by_a_block(parked, issue) {
+            return;
+        }
+        tracing::info!(
+            issue = issue.number,
+            run = %parked.id,
+            "the block parked this run; settling it so the lead can be asked to decide the block"
+        );
+        self.settle_off(parked, RunStatus::Cancelled, RUN_STOOD_DOWN_FOR_A_BLOCK)
+            .await;
+    }
+
+    /// Whether the block is an agent's question; read failures preserve operator stops.
+    async fn block_is_a_question(&self, issue: &IssueRow) -> bool {
+        match self.store.list_events(&issue.id).await {
+            Ok(events) => crate::driver::block_is_an_agents_question(&events),
+            Err(e) => {
+                tracing::warn!(issue = issue.number, error = %e, "could not read who blocked a card");
+                false
+            }
+        }
+    }
+
+    /// Return the coordinator, seeding a missing `@lead` when possible.
+    async fn coordinator(&self, project: &ProjectId) -> Option<AgentProfileId> {
+        if let Some(lead) = self.lead_of(project).await {
+            return Some(lead);
+        }
+        if self.leadless.lock().contains(project) {
+            return None;
+        }
+        match self.seed_lead(project).await {
+            Ok(()) => {
+                tracing::info!(%project, "this board had no @{LEAD_HANDLE}; seeded one");
+                self.lead_of(project).await
+            }
+            Err(e) => {
+                // Tombstones keep handles reserved.
+                tracing::warn!(
+                    %project,
+                    error = %e,
+                    "this board has no @{LEAD_HANDLE} and cannot be given one — hire an agent \
+                     named \"{LEAD_HANDLE}\"; review, stalled, blocked and triage wakes are off \
+                     until you do"
+                );
+                self.leadless.lock().insert(project.clone());
+                None
             }
         }
     }
@@ -842,33 +907,54 @@ impl ProjectManager {
         }
     }
 
-    async fn live_card(&self, run: &IssueRunRow) -> Option<IssueRow> {
-        match self.store.get_issue(&run.project_id, run.number).await {
-            Ok(Some(issue)) if crate::runs::accepts_runs(&issue) => Some(issue),
-            Ok(_) => {
-                self.call_off(run).await;
-                None
-            }
+    /// Apply the recovery verdict and return only a runnable card.
+    async fn card_for(&self, run: &IssueRunRow) -> Option<IssueRow> {
+        let card = match self.store.get_issue(&run.project_id, run.number).await {
+            Ok(card) => card,
             Err(e) => {
                 tracing::error!(issue = run.number, error = %e, "could not read the card a recorded run belongs to; leaving the run where it is");
+                return None;
+            }
+        };
+        match crate::runs::verdict(run, card.as_ref(), chrono::Utc::now()) {
+            crate::runs::Verdict::Stands => card,
+            crate::runs::Verdict::Park(why) => {
+                tracing::debug!(issue = run.number, run = %run.id, "{why}");
+                None
+            }
+            crate::runs::Verdict::CallOff => {
+                self.settle_off(run, RunStatus::Cancelled, call_off_reason(run))
+                    .await;
+                None
+            }
+            crate::runs::Verdict::GiveUp { bound, reason } => {
+                tracing::warn!(
+                    issue = run.number,
+                    run = %run.id,
+                    ?bound,
+                    resumes = run.resumes,
+                    "the board gave up on a recorded run"
+                );
+                self.settle_off(run, RunStatus::Failed, reason).await;
                 None
             }
         }
     }
 
-    async fn call_off(&self, run: &IssueRunRow) {
-        let reason = call_off_reason(run);
+    async fn settle_off(&self, run: &IssueRunRow, status: RunStatus, reason: &str) {
+        let prompts = self.prompt_closer();
         if let Err(e) = crate::settle::settle_run(
             &self.store,
             &self.events,
+            prompts.as_deref(),
             run,
             IssueActor::System,
-            RunStatus::Cancelled,
+            status,
             Some(reason),
         )
         .await
         {
-            tracing::error!(issue = run.number, error = %e, "could not call off a run on a finished card");
+            tracing::error!(issue = run.number, error = %e, "could not settle a run the board is done with");
         }
     }
 
@@ -880,6 +966,11 @@ impl ProjectManager {
     pub async fn start_run(&self, run: &IssueRunRow, session: &SessionId) -> Result<bool> {
         if !self.store.claim_run(&run.id, session).await? {
             return Ok(false);
+        }
+        // Resumes emit a run change but reuse their original `RunStarted` event.
+        self.events.run_changed(&run.project_id, run.number);
+        if crate::runs::ever_ran(run) {
+            return Ok(true);
         }
         crate::settle::record(
             &self.store,
@@ -921,9 +1012,11 @@ impl ProjectManager {
         // slot, and the comment follow-up this run owes is refused —
         // swallowing the nudge and billing a lead run in its place.
         let _driving = self.driving.lock().await;
+        let prompts = self.prompt_closer();
         if let Err(e) = crate::settle::settle_run(
             &self.store,
             &self.events,
+            prompts.as_deref(),
             run,
             IssueActor::Agent(run.agent_id.clone()),
             outcome.status,
@@ -1030,6 +1123,21 @@ impl ProjectManager {
         next
     }
 
+    /// Whether the run recorded qualifying card activity after its brief.
+    pub async fn run_left_a_mark(&self, run: &IssueRunRow, briefed_at: DateTime<Utc>) -> bool {
+        let own = IssueActor::Agent(run.agent_id.clone());
+        match self.store.events_since(&run.issue_id, briefed_at).await {
+            Ok(events) => events
+                .iter()
+                .any(|e| e.actor == own && crate::timeline::left_a_mark(&e.body)),
+            Err(e) => {
+                // A failed read cannot support a negative claim.
+                tracing::warn!(run = %run.id, error = %e, "could not read what a run left on its card");
+                true
+            }
+        }
+    }
+
     async fn was_told_something_during(
         &self,
         run: &IssueRunRow,
@@ -1040,12 +1148,7 @@ impl ProjectManager {
         // for an ordinary run the two are the same profile, and for a
         // lead's coordination run they differ — which is exactly right,
         // because the lead commenting "please continue" on a stalled card
-        // *is* somebody asking the assignee for more. Keyed on the profile,
-        // not on the run that wrote it, because a timeline entry records
-        // only its actor; narrowing it needs the authoring run on the event
-        // body, which is a stored-shape change. Until then this errs
-        // towards a missed nudge rather than an agent that answers its own
-        // progress note and wakes itself again on the answer.
+        // *is* somebody asking the assignee for more.
         let next_runner = match self.store.get_issue(&run.project_id, run.number).await {
             Ok(Some(issue)) => issue.assignee,
             Ok(None) => None,
@@ -1055,24 +1158,48 @@ impl ProjectManager {
             }
         };
         let own = IssueActor::Agent(next_runner.unwrap_or_else(|| run.agent_id.clone()));
-        match self.store.events_since(&run.issue_id, briefed_at).await {
-            Ok(events) => events
-                .iter()
-                .any(|e| matches!(e.body, IssueEventBody::Comment { .. }) && e.actor != own),
+        let since_the_brief = match self.store.events_since(&run.issue_id, briefed_at).await {
+            Ok(events) => events,
             Err(e) => {
                 tracing::warn!(run = %run.id, error = %e, "could not check for comments left during the run");
-                false
+                return false;
             }
+        };
+        if crate::comments::somebody_asked_for_more(&since_the_brief, &own) {
+            return true;
         }
+        // Read the wider block window only when this run lifted one.
+        crate::driver::a_block_was_lifted(&since_the_brief)
+            && self
+                .was_told_something_while_parked(run, briefed_at, &own)
+                .await
     }
 
-    /// Hand back whatever the block parked. The boot sweep and the hold
-    /// release both leave a blocked card's run where it lies, so the
-    /// unblock is the door that hands it out again: a queued row goes
-    /// straight to the dispatcher (the same narrowed two-dispatchers race a
-    /// restore accepts), and a held one is offered to the budget's own
-    /// release pass rather than started around it.
-    async fn redrive_after_unblock(&self, issue: &IssueRow) {
+    /// Check the parked window that the ordinary brief window cannot see.
+    async fn was_told_something_while_parked(
+        &self,
+        run: &IssueRunRow,
+        briefed_at: DateTime<Utc>,
+        own: &IssueActor,
+    ) -> bool {
+        let events = match self.store.list_events(&run.issue_id).await {
+            Ok(events) => events,
+            Err(e) => {
+                tracing::warn!(run = %run.id, error = %e, "could not read what was said while a card was blocked");
+                return false;
+            }
+        };
+        let Some(blocked_at) = crate::driver::block_standing_at(&events, briefed_at) else {
+            return false;
+        };
+        crate::comments::somebody_asked_for_more(
+            events.iter().filter(|e| e.created_at >= blocked_at),
+            own,
+        )
+    }
+
+    /// Redrive a parked row or deliver its comments; held rows pass through the budget gate.
+    async fn redrive_after_unblock(&self, issue: &IssueRow, started: Option<&IssueRunRow>) {
         let runs = match self.store.list_runs(&issue.id).await {
             Ok(runs) => runs,
             Err(e) => {
@@ -1080,21 +1207,15 @@ impl ProjectManager {
                 return;
             }
         };
-        let Some(parked) = runs.into_iter().find(|run| run.settled_at.is_none()) else {
+        let Some(parked) = crate::runs::unsettled(&runs).cloned() else {
+            self.deliver_what_was_said_while_parked(issue).await;
             return;
         };
-        // The same gates every other hand-back door asks, against the card
-        // as it is NOW: `live_card` calls a row on a finished card off (an
-        // unblock can ride the same update that cancels), and a concurrent
-        // re-block keeps the row parked. What this door does NOT close is
-        // two callers seeing the same Some→None edge and both dispatching —
-        // the store's update is unconditional, so unlike a restore there is
-        // no single-winner write; the claim still collapses execution and
-        // the loser settles visibly, per the documented dispatcher race.
-        let Some(card) = self.live_card(&parked).await else {
+        if started.is_some_and(|started| started.id == parked.id) {
             return;
-        };
-        if !crate::driver::board_may_start(&card) {
+        }
+        // Re-check current gates; the run claim resolves concurrent redispatches.
+        if self.card_for(&parked).await.is_none() {
             return;
         }
         match parked.status {
@@ -1111,8 +1232,35 @@ impl ProjectManager {
                     tracing::error!(issue = issue.number, error = %e, "could not release held runs after an unblock");
                 }
             }
+            // A running row remains executor-owned; settlement delivers parked comments.
             _ => {}
         }
+    }
+
+    /// Deliver block-window comments when no parked row remains to read them.
+    async fn deliver_what_was_said_while_parked(&self, issue: &IssueRow) {
+        let Some(assignee) = issue.assignee.clone() else {
+            return;
+        };
+        let events = match self.store.list_events(&issue.id).await {
+            Ok(events) => events,
+            Err(e) => {
+                tracing::warn!(issue = issue.number, error = %e, "could not read what was said while a card was blocked");
+                return;
+            }
+        };
+        let Some(blocked_at) = crate::driver::blocked_at(&events) else {
+            return;
+        };
+        let while_parked = events.iter().filter(|e| e.created_at >= blocked_at);
+        if !crate::comments::somebody_asked_for_more(while_parked, &IssueActor::Agent(assignee)) {
+            return;
+        }
+        tracing::info!(
+            issue = issue.number,
+            "unblocked; delivering what was said while the card was parked"
+        );
+        self.wake_if_listening(issue).await;
     }
 
     async fn record(&self, issue: &IssueRow, actor: IssueActor, body: IssueEventBody) {
@@ -1274,6 +1422,7 @@ impl ProjectManager {
         self.enqueue(issue, RunTrigger::Comment).await
     }
 
+    /// Resolve comment mentions without overriding a block.
     async fn mention_assignment(
         &self,
         project: &ProjectId,
@@ -1281,6 +1430,15 @@ impl ProjectManager {
         text: &str,
     ) -> Option<AgentProfileId> {
         let handle = crate::mentions::assigns_to(issue.assignee.is_some(), text)?;
+        if !crate::driver::board_may_start(issue) {
+            tracing::debug!(
+                issue = issue.number,
+                %handle,
+                "a mention named somebody on a card a block has stopped; recording it and \
+                 putting nobody on it"
+            );
+            return None;
+        }
         let team = self.agents.list_team(project).await.ok()?;
         team.into_iter()
             .find(|row| {
@@ -1307,7 +1465,7 @@ impl ProjectManager {
             .list_runs(&issue.id)
             .await?
             .into_iter()
-            .find(|run| !run.status.is_settled()))
+            .find(crate::runs::is_unsettled))
     }
 
     async fn delivery_for(&self, issue: &IssueRow) -> CommentDelivery {
@@ -1385,9 +1543,11 @@ impl ProjectManager {
         match live_session {
             Some(session) => Ok(Some(session)),
             None => {
+                let prompts = self.prompt_closer();
                 crate::settle::settle_run(
                     &self.store,
                     &self.events,
+                    prompts.as_deref(),
                     &run,
                     IssueActor::User,
                     RunStatus::Cancelled,
@@ -1399,9 +1559,7 @@ impl ProjectManager {
         }
     }
 
-    /// Run an issue again. Refused while one is already in flight — the
-    /// same dedupe guard a drag hits, surfaced as a conflict rather than a
-    /// silent second agent.
+    /// Run an issue again, unless another run or block already holds the card.
     pub async fn retry_run(&self, project: &ProjectId, number: i64) -> Result<IssueRunRow> {
         self.writable_project(project).await?;
         let issue = self.get_issue(project, number).await?;
@@ -1422,6 +1580,10 @@ impl ProjectManager {
                 },
             ));
         }
+        // Check liveness first because finished cards may retain a block reason.
+        if !crate::driver::board_may_start(&issue) {
+            return Err(ProjectError::invalid("issue", RETRY_ON_A_BLOCKED_CARD));
+        }
         let held = self
             .live_run(&issue)
             .await?
@@ -1433,7 +1595,9 @@ impl ProjectManager {
         match held {
             Some(held) => match self.live_run(&issue).await? {
                 Some(run) if run.id == held.id && run.status != RunStatus::Held => Ok(run),
-                _ => Err(ProjectError::Conflict(HELD_RUN_REFUSAL.to_owned())),
+                _ => Err(ProjectError::Conflict(held_run_refusal(
+                    self.headroom(&issue.project_id).await.figures(),
+                ))),
             },
             None => Err(ProjectError::Conflict(
                 "this issue already has a run".to_owned(),
@@ -1452,7 +1616,22 @@ impl ProjectManager {
     /// coming up rather than one that finishes before it: a `running` row
     /// whose actor died with the process is work that never finished.
     pub async fn resume_unsettled_runs(&self) -> Result<usize> {
-        self.store.requeue_unsettled().await?;
+        // Record interruptions even on archived boards; dispatch waits for restore.
+        for run in self.store.requeue_unsettled().await? {
+            crate::settle::record(
+                &self.store,
+                &self.events,
+                &run,
+                IssueActor::System,
+                IssueEventBody::RunInterrupted {
+                    run_id: run.id.clone(),
+                    attempt: run.attempt,
+                    resumes: run.resumes,
+                },
+            )
+            .await;
+            self.events.run_changed(&run.project_id, run.number);
+        }
         let mut count = 0;
         for project in self.store.list_projects(false).await? {
             match self.resume_project_runs(&project.id).await {
@@ -1472,19 +1651,8 @@ impl ProjectManager {
             if run.status != RunStatus::Queued {
                 continue;
             }
-            let Some(card) = self.live_card(&run).await else {
-                continue;
-            };
-            // A blocked card's row is left exactly where it is, like an
-            // archived board's: the block is somebody's decision to pause
-            // the card, and the boot sweep re-driving it would override
-            // that on nobody's authority. The unblock hands it back out.
-            if !crate::driver::board_may_start(&card) {
-                tracing::info!(
-                    issue = run.number,
-                    run = %run.id,
-                    "the card is blocked; leaving its queued run parked"
-                );
+            // The shared verdict parks blocked rows and settles exhausted recovery.
+            if self.card_for(&run).await.is_none() {
                 continue;
             }
             count += 1;
@@ -1501,6 +1669,7 @@ impl ProjectManager {
 
     pub async fn create_project(&self, new: NewProject) -> Result<ProjectRow> {
         let name = validate_name(&new.name)?;
+        validate_ceilings(new.daily_budget, new.daily_budget_tokens)?;
         let id = ProjectId::generate();
 
         let workdir = match new.workdir.as_deref().map(str::trim) {
@@ -1530,6 +1699,7 @@ impl ProjectManager {
             description: new.description.trim().to_owned(),
             workdir,
             daily_budget: new.daily_budget,
+            daily_budget_tokens: new.daily_budget_tokens,
             max_parallel_issue_runs: new
                 .max_parallel_issue_runs
                 .unwrap_or(DEFAULT_MAX_PARALLEL_ISSUE_RUNS),
@@ -1776,10 +1946,12 @@ impl ProjectManager {
         update: ProjectUpdate,
     ) -> Result<ProjectRow> {
         self.writable_project(id).await?;
+        validate_ceilings(update.daily_budget, update.daily_budget_tokens)?;
         let update = ProjectUpdate {
             name: validate_name(&update.name)?,
             description: update.description.trim().to_owned(),
-            daily_budget: validate_budget(update.daily_budget)?,
+            daily_budget: update.daily_budget,
+            daily_budget_tokens: update.daily_budget_tokens,
             max_parallel_issue_runs: update.max_parallel_issue_runs,
         };
         self.store.update_project(id, &update).await?;
@@ -1886,7 +2058,8 @@ impl ProjectManager {
             )
             .await;
         }
-        self.dispatch_if_triggered(Transition::created(&issue), &issue)
+        let _ = self
+            .dispatch_if_triggered(Transition::created(&issue), &issue)
             .await;
         Ok(Opened::Created(issue))
     }
@@ -1960,11 +2133,12 @@ impl ProjectManager {
         self.record_diff(&before, &after, actor.clone()).await;
         self.reclaim_if_finished(&before, &after, actor.clone())
             .await;
-        self.dispatch_if_triggered(Transition::between(&before, &after), &after)
+        let started = self
+            .dispatch_if_triggered(Transition::between(&before, &after), &after)
             .await;
         self.check_stage_barrier(&before, &after, actor).await;
         if before.blocked_reason.is_some() && after.blocked_reason.is_none() {
-            self.redrive_after_unblock(&after).await;
+            self.redrive_after_unblock(&after, started.as_ref()).await;
         }
         Ok(after)
     }
@@ -2047,7 +2221,8 @@ impl ProjectManager {
         self.record_diff(&before, &after, actor.clone()).await;
         self.reclaim_if_finished(&before, &after, actor.clone())
             .await;
-        self.dispatch_if_triggered(Transition::between(&before, &after), &after)
+        let _ = self
+            .dispatch_if_triggered(Transition::between(&before, &after), &after)
             .await;
         self.check_stage_barrier(&before, &after, actor).await;
         Ok(after)
@@ -2426,14 +2601,28 @@ fn validate_name(name: &str) -> Result<String> {
     Ok(trimmed.to_owned())
 }
 
-fn validate_budget(budget: Option<baybo_model::MicroUsd>) -> Result<Option<baybo_model::MicroUsd>> {
-    if budget.is_some_and(|b| b.into_micros() < 0) {
-        return Err(ProjectError::invalid(
-            "daily_budget",
-            "must not be negative — use 0 to pause the board, or leave it unset for no limit",
-        ));
+const FIELD_DAILY_BUDGET: &str = "daily_budget";
+const FIELD_DAILY_BUDGET_TOKENS: &str = "daily_budget_tokens";
+
+const CEILING_REFUSAL: &str =
+    "must not be negative — use 0 to pause the board, or leave it unset for no limit";
+
+fn validate_ceiling(field: &'static str, ceiling: Option<i64>) -> Result<()> {
+    if ceiling.is_some_and(|c| c < 0) {
+        return Err(ProjectError::invalid(field, CEILING_REFUSAL));
     }
-    Ok(budget)
+    Ok(())
+}
+
+fn validate_ceilings(
+    daily_budget: Option<baybo_model::MicroUsd>,
+    daily_budget_tokens: Option<i64>,
+) -> Result<()> {
+    validate_ceiling(
+        FIELD_DAILY_BUDGET,
+        daily_budget.map(baybo_model::MicroUsd::into_micros),
+    )?;
+    validate_ceiling(FIELD_DAILY_BUDGET_TOKENS, daily_budget_tokens)
 }
 
 /// An agent's name **is** its handle.

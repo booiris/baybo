@@ -263,7 +263,16 @@ impl IssueRunWaiter {
                     if self.shutdown.is_cancelled() {
                         return None;
                     }
-                    return Some(failed_outcome("the run stopped before producing anything"));
+                    // The board owns whether work reached the card; the branch may still differ.
+                    let left_a_mark = self
+                        .board
+                        .run_left_a_mark(&self.enqueued, self.briefed_at)
+                        .await;
+                    return Some(failed_outcome(if left_a_mark {
+                        RUN_ENDED_MID_FLIGHT
+                    } else {
+                        RUN_LEFT_NOTHING_ON_THE_CARD
+                    }));
                 }
             }
         }
@@ -286,22 +295,15 @@ impl IssueRunWaiter {
         ev.session_id == self.session_id && ev.kind == TurnInputKind::IssueRun
     }
 
+    /// Preserve failure and system-cancellation reasons on the card.
     async fn outcome_of_edge(&self, turn: &TurnId, kind: TurnStatusKind) -> RunOutcome {
-        let outcome = outcome_of(kind);
-        if kind != TurnStatusKind::Cancelled {
-            return outcome;
-        }
-        let stopped_by_a_human = match self.lifecycle.get(turn).await {
-            Ok(Some(turn)) => stopped_by_a_human(&turn.status),
-            Ok(None) => false,
+        match self.lifecycle.get(turn).await {
+            Ok(Some(turn)) => outcome_of_status(&turn.status),
+            Ok(None) => outcome_of(kind),
             Err(e) => {
-                warn!(run_id = %self.enqueued.id, error = %e, "could not read why the run's turn was cancelled");
-                false
+                warn!(run_id = %self.enqueued.id, error = %e, "could not read how the run's turn ended");
+                outcome_of(kind)
             }
-        };
-        RunOutcome {
-            stopped_by_a_human,
-            ..outcome
         }
     }
 
@@ -318,10 +320,54 @@ impl IssueRunWaiter {
             .filter(|t| t.input_kind() == TurnInputKind::IssueRun && t.is_terminal())
             .filter(|t| t.created_at >= self.enqueued.created_at)
             .max_by_key(|t| t.created_at)
-            .map(|t| RunOutcome {
-                stopped_by_a_human: stopped_by_a_human(&t.status),
-                ..outcome_of(t.status.kind())
-            })
+            .map(|t| outcome_of_status(&t.status))
+    }
+}
+
+/// Used when no run activity reached the card; the branch may still contain work.
+const RUN_LEFT_NOTHING_ON_THE_CARD: &str = r#"the run stopped before it finished, and nothing it did reached this card — its branch may still hold work, so check there before concluding it did none"#;
+
+/// Used when the card already records run activity.
+const RUN_ENDED_MID_FLIGHT: &str = r#"the run stopped before it finished, after it had already worked the card — what it did is above"#;
+
+/// Maximum provider error length stored on a card.
+const MAX_RUN_ERROR_CHARS: usize = 400;
+
+fn clip(reason: &str) -> String {
+    let mut clipped: String = reason.chars().take(MAX_RUN_ERROR_CHARS).collect();
+    if reason.chars().nth(MAX_RUN_ERROR_CHARS).is_some() {
+        clipped.push('…');
+    }
+    clipped
+}
+
+/// Map the stored terminal status to the card's run outcome.
+fn outcome_of_status(status: &TurnStatus) -> RunOutcome {
+    match status {
+        TurnStatus::Failed { reason } => failed_outcome(clip(reason)),
+        TurnStatus::Cancelled { reason, .. } => RunOutcome {
+            status: RunStatus::Cancelled,
+            error: cancel_note(*reason).map(str::to_owned),
+            stopped_by_a_human: matches!(
+                reason,
+                CancelReason::OperatorCancel | CancelReason::UserStopped
+            ),
+        },
+        other => outcome_of(other.kind()),
+    }
+}
+
+/// Explain system cancellations; user-requested stops need no note.
+fn cancel_note(reason: CancelReason) -> Option<&'static str> {
+    match reason {
+        CancelReason::OperatorCancel | CancelReason::UserStopped => None,
+        CancelReason::SystemCrash => Some("the process running this turn went down under it"),
+        CancelReason::SubagentTimeout => Some("a subagent it was waiting on hit its idle timeout"),
+        CancelReason::ParentCancelled => Some("the session it ran under was cancelled"),
+        CancelReason::ParentDeleted => Some("the session it ran under was deleted"),
+        CancelReason::UserPreempt => {
+            Some("something else was sent into its session while it was working")
+        }
     }
 }
 
@@ -351,20 +397,6 @@ fn failed_outcome(error: impl Into<String>) -> RunOutcome {
         status: RunStatus::Failed,
         error: Some(error.into()),
         stopped_by_a_human: false,
-    }
-}
-
-fn stopped_by_a_human(status: &TurnStatus) -> bool {
-    let TurnStatus::Cancelled { reason, .. } = status else {
-        return false;
-    };
-    match reason {
-        CancelReason::OperatorCancel | CancelReason::UserStopped => true,
-        CancelReason::UserPreempt
-        | CancelReason::SystemCrash
-        | CancelReason::SubagentTimeout
-        | CancelReason::ParentCancelled
-        | CancelReason::ParentDeleted => false,
     }
 }
 
@@ -479,6 +511,7 @@ mod tests {
                 description: String::new(),
                 workdir: None,
                 daily_budget: None,
+                daily_budget_tokens: None,
                 max_parallel_issue_runs: None,
             })
             .await
@@ -674,6 +707,7 @@ mod tests {
                     name: board.project.name.clone(),
                     description: board.project.description.clone(),
                     daily_budget: Some(MicroUsd::ZERO),
+                    daily_budget_tokens: None,
                     max_parallel_issue_runs: DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
                 },
             )
@@ -1249,6 +1283,83 @@ mod tests {
                 .iter()
                 .all(|row| row.session_id.is_none()),
             "no session was minted for it"
+        );
+    }
+
+    #[test]
+    fn every_cancel_reason_a_person_did_not_ask_for_says_why() {
+        for reason in [
+            CancelReason::UserPreempt,
+            CancelReason::SystemCrash,
+            CancelReason::SubagentTimeout,
+            CancelReason::ParentCancelled,
+            CancelReason::ParentDeleted,
+            CancelReason::OperatorCancel,
+            CancelReason::UserStopped,
+        ] {
+            let outcome = outcome_of_status(&TurnStatus::Cancelled {
+                reason,
+                partial_artifacts: Vec::new(),
+            });
+            assert_eq!(outcome.status, RunStatus::Cancelled);
+            assert_eq!(
+                outcome.error.is_some(),
+                !outcome.stopped_by_a_human,
+                "a person who pressed stop knows why; everything else used to reach the card as a \
+                 bare `cancelled`, which is the blank a lead fills in with a guess: {reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_providers_failure_text_reaches_the_card_clipped() {
+        let outcome = outcome_of_status(&TurnStatus::Failed {
+            reason: "x".repeat(5_000),
+        });
+        assert_eq!(outcome.status, RunStatus::Failed);
+        let said = outcome
+            .error
+            .expect("the card is told what the provider said");
+        assert_eq!(said.chars().count(), MAX_RUN_ERROR_CHARS + 1);
+        assert!(said.ends_with('\u{2026}'), "and it is visibly cut");
+
+        let short = outcome_of_status(&TurnStatus::Failed {
+            reason: "the model refused".to_owned(),
+        });
+        assert_eq!(short.error.as_deref(), Some("the model refused"));
+    }
+
+    #[tokio::test]
+    async fn a_run_that_worked_the_card_is_not_told_it_produced_nothing() {
+        let (board, run) = board_with_in_progress_card().await;
+        let before = chrono::Utc::now();
+        assert!(
+            !board.projects.run_left_a_mark(&run, before).await,
+            "nothing has happened on the card yet"
+        );
+
+        board
+            .projects
+            .comment(
+                &board.project.id,
+                run.number,
+                IssueActor::Agent(run.agent_id.clone()),
+                "pushed 51640fb and moved it to review",
+                &[],
+            )
+            .await
+            .expect("the run says what it did");
+
+        assert!(
+            board.projects.run_left_a_mark(&run, before).await,
+            "the executor may say a run failed; it may not say the card is untouched"
+        );
+        assert!(
+            !board
+                .projects
+                .run_left_a_mark(&run, chrono::Utc::now())
+                .await,
+            "and the window is the brief, not the whole card"
         );
     }
 }

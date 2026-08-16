@@ -11,7 +11,7 @@ import {
   type ProjectAttention,
 } from './useAttention';
 import { activityFor, burnIsNearLimit, useBoardActivity } from './useBoardActivity';
-import { formatUsd } from './budgetModel';
+import { boardMeter, heldOnBudget } from './budgetModel';
 
 export function ProjectSwitcher({
   current,
@@ -104,10 +104,14 @@ export function ProjectSwitcher({
                   const isCurrent = project.id === current?.id;
                   const stuck = attentionFor(waiting, project.id);
                   const live = activityFor(activity, project.id);
-                  const near = burnIsNearLimit(
-                    live?.burn_micros ?? 0,
-                    project.daily_budget_micros,
+                  const meter = boardMeter(
+                    { micros: live?.burn_micros ?? 0, tokens: live?.burn_tokens ?? 0 },
+                    {
+                      micros: project.daily_budget_micros,
+                      tokens: project.daily_budget_tokens,
+                    },
                   );
+                  const near = burnIsNearLimit(meter.used, meter.ceiling);
                   return (
                     <li key={project.id}>
                       <Link
@@ -149,10 +153,7 @@ export function ProjectSwitcher({
                                 : "Spent today / this board's daily ceiling"
                             }
                           >
-                            {formatUsd(live?.burn_micros ?? 0)}
-                            {project.daily_budget_micros == null
-                              ? ''
-                              : ` / ${formatUsd(project.daily_budget_micros)}`}
+                            {meter.text}
                           </span>
                         </span>
                       </Link>
@@ -239,7 +240,7 @@ export function ProjectSwitcher({
 function stuckSummary(stuck: ProjectAttention): string {
   const parts: string[] = [];
   if (stuck.approvals > 0) parts.push(`${stuck.approvals} waiting on approval`);
-  if (stuck.held > 0) parts.push(`${stuck.held} held on budget`);
+  if (stuck.held > 0) parts.push(heldOnBudget(stuck.held));
   if (stuck.failed > 0) parts.push(`${stuck.failed} failed`);
   if (stuck.unread > 0) parts.push(`${stuck.unread} new since you looked`);
   return parts.join(', ');

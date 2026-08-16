@@ -51,6 +51,8 @@ pub(crate) struct Comment {
     attachments: Vec<IssueAttachment>,
 }
 
+const BLOCKED_ON: &str = "\n\nThis card is blocked. The reason on it reads:\n";
+
 const SAID_SINCE_LAST_RUN: &str = "\n\nSaid since your last run:\n";
 
 const SAID_ON_THE_CARD: &str = "\n\nSaid on the card so far:\n";
@@ -95,6 +97,8 @@ const REVIEW_PREAMBLE: &str = r#"You are this board's lead, woken because this c
 
 const STALLED_PREAMBLE: &str = r#"You are this board's lead, woken because this card sits in In Progress with no run working it and nothing queued. Decide what happens to it: wake its assignee with a comment asking for a status or the next step, restaff it, move it back to Todo, or block it with a reason. Do not do the card's own work in this run."#;
 
+const BLOCKED_PREAMBLE: &str = r#"You are this board's lead, woken because this card is blocked and its reason is a question, not a status. Read the reason and decide: answer it and unblock the card, hand it back with a comment saying what to do instead, escalate it to the operator in a comment, or cancel the card. Do not do the card's own work in this run."#;
+
 /// The framing a coordination run opens with. An ordinary run is briefed by
 /// the card alone; the lead's wakes carry *why* it was woken, because the
 /// card itself does not say — the brief has no status line, and "staff
@@ -105,6 +109,7 @@ fn coordination_preamble(trigger: RunTrigger) -> Option<&'static str> {
         RunTrigger::Triage => Some(TRIAGE_PREAMBLE),
         RunTrigger::Review => Some(REVIEW_PREAMBLE),
         RunTrigger::Stalled => Some(STALLED_PREAMBLE),
+        RunTrigger::Blocked => Some(BLOCKED_PREAMBLE),
         RunTrigger::Started
         | RunTrigger::Assigned
         | RunTrigger::Retry
@@ -184,6 +189,11 @@ pub(crate) fn issue_brief(issue: &IssueRow, said: &Said, trigger: RunTrigger) ->
     } else {
         brief.push_str(&format!("{}\n\n{}", issue.title, issue.description));
     };
+    if let Some(reason) = issue.blocked_reason.as_deref() {
+        brief.push_str(BLOCKED_ON);
+        // Indentation distinguishes quoted prose from the brief's voice.
+        brief.push_str(&format!("  {}\n", reason.replace('\n', "\n  ")));
+    }
     if !issue.attachments.is_empty() {
         brief.push_str(FILES_ON_THE_CARD);
         for attachment in &issue.attachments {
@@ -458,6 +468,7 @@ mod tests {
             trigger: RunTrigger::Assigned,
             status: RunStatus::Queued,
             attempt,
+            resumes: 0,
             error: None,
             created_at: issue.created_at + Duration::minutes(attempt),
             started_at: None,
@@ -791,6 +802,34 @@ mod tests {
         assert!(
             ordinary.starts_with(&issue.title),
             "an ordinary run is briefed by the card alone: {ordinary}"
+        );
+    }
+
+    #[test]
+    fn a_blocked_card_puts_its_reason_in_the_brief() {
+        let mut issue = card();
+        issue.blocked_reason =
+            Some("the card asks for behaviour the Go spec forbids — which wins?".to_owned());
+
+        let woken = issue_brief(&issue, &with_files(Vec::new()), RunTrigger::Blocked);
+        assert!(
+            woken.starts_with(BLOCKED_PREAMBLE),
+            "the wake still says why it happened: {woken}"
+        );
+        assert!(
+            woken.contains("the card asks for behaviour the Go spec forbids — which wins?"),
+            "and the one field the whole question is about is in it: {woken}"
+        );
+
+        let ordinary = issue_brief(&issue, &with_files(Vec::new()), RunTrigger::Started);
+        assert!(
+            ordinary.contains("This card is blocked."),
+            "a block is a standing fact about the card, not a fact about one trigger: {ordinary}"
+        );
+        assert!(
+            !issue_brief(&card(), &with_files(Vec::new()), RunTrigger::Started)
+                .contains("This card is blocked."),
+            "and a card nothing has stopped says nothing about a block"
         );
     }
 

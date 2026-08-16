@@ -86,6 +86,7 @@ impl Fixture {
                 description: String::new(),
                 workdir: None,
                 daily_budget: None,
+                daily_budget_tokens: None,
                 max_parallel_issue_runs: Some(0),
             })
             .await
@@ -647,6 +648,7 @@ mod approvals {
                 description: String::new(),
                 workdir: None,
                 daily_budget: None,
+                daily_budget_tokens: None,
                 max_parallel_issue_runs: None,
             })
             .await
@@ -761,6 +763,7 @@ mod approvals {
                 description: String::new(),
                 workdir: None,
                 daily_budget: None,
+                daily_budget_tokens: None,
                 max_parallel_issue_runs: None,
             })
             .await
@@ -939,6 +942,7 @@ async fn an_exhausted_board_reads_as_idle_and_says_why() {
             description: String::new(),
             workdir: None,
             daily_budget: Some(baybo_model::MicroUsd::ZERO),
+            daily_budget_tokens: None,
             max_parallel_issue_runs: None,
         })
         .await
@@ -971,6 +975,43 @@ async fn an_exhausted_board_reads_as_idle_and_says_why() {
     );
     assert_eq!(listed["board"]["budget"]["exhausted"], true);
     assert_eq!(listed["board"]["budget"]["limit"], "$0.00");
+}
+
+#[tokio::test]
+async fn a_board_held_on_tokens_reports_tokens_not_dollars() {
+    let f = fixture().await;
+    let project = f
+        .manager
+        .create_project(NewProject {
+            name: "Token plan".to_owned(),
+            description: String::new(),
+            workdir: None,
+            daily_budget: None,
+            daily_budget_tokens: Some(0),
+            max_parallel_issue_runs: None,
+        })
+        .await
+        .expect("project");
+    let lead = f.manager.team(&project.id).await.expect("team")[0]
+        .id
+        .clone();
+    let ctx = f.ctx(&project.id, &lead);
+    f.call(
+        "IssueCreate",
+        &ctx,
+        json!({ "title": "held work", "assignee": "@lead", "status": "in_progress" }),
+    )
+    .await;
+
+    let listed = f.call("IssueList", &ctx, json!({})).await;
+    let budget = &listed["board"]["budget"];
+    assert_eq!(budget["exhausted"], true);
+    assert_eq!(budget["limit"], "0 tokens");
+    assert_eq!(budget["spent"], "0 tokens");
+    assert!(
+        !budget.to_string().contains('$'),
+        "a board with no money ceiling must not be described in money: {budget}"
+    );
 }
 
 #[tokio::test]

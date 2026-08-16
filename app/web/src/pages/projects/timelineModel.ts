@@ -8,7 +8,7 @@ import {
   type IssueStatus,
   type RunStatus,
 } from './boardModel';
-import { formatUsd } from './budgetModel';
+import { HELD_RUN_NOTE, formatTokens, formatUsd } from './budgetModel';
 import { handleOf } from './teamModel';
 
 export type IssueEvent = components['schemas']['IssueEventDto'];
@@ -54,12 +54,15 @@ export function eventTone(body: IssueEventBody): Tone {
     case 'run_settled':
       return body.status === 'done' ? 'ok' : body.status === 'failed' ? 'err' : 'muted';
     case 'blocked':
+    case 'run_interrupted':
     case 'approval_requested':
     case 'budget_exhausted':
+    case 'token_budget_exhausted':
       return 'warn';
     case 'unblocked':
     case 'stage_completed':
     case 'budget_restored':
+    case 'token_budget_restored':
       return 'ok';
     case 'approval_resolved':
       // How it resolved outranks what was decided: a window that expired or
@@ -87,10 +90,6 @@ export function actorLabel(event: IssueEvent): string {
 
 function unnamedActor(_kind: never): string {
   return 'somebody';
-}
-
-function usd(micros: number): string {
-  return `$${(micros / 1_000_000).toFixed(2)}`;
 }
 
 const DECISION_LABEL: Record<'approve' | 'approve_always' | 'deny', string> = {
@@ -161,6 +160,8 @@ export function describeEvent(body: IssueEventBody): string | null {
     }
     case 'run_started':
       return `started run #${body.attempt} (${body.trigger})`;
+    case 'run_interrupted':
+      return `run #${body.attempt} was interrupted before it finished — the board picked it up again`;
     case 'run_settled': {
       const detail = body.error != null && body.error.length > 0 ? ` — ${body.error}` : '';
       return `run #${body.attempt} ${body.status}${detail}`;
@@ -193,13 +194,17 @@ export function describeEvent(body: IssueEventBody): string | null {
     case 'stage_completed':
       return `stage ${body.stage} finished — every step in it is done or called off`;
     case 'budget_exhausted':
-      return `held the run — ${usd(body.spent_micros)} of the ${usd(
-        body.limit_micros,
-      )} daily budget is spent`;
+      return `held the run — ${formatUsd(body.spent_micros)} of the ${formatUsd(body.limit_micros)} daily budget is spent`;
     case 'budget_restored':
-      return `started the held run — ${usd(body.spent_micros)} of ${usd(
-        body.limit_micros,
-      )} spent today`;
+      return `started the held run — ${formatUsd(body.spent_micros)} of ${formatUsd(body.limit_micros)} spent today`;
+    case 'token_budget_exhausted':
+      return `held the run — ${formatTokens(body.spent_tokens)} of the ${formatTokens(
+        body.limit_tokens,
+      )} daily token budget is spent`;
+    case 'token_budget_restored':
+      return `started the held run — ${formatTokens(body.spent_tokens)} of ${formatTokens(
+        body.limit_tokens,
+      )} tokens spent today`;
     default:
       return unnamedEvent(body);
   }
@@ -216,7 +221,12 @@ function unnamedEvent(_body: never): string {
 /// here — where the hint is written — is what stops a raw ULID reaching the
 /// composer, which is what happened while this took only the issue.
 export function commentHint(
-  issue: { status: IssueStatus; assignee?: string | null; cancelled_at_ms?: number | null },
+  issue: {
+    status: IssueStatus;
+    assignee?: string | null;
+    cancelled_at_ms?: number | null;
+    blocked_reason?: string | null;
+  },
   runs: { status: RunStatus }[],
   team: Agent[],
 ): string {
@@ -230,9 +240,13 @@ export function commentHint(
   if (issue.status === 'backlog' || issue.status === 'done') {
     return `Records only — @${assignee} is not working on this right now.`;
   }
+  // A block takes precedence over any live run, matching the server.
+  if (issue.blocked_reason != null) {
+    return `Records only — a block has stopped this issue; @${assignee} picks this up when it is lifted.`;
+  }
   const live = unsettledRun(runs);
   if (live?.status === 'held') {
-    return `@${assignee} will read this when the held run starts — the project is over its daily budget.`;
+    return `@${assignee} will read this when the held run starts — ${HELD_RUN_NOTE}.`;
   }
   if (live?.status === 'queued') {
     return `@${assignee} will read this when the queued run starts.`;
@@ -381,10 +395,17 @@ export function feedLine(entry: FeedEntry): Span[] {
     case 'budget_exhausted':
       return join(
         'daily budget exhausted — ',
-        `${usd(body.spent_micros)} of ${usd(body.limit_micros)} spent`,
+        `${formatUsd(body.spent_micros)} of ${formatUsd(body.limit_micros)} spent`,
       );
     case 'budget_restored':
       return join('budget restored — ', at, ' released');
+    case 'token_budget_exhausted':
+      return join(
+        'daily token budget exhausted — ',
+        `${formatTokens(body.spent_tokens)} of ${formatTokens(body.limit_tokens)} spent`,
+      );
+    case 'token_budget_restored':
+      return join('token budget restored — ', at, ' released');
     default: {
       const said = describeEvent(body);
       return join(who(entry), ' · ', said ?? 'acted', at.length > 0 ? ' · ' : '', at);

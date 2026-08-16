@@ -146,6 +146,9 @@ pub struct ProjectDto {
     /// Daily spend ceiling in micro-USD. Absent means no limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daily_budget_micros: Option<i64>,
+    /// Daily token ceiling in the same UTC window; absent means unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_budget_tokens: Option<i64>,
     /// How many runs this board starts on its own, by taking cards off the
     /// top of Todo as room appears. `0` means it starts only what somebody
     /// drags into In Progress.
@@ -165,6 +168,7 @@ impl From<ProjectRow> for ProjectDto {
             description: row.description,
             workdir: row.workdir,
             daily_budget_micros: row.daily_budget.map(baybo_model::MicroUsd::into_micros),
+            daily_budget_tokens: row.daily_budget_tokens,
             max_parallel_issue_runs: i64::try_from(row.max_parallel_issue_runs).unwrap_or(i64::MAX),
             archived_at_ms: row.archived_at.map(|t| t.timestamp_millis()),
             created_at_ms: row.created_at.timestamp_millis(),
@@ -490,6 +494,7 @@ pub enum RunTriggerDto {
     StageBarrier,
     Review,
     Stalled,
+    Blocked,
 }
 
 impl From<RunTrigger> for RunTriggerDto {
@@ -504,6 +509,7 @@ impl From<RunTrigger> for RunTriggerDto {
             RunTrigger::StageBarrier => Self::StageBarrier,
             RunTrigger::Review => Self::Review,
             RunTrigger::Stalled => Self::Stalled,
+            RunTrigger::Blocked => Self::Blocked,
         }
     }
 }
@@ -614,6 +620,10 @@ pub enum IssueEventBodyDto {
         attempt: i64,
         trigger: RunTriggerDto,
     },
+    RunInterrupted {
+        attempt: i64,
+        resumes: i64,
+    },
     RunSettled {
         attempt: i64,
         status: RunStatusDto,
@@ -656,6 +666,14 @@ pub enum IssueEventBodyDto {
         spent_micros: i64,
         limit_micros: i64,
     },
+    TokenBudgetExhausted {
+        spent_tokens: i64,
+        limit_tokens: i64,
+    },
+    TokenBudgetRestored {
+        spent_tokens: i64,
+        limit_tokens: i64,
+    },
 }
 
 impl IssueEventBodyDto {
@@ -696,6 +714,20 @@ impl IssueEventBodyDto {
                 spent_micros,
                 limit_micros,
             },
+            IssueEventBody::TokenBudgetExhausted {
+                spent_tokens,
+                limit_tokens,
+            } => Self::TokenBudgetExhausted {
+                spent_tokens,
+                limit_tokens,
+            },
+            IssueEventBody::TokenBudgetRestored {
+                spent_tokens,
+                limit_tokens,
+            } => Self::TokenBudgetRestored {
+                spent_tokens,
+                limit_tokens,
+            },
             IssueEventBody::Comment { text, attachments } => Self::Comment {
                 text,
                 attachments: attachments
@@ -718,6 +750,9 @@ impl IssueEventBodyDto {
                 attempt,
                 trigger: trigger.into(),
             },
+            IssueEventBody::RunInterrupted {
+                attempt, resumes, ..
+            } => Self::RunInterrupted { attempt, resumes },
             IssueEventBody::RunSettled {
                 attempt,
                 status,
@@ -920,6 +955,9 @@ pub struct CreateProjectRequest {
     /// disagrees with the ledger it is measured against.
     #[serde(default)]
     pub daily_budget_micros: Option<i64>,
+    /// Daily token ceiling; omit for unlimited, or use `0` to pause agents.
+    #[serde(default)]
+    pub daily_budget_tokens: Option<i64>,
     /// How many runs the board may start on its own, by promoting cards off
     /// the top of Todo. Omit for the default; `0` leaves every start to
     /// whoever drags the card.
@@ -938,6 +976,9 @@ pub struct UpdateProjectRequest {
     /// disagrees with the ledger it is measured against.
     #[serde(default)]
     pub daily_budget_micros: Option<i64>,
+    /// Daily token ceiling; omit for unlimited, or use `0` to pause agents.
+    #[serde(default)]
+    pub daily_budget_tokens: Option<i64>,
     /// How many runs the board may start on its own, by promoting cards off
     /// the top of Todo. Full-replace like every other field here: omitting
     /// it restores the default rather than keeping what the board had.
@@ -1071,6 +1112,7 @@ async fn create_project(
             daily_budget: req
                 .daily_budget_micros
                 .map(baybo_model::MicroUsd::from_micros),
+            daily_budget_tokens: req.daily_budget_tokens,
             max_parallel_issue_runs: req
                 .max_parallel_issue_runs
                 .map(parallel_issue_runs)
@@ -1135,6 +1177,7 @@ async fn update_project(
                 daily_budget: req
                     .daily_budget_micros
                     .map(baybo_model::MicroUsd::from_micros),
+                daily_budget_tokens: req.daily_budget_tokens,
                 max_parallel_issue_runs: req
                     .max_parallel_issue_runs
                     .map(parallel_issue_runs)
@@ -1582,6 +1625,8 @@ pub struct ProjectActivityDto {
     /// the budget gate measures it, so the pair in the dropdown can never
     /// accuse the board of crossing a ceiling it did not.
     pub burn_micros: i64,
+    /// Tokens spent since the start of your day.
+    pub burn_tokens: i64,
 }
 
 #[utoipa::path(
@@ -1615,7 +1660,8 @@ async fn projects_activity(
         .map(|(project_id, activity)| ProjectActivityDto {
             project_id: project_id.as_str().to_owned(),
             working: activity.working,
-            burn_micros: activity.burn.into_micros(),
+            burn_micros: activity.burn.cost.into_micros(),
+            burn_tokens: activity.burn.tokens(),
         })
         .collect();
     Ok(Json(ListResponse::new(items)))
@@ -1931,7 +1977,7 @@ async fn cancel_run(
     ),
     responses(
         (status = 201, description = "The new run", body = IssueRunDto),
-        (status = 400, description = "The issue has nobody on it, or the board has finished with it: a cancelled card has to be reopened and a done one moved back before it runs again", body = ErrorBody),
+        (status = 400, description = "The issue has nobody on it, a block has stopped it, or the board has finished with it: a blocked card has to be unblocked, a cancelled one reopened and a done one moved back before it runs again", body = ErrorBody),
         (status = 401, description = "Unauthorized", body = ErrorBody),
         (status = 404, description = "Unknown project or issue", body = ErrorBody),
         (status = 409, description = "A run is already in flight, or the project is archived", body = ErrorBody),

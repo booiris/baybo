@@ -76,26 +76,18 @@ fn event_from_raw(raw: RawEvent) -> Result<IssueEventRow> {
 }
 
 const PROJECT_COLUMNS: &str = "id, name, description, workdir, daily_budget_micros, \
-     max_parallel_issue_runs, archived_at, created_at, updated_at";
+     daily_budget_tokens, max_parallel_issue_runs, archived_at, created_at, updated_at";
 
 const ISSUE_COLUMNS: &str = "id, project_id, number, title, description, status, priority, \
      assignee, position, blocked_reason, branch, parent_issue_id, stage, source_key, \
      cancelled_at, created_at, updated_at, attachments";
 
-/// What "unread" means, written once. An agent's comment, or an agent
-/// moving the card into Review, since the operator last opened *that card*.
-///
-/// The actor filter covers both arms deliberately: the operator's own words
-/// are not news to them, and without it a board they tidied up by dragging
-/// their own finished cards into Review would announce itself back at them.
-///
-/// Written against `issue_events e` joined to its `issues i`; binds
-/// `:review`. The card badge and the board's `attention` count are two
-/// readings of this one line — if they ever disagree, a rail dot outlives a
-/// board on which every card reads zero.
+/// Shared unread predicate for agent comments, blocks, and moves to Review.
+/// Used by card badges and board attention; binds `:review`.
 const UNREAD_EVENT_PREDICATE: &str = "e.created_at > COALESCE(i.read_at, 0) \
      AND e.actor LIKE 'agent:%' \
      AND (e.kind = 'comment' \
+          OR e.kind = 'blocked' \
           OR (e.kind = 'moved' AND json_extract(e.body, '$.to') = :review))";
 
 /// One column off the card's newest **work** run, by the one ordering every
@@ -119,7 +111,7 @@ macro_rules! newest_run {
             "(SELECT r.",
             $column,
             " FROM issue_runs r WHERE r.issue_id = i.id \
-             AND r.trigger NOT IN ('triage', 'review', 'stalled') \
+             AND r.trigger NOT IN ('triage', 'review', 'stalled', 'blocked') \
              ORDER BY r.created_at DESC, r.id DESC LIMIT 1)"
         )
     };
@@ -188,8 +180,21 @@ const RUN_COST_WINDOW: &str = "c.session_id = r.session_id \
      AND c.timestamp >= r.started_at \
      AND (r.settled_at IS NULL OR c.timestamp < r.settled_at)";
 
+/// Shared money/token aggregates; cached-token columns are input subsets.
+const SPEND_SUMS: &str = "COALESCE(SUM(c.input_tokens), 0), COALESCE(SUM(c.output_tokens), 0), \
+     COALESCE(SUM(c.cost_usd), 0)";
+
+fn spend_from_row(row: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<Spend> {
+    Ok(Spend {
+        input_tokens: row.get(first)?,
+        output_tokens: row.get(first + 1)?,
+        cost: baybo_model::MicroUsd::from_micros(row.get(first + 2)?),
+    })
+}
+
+/// Positional run columns; append fields to preserve [`read_raw_run`] indexes.
 const RUN_COLUMNS: &str = "id, issue_id, project_id, number, agent_id, session_id, trigger, \
-     status, attempt, error, created_at, started_at, settled_at";
+     status, attempt, error, created_at, started_at, settled_at, resumes";
 
 type RawRun = (
     String,
@@ -205,6 +210,7 @@ type RawRun = (
     i64,
     Option<i64>,
     Option<i64>,
+    i64,
 );
 
 fn read_raw_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRun> {
@@ -222,6 +228,7 @@ fn read_raw_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRun> {
         row.get(10)?,
         row.get(11)?,
         row.get(12)?,
+        row.get(13)?,
     ))
 }
 
@@ -240,6 +247,7 @@ fn run_from_raw(raw: RawRun) -> Result<IssueRunRow> {
         created_at,
         started_at,
         settled_at,
+        resumes,
     ) = raw;
     Ok(IssueRunRow {
         id: IssueRunId::from(id),
@@ -256,6 +264,7 @@ fn run_from_raw(raw: RawRun) -> Result<IssueRunRow> {
         status: RunStatus::parse(&status)
             .ok_or_else(|| StorageError::Storage(format!("issue_runs.status unknown: {status}")))?,
         attempt,
+        resumes,
         error,
         created_at: ts("issue_runs.created_at", created_at)?,
         started_at: ts_opt("issue_runs.started_at", started_at)?,
@@ -268,6 +277,7 @@ type RawProject = (
     String,
     String,
     String,
+    Option<i64>,
     Option<i64>,
     Option<i64>,
     Option<i64>,
@@ -307,6 +317,7 @@ fn read_raw_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawProject> {
         row.get(6)?,
         row.get(7)?,
         row.get(8)?,
+        row.get(9)?,
     ))
 }
 
@@ -357,6 +368,7 @@ fn project_from_raw(raw: RawProject) -> Result<ProjectRow> {
         description,
         workdir,
         daily_budget_micros,
+        daily_budget_tokens,
         max_parallel_issue_runs,
         archived_at,
         created_at,
@@ -370,6 +382,7 @@ fn project_from_raw(raw: RawProject) -> Result<ProjectRow> {
         description,
         workdir,
         daily_budget: daily_budget_micros.map(baybo_model::MicroUsd::from_micros),
+        daily_budget_tokens,
         // NULL is a row written before the column existed, not a board that
         // chose "no ceiling": the driver has to have a number, and the one
         // it gets is the same one a board opened today starts with.
@@ -485,6 +498,7 @@ impl ProjectStore for SqliteProjectStore {
         let description = row.description.clone();
         let workdir = row.workdir.clone();
         let daily_budget = row.daily_budget.map(baybo_model::MicroUsd::into_micros);
+        let daily_budget_tokens = row.daily_budget_tokens;
         let max_parallel_issue_runs =
             i64::try_from(row.max_parallel_issue_runs).unwrap_or(i64::MAX);
         let created_at = super::time::to_us(row.created_at);
@@ -494,14 +508,16 @@ impl ProjectStore for SqliteProjectStore {
                 conn.execute(
                     "INSERT INTO projects \
                      (id, name, description, workdir, daily_budget_micros, \
-                      max_parallel_issue_runs, archived_at, created_at, updated_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8)",
+                      daily_budget_tokens, max_parallel_issue_runs, archived_at, \
+                      created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9)",
                     rusqlite::params![
                         id,
                         name,
                         description,
                         workdir,
                         daily_budget,
+                        daily_budget_tokens,
                         max_parallel_issue_runs,
                         created_at,
                         updated_at
@@ -517,6 +533,7 @@ impl ProjectStore for SqliteProjectStore {
         let name = update.name.clone();
         let description = update.description.clone();
         let daily_budget = update.daily_budget.map(baybo_model::MicroUsd::into_micros);
+        let daily_budget_tokens = update.daily_budget_tokens;
         let max_parallel_issue_runs =
             i64::try_from(update.max_parallel_issue_runs).unwrap_or(i64::MAX);
         let now = super::time::now_us();
@@ -525,13 +542,15 @@ impl ProjectStore for SqliteProjectStore {
             .interact("projects.update", move |conn| {
                 Ok(conn.execute(
                     "UPDATE projects SET name = ?2, description = ?3, \
-                     daily_budget_micros = ?4, max_parallel_issue_runs = ?5, updated_at = ?6 \
+                     daily_budget_micros = ?4, daily_budget_tokens = ?5, \
+                     max_parallel_issue_runs = ?6, updated_at = ?7 \
                      WHERE id = ?1",
                     rusqlite::params![
                         id,
                         name,
                         description,
                         daily_budget,
+                        daily_budget_tokens,
                         max_parallel_issue_runs,
                         now
                     ],
@@ -545,24 +564,23 @@ impl ProjectStore for SqliteProjectStore {
         &self,
         project: &ProjectId,
         since: chrono::DateTime<chrono::Utc>,
-    ) -> Result<baybo_model::MicroUsd> {
+    ) -> Result<Spend> {
         let project = project.as_str().to_string();
         let since = super::time::to_us(since);
-        let micros = self
-            .pool
+        self.pool
             .interact("projects.spend_since", move |conn| {
-                let total: i64 = conn.query_row(
-                    "SELECT COALESCE(SUM(cost_usd), 0) FROM cost_records \
-                     WHERE timestamp >= ?2 AND session_id IN ( \
-                         SELECT session_id FROM issue_runs \
-                         WHERE project_id = ?1 AND session_id IS NOT NULL)",
+                Ok(conn.query_row(
+                    &format!(
+                        "SELECT {SPEND_SUMS} FROM cost_records c \
+                         WHERE c.timestamp >= ?2 AND c.session_id IN ( \
+                             SELECT session_id FROM issue_runs \
+                             WHERE project_id = ?1 AND session_id IS NOT NULL)"
+                    ),
                     rusqlite::params![project, since],
-                    |row| row.get(0),
-                )?;
-                Ok(total)
+                    |row| spend_from_row(row, 0),
+                )?)
             })
-            .await?;
-        Ok(baybo_model::MicroUsd::from_micros(micros))
+            .await
     }
 
     async fn mark_issue_read(
@@ -1369,7 +1387,7 @@ impl ProjectStore for SqliteProjectStore {
         let rows = self
             .pool
             .interact("projects.activity", move |conn| {
-                let mut activity: std::collections::HashMap<String, (usize, i64)> =
+                let mut activity: std::collections::HashMap<String, (usize, Spend)> =
                     std::collections::HashMap::new();
 
                 {
@@ -1394,20 +1412,21 @@ impl ProjectStore for SqliteProjectStore {
                     // board of overspending a ceiling it never crossed.
                     // `DISTINCT` is what stops a session shared by several
                     // runs being counted once per run.
-                    let mut stmt = conn.prepare(
-                        "SELECT r.project_id, COALESCE(SUM(c.cost_usd), 0) \
+                    let mut stmt = conn.prepare(&format!(
+                        "SELECT r.project_id, {SPEND_SUMS} \
                          FROM cost_records c \
                          JOIN (SELECT DISTINCT project_id, session_id FROM issue_runs \
                                WHERE session_id IS NOT NULL) r \
                            ON r.session_id = c.session_id \
                          WHERE c.timestamp >= ?1 \
-                         GROUP BY r.project_id",
-                    )?;
+                         GROUP BY r.project_id"
+                    ))?;
                     for row in stmt.query_map(rusqlite::params![since], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                        Ok((row.get::<_, String>(0)?, spend_from_row(row, 1)?))
                     })? {
-                        let (project, micros) = row?;
-                        activity.entry(project).or_default().1 += micros;
+                        let (project, spend) = row?;
+                        let entry = activity.entry(project).or_default();
+                        entry.1 = entry.1 + spend;
                     }
                 }
 
@@ -1420,10 +1439,7 @@ impl ProjectStore for SqliteProjectStore {
                     ProjectId::parse(id).map_err(|e| {
                         StorageError::Storage(format!("projects.id unreadable: {e}"))
                     })?,
-                    BoardActivity {
-                        working,
-                        burn: baybo_model::MicroUsd::from_micros(burn),
-                    },
+                    BoardActivity { working, burn },
                 ))
             })
             .collect()
@@ -1559,26 +1575,24 @@ impl ProjectStore for SqliteProjectStore {
         Ok(affected > 0)
     }
 
-    async fn requeue_unsettled(&self) -> Result<()> {
-        self.pool
+    async fn requeue_unsettled(&self) -> Result<Vec<IssueRunRow>> {
+        let raw = self
+            .pool
             .interact("issue_runs.requeue", move |conn| {
-                // `started_at` survives the roll-back. It is the instant the
-                // run was FIRST claimed, and it is the left edge of the
-                // window that attributes spend to this run
-                // ([`RUN_COST_WINDOW`]) — clearing it orphaned everything an
-                // interrupted run had already spent, money the board's own
-                // daily burn goes on counting. The price is that the run's
-                // duration then spans the downtime too, which is the honest
-                // number for a window that bills those hours.
-                conn.execute(
-                    "UPDATE issue_runs SET status = 'queued' \
-                     WHERE settled_at IS NULL AND status = 'running'",
-                    [],
-                )?;
-                Ok(())
+                // Preserve first claim so pre-restart spend stays in the run window.
+                // Update and return atomically so narrated resume counts match.
+                let mut stmt = conn.prepare(&format!(
+                    "UPDATE issue_runs SET status = 'queued', resumes = resumes + 1 \
+                     WHERE settled_at IS NULL AND status = 'running' \
+                     RETURNING {RUN_COLUMNS}"
+                ))?;
+                let rows = stmt
+                    .query_map([], read_raw_run)?
+                    .collect::<rusqlite::Result<Vec<RawRun>>>()?;
+                Ok(rows)
             })
             .await?;
-        Ok(())
+        raw.into_iter().map(run_from_raw).collect()
     }
 }
 
@@ -1592,7 +1606,7 @@ mod tests {
     /// other.
     #[test]
     fn coordination_triggers_match_the_enum() {
-        let listed = ["triage", "review", "stalled"];
+        let listed = ["triage", "review", "stalled", "blocked"];
         let probe = newest_run!("status");
         for name in listed {
             assert!(
@@ -1612,6 +1626,7 @@ mod tests {
             RunTrigger::StageBarrier,
             RunTrigger::Review,
             RunTrigger::Stalled,
+            RunTrigger::Blocked,
         ]
         .into_iter()
         .filter(|t| t.is_coordination())
@@ -1637,11 +1652,38 @@ mod tests {
             description: String::new(),
             workdir: format!("/tmp/{id}"),
             daily_budget: None,
+            daily_budget_tokens: None,
             max_parallel_issue_runs: DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
             archived_at: None,
             created_at: now,
             updated_at: now,
         }
+    }
+
+    #[tokio::test]
+    async fn a_row_written_before_the_token_ceiling_existed_has_no_ceiling() {
+        let (_dir, store) = store().await;
+        let row = project("01JLEGACY", "grandfathered");
+        store.create_project(&row).await.unwrap();
+
+        store
+            .pool
+            .interact("test.blank_the_column", |conn| {
+                conn.execute("UPDATE projects SET daily_budget_tokens = NULL", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let read = store.get_project(&row.id).await.unwrap().expect("row");
+        assert_eq!(
+            read.daily_budget_tokens, None,
+            "an absent ceiling is no ceiling; Some(0) would pause the board"
+        );
+        assert_eq!(
+            read.max_parallel_issue_runs, DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
+            "and the column beside it still resolves its own NULL, for its own reason"
+        );
     }
 
     fn new_run(issue: &IssueRow) -> NewIssueRun {
@@ -1838,6 +1880,7 @@ mod tests {
                         name: "Alpha".into(),
                         description: "the first".into(),
                         daily_budget: None,
+                        daily_budget_tokens: None,
                         max_parallel_issue_runs: DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
                     }
                 )
@@ -2198,6 +2241,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_requeue_bumps_the_resume_count_and_answers_with_the_rows_it_rolled_back() {
+        let (_dir, store) = store().await;
+        let p = project("proj-a", "A");
+        store.create_project(&p).await.unwrap();
+        let worked = store
+            .create_issue(&new_issue(&p.id, "worked", IssueStatus::Backlog))
+            .await
+            .unwrap();
+        let waiting = store
+            .create_issue(&new_issue(&p.id, "waiting", IssueStatus::Backlog))
+            .await
+            .unwrap();
+
+        let running = store.enqueue_run(&new_run(&worked)).await.unwrap();
+        assert_eq!(running.resumes, 0, "a fresh row has never been interrupted");
+        let session = SessionId::from("issue-1");
+        store.claim_run(&running.id, &session).await.unwrap();
+        let never_claimed = store.enqueue_run(&new_run(&waiting)).await.unwrap();
+
+        let swept = store.requeue_unsettled().await.unwrap();
+        assert_eq!(
+            swept.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec![running.id.as_str()],
+            "only the row that was in flight was rolled back"
+        );
+        let rolled = &swept[0];
+        assert_eq!(rolled.status, RunStatus::Queued);
+        assert_eq!(rolled.resumes, 1, "the meter counts this interruption");
+        assert_eq!(rolled.session_id, Some(session.clone()));
+        assert!(rolled.started_at.is_some());
+        assert_eq!(
+            store
+                .get_run(&never_claimed.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .resumes,
+            0,
+            "a row that was already queued was not interrupted, so its counter does not move"
+        );
+
+        store.claim_run(&running.id, &session).await.unwrap();
+        let again = store.requeue_unsettled().await.unwrap();
+        assert_eq!(again[0].resumes, 2, "each process start counts once");
+    }
+
+    #[tokio::test]
+    async fn a_run_recorded_before_the_resume_meter_existed_migrates_in_never_interrupted() {
+        let (_dir, store) = store().await;
+        let p = project("proj-a", "A");
+        store.create_project(&p).await.unwrap();
+        let issue = store
+            .create_issue(&new_issue(&p.id, "legacy", IssueStatus::Backlog))
+            .await
+            .unwrap();
+        let run = store.enqueue_run(&new_run(&issue)).await.unwrap();
+
+        store
+            .pool
+            .interact("test.rewind_the_resume_migration", move |conn| {
+                conn.execute("ALTER TABLE issue_runs DROP COLUMN resumes", [])?;
+                let migration = super::super::ADD_COLUMNS
+                    .iter()
+                    .find(|m| m.table == "issue_runs" && m.column == "resumes")
+                    .expect("the resume meter is a listed migration");
+                migration.apply(conn)?;
+                migration.apply(conn)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.get_run(&run.id).await.unwrap().unwrap().resumes,
+            0,
+            "a row that predates the column has never been handed back out"
+        );
+    }
+
+    #[tokio::test]
     async fn sparse_update_leaves_unnamed_fields_alone() {
         let (_dir, store) = store().await;
         let p = project("proj-a", "A");
@@ -2372,7 +2495,12 @@ mod tests {
         }
 
         let now = chrono::Utc::now();
-        let spend = |session: &SessionId, micros: i64, at: chrono::DateTime<chrono::Utc>| {
+        let spend = |session: &SessionId,
+                     micros: i64,
+                     input: usize,
+                     output: usize,
+                     cached: usize,
+                     at: chrono::DateTime<chrono::Utc>| {
             baybo_model::CostRecord {
                 user_id: "u".into(),
                 session_id: session.clone(),
@@ -2381,9 +2509,9 @@ mod tests {
                 reason: baybo_model::CallReason::default(),
                 model: "m".into(),
                 reasoning_effort: None,
-                input_tokens: 1,
-                output_tokens: 1,
-                cached_input_tokens: 0,
+                input_tokens: input,
+                output_tokens: output,
+                cached_input_tokens: cached,
                 cache_creation_input_tokens: 0,
                 cost_usd: baybo_model::MicroUsd::from_micros(micros),
                 timestamp: at,
@@ -2391,10 +2519,11 @@ mod tests {
         };
         let yesterday = now - chrono::Duration::days(1);
         for record in [
-            spend(&shared, 300, now),
-            spend(&shared, 200, now),
-            spend(&shared, 9_000, yesterday),
-            spend(&their_session, 7_000, now),
+            spend(&shared, 300, 40, 10, 0, now),
+            // Cached tokens are already included in `input_tokens`.
+            spend(&shared, 200, 100, 20, 90, now),
+            spend(&shared, 9_000, 5_000, 5_000, 0, yesterday),
+            spend(&their_session, 7_000, 70, 30, 0, now),
         ] {
             baybo_store::cost::CostStore::record(&costs, &record)
                 .await
@@ -2402,14 +2531,29 @@ mod tests {
         }
 
         let since = now - chrono::Duration::hours(1);
+        let mine_today = store.spend_since(&mine.id, since).await.unwrap();
         assert_eq!(
-            store.spend_since(&mine.id, since).await.unwrap(),
-            baybo_model::MicroUsd::from_micros(500),
+            mine_today,
+            Spend {
+                input_tokens: 140,
+                output_tokens: 30,
+                cost: baybo_model::MicroUsd::from_micros(500),
+            },
             "two calls on one shared session, counted once each"
         );
         assert_eq!(
+            mine_today.tokens(),
+            170,
+            "the cached prefix is inside `input_tokens` already; counting it again \
+             would hold a board against a ceiling it never reached"
+        );
+        assert_eq!(
             store.spend_since(&theirs.id, since).await.unwrap(),
-            baybo_model::MicroUsd::from_micros(7_000)
+            Spend {
+                input_tokens: 70,
+                output_tokens: 30,
+                cost: baybo_model::MicroUsd::from_micros(7_000),
+            }
         );
     }
 
@@ -2591,9 +2735,10 @@ mod tests {
                 reason: baybo_model::CallReason::default(),
                 model: "m".into(),
                 reasoning_effort: None,
-                input_tokens: 1,
-                output_tokens: 1,
-                cached_input_tokens: 0,
+                // Distinct counts catch swapped aggregate columns.
+                input_tokens: 70,
+                output_tokens: 30,
+                cached_input_tokens: 40,
                 cache_creation_input_tokens: 0,
                 cost_usd: baybo_model::MicroUsd::from_micros(1_500),
                 timestamp: now,
@@ -2615,9 +2760,18 @@ mod tests {
             "the dropdown's burn and the budget gate's spend are the same question"
         );
         assert_eq!(
-            gate,
+            gate.cost,
             baybo_model::MicroUsd::from_micros(1_500),
             "one call on a session two runs shared is billed once, not twice"
+        );
+        assert_eq!(
+            gate,
+            Spend {
+                input_tokens: 70,
+                output_tokens: 30,
+                cost: baybo_model::MicroUsd::from_micros(1_500),
+            },
+            "and the cached 40 are inside the 70, not beside them"
         );
         assert_eq!(activity[&p.id].working, 0, "both runs settled");
     }
@@ -2737,7 +2891,11 @@ mod tests {
         .unwrap();
 
         let since = now - chrono::Duration::hours(1);
-        let spent = baybo_model::MicroUsd::from_micros(500);
+        let spent = Spend {
+            input_tokens: 1,
+            output_tokens: 1,
+            cost: baybo_model::MicroUsd::from_micros(500),
+        };
         assert_eq!(store.spend_since(&p.id, since).await.unwrap(), spent);
 
         store.requeue_unsettled().await.unwrap();

@@ -40,11 +40,11 @@ every door leads through it.
 | `manager.rs` | `ProjectManager`: the whole write surface, the enqueue chokepoint, and the executor's port |
 | `settle.rs` | The settle chokepoint: the ledger row, the invalidation, and the timeline entry, as one sequence |
 | `artifacts.rs` | Which regenerable build output an idle checkout may give back, and the one verb that offers it |
-| `runs.rs` | The two run predicates (`triggers_run`, `accepts_runs`), the ledger entry, which earlier run a run continues, and `RunOutcome` |
+| `runs.rs` | The two run predicates (`triggers_run`, `accepts_runs`), which row still holds a card's slot (`is_unsettled`), the ledger entry, which earlier run a run continues, and `RunOutcome` |
 | `dispatch.rs` | Turning a recorded row into an `IssueRunEvent` the executor can run |
 | `brief.rs` | The brief a run is handed: the card, what has been said on it since, and which of its files fit |
 | `attachments.rs` | The one door a file gets onto a card through: blob ids in, stored attachments out |
-| `comments.rs` | `comment_delivery` — what a comment does besides being recorded |
+| `comments.rs` | `comment_delivery` — what a comment does besides being recorded — and whether a window of entries holds somebody asking for more |
 | `actors.rs` | What an agent-facing surface calls the somebody a timeline entry names |
 | `mentions.rs` | `@handle` scanning, and when a mention is a handover |
 | `stages.rs` | Sub-issues, `is_finished`, the stage barrier's two questions, the progress ring |
@@ -64,26 +64,33 @@ them carrying a copy of the rule.
 
 The web board is not one of those callers, and this is the seam to know about.
 A composer has to say what sending will do while the text is still being typed,
-so it cannot ask the server. There are three hand-written TypeScript mirrors in
-`app/web/src/pages/projects/`: `commentHint` and `mentionHint`/`mentionQuery`
-mirror `comments::comment_delivery` and `mentions::assigns_to`, and
-`retryRejection` mirrors the card-level refusals `ProjectManager::retry_run`
-answers with, so a button knows whether the click would be rejected before it is
-sent. Nothing enforces the correspondence — not a generated binding, not a
-shared schema — only the two test suites, one per language, asserting the same
-cases, which for the refusals means asserting the **literal sentences**
-(`the_retry_refusals_say_exactly_what_the_button_predicts`): the button quotes
-them, so a reword on one side is a lie on the other. So widening `is_live_work`
-by one column, or adding a run state that reads as idle, is a change on both
-sides in the same commit; `cargo test` alone will be green with a board that
-wakes an agent while the composer still promises "Records only".
+so it cannot ask the server. There are two hand-written TypeScript mirrors in
+`app/web/src/pages/projects/`: `commentHint` mirrors
+`comments::comment_delivery`, the block gate inside it included, and
+`mentionHint`/`mentionQuery` mirror `mentions::assigns_to` **and the refusal
+`mention_assignment` wraps it in** — a mention on a blocked card is recorded
+and staffs nobody, so the composer says that rather than promising a handover
+that will not happen. Nothing enforces the correspondence — not a generated
+binding, not a shared schema — only the two test suites, one per language,
+asserting the same cases. So widening `is_live_work` by one column, or adding a
+run state that reads as idle, is a change on both sides in the same commit;
+`cargo test` alone will be green with a board that wakes an agent while the
+composer still promises "Records only".
+
+The retry button has **no** mirror, deliberately: nothing about it is typed
+into, so it can send and render what came back. Its refusals are still
+sentences an operator reads (`the_retry_refusals_say_exactly_what_the_button
+_predicts` asserts them literally), and `IssueDetailPage` puts the server's own
+words in the error banner rather than guessing at them.
 
 One sentence over there is deliberately *not* a mirror. `HELD_RUN_NOTE` sits
 beside a **working** button: a press on a budget-held card goes through
 `enqueue`, which releases what the ceiling allows before it writes, so the press
 is what starts the run. `retry_run` reads the hold before and after and reports
 the start rather than the dedupe guard's conflict; only when the ceiling refuses
-again does it answer, with the budget as the reason.
+again does it answer, with the ceiling as the reason — naming *which*
+ceiling, because an operator told a token-limited board is "over its daily
+budget" goes and raises a dollar figure that was never what stopped it.
 
 ### The run ledger
 
@@ -129,6 +136,64 @@ one worktree, and — with the waiter looking only at turns from its own row's
 enqueue onwards — what lets a run treat the terminal turn it sees as
 unambiguously its own.
 
+**The hand-out question has one home.** `runs::verdict(run, card, now)` answers
+"may the board hand this recorded row out now?", asked of the card and the row
+**as they stand** — not as they stood when the row was written. Four doors ask
+it, all through `ProjectManager::card_for`: the boot sweep, the hold release,
+the dead-hold sweep, and the unblock. `enqueue` does not, because it is the
+door that *writes* the row and asks its own three gates. The verdict is one of
+four: the row **stands**, it is **parked** where it lies, it is **called off**
+because the card stopped taking work, or the board **gives up** on it. It says
+nothing about the runner's framework — that answer expires too, and
+`can_host_a_session` is asked of the store by the executor's `binding_for`,
+which stays the only ask a swept row gets.
+
+**Two bounds, because a sweep with no meter is a retry loop.** `issue_runs`
+carries a `resumes` counter, bumped inside the requeue's own `UPDATE` — the one
+statement that observes an interruption, once per process start per row.
+
+- A row that ever ran is handed back out at most `MAX_RUN_RESUMES` times; past
+  that it is settled `Failed`. There is no backoff, deliberately: the sweep
+  fires once per process start rather than on a rate, so a delay would only
+  park the row and need a second thing to come back for it — which is the
+  invisible loop the bound exists to end.
+- A row **nobody ever claimed** is settled `Failed` once it has waited
+  `MAX_QUEUED_WAIT_HOURS` for the board to hand it out. Asked only of an
+  unclaimed row, because `started_at` is the *first* claim: an age read off it
+  would call off a run that executed an hour ago.
+
+  The window is **not** the row's whole life, because not all of that wait is
+  the card's. It opens at whichever is later, the row's `created_at` or the
+  **card's** `updated_at` — the card's clock is what carries a block and the
+  unblock that lifts it, since both are writes to the issue row, so a row
+  parked by a three-day block is not called off by the very
+  `redrive_after_unblock` pass that exists to hand it back out. A `Held` row is
+  exempt on its own account: the verdict never asks the age of a row that is
+  not `Queued`, because a hold's age is the budget's doing and ageing one out
+  would drop work an exhausted board still owes. The parallelism ceiling never
+  delays a row this way at all — it gates promotions, not `enqueue`, so a
+  recorded row goes to the dispatcher whatever the ceiling says.
+
+  **One wait it over-charges**, stated here rather than closed. The exempt
+  hold above stops being exempt the instant it is released, and
+  `release_holds` writes a timeline entry and nothing else — neither the
+  row's `created_at` nor the card's `updated_at` moves — so a row released
+  after a long hold is charged the whole wait the budget cost it. Nothing on
+  the row records when it was released, so closing this needs a stored
+  instant, not a better predicate. The exposure is narrow: the release
+  dispatches the row in the same pass, so only a process death between the
+  two leaves it to be aged out on the next boot, and the cost is a `Failed`
+  row on a card the operator can retry.
+
+Both give-ups settle **`Failed`**, not `Cancelled`: `driver::newest_run_was_
+cancelled` reads a cancel as a stop that stands, so a cancel would keep the lead
+from ever being told, while a failure lights the card's badge and the board's
+`failed` count — signals that are discharged by acting.
+
+`resumes` is deliberately **not** on `IssueRunDto`. The card's timeline is where
+an interruption is said (`RunInterrupted`), and a second copy on the run row
+would be a number the board could render disagreeing with the entry beside it.
+
 ### One enqueue path, three gates
 
 `ProjectManager::enqueue_as` is the only function that writes a run row —
@@ -143,10 +208,70 @@ three questions once each:
 2. **Dedupe** — the store's partial unique index. A refused write means the
    issue already has a run in flight; the caller sees `None`, which is the guard
    working, not a failure.
-3. **Budget** — `budget::headroom`. The headroom is measured before the write
-   (the hold release below needs it), but it never decides *whether* the row is
-   written — only what happens to it afterwards. So an exhausted board records
-   the work it owes as `Held` rather than dropping it.
+3. **Budget** — `budget::headroom`, which is **two ceilings, not one**: a
+   daily money limit and a daily token limit, both optional, both measured
+   over the same UTC day and the same rows, and the board stops when
+   **either** is reached. The headroom is measured before the write (the
+   hold release below needs it), but it never decides *whether* the row is
+   written — only what happens to it afterwards. So an exhausted board
+   records the work it owes as `Held` rather than dropping it.
+
+   One read serves both meters: `ProjectStore::spend_since` returns a
+   `Spend`, so there is one answer to "what has this board burned today"
+   and the two ceilings cannot come to disagree about which cost rows are
+   the board's. A board with neither ceiling set still costs nothing — the
+   gate short-circuits to `Unlimited` without querying at all.
+
+   **Tokens are `input_tokens + output_tokens`, and the cached columns are
+   not added.** `cost_records.input_tokens` is already the whole prompt;
+   `cached_input_tokens` and `cache_creation_input_tokens` are subsets of
+   it, kept apart only so billing can price the three at different rates,
+   and the Anthropic adapter folds its natively-disjoint buckets into that
+   convention before the record is written. Summing all four would charge a
+   board twice for its cached prefix.
+
+   A hold names the ceiling that produced it — `BudgetExhausted` or
+   `TokenBudgetExhausted`, two variants rather than a "which unit" flag
+   beside fields called `spent_micros`. When both ceilings are set, the one
+   spoken in is **whichever has least room left**, decided once in
+   `speaks_money`: exhaustion first, then the tighter fraction,
+   cross-multiplied in `i128` so nothing divides and a paused ceiling of
+   zero needs no special case. Ties go to tokens.
+
+   Not a fixed "tokens always win" preference, which is what this started
+   as and which is wrong in both directions:
+
+   - It named the untouched ceiling on a board held by the other one. A
+     timeline row is permanent, so the card would assert forever that a
+     limit was exhausted while its own two numbers said it was not, and
+     `held_run_refusal` would send the operator to raise the one ceiling
+     that would not release anything.
+   - Nor is "prefer whichever is exhausted" enough on its own. A release
+     happens exactly when **neither** meter is exhausted, so that rule has
+     nothing to go on there and would answer a card's hold and its release
+     in two different units. Ranking by room left is defined in both
+     states, which is what keeps the pair stable.
+
+**The refusals that are knowable before the write have one home**, because
+two callers need them there. `enqueue` is allowed to answer `None` and cost
+nothing — but a caller that has to make room for the run *first* is not:
+the promoter moves the card out of Todo, where no later pass looks for it
+again, and the block wake settles the card's only recorded row. So the two
+questions that can be answered before anything is written — gate 1
+(liveness) and whether the runner can still host a session
+(`runs::can_host_a_session`, the ask the team section describes) — are
+`ProjectManager::enqueue_refusal`, asked by `enqueue_as` on its way in and
+by those two callers *before* the step they cannot take back. Dedupe is
+deliberately not in it: that refusal **is** the write, and no caller can be
+told it in advance. Budget is not a refusal at all — it holds.
+
+The framework half is the one that bites, and it bites the lead. A board's
+`@lead` is an ordinary non-builtin profile, so the admin API can move it
+onto `codex` long after the board was opened. Asked on the far side of the
+stand-down, the card's only run is settled `Cancelled`, nothing is enqueued
+in its place, and the card is left holding no run at all — invisible to the
+promoter, the hold release, the boot sweep and the wake alike, which is
+precisely the wedge the stand-down exists to prevent.
 
 Two predicates, not one, because they answer different questions:
 
@@ -193,21 +318,72 @@ from releasing one). The unblock is the door that hands the row back out —
 `redrive_after_unblock` dispatches a parked `Queued` row directly and offers a
 `Held` one to the budget's own release pass rather than starting around it.
 
+**And when there is no row left to hand back, that door delivers what was
+*said* while the card was parked.** A comment on a blocked card is
+`ParkedByABlock` — recorded, and nobody put on it — so an answer written
+there reaches nobody by itself, while the run that would have read it in a
+brief has either settled under the block or stood down for the question that
+produced it. The window is from when the block landed (`driver::blocked_at`,
+read off the same timeline entry `block_is_an_agents_question` reads, so a
+card cannot be adjudicated against one block and re-woken against another),
+because that is exactly the interval in which nothing could be woken:
+anything older was in a brief, or is the parked row's own to read. Whoever
+would run next is skipped, through the same
+`comments::somebody_asked_for_more` the mid-run follow-up asks. Without it
+the adjudication sits on the card for good and the board's next move is a
+Stalled question to the lead — a second billed run in place of an answer
+already written down.
+
+**A `Running` row is the third shape, and the delivery above cannot reach
+it.** It is the shape the block wake itself produces — the lead lifts the
+block from inside its own wake run — and that row is neither handed back nor
+re-briefed, while nothing may be enqueued behind it either: the card holds
+one unsettled row. So the delivery waits for it to settle, and rides the
+follow-up the settle already asks about (`wake_after_run`), with the window
+widened from the run's brief back to the block that stood when it was
+briefed (`driver::block_standing_at`, asked only on a settle whose own window
+holds an `Unblocked` — so an ordinary settle costs no second read). Read of
+the moment rather than of the newest block, so a card unblocked *before* the
+run was briefed answers `None`: that window was handed over by the unblock
+itself, and re-delivering it would wake the assignee on the answer it has
+already been given.
+
+An unblock that **also** starts a run hands out one run, not two.
+`update_issue` runs the trigger first and passes the row it recorded to
+`redrive_after_unblock`, which then knows the card's one unsettled row is its
+own doing: a row written after the block was gone was never parked by it, and
+cuts a brief that reads the same comments a hand-back would have handed over.
+
 At a **process start** the work is split in two. `requeue_unsettled` rolls every
-`running` row back to `Queued` in one statement and hands nothing back — an
-orphan is an orphan whatever board it is on, an archived one included, and
-rolling a row forward settles nothing. `resume_project_runs` then walks the
-boards, each reading its own unfinished rows, so runs go out per board in issue
-order, oldest card first, with no order promised across boards. Nothing
-downstream depends on which run starts first. That sweep is spawned *alongside*
-the server rather than before it (`gateway_cmd.rs`), so it races live traffic: a
-restore landing in the instant before the requeue commits finds its orphans
-still `Running`, skips them, and they wait for the next process start.
+`running` row back to `Queued` in one statement, bumping each row's `resumes` as
+it goes, and answers with the rows it rolled back — an orphan is an orphan
+whatever board it is on, an archived one included, and rolling a row forward
+settles nothing. `resume_unsettled_runs` writes one `RunInterrupted` entry per
+returned row, archived boards included: `record` is one of the writes that never
+asks `writable_project`, because it describes work already under way. The
+give-up bound is applied per board afterwards, which *does* ask, so a shelved
+board's over-limit row waits for the restore rather than being settled on a
+shelf. `resume_project_runs` then walks the boards, each reading its own
+unfinished rows, so runs go out per board in issue order, oldest card first,
+with no order promised across boards. Nothing downstream depends on which run
+starts first. That sweep is spawned *alongside* the server rather than before it
+(`gateway_cmd.rs`), so it races live traffic: a restore landing in the instant
+before the requeue commits finds its orphans still `Running`, skips them, and
+they wait for the next process start.
+
+Nothing renders "interrupted" on the card *face*, deliberately: the row reads
+`queued` with a session on it, and adding a run state to the board's status
+vocabulary is a change on both sides of a hand-written mirror. The timeline is
+where an interruption is said. A card showing "running" straight through a
+gateway outage cannot be fixed at all — nothing is serving that page.
 
 `retry_run` is the one caller that refuses a finished card itself rather than
 letting `enqueue` do it silently. `enqueue` can only answer `None`, which
 `retry_run` reads as the dedupe guard, so the operator would be told the card
-already has a run when it has none and never will.
+already has a run when it has none and never will. It refuses a **blocked**
+card for its own reason, and in that order: nothing clears `blocked_reason`
+when a card is finished, so a Done card keeps one for good and would otherwise
+be told to lift a block that is not why it was refused.
 
 ### Giving the build output back
 
@@ -265,11 +441,32 @@ bills those hours.
 
 Two things the window does not see, both named here so they are not
 rediscovered as bugs: a **subagent** spawned by a run bills against its own
-session id, so it is invisible to `run_spend` *and* to the budget gate's
-`spend_since` (widening both together, via `sessions.root_session_id`, is
-the fix — widening one alone would make a card's total exceed its board's);
-and an **external-framework** agent's run would price at $0.00 with real
-tokens, which `can_host_a_session` currently makes unreachable.
+session id, so it is invisible to `run_spend` *and* to both of the budget
+gate's meters (widening them together, via `sessions.root_session_id`, is
+the fix — widening one alone would make a card's total exceed its board's).
+That hole is *worse* under a token ceiling than under a money one, because
+on a subscription board tokens are the only meter that moves at all, so a
+subagent-heavy run is invisible to the only ceiling that can fire.
+
+And a run **priced at $0.00 with real tokens is the ordinary case, not an
+unreachable one** — this paragraph used to claim it was gated off by
+`can_host_a_session`, which is wrong and is why the hole went unnoticed.
+That gate asks about the agent's *framework* (`runs::accepts_runs` →
+`AgentFramework::Baybo`); it says nothing about which LLM entry the agent
+runs against. A teammate whose `profile.llm` names an `openai-subscription`
+entry is an ordinary baybo agent, and every one of its calls prices at zero:
+`openai-subscription` has no OpenRouter prefix, so
+`openrouter::pricing_for` misses, and the factory ships
+`ModelPricing::default()` deliberately — subscription billing is
+account-level, not per-token. `spend_since` therefore sums `cost_usd = 0`
+forever and **a money ceiling on such a board can never be reached, however
+low it is set.** The token ceiling below is the answer to that; the rejected
+alternative was a hand-written per-entry `pricing` override, which is a fake
+price for money that does not exist.
+
+The class is wider than one provider: anything absent from
+`openrouter_prefix.rs` that does not override `flat_default_pricing` prices
+at zero the same way.
 
 ### One dispatch per row — which is not guaranteed
 
@@ -413,7 +610,10 @@ the holds. Releasing first turns them into `Queued` rows the count can see. The
 case is not hypothetical: `update_project` releases what it un-parks itself, so
 the situation where a tick is the first thing to see new headroom is the **UTC
 day rolling over**, which nothing is notified about — exactly when a
-budget-limited board is holding runs.
+budget-limited board is holding runs. Both ceilings share that one window
+(`budget::day_start`) precisely so there is only one such instant; two
+windows would roll over at different times and leave a board over one limit
+and under the other for a reason nothing on screen could explain.
 
 At a process start the driver is sequenced *after* `resume_unsettled_runs`, in
 the same task (`gateway_cmd.rs`). They cannot be folded into one function —
@@ -426,14 +626,17 @@ spend that guard here.
 Five things it will not do, each of which is a rule and not a coincidence:
 
 - **It will not promote a card whose assignee cannot host a run.** Asked in
-  `promote`, *before* the move — and that ordering is the whole point. The two
+  `promote` through `enqueue_refusal`, *before* the move — and that ordering
+  is the whole point. The two
   writes a promotion makes are a move and an enqueue, in that order and not
   atomic, so every reason the enqueue could refuse has to be settled first: a
   card moved into In Progress and then refused a run is stranded, because it is
   no longer in Todo for a later pass to find. `is_promotable` only knows that
   *somebody* is on the card; whether that somebody still runs on baybo changes
   under the board's feet, since an operator can move an agent to another
-  framework long after it was assigned.
+  framework long after it was assigned. The block wake makes the same two
+  writes in the same order — a stand-down and an enqueue — which is why the
+  question is one predicate and not a line copied into the second caller.
 - **It will not promote a card that already has a run recorded.** A card holds
   one run slot; promoting one that is spoken for would move it into In Progress
   and then fail to start anything, which is the one state that column must never
@@ -442,8 +645,20 @@ Five things it will not do, each of which is a rule and not a coincidence:
   Both are in the busy set, held runs included.
 - **It will not overrule a block.** A person dragging a blocked card into In
   Progress is overriding the block deliberately; the board doing it would be
-  overriding it on nobody's authority.
-- **It will not start work while the budget is exhausted.** `enqueue` would
+  overriding it on nobody's authority. `driver::board_may_start` is that rule,
+  and the promoter is not its only reader: the hold release, the boot sweep,
+  the stage barrier, `runs::verdict`, the mention inside a comment
+  (`mention_assignment`), the operator's own `retry_run` — which names no
+  field of the card, so it is not one of the two writes that override a block
+  — and, because the block wake's own brief offers "hand it back with a
+  comment", `comments::comment_delivery` all ask it.
+  The comment door is the one that has to be named out loud, because a
+  comment is otherwise the board's ordinary way of waking an assignee: without
+  it the lead answering a block was the thing that started work against it.
+  Its `@mention` half needed naming separately, because an assignment reaches
+  a run through `triggers_run` rather than through the delivery, so the gate
+  on one says nothing about the other.
+- **It will not start work while either ceiling is exhausted.** `enqueue` would
   record the run and hold it, leaving a card in In Progress with nothing running
   under it. The existing hold/release path already owes that work.
 - **It will not preempt.** Priority decides who gets the *next* free slot, not
@@ -460,9 +675,69 @@ board takes next is not necessarily the one rendered at the top.
 **Asking the lead.** Some cards are not work the board can start — they are
 questions only the lead can answer, and the same pass that promotes asks them
 (`ask_the_lead`), one card per pass because the lead reads the whole board when
-it is woken. Three questions, in the order they matter, each its own trigger so
-the execution log says which was asked (`RunTrigger::is_coordination`):
+it is woken. One card **that was actually asked**: a candidate whose enqueue
+answers `None` woke nobody, so the pass goes on to the next one. Returning
+there instead let a single card the board can never start a run on — a
+finished one still carrying a block reason, an agent moved off baybo —
+swallow every question behind it, on every tick, in silence. Four questions,
+in the order they matter, each its own trigger so the execution log says which
+was asked (`RunTrigger::is_coordination`):
 
+- **Blocked** — a card a block has stopped, whose reason is an **agent's**
+  question rather than a person's stop. It goes first: review and stalled work
+  are revisited by other machinery, whereas a blocked card is invisible to the
+  promoter, to the hold release and to the boot sweep, so if nobody is woken
+  about it, it is the one card on the board nothing ever comes back to. This
+  is also the only question that requires what every other door refuses, which
+  is why `board_may_start` lives on each of the other three rather than inside
+  `takes_a_lead_question` — folding it in would let the block silence the one
+  wake that exists to answer it. `runs::verdict` exempts `RunTrigger::Blocked`
+  from the block park for the same reason, and **only** that trigger: a
+  Review, Stalled or Triage row recorded before the block asks about something
+  else, and handing one out would put the lead on a card somebody paused. Who
+  wrote the block is not on the row, so `driver::block_is_an_agents_question`
+  reads it off the timeline — the same shape as the stall question's
+  `newest_run_was_cancelled`, asked by the caller once it has the entries in
+  hand, and asked **last** because it is the only gate that costs a second
+  read. An operator's own block wakes nobody: they said stop, and adjudicating
+  it would countermand them within one tick.
+
+  **Two things had to give way for this wake to be reachable at all**, and
+  both are the block silencing its own question:
+
+  - *The card is not busy just because it holds a row.* The lead's questions
+    are asked against an `in_flight` set, not the promoter's `busy` one: a
+    row `runs::parked_by_a_block` has stopped is not work in flight, since
+    nothing hands it out until the block lifts and only this wake lifts it.
+    The two sets differ on blocked cards and nowhere else, so the other three
+    questions read the same either way. A row that is still `Running` is not
+    parked — the block landed under a turn whose executor will settle it — so
+    a card being worked stays the executor's.
+  - *The parked row stands down.* `idx_issue_runs_live` allows one unsettled
+    run per card, so the parked row and the question cannot both exist. Past
+    the agent's-question gate — **and past every refusal the enqueue can
+    make**, since the settle cannot be taken back and the wake that would
+    replace it is not yet a fact — `stand_down_for_the_question` settles the
+    parked row `Cancelled` with the reason on the card, and the wake takes
+    the slot. The work loses nothing it could keep: the row was not
+    executing, and whatever runs after the adjudication continues the same
+    session, which `session_run_to_continue` keys on the agent rather than on
+    the row. An operator's block never reaches this — a person's stop still
+    parks its run for `redrive_after_unblock` to hand back out unchanged.
+
+    A **held** row stands down as well, and that is decided rather than
+    incidental. Its other exits are all shut: `release_holds` refuses a
+    blocked card, and the only thing that lifts the block is the question
+    the hold is silencing — so a hold left standing is a card with no exit
+    at all, which is worse than losing the row. It also loses less than the
+    queued row beside it: a hold never executed, never opened a session and
+    never spent anything, and the answer it is waiting on is what would
+    have re-instructed it anyway.
+
+  A **finished** card is not a candidate either (`runs::accepts_runs`, asked
+  in `driver::blocked` because the other three pin their own column). Nothing
+  clears `blocked_reason` when a card is closed, so a Done card keeps a stale
+  reason for good — and this question is asked first, on every tick.
 - **Review** — a card sitting in Review with nothing running on it and an
   assignee that is not the lead. Arranging the review is the lead's to do, and
   before this existed the handoff waited for a patrol cron: the review sat idle
@@ -613,9 +888,17 @@ timeline, from the issue and its unsettled run:
 | Situation | Delivery |
 | --- | --- |
 | Nobody assigned, cancelled, or parked in Backlog/Done | `RecordOnly` |
+| A block has stopped the card | `ParkedByABlock` — recorded, and nobody may be put on it |
 | Live work, nothing reading | `Wake` — start a run |
 | A `Held` or `Queued` run exists | `WaitsForQueuedRun` — it assembles its brief later, so it will read this |
 | A `Running` run exists | `AfterCurrentRun` — deferred |
+
+`ParkedByABlock` is `driver::board_may_start` asked at the comment door, and it
+is ahead of the live-run rows deliberately: a `Running` run promises a
+follow-up, and on a blocked card that follow-up is a run the block refuses. It
+is told apart from `RecordOnly` because the two are answered differently — one
+is a card nobody is working, the other is a card with a named reason on it and
+a decision waiting to be made.
 
 The deferred case is the one with a moving part, and it is the board's to
 resolve, not the executor's: `finish_run` asks `wake_after_run` once the run
@@ -623,7 +906,7 @@ settles and the issue's live-run slot is free again, and that goes through
 `enqueue` like every other start. Writing the ledger row directly would produce
 a run nothing ever dispatches, holding the slot until the next boot.
 
-Two things bound "somebody said something", and both are the reason the
+Three things bound "somebody said something", and they are the reason the
 predicate lives here rather than beside the executor, which can see neither:
 
 - **The window is when the brief was read**, and that is *neither* instant the
@@ -640,6 +923,15 @@ predicate lives here rather than beside the executor, which can see neither:
   immediately *before* it reads, and the executor hands it back to `finish_run`.
   Stamped before rather than after so a comment racing the read is over-read
   rather than dropped.
+- **Unless the card came out of a block while the run worked**, in which case
+  the window reaches back to when that block landed. Everything said under the
+  block was answered `ParkedByABlock` — recorded, and nobody put on it — and a
+  run briefed under the block did not read it either, so the run in flight when
+  the block lifted is the first thing that can hand it over. This is what makes
+  the block wake's own shape work: the lead lifts the block from inside its
+  wake run, and the answer written while the card was parked reaches the
+  assignee when that run settles rather than sitting on the card until the
+  board bills a Stalled question about it.
 - **A comment by whoever would run next is not somebody asking for more.** The
   follow-up this check decides runs as the card's **current assignee**, so
   that is the profile the filter protects from waking itself — an agent
@@ -663,6 +955,45 @@ so it gets the same trigger, the same timeline entry and the same refusals for
 an agent that cannot run. In the *commenter's* name, not the operator's. A
 mention on somebody else's card is a question, never a reassignment: treating it
 otherwise would let a passing remark take work away from whoever is doing it.
+
+**And never on a card a block has stopped.** `ParkedByABlock` is "recorded,
+and nobody may be put on it", and an assignment is not only a staffing edit:
+on a card in In Progress it is `triggers_run`'s second edge, so a mention
+that walked past the block would start the very work the block stopped —
+through the one door that never asks `board_may_start`. The gate sits at
+this door (`mention_assignment`) rather than inside `mentions::assigns_to`,
+which stays the pure "is this comment a handover" rule the web mirrors, and
+beside the other card-level refusal the mention already answers to (an agent
+that cannot host a session).
+
+Both of those refusals are **log lines and nothing else** — the comment
+itself lands, so the card records the words and says nothing about the
+staffing they asked for. That is the reason `mentionHint` carries the block:
+the composer refuses in advance, in front of the person typing, which is the
+only place a refusal that writes nothing can be seen.
+
+That leaves `dispatch_if_triggered` — the last place `board_may_start` is
+not asked — exempt through exactly two doors, and both are an explicit
+write naming the card's status or its assignee: `move_issue` and
+`update_issue`. A person dragging a blocked card into In Progress is
+overriding the block deliberately, and the block stays on the card while
+they do it, so the card still reads as paused and the lead is still asked
+about it. Both doors are reachable by an **agent** too, through the
+`IssueUpdate` tool — the override is not the operator's alone. What makes
+that acceptable is the same thing that makes the drag acceptable: the write
+names the field, the `Moved`/`Assigned` entry it produces carries the
+agent's own name, and the block is still on the card afterwards.
+`create_issue` reaches the same trigger and cannot be an override — a card
+cannot be opened already blocked.
+
+Every other door asks the gate, the board's own and the operator's alike:
+the promoter, the hold release, the boot sweep, the stage barrier,
+`runs::verdict`, the comment door, the mention inside it, the lead's Review,
+Stalled and Triage wakes — and `retry_run`. That last one is an *operator*
+door and still asks, because the two exemptions are exemptions for naming a
+field: "run it again" names none, so a run started that way is a block overruled
+with nothing on the card recording that anybody decided to. It refuses with
+`RETRY_ON_A_BLOCKED_CARD` instead, which names the one write that lifts it.
 
 **A comment may be nothing but files.** "Here, look at this" under a screenshot
 is a real thing to say, so the emptiness rule is *no text and no files* rather
@@ -731,8 +1062,9 @@ this crate offers it:
 
 | | What it does | Why it is one call and not three |
 | --- | --- | --- |
-| `start_run(run, session)` | Claims the row, then says `RunStarted` on the card | The claim is what stops two agents on one card, so nothing may say a run started without having won it |
+| `start_run(run, session)` | Claims the row, announces the row's move to `running`, then says `RunStarted` on the card **once** | The claim is what stops two agents on one card, so nothing may say a run started without having won it. A re-claimed row is already on the card — the interruption between the two claims is the sweep's `RunInterrupted`, not a second "started". Only the *entry* is deduplicated: the state change is announced either way, or a resumed run renders as `queued` for the whole of its second life |
 | `finish_run(run, checkout, briefed_at, outcome)` | Settles, surfaces the branch, then follows up on comments | The order is a rule: the branch is read before the follow-up because a follow-up enqueues another run against the same checkout, and the settle is first so a card whose branch cannot be read still stops shimmering |
+| `run_left_a_mark(run, briefed_at)` | Answers whether this run touched the card after it was briefed | The executor may say a run *failed* — it watched the turn — but not that it produced *nothing*, because it cannot see the card |
 
 `briefed_at` is handed straight back from `IssueRunEvent` — the executor carries
 it rather than deriving it, because it is the only record of when the run's
@@ -744,6 +1076,32 @@ of it. See the follow-up window below.
 the card is this crate's. `stopped_by_a_human` is separate from `status` because
 the ledger row cannot carry it and it changes what the board owes: somebody who
 pressed stop is not asking for a follow-up.
+
+**One negative it may not assert.** "This run produced nothing" is a claim about
+the *card*, and the executor cannot see one: a run that committed, commented and
+moved its card to Review seconds before an interrupt was settled with that
+sentence, and the lead — reading a card that flatly contradicted itself — wrote
+an invented root cause into a permanent timeline. `run_left_a_mark` is the
+board's answer, over the run agent's own entries since `briefed_at`, and the
+executor picks its sentence from it. Bounded to the timeline on purpose: a
+commit is surfaced by `record_branch` either way, and asking git would put a
+second shell-out on a settle path. A read that *fails* answers "it worked" —
+asserting a negative off a failed read is the same defect.
+
+Which is why the sentence it picks says only what the board checked: **nothing
+this run did reached the card**, and its branch may still hold work. A run that
+committed without commenting or moving anything leaves no timeline entry at
+all, so a flat "produced nothing" would be the same invented negative one
+altitude down — the incident's own run had pushed a commit.
+
+**The settle reason reaches the card**, because the lead reads the card and not
+the transcript. The executor reads the whole `TurnStatus` for every terminal
+kind, not only for a cancel: a provider's own failure text lands on the card
+(clipped to `MAX_RUN_ERROR_CHARS`, since it is permanent and read on a card
+face), and a cancel nobody asked for names its `CancelReason` instead of
+arriving as a bare "cancelled" — which is exactly the blank a lead fills in with
+a guess. A person's own stop still carries no note: they know why they pressed
+it.
 
 **The branch is the one artefact a board hands over**, since it never merges, so
 `record_branch` is written to survive the awkward order rather than assume a
@@ -786,6 +1144,12 @@ keeps the newest comment. If older comments are dropped it inserts an explicit
 marker instead of presenting the tail as the whole discussion. A run taking
 over after another agent also gets a warning that the shared issue worktree may
 contain that agent's uncommitted changes.
+
+A card that carries a `blocked_reason` renders it, for **every** trigger — a
+block is a standing fact about the card, not a fact about one wake. The lead's
+block preamble says "read the reason and decide", and with nothing rendering
+the column, the one field that whole question is about was the one thing the
+brief left out.
 
 **Every comment in it is attributed** — `- the operator: …`, `- @qa: …` — and a
 comment's own newlines are indented so a line inside one cannot read as the next
@@ -830,6 +1194,21 @@ A project's team is `agent_profiles` rows carrying a `TeamMembership`
 disagree). Every board opens with a `@lead`, seeded **before** the project row so
 a failure leaves an inert orphan rather than a visible board with no
 coordinator.
+
+**And a board that predates that invariant is repaired into it.** `lead_of` is a
+string comparison against `LEAD_HANDLE` that silently answers `None`, so a board
+opened before the seed existed — whose operator, handles being permanent, hired
+its coordinator as `@leader` and cannot rename it — had every coordination run
+refused by a comparison nothing logged, and never asked a single question. The
+driver therefore goes through `coordinator`, which seeds a lead on a miss rather
+than returning `None`: `seed_lead` is idempotent-by-conflict (the unique index
+refuses a second `lead`), it does not consult `MAX_TEAM_AGENTS` (the lead comes
+with the board, it is not hired), and `ensure_named_persona_layout` is safe to
+re-run. A board whose lead was *removed* keeps that handle reserved forever, so
+the seed fails there — that case warns **once per process**, through a
+`leadless` set, and names the fix. The set is consulted only after a seed has
+already failed, so an operator who hires an agent called `lead` by hand is
+picked up on the next tick without a restart.
 
 Project-owned persona trees are grouped at
 `personas/project/<agent_id>/`. New leads and teammates are minted with a
@@ -877,8 +1256,11 @@ behind the operator's back.
   card as `baybo` can be on `codex` before its next run starts, and a row the
   boot sweep re-drives was recorded under whatever it was then. So
   `runs::can_host_a_session` is asked three times against one rule: by
-  `validate_assignee` when the card is assigned, by `enqueue` before it records
-  a row, and by the executor's `binding_for` before the answer is written into a
+  `validate_assignee` when the card is assigned, before a row is recorded
+  (through `enqueue_refusal`, which is `enqueue_as`'s own gate and the
+  pre-flight the promoter and the block wake ask ahead of the irreversible
+  step each makes), and by the executor's `binding_for` before the answer is
+  written into a
   session write-once. The executor's is not belt-and-braces — the sweeps hand
   out rows without passing through `enqueue`, so for those it is the only ask.
   It refuses rather than records: a top-level session bound to an external
@@ -900,12 +1282,58 @@ resolved server-side rather than against the live roster.
 `TimelineApprovalGate` wraps the channel's type-level approval gate and writes
 what it sees onto the issue's timeline — `ApprovalRequested` before the prompt
 is answered, `ApprovalResolved` after, including on the gate's own
-deny-on-timeout. Installed once over the channel, not per run, so there is
-nothing to arm or disarm and nothing to leak when a run dies unusually.
+deny-on-timeout. Installed once over the channel, not per run.
+
+**Three closers, one claim.** The gate keeps an in-memory ledger of the prompts
+this process has announced and not yet resolved. Taking an entry out of it *is*
+the claim on writing that prompt's resolution, so exactly one of three closers
+can write a given `call_id` and the timeline can neither dangle nor
+double-close:
+
+1. the gate's own return, when the inner gate answers (or denies itself on
+   timeout);
+2. `CardPromptCloser::close_card_prompts`, the port the run-settle path holds so
+   a run that stops being able to answer a prompt takes the prompt with it;
+3. `TimelineApprovalGate::close_open_prompts`, called from
+   `ManagerGraph::shutdown` **before** the actor cancel cascade.
+
+That ordering is load-bearing. A per-request `Drop` guard still exists and still
+covers an ordinary turn cancel, where the runtime is live and its spawned write
+lands — but `Drop` cannot await, so on a runtime already past its task drain the
+write is simply lost. That is how one `rm -rf` prompt on issue #3 sat in the
+ledger with an `approval_requested` row and no resolution under it from the day
+it was raised. Reversing the two statements in `shutdown` re-creates exactly
+that path.
+
+Closer 2 is a **chokepoint**, and in two senses. `settle::settle_run` calls
+`close_card_prompts` right after the `RunSettled` entry — inside the settle
+itself rather than at its three call sites, because a prompt outlives its run
+whenever a caller forgets, and the run is what was going to answer it. And the
+board is *handed* the closer by `TimelineApprovalGate::new` rather than being
+wired to it by whoever installs the gate: a port somebody has to remember to
+connect is one this crate already shipped once with no callers at all. The
+dispatcher's own settle passes `None` — a run whose checkout never opened
+reached no tool and raised no prompt.
+
+**Closing a prompt ends the request, not just the record.** Each ledger entry
+carries the `oneshot::Sender` that un-parks the wrapped gate's own call, so
+taking the entry drops it, and the wrapper — selecting on that receiver against
+`inner.request` — drops the inner future, which is what takes the prompt off
+the channel's queue (its `QueueCleanup` guard). The claim then arbitrates the
+**answer** as well as the ledger line: a request whose entry somebody else took
+returns `abandoned` whatever the inner gate says. A write-only closer left the
+human able to press Allow afterwards, and the tool ran against a card recording
+that nobody had allowed it.
 
 Pending-ness is **derived**, never stored: a request with no matching resolution
 on the same `call_id` is still open. A `pending` flag would be a second copy of a
-fact the timeline already carries, and the two would eventually disagree.
+fact the timeline already carries, and the two would eventually disagree. The
+claim ledger is not that flag — it is in-memory process state about what *this
+process* announced, and it says nothing after a restart.
+
+`ApprovalResolved` carries the resolution as well as the decision, because a
+human's "no", an expired window, an abandoned prompt and a standing policy are
+four different facts that arrive as one `Deny`.
 
 Nothing in this crate derives it, though — the two readers each derive it from
 what they can see. The board's attention badge counts the channel's **live
@@ -971,9 +1399,12 @@ and the stamp is not; the button says so on hover.
 Three SQL predicates in `crates/storage/src/sqlite/project.rs` are the single
 home of these rules:
 
-- `UNREAD_EVENT_PREDICATE` — an agent's comment, or an agent moving the card
-  into Review, newer than that card's `read_at`. The actor filter covers both
-  arms: the operator's own words and their own tidying are not news to them.
+- `UNREAD_EVENT_PREDICATE` — an agent's comment, an agent blocking the card, or
+  an agent moving it into Review, newer than that card's `read_at`. The actor
+  filter covers all three arms: the operator's own words, their own block and
+  their own tidying are not news to them. An agent's block joins the other two
+  because it is a decision the operator did not make, and on a blocked card it
+  is usually a question that gates the work.
 - `FAILED_CARD_PREDICATE` — a live card whose newest run failed. Both
   `card_signals()` (the badge) and `attention()` read it.
 - `UNSEEN_FAILURE_PREDICATE` — and that run settled after `read_at`.
@@ -1007,8 +1438,8 @@ would answer it a second time and differently.
 
 A hold whose card stopped accepting runs is settled by `call_off_dead_holds`,
 which `drive` calls **above** every gate under it. `release_holds` returns early
-on an exhausted budget and `promotions` returns early on
-`max_parallel_issue_runs == 0`, so both deliberate ways to stop a board used to
+on an exhausted ceiling — either of the two — and `promotions` returns early on
+`max_parallel_issue_runs == 0`, so every deliberate way to stop a board used to
 also stop the only sweep that could clear a hold on a card the operator had
 already cancelled.
 
@@ -1042,14 +1473,40 @@ signal would refetch every column to learn that somebody said something.
 ## Key Constraints
 
 - **One enqueue path.** Nothing outside `ProjectManager::enqueue` writes an
-  `issue_runs` row. Liveness, dedupe and budget are asked there, once each.
+  `issue_runs` row. Liveness, dedupe and budget are asked there, once each —
+  and the two a caller can be told *before* the write (liveness, and whether
+  the runner can still host a session) are `enqueue_refusal`, so the two
+  callers that must clear the way first — the promoter's move out of Todo,
+  the block wake's stand-down — ask them before doing anything they cannot
+  undo.
 - **At most one unsettled run per issue**, enforced by a partial unique index,
-  not by a check.
+  not by a check. **Which row that is has one home** — `runs::is_unsettled`,
+  read off `settled_at` and never off `status`, because `idx_issue_runs_live`
+  and `settle_run`'s own `WHERE` are what arbitrate the slot. Three doors ask
+  it: a comment's delivery, the block wake's stand-down, and the unblock's
+  hand-back. Spelled separately they agree only because `settle_run` happens
+  to write both fields together, which is a coincidence, not a type.
 - **A run row is written before anything is told about it**, and a failed
   dispatch costs a delay until the next boot sweep, never a lost run.
 - **A finished card takes no runs** — `stages::is_finished` is the one
   definition, and a row already recorded on such a card is called off rather
   than left unsettled.
+- **One home for "may the board hand this recorded row out now?"** —
+  `runs::verdict`, asked by every hand-out door through
+  `ProjectManager::card_for`: the boot sweep, the hold release, the dead-hold
+  sweep and the unblock. `enqueue` is the door that *writes* the row and asks
+  its own gates instead.
+- **The sweep is metered.** A recorded row is handed back out at most
+  `MAX_RUN_RESUMES` times, and a row nobody ever claimed waits at most
+  `MAX_QUEUED_WAIT_HOURS` from the later of its own `created_at` and its
+  card's `updated_at`; past either it is settled `Failed`, because nothing
+  else on the board ever says the sweep gave up. The log line names which of
+  the two bounds fired (`GaveUpOn`) — `resumes` alone cannot say, and an age
+  give-up read as a resume give-up that somehow fired at zero.
+  The count lives in `issue_runs.resumes` and not in a tally over timeline
+  entries: a timeline append is explicitly allowed to fail without failing the
+  thing it describes, so an events-derived counter undercounts on exactly the
+  boot where the append failed — and the loop comes back.
 - **Archived is read-only for a board's contents** — issues, comments, the
   team, a retry, and starting a run — enforced in `writable_project`, which
   every one of those writes starts with, the sweeps included (through

@@ -4,7 +4,16 @@ import { useAdminClient, useAuth } from '../../api/auth';
 import { setProjectArchived, updateProject } from './api';
 import type { Agent } from './boardModel';
 import type { Project } from './boardModel';
-import { budgetHint, formatBudget, parseBudget } from './budgetModel';
+import {
+  BUDGET_REFUSAL,
+  TOKEN_BUDGET_REFUSAL,
+  budgetHint,
+  formatBudget,
+  formatTokenBudget,
+  parseBudget,
+  parseTokenBudget,
+  tokenBudgetHint,
+} from './budgetModel';
 import { formatParallelIssueRuns, parallelIssueRunsHint, parseParallelIssueRuns } from './driverModel';
 import { fieldLabel, textInput } from './CreateProjectForm';
 
@@ -30,6 +39,7 @@ export function ProjectSettings({
   const [name, setName] = useState(project.name);
   const [description, setDescription] = useState(project.description);
   const [budget, setBudget] = useState(formatBudget(project.daily_budget_micros));
+  const [tokenBudget, setTokenBudget] = useState(formatTokenBudget(project.daily_budget_tokens));
   const [parallelIssueRuns, setParallelIssueRuns] = useState(formatParallelIssueRuns(project.max_parallel_issue_runs));
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -38,7 +48,12 @@ export function ProjectSettings({
   async function save() {
     const micros = parseBudget(budget);
     if (micros === undefined) {
-      setError('Daily budget must be an amount in dollars, or empty for no ceiling.');
+      setError(BUDGET_REFUSAL);
+      return;
+    }
+    const tokens = parseTokenBudget(tokenBudget);
+    if (tokens === undefined) {
+      setError(TOKEN_BUDGET_REFUSAL);
       return;
     }
     const slots = parseParallelIssueRuns(parallelIssueRuns);
@@ -52,6 +67,7 @@ export function ProjectSettings({
       name,
       description,
       daily_budget_micros: micros,
+      daily_budget_tokens: tokens,
       max_parallel_issue_runs: slots,
     });
     setBusy(false);
@@ -136,6 +152,26 @@ export function ProjectSettings({
           />
           <p className="mt-1 text-[0.7rem] text-ink-soft leading-snug">
             {budgetHint(parseBudget(budget) ?? null)}
+          </p>
+        </div>
+
+        <div>
+          <label className={fieldLabel} htmlFor="settings-token-budget">
+            Daily token budget
+          </label>
+          <input
+            id="settings-token-budget"
+            className={textInput}
+            value={tokenBudget}
+            inputMode="numeric"
+            disabled={archived}
+            placeholder="Leave empty for no ceiling"
+            onChange={(event) => {
+              setTokenBudget(event.target.value);
+            }}
+          />
+          <p className="mt-1 text-[0.7rem] text-ink-soft leading-snug">
+            {tokenBudgetHint(parseTokenBudget(tokenBudget) ?? null)}
           </p>
         </div>
 

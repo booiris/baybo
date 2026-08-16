@@ -21,6 +21,8 @@ Every monetary field — `CostRecord.cost_usd`, `CostSummary.total_cost_usd`, `S
 
 `record_external_tokens` is the one other recording entry point: the subagent spawner logs subscription-billed external-agent runs (claude code Max / codex) at `cost_usd = MicroUsd::ZERO` — tokens are persisted for the analytics breakdowns but never touch the daily/monthly accumulators.
 
+That explicit zero is **not the only way a row lands at `cost_usd = 0`**, and reading it as such is what hid a live gap. An ordinary in-process call through `record_call` prices at zero too whenever the model's `ModelPricing` is all-zero — which is exactly what `openai-subscription` ships, deliberately (`flat_default_pricing`, and the factory's own `ModelPricing::default()`), because subscription billing is account-level. Same outcome, different mechanism, and no code path anywhere marks the row as "billed under a subscription". Anything that gates on money must therefore say what it does on such a plan: `CostManager::check` never trips (unfixed, and named as such), and the kanban board's per-project daily budget grew a **token** ceiling beside it precisely because a dollar ceiling there is inert — see [`project.md`](project.md).
+
 Each in-process call also records `ChatRequest::reasoning_effort` directly. Requests that omit the setting, external-agent rows, and records written before the column existed store `NULL`. `QueryApi::compute_analytics` groups those rows into a nullable effort bucket alongside its model and reason breakdowns.
 
 `Router` also calls `check` at message ingress so over-cap users never spin up an actor.
