@@ -96,6 +96,7 @@ pub(super) fn rehydrate_message(
         MessageSource::RecalledMemory => ChatMessage::recalled_memory(content),
         MessageSource::SystemPromptUpdate => ChatMessage::system_prompt_update(content),
         MessageSource::SkillListing => ChatMessage::skill_listing(content),
+        MessageSource::SubagentSeed => ChatMessage::subagent_seed(content),
         MessageSource::SkillsUpdate => ChatMessage::skills_update(content),
         MessageSource::Agent => match role {
             Role::User => ChatMessage::agent_context(content),
@@ -707,6 +708,42 @@ impl SessionStore for SqliteSessionStore {
                 Ok(children)
             })
             .await
+    }
+
+    async fn list_lineage_children_page(
+        &self,
+        parent_session_id: &SessionId,
+        before: Option<(DateTime<Utc>, SessionId)>,
+        limit: usize,
+    ) -> Result<Vec<Session>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let parent = parent_session_id.as_str().to_string();
+        let before_us = before.as_ref().map(|(at, _)| super::time::to_us(*at));
+        let before_id = before.as_ref().map(|(_, id)| id.as_str().to_string());
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = self
+            .pool
+            .interact("sessions.list_lineage_children_page", move |conn| {
+                // `idx_sessions_parent` is a partial index on exactly this
+                // predicate, so the scan is the parent's children and nothing
+                // else. The keyset compares (created_at, id) as a PAIR: one
+                // turn's fan-out mints siblings inside the same microsecond,
+                // and a timestamp-only cursor would either skip or repeat them.
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {SESSION_LIST_COLUMNS} FROM sessions                      WHERE parent_session_id = ?1 AND lineage_kind IS NOT NULL                        AND (?2 IS NULL                             OR created_at < ?2                             OR (created_at = ?2 AND id < ?3))                      ORDER BY created_at DESC, id DESC                      LIMIT ?4"
+                ))?;
+                let rows = stmt
+                    .query_map(
+                        rusqlite::params![parent, before_us, before_id, limit_i64],
+                        read_session_list_row,
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
+        Ok(decode_session_list_rows(rows))
     }
 
     async fn append_session_message(

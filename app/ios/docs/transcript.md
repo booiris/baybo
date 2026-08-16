@@ -146,6 +146,28 @@ Three things the hatch must NOT break, and how:
   prompts. Dropping one leaves a gate nobody can answer until it self-denies, so
   `resync` leaves the queue alone.
 
+### The crash reload (the hatch's involuntary twin)
+
+`webViewWebContentProcessDidTerminate` → `TranscriptBridge.contentProcessDied`
+runs the SAME document reload for a WebContent process that died under a
+**visible** webview — the one case WebKit does not auto-reload (an offscreen
+kill heals itself on re-attach). Without it, `ready` stays latched true and
+every `call()` silently no-ops against a blank page: bricked until a resync or
+an app restart. Two deliberate differences from `rebuildIfShowing`, both
+load-bearing:
+
+- **The mirror is NOT dropped and `discardPersist` stays false.** A late
+  `persist` from the dead process carries the freshest pre-crash state —
+  exactly what the mirror should hold and what the fresh `ready`'s init
+  restores. The resync hatch inverts this because *it* deleted the mirror
+  first.
+- **A crash-loop budget.** The kill is memory pressure and the reload rebuilds
+  the same footprint, so an uncapped handler would flicker forever while
+  hammering the gateway with mount-edge syncs. Three reloads per 30s window;
+  a real first paint (`shown`) re-arms it. Past the cap the transcript stays
+  blank until the user backs out or resyncs. (`DeckBridge.contentProcessDied`
+  is the deck webview's twin, budget included, re-armed on its `ready`.)
+
 The LEG is untouched — no unsubscribe, no redial. An in-flight turn keeps running
 and its frames keep arriving through the reload (they buffer in the bridge's
 `pending` and flush after the fresh `init`), so the rebuilt thread shows that
@@ -216,7 +238,7 @@ delivering other traffic is left alone and only this connect fails.
 `queryFileState` / `downloadFile` / `previewFile` / `shareFile` / `viewImage` /
 `audioToggle` / `audioSeek` / `queryAudioState` / `playVideo` / `requestVideoPoster` /
 `retry` / `openUrl` / `copy` / `log` / `jumpVisible` / `runState` / `outline` /
-`outlineHere` / `htmlPreviewMaximized`.
+`outlineHere` / `subagents` / `htmlPreviewMaximized`.
 
 (The blob/file/audio/video messages are covered in [attachments.md](attachments.md).)
 
@@ -247,6 +269,30 @@ so clearing there dropped the stop button back to send until first output (the "
 appears late" bug).
 
 The webview is the single source of turn state — native never re-derives it.
+
+### The turn indicator claims its box at send
+
+`awaitingReply` also PAINTS. The pre-first-frame indicator (`.work-pending`, "✻ Working")
+is mounted by `awaitingReply || turnActive` and only FILLED at `turnActive` — the same box,
+held `visibility: hidden` until the turn is real.
+
+Keying the MOUNT on `turnActive` is what the reader feels as a lurch: that flag is
+server-driven, one gateway round trip behind the send, so the indicator inserted 43px
+(24px `--chat-row-gap` + a 19px line) into the log a beat AFTER the user's own bubble had
+settled — and the follow pin at the newest edge teleports the whole thread up by exactly
+the growth. Send, beat, jump. `handleUserSent` sets `awaitingReply` in the same batch as
+the optimistic row (one bridge message, one commit), so the box now rides the send's own
+motion instead. The handoff was already free: `.work-pending` and a step-less
+`.work.active` head both measure 19px, so pending → live costs 0px.
+
+The slot's lifetime IS the stop button's, which is why one flag drives both — a failed
+send, a turn that never starts (`AWAITING_MAX_MS`), and turn end retire the two together.
+`app/web` has always done it this way (`sendToSession` writes `awaitingReply: true` in the
+same `setViews` that appends the pending row); iOS was the divergent one.
+
+Beware the other four writers of `scrollTop = scrollHeight` when touching this — the
+ResizeObserver on `.chat-log` re-pins any height change the layout effect misses, so a fix
+that only guards one of them does nothing. `transcriptScroll.test.tsx` pins the no-move.
 
 ### Sync and persistence
 
@@ -605,15 +651,60 @@ The jump is web-side:
 - and let `onScroll` own `showJump` — which is also how "back to the newest edge" comes
   free, as the existing jump-to-latest circle.
 
-Landing clearance is `.msg-group.user`'s `scroll-margin-top`, not arithmetic at the call
-site. The arrival ring mounts inside `.bubble.user` (or the last `.attachment-bubble`)
-because `.msg-group` is unpositioned, and replays off a NONCE — a boolean would
-`Object.is`-bail a repeat jump to the same row.
+Landing clearance is `scroll-margin-top` on `.msg-group.user` AND
+`.msg-group.assistant`, not arithmetic at the call site. The arrival ring mounts inside
+`.bubble.user` (or the last `.attachment-bubble`), and for an agent row inside
+`.msg.assistant`, because `.msg-group` is unpositioned; it replays off a NONCE — a boolean
+would `Object.is`-bail a repeat jump to the same row. Both sides carry the clearance and
+the ring because a SEARCH hit lands on agent prose as often as on a user send, even though
+the message index only ever offers the latter.
+
+### Jumping to a search hit
+
+`jumpToOrdinal(ordinal)` is the search entry (`bridge.ts` → `Transcript.tsx`), and it
+differs from `jumpToMessage` in two ways that matter.
+
+**It addresses by ordinal, never by row id.** A user row is keyed by its
+`platform_msg_id` with the ordinal carried beside it, so `m${ordinal}` resolves agent rows
+and silently misses every user-authored hit. Resolution goes through `rowCoverageOrdinal`,
+which knows both shapes.
+
+**The row is usually not loaded, so it pages for it.** The window is tail-anchored with
+only a BACKWARD frontier — there is `oldestOrdinal` + `hasMoreOlder`, no `newestOrdinal`
+and no `hasMoreNewer` — and every live frame appends to the end. A window that stopped
+short of the newest edge would weld the next reply onto an ancient row, so paging backward
+until the ordinal is covered is the only way to reach it that keeps the invariant. It is
+exactly what the reader's own scroll-up does, just driven.
+
+The loop is **reply-driven, not a `for` loop**: `requestHistory` allows one request in
+flight and its reply lands in the frame switch, so a `pendingJump` ref is re-evaluated
+from a `useEffect` on `messages` — which covers the first paint, a `history_page` prepend
+and a `sync_page` REPLACE alike, without the frame switch knowing the loop exists.
+
+Three termination conditions, and the third is the one that bites:
+
+1. **covered** — jump, clear the ref;
+2. **at or above the floor but no row** — an ordinal inside the loaded window that renders
+   nothing (a tool row). Paging only ever loads rows FURTHER BACK, so no number of pages
+   produces it: stop immediately rather than dragging the reader through the whole history
+   to fail at the end of it;
+3. **`JUMP_PAGE_BUDGET` spent** — `prependOlder` advances the floor only on a NON-EMPTY
+   page while `hasMoreOlder` can stay true, so "the floor moved" is not a condition
+   anything may rely on and an empty-page loop would spin forever. The budget is
+   decremented per REQUEST and is the only thing that bounds it.
+
+Giving up appends a notice and leaves the reader where the paging got to — further back
+than they started, which is worth something. `transcriptScroll.test.tsx` pins all three,
+including the spin.
+
+**`superseded_by` is not a jump target** — see [`chat-list.md`](chat-list.md#jumping-to-a-hit).
 
 ### Two traps
 
-1. The five `@Published` outline mirrors reset in BOTH `retarget(to:)` and `case "ready"`
-   (one webview, every conversation).
+1. The `@Published` outline mirrors — plus `subagentsPresent`, which rides the same
+   reset — clear in BOTH `retarget(to:)` and `case "ready"` (one webview, every
+   conversation). The header entry they drive is PERMANENT for the index and
+   presence-gated for subagents; neither is gated on thread length any more.
 2. `deliver()` in `bridge.ts` ends in a bare `else e.jumpToLatest()`, so every new
    `Buffered` variant needs its own `else if` **ABOVE** it or the command silently becomes
    "scroll to the bottom" — TypeScript cannot see it; `bridge.test.ts` pins it.

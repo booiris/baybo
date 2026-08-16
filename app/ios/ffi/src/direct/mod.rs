@@ -59,15 +59,50 @@ pub(crate) struct DirectCredentials {
 /// client whose pool/default headers are reused across REST, blob, and push calls.
 pub(crate) struct DirectSessions {
     registry: SessionRegistry,
-    http: Mutex<Option<DirectHttpCache>>,
+    http: DirectHttpSlot,
 }
 
 impl Default for DirectSessions {
     fn default() -> Self {
+        let http = DirectHttpSlot::default();
         Self {
-            registry: SessionRegistry::default(),
-            http: Mutex::new(None),
+            registry: SessionRegistry::new(std::sync::Arc::new(chat::DirectDialer::new(
+                http.clone(),
+            ))),
+            http,
         }
+    }
+}
+
+/// The direct leg's authenticated-HTTP cache, shared between the sessions
+/// facade (REST / blob / push) and the chat dialer — the dialer is an OWNED
+/// object handed to the connection supervisor, so the cache it re-reads per
+/// dial has to be jointly owned rather than borrowed from the facade.
+#[derive(Clone, Default)]
+pub(crate) struct DirectHttpSlot(std::sync::Arc<Mutex<Option<DirectHttpCache>>>);
+
+impl DirectHttpSlot {
+    pub(crate) fn http_client(&self) -> Result<DirectHttp, String> {
+        let creds = credentials()?.ok_or("not connected; sign in first")?;
+        let key = DirectHttpKey::new(creds, device_id()?);
+        let mut guard = self.0.lock();
+        if let Some(cached) = guard.as_ref()
+            && cached.key == key
+        {
+            return Ok(cached.http.clone());
+        }
+        let cached = DirectHttpCache::new(key)?;
+        let http = cached.http.clone();
+        *guard = Some(cached);
+        Ok(http)
+    }
+
+    fn set(&self, cached: DirectHttpCache) {
+        *self.0.lock() = Some(cached);
+    }
+
+    fn clear(&self) {
+        *self.0.lock() = None;
     }
 }
 
@@ -98,26 +133,15 @@ impl DirectSessions {
     }
 
     pub(crate) fn http_client(&self) -> Result<DirectHttp, String> {
-        let creds = credentials()?.ok_or("not connected; sign in first")?;
-        let key = DirectHttpKey::new(creds, device_id()?);
-        let mut guard = self.http.lock();
-        if let Some(cached) = guard.as_ref()
-            && cached.key == key
-        {
-            return Ok(cached.http.clone());
-        }
-        let cached = DirectHttpCache::new(key)?;
-        let http = cached.http.clone();
-        *guard = Some(cached);
-        Ok(http)
+        self.http.http_client()
     }
 
     fn set_http_client(&self, cached: DirectHttpCache) {
-        *self.http.lock() = Some(cached);
+        self.http.set(cached);
     }
 
     pub(crate) fn clear_http_client(&self) {
-        *self.http.lock() = None;
+        self.http.clear();
     }
 }
 

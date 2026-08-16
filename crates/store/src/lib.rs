@@ -51,4 +51,4 @@ pub use session_folder::{SessionFolderRow, SessionFolderStore};
 pub use skill_risk::{AssessmentJob, AssessmentJobStatus, RiskLevel, RiskVerdict, SkillRiskStore};
 pub use task::{TaskPatch, TaskStore};
 pub use trace::{SpanEventRow, SpanRow, StepRow, ToolSetRow, TraceStore};
-pub use turn::{SessionTurnStats, TurnRow, TurnStore};
+pub use turn::{SessionTurnBounds, SessionTurnStats, TurnRow, TurnStore};

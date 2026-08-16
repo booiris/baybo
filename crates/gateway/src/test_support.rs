@@ -250,6 +250,7 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
     let deps = GatewayDeps {
         config,
         config_path: None,
+        inbound_dedup: Arc::new(baybo_channels::InboundDedup::new()),
         workspace_paths: Arc::new(baybo_workspace::WorkspacePaths::new(
             tempdir.path().to_path_buf(),
         )),

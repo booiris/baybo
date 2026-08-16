@@ -47,6 +47,60 @@ pub struct SessionTurnStats {
     pub latest_status_kind: String,
 }
 
+/// Wall-clock bounds and liveness for one session's turns.
+#[derive(Debug, Clone)]
+pub struct SessionTurnBounds {
+    pub session_id: SessionId,
+    /// Earliest `started_at`, falling back to `created_at` for a turn that was
+    /// queued but never started.
+    pub first_started_at: DateTime<Utc>,
+    /// Latest `ended_at`. `None` while any turn is still open, which is what
+    /// makes "still running" and "ran for N" one lookup rather than two.
+    pub last_ended_at: Option<DateTime<Utc>>,
+    /// At least one turn has not settled.
+    ///
+    /// Read off `ended_at` rather than `status_kind`: `Turn::transition`
+    /// stamps `ended_at` if and only if the target status is terminal, so the
+    /// timestamp already carries the answer and this layer — which owns none
+    /// of `baybo-turn`'s vocabulary — needs no third copy of the
+    /// pending/in_progress/stuck spelling.
+    pub live: bool,
+    /// `status_kind` of the newest turn by `created_at`, same encoding as
+    /// [`TurnRow::status_kind`].
+    pub latest_status_kind: String,
+}
+
+impl SessionTurnBounds {
+    /// Fold a session's turn rows. `None` when the session has no turns —
+    /// a spawned child whose actor has not opened one yet.
+    pub fn fold(session_id: &SessionId, rows: &[TurnRow]) -> Option<Self> {
+        let first_started_at = rows
+            .iter()
+            .map(|r| r.started_at.unwrap_or(r.created_at))
+            .min()?;
+        let live = rows.iter().any(|r| r.ended_at.is_none());
+        // An open turn leaves the whole session open — a max over just the
+        // closed ones would report a duration that quietly stopped growing
+        // while the child was still working.
+        let last_ended_at = if live {
+            None
+        } else {
+            rows.iter().filter_map(|r| r.ended_at).max()
+        };
+        let latest_status_kind = rows
+            .iter()
+            .max_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)))
+            .map(|r| r.status_kind.clone())?;
+        Some(Self {
+            session_id: session_id.clone(),
+            first_started_at,
+            last_ended_at,
+            live,
+            latest_status_kind,
+        })
+    }
+}
+
 /// Persistence backend for turns. Trades in [`TurnRow`] rather than the
 /// rich `baybo-turn` types so the contract stays in this leaf crate.
 #[async_trait]
@@ -91,6 +145,30 @@ pub trait TurnStore: Send + Sync {
     /// Turn aggregates grouped by session — one [`SessionTurnStats`] per
     /// session that has at least one turn. Ordering unspecified.
     async fn session_turn_stats(&self) -> Result<Vec<SessionTurnStats>>;
+    /// Turn bounds for a BOUNDED list of sessions, one grouped query.
+    ///
+    /// [`Self::session_turn_stats`] answers a similar question but groups the
+    /// whole table, and [`Self::list_active_by_session`] is per-session. The
+    /// subagent list surface needs both liveness and wall-clock for up to a
+    /// hundred children and is polled while its sheet is open, so neither
+    /// shape works: one is a full scan per poll, the other is a fan-out.
+    ///
+    /// Sessions with no turns are simply absent from the result. The default
+    /// implementation is the naive fan-out so in-memory fakes need no update;
+    /// the sqlite backend overrides it.
+    async fn session_turn_bounds(
+        &self,
+        session_ids: &[SessionId],
+    ) -> Result<Vec<SessionTurnBounds>> {
+        let mut out = Vec::new();
+        for session_id in session_ids {
+            let rows = self.list_by_session(session_id).await?;
+            if let Some(bounds) = SessionTurnBounds::fold(session_id, &rows) {
+                out.push(bounds);
+            }
+        }
+        Ok(out)
+    }
     /// Number of turns with the given snake_case `TurnStatusKind` wire
     /// string. Status surfaces need the number, not the rows.
     async fn count_by_status_kind(&self, status_kind: &str) -> Result<usize>;

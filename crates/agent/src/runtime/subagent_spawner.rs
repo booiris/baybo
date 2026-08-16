@@ -237,6 +237,7 @@ impl ActorSubagentSpawner {
                 metadata: MessageMetadata::default(),
             },
             platform_msg_id: String::new(),
+            bot_id: String::new(),
         };
         let child_session_id = child_session.id.clone();
         // Tier resolution: `model_tier` lookup, falling through to the
@@ -692,6 +693,32 @@ impl ActorSubagentSpawner {
                     "persist subagent identity on {}: {e}",
                     child.id,
                 )));
+            }
+            // The only place the task text reaches the session row: it exists
+            // otherwise solely inside the spawn request and the trace span
+            // label, so the surface that lists a parent's children
+            // (`/v1/chat/sessions/{id}/subagents`) would have nothing to name
+            // them by.
+            //
+            // Through the SETTER, not the struct field: `save`'s DO UPDATE
+            // deliberately omits `title` (it belongs to the targeted setters so
+            // a stale in-memory `Session` cannot clobber a rename), and
+            // `create_spawned_session` has already inserted the row — so
+            // assigning `child.title` here would be silently dropped.
+            // Best-effort: a child with no title still lists under its profile
+            // name, which is not worth failing a spawn over.
+            child.title = Some(request.task_summary.clone());
+            if let Err(e) = self
+                .session_manager
+                .store()
+                .set_title_if_absent(&child.id, &request.task_summary)
+                .await
+            {
+                warn!(
+                    session_id = %child.id,
+                    error = %e,
+                    "failed to stamp subagent task title",
+                );
             }
             Ok(child)
         }
@@ -1163,9 +1190,10 @@ async fn run_external_agent(
         &session_manager,
         &child_session_id,
         // The task is the parent agent's instruction to the subagent, not a
-        // human channel input — agent-context, so it never renders as a user
-        // bubble in the child session's transcript.
-        ChatMessage::agent_context(vec![ContentBlock::Text(request.task.clone())]),
+        // human channel input — but it IS the child's opening errand, and the
+        // one agent-injected row its transcript should render (SubagentSeed,
+        // same as the baybo-backend path's `append_spawned_prompt`).
+        ChatMessage::subagent_seed(vec![ContentBlock::Text(request.task.clone())]),
     )
     .await;
 

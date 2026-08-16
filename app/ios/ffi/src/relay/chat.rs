@@ -13,12 +13,14 @@ use device_proto::noise::StaticKeypair;
 use futures_util::SinkExt;
 use tokio_tungstenite::tungstenite::Message;
 
+use std::sync::Arc;
+
 use super::dial::dial_content_join;
 use super::pairing::{PairedRecord, load_paired_record};
 use crate::core::{ContentHandshake, ContentSession, Frame, user_message_frame};
 use crate::transport::{
-    ChatTransport, Connection, FrameCodec, SessionLeg, SessionRegistry, TransportError,
-    UserFrameFn, WsStream, recv_binary_handshake,
+    Connection, FrameCodec, LegDialer, SessionLeg, SessionRegistry, TransportError, UserFrameFn,
+    WsStream, recv_binary_handshake,
 };
 
 /// The relay leg's state: the shared session registry. The durable pairing
@@ -31,38 +33,22 @@ pub(crate) struct RelaySessions {
 impl RelaySessions {
     pub(crate) fn new() -> Self {
         Self {
-            registry: SessionRegistry::default(),
+            registry: SessionRegistry::new(Arc::new(RelayDialer)),
         }
     }
 }
 
-/// The relay frame codec: every `Frame` rides Noise (sealed + chunked on send,
-/// decrypted + reassembled on receipt).
-struct RelayCodec {
-    session: ContentSession,
-}
+/// The relay leg's dialer — the OWNED establish seam the connection supervisor
+/// holds ([`LegDialer`]). Stateless: the pairing record is reloaded from the
+/// keychain on every dial.
+struct RelayDialer;
 
-impl FrameCodec for RelayCodec {
-    fn encode_outbound(&mut self, frame: &Frame) -> Result<Vec<Vec<u8>>, TransportError> {
-        Ok(self.session.seal(frame)?)
-    }
-
-    fn decode_inbound(&mut self, bytes: &[u8]) -> Result<Vec<Frame>, TransportError> {
-        // A decrypt failure means the Noise stream desynced — unrecoverable, so the
-        // pump ends the session on this `Err`.
-        Ok(self.session.open(bytes)?)
-    }
-}
-
-impl ChatTransport for RelaySessions {
-    #[allow(clippy::manual_async_fn)]
-    fn establish(
-        &self,
-    ) -> impl std::future::Future<Output = Result<Connection, TransportError>> + Send {
-        async move {
-            // Preconditions surface as `Precondition` so a transient failure here
-            // doesn't tear down a healthy live session on a foreground reconnect
-            // (matches the original, which only reset on a failed dial below).
+impl LegDialer for RelayDialer {
+    fn establish(&self) -> futures_util::future::BoxFuture<'_, Result<Connection, TransportError>> {
+        Box::pin(async move {
+            // Preconditions surface as `Precondition` with their own prose
+            // ("pair a gateway first"), so the client can tell setup from
+            // network.
             let record = load_paired_record()
                 .map_err(TransportError::Precondition)?
                 .ok_or_else(|| {
@@ -91,7 +77,25 @@ impl ChatTransport for RelaySessions {
                 codec,
                 user_frame,
             })
-        }
+        })
+    }
+}
+
+/// The relay frame codec: every `Frame` rides Noise (sealed + chunked on send,
+/// decrypted + reassembled on receipt).
+struct RelayCodec {
+    session: ContentSession,
+}
+
+impl FrameCodec for RelayCodec {
+    fn encode_outbound(&mut self, frame: &Frame) -> Result<Vec<Vec<u8>>, TransportError> {
+        Ok(self.session.seal(frame)?)
+    }
+
+    fn decode_inbound(&mut self, bytes: &[u8]) -> Result<Vec<Frame>, TransportError> {
+        // A decrypt failure means the Noise stream desynced — unrecoverable, so the
+        // pump ends the session on this `Err`.
+        Ok(self.session.open(bytes)?)
     }
 }
 

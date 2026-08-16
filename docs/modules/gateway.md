@@ -971,7 +971,6 @@ crates/gateway/
 │   │   ├── boot.rs          #   install_channels / build_channel; APPROVAL_TIMEOUT=300s; per-channel gate
 │   │   ├── bot_reconciler.rs#   reconciles StartBot/StopBot rosters to Multiplexed sidecars
 │   │   ├── control.rs       #   ChannelControlRegistry (push control frames from outside the route task)
-│   │   ├── dedup.rs         #   InboundDedup (recent-window (channel,bot,platform_msg_id) dedup)
 │   │   ├── device_content.rs #  gateway side of a paired device's content (chat) session over the relay
 │   │   ├── device_pair.rs   #   XXpsk0 device-pairing handshake + mutual confirm (PairingHostDeps)
 │   │   ├── handshake.rs     #   validate_register (Tui/Tool/Subprocess/Web/Device gating via AuthedClient)

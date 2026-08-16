@@ -613,6 +613,7 @@ mod tests {
             actor_parent_token: CancellationToken::new(),
             rate_limit: LiveRateLimit::new(100, std::time::Duration::from_secs(60)),
             workspace: Arc::new(WorkspacePaths::new("/tmp/baybo-issue-router-test")),
+            inbound_dedup: Arc::new(baybo_channels::InboundDedup::new()),
         });
         RouterHarness {
             router,

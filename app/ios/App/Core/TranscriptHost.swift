@@ -7,7 +7,7 @@ final class TranscriptHost {
     let webView: WKWebView
     private let navigationPolicy = TranscriptNavigationPolicy()
 
-    init(store: ChatStore) {
+    init(store: any TranscriptTarget) {
         let bridge = TranscriptBridge(store: store)
         self.bridge = bridge
 
@@ -19,6 +19,7 @@ final class TranscriptHost {
             forURLScheme: TranscriptSchemeHandler.scheme)
 
         let webView = WKWebView(frame: .zero, configuration: config)
+        navigationPolicy.bridge = bridge
         webView.navigationDelegate = navigationPolicy
         webView.isOpaque = false
         webView.backgroundColor = .white
@@ -46,6 +47,8 @@ final class TranscriptHost {
 
 @MainActor
 private final class TranscriptNavigationPolicy: NSObject, WKNavigationDelegate {
+    weak var bridge: TranscriptBridge?
+
     func webView(
         _ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction
     ) async -> WKNavigationActionPolicy {
@@ -57,5 +60,9 @@ private final class TranscriptNavigationPolicy: NSObject, WKNavigationDelegate {
             return .cancel
         }
         return .allow
+    }
+
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        bridge?.contentProcessDied()
     }
 }

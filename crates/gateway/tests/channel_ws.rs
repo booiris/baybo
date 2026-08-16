@@ -1079,6 +1079,7 @@ async fn session_activity_pulse_reaches_unsubscribed_tab() {
             metadata: baybo_model::MessageMetadata::default(),
         },
         platform_msg_id: String::new(),
+        bot_id: String::new(),
     };
     // No throttle wait needed: `SessionPulse` keys `last_sent` on
     // `(SessionId, ActivityKind)`, so this User pulse sits in a different
@@ -1509,6 +1510,86 @@ async fn subscribe_to_a_non_pool_session_is_rejected() {
     );
 
     drop(device_client);
+    shutdown.trigger();
+    let _ = server_handle.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_for_an_unsubscribed_session_is_nacked_with_a_notice() {
+    // The drop itself is long-standing policy (a Subscribed-kind connection
+    // must not inject into sessions it never subscribed); what this pins is
+    // that the drop is no longer SILENT. A client wedged on a stale leg sends
+    // into this gate believing `connected` — before the Notice, the only
+    // symptom was a spinner that never resolved (the 2026-08-16 iOS
+    // cold-start black hole, visible server-side as bursts of the
+    // "not subscribed; dropping" warn at the outbox's 10s retry cadence).
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let cfg = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
+
+    let shutdown = tg.shutdown.clone();
+    let mut incoming_rx = tg.incoming_rx;
+    let (port, server_handle) = start_admin_ws_server(&tg.deps, shutdown.clone())
+        .await
+        .expect("bind admin server");
+
+    let mut client = connect_register(port, &tg.deps.admin_token, ChannelType::owner())
+        .await
+        .expect("handshake");
+
+    // No Subscribe for this session on this connection. Sent twice, as the
+    // client outbox's retry cadence would.
+    let void_message = |platform_msg_id: &str| {
+        Frame::Message(WireMessage {
+            content: "hello into the void".into(),
+            session_id: "sess-never-subscribed".into(),
+            user_id: WEB_OPERATOR_USER_ID.into(),
+            channel_type: ChannelType::owner(),
+            bot_id: String::new(),
+            attachments: Vec::new(),
+            platform_msg_id: platform_msg_id.into(),
+            role: MessageRole::User,
+            ordinal: None,
+        })
+    };
+    send_frame(&mut client, void_message("m-void"))
+        .await
+        .expect("send unsubscribed message");
+    send_frame(&mut client, void_message("m-void"))
+        .await
+        .expect("retry the unsubscribed message");
+
+    let frame = recv_frame_skip_activity(&mut client, Duration::from_secs(2))
+        .await
+        .expect("NACK notice for the unsubscribed send");
+    match frame {
+        Frame::Notice {
+            session_id, level, ..
+        } => {
+            assert_eq!(session_id, "sess-never-subscribed");
+            assert_eq!(level, "error");
+        }
+        other => panic!("expected error Notice, got {other:?}"),
+    }
+
+    // The retry is NACKed only once per session per connection — a fresh
+    // error card per outbox attempt would be noise — and dropped before
+    // dedup / echo / router: nothing reaches the intake and no second
+    // Notice follows.
+    assert!(
+        recv_frame_skip_activity(&mut client, Duration::from_millis(300))
+            .await
+            .is_err(),
+        "the retry must not mint a second Notice",
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), incoming_rx.recv())
+            .await
+            .is_err(),
+        "the dropped message must never reach the router",
+    );
+
+    drop(client);
     shutdown.trigger();
     let _ = server_handle.await;
 }

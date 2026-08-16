@@ -14,9 +14,9 @@ import WebKit
 final class TranscriptBridge: NSObject, ObservableObject {
     static let messageHandlerName = "baybo"
 
-    private weak var store: ChatStore?
+    private weak var store: (any TranscriptTarget)?
     weak var webView: WKWebView?
-    private var ready = false
+    private(set) var ready = false
     private var pending: [String] = []
     /// Which conversation the mounted page is rendering. Held here rather than
     /// read off `store` because `store` is weak: the LRU can evict and
@@ -42,12 +42,23 @@ final class TranscriptBridge: NSObject, ObservableObject {
     @Published private(set) var outline: [OutlineEntry] = []
     @Published private(set) var outlineHasMoreOlder = false
     @Published private(set) var outlineLoadingOlder = false
-    /// `false` until the transcript has enough of a thread to index — the header
-    /// button is absent, not disabled, below that gate.
-    @Published private(set) var outlineAvailable = false
+    /// The outline payload failed to decode — a contract break on the far side
+    /// of a seam whose marshalling fails silently. The header button is
+    /// PERMANENT and stays put; this only changes what the empty sheet says,
+    /// so a thread full of messages is never told "you have never sent one".
+    /// (It replaces an older gate that hid the button below three entries; the
+    /// button's position is worth more than the gate ever was.)
+    @Published private(set) var outlineFailed = false
     /// The entry the transcript is currently parked on, so the sheet can mark
     /// where the reader already is.
     @Published private(set) var outlineHereId: String?
+    /// This conversation has delegated to at least one subagent, derived from
+    /// the rendered rows rather than fetched — the web side sees a
+    /// `spawn_subagent` work step and says so, which costs no network and is
+    /// correct offline. Latches within a session (a page of history with no
+    /// spawn must not retract the header entry); `resetOutline` clears it when
+    /// the webview changes conversation.
+    @Published private(set) var subagentsPresent = false
     /// `false` until the transcript has painted its first frame (`shown`), so
     /// the webview can fade in rather than pop its content in as the chat
     /// screen slides on. Re-armed on every fresh page load (`ready`).
@@ -57,14 +68,14 @@ final class TranscriptBridge: NSObject, ObservableObject {
     /// trusted parent document, never inside the untrusted iframe.
     @Published private(set) var htmlPreviewMaximized = false
 
-    init(store: ChatStore) {
+    init(store: any TranscriptTarget) {
         self.store = store
         shownSessionId = store.sessionId
         super.init()
         store.attachBridge(self)
     }
 
-    func retarget(to newStore: ChatStore) {
+    func retarget(to newStore: any TranscriptTarget) {
         if store === newStore {
             newStore.attachBridge(self)
         } else {
@@ -98,6 +109,15 @@ final class TranscriptBridge: NSObject, ObservableObject {
         if ready { newStore.replayUnconfirmedSends(to: self) }
     }
 
+    /// The other half of `subagentsPresent`. The web side only sees the rows it
+    /// has LOADED, and the spawning turn leaves that window routinely (a
+    /// REPLACE rebuilds from the newest page), so entering a conversation also
+    /// asks the gateway once. Latching here rather than assigning keeps the two
+    /// sources OR-ed.
+    func noteSubagentsPresent() {
+        subagentsPresent = true
+    }
+
     /// ONE webview serves every conversation, so an index left behind renders
     /// over the next session's header — and its rows jump into a thread that no
     /// longer holds them. Safe to call on a page reload too: that remounts the
@@ -106,8 +126,9 @@ final class TranscriptBridge: NSObject, ObservableObject {
         outline = []
         outlineHasMoreOlder = false
         outlineLoadingOlder = false
-        outlineAvailable = false
+        outlineFailed = false
         outlineHereId = nil
+        subagentsPresent = false
     }
 
     /// Rebuild the page from scratch — the second half of `ChatStore.resync`,
@@ -128,17 +149,65 @@ final class TranscriptBridge: NSObject, ObservableObject {
     /// the fresh `init`).
     func rebuildIfShowing(_ sessionId: String) {
         guard shownSessionId == sessionId else { return }
-        guard let webView, let url = TranscriptSchemeHandler.indexURL else { return }
+        // The mirror was just deleted; a late persist from the dying document
+        // would resurrect it.
         discardPersist = true
+        reloadDocument()
+    }
+
+    /// How many back-to-back deaths `contentProcessDied` will answer with a
+    /// reload before giving up. The kill is memory pressure, and the reload
+    /// rebuilds the same footprint — with no cap, a page that dies on every
+    /// load flickers forever while hammering the gateway with mount-edge
+    /// syncs. Past the cap the transcript stays blank until the user backs
+    /// out or resyncs; a successful first paint (`shown`) re-arms the budget.
+    private static let maxConsecutiveDeaths = 3
+    private static let deathWindowSeconds: TimeInterval = 30
+    private var consecutiveDeaths = 0
+    private var lastDeathAt = Date.distantPast
+
+    /// The WebContent process died under a VISIBLE webview — the one case
+    /// WebKit does NOT auto-reload (an offscreen kill heals itself on
+    /// re-attach: the reload's fresh `ready` re-inits and re-seeds). Without
+    /// this, `ready` stays latched true and every call() silently no-ops
+    /// against a blank page — the transcript is bricked until a resync or an
+    /// app restart. Same recovery as `rebuildIfShowing` minus the mirror drop:
+    /// the mirror is intact and IS what the fresh `ready`'s init restores
+    /// (which is also why `discardPersist` stays false here — a late persist
+    /// from the dead process carries the freshest pre-crash state, exactly
+    /// what the mirror should hold).
+    func contentProcessDied() {
+        let now = Date()
+        if now.timeIntervalSince(lastDeathAt) > Self.deathWindowSeconds {
+            consecutiveDeaths = 0
+        }
+        lastDeathAt = now
+        consecutiveDeaths += 1
+        guard consecutiveDeaths <= Self.maxConsecutiveDeaths else {
+            NSLog("baybo: transcript web content process died again; giving up on reloads")
+            return
+        }
+        NSLog("baybo: transcript web content process died; reloading")
+        reloadDocument()
+    }
+
+    /// The one reload body both hatches share, so a latch added to one reset
+    /// list cannot silently miss the other. What it deliberately does NOT
+    /// own is `discardPersist` — whether a late persist from the dying
+    /// document is welcome is the one load-bearing difference between the
+    /// callers, and it must stay visible at each call site.
+    private func reloadDocument() {
+        guard let webView, let url = TranscriptSchemeHandler.indexURL else { return }
         ready = false
         // Buffered calls target a document about to be destroyed — and one of
-        // them may be an `init` carrying the mirror we just threw away.
+        // them may be an `init` carrying state the new document must rebuild
+        // for itself.
         pending.removeAll()
         htmlPreviewMaximized = false
         webView.load(URLRequest(url: url))
     }
 
-    func detachCurrent(_ leaving: ChatStore) {
+    func detachCurrent(_ leaving: any TranscriptTarget) {
         // SwiftUI can run the next screen's `onAppear` before this `onDisappear`.
         guard store === leaving else { return }
         collapseHtmlPreview()
@@ -190,9 +259,11 @@ final class TranscriptBridge: NSObject, ObservableObject {
     }
 
     /// The outbox released that send — it is durable, so the transcript may stop
-    /// overlaying its optimistic bubble across a REPLACE.
-    func sendConfirmed(_ msgId: String) {
-        call("sendConfirmed", jsonLiteral(msgId))
+    /// overlaying its optimistic bubble across a REPLACE. The durable row's
+    /// ordinal rides along (when the proof carried one) so the bubble gains
+    /// sync coverage the echo never gave it.
+    func sendConfirmed(_ msgId: String, ordinal: Int64?) {
+        call("sendConfirmed", "\(jsonLiteral(msgId)), \(ordinal.map(String.init) ?? "null")")
     }
 
     func blobResult(id: Int, dataBase64: String?, mimeType: String, error: String?) {
@@ -286,6 +357,22 @@ final class TranscriptBridge: NSObject, ObservableObject {
         call("jumpToMessage", jsonLiteral(rowId))
     }
 
+    /// Park the transcript on a search hit, addressed BY ORDINAL.
+    ///
+    /// Not a row id: a user row is keyed by its `platform_msg_id` with the
+    /// ordinal carried beside it, so building `m<ordinal>` here would resolve
+    /// agent rows and silently miss every user-authored hit — most of what a
+    /// search finds.
+    ///
+    /// Fire-and-forget, and deliberately stateful on the far side. `call`'s
+    /// pending queue covers "the webview has not loaded yet", but the ordinary
+    /// case is a webview that IS loaded and simply has not paged back far
+    /// enough — so the web side holds the request and pages toward it, giving up
+    /// against its own budget. Nothing here waits on the outcome.
+    func jumpToOrdinal(_ ordinal: Int64) {
+        call("jumpToOrdinal", String(ordinal))
+    }
+
     /// Page one more screen of older rows into the thread, so the index can
     /// reach further back than the thread currently holds.
     func outlineLoadOlder() {
@@ -365,7 +452,18 @@ final class TranscriptBridge: NSObject, ObservableObject {
     private func deliverInit() {
         guard let store else { return }
         shownSessionId = store.sessionId
-        let restored = TranscriptStore.read(sessionId: store.sessionId)
+        let restored: String?
+        if store.mirrored {
+            restored = TranscriptStore.read(sessionId: store.sessionId)
+        } else {
+            // A read-only page renders the server's CURRENT truth only. Delete
+            // rather than merely skip: installs that viewed this child against
+            // an old gateway already hold a mirror full of rows the fixed read
+            // path no longer serves, and nothing else would ever remove it.
+            TranscriptStore.delete(
+                sessionId: store.sessionId, in: SessionIndex.supportDirectory())
+            restored = nil
+        }
         // The in-app language override (falls back to the device language) —
         // the same source the native chrome renders from, so the two can't
         // diverge.
@@ -473,6 +571,11 @@ extension TranscriptBridge: WKScriptMessageHandler {
             jumpVisible = false
             resetOutline()
             contentVisible = store?.listed == false
+            // Queued durability confirms first, then the outbox replay: the
+            // confirm retires ids the replay must not re-seed, and neither may
+            // sit in `pending` where a rebuild/crash reload would destroy the
+            // transcript half of a release whose outbox half already committed.
+            store?.flushPendingSendConfirms(to: self)
             // After the flush, so the live frames that arrived during the load
             // keep their arrival order and the re-seeded bubbles land at the
             // tail — where an optimistic send always sits.
@@ -481,6 +584,9 @@ extension TranscriptBridge: WKScriptMessageHandler {
             htmlPreviewMaximized = false
         case "shown":
             // The transcript painted its first frame — fade the webview in.
+            // A real paint also proves the reloaded process is standing, so
+            // the crash-reload budget re-arms.
+            consecutiveDeaths = 0
             contentVisible = true
         case "sync":
             // The one forward-recovery pull: the webview posts its cursor
@@ -500,6 +606,12 @@ extension TranscriptBridge: WKScriptMessageHandler {
             // hatch just deleted, with exactly the state being thrown away.
             if discardPersist { break }
             // Persist is async and may arrive after the bridge retargets.
+            // A bridge whose target opted out of mirroring hosts only such
+            // targets (the subagent sheet's own webview), so drop the write for
+            // ANY session id — a late flush from the previously shown child
+            // must not mint a mirror either. deliverInit's delete is the
+            // backstop for a flush that slips through a mid-retarget nil store.
+            if let store, !store.mirrored { break }
             if let sessionId = (body["sessionId"] as? String) ?? store?.sessionId,
                 let state = body["state"],
                 let data = try? JSONSerialization.data(withJSONObject: state),
@@ -602,23 +714,31 @@ extension TranscriptBridge: WKScriptMessageHandler {
         case "outline":
             outlineHasMoreOlder = (body["hasMoreOlder"] as? Bool) ?? false
             outlineLoadingOlder = (body["loadingOlder"] as? Bool) ?? false
-            outlineAvailable = (body["available"] as? Bool) ?? false
             if let entries = body["entries"],
                 let data = try? JSONSerialization.data(withJSONObject: entries),
                 let decoded = try? JSONDecoder().decode([OutlineEntry].self, from: data)
             {
                 outline = decoded
+                outlineFailed = false
             } else {
                 // Keeping the previous rows would leave the sheet offering jumps
                 // into a thread that has moved on — an empty index is honest.
-                // `available` goes with them: a lit button that opens an empty
-                // sheet is worse than no button.
+                // But an empty index and a BROKEN one read identically to the
+                // reader, and only one of them is their own fault, so the sheet
+                // is told which happened.
                 NSLog("baybo: outline decode failed")
                 outline = []
-                outlineAvailable = false
+                outlineFailed = true
             }
         case "outlineHere":
             outlineHereId = body["rowId"] as? String
+        case "subagents":
+            // OR, never assignment: the flag is a latch (see the property), and
+            // the REST backstop below can also raise it for spawns that never
+            // scrolled into the loaded window.
+            if (body["present"] as? Bool) ?? false {
+                subagentsPresent = true
+            }
         case "runState":
             // The transcript's turn is/ isn't in flight — drives the composer's
             // send↔stop button on the store this webview currently targets.

@@ -490,10 +490,15 @@ rows never persist, and resends are swallowed by the live dedup — so they
 exhaust the cap and surface as `failed`, which is honest feedback ("this
 message was not processed"). A future `Dropped { platform_msg_ids }` control
 event could surface it immediately; out of scope for v2. Honest guarantee: the gateway's `InboundDedup` is an in-memory
-   FIFO of 4096 keys (`dedup.rs:27`), *not* Telegram's never-expiring
-   `random_id` store — blind retry is safe within a live gateway process and
-   the recent-send window, but a retry racing a gateway restart can
-   double-run a turn. Retries fired after a reconnect (or any suspected
+   FIFO of 4096 keys (one process-wide instance, `baybo-channels`'s
+   `dedup.rs`, shared by every listener AND the router), *not* Telegram's
+   never-expiring `random_id` store — blind retry is safe within a live
+   gateway process and the recent-send window, but a retry racing a gateway
+   restart can double-run a turn. A message the router's gates REJECT (rate
+   limit, cost cap, sanitizer, route failure) un-records its key: nothing
+   persisted, so the same-id retry must be admissible — without that, a
+   gated first send was permanently unsendable, its manual retries silently
+   swallowed pre-echo. Retries fired after a reconnect (or any suspected
    server restart) MUST therefore be gated on sync reconciliation first
    (does a row with my `platform_msg_id` exist?). If exactly-once ever
    matters more, the server-side option is a durable idempotency check —

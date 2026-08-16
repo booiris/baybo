@@ -114,6 +114,11 @@ was tried and failed, and several name a bug that shipped once already.
   Liquid Glass on an 18.0 deployment target.
 - [`docs/chat-list.md`](docs/chat-list.md) — `SessionIndex`, live unread, the
   approval mark, the app-icon badge, and push-tap routing.
+- [`docs/connection.md`](docs/connection.md) — the chat-leg connection
+  supervisor (one loop owns dial/death/subscription state), the `LegDialer`
+  seam, the send gate, the ack judgment, and the Swift `connState`
+  continuations. Shaped by the 2026-08-16 cold-start send black hole; read it
+  before touching `ffi/src/transport/` or the ChatStore dial paths.
 - [`docs/transcript.md`](docs/transcript.md) — the one reused WKWebView, store
   lifecycle and offscreen frame buffering, the native ⇄ web bridge, the keyboard
   inset, markdown/LaTeX rendering, and the message index.
@@ -130,6 +135,9 @@ was tried and failed, and several name a bug that shipped once already.
 - [`docs/deck.md`](docs/deck.md) — the iOS half of Deck;
   [`docs/modules/deck.md`](../../docs/modules/deck.md) is the design's source of
   truth.
+- [`docs/subagents.md`](docs/subagents.md) — the header's `Subagents` entry, the
+  three GET-only gateway routes behind it, the lineage-scoped readability
+  predicate, and the read-only child transcript (second webview, no mirror).
 
 ## Known gaps / follow-ups
 

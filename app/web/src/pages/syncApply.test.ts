@@ -5,6 +5,7 @@ import {
   applySyncReplace,
   applyTurnState,
   compactionDividerKeys,
+  finalizeMessage,
   joinKeptHead,
   pushToolStartedStep,
   rowsAboveFloor,
@@ -118,6 +119,56 @@ describe('applySyncReplace (baseline / rebase REPLACE + overlay)', () => {
   it('keeps nothing twice when the page already carries the row', () => {
     const page = [transcriptItemToRow(SID, msg(10, 'assistant', 'answer'))];
     expect(applySyncReplace(page, page, new Set(), null)).toHaveLength(1);
+  });
+
+  // A session's rows are never deleted, so an empty page against a thread that
+  // holds rows is always a pre-persist read — the shape every fresh session's
+  // baseline can produce (the gateway echoes before it writes, and a null
+  // cursor keeps every sync a baseline). Applying it deleted every
+  // ordinal-less row outside the kept sets — the clientMsgId-less
+  // echo-appended user row most of all.
+  it('treats an empty page against a non-empty thread as stale — nothing moves', () => {
+    const prev: TranscriptRow[] = [
+      { key: 'echoed', role: 'user', text: 'first message' },
+      { key: `row-${SID}-m12`, role: 'assistant', text: 'the reply' },
+    ];
+    expect(applySyncReplace(prev, [], new Set(), null)).toBe(prev);
+  });
+
+  // The other half of the same hole: the kept sets return BEHIND the page, so
+  // an owed ordinal-less first send re-filed below the ordinal-bearing reply
+  // that outran it — [reply, user], permanent (the reply's ordinal advanced
+  // the cursor, differences select strictly `>`, nothing re-orders it).
+  it('never re-files an owed first send below a reply the empty page predates', () => {
+    const prev: TranscriptRow[] = [
+      { key: 'pending-x', role: 'user', text: 'just sent', pending: true, clientMsgId: 'x' },
+      { key: `row-${SID}-m12`, role: 'assistant', text: 'the reply' },
+    ];
+    expect(applySyncReplace(prev, [], new Set(['x']), null).map((r) => r.text)).toEqual([
+      'just sent',
+      'the reply',
+    ]);
+  });
+});
+
+describe('finalizeMessage — the echo fall-through append', () => {
+  // The append arm used to mint a key and nothing else, so an echo-appended
+  // user row (this tab reloaded mid-send; a sibling tab sent) had no
+  // clientMsgId — invisible to the kept-set overlay, unmatchable by a
+  // re-echo, and unretirable by applySyncMerge's reconciliation.
+  it('carries the echo platform_msg_id as clientMsgId, and the overlay can then hold the row', () => {
+    const rows = finalizeMessage([], 'user', 'reloaded mid-send', false, [], 'client-uuid');
+    expect(rows[0].clientMsgId).toBe('client-uuid');
+
+    const page = [transcriptItemToRow(SID, msg(10, 'assistant', 'answer'))];
+    expect(
+      applySyncReplace(rows, page, new Set(['client-uuid']), null).map((r) => r.text),
+    ).toEqual(['answer', 'reloaded mid-send']);
+  });
+
+  it('a plain append without one stays clientMsgId-less (assistant rows never get one)', () => {
+    const rows = finalizeMessage([], 'assistant', 'an answer', false);
+    expect(rows[0].clientMsgId).toBeUndefined();
   });
 });
 

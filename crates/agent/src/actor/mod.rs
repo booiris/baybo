@@ -1622,6 +1622,7 @@ mod tests {
                 metadata: Default::default(),
             },
             platform_msg_id: String::new(),
+            bot_id: String::new(),
         }
     }
 

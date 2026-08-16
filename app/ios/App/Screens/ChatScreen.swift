@@ -11,6 +11,9 @@ struct ChatScreen: View {
     @ObservedObject private var bridge: TranscriptBridge
     private let host: TranscriptHost
     private let webView: WKWebView
+    /// Only for the one-shot search jump (`takePendingJump`) — the conversation
+    /// itself is driven by `store`.
+    @EnvironmentObject private var appStore: AppStore
     @Environment(\.dismiss) private var dismiss
     /// The hand-rolled model menu (`ModelMenuPanel`) — state lives here
     /// because the panel overlays the TRANSCRIPT, not just the header bar.
@@ -22,6 +25,8 @@ struct ChatScreen: View {
     @StateObject private var attach = AttachMenu()
     /// The header's message index (`MessageIndexSheet`).
     @State private var messageIndexOpen = false
+    /// The header's subagent list (`SubagentSheet`).
+    @State private var subagentsOpen = false
     /// The row a sheet tap picked. The jump runs from the sheet content's
     /// `.onDisappear`, not from the tap: that is deterministic against the
     /// dismissal where a guessed delay is not, so the ring blooms on a clear
@@ -63,7 +68,7 @@ struct ChatScreen: View {
             Group {
                 ChatHeaderView(
                     store: store, bridge: bridge, catalog: .shared, menuOpen: $modelMenuOpen,
-                    indexOpen: $messageIndexOpen
+                    indexOpen: $messageIndexOpen, subagentsOpen: $subagentsOpen
                 ) {
                     dismiss()
                 }
@@ -165,6 +170,23 @@ struct ChatScreen: View {
         .fullScreenCover(item: $store.videoPlayback) { playback in
             VideoPlayerScreen(url: playback.url)
         }
+        // ONE sheet: the child transcript is PUSHED inside it, so the detail
+        // slides in over the list instead of waiting for it to collapse, and
+        // backing out is a native pop straight back to the list.
+        //
+        // A `.sheet`, NOT a `fullScreenCover`: a cover fires this screen's
+        // `onDisappear`, which detaches the parent transcript's bridge for as
+        // long as it is up (`AppStore.chatPath`'s didSet says the same of the
+        // image viewer). Reading a subagent that ran for half an hour would
+        // overflow the parent's offscreen frame buffer and force a full
+        // re-sync on the way back.
+        .sheet(isPresented: $subagentsOpen) {
+            SubagentSheet(sessionId: store.sessionId, parentSessionId: store.sessionId)
+                .presentationDetents([.large])
+                .presentationDragIndicator(.hidden)
+                .presentationBackground(Theme.paper)
+                .presentationCornerRadius(Theme.radiusModal)
+        }
         .sheet(isPresented: $messageIndexOpen) {
             MessageIndexSheet(bridge: bridge) { rowId in
                 pendingJump = rowId
@@ -196,6 +218,7 @@ struct ChatScreen: View {
             modelMenuOpen = false
             attach.isOpen = false
             messageIndexOpen = false
+            subagentsOpen = false
         }
         .onAppear {
             host.bridge.retarget(to: store)
@@ -203,6 +226,32 @@ struct ChatScreen: View {
             ModelCatalog.shared.refreshIfNeeded()
             store.refreshModelPin()
             SessionIndex.shared.enterSession(store.sessionId)
+            // The header entry's second source: the web side can only see the
+            // rows it has loaded, and a spawn older than the current window is
+            // invisible to it. One bounded request per open covers that; the
+            // two are OR-ed, so an offline open still gets the web verdict.
+            Task {
+                guard
+                    let list = try? await Baybo.client.chatListSubagents(
+                        sessionId: store.sessionId, before: nil)
+                else { return }
+                // Keep the rows, not just the verdict: the sheet seeds from
+                // this, so opening it paints on the first frame instead of
+                // paying a second round trip for what was already fetched.
+                SubagentCache.shared.put(
+                    sessionId: store.sessionId, items: list.items,
+                    hasMoreOlder: list.hasMoreOlder)
+                if !list.items.isEmpty { bridge.noteSubagentsPresent() }
+            }
+            // A search result routed here: park the transcript on the matched
+            // message. Consumed on APPEAR rather than issued at the call site, so
+            // it survives a `TranscriptHost` rebuilt between the tap and this
+            // screen mounting — the queued JS would have gone with the old host.
+            // `takePendingJump` removes on read, so a later re-appear (a cover
+            // dismissing) can't re-park a reader who has moved on.
+            if let ordinal = appStore.takePendingJump(store.sessionId) {
+                bridge.jumpToOrdinal(ordinal)
+            }
             // Where the responder chain's paste hook (`AppDelegate`) sends an
             // image. Registered on the SCREEN, not on the composer: every
             // `fullScreenCover` over the chat tears the dock's `.safeAreaInset`
@@ -256,6 +305,7 @@ struct ChatHeaderView: View {
     @ObservedObject var catalog: ModelCatalog
     @Binding var menuOpen: Bool
     @Binding var indexOpen: Bool
+    @Binding var subagentsOpen: Bool
     let onBack: () -> Void
 
     private static let veilPeakAlpha = 0.8
@@ -303,35 +353,41 @@ struct ChatHeaderView: View {
                 offlineIcon
             }
 
-            // LAST, always. `Spacer()` absorbs every width change, so only the
-            // trailing-most element holds still; inboard of the outage disc
-            // this would slide 54pt under the blanket `legDown` animation every
-            // time the network drops. A persistent control must not move — the
-            // transient alarm inserts to its left.
-            if bridge.outlineAvailable {
-                indexButton
+            // BOTH persistent controls come LAST, after the outage branch.
+            // `Spacer()` absorbs every width change, so only the trailing side
+            // holds still; declared inboard of the alarm, either of these would
+            // slide 54pt under the blanket `legDown` animation every time the
+            // network drops. A persistent control must not move — the transient
+            // alarm inserts to their left.
+            if bridge.subagentsPresent {
+                subagentsButton
             }
+            indexButton
         }
         .padding(.horizontal, 24)
         .frame(height: Self.barHeight)
         .frame(maxWidth: .infinity)
-        // Keep the bar an accessibility CONTAINER. An offline session shows
-        // neither the model pill nor the index button, leaving the back chevron
-        // as the bar's ONLY focusable child — and SwiftUI then collapses the bar
-        // into that child, which inherits the bar's frame after the veil's
-        // `ignoresSafeArea` has stretched it over the status bar. The chevron
-        // reported (0, 0, 402, 108) instead of its own 42pt circle. Touching the
-        // GLYPH still worked, so nothing looked broken by hand — but a tap aimed
-        // at the element's CENTRE, which is what XCUITest does, landed on empty
-        // header and silently did nothing. That is how three back-chain UI tests
-        // died without a single line of navigation code changing.
+        // Keep the bar an accessibility CONTAINER. DO NOT delete this as
+        // obsolete now that the index button is permanent: what it defends
+        // against is the bar being left with ONE focusable child, which SwiftUI
+        // then collapses the bar into — the child inheriting the bar's frame
+        // after the veil's `ignoresSafeArea` has stretched it over the status
+        // bar. An offline session used to show neither the model pill nor the
+        // index button, leaving just the back chevron, which then reported
+        // (0, 0, 402, 108) instead of its own 42pt circle. Touching the GLYPH
+        // still worked, so nothing looked broken by hand — but a tap aimed at
+        // the element's CENTRE, which is what XCUITest does, landed on empty
+        // header and silently did nothing. That is how three back-chain UI
+        // tests died without a single line of navigation code changing. A
+        // permanent index button removes today's trigger; the next conditional
+        // child re-arms it.
         .accessibilityElement(children: .contain)
         .background(alignment: .top) { veil }
         .animation(.easeOut(duration: 0.15), value: store.legDown)
         // On the STACK, not on the button: an `.animation(_:value:)` inside the
         // view being inserted has no previous value to compare, so it would pop
         // in — and under the blanket animation above, on the wrong beat.
-        .animation(.easeOut(duration: 0.16), value: bridge.outlineAvailable)
+        .animation(.easeOut(duration: 0.16), value: bridge.subagentsPresent)
     }
 
     /// The model capsule: the effective MODEL id (the pinned entry's, or the
@@ -372,10 +428,38 @@ struct ChatHeaderView: View {
             .transition(.scale(scale: 0.6).combined(with: .opacity))
     }
 
-    /// Opens the message index over the transcript. Deliberately BADGELESS: an
-    /// ink capsule carrying a number already means "unread" one screen up, so
-    /// the count ships as the element's VALUE against a constant label — the
-    /// model pill's split, which is what the UI smokes drive.
+    /// Opens the subagent list over the transcript. Deliberately STATIC — no
+    /// pulse, no count, no badge. Liveness lives inside the sheet: a foreground
+    /// spawn could be derived locally but a BACKGROUND one could not (its tool
+    /// call acks immediately), so an animated header would be confidently wrong
+    /// half the time.
+    private var subagentsButton: some View {
+        Button {
+            Haptics.tap()
+            // The model menu is a bare Bool with no mutual exclusion; left open
+            // it strands its scrim behind the sheet.
+            if menuOpen {
+                withAnimation(.easeOut(duration: 0.15)) { menuOpen = false }
+            }
+            subagentsOpen = true
+        } label: {
+            Image(systemName: "point.3.connected.trianglepath.dotted")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(Theme.ink)
+                .frame(width: 42, height: 42)
+        }
+        .glassSurface(interactive: true, in: .circle)
+        .accessibilityLabel(Text(verbatim: Lang.shared.t("chat.subagents")))
+        .transition(.scale(scale: 0.7).combined(with: .opacity))
+    }
+
+    /// Opens the message index over the transcript. PERMANENT — it no longer
+    /// waits for a thread long enough to be worth indexing, because a control
+    /// that comes and goes costs the reader more than an empty sheet does.
+    /// Deliberately BADGELESS: an ink capsule carrying a number already means
+    /// "unread" one screen up, so the count ships as the element's VALUE
+    /// against a constant label — the model pill's split, which is what the UI
+    /// smokes drive.
     private var indexButton: some View {
         Button {
             Haptics.tap()
@@ -399,7 +483,6 @@ struct ChatHeaderView: View {
                 verbatim: MessageIndexSheet.countLabel(
                     bridge.outline.count, hasMore: bridge.outlineHasMoreOlder))
         )
-        .transition(.scale(scale: 0.7).combined(with: .opacity))
     }
 
     /// The effective MODEL id the pill names: the pinned model within the

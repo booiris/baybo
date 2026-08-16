@@ -18,10 +18,18 @@ pub struct SearchHit {
     /// conversation that spawned it.
     pub channel: ChannelType,
     pub created_at: DateTime<Utc>,
-    /// `Some(n)` when compaction replaced this row in the active set. The chat
-    /// view renders only `superseded_by IS NULL`, so a hit carrying `Some(n)`
-    /// has no home in the rendered conversation and callers must resolve it to
-    /// ordinal `n`, marking it as compacted rather than pretending it is live.
+    /// `Some(n)` when compaction stamped this row — `n` is the ordinal where the
+    /// compaction's re-inserted rows begin, and every row active at that moment
+    /// points at the same one.
+    ///
+    /// It is NOT a "this is not on screen" marker, and callers must not navigate
+    /// to `n`. The display read filters `compaction_inserted = 0`, not
+    /// `superseded_by IS NULL` (see `load_active_session_messages_tail`), so the
+    /// superseded ORIGINAL still renders and `ordinal` is the address to jump to;
+    /// `n` names a re-injected machinery row, which the display read excludes and
+    /// which therefore can never be on screen. What this actually says is that
+    /// the model's context was rewritten after this row — a fact about the LLM's
+    /// window, not about what the user can see.
     pub superseded_by: Option<i64>,
     /// The original message, not the segmented index text. Highlight by
     /// substring: a phrase of unigrams matches exactly the substring the user
@@ -35,7 +43,7 @@ pub struct SearchHit {
 ///
 /// Every session's prose is indexed — a chat, a cron fire, a subagent's own run —
 /// so scope is the caller's to state, and the default states the narrow one. A
-/// user-facing search box wants `channel: Some(owner)` and both flags false;
+/// user-facing search box wants `channel: Some(owner)` and every flag false;
 /// that is the same scope the chat list renders, and anything wider returns rows
 /// the box cannot open or the user asked to lose.
 #[derive(Debug, Clone, Default)]
@@ -56,6 +64,17 @@ pub struct SearchScope {
     /// resurface what they asked to lose.
     pub include_hidden: bool,
     pub include_archived: bool,
+    /// Reach cron fire sessions that are **not** conversations of their own: a
+    /// one-shot's private workspace (its result is reported into the
+    /// conversation that scheduled it), and every historical fire from before
+    /// recurring fires became conversations.
+    ///
+    /// Off by default because such a session is unreachable by construction on
+    /// the other side: the chat list drops it (`is_private_cron_session`) and the
+    /// REST attach path 404s it, so a hit there names a conversation no client
+    /// can list. A recurring fire IS a conversation and is never affected by
+    /// this flag.
+    pub include_cron_workspaces: bool,
 }
 
 /// Read-only search over transcript prose.

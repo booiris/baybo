@@ -25,6 +25,7 @@ export const zh: typeof en = {
       videoPlay: "播放视频",
       videoDownload: "下载视频",
       recoverFailed: "无法重新加载历史记录：{{error}}",
+      jumpNotFound: "没能定位到那条消息 —— 它比这个会话已加载的部分更靠前。",
       retrySend: "发送失败，点按重试",
       copied: "已复制",
       stopped: "已停止",

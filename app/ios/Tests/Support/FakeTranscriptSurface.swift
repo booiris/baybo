@@ -15,12 +15,17 @@ final class FakeTranscriptSurface: TranscriptSurface {
         let attachments: [AttachmentRef]
     }
 
+    struct Confirmed: Equatable {
+        let msgId: String
+        let ordinal: Int64?
+    }
+
     private(set) var seeded: [Seeded] = []
     private(set) var failed: [String] = []
     /// Sends the store told the transcript it no longer owes — the return leg of
     /// `userSent`, and the only thing that lets a REPLACE stop overlaying a
-    /// bubble.
-    private(set) var confirmed: [String] = []
+    /// bubble. The ordinal is the durable row's, when the proof carried one.
+    private(set) var confirmed: [Confirmed] = []
     /// Sessions the store asked to have rebuilt. Whether an ask becomes a page
     /// reload is `TranscriptBridge`'s call (it alone knows which conversation is
     /// mounted), so this records the ask, not the outcome.
@@ -34,8 +39,8 @@ final class FakeTranscriptSurface: TranscriptSurface {
         failed.append(msgId)
     }
 
-    func sendConfirmed(_ msgId: String) {
-        confirmed.append(msgId)
+    func sendConfirmed(_ msgId: String, ordinal: Int64?) {
+        confirmed.append(Confirmed(msgId: msgId, ordinal: ordinal))
     }
 
     func rebuildIfShowing(_ sessionId: String) {

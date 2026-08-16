@@ -107,7 +107,11 @@ fn classify(message: &ChatMessage) -> ContextPart {
         MessageSource::SkillListing | MessageSource::SkillsUpdate => ContextPart::Skills,
         MessageSource::SystemPromptUpdate => ContextPart::SystemPrompt,
         MessageSource::Cron | MessageSource::CronNotification => ContextPart::Cron,
-        MessageSource::User | MessageSource::UserInterjection => ContextPart::User,
+        // The child's errand plays the user-turn part in its session, and
+        // that is what it should be billed/compressed as.
+        MessageSource::User | MessageSource::UserInterjection | MessageSource::SubagentSeed => {
+            ContextPart::User
+        }
         // A board card handed to a run: framed and assembled by the board, not
         // typed by anyone, so not `User`. [`ContextPart::Agent`]'s own
         // definition — "task prompts, reminders, framing" — is what this is.

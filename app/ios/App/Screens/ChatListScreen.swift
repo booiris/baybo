@@ -444,29 +444,15 @@ struct SessionRowView: View {
         .contentShape(Rectangle())
     }
 
-    /// Longest user-message snippet the bold headline shows before the title
-    /// pass has run — a compact title stand-in, not the full message.
-    private static let headlineMaxChars = 8
-
     /// Bold first line: the title, else a short snippet of the user's last
     /// message, else a quiet placeholder for a session with no user turn yet.
     private var headline: String {
-        if let title = row.title, !title.isEmpty { return title }
-        if let userText = row.userText, !userText.isEmpty { return Self.snippet(userText) }
-        return Lang.shared.t("list.previewPlaceholder")
+        let named = SessionHeadline.text(title: row.title, userText: row.userText)
+        return named.isEmpty ? Lang.shared.t("list.previewPlaceholder") : named
     }
 
     private var hasHeadline: Bool {
         !(row.title ?? "").isEmpty || !(row.userText ?? "").isEmpty
-    }
-
-    /// The user-message fallback headline: whitespace collapsed and clipped to
-    /// `headlineMaxChars` with a trailing ellipsis when it overflows.
-    private static func snippet(_ text: String) -> String {
-        let collapsed = text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
-        return collapsed.count > headlineMaxChars
-            ? String(collapsed.prefix(headlineMaxChars)) + "…"
-            : collapsed
     }
 }
 

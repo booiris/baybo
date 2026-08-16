@@ -200,6 +200,15 @@
   }
 }
 
+/* The terms a search jump landed on, painted by `searchJump.ts` through the CSS
+   Custom Highlight API — the markdown body is React's, so a `<mark>` wrapped
+   into it would be undone by the next render. Same gold as the excerpt's
+   `<mark>` in the results panel, so a term looks the same in both places. */
+::highlight(chat-search-hit) {
+  background-color: color-mix(in oklab, var(--color-brand) 60%, transparent);
+  color: var(--color-ink);
+}
+
 /* Global tinted scrollbar: every scroll area blends into the warm canvas
    (transparent track shows the background behind it; thumb is a faint warm
    ink) instead of falling back to the browser's white/gray default. Applies

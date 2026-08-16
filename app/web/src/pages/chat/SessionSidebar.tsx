@@ -1012,7 +1012,13 @@ export function SessionSidebar({
           <SearchPanel
             query={search}
             activeSessionId={activeSessionId}
-            onOpen={(id) => navigate(`/chat/${id}`)}
+            // `m` is the row to land on, `q` the terms to light up once there —
+            // both on the URL so the jump survives a reload and can be shared.
+            onOpen={(id, ordinal) =>
+              navigate(
+                `/chat/${id}?m=${ordinal}&q=${encodeURIComponent(search.trim())}`,
+              )
+            }
           />
         ) : loading ? (
           <div className="flex justify-center py-6 text-ink-soft">

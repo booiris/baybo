@@ -33,6 +33,7 @@ import {
   postOutline,
   postOutlineHere,
   postRunState,
+  postSubagents,
   postSyncRequest,
   previewFile,
   queryAudioState,
@@ -86,6 +87,7 @@ export function wireStepToWork(s: WireWorkStepFrame): WorkStep {
     return {
       kind: "tool",
       callId: s.call_id ?? "",
+      tool: s.tool,
       label: s.label || s.tool || "",
       status: s.status ?? "running",
       summary: s.summary || undefined,
@@ -108,6 +110,7 @@ export function restStepToWork(s: NonNullable<TranscriptRowItem["steps"]>[number
       // "" only for a row the gateway persisted before it sent `call_id`;
       // `workStepKey` falls back to content-keying for those.
       callId: s.call_id ?? "",
+      tool: s.tool,
       label: s.tool_label || s.tool || "",
       status: s.tool_status ?? "",
       summary: s.tool_summary || undefined,
@@ -174,6 +177,18 @@ export function transcriptItemToRow(item: TranscriptRowItem): Row | null {
 /// page size (server-clamped to 1..200), so one fetch loads up to 50 rows.
 const HISTORY_PAGE_LIMIT = 50;
 
+/// How many pages a search-hit jump may spend reaching its ordinal — about 600
+/// DISPLAYED rows (an agentic turn persists hundreds of invisible tool rows per
+/// visible one, so this reaches far deeper into a transcript than the ordinal
+/// arithmetic suggests).
+///
+/// A cap and not a "load until found": each page is a serial round trip, on the
+/// relay leg a Noise tunnel exchange, and the reader is watching the thread grow
+/// under them the whole time. Past this the honest answer is to stop where we
+/// got to and say so — they are already further back than they started, which is
+/// worth something, whereas a minute of silent paging is not.
+const JUMP_PAGE_BUDGET = 12;
+
 /// Sync page size, elected per call site (docs/sync-protocol.md): one UI page
 /// for a baseline / cold open (`since` absent — a newest-page REPLACE by
 /// definition), the server hard cap when merging a difference into an
@@ -226,11 +241,6 @@ const LAZY_ATTACHMENT_ROOT_MARGIN = "400px 0px";
 /// one — native truncates to its own (shorter) width; this only keeps a pasted
 /// wall of text out of every bridge message the sheet's list rides on.
 const OUTLINE_TEXT_CAP = 160;
-
-/// Fewer of the user's own sends than this and the index sheet isn't worth a
-/// header button — a thread that short is faster to scroll than to index.
-/// `hasMoreOlder` overrides it: the unloaded pages hold more.
-const OUTLINE_MIN_ENTRIES = 3;
 
 /// Delay before `jumpToMessage`'s one-shot correction pass. The jump drags
 /// never-decoded images into the lazy band and they shove the target down as
@@ -564,6 +574,20 @@ export function outlineEntries(rows: Row[]): OutlineEntry[] {
   return out;
 }
 
+/// The tool that mints a child session — `baybo_model::SPAWN_SUBAGENT_TOOL_NAME`.
+const SPAWN_SUBAGENT_TOOL = "spawn_subagent";
+
+/// Whether the loaded rows show this conversation spawning a subagent — what
+/// lights the header's `Subagents` entry. Read off the rendered rows rather
+/// than asked for over the network, so a restored mirror answers it offline.
+export function hasSubagentSpawn(rows: Row[]): boolean {
+  return rows.some(
+    (row) =>
+      row.role === "work" &&
+      row.steps.some((s) => s.kind === "tool" && s.tool === SPAWN_SUBAGENT_TOOL),
+  );
+}
+
 /// Identity of a work step for dedup when folding two representations of the
 /// same turn's block. Text steps key by kind + text.
 ///
@@ -716,8 +740,7 @@ export function bundleAnswer(steps: WorkStep[]): BundleAnswer {
 /// Only the in-flight tail can be trailing prose. Mirrors the web chat's
 /// `dropInFlightAnswerStep`.
 export function dropInFlightAnswerStep(rows: Row[]): Row[] {
-  let i = rows.length - 1;
-  while (i >= 0 && rows[i].role === "notice") i--;
+  const i = lastBeforeNotices(rows);
   const row = i >= 0 ? rows[i] : undefined;
   if (row === undefined || row.role !== "work") return rows;
   const last = row.steps.length > 0 ? row.steps[row.steps.length - 1] : undefined;
@@ -766,8 +789,7 @@ export function freezeActiveWork(rows: Row[]): Row[] {
 /// `active:false` and its `elapsedMs` — `mutate` only appends steps — so a
 /// straggler never re-opens or re-times a settled card.
 export function openWorkIn(rows: Row[], mutate: (row: WorkRow) => WorkRow): Row[] {
-  let i = rows.length - 1;
-  while (i >= 0 && rows[i].role === "notice") i--;
+  const i = lastBeforeNotices(rows);
   const target = i >= 0 ? rows[i] : undefined;
   if (target && target.role === "work") {
     const next = [...rows];
@@ -963,24 +985,99 @@ export function foldAdjacentWork(rows: Row[], compactionPoints: CompactionPoint[
   return out;
 }
 
-/// Index in `rows` of the work block belonging to the SAME turn as a work row
-/// of durable ordinal `ord` that has ended up ABOVE the turn's answer bubble.
-/// Scan back over the trailing answer/notice run; accept the preceding work
-/// block only when that run carries an answer ordinal-above `ord`, so a
-/// genuinely later turn's block (its answer not yet on screen) is never
-/// mis-folded. `-1` when there is no such block. Used to re-home a durable
-/// progress `status` block the reopen path can strand below the reply.
-export function sameTurnWorkIndex(rows: Row[], ord: number): number {
+/// Ids of the work rows in a page whose ordinal is their OWN answer's — read off
+/// the page's ordering, never guessed from the row.
+///
+/// A block is keyed `w<ordinal>` off some row of its turn, and for a tool-free
+/// "thinking only" answer there IS no row but the answer itself: the gateway
+/// seeds the block from it (`work.ordinal = Some(ordinal)` on the assistant
+/// arm), so `w<N>` and `m<N>` are one turn and the block belongs ABOVE the
+/// bubble. But a block can also BORROW an ordinal it does not own — one seeded
+/// from a progress event, or from the page's last row when nothing of its turn
+/// has persisted yet — and that anchor belongs to the turn BEFORE it, so the
+/// same equality means the block belongs BELOW the bubble.
+///
+/// Same ordinal, opposite placement, and nothing on the row distinguishes them.
+/// The page does: it emits a block above the answer it owns and below the one it
+/// borrowed from. Both items are cut from the same source row, so a window that
+/// carries one carries the other.
+function blocksAboveTheirAnswer(pageRows: Row[]): Set<string> {
+  const answerAt = new Map<number, number>();
+  pageRows.forEach((r, i) => {
+    const ord = r.role === "assistant" ? rowCoverageOrdinal(r) : null;
+    if (ord !== null && !answerAt.has(ord)) answerAt.set(ord, i);
+  });
+  const owned = new Set<string>();
+  pageRows.forEach((r, i) => {
+    if (r.role !== "work") return;
+    const ord = rowOrdinal(r.id);
+    const at = ord === null ? undefined : answerAt.get(ord);
+    if (at !== undefined && at > i) owned.add(r.id);
+  });
+  return owned;
+}
+
+/// The thread has TWO tails, and confusing them is a bug with teeth.
+///
+/// `lastBeforeNotices` is the tail a live frame asks about — "what is the last
+/// row that isn't a trailing notice" — because a terminal notice keeps its own
+/// row beside the block it interrupts (`severTerminalNoticeIn`) and must not
+/// hide it. This is the scan `openWorkIn` runs, and it STOPS at an answer: a
+/// settled turn's card is behind its own bubble, and reaching past that bubble
+/// would let a later turn's frames rewrite a finished card.
+///
+/// `tailRunStart` is the tail a durable PLACEMENT asks about — "where does the
+/// trailing answer/notice run begin" — because a re-delivered block has to be
+/// weighed against the answer of the turn it belongs to. Only ordinal-carrying
+/// evidence may cross an answer this way.
+function lastBeforeNotices(rows: Row[]): number {
   let j = rows.length - 1;
-  let sawTurnAnswer = false;
-  while (j >= 0) {
-    const rj = rows[j];
-    if (rj.role !== "assistant" && rj.role !== "notice") break;
+  while (j >= 0 && rows[j].role === "notice") j--;
+  return j;
+}
+
+/// Index of the last row that is neither an answer nor a notice — i.e. the row
+/// just above the thread's trailing answer/notice run. `-1` when the whole list
+/// is that run. A user row ends the scan like any other: it opens the NEXT turn,
+/// so nothing below it belongs to what sits above.
+function tailRunStart(rows: Row[]): number {
+  let j = rows.length - 1;
+  while (j >= 0 && (rows[j].role === "assistant" || rows[j].role === "notice")) j--;
+  return j;
+}
+
+/// Index of the work block sitting directly above that trailing run — the block
+/// of the turn the run belongs to. `-1` when the run is not headed by one.
+function workBlockAboveTail(rows: Row[]): number {
+  const j = tailRunStart(rows);
+  return j >= 0 && rows[j].role === "work" ? j : -1;
+}
+
+/// Index in `rows` of the work block belonging to the SAME turn as `row`, a
+/// durable work row that has ended up BELOW its turn's answer bubble. Accept the
+/// block above the trailing answer/notice run only when that run carries the
+/// answer this block's ordinal points at, so a genuinely later turn's block (its
+/// answer not yet on screen) is never mis-folded. `-1` when there is no such
+/// block. Used to re-home a durable `status`/thinking-only block the reopen path
+/// can strand below the reply.
+///
+/// `ownsAnswerOrdinal` is the caller's evidence that this block's ordinal is its
+/// OWN answer's rather than one borrowed from the turn above
+/// (`blocksAboveTheirAnswer` reads it off the page's ordering) — the tool-free
+/// turn, whose block can only ever match its answer by EQUALITY. It defaults
+/// off: without that evidence, equality is not proof of anything, and folding on
+/// it would weld a later turn into the card above.
+export function sameTurnWorkIndex(rows: Row[], row: WorkRow, ownsAnswerOrdinal = false): number {
+  const ord = rowOrdinal(row.id);
+  if (ord === null) return -1;
+  const at = workBlockAboveTail(rows);
+  if (at < 0) return -1;
+  const sawTurnAnswer = rows.slice(at + 1).some((rj) => {
+    if (rj.role !== "assistant") return false;
     const oj = rowOrdinal(rj.id);
-    if (rj.role === "assistant" && oj !== null && oj > ord) sawTurnAnswer = true;
-    j--;
-  }
-  return sawTurnAnswer && j >= 0 && rows[j].role === "work" ? j : -1;
+    return oj !== null && (oj > ord || (ownsAnswerOrdinal && oj === ord));
+  });
+  return sawTurnAnswer ? at : -1;
 }
 
 /// Merge a DIFFERENCE sync page into the rendered thread: a row already held is
@@ -1010,6 +1107,7 @@ export function mergeSyncPage(
 ): Row[] {
   const next = [...prev];
   let byId = new Map(next.map((r, i) => [r.id, i] as const));
+  const ownsOrdinal = blocksAboveTheirAnswer(pageRows);
   /// Where a page row belongs: just past the last rendered row whose ordinal it
   /// is at or above — but ONLY when a durable row still sits below that point,
   /// which is the proof that this row really did land late. With nothing
@@ -1031,6 +1129,19 @@ export function mergeSyncPage(
   const placeAt = (row: Row): number => {
     const ord = rowCoverageOrdinal(row);
     if (ord === null) return next.length;
+    // A block that carries its OWN answer's ordinal (`blocksAboveTheirAnswer` —
+    // the tool-free turn) belongs directly ABOVE that bubble: "just past the
+    // last row I am not older than" files a turn's card below its own reply,
+    // which is the shape this whole function exists to prevent. Anchor on the
+    // bubble itself rather than merely excluding it from the scan — with its
+    // twin ordinal skipped, the scan lands on whatever ordinal-less row happens
+    // to precede it (a live send, a notice) and files the card above the
+    // question that produced it. With the answer not on screen there is nothing
+    // to sit above, and the ordinary scan is exactly right.
+    if (ownsOrdinal.has(row.id)) {
+      const answer = next.findIndex((r) => r.role === "assistant" && rowCoverageOrdinal(r) === ord);
+      if (answer >= 0) return answer;
+    }
     let at = 0;
     for (let i = 0; i < next.length; i++) {
       const held = rowCoverageOrdinal(next[i]);
@@ -1120,8 +1231,7 @@ export function mergeSyncPage(
     // holds an answer ordinal-above this block, so a genuinely later
     // turn's block (its answer not yet on screen) still appends.
     if (row.role === "work") {
-      const ord = rowOrdinal(row.id);
-      const at = ord !== null ? sameTurnWorkIndex(next, ord) : -1;
+      const at = sameTurnWorkIndex(next, row, ownsOrdinal.has(row.id));
       const target = at >= 0 ? next[at] : undefined;
       if (target && target.role === "work") {
         next[at] = reconcileWork(target, row);
@@ -1206,11 +1316,18 @@ export function applySyncReplace(
   page: Row[],
   unconfirmedSends: ReadonlySet<string>,
 ): Row[] {
+  // A session's rows are never deleted (session data is core data), so an
+  // empty page against a thread that holds rows is always a stale read: a
+  // baseline the gateway served before this session's first row persisted
+  // (echo before persist, plus a new session's actor cold-spawn — the longest
+  // such window of any send). Applying it keeps every surviving row but
+  // RE-FILES them — the kept sets return behind the page, so an ordinal-less
+  // first send lands below the reply that outran it (and a row that lost its
+  // kept-set membership is deleted outright). The empty page carries nothing a
+  // rebuild could need; the thread it failed to describe is what's on screen.
+  if (page.length === 0 && prev.length > 0) return prev;
   const pageIds = new Set(page.map((r) => r.id));
   const openWork = prev.filter((r): r is WorkRow => r.role === "work" && r.active).slice(-1);
-  const keptSends = prev.filter(
-    (r) => r.role === "user" && unconfirmedSends.has(r.id) && !pageIds.has(r.id),
-  );
   // Rows the page PREDATES. Its newest ordinal is the instant the server
   // snapshotted it, and a durable row above that is one this page cannot be
   // speaking about — a live reply that landed while the request was in flight.
@@ -1225,21 +1342,85 @@ export function applySyncReplace(
     const ordinal = rowCoverageOrdinal(r);
     return ordinal !== null && ordinal > ceiling && !pageIds.has(r.id);
   });
+  const keptLiveIds = new Set(keptLive.map((r) => r.id));
+  // A row can hold BOTH a membership and a stamped above-ceiling ordinal only
+  // through a call-site ordering slip (the confirm handler retires before it
+  // stamps) — but keeping the two sets exclusive HERE makes a slip render as
+  // one bubble instead of two with duplicate keys.
+  const keptSends = prev.filter(
+    (r) =>
+      r.role === "user" &&
+      unconfirmedSends.has(r.id) &&
+      !pageIds.has(r.id) &&
+      !keptLiveIds.has(r.id),
+  );
   let rows = page;
-  let carried = openWork;
-  if (openWork.length > 0) {
+  let carried: Row[] = openWork;
+  const live = openWork[0];
+  if (live !== undefined) {
     const tail = rows[rows.length - 1];
     if (tail && tail.role === "work" && sameContinuingTurn(tail)) {
       rows = [
         ...rows.slice(0, -1),
         {
           ...tail,
-          steps: mergeWorkSteps(tail.steps, openWork[0].steps),
+          steps: mergeWorkSteps(tail.steps, live.steps),
           active: true,
-          startedAt: tail.startedAt ?? openWork[0].startedAt,
+          startedAt: tail.startedAt ?? live.startedAt,
         },
       ];
       carried = [];
+    } else if (
+      keptLive.length === 0 &&
+      keptSends.length === 0 &&
+      rows.slice(tailRunStart(rows) + 1).some((r) => r.role === "assistant")
+    ) {
+      // The page ends on an ANSWER, not on this turn's open half: as far as the
+      // server is concerned the turn we are still holding open is over, and the
+      // page already carries its reconstruction ABOVE that bubble. Appending
+      // `carried` here is what put a second "Worked" card below the reply — the
+      // DIFFERENCE path has closed its trailing block on exactly this signal
+      // (`closeTrailingWork`) since it was written; REPLACE never did.
+      //
+      // Fold our steps back into the page's own block for that turn instead
+      // (`mergeWorkSteps` dedups, and the persisted side is the superset, so
+      // this is lossless), or — with no block to fold into — freeze what we hold
+      // so it cannot spin "Working" forever behind a settled reply.
+      //
+      // Only when nothing on screen outranks the page: a row the page predates
+      // (`keptLive` / `keptSends` — an owed send is how a LATER turn announces
+      // itself) proves the block belongs to that later turn, and it keeps its
+      // own live card at the tail.
+      //
+      // And only against POSITIVE evidence of the same turn — adjacency is not
+      // it. A turn with no user row (a background delivery) leaves both kept
+      // sets empty while its block is genuinely the next turn's, and joining
+      // there welds two turns into one card, which no later sync undoes. The
+      // evidence is overlap: a page that reconstructs the turn we watched holds
+      // every step we streamed (persistence is the superset), so the merge
+      // ABSORBS at least one of ours. Nothing absorbed means two turns.
+      const at = workBlockAboveTail(rows);
+      const above = at >= 0 ? rows[at] : undefined;
+      const target = above !== undefined && above.role === "work" ? above : undefined;
+      const fused = target !== undefined ? mergeWorkSteps(target.steps, live.steps) : undefined;
+      if (target !== undefined && fused !== undefined && fused.length < target.steps.length + live.steps.length) {
+        rows = [
+          ...rows.slice(0, at),
+          {
+            ...target,
+            steps: fused,
+            cancelled: (target.cancelled ?? false) || (live.cancelled ?? false),
+          },
+          ...rows.slice(at + 1),
+        ];
+        carried = [];
+      } else {
+        // No proof, so no join. Keep what we hold — those steps may be their
+        // only copy — but not as a live card: a block that spins "Working"
+        // behind a settled reply is the symptom, and nothing at the tail can
+        // close it once the page has moved past. An empty one was never work.
+        carried = live.steps.length === 0 ? [] : freezeActiveWork(carried);
+      }
     }
   }
   return [...rows, ...keptLive, ...keptSends, ...carried];
@@ -1377,8 +1558,7 @@ export function sanitizeRestoredRows(rows: Row[] | undefined): Row[] {
         // ordinal, so a mirror already corrupted by that bug self-corrects on
         // the next open instead of keeping the stray "Worked" card below the
         // reply forever (the reopen sync is a no-op once the cursor passed it).
-        const ord = rowOrdinal(r.id);
-        const at = ord !== null ? sameTurnWorkIndex(out, ord) : -1;
+        const at = sameTurnWorkIndex(out, r);
         const target = at >= 0 ? out[at] : undefined;
         if (target && target.role === "work") {
           out[at] = { ...target, steps: mergeWorkSteps(target.steps, r.steps), active: target.active || r.active };
@@ -2608,6 +2788,12 @@ const MessageRow = memo(function MessageRow({
       </time>
     ) : null;
 
+  // The bloom is declared before BOTH branches: the message index only ever
+  // offers the user's own sends, but a search hit lands on agent prose just as
+  // often, and a jump that scrolls without marking its target reads as a jump
+  // that did nothing.
+  const ring = flash !== 0 ? <span key={flash} className="jump-ring" aria-hidden="true" /> : null;
+
   if (m.role === "assistant") {
     return (
       <div className="msg-group assistant" data-row-id={m.id}>
@@ -2616,9 +2802,13 @@ const MessageRow = memo(function MessageRow({
         ))}
         {m.content && (
           <div className="msg assistant">
+            {ring}
             <MarkdownBody text={m.content} />
           </div>
         )}
+        {/* An attachment-only reply has no prose div to host the ring, so the
+            group carries it — the one case where there is nothing narrower. */}
+        {!m.content && ring}
         {timeEl}
       </div>
     );
@@ -2637,11 +2827,6 @@ const MessageRow = memo(function MessageRow({
       </button>
     ) : null;
   const hasText = m.content.length > 0;
-  // The ring needs a POSITIONED host: `.msg-group` is unpositioned, so parented
-  // there it would escape to the initial containing block and paint a
-  // full-viewport rectangle. Rides the same last-bubble rule as the send chrome.
-  const ring = flash !== 0 ? <span key={flash} className="jump-ring" aria-hidden="true" /> : null;
-
   return (
     <div className="msg-group user" data-row-id={m.id}>
       {attachments.map((a, i) => {
@@ -2842,6 +3027,12 @@ export function Transcript({
   // (`before_ordinal`). `null` = unknown / nothing older to page to.
   const oldestOrdinal = useRef<number | null>(restoredSplit.oldestOrdinal);
   const [hasMoreOlder, setHasMoreOlder] = useState<boolean>(restoredSplit.hasMoreOlder);
+  // Mirror of `hasMoreOlder` for the jump loop, which re-evaluates INSIDE the
+  // frame handler that just called `setHasMoreOlder` — the state it would close
+  // over there is a render behind, and reading it stale is the difference
+  // between stopping at the top of the thread and paging past it forever.
+  const hasMoreOlderRef = useRef(restoredSplit.hasMoreOlder);
+  hasMoreOlderRef.current = hasMoreOlder;
   const [loadingOlder, setLoadingOlder] = useState(false);
   // Compaction boundaries (`{ ordinal, at }[]`), the authoritative set carried
   // on every `sync_page`. Seeds the pre-compaction divider; restored from the
@@ -2907,6 +3098,10 @@ export function Transcript({
   // Which row the jump ring is blooming around, and the replay nonce that lets
   // it bloom again on a repeat jump to the same row (see MessageRow's `flash`).
   const [flash, setFlash] = useState({ id: "", nonce: 0 });
+  // A search hit whose row is not loaded yet: the ordinal to reach and how many
+  // more pages may be spent reaching it. A ref, not state — the loop is driven
+  // by frames landing, and re-rendering on each step would buy nothing.
+  const pendingJump = useRef<{ ordinal: number; pagesLeft: number } | null>(null);
   const jumpSettleTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   useEffect(() => () => clearTimeout(jumpSettleTimer.current), []);
 
@@ -3135,14 +3330,18 @@ export function Transcript({
   // `platform_msg_id`, so this stamp is the only thing that ever makes a send of
   // ours count as sync coverage (`rowCoverageOrdinal`).
   const markSent = useCallback((msgId: string, ordinal: number | null) => {
-    setMessages((rows) =>
-      rows.map((r) => {
+    setMessages((rows) => {
+      // Return the ORIGINAL array when nothing changed so React bails out of
+      // the re-render — `sendConfirmed` now calls this once per user row of
+      // every sync page, and the common case is a row already settled.
+      const next = rows.map((r) => {
         if (r.role !== "user" || r.id !== msgId) return r;
-        const next = ordinal ?? r.ordinal;
-        if (r.sendState === undefined && next === r.ordinal) return r;
-        return { ...r, sendState: undefined, ordinal: next };
-      }),
-    );
+        const stamped = ordinal ?? r.ordinal;
+        if (r.sendState === undefined && stamped === r.ordinal) return r;
+        return { ...r, sendState: undefined, ordinal: stamped };
+      });
+      return next.every((r, i) => r === rows[i]) ? rows : next;
+    });
   }, []);
 
   // Native's send Task errored — flip the still-sending bubble to the failed
@@ -3354,12 +3553,21 @@ export function Transcript({
       if (answer.kind === "recovered") setStreamingText(answer.text);
       else if (answer.kind === "superseded") setStreamingText("");
       setMessages((rows) => {
-        const last = rows[rows.length - 1];
-        const openBlock = last && last.role === "work" ? last : undefined;
+        // The tail is read PAST any trailing notice run, exactly as `openWorkIn`
+        // reads it: a terminal notice keeps its own row, and asking `rows[len-1]`
+        // instead would see the notice, miss both the block to rebuild and the
+        // answer the guard below turns on, and open a second card. It stops at an
+        // ANSWER, though — reaching past one would hand this bundle a settled
+        // turn's card to rewrite, which is a worse bug than the one it fixes.
+        const at = lastBeforeNotices(rows);
+        const tail = at >= 0 ? rows[at] : undefined;
+        const openBlock = tail && tail.role === "work" ? tail : undefined;
         if (workSteps.length === 0) {
           // Answer-only turn: no block, the streamed reply stands alone; drop a
           // stale empty/restored block if it's the tail.
-          return openBlock && openBlock.steps.length === 0 ? rows.slice(0, -1) : rows;
+          return openBlock && openBlock.steps.length === 0
+            ? [...rows.slice(0, at), ...rows.slice(at + 1)]
+            : rows;
         }
         // A stale finalization-window bundle: this turn's answer already landed
         // here (the tail is the committed reply) but the gateway still reports
@@ -3369,7 +3577,7 @@ export function Transcript({
         // reply (the [work][reply][work] split). A genuine next turn opens its
         // block from the live turn_state / reasoning / tool frames that follow,
         // not from this snapshot.
-        if (!openBlock && last && last.role === "assistant") return rows;
+        if (!openBlock && tail && tail.role === "assistant") return rows;
         // Re-open a block a prior restore froze (relaunch mid-turn) and replace
         // its steps; otherwise open a fresh one after the turn's user message.
         // Anchor `startedAt` to the server turn start (`startedMs`) when the
@@ -3381,7 +3589,7 @@ export function Transcript({
         // `rebuilt` is THE in-flight block — freeze any other still-active block
         // above it so re-opening one never leaves two live "Working" cards.
         return openBlock
-          ? [...freezeActiveWork(rows.slice(0, -1)), rebuilt]
+          ? [...freezeActiveWork(rows.slice(0, at)), rebuilt, ...rows.slice(at + 1)]
           : [...freezeActiveWork(rows), rebuilt];
       });
     },
@@ -3435,6 +3643,7 @@ export function Transcript({
     // Only advance the cursor on a non-empty page; an empty page leaves it put.
     if (newOldest !== null) oldestOrdinal.current = newOldest;
     setHasMoreOlder(more);
+    hasMoreOlderRef.current = more;
   }, []);
 
   // Fold the mirror's withheld older rows into the thread (see
@@ -3570,14 +3779,30 @@ export function Transcript({
   const applySyncPage = useCallback(
     (frame: Extract<WireFrame, { kind: "sync_page" }>) => {
       setSyncInFlight(false);
-      // Every sync carries the authoritative boundary set (empty ⇒ never
-      // compacted), so a warm re-entry's difference sync refreshes the divider
-      // just like a baseline REPLACE does.
-      setCompactionPoints(frame.compaction_points ?? []);
       const replace = frame.rebased || frame.since_ordinal === null;
       const pageRows = frame.rows
         .map(transcriptItemToRow)
         .filter((r): r is Row => r !== null);
+      // `applySyncReplace` already refuses the row swap for an empty page over
+      // a non-empty thread (see its comment) — but the swap is not all a
+      // REPLACE does. Left to run, this branch would also null the paging
+      // floor, drop a not-yet-drained mirror head, clear the compaction
+      // dividers and hide the load-older affordance, all off a page that
+      // described nothing. Provably no-ops today (an empty page implies zero
+      // durable rows), so this is the same statement at the frame level: a
+      // REPLACE carrying no rows against a thread that has some is stale in
+      // its entirety, not just row-wise. `messagesRef` can lag a same-batch
+      // live append, so this fails OPEN — the applySyncReplace guard still
+      // protects the rows.
+      if (replace && pageRows.length === 0 && messagesRef.current.length > 0) {
+        advanceCursorFromSync(frame.next_cursor, frame.rebased);
+        markReadIfAdvanced();
+        return;
+      }
+      // Every sync carries the authoritative boundary set (empty ⇒ never
+      // compacted), so a warm re-entry's difference sync refreshes the divider
+      // just like a baseline REPLACE does.
+      setCompactionPoints(frame.compaction_points ?? []);
       // The prefix invariant `mergeSyncPage` merges under is checked when the
       // request is POSTED (`runSync`), and the thread grows during the round
       // trip — so a difference can land on a thread it is no longer a prefix
@@ -3710,6 +3935,7 @@ export function Transcript({
           deferredHead.current = [];
           oldestOrdinal.current = frame.oldest_ordinal;
           setHasMoreOlder(frame.has_more_older);
+          hasMoreOlderRef.current = frame.has_more_older;
         }
         if (!turnActiveRef.current) clearStreaming();
       } else {
@@ -3761,6 +3987,18 @@ export function Transcript({
         }
         if (role === "user" && frame.platform_msg_id) {
           sentIds.current.add(frame.platform_msg_id);
+          // Reaching this append for an ordinal-less user frame means the echo
+          // beat `userSent` here — or `userSent` was lost (a retarget burst
+          // consumed by the outgoing tree). Either way the row this appends is
+          // the send's ONLY rendering, and like the optimistic bubble it is
+          // ordinal-less and pre-persist — so it needs the same REPLACE-overlay
+          // protection, or the send-time baseline (routinely empty for a first
+          // send) deletes it. The page carrying the id retires it, as always.
+          // A second paired device's echo enrols here too — knowingly: its row
+          // kept (and possibly re-filed below a narrow page) beats deleted,
+          // and the set is per-tree, never persisted, so the exposure ends at
+          // unmount.
+          if (ordinal === null) unconfirmedSends.current.add(frame.platform_msg_id);
         }
         if (role === "assistant") {
           // The terminal message is authoritative: it replaces the streamed
@@ -3770,6 +4008,14 @@ export function Transcript({
           closeWork();
           clearStreaming();
           setAwaitingReply(false);
+          // The turn is over the moment its answer commits. Waiting for the
+          // server's `turn_state{active:false}` to say so leaves the latch — the
+          // one signal here with no self-healing cap — stuck true whenever that
+          // frame is lost (an offscreen buffer overflow drops it, and no
+          // `sync_page` carries turn state to rebuild it), and a stuck latch
+          // paints the `work-pending` box under the settled reply forever. The
+          // server's own frame follows and is idempotent.
+          setTurnActive(false);
           recordEndedTurn(activeTurnStart.current);
           activeTurnStart.current = null;
           if (cursorRef.current.rebaseDirty) runSync();
@@ -3815,6 +4061,7 @@ export function Transcript({
         pushWorkStep({
           kind: "tool",
           callId: frame.call_id,
+          tool: frame.tool,
           label: frame.label || frame.tool,
           status: "running",
         });
@@ -4173,10 +4420,12 @@ export function Transcript({
     handleFrame,
     handleUserSent,
     markFailed,
+    markSent,
     handleConnEpoch,
     handleBottomInset,
     jumpToLatest,
     jumpToMessage,
+    jumpToOrdinal,
     handleOutlineLoadOlder,
     handleOutlineHereRequested,
     handleSyncRequested,
@@ -4185,10 +4434,12 @@ export function Transcript({
     handleFrame,
     handleUserSent,
     markFailed,
+    markSent,
     handleConnEpoch,
     handleBottomInset,
     jumpToLatest,
     jumpToMessage,
+    jumpToOrdinal,
     handleOutlineLoadOlder,
     handleOutlineHereRequested,
     handleSyncRequested,
@@ -4200,15 +4451,22 @@ export function Transcript({
         connEpoch: (epoch) => handlersRef.current.handleConnEpoch(epoch),
         userSent: (payload) => handlersRef.current.handleUserSent(payload),
         sendFailed: (msgId) => handlersRef.current.markFailed(msgId),
-        // Bookkeeping only — no re-render. The bubble already looks settled;
-        // what changes is that a REPLACE may now drop it in favour of the page's
-        // own copy.
-        sendConfirmed: (msgId) => {
+        // Retire the membership AND stamp the durable row's ordinal — the one
+        // mark nothing else can give this bubble: the echo never carries an
+        // ordinal, and the proof native acted on is often a point lookup that
+        // ships no page. Without the stamp, retiring the id leaves the row with
+        // NO keep predicate, and the next REPLACE whose page lacks it deletes
+        // the very bubble this call just proved durable. `markSent` files it
+        // under the ceiling rule (and clears any lingering send chrome —
+        // durability subsumes the echo).
+        sendConfirmed: (msgId, ordinal) => {
           unconfirmedSends.current.delete(msgId);
+          if (ordinal !== null) handlersRef.current.markSent(msgId, ordinal);
         },
         bottomInset: (px) => handlersRef.current.handleBottomInset(px),
         jumpToLatest: () => handlersRef.current.jumpToLatest(),
         jumpToMessage: (rowId) => handlersRef.current.jumpToMessage(rowId),
+        jumpToOrdinal: (ordinal) => handlersRef.current.jumpToOrdinal(ordinal),
         outlineLoadOlder: () => handlersRef.current.handleOutlineLoadOlder(),
         outlineHereRequested: () => handlersRef.current.handleOutlineHereRequested(),
         syncRequested: () => handlersRef.current.handleSyncRequested(),
@@ -4246,6 +4504,68 @@ export function Transcript({
   // Imperative rather than an effect keyed on the target — the same row can be
   // asked for twice, and the second ask must scroll on the tap, not on a render
   // that identical state never triggers.
+  /// A search hit the thread has not paged in yet: keep paging backward until
+  /// the ordinal is covered, then jump. `pagesLeft` is the hard cap.
+  ///
+  /// The window MUST stay contiguous and tail-anchored — there is no
+  /// `hasMoreNewer` and every live frame appends to the end, so a window that
+  /// stopped short of the newest edge would weld the next reply onto an ancient
+  /// row. Paging backward is the only way to reach an old row that keeps that
+  /// invariant: it is exactly what the reader's own scroll-up does, just driven.
+  function jumpToOrdinal(ordinal: number) {
+    pendingJump.current = { ordinal, pagesLeft: JUMP_PAGE_BUDGET };
+    advancePendingJump();
+  }
+
+  /// One step of the paging loop, re-entered from the `messages` effect below —
+  /// NOT a `for` loop: `requestHistory` allows one request at a time and its
+  /// reply lands asynchronously in the frame switch, so the only correct shape
+  /// is "try, fire one page, be called again when it lands".
+  function advancePendingJump() {
+    const pending = pendingJump.current;
+    if (pending === null) return;
+
+    const target = messagesRef.current.find((r) => rowCoverageOrdinal(r) === pending.ordinal);
+    if (target !== undefined) {
+      pendingJump.current = null;
+      jumpToMessage(target.id);
+      return;
+    }
+
+    const floor = oldestOrdinal.current;
+    // Below the floor: the rows are simply not loaded yet, so page for them.
+    // `floor === null` means nothing durable is rendered at all (a cold open
+    // whose first page has not landed) — hold, and the effect will re-enter.
+    if (floor !== null && pending.ordinal >= floor) {
+      // Inside the loaded window and still not found: the ordinal names a row
+      // this view does not render at all. Paging can only ever load rows
+      // FURTHER BACK, so no number of pages will produce it — stop now rather
+      // than dragging the reader through the whole history to fail anyway.
+      giveUpPendingJump();
+      return;
+    }
+    if (!hasMoreOlderRef.current) {
+      // The top of the thread, with the ordinal never covered.
+      if (floor !== null) giveUpPendingJump();
+      return;
+    }
+    if (pending.pagesLeft <= 0) {
+      giveUpPendingJump();
+      return;
+    }
+    // Decrement per REQUEST, not per re-entry: this is what bounds the loop
+    // when a page comes back empty. `prependOlder` advances the floor only on a
+    // non-empty page while `hasMoreOlder` can stay true, so "floor moved" is not
+    // a termination condition anyone can rely on — the budget is.
+    pending.pagesLeft -= 1;
+    loadOlder();
+  }
+
+  function giveUpPendingJump() {
+    pendingJump.current = null;
+    appendNotice(t("chat.jumpNotFound"));
+  }
+
   function jumpToMessage(rowId: string) {
     const node = document.querySelector(`[data-row-id="${CSS.escape(rowId)}"]`);
     if (node === null) {
@@ -4284,18 +4604,27 @@ export function Transcript({
     }, JUMP_SETTLE_MS);
   }
 
+  // The pending-jump loop's re-entry point. Every way a row can arrive — the
+  // first paint, a `history_page` prepend, a `sync_page` REPLACE — ends in a
+  // `messages` change, so watching that covers them all without the frame
+  // switch having to know the loop exists. A no-op whenever nothing is pending,
+  // which is almost always.
+  //
+  // Deliberately NOT keyed on the request landing: a REPLACE can rebuild the
+  // thread under the loop, and re-deriving from whatever is now rendered is the
+  // only reading that survives that.
+  useEffect(() => {
+    if (pendingJump.current !== null) advancePendingJump();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [messages]);
+
   // The sheet is native, but only this tree knows which sends are in it (the
   // optimistic bubble exists here before any echo, `/stop` echoes are filtered
   // here, and the loaded window is this tree's). bridge.ts owns the debounce and
   // the identity guard, so every re-derive just posts.
   const outline = useMemo(() => outlineEntries(messages), [messages]);
   const outlinePost = useMemo<OutlinePost>(
-    () => ({
-      entries: outline,
-      hasMoreOlder,
-      loadingOlder,
-      available: outline.length >= OUTLINE_MIN_ENTRIES || hasMoreOlder,
-    }),
+    () => ({ entries: outline, hasMoreOlder, loadingOlder }),
     [outline, hasMoreOlder, loadingOlder],
   );
   // Read by `jumpToMessage`'s self-heal, which fires off a bridge event rather
@@ -4306,6 +4635,20 @@ export function Transcript({
     postOutline(outlinePost);
   }, [outlinePost]);
 
+  // The header's `Subagents` entry, from the rows already on screen — no request,
+  // and right offline. LATCHED for the session, which the `key={sessionId}` mount
+  // scopes: a REPLACE rebuilds the thread from the newest page and backward paging
+  // starts there, so the spawning turn leaves the loaded window routinely — the
+  // child it minted does not leave with it.
+  const spawnedRef = useRef(false);
+  const hasSubagents = useMemo(() => {
+    spawnedRef.current ||= hasSubagentSpawn(messages);
+    return spawnedRef.current;
+  }, [messages]);
+  useEffect(() => {
+    postSubagents(hasSubagents);
+  }, [hasSubagents]);
+
   // The button itself is native (a liquid-glass circle above the composer) —
   // mirror the visibility over the bridge; taps come back via the
   // `jumpToLatest` transcript event above.
@@ -4315,7 +4658,13 @@ export function Transcript({
 
   // While the turn's work block is live it already signals activity; the bare
   // "Working" pending line only covers the gap before the first frame lands.
-  const lastRow = messages[messages.length - 1];
+  // Read past a trailing notice run, as every other live-frame tail reader does:
+  // a terminal notice landing beside a live block would otherwise read as "no
+  // block live" and paint the pending box a second time below it. NOT past an
+  // answer — `closeWork` freezes `rows[len-1]`, so a block this called live
+  // across its own bubble would be one nothing can ever close, and `running`
+  // would strand the composer on the stop button for the rest of the session.
+  const lastRow = messages[lastBeforeNotices(messages)];
   const workLive = lastRow !== undefined && lastRow.role === "work" && lastRow.active;
 
   // Mirror the turn's run state to native so the composer's send button flips to
@@ -4404,8 +4753,16 @@ export function Transcript({
             <MarkdownBody text={streaming} />
           </div>
         )}
-        {turnActive && !streaming && !workLive && (
-          <div className="work-pending">
+        {(awaitingReply || turnActive) && !streaming && !workLive && (
+          // Claimed by the SEND, filled when the turn starts. `turnActive` is
+          // server-driven — a round trip behind the send — so mounting on it put
+          // a 43px row into the log a beat AFTER the bubble had settled, and the
+          // follow pin teleported the thread up for it: a second, unprompted
+          // lurch. `awaitingReply` is set in the same batch as the optimistic
+          // bubble, so the box rides the send's own motion instead. Its lifetime
+          // is the stop button's — a send that fails, or never starts a turn,
+          // retires both.
+          <div className={`work-pending${turnActive ? "" : " reserved"}`}>
             <span className="work-spin">✻</span>
             {t("chat.working")}
           </div>

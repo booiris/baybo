@@ -2415,13 +2415,14 @@ impl AgentLoop {
     }
 
     /// Append a subagent-spawned session's initial prompt as a persisted
-    /// agent-context row ahead of the turn (hidden from chat surfaces).
+    /// `SubagentSeed` row ahead of the turn — the one agent-injected row chat
+    /// surfaces render (the child's transcript opens with its errand).
     pub async fn append_spawned_prompt(
         &mut self,
         content: Vec<ContentBlock>,
     ) -> anyhow::Result<()> {
         self.context_manager.ensure_seeded().await;
-        let msg = ChatMessage::agent_context(content);
+        let msg = ChatMessage::subagent_seed(content);
         self.context_manager.append(&msg).await;
         Ok(())
     }

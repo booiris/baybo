@@ -11,7 +11,8 @@
     "test:watch": "vitest",
     "type-check": "tsc -b --noEmit",
     "lint": "eslint src",
-    "gen:api": "openapi-typescript ../../docs/openapi.json -o src/api/schema.d.ts"
+    "gen:api": "openapi-typescript ../../docs/openapi.json -o src/api/schema.d.ts",
+    "gen:snippet-vectors": "tsx scripts/gen-search-snippet-vectors.mjs"
   },
   "dependencies": {
     "@dicebear/bottts": "^9.4.2",
@@ -54,6 +55,7 @@
     "jsdom": "^29.1.1",
     "openapi-typescript": "^7.4.0",
     "tailwindcss": "^4.0.0",
+    "tsx": "^4.23.12",
     "typescript": "^5.7.0",
     "typescript-eslint": "^8.64.0",
     "vite": "^6.4.3",

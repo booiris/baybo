@@ -39,6 +39,7 @@ final class DeckBridge: NSObject, WKScriptMessageHandler {
     private func handle(type: String, body: [String: Any]) {
         switch type {
         case "ready":
+            consecutiveDeaths = 0
             ready = true
             store?.bridgeBecameReady()
             for js in pending {
@@ -106,6 +107,35 @@ final class DeckBridge: NSObject, WKScriptMessageHandler {
     }
 
     // MARK: native → web
+
+    /// The transcript webview's crash-recovery twin (see
+    /// `TranscriptBridge.contentProcessDied`): a WebContent death under a
+    /// VISIBLE deck leaves `ready` latched and every eval a silent no-op —
+    /// bricked until app restart. Reload and let the fresh `ready` replay.
+    /// The 30s window bounds a crash storm: three reloads, then quiet until
+    /// the window lapses (`ready` re-arms the budget on a surviving load).
+    private static let maxConsecutiveDeaths = 3
+    private static let deathWindowSeconds: TimeInterval = 30
+    private var consecutiveDeaths = 0
+    private var lastDeathAt = Date.distantPast
+
+    func contentProcessDied() {
+        let now = Date()
+        if now.timeIntervalSince(lastDeathAt) > Self.deathWindowSeconds {
+            consecutiveDeaths = 0
+        }
+        lastDeathAt = now
+        consecutiveDeaths += 1
+        guard consecutiveDeaths <= Self.maxConsecutiveDeaths else {
+            NSLog("baybo: deck web content process died again; giving up on reloads")
+            return
+        }
+        guard let webView, let url = DeckHost.deckURL else { return }
+        NSLog("baybo: deck web content process died; reloading")
+        ready = false
+        pending.removeAll()
+        webView.load(URLRequest(url: url))
+    }
 
     private func eval(_ fn: String, _ jsonPayload: String) {
         let js = "window.deckShell.\(fn)(\(jsonPayload));"

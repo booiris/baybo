@@ -56,11 +56,12 @@ function recorder(): { log: string[]; events: TranscriptEvents } {
       connEpoch: (epoch) => log.push(`epoch:${epoch}`),
       userSent: (payload) => log.push(`userSent:${payload.msgId}`),
       sendFailed: (msgId) => log.push(`sendFailed:${msgId}`),
-      sendConfirmed: (msgId) => log.push(`sendConfirmed:${msgId}`),
+      sendConfirmed: (msgId, ordinal) => log.push(`sendConfirmed:${msgId}:${ordinal}`),
       bottomInset: (px) => log.push(`inset:${px}`),
       jumpToLatest: () => log.push("jump"),
       syncRequested: () => log.push("sync"),
       jumpToMessage: (rowId) => log.push(`jumpToMessage:${rowId}`),
+      jumpToOrdinal: (ordinal) => log.push(`jumpToOrdinal:${ordinal}`),
       outlineLoadOlder: () => log.push("outlineLoadOlder"),
       outlineHereRequested: () => log.push("outlineHere"),
     },
@@ -185,7 +186,6 @@ describe("postOutline — the message index mirror", () => {
       ],
       hasMoreOlder: true,
       loadingOlder: false,
-      available: true,
     };
   }
 
@@ -208,7 +208,6 @@ describe("postOutline — the message index mirror", () => {
         ],
         hasMoreOlder: true,
         loadingOlder: false,
-        available: true,
       },
     ]);
   });
@@ -261,6 +260,46 @@ describe("postOutline — the message index mirror", () => {
   });
 });
 
+describe("postSubagents — the header's Subagents entry", () => {
+  function subagentPosts(): Record<string, unknown>[] {
+    return posted.filter((m) => m.type === "subagents");
+  }
+
+  it("posts the verdict flat, in the shape native parses", async () => {
+    const bridge = await loadBridge();
+    window.baybo.init(initPayload(SESSION_A));
+    bridge.postSubagents(false);
+    bridge.postSubagents(true);
+    expect(subagentPosts()).toEqual([
+      { type: "subagents", present: false },
+      { type: "subagents", present: true },
+    ]);
+  });
+
+  it("drops a repost of the value native already holds — the transcript re-derives on every commit", async () => {
+    const bridge = await loadBridge();
+    window.baybo.init(initPayload(SESSION_A));
+    bridge.postSubagents(true);
+    bridge.postSubagents(true);
+    bridge.postSubagents(true);
+    expect(subagentPosts()).toEqual([{ type: "subagents", present: true }]);
+  });
+
+  // One WKWebView serves every conversation: without the reset, session B's
+  // `false` is compared against A's and never posts, leaving a Subagents button
+  // on a conversation that has none.
+  it("re-posts after init even when the verdict is unchanged", async () => {
+    const bridge = await loadBridge();
+    window.baybo.init(initPayload(SESSION_A));
+    bridge.postSubagents(false);
+    expect(subagentPosts()).toHaveLength(1);
+
+    window.baybo.init(initPayload(SESSION_B));
+    bridge.postSubagents(false);
+    expect(subagentPosts()).toHaveLength(2);
+  });
+});
+
 describe("the pre-subscribe buffer", () => {
   it("replays everything native pushed before the transcript subscribed, in ARRIVAL ORDER", async () => {
     const bridge = await loadBridge();
@@ -270,7 +309,10 @@ describe("the pre-subscribe buffer", () => {
     window.baybo.setConnEpoch(2);
     window.baybo.userSent({ msgId: "pm-1", text: "hi", attachments: [] });
     window.baybo.sendFailed("pm-1");
-    window.baybo.sendConfirmed("pm-1");
+    // The durable ordinal rides the confirmation (a null is a proof that
+    // carried none) — both shapes must survive the buffer.
+    window.baybo.sendConfirmed("pm-1", 41);
+    window.baybo.sendConfirmed("pm-1", null);
     window.baybo.setBottomInset(120);
     window.baybo.jumpToLatest();
     window.baybo.requestSync();
@@ -285,7 +327,8 @@ describe("the pre-subscribe buffer", () => {
       "epoch:2",
       "userSent:pm-1",
       "sendFailed:pm-1",
-      "sendConfirmed:pm-1",
+      "sendConfirmed:pm-1:41",
+      "sendConfirmed:pm-1:null",
       "inset:120",
       "jump",
       "sync",
@@ -319,6 +362,48 @@ describe("the pre-subscribe buffer", () => {
     expect(log).toEqual([]);
   });
 
+  // The re-keyed tree COMMITS asynchronously, and native's retarget burst (the
+  // outbox's replayed `userSent`s, the offscreen frame flush) follows init in
+  // the same main-actor turn — so with the old subscription left live, the
+  // outgoing tree consumed the new conversation's first message and it died at
+  // that tree's unmount, never re-buffered. This pins init detaching it.
+  it("detaches the outgoing tree on a cross-session init — the retarget burst waits for the NEW tree", async () => {
+    const bridge = await loadBridge();
+    window.baybo.init(initPayload(SESSION_A));
+    const treeA = recorder();
+    const offA = bridge.subscribeTranscript(treeA.events);
+
+    window.baybo.init(initPayload(SESSION_B));
+    window.baybo.userSent({ msgId: "pm-b", text: "first message", attachments: [] });
+    window.baybo.pushFrame("b-frame");
+    expect(treeA.log).toEqual([]);
+
+    const treeB = recorder();
+    bridge.subscribeTranscript(treeB.events);
+    expect(treeB.log).toEqual(["userSent:pm-b", "frame:b-frame"]);
+
+    // The old tree's unmount cleanup runs AFTER the new tree subscribed —
+    // identity-guarded, it must not tear down B's live subscription.
+    offA();
+    window.baybo.pushFrame("b-live");
+    expect(treeB.log).toEqual(["userSent:pm-b", "frame:b-frame", "frame:b-live"]);
+  });
+
+  // The counter-case that makes the detach conditional: a same-session re-init
+  // (the LRU evicted the native store and re-opening minted a fresh one) keeps
+  // the very same React tree — its key doesn't change, nothing remounts, and
+  // nobody would ever subscribe again. Detaching there would buffer forever.
+  it("keeps the live subscription across a same-session re-init", async () => {
+    const bridge = await loadBridge();
+    window.baybo.init(initPayload(SESSION_A));
+    const tree = recorder();
+    bridge.subscribeTranscript(tree.events);
+
+    window.baybo.init(initPayload(SESSION_A));
+    window.baybo.userSent({ msgId: "pm-1", text: "replayed", attachments: [] });
+    expect(tree.log).toEqual(["userSent:pm-1"]);
+  });
+
   // `deliver()` ends in a BARE `else e.jumpToLatest()`, so a command whose
   // `Buffered` variant has no explicit branch silently becomes "scroll to the
   // bottom" — and TypeScript cannot catch it (the union is exhausted by the
@@ -327,12 +412,18 @@ describe("the pre-subscribe buffer", () => {
   it("replays each index command as ITSELF, never as the jumpToLatest fall-through", async () => {
     const bridge = await loadBridge();
     window.baybo.jumpToMessage("m42");
+    window.baybo.jumpToOrdinal(42);
     window.baybo.outlineLoadOlder();
     window.baybo.requestOutlineHere();
 
     const { log, events } = recorder();
     bridge.subscribeTranscript(events);
-    expect(log).toEqual(["jumpToMessage:m42", "outlineLoadOlder", "outlineHere"]);
+    expect(log).toEqual([
+      "jumpToMessage:m42",
+      "jumpToOrdinal:42",
+      "outlineLoadOlder",
+      "outlineHere",
+    ]);
     expect(log).not.toContain("jump");
   });
 

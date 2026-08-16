@@ -6,6 +6,7 @@
 
 use crate::binding::NOT_BOUND_MSG;
 use crate::direct::INVALID_TOKEN_CODE;
+use crate::transport::{NOT_CONNECTED_MSG, SESSION_CLOSED_MSG};
 
 /// The FFI error surface. `InvalidToken` and `NotBound` used to be string codes
 /// the webview matched on (`invalid_token` / the unbound prose); as enum variants
@@ -18,18 +19,28 @@ pub enum BayboError {
     /// The gateway rejected the admin Bearer token (HTTP 401).
     #[error("{}", INVALID_TOKEN_CODE)]
     InvalidToken,
+    /// The chat leg can't carry this session right now: no live pump, or the
+    /// session's subscription was proven on a leg that is no longer the live
+    /// one. Swift's send fast path matches this to fall through to the
+    /// dial-and-send slow path instead of trusting a stale `connected`.
+    #[error("{}", NOT_CONNECTED_MSG)]
+    NotConnected,
     /// Any other failure, carrying the leg's own prose verbatim.
     #[error("{message}")]
     Other { message: String },
 }
 
 impl BayboError {
-    /// Fold an internal `String` error into the FFI enum: the two stable codes
-    /// become their variants, everything else rides as prose.
+    /// Fold an internal `String` error into the FFI enum: the stable codes
+    /// become their variants, everything else rides as prose. The transport's
+    /// two dead-leg spellings collapse into one variant — for the caller they
+    /// mean the same thing: this send/connect did not reach the gateway, and
+    /// a redial is the recovery.
     pub(crate) fn from_msg(message: String) -> Self {
         match message.as_str() {
             INVALID_TOKEN_CODE => Self::InvalidToken,
             NOT_BOUND_MSG => Self::NotBound,
+            NOT_CONNECTED_MSG | SESSION_CLOSED_MSG => Self::NotConnected,
             _ => Self::Other { message },
         }
     }
@@ -179,6 +190,147 @@ pub struct ChatSessionSummary {
     /// was deleted, its history kept) is always `false` — nothing is left to
     /// hold the bit.
     pub cron_group_pinned: bool,
+}
+
+/// One matching message inside a [`ChatSearchGroup`], mirroring the gateway's
+/// `ChatSearchHit` (`GET /v1/chat/search`).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ChatSearchHit {
+    /// Where this message sits in the session's transcript — the jump address.
+    ///
+    /// This is the ordinal to navigate to even when [`Self::superseded_by`] is
+    /// set: the display read filters `compaction_inserted = 0`, so a superseded
+    /// ORIGINAL still renders. Note the transcript keys a user row by its
+    /// `platform_msg_id`, not by `m<ordinal>`, so a jump must resolve BY ordinal
+    /// (`rowCoverageOrdinal`) rather than by building a row id — building one
+    /// silently misses every user-authored hit.
+    pub ordinal: i64,
+    /// `"user"` / `"assistant"` — the gateway's `Role::as_str`, passed through
+    /// rather than parsed: this side only labels it.
+    pub role: String,
+    /// The ORIGINAL prose, never the segmented index text. Highlight by
+    /// substring — a phrase of unigrams matches exactly the substring typed, so
+    /// a client-side match agrees with what the index matched.
+    pub text: String,
+    /// RFC 3339, parsed on the Swift side for the excerpt's timestamp.
+    pub created_at: String,
+    /// Set when compaction stamped this row: the ordinal where that compaction's
+    /// re-inserted rows begin. **Not a jump target and not a "hidden" marker** —
+    /// those rows carry `compaction_inserted = 1` and never render, while this
+    /// hit's own `ordinal` does. Every row active at a compaction points at the
+    /// same ordinal, so in a compacted conversation most hits carry it; it says
+    /// the model's context was rewritten after this row, nothing about what the
+    /// user can see. Carried so a client that wants to reason about compaction
+    /// can, not so it can label the hit.
+    pub superseded_by: Option<i64>,
+}
+
+/// One conversation's matches, collapsed into a single result card.
+///
+/// Grouped rather than listed flat because one chatty conversation would
+/// otherwise fill the result set — measured on real data, a single conversation
+/// took 15 of 30 slots and hid 10 others. The gateway groups over a window much
+/// wider than it returns, so this cannot be reproduced client-side.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ChatSearchGroup {
+    pub session_id: String,
+    /// The gateway's title, `None` before the title pass has run. The card
+    /// prefers this device's own list row (same headline rule as the chat list)
+    /// so one conversation is not named two different things in two places.
+    pub session_title: Option<String>,
+    /// Best-matching excerpts, best first, at most 3 (the gateway's cap).
+    pub hits: Vec<ChatSearchHit>,
+    /// Total matches in this conversation — equal to `hits.len()` at or under
+    /// the cap, larger above it, so a card can say "and N more" without a second
+    /// call.
+    pub total_hits: i64,
+}
+
+/// A whole result set for one query (`GET /v1/chat/search`).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ChatSearchResults {
+    /// Conversations, best match first; a conversation ranks by its best hit.
+    pub groups: Vec<ChatSearchGroup>,
+    /// The query matched more than the gateway's scan window, so some
+    /// conversations are missing and `total_hits` undercounts. There is no
+    /// cursor by design — a search box refines the query, it does not page.
+    pub truncated: bool,
+}
+
+/// How far a subagent child got, mirroring the gateway's `ChatSubagentStatus`.
+/// Derived from the child's TURN rows, never its session row: nothing rewrites
+/// a child's session after creation, so its `last_active` sits on `created_at`
+/// forever.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum ChatSubagentStatus {
+    /// Spawned, but its actor has not opened a turn yet.
+    Pending,
+    /// At least one turn is still open — the sheet polls a child in this state.
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+    /// A status this build does not name. Both ends carry the arm on purpose: a
+    /// gateway that grows a status must cost one row its label, not blank the
+    /// whole sheet with a decode error.
+    ///
+    /// Do NOT read it as "terminal". The gateway only emits its own `Unknown`
+    /// after ruling out a live turn, but `#[serde(other)]` also lands here for
+    /// any FUTURE status string — including a non-terminal one — so a client
+    /// that treats this arm as an end state (the read-only page stops polling
+    /// on it) would freeze such a child mid-run until reopened.
+    Unknown,
+}
+
+/// One direct subagent child of a conversation, mirroring the gateway's
+/// `ChatSubagentSummary` (`GET /v1/chat/sessions/{id}/subagents`). Timestamps
+/// are RFC 3339 strings, like [`ChatSessionSummary`]'s.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ChatSubagentSummary {
+    /// The child's own session id — the argument to
+    /// [`crate::BayboClient::chat_fetch_subagent_history`], and to
+    /// [`crate::BayboClient::chat_list_subagents`] when drilling further down.
+    pub session_id: String,
+    /// Profile the parent spawned (`explorer`, `general-purpose`, …).
+    pub subagent_type: Option<String>,
+    /// `"baybo"` for an in-process child, else the external agent's name
+    /// (`"claude"` / `"codex"`).
+    pub backend: String,
+    /// The errand the parent authored. `None` for a child spawned before the
+    /// gateway stamped it onto the child's title — the row falls back to
+    /// `subagent_type`.
+    pub task: Option<String>,
+    pub status: ChatSubagentStatus,
+    pub created_at: String,
+    /// When its first turn began; `None` while [`ChatSubagentStatus::Pending`].
+    pub started_at: Option<String>,
+    /// When its last turn ended, `None` while anything is still open. A pair
+    /// rather than a precomputed duration, so a running child's clock ticks
+    /// without polling for it.
+    pub ended_at: Option<String>,
+}
+
+/// A session's direct subagent children (`GET /v1/chat/sessions/{id}/subagents`).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ChatSubagentList {
+    /// Ascending by creation — the transcript's own direction, so the newest
+    /// (usually the running one) is last.
+    pub items: Vec<ChatSubagentSummary>,
+    /// Older children exist below `items[0]`. The sheet pages back by handing
+    /// that row's `(created_at, session_id)` back as [`SubagentCursor`] — the
+    /// fan-out limiter bounds CONCURRENT breadth, not the cumulative count, so
+    /// an overnight conversation really can leave hundreds behind.
+    pub has_more_older: bool,
+}
+
+/// Keyset cursor into a parent's children: return those strictly OLDER than
+/// this row. The id rides along because one turn's fan-out mints siblings
+/// inside the same microsecond, which a timestamp alone cannot separate.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct SubagentCursor {
+    /// RFC 3339, verbatim from the row's `created_at`.
+    pub created_at: String,
+    pub session_id: String,
 }
 
 /// One selectable LLM entry for the chat header's model picker — a `baybo.json`
@@ -578,6 +730,21 @@ mod tests {
             BayboError::from_msg(NOT_BOUND_MSG.to_string()),
             BayboError::NotBound
         ));
+    }
+
+    /// The dead-leg pair rides the same untyped-string seam: both transport
+    /// spellings must stringify to their bare codes and fold into
+    /// `NotConnected`, or Swift's send fast path stops falling through to the
+    /// dial-and-send slow path and a stale `connected` becomes a black hole
+    /// again.
+    #[test]
+    fn both_dead_leg_errors_fold_into_the_not_connected_variant() {
+        for err in [TransportError::NotConnected, TransportError::SessionClosed] {
+            assert!(matches!(
+                BayboError::from_msg(err.to_string()),
+                BayboError::NotConnected
+            ));
+        }
     }
 
     /// All three hops end to end, exactly as `chat_connect` runs them.

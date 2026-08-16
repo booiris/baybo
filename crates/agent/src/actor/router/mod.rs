@@ -266,6 +266,13 @@ pub struct Router {
     /// conversation by its virtual transcript path and each agent by its
     /// memory directory, and both are composed from here.
     workspace: Arc<baybo_workspace::WorkspacePaths>,
+    /// The gateway's inbound dedup window — the SAME instance the channel
+    /// layer records into before the echo. The router un-records a key
+    /// when its gates reject the message: nothing was persisted, so a
+    /// burned key would black-hole every retry of the same
+    /// `platform_msg_id` (the client outbox retries under the same id by
+    /// design, so the send would be permanently unsendable).
+    inbound_dedup: Arc<baybo_channels::InboundDedup>,
 }
 
 /// Construction bundle for [`Router`]. Every field is required — call
@@ -300,6 +307,8 @@ pub struct RouterConfig {
     pub rate_limit: Arc<LiveRateLimit>,
     /// Workspace addresses — see [`Router::workspace`].
     pub workspace: Arc<baybo_workspace::WorkspacePaths>,
+    /// The shared inbound dedup — see [`Router::inbound_dedup`].
+    pub inbound_dedup: Arc<baybo_channels::InboundDedup>,
 }
 
 impl Router {
@@ -320,6 +329,7 @@ impl Router {
             actor_parent_token,
             rate_limit,
             workspace,
+            inbound_dedup,
         } = config;
         Self {
             session_manager,
@@ -337,6 +347,7 @@ impl Router {
             board,
             actor_parent_token,
             workspace,
+            inbound_dedup,
         }
     }
 

@@ -89,6 +89,16 @@ The sidebar header carries a **`Search messages` box** under the New-chat button
 
 The query goes to `GET /v1/chat/search` with nothing but `q` (`SearchPanel.tsx`), which means the server's defaults apply: **hidden and archived conversations are excluded**, and adding an `include_*` flag here would resurface exactly what the user filed away.
 
+Each result card is one conversation — title, hit count, and a few **excerpts** cut around the match by `searchSnippet.ts` and highlighted client-side by substring. **Every excerpt is its own click target** (the card is no longer one big button; the title row keeps the whole-card gesture and lands on the best-scoring hit), because a result is a *place in a conversation* and three hits in one conversation are three different places.
+
+Opening one navigates to `/chat/<id>?m=<ordinal>&q=<terms>` and the thread **lands on that row** (`searchJump.ts` + the walk in `ChatPage`). Three things make that work, and each is load-bearing:
+
+- **The row usually isn't loaded.** A conversation opens on its newest page, and the hit can be hundreds of rows above it, so the jump *walks* the page floor down — `before_ordinal` pages at the API's `limit=200` ceiling — until the floor passes the target. Bounded at `MAX_JUMP_PAGES`; measured against the live database, the longest conversation is 772 rendered rows, so reaching its **first** message costs 4 pages and the typical hit costs **zero**. The walk also has to wait out the underfill fallback, which takes the single-flight page gate first on a cold open.
+- **The ordinal is not always a row.** The model's mid-turn prose is persisted at its own ordinal but *rendered inside* the turn's collapsed work card, so the landing rule is "the last row at or before the target", not `getElementById`. A hit compaction superseded jumps to `superseded_by` instead — the matched row is not in the rendered thread at all, and the excerpt's `compacted` badge is what says so.
+- **A jump is scroll-back.** `pinnedToBottomRef` gates every auto-scroll-to-bottom path (the tail effect, the content ResizeObserver, the prepend's own anchor restore), so the walk drops it first; otherwise each prepended page would yank the viewport back to the newest row.
+
+The landed row gets a 1.6s tint — a full-band strip on the row wrapper, so it reads the same whether a bubble, a notice or a work card landed — and the `q` terms are painted inside it via the **CSS Custom Highlight API**. Not `<mark>`: the bubble body is React-rendered markdown, and a wrapper hand-inserted into that subtree is undone by the next render. Where the API is missing the scroll and the tint still happen. The window is **front-loaded deliberately**: ~12 characters of lead-in against ~108 of tail, because the excerpt renders `line-clamp-2` in the 260px sidebar (~34 full-width CJK characters, ~58 ASCII) and every character in front of the match is a character that pushes the highlight past the clamp. A symmetric 60-character pad rendered **10 of 13 hits for one live query with the searched term off-screen** — real matches on cards that read as if they contain nothing that was searched for. Overflowing the clamp on the tail side is free; overflowing it on the lead side costs the whole feature.
+
 ### Other row affordances
 
 Two more badges can appear in a row's right slot, left of the timestamp:

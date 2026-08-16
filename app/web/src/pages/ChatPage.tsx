@@ -14,7 +14,7 @@ import {
   type MouseEvent as ReactMouseEvent,
   type ReactNode,
 } from 'react';
-import { useNavigate, useParams } from 'react-router-dom';
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { uuid } from '../uuid';
 import ReactMarkdown, { type Components, type Options } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -76,6 +76,7 @@ import { useFolderStore } from './chat/folderStore';
 import { useInputHistory } from './chat/inputHistory';
 import { normalizeMath } from './chat/mathDelimiters';
 import { withoutArchived } from './chat/sessionBuckets';
+import { anchorRowFor, clearSearchHighlight, paintSearchHighlight } from './chat/searchJump';
 import type { SessionSummary } from './chat/types';
 
 type ApiTranscriptItem = components['schemas']['ChatTranscriptItem'];
@@ -339,6 +340,35 @@ const SAFETY_TICK_MS = 180_000;
 /** Outbox retry sweep cadence — fine-grained enough to fire within a few
  *  seconds of the 10s no-echo deadline without busy-spinning. */
 const OUTBOX_TICK_MS = 3_000;
+
+/** Page size while walking back to a search hit — the server's ceiling
+ *  (`MAX_HISTORY_LIMIT`). The walk is a means, not a read: the reader is
+ *  waiting on it, so it should cost as few round-trips as the API allows. */
+const JUMP_PAGE_LIMIT = 200;
+
+/** Pages that walk may load before giving up and landing on the oldest row it
+ *  reached. Measured against the live database, the longest conversation is 772
+ *  rendered rows — 4 pages to reach its FIRST message — so this is well past
+ *  any real jump and exists only so a pathological session cannot spin. */
+const MAX_JUMP_PAGES = 10;
+
+/** How long the landed row stays tinted. Long enough to catch the eye after the
+ *  scroll settles, short enough not to become part of the reading surface. */
+const JUMP_FLASH_MS = 1_600;
+
+/** How long the jump walk waits out a page some other trigger is already
+ *  loading. One frame is not enough — the page is a round-trip — and the wait
+ *  only happens when the walk and the underfill fallback overlap. */
+const JUMP_RETRY_MS = 60;
+
+/** The `?m=` a search result navigates with: the ordinal to land on. Anything
+ *  else on the URL is someone else's parameter, and a jump to nowhere is worse
+ *  than no jump. */
+function parseJumpTarget(raw: string | null): number | null {
+  if (raw === null) return null;
+  const ordinal = Number(raw);
+  return Number.isSafeInteger(ordinal) && ordinal >= 0 ? ordinal : null;
+}
 
 /** How many ended-turn `started_at` stamps to remember per session for
  *  the SubscribeState turn-identity staleness test. */
@@ -1863,75 +1893,192 @@ export function ChatPage() {
   // `scrollHeight - scrollTop` before the state update and restoring
   // it after — otherwise the new top of the list would yank the
   // viewport out from under the user.
+  //
+  // Returns the page floor the response carried, or `null` when nothing was
+  // loaded (already at the first row, a request in flight, or the fetch
+  // failed). The jump walk below drives this in a loop and must read the new
+  // floor from the RESPONSE: `views` commits a render later, so a loop that
+  // consulted it would re-request the same page until it hit its bound.
+  const loadOlderPage = useCallback(
+    async (
+      sid: string,
+      limit?: number,
+    ): Promise<{ oldestOrdinal: number | null; hasMore: boolean } | null> => {
+      if (loadingOlderRef.current) return null;
+      const view = viewsRef.current[sid];
+      if (!view || !view.hasMore || view.olderLoading || view.oldestOrdinal === null) return null;
+      loadingOlderRef.current = true;
+      const scroller = transcriptScrollRef.current;
+      // Only preserve the scroll offset when the user is reading scroll-back.
+      // When pinned to the bottom (fresh open / underfill auto-load), the
+      // auto-scroll-to-bottom effect re-pins after the prepend; a rival anchor
+      // restore here would fight it and produce jitter, so skip it.
+      const anchorFromBottom =
+        scroller && !pinnedToBottomRef.current
+          ? scroller.scrollHeight - scroller.scrollTop
+          : null;
+      setViews((prev) => mergeView(prev, sid, { olderLoading: true }));
+      try {
+        const { data, error } = await client.GET('/v1/chat/sessions/{session_id}', {
+          params: {
+            path: { session_id: sid },
+            query:
+              limit === undefined
+                ? { before_ordinal: view.oldestOrdinal }
+                : { before_ordinal: view.oldestOrdinal, limit },
+          },
+        });
+        if (error || !data) {
+          console.warn('chat history older-page load failed', sid, error);
+          setViews((prev) => mergeView(prev, sid, { olderLoading: false }));
+          return null;
+        }
+        const newRows = data.transcript.map((item) => transcriptItemToRow(sid, item));
+        // A backfill page is a durability surface too — release any outbox
+        // entry whose ordinal-stamped row shows up here.
+        confirmDurableFromItems(sid, data.transcript);
+        // Real message-ordinal bound from the server (not the transcript items,
+        // which may include control events without one).
+        const newOldest = data.oldest_ordinal ?? view.oldestOrdinal;
+        setViews((prev) => {
+          const cur = prev[sid] ?? EMPTY_VIEW;
+          return {
+            ...prev,
+            [sid]: {
+              ...cur,
+              // Fold at the seam: a turn longer than one page comes back as two
+              // `work` items (the older page's tail-of-turn half above the current
+              // thread's head-of-turn half). One turn must stay one card — but a
+              // pair straddling a compaction boundary is two turns, kept apart so
+              // the divider lands between them (a backfill page carries no
+              // `compaction_points`; the session-level set is the view's).
+              transcript: foldAdjacentWork([...newRows, ...cur.transcript], cur.compactionPoints),
+              oldestOrdinal: newOldest,
+              hasMore: data.has_more,
+              olderLoading: false,
+            },
+          };
+        });
+        // Restore scroll position so the previously-visible top row stays
+        // visible. Run after the next paint so the prepended rows have
+        // their measured height.
+        if (scroller && anchorFromBottom !== null) {
+          requestAnimationFrame(() => {
+            scroller.scrollTop = scroller.scrollHeight - anchorFromBottom;
+          });
+        }
+        return { oldestOrdinal: newOldest, hasMore: data.has_more };
+      } catch (e) {
+        console.warn('chat history older-page load threw', sid, e);
+        setViews((prev) => mergeView(prev, sid, { olderLoading: false }));
+        return null;
+      } finally {
+        loadingOlderRef.current = false;
+      }
+    },
+    [client, confirmDurableFromItems],
+  );
+
+  /** The scroll-up / underfill trigger: one page for the session on screen. */
   const loadOlder = useCallback(async () => {
     if (!sessionId) return;
-    if (loadingOlderRef.current) return;
-    const view = views[sessionId];
-    if (!view || !view.hasMore || view.olderLoading || view.oldestOrdinal === null) return;
-    loadingOlderRef.current = true;
-    const scroller = transcriptScrollRef.current;
-    // Only preserve the scroll offset when the user is reading scroll-back.
-    // When pinned to the bottom (fresh open / underfill auto-load), the
-    // auto-scroll-to-bottom effect re-pins after the prepend; a rival anchor
-    // restore here would fight it and produce jitter, so skip it.
-    const anchorFromBottom =
-      scroller && !pinnedToBottomRef.current
-        ? scroller.scrollHeight - scroller.scrollTop
-        : null;
-    setViews((prev) => mergeView(prev, sessionId, { olderLoading: true }));
-    try {
-      const { data, error } = await client.GET('/v1/chat/sessions/{session_id}', {
-        params: {
-          path: { session_id: sessionId },
-          query: { before_ordinal: view.oldestOrdinal },
-        },
-      });
-      if (error || !data) {
-        console.warn('chat history older-page load failed', sessionId, error);
-        setViews((prev) => mergeView(prev, sessionId, { olderLoading: false }));
-        return;
+    await loadOlderPage(sessionId);
+  }, [sessionId, loadOlderPage]);
+
+  // Landing a search hit: `/chat/<id>?m=<ordinal>&q=<terms>`, built by the
+  // sidebar's search panel. The hit can be hundreds of rows above the tail the
+  // conversation opens on, so the row has to be *fetched* before it can be
+  // scrolled to — walk the page floor down to it, then hand the scroll to the
+  // layout effect below.
+  const [searchParams] = useSearchParams();
+  const jumpTarget = parseJumpTarget(searchParams.get('m'));
+  const jumpQuery = searchParams.get('q') ?? '';
+  // One walk per (session, ordinal). The effect re-fires on every commit the
+  // walk itself causes, and a second walk would race the first for the
+  // `loadingOlderRef` gate and land on a half-loaded thread.
+  const jumpRanRef = useRef<string | null>(null);
+  const [pendingJumpScroll, setPendingJumpScroll] = useState<number | null>(null);
+  const [flashRowKey, setFlashRowKey] = useState<string | null>(null);
+
+  const runJump = useCallback(
+    async (sid: string, target: number) => {
+      // A jump IS scroll-back, and every auto-scroll-to-bottom path is gated on
+      // this one ref — the tail effect, the content ResizeObserver, and
+      // `loadOlderPage`'s own anchor restore. Dropping it here is what keeps
+      // the prepends from yanking the viewport back down to the newest row.
+      pinnedToBottomRef.current = false;
+      setHasNewBelow(false);
+      const view = viewsRef.current[sid];
+      let floor = view?.oldestOrdinal ?? null;
+      let hasMore = view?.hasMore ?? false;
+      for (let page = 0; page < MAX_JUMP_PAGES; page++) {
+        if (floor === null || floor <= target || !hasMore) break;
+        const loaded = await loadOlderPage(sid, JUMP_PAGE_LIMIT);
+        if (loaded !== null) {
+          floor = loaded.oldestOrdinal;
+          hasMore = loaded.hasMore;
+          continue;
+        }
+        // Refused. Either there is nothing left to load, or — the common one on
+        // a cold open — the underfill fallback owns the in-flight page: it runs
+        // as a layout effect on the same commit that lets this walk start, so
+        // it takes the single-flight gate first. That page walks the same
+        // direction, so wait for it and re-read the floor rather than giving up
+        // one page short of the row we were asked for.
+        if (!loadingOlderRef.current) break;
+        await new Promise((resolve) => window.setTimeout(resolve, JUMP_RETRY_MS));
+        const latest = viewsRef.current[sid];
+        floor = latest?.oldestOrdinal ?? floor;
+        hasMore = latest?.hasMore ?? hasMore;
       }
-      const newRows = data.transcript.map((item) => transcriptItemToRow(sessionId, item));
-      // A backfill page is a durability surface too — release any outbox
-      // entry whose ordinal-stamped row shows up here.
-      confirmDurableFromItems(sessionId, data.transcript);
-      // Real message-ordinal bound from the server (not the transcript items,
-      // which may include control events without one).
-      const newOldest = data.oldest_ordinal ?? view.oldestOrdinal;
-      setViews((prev) => {
-        const cur = prev[sessionId] ?? EMPTY_VIEW;
-        return {
-          ...prev,
-          [sessionId]: {
-            ...cur,
-            // Fold at the seam: a turn longer than one page comes back as two
-            // `work` items (the older page's tail-of-turn half above the current
-            // thread's head-of-turn half). One turn must stay one card — but a
-            // pair straddling a compaction boundary is two turns, kept apart so
-            // the divider lands between them (a backfill page carries no
-            // `compaction_points`; the session-level set is the view's).
-            transcript: foldAdjacentWork([...newRows, ...cur.transcript], cur.compactionPoints),
-            oldestOrdinal: newOldest,
-            hasMore: data.has_more,
-            olderLoading: false,
-          },
-        };
-      });
-      // Restore scroll position so the previously-visible top row stays
-      // visible. Run after the next paint so the prepended rows have
-      // their measured height.
-      if (scroller && anchorFromBottom !== null) {
-        requestAnimationFrame(() => {
-          scroller.scrollTop = scroller.scrollHeight - anchorFromBottom;
-        });
-      }
-    } catch (e) {
-      console.warn('chat history older-page load threw', sessionId, e);
-      setViews((prev) => mergeView(prev, sessionId, { olderLoading: false }));
-    } finally {
-      loadingOlderRef.current = false;
+      // Not measured here: the pages that just landed are in `views`, and the
+      // DOM they render into is a commit away.
+      setPendingJumpScroll(target);
+    },
+    [loadOlderPage],
+  );
+
+  useEffect(() => {
+    if (jumpTarget === null) {
+      // Navigating anywhere without a target re-arms the walk, so opening the
+      // same hit again later jumps again instead of being deduped against the
+      // run before it.
+      jumpRanRef.current = null;
+      return;
     }
-  }, [client, sessionId, views, confirmDurableFromItems]);
+    if (!sessionId) return;
+    // The walk starts from the first page's floor, so that page has to land
+    // before it can start.
+    if (!currentView.historyLoaded) return;
+    const token = `${sessionId}:${jumpTarget}`;
+    if (jumpRanRef.current === token) return;
+    jumpRanRef.current = token;
+    void runJump(sessionId, jumpTarget);
+  }, [sessionId, jumpTarget, currentView.historyLoaded, runJump]);
+
+  useLayoutEffect(() => {
+    if (pendingJumpScroll === null) return;
+    const scroller = transcriptScrollRef.current;
+    if (!scroller) return;
+    const anchor = anchorRowFor(scroller, pendingJumpScroll);
+    // Cleared unconditionally: a target nothing resolves to (an empty thread)
+    // must not leave the jump armed for every later commit.
+    setPendingJumpScroll(null);
+    if (!anchor) return;
+    anchor.scrollIntoView({ block: 'center' });
+    setFlashRowKey(anchor.id);
+    paintSearchHighlight(anchor, jumpQuery);
+  }, [pendingJumpScroll, jumpQuery]);
+
+  useEffect(() => {
+    if (flashRowKey === null) return;
+    const timer = window.setTimeout(() => setFlashRowKey(null), JUMP_FLASH_MS);
+    return () => window.clearTimeout(timer);
+  }, [flashRowKey]);
+
+  // The highlight is held outside the DOM, so nothing takes it down with the
+  // row it painted — leaving one session's terms lit inside the next.
+  useEffect(() => clearSearchHighlight, [sessionId]);
 
   const handleTranscriptScroll = useCallback(() => {
     const scroller = transcriptScrollRef.current;
@@ -3170,18 +3317,36 @@ export function ChatPage() {
                   return nodes;
                 }
                 const retryId = row.failed ? row.clientMsgId : undefined;
+                const ordinal = rowOrdinal(row.key);
                 nodes.push(
-                  <MessageBubble
+                  // The row's DOM identity, and the only thing a search jump
+                  // has to aim at. Wrapped rather than pushed into
+                  // `MessageBubble` because a bubble, a notice and a work card
+                  // are three different roots; the tint is a full-band strip
+                  // (not a ring on the bubble) for the same reason — it reads
+                  // the same whichever of the three landed, and it cannot
+                  // disturb the left/right alignment the roots own. `min-w-0`
+                  // because a flex child defaults to `min-width:auto` and would
+                  // refuse to shrink below its content, overflowing the band.
+                  <div
                     key={row.key}
-                    row={row}
-                    adminToken={adminToken}
-                    baseUrl={baseUrl}
-                    onRetry={
-                      retryId !== undefined && sessionId
-                        ? () => retryFailedSend(sessionId, retryId)
-                        : undefined
-                    }
-                  />,
+                    id={row.key}
+                    data-ordinal={ordinal ?? undefined}
+                    className={`min-w-0 rounded-md transition-colors duration-700 ${
+                      row.key === flashRowKey ? 'bg-brand/25' : 'bg-transparent'
+                    }`}
+                  >
+                    <MessageBubble
+                      row={row}
+                      adminToken={adminToken}
+                      baseUrl={baseUrl}
+                      onRetry={
+                        retryId !== undefined && sessionId
+                          ? () => retryFailedSend(sessionId, retryId)
+                          : undefined
+                      }
+                    />
+                  </div>,
                 );
                 if (isCancelledWorkAt(arr, i, currentView.turn)) {
                   nodes.push(
@@ -3819,7 +3984,10 @@ export function routeInboundFrame(
             ...prev,
             [sid]: {
               ...view,
-              transcript: finalizeMessage(view.transcript, role, frame.content, hasAttachments, frame.attachments),
+              transcript: finalizeMessage(
+                view.transcript, role, frame.content, hasAttachments, frame.attachments,
+                clientMsgId,
+              ),
             },
           };
         });
@@ -4654,12 +4822,19 @@ export function applyTurnState(
   return [...prev, newWorkRow(startedAt, prev.length)];
 }
 
-function finalizeMessage(
+export function finalizeMessage(
   prev: TranscriptRow[],
   role: 'user' | 'assistant',
   content: string,
   hasAttachments: boolean,
   attachments: WireAttachment[] = [],
+  // The echo fall-through's idempotency key. Without it the appended row is
+  // invisible to every protection and reconciliation that keys on
+  // `clientMsgId`: `applySyncReplace`'s kept set cannot overlay it, a re-echo
+  // appends a duplicate instead of matching in place, `applySyncMerge` cannot
+  // retire it against the durable row, and `confirmDurable` cannot clear its
+  // flags. Only the user-echo path has one to pass.
+  clientMsgId?: string,
 ): TranscriptRow[] {
   const details = attachments.length > 0 ? attachments : undefined;
   const last = prev[prev.length - 1];
@@ -4684,6 +4859,7 @@ function finalizeMessage(
       key: `msg-${prev.length}-${Date.now()}`,
       role,
       text: content,
+      clientMsgId,
       hasAttachments: hasAttachments || undefined,
       attachments: details,
       createdAt: new Date().toISOString(),
@@ -4797,14 +4973,20 @@ function findOpenWorkIndex(rows: TranscriptRow[], startedAt: number): number {
   return -1;
 }
 
-/** The server reconstructs a turn's work block per page window, so a turn
- *  longer than one page comes back as two `work` items keyed `w<ordinal>` by
- *  whichever intermediate row led each window. Pull the ordinal back out of a
- *  reconstructed row's key (`row-<sessionId>-w<ordinal>`) so a fold can tell the
- *  two halves apart. `null` for a live/optimistic block, whose key isn't
- *  server-derived — which is exactly what routes such a pair to `reconcileWork`
- *  (one span, two representations) rather than `joinWorkHalves`. */
-function workRowOrdinal(key: string): number | null {
+/** Pull the ordinal back out of a server-derived row key
+ *  (`row-<sessionId>-m<ordinal>` / `-w<ordinal>`).
+ *
+ *  Two callers, both needing the same parse. A work fold needs it because the
+ *  server reconstructs a turn's block per page window, so a turn longer than one
+ *  page comes back as two `w<ordinal>` items keyed by whichever intermediate row
+ *  led each window, and the fold must tell the halves apart. A search jump needs
+ *  it to address rows by ordinal in the DOM.
+ *
+ *  `null` for a live/optimistic block (whose key isn't server-derived — which is
+ *  exactly what routes such a pair to `reconcileWork` rather than
+ *  `joinWorkHalves`) and for a control event, which is keyed `n<seq>` and is not
+ *  ordinal-addressed at all. */
+export function rowOrdinal(key: string): number | null {
   const id = key.slice(key.lastIndexOf('-') + 1);
   const match = /^[mw](\d+)$/.exec(id);
   if (!match) return null;
@@ -4824,7 +5006,7 @@ function workRowOrdinal(key: string): number | null {
 export function syncSince(cursor: number | null, transcript: TranscriptRow[]): number | null {
   if (cursor === null) return null;
   for (const row of transcript) {
-    const ordinal = workRowOrdinal(row.key);
+    const ordinal = rowOrdinal(row.key);
     if (ordinal !== null && ordinal > cursor) return null;
   }
   return cursor;
@@ -4963,8 +5145,8 @@ function joinWorkHalves(first: TranscriptRow, second: TranscriptRow): Transcript
  *  halves of one turn ⇒ span them; anything else (a live block beside its own
  *  reconstruction, a redelivered row) is one span in two forms ⇒ reconcile. */
 function foldWork(prev: TranscriptRow, next: TranscriptRow): TranscriptRow {
-  const prevOrd = workRowOrdinal(prev.key);
-  const nextOrd = workRowOrdinal(next.key);
+  const prevOrd = rowOrdinal(prev.key);
+  const nextOrd = rowOrdinal(next.key);
   return prevOrd !== null && nextOrd !== null && prevOrd !== nextOrd
     ? joinWorkHalves(prev, next)
     : reconcileWork(prev, next);
@@ -4980,7 +5162,7 @@ function foldWork(prev: TranscriptRow, next: TranscriptRow): TranscriptRow {
  *  `undefined` flag (older server) declines, degrading to the pre-fix two-block
  *  view rather than risking a wrong merge. */
 function sameContinuingTurn(prev: TranscriptRow): boolean {
-  if (workRowOrdinal(prev.key) === null) return true;
+  if (rowOrdinal(prev.key) === null) return true;
   return prev.workComplete === false;
 }
 
@@ -5001,8 +5183,8 @@ function crossesCompaction(
   next: TranscriptRow,
   compactionPoints: { ordinal: number; at: string }[],
 ): boolean {
-  const a = workRowOrdinal(prev.key);
-  const b = workRowOrdinal(next.key);
+  const a = rowOrdinal(prev.key);
+  const b = rowOrdinal(next.key);
   if (a === null || b === null) return false;
   return compactionPoints.some((p) => a < p.ordinal && p.ordinal <= b);
 }
@@ -5048,7 +5230,7 @@ export function compactionDividerKeys(
   if (compactionPoints.length === 0) return out;
   let prevOrdinal: number | null = null;
   for (const row of transcript) {
-    const ordinal = workRowOrdinal(row.key);
+    const ordinal = rowOrdinal(row.key);
     if (ordinal === null) continue;
     if (prevOrdinal !== null) {
       const lower = prevOrdinal;
@@ -5238,7 +5420,7 @@ export function rowsAboveFloor(
 ): TranscriptRow[] {
   let cut = rows.length;
   for (let i = 0; i < rows.length; i++) {
-    const ordinal = workRowOrdinal(rows[i].key);
+    const ordinal = rowOrdinal(rows[i].key);
     if (ordinal !== null && ordinal >= floor) {
       cut = i;
       break;
@@ -5268,7 +5450,7 @@ export function joinKeptHead(
   const last = head[head.length - 1];
   const cutAtStart =
     last.kind === 'work' &&
-    workRowOrdinal(last.key) !== null &&
+    rowOrdinal(last.key) !== null &&
     rebuilt.length > 0 &&
     rebuilt[0].kind === 'work';
   const seam = cutAtStart ? [...head.slice(0, -1), { ...last, workComplete: false }] : head;
@@ -5293,11 +5475,11 @@ function rowsAbovePageCeiling(prev: TranscriptRow[], page: TranscriptRow[]): Tra
   const held = new Set(page.map((r) => r.key));
   let ceiling = Number.NEGATIVE_INFINITY;
   for (const row of page) {
-    const ordinal = workRowOrdinal(row.key);
+    const ordinal = rowOrdinal(row.key);
     if (ordinal !== null && ordinal > ceiling) ceiling = ordinal;
   }
   return prev.filter((r) => {
-    const ordinal = workRowOrdinal(r.key);
+    const ordinal = rowOrdinal(r.key);
     return ordinal !== null && ordinal > ceiling && !held.has(r.key);
   });
 }
@@ -5308,6 +5490,16 @@ export function applySyncReplace(
   unconfirmedSendIds: ReadonlySet<string>,
   turn: SessionView['turn'],
 ): TranscriptRow[] {
+  // A session's rows are never deleted, so an empty page against a thread that
+  // holds rows is always a stale read — a baseline served before this
+  // session's first row persisted (the gateway echoes an inbound before it
+  // writes it, and a fresh session's cursor stays null until a sync answers,
+  // so every sync on it is a baseline). Applying it would re-file the kept
+  // rows behind the page — an ordinal-less first send below the reply that
+  // outran it — and delete outright every ordinal-less row outside the kept
+  // sets (a clientMsgId-less echo append most of all). Mirrors the identical
+  // guard in app/ios/web's applySyncReplace.
+  if (page.length === 0 && prev.length > 0) return prev;
   const pageSendIds = new Set<string>();
   for (const row of page) {
     if (row.clientMsgId !== undefined) pageSendIds.add(row.clientMsgId);

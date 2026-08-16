@@ -5,6 +5,7 @@
 //! type, and drives the per-connection inbound loop until either side
 //! closes.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use axum::Router;
@@ -293,6 +294,12 @@ pub(super) async fn run_inbound_loop<R: super::adapter::FrameSource>(
     sidecar: &Sidecar,
 ) {
     let kind = sidecar.channel.kind();
+    // Sessions this connection has already been NACKed for sending into
+    // unsubscribed (see `resolve_inbound_session`): the client outbox retries
+    // on a fixed cadence, and one error card per SESSION is signal while one
+    // per ATTEMPT is noise. Per-connection on purpose — a reconnect that
+    // re-subscribes starts clean.
+    let mut nacked_unsubscribed: HashSet<SessionId> = HashSet::new();
     while let Some(frame) = source.next_frame().await {
         match frame {
             Frame::Subscribe { session_id } => {
@@ -410,8 +417,15 @@ pub(super) async fn run_inbound_loop<R: super::adapter::FrameSource>(
                     }
                     continue;
                 }
-                let Some(incoming) =
-                    build_inbound_message(state, sidecar, channel_type, kind, wire_msg).await
+                let Some(incoming) = build_inbound_message(
+                    state,
+                    sidecar,
+                    channel_type,
+                    kind,
+                    wire_msg,
+                    &mut nacked_unsubscribed,
+                )
+                .await
                 else {
                     continue;
                 };
@@ -479,8 +493,15 @@ pub(super) async fn run_inbound_loop<R: super::adapter::FrameSource>(
                 // session resolution are skipped, not fatal.
                 let mut batch = Vec::with_capacity(messages.len());
                 for wire_msg in messages {
-                    let Some(incoming) =
-                        build_inbound_message(state, sidecar, channel_type, kind, wire_msg).await
+                    let Some(incoming) = build_inbound_message(
+                        state,
+                        sidecar,
+                        channel_type,
+                        kind,
+                        wire_msg,
+                        &mut nacked_unsubscribed,
+                    )
+                    .await
                     else {
                         continue;
                     };
@@ -717,8 +738,17 @@ async fn build_inbound_message(
     channel_type: &ChannelType,
     kind: ChannelKind,
     wire_msg: baybo_channels::wire::Message,
+    nacked_unsubscribed: &mut HashSet<SessionId>,
 ) -> Option<IncomingMessage> {
-    let session_id = resolve_inbound_session(state, sidecar, channel_type, kind, &wire_msg).await?;
+    let session_id = resolve_inbound_session(
+        state,
+        sidecar,
+        channel_type,
+        kind,
+        &wire_msg,
+        nacked_unsubscribed,
+    )
+    .await?;
     // Sender identity is fixed by the channel, not carried in the message.
     // The `owner` channel (web + device, register-validated so a leaked token
     // can't claim another stream) is one `OWNER` sharing one memory/cost
@@ -753,6 +783,7 @@ async fn build_inbound_message(
             metadata: MessageMetadata::default(),
         },
         platform_msg_id: wire_msg.platform_msg_id,
+        bot_id: wire_msg.bot_id,
     })
 }
 
@@ -767,6 +798,7 @@ async fn resolve_inbound_session(
     channel_type: &ChannelType,
     kind: ChannelKind,
     wire_msg: &baybo_channels::wire::Message,
+    nacked_unsubscribed: &mut HashSet<SessionId>,
 ) -> Option<SessionId> {
     match kind {
         ChannelKind::Subscribed => {
@@ -784,6 +816,31 @@ async fn resolve_inbound_session(
                     %session_id,
                     "Message for session not subscribed by this connection; dropping",
                 );
+                // Never silent: this drop happens before the dedup record and
+                // the echo, so to the sender it is indistinguishable from a
+                // healthy send — the exact shape of the 2026-08-16 client bug
+                // where a stale leg swallowed every send into a spinner that
+                // never resolved. The Notice gives a (possibly buggy) client
+                // something to show and the owner something to see. Once per
+                // session per connection: the client outbox retries on a fixed
+                // cadence, and a fresh error card per attempt is noise.
+                if nacked_unsubscribed.insert(session_id.clone())
+                    && let Err(e) = sidecar
+                        .send_frame(Frame::Notice {
+                            session_id: session_id.clone(),
+                            user_id: wire_msg.user_id.clone(),
+                            level: "error".to_string(),
+                            text:
+                                "message dropped: this connection is not subscribed to the session"
+                                    .to_string(),
+                            transient: false,
+                            mid_turn: Some(false),
+                            durable_id: None,
+                        })
+                        .await
+                {
+                    tracing::debug!(error = %e, "send not-subscribed notice failed");
+                }
                 return None;
             }
             // Idempotent Send: clients supply a stable `platform_msg_id`
@@ -855,7 +912,7 @@ async fn resolve_inbound_session(
                 );
                 return None;
             }
-            if !enforce_pairing(
+            match enforce_pairing(
                 state,
                 sidecar,
                 channel_type,
@@ -864,7 +921,21 @@ async fn resolve_inbound_session(
             )
             .await
             {
-                return None;
+                PairingGate::Proceed => {}
+                // Answered: the pairing prompt went back to the user, so the
+                // key stays burned — a sidecar replay would only re-prompt.
+                PairingGate::Refused => return None,
+                // Transient: nothing answered, nothing persisted. Give the key
+                // back or the sidecar's long-poll replay of this message is
+                // swallowed forever (same rule as the router's gate bails).
+                PairingGate::Errored => {
+                    state.inbound_dedup.remove(
+                        channel_type,
+                        &wire_msg.bot_id,
+                        &wire_msg.platform_msg_id,
+                    );
+                    return None;
+                }
             }
             match super::slash::try_handle(
                 &state.session_resolver,
@@ -878,6 +949,8 @@ async fn resolve_inbound_session(
                     if let Err(e) = sidecar.send_frame(Frame::Message(reply)).await {
                         tracing::warn!(error = %e, "send slash reply failed");
                     }
+                    // Answered — the key stays burned deliberately, so a
+                    // replay doesn't re-run the command.
                     return None;
                 }
                 super::slash::SlashOutcome::PassThrough => {}
@@ -895,6 +968,13 @@ async fn resolve_inbound_session(
                         user_id = %wire_msg.user_id,
                         "resolve session id for inbound message failed; dropping",
                     );
+                    // Transient store failure: nothing persisted, so the key
+                    // must not stay burned (see the pairing Errored arm).
+                    state.inbound_dedup.remove(
+                        channel_type,
+                        &wire_msg.bot_id,
+                        &wire_msg.platform_msg_id,
+                    );
                     None
                 }
             }
@@ -902,21 +982,29 @@ async fn resolve_inbound_session(
     }
 }
 
-/// Pairing gate. Returns `true` if the inbound can proceed, `false`
-/// if it was dropped (refused or errored). On refusal the pairing
-/// code is posted back as a `Frame::Notice` so the sidecar surfaces
-/// it through its existing notice routing.
+/// Pairing gate verdict. The split between the two drop arms is what the
+/// caller's dedup handling keys on: `Refused` was ANSWERED (the pairing code
+/// went back as a `Frame::Notice`), `Errored` answered nothing.
+enum PairingGate {
+    Proceed,
+    Refused,
+    Errored,
+}
+
+/// Pairing gate. On refusal the pairing code is posted back as a
+/// `Frame::Notice` so the sidecar surfaces it through its existing notice
+/// routing.
 async fn enforce_pairing(
     state: &WsChannelState,
     sidecar: &Sidecar,
     channel_type: &ChannelType,
     bot_id: &str,
     user_id: &str,
-) -> bool {
+) -> PairingGate {
     use baybo_pairing::CheckOutcome;
 
     match state.pairing.check(channel_type, bot_id, user_id).await {
-        Ok(CheckOutcome::Approved) => true,
+        Ok(CheckOutcome::Approved) => PairingGate::Proceed,
         Ok(CheckOutcome::Pending { code }) => {
             tracing::warn!(
                 %channel_type,
@@ -941,7 +1029,7 @@ async fn enforce_pairing(
             if let Err(e) = sidecar.send_frame(notice).await {
                 tracing::debug!(error = %e, "send pairing notice failed");
             }
-            false
+            PairingGate::Refused
         }
         Err(e) => {
             tracing::error!(
@@ -951,7 +1039,7 @@ async fn enforce_pairing(
                 user_id_hash = %super::short_hash(user_id),
                 "pairing check failed; dropping message",
             );
-            false
+            PairingGate::Errored
         }
     }
 }

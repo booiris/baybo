@@ -49,8 +49,8 @@ use baybo_channels::wire::{
 use baybo_channels::{STOP_CANCELLED_REPLY_LINE, STOP_COMMAND_NAME, StampedEvent};
 use baybo_model::{
     AgentBinding, AgentFramework, ApprovalDecision, ChannelType, ChatMessage, ContentBlock,
-    ControlEvent, ControlEventKind, FolderId, FolderSummary, LlmEntryName, Role, Session,
-    SessionId, TOOL_RESULT_ERROR_PREFIX, ThinkingContent, TriggerSource, User,
+    ControlEvent, ControlEventKind, FolderId, FolderSummary, LineageKind, LlmEntryName, Role,
+    Session, SessionId, TOOL_RESULT_ERROR_PREFIX, ThinkingContent, TriggerSource, User,
 };
 use baybo_session::SessionError;
 use baybo_store::SearchScope;
@@ -73,6 +73,9 @@ pub fn routes() -> OpenApiRouter<AdminState> {
         .routes(routes!(search_messages))
         .routes(routes!(get_session))
         .routes(routes!(sync_session))
+        .routes(routes!(list_subagents))
+        .routes(routes!(get_subagent))
+        .routes(routes!(sync_subagent))
         .routes(routes!(lookup_session_message))
         .routes(routes!(set_session_model))
         .routes(routes!(set_session_pin))
@@ -169,12 +172,19 @@ pub struct ChatSearchHit {
     /// client-side match agrees with what the index matched.
     pub text: String,
     pub created_at: DateTime<Utc>,
-    /// Set when compaction replaced this row in the active transcript, to the
-    /// ordinal that replaced it. The chat view renders only live rows, so such a
-    /// hit exists in history but not on screen: clients label it, and a
-    /// jump-to-message navigates here rather than to `ordinal`, which is not on
-    /// screen to navigate to. Carried as the ordinal rather than a bool so that
-    /// remains possible without another round trip.
+    /// Set when compaction stamped this row: the ordinal where that
+    /// compaction's re-inserted rows begin. Every row active at that moment
+    /// points at the same one, so in a compacted conversation most hits carry
+    /// it.
+    ///
+    /// **Do not navigate here, and do not label the hit "not on screen".** The
+    /// display read filters `compaction_inserted = 0`, NOT `superseded_by IS
+    /// NULL` (`load_active_session_messages_tail`), so the superseded original
+    /// still renders and `ordinal` is the address to jump to — while this
+    /// ordinal names a re-injected machinery row that the display read excludes,
+    /// so aiming a jump at it can only ever miss. What it actually reports is
+    /// that the model's context was rewritten after this row: a fact about the
+    /// LLM's window, not about what the user can see.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub superseded_by: Option<i64>,
 }
@@ -963,6 +973,13 @@ async fn search_messages(
         session: query.session_id.clone().map(SessionId::from),
         include_hidden: query.include_hidden,
         include_archived: query.include_archived,
+        // Policy, not a knob: this route answers "find a conversation I can
+        // open", and a cron workspace is precisely the session that cannot be
+        // opened — `/v1/chat/sessions` drops it and the attach path 404s it. No
+        // query param exposes this; an operator view that wants fire transcripts
+        // is a different product with a different scope, and turning it on is a
+        // query-side change with no reindex.
+        include_cron_workspaces: false,
     };
     let limit = query
         .limit
@@ -1241,19 +1258,39 @@ async fn get_session(
 ) -> Result<Json<ChatSessionDetail>> {
     let authed = authed.as_ref().map(|ext| &ext.0);
     let (sid, session) = load_scoped_chat_session(&state, &session_id, authed).await?;
+    session_detail(
+        &state,
+        sid,
+        session,
+        session_id,
+        query.before_ordinal,
+        query.limit,
+    )
+    .await
+}
 
-    let limit = query
-        .limit
+/// The read half of `GET /chat/sessions/{id}` and `GET /chat/subagents/{id}`.
+/// Only ADMISSION differs between those two routes; what they return must not,
+/// so the page is built once here rather than transcribed per route.
+async fn session_detail(
+    state: &AdminState,
+    sid: SessionId,
+    session: Session,
+    session_id: String,
+    before_ordinal: Option<i64>,
+    limit: Option<usize>,
+) -> Result<Json<ChatSessionDetail>> {
+    let limit = limit
         .unwrap_or(DEFAULT_HISTORY_LIMIT)
         .clamp(1, MAX_HISTORY_LIMIT);
-    let page = build_history_page(&state, &sid, &session, query.before_ordinal, limit).await?;
+    let page = build_history_page(state, &sid, &session, before_ordinal, limit).await?;
     // Session-level divider metadata, consumed only off the baseline/meta
     // fetch (`before_ordinal` absent) — the limit-1 open where the client
     // decides where to draw its pre-compaction dividers. Scroll-up backfill
     // pages discard it, so skip the lookup there rather than recomputing it
     // per page. Best-effort — a lookup failure just omits the dividers
     // rather than failing the load.
-    let compaction_points = if query.before_ordinal.is_none() {
+    let compaction_points = if before_ordinal.is_none() {
         state
             .session_manager
             .compaction_boundaries(&sid)
@@ -1419,13 +1456,24 @@ async fn sync_session(
 ) -> Result<Json<ChatSyncResponse>> {
     let authed = authed.as_ref().map(|ext| &ext.0);
     let (sid, session) = load_scoped_chat_session(&state, &session_id, authed).await?;
+    session_sync(&state, sid, session, query).await
+}
+
+/// The read half of `GET …/sync` for both route families — see
+/// [`session_detail`] for why the body is shared rather than transcribed.
+async fn session_sync(
+    state: &AdminState,
+    sid: SessionId,
+    session: Session,
+    query: SyncSessionQuery,
+) -> Result<Json<ChatSyncResponse>> {
     let limit = query
         .limit
         .unwrap_or(DEFAULT_HISTORY_LIMIT)
         .clamp(1, MAX_HISTORY_LIMIT);
 
     let rebased = if let Some(since) = query.since_ordinal {
-        match sync_difference(&state, &sid, since, limit).await? {
+        match sync_difference(state, &sid, since, limit).await? {
             Some(response) => return Ok(Json(response)),
             // Difference exceeded the limit (in emitted rows) or the raw
             // scan bound — fall through to a newest-page rebase.
@@ -1437,7 +1485,7 @@ async fn sync_session(
         false
     };
 
-    let page = build_history_page(&state, &sid, &session, None, limit).await?;
+    let page = build_history_page(state, &sid, &session, None, limit).await?;
     Ok(Json(ChatSyncResponse {
         rows: page.transcript,
         // The tail scan starts at the newest persisted row, so the
@@ -1447,7 +1495,7 @@ async fn sync_session(
         rebased,
         oldest_ordinal: page.oldest_ordinal,
         has_more_older: page.has_more,
-        compaction_points: sync_compaction_points(&state, &sid).await,
+        compaction_points: sync_compaction_points(state, &sid).await,
     }))
 }
 
@@ -1575,6 +1623,241 @@ async fn sync_difference(
         has_more_older: false,
         compaction_points: sync_compaction_points(state, sid).await,
     }))
+}
+
+/// Page size for a subagent listing. The fan-out limiter bounds CONCURRENT
+/// breadth, not the cumulative count — an overnight agentic conversation can
+/// leave hundreds of children behind — and this surface polls while it is on
+/// screen, so the page is a real cursor rather than a truncation.
+const SUBAGENT_PAGE: usize = 50;
+
+/// How a child's work ended, as far as its turn rows can say.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatSubagentStatus {
+    /// Spawned, but its actor has not opened a turn yet.
+    Pending,
+    /// At least one turn is still open.
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+    /// Terminal (its turns carry an end) under a `status_kind` this gateway
+    /// does not know — schema drift, reported rather than guessed at.
+    Unknown,
+}
+
+/// One direct subagent child of a session.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ChatSubagentSummary {
+    pub session_id: String,
+    /// Profile the parent spawned (`explorer`, `general-purpose`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_type: Option<String>,
+    /// `"baybo"`, or the external agent's name (`"claude"` / `"codex"`).
+    pub backend: String,
+    /// The errand the parent authored, stamped onto the child's title at
+    /// spawn. `None` for children spawned before that stamp existed — the
+    /// client falls back to the profile name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    pub status: ChatSubagentStatus,
+    pub created_at: DateTime<Utc>,
+    /// When its first turn began. `None` until one opens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    /// When its last turn ended; `None` while anything is still open. Sent as
+    /// a pair with `started_at` rather than a precomputed duration so a client
+    /// can tick a running child's clock without polling for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<DateTime<Utc>>,
+}
+
+/// Response from `GET /v1/chat/sessions/{session_id}/subagents`.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ChatSubagentList {
+    /// Ascending by `created_at` — the transcript's own direction, so the
+    /// newest (usually the running one) is last.
+    pub items: Vec<ChatSubagentSummary>,
+    /// Older children exist below `items[0]`. The client pages back by sending
+    /// that row's `created_at` + `session_id` as the cursor.
+    pub has_more_older: bool,
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct SubagentListQuery {
+    /// Keyset cursor: return children strictly OLDER than this
+    /// `(created_at, session_id)` pair. Both or neither — a timestamp alone
+    /// cannot separate the siblings one turn's fan-out mints in the same
+    /// microsecond.
+    #[serde(default)]
+    pub before_created_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub before_id: Option<String>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/chat/sessions/{session_id}/subagents",
+    tag = "chat",
+    params(
+        ("session_id" = String, Path, description = "Parent session id. Either an owner-chat conversation or a readable subagent child (drilling from a child into its own children)."),
+        SubagentListQuery,
+    ),
+    responses(
+        (status = 200, description = "Direct subagent children, ascending", body = ChatSubagentList),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Session not found", body = ErrorBody),
+    )
+)]
+async fn list_subagents(
+    State(state): State<AdminState>,
+    Path(session_id): Path<String>,
+    Query(query): Query<SubagentListQuery>,
+    authed: Option<Extension<AuthedClient>>,
+) -> Result<Json<ChatSubagentList>> {
+    let authed = authed.as_ref().map(|ext| &ext.0);
+    let (sid, _parent) = load_readable_parent_session(&state, &session_id, authed).await?;
+
+    // Both halves of the cursor or neither: a partial one would silently page
+    // from a different place than the client meant.
+    let before = match (query.before_created_at, query.before_id.as_deref()) {
+        (Some(at), Some(id)) => Some((at, SessionId::from(id))),
+        _ => None,
+    };
+    // Over-fetch by one to answer `has_more_older` without a COUNT, the same
+    // trick `build_history_page` uses.
+    let mut children = state
+        .session_manager
+        .store()
+        .list_lineage_children_page(&sid, before, SUBAGENT_PAGE + 1)
+        .await
+        .map_err(|e| GatewayError::Internal(format!("list subagent children: {e}")))?;
+    let has_more_older = children.len() > SUBAGENT_PAGE;
+    children.truncate(SUBAGENT_PAGE);
+    // The store pages NEWEST first (that is the direction a cursor walks); the
+    // sheet reads oldest-first like the transcript it belongs to.
+    children.reverse();
+
+    // One grouped query for every child's liveness and wall clock. The sheet
+    // polls while it is open, so a per-child turn read is not an option.
+    let bounds: HashMap<SessionId, baybo_store::SessionTurnBounds> = state
+        .turn_lifecycle
+        .session_turn_bounds(&children.iter().map(|s| s.id.clone()).collect::<Vec<_>>())
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "chat: subagent turn bounds failed");
+            Vec::new()
+        })
+        .into_iter()
+        .map(|b| (b.session_id.clone(), b))
+        .collect();
+
+    let items = children
+        .into_iter()
+        .map(|child| {
+            let bound = bounds.get(&child.id);
+            ChatSubagentSummary {
+                status: subagent_status(bound),
+                started_at: bound.map(|b| b.first_started_at),
+                ended_at: bound.and_then(|b| b.last_ended_at),
+                session_id: child.id.as_ref().to_string(),
+                subagent_type: child.state.subagent_type.clone(),
+                backend: subagent_backend_name(&child),
+                task: child.title.clone(),
+                created_at: child.created_at,
+            }
+        })
+        .collect();
+
+    Ok(Json(ChatSubagentList {
+        items,
+        has_more_older,
+    }))
+}
+
+/// `"baybo"` unless the child was tagged with an external backend at genesis.
+/// A missing tag reads as `baybo`: that is what a pre-tag child ran.
+fn subagent_backend_name(child: &Session) -> String {
+    match &child.state.subagent_backend {
+        Some(baybo_model::SubagentBackendTag::External { external_kind, .. }) => {
+            external_kind.as_str().to_owned()
+        }
+        _ => baybo_model::BAYBO_BACKEND_TAG.to_owned(),
+    }
+}
+
+fn subagent_status(bounds: Option<&baybo_store::SessionTurnBounds>) -> ChatSubagentStatus {
+    let Some(bounds) = bounds else {
+        return ChatSubagentStatus::Pending;
+    };
+    if bounds.live {
+        return ChatSubagentStatus::Running;
+    }
+    match bounds.latest_status_kind.as_str() {
+        "completed" => ChatSubagentStatus::Completed,
+        "failed" => ChatSubagentStatus::Failed,
+        "cancelled" => ChatSubagentStatus::Cancelled,
+        _ => ChatSubagentStatus::Unknown,
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/chat/subagents/{session_id}",
+    tag = "chat",
+    params(
+        ("session_id" = String, Path, description = "Subagent child session id"),
+        GetSessionQuery,
+    ),
+    responses(
+        (status = 200, description = "Child detail + transcript slice", body = ChatSessionDetail),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Session not found", body = ErrorBody),
+    )
+)]
+async fn get_subagent(
+    State(state): State<AdminState>,
+    Path(session_id): Path<String>,
+    Query(query): Query<GetSessionQuery>,
+    authed: Option<Extension<AuthedClient>>,
+) -> Result<Json<ChatSessionDetail>> {
+    let authed = authed.as_ref().map(|ext| &ext.0);
+    let (sid, session) = load_readable_subagent_session(&state, &session_id, authed).await?;
+    session_detail(
+        &state,
+        sid,
+        session,
+        session_id,
+        query.before_ordinal,
+        query.limit,
+    )
+    .await
+}
+
+#[utoipa::path(
+    get,
+    path = "/chat/subagents/{session_id}/sync",
+    tag = "chat",
+    params(
+        ("session_id" = String, Path, description = "Subagent child session id"),
+        SyncSessionQuery,
+    ),
+    responses(
+        (status = 200, description = "Forward-recovery pull for a child transcript", body = ChatSyncResponse),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Session not found", body = ErrorBody),
+    )
+)]
+async fn sync_subagent(
+    State(state): State<AdminState>,
+    Path(session_id): Path<String>,
+    Query(query): Query<SyncSessionQuery>,
+    authed: Option<Extension<AuthedClient>>,
+) -> Result<Json<ChatSyncResponse>> {
+    let authed = authed.as_ref().map(|ext| &ext.0);
+    let (sid, session) = load_readable_subagent_session(&state, &session_id, authed).await?;
+    session_sync(&state, sid, session, query).await
 }
 
 #[utoipa::path(
@@ -2748,6 +3031,98 @@ async fn load_scoped_chat_session(
     Ok((sid, session))
 }
 
+/// Bound on the lineage walk in [`load_readable_subagent_session`]. Mirrors
+/// `spawn_subagent`'s own depth-check cap and exists for the same reason: a
+/// corrupt chain must terminate the walk rather than spin. Real chains are
+/// three deep (`DEFAULT_MAX_SUBAGENT_DEPTH`).
+const MAX_LINEAGE_WALK_HOPS: u32 = 128;
+
+/// Load a subagent child session and admit it only if a client could already
+/// open the conversation it ultimately descends from.
+///
+/// Walking the lineage chain — rather than reading the denormalised
+/// `root_session_id` in one hop — is deliberate. That column is written at
+/// genesis and read by no query anywhere (`idx_sessions_root` was dropped in
+/// the 2026-07 audit for exactly that reason), so promoting it to a permission
+/// decision would make a single bad write a silent authorization bug with
+/// nothing to catch it. `parent_session_id` is indexed and is the same chain
+/// `spawn_subagent`'s depth cap already trusts.
+///
+/// The root must ALSO not be a hidden cron fire. Production fire sessions are
+/// minted on the cron job's own channel, so a job scheduled from an owner
+/// conversation yields an owner-channel fire session — and a one-shot fire is
+/// a private workspace the chat list drops and the attach path 404s. Testing
+/// only `channel == owner` would open a side door into a conversation no
+/// client is meant to reach. The rule is "the root is a session you could
+/// already open", not "the root is on the owner channel".
+///
+/// Every rejection returns the SAME `NotFound` body as an unknown id, for the
+/// reason [`load_scoped_chat_session`] documents.
+async fn load_readable_subagent_session(
+    state: &AdminState,
+    session_id: &str,
+    authed: Option<&AuthedClient>,
+) -> Result<(SessionId, Session)> {
+    let sid = SessionId::from(session_id);
+    let not_found = || GatewayError::NotFound(format!("subagent session {session_id}"));
+    let load = |id: SessionId| async move {
+        state
+            .session_manager
+            .get(&id)
+            .await
+            .map_err(|e| GatewayError::Internal(format!("load session: {e}")))
+    };
+
+    let child = load(sid.clone()).await?.ok_or_else(not_found)?;
+    // A session with no lineage is not a subagent, whatever else it is. This
+    // route must never become a second way to read an ordinary conversation.
+    match child.lineage.as_ref().map(|l| &l.kind) {
+        Some(LineageKind::Subagent) => {}
+        None => return Err(not_found()),
+    }
+
+    let mut root = child.clone();
+    for _ in 0..MAX_LINEAGE_WALK_HOPS {
+        let Some(lineage) = root.lineage.clone() else {
+            break;
+        };
+        root = load(lineage.parent_session_id)
+            .await?
+            .ok_or_else(not_found)?;
+    }
+    // Still parented after the cap ⇒ a cycle or a chain far beyond anything
+    // `spawn_subagent` can produce. Refuse rather than admit on a walk that
+    // never reached a root.
+    if root.lineage.is_some() {
+        return Err(not_found());
+    }
+    if root.channel != chat_list_channel(authed) || is_private_cron_session(&root) {
+        return Err(not_found());
+    }
+    Ok((sid, child))
+}
+
+/// Resolve a session that may be either an ordinary owner-chat conversation or
+/// a readable subagent child. Only the child LISTING needs this: drilling from
+/// a child into its own children asks the same question of an id that is not
+/// on the owner channel.
+/// A hidden one-shot cron fire is refused HERE as well, even though
+/// `load_scoped_chat_session` admits it: that route already serves the fire by
+/// id, but nothing ever hands a client one, and enumerating its children would
+/// be exposure with no legitimate caller. Falling through to the subagent path
+/// makes the refusal automatic — a fire session has no lineage, so it fails
+/// there — and returns the identical `NotFound` body.
+async fn load_readable_parent_session(
+    state: &AdminState,
+    session_id: &str,
+    authed: Option<&AuthedClient>,
+) -> Result<(SessionId, Session)> {
+    match load_scoped_chat_session(state, session_id, authed).await {
+        Ok((sid, session)) if !is_private_cron_session(&session) => Ok((sid, session)),
+        _ => load_readable_subagent_session(state, session_id, authed).await,
+    }
+}
+
 /// Batch form of [`load_scoped_chat_session`]'s scope check: one grouped
 /// flat-column query instead of a session load per id. Refuses the whole
 /// batch when any id is unknown or off the caller's chat channel —
@@ -2892,6 +3267,17 @@ fn last_user_preview(
 /// session) — the row then falls back to its title / user preview client-side.
 /// The window is bounded to [`LAST_MESSAGE_PREVIEW_SCAN`] rows so a long
 /// tool loop can't turn one preview into an unbounded tail read.
+/// The user-bubble predicate every chat surface shares: a genuine channel
+/// input ([`baybo_model::ChatMessage::from_user`]), or a spawned child's
+/// opening errand — the ONE agent-injected row that should render (see
+/// [`baybo_model::MessageSource::SubagentSeed`]; rows from before that
+/// variant existed are plain `agent` and stay hidden, deliberately —
+/// provenance, never content-sniffing, is what separates the errand from the
+/// skill-reminder machinery that shares its shape).
+fn renders_as_user_bubble(msg: &baybo_model::ChatMessage) -> bool {
+    msg.from_user() || msg.source() == baybo_model::MessageSource::SubagentSeed
+}
+
 fn last_message_preview(
     tail: &[(i64, chrono::DateTime<chrono::Utc>, baybo_model::ChatMessage)],
 ) -> Option<String> {
@@ -2900,7 +3286,7 @@ fn last_message_preview(
         // tool-free final assistant answer. Everything else (agent-injected
         // user rows, assistant work-block narration, tool results) renders no
         // bubble there, so it must not become a preview here.
-        let role = if msg.from_user() {
+        let role = if renders_as_user_bubble(msg) {
             "user"
         } else if matches!(msg.role, Role::Assistant) && !msg.has_tool_use() {
             "assistant"
@@ -3090,6 +3476,10 @@ fn reconstruct_transcript_with_attachments(
     // the answer (there are no intermediate rows to time against), so its
     // reconstructed work block spans from here to the answer's timestamp.
     let mut turn_started: Option<DateTime<Utc>> = None;
+    // When the newest turn this page closed produced its answer. Read by the
+    // trailing in-flight fold to tell a still-running turn's buffered work from
+    // a finished turn's leftovers — see the trailing fold's per-step filter.
+    let mut last_answer_at: Option<DateTime<Utc>> = None;
 
     // Whether the entry at index `i` is a `/stop` echo that ACTUALLY cancelled
     // an in-progress reply — i.e. its acknowledgement notice (the next entry,
@@ -3176,7 +3566,7 @@ fn reconstruct_transcript_with_attachments(
             turn_started = None;
         }
         match msg.role {
-            Role::User if msg.from_user() => {
+            Role::User if renders_as_user_bubble(&msg) => {
                 work.flush(&mut items, None, true);
                 turn_started = Some(created_at);
                 if let Some(item) = message_item(
@@ -3225,8 +3615,12 @@ fn reconstruct_transcript_with_attachments(
                         } => {
                             work.pending_tools.insert(id.clone(), work.steps.len());
                             work.steps.push(
-                                ChatWorkStep::tool(id.clone(), name.clone(), tool_label(input))
-                                    .stamped(created_at),
+                                ChatWorkStep::tool(
+                                    id.clone(),
+                                    name.clone(),
+                                    tool_label(name, input),
+                                )
+                                .stamped(created_at),
                             );
                         }
                         _ => {}
@@ -3302,6 +3696,7 @@ fn reconstruct_transcript_with_attachments(
                 // Turn boundary: a later turn that has no user row on this
                 // page (a cron fire) must not inherit this turn's start.
                 turn_started = None;
+                last_answer_at = Some(created_at);
             }
             Role::Tool => {
                 work.last = Some(created_at);
@@ -3346,34 +3741,66 @@ fn reconstruct_transcript_with_attachments(
     // trailing block — so a tab loading mid-turn shows what was thought before
     // it joined. For a turn still in its first iteration there's no persisted
     // intermediate row, so seed the block's ordinal from the newest message.
-    let has_in_flight = !in_flight_steps.is_empty();
-    // A `status` step reaches the trailing block from TWO sources at once for
-    // the in-flight turn: the persisted `progress` control events (folded above,
-    // at their anchor positions) AND the live channel's in-flight buffer. Drop
-    // the buffered duplicates so the same narration line isn't rendered twice —
-    // the positioned control-event copy wins; any status line the buffer holds
-    // that hasn't persisted yet still appends.
-    let folded_status: std::collections::HashSet<String> = work
-        .steps
-        .iter()
-        .filter(|s| s.kind == WorkStepKind::Status)
-        .map(|s| s.text.clone())
-        .collect();
-    work.steps.extend(
-        in_flight_steps
+    //
+    // Only the steps that are still THIS turn's, though. The buffer is cleared by
+    // the turn's own `Message` / `TurnState{inactive}` fan-out, which runs after
+    // the answer row is persisted — so through that finalization window a page
+    // holds both the finished turn's reconstructed card and a full replay of the
+    // same work, and folding it emits the turn a second time below its own reply,
+    // seeded (`last_ordinal`) with that very reply's ordinal: the
+    // `[work][reply][work]` duplicate. The cut is per STEP, on the step's own
+    // instant, rather than a gate on the turn latch: latch and buffer are read
+    // from two different places at two different moments, so the NEXT turn's
+    // start can already be visible while the previous turn's steps are still
+    // buffered, and a whole-buffer gate would wave the duplicate through on the
+    // strength of a turn the steps don't belong to. Every buffered step is
+    // stamped when the channel records it (`StampedEvent`), so an unstamped one
+    // is a synthetic this can't place — drop it rather than guess it is new.
+    let in_flight_steps: Vec<ChatWorkStep> = match last_answer_at {
+        Some(answered) => in_flight_steps
             .into_iter()
-            .filter(|s| s.kind != WorkStepKind::Status || !folded_status.contains(&s.text)),
-    );
-    if has_in_flight && work.ordinal.is_none() {
-        work.ordinal = Some(last_ordinal);
+            .filter(|s| s.at.is_some_and(|at| at > answered))
+            .collect(),
+        None => in_flight_steps,
+    };
+    // The turn still running BELOW that answer, if any. An `active_turn_started`
+    // at or before it is the latch of the turn the page already shows finished:
+    // `active_turn_started_at` lingers through post-answer finalization.
+    let live_turn_started =
+        active_turn_started.filter(|start| last_answer_at.is_none_or(|answered| *start > answered));
+    let has_in_flight = !in_flight_steps.is_empty();
+    if has_in_flight {
+        // A `status` step reaches the trailing block from TWO sources at once for
+        // the in-flight turn: the persisted `progress` control events (folded
+        // above, at their anchor positions) AND the live channel's in-flight
+        // buffer. Drop the buffered duplicates so the same narration line isn't
+        // rendered twice — the positioned control-event copy wins; any status
+        // line the buffer holds that hasn't persisted yet still appends.
+        let folded_status: std::collections::HashSet<String> = work
+            .steps
+            .iter()
+            .filter(|s| s.kind == WorkStepKind::Status)
+            .map(|s| s.text.clone())
+            .collect();
+        work.steps.extend(
+            in_flight_steps
+                .into_iter()
+                .filter(|s| s.kind != WorkStepKind::Status || !folded_status.contains(&s.text)),
+        );
+        if work.ordinal.is_none() {
+            work.ordinal = Some(last_ordinal);
+        }
     }
     // When a turn is still in flight, align this trailing block's start with
     // the live `TurnState`'s `started_at` (the turn start instant) rather than
     // the first message's timestamp. Both are computed from
     // `active_turn_started_at`, so they match exactly — which is what lets a
     // reloading tab *reopen* this block on the next `turn_state{active}`
-    // (`workStartedAt === startedAt`) instead of opening a second one.
-    if let Some(start) = active_turn_started
+    // (`workStartedAt === startedAt`) instead of opening a second one. Only the
+    // turn running BELOW the newest answer qualifies: a lingering latch belongs
+    // to the turn whose answer is already above, and stamping it on a block down
+    // here would hand the client a reopen key for the wrong turn.
+    if let Some(start) = live_turn_started
         && !work.steps.is_empty()
     {
         work.started = Some(start);
@@ -3504,10 +3931,22 @@ fn thinking_text(content: &[ThinkingContent]) -> String {
 /// (path / command / url / query). Stands in for the live `progress_label`,
 /// which needs the tool registry that isn't on the read path. `None` when
 /// nothing recognizable is present.
-fn tool_label(input: &serde_json::Value) -> Option<String> {
+fn tool_label(tool: &str, input: &serde_json::Value) -> Option<String> {
     const KEYS: [&str; 6] = ["command", "url", "path", "file_path", "query", "pattern"];
+    /// `spawn_subagent` carries none of the generic keys, so a delegation
+    /// rendered as a bare tool name with no hint of who was sent to do what.
+    /// Its `description` IS the errand — the same string the child session's
+    /// title is stamped with at spawn — and the profile name is the fallback.
+    /// Scoped to this one tool rather than added to `KEYS`: `description` is a
+    /// common parameter name and would relabel unrelated calls.
+    const SPAWN_KEYS: [&str; 2] = ["description", "subagent_type"];
     let obj = input.as_object()?;
-    for key in KEYS {
+    let keys: &[&str] = if tool == baybo_model::SPAWN_SUBAGENT_TOOL_NAME {
+        &SPAWN_KEYS
+    } else {
+        &KEYS
+    };
+    for key in keys.iter().copied() {
         if let Some(s) = obj.get(key).and_then(|v| v.as_str()) {
             let label = collapse_ws(s);
             if !label.is_empty() {
@@ -3618,6 +4057,35 @@ mod tests {
             created_at: ts(secs),
             platform_msg_id: String::new(),
         }
+    }
+
+    #[test]
+    fn tool_label_names_the_subagent_errand() {
+        let input = serde_json::json!({
+            "subagent_type": "explorer",
+            "description": "search the sync protocol",
+            "prompt": "a long self-contained instruction",
+        });
+        assert_eq!(
+            tool_label(baybo_model::SPAWN_SUBAGENT_TOOL_NAME, &input).as_deref(),
+            Some("search the sync protocol"),
+            "a delegation step must say what was delegated"
+        );
+        // Falls back to the profile when the model omitted a description.
+        let bare = serde_json::json!({ "subagent_type": "planner" });
+        assert_eq!(
+            tool_label(baybo_model::SPAWN_SUBAGENT_TOOL_NAME, &bare).as_deref(),
+            Some("planner")
+        );
+        // The spawn keys are scoped to that tool — `description` is a common
+        // parameter name and must not relabel unrelated calls.
+        assert_eq!(
+            tool_label(
+                "cron_create",
+                &serde_json::json!({"description": "nightly"})
+            ),
+            None
+        );
     }
 
     #[test]
@@ -4223,6 +4691,124 @@ mod tests {
     }
 
     #[test]
+    fn reconstruct_drops_an_in_flight_buffer_its_own_turn_already_outlived() {
+        // The finalization window: the answer row is persisted (so the turn's
+        // card is reconstructed above it) but the turn's `Message` fan-out has
+        // not cleared the live channel's buffer yet, so the SAME work is
+        // available twice. Folding it emits the card a second time below the
+        // reply — seeded from `last_ordinal`, i.e. that reply's own ordinal.
+        let tail = vec![
+            (2, ts(2), ChatMessage::user(vec![text("go")])),
+            (
+                3,
+                ts(3),
+                ChatMessage::assistant(vec![tool_use(
+                    "c1",
+                    "Bash",
+                    serde_json::json!({"command": "ls"}),
+                )]),
+            ),
+            (5, ts(5), ChatMessage::assistant(vec![text("here you go")])),
+        ];
+        // The channel stamps every buffered step when it records it, and all of
+        // this turn's landed before its answer row was written.
+        let in_flight = vec![
+            ChatWorkStep::reasoning("weighing the options".into()).stamped(ts(3)),
+            ChatWorkStep::tool("c1".into(), "Bash".into(), Some("ls".into())).stamped(ts(4)),
+        ];
+        let items = reconstruct_transcript(tail, Vec::new(), Some(ts(1)), in_flight);
+
+        assert_eq!(
+            items
+                .iter()
+                .filter(|i| matches!(i.kind, TranscriptItemKind::Work))
+                .count(),
+            1,
+            "one turn, one card: {items:?}"
+        );
+        let last = items.last().expect("items");
+        assert!(
+            matches!(last.kind, TranscriptItemKind::Message) && last.role == "assistant",
+            "the reply ends the thread, nothing below it: {items:?}"
+        );
+    }
+
+    #[test]
+    fn reconstruct_keeps_an_in_flight_buffer_from_a_turn_started_after_the_answer() {
+        // The other side of the same test: a turn that began AFTER the newest
+        // persisted answer has work no page row can show yet, so its buffered
+        // steps still surface as the trailing (cut-off) block.
+        let tail = vec![
+            (2, ts(2), ChatMessage::user(vec![text("go")])),
+            (3, ts(3), ChatMessage::assistant(vec![text("done")])),
+        ];
+        let in_flight =
+            vec![ChatWorkStep::reasoning("a later turn thinking".into()).stamped(ts(9))];
+        let items = reconstruct_transcript(tail, Vec::new(), Some(ts(9)), in_flight);
+
+        let last = items.last().expect("items");
+        assert!(
+            matches!(last.kind, TranscriptItemKind::Work),
+            "the later turn keeps its trailing block: {items:?}"
+        );
+        assert_eq!(last.work_started_at, Some(ts(9)));
+        assert_eq!(
+            last.turn_complete,
+            Some(false),
+            "a trailing block declares itself cut off"
+        );
+    }
+
+    #[test]
+    fn reconstruct_does_not_stamp_a_lingering_turn_start_on_a_block_below_the_answer() {
+        use baybo_model::ControlEventKind::Progress;
+        // A block that opens BELOW the newest answer (its first durable artifact
+        // is a progress event, and control events sort after the row they anchor
+        // to) belongs to whatever comes next — not to the turn whose
+        // `active_turn_started_at` is still lingering through finalization above
+        // it. Stamping that start here hands the client a reopen key
+        // (`workStartedAt === startedAt`) for the wrong turn.
+        let tail = vec![
+            (2, ts(2), ChatMessage::user(vec![text("go")])),
+            (3, ts(3), ChatMessage::assistant(vec![text("done")])),
+        ];
+        let events = vec![ctl(0, 3, Progress, "narrating", 5)];
+        let items = reconstruct_transcript(tail, events, Some(ts(1)), Vec::new());
+
+        let work = items
+            .iter()
+            .find(|i| matches!(i.kind, TranscriptItemKind::Work))
+            .expect("the trailing progress block");
+        assert_eq!(
+            work.work_started_at,
+            Some(ts(5)),
+            "keeps its own anchor, not the finished turn's start: {items:?}"
+        );
+    }
+
+    #[test]
+    fn reconstruct_drops_a_stale_buffer_even_once_the_next_turn_has_started() {
+        // The latch and the buffer come from two different places read at two
+        // different moments, so the NEXT turn's start is visible here while the
+        // PREVIOUS turn's steps are still sitting in the buffer. Judged as a
+        // whole the buffer would look live; judged per step it is what it is —
+        // work that happened before the answer above, already on the page.
+        let tail = vec![
+            (2, ts(2), ChatMessage::user(vec![text("go")])),
+            (3, ts(3), ChatMessage::assistant(vec![text("done")])),
+        ];
+        let stale = vec![ChatWorkStep::reasoning("turn A thinking".into()).stamped(ts(1))];
+        let items = reconstruct_transcript(tail, Vec::new(), Some(ts(9)), stale);
+
+        assert!(
+            !items
+                .iter()
+                .any(|i| matches!(i.kind, TranscriptItemKind::Work)),
+            "the previous turn's leftovers are not the new turn's card: {items:?}"
+        );
+    }
+
+    #[test]
     fn reconstruct_control_event_mid_block_splits_the_work() {
         use baybo_model::ControlEventKind::NoticeInfo;
         // A control event anchored at a row *inside* a tool turn (after_ordinal
@@ -4594,15 +5180,18 @@ mod tests {
     #[test]
     fn tool_label_pulls_first_known_key() {
         assert_eq!(
-            tool_label(&serde_json::json!({"command": "ls -la"})).as_deref(),
+            tool_label("bash", &serde_json::json!({"command": "ls -la"})).as_deref(),
             Some("ls -la")
         );
         assert_eq!(
-            tool_label(&serde_json::json!({"path": "/a/b"})).as_deref(),
+            tool_label("read", &serde_json::json!({"path": "/a/b"})).as_deref(),
             Some("/a/b")
         );
-        assert_eq!(tool_label(&serde_json::json!({"other": "x"})), None);
-        assert_eq!(tool_label(&serde_json::json!("not an object")), None);
+        assert_eq!(tool_label("read", &serde_json::json!({"other": "x"})), None);
+        assert_eq!(
+            tool_label("read", &serde_json::json!("not an object")),
+            None
+        );
     }
 
     #[test]

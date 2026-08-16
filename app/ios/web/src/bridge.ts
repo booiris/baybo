@@ -81,7 +81,7 @@ type BayboGlobal = {
   setConnEpoch(epoch: number): void;
   userSent(payload: UserSentPayload): void;
   sendFailed(msgId: string): void;
-  sendConfirmed(msgId: string): void;
+  sendConfirmed(msgId: string, ordinal: number | null): void;
   blobResult(payload: BlobResultPayload): void;
   fileState(payload: FileStatePayload): void;
   audioState(payload: AudioStatePayload): void;
@@ -92,6 +92,12 @@ type BayboGlobal = {
   /// A row of the native message-index sheet was tapped — park that user
   /// message under the header veil. `rowId` is an `OutlineEntry.id`.
   jumpToMessage(rowId: string): void;
+  /// A native search result was tapped. Addressed BY ORDINAL, never by row id:
+  /// a user row is keyed by its `platform_msg_id` with the ordinal carried
+  /// beside it, so building `m<ordinal>` would resolve only agent rows and
+  /// silently miss every user-authored hit. The thread pages backward on its own
+  /// if the row is not loaded yet (see `JUMP_PAGE_BUDGET`).
+  jumpToOrdinal(ordinal: number): void;
   /// The sheet's "load earlier" row — runs the transcript's own backward
   /// paging, which grows the outline when the prepend lands.
   outlineLoadOlder(): void;
@@ -207,9 +213,6 @@ export type OutlinePost = {
   /// Older pages remain on the server — the sheet says `24+`, not `24`.
   hasMoreOlder: boolean;
   loadingOlder: boolean;
-  /// Whether the affordance is worth showing at all. The web decides, because
-  /// it is the only layer that can count.
-  available: boolean;
 };
 
 const OUTLINE_DEBOUNCE_MS = 250;
@@ -262,6 +265,24 @@ export function resendOutline(state: OutlinePost): void {
 /// on, so the sheet opens scrolled to it. `null` when nothing is above the fold.
 export function postOutlineHere(rowId: string | null): void {
   postSafe({ type: "outlineHere", rowId });
+}
+
+/// The header's `Subagents` entry, which shows only for a conversation that has
+/// children. The transcript reads that off a rendered `spawn_subagent` work step
+/// — no request, and it holds up offline — and mirrors the verdict here. Native
+/// ORs it with its own bounded list pull, which covers a spawn that scrolled out
+/// of the loaded window before this tree ever saw it.
+///
+/// Guarded, not debounced: the transcript re-derives on every commit but the
+/// value changes at most once per session, so the redundant posts are all this
+/// has to drop — and the one that does change must go out on the frame it
+/// changed, as the outline's first post does.
+let subagentsLastPosted: boolean | undefined;
+
+export function postSubagents(present: boolean): void {
+  if (present === subagentsLastPosted) return;
+  subagentsLastPosted = present;
+  postSafe({ type: "subagents", present });
 }
 
 /// The composer's send button is native and flips to a stop affordance while a
@@ -550,8 +571,11 @@ export type TranscriptEvents = {
   sendFailed(msgId: string): void;
   /// The outbox released that send: the gateway has provably written it, so the
   /// transcript may stop overlaying its optimistic bubble across a REPLACE. The
-  /// return leg of `userSent` — nothing on this side can infer it.
-  sendConfirmed(msgId: string): void;
+  /// return leg of `userSent` — nothing on this side can infer it. `ordinal` is
+  /// the durable row's (the sync-page row or the point lookup carried it) so
+  /// the bubble gains the sync coverage its ordinal-less echo never gave it —
+  /// retiring the id alone would leave the row with no keep predicate at all.
+  sendConfirmed(msgId: string, ordinal: number | null): void;
   /// Native chrome covering the webview's bottom edge (composer + ridden
   /// keyboard), in CSS px. Streams per layout tick through keyboard
   /// animations.
@@ -562,6 +586,9 @@ export type TranscriptEvents = {
   syncRequested(): void;
   /// A message-index row was tapped — park that user message under the veil.
   jumpToMessage(rowId: string): void;
+  /// A search hit was tapped — park the row at `ordinal`, paging backward for
+  /// it first if the thread has not loaded that far yet.
+  jumpToOrdinal(ordinal: number): void;
   /// The index sheet's "load earlier" row — page the thread backwards.
   outlineLoadOlder(): void;
   /// The index sheet is opening — answer with the reader's current position.
@@ -573,11 +600,12 @@ type Buffered =
   | { kind: "epoch"; epoch: number }
   | { kind: "userSent"; payload: UserSentPayload }
   | { kind: "sendFailed"; msgId: string }
-  | { kind: "sendConfirmed"; msgId: string }
+  | { kind: "sendConfirmed"; msgId: string; ordinal: number | null }
   | { kind: "bottomInset"; px: number }
   | { kind: "jumpToLatest" }
   | { kind: "syncRequested" }
   | { kind: "jumpToMessage"; rowId: string }
+  | { kind: "jumpToOrdinal"; ordinal: number }
   | { kind: "outlineLoadOlder" }
   | { kind: "outlineHereRequested" };
 
@@ -619,7 +647,7 @@ function deliver(e: TranscriptEvents, item: Buffered): void {
   else if (item.kind === "epoch") e.connEpoch(item.epoch);
   else if (item.kind === "userSent") e.userSent(item.payload);
   else if (item.kind === "sendFailed") e.sendFailed(item.msgId);
-  else if (item.kind === "sendConfirmed") e.sendConfirmed(item.msgId);
+  else if (item.kind === "sendConfirmed") e.sendConfirmed(item.msgId, item.ordinal);
   else if (item.kind === "bottomInset") e.bottomInset(item.px);
   else if (item.kind === "syncRequested") e.syncRequested();
   // Every kind needs its own branch ABOVE the terminal else: that else is a
@@ -627,6 +655,7 @@ function deliver(e: TranscriptEvents, item: Buffered): void {
   // new command into "scroll to the bottom" — and the type checker cannot see
   // it. `bridge.test.ts` pins this.
   else if (item.kind === "jumpToMessage") e.jumpToMessage(item.rowId);
+  else if (item.kind === "jumpToOrdinal") e.jumpToOrdinal(item.ordinal);
   else if (item.kind === "outlineLoadOlder") e.outlineLoadOlder();
   else if (item.kind === "outlineHereRequested") e.outlineHereRequested();
   else e.jumpToLatest();
@@ -644,6 +673,17 @@ window.baybo = {
   init(payload) {
     // Native flushes the old mirror before retargeting; do not post stale state here.
     buffer.length = 0;
+    // A cross-session retarget re-keys the React tree, but that commit is
+    // ASYNCHRONOUS — until the new tree's subscribe effect runs, `events` is
+    // still the outgoing session's tree, and native's retarget burst (buffered
+    // frames, the outbox's replayed `userSent`s) follows this call in the same
+    // main-actor turn. Delivered to the old tree it is consumed there and dies
+    // at its unmount — never re-buffered — so the new conversation's first
+    // message simply never renders. Detach the stale subscriber so the burst
+    // buffers and drains at the new tree's subscription. Same-session re-inits
+    // (an LRU-evicted store re-created) must KEEP it: the key doesn't change,
+    // nothing remounts, and nobody would ever subscribe again.
+    if (initPayload !== null && initPayload.sessionId !== payload.sessionId) events = null;
     blobPending.clear();
     posterPending.clear();
     clearTimeout(persistTimer);
@@ -658,6 +698,13 @@ window.baybo = {
     outlinePending = null;
     outlineLastJson = "";
     outlinePosted = false;
+    // `undefined`, not `false`: the new tree's first verdict must reach native
+    // even when it matches the outgoing session's. The hazard is the FALSE
+    // NEGATIVE — native clears its own flag on every retarget/`ready` and
+    // latches only on `true`, so a guard still holding `true` from the
+    // outgoing conversation would swallow the incoming one's `true` and leave
+    // a chat that HAS subagents without the header entry.
+    subagentsLastPosted = undefined;
     connEpoch = payload.connEpoch;
     initPayload = payload;
     window.dispatchEvent(new Event(HTML_PREVIEW_COLLAPSE_EVENT));
@@ -676,8 +723,8 @@ window.baybo = {
   sendFailed(msgId) {
     dispatch({ kind: "sendFailed", msgId });
   },
-  sendConfirmed(msgId) {
-    dispatch({ kind: "sendConfirmed", msgId });
+  sendConfirmed(msgId, ordinal) {
+    dispatch({ kind: "sendConfirmed", msgId, ordinal: ordinal ?? null });
   },
   blobResult(payload) {
     settleBlob(payload);
@@ -706,6 +753,9 @@ window.baybo = {
   },
   jumpToMessage(rowId) {
     dispatch({ kind: "jumpToMessage", rowId });
+  },
+  jumpToOrdinal(ordinal) {
+    dispatch({ kind: "jumpToOrdinal", ordinal });
   },
   outlineLoadOlder() {
     dispatch({ kind: "outlineLoadOlder" });

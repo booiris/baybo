@@ -5,7 +5,7 @@
 //! (direct's [`DirectHttp`], relay's [`GatewayApi`] tunnel) are unified by
 //! this enum instead. `BayboClient::gateway_client` resolves the active leg
 //! ONCE; call sites stop re-stating the two-arm `match` per method
-//! (dedup-at-the-seam, the `transport.rs` `ChatTransport` doctrine).
+//! (dedup-at-the-seam, the `transport.rs` `LegDialer` doctrine).
 
 use serde::de::DeserializeOwned;
 

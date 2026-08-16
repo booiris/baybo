@@ -117,6 +117,7 @@ impl AgentTestHarness {
         self.send_message(IncomingMessage {
             message,
             platform_msg_id: String::new(),
+            bot_id: String::new(),
         })
         .await
     }

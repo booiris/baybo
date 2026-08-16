@@ -30,10 +30,11 @@ use crate::core::WireAttachment;
 
 pub use api::{
     ApnsEnvironment, ApprovalDecision, AttachmentKind, AttachmentRef, BayboError, BlobProgress,
-    BlobServeOutcome, ChatSessionSummary, ClientConfig, CronJobStatus, CronJobSummary,
-    DeckCardInfo, DeckLayoutEntryInput, DeckSink, DeckSnapshotInfo, DeckView, FrameSink,
-    LlmModelCatalog, LlmModelInfo, MessageLookup, PairAbortListener, PairChallenge, PairTarget,
-    PairedSummary, SessionListSink, SessionModelPin,
+    BlobServeOutcome, ChatSearchGroup, ChatSearchHit, ChatSearchResults, ChatSessionSummary,
+    ChatSubagentList, ChatSubagentStatus, ChatSubagentSummary, ClientConfig, CronJobStatus,
+    CronJobSummary, DeckCardInfo, DeckLayoutEntryInput, DeckSink, DeckSnapshotInfo, DeckView,
+    FrameSink, LlmModelCatalog, LlmModelInfo, MessageLookup, PairAbortListener, PairChallenge,
+    PairTarget, PairedSummary, SessionListSink, SessionModelPin, SubagentCursor,
 };
 use apns::ApnsState;
 use binding::{ActiveLeg, active_leg};
@@ -742,6 +743,57 @@ impl BayboClient {
         .await
     }
 
+    /// The direct subagent children of `session_id`, ascending — what the chat
+    /// header's `Subagents` sheet lists, and what tells it whether to offer the
+    /// entry at all. The sheet re-runs it on a timer while it is open, so a
+    /// child that a turn spawns after the sheet opened still shows up.
+    pub async fn chat_list_subagents(
+        self: Arc<Self>,
+        session_id: String,
+        before: Option<SubagentCursor>,
+    ) -> Result<ChatSubagentList, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::list_subagents(&client, session_id, before).await
+        })
+        .await
+    }
+
+    /// [`Self::chat_fetch_history`] for a subagent child, over the read-only
+    /// route that admits it: a child session is not on the `owner` channel, so
+    /// the ordinary session read 404s it. Same `history_page` frame — the child
+    /// renders in its own webview through the same transcript bundle.
+    pub async fn chat_fetch_subagent_history(
+        self: Arc<Self>,
+        session_id: String,
+        before_ordinal: Option<i64>,
+        limit: Option<u32>,
+    ) -> Result<String, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::fetch_subagent_history_page(&client, session_id, before_ordinal, limit)
+                .await
+        })
+        .await
+    }
+
+    /// [`Self::chat_fetch_sync`] for a subagent child, over the same read-only
+    /// route, returning the same `sync_page` frame. This is how a running child
+    /// advances: it has no WS subscription and no live frames — the read-only
+    /// page polls this while the child it shows has not ended.
+    pub async fn chat_fetch_subagent_sync(
+        self: Arc<Self>,
+        session_id: String,
+        since_ordinal: Option<i64>,
+        limit: u32,
+    ) -> Result<String, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::fetch_subagent_sync(&client, session_id, since_ordinal, limit).await
+        })
+        .await
+    }
+
     /// Per-send durability point lookup over the active binding's API surface:
     /// whether a persisted row carries `platform_msg_id` (and its ordinal).
     /// Resolves a rebase-floor outbox entry (`unknown`) without consuming a
@@ -759,6 +811,28 @@ impl BayboClient {
                 found: response.found,
                 ordinal: response.ordinal,
             })
+        })
+        .await
+    }
+
+    /// Full-text search over the owner's transcripts (`GET /v1/chat/search`),
+    /// grouped by conversation and ranked best-first.
+    ///
+    /// Scope is the gateway's default and is not configurable from here: hidden
+    /// sessions stay lost, archived ones stay archived, and cron workspaces —
+    /// fires that are not conversations of their own — are excluded server-side,
+    /// because a hit there names a session no client can list and the device
+    /// channel would happily let the phone post into it.
+    ///
+    /// The caller owns debounce and staleness; this is a plain request. Direct
+    /// reaches it over REST, relay through the Noise-protected API tunnel.
+    pub async fn chat_search(
+        self: Arc<Self>,
+        query: String,
+    ) -> Result<ChatSearchResults, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::search_messages(&client, &query).await
         })
         .await
     }

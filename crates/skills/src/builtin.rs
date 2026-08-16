@@ -190,8 +190,12 @@ mod tests {
         let handler_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(HANDLER);
         let handler = std::fs::read_to_string(&handler_path)
             .unwrap_or_else(|e| panic!("read {}: {e}", handler_path.display()));
+        // Anchored on the DECLARATION, not the first mention: the identifier
+        // also appears in prose (a `see htmlPreviewCSP` cross-reference above
+        // the `/vendor/` path constant), and anchoring on that would compare
+        // whichever literal happened to follow the comment.
         let (_, after) = handler
-            .split_once("htmlPreviewCSP")
+            .split_once("let htmlPreviewCSP")
             .expect("the handler declares htmlPreviewCSP");
         let open = after.find('"').expect("its value is a string literal");
         let close = open + 1 + after[open + 1..].find('"').expect("literal is closed");

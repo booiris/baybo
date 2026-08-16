@@ -84,10 +84,27 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
 
     private var connectError: Error?
     private var sendError: Error?
+    /// Fails ONLY `chatSend` (the connected fast path), leaving
+    /// `chatSendAfterConnect` healthy — the stale-leg shape, where the registry
+    /// disowns the current leg but a redial-and-send succeeds.
+    private var plainSendError: Error?
+    /// Holds `chatConnect` open (sink already registered) so a test can drop
+    /// the leg while the dial's success is still unwinding.
+    private var connectStallMs: Int = 0
+    /// The same window for `chatSendAfterConnect` — the send slow path has its
+    /// own success continuation with the same stale-success hazard.
+    private var sendAfterConnectStallMs: Int = 0
     private var createSessionError: Error?
     private var syncOutcome: Result<String, Error> = .success(FakeBayboClient.emptySyncFrame)
     private var lookupResults: [String: MessageLookup] = [:]
     private var lookupError: Error?
+    private var subagentList = ChatSubagentList(items: [], hasMoreOlder: false)
+    private var subagentListError: Error?
+    private var subagentListCalls: [String] = []
+    /// Recorded search queries, in call order — what a debounce test asserts on.
+    private var searches: [String] = []
+    private var searchResults: [String: ChatSearchResults] = [:]
+    private var searchError: Error?
     private var approvalError: Error?
     private var sessionModelPin = SessionModelPin(llm: nil, model: nil, effort: nil)
     private var sessionModelError: Error?
@@ -109,6 +126,9 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     var connectedSessions: [String] { lock.withLock { connects } }
     var createdSessionIds: [String] { lock.withLock { createdSessions } }
     var lookupCalls: [LookupCall] { lock.withLock { lookups } }
+    /// Queries that reached the core, in order — a debounce or a
+    /// skip-while-composing assertion is a statement about THIS array.
+    var searchCalls: [String] { lock.withLock { searches } }
     var approvalCalls: [ApprovalCall] { lock.withLock { approvals } }
     var readOrdinals: [Int64] { lock.withLock { marksRead } }
     /// One entry per `chatMarkManyRead` call — the cron group's "mark all read"
@@ -147,6 +167,15 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     /// Clear a prior `failConnect` — the network came back.
     func succeedConnect() { lock.withLock { connectError = nil } }
     func failSend(with error: Error) { lock.withLock { sendError = error } }
+    /// Fail only the connected fast path (`chatSend`); the dial-and-send slow
+    /// path stays healthy. See `plainSendError`.
+    func failPlainSend(with error: Error) { lock.withLock { plainSendError = error } }
+    /// Hold each `chatConnect` open for `ms` after registering the sink — the
+    /// window a test needs to drop the leg mid-dial.
+    func stallConnect(ms: Int) { lock.withLock { connectStallMs = ms } }
+    /// Hold each `chatSendAfterConnect` open for `ms` after registering the
+    /// sink — the send slow path's mid-dial window.
+    func stallSendAfterConnect(ms: Int) { lock.withLock { sendAfterConnectStallMs = ms } }
     func failCreateSession(with error: Error) { lock.withLock { createSessionError = error } }
     /// Clear a prior `failCreateSession` — simulates the network coming back so a
     /// stranded draft's next recovery attempt succeeds.
@@ -214,6 +243,12 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
 
     func failLookup(with error: Error) { lock.withLock { lookupError = error } }
 
+    func stubSearch(_ query: String, with results: ChatSearchResults) {
+        lock.withLock { searchResults[query] = results }
+    }
+
+    func failSearch(with error: Error) { lock.withLock { searchError = error } }
+
     /// The session meta's pin answer for `chatSessionModel`.
     func answerSessionModel(llm: String?, model: String? = nil, effort: String? = nil) {
         lock.withLock { sessionModelPin = SessionModelPin(llm: llm, model: model, effort: effort) }
@@ -232,6 +267,13 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
         lock.withLock { sinks[sessionId] }?.onFrame(frameJson: frameJson)
     }
 
+    /// Report the leg dead to the session's registered sink, exactly as the
+    /// core's `on_disconnected` fan-out does (the FFI guarantees the delivery
+    /// for every unsolicited pump death).
+    func dropLeg(of sessionId: String) {
+        lock.withLock { sinks[sessionId] }?.onDisconnected(sessionId: sessionId)
+    }
+
     // MARK: - BayboClientProtocol
 
     func chatConnect(sessionId: String, sink: FrameSink) async throws {
@@ -241,6 +283,8 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
             return connectError
         }
         if let error { throw error }
+        let stall = lock.withLock { connectStallMs }
+        if stall > 0 { try? await Task.sleep(for: .milliseconds(stall)) }
     }
 
     func chatSendAfterConnect(
@@ -258,12 +302,15 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
             return nil
         }
         if let error { throw error }
+        let stall = lock.withLock { sendAfterConnectStallMs }
+        if stall > 0 { try? await Task.sleep(for: .milliseconds(stall)) }
     }
 
     func chatSend(
         sessionId: String, text: String, msgId: String, attachments: [AttachmentRef]
     ) async throws {
         let error: Error? = lock.withLock {
+            if let plainSendError { return plainSendError }
             if let sendError { return sendError }
             sends.append(
                 SendCall(
@@ -299,6 +346,16 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
         return try outcome.get()
     }
 
+    func chatSearch(query: String) async throws -> ChatSearchResults {
+        let outcome: Result<ChatSearchResults, Error> = lock.withLock {
+            searches.append(query)
+            if let searchError { return .failure(searchError) }
+            return .success(
+                searchResults[query] ?? ChatSearchResults(groups: [], truncated: false))
+        }
+        return try outcome.get()
+    }
+
     func chatResolveApproval(callId: String, decision: ApprovalDecision) async throws {
         let error: Error? = lock.withLock {
             approvals.append(ApprovalCall(callId: callId, decision: decision))
@@ -326,6 +383,33 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     func chatFetchHistory(sessionId: String, beforeOrdinal: Int64?, limit: UInt32?) async throws
         -> String
     {
+        throw Self.unsupported
+    }
+
+    // The subagent read surface. `chatListSubagents` is programmable because the
+    // read-only page's polling loop retires itself on what it returns; the two
+    // transcript pulls follow `chatFetchHistory` and stay unsupported until a
+    // test needs them.
+    func chatListSubagents(sessionId: String, before: SubagentCursor?) async throws
+        -> ChatSubagentList
+    {
+        let outcome: Result<ChatSubagentList, Error> = lock.withLock {
+            subagentListCalls.append(sessionId)
+            if let subagentListError { return .failure(subagentListError) }
+            return .success(subagentList)
+        }
+        return try outcome.get()
+    }
+
+    func chatFetchSubagentHistory(
+        sessionId: String, beforeOrdinal: Int64?, limit: UInt32?
+    ) async throws -> String {
+        throw Self.unsupported
+    }
+
+    func chatFetchSubagentSync(
+        sessionId: String, sinceOrdinal: Int64?, limit: UInt32
+    ) async throws -> String {
         throw Self.unsupported
     }
 

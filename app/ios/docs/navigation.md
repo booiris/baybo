@@ -8,15 +8,45 @@
 
 The home shell (`AppStore.Route.home`) is `HomeTabView`, a NATIVE
 `TabView(selection: $homeTab)` (Liquid Glass bar on iOS 26+, the classic system
-bar on 18–25 — system chrome, degrades on its own) with four sections
-(Deck · Projects · Chats · Settings, `AppStore.HomeTab`).
+bar on 18–25 — system chrome, degrades on its own) with five sections
+(Deck · Projects · Chats · Settings · Search, `AppStore.HomeTab`).
 
 - `deck` (`DeckScreen` — the board of agent-authored live cards, see
   [deck.md](deck.md) and `docs/modules/deck.md`),
-- `chats` (`ChatListScreen`) and
-- `settings` (`SettingsScreen` — language, version, log out)
+- `chats` (`ChatListScreen`),
+- `settings` (`SettingsScreen` — language, version, log out) and
+- `search` (`SearchScreen` — full-text over every conversation, see
+  [chat-list.md](chat-list.md#searching-conversations))
 
 have real screens; `projects` is `PlaceholderScreen`.
+
+**Why search does NOT use `.searchable` / the iOS 26 tab-bar morph.** On 26,
+selecting a search-role tab can turn the tab bar itself into a search field. It
+needs a navigation bar to host that field, and this shell has none: the
+`.toolbar(.hidden, for: .navigationBar)` applied to `HomeTabView` propagates into
+nested `NavigationStack`s. Measured on 26.5 — `.searchable` on the tab content,
+on an inner stack with the bar hidden, with it forced `.visible`, and on the
+`TabView` itself — the field rendered in the accessibility tree in **none** of
+them, and `.navigationTitle` on that inner stack did not render either, which is
+what proves the bar never exists. Getting the morph means dropping the shell-wide
+hide in favour of per-destination hiding: a `RootView` refactor touching every
+pushed screen's chrome. It is NOT a deployment-target question — `#available(iOS
+26.0, *)` was true throughout.
+
+So the bottom morph is hand-rolled instead, and ONLY the bottom: selecting search
+hides the native tab bar and `SearchScreen` docks its own field where the bar
+was, growing it from the search circle's footprint. The bar is untouched
+everywhere else, so the Liquid Glass selection morph is still the system's. This
+is NOT the "bar pops back in after the transition" glitch below — that one is a
+pushed screen on an inner stack revealing the bar on the POP; here nothing is
+pushed and the bar hides and returns on tab SELECTION, in place.
+
+**Search is the one tab with a `role`.** `Tab(..., role: .search)` is what makes
+iOS 26 lift it OUT of the glass pill and float it as a detached circle at the
+trailing edge; without the role it would just be a fifth item inside the pill.
+`TabRole` is iOS 18.0+ — exactly the deployment target — and on 18–25 it renders
+as an ordinary tab, so nothing here branches on version. It is also the only tab
+whose screen skips the shared wordmark header: its search field IS its header.
 
 ### The NavigationStack wraps the WHOLE TabView
 
@@ -34,6 +64,12 @@ No session is minted at launch or login; the compose button — the Chats header
 top-right glass circle — is the only session creator, and compose / push-tap
 routing force `homeTab = .chats` (in `activateSession`) so a pushed conversation
 lands in the Chats stack.
+
+**One exception, `keepTab: true`** — a conversation opened from a SEARCH hit
+leaves the selection alone, so backing out of it returns to the results that
+found it rather than to the chat list. That is safe precisely because of the
+section above: the push covers the whole TabView, so the tab underneath is
+untouched and simply reappears on the pop.
 
 ### Tint, and why compose is not in the tab bar
 
