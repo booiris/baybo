@@ -895,6 +895,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "baybo-model",
+ "baybo-session",
  "baybo-storage",
  "baybo-store",
  "baybo-tools",

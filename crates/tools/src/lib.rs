@@ -28,7 +28,7 @@ use uuid::Uuid;
 pub use approval::{
     ApprovalDecision, ApprovalGate, ApprovalGateMap, ApprovalOutcome, ApprovalQueue,
     ApprovalRequest, ApprovalResolution, ApprovedResource, AutoDenyGate, ChannelApprovalGate,
-    HostPattern, PendingEdge, PendingWatcher, ResourceAccess,
+    HostPattern, PendingEdge, PendingWatcher, ResourceAccess, refusal_reason,
 };
 pub(crate) use baybo_model::FileFingerprint;
 pub use builtin::paths::shell_reachable_workspace_roots;
@@ -119,6 +119,16 @@ pub enum ToolConcurrency {
     Independent,
 }
 
+/// Whether output is exactly attributable to declared file resources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputSource {
+    /// Every output byte came from an enumerated file.
+    DeclaredFiles,
+    /// Any source not enumerated exactly.
+    #[default]
+    Opaque,
+}
+
 // ---------------------------------------------------------------------------
 // Tool trait
 // ---------------------------------------------------------------------------
@@ -142,6 +152,11 @@ pub trait Tool: Send + Sync {
     /// Tools with no side effects return an empty vec (the default).
     fn accessed_resources(&self, _params: &Value) -> Vec<ResourceAccess> {
         Vec::new()
+    }
+
+    /// Output provenance for prompt-injection severity; defaults to opaque.
+    fn output_source(&self) -> OutputSource {
+        OutputSource::default()
     }
 
     /// Caller-supplied human-readable label for this call (typically a
@@ -617,6 +632,8 @@ impl ApprovalHandle {
     /// entry covers the original privilege but not the elevated one,
     /// so we must always re-prompt. Never persists the decision —
     /// follow-up calls always re-prompt too.
+    ///
+    /// Returns the full outcome so callers can distinguish denial from expiry.
     pub async fn request_uncached(
         &self,
         tool: &str,
@@ -624,7 +641,7 @@ impl ApprovalHandle {
         user: &User,
         accesses: Vec<ResourceAccess>,
         params_preview: String,
-    ) -> ApprovalDecision {
+    ) -> ApprovalOutcome {
         let req = ApprovalRequest {
             call_id: Uuid::new_v4().to_string(),
             tool_call_id: self.tool_call_id.clone(),
@@ -635,9 +652,9 @@ impl ApprovalHandle {
             params_preview,
             description: None,
         };
-        let decision = self.gate.request(req).await.decision;
-        *self.last_decision.lock() = Some(decision);
-        decision
+        let outcome = self.gate.request(req).await;
+        *self.last_decision.lock() = Some(outcome.decision);
+        outcome
     }
 
     /// Forward a request to the gate, filtered by the session approval
@@ -651,7 +668,7 @@ impl ApprovalHandle {
         user: &User,
         accesses: Vec<ResourceAccess>,
         params_preview: String,
-    ) -> ApprovalDecision {
+    ) -> ApprovalOutcome {
         // Filter against the cache up front. Read-only file accesses
         // were already a no-op for the pre-execute gate (see
         // `ToolExecutor::execute`); preserve that behaviour here so
@@ -671,7 +688,7 @@ impl ApprovalHandle {
         };
 
         if uncovered.is_empty() {
-            return ApprovalDecision::Approve;
+            return ApprovalOutcome::policy(ApprovalDecision::Approve);
         }
 
         let req = ApprovalRequest {
@@ -684,9 +701,9 @@ impl ApprovalHandle {
             params_preview,
             description: None,
         };
-        let decision = self.gate.request(req).await.decision;
-        *self.last_decision.lock() = Some(decision);
-        if decision == ApprovalDecision::ApproveAlways {
+        let outcome = self.gate.request(req).await;
+        *self.last_decision.lock() = Some(outcome.decision);
+        if outcome.decision == ApprovalDecision::ApproveAlways {
             let mut cache = self.approved_cache.lock();
             for access in &uncovered {
                 let entry = access.to_approved();
@@ -695,7 +712,7 @@ impl ApprovalHandle {
                 }
             }
         }
-        decision
+        outcome
     }
 }
 
@@ -1126,7 +1143,7 @@ mod approval_handle_tests {
                 "{}".into(),
             )
             .await;
-        assert_eq!(d, ApprovalDecision::Deny);
+        assert_eq!(d, ApprovalOutcome::answered(ApprovalDecision::Deny));
         assert_eq!(probe.last_decision(), Some(ApprovalDecision::Deny));
     }
 
@@ -1148,8 +1165,36 @@ mod approval_handle_tests {
                 "{}".into(),
             )
             .await;
-        assert_eq!(d, ApprovalDecision::Approve);
+        assert_eq!(d, ApprovalOutcome::policy(ApprovalDecision::Approve));
         assert_eq!(probe.last_decision(), None, "no prompt raised, no record");
+    }
+
+    #[tokio::test]
+    async fn a_cached_hit_resolves_as_policy_not_answered() {
+        let cache = Arc::new(parking_lot::Mutex::new(vec![
+            ResourceAccess::ExecCommand {
+                command: "x".into(),
+            }
+            .to_approved(),
+        ]));
+        let h = ApprovalHandle::new(
+            Arc::new(FixedGate(ApprovalDecision::Deny)),
+            cache,
+            Some("use-1".into()),
+        );
+        let out = h
+            .request(
+                "Bash",
+                &"s".into(),
+                &user(),
+                vec![ResourceAccess::ExecCommand {
+                    command: "x".into(),
+                }],
+                "{}".into(),
+            )
+            .await;
+        assert_eq!(out, ApprovalOutcome::policy(ApprovalDecision::Approve));
+        assert_eq!(h.last_decision(), None);
     }
 
     #[tokio::test]
@@ -1167,5 +1212,47 @@ mod approval_handle_tests {
             )
             .await;
         assert_eq!(h.last_decision(), Some(ApprovalDecision::ApproveAlways));
+    }
+}
+
+#[cfg(test)]
+mod output_source_tests {
+    use super::*;
+    use crate::builtin::{BashTool, GlobTool, GrepTool, ReadTool};
+
+    #[test]
+    fn read_declares_the_one_file_its_output_came_from() {
+        assert_eq!(ReadTool.output_source(), OutputSource::DeclaredFiles);
+    }
+
+    #[test]
+    fn a_search_root_is_not_an_enumeration_of_what_was_read() {
+        let pm = baybo_process::ProcessManager::transient();
+        let root = serde_json::json!({ "path": "/data/kanban", "pattern": "x" });
+        for (name, tool) in [
+            (
+                "Grep",
+                Box::new(GrepTool::new(std::sync::Arc::clone(&pm))) as Box<dyn Tool>,
+            ),
+            ("Glob", Box::new(GlobTool::new(pm)) as Box<dyn Tool>),
+        ] {
+            assert_eq!(
+                tool.accessed_resources(&root),
+                vec![ResourceAccess::ReadFile {
+                    path: std::path::PathBuf::from("/data/kanban"),
+                }],
+                "{name} declares only its search root"
+            );
+            assert_eq!(
+                tool.output_source(),
+                OutputSource::Opaque,
+                "{name} must not claim its output is limited to that root"
+            );
+        }
+    }
+
+    #[test]
+    fn command_output_stays_opaque() {
+        assert_eq!(BashTool::for_test().output_source(), OutputSource::Opaque);
     }
 }

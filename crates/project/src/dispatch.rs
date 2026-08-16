@@ -143,6 +143,8 @@ async fn prepare(config: &DispatchConfig, run: IssueRunRow) -> Option<IssueRunEv
             if let Err(settling) = crate::settle::settle_run(
                 store,
                 events,
+                // No checkout means no tool could have parked a prompt.
+                None,
                 &run,
                 IssueActor::System,
                 RunStatus::Failed,

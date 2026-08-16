@@ -276,7 +276,7 @@ async fn check_env_or_prompt(
     })?;
 
     let preview = format!("Skill '{}' env vars: {}", skill.name, required.join(", "));
-    let decision = approval
+    let outcome = approval
         .request_uncached(
             tool_name,
             &ctx.session_id,
@@ -287,13 +287,14 @@ async fn check_env_or_prompt(
             preview,
         )
         .await;
-    match decision {
+    match outcome.decision {
         ApprovalDecision::Approve | ApprovalDecision::ApproveAlways => Ok(()),
         ApprovalDecision::Deny => Err(ToolError::Denied {
             tool: tool_name.to_string(),
             reason: format!(
-                "user declined env-var access required by skill '{}'",
-                skill.name
+                "env-var access required by skill '{}' was not approved — {}",
+                skill.name,
+                baybo_tools::refusal_reason(outcome.resolution)
             ),
         }),
     }

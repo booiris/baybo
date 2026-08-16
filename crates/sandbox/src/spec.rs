@@ -39,11 +39,10 @@ pub struct SandboxSpec {
 /// agent process; the tmpfs adds defence-in-depth so a misbehaving
 /// command cannot even *enumerate* the directory contents.
 ///
-/// `home` is the user's `$HOME` (caller resolves `HOME` / falls back
-/// as appropriate); `baybo_state` is `$BAYBO_HOME` or `~/.baybo`.
+/// `state_roots` includes both live and default Baybo state directories.
 /// Non-existent entries are filtered later at adapter-build time, so
 /// it's safe to return paths that may not exist on every host.
-pub fn default_sensitive_denylist(home: Option<&Path>, baybo_state: Option<&Path>) -> Vec<PathBuf> {
+pub fn default_sensitive_denylist(home: Option<&Path>, state_roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     if let Some(h) = home {
         out.push(h.join(".ssh"));
@@ -55,8 +54,10 @@ pub fn default_sensitive_denylist(home: Option<&Path>, baybo_state: Option<&Path
         out.push(h.join(".docker"));
         out.push(h.join(".kube"));
     }
-    if let Some(s) = baybo_state {
-        out.push(s.to_path_buf());
+    for root in state_roots {
+        if !out.contains(root) {
+            out.push(root.clone());
+        }
     }
     out
 }
@@ -428,6 +429,24 @@ mod tests {
                 Path::new("/opt/x")
             ),
             None
+        );
+    }
+
+    #[test]
+    fn every_state_root_is_masked_and_duplicates_collapse() {
+        let home = PathBuf::from("/home/u");
+        let live = PathBuf::from("/home/u/work/baybo-ws");
+        let default_root = PathBuf::from("/home/u/.baybo");
+        let denied = default_sensitive_denylist(Some(&home), &[live.clone(), default_root.clone()]);
+        assert!(denied.contains(&live), "the LIVE workspace must be masked");
+        assert!(denied.contains(&default_root));
+        assert!(denied.contains(&home.join(".ssh")));
+
+        let same = default_sensitive_denylist(Some(&home), &[default_root.clone(), default_root]);
+        assert_eq!(
+            same.iter().filter(|p| p.ends_with(".baybo")).count(),
+            1,
+            "a repeated state root must collapse to one mask"
         );
     }
 }

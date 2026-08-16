@@ -19,6 +19,7 @@ baybo-workspace = { workspace = true, features = ["io"] }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
+parking_lot = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -26,7 +27,7 @@ tokio = { workspace = true, features = ["fs", "process"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
-parking_lot = { workspace = true }
+baybo-session = { workspace = true, features = ["test-support"] }
 baybo-storage = { workspace = true, features = ["test-support"] }
 baybo-tools = { workspace = true, features = ["test-support"] }
 serde_json = { workspace = true }

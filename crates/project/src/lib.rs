@@ -21,7 +21,7 @@ mod timeline;
 pub mod tools;
 pub mod worktree;
 
-pub use approvals::TimelineApprovalGate;
+pub use approvals::{CardPromptCloser, TimelineApprovalGate};
 pub use artifacts::{BuildArtifacts, ReclaimedArtifacts};
 pub use attachments::{AttachmentRequest, MAX_ISSUE_ATTACHMENTS};
 pub use comments::CommentDelivery;

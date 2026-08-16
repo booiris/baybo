@@ -183,6 +183,10 @@ impl Tool for ReadTool {
             .unwrap_or_default()
     }
 
+    fn output_source(&self) -> crate::OutputSource {
+        crate::OutputSource::DeclaredFiles
+    }
+
     /// Read-only (filesystem or virtual transcript); mutates no shared
     /// state, so parallel reads within a turn cannot race.
     fn concurrency(&self) -> ToolConcurrency {

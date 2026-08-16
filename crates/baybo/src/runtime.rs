@@ -46,7 +46,7 @@ use baybo_turn::TurnLifecycle;
 use regex::Regex;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::boot;
 
@@ -214,6 +214,9 @@ pub struct ManagerGraph {
     /// cascades down through every actor's per-turn cancel tree.
     pub actor_parent_token: CancellationToken,
 
+    /// Approval wrapper retained so shutdown can close parked card prompts.
+    pub timeline_approvals: Option<Arc<baybo_project::TimelineApprovalGate>>,
+
     /// Fan-out limiter shared between `spawn_subagent` (reserves at
     /// dispatch) and the router (releases on terminal). The CLI /
     /// observability surface also reads its snapshot. Constructed in
@@ -228,6 +231,10 @@ const SHUTDOWN_WATCHDOG_MARGIN: std::time::Duration = std::time::Duration::from_
 
 impl ManagerGraph {
     pub async fn shutdown(&mut self, deadline: tokio::time::Instant) {
+        // Close before cancellation because `Drop` cannot await runtime teardown.
+        if let Some(approvals) = &self.timeline_approvals {
+            approvals.close_open_prompts().await;
+        }
         self.actor_parent_token.cancel();
         let sandbox_runner = self.sandbox_runner.clone();
         tokio::join!(self.mcp_runtime.shutdown(deadline), async move {
@@ -284,7 +291,7 @@ pub async fn build_managers(
         let reg = Arc::new(SkillRegistry::new());
         let builtins = reg.register_builtins();
         if builtins > 0 {
-            info!(count = builtins, "registered built-in skills");
+            debug!(count = builtins, "registered built-in skills");
         }
         // The built-in's own directory, eagerly: every other agent is loaded
         // lazily at actor build because the set of agents is DB state, but
@@ -293,7 +300,7 @@ pub async fn build_managers(
         let builtin = baybo_model::AgentProfileId::builtin();
         let loaded = reg.ensure_agent_skills(&builtin, &workspace_paths);
         if loaded > 0 {
-            info!(
+            debug!(
                 count = loaded,
                 path = %builtin.skills_dir(&workspace_paths).display(),
                 "loaded skills from the built-in persona"
@@ -305,12 +312,12 @@ pub async fn build_managers(
         let reg = Arc::new(baybo_subagent::SubagentRegistry::new());
         let builtins = reg.register_builtins();
         if builtins > 0 {
-            info!(count = builtins, "registered built-in subagent profiles");
+            debug!(count = builtins, "registered built-in subagent profiles");
         }
         let workspace_agents = workspace_paths.agents_dir();
         let loaded = reg.load_dir(&workspace_agents);
         if loaded > 0 {
-            info!(
+            debug!(
                 count = loaded,
                 path = %workspace_agents.display(),
                 "loaded subagent profiles from workspace"
@@ -401,7 +408,7 @@ pub async fn build_managers(
     .map_err(|e| anyhow::anyhow!("build LLM client pool: {e}"))?;
     let llm_client = pool.default_client();
     let info = llm_client.model_info();
-    info!(
+    debug!(
         provider = %info.provider,
         model = %info.id,
         pool_entries = %pool
@@ -650,7 +657,7 @@ pub async fn build_managers(
         Arc::clone(&secret_vault),
     ));
     let gate_map = channels_registry.approval_gates();
-    baybo_gateway::channel::boot::install_timeline_approval_gate(
+    let timeline_approvals = baybo_gateway::channel::boot::install_timeline_approval_gate(
         &channels_registry,
         Arc::clone(&project_manager),
         stores.session.clone(),
@@ -704,7 +711,7 @@ pub async fn build_managers(
         );
         work_dir
     });
-    info!(path = %sandbox_root.display(), "sandbox FS scope rooted at workspace work/");
+    debug!(path = %sandbox_root.display(), "sandbox FS scope rooted at workspace work/");
     // Resolver consulted on `Read` before the filesystem: serves the session
     // transcript from the store for post-compaction recovery, with per-session
     // access control. `ReadTool` consults it; `None` would disable virtual reads.
@@ -825,6 +832,7 @@ pub async fn build_managers(
         issue_run_rx: Some(issue_run_rx),
         subagent_spawner_slot,
         actor_parent_token,
+        timeline_approvals,
         subagent_dispatch_limiter,
     })
 }

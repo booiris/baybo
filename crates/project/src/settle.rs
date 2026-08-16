@@ -24,9 +24,11 @@ use crate::events::ProjectEvents;
 
 /// Settle a run and tell the board. `Ok(false)` means somebody else settled
 /// it first, which is the same outcome and owes the board nothing more.
+/// `prompts` keeps approval cleanup at this settlement chokepoint.
 pub(crate) async fn settle_run(
     store: &Arc<dyn ProjectStore>,
     events: &Arc<dyn ProjectEvents>,
+    prompts: Option<&dyn crate::CardPromptCloser>,
     run: &IssueRunRow,
     actor: IssueActor,
     status: RunStatus,
@@ -49,6 +51,12 @@ pub(crate) async fn settle_run(
         },
     )
     .await;
+    // Preserve timeline order: run settlement precedes prompt abandonment.
+    if let Some(prompts) = prompts {
+        prompts
+            .close_card_prompts(&run.project_id, run.number)
+            .await;
+    }
     Ok(true)
 }
 

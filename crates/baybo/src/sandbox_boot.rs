@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 const DOCKER_ENV_MARKER: &str = "/.dockerenv";
 const CONTAINER_ENV_MARKER: &str = "/run/.containerenv";
@@ -36,7 +36,7 @@ pub(crate) async fn resolve_sandbox_runner(
     match baybo_sandbox::current_platform_runner(process_manager).await {
         Ok(runner) => match runner.warm().await {
             Ok(()) => {
-                info!(backend = ?runner.backend(), "OS sandbox ready");
+                debug!(backend = ?runner.backend(), "OS sandbox ready");
                 Ok(SandboxBoot {
                     runner: Some(runner),
                     bypass_reason: None,

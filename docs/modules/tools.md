@@ -327,6 +327,12 @@ Typical rules:
 - Concrete paths/hosts/commands are gated by user approval, not by manifest
 - A `channels`-restricted tool is invisible and refused outside its channels
 
+`Tool::output_source() -> OutputSource` is a third, independent axis: what the tool's *output is made of*. `OutputSource::DeclaredFiles` means every byte of the output came from a path the same call listed in `accessed_resources`; `OutputSource::Opaque` (the default) is everything else. Exactly one tool overrides it — `ReadTool` — and it feeds one consumer: the agent's prompt-injection scanner, which demotes a detection in workspace-local content by one severity tier (see `docs/modules/security.md`, "Severity is scoped by output provenance"). It grants no capability and relaxes no gate.
+
+**The bar is enumeration, not containment.** `GrepTool` and `GlobTool` read nothing but local files and are still `Opaque`, because they declare only their search **root** while their output is drawn from everything under it — a symlink out of the checkout, a vendored dependency, a `node_modules` tree. A consumer that checks the declared path against the checkout has therefore checked a path the content did not come from, and `OutputProvenance::classify` would hand back `WorkspaceLocal` for text that came from anywhere. Only a tool that names the files its output is made of may claim `DeclaredFiles`; `Read` does, which is why it is the only one.
+
+It is a separate method rather than something inferred from `accessed_resources`, because **an empty access list is not evidence of locality**: `WebFetchTool::accessed_resources` returns `[]` for every hostname URL (the host-shape policy below), so inferring "local" from "declared nothing" would demote the widest external-content channel in the system. `BashTool` is deliberately `Opaque` for the same reason as `Grep`: it declares `ExecCommand`, and `curl` / `git fetch` / `gh api` all come out of it.
+
 ### User-approval gate
 
 `ToolExecutor` holds an `Arc<ApprovalGateMap>` shared with `ChannelRegistry`. At execution time it calls `gate_map.get(channel, session_id)` to resolve the right gate for the session's channel; if no gate is registered, `AutoDenyGate` (fail-closed) is returned. Matching:
@@ -357,6 +363,12 @@ This is a deliberate departure from "concrete HTTP hosts are gated by approval" 
 Cross-host redirects are still rejected inside the redirect policy (with a "re-issue WebFetch on the new URL" error) so a host change is always visible in the call trace, not silently followed inside `reqwest`. Per-hop SSRF re-validation runs on every redirect target regardless.
 
 `ChannelApprovalGate` + `ApprovalQueue` (`crates/tools/src/approval.rs`) extract the common queue-and-oneshot pattern so each channel only supplies a sync waker callback (e.g. `|| event_tx.try_send(WakeUp)`). The queue exposes `peek_head` / `resolve_head` / `len` so the channel's event loop can render and dismiss inline prompts without touching oneshot internals.
+
+#### Why a refusal is never just "denied"
+
+A gate returns `ApprovalOutcome { decision, resolution }`, and `ApprovalHandle::request` / `request_uncached` hand the whole thing back rather than only the decision. The decision alone cannot carry the difference: a human's "no", a window that expired with nobody looking, a prompt torn down by a cancel, and a standing policy that never asked anyone all arrive as `ApprovalDecision::Deny`.
+
+Every refusal a tool or the executor reports to the model is therefore worded from `refusal_reason(resolution)` — the single home for that prose, in `crates/tools/src/approval.rs`. Telling the model a person refused when nobody looked is how it learns to argue with somebody who was never there, and in this repo's ledger the common case by far is the 300 s timeout, not a human. The consumers are the executor's pre-execution gate and the skills env-var gate. A cache hit resolves as `Policy` for the same reason — a standing rule decided it, nobody was asked.
 
 `ApprovalGateMap` keeps two `DashMap`s — `type_level: DashMap<ChannelType, Arc<dyn ApprovalGate>>` for sidecar registrations and `session_level: DashMap<(ChannelType, SessionId), Arc<dyn ApprovalGate>>` for session-scoped clients. `get(channel, session_id)` tries the session-level entry first and falls back to the type-level gate, returning `AutoDenyGate` when neither is present. `ChannelRegistry` populates entries at `register()` time and evicts on `unregister()`; `ToolExecutor` reads per-call. Both sides hold an `Arc` to the same map, so gates registered after `ToolExecutor` construction are visible immediately. Adding a new channel with approval support requires only wiring an `Arc<dyn ApprovalGate>` into the `Channel` at construction time — no changes to `ToolExecutor` or bootstrap code.
 

@@ -88,20 +88,22 @@ pub fn install_channels(
 /// of the map this is about to overwrite: the channel's gate is by
 /// construction the one that prompts, so the wrapper cannot end up wrapping
 /// itself or a later replacement.
+/// Returns the wrapper so shutdown can await closure of parked prompts.
 pub fn install_timeline_approval_gate(
     registry: &Arc<ChannelRegistry>,
     manager: Arc<ProjectManager>,
     sessions: Arc<dyn SessionStore>,
-) {
+) -> Option<Arc<TimelineApprovalGate>> {
     let owner = ChannelType::owner();
     let Some(inner) = registry.get(&owner).and_then(|c| c.approval_gate()) else {
         tracing::warn!("no owner approval gate to wrap; cards will not record their prompts");
-        return;
+        return None;
     };
-    registry.approval_gates().insert(
-        owner,
-        Arc::new(TimelineApprovalGate::new(inner, manager, sessions)),
-    );
+    let gate = Arc::new(TimelineApprovalGate::new(inner, manager, sessions));
+    registry
+        .approval_gates()
+        .insert(owner, Arc::clone(&gate) as Arc<dyn ApprovalGate>);
+    Some(gate)
 }
 
 /// Install one channel with its approval gate. For the shared `owner` chat

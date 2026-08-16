@@ -117,6 +117,21 @@ impl ApprovalOutcome {
     }
 }
 
+const REFUSAL_ANSWERED: &str = r#"a human saw this prompt and said no"#;
+const REFUSAL_TIMED_OUT: &str = r#"nobody answered this prompt before its window expired, so it denied itself — no human has seen it, and re-sending the same request will park for the same window and expire the same way"#;
+const REFUSAL_ABANDONED: &str = r#"this prompt was torn down before anyone decided it — the turn was cancelled, or the process is shutting down"#;
+const REFUSAL_POLICY: &str = r#"a standing policy denied this without asking anyone, because this session has no approval surface — every prompt here will be denied the same way"#;
+
+/// Explain the denial source without trailing punctuation.
+pub fn refusal_reason(resolution: ApprovalResolution) -> &'static str {
+    match resolution {
+        ApprovalResolution::Answered => REFUSAL_ANSWERED,
+        ApprovalResolution::TimedOut => REFUSAL_TIMED_OUT,
+        ApprovalResolution::Abandoned => REFUSAL_ABANDONED,
+        ApprovalResolution::Policy => REFUSAL_POLICY,
+    }
+}
+
 /// Implemented by channel-side UIs (or an auto-deny fallback) to resolve
 /// approval requests. Must be safe to call concurrently — a single agent turn
 /// may dispatch multiple tool calls in parallel, each going through this gate
@@ -799,6 +814,27 @@ mod tests {
             seen,
             vec!["a".to_string(), "b".to_string()],
             "every prompt is announced exactly once, with its own id"
+        );
+    }
+
+    #[test]
+    fn every_resolution_gets_its_own_refusal_wording() {
+        let all = [
+            ApprovalResolution::Answered,
+            ApprovalResolution::TimedOut,
+            ApprovalResolution::Abandoned,
+            ApprovalResolution::Policy,
+        ];
+        let worded: Vec<&str> = all.into_iter().map(refusal_reason).collect();
+        for (i, a) in worded.iter().enumerate() {
+            for b in worded.iter().skip(i + 1) {
+                assert_ne!(a, b, "two resolutions share one sentence");
+            }
+            assert!(!a.ends_with('.'), "callers punctuate: {a}");
+        }
+        assert!(
+            !refusal_reason(ApprovalResolution::TimedOut).contains("human saw"),
+            "a window nobody opened must not read as a human refusal"
         );
     }
 

@@ -335,14 +335,27 @@ Default Bash denylist (built by
 - `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.gpg` — credentials and keys
 - `~/.config/gh`, `~/.config/gcloud` — cloud CLI tokens
 - `~/.docker`, `~/.kube` — registry / cluster auth
-- `$BAYBO_HOME` (or `~/.baybo` if unset) — Baybo's own state, secrets,
-  identity files. The whole tree is masked, then the caller's own skill
+- **Every baybo state root** — Baybo's own state, secrets, identity files.
+  The whole tree is masked, then the caller's own skill
   directory alone is re-exposed read-only via `with_readable_paths`
   (above) so skill scripts run in place; `config/`, `state/`, `.key/`,
   and the rest of `personas/` — every agent's identity and memory files,
   including those of the agent whose skills are bound — stay hidden. Note
   the RO re-bind creates its intermediate directories, so a `personas/`
   node now exists inside the sandbox; its contents remain masked.
+
+  **Two roots, not one**, because they diverge: `default_sensitive_denylist`
+  takes a `state_roots` slice, and `ToolExecutor::permissive_scope` fills it
+  with the **live** workspace (`config.workspace.path`, i.e.
+  `WorkspacePaths::root()` — the tree this process actually keeps
+  `state/storage.db`, `.key/`, `config/` and `personas/` in) *and*
+  `$BAYBO_HOME` / `~/.baybo`, where a default install keeps its own. Deriving
+  the mask from the env-var location alone was a live hole whenever an
+  operator pointed the workspace elsewhere under `$HOME`: the RW `$HOME` bind
+  then handed every ordinary sandboxed command baybo's key material and
+  provider credentials, read *and* write, with no escape, no judge and no
+  approval. `crates/sandbox/tests/bwrap_smoke.rs` pins the mask against a real
+  bwrap, with the un-masked spelling as the control.
 
 Trade-offs:
 

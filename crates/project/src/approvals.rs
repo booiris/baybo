@@ -1,16 +1,33 @@
 //! Putting a run's approval prompts on the card that asked for them.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
 use baybo_model::{ApprovalDecision, ApprovalResolution, ProjectId, SessionId};
 use baybo_store::SessionStore;
 use baybo_store::project::{IssueActor, IssueEventBody};
 use baybo_tools::{ApprovalGate, ApprovalOutcome, ApprovalRequest};
+use parking_lot::Mutex;
+use tokio::sync::oneshot;
 
 use crate::ProjectManager;
 
 const MAX_SUMMARY_CHARS: usize = 160;
+
+struct OpenPrompt {
+    call_id: String,
+    project: ProjectId,
+    number: i64,
+    actor: IssueActor,
+    /// Dropping this cancels the wrapped gate's request.
+    cancel: oneshot::Sender<()>,
+}
+
+/// Closes a card's parked approval prompts and cancels their requests.
+#[async_trait]
+pub trait CardPromptCloser: Send + Sync {
+    async fn close_card_prompts(&self, project: &ProjectId, number: i64);
+}
 
 /// Wraps a channel's approval gate and writes what it sees onto the issue's
 /// timeline.
@@ -20,18 +37,117 @@ pub struct TimelineApprovalGate {
     inner: Arc<dyn ApprovalGate>,
     manager: Arc<ProjectManager>,
     sessions: Arc<dyn SessionStore>,
+    /// Removing an entry claims its single resolution across all close paths.
+    open: Arc<Mutex<Vec<OpenPrompt>>>,
+}
+
+fn claim(open: &Mutex<Vec<OpenPrompt>>, call_id: &str) -> Option<OpenPrompt> {
+    let mut open = open.lock();
+    let pos = open.iter().position(|p| p.call_id == call_id)?;
+    Some(open.remove(pos))
+}
+
+async fn record_resolved(
+    manager: &ProjectManager,
+    prompt: OpenPrompt,
+    decision: ApprovalDecision,
+    resolution: ApprovalResolution,
+) {
+    let OpenPrompt {
+        call_id,
+        project,
+        number,
+        actor,
+        cancel,
+    } = prompt;
+    // Cancel the parked tool before recording its resolution.
+    drop(cancel);
+    manager
+        .record_event(
+            &project,
+            number,
+            actor,
+            IssueEventBody::ApprovalResolved {
+                call_id,
+                decision,
+                resolution,
+            },
+        )
+        .await;
+}
+
+async fn close_card(
+    manager: &ProjectManager,
+    open: &Mutex<Vec<OpenPrompt>>,
+    project: &ProjectId,
+    number: i64,
+) {
+    let mine = {
+        let mut open = open.lock();
+        let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut *open)
+            .into_iter()
+            .partition(|p| &p.project == project && p.number == number);
+        *open = rest;
+        mine
+    };
+    for prompt in mine {
+        record_resolved(
+            manager,
+            prompt,
+            ApprovalDecision::Deny,
+            ApprovalResolution::Abandoned,
+        )
+        .await;
+    }
+}
+
+/// Manager-owned prompt closer; the weak manager reference avoids a cycle.
+struct ParkedPrompts {
+    open: Arc<Mutex<Vec<OpenPrompt>>>,
+    manager: Weak<ProjectManager>,
+}
+
+#[async_trait]
+impl CardPromptCloser for ParkedPrompts {
+    async fn close_card_prompts(&self, project: &ProjectId, number: i64) {
+        let Some(manager) = self.manager.upgrade() else {
+            return;
+        };
+        close_card(&manager, &self.open, project, number).await;
+    }
 }
 
 impl TimelineApprovalGate {
+    /// Wrap `inner` and register its prompt closer with the board.
     pub fn new(
         inner: Arc<dyn ApprovalGate>,
         manager: Arc<ProjectManager>,
         sessions: Arc<dyn SessionStore>,
     ) -> Self {
+        let open = Arc::new(Mutex::new(Vec::new()));
+        manager.set_prompt_closer(Arc::new(ParkedPrompts {
+            open: Arc::clone(&open),
+            manager: Arc::downgrade(&manager),
+        }));
         Self {
             inner,
             manager,
             sessions,
+            open,
+        }
+    }
+
+    /// Await closure of prompts that `Drop` cannot safely persist at shutdown.
+    pub async fn close_open_prompts(&self) {
+        let parked = std::mem::take(&mut *self.open.lock());
+        for prompt in parked {
+            record_resolved(
+                &self.manager,
+                prompt,
+                ApprovalDecision::Deny,
+                ApprovalResolution::Abandoned,
+            )
+            .await;
         }
     }
 
@@ -68,11 +184,20 @@ impl ApprovalGate for TimelineApprovalGate {
                     .find(|run| run.settled_at.is_none())
                     .map(|run| run.attempt)
             });
+        // Register before announcing so cancellation cannot orphan the prompt.
+        let (cancel, cancelled) = oneshot::channel();
+        self.open.lock().push(OpenPrompt {
+            call_id: call_id.clone(),
+            project: project.clone(),
+            number,
+            actor: actor.clone(),
+            cancel,
+        });
         self.manager
             .record_event(
                 &project,
                 number,
-                actor.clone(),
+                actor,
                 IssueEventBody::ApprovalRequested {
                     call_id: call_id.clone(),
                     attempt,
@@ -82,85 +207,61 @@ impl ApprovalGate for TimelineApprovalGate {
             )
             .await;
 
-        // If this future is dropped while the inner gate is still parked —
-        // the turn was cancelled, the process is shutting down — nothing
-        // after the `.await` runs, and the request the card announced would
-        // stay open on its timeline forever. The guard closes it as
-        // abandoned instead; it is disarmed on the ordinary path below.
-        let mut guard = AbandonGuard {
+        // Live cancellation uses `Drop`; shutdown uses the awaited close path.
+        let _guard = AbandonGuard {
             manager: Arc::clone(&self.manager),
-            project,
-            number,
-            actor,
-            call_id: Some(call_id),
+            open: Arc::clone(&self.open),
+            call_id: call_id.clone(),
         };
 
-        let outcome = self.inner.request(req).await;
+        let outcome = tokio::select! {
+            biased;
+            _ = cancelled => ApprovalOutcome::abandoned(),
+            outcome = self.inner.request(req) => outcome,
+        };
 
-        if let Some(call_id) = guard.disarm() {
-            self.manager
-                .record_event(
-                    &guard.project,
-                    guard.number,
-                    guard.actor.clone(),
-                    IssueEventBody::ApprovalResolved {
-                        call_id,
-                        decision: outcome.decision,
-                        resolution: outcome.resolution,
-                    },
-                )
-                .await;
+        // A closer that won the claim also overrides any raced approval.
+        match claim(&self.open, &call_id) {
+            Some(prompt) => {
+                record_resolved(&self.manager, prompt, outcome.decision, outcome.resolution).await;
+                outcome
+            }
+            None => ApprovalOutcome::abandoned(),
         }
-        outcome
     }
 }
 
-/// Closes an announced approval on the issue timeline when the request
-/// future is dropped undecided. Best-effort by construction: `Drop` cannot
-/// await, so the write is spawned, and a runtime already past its task
-/// drain loses it — the failure mode is the status quo (an open request),
-/// never a wrong entry.
+#[async_trait]
+impl CardPromptCloser for TimelineApprovalGate {
+    async fn close_card_prompts(&self, project: &ProjectId, number: i64) {
+        close_card(&self.manager, &self.open, project, number).await;
+    }
+}
+
+/// Closes a prompt dropped during live cancellation.
 struct AbandonGuard {
     manager: Arc<ProjectManager>,
-    project: ProjectId,
-    number: i64,
-    actor: IssueActor,
-    /// `Some` while armed; [`Self::disarm`] takes it so the ordinary
-    /// resolution path writes its own event instead.
-    call_id: Option<String>,
-}
-
-impl AbandonGuard {
-    fn disarm(&mut self) -> Option<String> {
-        self.call_id.take()
-    }
+    open: Arc<Mutex<Vec<OpenPrompt>>>,
+    call_id: String,
 }
 
 impl Drop for AbandonGuard {
     fn drop(&mut self) {
-        let Some(call_id) = self.call_id.take() else {
+        let Some(prompt) = claim(&self.open, &self.call_id) else {
             return;
         };
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
         let manager = Arc::clone(&self.manager);
-        let project = self.project.clone();
-        let number = self.number;
-        let actor = self.actor.clone();
         handle.spawn(async move {
-            manager
-                .record_event(
-                    &project,
-                    number,
-                    actor,
-                    IssueEventBody::ApprovalResolved {
-                        call_id,
-                        decision: ApprovalDecision::Deny,
-                        resolution: ApprovalResolution::Abandoned,
-                    },
-                )
-                .await;
+            record_resolved(
+                &manager,
+                prompt,
+                ApprovalDecision::Deny,
+                ApprovalResolution::Abandoned,
+            )
+            .await;
         });
     }
 }

@@ -1962,7 +1962,7 @@ impl BashTool {
              Reason  : {rationale}\n\
              Approve to run it ({run_location})."
         );
-        let decision = approval
+        let outcome = approval
             .request(
                 "Bash",
                 &ctx.session_id,
@@ -1973,7 +1973,7 @@ impl BashTool {
                 preview,
             )
             .await;
-        match decision {
+        match outcome.decision {
             ApprovalDecision::Approve | ApprovalDecision::ApproveAlways => Ok(()),
             ApprovalDecision::Deny => Err(ToolError::Execution(format!(
                 "destructive command denied ({rationale})"
@@ -2066,7 +2066,7 @@ impl BashTool {
              Reason  : {rationale}\n\
              Approve to retry WITHOUT the OS sandbox (full shell, no workspace guard)."
         );
-        let decision = approval
+        let outcome = approval
             .request_uncached(
                 "Bash",
                 &ctx.session_id,
@@ -2078,7 +2078,7 @@ impl BashTool {
             )
             .await;
         Ok(matches!(
-            decision,
+            outcome.decision,
             ApprovalDecision::Approve | ApprovalDecision::ApproveAlways
         ))
     }
