@@ -5,6 +5,7 @@
 //! type, and drives the per-connection inbound loop until either side
 //! closes.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use axum::Router;
@@ -293,6 +294,12 @@ pub(super) async fn run_inbound_loop<R: super::adapter::FrameSource>(
     sidecar: &Sidecar,
 ) {
     let kind = sidecar.channel.kind();
+    // Sessions this connection has already been NACKed for sending into
+    // unsubscribed (see `resolve_inbound_session`): the client outbox retries
+    // on a fixed cadence, and one error card per SESSION is signal while one
+    // per ATTEMPT is noise. Per-connection on purpose — a reconnect that
+    // re-subscribes starts clean.
+    let mut nacked_unsubscribed: HashSet<SessionId> = HashSet::new();
     while let Some(frame) = source.next_frame().await {
         match frame {
             Frame::Subscribe { session_id } => {
@@ -410,8 +417,15 @@ pub(super) async fn run_inbound_loop<R: super::adapter::FrameSource>(
                     }
                     continue;
                 }
-                let Some(incoming) =
-                    build_inbound_message(state, sidecar, channel_type, kind, wire_msg).await
+                let Some(incoming) = build_inbound_message(
+                    state,
+                    sidecar,
+                    channel_type,
+                    kind,
+                    wire_msg,
+                    &mut nacked_unsubscribed,
+                )
+                .await
                 else {
                     continue;
                 };
@@ -479,8 +493,15 @@ pub(super) async fn run_inbound_loop<R: super::adapter::FrameSource>(
                 // session resolution are skipped, not fatal.
                 let mut batch = Vec::with_capacity(messages.len());
                 for wire_msg in messages {
-                    let Some(incoming) =
-                        build_inbound_message(state, sidecar, channel_type, kind, wire_msg).await
+                    let Some(incoming) = build_inbound_message(
+                        state,
+                        sidecar,
+                        channel_type,
+                        kind,
+                        wire_msg,
+                        &mut nacked_unsubscribed,
+                    )
+                    .await
                     else {
                         continue;
                     };
@@ -717,8 +738,17 @@ async fn build_inbound_message(
     channel_type: &ChannelType,
     kind: ChannelKind,
     wire_msg: baybo_channels::wire::Message,
+    nacked_unsubscribed: &mut HashSet<SessionId>,
 ) -> Option<IncomingMessage> {
-    let session_id = resolve_inbound_session(state, sidecar, channel_type, kind, &wire_msg).await?;
+    let session_id = resolve_inbound_session(
+        state,
+        sidecar,
+        channel_type,
+        kind,
+        &wire_msg,
+        nacked_unsubscribed,
+    )
+    .await?;
     // Sender identity is fixed by the channel, not carried in the message.
     // The `owner` channel (web + device, register-validated so a leaked token
     // can't claim another stream) is one `OWNER` sharing one memory/cost
@@ -768,6 +798,7 @@ async fn resolve_inbound_session(
     channel_type: &ChannelType,
     kind: ChannelKind,
     wire_msg: &baybo_channels::wire::Message,
+    nacked_unsubscribed: &mut HashSet<SessionId>,
 ) -> Option<SessionId> {
     match kind {
         ChannelKind::Subscribed => {
@@ -785,6 +816,31 @@ async fn resolve_inbound_session(
                     %session_id,
                     "Message for session not subscribed by this connection; dropping",
                 );
+                // Never silent: this drop happens before the dedup record and
+                // the echo, so to the sender it is indistinguishable from a
+                // healthy send — the exact shape of the 2026-08-16 client bug
+                // where a stale leg swallowed every send into a spinner that
+                // never resolved. The Notice gives a (possibly buggy) client
+                // something to show and the owner something to see. Once per
+                // session per connection: the client outbox retries on a fixed
+                // cadence, and a fresh error card per attempt is noise.
+                if nacked_unsubscribed.insert(session_id.clone())
+                    && let Err(e) = sidecar
+                        .send_frame(Frame::Notice {
+                            session_id: session_id.clone(),
+                            user_id: wire_msg.user_id.clone(),
+                            level: "error".to_string(),
+                            text:
+                                "message dropped: this connection is not subscribed to the session"
+                                    .to_string(),
+                            transient: false,
+                            mid_turn: Some(false),
+                            durable_id: None,
+                        })
+                        .await
+                {
+                    tracing::debug!(error = %e, "send not-subscribed notice failed");
+                }
                 return None;
             }
             // Idempotent Send: clients supply a stable `platform_msg_id`

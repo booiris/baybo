@@ -613,6 +613,23 @@
         }
       }
     },
+    "chat.legLost": {
+      "extractionState": "stale",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Connection to the gateway was lost — reconnecting."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "与网关的连接已断开——正在重连。"
+          }
+        }
+      }
+    },
     "chat.loadOlder": {
       "extractionState": "stale",
       "localizations": {

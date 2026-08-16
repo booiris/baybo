@@ -13,7 +13,8 @@ use crate::api::BayboError;
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 /// The process-wide runtime, built on first use. Two workers: the transport is
-/// a handful of IO-bound tasks (one chat pump + one-shot blob/pairing legs).
+/// a handful of IO/timer-bound tasks (per-leg supervisor loops, the chat pump,
+/// dial children, ack timers, one-shot blob/pairing legs).
 pub(crate) fn runtime() -> &'static tokio::runtime::Runtime {
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()

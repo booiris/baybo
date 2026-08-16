@@ -1503,6 +1503,8 @@ func bayboErrorText(_ error: Error) -> String {
         return message
     case BayboError.NotBound:
         return Lang.shared.t("landing.subtitle")
+    case BayboError.NotConnected:
+        return Lang.shared.t("chat.legLost")
     default:
         return error.localizedDescription
     }
