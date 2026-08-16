@@ -270,6 +270,30 @@ appears late" bug).
 
 The webview is the single source of turn state — native never re-derives it.
 
+### The turn indicator claims its box at send
+
+`awaitingReply` also PAINTS. The pre-first-frame indicator (`.work-pending`, "✻ Working")
+is mounted by `awaitingReply || turnActive` and only FILLED at `turnActive` — the same box,
+held `visibility: hidden` until the turn is real.
+
+Keying the MOUNT on `turnActive` is what the reader feels as a lurch: that flag is
+server-driven, one gateway round trip behind the send, so the indicator inserted 43px
+(24px `--chat-row-gap` + a 19px line) into the log a beat AFTER the user's own bubble had
+settled — and the follow pin at the newest edge teleports the whole thread up by exactly
+the growth. Send, beat, jump. `handleUserSent` sets `awaitingReply` in the same batch as
+the optimistic row (one bridge message, one commit), so the box now rides the send's own
+motion instead. The handoff was already free: `.work-pending` and a step-less
+`.work.active` head both measure 19px, so pending → live costs 0px.
+
+The slot's lifetime IS the stop button's, which is why one flag drives both — a failed
+send, a turn that never starts (`AWAITING_MAX_MS`), and turn end retire the two together.
+`app/web` has always done it this way (`sendToSession` writes `awaitingReply: true` in the
+same `setViews` that appends the pending row); iOS was the divergent one.
+
+Beware the other four writers of `scrollTop = scrollHeight` when touching this — the
+ResizeObserver on `.chat-log` re-pins any height change the layout effect misses, so a fix
+that only guards one of them does nothing. `transcriptScroll.test.tsx` pins the no-move.
+
 ### Sync and persistence
 
 The `sync` message carries the webview's cursor (`sinceOrdinal`, null = baseline) +
