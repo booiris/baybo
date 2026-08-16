@@ -257,11 +257,15 @@ button {
 .bubble.sending,
 .bubble.failed { position: relative; }
 /* "sending": a black ring with a rotating gap, spinning until the server echoes
-   the message back. The 400ms `delayed-in` keeps it INVISIBLE through a healthy
-   send — the echo usually lands well inside the delay and unmounts the ring
-   before it ever paints, so a normal send shows nothing (a ring flashing in and
-   out on every message read as jitter). Only a send that genuinely waits — slow
-   leg, offline queue — fades it in. */
+   the message back. The `delayed-in` delay keeps it INVISIBLE through a healthy
+   send — the echo unmounts the ring before it ever paints, so a normal send
+   shows nothing (a ring flashing in and out on every message read as jitter).
+   Only a send that genuinely waits — slow leg, offline queue — fades it in.
+   Longer than the shared 400ms reveal (`.thread-loading`, the attachment
+   spinner) on purpose: this ring is not the only sign of life. The turn's
+   "✻ Working" line lands within a few hundred ms of a healthy send and says the
+   same thing louder, so the ring is worth painting only once the send is stuck
+   past where that would have appeared — not merely slower than 400ms. */
 .send-spinner {
   position: absolute;
   left: -1.25rem;
@@ -274,7 +278,7 @@ button {
   border-top-color: transparent;
   animation:
     send-spin 0.7s linear infinite,
-    delayed-in 160ms ease-out 400ms both;
+    delayed-in 160ms ease-out 900ms both;
   pointer-events: none;
 }
 @keyframes send-spin { to { transform: rotate(360deg); } }
@@ -378,9 +382,9 @@ button {
   border-top-color: transparent;
   animation: send-spin 0.7s linear infinite;
 }
-/* Shared "appear only if you're still here at 400ms" ramp (thread-loading, the
-   send spinner): `both` holds opacity 0 through the delay, so anything that
-   unmounts inside it was never seen. */
+/* Shared "appear only if you're still here" ramp — each caller sets its own
+   delay (thread-loading 400ms, the send spinner 900ms): `both` holds opacity 0
+   through the delay, so anything that unmounts inside it was never seen. */
 @keyframes delayed-in {
   from { opacity: 0; }
   to { opacity: 1; }
@@ -995,6 +999,13 @@ html.html-preview-maximized body {
   color: var(--color-ink-soft);
   overflow-wrap: anywhere;
 }
+/* Claimed at send, filled when the turn starts. `visibility` rather than a
+   spacer or a min-height: the reserved box is the SAME box, laid out by the same
+   text, so the two states cannot drift apart and the fill costs no reflow. It
+   also keeps the line out of the a11y tree until it is true. The hidden ✻ would
+   otherwise keep rotating for the whole window (30s on an offline send). */
+.work-pending.reserved { visibility: hidden; }
+.work-pending.reserved .work-spin { animation-play-state: paused; }
 
 /* The `/stop` acknowledgement, compact: a small filled square (echoing the
    composer's stop glyph) + "Stopped", centered and soft — the monochrome

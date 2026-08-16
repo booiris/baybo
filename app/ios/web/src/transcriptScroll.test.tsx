@@ -297,6 +297,81 @@ describe("scroll-up paging holds the viewport", () => {
   });
 });
 
+/// The turn indicator's box, under a reader sitting at the newest edge.
+///
+/// `turnActive` is server-driven — it arrives a round trip after the send — so
+/// mounting the indicator on it inserted a row a beat AFTER the user's bubble
+/// had settled, and the follow pin teleported the thread up for it: a second,
+/// unprompted lurch (43px in the real layout; one whole `ROW_H` band here).
+/// The box is now claimed by the send itself, in the same commit as the bubble.
+describe("the post-send working indicator", () => {
+  async function userSent(msgId: string): Promise<void> {
+    await act(async () => {
+      window.baybo.userSent({ msgId, text: "hi", attachments: [] });
+    });
+    await settle();
+  }
+
+  function pending(): { total: number; reserved: number } {
+    return {
+      total: document.querySelectorAll(".work-pending").length,
+      reserved: document.querySelectorAll(".work-pending.reserved").length,
+    };
+  }
+
+  it("claims its box with the send, so the turn starting moves nothing", async () => {
+    await open(60, 999);
+    await userSent("pm-1");
+    const settled = scrollTop;
+
+    await pushFrame({ kind: "turn_state", active: true });
+
+    expect(scrollTop).toBe(settled);
+  });
+
+  it("holds the claimed box invisible until the turn actually starts", async () => {
+    await open(60, 999);
+    await userSent("pm-1");
+    expect(pending()).toEqual({ total: 1, reserved: 1 });
+
+    await pushFrame({ kind: "turn_state", active: true });
+
+    expect(pending()).toEqual({ total: 1, reserved: 0 });
+  });
+
+  it("still shows for a turn this device did not start", async () => {
+    await open(60, 999);
+    await pushFrame({ kind: "turn_state", active: true });
+    expect(pending()).toEqual({ total: 1, reserved: 0 });
+  });
+
+  it("retires the reserved box with the send that failed", async () => {
+    await open(60, 999);
+    await userSent("pm-1");
+    await act(async () => {
+      window.baybo.sendFailed("pm-1");
+    });
+    await settle();
+    // No turn is coming, so the box must go with the stop button — a reserved
+    // slot left behind would hold 43px of dead paper for the rest of the thread.
+    expect(pending()).toEqual({ total: 0, reserved: 0 });
+  });
+
+  it("hands off to the live work block without a second reflow", async () => {
+    await open(60, 999);
+    await userSent("pm-1");
+    await pushFrame({ kind: "turn_state", active: true });
+    const settled = scrollTop;
+
+    await pushFrame({ kind: "tool_started", call_id: "t1", tool: "read_file", label: "Read a.rs" });
+
+    // Both are one line of the same 0.75rem chrome, so the swap is 0px in the
+    // real layout — and one row in, one row out here.
+    expect(pending()).toEqual({ total: 0, reserved: 0 });
+    expect(scrollTop).toBe(settled);
+  });
+});
+
 describe("a REPLACE under a reader parked in history", () => {
   /// Open, page one slice of history in, and park mid-thread — the state the
   /// reported bug fired from.

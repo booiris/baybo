@@ -4593,8 +4593,16 @@ export function Transcript({
             <MarkdownBody text={streaming} />
           </div>
         )}
-        {turnActive && !streaming && !workLive && (
-          <div className="work-pending">
+        {(awaitingReply || turnActive) && !streaming && !workLive && (
+          // Claimed by the SEND, filled when the turn starts. `turnActive` is
+          // server-driven — a round trip behind the send — so mounting on it put
+          // a 43px row into the log a beat AFTER the bubble had settled, and the
+          // follow pin teleported the thread up for it: a second, unprompted
+          // lurch. `awaitingReply` is set in the same batch as the optimistic
+          // bubble, so the box rides the send's own motion instead. Its lifetime
+          // is the stop button's — a send that fails, or never starts a turn,
+          // retires both.
+          <div className={`work-pending${turnActive ? "" : " reserved"}`}>
             <span className="work-spin">✻</span>
             {t("chat.working")}
           </div>
