@@ -3469,6 +3469,10 @@ fn reconstruct_transcript_with_attachments(
     // the answer (there are no intermediate rows to time against), so its
     // reconstructed work block spans from here to the answer's timestamp.
     let mut turn_started: Option<DateTime<Utc>> = None;
+    // When the newest turn this page closed produced its answer. Read by the
+    // trailing in-flight fold to tell a still-running turn's buffered work from
+    // a finished turn's leftovers — see the trailing fold's per-step filter.
+    let mut last_answer_at: Option<DateTime<Utc>> = None;
 
     // Whether the entry at index `i` is a `/stop` echo that ACTUALLY cancelled
     // an in-progress reply — i.e. its acknowledgement notice (the next entry,
@@ -3685,6 +3689,7 @@ fn reconstruct_transcript_with_attachments(
                 // Turn boundary: a later turn that has no user row on this
                 // page (a cron fire) must not inherit this turn's start.
                 turn_started = None;
+                last_answer_at = Some(created_at);
             }
             Role::Tool => {
                 work.last = Some(created_at);
@@ -3729,34 +3734,66 @@ fn reconstruct_transcript_with_attachments(
     // trailing block — so a tab loading mid-turn shows what was thought before
     // it joined. For a turn still in its first iteration there's no persisted
     // intermediate row, so seed the block's ordinal from the newest message.
-    let has_in_flight = !in_flight_steps.is_empty();
-    // A `status` step reaches the trailing block from TWO sources at once for
-    // the in-flight turn: the persisted `progress` control events (folded above,
-    // at their anchor positions) AND the live channel's in-flight buffer. Drop
-    // the buffered duplicates so the same narration line isn't rendered twice —
-    // the positioned control-event copy wins; any status line the buffer holds
-    // that hasn't persisted yet still appends.
-    let folded_status: std::collections::HashSet<String> = work
-        .steps
-        .iter()
-        .filter(|s| s.kind == WorkStepKind::Status)
-        .map(|s| s.text.clone())
-        .collect();
-    work.steps.extend(
-        in_flight_steps
+    //
+    // Only the steps that are still THIS turn's, though. The buffer is cleared by
+    // the turn's own `Message` / `TurnState{inactive}` fan-out, which runs after
+    // the answer row is persisted — so through that finalization window a page
+    // holds both the finished turn's reconstructed card and a full replay of the
+    // same work, and folding it emits the turn a second time below its own reply,
+    // seeded (`last_ordinal`) with that very reply's ordinal: the
+    // `[work][reply][work]` duplicate. The cut is per STEP, on the step's own
+    // instant, rather than a gate on the turn latch: latch and buffer are read
+    // from two different places at two different moments, so the NEXT turn's
+    // start can already be visible while the previous turn's steps are still
+    // buffered, and a whole-buffer gate would wave the duplicate through on the
+    // strength of a turn the steps don't belong to. Every buffered step is
+    // stamped when the channel records it (`StampedEvent`), so an unstamped one
+    // is a synthetic this can't place — drop it rather than guess it is new.
+    let in_flight_steps: Vec<ChatWorkStep> = match last_answer_at {
+        Some(answered) => in_flight_steps
             .into_iter()
-            .filter(|s| s.kind != WorkStepKind::Status || !folded_status.contains(&s.text)),
-    );
-    if has_in_flight && work.ordinal.is_none() {
-        work.ordinal = Some(last_ordinal);
+            .filter(|s| s.at.is_some_and(|at| at > answered))
+            .collect(),
+        None => in_flight_steps,
+    };
+    // The turn still running BELOW that answer, if any. An `active_turn_started`
+    // at or before it is the latch of the turn the page already shows finished:
+    // `active_turn_started_at` lingers through post-answer finalization.
+    let live_turn_started =
+        active_turn_started.filter(|start| last_answer_at.is_none_or(|answered| *start > answered));
+    let has_in_flight = !in_flight_steps.is_empty();
+    if has_in_flight {
+        // A `status` step reaches the trailing block from TWO sources at once for
+        // the in-flight turn: the persisted `progress` control events (folded
+        // above, at their anchor positions) AND the live channel's in-flight
+        // buffer. Drop the buffered duplicates so the same narration line isn't
+        // rendered twice — the positioned control-event copy wins; any status
+        // line the buffer holds that hasn't persisted yet still appends.
+        let folded_status: std::collections::HashSet<String> = work
+            .steps
+            .iter()
+            .filter(|s| s.kind == WorkStepKind::Status)
+            .map(|s| s.text.clone())
+            .collect();
+        work.steps.extend(
+            in_flight_steps
+                .into_iter()
+                .filter(|s| s.kind != WorkStepKind::Status || !folded_status.contains(&s.text)),
+        );
+        if work.ordinal.is_none() {
+            work.ordinal = Some(last_ordinal);
+        }
     }
     // When a turn is still in flight, align this trailing block's start with
     // the live `TurnState`'s `started_at` (the turn start instant) rather than
     // the first message's timestamp. Both are computed from
     // `active_turn_started_at`, so they match exactly — which is what lets a
     // reloading tab *reopen* this block on the next `turn_state{active}`
-    // (`workStartedAt === startedAt`) instead of opening a second one.
-    if let Some(start) = active_turn_started
+    // (`workStartedAt === startedAt`) instead of opening a second one. Only the
+    // turn running BELOW the newest answer qualifies: a lingering latch belongs
+    // to the turn whose answer is already above, and stamping it on a block down
+    // here would hand the client a reopen key for the wrong turn.
+    if let Some(start) = live_turn_started
         && !work.steps.is_empty()
     {
         work.started = Some(start);
@@ -4643,6 +4680,124 @@ mod tests {
                 .iter()
                 .any(|i| matches!(i.kind, TranscriptItemKind::Message) && i.role == "assistant"),
             "an in-flight turn has no answer bubble yet: {items:?}"
+        );
+    }
+
+    #[test]
+    fn reconstruct_drops_an_in_flight_buffer_its_own_turn_already_outlived() {
+        // The finalization window: the answer row is persisted (so the turn's
+        // card is reconstructed above it) but the turn's `Message` fan-out has
+        // not cleared the live channel's buffer yet, so the SAME work is
+        // available twice. Folding it emits the card a second time below the
+        // reply — seeded from `last_ordinal`, i.e. that reply's own ordinal.
+        let tail = vec![
+            (2, ts(2), ChatMessage::user(vec![text("go")])),
+            (
+                3,
+                ts(3),
+                ChatMessage::assistant(vec![tool_use(
+                    "c1",
+                    "Bash",
+                    serde_json::json!({"command": "ls"}),
+                )]),
+            ),
+            (5, ts(5), ChatMessage::assistant(vec![text("here you go")])),
+        ];
+        // The channel stamps every buffered step when it records it, and all of
+        // this turn's landed before its answer row was written.
+        let in_flight = vec![
+            ChatWorkStep::reasoning("weighing the options".into()).stamped(ts(3)),
+            ChatWorkStep::tool("c1".into(), "Bash".into(), Some("ls".into())).stamped(ts(4)),
+        ];
+        let items = reconstruct_transcript(tail, Vec::new(), Some(ts(1)), in_flight);
+
+        assert_eq!(
+            items
+                .iter()
+                .filter(|i| matches!(i.kind, TranscriptItemKind::Work))
+                .count(),
+            1,
+            "one turn, one card: {items:?}"
+        );
+        let last = items.last().expect("items");
+        assert!(
+            matches!(last.kind, TranscriptItemKind::Message) && last.role == "assistant",
+            "the reply ends the thread, nothing below it: {items:?}"
+        );
+    }
+
+    #[test]
+    fn reconstruct_keeps_an_in_flight_buffer_from_a_turn_started_after_the_answer() {
+        // The other side of the same test: a turn that began AFTER the newest
+        // persisted answer has work no page row can show yet, so its buffered
+        // steps still surface as the trailing (cut-off) block.
+        let tail = vec![
+            (2, ts(2), ChatMessage::user(vec![text("go")])),
+            (3, ts(3), ChatMessage::assistant(vec![text("done")])),
+        ];
+        let in_flight =
+            vec![ChatWorkStep::reasoning("a later turn thinking".into()).stamped(ts(9))];
+        let items = reconstruct_transcript(tail, Vec::new(), Some(ts(9)), in_flight);
+
+        let last = items.last().expect("items");
+        assert!(
+            matches!(last.kind, TranscriptItemKind::Work),
+            "the later turn keeps its trailing block: {items:?}"
+        );
+        assert_eq!(last.work_started_at, Some(ts(9)));
+        assert_eq!(
+            last.turn_complete,
+            Some(false),
+            "a trailing block declares itself cut off"
+        );
+    }
+
+    #[test]
+    fn reconstruct_does_not_stamp_a_lingering_turn_start_on_a_block_below_the_answer() {
+        use baybo_model::ControlEventKind::Progress;
+        // A block that opens BELOW the newest answer (its first durable artifact
+        // is a progress event, and control events sort after the row they anchor
+        // to) belongs to whatever comes next — not to the turn whose
+        // `active_turn_started_at` is still lingering through finalization above
+        // it. Stamping that start here hands the client a reopen key
+        // (`workStartedAt === startedAt`) for the wrong turn.
+        let tail = vec![
+            (2, ts(2), ChatMessage::user(vec![text("go")])),
+            (3, ts(3), ChatMessage::assistant(vec![text("done")])),
+        ];
+        let events = vec![ctl(0, 3, Progress, "narrating", 5)];
+        let items = reconstruct_transcript(tail, events, Some(ts(1)), Vec::new());
+
+        let work = items
+            .iter()
+            .find(|i| matches!(i.kind, TranscriptItemKind::Work))
+            .expect("the trailing progress block");
+        assert_eq!(
+            work.work_started_at,
+            Some(ts(5)),
+            "keeps its own anchor, not the finished turn's start: {items:?}"
+        );
+    }
+
+    #[test]
+    fn reconstruct_drops_a_stale_buffer_even_once_the_next_turn_has_started() {
+        // The latch and the buffer come from two different places read at two
+        // different moments, so the NEXT turn's start is visible here while the
+        // PREVIOUS turn's steps are still sitting in the buffer. Judged as a
+        // whole the buffer would look live; judged per step it is what it is —
+        // work that happened before the answer above, already on the page.
+        let tail = vec![
+            (2, ts(2), ChatMessage::user(vec![text("go")])),
+            (3, ts(3), ChatMessage::assistant(vec![text("done")])),
+        ];
+        let stale = vec![ChatWorkStep::reasoning("turn A thinking".into()).stamped(ts(1))];
+        let items = reconstruct_transcript(tail, Vec::new(), Some(ts(9)), stale);
+
+        assert!(
+            !items
+                .iter()
+                .any(|i| matches!(i.kind, TranscriptItemKind::Work)),
+            "the previous turn's leftovers are not the new turn's card: {items:?}"
         );
     }
 

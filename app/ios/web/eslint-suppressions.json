@@ -6,10 +6,10 @@
   },
   "src/Transcript.tsx": {
     "@typescript-eslint/no-unnecessary-condition": {
-      "count": 14
+      "count": 13
     },
     "@typescript-eslint/strict-boolean-expressions": {
-      "count": 51
+      "count": 49
     }
   },
   "src/WorkBlock.tsx": {
