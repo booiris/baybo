@@ -309,8 +309,8 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
         leak_detector: Arc::clone(&leak_detector),
     });
     let log_buffer = tracing_guards.log_buffer();
-    tracing::info!(token_len = token.len(), "gateway token loaded from vault");
-    tracing::info!(
+    tracing::debug!(token_len = token.len(), "gateway token loaded from vault");
+    tracing::debug!(
         token_len = tui_token.len(),
         "fresh TUI token published to vault"
     );
@@ -517,7 +517,7 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
             approval_stream,
             async move { push_shutdown.wait().await },
         ));
-        tracing::info!(
+        tracing::debug!(
             approval_pushes = approval_wired,
             "push: dispatcher started (turn lifecycle bus + approval gate)"
         );
@@ -608,11 +608,11 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
     if let Some(runtime) = sidecar_runtime.as_ref() {
         let domains: Vec<&str> = runtime.domains().collect();
         if domains.is_empty() {
-            tracing::info!("no embedded sidecars in this build");
+            tracing::debug!("no embedded sidecars in this build");
         } else {
             for domain in &domains {
                 let names: Vec<&str> = runtime.names_in_domain(domain).collect();
-                tracing::info!(
+                tracing::debug!(
                     domain = %domain,
                     sidecars = ?names,
                     channel_port,
@@ -669,7 +669,11 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
     println!("Web dashboard: http://{banner_bind}");
     println!("Admin token:   {token}");
 
-    tracing::info!(bind = %banner_bind, "gateway start: all components initialized");
+    tracing::info!(
+        bind = %banner_bind,
+        channel_port,
+        "gateway start: all components initialized"
+    );
 
     let admin_shutdown = shutdown.clone();
     let channel_shutdown = shutdown.clone();
@@ -693,7 +697,7 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
             Ok(())
         }
         _ = router_shutdown.wait() => {
-            tracing::info!("shutdown signal received, stopping gateway");
+            tracing::debug!("shutdown signal received, stopping gateway");
             Ok(())
         }
     };

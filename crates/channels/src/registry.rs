@@ -52,7 +52,7 @@ impl ChannelRegistry {
         }
         let key = channel_type.clone();
         self.channels.insert(channel_type, channel);
-        tracing::info!(channel_type = %key, "channel installed");
+        tracing::debug!(channel_type = %key, "channel installed");
         Ok(())
     }
 

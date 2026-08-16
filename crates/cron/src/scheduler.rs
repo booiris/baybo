@@ -717,7 +717,7 @@ impl CronScheduler {
         self.recover_pending().await;
 
         let mut interval = tokio::time::interval(TICK_INTERVAL);
-        info!(
+        debug!(
             tick_secs = TICK_INTERVAL.as_secs(),
             "cron scheduler started"
         );
@@ -728,7 +728,7 @@ impl CronScheduler {
                     self.tick().await;
                 }
                 _ = self.shutdown.wait() => {
-                    info!("cron scheduler shutting down");
+                    debug!("cron scheduler shutting down");
                     break;
                 }
             }

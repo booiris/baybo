@@ -351,7 +351,7 @@ async fn run(state: WsChannelState, shutdown: ShutdownSignal) {
             _ = shutdown.wait() => break,
         }
     }
-    tracing::info!("relay-content: control manager stopped");
+    tracing::debug!("relay-content: control manager stopped");
 }
 
 /// Hold one control connection until it closes (or the device is revoked, or the

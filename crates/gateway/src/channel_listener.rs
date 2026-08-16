@@ -127,7 +127,7 @@ impl ChannelServer {
 
     /// Run until `shutdown` fires and in-flight connections drain.
     pub async fn run(self, shutdown: ShutdownSignal) -> Result<()> {
-        tracing::info!(
+        tracing::debug!(
             port = self.port_file.port,
             port_file = %self.port_file.path.display(),
             listener = "channel",
@@ -150,7 +150,7 @@ impl ChannelServer {
             tokio::select! {
                 biased;
                 _ = shutdown_for_loop.wait() => {
-                    tracing::info!(listener = "channel", "shutdown signal received");
+                    tracing::debug!(listener = "channel", "shutdown signal received");
                     break;
                 }
                 accept = listener.accept() => {

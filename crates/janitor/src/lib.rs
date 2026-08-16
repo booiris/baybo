@@ -255,7 +255,7 @@ impl Janitor {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut pairing_interval = tokio::time::interval(PAIRING_SWEEP_INTERVAL);
         pairing_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        tracing::info!(tick_secs = TICK_INTERVAL.as_secs(), "janitor started",);
+        tracing::debug!(tick_secs = TICK_INTERVAL.as_secs(), "janitor started",);
         // First-tick sentinel: sweep immediately on boot, then space
         // subsequent runs by `SIDECAR_SWEEP_INTERVAL`.
         let mut last_sidecar_sweep: Option<Instant> = None;
@@ -275,7 +275,7 @@ impl Janitor {
                     let _ = self.sweep_pairings_once(chrono::Utc::now()).await;
                 }
                 _ = &mut shutdown => {
-                    tracing::info!("janitor shutting down");
+                    tracing::debug!("janitor shutting down");
                     break;
                 }
             }

@@ -110,7 +110,7 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
     // disconnect log can pair with this attach by connection_id + lifetime.
     let connection_id = sidecar.connection_id();
     let attached_at = std::time::Instant::now();
-    tracing::info!(
+    tracing::debug!(
         channel_type = %channel_type,
         %connection_id,
         "channel-ws client attached"
@@ -174,7 +174,7 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
     }
     sidecar.shutdown().await;
 
-    tracing::info!(
+    tracing::debug!(
         %channel_type,
         %connection_id,
         duration_ms = attached_at.elapsed().as_millis() as u64,

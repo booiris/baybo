@@ -30,7 +30,7 @@ use baybo_project::IssueRunEvent;
 use baybo_store::agent_profile::AgentProfileStore;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::actor::AgentMessage;
 use crate::actor::mailbox::MailboxSender;
@@ -347,7 +347,7 @@ impl Router {
         mut response_rx: mpsc::Receiver<AgentOutput>,
     ) {
         let channel_count = self.channels.len();
-        info!(channel_count, "router starting");
+        debug!(channel_count, "router starting");
 
         // Before any live traffic: hand over one-shot cron results whose
         // delivery a crash interrupted. Idempotent — an origin that already

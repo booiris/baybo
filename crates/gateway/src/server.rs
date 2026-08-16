@@ -289,7 +289,7 @@ impl GatewayServer {
                 addr: self.bind.to_string(),
                 reason: e.to_string(),
             })?;
-        tracing::info!(bind = %self.bind, listener = "admin", "gateway listening");
+        tracing::debug!(bind = %self.bind, listener = "admin", "gateway listening");
         let shutdown_fut = async move {
             shutdown.wait().await;
         };
