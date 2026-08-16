@@ -1199,6 +1199,18 @@ impl AgentLoop {
         ))
     }
 
+    /// Persist cancellation-safe partial blocks, excluding dangling tool uses.
+    async fn persist_cancelled_partial(&mut self, e: anyhow::Error) -> anyhow::Error {
+        if let Some(cancelled) = e.downcast_ref::<CancelledTurn>()
+            && !cancelled.partial.is_empty()
+        {
+            self.context_manager
+                .append(&ChatMessage::assistant(cancelled.partial.clone()))
+                .await;
+        }
+        e
+    }
+
     /// One iteration of the agentic loop, scoped to a single
     /// `LlmIteration` step (opened by [`crate::runtime::scope::with_step`] in
     /// the caller). Calls the LLM, then executes the response's tool
@@ -1233,22 +1245,7 @@ impl AgentLoop {
             .await
         {
             Ok(pair) => pair,
-            Err(e) => {
-                // Cancelled mid-call: persist any partial assistant content
-                // the stream produced before the abort, so the cancelled
-                // turn's work block survives a page reload (reconstruction
-                // reads it back from `session_messages`). Only text + thinking
-                // are salvaged — never a dangling tool_use — so the row is a
-                // valid standalone assistant turn for the next request.
-                if let Some(cancelled) = e.downcast_ref::<CancelledTurn>()
-                    && !cancelled.partial.is_empty()
-                {
-                    self.context_manager
-                        .append(&ChatMessage::assistant(cancelled.partial.clone()))
-                        .await;
-                }
-                return Err(e);
-            }
+            Err(e) => return Err(self.persist_cancelled_partial(e).await),
         };
         // The observation has now ridden a request, so retire it. Leaving it
         // mounted would re-raise, on every later iteration, an objection the
@@ -1295,6 +1292,16 @@ impl AgentLoop {
                     ordinal,
                 },
             });
+        }
+
+        // Bail before persisting tool-use ids, but let an already-finished answer win.
+        if cancel_token.is_cancelled() {
+            let cancelled = CancelledTurn {
+                partial: salvage_partial_blocks(&response),
+            };
+            return Err(self
+                .persist_cancelled_partial(anyhow::Error::new(cancelled))
+                .await);
         }
 
         // Append assistant message including thinking and tool-call
@@ -1446,12 +1453,52 @@ impl AgentLoop {
                     .await
             }
         });
-        let tool_results = futures::future::join_all(exec_futures).await;
+        // Race cancellation so tools that ignore the token cannot delay `/stop`.
+        // Drain ready results first; dropping the remaining futures cancels them.
+        let mut tool_results: Vec<Option<ExecutedTool>> = std::iter::repeat_with(|| None)
+            .take(response.tool_calls.len())
+            .collect();
+        let mut pending = futures::stream::FuturesUnordered::new();
+        for (idx, fut) in exec_futures.enumerate() {
+            pending.push(async move { (idx, fut.await) });
+        }
+        let cancelled_mid_batch = loop {
+            tokio::select! {
+                biased;
+                next = futures::StreamExt::next(&mut pending) => match next {
+                    Some((idx, executed)) => tool_results[idx] = Some(executed),
+                    None => break false,
+                },
+                _ = cancel_token.cancelled() => break true,
+            }
+        };
+        drop(pending);
 
         // Sequential post-processing: append results in `tool_calls`
         // order so context state stays byte-stable across calls.
         let mut llm_visible_images: Vec<ContentBlock> = Vec::new();
         for (tool_call, executed) in response.tool_calls.iter().zip(tool_results) {
+            // Every persisted tool use needs a result in the live context window.
+            let Some(executed) = executed else {
+                self.emit_tool_completed(
+                    delta_tx,
+                    session,
+                    tool_call.id.clone(),
+                    ToolStatus::Error,
+                    "cancelled".to_string(),
+                    None,
+                )
+                .await;
+                let wrapped = baybo_model::wrap_tool_output(
+                    &tool_call.name,
+                    baybo_context::prompts::cancelled_turn::TOOL_RESULT_BODY,
+                    &[],
+                );
+                let tool_msg =
+                    ChatMessage::tool_result_with_meta(tool_call.id.clone(), wrapped, None);
+                self.context_manager.append(&tool_msg).await;
+                continue;
+            };
             let (status, raw_summary) = tool_completion_summary(&executed);
             let call_approval = executed.approval;
             self.emit_tool_completed(
@@ -1627,8 +1674,13 @@ impl AgentLoop {
                 .await;
         }
 
-        // Flush accumulated approvals back into session state.
+        // Completed calls keep their approval grants even when the batch is cancelled.
         session.state.approved_resources = approved.lock().clone();
+
+        // `with_step` maps this unwind to the turn's cancellation outcome.
+        if cancelled_mid_batch {
+            return Err(anyhow::anyhow!("turn cancelled during tool execution"));
+        }
 
         let task_mutated = response
             .tool_calls

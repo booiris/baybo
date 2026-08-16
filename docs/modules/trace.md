@@ -206,7 +206,13 @@ an LLM or tool request goes out. There is no deferred/background write path.
 
 ### Recovery
 
-`baybo_agent::recovery` closes half-open trace rows left by dropped execution.
+`baybo_agent::recovery` closes half-open trace rows left behind by a process or
+actor that died. It is not the only closer of a dropped future: a span whose
+guard future is dropped while the process lives (a `/stop` abandoning an
+in-flight tool call) is closed immediately by `runtime::scope::with_span`'s Drop
+guard, and has to be — recovery reaches pending spans only under a step that is
+itself unfinished, and that step closes normally on the same unwind.
+
 At boot, `recover_orphaned_traces_and_turns` walks non-terminal turns from the
 prior process, closes pending spans/steps at the last observed child activity,
 and cancels the turn as `SystemCrash`. It also asks `TraceStore` for unfinished

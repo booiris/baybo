@@ -14,6 +14,9 @@
 /// emitted as its own block via [`marker_block_text`].
 pub const SUFFIX: &str = "\n\n[This turn was cancelled before it finished — the reply and any reasoning above are incomplete.]";
 
+/// Synthetic result for a cancelled in-flight call whose side effects are unknown.
+pub const TOOL_RESULT_BODY: &str = "[the turn was cancelled while this tool call was still running; it may or may not have completed its side effects]";
+
 /// The marker as a standalone block body — [`SUFFIX`] without its leading
 /// blank line, for the thinking-only salvage that has no text block to append
 /// to.
@@ -54,5 +57,13 @@ mod tests {
     #[test]
     fn leaves_unmarked_text_untouched() {
         assert_eq!(strip_marker("a finished answer"), "a finished answer");
+    }
+
+    #[test]
+    fn the_cancel_fill_does_not_claim_a_crash() {
+        assert!(!TOOL_RESULT_BODY.is_empty());
+        assert!(!TOOL_RESULT_BODY.contains("crash"));
+        assert!(!TOOL_RESULT_BODY.contains("restart"));
+        assert!(TOOL_RESULT_BODY.contains("cancelled"));
     }
 }

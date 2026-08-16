@@ -5049,3 +5049,243 @@ async fn an_llm_span_records_its_tool_set_by_reference() {
 
     harness.shutdown().await;
 }
+
+/// Concurrent probes where one finishes and one ignores cancellation.
+mod batch_cancel_tools {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use baybo_model::TrustLevel;
+    use baybo_tools::{Tool, ToolConcurrency, ToolContext, ToolManifest, ToolOutput};
+    use serde_json::{Value, json};
+    use tokio::sync::Notify;
+
+    fn manifest(name: &str) -> ToolManifest {
+        ToolManifest {
+            name: name.to_string(),
+            description: "batch-cancel probe".into(),
+            trust_level: TrustLevel::Trusted,
+            parameters_schema: json!({"type": "object", "additionalProperties": true}),
+            capabilities: vec![],
+            channels: Vec::new(),
+        }
+    }
+
+    pub struct ParkingTool {
+        entered: Arc<Notify>,
+    }
+
+    impl ParkingTool {
+        pub const NAME: &'static str = "parks_forever";
+
+        pub fn new(entered: Arc<Notify>) -> Self {
+            Self { entered }
+        }
+
+        pub fn manifest() -> ToolManifest {
+            manifest(Self::NAME)
+        }
+    }
+
+    #[async_trait]
+    impl Tool for ParkingTool {
+        fn name(&self) -> &str {
+            Self::NAME
+        }
+        fn description(&self) -> String {
+            "Parks forever.".to_string()
+        }
+        fn parameters_schema(&self) -> Value {
+            json!({"type": "object", "additionalProperties": true})
+        }
+        fn concurrency(&self) -> ToolConcurrency {
+            ToolConcurrency::Concurrent
+        }
+        async fn execute(
+            &self,
+            _params: Value,
+            _ctx: &ToolContext,
+        ) -> baybo_tools::Result<ToolOutput> {
+            self.entered.notify_one();
+            std::future::pending::<()>().await;
+            unreachable!("the parking tool ends only by drop-on-cancel")
+        }
+    }
+
+    pub struct QuickTool {
+        done: Arc<Notify>,
+    }
+
+    impl QuickTool {
+        pub const NAME: &'static str = "answers_at_once";
+        pub const ANSWER: &'static str = "the quick tool really finished";
+
+        pub fn new(done: Arc<Notify>) -> Self {
+            Self { done }
+        }
+
+        pub fn manifest() -> ToolManifest {
+            manifest(Self::NAME)
+        }
+    }
+
+    #[async_trait]
+    impl Tool for QuickTool {
+        fn name(&self) -> &str {
+            Self::NAME
+        }
+        fn description(&self) -> String {
+            "Answers immediately.".to_string()
+        }
+        fn parameters_schema(&self) -> Value {
+            json!({"type": "object", "additionalProperties": true})
+        }
+        fn concurrency(&self) -> ToolConcurrency {
+            ToolConcurrency::Concurrent
+        }
+        async fn execute(
+            &self,
+            _params: Value,
+            _ctx: &ToolContext,
+        ) -> baybo_tools::Result<ToolOutput> {
+            self.done.notify_one();
+            Ok(ToolOutput::Text(Self::ANSWER.to_string()))
+        }
+    }
+}
+
+/// Cancellation preserves completed results, call pairing, and terminal spans.
+#[tokio::test(start_paused = true)]
+async fn stop_aborts_an_in_flight_tool_batch_without_dangling_tool_use() {
+    use batch_cancel_tools::{ParkingTool, QuickTool};
+    use baybo_store::SessionStore;
+    use baybo_trace::TraceStore;
+    use baybo_turn::CancelReason;
+
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let finished = Arc::new(tokio::sync::Notify::new());
+    let parking = Arc::new(ParkingTool::new(Arc::clone(&entered)));
+    let quick = Arc::new(QuickTool::new(Arc::clone(&finished)));
+
+    let mut harness = AgentTestHarness::builder()
+        .with_tool(quick as Arc<dyn Tool>, QuickTool::manifest())
+        .with_tool(parking as Arc<dyn Tool>, ParkingTool::manifest())
+        .build();
+
+    harness.stub_llm.push_stream(vec![
+        StreamEvent::ToolCall(ToolCallInfo {
+            id: "quick-1".into(),
+            name: QuickTool::NAME.into(),
+            arguments: json!({}),
+            signature: None,
+        }),
+        StreamEvent::ToolCall(ToolCallInfo {
+            id: "parked-1".into(),
+            name: ParkingTool::NAME.into(),
+            arguments: json!({}),
+            signature: None,
+        }),
+    ]);
+
+    harness.send_text("run both").await.unwrap();
+
+    // Wait until one call finishes while the other remains in flight.
+    tokio::time::timeout(Duration::from_secs(2), finished.notified())
+        .await
+        .expect("the quick tool should have completed");
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .expect("the parking tool should be in flight");
+
+    let turns = harness
+        .turn_lifecycle
+        .list_active_chat_turns_by_session(&harness.session.id)
+        .await
+        .expect("list active turns");
+    assert!(!turns.is_empty(), "a turn must be in flight to cancel");
+    for turn in &turns {
+        harness
+            .turn_lifecycle
+            .cancel(&turn.id, CancelReason::UserStopped, vec![])
+            .await
+            .expect("cancel the in-flight turn");
+    }
+
+    harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    let transcript = harness
+        .memory_session_store
+        .load_session_messages_with_supersede(&harness.session.id)
+        .await
+        .expect("load transcript");
+
+    let mut declared: Vec<String> = Vec::new();
+    let mut answered: Vec<String> = Vec::new();
+    let mut quick_result_text = String::new();
+    for row in &transcript {
+        for block in &row.message.content {
+            match block {
+                ContentBlock::ToolUse { id, .. } => declared.push(id.clone()),
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } => {
+                    answered.push(tool_use_id.clone());
+                    if tool_use_id == "quick-1" {
+                        quick_result_text = content.to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    declared.sort();
+    answered.sort();
+    assert_eq!(
+        declared,
+        vec!["parked-1".to_string(), "quick-1".to_string()],
+        "the dispatched assistant row must declare both calls"
+    );
+    assert_eq!(
+        answered, declared,
+        "every declared tool_use needs exactly one tool_result, or the next \
+         provider request is rejected: {transcript:?}"
+    );
+    assert!(
+        quick_result_text.contains(QuickTool::ANSWER),
+        "a call that finished before the cancel keeps its real result, got \
+         {quick_result_text:?}"
+    );
+
+    let trace_store: Arc<dyn TraceStore> = harness.trace_store.clone();
+    // Let `with_span`'s asynchronous drop guard finish.
+    let mut pending_spans = Vec::new();
+    for _ in 0..64 {
+        pending_spans.clear();
+        for turn in &turns {
+            for step in trace_store.list_steps_by_turn(&turn.id).await.unwrap() {
+                for row in trace_store.list_spans_by_step(&step.id).await.unwrap() {
+                    let span = baybo_trace::Span::from_row(row).unwrap();
+                    if !span.outcome.is_terminal() {
+                        pending_spans.push((span.id, span.kind.tag()));
+                    }
+                }
+            }
+        }
+        if pending_spans.is_empty() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        pending_spans.is_empty(),
+        "a cancelled tool call must not leave a forever-in-flight span behind: \
+         {pending_spans:?}"
+    );
+
+    // This times out if cancellation leaves the loop parked in the tool call.
+    tokio::time::timeout(Duration::from_secs(5), harness.shutdown())
+        .await
+        .expect("actor must terminate after its in-flight tool batch is cancelled");
+}

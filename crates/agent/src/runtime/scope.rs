@@ -27,8 +27,10 @@
 //!
 //! Errors emitted by the close call itself are logged at `warn` and
 //! swallowed: the body's outcome is what propagates.
+//! Dropped tool futures close their spans; boot recovery handles missing runtimes.
 
 use std::future::Future;
+use std::sync::Arc;
 
 use baybo_model::{ParallelGroup, SessionId, TriggerKind, TurnId};
 use baybo_trace::{
@@ -269,8 +271,9 @@ async fn cancel_row(lifecycle: &TurnLifecycle, turn_id: TurnId) {
 /// `SpanFinalize::Empty` (no end-time payload available) and
 /// `Cancelled { reason }` / `Failed { reason: e.to_string() }` per the
 /// same rules as `with_step`.
+/// Dropping this future also closes its span.
 pub(crate) async fn with_span<F, Fut, T>(
-    rec: &SpanRecorder,
+    rec: &Arc<SpanRecorder>,
     step: &StepHandle,
     turn_id: TurnId,
     kind: SpanKind,
@@ -283,6 +286,7 @@ where
     Fut: Future<Output = anyhow::Result<(SpanFinalize, LifecycleOutcome, T)>>,
 {
     let span = rec.begin_span(step, kind, parallel_group).await?;
+    let abandoned = SpanCloseOnDrop::arm(rec, span.clone(), turn_id, cancel_reason(cancel));
     let result = body(span.clone()).await;
     let (finalize, outcome, value_result): (SpanFinalize, LifecycleOutcome, anyhow::Result<T>) =
         match result {
@@ -300,7 +304,63 @@ where
             }
         }
     }
+    abandoned.disarm();
     value_result
+}
+
+fn cancel_reason(cancel: CancelContext<'_>) -> CancelReason {
+    cancel.map_or(CancelReason::ParentCancelled, |(_, reason)| reason)
+}
+
+/// Closes a half-open span from `Drop`; boot recovery covers missing runtimes.
+struct SpanCloseOnDrop {
+    rec: Arc<SpanRecorder>,
+    turn_id: TurnId,
+    reason: CancelReason,
+    handle: Option<SpanHandle>,
+}
+
+impl SpanCloseOnDrop {
+    fn arm(
+        rec: &Arc<SpanRecorder>,
+        handle: SpanHandle,
+        turn_id: TurnId,
+        reason: CancelReason,
+    ) -> Self {
+        Self {
+            rec: Arc::clone(rec),
+            turn_id,
+            reason,
+            handle: Some(handle),
+        }
+    }
+
+    fn disarm(mut self) {
+        self.handle = None;
+    }
+}
+
+impl Drop for SpanCloseOnDrop {
+    fn drop(&mut self) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        let span_id = handle.span_id;
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            warn!(%span_id, "span abandoned outside a runtime; left for boot recovery");
+            return;
+        };
+        let rec = Arc::clone(&self.rec);
+        let turn_id = self.turn_id;
+        let outcome = LifecycleOutcome::Cancelled {
+            reason: self.reason,
+        };
+        runtime.spawn(async move {
+            if let Err(e) = rec.cancel_span(handle, turn_id, outcome).await {
+                warn!(error = %e, %span_id, "failed to close an abandoned span");
+            }
+        });
+    }
 }
 
 /// LLM-call span guard: the body must always
@@ -360,9 +420,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use baybo_model::StepId;
     use baybo_store::TurnStore;
+    use baybo_trace::test_support::MemoryTraceStore;
+    use baybo_trace::{LifecycleState, Span, ToolCallBegin, TraceEventStream, TraceStore};
     use baybo_turn::test_support::MemoryTurnStore;
     use std::sync::Arc;
+    use std::time::Duration;
 
     fn spec() -> TurnSpec {
         TurnSpec {
@@ -454,5 +518,110 @@ mod tests {
         let suppressed =
             with_turn(&lifecycle, token, spec(), |_| async { Ok((done(), 42u8)) }).await;
         assert!(suppressed.is_err(), "a cancelled turn hands back no value");
+    }
+
+    fn tool_span_kind() -> SpanKind {
+        SpanKind::ToolCall {
+            begin: ToolCallBegin {
+                tool_name: "Bash".into(),
+                tool_artifact_hash: String::new(),
+                triggered_by: None,
+                params: serde_json::Value::Null,
+            },
+            result: None,
+        }
+    }
+
+    async fn settled_span(store: &Arc<MemoryTraceStore>, step_id: &StepId) -> Span {
+        for _ in 0..256 {
+            let rows = store.list_spans_by_step(step_id).await.expect("list spans");
+            if let Some(row) = rows.into_iter().next() {
+                let span = Span::from_row(row).expect("decode span");
+                if span.ended_at.is_some() {
+                    return span;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("the abandoned span never closed");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_span_future_still_closes_its_row() {
+        let store = Arc::new(MemoryTraceStore::new());
+        let rec = Arc::new(SpanRecorder::new(
+            SessionId::from("sess"),
+            "user".to_string(),
+            Arc::clone(&store) as Arc<dyn TraceStore>,
+            TraceEventStream::new(),
+        ));
+        let turn_id = TurnId::new();
+        let step = rec
+            .begin_step(turn_id, StepKind::LlmIteration)
+            .await
+            .expect("begin step");
+        let token = CancellationToken::new();
+
+        let mut guarded = Box::pin(with_span(
+            &rec,
+            &step,
+            turn_id,
+            tool_span_kind(),
+            None,
+            Some((&token, CancelReason::UserStopped)),
+            |_| async {
+                std::future::pending::<()>().await;
+                Ok((SpanFinalize::Empty, LifecycleOutcome::Ok, ()))
+            },
+        ));
+        tokio::select! {
+            _ = &mut guarded => panic!("the body parks forever; it cannot complete"),
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        token.cancel();
+        drop(guarded);
+
+        let span = settled_span(&store, &step.step_id).await;
+        assert_eq!(
+            span.outcome,
+            LifecycleState::Done(LifecycleOutcome::Cancelled {
+                reason: CancelReason::UserStopped
+            }),
+            "the abandoned span closes with the scope's own cancel reason"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_span_that_closes_normally_is_not_reclosed() {
+        let store = Arc::new(MemoryTraceStore::new());
+        let rec = Arc::new(SpanRecorder::new(
+            SessionId::from("sess"),
+            "user".to_string(),
+            Arc::clone(&store) as Arc<dyn TraceStore>,
+            TraceEventStream::new(),
+        ));
+        let turn_id = TurnId::new();
+        let step = rec
+            .begin_step(turn_id, StepKind::LlmIteration)
+            .await
+            .expect("begin step");
+
+        with_span(
+            &rec,
+            &step,
+            turn_id,
+            tool_span_kind(),
+            None,
+            None,
+            |_| async { Ok((SpanFinalize::Empty, LifecycleOutcome::Ok, ())) },
+        )
+        .await
+        .expect("body completed");
+
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        let span = settled_span(&store, &step.step_id).await;
+        assert_eq!(span.outcome, LifecycleState::Done(LifecycleOutcome::Ok));
     }
 }
