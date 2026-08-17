@@ -14,6 +14,7 @@ import { LlmPage } from './pages/LlmPage';
 import { ChatPage } from './pages/ChatPage';
 import { ProjectsIndex } from './pages/projects/ProjectsIndex';
 import { ProjectBoardPage } from './pages/projects/ProjectBoardPage';
+import { ColumnPage } from './pages/projects/ColumnPage';
 import { IssueDetailPage } from './pages/projects/IssueDetailPage';
 import { useAuth } from './api/auth';
 
@@ -78,6 +79,7 @@ export default function App() {
           <Route path="/chat/:sessionId" element={<ChatPage />} />
           <Route path="/projects" element={<ProjectsIndex />} />
           <Route path="/projects/:pid" element={<ProjectBoardPage />} />
+          <Route path="/projects/:pid/board/:status" element={<ColumnPage />} />
           <Route path="/projects/:pid/issues/:num" element={<IssueDetailPage />} />
           <Route path="/logs" element={<LogsPage />} />
           <Route path="/traces" element={<TracesPage />} />

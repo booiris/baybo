@@ -23,13 +23,13 @@ import {
   RiAddLine,
   RiArchiveLine,
   RiCheckDoubleLine,
+  RiFullscreenLine,
   RiLoader4Line,
   RiSettings3Line,
 } from 'react-icons/ri';
 
 import { useAdminClient, useAuth } from '../../api/auth';
 import { IconButton } from '../../components/IconButton';
-import { useDismiss } from '../../components/useDismiss';
 import {
   fetchActiveRuns,
   fetchTeam,
@@ -40,6 +40,7 @@ import {
   fetchProjects,
   markProjectRead,
   moveIssue,
+  patchIssue,
 } from './api';
 import {
   COLUMNS,
@@ -63,7 +64,7 @@ import {
   HEADER_ACTION_DEAD,
   HEADER_ACTION_OFF,
   HEADER_ACTION_ON,
-  hoistUnread,
+  readingOrder,
   liveCount,
   moveAnnouncement,
   statusOf,
@@ -75,10 +76,22 @@ import {
   placementChanged,
   resolveDrop,
   runIndicator,
+  withPin,
   withPositions,
 } from './boardModel';
 import { boardCollisionDetection } from './dropTarget';
-import { Avatar } from './Avatar';
+import {
+  AssigneeFace,
+  BlockedBadge,
+  BranchChip,
+  FailedBadge,
+  PinButton,
+  PRIORITY_MARK,
+  SubIssueRing,
+  UnassignedMark,
+  UnreadPill,
+} from './cardChrome';
+import { FloatingPanel } from './FloatingPanel';
 import { generatedPortrait, useTeamPortraits, type Portrait } from './portrait';
 import { writeLastProjectId } from './lastProject';
 import { CreateIssueModal } from './CreateIssueModal';
@@ -94,14 +107,6 @@ import { TeamStrip } from './TeamStrip';
 import { handleOf } from './teamModel';
 import { ToastStack, useToasts } from './Toasts';
 import { useBoardStream } from './useBoardStream';
-
-const PRIORITY_MARK: Record<Issue['priority'], { glyph: string; tone: string } | null> = {
-  urgent: { glyph: '▲▲', tone: 'text-err' },
-  high: { glyph: '▲', tone: 'text-warn' },
-  medium: { glyph: '◆', tone: 'text-info' },
-  low: { glyph: '▽', tone: 'text-ink-soft' },
-  none: null,
-};
 
 export function ProjectBoardPage() {
   const { pid } = useParams<{ pid: string }>();
@@ -179,7 +184,7 @@ export function ProjectBoardPage() {
       // drag start: a card jumped slots inside its own column before the
       // first `over` resolved, and a 4px twitch on a card that had never
       // moved posted a reorder.
-      setBoard(hoistUnread(groupByStatus(issuesOutcome.value)));
+      setBoard(readingOrder(groupByStatus(issuesOutcome.value)));
       if (listOutcome.kind === 'ok') setProjects(listOutcome.value);
       if (agentsOutcome.kind === 'ok') setTeam(agentsOutcome.value);
       setActiveRuns(runsOutcome.kind === 'ok' ? runsOutcome.value : []);
@@ -305,7 +310,10 @@ export function ProjectBoardPage() {
 
       const issue = findIssue(next, number);
       if (issue === null) return;
-      const refusal = dropRejection(issue, issue.status);
+      // The refusal names the column the card snapped back to, so it must
+      // read the pre-move card — the moved copy already wears the very
+      // column it is being refused.
+      const refusal = dropRejection(findIssue(before, number) ?? issue, issue.status);
       if (refusal !== null) {
         setBoard(before);
         pushToast('warn', refusal);
@@ -375,6 +383,32 @@ export function ProjectBoardPage() {
     setRefreshKey((key) => key + 1);
     invalidateAttention(client);
   }, [client, logout, projectId, pushToast]);
+
+  /// The card moves on the press and the write follows it.
+  ///
+  /// Optimistic rather than a refetch, because the whole point of the pin is
+  /// where the card lands and a round trip's worth of stillness after
+  /// pressing it reads as nothing having happened. A failure puts the board
+  /// back exactly as it was and says so — the pin is the one signal on this
+  /// board whose truth is the server's, so a card left floating on a write
+  /// that never landed would be the board lying about the operator's own
+  /// instruction.
+  const togglePin = useCallback(
+    async (number: number, pinned: boolean) => {
+      const before = board;
+      setBoard(withPin(board, number, pinned));
+      const outcome = await patchIssue(client, projectId, number, { pinned });
+      if (outcome.kind === 'unauthorized') {
+        logout();
+        return;
+      }
+      if (outcome.kind === 'failed') {
+        setBoard(before);
+        pushToast('err', `${pinned ? 'Pin' : 'Unpin'} failed — ${outcome.message}`);
+      }
+    },
+    [board, client, logout, projectId, pushToast],
+  );
 
   const openIssue = useCallback(
     (number: number) => {
@@ -532,8 +566,18 @@ export function ProjectBoardPage() {
                 activeOver={dropInto}
                 onOpen={openIssue}
                 onOpenAgent={openAgent}
+                onTogglePin={togglePin}
                 onCreate={() => {
                   setCreateIn(status);
+                }}
+                onExpand={() => {
+                  // The column page reads the same filter params this board
+                  // does, so the narrowing survives the zoom in — and the
+                  // zoom back out.
+                  navigate({
+                    pathname: `/projects/${encodeURIComponent(projectId)}/board/${status}`,
+                    search: params.toString(),
+                  });
                 }}
               />
             ))}
@@ -671,7 +715,9 @@ function BoardColumn({
   activeOver,
   onOpen,
   onOpenAgent,
+  onTogglePin,
   onCreate,
+  onExpand,
 }: {
   status: IssueStatus;
   issues: Issue[];
@@ -685,7 +731,9 @@ function BoardColumn({
   activeOver: IssueStatus | null;
   onOpen: (number: number) => void;
   onOpenAgent: (agentId: string) => void;
+  onTogglePin: (number: number, pinned: boolean) => void;
   onCreate: () => void;
+  onExpand: () => void;
 }) {
   const { setNodeRef, isOver } = useDroppable({ id: columnDropId(status) });
   // One array per set of cards rather than per render: `SortableContext` keys
@@ -731,8 +779,17 @@ function BoardColumn({
         >
           {liveCount(issues) === total ? total : `${liveCount(issues)}/${total}`}
         </span>
+        {/* Not disabled with the board: maximizing is reading, and an
+            archived board is exactly the one being read rather than worked. */}
         <IconButton
           className="ml-auto !w-6 !h-6 bg-surface"
+          title={`Open ${COLUMN_LABEL[status]} as a full page`}
+          onClick={onExpand}
+        >
+          <RiFullscreenLine />
+        </IconButton>
+        <IconButton
+          className="!w-6 !h-6 bg-surface"
           title={`New issue in ${COLUMN_LABEL[status]}`}
           onClick={onCreate}
           disabled={disabled}
@@ -756,6 +813,7 @@ function BoardColumn({
               disabled={disabled}
               onOpen={onOpen}
               onOpenAgent={onOpenAgent}
+              onTogglePin={onTogglePin}
             />
           ))}
         </SortableContext>
@@ -785,6 +843,7 @@ function SortableIssueCard({
   disabled,
   onOpen,
   onOpenAgent,
+  onTogglePin,
 }: {
   issue: Issue;
   run: 'queued' | 'running' | null;
@@ -793,15 +852,24 @@ function SortableIssueCard({
   disabled: boolean;
   onOpen: (number: number) => void;
   onOpenAgent: (agentId: string) => void;
+  onTogglePin: (number: number, pinned: boolean) => void;
 }) {
-  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
-    id: cardDragId(issue.number),
-    disabled,
-  });
+  const { attributes, listeners, setNodeRef, setActivatorNodeRef, transform, transition, isDragging } =
+    useSortable({
+      id: cardDragId(issue.number),
+      disabled,
+    });
 
   return (
     <div
-      ref={setNodeRef}
+      // The wrapper is also the keyboard sensor's activator node, so its
+      // `event.target !== activator` guard engages: Enter on a control
+      // inside the card — the avatar, the pin, the branch chip — presses
+      // that control instead of silently lifting the card.
+      ref={(node) => {
+        setNodeRef(node);
+        setActivatorNodeRef(node);
+      }}
       style={{ transform: CSS.Transform.toString(transform), transition }}
       className={`touch-none ${isDragging ? 'opacity-40' : ''}`}
       {...attributes}
@@ -815,164 +883,12 @@ function SortableIssueCard({
         run={run}
         team={team}
         portrait={portrait}
+        disabled={disabled}
         onOpenAgent={onOpenAgent}
+        onTogglePin={onTogglePin}
       />
     </div>
   );
-}
-
-/// A ring, not a bar. It sits inline beside the assignee on a card whose
-/// other rows are already full-width, and a circle reads as "how far
-/// through the steps" at a glance where a fifth horizontal bar would just
-/// be another line of card furniture.
-function SubIssueRing({ progress }: { progress: { done: number; total: number } }) {
-  const { done, total } = progress;
-  const fraction = total === 0 ? 0 : done / total;
-  const radius = 5;
-  const circumference = 2 * Math.PI * radius;
-  return (
-    <span
-      className="inline-flex items-center gap-1 shrink-0"
-      title={`${done} of ${total} sub-issues done`}
-    >
-      <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true" className="shrink-0">
-        <circle
-          cx="7"
-          cy="7"
-          r={radius}
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="2"
-          className="text-black/20"
-        />
-        <circle
-          cx="7"
-          cy="7"
-          r={radius}
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="2"
-          strokeLinecap="round"
-          strokeDasharray={`${circumference * fraction} ${circumference}`}
-          transform="rotate(-90 7 7)"
-          className={done === total ? 'text-ok' : 'text-brand'}
-        />
-      </svg>
-      <span className="font-mono text-[0.54rem] text-ink-soft tabular-nums">
-        {done}/{total}
-      </span>
-    </span>
-  );
-}
-
-/// How long the panel takes to arrive, and to leave.
-const PANEL_SLIDE_MS = 180;
-
-/// The board's right-hand layer: the activity drawer and the agent profile,
-/// which share it and are mutually exclusive.
-///
-/// It slides in rather than appearing, and it leaves on ✕, on Escape, and on
-/// a press anywhere outside it. One home for all three, because both panels
-/// are reached from the same places and a rule kept in each would be the same
-/// rule only until one of them changed.
-///
-/// `children` is a function so ✕ leaves the way the other two do. Handed the
-/// parent's `onDismiss` directly it would unmount on the spot, and a panel
-/// that slides in but blinks out reads as a bug.
-function FloatingPanel({
-  onDismiss,
-  children,
-}: {
-  onDismiss: () => void;
-  children: (leave: () => void) => React.ReactNode;
-}) {
-  const root = useRef<HTMLDivElement>(null);
-  const [shown, setShown] = useState(false);
-  const [leaving, setLeaving] = useState(false);
-  const timer = useRef<number | null>(null);
-
-  // Mounted off-screen and moved on the next frame: a panel that mounts
-  // already at its resting place has nothing to transition from.
-  useEffect(() => {
-    const frame = requestAnimationFrame(() => {
-      setShown(true);
-    });
-    return () => {
-      cancelAnimationFrame(frame);
-      if (timer.current !== null) window.clearTimeout(timer.current);
-    };
-  }, []);
-
-  const leave = useCallback(() => {
-    if (timer.current !== null) return;
-    setLeaving(true);
-    // The unmount is the parent's and has to wait for the slide. The cleanup
-    // above cancels it, so a panel replaced mid-slide — another avatar
-    // pressed — does not take the one that replaced it down with it.
-    timer.current = window.setTimeout(onDismiss, PANEL_SLIDE_MS);
-  }, [onDismiss]);
-
-  useDismiss({ open: !leaving, root, onDismiss: leave });
-
-  return (
-    <div
-      ref={root}
-      style={{ transitionDuration: `${PANEL_SLIDE_MS}ms` }}
-      className={`absolute inset-y-0 right-0 z-30 flex shadow-brutal transition-transform ease-out motion-reduce:transition-none ${
-        shown && !leaving ? 'translate-x-0' : 'translate-x-full'
-      }`}
-    >
-      {children(leave)}
-    </div>
-  );
-}
-
-/// The branch chip. Copies rather than navigates: it sits inside a card
-/// whose own click opens the issue, so without stopping the event the one
-/// affordance the mockup gives it would be unreachable.
-function BranchChip({ branch }: { branch: string }) {
-  const [copied, setCopied] = useState(false);
-  return (
-    <button
-      type="button"
-      title={`${branch} — click to copy`}
-      className="self-start max-w-full truncate border border-black/25 bg-canvas rounded px-1.5 font-mono text-[0.56rem] text-ink-soft cursor-pointer hover:border-black"
-      onClick={(event) => {
-        event.stopPropagation();
-        try {
-          // `navigator.clipboard` is typed as always present but is
-          // **absent** outside a secure context — which a dashboard served
-          // over plain http on a LAN address is. Reading `.writeText` off
-          // `undefined` throws synchronously, so the try is the guard; a
-          // rejected promise (permission refused) is the other half.
-          void navigator.clipboard.writeText(branch).then(
-            () => {
-              setCopied(true);
-              window.setTimeout(() => {
-                setCopied(false);
-              }, 1200);
-            },
-            () => {
-              // Nothing: the branch name is still in the title attribute,
-              // and a "copied" that did not happen is worse than silence.
-            },
-          );
-        } catch {
-          // Same reasoning.
-        }
-      }}
-    >
-      ⑂ {copied ? 'copied' : branch}
-    </button>
-  );
-}
-
-/// What the card's number means, spelled out where it is hovered. The
-/// badge counts an agent's comments *and* an agent moving the card into
-/// Review, so "messages" alone would be a lie on a card that has only been
-/// handed back.
-function unreadTitle(unread: number): string {
-  return `${unread} new since you opened this card`;
 }
 
 function IssueCard({
@@ -981,7 +897,9 @@ function IssueCard({
   overlay = false,
   team = [],
   portrait = generatedPortrait,
+  disabled = false,
   onOpenAgent,
+  onTogglePin,
 }: {
   issue: Issue;
   run?: 'queued' | 'running' | null;
@@ -991,19 +909,36 @@ function IssueCard({
   /// draws the generated one, which is the same picture in every case an
   /// upload is absent — and a drag is too short to fetch one anyway.
   portrait?: Portrait;
+  /// An archived board. Its cards are read-only, so the pin is shown as it
+  /// is and cannot be worked.
+  disabled?: boolean;
   /// Opens the assignee's profile. Absent on the drag overlay, which is a
   /// picture of a card rather than a card.
   onOpenAgent?: (agentId: string) => void;
+  /// Absent on the drag overlay, for the same reason.
+  onTogglePin?: (number: number, pinned: boolean) => void;
 }) {
   const cancelled = issue.cancelled_at_ms != null;
   const priority = PRIORITY_MARK[issue.priority];
   return (
     <article
-      className={`bg-surface border-2 border-black rounded-md shadow-brutal-xs px-2.5 py-2 flex flex-col gap-1.5 cursor-pointer ${
+      className={`group bg-surface border-2 border-black rounded-md shadow-brutal-xs px-2.5 py-2 flex flex-col gap-1.5 cursor-pointer ${
         overlay ? 'rotate-2 shadow-brutal w-full h-full' : ''
       } ${cancelled ? 'opacity-55' : ''}`}
     >
       <div className="flex items-center gap-1.5 font-mono text-[0.6rem] text-ink-soft">
+        {/* Leading, not in the right-hand corner: that corner is the unread
+            count's, and it is the one number on this board the eye is
+            trained to find. */}
+        {onTogglePin === undefined ? null : (
+          <PinButton
+            pinned={issue.pinned}
+            disabled={disabled}
+            onToggle={(pinned) => {
+              onTogglePin(issue.number, pinned);
+            }}
+          />
+        )}
         {priority !== null ? (
           <span className={`${priority.tone} font-bold`}>{priority.glyph}</span>
         ) : null}
@@ -1014,19 +949,7 @@ function IssueCard({
         >
           {updatedAgo(issue.updated_at_ms, Date.now())}
         </span>
-        {issue.unread > 0 ? (
-          // The board's only count, and the corner the eye lands on. It is
-          // the countable half of the rail's dot: every number here is one
-          // card away from being cleared, which is the whole reason the
-          // rail's own number became a dot.
-          <span
-            title={unreadTitle(issue.unread)}
-            aria-label={unreadTitle(issue.unread)}
-            className="shrink-0 min-w-[1rem] h-4 px-1 rounded-full border-2 border-black bg-err text-white text-[0.55rem] font-bold leading-[0.75rem] text-center tabular-nums"
-          >
-            {issue.unread}
-          </span>
-        ) : null}
+        {issue.unread > 0 ? <UnreadPill unread={issue.unread} /> : null}
       </div>
       <p
         className={`font-mono text-[0.76rem] font-bold leading-snug line-clamp-2 ${
@@ -1035,60 +958,25 @@ function IssueCard({
       >
         {issue.title}
       </p>
-      {issue.blocked_reason != null ? (
-        <span
-          className="self-start border border-warn/50 bg-warn/10 text-warn rounded px-1.5 font-mono text-[0.56rem] font-bold uppercase"
-          title={issue.blocked_reason}
-        >
-          ⚑ Blocked
-        </span>
-      ) : null}
-      {issue.last_run_failed ? (
-        // A failed run leaves the card exactly where it was, wearing
-        // nothing — so the board's badge counted failures on a board where
-        // no card admitted to one, and finding them meant opening cards one
-        // at a time. It wears the Blocked badge's shape in the error tone,
-        // because both say the same thing: this card has stopped.
-        <span
-          className="self-start border border-err/50 bg-err/10 text-err rounded px-1.5 font-mono text-[0.56rem] font-bold uppercase"
-          title="This card's newest run failed. Open it to retry."
-        >
-          ✕ Run failed
-        </span>
-      ) : null}
+      {issue.blocked_reason != null ? <BlockedBadge reason={issue.blocked_reason} /> : null}
+      {issue.last_run_failed ? <FailedBadge /> : null}
       {hasDeliverable(issue) && issue.branch != null ? <BranchChip branch={issue.branch} /> : null}
       <div className="flex items-center gap-1.5">
         {issue.assignee != null ? (
-          <button
-            type="button"
-            title={`Open @${handleOf(team, issue.assignee)}'s profile`}
-            onClick={(event) => {
-              // The card's own click opens the issue, so the avatar has to
-              // claim the event or it can never be the profile's entry point.
-              event.stopPropagation();
-              onOpenAgent?.(issue.assignee ?? '');
-            }}
-            className="flex items-center gap-1.5 min-w-0 cursor-pointer hover:underline"
-          >
-            <Avatar
-              handle={handleOf(team, issue.assignee)}
-              src={portrait(issue.assignee)}
-              run={run}
-              size="sm"
-            />
-            <span className="font-mono text-[0.58rem] text-ink-soft truncate">
-              @{handleOf(team, issue.assignee)}
-            </span>
-          </button>
+          <AssigneeFace
+            handle={handleOf(team, issue.assignee)}
+            src={portrait(issue.assignee)}
+            run={run}
+            onOpen={
+              onOpenAgent === undefined
+                ? undefined
+                : () => {
+                    onOpenAgent(issue.assignee ?? '');
+                  }
+            }
+          />
         ) : (
-          // A card nobody is on says so. Rendering nothing made an
-          // untriaged card look the same as one whose footer had simply
-          // scrolled off, and the parking lot is exactly where the
-          // operator is scanning for work to hand out.
-          <>
-            <span className="w-4 h-4 rounded-full border-2 border-dashed border-black/40 shrink-0" />
-            <span className="font-mono text-[0.58rem] text-ink-soft italic">unassigned</span>
-          </>
+          <UnassignedMark />
         )}
         {issue.sub_issues != null ? (
           <span className="ml-auto">

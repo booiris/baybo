@@ -31,6 +31,7 @@ function issue(number: number, overrides: Partial<Issue> = {}): Issue {
     updated_at_ms: 0,
     unread: 0,
     last_run_failed: false,
+    pinned: false,
     ...overrides,
   };
 }
@@ -108,7 +109,17 @@ function stubClient() {
       }
       throw new Error(`unexpected POST ${path}`);
     }),
-    PATCH: vi.fn(),
+    // Resolved, not bare: `patchIssue` destructures the answer, and a stub
+    // returning `undefined` throws inside it — which the client reports as a
+    // failed write, so every optimistic press would silently roll back. The
+    // return type is written out so a test can hand it a refusal instead.
+    PATCH: vi.fn(
+      async (): Promise<{
+        data: undefined;
+        error: { error: string } | undefined;
+        response: Response;
+      }> => ({ data: undefined, error: undefined, response: ok }),
+    ),
   };
 }
 
@@ -333,6 +344,58 @@ describe('ProjectBoardPage', () => {
       expect(screen.getByRole('button', { name: 'Mark read' })).toBeDisabled();
     });
     expect(screen.queryByTitle(/new since you opened this card/)).toBeNull();
+  });
+
+  it('reads a pinned card above the one carrying something new', async () => {
+    // The rank, on one board: #2 is unread and leads the column to start
+    // with. Pinning #1 — which has nothing new on it at all — puts it in
+    // front, because what the operator chose outranks what arrived.
+    renderBoard();
+    await screen.findByText('Wire the board');
+
+    const backlog = screen.getByRole('heading', { name: 'Backlog' }).closest('section');
+    const before = within(backlog as HTMLElement).getAllByRole('article');
+    expect(before[0].textContent).toContain('Blocked one');
+
+    await userEvent.click(within(before[1]).getByRole('button', { name: /Pin this card/ }));
+
+    expect(client.PATCH).toHaveBeenCalledWith('/v1/projects/{project_id}/issues/{number}', {
+      params: { path: { project_id: PROJECT.id, number: 1 } },
+      body: { pinned: true },
+    });
+    await waitFor(() => {
+      const cards = within(backlog as HTMLElement).getAllByRole('article');
+      expect(cards[0].textContent).toContain('Wire the board');
+      expect(cards[1].textContent).toContain('Blocked one');
+    });
+    // The press must not also open the card — the card's own click
+    // navigates, so the pin has to claim the event.
+    expect(screen.getByRole('heading', { name: 'Backlog' })).toBeInTheDocument();
+  });
+
+  it('puts the card back where it was when the pin fails to land', async () => {
+    client.PATCH.mockResolvedValueOnce({
+      data: undefined,
+      error: { error: 'nope' },
+      response: { status: 500, ok: false } as Response,
+    });
+    renderBoard();
+    await screen.findByText('Wire the board');
+
+    const backlog = screen.getByRole('heading', { name: 'Backlog' }).closest('section');
+    await userEvent.click(
+      within(within(backlog as HTMLElement).getAllByRole('article')[1]).getByRole('button', {
+        name: /Pin this card/,
+      }),
+    );
+
+    // The pin is the one mark on this board whose truth is the server's, so
+    // a card left floating on a write that never landed would be the board
+    // lying about the operator's own instruction.
+    expect(await screen.findByText(/Pin failed/)).toBeInTheDocument();
+    const cards = within(backlog as HTMLElement).getAllByRole('article');
+    expect(cards[0].textContent).toContain('Blocked one');
+    expect(cards[1].textContent).toContain('Wire the board');
   });
 
   it('opens the assignee’s profile from the card without opening the card', async () => {

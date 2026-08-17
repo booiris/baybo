@@ -125,6 +125,53 @@ mode collapsing the strip could introduce, and the badge is what rules it out.
 `boardFilter.ts` owns the list of narrowings (`restrictionCount`), because the
 badge and the Clear button must never disagree about what counts as filtered.
 
+## The column page
+
+One column of the board as a whole page — `/projects/:pid/board/:status`
+(`pages/projects/ColumnPage.tsx`), reached from the maximize button in each
+column's header. The board's columns are honest about what they are — five
+narrow queues — and a queue holding thirty cards reads as a smear of two-line
+tiles; this is the same column at reading width. Each card is **one flat row**
+in a single bordered surface, rows separated by 1px rules (the activity
+drawer's "a stream, not a stack of cards"), the card's whole vocabulary laid
+out in aligned cells: priority mark, `#number`, the full title, the Blocked /
+Run-failed badges, the branch chip, the sub-issue ring, working/queued, the
+assignee's face, the relative time, and the unread pill. The cells come from
+`cardChrome.tsx`, which both the board's tile and this row read — one home, so
+the two views of a card cannot drift apart.
+
+The header keeps the whole board one press away: a row of five stage tabs
+(`COLUMN_PILL_LABEL` + the board's live counts, the current one gold), the
+same `BoardFilterMenu`, and a New-issue button scoped to this column. The
+filter is the **same URL vocabulary the board reads**, and the back link and
+the tabs carry the params along — the narrowing survives the zoom in, across
+stages, and back out. A tab whose stage holds something new wears a **red
+dot, not a number** — pressing a tab cannot discharge what it shows, opening
+cards does — and the open stage's tab stays bare, because its rows carry the
+counts themselves (`columnHasNews`, the same predicate `readingOrder` lifts
+by, so the dot and the lift cannot disagree).
+
+It stays the board in every rule that matters, deliberately: the reading
+order (pin, then unread) is applied once to the fetched board and never
+written; a drag reorders within the column and sends `persistedOrder` (then
+`withPositions` writes it back); a `project_changed` frame that lands
+mid-drag is held until the card does; `dropRejection` still refuses
+unassigned work into In Progress; the pin is the same press the board's tile
+takes; and the assignee's face opens the agent profile in the same sliding
+right-hand layer (`FloatingPanel.tsx`, shared with the board for exactly this
+reason). The one thing a single-column page cannot do — drag a card to
+another column — the row's status `Picker` does instead, appending the card
+to the end of the destination's stored order, exactly as a drop on a
+column's body would.
+
+Two mechanics the row's shape depends on. The row div is also the keyboard
+sensor's **activator node**, engaging dnd-kit's `event.target !== activator`
+guard: Enter on a control inside the row — the picker, the pin, the face —
+presses that control, instead of silently lifting the row and eating the
+press. And below `sm` the assignee and time cells go; they are the widest
+facts the title can spare, and the always-on set has to fit a phone with the
+title still worth reading.
+
 ## Where a notification is a number and where it is a dot
 
 Two levels, and the difference is whether the thing you press can discharge
