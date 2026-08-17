@@ -234,7 +234,7 @@ function simulate(
   const seen = new Map<string, number>();
 
   for (let iteration = 0; iteration < CAP; iteration += 1) {
-    const view = filterBoard(board, scenario.filter, []);
+    const view = filterBoard(board, scenario.filter, [], []);
     const { rects, containers } = measure(view, registry);
     const args: CollisionArgs = {
       active: { id: activeId } as Active,
@@ -261,7 +261,7 @@ function simulate(
     lastOverId = overId;
     const drop = resolveDrop(view, activeId, overId);
     if (drop !== null) board = moveCard(board, drop);
-    steps.push({ overId, columns: columnSignature(filterBoard(board, scenario.filter, [])) });
+    steps.push({ overId, columns: columnSignature(filterBoard(board, scenario.filter, [], [])) });
   }
   return { converged: false, steps, cycleStart: null };
 }
@@ -399,7 +399,7 @@ function sweep(
   for (const layout of LAYOUTS) {
     const board = boardOf(layout.counts, layout.cancelled ?? []);
     const filter = layout.filter ?? EMPTY_FILTER;
-    const view = filterBoard(board, filter, []);
+    const view = filterBoard(board, filter, [], []);
     const actives = new Set<number>();
     for (const status of COLUMNS) {
       const column = view[status];
@@ -440,7 +440,7 @@ function complaint(swept: Sweep): string[] {
     `${swept.found} non-converging (board, cursor) pairs: ${JSON.stringify(swept.zones)}`,
     scenario.name,
     `  zone: ${zoneOf(scenario.pointer)} — cursor (${scenario.pointer.x}, ${scenario.pointer.y})`,
-    `  start: ${columnSignature(filterBoard(scenario.board, scenario.filter, []))}`,
+    `  start: ${columnSignature(filterBoard(scenario.board, scenario.filter, [], []))}`,
     ...cycleOf(outcome).map(
       (step, index) => `  ${index + 1}. over=${step.overId} -> ${step.columns}`,
     ),

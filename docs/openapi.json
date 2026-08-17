@@ -4448,7 +4448,7 @@
           {
             "name": "since_ms",
             "in": "query",
-            "description": "Start of your day, epoch ms. Defaults to the last 24 hours.",
+            "description": "Start of the budget's day (UTC midnight), epoch ms. Defaults to the last 24 hours.",
             "required": false,
             "schema": {
               "type": "integer",
@@ -4483,12 +4483,12 @@
                           "burn_micros": {
                             "type": "integer",
                             "format": "int64",
-                            "description": "Spend since the start of your day, in micro-USD. Measured exactly as\nthe budget gate measures it, so the pair in the dropdown can never\naccuse the board of crossing a ceiling it did not."
+                            "description": "Spend since `since_ms`, in micro-USD. Shown against the ceiling that\nstops the board, so the caller must send the **budget's** day —\n`budget::day_start`, UTC midnight — or the pair in the dropdown\naccuses the board of crossing a ceiling it did not."
                           },
                           "burn_tokens": {
                             "type": "integer",
                             "format": "int64",
-                            "description": "Tokens spent since the start of your day."
+                            "description": "Tokens spent over the same window."
                           },
                           "project_id": {
                             "type": "string"
@@ -4547,12 +4547,11 @@
                       "type": "array",
                       "items": {
                         "type": "object",
-                        "description": "One board with something waiting on the operator.",
+                        "description": "One board with something waiting on the operator.\n\nEvery count here is an event. Runs the daily ceiling is holding are a\nstanding condition rather than news and are deliberately absent — the\nboard reports those in its own header, next to the setting that lifts\nthem. See `AttentionCounts`.",
                         "required": [
                           "project_id",
                           "name",
                           "approvals",
-                          "held",
                           "failed",
                           "unread"
                         ],
@@ -4565,11 +4564,6 @@
                           "failed": {
                             "type": "integer",
                             "description": "Live cards whose newest run failed.",
-                            "minimum": 0
-                          },
-                          "held": {
-                            "type": "integer",
-                            "description": "Runs recorded but not started, because the board is over budget.",
                             "minimum": 0
                           },
                           "name": {

@@ -135,7 +135,7 @@ export function CreateProjectForm({ onDone }: { onDone?: () => void }) {
       </div>
       <div>
         <label className={fieldLabel} htmlFor="project-budget">
-          Daily budget — optional
+          Daily budget (USD) — optional
         </label>
         <input
           id="project-budget"
@@ -145,7 +145,7 @@ export function CreateProjectForm({ onDone }: { onDone?: () => void }) {
           onChange={(event) => {
             setBudget(event.target.value);
           }}
-          placeholder="Leave empty for no ceiling"
+          placeholder="e.g. 5.00 — empty for no ceiling"
         />
         <p className="mt-1 text-[0.7rem] text-ink-soft leading-snug">
           {budgetHint(parseBudget(budget) ?? null)} You can change it later.
@@ -153,7 +153,7 @@ export function CreateProjectForm({ onDone }: { onDone?: () => void }) {
       </div>
       <div>
         <label className={fieldLabel} htmlFor="project-token-budget">
-          Daily token budget — optional
+          Daily token budget (tokens) — optional
         </label>
         <input
           id="project-token-budget"
@@ -163,7 +163,7 @@ export function CreateProjectForm({ onDone }: { onDone?: () => void }) {
           onChange={(event) => {
             setTokenBudget(event.target.value);
           }}
-          placeholder="Leave empty for no ceiling"
+          placeholder="e.g. 2000000 — empty for no ceiling"
         />
         <p className="mt-1 text-[0.7rem] text-ink-soft leading-snug">
           {tokenBudgetHint(parseTokenBudget(tokenBudget) ?? null)} You can change it later.

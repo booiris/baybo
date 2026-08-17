@@ -135,8 +135,9 @@ tiles; this is the same column at reading width. Each card is **one flat row**
 in a single bordered surface, rows separated by 1px rules (the activity
 drawer's "a stream, not a stack of cards"), the card's whole vocabulary laid
 out in aligned cells: priority mark, `#number`, the full title, the Blocked /
-Run-failed badges, the branch chip, the sub-issue ring, working/queued, the
-assignee's face, the relative time, and the unread pill. The cells come from
+Run-failed badges, the branch chip, the sub-issue ring, working / queued /
+held, the assignee's face, the relative time, and the unread pill. The cells
+come from
 `cardChrome.tsx`, which both the board's tile and this row read — one home, so
 the two views of a card cannot drift apart.
 
@@ -233,11 +234,82 @@ looking clears it — its detail page's **Run again** is what does. Before it
 existed the rail counted failures on a board where no card admitted to one,
 so finding the card the badge meant took opening them one at a time.
 
+## A dot is for news; a stopped board is not news
+
+The rail's dot means **an event is waiting on you** — an approval, a failed
+run, an agent's comment. It does *not* mean "this board has a problem", and
+the difference is why runs the daily ceiling is holding were taken out of it.
+
+A hold is a standing condition. It does not arrive, and it stops being true
+only when the operator changes a number. Painted into one undifferentiated
+dot — in the very same red the card's unread pill wears — it was
+indistinguishable from a mark that could not be cleared, and that is exactly
+how it got reported: *"the red dot won't go away."* The operator was right,
+and reading the dot as an unread badge was the natural reading, because the
+design gives news and stoppage one colour and one shape.
+
+So the condition moved to where you can act on it. `OverCeilingChip` joins the
+board header's right-hand action group whenever `burnState(...) === 'over'`,
+wearing `HEADER_ACTION` in the warn tone, a `RiPauseCircleLine`, and the
+figures — `$6.10 / $5.00 · 602k / 100k` — with the sentence in its title.
+
+Two things the mark is deliberately not. Not `⚑`: that is already the board's
+mark for *blocked*, on the card badge, the timeline and the issue rail, and
+one mark cannot mean two things on a board where cards really do get blocked.
+And not a unicode glyph at all — the card badges are drawn in unicode but this
+group's icons come from Remix, so a bare character here would be a third
+vocabulary in one row.
+
+**Both** ceilings are named when both are set (`boardMeters`), and only the
+one that is biting is at full strength. `boardMeter` picks a single ceiling to
+*speak in*, which is right for a sentence and wrong for a readout: money and
+tokens are independent gates, either stops the board, and an operator shown
+only the tighter of two that are both spent raises one and watches nothing
+happen. Pressing it opens project settings.
+
+A **chip in the group**, and deliberately not a banner across the board. The
+first cut was a warn-tinted strip under the header, and it was wrong for a
+reason worth keeping written down: a board over its ceiling is over it for
+twenty-three hours of every day, so a strip is up ~23/24 and is furniture by
+the second morning — the dot's failure again, in a louder register. The
+header's right-hand group is already where everything acting on the whole
+board lives, and `BoardFilterMenu` is the precedent for the shape: a control
+that tints and carries a figure exactly when the board is holding something
+back. It also costs no column height, which is what killed the second toolbar
+row in the first place.
+
+The figure being on screen **at rest** is the trade the bare dot could not
+make, because a dot has nowhere to put a number. On the column page the chip
+drops its press — that page has no settings modal, and the board is one press
+away on the back link it already has.
+
+The trade is real and was taken deliberately: a frozen board no longer says so
+from the rail, so a board you are not looking at goes quiet. What still
+reaches across boards is the project switcher's per-board meter, which shows
+`602k / 100k` in the warn tone.
+
+Two card-level things survive from when `held` was a rail signal, and both
+earn their place independently. The card says `held` in the run cell both
+views share (`cardChrome.RunWord`), in the warn tone the issue page's own run
+chip wears — it used to print `queued` there, because `runIndicator` answered
+a three-value question with two, so a card the budget had stopped claimed to
+be waiting for a free slot on a board where every slot was free. And the
+filter menu's **Held on budget only** finds those cards among thirty, which a
+word in a meta row cannot. That narrowing is the one whose fact is **not on
+the card's row**: it comes off the board's live runs through `runIndicator`,
+the very call the card's word reads, so `filterBoard` resolves it per card and
+hands it to `matches`. Deriving it a second time server-side onto the card DTO
+would have been two sources for one fact on two refresh schedules, which is
+the drift `CardSignals` exists to prevent.
+
 `useAttention` is one module-level store with one timer and an
 `invalidateAttention(client)` — not a `useState` + `setInterval` per
 component. The minute-long poll used to be the *only* refresh, so a signal
 the operator had just discharged stayed on screen for up to a minute; every
-act that clears one now asks the server again.
+act that clears one now asks the server again. Every act: the project-settings
+save is the one that releases a held run, and it was the last one still
+bumping `refreshKey` without asking the rail — so the fix for the dot left the
+dot up, and read as the fix not having worked.
 
 ## Pinning a card
 
@@ -513,7 +585,15 @@ existing idiom for things this size, not an exception to the language.
 
 The **team strip** in the board header is faces and nothing else — 26px, a live
 status dot on every one (green working, grey idle), a gold halo on the lead, a
-dashed `＋` at the end. The handle rides in the tooltip: sixteen named pills are
+dashed `＋` at the end. A teammate with nothing going but something waiting is
+dimmed rather than plainly idle, and `teamModel.agentRunStates` is the one
+place that decides which: **working** outranks the waits, because an agent on
+three cards is not idle whatever is stacked behind them, and among the waits
+**held** outranks **queued**, because a queued run starts on its own when a
+slot frees and a held one waits on somebody raising a ceiling. A held run used
+to answer to neither of the two sets that function replaced, so a board the
+budget had stopped drew a full strip of grey idle dots with nothing on it to
+say why. The handle rides in the tooltip: sixteen named pills are
 wider than the header they sit in, and the face is what the operator already
 recognises on every card. Removal is not on the strip; it is on the profile the
 face opens, where it asks twice.

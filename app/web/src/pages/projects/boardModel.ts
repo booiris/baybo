@@ -1,5 +1,7 @@
 import type { components, paths } from '../../api/schema';
 
+import type { AvatarRun } from './Avatar';
+
 export type Issue = components['schemas']['IssueDto'];
 export type Agent = components['schemas']['TeamMemberDto'];
 // The generator inlines runs because they have no point endpoint.
@@ -343,13 +345,33 @@ export function placementChanged(before: Board, after: Board, number: number): b
   return beforeIndex !== afterIndex;
 }
 
-export function runIndicator(
-  activeRuns: IssueRun[],
-  number: number,
-): 'queued' | 'running' | null {
+/// One run's status in the vocabulary the face and the word beside it both
+/// read (`AvatarRun`).
+///
+/// `held` is its own answer and not a shade of `queued`. Collapsing the two
+/// made every card the budget had stopped print "queued — waiting for a free
+/// slot" while every slot on the board was free, which is the board
+/// contradicting the rail's own dot: the dot said two runs were held, and the
+/// only surface it points at said nobody was held at all.
+///
+/// One home, because the card's word, the filter's "Held only" and the team
+/// strip's face all ask it — and three spellings of "held is not queued" is
+/// how two of them end up disagreeing.
+export function runState(status: RunStatus): AvatarRun {
+  switch (status) {
+    case 'running':
+      return 'running';
+    case 'held':
+      return 'held';
+    default:
+      return 'queued';
+  }
+}
+
+/// What a card's live run is doing, or `null` when nothing is on it.
+export function runIndicator(activeRuns: IssueRun[], number: number): AvatarRun {
   const run = activeRuns.find((candidate) => candidate.number === number);
-  if (run === undefined) return null;
-  return run.status === 'running' ? 'running' : 'queued';
+  return run === undefined ? null : runState(run.status);
 }
 
 /// How long something took. One spelling, because the execution log measures

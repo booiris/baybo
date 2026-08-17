@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { RiPushpin2Fill, RiPushpin2Line } from 'react-icons/ri';
 
 import type { Issue } from './boardModel';
-import { Avatar, type AvatarRun } from './Avatar';
+import { Avatar, type AvatarRun, runNote } from './Avatar';
 
 /// What a card wears, wherever a card is drawn — the board's column card and
 /// the column page's row say these the same way because they say them from
@@ -231,6 +231,35 @@ export function UnassignedMark() {
       <span className="w-4 h-4 rounded-full border-2 border-dashed border-black/40 shrink-0" />
       <span className="font-mono text-[0.58rem] text-ink-soft italic">unassigned</span>
     </>
+  );
+}
+
+/// The one word a card says about its run, and the one place it is spelled.
+///
+/// Both views wrote it inline as `run === 'running' ? 'working' : 'queued'`,
+/// which is a two-branch answer to a three-value question: a run the daily
+/// ceiling had stopped printed "queued" on a board with every slot free. Held
+/// takes the warn tone the issue page's own run chip already gives it, so the
+/// card and the card's page say the same thing in the same colour.
+///
+/// The `why` is in the title rather than the cell because the cell is 0.54rem
+/// of uppercase mono — it has room for a state, not for a reason.
+const RUN_WORD: Record<Exclude<AvatarRun, null>, { word: string; tone: string }> = {
+  running: { word: 'working', tone: 'text-ok' },
+  queued: { word: 'queued', tone: 'text-ink-soft' },
+  held: { word: 'held', tone: 'text-warn' },
+};
+
+export function RunWord({ run, className = '' }: { run: AvatarRun; className?: string }) {
+  if (run === null) return null;
+  const { word, tone } = RUN_WORD[run];
+  return (
+    <span
+      title={`This card's run${runNote(run)}`}
+      className={`shrink-0 font-mono text-[0.54rem] font-bold uppercase ${tone} ${className}`}
+    >
+      {word}
+    </span>
   );
 }
 

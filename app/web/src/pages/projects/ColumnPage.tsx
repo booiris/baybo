@@ -70,6 +70,7 @@ import {
 import { boardFilterParams, filterBoard, parseBoardFilter } from './boardFilter';
 import type { BoardFilter } from './boardFilter';
 import { BoardFilterMenu } from './BoardFilterMenu';
+import { OverCeilingChip } from './OverCeilingChip';
 import { generatedPortrait, useTeamPortraits, type Portrait } from './portrait';
 import { writeLastProjectId } from './lastProject';
 import { CreateIssueModal } from './CreateIssueModal';
@@ -84,14 +85,17 @@ import {
   FailedBadge,
   PinButton,
   PRIORITY_MARK,
+  RunWord,
   SubIssueRing,
   UnassignedMark,
   UnreadPill,
 } from './cardChrome';
+import type { AvatarRun } from './Avatar';
 import { handleOf } from './teamModel';
 import { invalidateAttention } from './useAttention';
 import { ToastStack, useToasts } from './Toasts';
 import { useBoardStream } from './useBoardStream';
+import { useBoardActivity } from './useBoardActivity';
 
 /// One column of the board, as a whole page.
 ///
@@ -212,7 +216,9 @@ export function ColumnPage() {
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
   );
 
-  const view = useMemo(() => filterBoard(board, filter, team), [board, filter, team]);
+  const view = useMemo(() => filterBoard(board, filter, team, activeRuns), [activeRuns, board, filter, team]);
+  // Same numbers the board page's notice reads: this page is that board.
+  const activity = useBoardActivity(true, refreshKey);
   const list = useMemo(() => (status === null ? [] : view[status]), [status, view]);
   // One array per set of rows: `SortableContext` keys its context value off
   // this and compares it by identity, so a fresh one per render re-renders
@@ -289,7 +295,7 @@ export function ColumnPage() {
       if (target?.kind !== 'card') return;
       const over = event.over === null ? null : parseDragId(String(event.over.id));
       if (over?.kind !== 'card' || over.number === target.number) return;
-      const column = filterBoard(board, filter, team)[status];
+      const column = filterBoard(board, filter, team, activeRuns)[status];
       const from = column.findIndex((row) => row.number === target.number);
       const at = column.findIndex((row) => row.number === over.number);
       if (from === -1 || at === -1) return;
@@ -302,7 +308,7 @@ export function ColumnPage() {
       if (!placementChanged(board, next, target.number)) return;
       await commitMove(board, next, target.number, anchor);
     },
-    [board, commitMove, filter, status, team],
+    [activeRuns, board, commitMove, filter, status, team],
   );
 
   const onDragCancel = useCallback(() => {
@@ -424,6 +430,13 @@ export function ColumnPage() {
           })}
         </nav>
         <div className="ml-auto flex items-center gap-2">
+          {project === null ? null : (
+            <OverCeilingChip
+              project={project}
+              activity={activity}
+              held={activeRuns.filter((run) => run.status === 'held').length}
+            />
+          )}
           <BoardFilterMenu
             filter={filter}
             team={team}
@@ -597,7 +610,7 @@ function ColumnRow({
   onTogglePin,
 }: {
   issue: Issue;
-  run: 'queued' | 'running' | null;
+  run: AvatarRun;
   team: Agent[];
   portrait: Portrait;
   readOnly: boolean;
@@ -658,7 +671,7 @@ function RowBody({
   onTogglePin,
 }: {
   issue: Issue;
-  run?: 'queued' | 'running' | null;
+  run?: AvatarRun;
   team?: Agent[];
   portrait?: Portrait;
   readOnly?: boolean;
@@ -729,12 +742,11 @@ function RowBody({
       <span className="hidden sm:flex w-12 shrink-0 justify-end">
         {issue.sub_issues != null ? <SubIssueRing progress={issue.sub_issues} /> : null}
       </span>
-      <span
-        className={`hidden md:block w-14 shrink-0 text-right text-[0.54rem] font-bold uppercase ${
-          run === 'running' ? 'text-ok' : 'text-ink-soft'
-        }`}
-      >
-        {run === 'running' ? 'working' : run === 'queued' ? 'queued' : ''}
+      {/* The box stays whether or not there is a word in it: it is a column
+          in a row of aligned cells, and one that collapsed on an idle card
+          would shift every cell after it. */}
+      <span className="hidden md:block w-14 shrink-0 text-right">
+        <RunWord run={run} />
       </span>
       {/* The picker's own presses must not fall through to the row link
           under them — the row opens the card, and this cell moves it. */}

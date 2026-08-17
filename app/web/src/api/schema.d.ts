@@ -7199,7 +7199,7 @@ export interface operations {
     projects_activity: {
         parameters: {
             query?: {
-                /** @description Start of your day, epoch ms. Defaults to the last 24 hours. */
+                /** @description Start of the budget's day (UTC midnight), epoch ms. Defaults to the last 24 hours. */
                 since_ms?: number;
             };
             header?: never;
@@ -7218,14 +7218,15 @@ export interface operations {
                         items: {
                             /**
                              * Format: int64
-                             * @description Spend since the start of your day, in micro-USD. Measured exactly as
-                             *     the budget gate measures it, so the pair in the dropdown can never
-                             *     accuse the board of crossing a ceiling it did not.
+                             * @description Spend since `since_ms`, in micro-USD. Shown against the ceiling that
+                             *     stops the board, so the caller must send the **budget's** day —
+                             *     `budget::day_start`, UTC midnight — or the pair in the dropdown
+                             *     accuses the board of crossing a ceiling it did not.
                              */
                             burn_micros: number;
                             /**
                              * Format: int64
-                             * @description Tokens spent since the start of your day.
+                             * @description Tokens spent over the same window.
                              */
                             burn_tokens: number;
                             project_id: string;
@@ -7271,8 +7272,6 @@ export interface operations {
                             approvals: number;
                             /** @description Live cards whose newest run failed. */
                             failed: number;
-                            /** @description Runs recorded but not started, because the board is over budget. */
-                            held: number;
                             name: string;
                             project_id: string;
                             /** @description Agents' comments and cards arriving in Review since you last looked. */

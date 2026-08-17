@@ -522,8 +522,9 @@ router mints, so it is a real reordering rather than a `WHERE` clause.
 
 ### Holds and release
 
-An exhausted board records work instead of dropping it. The held row shows on
-the card with figures (`BudgetExhausted`), and it starts the moment there is
+An exhausted board records work instead of dropping it. The card says so
+twice — `held` where its live run's state is drawn, and a timeline entry
+carrying the figures (`BudgetExhausted`) — and it starts the moment there is
 headroom again.
 
 Holds are released **by activity, not by a clock**. Four things reach
@@ -1359,15 +1360,15 @@ the queue and can refuse a prompt the timeline still lists.
 A prompt from an ordinary session passes straight through — the trigger lookup
 says it belongs to no issue.
 
-### Attention: four signals, two contracts
+### Attention: three signals, and the one that was thrown out
 
 `attention()` answers one question per board — is anything waiting on the
-operator — as four counts: `approvals`, `held`, `failed`, `unread`. They divide
-on **what discharges them**, and the split is the whole design:
+operator — as three counts: `approvals`, `failed`, `unread`. The membership
+rule is that **every one of them is an event**: something arrived, broke, or
+is being asked. They then divide on what discharges them:
 
-- `approvals` and `held` clear by **acting**. Answer the prompt, give the board
-  budget. Looking at them changes nothing a query could see, which is exactly
-  why they need no stored state.
+- `approvals` clears by **acting**. Answer the prompt. Looking at it changes
+  nothing a query could see, which is exactly why it needs no stored state.
 - `unread` clears by **reading**.
 - `failed` is **both**, and is the only signal read by two rules. The *card* is
   broken until somebody acts — retry, finish, cancel, block — and wears its
@@ -1380,6 +1381,23 @@ on **what discharges them**, and the split is the whole design:
   moved — opening it, or reading the whole board — while the card goes on
   saying so. A card that fails *again* relights the rail off the same cursor —
   one rule, not two.
+
+**Runs the daily ceiling is holding are deliberately absent**, and the reason
+is the membership rule rather than any doubt that they matter — a stopped
+board is the most literal "only you can fix this" there is. A hold is a
+*standing condition*: it does not arrive, and it stops being true only when
+the operator changes a number. Rendered into the rail's one undifferentiated
+dot — the same red the card's unread pill wears — it was indistinguishable
+from a mark that could not be cleared at all, and that is precisely how it was
+reported. So a condition now goes where it can be acted on: `OverCeilingChip`
+in the board header's own action group, carrying the spend against the ceiling
+as a figure on screen and the runs it is holding in its title, and opening the
+setting that lifts it. The rail keeps the events.
+
+What that costs is cross-board reach — a board frozen by its own ceiling no
+longer says so from the rail, and you learn it by opening the board or the
+project switcher, whose per-board meter shows `602k / 100k` in the warn tone
+(`burnState`). That was the accepted trade, not an oversight.
 
 The cursor is `issues.read_at`, one per card, moved by `mark_issue_read` and
 `mark_project_read` and by nothing else. Per card and not per board: an

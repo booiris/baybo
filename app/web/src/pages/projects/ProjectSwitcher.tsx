@@ -10,8 +10,14 @@ import {
   useAttention,
   type ProjectAttention,
 } from './useAttention';
-import { activityFor, burnIsNearLimit, useBoardActivity } from './useBoardActivity';
-import { boardMeter, heldOnBudget } from './budgetModel';
+import { activityFor, burnState, useBoardActivity, type BurnState } from './useBoardActivity';
+import { boardMeter } from './budgetModel';
+
+const BURN_NOTE: Record<BurnState, string> = {
+  ok: "Spent today / this board's daily ceiling",
+  near: 'Close to the daily ceiling — new runs are held once it is reached',
+  over: 'Over the daily ceiling — new runs are held, and start again when it resets at 00:00 UTC or you raise it',
+};
 
 export function ProjectSwitcher({
   current,
@@ -111,7 +117,7 @@ export function ProjectSwitcher({
                       tokens: project.daily_budget_tokens,
                     },
                   );
-                  const near = burnIsNearLimit(meter.used, meter.ceiling);
+                  const burn = burnState(meter.used, meter.ceiling);
                   return (
                     <li key={project.id}>
                       <Link
@@ -134,7 +140,7 @@ export function ProjectSwitcher({
                             title={stuckSummary(stuck)}
                             className="shrink-0 rounded-full border-2 border-black bg-err text-white px-1.5 font-mono text-[0.55rem] font-bold leading-[0.85rem] tabular-nums"
                           >
-                            {stuck.approvals + stuck.held + stuck.failed + stuck.unread}
+                            {stuck.approvals + stuck.failed + stuck.unread}
                           </span>
                         )}
                         <span className="ml-auto shrink-0 flex items-baseline gap-2 text-[0.58rem] tabular-nums">
@@ -146,12 +152,8 @@ export function ProjectSwitcher({
                             <span className="text-ink-soft">idle</span>
                           )}
                           <span
-                            className={near ? 'text-warn font-bold' : 'text-ink-soft'}
-                            title={
-                              near
-                                ? 'Close to the daily ceiling — new runs are held once it is reached'
-                                : "Spent today / this board's daily ceiling"
-                            }
+                            className={burn === 'ok' ? 'text-ink-soft' : 'text-warn font-bold'}
+                            title={BURN_NOTE[burn]}
                           >
                             {meter.text}
                           </span>
@@ -240,7 +242,6 @@ export function ProjectSwitcher({
 function stuckSummary(stuck: ProjectAttention): string {
   const parts: string[] = [];
   if (stuck.approvals > 0) parts.push(`${stuck.approvals} waiting on approval`);
-  if (stuck.held > 0) parts.push(heldOnBudget(stuck.held));
   if (stuck.failed > 0) parts.push(`${stuck.failed} failed`);
   if (stuck.unread > 0) parts.push(`${stuck.unread} new since you looked`);
   return parts.join(', ');

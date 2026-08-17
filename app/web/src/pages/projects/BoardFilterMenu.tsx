@@ -203,6 +203,20 @@ export function BoardFilterMenu({
             Failed run only
           </label>
 
+          <label
+            className="flex items-center gap-1.5 font-mono text-[0.68rem] cursor-pointer"
+            title="Cards whose run the daily ceiling has stopped. Raise the ceiling in ⚙ Project settings to start them."
+          >
+            <input
+              type="checkbox"
+              checked={filter.heldOnly}
+              onChange={(event) => {
+                onChange({ ...filter, heldOnly: event.target.checked });
+              }}
+            />
+            Held on budget only
+          </label>
+
           <label className="flex items-center gap-1.5 font-mono text-[0.68rem] cursor-pointer">
             <input
               type="checkbox"

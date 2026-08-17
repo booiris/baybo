@@ -1,25 +1,31 @@
-import type { Agent, IssueRun } from './boardModel';
+import { runState, type Agent, type IssueRun } from './boardModel';
+import type { AvatarRun } from './Avatar';
 
-export function workingAgentIds(activeRuns: IssueRun[]): Set<string> {
-  return new Set(
-    activeRuns.filter((run) => run.status === 'running').map((run) => run.agent_id),
-  );
-}
-
-/// Agents with a run waiting on a free slot, and none of their own going.
+/// Where each teammate stands, over every run on the board — one face per
+/// agent, so one answer per agent.
 ///
-/// Separate from [`workingAgentIds`] rather than a second status on one map:
-/// an agent can have a queued run on one card while working another, and the
-/// strip must show that as working — the dimmed queued face means "this
-/// teammate is idle *and* has something waiting", which is a different thing
-/// to see.
-export function queuedAgentIds(activeRuns: IssueRun[]): Set<string> {
-  const working = workingAgentIds(activeRuns);
-  return new Set(
-    activeRuns
-      .filter((run) => run.status === 'queued' && !working.has(run.agent_id))
-      .map((run) => run.agent_id),
-  );
+/// The rank is the whole idea, because an agent can be on three cards at
+/// once: **working** outranks the rest, since a teammate who is actually
+/// going is not idle whatever else is stacked behind them; and among the
+/// waits, **held** outranks **queued**, because a queued run starts on its
+/// own when a slot frees and a held one does not start until somebody raises
+/// a ceiling. The dimmed face means "idle *and* something is waiting", which
+/// is a different thing to see from plainly idle.
+///
+/// A held run used to answer to neither of the two sets this replaced, so a
+/// board whose whole team the budget had stopped drew a full strip of grey
+/// idle dots with nothing anywhere to say why.
+const RANK: Record<Exclude<AvatarRun, null>, number> = { running: 3, held: 2, queued: 1 };
+
+export function agentRunStates(activeRuns: IssueRun[]): Map<string, AvatarRun> {
+  const states = new Map<string, AvatarRun>();
+  for (const run of activeRuns) {
+    const state = runState(run.status);
+    if (state === null) continue;
+    const seen = states.get(run.agent_id);
+    if (seen == null || RANK[state] > RANK[seen]) states.set(run.agent_id, state);
+  }
+  return states;
 }
 
 export function handleOf(team: Agent[], agentId: string): string {

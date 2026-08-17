@@ -87,10 +87,12 @@ import {
   FailedBadge,
   PinButton,
   PRIORITY_MARK,
+  RunWord,
   SubIssueRing,
   UnassignedMark,
   UnreadPill,
 } from './cardChrome';
+import type { AvatarRun } from './Avatar';
 import { FloatingPanel } from './FloatingPanel';
 import { generatedPortrait, useTeamPortraits, type Portrait } from './portrait';
 import { writeLastProjectId } from './lastProject';
@@ -100,6 +102,7 @@ import { ActivityDrawer } from './ActivityDrawer';
 import { AgentProfile } from './AgentProfile';
 import { ProjectSettings } from './ProjectSettings';
 import { BoardFilterMenu } from './BoardFilterMenu';
+import { OverCeilingChip } from './OverCeilingChip';
 import { boardFilterParams, filterBoard, parseBoardFilter } from './boardFilter';
 import type { BoardFilter } from './boardFilter';
 import { invalidateAttention } from './useAttention';
@@ -107,6 +110,7 @@ import { TeamStrip } from './TeamStrip';
 import { handleOf } from './teamModel';
 import { ToastStack, useToasts } from './Toasts';
 import { useBoardStream } from './useBoardStream';
+import { useBoardActivity } from './useBoardActivity';
 
 export function ProjectBoardPage() {
   const { pid } = useParams<{ pid: string }>();
@@ -202,9 +206,17 @@ export function ProjectBoardPage() {
   }, [client, logout, projectId, refreshKey]);
 
   // Move requests use the full column order, never this filtered view.
-  const view = useMemo(() => filterBoard(board, filter, team), [board, filter, team]);
+  const view = useMemo(() => filterBoard(board, filter, team, activeRuns), [activeRuns, board, filter, team]);
 
   const unread = useMemo(() => unreadTotal(board), [board]);
+  // The ceiling's own numbers, for the notice below the header. Refetched on
+  // the same signal the board is, so a released hold takes the notice with
+  // it rather than leaving it up until something else happens.
+  const activity = useBoardActivity(true, refreshKey);
+  const heldCount = useMemo(
+    () => activeRuns.filter((run) => run.status === 'held').length,
+    [activeRuns],
+  );
 
   const refetch = useCallback(() => {
     setRefreshKey((key) => key + 1);
@@ -265,7 +277,7 @@ export function ProjectBoardPage() {
   const onDragOver = useCallback(
     (event: DragOverEvent) => {
       const overId = event.over === null ? null : String(event.over.id);
-      const drop = resolveDrop(filterBoard(board, filter, team), String(event.active.id), overId);
+      const drop = resolveDrop(filterBoard(board, filter, team, activeRuns), String(event.active.id), overId);
       // A cursor over nothing keeps the preview — and the destination outline
       // — where they were; only aiming somewhere new moves them.
       if (drop === null) return;
@@ -276,7 +288,7 @@ export function ProjectBoardPage() {
       // during a drag re-measures every droppable.
       if (placementChanged(board, next, drop.issue.number)) setBoard(next);
     },
-    [board, filter, team],
+    [activeRuns, board, filter, team],
   );
 
   const onDragEnd = useCallback(
@@ -292,7 +304,7 @@ export function ProjectBoardPage() {
       const number = target.number;
 
       const drop = resolveDrop(
-        filterBoard(board, filter, team),
+        filterBoard(board, filter, team, activeRuns),
         String(event.active.id),
         event.over === null ? null : String(event.over.id),
       );
@@ -357,7 +369,7 @@ export function ProjectBoardPage() {
       );
       if (said !== null) pushToast('ok', said);
     },
-    [board, client, filter, logout, projectId, pushToast, team],
+    [activeRuns, board, client, filter, logout, projectId, pushToast, team],
   );
 
   const onDragCancel = useCallback(() => {
@@ -474,6 +486,16 @@ export function ProjectBoardPage() {
           }}
         />
         <div className="ml-auto flex items-center gap-2">
+          {project === null ? null : (
+            <OverCeilingChip
+              project={project}
+              activity={activity}
+              held={heldCount}
+              onOpenSettings={() => {
+                setShowSettings(true);
+              }}
+            />
+          )}
           <button
             type="button"
             disabled={unread === 0}
@@ -674,7 +696,12 @@ export function ProjectBoardPage() {
           }}
           onSaved={(saved) => {
             setProject(saved);
-            setRefreshKey((key) => key + 1);
+            // `refetch`, not a bare `setRefreshKey`: raising the ceiling is
+            // the one act that releases a held run, and this was the one
+            // refresh in the page that did not also ask the rail again — so
+            // the dot the operator had just discharged sat there for up to a
+            // poll interval and read as one the fix had not worked on.
+            refetch();
           }}
         />
       ) : null}
@@ -846,7 +873,7 @@ function SortableIssueCard({
   onTogglePin,
 }: {
   issue: Issue;
-  run: 'queued' | 'running' | null;
+  run: AvatarRun;
   team: Agent[];
   portrait: Portrait;
   disabled: boolean;
@@ -902,7 +929,7 @@ function IssueCard({
   onTogglePin,
 }: {
   issue: Issue;
-  run?: 'queued' | 'running' | null;
+  run?: AvatarRun;
   overlay?: boolean;
   team?: Agent[];
   /// Resolved faces from the board. The drag overlay leaves it alone and
@@ -983,15 +1010,7 @@ function IssueCard({
             <SubIssueRing progress={issue.sub_issues} />
           </span>
         ) : null}
-        {run !== null ? (
-          <span
-            className={`${issue.sub_issues == null ? 'ml-auto' : ''} shrink-0 font-mono text-[0.54rem] font-bold uppercase ${
-              run === 'running' ? 'text-ok' : 'text-ink-soft'
-            }`}
-          >
-            {run === 'running' ? 'working' : 'queued'}
-          </span>
-        ) : null}
+        <RunWord run={run} className={issue.sub_issues == null ? 'ml-auto' : ''} />
       </div>
     </article>
   );

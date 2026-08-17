@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import type { Agent, Issue } from './boardModel';
+import type { Agent, Issue, IssueRun } from './boardModel';
 import { emptyBoard } from './boardModel';
 import {
   EMPTY_FILTER,
@@ -53,62 +53,75 @@ describe('matches', () => {
     // Cancel is the terminal negative, not a delete: the card stays on the
     // board struck through, and hiding it is the deliberate act.
     const cancelled = issue(1, { cancelled_at_ms: 123 });
-    expect(matches(cancelled, filter(), TEAM)).toBe(true);
-    expect(matches(cancelled, filter({ showCancelled: false }), TEAM)).toBe(false);
+    expect(matches(cancelled, filter(), TEAM, null)).toBe(true);
+    expect(matches(cancelled, filter({ showCancelled: false }), TEAM, null)).toBe(false);
   });
 
   it('finds a card by title substring, case-insensitively', () => {
     const card = issue(1, { title: 'Wire the Board' });
-    expect(matches(card, filter({ text: 'wire' }), TEAM)).toBe(true);
-    expect(matches(card, filter({ text: 'BOARD' }), TEAM)).toBe(true);
-    expect(matches(card, filter({ text: 'parser' }), TEAM)).toBe(false);
+    expect(matches(card, filter({ text: 'wire' }), TEAM, null)).toBe(true);
+    expect(matches(card, filter({ text: 'BOARD' }), TEAM, null)).toBe(true);
+    expect(matches(card, filter({ text: 'parser' }), TEAM, null)).toBe(false);
   });
 
   it('finds a card by number, with or without the hash', () => {
     const card = issue(12, { title: 'nothing to match on' });
-    expect(matches(card, filter({ text: '#12' }), TEAM)).toBe(true);
-    expect(matches(card, filter({ text: '12' }), TEAM)).toBe(true);
-    expect(matches(card, filter({ text: '1' }), TEAM)).toBe(false);
+    expect(matches(card, filter({ text: '#12' }), TEAM, null)).toBe(true);
+    expect(matches(card, filter({ text: '12' }), TEAM, null)).toBe(true);
+    expect(matches(card, filter({ text: '1' }), TEAM, null)).toBe(false);
   });
 
   it('separates "anyone" from "nobody"', () => {
     const taken = issue(1, { assignee: 'id-dev-1' });
     const free = issue(2);
-    expect(matches(taken, filter(), TEAM)).toBe(true);
-    expect(matches(free, filter(), TEAM)).toBe(true);
+    expect(matches(taken, filter(), TEAM, null)).toBe(true);
+    expect(matches(free, filter(), TEAM, null)).toBe(true);
 
     const unassigned = filter({ assignee: { kind: 'unassigned' } });
-    expect(matches(taken, unassigned, TEAM)).toBe(false);
-    expect(matches(free, unassigned, TEAM)).toBe(true);
+    expect(matches(taken, unassigned, TEAM, null)).toBe(false);
+    expect(matches(free, unassigned, TEAM, null)).toBe(true);
 
     const dev = filter({ assignee: { kind: 'handle', handle: 'dev-1' } });
-    expect(matches(taken, dev, TEAM)).toBe(true);
-    expect(matches(free, dev, TEAM)).toBe(false);
+    expect(matches(taken, dev, TEAM, null)).toBe(true);
+    expect(matches(free, dev, TEAM, null)).toBe(false);
   });
 
   it('matches an assignee by the handle the card renders', () => {
     const departed = issue(1, { assignee: 'id-gone' });
-    expect(matches(departed, filter({ assignee: { kind: 'handle', handle: 'dev-1' } }), TEAM)).toBe(
+    expect(matches(departed, filter({ assignee: { kind: 'handle', handle: 'dev-1' } }), TEAM, null)).toBe(
       false,
     );
   });
 
   it('narrows to what is new, on the card count and nothing else', () => {
-    expect(matches(issue(1), filter({ unreadOnly: true }), TEAM)).toBe(false);
-    expect(matches(issue(1, { unread: 2 }), filter({ unreadOnly: true }), TEAM)).toBe(true);
+    expect(matches(issue(1), filter({ unreadOnly: true }), TEAM, null)).toBe(false);
+    expect(matches(issue(1, { unread: 2 }), filter({ unreadOnly: true }), TEAM, null)).toBe(true);
     // A failed run is its own narrowing precisely because looking never
     // clears it; folding it in here would hand this filter a card it
     // cannot empty.
-    expect(matches(issue(1, { last_run_failed: true }), filter({ unreadOnly: true }), TEAM)).toBe(
+    expect(matches(issue(1, { last_run_failed: true }), filter({ unreadOnly: true }), TEAM, null)).toBe(
       false,
     );
   });
 
   it('narrows to blocked work', () => {
-    expect(matches(issue(1), filter({ blockedOnly: true }), TEAM)).toBe(false);
+    expect(matches(issue(1), filter({ blockedOnly: true }), TEAM, null)).toBe(false);
     expect(
-      matches(issue(1, { blocked_reason: 'waiting on review' }), filter({ blockedOnly: true }), TEAM),
+      matches(issue(1, { blocked_reason: 'waiting on review' }), filter({ blockedOnly: true }), TEAM, null),
     ).toBe(true);
+  });
+
+  it('narrows to work the daily ceiling has stopped', () => {
+    // Held is the one narrowing whose fact is not on the card's row — it
+    // comes off the board's live runs, through the same `runIndicator` the
+    // card's own word reads, so the two cannot disagree about what held is.
+    const card = issue(1);
+    expect(matches(card, filter({ heldOnly: true }), TEAM, 'held')).toBe(true);
+    expect(matches(card, filter({ heldOnly: true }), TEAM, 'queued')).toBe(false);
+    expect(matches(card, filter({ heldOnly: true }), TEAM, 'running')).toBe(false);
+    expect(matches(card, filter({ heldOnly: true }), TEAM, null)).toBe(false);
+    // Off, it says nothing about any of them.
+    expect(matches(card, filter(), TEAM, null)).toBe(true);
   });
 
   it('applies every clause together', () => {
@@ -118,8 +131,8 @@ describe('matches', () => {
       assignee: { kind: 'handle', handle: 'dev-1' },
       blockedOnly: true,
     });
-    expect(matches(card, all, TEAM)).toBe(true);
-    expect(matches({ ...card, blocked_reason: undefined }, all, TEAM)).toBe(false);
+    expect(matches(card, all, TEAM, null)).toBe(true);
+    expect(matches({ ...card, blocked_reason: undefined }, all, TEAM, null)).toBe(false);
   });
 });
 
@@ -128,10 +141,31 @@ describe('filterBoard', () => {
     const board = emptyBoard();
     board.backlog = [issue(1, { title: 'keep' }), issue(2, { title: 'drop' })];
     board.todo = [issue(3, { title: 'keep', status: 'todo' })];
-    const view = filterBoard(board, filter({ text: 'keep' }), TEAM);
+    const view = filterBoard(board, filter({ text: 'keep' }), TEAM, []);
     expect(view.backlog.map((i) => i.number)).toEqual([1]);
     expect(view.todo.map((i) => i.number)).toEqual([3]);
     expect(board.backlog).toHaveLength(2);
+  });
+
+  it('resolves each card’s run state from the board’s own runs', () => {
+    const board = emptyBoard();
+    board.backlog = [issue(1), issue(2), issue(3)];
+    const runs: IssueRun[] = [
+      { number: 1, agent_id: 'a', trigger: 'started', status: 'held', attempt: 1, created_at_ms: 0 },
+      {
+        number: 2,
+        agent_id: 'a',
+        trigger: 'started',
+        status: 'queued',
+        attempt: 1,
+        created_at_ms: 0,
+      },
+    ];
+    expect(filterBoard(board, filter({ heldOnly: true }), TEAM, runs).backlog.map((i) => i.number))
+      .toEqual([1]);
+    // Card #3 has no run at all, and a board handed no runs holds nothing —
+    // both must read as "not held" rather than as unknown.
+    expect(filterBoard(board, filter({ heldOnly: true }), TEAM, []).backlog).toHaveLength(0);
   });
 });
 

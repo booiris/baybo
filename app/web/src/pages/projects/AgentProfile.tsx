@@ -6,7 +6,7 @@ import { useAdminClient } from '../../api/auth';
 import { fetchModelPool, setAgentModel } from './api';
 import { COLUMN_LABEL, type Agent, type Issue, type IssueRun } from './boardModel';
 import { Picker } from './Picker';
-import { llmOptions, llmSelected, workingAgentIds, type ModelPool } from './teamModel';
+import { agentRunStates, llmOptions, llmSelected, type ModelPool } from './teamModel';
 
 export function AgentProfile({
   agent,
@@ -31,7 +31,7 @@ export function AgentProfile({
   /// snapshot, and a pin it just wrote must not read back stale.
   onChanged: () => void;
 }) {
-  const working = workingAgentIds(activeRuns).has(agent.id);
+  const working = agentRunStates(activeRuns).get(agent.id) === 'running';
   const assigned = issues.filter(
     (issue) => issue.assignee === agent.id && issue.cancelled_at_ms == null,
   );

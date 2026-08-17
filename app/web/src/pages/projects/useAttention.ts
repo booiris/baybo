@@ -3,12 +3,22 @@ import { useEffect, useState } from 'react';
 import { useAdminClient } from '../../api/auth';
 import type { AdminClient } from '../../api/client';
 import type { paths } from '../../api/schema';
-import { heldOnBudget } from './budgetModel';
 
 export type ProjectAttention =
   paths['/v1/projects/attention']['get']['responses'][200]['content']['application/json']['items'][number];
 
 const POLL_MS = 60_000;
+
+/// How long one poll may stay open before the store stops waiting on it.
+///
+/// `fetch` has no timeout of its own, so a socket that opens and then goes
+/// quiet leaves its promise pending forever — and with it `store.inFlight`,
+/// which every later `invalidateAttention` joins instead of asking again.
+/// The badge then holds whatever it last painted for the life of the tab,
+/// which is this module's own failure mode wearing the bug it was written to
+/// fix. Shorter than [`POLL_MS`] on purpose: a poll still open when the next
+/// one is due is a poll that is never going to answer.
+const POLL_TIMEOUT_MS = 15_000;
 
 /// One cache, one timer, for every component that shows the badge.
 ///
@@ -44,9 +54,28 @@ function publish(boards: ProjectAttention[]) {
   for (const listener of store.listeners) listener();
 }
 
+const EXPIRED = Symbol('attention poll expired');
+
 async function poll(client: AdminClient): Promise<void> {
+  const abort = new AbortController();
+  // Aborted *and* raced, which is one belt more than it looks. The abort is
+  // what frees the socket; the race is what guarantees this function settles
+  // and so releases `store.inFlight`, because a transport that does not
+  // honour the signal would otherwise strand the store exactly as before.
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<typeof EXPIRED>((resolve) => {
+    timer = setTimeout(() => {
+      abort.abort();
+      resolve(EXPIRED);
+    }, POLL_TIMEOUT_MS);
+  });
   try {
-    const { data, error, response } = await client.GET('/v1/projects/attention');
+    const answer = await Promise.race([
+      client.GET('/v1/projects/attention', { signal: abort.signal }),
+      expired,
+    ]);
+    if (answer === EXPIRED) return;
+    const { data, error, response } = answer;
     if (error !== undefined || !response.ok) return;
     publish(data.items);
   } catch {
@@ -54,6 +83,8 @@ async function poll(client: AdminClient): Promise<void> {
     // the next poll replaces them wholesale, and an empty list is how the
     // server says "nothing waiting", so a dropped request must not be
     // allowed to say it on the server's behalf.
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -158,11 +189,9 @@ export function attentionSummary(boards: ProjectAttention[]): string {
   const sum = (pick: (b: ProjectAttention) => number) =>
     boards.reduce((total, board) => total + pick(board), 0);
   const approvals = sum((b) => b.approvals);
-  const held = sum((b) => b.held);
   const failed = sum((b) => b.failed);
   const unread = sum((b) => b.unread);
   if (approvals > 0) parts.push(`${approvals} waiting on approval`);
-  if (held > 0) parts.push(heldOnBudget(held));
   if (failed > 0) parts.push(`${failed} failed`);
   if (unread > 0) parts.push(`${unread} new since you looked`);
   const where = boards.length === 1 ? boards[0].name : `${boards.length} boards`;

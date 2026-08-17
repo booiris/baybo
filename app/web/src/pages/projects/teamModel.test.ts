@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { Agent, IssueRun } from './boardModel';
-import { handleOf, handleProblem, llmOptions, llmSelected, workingAgentIds } from './teamModel';
+import { agentRunStates, handleOf, handleProblem, llmOptions, llmSelected } from './teamModel';
 
 function run(agentId: string, status: IssueRun['status']): IssueRun {
   return {
@@ -26,14 +26,34 @@ function member(id: string, handle: string): Agent {
   };
 }
 
-describe('workingAgentIds', () => {
-  it('counts running work and not queued work', () => {
-    const working = workingAgentIds([run('a', 'running'), run('b', 'queued')]);
-    expect([...working]).toEqual(['a']);
+describe('agentRunStates', () => {
+  it('tells working apart from waiting', () => {
+    const states = agentRunStates([run('a', 'running'), run('b', 'queued')]);
+    expect(states.get('a')).toBe('running');
+    expect(states.get('b')).toBe('queued');
   });
 
-  it('is empty when nothing is in flight', () => {
-    expect(workingAgentIds([]).size).toBe(0);
+  it('does not draw a teammate the budget stopped as plainly idle', () => {
+    // A held run answered to neither of the two sets this replaced, so a
+    // board the ceiling had stopped showed a full strip of grey idle dots
+    // with nothing anywhere on it to say why.
+    expect(agentRunStates([run('a', 'held')]).get('a')).toBe('held');
+  });
+
+  it('ranks working over held, and held over queued', () => {
+    // One face per agent, and an agent can be on three cards. Working wins
+    // because a teammate who is going is not idle whatever is stacked
+    // behind them; held beats queued because a queued run starts on its own
+    // when a slot frees and a held one waits on somebody raising a ceiling.
+    const busy = agentRunStates([run('a', 'queued'), run('a', 'held'), run('a', 'running')]);
+    expect(busy.get('a')).toBe('running');
+    const stopped = agentRunStates([run('a', 'queued'), run('a', 'held')]);
+    expect(stopped.get('a')).toBe('held');
+  });
+
+  it('says nothing about an agent with nothing in flight', () => {
+    expect(agentRunStates([]).size).toBe(0);
+    expect(agentRunStates([run('a', 'running')]).get('b')).toBeUndefined();
   });
 });
 

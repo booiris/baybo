@@ -54,7 +54,6 @@ const board = (name: string) => ({
   project_id: `01J${name}`,
   name,
   approvals: 1,
-  held: 0,
   failed: 0,
   unread: 0,
 });
@@ -104,6 +103,37 @@ describe('the attention store', () => {
 
     await gateway.answer();
     expect(gateway.calls()).toBe(2);
+  });
+
+  it('gives up on a request that never answers, instead of wedging on it', async () => {
+    // `fetch` has no timeout, and this store keeps exactly one request in
+    // flight for every caller to join. A socket that opens and goes quiet
+    // therefore used to pin `inFlight` forever: the badge froze at whatever
+    // it last painted, for the life of the tab, with the server perfectly
+    // healthy. That is this module's own failure mode — the un-clearable
+    // dot it was written to prevent, arriving from the client side.
+    vi.useFakeTimers();
+    try {
+      const { invalidateAttention } = await freshModule();
+      const gateway = fakeGateway([LIT, QUIET]);
+
+      invalidateAttention(gateway.client);
+      expect(gateway.calls()).toBe(1);
+      // Nothing answers. A second act finds the dead request and parks
+      // behind it rather than asking.
+      invalidateAttention(gateway.client);
+      expect(gateway.calls()).toBe(1);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(20_000);
+      });
+
+      // The abandoned poll released the store, and the invalidation it was
+      // sitting on got a request of its own.
+      expect(gateway.calls()).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('shares one cache and one request across every component', async () => {

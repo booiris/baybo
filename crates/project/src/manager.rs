@@ -418,14 +418,32 @@ impl ProjectManager {
 
         // `Headroom` guarantees figures for an exhausted board.
         if let (true, Some(figures)) = (headroom.is_exhausted(), headroom.figures()) {
-            if let Err(e) = self.store.hold_run(&run.id).await {
-                // The hold failed, so the run is still `Queued` and will be
-                // started. Overspending by one run beats stranding it.
-                tracing::error!(issue = issue.number, error = %e, "could not hold a run over budget");
-            } else {
-                self.record(issue, IssueActor::System, figures.exhausted())
-                    .await;
-                return Some(run);
+            // The **held** row, not the one `enqueue_run` answered with a
+            // moment earlier: that one still says `Queued`, and it is what
+            // the caller reports. Handed back unchanged it made the
+            // follow-up log line call a stopped run "queued", and `retry`
+            // answer 201 with a body saying the run was on its way.
+            match self.store.hold_run(&run.id).await {
+                Ok(Some(held)) => {
+                    self.record(issue, IssueActor::System, figures.exhausted())
+                        .await;
+                    return Some(held);
+                }
+                // Either way the hold did not take, so the row is still
+                // startable and is started: overspending by one run beats
+                // stranding it. `None` is a compare-and-set that found the
+                // row in another state, which nothing else should be able to
+                // do to a row this call has only just written.
+                Ok(None) => {
+                    tracing::warn!(
+                        issue = issue.number,
+                        run = %run.id,
+                        "a run was moved out of the queue before the budget could hold it"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(issue = issue.number, error = %e, "could not hold a run over budget");
+                }
             }
         }
         (self.dispatch)(run.clone());
@@ -493,16 +511,20 @@ impl ProjectManager {
             let Some(issue) = self.card_for(&run).await else {
                 continue;
             };
-            if !self.store.release_run(&run.id).await? {
+            // What goes out is the **queued** row this just wrote. `held`
+            // came off `held_runs`, so dispatching it would hand the
+            // executor a row saying `Held` — and `IssueRunWaiter::enqueued`
+            // documents its copy as reading `Queued` for the whole turn.
+            let Some(queued) = self.store.release_run(&run.id).await? else {
                 continue;
-            }
+            };
             released += 1;
-            self.events.run_changed(project, run.number);
+            self.events.run_changed(project, queued.number);
             if let Some(figures) = figures {
                 self.record(&issue, IssueActor::System, figures.restored())
                     .await;
             }
-            (self.dispatch)(run);
+            (self.dispatch)(queued);
         }
         Ok(released)
     }
@@ -1945,7 +1967,7 @@ impl ProjectManager {
         id: &ProjectId,
         update: ProjectUpdate,
     ) -> Result<ProjectRow> {
-        self.writable_project(id).await?;
+        let before = self.writable_project(id).await?;
         validate_ceilings(update.daily_budget, update.daily_budget_tokens)?;
         let update = ProjectUpdate {
             name: validate_name(&update.name)?,
@@ -1954,6 +1976,25 @@ impl ProjectManager {
             daily_budget_tokens: update.daily_budget_tokens,
             max_parallel_issue_runs: update.max_parallel_issue_runs,
         };
+        // A ceiling is the one field here that can stop a board, and it left
+        // no trace anywhere: no event, no timeline row, and `updated_at` is
+        // bumped by any field, so "when did this board get a 100k/day token
+        // ceiling, and was it meant" had no answer at all. This is not an
+        // audit trail — a board-level event stream is what that would take,
+        // and none exists — but it does put the before and after somewhere a
+        // later investigation can read.
+        if before.daily_budget != update.daily_budget
+            || before.daily_budget_tokens != update.daily_budget_tokens
+        {
+            tracing::info!(
+                project = %id,
+                money_from = ?before.daily_budget,
+                money_to = ?update.daily_budget,
+                tokens_from = ?before.daily_budget_tokens,
+                tokens_to = ?update.daily_budget_tokens,
+                "a daily ceiling changed"
+            );
+        }
         self.store.update_project(id, &update).await?;
         self.events.project_changed(id);
         // A raised ceiling should start the work it was blocking, without

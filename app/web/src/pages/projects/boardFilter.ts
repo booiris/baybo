@@ -1,4 +1,13 @@
-import { COLUMNS, emptyBoard, type Agent, type Board, type Issue } from './boardModel';
+import {
+  COLUMNS,
+  emptyBoard,
+  runIndicator,
+  type Agent,
+  type Board,
+  type Issue,
+  type IssueRun,
+} from './boardModel';
+import type { AvatarRun } from './Avatar';
 import { handleOf } from './teamModel';
 
 export type AssigneeFilter =
@@ -12,6 +21,7 @@ export type BoardFilter = {
   unreadOnly: boolean;
   blockedOnly: boolean;
   failedOnly: boolean;
+  heldOnly: boolean;
   showCancelled: boolean;
 };
 
@@ -26,6 +36,7 @@ export const EMPTY_FILTER: BoardFilter = {
   unreadOnly: false,
   blockedOnly: false,
   failedOnly: false,
+  heldOnly: false,
   showCancelled: true,
 };
 
@@ -34,6 +45,7 @@ const PARAM_ASSIGNEE = 'assignee';
 const PARAM_UNREAD = 'unread';
 const PARAM_BLOCKED = 'blocked';
 const PARAM_FAILED = 'failed';
+const PARAM_HELD = 'held';
 const PARAM_CANCELLED = 'cancelled';
 
 const UNASSIGNED = 'unassigned';
@@ -48,6 +60,7 @@ function restrictions(filter: BoardFilter): boolean[] {
     filter.unreadOnly,
     filter.blockedOnly,
     filter.failedOnly,
+    filter.heldOnly,
     !filter.showCancelled,
   ];
 }
@@ -79,7 +92,16 @@ function matchesAssignee(issue: Issue, filter: AssigneeFilter, team: Agent[]): b
   }
 }
 
-export function matches(issue: Issue, filter: BoardFilter, team: Agent[]): boolean {
+/// `run` is the card's live run state, which is not on the row: it comes off
+/// the board's `activeRuns` through `runIndicator`, the same call the card's
+/// own word reads. Passed in rather than looked up here so that the narrowing
+/// and the word on the card can never disagree about what "held" means.
+export function matches(
+  issue: Issue,
+  filter: BoardFilter,
+  team: Agent[],
+  run: AvatarRun,
+): boolean {
   if (!filter.showCancelled && issue.cancelled_at_ms != null) return false;
   // The card's own count and nothing else. A failed run is a separate
   // narrowing precisely because looking never clears it — folding it in here
@@ -87,14 +109,27 @@ export function matches(issue: Issue, filter: BoardFilter, team: Agent[]): boole
   if (filter.unreadOnly && issue.unread === 0) return false;
   if (filter.blockedOnly && issue.blocked_reason == null) return false;
   if (filter.failedOnly && !issue.last_run_failed) return false;
+  // Held is the one narrowing whose cards the operator cannot act on from
+  // the board at all — the act is a ceiling, one screen away in settings. It
+  // is here so that a rail dot counting held runs has somewhere to land: the
+  // card says `held` on its face, and this is how you find those cards on a
+  // board of thirty without opening them one at a time.
+  if (filter.heldOnly && run !== 'held') return false;
   if (!matchesAssignee(issue, filter.assignee, team)) return false;
   return matchesText(issue, filter.text);
 }
 
-export function filterBoard(board: Board, filter: BoardFilter, team: Agent[]): Board {
+export function filterBoard(
+  board: Board,
+  filter: BoardFilter,
+  team: Agent[],
+  activeRuns: IssueRun[],
+): Board {
   const view = emptyBoard();
   for (const status of COLUMNS) {
-    view[status] = board[status].filter((issue) => matches(issue, filter, team));
+    view[status] = board[status].filter((issue) =>
+      matches(issue, filter, team, runIndicator(activeRuns, issue.number)),
+    );
   }
   return view;
 }
@@ -113,6 +148,7 @@ export function parseBoardFilter(params: URLSearchParams): BoardFilter {
     unreadOnly: params.get(PARAM_UNREAD) === '1',
     blockedOnly: params.get(PARAM_BLOCKED) === '1',
     failedOnly: params.get(PARAM_FAILED) === '1',
+    heldOnly: params.get(PARAM_HELD) === '1',
     // Absent means shown: hiding is the deliberate act, so it is the one
     // that has to be written down in the URL.
     showCancelled: params.get(PARAM_CANCELLED) !== '0',
@@ -130,6 +166,7 @@ export function boardFilterParams(filter: BoardFilter): URLSearchParams {
   if (filter.unreadOnly) params.set(PARAM_UNREAD, '1');
   if (filter.blockedOnly) params.set(PARAM_BLOCKED, '1');
   if (filter.failedOnly) params.set(PARAM_FAILED, '1');
+  if (filter.heldOnly) params.set(PARAM_HELD, '1');
   if (!filter.showCancelled) params.set(PARAM_CANCELLED, '0');
   return params;
 }

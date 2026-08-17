@@ -1468,6 +1468,64 @@ async fn a_retry_on_a_held_run_blames_the_budget_when_there_is_still_no_room() {
 }
 
 #[tokio::test]
+async fn a_run_the_budget_held_says_held_in_the_answer_it_hands_back() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(NewProject {
+            daily_budget: Some(baybo_model::MicroUsd::ZERO),
+            daily_budget_tokens: None,
+            ..new_project("Skint")
+        })
+        .await
+        .expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev),
+                ..new_issue("work nobody can afford yet")
+            },
+        )
+        .await
+        .expect("issue");
+    // Free the card's dedupe slot, so the press below reaches the enqueue
+    // rather than the refusal that sits above it.
+    let first = f.manager.list_runs(&p.id, 1).await.expect("runs").remove(0);
+    f.store_settle(&first.id, RunStatus::Cancelled).await;
+    f.dispatched.lock().clear();
+
+    let started = f
+        .manager
+        .retry_run(&p.id, 1)
+        .await
+        .expect("the press was taken");
+    // The row the enqueue answered with was written *before* the hold, so
+    // handing it back unchanged told the caller the opposite of what the
+    // ledger holds: this response said the run was on its way, and the
+    // follow-up path logged "queued a follow-up" for a run the budget had
+    // just stopped.
+    assert_eq!(started.status, RunStatus::Held);
+    let ledger = f.manager.list_runs(&p.id, 1).await.expect("runs");
+    let recorded = ledger
+        .iter()
+        .find(|run| run.id == started.id)
+        .expect("the row it claims to have started");
+    assert_eq!(
+        recorded.status,
+        RunStatus::Held,
+        "which is what the ledger says too"
+    );
+    assert!(
+        f.dispatched.lock().is_empty(),
+        "and nothing went out on a board with no room"
+    );
+}
+
+#[tokio::test]
 async fn a_crash_leaves_runs_the_boot_sweep_hands_back() {
     let f = fixture().await;
     let p = f.manager.create_project(new_project("p")).await.expect("p");
@@ -1890,8 +1948,8 @@ forwards_everything_else! {
         -> StoreResult<Vec<IssueEventRow>>;
     live_issue_by_source_key(project: &ProjectId, source_key: &str) -> StoreResult<Option<IssueRow>>;
     list_children(parent: &IssueId) -> StoreResult<Vec<IssueRow>>;
-    hold_run(id: &IssueRunId) -> StoreResult<bool>;
-    release_run(id: &IssueRunId) -> StoreResult<bool>;
+    hold_run(id: &IssueRunId) -> StoreResult<Option<baybo_store::project::IssueRunRow>>;
+    release_run(id: &IssueRunId) -> StoreResult<Option<baybo_store::project::IssueRunRow>>;
     mark_issue_read(issue: &IssueId, at: DateTime<Utc>) -> StoreResult<bool>;
     mark_project_read(project: &ProjectId, at: DateTime<Utc>) -> StoreResult<usize>;
     card_signals(project: &ProjectId)
@@ -2388,8 +2446,12 @@ async fn a_hold_on_a_cancelled_card_is_called_off_even_on_a_stopped_board() {
         .into_issue();
 
     assert_eq!(
-        f.manager.attention(&[]).await.expect("attention")[0].1.held,
-        1
+        f.manager
+            .list_runs(&project.id, issue.number)
+            .await
+            .expect("runs")[0]
+            .status,
+        RunStatus::Held
     );
 
     f.manager
@@ -2429,14 +2491,9 @@ async fn a_hold_on_a_cancelled_card_is_called_off_even_on_a_stopped_board() {
         .list_runs(&project.id, issue.number)
         .await
         .expect("runs");
-    assert_eq!(runs[0].status, RunStatus::Cancelled);
-    assert!(
-        f.manager
-            .attention(&[])
-            .await
-            .expect("attention")
-            .iter()
-            .all(|(_, c)| c.held == 0),
+    assert_eq!(
+        runs[0].status,
+        RunStatus::Cancelled,
         "a hold nothing will ever start is not work waiting for a slot"
     );
 }
@@ -2483,10 +2540,19 @@ async fn a_raised_budget_releases_what_it_was_holding() {
         .await
         .expect("raise the ceiling");
 
+    let dispatched = f.dispatched.lock().clone();
     assert_eq!(
-        f.dispatched.lock().len(),
+        dispatched.len(),
         1,
         "the held run started once there was room"
+    );
+    // The released row, not the one `held_runs` read a moment earlier.
+    // `IssueRunWaiter::enqueued` documents its copy as reading `Queued` for
+    // the whole turn, and it can only do that if what it was handed says so.
+    assert_eq!(
+        dispatched[0].status,
+        RunStatus::Queued,
+        "and what went out is the row the release wrote"
     );
     let runs = f.manager.list_runs(&project.id, 1).await.expect("runs");
     assert_eq!(runs[0].status, RunStatus::Queued);
@@ -3698,10 +3764,20 @@ async fn the_attention_count_is_what_only_the_operator_can_clear() {
         .await
         .expect("create")
         .into_issue();
-    let counts = f.manager.attention(&[]).await.expect("attention");
-    assert_eq!(counts.len(), 1);
-    assert_eq!(counts[0].1.held, 1);
-    assert_eq!(counts[0].1.failed, 0);
+    // A board stopped by its own ceiling is a standing condition, not news:
+    // it is reported in the board's header, never in the rail's mark.
+    assert!(
+        f.manager
+            .attention(&[])
+            .await
+            .expect("attention")
+            .is_empty(),
+        "an over-budget board is not, on its own, something waiting on you"
+    );
+    assert_eq!(
+        f.manager.list_runs(&p.id, 1).await.expect("runs")[0].status,
+        RunStatus::Held
+    );
 
     f.manager
         .update_project(
@@ -3716,10 +3792,10 @@ async fn the_attention_count_is_what_only_the_operator_can_clear() {
         )
         .await
         .expect("raise");
-    let counts = f.manager.attention(&[]).await.expect("attention");
-    assert!(
-        counts.iter().all(|(_, c)| c.held == 0),
-        "the hold was released: {counts:?}"
+    assert_eq!(
+        f.manager.list_runs(&p.id, 1).await.expect("runs")[0].status,
+        RunStatus::Queued,
+        "the hold was released"
     );
 }
 
@@ -3810,11 +3886,7 @@ async fn an_archived_board_asks_for_nothing() {
     let f = fixture().await;
     let p = f
         .manager
-        .create_project(NewProject {
-            daily_budget: Some(baybo_model::MicroUsd::ZERO),
-            daily_budget_tokens: None,
-            ..new_project("Shelved")
-        })
+        .create_project(new_project("Shelved"))
         .await
         .expect("p");
     let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
@@ -3825,12 +3897,20 @@ async fn an_archived_board_asks_for_nothing() {
             NewIssueRequest {
                 status: IssueStatus::InProgress,
                 assignee: Some(dev),
-                ..new_issue("held")
+                ..new_issue("broken")
             },
         )
         .await
         .expect("create")
         .into_issue();
+    // A failure nobody has looked at, because that is a signal the rail still
+    // carries. A hold used to stand in for one here and no longer can: a
+    // board stopped by its own ceiling is a standing condition, reported in
+    // the board's header rather than in the rail's mark.
+    let run = f.manager.list_runs(&p.id, 1).await.expect("runs")[0]
+        .id
+        .clone();
+    f.store_settle(&run, RunStatus::Failed).await;
     assert_eq!(f.manager.attention(&[]).await.expect("attention").len(), 1);
 
     f.manager

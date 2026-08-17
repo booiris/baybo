@@ -45,7 +45,7 @@ describe('ProjectSettings', () => {
       onAddAgent={vi.fn()}
       />,
     );
-    const box = screen.getByLabelText('Daily budget');
+    const box = screen.getByLabelText('Daily budget (USD)');
     expect(box).toHaveValue('12.5');
 
     await userEvent.clear(box);
@@ -71,7 +71,7 @@ describe('ProjectSettings', () => {
       onAddAgent={vi.fn()}
       />,
     );
-    await userEvent.clear(screen.getByLabelText('Daily budget'));
+    await userEvent.clear(screen.getByLabelText('Daily budget (USD)'));
     await userEvent.click(screen.getByRole('button', { name: 'Save' }));
     await waitFor(() => {
       expect(api.updateProject).toHaveBeenCalledWith(
@@ -93,7 +93,7 @@ describe('ProjectSettings', () => {
       onAddAgent={vi.fn()}
       />,
     );
-    const box = screen.getByLabelText('Daily token budget');
+    const box = screen.getByLabelText('Daily token budget (tokens)');
     expect(box).toHaveValue('250000');
 
     await userEvent.clear(box);
@@ -119,7 +119,7 @@ describe('ProjectSettings', () => {
       onAddAgent={vi.fn()}
       />,
     );
-    await userEvent.clear(screen.getByLabelText('Daily token budget'));
+    await userEvent.clear(screen.getByLabelText('Daily token budget (tokens)'));
     await userEvent.click(screen.getByRole('button', { name: 'Save' }));
     await waitFor(() => {
       expect(api.updateProject).toHaveBeenCalledWith(
@@ -141,7 +141,7 @@ describe('ProjectSettings', () => {
       onAddAgent={vi.fn()}
       />,
     );
-    await userEvent.type(screen.getByLabelText('Daily token budget'), '250k');
+    await userEvent.type(screen.getByLabelText('Daily token budget (tokens)'), '250k');
     await userEvent.click(screen.getByRole('button', { name: 'Save' }));
     expect(await screen.findByText(/whole number of tokens/)).toBeInTheDocument();
     expect(api.updateProject).not.toHaveBeenCalled();
@@ -211,10 +211,35 @@ describe('ProjectSettings', () => {
       team={[]}
       onOpenProfile={vi.fn()}
       onAddAgent={vi.fn()} />);
-    await userEvent.type(screen.getByLabelText('Daily budget'), 'lots');
+    await userEvent.type(screen.getByLabelText('Daily budget (USD)'), 'lots');
     await userEvent.click(screen.getByRole('button', { name: 'Save' }));
     expect(await screen.findByText(/must be an amount in dollars/)).toBeInTheDocument();
     expect(api.updateProject).not.toHaveBeenCalled();
+  });
+
+  it('says which unit each ceiling is in', () => {
+    // Two identical boxes whose units are 10^6 apart. Unlabelled, "5" in the
+    // money box is $5 and "5" in the token box is five tokens, and nothing
+    // on screen said which was which — the live board that started all this
+    // carries a 100,000-token ceiling, a tenth of one run.
+    render(
+      <ProjectSettings
+        project={project()}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+        team={[]}
+        onOpenProfile={vi.fn()}
+        onAddAgent={vi.fn()}
+      />,
+    );
+    expect(screen.getByLabelText('Daily budget (USD)')).toHaveAttribute(
+      'placeholder',
+      expect.stringContaining('5.00'),
+    );
+    expect(screen.getByLabelText('Daily token budget (tokens)')).toHaveAttribute(
+      'placeholder',
+      expect.stringContaining('2000000'),
+    );
   });
 
   it('makes an archived board read-only but still un-archivable', async () => {
@@ -229,8 +254,8 @@ describe('ProjectSettings', () => {
       />,
     );
     expect(screen.getByLabelText('Name')).toBeDisabled();
-    expect(screen.getByLabelText('Daily budget')).toBeDisabled();
-    expect(screen.getByLabelText('Daily token budget')).toBeDisabled();
+    expect(screen.getByLabelText('Daily budget (USD)')).toBeDisabled();
+    expect(screen.getByLabelText('Daily token budget (tokens)')).toBeDisabled();
     expect(screen.queryByRole('button', { name: 'Save' })).not.toBeInTheDocument();
 
     await userEvent.click(screen.getByRole('button', { name: 'Unarchive' }));

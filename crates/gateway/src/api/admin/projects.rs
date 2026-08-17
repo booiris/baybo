@@ -1560,14 +1560,17 @@ async fn resolve_approval(
 }
 
 /// One board with something waiting on the operator.
+///
+/// Every count here is an event. Runs the daily ceiling is holding are a
+/// standing condition rather than news and are deliberately absent — the
+/// board reports those in its own header, next to the setting that lifts
+/// them. See `AttentionCounts`.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ProjectAttentionDto {
     pub project_id: String,
     pub name: String,
     /// Tool calls parked on an approval prompt.
     pub approvals: usize,
-    /// Runs recorded but not started, because the board is over budget.
-    pub held: usize,
     /// Live cards whose newest run failed.
     pub failed: usize,
     /// Agents' comments and cards arriving in Review since you last looked.
@@ -1632,11 +1635,12 @@ pub struct ProjectActivityDto {
     /// Runs executing. Counted from runs, not from the In Progress column —
     /// a run outlives its column, so the two disagree by design.
     pub working: usize,
-    /// Spend since the start of your day, in micro-USD. Measured exactly as
-    /// the budget gate measures it, so the pair in the dropdown can never
-    /// accuse the board of crossing a ceiling it did not.
+    /// Spend since `since_ms`, in micro-USD. Shown against the ceiling that
+    /// stops the board, so the caller must send the **budget's** day —
+    /// `budget::day_start`, UTC midnight — or the pair in the dropdown
+    /// accuses the board of crossing a ceiling it did not.
     pub burn_micros: i64,
-    /// Tokens spent since the start of your day.
+    /// Tokens spent over the same window.
     pub burn_tokens: i64,
 }
 
@@ -1644,7 +1648,7 @@ pub struct ProjectActivityDto {
     get,
     path = "/projects/activity",
     tag = "projects",
-    params(("since_ms" = Option<i64>, Query, description = "Start of your day, epoch ms. Defaults to the last 24 hours.")),
+    params(("since_ms" = Option<i64>, Query, description = "Start of the budget's day (UTC midnight), epoch ms. Defaults to the last 24 hours.")),
     responses(
         (status = 200, description = "Every board's live working count and today's burn. Boards with neither are absent.", body = inline(ListResponse<ProjectActivityDto>)),
         (status = 401, description = "Unauthorized", body = ErrorBody),
@@ -1654,9 +1658,10 @@ async fn projects_activity(
     State(state): State<AdminState>,
     Query(query): Query<ActivityQuery>,
 ) -> Result<Json<ListResponse<ProjectActivityDto>>> {
-    // The caller's day, not the server's: "today's burn" is a question
-    // about the operator's clock, and a server in another timezone would
-    // answer a different one.
+    // The window is the caller's to name, because this endpoint also
+    // answers "the last day" for surfaces with no ceiling in view. What it
+    // must NOT be is the reader's calendar day: the number is read against
+    // `daily_budget_*`, and `budget::day_start` is UTC.
     let since = match query.since_ms {
         Some(ms) => chrono::DateTime::from_timestamp_millis(ms)
             .ok_or_else(|| GatewayError::BadRequest(format!("since_ms out of range: {ms}")))?,
@@ -1728,7 +1733,6 @@ async fn projects_attention(
                 project_id: id.clone(),
                 name: name.clone(),
                 approvals: count.approvals,
-                held: count.held,
                 failed: count.failed,
                 unread: count.unread,
             })

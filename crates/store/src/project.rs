@@ -545,11 +545,23 @@ pub trait ProjectStore: Send + Sync {
 
     async fn list_children(&self, parent: &IssueId) -> Result<Vec<IssueRow>>;
 
-    async fn hold_run(&self, id: &IssueRunId) -> Result<bool>;
+    /// Stop a queued run on the budget, answering with the row **as it now
+    /// stands** — `None` when the compare-and-set found it in some other
+    /// state and wrote nothing.
+    ///
+    /// The row and not a `bool`, because the caller has the pre-write copy
+    /// in its hand and a `bool` invites it to patch that copy into what it
+    /// believes this wrote. It did, and got it wrong: the follow-up log line
+    /// called a held run "queued", and `retry` answered 201 with a body
+    /// saying the run was on its way. Whoever holds the ingredients cooks.
+    async fn hold_run(&self, id: &IssueRunId) -> Result<Option<IssueRunRow>>;
 
     async fn held_runs(&self, project: &ProjectId) -> Result<Vec<IssueRunRow>>;
 
-    async fn release_run(&self, id: &IssueRunId) -> Result<bool>;
+    /// Put a held run back in the queue. Answers like [`Self::hold_run`] and
+    /// for the same reason: the released row is what gets dispatched, and
+    /// the dispatcher's copy is documented as reading `Queued`.
+    async fn release_run(&self, id: &IssueRunId) -> Result<Option<IssueRunRow>>;
 
     /// Note that the operator has opened this card. Monotonic: a slow
     /// request must not rewind the cursor and resurrect a badge that was
@@ -796,6 +808,18 @@ impl RunStatus {
 }
 
 /// What is waiting on the operator on one board.
+///
+/// Every one of these is an **event** — something arrived, or broke, or is
+/// being asked. That is the whole membership rule, and it is why runs the
+/// daily ceiling is holding are deliberately **not** here despite being the
+/// most literal "only you can fix this" the board has.
+///
+/// A hold is a *standing condition*, not news: it does not arrive, it does
+/// not stop being true until the operator changes a number, and the mark it
+/// produced was therefore indistinguishable from one that could not be
+/// cleared at all — which is exactly how it was reported. The board says it
+/// where it can be acted on instead: an over-ceiling notice in the board's
+/// own header, beside the settings that lift it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AttentionCounts {
     /// Tool calls parked on an approval prompt. Filled from the channel's
@@ -803,10 +827,8 @@ pub struct AttentionCounts {
     /// prompt that already timed out, and pairing request/resolution by
     /// `call_id` in SQL would scan a table that grows forever.
     pub approvals: usize,
-    /// Runs recorded but not started, because the board is over budget.
-    pub held: usize,
     /// The sum of every card's [`CardSignals::unread`] on this board.
-    /// Unlike the other three this is time-based, because reading an
+    /// Unlike the other two this is time-based, because reading an
     /// agent's comment changes nothing a query could otherwise see.
     pub unread: usize,
     /// Live cards whose newest run failed. Nothing retries by itself, so
@@ -875,7 +897,7 @@ pub struct BoardActivity {
 
 impl AttentionCounts {
     pub fn total(self) -> usize {
-        self.approvals + self.held + self.failed + self.unread
+        self.approvals + self.failed + self.unread
     }
 
     pub fn is_empty(self) -> bool {

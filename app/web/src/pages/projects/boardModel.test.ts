@@ -259,6 +259,15 @@ describe('runIndicator', () => {
     expect(runIndicator(active, 3)).toBeNull();
     expect(runIndicator([], 1)).toBeNull();
   });
+
+  it('does not report a run the budget stopped as one waiting for a slot', () => {
+    // The two are not the same wait and the operator cannot act on them the
+    // same way: a queued run starts when a slot frees, a held one starts
+    // when the ceiling does. Collapsed into 'queued' the whole board denied
+    // holding anything while the rail's dot counted two — and the board is
+    // the only surface that dot points at.
+    expect(runIndicator([run(4, { status: 'held' })], 4)).toBe('held');
+  });
 });
 
 describe('unsettledRun', () => {

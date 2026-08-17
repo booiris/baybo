@@ -16,6 +16,7 @@ import {
 } from './budgetModel';
 import { formatParallelIssueRuns, parallelIssueRunsHint, parseParallelIssueRuns } from './driverModel';
 import { fieldLabel, textInput } from './CreateProjectForm';
+import { activityFor, useBoardActivity } from './useBoardActivity';
 
 export function ProjectSettings({
   project,
@@ -44,6 +45,13 @@ export function ProjectSettings({
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const archived = project.archived_at_ms != null;
+  // What the board has already spent against the ceilings being typed. The
+  // two fields are the only place a ceiling is chosen, and choosing one
+  // blind is how a board ends up stopped by a number nobody meant — see
+  // `STAYS_STOPPED`. Fetched on open, like the switcher's own meter, and
+  // absent is absent: a board with no spend today is left out of the
+  // response and must read as zero rather than as unknown.
+  const spent = activityFor(useBoardActivity(true, 0), project.id);
 
   async function save() {
     const micros = parseBudget(budget);
@@ -137,7 +145,7 @@ export function ProjectSettings({
 
         <div>
           <label className={fieldLabel} htmlFor="settings-budget">
-            Daily budget
+            Daily budget (USD)
           </label>
           <input
             id="settings-budget"
@@ -145,19 +153,19 @@ export function ProjectSettings({
             value={budget}
             inputMode="decimal"
             disabled={archived}
-            placeholder="Leave empty for no ceiling"
+            placeholder="e.g. 5.00 — empty for no ceiling"
             onChange={(event) => {
               setBudget(event.target.value);
             }}
           />
           <p className="mt-1 text-[0.7rem] text-ink-soft leading-snug">
-            {budgetHint(parseBudget(budget) ?? null)}
+            {budgetHint(parseBudget(budget) ?? null, spent?.burn_micros ?? 0)}
           </p>
         </div>
 
         <div>
           <label className={fieldLabel} htmlFor="settings-token-budget">
-            Daily token budget
+            Daily token budget (tokens)
           </label>
           <input
             id="settings-token-budget"
@@ -165,13 +173,13 @@ export function ProjectSettings({
             value={tokenBudget}
             inputMode="numeric"
             disabled={archived}
-            placeholder="Leave empty for no ceiling"
+            placeholder="e.g. 2000000 — empty for no ceiling"
             onChange={(event) => {
               setTokenBudget(event.target.value);
             }}
           />
           <p className="mt-1 text-[0.7rem] text-ink-soft leading-snug">
-            {tokenBudgetHint(parseTokenBudget(tokenBudget) ?? null)}
+            {tokenBudgetHint(parseTokenBudget(tokenBudget) ?? null, spent?.burn_tokens ?? 0)}
           </p>
         </div>
 

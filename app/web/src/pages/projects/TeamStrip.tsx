@@ -4,13 +4,7 @@ import { RiAddLine } from 'react-icons/ri';
 import { useAdminClient } from '../../api/auth';
 import { fetchModelPool } from './api';
 import type { Agent, IssueRun } from './boardModel';
-import {
-  handleProblem,
-  llmOptions,
-  queuedAgentIds,
-  workingAgentIds,
-  type ModelPool,
-} from './teamModel';
+import { agentRunStates, handleProblem, llmOptions, type ModelPool } from './teamModel';
 import { Avatar, AVATAR_BOX, runNote, type AvatarRun } from './Avatar';
 import { Picker, type PickerOption } from './Picker';
 import type { Portrait } from './portrait';
@@ -72,8 +66,7 @@ export function TeamStrip({
     setOwnHiring(value);
     if (!value) onHireClosed?.();
   };
-  const working = workingAgentIds(activeRuns);
-  const queued = queuedAgentIds(activeRuns);
+  const runs = agentRunStates(activeRuns);
 
   return (
     <div className="flex items-center gap-1">
@@ -82,7 +75,7 @@ export function TeamStrip({
           key={agent.id}
           agent={agent}
           portrait={portrait}
-          run={working.has(agent.id) ? 'running' : queued.has(agent.id) ? 'queued' : null}
+          run={runs.get(agent.id) ?? null}
           onOpen={() => {
             onOpenProfile(agent);
           }}

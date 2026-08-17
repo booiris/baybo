@@ -44,12 +44,33 @@ export function formatTokens(count: number): string {
   return `${thousands < 10 ? thousands.toFixed(1) : Math.round(thousands)}k`;
 }
 
-export function budgetHint(micros: number | null | undefined): string {
+/// What a ceiling the day has already passed actually does.
+///
+/// Both hints below promise that runs "start again as soon as there is
+/// room", and for a ceiling under what today has already spent that promise
+/// is false: the release bails before it touches a row. Saving one is a
+/// legitimate act — it is how a board is stopped — but it is *silent*. The
+/// modal closes, the board repaints identically, nothing is written to any
+/// timeline, and the held runs stay held. An operator who raised the ceiling
+/// to fix exactly that reads the whole thing as the save not having worked.
+const STAYS_STOPPED =
+  ' Today has already spent this, so the board stays stopped and anything held stays held — until you go above the spend, or the day resets at 00:00 UTC.';
+
+function alreadySpent(ceiling: number, spentToday: number | null | undefined): boolean {
+  return spentToday != null && spentToday >= ceiling;
+}
+
+export function budgetHint(
+  micros: number | null | undefined,
+  spentToday?: number | null,
+): string {
   if (micros == null) return 'No ceiling — this board spends what its work costs.';
   if (micros === 0) {
     return 'Paused: work is recorded and held, and starts when you raise this.';
   }
-  return 'Runs are held once the day’s spend reaches this, and start again as soon as there is room.';
+  const hint =
+    'Runs are held once the day’s spend reaches this, and start again as soon as there is room.';
+  return alreadySpent(micros, spentToday) ? hint + STAYS_STOPPED : hint;
 }
 
 /// Parse an optional whole-token ceiling.
@@ -67,12 +88,49 @@ export function formatTokenBudget(count: number | null | undefined): string {
   return String(count);
 }
 
-export function tokenBudgetHint(count: number | null | undefined): string {
+export function tokenBudgetHint(
+  count: number | null | undefined,
+  spentToday?: number | null,
+): string {
   if (count == null) return 'Unlimited — this board spends the tokens its work takes.';
   if (count === 0) {
     return 'Paused: work is recorded and held, and starts when you raise this.';
   }
-  return 'Runs are held once the day’s tokens reach this, and start again as soon as there is room. This is the ceiling that still bites on a subscription plan, where every run is billed at $0.';
+  const hint =
+    'Runs are held once the day’s tokens reach this, and start again as soon as there is room. This is the ceiling that still bites on a subscription plan, where every run is billed at $0.';
+  return alreadySpent(count, spentToday) ? hint + STAYS_STOPPED : hint;
+}
+
+/// Every ceiling this board actually has, in the unit each one is set in.
+///
+/// [`boardMeter`] answers a different question — which single ceiling to
+/// *speak in* — and that is right for a sentence, which can only be in one
+/// unit. It is wrong for a readout: money and tokens are independent gates
+/// and **either** one stops the board, so naming only the tighter of two
+/// sends the operator to raise a ceiling that may not be the one biting, or
+/// to raise one of two that are both biting and watch nothing happen.
+///
+/// A board with no ceiling at all still has a meter — what it has spent —
+/// which is what the switcher's idle rows show.
+export function boardMeters(
+  burn: { micros: number; tokens: number },
+  ceilings: { micros: number | null | undefined; tokens: number | null | undefined },
+): { text: string; over: boolean }[] {
+  const meters: { text: string; over: boolean }[] = [];
+  if (ceilings.micros != null) {
+    meters.push({
+      text: `${formatUsd(burn.micros)} / ${formatUsd(ceilings.micros)}`,
+      over: burn.micros >= ceilings.micros,
+    });
+  }
+  if (ceilings.tokens != null) {
+    meters.push({
+      text: `${formatTokens(burn.tokens)} / ${formatTokens(ceilings.tokens)}`,
+      over: burn.tokens >= ceilings.tokens,
+    });
+  }
+  if (meters.length === 0) meters.push({ text: formatUsd(burn.micros), over: false });
+  return meters;
 }
 
 /// Show the ceiling with the least remaining headroom, matching the server.

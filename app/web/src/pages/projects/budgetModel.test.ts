@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   boardMeter,
+  boardMeters,
   budgetHint,
   formatBudget,
   formatTokenBudget,
@@ -98,6 +99,23 @@ describe('budgetHint', () => {
     expect(budgetHint(0)).toContain('Paused');
     expect(budgetHint(5_000_000)).toContain('held');
   });
+
+  it('admits when the day has already spent the ceiling being typed', () => {
+    // The default promise — "start again as soon as there is room" — is
+    // false here, and saving it is silent: the release bails before it
+    // touches a row, so the modal closes over a board that did not move.
+    expect(budgetHint(1_000_000, 5_000_000)).toContain('stays stopped');
+    // The boundary is the gate's, `spent >= limit`.
+    expect(budgetHint(5_000_000, 5_000_000)).toContain('stays stopped');
+    expect(budgetHint(5_000_000, 4_999_999)).not.toContain('stays stopped');
+  });
+
+  it('says nothing extra when it was not told what the day has spent', () => {
+    // A caller with no burn to hand it must get the plain hint rather than
+    // an accusation built out of a missing number.
+    expect(budgetHint(5_000_000)).not.toContain('stays stopped');
+    expect(budgetHint(5_000_000, null)).not.toContain('stays stopped');
+  });
 });
 
 describe('parseTokenBudget', () => {
@@ -143,6 +161,46 @@ describe('tokenBudgetHint', () => {
 
   it('does not repeat the money hint\'s opening words', () => {
     expect(tokenBudgetHint(null)).not.toContain('No ceiling');
+  });
+
+  it('admits when the day has already spent the ceiling being typed', () => {
+    // The live board this was written for: a 100k/day token ceiling on a
+    // board whose median run costs ~1M, six times past it by 00:00:33 UTC.
+    // Retyping 100000 there looks exactly like fixing it and does nothing.
+    expect(tokenBudgetHint(100_000, 601_902)).toContain('stays stopped');
+    expect(tokenBudgetHint(700_000, 601_902)).not.toContain('stays stopped');
+  });
+});
+
+describe('boardMeters', () => {
+  it('names every ceiling that is set, and which of them is spent', () => {
+    const both = boardMeters(
+      { micros: 6_100_000, tokens: 601_902 },
+      { micros: 5_000_000, tokens: 100_000 },
+    );
+    expect(both.map((m) => m.text)).toEqual(['$6.10 / $5.00', '602k / 100k']);
+    expect(both.every((m) => m.over)).toBe(true);
+  });
+
+  it('marks only the ceiling that is actually biting', () => {
+    const one = boardMeters(
+      { micros: 1_200_000, tokens: 601_902 },
+      { micros: 5_000_000, tokens: 100_000 },
+    );
+    expect(one.map((m) => m.over)).toEqual([false, true]);
+  });
+
+  it('leaves out a ceiling that does not exist', () => {
+    expect(
+      boardMeters({ micros: 1_840_000, tokens: 400 }, { micros: 5_000_000, tokens: null }).map(
+        (m) => m.text,
+      ),
+    ).toEqual(['$1.84 / $5.00']);
+  });
+
+  it('still reports the spend on a board with no ceiling at all', () => {
+    const none = boardMeters({ micros: 1_840_000, tokens: 400 }, { micros: null, tokens: null });
+    expect(none).toEqual([{ text: '$1.84', over: false }]);
   });
 });
 

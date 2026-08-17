@@ -912,31 +912,15 @@ impl ProjectStore for SqliteProjectStore {
     }
 
     async fn attention(&self) -> Result<Vec<(ProjectId, AttentionCounts)>> {
-        let held_status = RunStatus::Held.as_str();
         let failed_status = RunStatus::Failed.as_str();
         let done_status = IssueStatus::Done.as_str();
         let review_status = IssueStatus::Review.as_str();
         let rows = self
             .pool
             .interact("projects.attention", move |conn| {
-                let mut counts: std::collections::HashMap<String, (usize, usize, usize)> =
+                // Held runs are deliberately absent — see [`AttentionCounts`].
+                let mut counts: std::collections::HashMap<String, (usize, usize)> =
                     std::collections::HashMap::new();
-
-                {
-                    let mut stmt = conn.prepare(
-                        "SELECT r.project_id, COUNT(*) FROM issue_runs r \
-                         JOIN projects p ON p.id = r.project_id \
-                         WHERE r.status = ?1 AND r.settled_at IS NULL \
-                           AND p.archived_at IS NULL \
-                         GROUP BY r.project_id",
-                    )?;
-                    for row in stmt.query_map(rusqlite::params![held_status], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-                    })? {
-                        let (project, count) = row?;
-                        counts.entry(project).or_default().0 += count.max(0) as usize;
-                    }
-                }
 
                 {
                     // Both halves: the card is broken (`FAILED_CARD_PREDICATE`)
@@ -959,7 +943,7 @@ impl ProjectStore for SqliteProjectStore {
                     )?;
                     for row in rows {
                         let (project, count) = row?;
-                        counts.entry(project).or_default().1 += count.max(0) as usize;
+                        counts.entry(project).or_default().0 += count.max(0) as usize;
                     }
                 }
 
@@ -980,7 +964,7 @@ impl ProjectStore for SqliteProjectStore {
                     )?;
                     for row in rows {
                         let (project, count) = row?;
-                        counts.entry(project).or_default().2 += count.max(0) as usize;
+                        counts.entry(project).or_default().1 += count.max(0) as usize;
                     }
                 }
                 Ok(counts.into_iter().collect::<Vec<_>>())
@@ -988,12 +972,11 @@ impl ProjectStore for SqliteProjectStore {
             .await?;
 
         rows.into_iter()
-            .map(|(project, (held, failed, unread))| {
+            .map(|(project, (failed, unread))| {
                 Ok((
                     ProjectId::parse(project).map_err(|e| StorageError::Storage(e.to_string()))?,
                     AttentionCounts {
                         approvals: 0,
-                        held,
                         failed,
                         unread,
                     },
@@ -1542,19 +1525,26 @@ impl ProjectStore for SqliteProjectStore {
         Ok(affected > 0)
     }
 
-    async fn hold_run(&self, id: &IssueRunId) -> Result<bool> {
+    async fn hold_run(&self, id: &IssueRunId) -> Result<Option<IssueRunRow>> {
         let id = id.as_str().to_string();
-        let affected = self
+        let raw = self
             .pool
             .interact("issue_runs.hold", move |conn| {
-                Ok(conn.execute(
+                // Write and read back in one statement, as `requeue_unsettled`
+                // does: the caller is handed the row this wrote rather than
+                // its own pre-write copy plus a guess at what changed.
+                let mut stmt = conn.prepare(&format!(
                     "UPDATE issue_runs SET status = 'held' \
-                     WHERE id = ?1 AND status = 'queued' AND settled_at IS NULL",
-                    rusqlite::params![id],
-                )?)
+                     WHERE id = ?1 AND status = 'queued' AND settled_at IS NULL \
+                     RETURNING {RUN_COLUMNS}"
+                ))?;
+                Ok(stmt
+                    .query_map(rusqlite::params![id], read_raw_run)?
+                    .next()
+                    .transpose()?)
             })
             .await?;
-        Ok(affected > 0)
+        raw.map(run_from_raw).transpose()
     }
 
     async fn held_runs(&self, project: &ProjectId) -> Result<Vec<IssueRunRow>> {
@@ -1575,18 +1565,23 @@ impl ProjectStore for SqliteProjectStore {
         raws.into_iter().map(run_from_raw).collect()
     }
 
-    async fn release_run(&self, id: &IssueRunId) -> Result<bool> {
+    async fn release_run(&self, id: &IssueRunId) -> Result<Option<IssueRunRow>> {
         let id = id.as_str().to_string();
-        let affected = self
+        let raw = self
             .pool
             .interact("issue_runs.release", move |conn| {
-                Ok(conn.execute(
-                    "UPDATE issue_runs SET status = 'queued' WHERE id = ?1 AND status = 'held'",
-                    rusqlite::params![id],
-                )?)
+                let mut stmt = conn.prepare(&format!(
+                    "UPDATE issue_runs SET status = 'queued' \
+                     WHERE id = ?1 AND status = 'held' \
+                     RETURNING {RUN_COLUMNS}"
+                ))?;
+                Ok(stmt
+                    .query_map(rusqlite::params![id], read_raw_run)?
+                    .next()
+                    .transpose()?)
             })
             .await?;
-        Ok(affected > 0)
+        raw.map(run_from_raw).transpose()
     }
 
     async fn requeue_unsettled(&self) -> Result<Vec<IssueRunRow>> {
