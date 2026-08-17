@@ -14,7 +14,7 @@ import {
   emptyBoard,
   groupByStatus,
   hasDeliverable,
-  hoistUnread,
+  readingOrder,
   moveAnnouncement,
   liveCount,
   moveCard,
@@ -29,6 +29,7 @@ import {
   runLogView,
   unreadTotal,
   unsettledRun,
+  withPin,
   withPositions,
 } from './boardModel';
 
@@ -46,6 +47,7 @@ function issue(number: number, overrides: Partial<Issue> = {}): Issue {
     updated_at_ms: 0,
     unread: 0,
     last_run_failed: false,
+    pinned: false,
     ...overrides,
   };
 }
@@ -450,9 +452,9 @@ describe('unreadTotal', () => {
   });
 });
 
-describe('hoistUnread', () => {
+describe('readingOrder', () => {
   it('lifts what is new to the top of its own column', () => {
-    const view = hoistUnread(
+    const view = readingOrder(
       board({
         backlog: [issue(1), issue(2, { unread: 1 }), issue(3)],
         todo: [issue(4, { status: 'todo', unread: 3 })],
@@ -466,7 +468,7 @@ describe('hoistUnread', () => {
     // The hoist is a reading order laid over `position`, never a rewrite of
     // it: two cards that are both new stay in the order they were dragged
     // into, and so do two that are not.
-    const view = hoistUnread(
+    const view = readingOrder(
       board({
         backlog: [
           issue(1),
@@ -484,7 +486,7 @@ describe('hoistUnread', () => {
     // Cancel is terminal. A card called off after somebody spoke on it still
     // carries the count, and floating it to the top of a column of live work
     // is the board arguing with itself.
-    const view = hoistUnread(
+    const view = readingOrder(
       board({ backlog: [issue(1), issue(2, { unread: 4, cancelled_at_ms: 99 })] }),
     );
     expect(view.backlog.map((i) => i.number)).toEqual([1, 2]);
@@ -492,8 +494,80 @@ describe('hoistUnread', () => {
 
   it('leaves the board it was handed alone', () => {
     const start = board({ backlog: [issue(1), issue(2, { unread: 1 })] });
-    hoistUnread(start);
+    readingOrder(start);
     expect(start.backlog.map((i) => i.number)).toEqual([1, 2]);
+  });
+
+  it('reads a pinned card first even when it has nothing new on it', () => {
+    // The rank is the point. A pin is what the operator chose; an unread
+    // count is what happened to a card while they were elsewhere.
+    const view = readingOrder(
+      board({
+        backlog: [issue(1), issue(2, { unread: 4 }), issue(3, { pinned: true })],
+      }),
+    );
+    expect(view.backlog.map((i) => i.number)).toEqual([3, 2, 1]);
+  });
+
+  it('hoists the unread inside the pinned block too', () => {
+    const view = readingOrder(
+      board({
+        backlog: [
+          issue(1, { pinned: true }),
+          issue(2, { pinned: true, unread: 2 }),
+          issue(3),
+          issue(4, { unread: 1 }),
+        ],
+      }),
+    );
+    expect(view.backlog.map((i) => i.number)).toEqual([2, 1, 4, 3]);
+  });
+
+  it('keeps the operator order inside the pinned block', () => {
+    const view = readingOrder(
+      board({
+        backlog: [issue(1, { pinned: true }), issue(2), issue(3, { pinned: true })],
+      }),
+    );
+    expect(view.backlog.map((i) => i.number)).toEqual([1, 3, 2]);
+  });
+
+  it('lifts a cancelled card that was pinned, unlike one that is only unread', () => {
+    // The two rules are a deliberate pair. Nothing but the operator put the
+    // pin there, and a control that quietly stops working on cards it still
+    // offers itself on is worse than a struck-through card at the top.
+    const view = readingOrder(
+      board({
+        backlog: [
+          issue(1),
+          issue(2, { unread: 4, cancelled_at_ms: 99 }),
+          issue(3, { pinned: true, cancelled_at_ms: 99 }),
+        ],
+      }),
+    );
+    expect(view.backlog.map((i) => i.number)).toEqual([3, 1, 2]);
+  });
+});
+
+describe('withPin', () => {
+  it('flips the card and re-reads the column in one go', () => {
+    const start = board({ backlog: [issue(1), issue(2), issue(3)] });
+    const next = withPin(start, 3, true);
+    expect(next.backlog.map((i) => i.number)).toEqual([3, 1, 2]);
+    expect(next.backlog[0].pinned).toBe(true);
+    expect(start.backlog.map((i) => i.number)).toEqual([1, 2, 3]);
+  });
+
+  it('drops the card back where the operator put it when the pin comes off', () => {
+    const start = board({ backlog: [issue(1), issue(2, { pinned: true }), issue(3)] });
+    expect(withPin(start, 2, false).backlog.map((i) => i.number)).toEqual([1, 2, 3]);
+  });
+
+  it('writes no position, so nothing a pin does can reach a move', () => {
+    const start = board({ backlog: [issue(1), issue(2), issue(3)] });
+    const pinned = withPin(start, 3, true);
+    expect(pinned.backlog.map((i) => i.position)).toEqual([3, 1, 2]);
+    expect(persistedOrder(pinned.backlog, 1, 2)).toEqual([1, 2, 3]);
   });
 });
 

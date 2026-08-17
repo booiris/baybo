@@ -343,6 +343,11 @@ const ADD_COLUMNS: &[AddColumn] = &[
         definition: "INTEGER",
     },
     AddColumn {
+        table: "issues",
+        column: "pinned",
+        definition: "INTEGER NOT NULL DEFAULT 0",
+    },
+    AddColumn {
         table: "sessions",
         column: "parent_span_id",
         definition: "TEXT",
@@ -1421,6 +1426,11 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     -- and a research issue that produced a report and no
                     -- code should show no branch anywhere.
                     branch         TEXT,
+                    -- Kept in front of the operator: a pinned card is read
+                    -- first in its column. Reading order only — it is not a
+                    -- second `position` and not a second `priority`, and no
+                    -- query orders by it.
+                    pinned         INTEGER NOT NULL DEFAULT 0,
                     -- When the operator last opened this card. The only read
                     -- state in the feature: an agent's comment and a card
                     -- arriving in Review leave no other trace when read, and

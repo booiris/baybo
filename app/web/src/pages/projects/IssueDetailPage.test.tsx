@@ -26,6 +26,7 @@ function issue(overrides: Partial<Issue> = {}): Issue {
     updated_at_ms: 0,
     unread: 0,
     last_run_failed: false,
+    pinned: false,
     ...overrides,
   };
 }
@@ -584,12 +585,34 @@ describe('IssueDetailPage rail', () => {
     // left Status/Priority/Assignee beside their labels while Parent and
     // Blocked sat flush right. The fixed height is what evens the spacing
     // out, the Assignee row carrying an 18px face and the rest one line.
-    for (const label of ['Status', 'Priority', 'Assignee', 'Parent', 'Blocked']) {
+    for (const label of ['Status', 'Priority', 'Assignee', 'Pinned', 'Parent', 'Blocked']) {
       const row = screen.getByText(label).parentElement;
       expect(row?.className, label).toContain('w-full');
       expect(row?.className, label).toContain('justify-between');
       expect(row?.className, label).toContain('min-h-[26px]');
     }
+  });
+
+  it('pins the card from the rail, where a touch screen can always reach it', async () => {
+    client.PATCH.mockClear().mockResolvedValue({
+      data: { ...issue(), pinned: true },
+      error: undefined,
+      response: ok,
+    });
+    renderIssue(issue());
+
+    // The board's own pin is a glyph that appears on hover; this row is on
+    // screen whether or not there is a pointer to hover with.
+    const pin = await screen.findByRole('button', { name: 'Pin to top' });
+    expect(pin).toHaveAttribute('aria-pressed', 'false');
+    await userEvent.click(pin);
+
+    expect(client.PATCH).toHaveBeenCalledWith('/v1/projects/{project_id}/issues/{number}', {
+      params: { path: { project_id: PROJECT_ID, number: 7 } },
+      body: { pinned: true },
+    });
+    const pinned = await screen.findByRole('button', { name: 'Pinned' });
+    expect(pinned).toHaveAttribute('aria-pressed', 'true');
   });
 
   it('names the branch, and says the worktree will not be there forever', async () => {

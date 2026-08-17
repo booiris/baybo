@@ -249,6 +249,7 @@ mod tests {
             priority: baybo_store::project::IssuePriority::None,
             assignee: agent("dev-1"),
             position: 0,
+            pinned: false,
             blocked_reason: None,
             branch: None,
             parent_issue_id: None,

@@ -201,6 +201,14 @@ pub struct IssueRow {
     /// the whole target column in one transaction (the `reorder` shape),
     /// so positions never drift and never collide.
     pub position: i64,
+    /// Kept in front of the operator: a pinned card is read first in its
+    /// column, above even the cards carrying something new.
+    ///
+    /// A **reading** order and nothing else. It never touches `position`,
+    /// and it is deliberately absent from `driver::promotion_order` — what
+    /// the board works on next is `priority`, and two fields answering that
+    /// question is one of them being wrong.
+    pub pinned: bool,
     /// Why work stopped, when it did. A badge on the card, not a column —
     /// blocked work is still in whichever column it was in.
     pub blocked_reason: Option<String>,
@@ -251,6 +259,9 @@ pub struct IssueUpdate {
     pub assignee: Option<Option<AgentProfileId>>,
     pub blocked_reason: Option<Option<String>>,
     pub cancelled: Option<bool>,
+    /// Singly optional, unlike its neighbours: there is no third state to
+    /// express. A pin is on or off, and absent leaves it as it was.
+    pub pinned: Option<bool>,
 }
 
 impl IssueUpdate {
@@ -266,6 +277,7 @@ impl IssueUpdate {
             && self.assignee.is_none()
             && self.blocked_reason.is_none()
             && self.cancelled.is_none()
+            && self.pinned.is_none()
     }
 }
 
@@ -995,6 +1007,60 @@ mod tests {
                 Some(actor.clone()),
                 "{actor:?}"
             );
+        }
+    }
+
+    /// `is_empty` is the 400 gate on the REST patch *and* the branch the
+    /// agent tool picks between reading a card and writing it — a field
+    /// missing from the chain is a patch that is silently dropped rather
+    /// than refused.
+    #[test]
+    fn every_field_of_a_patch_counts_as_setting_one() {
+        assert!(IssueUpdate::default().is_empty());
+        let each: [IssueUpdate; 10] = [
+            IssueUpdate {
+                title: Some("t".into()),
+                ..Default::default()
+            },
+            IssueUpdate {
+                description: Some("d".into()),
+                ..Default::default()
+            },
+            IssueUpdate {
+                attachments: Some(Vec::new()),
+                ..Default::default()
+            },
+            IssueUpdate {
+                priority: Some(IssuePriority::Urgent),
+                ..Default::default()
+            },
+            IssueUpdate {
+                parent: Some(None),
+                ..Default::default()
+            },
+            IssueUpdate {
+                stage: Some(1),
+                ..Default::default()
+            },
+            IssueUpdate {
+                assignee: Some(None),
+                ..Default::default()
+            },
+            IssueUpdate {
+                blocked_reason: Some(None),
+                ..Default::default()
+            },
+            IssueUpdate {
+                cancelled: Some(true),
+                ..Default::default()
+            },
+            IssueUpdate {
+                pinned: Some(true),
+                ..Default::default()
+            },
+        ];
+        for update in each {
+            assert!(!update.is_empty(), "{update:?}");
         }
     }
 }

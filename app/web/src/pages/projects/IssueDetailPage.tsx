@@ -12,6 +12,8 @@ import {
   RiArrowLeftLine,
   RiGitMergeLine,
   RiLoader4Line,
+  RiPushpin2Fill,
+  RiPushpin2Line,
   RiRefreshLine,
 } from 'react-icons/ri';
 
@@ -1184,6 +1186,38 @@ export function IssueDetailPage() {
                     </span>
                   )}
                 </Picker>
+              </Row>
+              {/* A press, like the three rows above it — and unlike Parent
+                  and Blocked, which are facts. The board's own pin is a
+                  hover-revealed glyph on a card; this one is always on
+                  screen, which is what a touch screen has to reach for. */}
+              <Row label="Pinned">
+                <button
+                  type="button"
+                  disabled={saving}
+                  aria-pressed={issue.pinned}
+                  title={
+                    issue.pinned
+                      ? 'Stop keeping this card at the top of its column'
+                      : 'Keep this card at the top of its column'
+                  }
+                  onClick={() => {
+                    void apply({ pinned: !issue.pinned });
+                  }}
+                  className={`${railPickerChip} inline-flex items-center gap-1 pr-1.5 disabled:opacity-40 disabled:cursor-not-allowed ${
+                    issue.pinned ? 'text-brand-hover' : 'font-normal text-ink-soft'
+                  }`}
+                >
+                  {issue.pinned ? (
+                    <>
+                      <RiPushpin2Fill aria-hidden /> Pinned
+                    </>
+                  ) : (
+                    <>
+                      <RiPushpin2Line aria-hidden /> Pin to top
+                    </>
+                  )}
+                </button>
               </Row>
               <Row label="Parent">
                 {issue.parent == null ? (

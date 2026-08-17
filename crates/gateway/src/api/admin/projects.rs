@@ -320,6 +320,11 @@ pub struct IssueDto {
     pub assignee: Option<String>,
     /// Rank within the column, dense and ascending.
     pub position: i64,
+    /// Kept in front of the operator: a pinned card is read first in its
+    /// column, above even the cards carrying something new. A reading
+    /// order and nothing else — it never touches `position`, and the board
+    /// does not take work out of Todo by it.
+    pub pinned: bool,
     /// The branch this issue's work landed on. Absent until it has a
     /// commit, so a research issue never shows one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -418,6 +423,7 @@ impl From<IssueRow> for IssueDto {
             priority: row.priority.into(),
             assignee: row.assignee.map(|a| a.to_string()),
             position: row.position,
+            pinned: row.pinned,
             branch: row.branch,
             blocked_reason: row.blocked_reason,
             parent: None,
@@ -1051,6 +1057,10 @@ pub struct UpdateIssueRequest {
     pub parent: Option<i64>,
     #[serde(default)]
     pub stage: Option<i64>,
+    /// Keep this card at the top of its column, or stop. Singly optional:
+    /// the pin is on or off, and an absent key leaves it.
+    #[serde(default)]
+    pub pinned: Option<bool>,
 }
 
 /// One drag-and-drop: where the card lands, plus that column's full
@@ -1379,6 +1389,7 @@ async fn update_issue(
                 cancelled: req.cancelled,
                 parent,
                 stage: req.stage,
+                pinned: req.pinned,
             },
             attachments.as_deref(),
         )

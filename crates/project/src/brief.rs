@@ -429,6 +429,7 @@ mod tests {
             priority: IssuePriority::None,
             assignee: None,
             position: 0,
+            pinned: false,
             blocked_reason: None,
             branch: None,
             parent_issue_id: None,

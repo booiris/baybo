@@ -78,9 +78,13 @@ fn event_from_raw(raw: RawEvent) -> Result<IssueEventRow> {
 const PROJECT_COLUMNS: &str = "id, name, description, workdir, daily_budget_micros, \
      daily_budget_tokens, max_parallel_issue_runs, archived_at, created_at, updated_at";
 
+/// The projection order **is** [`RawIssue`]'s tuple order, and nothing links
+/// the two at compile time. A new column goes on the end, always: inserting
+/// one mid-list silently re-decodes every field after it, and only the ones
+/// that happen to be parsed would fail loudly.
 const ISSUE_COLUMNS: &str = "id, project_id, number, title, description, status, priority, \
      assignee, position, blocked_reason, branch, parent_issue_id, stage, source_key, \
-     cancelled_at, created_at, updated_at, attachments";
+     cancelled_at, created_at, updated_at, attachments, pinned";
 
 /// Shared unread predicate for agent comments, blocks, and moves to Review.
 /// Used by card badges and board attention; binds `:review`.
@@ -304,6 +308,7 @@ type RawIssue = (
     i64,
     i64,
     String,
+    i64,
 );
 
 fn read_raw_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawProject> {
@@ -341,6 +346,7 @@ fn read_raw_issue(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawIssue> {
         row.get(15)?,
         row.get(16)?,
         row.get(17)?,
+        row.get(18)?,
     ))
 }
 
@@ -415,6 +421,7 @@ fn issue_from_raw(raw: RawIssue) -> Result<IssueRow> {
         created_at,
         updated_at,
         attachments,
+        pinned,
     ) = raw;
     Ok(IssueRow {
         id: IssueId::from(id),
@@ -440,6 +447,7 @@ fn issue_from_raw(raw: RawIssue) -> Result<IssueRow> {
             .transpose()
             .map_err(|e| StorageError::Storage(e.to_string()))?,
         position,
+        pinned: pinned != 0,
         blocked_reason,
         branch,
         parent_issue_id: parent_issue_id.map(IssueId::from),
@@ -836,6 +844,10 @@ impl ProjectStore for SqliteProjectStore {
                     .transpose()
                     .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
                 let priority = update.priority.map(|p| p.as_str());
+                // COALESCE and not a CASE-WHEN pair: the three below are
+                // doubly optional and need "set it to NULL" told apart from
+                // "leave it alone". A pin has no such third state.
+                let pinned = update.pinned.map(i64::from);
                 let (set_blocked, blocked) = match &update.blocked_reason {
                     Some(value) => (true, value.clone()),
                     None => (false, None),
@@ -871,6 +883,7 @@ impl ProjectStore for SqliteProjectStore {
                        cancelled_at   = CASE WHEN ?10 THEN ?11 ELSE cancelled_at END, \
                        parent_issue_id = CASE WHEN ?13 THEN ?14 ELSE parent_issue_id END, \
                        stage          = COALESCE(?15, stage), \
+                       pinned         = COALESCE(?17, pinned), \
                        updated_at     = ?12 \
                      WHERE project_id = ?1 AND number = ?2",
                     rusqlite::params![
@@ -889,7 +902,8 @@ impl ProjectStore for SqliteProjectStore {
                         set_parent,
                         parent,
                         stage,
-                        attachments
+                        attachments,
+                        pinned
                     ],
                 )?)
             })
@@ -2436,6 +2450,151 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn a_pin_goes_on_and_off_and_survives_every_other_edit() {
+        let (_dir, store) = store().await;
+        let p = project("proj-a", "A");
+        store.create_project(&p).await.unwrap();
+        let opened = store
+            .create_issue(&new_issue(&p.id, "watch this one", IssueStatus::Todo))
+            .await
+            .unwrap();
+        assert!(!opened.pinned, "a card is opened unpinned");
+
+        store
+            .update_issue(
+                &p.id,
+                1,
+                &IssueUpdate {
+                    pinned: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(store.get_issue(&p.id, 1).await.unwrap().unwrap().pinned);
+        assert!(
+            store.list_issues(&p.id).await.unwrap()[0].pinned,
+            "the board read carries it too, not only the point lookup"
+        );
+
+        store
+            .update_issue(
+                &p.id,
+                1,
+                &IssueUpdate {
+                    title: Some("renamed".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            store.get_issue(&p.id, 1).await.unwrap().unwrap().pinned,
+            "an unrelated patch did not unpin it"
+        );
+
+        store
+            .update_issue(
+                &p.id,
+                1,
+                &IssueUpdate {
+                    pinned: Some(false),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!store.get_issue(&p.id, 1).await.unwrap().unwrap().pinned);
+    }
+
+    /// A pin is a reading order, and `move_issue` is the one write that
+    /// renumbers a whole column. If the pin ever leaked into that scan a
+    /// card would keep the top of its column after being unpinned.
+    #[tokio::test]
+    async fn a_move_neither_reads_the_pin_nor_clears_it() {
+        let (_dir, store) = store().await;
+        let p = project("proj-a", "A");
+        store.create_project(&p).await.unwrap();
+        for title in ["first", "second"] {
+            store
+                .create_issue(&new_issue(&p.id, title, IssueStatus::Todo))
+                .await
+                .unwrap();
+        }
+        store
+            .update_issue(
+                &p.id,
+                2,
+                &IssueUpdate {
+                    pinned: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        store
+            .move_issue(&p.id, 2, IssueStatus::Review, &[2])
+            .await
+            .unwrap();
+
+        let moved = store.get_issue(&p.id, 2).await.unwrap().unwrap();
+        assert!(moved.pinned, "the card kept its pin across the column");
+        assert_eq!(
+            moved.position, 0,
+            "and its rank came from the order it was moved in, not from the pin"
+        );
+        assert_eq!(
+            store.get_issue(&p.id, 1).await.unwrap().unwrap().position,
+            0,
+            "the column it left closed its gap as usual"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_card_opened_before_the_pin_existed_migrates_in_unpinned() {
+        let (_dir, store) = store().await;
+        let p = project("proj-a", "A");
+        store.create_project(&p).await.unwrap();
+        store
+            .create_issue(&new_issue(&p.id, "legacy", IssueStatus::Backlog))
+            .await
+            .unwrap();
+
+        store
+            .pool
+            .interact("test.rewind_the_pin_migration", move |conn| {
+                conn.execute("ALTER TABLE issues DROP COLUMN pinned", [])?;
+                let migration = super::super::ADD_COLUMNS
+                    .iter()
+                    .find(|m| m.table == "issues" && m.column == "pinned")
+                    .expect("the pin is a listed migration");
+                migration.apply(conn)?;
+                migration.apply(conn)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            !store.get_issue(&p.id, 1).await.unwrap().unwrap().pinned,
+            "a row that predates the column was never pinned"
+        );
+        store
+            .update_issue(
+                &p.id,
+                1,
+                &IssueUpdate {
+                    pinned: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(store.get_issue(&p.id, 1).await.unwrap().unwrap().pinned);
     }
 
     #[tokio::test]

@@ -384,6 +384,40 @@ async fn a_patch_leaves_unnamed_fields_alone_and_null_clears_the_block() {
 }
 
 #[tokio::test]
+async fn a_pin_is_a_field_a_patch_can_set_on_its_own() {
+    let (router, _tg) = router().await;
+    let p = open_project(&router, "pins").await;
+    open_issue(&router, &p, "watch this one").await;
+    let uri = format!("/v1/projects/{p}/issues/1");
+    let opened = get(&router, &uri, StatusCode::OK).await;
+    assert_eq!(opened["pinned"], false, "a card is opened unpinned");
+
+    // The 200 is the assertion. A `pinned` missing from
+    // `IssueUpdate::is_empty` makes this body read as "sets no field", and
+    // the whole feature 400s from one line nothing else covers.
+    let patched = patch(&router, &uri, json!({ "pinned": true }), StatusCode::OK).await;
+    assert_eq!(patched["pinned"], true);
+
+    let patched = patch(&router, &uri, json!({ "title": "renamed" }), StatusCode::OK).await;
+    assert_eq!(
+        patched["pinned"], true,
+        "an unrelated patch did not unpin it"
+    );
+
+    let moved = post(
+        &router,
+        &format!("/v1/projects/{p}/issues/1/move"),
+        json!({ "status": "review", "ordered_numbers": [1] }),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(moved["pinned"], true, "and neither did a move");
+
+    let patched = patch(&router, &uri, json!({ "pinned": false }), StatusCode::OK).await;
+    assert_eq!(patched["pinned"], false);
+}
+
+#[tokio::test]
 async fn an_archived_project_leaves_the_listing_and_stops_taking_writes() {
     let (router, _tg) = router().await;
     let p = open_project(&router, "archivable").await;

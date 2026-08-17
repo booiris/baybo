@@ -2672,6 +2672,13 @@ export interface components {
              */
             parent?: number | null;
             /**
+             * @description Kept in front of the operator: a pinned card is read first in its
+             *     column, above even the cards carrying something new. A reading
+             *     order and nothing else — it never touches `position`, and the board
+             *     does not take work out of Todo by it.
+             */
+            pinned: boolean;
+            /**
              * Format: int64
              * @description Rank within the column, dense and ascending.
              */
@@ -3625,6 +3632,11 @@ export interface components {
              * @description Re-parent by number; `0` detaches. Absent leaves the parent alone.
              */
             parent?: number | null;
+            /**
+             * @description Keep this card at the top of its column, or stop. Singly optional:
+             *     the pin is on or off, and an absent key leaves it.
+             */
+            pinned?: boolean | null;
             priority?: null | components["schemas"]["IssuePriorityDto"];
             /** Format: int64 */
             stage?: number | null;
@@ -7751,6 +7763,13 @@ export interface operations {
                              *     Absent on a top-level card.
                              */
                             parent?: number | null;
+                            /**
+                             * @description Kept in front of the operator: a pinned card is read first in its
+                             *     column, above even the cards carrying something new. A reading
+                             *     order and nothing else — it never touches `position`, and the board
+                             *     does not take work out of Todo by it.
+                             */
+                            pinned: boolean;
                             /**
                              * Format: int64
                              * @description Rank within the column, dense and ascending.

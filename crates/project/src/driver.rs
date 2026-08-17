@@ -80,6 +80,12 @@ fn needs_staffing(issue: &IssueRow, busy: &BTreeSet<i64>) -> bool {
 /// The same order [`IssueList`](crate::tools::IssueList) already reads a
 /// column in, and that is the point — "what is next in Todo" has one
 /// answer, whether an agent asks for it or the board acts on it.
+///
+/// `pinned` is deliberately not in here. A pin is how the operator wants a
+/// column *read*; `priority` is what the board should work on first, and
+/// two fields answering that question is one of them being wrong. Pinning
+/// a card to keep an eye on it must not quietly promote it past urgent
+/// work.
 fn promotion_order(a: &IssueRow, b: &IssueRow) -> Ordering {
     let rank = |p: IssuePriority| IssuePriority::ALL.iter().position(|slot| *slot == p);
     rank(a.priority)
@@ -321,6 +327,7 @@ mod tests {
             priority: IssuePriority::None,
             assignee: Some(AgentProfileId::parse("dev-1".to_owned()).expect("agent")),
             position: number,
+            pinned: false,
             blocked_reason: None,
             branch: None,
             parent_issue_id: None,

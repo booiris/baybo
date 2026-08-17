@@ -5260,6 +5260,7 @@
                           "status",
                           "priority",
                           "position",
+                          "pinned",
                           "stage",
                           "unread",
                           "last_run_failed",
@@ -5326,6 +5327,10 @@
                             ],
                             "format": "int64",
                             "description": "The issue this one is a step of, by its number on this board.\nAbsent on a top-level card."
+                          },
+                          "pinned": {
+                            "type": "boolean",
+                            "description": "Kept in front of the operator: a pinned card is read first in its\ncolumn, above even the cards carrying something new. A reading\norder and nothing else — it never touches `position`, and the board\ndoes not take work out of Todo by it."
                           },
                           "position": {
                             "type": "integer",
@@ -9336,6 +9341,7 @@
           "status",
           "priority",
           "position",
+          "pinned",
           "stage",
           "unread",
           "last_run_failed",
@@ -9402,6 +9408,10 @@
             ],
             "format": "int64",
             "description": "The issue this one is a step of, by its number on this board.\nAbsent on a top-level card."
+          },
+          "pinned": {
+            "type": "boolean",
+            "description": "Kept in front of the operator: a pinned card is read first in its\ncolumn, above even the cards carrying something new. A reading\norder and nothing else — it never touches `position`, and the board\ndoes not take work out of Todo by it."
           },
           "position": {
             "type": "integer",
@@ -11585,6 +11595,13 @@
             ],
             "format": "int64",
             "description": "Re-parent by number; `0` detaches. Absent leaves the parent alone."
+          },
+          "pinned": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Keep this card at the top of its column, or stop. Singly optional:\nthe pin is on or off, and an absent key leaves it."
           },
           "priority": {
             "oneOf": [

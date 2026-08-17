@@ -239,6 +239,51 @@ component. The minute-long poll used to be the *only* refresh, so a signal
 the operator had just discharged stayed on screen for up to a minute; every
 act that clears one now asks the server again.
 
+## Pinning a card
+
+Above the unread lift sits one the operator asks for. A **pinned** card is
+read first in its column, and `readingOrder` is where both lifts live because
+they are one order: **pinned, then unread, then the board's own** — with the
+unread lift applying again *inside* the pinned block, so a pinned card
+carrying a comment leads it. The rank is the whole idea. A pin is what
+somebody chose; an unread count is what happened to a card while they were
+elsewhere, and what was chosen outranks what arrived.
+
+It is a reading order and nothing else, held to exactly the promises the
+unread lift makes. It never writes `position` — a drag still sends
+`persistedOrder`, the stored order — and it is deliberately absent from the
+board's `(priority, position, number)` pick order, which is how work leaves
+Todo. `priority` is already the field that says "do this first"; a pin that
+also promoted a card would give one question two answers, and pinning a card
+merely to keep an eye on it would quietly jump it past urgent work. The cost
+is the one the unread lift already charges: a second boundary a dragged card
+settles back across on the next refetch.
+
+The two lifts disagree about cancelled cards, on purpose. An unread count
+never lifts one; a pin does. Nothing but the operator put the pin there, and
+a control that goes on offering itself while quietly refusing to work is
+worse than a struck-through card at the top of a column.
+
+The pin **is** the marker — one element, not a badge beside a button.
+`cardChrome.PinButton` draws a filled pushpin on a pinned card and nothing at
+all on an unpinned one until the card is hovered or the button is tabbed to,
+because a permanent outline glyph on every card is furniture. It leads the
+card's meta row rather than taking the top-right corner, which belongs to the
+unread count. It has to stop the press twice over: the card's own click opens
+the issue, and the whole card is also the drag handle, so `pointerdown` is
+stopped as well or a press that drifted 4px picks the card up.
+
+That makes the card a shortcut, not the only door — hover is a thing a touch
+screen does not have. The issue's own rail carries a **Pinned** row that is
+always on screen, a press like the Status/Priority/Assignee rows above it
+rather than a fact like Parent and Blocked. Both write the same
+`PATCH { pinned }`, and both are optimistic: the card moves under the press
+and a failed write puts the board back and says so, because the pin is the
+one mark here whose truth is the server's.
+
+Nothing is written to the timeline. A pin changes nothing about the work —
+priority, which genuinely decides what the board starts, is silent too.
+
 ## A card's three properties
 
 Status, priority and assignee are set in two places — the issue page's rail and

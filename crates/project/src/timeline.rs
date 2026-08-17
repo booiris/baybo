@@ -67,6 +67,7 @@ mod tests {
             priority: IssuePriority::None,
             assignee: None,
             position: 0,
+            pinned: false,
             blocked_reason: None,
             branch: None,
             parent_issue_id: None,
@@ -92,6 +93,18 @@ mod tests {
         assert!(
             diff_events(&before, &after).is_empty(),
             "prose edits are not events; the current text is on the page"
+        );
+    }
+
+    #[test]
+    fn a_pin_is_not_something_that_happened_to_the_card() {
+        let before = issue();
+        let mut after = before.clone();
+        after.pinned = true;
+        assert!(
+            diff_events(&before, &after).is_empty(),
+            "the pin is how one person reads the column, and priority — which \
+             actually decides what the board starts — is silent too"
         );
     }
 

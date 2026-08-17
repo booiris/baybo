@@ -23,6 +23,7 @@ function child(stage: number, overrides: Partial<Issue> = {}): Issue {
     updated_at_ms: 0,
     unread: 0,
     last_run_failed: false,
+    pinned: false,
     ...overrides,
   };
 }

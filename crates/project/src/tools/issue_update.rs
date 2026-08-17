@@ -162,6 +162,11 @@ Two of these do more than edit a row:
             // agreeing on what an empty string means.
             blocked_reason: p.blocked.map(Some),
             cancelled: p.cancelled,
+            // Not in this tool's vocabulary, deliberately. The pin is the
+            // operator's own reading order — an agent that could set it
+            // would be reaching into how its work is looked at rather than
+            // changing anything about the work.
+            pinned: None,
         };
         if update.is_empty() && status.is_none() {
             return Err(ToolError::InvalidParams(

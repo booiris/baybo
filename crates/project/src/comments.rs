@@ -80,6 +80,7 @@ mod tests {
             priority: IssuePriority::None,
             assignee: assigned.then(|| AgentProfileId::parse("dev-1".to_owned()).expect("agent")),
             position: 0,
+            pinned: false,
             blocked_reason: None,
             branch: None,
             parent_issue_id: None,

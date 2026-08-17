@@ -568,6 +568,17 @@ conversion: that is the last point where the sign still exists, and a
 saturating conversion would hand the driver a slot count that empties the
 whole Todo column in one pass.
 
+"Most urgent first, then column order" is `driver::promotion_order`,
+`(priority, position, number)`, and it is the same order `IssueList` reads a
+column in — "what is next in Todo" has one answer whether an agent asks or
+the board acts. `issues.pinned` is **not** in it. A pin is how the operator
+wants a column *read* (the board floats a pinned card to the top of its
+column, and nothing else); `priority` is what the board should work on
+first, and two fields answering that question is one of them being wrong.
+Pinning a card to keep an eye on it must not quietly promote it past urgent
+work. The pin also writes no timeline entry, for the same reason priority
+does not: it changes nothing about the work.
+
 The driver is **level-triggered**: it reads the board as it stands and closes
 the gap, so calling it twice on an unchanged board does nothing the second
 time. Nothing tells it a card became ready — it looks.

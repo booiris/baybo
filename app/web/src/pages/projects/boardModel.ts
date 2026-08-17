@@ -110,8 +110,16 @@ export function unreadTotal(board: Board): number {
   );
 }
 
-/// Cards with something new on top, everything else in the board's own
-/// order.
+/// The order a column is **read** in: pinned cards first, then cards with
+/// something new, then everything else in the board's own order.
+///
+/// Two lifts, ranked, and the rank is the point. A pin is the operator
+/// saying "keep this in front of me"; an unread count is something that
+/// happened to a card while they were elsewhere. What somebody chose
+/// outranks what arrived, so a pinned card that has been read still sits
+/// above an unpinned one that has not — and inside each half the other
+/// lift still applies, so a pinned card carrying a comment leads the pinned
+/// block.
 ///
 /// Applied **once, to the board the fetch produced**, rather than to the
 /// rendered view: one order, so what is on screen is what a drag is resolved
@@ -121,23 +129,47 @@ export function unreadTotal(board: Board): number {
 /// inside its column before the first `over` resolved, so a 4px twitch
 /// posted a reorder of a column nobody had touched.
 ///
-/// It writes no `position`, not even through a drag: the partition is
+/// It writes no `position`, not even through a drag: each partition is
 /// stable, so the order the operator dragged their cards into survives
-/// inside each half and a card falls back into it as soon as it is read,
-/// and a move sends [`persistedOrder`] — the stored order with one card
-/// moved — rather than the order on screen.
+/// inside every band and a card falls back into it as soon as it is read or
+/// unpinned, and a move sends [`persistedOrder`] — the stored order with one
+/// card moved — rather than the order on screen. A pin therefore costs one
+/// more boundary a dragged card settles back across on the next refetch,
+/// which is the same trade the unread lift already makes.
 ///
-/// A cancelled card is never lifted. Cancel is terminal, and floating a
-/// struck-through card over live work because somebody spoke on it before it
-/// was called off is the board arguing with itself.
-export function hoistUnread(board: Board): Board {
-  const isNew = (issue: Issue) => issue.unread > 0 && issue.cancelled_at_ms == null;
+/// A cancelled card is never lifted **by its unread count**. Cancel is
+/// terminal, and floating a struck-through card over live work because
+/// somebody spoke on it before it was called off is the board arguing with
+/// itself. A pin still lifts one, because nothing else put it there: the pin
+/// is an instruction, and a control that quietly stops working on cards it
+/// still offers itself on is worse than a struck-through card at the top.
+export function readingOrder(board: Board): Board {
   const view = emptyBoard();
   for (const status of COLUMNS) {
-    const column = board[status];
-    view[status] = [...column.filter(isNew), ...column.filter((issue) => !isNew(issue))];
+    const [pinned, rest] = partition(board[status], (issue) => issue.pinned);
+    view[status] = [...hoist(pinned, hasNews), ...hoist(rest, hasNews)];
   }
   return view;
+}
+
+/// Something new on a live card — the lift [`readingOrder`] applies, and the
+/// dot a stage tab wears for a column that is not on screen. One predicate,
+/// so the lift and the dot can never disagree about what counts as news.
+export function hasNews(issue: Issue): boolean {
+  return issue.unread > 0 && issue.cancelled_at_ms == null;
+}
+
+export function columnHasNews(column: Issue[]): boolean {
+  return column.some(hasNews);
+}
+
+function partition(column: Issue[], lift: (issue: Issue) => boolean): [Issue[], Issue[]] {
+  return [column.filter(lift), column.filter((issue) => !lift(issue))];
+}
+
+function hoist(column: Issue[], lift: (issue: Issue) => boolean): Issue[] {
+  const [lifted, rest] = partition(column, lift);
+  return [...lifted, ...rest];
 }
 
 // Cards and columns share one DndContext, so their ids need namespaces.
@@ -283,6 +315,22 @@ export function withPositions(board: Board, status: IssueStatus, ordered: number
       return at === -1 ? issue : { ...issue, position: at };
     }),
   };
+}
+
+/// One card's pin flipped, and its column re-read in the new order.
+///
+/// [`readingOrder`] runs in the load effect, over the board the fetch
+/// produced — so a pin written locally without re-running it leaves the card
+/// wearing a mark it has not moved for until the next refetch answers, which
+/// reads as the press having half worked.
+export function withPin(board: Board, number: number, pinned: boolean): Board {
+  const next = emptyBoard();
+  for (const status of COLUMNS) {
+    next[status] = board[status].map((issue) =>
+      issue.number === number ? { ...issue, pinned } : issue,
+    );
+  }
+  return readingOrder(next);
 }
 
 export function placementChanged(before: Board, after: Board, number: number): boolean {
