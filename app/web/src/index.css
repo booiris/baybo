@@ -320,11 +320,17 @@ ol.md-list > li::before {
   outline: none;
   font-family: var(--font-sans);
   font-size: var(--text-card);
-  line-height: 1.25;
+  /* The leading a timeline bubble's prose already carries: the markdown
+     component map puts `leading-relaxed` on every `<p>` it renders, and this is
+     the variable that utility expands to — so the description and the comments
+     under it read as one document instead of two settings free to drift. */
+  line-height: var(--leading-relaxed);
 }
 
+/* The `my-2` that same map gives a bubble's blocks. Against relaxed leading a
+   quarter-rem gap reads as a wrapped line rather than a new paragraph. */
 .md-editor .ProseMirror > * + * {
-  margin-top: 0.25rem;
+  margin-top: 0.5rem;
 }
 
 .md-editor .ProseMirror h1,
