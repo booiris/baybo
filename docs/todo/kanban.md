@@ -330,7 +330,8 @@ existing git repo.
   assignee, blocked-only, hide-cancelled; the trigger carries a count of
   active narrowings), **Activity** toggle
   (right drawer: the feed of status changes, run results, blockers, hires,
-  budget events), settings (team management, budget knobs, archive).
+  budget events), settings (budget knobs, the board's markdown
+  description, archive behind a confirmation).
 - **There is no chat with the lead.** The board is the whole control
   surface: work is described on cards and agents are directed by
   @mention on a card, so a conversation running beside the board would be
@@ -360,7 +361,8 @@ existing git repo.
   (native/claude/codex) and llm pin. Unlike `ProjectAgentCreate` (which
   deliberately exposes neither knob), the user form may set framework and
   llm. Creations stamp `created_by = User` and share the `max_agents`
-  cap with lead hires; ⚙ team management carries the same action.
+  cap with lead hires. The strip is the one place a team is managed;
+  ⚙ carries the board's own knobs and nothing else.
 - Live updates ride the existing owner-channel WS frame family (board and
   detail invalidate on issue/run/event deltas; no polling).
 

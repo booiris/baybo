@@ -2,7 +2,6 @@ import { useState } from 'react';
 
 import { useAdminClient, useAuth } from '../../api/auth';
 import { setProjectArchived, updateProject } from './api';
-import type { Agent } from './boardModel';
 import type { Project } from './boardModel';
 import {
   BUDGET_REFUSAL,
@@ -16,24 +15,17 @@ import {
 } from './budgetModel';
 import { formatParallelIssueRuns, parallelIssueRunsHint, parseParallelIssueRuns } from './driverModel';
 import { fieldLabel, textInput } from './CreateProjectForm';
+import { MarkdownEditor } from './MarkdownEditor';
 import { activityFor, useBoardActivity } from './useBoardActivity';
 
 export function ProjectSettings({
   project,
   onClose,
   onSaved,
-  team,
-  onOpenProfile,
-  onAddAgent,
 }: {
   project: Project;
   onClose: () => void;
   onSaved: (project: Project) => void;
-  /// The roster, so ⚙ can manage the team the mockup says it manages
-  /// rather than only the board's knobs.
-  team: Agent[];
-  onOpenProfile: (agent: Agent) => void;
-  onAddAgent: () => void;
 }) {
   const client = useAdminClient();
   const { logout } = useAuth();
@@ -44,6 +36,10 @@ export function ProjectSettings({
   const [parallelIssueRuns, setParallelIssueRuns] = useState(formatParallelIssueRuns(project.max_parallel_issue_runs));
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // Archiving is asked about before it happens; un-archiving is not. Only one
+  // of the two takes a board away from everyone looking at it, and a question
+  // in front of the restorative direction is a question nobody reads.
+  const [confirmingArchive, setConfirmingArchive] = useState(false);
   const archived = project.archived_at_ms != null;
   // What the board has already spent against the ceilings being typed. The
   // two fields are the only place a ceiling is chosen, and choosing one
@@ -129,18 +125,23 @@ export function ProjectSettings({
         </div>
 
         <div>
-          <label className={fieldLabel} htmlFor="settings-description">
-            Description
-          </label>
-          <input
-            id="settings-description"
-            className={textInput}
-            value={description}
-            disabled={archived}
-            onChange={(event) => {
-              setDescription(event.target.value);
-            }}
-          />
+          {/* A `<span>`, not a `<label>`: what it names is a ProseMirror
+              surface rather than a form control, and the editor carries the
+              same words as its own `aria-label`. */}
+          <span className={fieldLabel}>Description</span>
+          <div
+            className={`w-full min-h-[3.5rem] px-3 py-2 border-2 border-black rounded-md shadow-brutal-xs md-editor ${
+              archived ? 'bg-canvas opacity-60' : 'bg-white'
+            }`}
+          >
+            <MarkdownEditor
+              initialValue={project.description}
+              ariaLabel="Description"
+              placeholder="What this project is about"
+              editable={!archived}
+              onChange={setDescription}
+            />
+          </div>
         </div>
 
         <div>
@@ -207,43 +208,6 @@ export function ProjectSettings({
           creation.
         </p>
 
-        <section className="border-t-2 border-black/15 pt-3">
-          <h3 className="font-mono text-[0.6rem] font-bold uppercase tracking-wider text-ink-soft">
-            Team
-          </h3>
-          <ul className="mt-1.5 flex flex-col gap-1">
-            {team.map((agent) => (
-              <li key={agent.id}>
-                <button
-                  type="button"
-                  onClick={() => {
-                    onOpenProfile(agent);
-                  }}
-                  className="w-full text-left flex items-baseline gap-2 border-2 border-black/15 hover:border-black rounded-md px-2 py-1 bg-surface font-mono text-[0.68rem]"
-                >
-                  <span className="font-bold">@{agent.handle}</span>
-                  <span className="min-w-0 flex-1 truncate text-ink-soft">{agent.name}</span>
-                  {agent.lead ? (
-                    <span className="shrink-0 rounded border border-black bg-brand px-1 text-[0.5rem] font-bold uppercase">
-                      lead
-                    </span>
-                  ) : null}
-                </button>
-              </li>
-            ))}
-          </ul>
-          <button
-            type="button"
-            onClick={onAddAgent}
-            className="mt-1.5 border-2 border-dashed border-black rounded-md px-2 py-1 font-mono text-[0.66rem] cursor-pointer hover:bg-canvas"
-          >
-            ＋ New agent
-          </button>
-          <p className="mt-1 font-mono text-[0.58rem] text-ink-soft">
-            team {team.length}/16 — the lead hires against the same cap.
-          </p>
-        </section>
-
         {error !== null ? (
           <p className="border-2 border-err text-err rounded-md px-2 py-1 font-mono text-[0.68rem] break-words">
             {error}
@@ -255,7 +219,11 @@ export function ProjectSettings({
             type="button"
             disabled={busy}
             onClick={() => {
-              void toggleArchive();
+              if (archived) {
+                void toggleArchive();
+                return;
+              }
+              setConfirmingArchive(true);
             }}
             className={`border-2 rounded-md px-3 py-1 font-mono text-[0.68rem] disabled:opacity-50 ${
               archived ? 'border-black bg-brand' : 'border-warn text-warn bg-surface'
@@ -287,6 +255,75 @@ export function ProjectSettings({
               {busy ? 'Saving…' : 'Save'}
             </button>
           )}
+        </div>
+      </div>
+
+      {confirmingArchive ? (
+        <ArchiveConfirm
+          name={project.name}
+          busy={busy}
+          onCancel={() => {
+            setConfirmingArchive(false);
+          }}
+          onConfirm={() => {
+            setConfirmingArchive(false);
+            void toggleArchive();
+          }}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+/// What archiving costs, asked at the moment it is being decided. It sits over
+/// the settings panel rather than replacing its buttons so the numbers being
+/// archived stay on screen behind the question.
+function ArchiveConfirm({
+  name,
+  busy,
+  onCancel,
+  onConfirm,
+}: {
+  name: string;
+  busy: boolean;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label="Archive project"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-6"
+      onClick={onCancel}
+    >
+      <div
+        className="w-full max-w-sm bg-surface border-[3px] border-black rounded-md shadow-brutal p-4 flex flex-col gap-3"
+        onClick={(event) => {
+          event.stopPropagation();
+        }}
+      >
+        <h3 className="font-mono text-sm font-bold">Archive {name}?</h3>
+        <p className="font-mono text-[0.68rem] leading-snug text-ink-soft">
+          The board leaves the switcher and stops taking work — running cards finish, nothing new
+          starts. Its cards, runs and history stay, and you can unarchive it from here.
+        </p>
+        <div className="flex justify-end gap-2">
+          <button
+            type="button"
+            onClick={onCancel}
+            className="border-2 border-black rounded-md px-3 py-1 font-mono text-[0.68rem] bg-surface"
+          >
+            Never mind
+          </button>
+          <button
+            type="button"
+            disabled={busy}
+            onClick={onConfirm}
+            className="border-2 border-warn bg-warn text-white rounded-md px-3 py-1 font-mono text-[0.68rem] font-bold disabled:opacity-50"
+          >
+            Archive it
+          </button>
         </div>
       </div>
     </div>

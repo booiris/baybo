@@ -125,6 +125,29 @@ mode collapsing the strip could introduce, and the badge is what rules it out.
 `boardFilter.ts` owns the list of narrowings (`restrictionCount`), because the
 badge and the Clear button must never disagree about what counts as filtered.
 
+## Project settings
+
+⚙ holds the board's **own knobs** — name, description, the two ceilings, the
+run cap, archive — and no roster. The team is managed from the strip a few
+pixels to its left, which is always on screen; a second copy of it here would
+give hiring and removal two front doors that have to agree.
+
+The description is the **card's markdown editor** (`MarkdownEditor`), not a
+one-line input: it is what a board says about itself, read by whoever opens ⚙,
+and a project is described in paragraphs more often than in a sentence. It
+reaches no agent — the brief a run is given is built from the *issue's*
+description (`crates/project/src/brief.rs`), never the board's. An archived board gets
+the same editor with `editable={false}`, which is read once at mount — the
+panel closes on archive, so nothing flips it in place.
+
+**Archive asks first.** It takes a board away from everyone looking at it,
+which is exactly the shape a confirmation is for; the dialog names the board
+and says what survives (running cards finish, the cards and history stay).
+**Unarchive does not ask** — it is the way back, and a question in front of the
+restorative direction is a question nobody reads. The dialog sits *over* the
+panel rather than replacing its buttons, so the numbers being archived stay on
+screen behind it.
+
 ## The stage page
 
 One stage of the board as a whole page — `/projects/:pid/board/:status`

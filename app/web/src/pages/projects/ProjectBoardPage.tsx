@@ -685,15 +685,6 @@ export function ProjectBoardPage() {
           onClose={() => {
             setShowSettings(false);
           }}
-          team={team}
-          onOpenProfile={(agent) => {
-            setShowSettings(false);
-            openAgent(agent.id);
-          }}
-          onAddAgent={() => {
-            setShowSettings(false);
-            setHireOpen(true);
-          }}
           onSaved={(saved) => {
             setProject(saved);
             // `refetch`, not a bare `setRefreshKey`: raising the ceiling is

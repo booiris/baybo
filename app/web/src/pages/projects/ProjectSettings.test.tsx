@@ -12,6 +12,35 @@ const client = vi.hoisted(() => ({}));
 const auth = vi.hoisted(() => ({ logout: () => {} }));
 vi.mock('../../api/auth', () => ({ useAdminClient: () => client, useAuth: () => auth }));
 
+// Milkdown drives a real ProseMirror view, which jsdom hosts badly and which
+// none of this is about: what matters here is that the panel saves whatever
+// markdown the editor hands it, and that an archived board can't type.
+vi.mock('./MarkdownEditor', () => ({
+  MarkdownEditor: ({
+    initialValue,
+    onChange,
+    ariaLabel,
+    placeholder,
+    editable = true,
+  }: {
+    initialValue: string;
+    onChange: (markdown: string) => void;
+    ariaLabel: string;
+    placeholder?: string;
+    editable?: boolean;
+  }) => (
+    <textarea
+      aria-label={ariaLabel}
+      placeholder={placeholder}
+      defaultValue={initialValue}
+      readOnly={!editable}
+      onChange={(event) => {
+        onChange(event.target.value);
+      }}
+    />
+  ),
+}));
+
 function project(overrides: Partial<Project> = {}): Project {
   return {
     id: '01JP',
@@ -40,9 +69,6 @@ describe('ProjectSettings', () => {
         project={project({ daily_budget_micros: 12_500_000 })}
         onClose={vi.fn()}
         onSaved={vi.fn()}
-      team={[]}
-      onOpenProfile={vi.fn()}
-      onAddAgent={vi.fn()}
       />,
     );
     const box = screen.getByLabelText('Daily budget (USD)');
@@ -66,9 +92,6 @@ describe('ProjectSettings', () => {
         project={project({ daily_budget_micros: 5_000_000 })}
         onClose={vi.fn()}
         onSaved={vi.fn()}
-      team={[]}
-      onOpenProfile={vi.fn()}
-      onAddAgent={vi.fn()}
       />,
     );
     await userEvent.clear(screen.getByLabelText('Daily budget (USD)'));
@@ -88,9 +111,6 @@ describe('ProjectSettings', () => {
         project={project({ daily_budget_tokens: 250_000 })}
         onClose={vi.fn()}
         onSaved={vi.fn()}
-      team={[]}
-      onOpenProfile={vi.fn()}
-      onAddAgent={vi.fn()}
       />,
     );
     const box = screen.getByLabelText('Daily token budget (tokens)');
@@ -114,9 +134,6 @@ describe('ProjectSettings', () => {
         project={project({ daily_budget_tokens: 250_000 })}
         onClose={vi.fn()}
         onSaved={vi.fn()}
-      team={[]}
-      onOpenProfile={vi.fn()}
-      onAddAgent={vi.fn()}
       />,
     );
     await userEvent.clear(screen.getByLabelText('Daily token budget (tokens)'));
@@ -136,9 +153,6 @@ describe('ProjectSettings', () => {
         project={project()}
         onClose={vi.fn()}
         onSaved={vi.fn()}
-      team={[]}
-      onOpenProfile={vi.fn()}
-      onAddAgent={vi.fn()}
       />,
     );
     await userEvent.type(screen.getByLabelText('Daily token budget (tokens)'), '250k');
@@ -153,9 +167,6 @@ describe('ProjectSettings', () => {
         project={project({ max_parallel_issue_runs: 2 })}
         onClose={vi.fn()}
         onSaved={vi.fn()}
-      team={[]}
-      onOpenProfile={vi.fn()}
-      onAddAgent={vi.fn()}
       />,
     );
     const box = screen.getByLabelText('Parallel issue runs');
@@ -179,19 +190,13 @@ describe('ProjectSettings', () => {
         project={project({ max_parallel_issue_runs: 0 })}
         onClose={vi.fn()}
         onSaved={vi.fn()}
-      team={[]}
-      onOpenProfile={vi.fn()}
-      onAddAgent={vi.fn()}
       />,
     );
     expect(screen.getByText(/cards stay in Todo until you move them/)).toBeInTheDocument();
   });
 
   it('refuses an empty run ceiling rather than silently restoring the default', async () => {
-    render(<ProjectSettings project={project()} onClose={vi.fn()} onSaved={vi.fn()}
-      team={[]}
-      onOpenProfile={vi.fn()}
-      onAddAgent={vi.fn()} />);
+    render(<ProjectSettings project={project()} onClose={vi.fn()} onSaved={vi.fn()} />);
     await userEvent.clear(screen.getByLabelText('Parallel issue runs'));
     await userEvent.click(screen.getByRole('button', { name: 'Save' }));
     expect(await screen.findByText(/must be a whole number/)).toBeInTheDocument();
@@ -199,18 +204,12 @@ describe('ProjectSettings', () => {
   });
 
   it('separates zero from empty in what it tells the operator', () => {
-    render(<ProjectSettings project={project()} onClose={vi.fn()} onSaved={vi.fn()}
-      team={[]}
-      onOpenProfile={vi.fn()}
-      onAddAgent={vi.fn()} />);
+    render(<ProjectSettings project={project()} onClose={vi.fn()} onSaved={vi.fn()} />);
     expect(screen.getByText(/No ceiling/)).toBeInTheDocument();
   });
 
   it('refuses text that is not an amount instead of sending something else', async () => {
-    render(<ProjectSettings project={project()} onClose={vi.fn()} onSaved={vi.fn()}
-      team={[]}
-      onOpenProfile={vi.fn()}
-      onAddAgent={vi.fn()} />);
+    render(<ProjectSettings project={project()} onClose={vi.fn()} onSaved={vi.fn()} />);
     await userEvent.type(screen.getByLabelText('Daily budget (USD)'), 'lots');
     await userEvent.click(screen.getByRole('button', { name: 'Save' }));
     expect(await screen.findByText(/must be an amount in dollars/)).toBeInTheDocument();
@@ -227,9 +226,6 @@ describe('ProjectSettings', () => {
         project={project()}
         onClose={vi.fn()}
         onSaved={vi.fn()}
-        team={[]}
-        onOpenProfile={vi.fn()}
-        onAddAgent={vi.fn()}
       />,
     );
     expect(screen.getByLabelText('Daily budget (USD)')).toHaveAttribute(
@@ -248,9 +244,6 @@ describe('ProjectSettings', () => {
         project={project({ archived_at_ms: 111 })}
         onClose={vi.fn()}
         onSaved={vi.fn()}
-      team={[]}
-      onOpenProfile={vi.fn()}
-      onAddAgent={vi.fn()}
       />,
     );
     expect(screen.getByLabelText('Name')).toBeDisabled();
@@ -258,40 +251,62 @@ describe('ProjectSettings', () => {
     expect(screen.getByLabelText('Daily token budget (tokens)')).toBeDisabled();
     expect(screen.queryByRole('button', { name: 'Save' })).not.toBeInTheDocument();
 
+    expect(screen.getByLabelText('Description')).toHaveAttribute('readonly');
+
+    // Un-archiving is the way back and asks nothing: the confirmation guards
+    // the direction that takes the board away, not the one that returns it.
     await userEvent.click(screen.getByRole('button', { name: 'Unarchive' }));
     expect(api.setProjectArchived).toHaveBeenCalledWith(client, '01JP', false);
   });
 
-  it('manages the team from settings, reaching the same profile and hire form', async () => {
-    const onOpenProfile = vi.fn();
-    const onAddAgent = vi.fn();
-    render(
-      <ProjectSettings
-        project={project()}
-        onClose={vi.fn()}
-        onSaved={vi.fn()}
-        team={[
-          {
-            id: '01JLEAD',
-            handle: 'lead',
-            name: 'Lead',
-            description: '',
-            framework: 'baybo',
-            lead: true,
-            created_at_ms: 0,
-          },
-        ]}
-        onOpenProfile={onOpenProfile}
-        onAddAgent={onAddAgent}
-      />,
-    );
+  it('asks before archiving, and archives only once the question is answered', async () => {
+    render(<ProjectSettings project={project()} onClose={vi.fn()} onSaved={vi.fn()} />);
 
-    await userEvent.click(screen.getByText('@lead'));
-    expect(onOpenProfile).toHaveBeenCalled();
+    await userEvent.click(screen.getByRole('button', { name: 'Archive' }));
+    expect(api.setProjectArchived).not.toHaveBeenCalled();
+    expect(screen.getByRole('dialog', { name: 'Archive project' })).toBeInTheDocument();
 
-    // The same form the team strip's ＋ opens — settings must not grow a
-    // second one that drifts from it.
-    await userEvent.click(screen.getByRole('button', { name: /New agent/ }));
-    expect(onAddAgent).toHaveBeenCalled();
+    await userEvent.click(screen.getByRole('button', { name: 'Archive it' }));
+    await waitFor(() => {
+      expect(api.setProjectArchived).toHaveBeenCalledWith(client, '01JP', true);
+    });
   });
+
+  it('leaves the board alone when the question is waved off', async () => {
+    render(<ProjectSettings project={project()} onClose={vi.fn()} onSaved={vi.fn()} />);
+
+    await userEvent.click(screen.getByRole('button', { name: 'Archive' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Never mind' }));
+
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(api.setProjectArchived).not.toHaveBeenCalled();
+  });
+
+  it('saves the description as the markdown the editor produced', async () => {
+    render(<ProjectSettings project={project()} onClose={vi.fn()} onSaved={vi.fn()} />);
+
+    const box = screen.getByLabelText('Description');
+    expect(box).toHaveValue('the board');
+
+    await userEvent.clear(box);
+    await userEvent.type(box, '## Goals');
+    await userEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => {
+      expect(api.updateProject).toHaveBeenCalledWith(
+        client,
+        '01JP',
+        expect.objectContaining({ description: '## Goals' }),
+      );
+    });
+  });
+
+  it('leaves the roster to the board, keeping one place a team is managed', () => {
+    // The team strip above the board is the one. Settings carried a second
+    // copy of it, so a hire had two front doors that had to agree.
+    render(<ProjectSettings project={project()} onClose={vi.fn()} onSaved={vi.fn()} />);
+
+    expect(screen.queryByText('Team')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /New agent/ })).not.toBeInTheDocument();
+  });
+
 });

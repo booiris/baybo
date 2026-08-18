@@ -30,6 +30,10 @@ export type MarkdownEditorProps = {
   placeholder?: string;
   ariaLabel: string;
   className?: string;
+  /// Whether the document can be typed into. Read once, at mount, like
+  /// `initialValue` — a surface that can flip this while open has to re-mount
+  /// the editor to make it take.
+  editable?: boolean;
   /// Bumped by the parent to empty the editor — how the composer clears
   /// itself after a comment is sent.
   resetSignal?: number;
@@ -42,6 +46,7 @@ function Editing({
   placeholder,
   ariaLabel,
   className,
+  editable = true,
   resetSignal = 0,
 }: MarkdownEditorProps) {
   // Whether to show the prompt, decided here rather than in CSS. An "empty"
@@ -57,6 +62,7 @@ function Editing({
           ctx.set(defaultValueCtx, initialValue);
           ctx.update(editorViewOptionsCtx, (prev) => ({
             ...prev,
+            editable: () => editable,
             attributes: {
               ...prev.attributes,
               'aria-label': ariaLabel,
