@@ -9,11 +9,13 @@ import {
   assignableAgents,
   updatedAgo,
   cardDragId,
+  backFrom,
   columnDropId,
   dropRejection,
   emptyBoard,
   groupByStatus,
   hasDeliverable,
+  readingBands,
   readingOrder,
   moveAnnouncement,
   liveCount,
@@ -23,6 +25,7 @@ import {
   placementChanged,
   runDuration,
   runIndicator,
+  stageTally,
   resolveDrop,
   resolveLanding,
   RUN_LOG_HEAD,
@@ -555,6 +558,115 @@ describe('readingOrder', () => {
       }),
     );
     expect(view.backlog.map((i) => i.number)).toEqual([3, 1, 2]);
+  });
+});
+
+describe('readingBands', () => {
+  const column = [
+    issue(1),
+    issue(2, { unread: 1 }),
+    issue(3, { pinned: true }),
+    issue(4, { pinned: true, unread: 2 }),
+    issue(5, { unread: 3, cancelled_at_ms: 99 }),
+  ];
+
+  it('files every card under exactly one band', () => {
+    const bands = readingBands(column, 'backlog');
+    const filed = bands.flatMap((band) => band.issues.map((row) => row.number)).sort();
+    expect(filed).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  it('sends a pinned card to Pinned even when it is also new', () => {
+    // The bands are the rank `readingOrder` applies, and it ranks the pin
+    // above the count. A card in two bands would be the page saying the
+    // order follows a rule it does not follow.
+    const bands = readingBands(column, 'backlog');
+    expect(bands[0].issues.map((row) => row.number)).toEqual([3, 4]);
+    expect(bands[1].issues.map((row) => row.number)).toEqual([2]);
+    expect(bands[2].issues.map((row) => row.number)).toEqual([1, 5]);
+  });
+
+  it('never reorders a column that is already in reading order', () => {
+    // The load-bearing one. `ColumnPage` draws its rows from the bands and
+    // resolves a drag in the same array, so banding a column must be a
+    // grouping and not a second sort — a card that changed slots on the way
+    // through here would land a drop where nobody aimed it.
+    const read = readingOrder(board({ backlog: column })).backlog;
+    const banded = readingBands(read, 'backlog').flatMap((band) => band.issues);
+    expect(banded.map((row) => row.number)).toEqual(read.map((row) => row.number));
+  });
+
+  it('leaves the column it was handed alone', () => {
+    readingBands(column, 'backlog');
+    expect(column.map((row) => row.number)).toEqual([1, 2, 3, 4, 5]);
+  });
+});
+
+describe('backFrom', () => {
+  it('returns to the stage page it was opened from, filter and all', () => {
+    expect(backFrom('p1', '/projects/p1/board/todo?q=blocked')).toEqual({
+      to: '/projects/p1/board/todo?q=blocked',
+      label: 'Todo',
+    });
+    expect(backFrom('p1', '/projects/p1/board/in_progress')).toEqual({
+      to: '/projects/p1/board/in_progress',
+      label: 'In Progress',
+    });
+  });
+
+  it('falls back to the board when nobody said where they came from', () => {
+    // A pasted URL has no history behind it, so the board is the honest
+    // answer rather than a guess.
+    expect(backFrom('p1', undefined)).toEqual({ to: '/projects/p1', label: 'Board' });
+    expect(backFrom('p1', null)).toEqual({ to: '/projects/p1', label: 'Board' });
+    expect(backFrom('p1', 42)).toEqual({ to: '/projects/p1', label: 'Board' });
+  });
+
+  it('refuses anywhere that is not a stage of this project', () => {
+    // The value becomes a navigation target, so it is checked rather than
+    // trusted: another project's board, a made-up stage, and anything
+    // pointing off-site all fall back.
+    for (const hostile of [
+      '/projects/other/board/todo',
+      '/projects/p1/board/shipping',
+      'https://example.com/projects/p1/board/todo',
+      '//example.com',
+      '/projects/p1/issues/3',
+      '',
+    ]) {
+      expect(backFrom('p1', hostile)).toEqual({ to: '/projects/p1', label: 'Board' });
+    }
+  });
+});
+
+describe('stageTally', () => {
+  const runs = [
+    { number: 1, attempt: 1, agent_id: 'a', status: 'running', trigger: 'started', created_at_ms: 0 },
+    { number: 2, attempt: 1, agent_id: 'a', status: 'queued', trigger: 'started', created_at_ms: 0 },
+  ] as IssueRun[];
+
+  it('counts what the stage is doing, and only what is still live', () => {
+    const tally = stageTally(
+      [
+        issue(1),
+        issue(2, { unread: 2 }),
+        issue(3, { last_run_failed: true }),
+        issue(4, { cancelled_at_ms: 9, unread: 5, last_run_failed: true }),
+      ],
+      runs,
+    );
+    // A queued run is not work in flight, and a cancelled card's old
+    // failure is not something to go and fix.
+    expect(tally).toEqual({ live: 3, working: 1, unread: 1, failed: 1 });
+  });
+
+  it('counts cards with something new, not the sum of their badges', () => {
+    // Cards, not the sum of their badges: one card carrying four comments
+    // is one card needing the operator. It is deliberately **not** the
+    // `New` band's size — a pinned card that is also unread reads under
+    // `Pinned` but is still counted here, because the heading answers "how
+    // much is waiting on me" and the band answers "why is this at the top".
+    expect(stageTally([issue(1, { unread: 4 })], []).unread).toBe(1);
   });
 });
 

@@ -165,6 +165,125 @@ export function columnHasNews(column: Issue[]): boolean {
   return column.some(hasNews);
 }
 
+/// The three groups [`readingOrder`] ranks a column into, named.
+///
+/// The order itself is old; drawing it is not. On the board's 210px column the
+/// rule is invisible — thirty tiles in an order whose reason is in this file
+/// and nowhere on screen — so the stage page renders each group under its own
+/// label, and the operator can see that the top of the wall is *theirs* rather
+/// than the board having shuffled itself.
+///
+/// It is a **grouping of what is already rendered**, never a second sort. Every
+/// card lands in exactly one band, and over a column in reading order the
+/// bands' concatenation is that same column, unchanged. That is what lets the
+/// page draw its whole wall from this one call without showing an order
+/// nothing stored — and it is why `commitMove` re-applies [`readingOrder`] to
+/// every optimistic write, since a column left out of reading order turns this
+/// grouping into a silent re-sort of what is on screen.
+export type BandKey = 'pinned' | 'news' | 'queue';
+
+export type ReadingBand = {
+  key: BandKey;
+  label: string;
+  /// Why these cards are here, for the header's tooltip. The label is two
+  /// words; a band that lifts cards over other cards owes the reader more.
+  note: string;
+  issues: Issue[];
+};
+
+/// Which band a card belongs to, and the only place that is decided.
+function bandKeyOf(issue: Issue): BandKey {
+  if (issue.pinned) return 'pinned';
+  return hasNews(issue) ? 'news' : 'queue';
+}
+
+export function readingBands(column: readonly Issue[], status: IssueStatus): ReadingBand[] {
+  const of = (key: BandKey) => column.filter((issue) => bandKeyOf(issue) === key);
+  return [
+    {
+      key: 'pinned',
+      label: 'Pinned',
+      note: 'Held at the top because you pinned them — press the pin again to release one',
+      issues: of('pinned'),
+    },
+    {
+      key: 'news',
+      label: 'New',
+      note: 'Something has happened on these since you last opened them. Opening one clears it',
+      issues: of('news'),
+    },
+    {
+      key: 'queue',
+      label: 'Queue',
+      // Two things this must not claim. It cannot say "what a drag writes"
+      // — the stage page has no drag, and a tooltip naming a gesture that
+      // is not there sends the operator hunting for it. And only Todo is
+      // drawn from: on the other four stages `position` is a reading order
+      // and nothing takes work out of them by it.
+      note:
+        status === 'todo'
+          ? 'The order the stage stores — with priority, what the board starts next. Drag on the board to change it'
+          : 'The order the stage stores. Drag on the board to change it',
+      issues: of('queue'),
+    },
+  ];
+}
+
+/// Where a card's page goes back to, and what that door is called.
+///
+/// A card is opened from the board or from a stage page, and those are not
+/// the same place. A fixed "← Board" on the card sent an operator who had
+/// maximized Todo two steps from where they were — and dropped that stage's
+/// filter on the way, so the wall they returned to was not the wall they
+/// left. The opener records where it came from; this reads it back.
+///
+/// It refuses anything that is not a page of **this** project. The value
+/// arrives through router state, which is same-origin and not addressable
+/// from outside — but a back link is a navigation target, and one built out
+/// of a value this function did not check is the shape of an open redirect
+/// whoever writes the next opener will not be looking for.
+export function backFrom(projectId: string, from: unknown): { to: string; label: string } {
+  const board = { to: `/projects/${encodeURIComponent(projectId)}`, label: 'Board' };
+  if (typeof from !== 'string') return board;
+  const [path] = from.split('?');
+  const prefix = `/projects/${encodeURIComponent(projectId)}/board/`;
+  if (!from.startsWith(prefix)) return board;
+  const status = path.slice(prefix.length);
+  if (!COLUMNS.includes(status as IssueStatus)) return board;
+  return { to: from, label: COLUMN_LABEL[status as IssueStatus] };
+}
+
+/// What one stage says about itself in its own heading.
+///
+/// Counted over the **whole stage**, not the filtered view: the masthead
+/// describes the column, and a heading that quietly shrank with the filter
+/// would report a stage as calm because its noisy cards were hidden. The
+/// stage tabs carry the `matched/whole` split, so the narrowing is admitted
+/// where it applies.
+///
+/// `unread` counts live **cards** carrying something new — cards, not the sum
+/// of their badges, so one card holding four comments is one card here, and a
+/// cancelled card commented on before it was called off is none.
+///
+/// It is deliberately **not** the `New` band's size. A pinned card that is
+/// also unread reads under `Pinned`, because a pin outranks a count — but it
+/// is still something waiting on the operator, so it is counted here. The
+/// heading answers "how much is waiting on me"; the band answers "why is this
+/// card at the top".
+export type StageTally = { live: number; working: number; unread: number; failed: number };
+
+export function stageTally(column: Issue[], activeRuns: IssueRun[]): StageTally {
+  const working = new Set(
+    activeRuns.filter((run) => run.status === 'running').map((run) => run.number),
+  );
+  return {
+    live: liveCount(column),
+    working: column.filter((issue) => working.has(issue.number)).length,
+    unread: column.filter(hasNews).length,
+    failed: column.filter((issue) => issue.cancelled_at_ms == null && issue.last_run_failed).length,
+  };
+}
+
 function partition(column: Issue[], lift: (issue: Issue) => boolean): [Issue[], Issue[]] {
   return [column.filter(lift), column.filter((issue) => !lift(issue))];
 }

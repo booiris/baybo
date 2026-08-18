@@ -1,24 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Link, Navigate, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import {
-  DndContext,
-  DragOverlay,
-  KeyboardSensor,
-  PointerSensor,
-  closestCenter,
-  useSensor,
-  useSensors,
-  type DragEndEvent,
-  type DragStartEvent,
-} from '@dnd-kit/core';
-import {
-  SortableContext,
-  arrayMove,
-  sortableKeyboardCoordinates,
-  useSortable,
-  verticalListSortingStrategy,
-} from '@dnd-kit/sortable';
-import { CSS } from '@dnd-kit/utilities';
+  Link,
+  Navigate,
+  useLocation,
+  useNavigate,
+  useParams,
+  useSearchParams,
+} from 'react-router-dom';
 import { RiAddLine, RiArchiveLine, RiArrowLeftLine, RiLoader4Line } from 'react-icons/ri';
 
 import { useAdminClient, useAuth } from '../../api/auth';
@@ -38,30 +26,29 @@ import {
   HEADER_ACTION,
   HEADER_ACTION_DEAD,
   HEADER_ACTION_OFF,
-  HEADER_ACTION_ON,
-  STATUS_PILL,
   type Agent,
   type Board,
   type Issue,
   type IssueRun,
   type IssueStatus,
   type Project,
+  type ReadingBand,
+  type StageTally,
   assignableAgents,
-  cardDragId,
   columnHasNews,
   dropRejection,
   emptyBoard,
   findIssue,
   groupByStatus,
   hasDeliverable,
+  readingBands,
   readingOrder,
   liveCount,
   moveAnnouncement,
   moveCard,
-  parseDragId,
   persistedOrder,
-  placementChanged,
   runIndicator,
+  stageTally,
   statusOf,
   updatedAgo,
   withPin,
@@ -71,13 +58,13 @@ import { boardFilterParams, filterBoard, parseBoardFilter } from './boardFilter'
 import type { BoardFilter } from './boardFilter';
 import { BoardFilterMenu } from './BoardFilterMenu';
 import { OverCeilingChip } from './OverCeilingChip';
-import { generatedPortrait, useTeamPortraits, type Portrait } from './portrait';
+import { useTeamPortraits, type Portrait } from './portrait';
 import { writeLastProjectId } from './lastProject';
 import { CreateIssueModal } from './CreateIssueModal';
 import { AgentProfile } from './AgentProfile';
 import { FloatingPanel } from './FloatingPanel';
 import { Picker } from './Picker';
-import { statusChipShape, statusOptions } from './issueFields';
+import { PRIORITY_LABEL, statusChipShape, statusOptions } from './issueFields';
 import {
   AssigneeFace,
   BlockedBadge,
@@ -97,18 +84,25 @@ import { ToastStack, useToasts } from './Toasts';
 import { useBoardStream } from './useBoardStream';
 import { useBoardActivity } from './useBoardActivity';
 
-/// One column of the board, as a whole page.
+/// One stage of the board, as a whole page — the board's 210px lane opened
+/// out to the screen it was maximized onto.
 ///
-/// The board's columns are honest about what they are — five narrow queues —
-/// and a queue holding thirty cards reads as a smear of two-line tiles. This
-/// page is the same column at reading width: one row per card, the card's
-/// whole vocabulary (priority mark, badges, branch, faces, unread) laid out
-/// in aligned cells, in the same order the board renders and writes.
+/// The board shows a stage as a tall thin queue of cramped tiles; this shows
+/// the same stage as a **wall of cards** that uses the width, grouped under
+/// the reading order's own three bands. Every fact the board's tile carries
+/// is here, drawn bigger: nothing is truncated into a tooltip because there
+/// is finally room for it.
 ///
-/// It stays the board in every rule that matters: the unread hoist is the
-/// reading order and is never written, a drag sends `persistedOrder`, a
-/// refetch is held while a card is in the air, and the filter is the same
-/// URL vocabulary — so the narrowing survives the zoom in and back out.
+/// **It does not reorder.** The board is where a stage's order is dragged
+/// into shape; here the same cards are read, triaged and handed on — the
+/// pin, the Move chip and the card itself. That is a deliberate split, and
+/// it is what lets this page lay its cards out in a grid at all: `position`
+/// is a one-dimensional rank, and a grid cannot show one without lying about
+/// which of two side-by-side cards comes first.
+///
+/// It stays the board in every other rule: the reading order is never
+/// written, a Move sends `persistedOrder`, and the filter is the same URL
+/// vocabulary — so a narrowing survives the zoom in and back out.
 export function ColumnPage() {
   const { pid, status: statusParam } = useParams<{ pid: string; status: string }>();
   const projectId = pid ?? '';
@@ -118,6 +112,7 @@ export function ColumnPage() {
   const client = useAdminClient();
   const { logout } = useAuth();
   const navigate = useNavigate();
+  const location = useLocation();
   const { toasts, pushToast, dismissToast } = useToasts();
 
   const [project, setProject] = useState<Project | null>(null);
@@ -128,16 +123,12 @@ export function ColumnPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
-  const [dragging, setDragging] = useState<Issue | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
   const [profileOf, setProfileOf] = useState<string | null>(null);
   const [params, setParams] = useSearchParams();
   const filter = useMemo(() => parseBoardFilter(params), [params]);
 
-  // Non-null for exactly as long as a row is in the air — the board the drag
-  // started from, and the flag that holds a refetch back until it lands.
-  const preDrag = useRef<Board | null>(null);
-  const missedRefresh = useRef(false);
+  const stageBar = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     let canceled = false;
@@ -166,9 +157,9 @@ export function ColumnPage() {
       }
       setError(null);
       setProject(projectOutcome.value);
-      // Hoisted here, to the board itself, for the board page's reason: one
-      // order on screen, in the drag, and under `resolveDrop` — never a
-      // second one that only exists while nothing is being dragged.
+      // Applied to the board the fetch produced, not to the rendered view:
+      // `readingBands` groups a column it is promised is already in reading
+      // order, and one applied a layer up would be a second order.
       setBoard(readingOrder(groupByStatus(issuesOutcome.value)));
       if (agentsOutcome.kind === 'ok') setTeam(agentsOutcome.value);
       setActiveRuns(runsOutcome.kind === 'ok' ? runsOutcome.value : []);
@@ -189,50 +180,59 @@ export function ColumnPage() {
     invalidateAttention(client);
   }, [client]);
 
-  useBoardStream(
-    projectId,
-    null,
-    useCallback(() => {
-      // Held while a row is in the air: a refetch re-keys every row and
-      // re-ranks the very list being dragged in, so the drop would resolve
-      // against a layout the operator never aimed at.
-      if (preDrag.current !== null) {
-        missedRefresh.current = true;
-        return;
-      }
-      refetch();
-    }, [refetch]),
-  );
+  // Answered the moment it lands. Nothing has to be held back: with no drag
+  // there is no gesture in flight for a re-keyed list to resolve against —
+  // the board page holds its frames for exactly that reason and this page
+  // no longer needs to.
+  useBoardStream(projectId, null, refetch);
 
-  // The frame the drag held back, answered the moment it lands.
+  // Below `sm` the stage bar is a scroller, and a scroller mounts at the
+  // left. Arriving on a late stage — Done starts ~370px into a ~300px strip
+  // on a phone — showed four stages the operator is not on and no gold
+  // segment at all. A no-op at `sm` and up, where the bar is a five-column
+  // grid that does not scroll.
+  //
+  // **Once per stage**, tracked in a ref rather than by the dep list. It has
+  // to keep `loading` as a dep, because the first commit renders the spinner
+  // and the bar is not in the DOM yet — but `loading` flips on every refetch,
+  // and with the WS hold gone that is every `project_changed` frame. Left to
+  // the deps alone, an agent's comment on some other card would yank the bar
+  // back from wherever the operator had just swiped it.
+  const centred = useRef<IssueStatus | null>(null);
   useEffect(() => {
-    if (dragging !== null || !missedRefresh.current) return;
-    missedRefresh.current = false;
-    refetch();
-  }, [dragging, refetch]);
-
-  const sensors = useSensors(
-    useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
-    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
-  );
+    if (centred.current === status) return;
+    const bar = stageBar.current;
+    const here = bar?.querySelector<HTMLElement>('[aria-current="page"]');
+    if (bar == null || here == null) return;
+    bar.scrollLeft = here.offsetLeft - bar.offsetLeft - (bar.clientWidth - here.offsetWidth) / 2;
+    centred.current = status;
+  }, [status, loading]);
 
   const view = useMemo(() => filterBoard(board, filter, team, activeRuns), [activeRuns, board, filter, team]);
   // Same numbers the board page's notice reads: this page is that board.
   const activity = useBoardActivity(true, refreshKey);
   const list = useMemo(() => (status === null ? [] : view[status]), [status, view]);
-  // One array per set of rows: `SortableContext` keys its context value off
-  // this and compares it by identity, so a fresh one per render re-renders
-  // every row and disables the sort animation.
-  const items = useMemo(() => list.map((issue) => cardDragId(issue.number)), [list]);
+  const bands = useMemo(
+    () => (status === null ? [] : readingBands(list, status)),
+    [list, status],
+  );
+  // A band header only earns its line when there is another band to be told
+  // apart from — one header over the whole wall labels nothing.
+  const banded = useMemo(() => bands.filter((band) => band.issues.length > 0).length > 1, [bands]);
+  const shown = useMemo(() => bands.reduce((total, band) => total + band.issues.length, 0), [bands]);
 
-  type Commit = (before: Board, next: Board, number: number, anchor: number | null) => Promise<void>;
+  type Commit = (before: Board, next: Board, number: number) => Promise<void>;
   // The failed-move toast's Retry re-enters the commit with the same
   // arguments; a ref reaches the current one without the callback having to
   // depend on itself.
   const commitRef = useRef<Commit | null>(null);
   const commitMove: Commit = useCallback(
-    async (before, next, number, anchor) => {
-      setBoard(next);
+    async (before, next, number) => {
+      // Re-read, exactly as `withPin` does. `readingBands` promises to be a
+      // grouping of a column already in reading order, and an optimistic
+      // move breaks that precondition the instant it lands — the bands would
+      // become a second sort over a column they claim only to group.
+      setBoard(readingOrder(next));
       const moved = findIssue(next, number);
       if (moved === null) return;
       // The refusal names the column the card snapped back to, so it reads
@@ -245,10 +245,12 @@ export function ColumnPage() {
         return;
       }
       const from = statusOf(before, number);
-      // What the column stores, not what it shows: the hoist is a reading
-      // order and a move must not write it.
-      const ordered = persistedOrder(next[moved.status], number, anchor);
-      setBoard(withPositions(next, moved.status, ordered));
+      // What the destination stores, not what this page shows: the reading
+      // order is a reading order, and a move must not write it. `null` for
+      // the anchor puts the card at the end of the stage it is joining,
+      // exactly as a drop on a column's body does on the board.
+      const ordered = persistedOrder(next[moved.status], number, null);
+      setBoard(readingOrder(withPositions(next, moved.status, ordered)));
       const outcome = await moveIssue(client, projectId, number, moved.status, ordered);
       if (outcome.kind === 'unauthorized') {
         logout();
@@ -259,7 +261,7 @@ export function ColumnPage() {
         pushToast('err', `Move failed, rolled back — ${outcome.message}`, {
           label: 'Retry',
           run: () => {
-            void commitRef.current?.(before, next, number, anchor);
+            void commitRef.current?.(before, next, number);
           },
         });
         return;
@@ -275,53 +277,13 @@ export function ColumnPage() {
   );
   commitRef.current = commitMove;
 
-  const onDragStart = useCallback(
-    (event: DragStartEvent) => {
-      const target = parseDragId(String(event.active.id));
-      const card = target?.kind === 'card' ? findIssue(board, target.number) : null;
-      preDrag.current = card === null ? null : board;
-      setDragging(card);
-    },
-    [board],
-  );
-
-  const onDragEnd = useCallback(
-    async (event: DragEndEvent) => {
-      setDragging(null);
-      const before = preDrag.current;
-      preDrag.current = null;
-      if (before === null || status === null) return;
-      const target = parseDragId(String(event.active.id));
-      if (target?.kind !== 'card') return;
-      const over = event.over === null ? null : parseDragId(String(event.over.id));
-      if (over?.kind !== 'card' || over.number === target.number) return;
-      const column = filterBoard(board, filter, team, activeRuns)[status];
-      const from = column.findIndex((row) => row.number === target.number);
-      const at = column.findIndex((row) => row.number === over.number);
-      if (from === -1 || at === -1) return;
-      // The order dnd-kit previewed, read back in the one shape
-      // `persistedOrder` accepts: the card this one now sits in front of.
-      const anchor = arrayMove(column, from, at)[at + 1]?.number ?? null;
-      const issue = findIssue(board, target.number);
-      if (issue === null) return;
-      const next = moveCard(board, { status, before: anchor, issue });
-      if (!placementChanged(board, next, target.number)) return;
-      await commitMove(board, next, target.number, anchor);
-    },
-    [activeRuns, board, commitMove, filter, status, team],
-  );
-
-  const onDragCancel = useCallback(() => {
-    setDragging(null);
-    preDrag.current = null;
-  }, []);
-
   const relocate = useCallback(
     (issue: Issue, to: IssueStatus) => {
       if (to === issue.status) return;
-      // No anchor: a card sent to another column joins the end of its queue,
-      // exactly as a drop on the column's body does on the board.
-      void commitMove(board, moveCard(board, { status: to, before: null, issue }), issue.number, null);
+      // The one thing a single-stage page cannot do by moving a card around
+      // on it. The card joins the end of the stage it is sent to, exactly as
+      // a drop on a column's body does on the board.
+      void commitMove(board, moveCard(board, { status: to, before: null, issue }), issue.number);
     },
     [board, commitMove],
   );
@@ -345,11 +307,19 @@ export function ColumnPage() {
     [board, client, logout, projectId, pushToast],
   );
 
+  // Where a card opened from here goes back to. The detail page's own link
+  // is fixed on the board, which from a maximized stage is two steps from
+  // where the operator was — and drops this stage's filter on the way, so
+  // the wall they came back to is not the wall they left.
+  const here = `${location.pathname}${location.search}`;
+
   const openIssue = useCallback(
     (number: number) => {
-      navigate(`/projects/${encodeURIComponent(projectId)}/issues/${number}`);
+      navigate(`/projects/${encodeURIComponent(projectId)}/issues/${number}`, {
+        state: { from: here },
+      });
     },
-    [navigate, projectId],
+    [here, navigate, projectId],
   );
 
   /// One door to the profile, from every face on the page.
@@ -372,11 +342,12 @@ export function ColumnPage() {
   }
 
   const total = liveCount(board[status]);
+  const tally = stageTally(board[status], activeRuns);
+  const matched = liveCount(view[status]);
 
   return (
     <div className="flex flex-col h-full min-h-0">
-      <h1 className="sr-only">{`${COLUMN_LABEL[status]} — ${project?.name ?? ''}`}</h1>
-      <header className="h-12 shrink-0 px-4 border-b-2 border-black flex items-center gap-3 bg-canvas">
+      <header className="h-12 shrink-0 px-5 border-b-2 border-black flex items-center gap-3 bg-canvas">
         <Link
           to={{ pathname: `/projects/${encodeURIComponent(projectId)}`, search: params.toString() }}
           className="inline-flex shrink-0 items-center gap-1 font-mono text-[0.72rem] text-ink-soft hover:text-ink"
@@ -388,47 +359,6 @@ export function ColumnPage() {
             <RiArchiveLine /> Archived — read only
           </span>
         ) : null}
-        {/* The five stages as a row of presses, so the zoomed-in view keeps
-            the board's whole width one press away instead of a round trip
-            through the board. */}
-        <nav aria-label="Stages" className="flex min-w-0 items-center gap-1.5 overflow-x-auto">
-          {COLUMNS.map((tab) => {
-            const live = liveCount(view[tab]);
-            const whole = liveCount(board[tab]);
-            return (
-              <Link
-                key={tab}
-                to={{
-                  pathname: `/projects/${encodeURIComponent(projectId)}/board/${tab}`,
-                  search: params.toString(),
-                }}
-                aria-current={tab === status ? 'page' : undefined}
-                className={`${HEADER_ACTION} shrink-0 ${tab === status ? HEADER_ACTION_ON : HEADER_ACTION_OFF}`}
-              >
-                {COLUMN_PILL_LABEL[tab]}{' '}
-                <span
-                  className="rounded-full bg-ink text-brand font-mono text-[0.56rem] px-1.5 leading-[1.05rem] tabular-nums"
-                  title={
-                    live === whole
-                      ? `${whole} live`
-                      : `${live} of ${whole} live cards match the filter`
-                  }
-                >
-                  {live === whole ? whole : `${live}/${whole}`}
-                </span>
-                {/* A dot, not a number: pressing a tab cannot discharge what
-                    it shows — opening cards does. The stage on screen wears
-                    none, because its rows carry the counts themselves. */}
-                {tab !== status && columnHasNews(board[tab]) ? (
-                  <span
-                    title={`Something new in ${COLUMN_LABEL[tab]}`}
-                    className="w-2 h-2 shrink-0 rounded-full border border-black bg-err"
-                  />
-                ) : null}
-              </Link>
-            );
-          })}
-        </nav>
         <div className="ml-auto flex items-center gap-2">
           {project === null ? null : (
             <OverCeilingChip
@@ -459,6 +389,109 @@ export function ColumnPage() {
         </div>
       </header>
 
+      {/* The page says what it is before it says what is in it. On the board
+          a column is a 210px queue whose name is a 10px label; opened to the
+          full width it is the subject of the page, and the operator arrives
+          here from four other stages that look exactly the same. */}
+      <div className="shrink-0 border-b-2 border-black bg-canvas">
+        <div className="px-5 pt-5 pb-4 flex items-end justify-between gap-6">
+          <div className="min-w-0 flex flex-col gap-1.5">
+            <span className="font-mono text-[0.6rem] font-bold uppercase tracking-[0.2em] text-ink-soft truncate">
+              {project?.name ?? 'Project'} · Stage {COLUMNS.indexOf(status) + 1} of {COLUMNS.length}
+            </span>
+            <h1 className="font-mono text-[1.5rem] sm:text-[2rem] leading-none font-bold uppercase tracking-tight">
+              {COLUMN_LABEL[status]}
+              {/* Which board's Backlog. On screen the eyebrow above says it,
+                  but a reader jumping by heading lands here with nothing
+                  before it. */}
+              <span className="sr-only"> — {project?.name ?? 'project'}</span>
+            </h1>
+            <StageStats tally={tally} />
+          </div>
+          {/* The stage's own size — how much work the stage holds, never the
+              filtered count, since a number that shrank when a filter hid
+              cards would report an emptied stage. The tabs carry the
+              `matched/whole` split.
+
+              Sized **under** the heading it sits beside, not level with it.
+              At the `<h1>`'s own 2rem, inside a 72px block with a 3px border
+              and a full `shadow-brutal`, the count was the loudest thing on
+              the page — a supporting figure outshouting the name of the
+              thing it counts. It also grows with its digits rather than
+              sitting in a fixed square, so a stage holding 120 cards does
+              not clip. */}
+          <span
+            title={
+              matched === tally.live
+                ? `${tally.live} live cards in ${COLUMN_LABEL[status]}`
+                : `${tally.live} live cards in ${COLUMN_LABEL[status]} — ${matched} match the filter`
+            }
+            className="shrink-0 min-w-10 h-10 px-2 grid place-items-center border-2 border-black rounded-md bg-brand shadow-brutal-sm font-mono text-[1.05rem] font-bold tabular-nums"
+          >
+            {tally.live}
+          </span>
+        </div>
+
+        {/* One instrument rather than five loose pills: the stages are a
+            pipeline, and a segmented control is what a pipeline looks like
+            when every part of it is one press away. */}
+        <nav aria-label="Stages" className="px-5 pb-5">
+          {/* Five equal segments where there is room for five. On a phone
+              there is not — squeezed to 68px each, every label truncates to
+              "IN P…" — so below `sm` it scrolls sideways at its natural
+              width instead, with the next stage showing at the edge to say
+              so. `overflow-x-auto` clips as well as scrolls, which is what
+              keeps the segments inside the rounded border either way. */}
+          <div
+            ref={stageBar}
+            className="flex overflow-x-auto sm:grid sm:grid-cols-5 sm:overflow-hidden border-2 border-black rounded-md shadow-brutal-sm"
+          >
+            {COLUMNS.map((tab) => {
+              const live = liveCount(view[tab]);
+              const whole = liveCount(board[tab]);
+              const here = tab === status;
+              return (
+                <Link
+                  key={tab}
+                  to={{
+                    pathname: `/projects/${encodeURIComponent(projectId)}/board/${tab}`,
+                    search: params.toString(),
+                  }}
+                  aria-current={here ? 'page' : undefined}
+                  className={`shrink-0 sm:shrink flex items-center justify-between gap-2 px-3 py-2 border-r-2 border-black last:border-r-0 font-mono text-[0.62rem] font-bold uppercase tracking-wider transition-colors ${
+                    here ? 'bg-brand text-ink' : 'bg-surface text-ink-soft hover:bg-brand/25'
+                  }`}
+                >
+                  <span className="truncate">{COLUMN_PILL_LABEL[tab]}</span>
+                  <span className="flex shrink-0 items-center gap-1.5">
+                    {/* A dot, not a number: pressing a tab cannot discharge
+                        what it shows — opening cards does. The stage on
+                        screen wears none, because its rows carry the counts
+                        themselves. */}
+                    {!here && columnHasNews(board[tab]) ? (
+                      <span
+                        title={`Something new in ${COLUMN_LABEL[tab]}`}
+                        className="w-2 h-2 rounded-full border border-black bg-err"
+                      />
+                    ) : null}
+                    <span
+                      className="rounded-full bg-ink text-brand text-[0.56rem] px-1.5 leading-[1.05rem] tabular-nums"
+                      title={
+                        live === whole
+                          ? `${whole} live`
+                          : `${live} of ${whole} live cards match the filter`
+                      }
+                    >
+                      {live === whole ? whole : `${live}/${whole}`}
+                    </span>
+                  </span>
+                </Link>
+              );
+            })}
+          </div>
+        </nav>
+      </div>
+
       {error != null ? (
         <div className="m-4 bg-white border-[3px] border-err text-err rounded-md shadow-brutal-sm px-4 py-3 font-mono text-sm break-words">
           {error}
@@ -469,35 +502,58 @@ export function ColumnPage() {
           the scroller would be placed against the content and scroll away
           with it. */}
       <div className="relative flex-1 min-h-0 flex flex-col">
-        <div className="flex-1 min-h-0 overflow-y-auto bg-surface">
-          <div className="mx-auto w-full max-w-6xl p-4">
-          <DndContext
-            sensors={sensors}
-            collisionDetection={closestCenter}
-            onDragStart={onDragStart}
-            onDragEnd={(event) => {
-              void onDragEnd(event);
-            }}
-            onDragCancel={onDragCancel}
-          >
-            {list.length > 0 ? (
-              <div className="border-2 border-black rounded-md bg-canvas shadow-brutal-sm divide-y divide-black/15 overflow-hidden">
-                <SortableContext items={items} strategy={verticalListSortingStrategy}>
-                  {list.map((issue) => (
-                    <ColumnRow
-                      key={issue.number}
-                      issue={issue}
-                      run={runIndicator(activeRuns, issue.number)}
-                      team={team}
-                      portrait={portrait}
-                      readOnly={archived}
-                      onOpen={openIssue}
-                      onOpenAgent={openAgent}
-                      onRelocate={relocate}
-                      onTogglePin={togglePin}
-                    />
-                  ))}
-                </SortableContext>
+        <div className="flex-1 min-h-0 overflow-y-auto bg-canvas">
+          {/* No reading-width cap. This page is what the maximize button
+              opens, and a column frozen at 1152px under a stage bar that
+              spans the screen is the page disagreeing with itself — at
+              2560 the bar was 2.2× the width of the cards beneath it, with
+              the count block stranded 728px past their right edge. */}
+          <div className="w-full px-5 py-5 flex flex-col gap-5">
+            {shown > 0 ? (
+              /* **One** grid, with the band headers spanning it, rather than
+                 a grid per band. Three grids means three parents, and React
+                 unmounts a card that moves between them — so pinning a card,
+                 or a WS refetch that clears its unread, destroyed and rebuilt
+                 the very card being interacted with, closing any picker open
+                 on it and dropping focus to the body.
+
+                 One more column each time a card would otherwise get wider
+                 than it has anything to say. It stops at four: a fifth needs
+                 a breakpoint past `2xl`, and an arbitrary `min-[2100px]:` one
+                 is emitted *before* the named scale in this Tailwind, so it
+                 loses to `2xl:grid-cols-4` at every width matching both — a
+                 class that reads as live and does nothing. A fifth column
+                 wants a real `--breakpoint-3xl` token first. */
+              <div className="grid gap-3 grid-cols-1 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
+                {bands.flatMap((band) =>
+                  band.issues.length === 0
+                    ? []
+                    : [
+                        ...(banded
+                          ? [
+                              <div key={`band-${band.key}`} className="col-span-full">
+                                <BandHeader band={band} />
+                              </div>,
+                            ]
+                          : []),
+                        ...band.issues.map((issue) => (
+                          <IssueTile
+                            key={issue.number}
+                            issue={issue}
+                            to={`/projects/${encodeURIComponent(projectId)}/issues/${issue.number}`}
+                            from={here}
+                            run={runIndicator(activeRuns, issue.number)}
+                            team={team}
+                            portrait={portrait}
+                            readOnly={archived}
+                            onOpen={openIssue}
+                            onOpenAgent={openAgent}
+                            onRelocate={relocate}
+                            onTogglePin={togglePin}
+                          />
+                        )),
+                      ],
+                )}
               </div>
             ) : (
               <p className="border-2 border-dashed border-black/30 rounded-md p-10 text-center font-mono text-[0.68rem] text-ink-soft leading-relaxed">
@@ -512,18 +568,6 @@ export function ColumnPage() {
                 )}
               </p>
             )}
-
-            <DragOverlay>
-              {dragging !== null ? (
-                <RowBody
-                  issue={dragging}
-                  run={runIndicator(activeRuns, dragging.number)}
-                  team={team}
-                  overlay
-                />
-              ) : null}
-            </DragOverlay>
-          </DndContext>
           </div>
         </div>
         {profileOf !== null
@@ -598,8 +642,86 @@ export function ColumnPage() {
   );
 }
 
-function ColumnRow({
+/// What the stage is doing, under its own name — and only when it is doing
+/// it. A heading that always prints `0 working · 0 unread · 0 failed` reads
+/// as furniture and stops being looked at; these three lines exist to be
+/// noticed, so a quiet stage says nothing at all.
+///
+/// The row keeps its height either way: five stages that differ by a line
+/// would move the whole list up and down as the operator walks the tabs.
+function StageStats({ tally }: { tally: StageTally }) {
+  const quiet = tally.working === 0 && tally.unread === 0 && tally.failed === 0;
+  return (
+    <div className="flex min-h-[1.05rem] items-center gap-3 font-mono text-[0.66rem] tabular-nums">
+      {quiet ? (
+        <span className="text-ink-soft">Nothing waiting on you</span>
+      ) : (
+        <>
+          {tally.working > 0 ? (
+            <span className="text-ink-soft" title="Runs in flight on this stage">
+              <b className="text-ok">{tally.working}</b> working
+            </span>
+          ) : null}
+          {tally.unread > 0 ? (
+            <span className="text-ink-soft" title="Cards with something new since you opened them">
+              <b className="text-err">{tally.unread}</b> new
+            </span>
+          ) : null}
+          {tally.failed > 0 ? (
+            <span className="text-ink-soft" title="Cards whose newest run failed">
+              <b className="text-err">{tally.failed}</b> run failed
+            </span>
+          ) : null}
+        </>
+      )}
+    </div>
+  );
+}
+
+/// The rule the order follows, written on the page it orders.
+///
+/// A strip rather than a heading: it separates two runs of rows inside one
+/// surface, and a card-like block per band would break the list into four
+/// lists — see the fragment in `ColumnPage`.
+function BandHeader({ band }: { band: ReadingBand }) {
+  return (
+    <div
+      title={band.note}
+      className="flex items-center gap-2.5 font-mono text-[0.62rem] font-bold uppercase tracking-[0.18em] text-ink-soft"
+    >
+      {/* A heading, so a reader can jump band to band the way the eye does
+          down the labels. */}
+      <h2 className="font-bold text-ink">{band.label}</h2>
+      <span className="rounded-full bg-ink text-brand text-[0.56rem] px-1.5 leading-[1.05rem] tabular-nums">
+        {band.issues.length}
+      </span>
+      {band.key === 'news' ? (
+        <span aria-hidden className="w-2 h-2 rounded-full border border-black bg-err" />
+      ) : null}
+      {/* The rule runs the width of the grid it introduces, which is what
+          makes three stacked grids read as three sections of one wall
+          rather than as three unrelated walls. */}
+      <span aria-hidden className="flex-1 h-0.5 bg-ink/25" />
+    </div>
+  );
+}
+
+/// One issue as one card.
+///
+/// This is the board's tile with the room it never had. On a 210px lane a
+/// tile has to choose: the title wraps to two cramped lines and the branch,
+/// the run word and the assignee fight over one footer. Here a card is
+/// 400-600px, so the same facts sit in three honest zones — a header line of
+/// identity, the title, and a footer of who and what next — and the title
+/// gets two full lines before it is ever cut.
+///
+/// The card is a press: it opens the issue. Everything inside it that does
+/// something else — the pin, the assignee's face, the branch chip, the Move
+/// picker — claims its own press, or the operator could never reach it.
+function IssueTile({
   issue,
+  to,
+  from,
   run,
   team,
   portrait,
@@ -610,6 +732,14 @@ function ColumnRow({
   onTogglePin,
 }: {
   issue: Issue;
+  /// Where the title's link goes. The card's own press navigates too, but a
+  /// press is not a door: a link is what a keyboard reaches, what a screen
+  /// reader lists, and what a middle-click opens in a tab.
+  to: string;
+  /// This page, so the card's own page can come back to it rather than to
+  /// the board. Carried in router state, which survives a reload and is
+  /// absent on a pasted URL — where the board is the honest answer.
+  from: string;
   run: AvatarRun;
   team: Agent[];
   portrait: Portrait;
@@ -619,194 +749,150 @@ function ColumnRow({
   onRelocate: (issue: Issue, to: IssueStatus) => void;
   onTogglePin: (number: number, pinned: boolean) => void;
 }) {
-  const { attributes, listeners, setNodeRef, setActivatorNodeRef, transform, transition, isDragging } =
-    useSortable({
-      id: cardDragId(issue.number),
-      disabled: readOnly,
-    });
-
+  const cancelled = issue.cancelled_at_ms != null;
+  const priority = PRIORITY_MARK[issue.priority];
+  const marks =
+    issue.blocked_reason != null || issue.last_run_failed || (hasDeliverable(issue) && issue.branch != null);
   return (
-    <div
-      // The wrapper is also the keyboard sensor's activator node, so its
-      // `event.target !== activator` guard engages: Enter on a control
-      // inside the row — the status picker, the pin, the face — presses
-      // that control instead of silently lifting the row.
-      ref={(node) => {
-        setNodeRef(node);
-        setActivatorNodeRef(node);
-      }}
-      style={{ transform: CSS.Transform.toString(transform), transition }}
-      className={`touch-none ${isDragging ? 'opacity-40' : ''}`}
-      {...attributes}
-      {...listeners}
+    <article
+      // Two things this card must not do, both of which cost the Move
+      // picker its panel. It is **not `overflow-hidden`** — the panel is
+      // absolutely positioned inside it, and a clipping ancestor eats it
+      // (the spine is inset rather than clipped instead). And it does
+      // **not transform on hover**: a non-`none` `translate` makes the card
+      // a stacking context, which confines the panel's `z-30` to it while
+      // every later card in the grid paints on top. Measured, only 13% of
+      // the panel stayed hit-testable, and because a press then landed on
+      // two different elements the `click` fired on their common ancestor —
+      // so the option did nothing at all. The shadow alone is the hover.
+      className={`group relative flex flex-col border-2 border-black rounded-md bg-surface shadow-brutal-sm cursor-pointer transition-[box-shadow] hover:shadow-brutal ${
+        cancelled ? 'opacity-55' : ''
+      }`}
       onClick={() => {
         onOpen(issue.number);
       }}
     >
-      <RowBody
-        issue={issue}
-        run={run}
-        team={team}
-        portrait={portrait}
-        readOnly={readOnly}
-        onOpenAgent={onOpenAgent}
-        onRelocate={onRelocate}
-        onTogglePin={onTogglePin}
-      />
-    </div>
-  );
-}
+      {/* Priority down the card's left edge. On the row it was the one edge
+          you swept; on a wall it is what lets a column of cards still be
+          read for urgency without reading a word of any of them. Inset from
+          the ends so it clears the corner radius the card no longer clips. */}
+      {priority === null ? null : (
+        <span aria-hidden className={`absolute left-0 inset-y-2 w-[3px] ${priority.spine}`} />
+      )}
 
-/// One card as one row: the same vocabulary the board's tile wears, laid in
-/// aligned cells so thirty of them read as a table instead of a smear.
-function RowBody({
-  issue,
-  run = null,
-  team = [],
-  portrait = generatedPortrait,
-  readOnly = false,
-  overlay = false,
-  onOpenAgent,
-  onRelocate,
-  onTogglePin,
-}: {
-  issue: Issue;
-  run?: AvatarRun;
-  team?: Agent[];
-  portrait?: Portrait;
-  readOnly?: boolean;
-  /// The drag overlay is a picture of a row, not a row: no picker, its own
-  /// frame and shadow.
-  overlay?: boolean;
-  /// Absent on the drag overlay, where the face is a picture and not a door.
-  onOpenAgent?: (agentId: string) => void;
-  onRelocate?: (issue: Issue, to: IssueStatus) => void;
-  /// Absent on the drag overlay, like `onRelocate`.
-  onTogglePin?: (number: number, pinned: boolean) => void;
-}) {
-  const cancelled = issue.cancelled_at_ms != null;
-  const priority = PRIORITY_MARK[issue.priority];
-  return (
-    <div
-      className={`group flex items-center gap-2.5 px-3 py-2 font-mono ${
-        overlay
-          ? 'bg-surface border-2 border-black rounded-md shadow-brutal'
-          : 'cursor-pointer hover:bg-brand/10'
-      } ${cancelled ? 'opacity-55' : ''}`}
-    >
-      <span className="w-4 shrink-0 flex justify-center">
-        {onTogglePin === undefined ? null : (
-          <PinButton
-            pinned={issue.pinned}
-            disabled={readOnly}
-            onToggle={(pinned) => {
-              onTogglePin(issue.number, pinned);
-            }}
-          />
+      <div className="flex items-center gap-2 pl-4 pr-2.5 pt-2 font-mono text-[0.6rem] text-ink-soft">
+        <PinButton
+          pinned={issue.pinned}
+          disabled={readOnly}
+          onToggle={(pinned) => {
+            onTogglePin(issue.number, pinned);
+          }}
+        />
+        <span className="font-bold tabular-nums">#{issue.number}</span>
+        {priority === null ? null : (
+          <span className={`truncate ${priority.tone}`}>
+            {priority.glyph} {PRIORITY_LABEL[issue.priority]}
+          </span>
         )}
-      </span>
-      <span
-        className={`w-6 shrink-0 text-center text-[0.62rem] font-bold ${
-          priority === null ? '' : priority.tone
-        }`}
-        title={priority === null ? undefined : `Priority: ${issue.priority}`}
-      >
-        {priority === null ? '' : priority.glyph}
-      </span>
-      <span className="w-11 shrink-0 text-[0.66rem] font-bold text-ink-soft tabular-nums">
-        #{issue.number}
-      </span>
-      <span
-        className={`min-w-0 flex-1 truncate text-[0.78rem] font-bold ${
+        <span
+          className="ml-auto shrink-0 tabular-nums"
+          title={`Last touched ${new Date(issue.updated_at_ms).toLocaleString()}`}
+        >
+          {updatedAgo(issue.updated_at_ms, Date.now())}
+        </span>
+        {issue.unread > 0 ? <UnreadPill unread={issue.unread} /> : null}
+      </div>
+
+      {/* Two lines before it truncates. The row could afford one; a card is
+          the reason the grid does not cost a readable title.
+
+          The title is a **link**, and it is the card's only keyboard door.
+          The card's own press is a mouse convenience; dropping dnd-kit took
+          its `attributes` with it, and those were what had been quietly
+          supplying the tab stop. A link is also what a screen reader lists
+          and what a middle-click opens in a tab. It stops the press from
+          bubbling so the card's `onClick` does not navigate a second time —
+          `preventDefault` would be wrong here, since the navigation is the
+          link's own job. */}
+      <p
+        className={`pl-4 pr-2.5 pt-1.5 font-mono text-[0.82rem] font-bold leading-snug line-clamp-2 ${
           cancelled ? 'line-through' : ''
         }`}
         title={issue.title}
       >
-        {issue.title}
-      </span>
-      {issue.blocked_reason != null ? (
-        <span className="flex shrink-0 items-center">
-          <BlockedBadge reason={issue.blocked_reason} />
-        </span>
+        <Link
+          to={to}
+          state={{ from }}
+          className="outline-none focus-visible:underline focus-visible:decoration-2 focus-visible:underline-offset-2"
+          onClick={(event) => {
+            event.stopPropagation();
+          }}
+        >
+          {issue.title}
+        </Link>
+      </p>
+
+      {marks ? (
+        <div className="flex flex-wrap items-center gap-1.5 pl-4 pr-2.5 pt-2">
+          {issue.blocked_reason != null ? <BlockedBadge reason={issue.blocked_reason} /> : null}
+          {issue.last_run_failed ? <FailedBadge /> : null}
+          {hasDeliverable(issue) && issue.branch != null ? (
+            <BranchChip branch={issue.branch} />
+          ) : null}
+        </div>
       ) : null}
-      {issue.last_run_failed ? (
-        <span className="flex shrink-0 items-center">
-          <FailedBadge />
+
+      {/* Pushed to the card's foot, so a short title and a long one give the
+          same card: a grid row is as tall as its tallest card, and footers
+          that floated would leave every short card with a hole in it. */}
+      <div className="mt-auto flex items-center gap-2 pl-4 pr-2.5 pb-2 pt-3">
+        <span className="flex min-w-0 flex-1 items-center gap-1.5">
+          {issue.assignee != null ? (
+            <AssigneeFace
+              handle={handleOf(team, issue.assignee)}
+              src={portrait(issue.assignee)}
+              run={run}
+              onOpen={() => {
+                onOpenAgent(issue.assignee ?? '');
+              }}
+            />
+          ) : (
+            <UnassignedMark />
+          )}
         </span>
-      ) : null}
-      {hasDeliverable(issue) && issue.branch != null ? (
-        <span className="hidden xl:flex shrink-0 items-center max-w-44">
-          <BranchChip branch={issue.branch} />
-        </span>
-      ) : null}
-      <span className="hidden sm:flex w-12 shrink-0 justify-end">
         {issue.sub_issues != null ? <SubIssueRing progress={issue.sub_issues} /> : null}
-      </span>
-      {/* The box stays whether or not there is a word in it: it is a column
-          in a row of aligned cells, and one that collapsed on an idle card
-          would shift every cell after it. */}
-      <span className="hidden md:block w-14 shrink-0 text-right">
         <RunWord run={run} />
-      </span>
-      {/* The picker's own presses must not fall through to the row link
-          under them — the row opens the card, and this cell moves it. */}
-      <span
-        className="w-[5.6rem] shrink-0 flex justify-center"
-        onClick={(event) => {
-          event.preventDefault();
-          event.stopPropagation();
-        }}
-      >
-        {overlay || readOnly || onRelocate === undefined ? (
-          <span className={`${statusChipShape} px-2 ${STATUS_PILL[issue.status]}`}>
-            {COLUMN_PILL_LABEL[issue.status]}
-          </span>
-        ) : (
-          <Picker
-            label={`Status of #${issue.number}`}
-            title="Move this card to another column"
-            value={issue.status}
-            disabled={false}
-            options={statusOptions}
-            onPick={(picked) => {
-              onRelocate(issue, picked as IssueStatus);
+        {/* The stage this card is in is the page's own heading, so the chip
+            wears the action instead of the value. Its press must not fall
+            through to the card, which opens the issue. */}
+        {readOnly ? null : (
+          <span
+            className="shrink-0"
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
             }}
-            triggerClassName={`${statusChipShape} pl-2 pr-0.5 ${STATUS_PILL[issue.status]} hover:border-black`}
           >
-            {COLUMN_PILL_LABEL[issue.status]}
-          </Picker>
+            <Picker
+              label={`Move #${issue.number}`}
+              // The stage is state, not the object of the verb: the default
+              // name would read "Move #3: Review" on a card already in
+              // Review — naming the one destination the picker refuses.
+              ariaLabel={`Move #${issue.number} — currently in ${COLUMN_LABEL[issue.status]}`}
+              title="Move this card to another stage"
+              value={issue.status}
+              disabled={false}
+              options={statusOptions}
+              onPick={(picked) => {
+                onRelocate(issue, picked as IssueStatus);
+              }}
+              triggerClassName={`${statusChipShape} pl-2 pr-0.5 border-black/25 text-ink-soft transition-colors group-hover:border-black group-hover:bg-canvas group-hover:text-ink focus-visible:border-black focus-visible:bg-canvas focus-visible:text-ink`}
+            >
+              Move
+            </Picker>
+          </span>
         )}
-      </span>
-      {/* Hidden below `sm` with the time cell: the always-on set has to fit
-          a phone, and these two are the widest facts the title can spare —
-          the card itself still names its assignee one tap away. */}
-      <span className="hidden sm:flex w-28 shrink-0 items-center gap-1.5 min-w-0">
-        {issue.assignee != null ? (
-          <AssigneeFace
-            handle={handleOf(team, issue.assignee)}
-            src={portrait(issue.assignee)}
-            run={run}
-            onOpen={
-              onOpenAgent === undefined
-                ? undefined
-                : () => {
-                    onOpenAgent(issue.assignee ?? '');
-                  }
-            }
-          />
-        ) : (
-          <UnassignedMark />
-        )}
-      </span>
-      <span
-        className="hidden sm:block w-9 shrink-0 text-right text-[0.6rem] text-ink-soft tabular-nums"
-        title={`Last touched ${new Date(issue.updated_at_ms).toLocaleString()}`}
-      >
-        {updatedAgo(issue.updated_at_ms, Date.now())}
-      </span>
-      <span className="w-7 shrink-0 flex justify-end">
-        {issue.unread > 0 ? <UnreadPill unread={issue.unread} /> : null}
-      </span>
-    </div>
+      </div>
+    </article>
   );
 }

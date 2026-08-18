@@ -5,18 +5,30 @@ import type { Issue } from './boardModel';
 import { Avatar, type AvatarRun, runNote } from './Avatar';
 
 /// What a card wears, wherever a card is drawn — the board's column card and
-/// the column page's row say these the same way because they say them from
+/// the stage page's card say these the same way because they say them from
 /// here.
 
+/// Every way a priority is drawn, in one entry each: the glyph the board's
+/// tile wears, the ink it wears it in, and the `spine` — a 3px bar down the
+/// left edge of a stage-page card, which is what makes a wall of thirty
+/// readable down its edge before any of it is read across.
+///
+/// One entry rather than a table per surface, because a priority that reads
+/// urgent-red as a glyph and warn-orange as a bar is the page disagreeing
+/// with itself.
+///
 /// The glyph's medium wears `text-info` while the picker word "Medium"
 /// (issueFields' `PRIORITY_TONE`) wears plain ink — deliberately. A ◆ in ink
 /// vanishes into the mono text beside it, and the mark is read at a glance
 /// or not at all; the words carry themselves.
-export const PRIORITY_MARK: Record<Issue['priority'], { glyph: string; tone: string } | null> = {
-  urgent: { glyph: '▲▲', tone: 'text-err' },
-  high: { glyph: '▲', tone: 'text-warn' },
-  medium: { glyph: '◆', tone: 'text-info' },
-  low: { glyph: '▽', tone: 'text-ink-soft' },
+export const PRIORITY_MARK: Record<
+  Issue['priority'],
+  { glyph: string; tone: string; spine: string } | null
+> = {
+  urgent: { glyph: '▲▲', tone: 'text-err', spine: 'bg-err' },
+  high: { glyph: '▲', tone: 'text-warn', spine: 'bg-warn' },
+  medium: { glyph: '◆', tone: 'text-info', spine: 'bg-info' },
+  low: { glyph: '▽', tone: 'text-ink-soft', spine: 'bg-black/25' },
   none: null,
 };
 
@@ -134,7 +146,7 @@ export function SubIssueRing({ progress }: { progress: { done: number; total: nu
 /// The pin, which is the same element as the marker: a pinned card wears a
 /// filled pushpin, and pressing it is what unpins.
 ///
-/// An unpinned card's pin is invisible until the row is hovered or the
+/// An unpinned card's pin is invisible until the card is hovered or the
 /// button is tabbed to, because a permanent outline glyph on every card is
 /// furniture on a surface whose whole language is "nothing here that is not
 /// saying something". That does make it a shortcut rather than the only
@@ -142,9 +154,10 @@ export function SubIssueRing({ progress }: { progress: { done: number; total: nu
 /// which is what a touch screen reaches for.
 ///
 /// It has to stop the press twice over. The card's own click opens the
-/// issue (the reason `BranchChip` stops one), and the whole card is also the
-/// drag handle — dnd-kit's listeners sit on the wrapper, so without stopping
-/// `pointerdown` a press that drifted 4px would pick the card up instead.
+/// issue (the reason `BranchChip` stops one), and on the **board** the whole
+/// card is also the drag handle — dnd-kit's listeners sit on the wrapper, so
+/// without stopping `pointerdown` a press that drifted 4px would pick the
+/// card up instead. The stage page has no drag; the board still does.
 export function PinButton({
   pinned,
   disabled = false,
@@ -184,8 +197,8 @@ export function PinButton({
 /// The assignee as a press: the face and its handle open the profile
 /// wherever a card shows them. The card's own click opens the issue, so the
 /// button has to claim the event or it could never be the profile's entry
-/// point. Without `onOpen` — the drag overlay, an archived surface — the
-/// same face draws as a picture instead of a door.
+/// point. Without `onOpen` — the board's drag overlay, an archived surface —
+/// the same face draws as a picture instead of a door.
 export function AssigneeFace({
   handle,
   src,

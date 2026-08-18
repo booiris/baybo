@@ -125,53 +125,107 @@ mode collapsing the strip could introduce, and the badge is what rules it out.
 `boardFilter.ts` owns the list of narrowings (`restrictionCount`), because the
 badge and the Clear button must never disagree about what counts as filtered.
 
-## The column page
+## The stage page
 
-One column of the board as a whole page — `/projects/:pid/board/:status`
+One stage of the board as a whole page — `/projects/:pid/board/:status`
 (`pages/projects/ColumnPage.tsx`), reached from the maximize button in each
-column's header. The board's columns are honest about what they are — five
-narrow queues — and a queue holding thirty cards reads as a smear of two-line
-tiles; this is the same column at reading width. Each card is **one flat row**
-in a single bordered surface, rows separated by 1px rules (the activity
-drawer's "a stream, not a stack of cards"), the card's whole vocabulary laid
-out in aligned cells: priority mark, `#number`, the full title, the Blocked /
-Run-failed badges, the branch chip, the sub-issue ring, working / queued /
-held, the assignee's face, the relative time, and the unread pill. The cells
-come from
-`cardChrome.tsx`, which both the board's tile and this row read — one home, so
-the two views of a card cannot drift apart.
+column's header. The board shows a stage as a 210px lane of cramped tiles;
+this shows the same stage as a **wall of cards** that uses the screen it was
+maximized onto.
 
-The header keeps the whole board one press away: a row of five stage tabs
-(`COLUMN_PILL_LABEL` + the board's live counts, the current one gold), the
-same `BoardFilterMenu`, and a New-issue button scoped to this column. The
-filter is the **same URL vocabulary the board reads**, and the back link and
-the tabs carry the params along — the narrowing survives the zoom in, across
-stages, and back out. A tab whose stage holds something new wears a **red
-dot, not a number** — pressing a tab cannot discharge what it shows, opening
-cards does — and the open stage's tab stays bare, because its rows carry the
-counts themselves (`columnHasNews`, the same predicate `readingOrder` lifts
-by, so the dot and the lift cannot disagree).
+**It does not reorder, and that is what buys the grid.** `position` is a
+one-dimensional rank — the middle term of `(priority, position, number)`, the
+order the board pulls Todo work in — and a grid cannot show a 1-D rank without
+lying about which of two side-by-side cards comes first. So the split is
+deliberate: the **board** is where a stage's order is dragged into shape; here
+the same cards are read, triaged and handed on, through the pin, the Move chip
+and the card itself. Nothing on this page is draggable, which also means the
+page carries no `touch-action: none` and a finger scrolls it.
 
-It stays the board in every rule that matters, deliberately: the reading
-order (pin, then unread) is applied once to the fetched board and never
-written; a drag reorders within the column and sends `persistedOrder` (then
-`withPositions` writes it back); a `project_changed` frame that lands
-mid-drag is held until the card does; `dropRejection` still refuses
-unassigned work into In Progress; the pin is the same press the board's tile
-takes; and the assignee's face opens the agent profile in the same sliding
-right-hand layer (`FloatingPanel.tsx`, shared with the board for exactly this
-reason). The one thing a single-column page cannot do — drag a card to
-another column — the row's status `Picker` does instead, appending the card
-to the end of the destination's stored order, exactly as a drop on a
-column's body would.
+**The page says what it is before it says what is in it.** A masthead carries
+the project and the stage's place in the pipeline as an eyebrow, the stage's
+name as the page's `<h1>`, a gold count block holding the stage's live count,
+and `StageStats` — *working / new / run failed*. Those print only when they are
+not zero, and a stage with nothing on it says "Nothing waiting on you": a line
+that always reads `0 · 0 · 0` is furniture, and furniture stops being looked
+at. The row keeps its height either way, so walking the tabs does not shunt the
+wall up and down. Both are counted over the **whole stage**, never the filtered
+view — a heading that shrank with the filter would report a stage as calm
+because its noisy cards were hidden.
 
-Two mechanics the row's shape depends on. The row div is also the keyboard
-sensor's **activator node**, engaging dnd-kit's `event.target !== activator`
-guard: Enter on a control inside the row — the picker, the pin, the face —
-presses that control, instead of silently lifting the row and eating the
-press. And below `sm` the assignee and time cells go; they are the widest
-facts the title can spare, and the always-on set has to fit a phone with the
-title still worth reading.
+The five stages are **one segmented control**: equal widths, 2px dividers, the
+open stage's segment filled gold, each carrying the board's `matched/whole`
+live count. A stage holding something new wears a **red dot, not a number** —
+pressing a tab cannot discharge what it shows, opening cards does — while the
+open stage's segment stays bare, because its cards carry the counts
+themselves (`columnHasNews`, the same predicate `readingOrder` lifts by).
+Beside them sit the same `BoardFilterMenu`, the over-ceiling chip and a
+New-issue button scoped to this stage. The filter is the **same URL vocabulary
+the board reads**, and the back link and the segments carry the params along.
+
+**Nothing is capped to a reading width.** This page is what the maximize button
+opens; a column frozen at 1152px under a stage bar that spans the screen is the
+page disagreeing with itself — at 2560 the bar was 2.2× the width of the list
+beneath it, with the count block stranded 728px past its right edge, which is
+what made ~380px of gutter per side read as a bug rather than as margin. The
+masthead, the stage bar and the wall all run to the same page padding.
+
+**The reading order is drawn, not just applied.** `readingBands` groups the
+stage into **Pinned / New / Queue**, each its own grid under a labelled rule
+whose tooltip says why those cards are there. Headers appear only when more
+than one band is non-empty: one header over the whole wall separates nothing.
+Banding is a **grouping, never a second sort** — `boardModel.test.ts` pins that
+concatenating the bands over a column in reading order returns that column
+unchanged, and `commitMove` re-reads the board on every optimistic write (as
+`withPin` does) so that precondition cannot lapse.
+
+A card is the board's tile with the room it never had: a header line of
+identity (pin, `#number`, priority, age, unread), the title at 0.82rem bold
+over **two full lines** before it is ever cut, a wrap of badges and the branch
+chip, and a footer of assignee / sub-issues / run word / Move — pushed to the
+card's foot with `mt-auto`, because a grid row is as tall as its tallest card
+and floating footers would leave every short card with a hole. Priority is a
+3px spine down the left edge, inset from the ends. The cells come from
+`cardChrome.tsx`, which the board's tile reads too.
+
+The title is a **link**, and it is the card's keyboard door. The card's own
+press is a mouse convenience; dropping dnd-kit took its `attributes` with it,
+and those had been quietly supplying the tab stop — for a while the page's
+primary action had no non-mouse way in at all. A link is also what a screen
+reader lists and what a middle-click opens in a tab. It stops the press from
+bubbling so the card does not navigate twice.
+
+The wall is **one grid**, not one per band, with the headers spanning it. Three
+grids means three parents, and React unmounts a card that moves between them —
+so pinning a card, or a refetch that clears its unread, destroyed and rebuilt
+the very card being interacted with.
+
+Two things a card must never do, both of which cost the Move picker its panel.
+It is **not `overflow-hidden`** — the panel is absolutely positioned inside it
+and a clipping ancestor eats it (the spine is inset rather than clipped, which
+is what the clipping was for). And it **must not transform on hover**: a
+non-`none` `translate` makes the card a stacking context, confining the panel's
+`z-30` to it while every later grid item paints on top. Measured, that left 13%
+of the panel hit-testable — and because a press then landed on two different
+elements, the `click` fired on their common ancestor and the option did nothing
+at all. The shadow alone is the hover; with the transform gone the panel
+measures 100% reachable.
+
+The **column ladder stops at four** (`md:2 xl:3 2xl:4`): a fifth needs a
+breakpoint past `2xl`, and an arbitrary `min-[2100px]:` variant is emitted
+*before* the named scale in this Tailwind, so it loses to `2xl:grid-cols-4` at
+every width matching both — a class that reads as live and does nothing. Give
+it a real `--breakpoint-3xl` token first.
+
+The stage bar scrolls sideways below `sm`, with the open stage centred **once
+per stage** — a scroller mounts at the left and Done starts ~370px into a
+~300px strip, but the effect must keep `loading` in its deps (the first commit
+renders the spinner, so the bar is not in the DOM yet) and `loading` flips on
+every refetch. Left to the deps alone, an agent's comment on some other card
+yanked the bar back from wherever the operator had just swiped it.
+
+Measured at 30 cards, 0 titles truncated at any width: 11 cards fully visible
+at 1440×900, 16 at 1920×1080, 28 at 2560×1440.
 
 ## Where a notification is a number and where it is a dot
 
@@ -279,7 +333,7 @@ back. It also costs no column height, which is what killed the second toolbar
 row in the first place.
 
 The figure being on screen **at rest** is the trade the bare dot could not
-make, because a dot has nowhere to put a number. On the column page the chip
+make, because a dot has nowhere to put a number. On the stage page the chip
 drops its press — that page has no settings modal, and the board is one press
 away on the back link it already has.
 

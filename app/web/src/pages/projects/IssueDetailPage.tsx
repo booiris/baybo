@@ -6,7 +6,7 @@ import {
   useState,
   type ReactNode,
 } from 'react';
-import { Link, useParams } from 'react-router-dom';
+import { Link, useLocation, useParams } from 'react-router-dom';
 import {
   RiArrowDownLine,
   RiArrowLeftLine,
@@ -35,6 +35,7 @@ import {
   type IssueAttachmentRequest,
 } from './api';
 import {
+  backFrom,
   COLUMN_LABEL,
   RUN_LOG_HEAD,
   STATUS_PILL,
@@ -236,6 +237,10 @@ export function IssueDetailPage() {
   const number = Number(num ?? '');
   const client = useAdminClient();
   const { logout } = useAuth();
+  // Router state survives a reload and is absent on a pasted URL, which is
+  // exactly when the board is the honest answer. `backFrom` refuses
+  // anything that is not a stage of this project.
+  const back = backFrom(projectId, (useLocation().state as { from?: unknown } | null)?.from);
 
   const [issue, setIssue] = useState<Issue | null>(null);
   const [board, setBoard] = useState<Issue[]>([]);
@@ -760,11 +765,14 @@ export function IssueDetailPage() {
   return (
     <div className="flex flex-col h-full min-h-0">
       <header className="h-12 shrink-0 px-4 border-b-2 border-black flex items-center gap-3 bg-canvas">
+        {/* Back to whichever surface opened this card, not always the
+            board: from a maximized stage that was two steps from where the
+            operator was, and it dropped that stage's filter on the way. */}
         <Link
-          to={`/projects/${encodeURIComponent(projectId)}`}
+          to={back.to}
           className="inline-flex items-center gap-1 font-mono text-[0.72rem] text-ink-soft hover:text-ink"
         >
-          <RiArrowLeftLine /> Board
+          <RiArrowLeftLine /> {back.label}
         </Link>
         <span className="shrink-0 border-2 border-black bg-brand/35 rounded px-2 font-mono text-[0.6rem] font-bold uppercase tracking-wider">
           {COLUMN_LABEL[issue.status]}

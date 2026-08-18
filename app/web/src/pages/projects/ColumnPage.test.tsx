@@ -1,7 +1,7 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { MemoryRouter, Route, Routes } from 'react-router-dom';
+import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 
 import { ColumnPage } from './ColumnPage';
 import type { Issue, Project } from './boardModel';
@@ -131,124 +131,44 @@ vi.mock('../../api/auth', () => ({
   useAuth: () => auth,
 }));
 
+/// Stands in for `IssueDetailPage` and reports the origin it was handed, so
+/// a test can assert the round trip rather than the shape of one link.
+function DetailStub() {
+  const from = (useLocation().state as { from?: unknown } | null)?.from;
+  return <p>{typeof from === 'string' ? `came from ${from}` : 'issue detail'}</p>;
+}
+
+/// Whether the card's page was reached at all. Asserted through this rather
+/// than through one of the stub's two strings: the stub prints the origin
+/// when it is handed one, so a bare `queryByText('issue detail')` guard
+/// stopped being able to fail the moment the origin started travelling.
+function onDetailPage(): boolean {
+  return screen.queryByText(/^(came from |issue detail$)/) !== null;
+}
+
 function renderColumn(status = 'backlog', query = '') {
   return render(
     <MemoryRouter initialEntries={[`/projects/${PROJECT.id}/board/${status}${query}`]}>
       <Routes>
         <Route path="/projects/:pid" element={<p>the whole board</p>} />
         <Route path="/projects/:pid/board/:status" element={<ColumnPage />} />
-        <Route path="/projects/:pid/issues/:num" element={<p>issue detail</p>} />
+        <Route path="/projects/:pid/issues/:num" element={<DetailStub />} />
       </Routes>
     </MemoryRouter>,
   );
 }
 
-// ---------------------------------------------------------------------------
-// A fake layout for the drag tests, after `boardDrag.test.tsx`: jsdom
-// measures everything as 0×0, so rects are derived from the CURRENT DOM
-// order of the rows in the list. One column, so one stack of uniform rows.
-// ---------------------------------------------------------------------------
-
-const ROW_TOP = 100;
-const ROW_H = 40;
-const ROW_W = 800;
-
-type Box = { x: number; y: number; width: number; height: number };
-
-/// The rect the drag overlay reports — measured once, at pickup.
-let overlayBox: Box = { x: 0, y: 0, width: 0, height: 0 };
-
-function listContainer(): Element | null {
-  return document.querySelector('[class*="divide-y"]');
+/// The card a title belongs to. Every press that is not "open the issue"
+/// lives inside it.
+function cardOf(node: HTMLElement): HTMLElement {
+  const card = node.closest('article');
+  if (card === null) throw new Error(`no card around ${node.textContent}`);
+  return card;
 }
 
-function boxOf(el: Element): Box {
-  const zero = { x: 0, y: 0, width: 0, height: 0 };
-  const container = listContainer();
-  if (container === null) return zero;
-  if (el === container) {
-    return { x: 0, y: ROW_TOP, width: ROW_W, height: container.children.length * ROW_H };
-  }
-  if (container.contains(el)) {
-    let cur: Element | null = el;
-    while (cur !== null && cur.parentElement !== container) cur = cur.parentElement;
-    if (cur === null) return zero;
-    const index = Array.from(container.children).indexOf(cur);
-    return { x: 0, y: ROW_TOP + index * ROW_H, width: ROW_W, height: ROW_H };
-  }
-  // Page shells that contain the list measure zero; what is left outside it
-  // is the drag overlay.
-  if (el.contains(container)) return zero;
-  return overlayBox;
-}
-
-function installFakeLayout(): () => void {
-  const original = Element.prototype.getBoundingClientRect;
-  Element.prototype.getBoundingClientRect = function fake(this: Element): DOMRect {
-    const b = boxOf(this);
-    return {
-      ...b,
-      top: b.y,
-      left: b.x,
-      right: b.x + b.width,
-      bottom: b.y + b.height,
-      toJSON: () => b,
-    } as DOMRect;
-  };
-  return () => {
-    Element.prototype.getBoundingClientRect = original;
-  };
-}
-
-class FakePointerEvent extends MouseEvent {
-  pointerId = 1;
-  pointerType = 'mouse';
-  isPrimary = true;
-  width = 1;
-  height = 1;
-  pressure = 0.5;
-}
-
-function pointer(type: string, x: number, y: number): FakePointerEvent {
-  return new FakePointerEvent(type, {
-    bubbles: true,
-    cancelable: true,
-    clientX: x,
-    clientY: y,
-    button: 0,
-    buttons: 1,
-  });
-}
-
-function rowNode(title: string): HTMLElement {
-  const container = listContainer();
-  let el: Element | null = screen.getByTitle(title);
-  while (el !== null && el.parentElement !== container) el = el.parentElement;
-  if (el === null) throw new Error(`no row for ${title}`);
-  return el as HTMLElement;
-}
-
-function rowCentre(title: string): { node: HTMLElement; x: number; y: number } {
-  const node = rowNode(title);
-  const box = boxOf(node);
-  return { node, x: box.x + box.width / 2, y: box.y + box.height / 2 };
-}
-
-async function settle(ms = 30): Promise<void> {
-  await act(async () => {
-    await new Promise((resolve) => {
-      setTimeout(resolve, ms);
-    });
-  });
-}
-
-/// pointerdown on a row, then the 4px the activation constraint wants.
-function grab(title: string): { x: number; y: number } {
-  const { node, x, y } = rowCentre(title);
-  overlayBox = boxOf(node);
-  fireEvent(node, pointer('pointerdown', x, y));
-  fireEvent(document, pointer('pointermove', x, y + 6));
-  return { x, y };
+/// The cards on screen, in the order they are drawn.
+function renderedTitles(): (string | null)[] {
+  return screen.getAllByTitle(/^issue |^Wire|^Blocked|^Cancelled/).map((n) => n.textContent);
 }
 
 function movesPosted(): unknown[][] {
@@ -267,7 +187,7 @@ describe('ColumnPage', () => {
     client.GET.mockClear();
   });
 
-  it('shows only the routed column, one row per card, unread hoisted on top', async () => {
+  it('shows only the routed stage, one card per issue, unread lifted to the front', async () => {
     renderColumn();
     await screen.findByText('Wire the board');
 
@@ -331,7 +251,11 @@ describe('ColumnPage', () => {
     await screen.findByText('Wire the board');
 
     await userEvent.click(screen.getByText('Wire the board'));
-    expect(await screen.findByText('issue detail')).toBeInTheDocument();
+    // The stub reports the origin it was handed, so this also pins that a
+    // card opened from here knows the way back.
+    expect(
+      await screen.findByText('came from /projects/01JPROJECT/board/backlog'),
+    ).toBeInTheDocument();
   });
 
   it('opens the assignee’s profile from the row without opening the card', async () => {
@@ -342,14 +266,14 @@ describe('ColumnPage', () => {
     expect(
       await screen.findByRole('button', { name: /Close the agent profile/ }),
     ).toBeInTheDocument();
-    expect(screen.queryByText('issue detail')).not.toBeInTheDocument();
+    expect(onDetailPage()).toBe(false);
   });
 
   it('moves a card to another column from its row, joining the end of the queue', async () => {
     renderColumn();
     await screen.findByText('Wire the board');
 
-    await userEvent.click(screen.getByLabelText('Status of #1: Backlog'));
+    await userEvent.click(screen.getByLabelText('Move #1 — currently in Backlog'));
     await userEvent.click(screen.getByRole('button', { name: 'In Progress' }));
 
     await waitFor(() => {
@@ -373,7 +297,7 @@ describe('ColumnPage', () => {
     // The row is the keyboard sensor's activator, so a keydown bubbling out
     // of the picker's trigger must press the trigger — not start a silent
     // keyboard drag whose next Enter posts a reorder nobody aimed.
-    screen.getByLabelText('Status of #1: Backlog').focus();
+    screen.getByLabelText('Move #1 — currently in Backlog').focus();
     await userEvent.keyboard('{Enter}');
 
     expect(await screen.findByRole('button', { name: 'In Progress' })).toBeInTheDocument();
@@ -384,7 +308,7 @@ describe('ColumnPage', () => {
     await screen.findByText('Blocked one');
     const posts = client.POST.mock.calls.length;
 
-    await userEvent.click(screen.getByLabelText('Status of #2: Backlog'));
+    await userEvent.click(screen.getByLabelText('Move #2 — currently in Backlog'));
     await userEvent.click(screen.getByRole('button', { name: 'In Progress' }));
 
     // The whole sentence: the column named is the one the card snapped BACK
@@ -402,7 +326,7 @@ describe('ColumnPage', () => {
     renderColumn();
     await screen.findByText('Wire the board');
 
-    await userEvent.click(screen.getByLabelText('Status of #1: Backlog'));
+    await userEvent.click(screen.getByLabelText('Move #1 — currently in Backlog'));
     await userEvent.click(screen.getByRole('button', { name: 'In Progress' }));
 
     expect(
@@ -428,13 +352,13 @@ describe('ColumnPage', () => {
     });
   });
 
-  it('pins a row to the top of the column, the same press the board takes', async () => {
+  it('pins a card to the front of the stage, the same press the board takes', async () => {
     renderColumn();
     await screen.findByText('Wire the board');
 
     const rows = screen.getAllByTitle(/^issue |^Wire|^Blocked|^Cancelled/);
     await userEvent.click(
-      within(rows[1].closest('div[class*="group"]') as HTMLElement).getByRole('button', {
+      within(cardOf(rows[1])).getByRole('button', {
         name: /Pin this card/,
       }),
     );
@@ -448,7 +372,7 @@ describe('ColumnPage', () => {
       expect(after[0].textContent).toContain('Wire the board');
     });
     // The row's own click opens the card; the pin must claim its press.
-    expect(screen.queryByText('issue detail')).not.toBeInTheDocument();
+    expect(onDetailPage()).toBe(false);
   });
 
   it('reads an archived project without offering to work it', async () => {
@@ -458,8 +382,187 @@ describe('ColumnPage', () => {
 
     expect(screen.getByText('Archived — read only')).toBeInTheDocument();
     expect(screen.getByTitle('New issue in Backlog')).toBeDisabled();
-    // The status chip is a fact, not a control.
-    expect(screen.queryByLabelText('Status of #1: Backlog')).not.toBeInTheDocument();
+    // Nothing on the row offers to move it either.
+    expect(screen.queryByLabelText('Move #1 — currently in Backlog')).not.toBeInTheDocument();
+  });
+
+  it('names the stage it is showing, and how much work it holds', async () => {
+    renderColumn();
+    await screen.findByText('Wire the board');
+
+    // The page's own heading, not a 10px label on a 210px queue.
+    expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent('Backlog');
+    expect(screen.getByText('Kanban · Stage 1 of 5')).toBeInTheDocument();
+    // Two live cards — the cancelled one is not work.
+    expect(screen.getByTitle('2 live cards in Backlog')).toHaveTextContent('2');
+    // …and the one thing waiting on the operator, named.
+    expect(screen.getByTitle(/Cards with something new/)).toHaveTextContent('1 new');
+    expect(screen.queryByText(/run failed/)).not.toBeInTheDocument();
+  });
+
+  it('counts the whole stage in its heading, not what the filter let through', async () => {
+    renderColumn('backlog', '?q=blocked');
+    await screen.findByText('Blocked one');
+
+    // One row is on screen, but the stage still holds two live cards — a
+    // heading that shrank with the filter would report an emptied stage.
+    expect(screen.queryByText('Wire the board')).not.toBeInTheDocument();
+    const block = screen.getByTitle('2 live cards in Backlog — 1 match the filter');
+    expect(block).toHaveTextContent('2');
+  });
+
+  it('says nothing rather than printing zeroes on a quiet stage', async () => {
+    renderColumn('todo');
+    await screen.findByText('Nothing waiting on you');
+    expect(screen.getByTitle('0 live cards in Todo')).toBeInTheDocument();
+  });
+
+  it('draws the reading order as bands, in the order the rows are drawn', async () => {
+    renderColumn();
+    await screen.findByText('Wire the board');
+
+    // #2 is unread, #1 and #3 are not — so the lift the board applies
+    // silently is on the page as two labelled runs of rows.
+    const headers = screen.getAllByText(/^(Pinned|New|Queue)$/);
+    expect(headers.map((node) => node.textContent)).toEqual(['New', 'Queue']);
+    const rows = screen.getAllByTitle(/^issue |^Wire|^Blocked|^Cancelled/);
+    expect(rows[0].textContent).toContain('Blocked one');
+    expect(rows[1].textContent).toContain('Wire the board');
+  });
+
+  it('drops the band headers when there is only one band to name', async () => {
+    renderColumn('in_progress');
+    await screen.findByText('Under way');
+
+    // Every card here is new, so a lone "New" header would separate nothing.
+    expect(screen.queryByText('New')).not.toBeInTheDocument();
+    expect(screen.queryByText('Queue')).not.toBeInTheDocument();
+  });
+
+  it('lifts a pinned card into its own band, above what is merely new', async () => {
+    renderColumn();
+    await screen.findByText('Wire the board');
+
+    const rows = screen.getAllByTitle(/^issue |^Wire|^Blocked|^Cancelled/);
+    await userEvent.click(
+      within(cardOf(rows[1])).getByRole('button', {
+        name: /Pin this card/,
+      }),
+    );
+
+    await waitFor(() => {
+      expect(screen.getAllByText(/^(Pinned|New|Queue)$/).map((n) => n.textContent)).toEqual([
+        'Pinned',
+        'New',
+        'Queue',
+      ]);
+    });
+    // What the operator chose leads what merely arrived.
+    const after = screen.getAllByTitle(/^issue |^Wire|^Blocked|^Cancelled/);
+    expect(after[0].textContent).toContain('Wire the board');
+    expect(after[1].textContent).toContain('Blocked one');
+  });
+
+  it('lays the whole wall out as one grid, banded in the reading order', async () => {
+    renderColumn();
+    await screen.findByText('Wire the board');
+
+    const headers = screen.getAllByText(/^(Pinned|New|Queue)$/);
+    expect(headers.map((node) => node.textContent)).toEqual(['New', 'Queue']);
+    expect(renderedTitles()).toEqual(['Blocked one', 'Wire the board', 'Cancelled one']);
+
+    // **One** grid, not one per band. Three parents would mean React
+    // unmounts a card that moves between bands — so pinning a card, or a
+    // refetch that clears its unread, would destroy and rebuild the very
+    // card being interacted with. The headers span the single grid.
+    expect(document.querySelectorAll('[class*="grid-cols-1"]')).toHaveLength(1);
+    for (const header of headers) {
+      expect(header.closest('.col-span-full')).not.toBeNull();
+    }
+  });
+
+  it('gives every card a keyboard door to its issue', async () => {
+    renderColumn();
+    await screen.findByText('Wire the board');
+
+    // The card's own press is a mouse convenience. Dropping dnd-kit took
+    // its `attributes` — and with them the tab stop that had been the only
+    // non-mouse way to open an issue from this page.
+    const link = screen.getByRole('link', { name: 'Wire the board' });
+    expect(link).toHaveAttribute('href', `/projects/${PROJECT.id}/issues/1`);
+
+    link.focus();
+    expect(document.activeElement).toBe(link);
+    await userEvent.keyboard('{Enter}');
+    expect(
+      await screen.findByText('came from /projects/01JPROJECT/board/backlog'),
+    ).toBeInTheDocument();
+  });
+
+  it('does not transform a card on hover, which would trap the Move panel', async () => {
+    renderColumn();
+    await screen.findByText('Wire the board');
+
+    // A non-`none` `translate` makes the card a stacking context, confining
+    // the picker's `z-30` panel to it while every later card paints on top.
+    // Measured at 13% of the panel left hit-testable — and a press whose
+    // down and up land on different elements fires `click` on their common
+    // ancestor, so the option does nothing at all.
+    for (const card of screen.getAllByRole('article')) {
+      expect(card.className).not.toMatch(/translate/);
+      expect(card.className).not.toMatch(/hover:scale/);
+    }
+  });
+
+  it('offers no way to reorder a stage from here', async () => {
+    renderColumn();
+    await screen.findByText('Wire the board');
+
+    // Deliberate: `position` is a one-dimensional rank and a grid cannot
+    // show one without lying about which of two side-by-side cards leads.
+    // The board is where an order is dragged into shape; this page reads,
+    // triages and hands on. Nothing here may claim otherwise.
+    for (const card of screen.getAllByRole('article')) {
+      expect(card).not.toHaveAttribute('draggable', 'true');
+      expect(card.className).not.toContain('touch-none');
+    }
+    expect(document.querySelector('[role="button"][aria-roledescription]')).toBeNull();
+  });
+
+  it('gives a long title two lines before it gives up', async () => {
+    renderColumn();
+    const title = await screen.findByTitle('Wire the board');
+
+    // The one cost the measured grid charged was truncated titles. A card
+    // has the vertical room a row never did, so it spends it here.
+    expect(title.className).toContain('line-clamp-2');
+  });
+
+  it('sends the card off knowing where to come back to', async () => {
+    renderColumn('backlog', '?q=blocked');
+    await screen.findByText('Blocked one');
+
+    // The detail page's back link is fixed on the board, which from a
+    // maximized stage is two steps from where the operator was — and drops
+    // this stage's filter on the way, so the wall they came back to was not
+    // the wall they left. Both doors out of a card carry the origin: the
+    // title's link and the card's own press.
+    const link = screen.getByRole('link', { name: 'Blocked one' });
+    await userEvent.click(link);
+    expect(await screen.findByText('came from /projects/01JPROJECT/board/backlog?q=blocked'))
+      .toBeInTheDocument();
+  });
+
+  it('carries the origin on the card’s own press too, not just the title link', async () => {
+    renderColumn('backlog', '?q=blocked');
+    await screen.findByText('Blocked one');
+
+    // The whole card is a mouse target; only the title is a link. If just
+    // one of them recorded the origin, which door you used would decide
+    // where Back went.
+    await userEvent.click(cardOf(screen.getByTitle('Blocked one')));
+    expect(await screen.findByText('came from /projects/01JPROJECT/board/backlog?q=blocked'))
+      .toBeInTheDocument();
   });
 
   it('walks back to the board without dropping the narrowing', async () => {
@@ -470,85 +573,4 @@ describe('ColumnPage', () => {
     expect(back?.getAttribute('href')).toBe(`/projects/${PROJECT.id}?q=blocked`);
   });
 
-  describe('dragging a row', () => {
-    let restoreLayout: () => void;
-
-    beforeEach(() => {
-      restoreLayout = installFakeLayout();
-      (window as unknown as { PointerEvent: typeof FakePointerEvent }).PointerEvent =
-        FakePointerEvent;
-    });
-
-    afterEach(() => {
-      restoreLayout();
-    });
-
-    it('a drag writes the stored order, not the reading order — twice in a row', async () => {
-      renderColumn();
-      await screen.findByText('Wire the board');
-      // Reading order: [Blocked #2 (unread), Wire #1, Cancelled #3].
-      // Stored positions: #1@0, #2@1, #3@2.
-
-      // Drag the bottom row onto the top slot.
-      grab('Cancelled one');
-      await settle();
-      const to = rowCentre('Blocked one');
-      fireEvent(document, pointer('pointermove', to.x, to.y));
-      await settle();
-      fireEvent(document, pointer('pointerup', to.x, to.y));
-
-      // Inserted before #2 in the STORED order — [1,3,2], not the rendered
-      // [3,2,1]: the reading order is never written.
-      await waitFor(() => {
-        expect(movesPosted()).toHaveLength(1);
-      });
-      expect(movesPosted()[0][1]).toMatchObject({
-        body: { status: 'backlog', ordered_numbers: [1, 3, 2] },
-      });
-
-      // A second drag BEFORE any refetch: the first drag's order was written
-      // back onto the cards, so this one anchors against [1,3,2] — stale
-      // positions would send [2,1,3] and undo the first move.
-      grab('Wire the board');
-      await settle();
-      const top = rowCentre('Cancelled one');
-      fireEvent(document, pointer('pointermove', top.x, top.y));
-      await settle();
-      fireEvent(document, pointer('pointerup', top.x, top.y));
-
-      await waitFor(() => {
-        expect(movesPosted()).toHaveLength(2);
-      });
-      expect(movesPosted()[1][1]).toMatchObject({
-        body: { status: 'backlog', ordered_numbers: [1, 3, 2] },
-      });
-    });
-
-    it('holds a frame while a row is in the air, and answers it on landing', async () => {
-      renderColumn();
-      await screen.findByText('Wire the board');
-      const issueGets = () =>
-        client.GET.mock.calls.filter(([path]) => path === '/v1/projects/{project_id}/issues')
-          .length;
-      const before = issueGets();
-
-      const from = grab('Wire the board');
-      await settle();
-      // A `project_changed` frame lands mid-drag: it must NOT refetch under
-      // the drag — a refetch re-keys every row and re-ranks the very list
-      // being dragged in.
-      act(() => {
-        stream.onFrame?.();
-      });
-      await settle();
-      expect(issueGets()).toBe(before);
-
-      // Released in place: no move posted, and the held frame is answered.
-      fireEvent(document, pointer('pointerup', from.x, from.y + 6));
-      await waitFor(() => {
-        expect(issueGets()).toBe(before + 1);
-      });
-      expect(movesPosted()).toHaveLength(0);
-    });
-  });
 });
