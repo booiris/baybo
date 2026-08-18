@@ -180,13 +180,13 @@ unchanged, and `commitMove` re-reads the board on every optimistic write (as
 `withPin` does) so that precondition cannot lapse.
 
 A card is the board's tile with the room it never had: a header line of
-identity (pin, `#number`, priority, age, unread), the title at 0.82rem bold
-over **two full lines** before it is ever cut, a wrap of badges and the branch
-chip, and a footer of assignee / sub-issues / run word / Move — pushed to the
-card's foot with `mt-auto`, because a grid row is as tall as its tallest card
-and floating footers would leave every short card with a hole. Priority is a
-3px spine down the left edge, inset from the ends. The cells come from
-`cardChrome.tsx`, which the board's tile reads too.
+identity (`#number` and priority at its head, pin, age and unread at its right
+end), the title at 0.82rem bold over **two full lines** before it is ever cut,
+a wrap of badges and the branch chip, and a footer of assignee / sub-issues /
+run word / Move — pushed to the card's foot with `mt-auto`, because a grid row
+is as tall as its tallest card and floating footers would leave every short
+card with a hole. Priority is a 3px spine down the left edge, inset from the
+ends. The cells come from `cardChrome.tsx`, which the board's tile reads too.
 
 The title is a **link**, and it is the card's keyboard door. The card's own
 press is a mouse convenience; dropping dnd-kit took its `attributes` with it,
@@ -393,11 +393,15 @@ worse than a struck-through card at the top of a column.
 The pin **is** the marker — one element, not a badge beside a button.
 `cardChrome.PinButton` draws a filled pushpin on a pinned card and nothing at
 all on an unpinned one until the card is hovered or the button is tabbed to,
-because a permanent outline glyph on every card is furniture. It leads the
-card's meta row rather than taking the top-right corner, which belongs to the
-unread count. It has to stop the press twice over: the card's own click opens
-the issue, and the whole card is also the drag handle, so `pointerdown` is
-stopped as well or a press that drifted 4px picks the card up.
+because a permanent outline glyph on every card is furniture. It sits at the
+**right-hand end** of the card's header line, immediately in front of the age,
+and both surfaces say it the same way. Not at the head of that line: the head
+is where a card is *identified* — its number, its priority, the spine beside
+them — and a control standing in that queue reads as one more fact about the
+card. Not the corner past the age either, which is the unread count's. It has
+to stop the press twice over: the card's own click opens the issue, and on the
+board the whole card is also the drag handle, so `pointerdown` is stopped as
+well or a press that drifted 4px picks the card up.
 
 That makes the card a shortcut, not the only door — hover is a thing a touch
 screen does not have. The issue's own rail carries a **Pinned** row that is

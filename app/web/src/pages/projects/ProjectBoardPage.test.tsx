@@ -373,6 +373,19 @@ describe('ProjectBoardPage', () => {
     expect(screen.getByRole('heading', { name: 'Backlog' })).toBeInTheDocument();
   });
 
+  it("wears the pin at the meta row's right end, in front of the time", async () => {
+    renderBoard();
+    const card = (await screen.findByText('Wire the board')).closest('article') as HTMLElement;
+
+    // The head of the meta row is where the card is identified — its mark
+    // and its number — and the corner past the time is the unread count's.
+    const number = within(card).getByText('#1');
+    const pin = within(card).getByRole('button', { name: /Pin this card/ });
+    const time = within(card).getByTitle(/^Last touched/);
+    expect(number.compareDocumentPosition(pin) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(pin.compareDocumentPosition(time) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
   it('puts the card back where it was when the pin fails to land', async () => {
     client.PATCH.mockResolvedValueOnce({
       data: undefined,

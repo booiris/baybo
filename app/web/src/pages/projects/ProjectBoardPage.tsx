@@ -954,27 +954,31 @@ function IssueCard({
       } ${cancelled ? 'opacity-55' : ''}`}
     >
       <div className="flex items-center gap-1.5 font-mono text-[0.6rem] text-ink-soft">
-        {/* Leading, not in the right-hand corner: that corner is the unread
-            count's, and it is the one number on this board the eye is
-            trained to find. */}
-        {onTogglePin === undefined ? null : (
-          <PinButton
-            pinned={issue.pinned}
-            disabled={disabled}
-            onToggle={(pinned) => {
-              onTogglePin(issue.number, pinned);
-            }}
-          />
-        )}
         {priority !== null ? (
           <span className={`${priority.tone} font-bold`}>{priority.glyph}</span>
         ) : null}
         <span className="font-bold">#{issue.number}</span>
-        <span
-          className="ml-auto tabular-nums"
-          title={`Last touched ${new Date(issue.updated_at_ms).toLocaleString()}`}
-        >
-          {updatedAgo(issue.updated_at_ms, Date.now())}
+        {/* In front of the time, at the row's other end: the head of the meta
+            row is where the card is identified — its mark and its number —
+            and a press standing in that queue reads as one more fact about
+            the card. The corner past the time stays the unread count's, the
+            one number on this board the eye is trained to find. */}
+        <span className="ml-auto flex items-center gap-1.5">
+          {onTogglePin === undefined ? null : (
+            <PinButton
+              pinned={issue.pinned}
+              disabled={disabled}
+              onToggle={(pinned) => {
+                onTogglePin(issue.number, pinned);
+              }}
+            />
+          )}
+          <span
+            className="tabular-nums"
+            title={`Last touched ${new Date(issue.updated_at_ms).toLocaleString()}`}
+          >
+            {updatedAgo(issue.updated_at_ms, Date.now())}
+          </span>
         </span>
         {issue.unread > 0 ? <UnreadPill unread={issue.unread} /> : null}
       </div>

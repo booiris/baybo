@@ -375,6 +375,19 @@ describe('ColumnPage', () => {
     expect(onDetailPage()).toBe(false);
   });
 
+  it("wears the pin at the meta line's right end, in front of the time", async () => {
+    renderColumn();
+    const card = cardOf(await screen.findByText('Wire the board'));
+
+    // The head of the line is where the card is identified — its number, its
+    // priority — and the corner past the time is the unread count's.
+    const number = within(card).getByText('#1');
+    const pin = within(card).getByRole('button', { name: /Pin this card/ });
+    const time = within(card).getByTitle(/^Last touched/);
+    expect(number.compareDocumentPosition(pin) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(pin.compareDocumentPosition(time) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
   it('reads an archived project without offering to work it', async () => {
     projectDto = { ...PROJECT, archived_at_ms: 111 };
     renderColumn();

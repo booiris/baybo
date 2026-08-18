@@ -781,24 +781,31 @@ function IssueTile({
       )}
 
       <div className="flex items-center gap-2 pl-4 pr-2.5 pt-2 font-mono text-[0.6rem] text-ink-soft">
-        <PinButton
-          pinned={issue.pinned}
-          disabled={readOnly}
-          onToggle={(pinned) => {
-            onTogglePin(issue.number, pinned);
-          }}
-        />
         <span className="font-bold tabular-nums">#{issue.number}</span>
         {priority === null ? null : (
           <span className={`truncate ${priority.tone}`}>
             {priority.glyph} {PRIORITY_LABEL[issue.priority]}
           </span>
         )}
-        <span
-          className="ml-auto shrink-0 tabular-nums"
-          title={`Last touched ${new Date(issue.updated_at_ms).toLocaleString()}`}
-        >
-          {updatedAgo(issue.updated_at_ms, Date.now())}
+        {/* In front of the time, at the line's other end: the head of the
+            meta line is where the card is identified — its number, its
+            priority — and a press standing in that queue is read as one more
+            fact about the card. The corner past the time stays the unread
+            count's. */}
+        <span className="ml-auto flex shrink-0 items-center gap-2">
+          <PinButton
+            pinned={issue.pinned}
+            disabled={readOnly}
+            onToggle={(pinned) => {
+              onTogglePin(issue.number, pinned);
+            }}
+          />
+          <span
+            className="tabular-nums"
+            title={`Last touched ${new Date(issue.updated_at_ms).toLocaleString()}`}
+          >
+            {updatedAgo(issue.updated_at_ms, Date.now())}
+          </span>
         </span>
         {issue.unread > 0 ? <UnreadPill unread={issue.unread} /> : null}
       </div>
