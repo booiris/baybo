@@ -36,6 +36,7 @@ export function Picker({
   disabled,
   onPick,
   options,
+  ariaLabel,
   triggerClassName = '',
   className = '',
   panelClassName = '',
@@ -43,6 +44,15 @@ export function Picker({
   children,
 }: {
   label: string;
+  /// The whole accessible name, when `label: value` would not be one.
+  ///
+  /// The default reads the trigger as *the value it holds* — "Status of #3:
+  /// Review" — which is right when the trigger wears that value. A trigger
+  /// that wears an **action** instead is announced as the object of its own
+  /// verb: the stage page's chip says "Move", and the value it holds is the
+  /// stage the card is already in, so the default named the one destination
+  /// the picker refuses.
+  ariaLabel?: string;
   value: string;
   disabled: boolean;
   onPick: (value: string) => void;
@@ -77,7 +87,7 @@ export function Picker({
         type="button"
         aria-haspopup="true"
         aria-expanded={open}
-        aria-label={`${label}: ${current?.label ?? value}`}
+        aria-label={ariaLabel ?? `${label}: ${current?.label ?? value}`}
         title={title}
         disabled={disabled}
         onClick={() => {
