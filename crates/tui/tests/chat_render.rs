@@ -248,6 +248,83 @@ fn user_message_streams_an_assistant_reply() {
     });
 }
 
+/// Markdown blocks reach a real terminal as rendered layout, not as source.
+/// `capture-pane -p` carries no styling, so this pins the *glyphs and layout*
+/// markdown produces (bullets, code gutter, table rules) and — the part that
+/// matters most — that no markup punctuation is left on screen.
+#[test]
+#[ignore = "tmux render test; flaky under load — run in CI with --ignored"]
+fn markdown_blocks_render_as_layout_not_source() {
+    run_chat("markdown_blocks_render_as_layout_not_source", |s| {
+        say(s, SAY_MARKDOWN);
+        wait_render(s, "markdown answer", |c| c.contains(MARKDOWN_TAIL))?;
+        let history = s.capture_with_scrollback(400).map_err(|e| e.to_string())?;
+
+        for (label, needle) in [
+            ("heading text", MARKDOWN_HEADING),
+            ("emphasised word", MARKDOWN_EMPHASISED),
+            ("bullet glyph", "•"),
+            ("ordered marker", "1. step one"),
+            ("code gutter", "│ fn main() {}"),
+            ("code language label", "┌ rust"),
+            ("table rule", "├"),
+            ("quote gutter", "▌"),
+            ("han paragraph", MARKDOWN_TAIL),
+        ] {
+            assert!(
+                history.contains(needle),
+                "{label} ({needle:?}) missing from:\n{history}"
+            );
+        }
+
+        for (label, marker) in [
+            ("bold markers", "**"),
+            ("fence markers", "```"),
+            ("table pipes", "| lang |"),
+            ("list dashes", "- first point"),
+        ] {
+            assert!(
+                !history.contains(marker),
+                "{label} ({marker:?}) left as literal source in:\n{history}"
+            );
+        }
+        Ok(())
+    });
+}
+
+/// Answer text held back by the markdown block scanner must reach scrollback
+/// *above* a tool block that arrives while it is still buffered. `insert_before`
+/// cannot write beneath a committed row, so getting this wrong inverts the turn's
+/// reading order permanently.
+#[test]
+#[ignore = "tmux render test; flaky under load — run in CI with --ignored"]
+fn buffered_answer_text_commits_above_a_tool_block() {
+    run_chat("buffered_answer_text_commits_above_a_tool_block", |s| {
+        say(s, SAY_MARKDOWN_TOOL);
+        wait_render(s, "markdown + tool turn", |c| c.contains(MDTOOL_TAIL))?;
+        let history = s.capture_with_scrollback(400).map_err(|e| e.to_string())?;
+
+        let held = history
+            .find(MDTOOL_HELD)
+            .ok_or_else(|| format!("held-back prose missing:\n{history}"))?;
+        let tool = history
+            .find(TOOL_SUMMARY)
+            .ok_or_else(|| format!("tool result missing:\n{history}"))?;
+        let tail = history
+            .find(MDTOOL_TAIL)
+            .ok_or_else(|| format!("post-tool prose missing:\n{history}"))?;
+        assert!(
+            held < tool,
+            "buffered prose landed BELOW its tool block:\n{history}"
+        );
+        assert!(
+            tool < tail,
+            "post-tool prose landed above the tool block:\n{history}"
+        );
+        Ok(())
+    });
+}
+
 #[test]
 #[ignore = "tmux render test; flaky under load — run in CI with --ignored"]
 fn live_region_survives_a_resize() {
