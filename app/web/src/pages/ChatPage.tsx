@@ -309,7 +309,14 @@ export function transcriptTailSignature(
 /** Slack (px) under which the transcript is treated as not overflowing its
  *  viewport, so scroll can never fire and the older-page load must be kicked
  *  off programmatically. See the underfill fallback effect. */
-const UNDERFILL_SLACK_PX = 4;
+/// How close to the top a reader gets before the next older page is fetched.
+/// Exported because the board's run panel reads a transcript the same way, and
+/// two numbers here would be two different moments to page back.
+export const OLDER_SCROLL_SLACK_PX = 200;
+
+/// Slack for the underfill fallback — a thread shorter than its pane cannot be
+/// scrolled, so the scroll trigger above can never fire for it.
+export const UNDERFILL_SLACK_PX = 4;
 
 /** A live work block's step list is its own small scroller inside the thread,
  *  so it holds its newest line on a tighter slack than the thread's: a couple
@@ -2090,7 +2097,7 @@ export function ChatPage() {
     // top. The `loadOlder` callback no-ops if a request is already
     // in flight or `hasMore === false`, so emitting this on every
     // scroll event is safe.
-    if (scroller.scrollTop <= 200) {
+    if (scroller.scrollTop <= OLDER_SCROLL_SLACK_PX) {
       void loadOlder();
     }
   }, [loadOlder]);
@@ -3280,8 +3287,23 @@ export function ChatPage() {
           ) : currentView.transcript.length === 0 && !currentView.pendingApproval ? (
             <WelcomeEmpty slashCommands={slashCommands} onPick={handleComposerChange} />
           ) : (
-            <div ref={observeTranscriptContent} className="flex flex-col gap-3 w-full max-w-4xl mx-auto">
-              {currentView.olderLoading ? (
+            <ThreadView
+              rows={currentView.transcript}
+              turn={currentView.turn}
+              baseUrl={baseUrl}
+              adminToken={adminToken}
+              compactionDividerBeforeKey={compactionDividerBeforeKey}
+              flashRowKey={flashRowKey}
+              contentRef={observeTranscriptContent}
+              onRetry={
+                sessionId === undefined
+                  ? undefined
+                  : (clientMsgId) => {
+                      retryFailedSend(sessionId, clientMsgId);
+                    }
+              }
+              head={
+              currentView.olderLoading ? (
                 <div className="flex justify-center py-2 text-ink-soft">
                   <RiLoader4Line className="text-xl animate-spin" />
                 </div>
@@ -3289,102 +3311,39 @@ export function ChatPage() {
                 <div className="flex justify-center py-1 text-[0.7rem] font-mono text-ink-soft uppercase tracking-wider">
                   scroll up to load older messages
                 </div>
-              ) : null}
-              {currentView.transcript.flatMap((row, i, arr) => {
-                const nodes: React.ReactNode[] = [];
-                // Boundary divider at the pre-compaction→post-compaction seam.
-                const dividerAt = compactionDividerBeforeKey.get(row.key);
-                if (dividerAt !== undefined) {
-                  nodes.push(
-                    <CompactionDivider key={`${row.key}-compaction`} at={dividerAt} />,
-                  );
-                }
-                // `/stop`, aligned with iOS: the command echo is never painted,
-                // and its acknowledgement collapses to a compact "Stopped"
-                // indicator (adjacent ones — a live mark and its re-delivered
-                // durable notice — merge into one) rather than a verbose bar. The
-                // rows stay in the array so dedup / cancel-marking are unaffected.
-                const stopKind = stopRowKind(row);
-                if (stopKind === 'echo') return nodes;
-                if (stopKind === 'ack') {
-                  // Collapse a run of adjacent acks to one indicator (a live mark
-                  // and its re-delivered durable notice). `i > 0` guards the
-                  // index; `arr` is non-empty here.
-                  const prevIsAck = i > 0 && stopRowKind(arr[i - 1]) === 'ack';
-                  if (!prevIsAck) {
-                    nodes.push(<StoppedIndicator key={`${row.key}-stopped`} />);
-                  }
-                  return nodes;
-                }
-                const retryId = row.failed ? row.clientMsgId : undefined;
-                const ordinal = rowOrdinal(row.key);
-                nodes.push(
-                  // The row's DOM identity, and the only thing a search jump
-                  // has to aim at. Wrapped rather than pushed into
-                  // `MessageBubble` because a bubble, a notice and a work card
-                  // are three different roots; the tint is a full-band strip
-                  // (not a ring on the bubble) for the same reason — it reads
-                  // the same whichever of the three landed, and it cannot
-                  // disturb the left/right alignment the roots own. `min-w-0`
-                  // because a flex child defaults to `min-width:auto` and would
-                  // refuse to shrink below its content, overflowing the band.
-                  <div
-                    key={row.key}
-                    id={row.key}
-                    data-ordinal={ordinal ?? undefined}
-                    className={`min-w-0 rounded-md transition-colors duration-700 ${
-                      row.key === flashRowKey ? 'bg-brand/25' : 'bg-transparent'
-                    }`}
-                  >
-                    <MessageBubble
-                      row={row}
-                      adminToken={adminToken}
-                      baseUrl={baseUrl}
-                      onRetry={
-                        retryId !== undefined && sessionId
-                          ? () => retryFailedSend(sessionId, retryId)
-                          : undefined
-                      }
-                    />
-                  </div>,
-                );
-                if (isCancelledWorkAt(arr, i, currentView.turn)) {
-                  nodes.push(
-                    <CancelledTurnIndicator key={`${row.key}-cancelled`} />,
-                  );
-                }
-                return nodes;
-              })}
-              {/* Deferred ("send after the reply") messages render as dimmed
-                  user bubbles pinned below the agent's output — never woven into
-                  the streaming transcript array, so they can't split the answer
-                  bubble. They dispatch (and become real transcript rows) once the
-                  turn completes. */}
-              {queue.deferred.map((item) => (
-                <MessageBubble
-                  key={`deferred-${item.id}`}
-                  row={{
-                    key: `deferred-${item.id}`,
-                    role: 'user',
-                    text: item.text,
-                    attachments: item.attachments,
-                    hasAttachments: item.attachments.length > 0,
-                    pending: true,
-                  }}
-                  adminToken={adminToken}
-                  baseUrl={baseUrl}
-                />
-              ))}
-              {currentView.awaitingReply ? <WorkingIndicator /> : null}
-              {currentView.pendingApproval ? (
-                <ApprovalCard
-                  approval={currentView.pendingApproval}
-                  onDecide={handleApprovalDecision}
-                  connected={status.state === 'connected'}
-                />
-              ) : null}
-              <div ref={transcriptEndRef} />
-            </div>
+              ) : null
+              }
+            >
+            {/* Deferred ("send after the reply") messages render as dimmed
+                user bubbles pinned below the agent's output — never woven into
+                the streaming transcript array, so they can't split the answer
+                bubble. They dispatch (and become real transcript rows) once the
+                turn completes. */}
+            {queue.deferred.map((item) => (
+              <MessageBubble
+                key={`deferred-${item.id}`}
+                row={{
+                  key: `deferred-${item.id}`,
+                  role: 'user',
+                  text: item.text,
+                  attachments: item.attachments,
+                  hasAttachments: item.attachments.length > 0,
+                  pending: true,
+                }}
+                adminToken={adminToken}
+                baseUrl={baseUrl}
+              />
+            ))}
+            {currentView.awaitingReply ? <WorkingIndicator /> : null}
+            {currentView.pendingApproval ? (
+              <ApprovalCard
+                approval={currentView.pendingApproval}
+                onDecide={handleApprovalDecision}
+                connected={status.state === 'connected'}
+              />
+            ) : null}
+            <div ref={transcriptEndRef} />
+            </ThreadView>
           )}
         </div>
         </div>
@@ -4747,6 +4706,45 @@ export function markLastWorkCancelled(rows: TranscriptRow[]): TranscriptRow[] {
   return next;
 }
 
+/// Index of the work block the turn at the tail belongs to, or `-1`.
+///
+/// Not the literal last row: a turn's partial answer bubble and its committed
+/// notice rows land BELOW its block. Anything else — a user message, another
+/// block — is the barrier, so the scan finds the same turn's block rather
+/// than treating a finished one as still open.
+function tailWorkIndex(rows: TranscriptRow[]): number {
+  let i = rows.length - 1;
+  while (i >= 0) {
+    const row = rows[i];
+    if (row.kind === 'work') break;
+    if (row.role !== 'assistant' && row.notice === undefined) break;
+    i -= 1;
+  }
+  return i >= 0 && rows[i].kind === 'work' ? i : -1;
+}
+
+/** Re-open the trailing work block of a thread whose turn is still running.
+ *
+ *  A REST page reconstructs every block collapsed — `transcriptItemToRow` sets
+ *  `workActive: false`, because a page of persisted rows says nothing about
+ *  what is still in flight. A reader that knows from elsewhere that a turn is
+ *  live (the board's run panel reads the run ledger beside the transcript)
+ *  hands the block back its OWN start, which is the only value
+ *  `applyTurnState` re-opens a closed block on: any other would re-time it.
+ *
+ *  `notBefore` is what keeps that honest. The tail block is only THIS turn's
+ *  if it opened at or after the live work began — a session that hosts several
+ *  runs spends the first seconds of a new one still showing the last one's
+ *  finished block, and re-opening that would light a finished turn as
+ *  "Working". A tail with no block, a block with no start, or a block older
+ *  than the live work is left exactly as it was. */
+export function openLiveTail(rows: TranscriptRow[], notBefore: number): TranscriptRow[] {
+  const i = tailWorkIndex(rows);
+  const startedAt = i === -1 ? undefined : rows[i].workStartedAt;
+  if (startedAt === undefined || startedAt < notBefore) return rows;
+  return applyTurnState(rows, true, startedAt);
+}
+
 /** Reconcile the transcript's tail with the server's `TurnState`.
  *
  *  Active (`started_at` is always present — the server asserts it iff
@@ -4765,9 +4763,11 @@ export function markLastWorkCancelled(rows: TranscriptRow[]): TranscriptRow[] {
  *  that ends without either (error, cancel, blank cron reply) can't
  *  leave the block spinning forever.
  *
- *  Idempotent — driven only by `turn_state` frames (the authoritative
- *  server signal); the REST history reload no longer folds a cached turn
- *  through here. */
+ *  Idempotent. In the chat it is driven only by `turn_state` frames, the
+ *  authoritative server signal — a REST history reload does not fold a
+ *  cached turn through here. `openLiveTail` is the one other caller: the
+ *  board's run panel has no socket and reads liveness off the run ledger
+ *  instead, which is why it must supply the block's own start. */
 export function applyTurnState(
   prev: TranscriptRow[],
   active: boolean,
@@ -4790,19 +4790,9 @@ export function applyTurnState(
   // off it, or a finished turn resurfaces as a phantom "Working" box whose
   // elapsed counts from the wrong (old) start.
   if (startedAt === null) return prev;
-  // The turn's block may not be the literal tail: its partial answer bubble
-  // and committed notice rows land below it. Scan back over that trailing
-  // answer/notice run — anything else (a user message, another block) is the
-  // barrier — so the reconciliation finds the same turn's block instead of
-  // opening a duplicate below it.
-  let i = prev.length - 1;
-  while (i >= 0) {
-    const row = prev[i];
-    if (row.kind === 'work') break;
-    if (row.role !== 'assistant' && row.notice === undefined) break;
-    i -= 1;
-  }
-  const last = prev[i];
+  // The turn's block may not be the literal tail — see `tailWorkIndex`.
+  const i = tailWorkIndex(prev);
+  const last = i === -1 ? undefined : prev[i];
   if (last?.kind === 'work' && (last.workActive || last.workStartedAt === startedAt)) {
     // Re-pin an already-open block, or re-open a *closed* block only when
     // its start matches this turn — the same in-flight turn a REST reload
@@ -6226,6 +6216,129 @@ function AttachmentList({
   );
 }
 
+/// A thread with no compaction behind it. Module-level so a reader that
+/// passes none doesn't hand the loop a fresh Map every render.
+const NO_COMPACTION_DIVIDERS: ReadonlyMap<string, string> = new Map();
+
+/// The transcript itself: rows in, bubbles / work cards / dividers out.
+///
+/// Lifted out of the page because it has a second reader — the board's run
+/// panel (`pages/projects/RunTranscriptPanel`) shows a card's run as the
+/// conversation it was. Four decisions live in this loop (where the
+/// compaction divider lands, that a `/stop` echo is never painted, that
+/// adjacent acknowledgements collapse to one indicator, and where the
+/// cancelled-turn mark goes), and a board that re-derived any of them would
+/// be the second place that decides what a transcript looks like — which is
+/// the shape the iOS mirror is already in.
+///
+/// Everything live is the caller's: `head` takes the scroll-up affordance,
+/// `children` the composer-side chrome (deferred bubbles, the working
+/// indicator, an approval card). A read-only reader passes neither.
+export function ThreadView({
+  rows,
+  turn,
+  baseUrl,
+  adminToken,
+  compactionDividerBeforeKey = NO_COMPACTION_DIVIDERS,
+  flashRowKey,
+  onRetry,
+  contentRef,
+  head,
+  children,
+}: {
+  rows: TranscriptRow[];
+  /// Server-authoritative turn state, read only to tell a cancelled turn from
+  /// a finished one. `null` where nothing has said yet.
+  turn: SessionView['turn'];
+  baseUrl: string;
+  adminToken: string | null;
+  /// Row key → the instant a pre-compaction divider is drawn above it.
+  compactionDividerBeforeKey?: ReadonlyMap<string, string>;
+  /// The row a search jump landed on, tinted for a moment.
+  flashRowKey?: string | null;
+  /// Fires the manual outbox retry for a failed send. Absent on a read-only
+  /// thread, where the failed affordance has nothing to do.
+  onRetry?: (clientMsgId: string) => void;
+  /// Observed for growth by the caller's bottom-edge hold.
+  contentRef?: (node: Element | null) => void;
+  head?: ReactNode;
+  children?: ReactNode;
+}) {
+  return (
+    <div ref={contentRef} className="flex flex-col gap-3 w-full max-w-4xl mx-auto">
+      {head}
+      {rows.flatMap((row, i, arr) => {
+        const nodes: React.ReactNode[] = [];
+        // Boundary divider at the pre-compaction→post-compaction seam.
+        const dividerAt = compactionDividerBeforeKey.get(row.key);
+        if (dividerAt !== undefined) {
+          nodes.push(
+            <CompactionDivider key={`${row.key}-compaction`} at={dividerAt} />,
+          );
+        }
+        // `/stop`, aligned with iOS: the command echo is never painted,
+        // and its acknowledgement collapses to a compact "Stopped"
+        // indicator (adjacent ones — a live mark and its re-delivered
+        // durable notice — merge into one) rather than a verbose bar. The
+        // rows stay in the array so dedup / cancel-marking are unaffected.
+        const stopKind = stopRowKind(row);
+        if (stopKind === 'echo') return nodes;
+        if (stopKind === 'ack') {
+          // Collapse a run of adjacent acks to one indicator (a live mark
+          // and its re-delivered durable notice). `i > 0` guards the
+          // index; `arr` is non-empty here.
+          const prevIsAck = i > 0 && stopRowKind(arr[i - 1]) === 'ack';
+          if (!prevIsAck) {
+            nodes.push(<StoppedIndicator key={`${row.key}-stopped`} />);
+          }
+          return nodes;
+        }
+        const retryId = row.failed ? row.clientMsgId : undefined;
+        const ordinal = rowOrdinal(row.key);
+        nodes.push(
+          // The row's DOM identity, and the only thing a search jump
+          // has to aim at. Wrapped rather than pushed into
+          // `MessageBubble` because a bubble, a notice and a work card
+          // are three different roots; the tint is a full-band strip
+          // (not a ring on the bubble) for the same reason — it reads
+          // the same whichever of the three landed, and it cannot
+          // disturb the left/right alignment the roots own. `min-w-0`
+          // because a flex child defaults to `min-width:auto` and would
+          // refuse to shrink below its content, overflowing the band.
+          <div
+            key={row.key}
+            id={row.key}
+            data-ordinal={ordinal ?? undefined}
+            className={`min-w-0 rounded-md transition-colors duration-700 ${
+              row.key === flashRowKey ? 'bg-brand/25' : 'bg-transparent'
+            }`}
+          >
+            <MessageBubble
+              row={row}
+              adminToken={adminToken}
+              baseUrl={baseUrl}
+              onRetry={
+                retryId !== undefined && onRetry !== undefined
+                  ? () => {
+                      onRetry(retryId);
+                    }
+                  : undefined
+              }
+            />
+          </div>,
+        );
+        if (isCancelledWorkAt(arr, i, turn)) {
+          nodes.push(
+            <CancelledTurnIndicator key={`${row.key}-cancelled`} />,
+          );
+        }
+        return nodes;
+      })}
+      {children}
+    </div>
+  );
+}
+
 function MessageBubble({
   row,
   adminToken,
@@ -6305,22 +6418,36 @@ function MessageBubble({
   const body =
     row.text ||
     (row.hasAttachments && attachmentDetails.length === 0 ? '[attachment]' : '');
-  // Markdown rendering is reserved for assistant output — user input
-  // is left as plain pre-wrap so markdown-looking syntax (e.g. paths
-  // with underscores, leading hashes in shell logs, raw HTML tags)
-  // shows up verbatim instead of being silently reinterpreted. The
-  // streaming caret is also dropped on the markdown side: the pacer's
-  // character-by-character reveal already conveys "in progress", and
-  // a caret pinned to the bubble's tail would land below a block
-  // element when the last token is a code fence or list, looking off.
-  const showMarkdown = !isUser && !row.notice && body.length > 0;
+  // Every bubble renders markdown, the user's included — somebody writing
+  // `**this**` means emphasis, and a board run's brief is the card's
+  // description straight out of the card's markdown editor.
+  //
+  // What that costs, and how it is paid: markdown folds single newlines into
+  // one paragraph, which would reflow a pasted log into a wall. A user row is
+  // therefore rendered with `breaks`, where a newline stays a line — the same
+  // mode reasoning steps use. The residual reinterpretations (`__init__` as
+  // bold, a leading `#` in a shell log as a heading) are the trade, and they
+  // land on text a person chose to type rather than on the agent's output.
+  //
+  // The streaming caret is dropped on the markdown side: the pacer's
+  // character-by-character reveal already conveys "in progress", and a caret
+  // pinned to the bubble's tail would land below a block element when the last
+  // token is a code fence or list, looking off.
+  const showMarkdown = !row.notice && body.length > 0;
   return (
     <div className={`group flex flex-col min-w-0 ${isUser ? 'items-end' : 'items-start'}`}>
       <div className={`flex flex-col w-fit min-w-0 ${isUser ? 'max-w-2xl' : 'max-w-4xl'}`}>
         <div className="relative min-w-0">
           <div
             className={`rounded-md py-2 text-sm text-ink transition-opacity break-words [overflow-wrap:anywhere] ${
-              showMarkdown ? 'chat-prose' : 'font-mono whitespace-pre-wrap'
+              // A user bubble keeps mono — it is the operator's own words in the
+              // dashboard's own voice — and only stops being `pre-wrap` once
+              // markdown is laying the lines out instead.
+              isUser
+                ? `font-mono ${showMarkdown ? '' : 'whitespace-pre-wrap'}`
+                : showMarkdown
+                  ? 'chat-prose'
+                  : 'font-mono whitespace-pre-wrap'
             } ${isUser ? 'border-2 border-black px-3 bg-brand/60 shadow-brutal-sm' : ''} ${
               row.pending ? 'opacity-60' : ''
             }`}
@@ -6335,7 +6462,7 @@ function MessageBubble({
               </div>
             ) : null}
             {showMarkdown ? (
-              <MarkdownBody text={body} />
+              <MarkdownBody text={body} breaks={isUser} />
             ) : (
               <>
                 {body}

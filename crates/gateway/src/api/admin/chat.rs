@@ -1269,10 +1269,11 @@ async fn get_session(
     .await
 }
 
-/// The read half of `GET /chat/sessions/{id}` and `GET /chat/subagents/{id}`.
-/// Only ADMISSION differs between those two routes; what they return must not,
-/// so the page is built once here rather than transcribed per route.
-async fn session_detail(
+/// The read half of `GET /chat/sessions/{id}`, `GET /chat/subagents/{id}` and
+/// the board's `GET /projects/{id}/issues/{n}/runs/{attempt}/transcript`.
+/// Only ADMISSION differs between those routes; what they return must not, so
+/// the page is built once here rather than transcribed per route.
+pub(crate) async fn session_detail(
     state: &AdminState,
     sid: SessionId,
     session: Session,
@@ -3275,7 +3276,14 @@ fn last_user_preview(
 /// provenance, never content-sniffing, is what separates the errand from the
 /// skill-reminder machinery that shares its shape).
 fn renders_as_user_bubble(msg: &baybo_model::ChatMessage) -> bool {
-    msg.from_user() || msg.source() == baybo_model::MessageSource::SubagentSeed
+    msg.from_user()
+        || msg.source() == baybo_model::MessageSource::SubagentSeed
+        // A board run's brief is the ask its whole transcript answers, and the
+        // ONLY transcripts holding one are issue runs' — so this needs no
+        // per-reader knob. It used to be one, and a shared read path carrying
+        // a parameter for a single caller is a parameter that can be passed
+        // wrong; the row's own provenance cannot be.
+        || msg.source() == baybo_model::MessageSource::IssueBrief
 }
 
 fn last_message_preview(
@@ -3569,7 +3577,7 @@ fn reconstruct_transcript_with_attachments(
             Role::User if renders_as_user_bubble(&msg) => {
                 work.flush(&mut items, None, true);
                 turn_started = Some(created_at);
-                if let Some(item) = message_item(
+                if let Some(mut item) = message_item(
                     ordinal,
                     created_at,
                     "user",
@@ -3579,6 +3587,20 @@ fn reconstruct_transcript_with_attachments(
                         .cloned()
                         .unwrap_or_default(),
                 ) {
+                    // The board shows a brief to a PERSON, and the framing
+                    // around it is written for the model — who it is, that
+                    // nobody is waiting at a keyboard, where its checkout is.
+                    // Rendered whole it buries the one line the reader opened
+                    // the panel for. Same shape as the cancelled-turn marker
+                    // below: strip what the prompt module added, on the way
+                    // out, at the one surface that shows it.
+                    if msg.source() == baybo_model::MessageSource::IssueBrief {
+                        item.text = baybo_context::prompts::issue::unframe_issue_brief(&item.text)
+                            .to_string();
+                    }
+                    if item.text.is_empty() && !item.has_attachments {
+                        continue;
+                    }
                     items.push(item);
                 }
             }
@@ -4086,6 +4108,50 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn a_brief_reconstructs_as_the_ask_it_answers() {
+        // One reading, not one per reader: the only transcripts holding a
+        // brief are issue runs', so there is nothing for a knob to choose
+        // between — and the framing the prompt module wrapped it in comes back
+        // off, because that half is written for the model.
+        let tail = vec![
+            (
+                1,
+                ts(1),
+                ChatMessage::issue_brief(vec![text(
+                    &baybo_context::prompts::issue::frame_issue_brief(
+                        7,
+                        "/ws/work/projects/p/7",
+                        "fix the retry",
+                    ),
+                )]),
+            ),
+            (
+                2,
+                ts(4),
+                ChatMessage::assistant(vec![
+                    text("looking"),
+                    tool_use("c1", "Read", serde_json::json!({"path": "/x"})),
+                ]),
+            ),
+            (
+                3,
+                ts(6),
+                ChatMessage::tool_result("c1".to_owned(), "ok".to_owned()),
+            ),
+            (4, ts(9), ChatMessage::assistant(vec![text("fixed")])),
+        ];
+
+        let items = reconstruct_transcript(tail, Vec::new(), None, Vec::new());
+        assert!(matches!(items[0].kind, TranscriptItemKind::Message));
+        assert_eq!(items[0].role, "user");
+        assert_eq!(items[0].text, "fix the retry", "the ask, not the framing");
+        // And it opens the turn, so the run's work is timed from the moment it
+        // was asked rather than from its first persisted iteration.
+        assert!(matches!(items[1].kind, TranscriptItemKind::Work));
+        assert_eq!(items[1].work_started_at, Some(ts(1)));
     }
 
     #[test]

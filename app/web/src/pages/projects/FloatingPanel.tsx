@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type ReactNode,
+  type RefObject,
+} from 'react';
 
 import { useDismiss } from '../../components/useDismiss';
 
@@ -19,9 +26,18 @@ const PANEL_SLIDE_MS = 180;
 /// that slides in but blinks out reads as a bug.
 export function FloatingPanel({
   onDismiss,
+  trigger,
+  keepOpenWithin,
   children,
 }: {
   onDismiss: () => void;
+  /// Where Escape puts the keyboard back. Absent on a panel opened from a
+  /// control that is gone from under the cursor by then — a card's avatar
+  /// opens the agent profile and the card may have been replaced since.
+  trigger?: RefObject<HTMLElement | null>;
+  /// A region outside the panel whose presses must not close it — the
+  /// controls that swap what it shows. See [`useDismiss`].
+  keepOpenWithin?: RefObject<HTMLElement | null>;
   children: (leave: () => void) => ReactNode;
 }) {
   const root = useRef<HTMLDivElement>(null);
@@ -50,7 +66,7 @@ export function FloatingPanel({
     timer.current = window.setTimeout(onDismiss, PANEL_SLIDE_MS);
   }, [onDismiss]);
 
-  useDismiss({ open: !leaving, root, onDismiss: leave });
+  useDismiss({ open: !leaving, root, trigger, keepOpenWithin, onDismiss: leave });
 
   return (
     <div

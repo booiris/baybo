@@ -381,9 +381,11 @@ pub enum MessageSource {
     /// `docs/mid-turn-user-interjection.md`.
     UserInterjection,
     /// A board issue's brief, framed at run time: synthesized by the agent
-    /// and hidden from chat surfaces, but tracked distinctly so a card's
-    /// work log can tell "this is the instruction" from "this is what the
-    /// agent said about it".
+    /// rather than typed by anyone, but tracked distinctly so a card's work
+    /// log can tell "this is the instruction" from "this is what the agent
+    /// said about it" — which is what lets a run's transcript open on the ask
+    /// it answers, with the model-facing framing taken back off
+    /// (`baybo_context::prompts::issue::unframe_issue_brief`).
     IssueBrief,
     /// A cron job's fire-time framed prompt: synthesized by the agent and
     /// hidden from the chat transcript, but tracked distinctly so operator

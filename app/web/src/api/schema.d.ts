@@ -1256,6 +1256,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/projects/{project_id}/issues/{number}/runs/{attempt}/transcript": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["issue_run_transcript"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/projects/{project_id}/read": {
         parameters: {
             query?: never;
@@ -8397,6 +8413,64 @@ export interface operations {
             };
             /** @description A run is already in flight, or the project is archived */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    issue_run_transcript: {
+        parameters: {
+            query?: {
+                /**
+                 * @description Return only rows whose `ordinal` is strictly less than this
+                 *     value. Omit on the initial fetch; pass the lowest ordinal from
+                 *     the prior page to scroll further back. Maps to a primary-key
+                 *     range scan over the `session_messages` active index.
+                 */
+                before_ordinal?: number | null;
+                /**
+                 * @description Maximum rows to return. Defaults to
+                 *     [`DEFAULT_HISTORY_LIMIT`], clamped to [`MAX_HISTORY_LIMIT`].
+                 */
+                limit?: number | null;
+            };
+            header?: never;
+            path: {
+                /** @description Project id */
+                project_id: string;
+                /** @description Issue number within the project */
+                number: number;
+                /** @description Which run of the card, as the execution log numbers it */
+                attempt: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The conversation this run worked in, newest page first. A SESSION, not a run: one agent's runs on a card share it, so a later attempt's page also holds the earlier ones */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatSessionDetail"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unknown project, issue or attempt — or a run no executor ever claimed, which has no conversation to show */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

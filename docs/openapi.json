@@ -6245,6 +6245,103 @@
         }
       }
     },
+    "/v1/projects/{project_id}/issues/{number}/runs/{attempt}/transcript": {
+      "get": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "issue_run_transcript",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "number",
+            "in": "path",
+            "description": "Issue number within the project",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "attempt",
+            "in": "path",
+            "description": "Which run of the card, as the execution log numbers it",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "before_ordinal",
+            "in": "query",
+            "description": "Return only rows whose `ordinal` is strictly less than this\nvalue. Omit on the initial fetch; pass the lowest ordinal from\nthe prior page to scroll further back. Maps to a primary-key\nrange scan over the `session_messages` active index.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum rows to return. Defaults to\n[`DEFAULT_HISTORY_LIMIT`], clamped to [`MAX_HISTORY_LIMIT`].",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The conversation this run worked in, newest page first. A SESSION, not a run: one agent's runs on a card share it, so a later attempt's page also holds the earlier ones",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatSessionDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown project, issue or attempt — or a run no executor ever claimed, which has no conversation to show",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/projects/{project_id}/read": {
       "post": {
         "tags": [

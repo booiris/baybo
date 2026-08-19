@@ -47,8 +47,11 @@ the behaviour was verified against its source (clone inspected 2026-08-05).
 8. Issue detail is a **multica-style two-pane route**: main pane =
    description + sub-issues + third-person timeline with a comment
    composer; right rail = properties, branch + diff, execution log, token
-   cost. The agent's full working transcript is collapsed behind a
-   "view transcript" link (reuses the trace viewer).
+   cost. A run's working transcript opens **over the main pane** as a
+   read-only conversation panel (revised 2026-08-18; the original decision
+   was a link into the trace viewer), rendered by the chat page's own
+   thread components. The trace viewer keeps the spans, per-call tokens
+   and context window, and stays one press away from the panel's header.
 9. **No in-UI diff or merge** (revised 2026-08-05; the original
    merge-button decision was cut — the rail is too cramped for a
    meaningful diff, and the button went with it). The detail rail shows
@@ -384,8 +387,22 @@ Two-pane route, no tabs (multica's shape):
   button, per decision 9); **execution log** — every run with trigger
   reason ("drag", "comment", "stage barrier", "retry", "promoted",
   "triage"), status, duration,
-  cost, Cancel / Retry / **View transcript** (links into the existing
-  trace viewer for the run's session); token totals.
+  cost, Cancel / Retry / **Read as a conversation** — the trace viewer's own icon
+  that opens the run's transcript as a chat-style panel over the main
+  pane (`RunTranscriptPanel`, fed by
+  `GET /v1/projects/{id}/issues/{n}/runs/{attempt}/transcript`), never a
+  navigation away from the card; token totals.
+
+  Two consequences worth stating, because both are visible: the panel shows
+  a **session**, and one agent's runs on a card share one — so an attempt's
+  page also holds the attempts before it, each under its own run header.
+  The transcript opens on the run's **brief** — the ask the rest of the page
+  answers — shown **unframed**: `unframe_issue_brief` takes back off what
+  `frame_issue_brief` put on (who the agent is, that nobody is waiting at a
+  keyboard, where its checkout is), because that half is written for the model
+  and rendering it whole buries the card's own line under six hundred
+  characters of machinery. No per-reader knob: the only transcripts holding a
+  brief are runs', so there is nothing for one to choose between.
 - Approval requests raised by a run (tool approvals) render as timeline
   cards with approve/deny inline, and mirror into the activity feed.
 

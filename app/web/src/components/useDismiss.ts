@@ -16,11 +16,23 @@ export function useDismiss({
   open,
   root,
   trigger,
+  keepOpenWithin,
   onDismiss,
 }: {
   open: boolean;
   /// The panel and its trigger together: a press inside this is not outside.
   root: RefObject<HTMLElement | null>;
+  /// A second region a press inside does not close the panel — for a panel
+  /// whose controls live somewhere else on the page. The board's run panel is
+  /// swapped from the execution log beside it, and a press there that closed
+  /// the panel would close the very thing it was swapping.
+  ///
+  /// A region rather than the one control, because the panel is opened from
+  /// any row of that log and stopping the event at the button instead would
+  /// silence every OTHER popover's dismissal on the page: React delegates to
+  /// the root container, so `stopPropagation` there never reaches this
+  /// listener either.
+  keepOpenWithin?: RefObject<HTMLElement | null>;
   /// Where Escape puts the focus back. Absent on a panel that was not opened
   /// from a control of its own — a card's avatar opens the agent profile and
   /// is gone from under the cursor by the time Escape is pressed.
@@ -30,7 +42,9 @@ export function useDismiss({
   useEffect(() => {
     if (!open) return;
     function onPointerDown(event: MouseEvent) {
-      if (root.current?.contains(event.target as Node) === true) return;
+      const target = event.target as Node;
+      if (root.current?.contains(target) === true) return;
+      if (keepOpenWithin?.current?.contains(target) === true) return;
       onDismiss();
     }
     function onKeyDown(event: KeyboardEvent) {
@@ -45,5 +59,5 @@ export function useDismiss({
       document.removeEventListener('mousedown', onPointerDown);
       document.removeEventListener('keydown', onKeyDown);
     };
-  }, [open, root, trigger, onDismiss]);
+  }, [open, root, trigger, keepOpenWithin, onDismiss]);
 }

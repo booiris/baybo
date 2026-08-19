@@ -5,6 +5,7 @@ import {
   useRef,
   useState,
   type ReactNode,
+  type RefObject,
 } from 'react';
 import { Link, useLocation, useParams } from 'react-router-dom';
 import {
@@ -41,7 +42,11 @@ import {
   STATUS_PILL,
   assignableAgents,
   runDuration,
+  runIsLive,
   runLogView,
+  RUN_CHIP,
+  RUN_TONE,
+  RUN_TRIGGER_LABEL,
   tokensOf,
   unsettledRun,
   type Agent,
@@ -64,6 +69,8 @@ import { Avatar } from './Avatar';
 import { useTeamPortraits } from './portrait';
 import { Picker } from './Picker';
 import { SubIssues } from './SubIssues';
+import { RunTranscriptPanel } from './RunTranscriptPanel';
+import { FloatingPanel } from './FloatingPanel';
 import { Timeline } from './Timeline';
 import type { IssueEvent } from './timelineModel';
 import { useBoardStream } from './useBoardStream';
@@ -116,43 +123,25 @@ function Row({ label, children }: { label: string; children: ReactNode }) {
   );
 }
 
-const RUN_TONE: Record<IssueRun['status'], string> = {
-  held: 'border-warn/50 bg-warn/12 text-warn',
-  queued: 'border-black/35 bg-canvas text-ink-soft',
-  running: 'border-black bg-brand/40 text-ink',
-  done: 'border-ok/50 bg-ok/15 text-ok',
-  failed: 'border-err/45 bg-err/12 text-err',
-  cancelled: 'border-black/35 bg-canvas text-ink-soft',
-};
-
-/// Why this run happened. The mockup writes the first one "drag", which is
-/// only ever one of the three ways a card reaches In Progress — a REST move
-/// and an agent's own tool call produce the same trigger, and a log that
-/// blames a drag for either is lying about who started the work.
-const RUN_TRIGGER_LABEL: Record<IssueRun['trigger'], string> = {
-  started: 'moved to In Progress',
-  assigned: 'assigned',
-  retry: 'retry',
-  comment: 'comment',
-  promoted: 'the board had room',
-  triage: 'nobody assigned',
-  stage_barrier: 'stage barrier',
-  review: 'awaiting review',
-  stalled: 'work stopped',
-  blocked: 'blocked, needs a decision',
-};
-
 function RunRow({
   run,
   onCancel,
+  onRead,
+  open,
+  triggerRef,
   busy,
 }: {
   run: IssueRun;
   onCancel: () => void;
+  /// Open (or close) this run's conversation over the card.
+  onRead: () => void;
+  open: boolean;
+  /// Where Escape puts the keyboard back, held by whichever row is open.
+  triggerRef: RefObject<HTMLButtonElement | null>;
   busy: boolean;
 }) {
   const duration = runDuration(run, Date.now());
-  const live = run.status === 'queued' || run.status === 'running' || run.status === 'held';
+  const live = runIsLive(run);
   // Subscription-priced runs fall back to token usage.
   const consumed = tokensOf(run);
   const cost =
@@ -161,8 +150,7 @@ function RunRow({
       : consumed > 0
         ? `${formatTokens(consumed)} tok`
         : null;
-  // A live run can be stopped; every run has a transcript once it has a
-  // session to open. Nothing here starts one — work begins by moving the
+  // A live run can be stopped; every run can be read once it has a session. Nothing here starts one — work begins by moving the
   // card, putting somebody on it, commenting, a stage barrier, or the board
   // taking it off the top of Todo.
   //
@@ -182,11 +170,7 @@ function RunRow({
         >
           {RUN_TRIGGER_LABEL[run.trigger]}
         </span>
-        <span
-          className={`shrink-0 rounded-full border px-2 font-bold uppercase tracking-wider ${RUN_TONE[run.status]}`}
-        >
-          {run.status}
-        </span>
+        <span className={`${RUN_CHIP} ${RUN_TONE[run.status]}`}>{run.status}</span>
       </div>
       {meta ? (
         <div className="mt-1 flex items-center justify-end gap-2.5 text-ink-soft">
@@ -214,16 +198,25 @@ function RunRow({
             </button>
           ) : null}
           {run.session_id != null ? (
-            // The trace page's own icon, so the link wears the face of where
-            // it lands rather than a second symbol for the same place.
-            <a
-              aria-label={`Transcript of run #${run.attempt}`}
-              title="Open this run's transcript"
-              href={`#/traces/${encodeURIComponent(run.session_id)}`}
-              className="flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded-md border border-black/40 bg-surface text-info hover:border-black hover:bg-brand hover:text-ink"
+            // The trace page's own icon, kept even though the press now opens
+            // the conversation panel instead of that page: this is the mark
+            // the log has always carried for "show me this run's working", and
+            // the panel's header still links on to the trace itself.
+            <button
+              type="button"
+              ref={open ? triggerRef : undefined}
+              aria-label={`Conversation of run #${run.attempt}`}
+              title="Read this run as a conversation"
+              aria-expanded={open}
+              onClick={onRead}
+              className={`flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded-md border ${
+                open
+                  ? 'border-black bg-brand text-ink'
+                  : 'border-black/40 bg-surface text-info hover:border-black hover:bg-brand hover:text-ink'
+              }`}
             >
               <RiGitMergeLine aria-hidden />
-            </a>
+            </button>
           ) : null}
         </div>
       ) : null}
@@ -249,6 +242,15 @@ export function IssueDetailPage() {
   const [runLog, setRunLog] = useState<RunLog | null>(null);
   const runs = runLog?.items ?? [];
   const [allRuns, setAllRuns] = useState(false);
+  /// Which run's conversation is open over the card, by attempt. One at a
+  /// time: the panel covers the pane it is read against.
+  const [openAttempt, setOpenAttempt] = useState<number | null>(null);
+  const openRun = runs.find((run) => run.attempt === openAttempt) ?? null;
+  const openTrigger = useRef<HTMLButtonElement | null>(null);
+  /// The execution log, as the run panel's control surface. A press on any of
+  /// its rows swaps what the panel shows, so `FloatingPanel` must not read it
+  /// as a press outside — see [`useDismiss`].
+  const runLogBox = useRef<HTMLElement | null>(null);
   const runView = runLogView(runs, allRuns);
   const [events, setEvents] = useState<IssueEvent[]>([]);
   const [refreshKey, setRefreshKey] = useState(0);
@@ -297,6 +299,7 @@ export function IssueDetailPage() {
     tail.current = '';
     setNewBelow(false);
     setAllRuns(false);
+    setOpenAttempt(null);
   }, [projectId, number]);
 
   // A card opens at the foot of its own history — the newest entries and the
@@ -824,7 +827,10 @@ export function IssueDetailPage() {
             pane: an absolute box in a scroller is placed against the content
             and scrolls away with it, and the composer it would sit above is
             itself only stuck while the timeline is on screen. */}
-        <div className="relative flex flex-1 min-w-0">
+        {/* `overflow-hidden` because the panel below mounts off-screen at
+            `translate-x-full` and slides in: without a clipping ancestor of
+            its own it sweeps across the rail on the way. */}
+        <div className="relative flex flex-1 min-w-0 overflow-hidden">
         <main
           ref={pane}
           onScroll={onPaneScroll}
@@ -975,6 +981,33 @@ export function IssueDetailPage() {
             <RiArrowDownLine className="text-sm" />
             New activity
           </button>
+        ) : null}
+
+        {/* Keyed by session, so pressing a second run of the same agent leaves
+            the panel where it is rather than tearing it down and re-reading
+            what is already on screen. */}
+        {openRun?.session_id != null ? (
+          <FloatingPanel
+            key={openRun.session_id}
+            trigger={openTrigger}
+            keepOpenWithin={runLogBox}
+            onDismiss={() => {
+              setOpenAttempt(null);
+            }}
+          >
+            {(leave) => (
+              <RunTranscriptPanel
+                projectId={projectId}
+                number={number}
+                attempt={openRun.attempt}
+                sessionId={openRun.session_id ?? ''}
+                runs={runs}
+                agents={agents}
+                portrait={portrait}
+                onClose={leave}
+              />
+            )}
+          </FloatingPanel>
         ) : null}
         </div>
 
@@ -1266,7 +1299,7 @@ export function IssueDetailPage() {
             </section>
           ) : null}
 
-          <section className={railBox}>
+          <section ref={runLogBox} className={railBox}>
             <h2 className={railLabel}>Execution log</h2>
             {/* Read-only, apart from stopping what is running: the log
                 reports the board's work rather than commanding it. */}
@@ -1282,6 +1315,11 @@ export function IssueDetailPage() {
                     key={run.attempt}
                     run={run}
                     busy={saving}
+                    open={openAttempt === run.attempt}
+                    triggerRef={openTrigger}
+                    onRead={() => {
+                      setOpenAttempt((current) => (current === run.attempt ? null : run.attempt));
+                    }}
                     onCancel={() => {
                       void stopRun();
                     }}

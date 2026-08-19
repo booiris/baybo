@@ -456,12 +456,13 @@ it is a step of.
 
 ## The board's right-hand layer
 
-The activity drawer and the agent profile share one layer, are mutually
-exclusive, and never navigate away from the board. `FloatingPanel` owns how
-they arrive and leave: they **slide in** from the right (180ms, `motion-reduce`
-respected) and leave the same way on **✕, Escape, or a press anywhere outside**
-— the three the design specifies, kept in one place because both panels are
-reached from the same avatars and buttons.
+The activity drawer, the agent profile and a run's conversation share one
+layer, are mutually exclusive, and never navigate away from the board.
+`FloatingPanel` owns how they arrive and leave: they **slide in** from the
+right (180ms, `motion-reduce` respected) and leave the same way on **✕,
+Escape, or a press anywhere outside** — the three the design specifies, kept
+in one place because all three panels are reached from the same avatars,
+buttons and rows.
 
 Two details the shape depends on. The panel mounts off-screen and moves on the
 next frame, since one that mounts at its resting place has nothing to
@@ -470,6 +471,89 @@ panel replaced mid-slide — a second avatar pressed while the first profile is
 still leaving — must not take its replacement down with it: the profile panel
 is keyed by agent id so the outgoing instance unmounts and cancels its own
 pending close.
+
+## A run, read as a conversation
+
+The layer's third tenant, and its first on the **issue** route:
+`RunTranscriptPanel`, opened by the trace icon on a row of the execution
+log. It covers `<main>` and stops at the 340px rail, so the log stays on screen
+and runs can be swapped without closing anything — and it is keyed by
+**session**, so pressing a second run of the same agent leaves the panel where
+it is rather than tearing down what is already on screen.
+
+Not a route, and not an inline expansion. The card's own pane holds its newest
+edge (`useHoldBottomEdge` watches the content box), so growing a transcript
+inside it would yank a pinned reader to the foot of the card; the rail is
+pin-safe and 340px wide, which is unreadable for prose. The wrapper it mounts
+in needs `overflow-hidden` of its own — the panel starts at `translate-x-full`,
+and with no clipping ancestor it sweeps across the rail on the way in.
+
+It is a `<section aria-label>` (role `region`), **not** a second `<aside>`: the
+rail behind it already answers `complementary`, and two of those on one page
+make the rail impossible to address. It takes focus on open — it is mounted
+*before* the rail that opens it, so otherwise the keyboard would have to walk
+backwards through the whole card to reach it — with `preventScroll`, because
+at that instant it is still parked at `translate-x-full` outside the
+`overflow-hidden` wrapper, and a default focus would scroll the card's own
+pane off screen to reveal it.
+
+Its swap comes from a control **outside** it, which is the one thing
+`FloatingPanel` could not express before: a press on the execution log had to
+stop closing the panel without stopping every other popover on the page from
+closing. `useDismiss` therefore takes a second region, `keepOpenWithin`, and
+the panel is handed the log. Stopping the event at the icon instead does not
+work and is worth knowing why: React delegates to the root container, so
+`stopPropagation` there never reaches `document` — where every outside-press
+rule on this page is registered — and one panel's swap silenced all of them.
+
+The panel deliberately wears the **/chat band** — `ThreadView`, `MessageBubble`,
+`chat-prose` — rather than the card timeline's bordered `bg-brand/60` bubbles.
+That is admissible only because it *covers* the timeline instead of sitting
+beside it: re-skinning `MessageBubble` for the board would fork the one thread
+renderer, which is the state `app/ios/web/src/Transcript.tsx` is already in.
+Chrome on `canvas`, thread on `surface`, per the role split above.
+
+Read-only in the same sense the activity drawer is: no composer, and no
+approve/deny. A prompt waiting on an answer shows as the step it is and is
+answered on the card's own timeline — the pane directly behind the panel.
+
+There is no socket here. The transcript arrives over REST, and a run that is
+still going is followed by re-reading its **newest page** every two seconds
+while the tab is on screen; the poll stops the moment the run ledger settles,
+after one last read for the words that ended it. Newest page specifically,
+because that is the only one the server folds an in-flight turn's live steps
+into.
+
+Because a page of persisted rows says nothing about what is in flight, a
+running turn arrives **collapsed**, and the run ledger beside it is what
+re-opens the block. That overlay is **derived at render, never stored**: held
+in state it would survive the run it describes, leaving a block spinning
+"Working" under a header that says `done`. It is also floored at the live
+run's own start — a session holds every run one agent made on the card, so
+the first seconds of a new one still show the last one's finished block.
+
+The panel opens with the **brief** — the ask the rest of the page answers —
+with the framing stripped on the way out (`unframe_issue_brief`): who the
+agent is and where its checkout is are written for the model, and an opening
+bubble of that buries the card's line.
+
+The thread runs **one step smaller** than /chat's — this is a 760px column
+laid over a card, read as a record rather than talked into, where the chat's
+size is set for a full-width band you are composing in. The scale is a
+`.run-thread` class in `index.css`, not a density prop on `ThreadView`:
+threading a variant through the bubble, the work block and every step view
+would fork the one renderer along a purely visual seam. It sits unlayered
+beside `.work-reasoning`, for the same reason and with the same trap — the
+markdown component map sizes headings absolutely, so they are re-scaled
+em-relative or a `## Plan` outgrows the prose it heads.
+
+It reads as markdown, because **every** bubble now does, the user's included
+— somebody writing `**this**` means emphasis, and a brief is the card's
+description straight out of the card's markdown editor. The rule it replaces
+(user text verbatim) was protecting one real thing: markdown folds single
+newlines, which would reflow a pasted log into a wall. A user row therefore
+renders with `breaks`, where a newline stays a line. A user bubble keeps its
+mono face; only the agent's prose is Inter.
 
 ## Activity drawer
 

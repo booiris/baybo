@@ -29,6 +29,25 @@ pub fn frame_issue_brief(number: i64, checkout: &str, brief: &str) -> String {
     )
 }
 
+/// The card's own ask, with the framing this module wrapped it in taken back
+/// off — for a surface that shows a run's brief to a **person**.
+///
+/// The framing is written for the model: who it is, that nobody is waiting at
+/// a keyboard, where its checkout is. An operator reading a run already knows
+/// all of that, and rendering it as the opening bubble buries the one line
+/// they came for under six hundred characters of machinery.
+///
+/// Split on [`INSTRUCTION_LABEL`], which the framer deliberately puts last so
+/// that the instruction is the tail. A row that carries no label is handed
+/// back whole: a brief framed by some older shape is still the ask, and
+/// guessing where it ends would be worse than showing it.
+pub fn unframe_issue_brief(framed: &str) -> &str {
+    match framed.split_once(&format!("\n{INSTRUCTION_LABEL}\n")) {
+        Some((_framing, ask)) => ask,
+        None => framed,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -48,5 +67,22 @@ mod tests {
             framed.contains("/ws/work/projects/p/7"),
             "the framing must name the checkout: {framed}"
         );
+    }
+
+    #[test]
+    fn a_reader_is_given_the_ask_and_none_of_the_framing() {
+        let framed = frame_issue_brief(7, "/ws/work/projects/p/7", "Fix the reconnect storm");
+        assert_eq!(unframe_issue_brief(&framed), "Fix the reconnect storm");
+
+        // A brief holding the label itself keeps everything past the FIRST
+        // one, which is the one the framer wrote.
+        let quoting = frame_issue_brief(7, "/ws", "See below.\nThe issue:\nis subtle");
+        assert_eq!(
+            unframe_issue_brief(&quoting),
+            "See below.\nThe issue:\nis subtle"
+        );
+
+        // Anything this module did not frame is the ask already.
+        assert_eq!(unframe_issue_brief("just do it"), "just do it");
     }
 }

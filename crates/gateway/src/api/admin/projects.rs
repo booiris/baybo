@@ -17,6 +17,7 @@ use baybo_store::project::{
     ProjectUpdate, RunStatus, RunTrigger,
 };
 
+use super::chat::{ChatSessionDetail, GetSessionQuery, session_detail};
 use crate::api::dto::{ErrorBody, ListResponse};
 use crate::server::AdminState;
 use crate::{GatewayError, Result};
@@ -30,6 +31,7 @@ pub fn routes() -> OpenApiRouter<AdminState> {
         .routes(routes!(get_issue, update_issue))
         .routes(routes!(move_issue))
         .routes(routes!(list_issue_runs))
+        .routes(routes!(issue_run_transcript))
         .routes(routes!(list_issue_events))
         .routes(routes!(project_feed))
         .routes(routes!(projects_attention))
@@ -1465,6 +1467,73 @@ async fn list_issue_runs(
         total_input_tokens: log.total.input_tokens,
         total_output_tokens: log.total.output_tokens,
     }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/projects/{project_id}/issues/{number}/runs/{attempt}/transcript",
+    tag = "projects",
+    params(
+        ("project_id" = String, Path, description = "Project id"),
+        ("number" = i64, Path, description = "Issue number within the project"),
+        (
+            "attempt" = i64,
+            Path,
+            description = "Which run of the card, as the execution log numbers it"
+        ),
+        GetSessionQuery,
+    ),
+    responses(
+        (
+            status = 200,
+            description = "The conversation this run worked in, newest page first. A SESSION, not a run: one agent's runs on a card share it, so a later attempt's page also holds the earlier ones",
+            body = ChatSessionDetail
+        ),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (
+            status = 404,
+            description = "Unknown project, issue or attempt — or a run no executor ever claimed, which has no conversation to show",
+            body = ErrorBody
+        ),
+    )
+)]
+async fn issue_run_transcript(
+    State(state): State<AdminState>,
+    Path((project_id, number, attempt)): Path<(String, i64, i64)>,
+    Query(query): Query<GetSessionQuery>,
+) -> Result<Json<ChatSessionDetail>> {
+    let id = parse_project_id(&project_id)?;
+    let runs = state
+        .project_manager
+        .list_runs(&id, number)
+        .await
+        .map_err(project_err)?;
+    let run = runs
+        .iter()
+        .find(|run| run.attempt == attempt)
+        .ok_or_else(|| GatewayError::NotFound(format!("issue #{number} run #{attempt}")))?;
+    // A run the executor never claimed has a ledger row and no session: the
+    // card can say it is queued while there is still nothing to read.
+    let sid = run.session_id.clone().ok_or_else(|| {
+        GatewayError::NotFound(format!(
+            "issue #{number} run #{attempt} has not started working"
+        ))
+    })?;
+    let session = state
+        .session_manager
+        .get(&sid)
+        .await
+        .map_err(|e| GatewayError::Internal(format!("load run session: {e}")))?
+        .ok_or_else(|| GatewayError::NotFound(format!("session {sid}")))?;
+    session_detail(
+        &state,
+        sid.clone(),
+        session,
+        sid.to_string(),
+        query.before_ordinal,
+        query.limit,
+    )
+    .await
 }
 
 /// Query for `GET /projects/{project_id}/feed`.

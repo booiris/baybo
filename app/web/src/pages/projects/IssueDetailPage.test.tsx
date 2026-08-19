@@ -58,6 +58,57 @@ const TEAM = [
 
 const ok = { status: 200, ok: true } as Response;
 
+/// One run's conversation, as the board's transcript route answers it: the
+/// brief the card gave it, the work it did, what it said back.
+const TRANSCRIPT = {
+  session_id: '01SESSION',
+  created_at: '2026-01-01T00:00:00Z',
+  last_active: '2026-01-01T00:01:00Z',
+  hidden: false,
+  transcript: [
+    {
+      id: 'm1',
+      kind: 'message' as const,
+      role: 'user',
+      text: '[issue #7] Wire the retry',
+      created_at: '2026-01-01T00:00:00Z',
+      ordinal: 1,
+      has_attachments: false,
+      platform_msg_id: '',
+    },
+    {
+      id: 'w2',
+      kind: 'work' as const,
+      role: 'system',
+      text: '',
+      created_at: '2026-01-01T00:00:10Z',
+      ordinal: 2,
+      has_attachments: false,
+      platform_msg_id: '',
+      work_started_at: '2026-01-01T00:00:05Z',
+      work_ended_at: '2026-01-01T00:00:40Z',
+      turn_complete: true,
+      steps: [
+        { kind: 'tool' as const, tool: 'Bash', call_id: 'c1', tool_status: 'ok' },
+      ],
+    },
+    {
+      id: 'm3',
+      kind: 'message' as const,
+      role: 'assistant',
+      text: 'retry now backs off',
+      created_at: '2026-01-01T00:00:40Z',
+      ordinal: 3,
+      has_attachments: false,
+      platform_msg_id: '',
+    },
+  ],
+  has_more: false,
+  oldest_ordinal: 1,
+  newest_ordinal: 3,
+  compaction_points: [],
+};
+
 function comment(id: string, text: string): IssueEvent {
   return {
     id,
@@ -88,6 +139,9 @@ const client = {
     }
     if (path === '/v1/projects/{project_id}/agents') {
       return { data: { items: TEAM }, error: undefined, response: ok };
+    }
+    if (path === '/v1/projects/{project_id}/issues/{number}/runs/{attempt}/transcript') {
+      return { data: TRANSCRIPT, error: undefined, response: ok };
     }
     throw new Error(`unexpected GET ${path}`);
   }),
@@ -258,13 +312,68 @@ describe('IssueDetailPage execution log', () => {
     expect(screen.queryByRole('button', { name: 'Run it now' })).toBeNull();
   });
 
-  it('reaches the transcript by icon, and says where the icon goes', async () => {
+  it('opens the run as a conversation rather than navigating to the trace', async () => {
     renderIssue(issue(), [{ ...run('done'), session_id: '01SESSION' }]);
 
     // The word is gone from the rail but not from the accessibility tree —
-    // an unlabelled glyph is a link to nowhere for anybody not looking at it.
-    const link = await screen.findByRole('link', { name: 'Transcript of run #1' });
-    expect(link).toHaveAttribute('href', '#/traces/01SESSION');
+    // an unlabelled glyph is a control to nowhere for anybody not looking.
+    const icon = await screen.findByRole('button', { name: 'Conversation of run #1' });
+    await userEvent.click(icon);
+
+    const panel = await screen.findByRole('region', { name: /run #1 conversation/i });
+    // The ask the run was given, and what it said back — the two ends of the
+    // flow the trace page makes you assemble yourself.
+    expect(panel).toHaveTextContent('[issue #7] Wire the retry');
+    expect(panel).toHaveTextContent('retry now backs off');
+    // No composer, and nothing to approve: this reads a run, it does not
+    // drive one.
+    expect(screen.queryByRole('textbox', { name: /message/i })).toBeNull();
+
+    // The trace viewer is still where the spans and the token arithmetic
+    // live, so it stays one press away rather than being dropped.
+    const trace = screen.getByRole('link', { name: /full trace/i });
+    expect(trace).toHaveAttribute('href', '/traces/01SESSION');
+  });
+
+  it('swaps the conversation between runs of one session instead of closing it', async () => {
+    // The execution log sits OUTSIDE the panel, so the panel's
+    // dismiss-on-outside-press used to fire on the way to this very click and
+    // shut the thing the press was swapping.
+    renderIssue(issue(), [
+      { ...run('done'), attempt: 2, session_id: '01SESSION' },
+      { ...run('done'), attempt: 1, session_id: '01SESSION' },
+    ]);
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Conversation of run #2' }));
+    await screen.findByRole('region', { name: /run #2 conversation/i });
+
+    await userEvent.click(screen.getByRole('button', { name: 'Conversation of run #1' }));
+    // Past the panel's 180ms slide: the outside-press dismissal is a *timer*,
+    // so an assertion made straight after the click passes on the bug too —
+    // the panel is still on screen at that instant and gone a moment later.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(screen.getByRole('region', { name: /run #1 conversation/i })).toBeInTheDocument();
+  });
+
+  it('still lets every other popover on the card close under that press', async () => {
+    // The first fix for the swap above stopped the icon's mousedown outright.
+    // React delegates to the root container, so that never reached `document`
+    // — where every outside-press rule on this page is registered — and one
+    // panel's swap silenced all of them.
+    renderIssue(issue(), [{ ...run('done'), session_id: '01SESSION' }]);
+
+    await userEvent.click(await screen.findByRole('button', { name: 'More actions' }));
+    expect(screen.getByRole('button', { name: 'Block…' })).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Conversation of run #1' }));
+    expect(screen.queryByRole('button', { name: 'Block…' })).toBeNull();
+  });
+
+  it('carries no conversation to open on a run nothing ever claimed', async () => {
+    renderIssue(issue(), [run('queued')]);
+
+    await screen.findByText('queued');
+    expect(screen.queryByRole('button', { name: /conversation of run/i })).toBeNull();
   });
 
   it('keeps what a run cost on its own line, away from what a run is', async () => {

@@ -515,14 +515,66 @@ export function tokensOf(run: IssueRun): number {
 // Unknown future states remain unsettled rather than hiding active work.
 const SETTLED: ReadonlySet<RunStatus> = new Set<RunStatus>(['done', 'failed', 'cancelled']);
 
-export function unsettledRun<T extends { status: RunStatus }>(runs: readonly T[]): T | null {
-  return runs.find((run) => !SETTLED.has(run.status)) ?? null;
+/// Whether this run is still going. One spelling, because three places ask
+/// it — the execution log's Cancel affordance, the card's "is anything on
+/// this" question, and the run panel's decision to keep re-reading the
+/// transcript — and a fourth answer would be a panel that stops following a
+/// run the row beside it still calls running.
+export function runIsLive<T extends { status: RunStatus }>(run: T): boolean {
+  return !SETTLED.has(run.status);
 }
+
+export function unsettledRun<T extends { status: RunStatus }>(runs: readonly T[]): T | null {
+  return runs.find(runIsLive) ?? null;
+}
+
+/// A run's status chip, minus its tone. Shared by the execution log's row and
+/// by both places the run panel names a run — three copies of one pill on one
+/// screen, and the two in the panel sit close enough to drift visibly.
+export const RUN_CHIP =
+  'shrink-0 rounded-full border px-2 font-bold uppercase tracking-wider';
+
+/// The tone that chip wears, per status.
+export const RUN_TONE: Record<IssueRun['status'], string> = {
+  held: 'border-warn/50 bg-warn/12 text-warn',
+  queued: 'border-black/35 bg-canvas text-ink-soft',
+  running: 'border-black bg-brand/40 text-ink',
+  done: 'border-ok/50 bg-ok/15 text-ok',
+  failed: 'border-err/45 bg-err/12 text-err',
+  cancelled: 'border-black/35 bg-canvas text-ink-soft',
+};
+
+/// Why this run happened. The mockup writes the first one "drag", which is
+/// only ever one of the three ways a card reaches In Progress — a REST move
+/// and an agent's own tool call produce the same trigger, and a log that
+/// blames a drag for either is lying about who started the work.
+export const RUN_TRIGGER_LABEL: Record<IssueRun['trigger'], string> = {
+  started: 'moved to In Progress',
+  assigned: 'assigned',
+  retry: 'retry',
+  comment: 'comment',
+  promoted: 'the board had room',
+  triage: 'nobody assigned',
+  stage_barrier: 'stage barrier',
+  review: 'awaiting review',
+  stalled: 'work stopped',
+  blocked: 'blocked, needs a decision',
+};
 
 /// How many runs the execution log shows before the rest fold away. A run is
 /// two lines in a 340px rail, so a card that has been retried and commented on
 /// all week pushes its own totals off the bottom of the pane.
 export const RUN_LOG_HEAD = 5;
+
+/// How much of a run's conversation one read pulls. The server's own
+/// `MAX_HISTORY_LIMIT`, so asking for more would only be clamped.
+export const RUN_TRANSCRIPT_PAGE = 200;
+
+/// How often the run panel re-reads a live run. The transcript arrives over
+/// REST, not the chat socket, so this is the whole of "watch it think" — and
+/// a tool step takes seconds, so a finer interval would only re-fetch the
+/// same page. Only while a run is live and the tab is on screen.
+export const RUN_POLL_MS = 2000;
 
 export type RunLogView<T> = {
   shown: readonly T[];

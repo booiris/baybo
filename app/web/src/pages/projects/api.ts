@@ -171,6 +171,52 @@ export async function fetchActiveRuns(
   }
 }
 
+/// One page of the conversation a run worked in.
+///
+/// A SESSION, not a run: one agent's runs on a card share it (a retry
+/// continues where the last attempt left off), so an attempt's page also
+/// holds the ones before it. The board slices it back apart by run.
+export type RunTranscript = components['schemas']['ChatSessionDetail'];
+
+/// Read a run's conversation.
+///
+/// A board route rather than the chat one it shares a body with, for two
+/// reasons the panel depends on: it is addressed the way the execution log
+/// addresses a run (card + attempt, never a session id the client had to
+/// learn), and it is the ONE reader that is shown the run's brief — on a chat
+/// surface that row is the framing the agent wrote itself, and here it is the
+/// ask the rest of the page answers.
+///
+/// `beforeOrdinal` pages backwards; the newest page (`null`) is also the only
+/// one the server folds a still-running turn's live steps into, which is why
+/// following a run means re-reading THAT page rather than syncing forward.
+export async function fetchRunTranscript(
+  client: AdminClient,
+  projectId: string,
+  number: number,
+  attempt: number,
+  beforeOrdinal: number | null,
+  limit: number,
+): Promise<Outcome<RunTranscript>> {
+  try {
+    const { data, error, response } = await client.GET(
+      '/v1/projects/{project_id}/issues/{number}/runs/{attempt}/transcript',
+      {
+        params: {
+          path: { project_id: projectId, number, attempt },
+          query: { before_ordinal: beforeOrdinal ?? undefined, limit },
+        },
+      },
+    );
+    if (response.status === 401) return { kind: 'unauthorized' };
+    if (error !== undefined) return failure(response.status, error.error);
+    if (!response.ok) return failure(response.status, undefined);
+    return { kind: 'ok', value: data };
+  } catch (e) {
+    return { kind: 'failed', message: networkMessage(e) };
+  }
+}
+
 export async function fetchIssueRuns(
   client: AdminClient,
   projectId: string,

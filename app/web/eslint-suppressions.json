@@ -47,10 +47,10 @@
   },
   "src/pages/ChatPage.tsx": {
     "@typescript-eslint/no-unnecessary-condition": {
-      "count": 43
+      "count": 42
     },
     "@typescript-eslint/strict-boolean-expressions": {
-      "count": 114
+      "count": 113
     }
   },
   "src/pages/CronPage.tsx": {

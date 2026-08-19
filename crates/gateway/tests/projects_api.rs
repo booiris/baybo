@@ -1447,3 +1447,107 @@ async fn a_prompt_from_a_chat_session_cannot_be_answered_from_a_card() {
         "the chat's prompt is still the chat's"
     );
 }
+
+#[tokio::test]
+async fn a_runs_transcript_opens_on_the_brief_the_card_gave_it() {
+    let (router, tg) = router().await;
+    let p = open_project(&router, "transcript").await;
+    seed_teammate(&tg, &p, "dev-1").await;
+    post(
+        &router,
+        &format!("/v1/projects/{p}/issues"),
+        json!({ "title": "fix the retry", "status": "in_progress", "assignee": "dev-1" }),
+        StatusCode::CREATED,
+    )
+    .await;
+
+    // Nothing has claimed the run, so there is no conversation yet — and an
+    // attempt the card never had is the same answer as a card that never was.
+    get(
+        &router,
+        &format!("/v1/projects/{p}/issues/1/runs/1/transcript"),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    get(
+        &router,
+        &format!("/v1/projects/{p}/issues/1/runs/9/transcript"),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+
+    // Stand in for the executor: mint the run's session and claim it.
+    let created = post(&router, "/v1/chat/sessions", json!({}), StatusCode::OK).await;
+    let session_id = created["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    let sid = baybo_model::SessionId::from(session_id.as_str());
+    tg.deps
+        .session_manager
+        .append_session_message(
+            &sid,
+            &baybo_model::ChatMessage::issue_brief(vec![baybo_model::ContentBlock::Text(
+                baybo_context::prompts::issue::frame_issue_brief(
+                    1,
+                    "/ws/work/projects/p/1",
+                    "fix the retry",
+                ),
+            )]),
+        )
+        .await
+        .expect("append brief");
+    tg.deps
+        .session_manager
+        .append_session_message(
+            &sid,
+            &baybo_model::ChatMessage::assistant(vec![baybo_model::ContentBlock::Text(
+                "done".into(),
+            )]),
+        )
+        .await
+        .expect("append reply");
+    let project = baybo_model::ProjectId::parse(p.clone()).expect("project id");
+    let runs = tg
+        .deps
+        .project_manager
+        .list_runs(&project, 1)
+        .await
+        .expect("runs");
+    assert!(
+        tg.deps
+            .project_manager
+            .start_run(&runs[0], &sid)
+            .await
+            .expect("claim"),
+        "the run was there to claim"
+    );
+
+    let board = get(
+        &router,
+        &format!("/v1/projects/{p}/issues/1/runs/1/transcript"),
+        StatusCode::OK,
+    )
+    .await;
+    let rows = board["transcript"].as_array().expect("transcript");
+    assert_eq!(
+        rows[0]["role"], "user",
+        "the board opens on the ask: {rows:?}"
+    );
+    // The ask, with the model-facing framing taken back off — a reader opened
+    // this panel for the card's line, not for the run's system prompt.
+    assert_eq!(rows[0]["text"], "fix the retry");
+    assert_eq!(rows[1]["role"], "assistant");
+
+    // The same session read through the chat route reads the same way: the
+    // brief is a property of the transcript, not of who opened it. Nothing
+    // else changes on a chat surface, because no other session has one.
+    let chat = get(
+        &router,
+        &format!("/v1/chat/sessions/{session_id}"),
+        StatusCode::OK,
+    )
+    .await;
+    let rows = chat["transcript"].as_array().expect("transcript");
+    assert_eq!(rows[0]["text"], "fix the retry");
+}

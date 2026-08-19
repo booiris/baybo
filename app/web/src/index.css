@@ -171,6 +171,48 @@
   font-size: 1em;
 }
 
+/* The board's run panel reads one step smaller than /chat. It is a 760px
+   column laid over a card, and it is read as a record rather than talked into
+   — the chat's reading size is set for a full-width band you are composing in.
+   Scoped to a class the panel puts on its thread rather than given to
+   `ThreadView` as a density prop: the size is the SURFACE's business, and
+   threading a variant through the bubble, the work block and every step view
+   would fork the one renderer along a purely visual seam. Unlayered, like the
+   rules above, so it outranks the `text-sm` / `text-xs` those components
+   carry. */
+.run-thread :is(.text-sm, .text-base) {
+  font-size: 0.8125rem;
+}
+
+.run-thread .text-xs {
+  font-size: 0.6875rem;
+}
+
+/* After the rule above on purpose: the assistant bubble carries `text-sm` AND
+   `chat-prose`, same specificity, so the later declaration is the one that
+   lands. */
+.run-thread .chat-prose {
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.run-thread .work-reasoning {
+  font-size: 0.6875rem;
+}
+
+/* `MARKDOWN_COMPONENTS` sizes headings absolutely (`text-base` / `text-sm`)
+   for the chat's reading size, so at 13px a `## Plan` renders LARGER than the
+   prose it heads — the same trap `.work-reasoning` documents above, one
+   surface over. Re-scale em-relative; at this size only two ranks stay
+   distinct, so h3 and below read as headings through their weight. */
+.run-thread .chat-prose :is(h1, h2) {
+  font-size: 1.15em;
+}
+
+.run-thread .chat-prose :is(h3, h4, h5, h6) {
+  font-size: 1em;
+}
+
 @layer base {
 
 
