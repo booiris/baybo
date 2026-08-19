@@ -5,7 +5,7 @@
 //! rendering model, the live chat history lives in the terminal's own
 //! scrollback buffer, written via [`ratatui::Terminal::insert_before`]. This
 //! module tracks what's currently *live* in the viewport (the input draft, the
-//! streaming-response preview, the single pending approval) plus a bounded
+//! working indicator, the single pending approval) plus a bounded
 //! [`TranscriptBlock`] log of what was committed, kept solely so the on-screen
 //! conversation can be re-rendered after a resize refresh wipes the terminal's
 //! scrollback — see [`AppState::record_block`].
@@ -19,6 +19,8 @@ use ratatui::text::Line;
 use ratatui::widgets::TableState;
 
 use baybo_tools::{ApprovalDecision, ApprovalQueue, ResourceAccess};
+
+use crate::markdown::MarkdownStream;
 
 const HISTORY_CAP: usize = 500;
 
@@ -95,8 +97,12 @@ pub(crate) enum TranscriptBlock {
     /// User message / mid-turn steer. Stored as text because its full-width
     /// highlighted bar is width-dependent (rebuilt by `render_user_lines`).
     User(String),
-    /// Assistant answer body (rendered lines; re-wraps on replay).
-    Answer(Vec<Line<'static>>),
+    /// Assistant answer body. Stored as the markdown **source** lines of the
+    /// answer run, because the rendered rows are pre-wrapped to the committing
+    /// terminal's width — replay re-lays them out at the new one. Consecutive
+    /// answer commits append to one record so a code fence spanning several
+    /// commits re-parses as a fence.
+    Answer(Vec<String>),
     /// Tool block — `● tool` + `⎿ summary`, or a resolved-approval summary.
     Tool(Vec<Line<'static>>),
     /// Standalone block: status / log / system note.
@@ -110,15 +116,21 @@ pub(crate) enum TranscriptBlock {
 /// unbounded history into scrollback; the oldest blocks are evicted past this.
 const TRANSCRIPT_MAX_LINES: usize = 4000;
 
+/// Cap on one answer run's retained source. A run coalesces every answer commit
+/// of a response into a single record, and a record is never evicted while it is
+/// the only one — so an unbounded run would first sail past
+/// [`TRANSCRIPT_MAX_LINES`] and then be dropped whole by the next recorded block,
+/// wiping the whole log. Bounding a run to half the budget keeps that headroom.
+const MAX_ANSWER_RUN_LINES: usize = TRANSCRIPT_MAX_LINES / 2;
+
 /// Rows a transcript block occupies, for the [`TRANSCRIPT_MAX_LINES`] cap.
 /// `User` counts its source newlines (the bar is one row per text line);
 /// `Cooked` is a single footer row.
 fn block_line_count(block: &TranscriptBlock) -> usize {
     match block {
         TranscriptBlock::User(text) => text.lines().count().max(1),
-        TranscriptBlock::Answer(lines)
-        | TranscriptBlock::Tool(lines)
-        | TranscriptBlock::Other(lines) => lines.len(),
+        TranscriptBlock::Answer(lines) => lines.len().max(1),
+        TranscriptBlock::Tool(lines) | TranscriptBlock::Other(lines) => lines.len(),
         TranscriptBlock::Cooked(_) => 1,
     }
 }
@@ -135,19 +147,28 @@ pub(crate) struct AppState {
     pub(crate) cursor: usize,
     pub(crate) history: VecDeque<String>,
     pub(crate) history_cursor: Option<usize>,
-    /// Trailing partial line of the in-flight agent response — the
-    /// suffix that hasn't yet been terminated by a `\n` and committed
-    /// to scrollback. Each `AppEvent::StreamDelta` appends to it, and
-    /// [`drain_complete_stream_lines`] pops everything up to (and
-    /// including) the most recent `\n`. The final `AppEvent::Outgoing`
-    /// flushes whatever remains.
+    /// Raw delta bytes of the in-flight agent response that have not yet been
+    /// handed to [`AppState::markdown`]. Each `AppEvent::StreamDelta` appends,
+    /// and [`drain_complete_stream_lines`] pops every `\n`-terminated line,
+    /// leaving the trailing partial. **Nothing renders this buffer** — the live
+    /// region has no streaming section, so text appears only once a markdown
+    /// block closes and commits. The final `AppEvent::Outgoing` flushes the
+    /// remainder.
     pub(crate) streaming: Option<String>,
-    /// Whether the current agent response has already committed any
-    /// line to scrollback. Drives the prefix choice: the very first
-    /// committed line uses `baybo> ` (bold green), subsequent lines use
-    /// the `      ` (six-space) continuation indent so the conversation
-    /// reads as one coherent block.
+    /// Whether the current agent response has already committed any row to
+    /// scrollback. Drives the leader choice: the response's first row gets the
+    /// pale `● ` dot, every row after it the matching two-space indent, so the
+    /// answer reads as one coherent block. Latched only once a row actually
+    /// reached the screen — a source line the markdown stream is still
+    /// buffering has not drawn the dot yet.
     pub(crate) streaming_committed_any: bool,
+    /// Markdown block scanner + renderer for the answer currently streaming.
+    /// Reset alongside the stream buffer by [`AppState::clear_stream`].
+    pub(crate) markdown: MarkdownStream,
+    /// Whether the `Answer` record at the tail of the transcript is still the
+    /// run being appended to. Any other recorded block, and the end of the
+    /// response, closes it — see [`AppState::record_answer_source`].
+    answer_run_open: bool,
     /// When the current turn became active. Drives the animated
     /// "working" indicator and its elapsed-seconds readout in the live
     /// region; `None` whenever no turn we initiated is in flight. Set by
@@ -240,6 +261,8 @@ impl AppState {
             history_cursor: None,
             streaming: None,
             streaming_committed_any: false,
+            markdown: MarkdownStream::new(),
+            answer_run_open: false,
             working_since: None,
             running_tools: Vec::new(),
             spinner_tick: 0,
@@ -637,7 +660,37 @@ impl AppState {
     pub(crate) fn clear_stream(&mut self) {
         self.streaming = None;
         self.streaming_committed_any = false;
+        self.markdown.reset();
+        self.answer_run_open = false;
         self.running_tools.clear();
+    }
+
+    /// Record the source of a committed answer unit, appending to the answer run
+    /// already at the tail of the log so replay re-parses the run as one
+    /// document. Any other block landing in between ends the run, as does the end
+    /// of the response — without that, two turns' answers would merge into one
+    /// replayed document.
+    ///
+    /// `reopen_fence` is the opener of a fence that was already in progress
+    /// *before* these lines. It is prepended when this starts a new record, so a
+    /// fence split by a tool block still replays as a fence.
+    pub(crate) fn record_answer_source(&mut self, lines: &[String], reopen_fence: Option<String>) {
+        if lines.is_empty() {
+            return;
+        }
+        if let Some(TranscriptBlock::Answer(existing)) =
+            self.transcript.back_mut().filter(|_| self.answer_run_open)
+        {
+            existing.extend_from_slice(lines);
+            self.transcript_lines += lines.len();
+            self.evict_past_cap();
+            return;
+        }
+        let mut source = Vec::with_capacity(lines.len() + 1);
+        source.extend(reopen_fence);
+        source.extend_from_slice(lines);
+        self.record_block(TranscriptBlock::Answer(source));
+        self.answer_run_open = true;
     }
 
     /// Append a committed block to the resize-replay log, evicting the oldest
@@ -645,13 +698,32 @@ impl AppState {
     /// (the most recent block is always kept). Called by the scrollback-commit
     /// helpers right after they insert.
     pub(crate) fn record_block(&mut self, block: TranscriptBlock) {
+        self.answer_run_open = false;
         self.transcript_lines += block_line_count(&block);
         self.transcript.push_back(block);
+        self.evict_past_cap();
+    }
+
+    /// Drop the oldest blocks until the retained line count is back under
+    /// [`TRANSCRIPT_MAX_LINES`]. Runs after every path that grows the log,
+    /// including an answer run appending to the record already at the tail.
+    ///
+    /// A lone block is never evicted — losing the newest block would leave a
+    /// resize with nothing to replay — so a growing answer run is trimmed from
+    /// its own head to [`MAX_ANSWER_RUN_LINES`] instead.
+    fn evict_past_cap(&mut self) {
         while self.transcript_lines > TRANSCRIPT_MAX_LINES && self.transcript.len() > 1 {
             if let Some(evicted) = self.transcript.pop_front() {
                 self.transcript_lines = self
                     .transcript_lines
                     .saturating_sub(block_line_count(&evicted));
+            }
+        }
+        if let Some(TranscriptBlock::Answer(lines)) = self.transcript.back_mut() {
+            let drop = lines.len().saturating_sub(MAX_ANSWER_RUN_LINES);
+            if drop > 0 {
+                lines.drain(..drop);
+                self.transcript_lines -= drop;
             }
         }
     }
@@ -662,6 +734,7 @@ impl AppState {
     pub(crate) fn clear_transcript(&mut self) {
         self.transcript.clear();
         self.transcript_lines = 0;
+        self.answer_run_open = false;
     }
 
     /// Take the replay log out for a resize refresh, leaving it empty. Replay
@@ -669,6 +742,7 @@ impl AppState {
     /// the log rebuilds itself to the same content as a side effect.
     pub(crate) fn take_transcript(&mut self) -> VecDeque<TranscriptBlock> {
         self.transcript_lines = 0;
+        self.answer_run_open = false;
         std::mem::take(&mut self.transcript)
     }
 
@@ -1244,11 +1318,108 @@ mod tests {
     }
 
     #[test]
+    fn an_answer_run_appends_to_one_record_and_still_honours_the_cap() {
+        let mut app = AppState::new();
+        app.record_block(TranscriptBlock::User("hi".into()));
+        app.record_answer_source(&["first".to_string()], None);
+        app.record_answer_source(&["second".to_string(), "third".to_string()], None);
+        assert_eq!(
+            app.transcript.len(),
+            2,
+            "consecutive answer commits coalesce into one record"
+        );
+        assert!(matches!(
+            app.transcript.back(),
+            Some(TranscriptBlock::Answer(lines)) if lines == &["first", "second", "third"]
+        ));
+
+        // A tool block ends the run, so the next answer starts a new record.
+        app.record_block(TranscriptBlock::Tool(vec![Line::from("tool")]));
+        app.record_answer_source(&["after".to_string()], None);
+        assert_eq!(app.transcript.len(), 4);
+
+        // Growing the tail run must still evict, or the cap goes unenforced.
+        let bulk: Vec<String> = (0..TRANSCRIPT_MAX_LINES + 10)
+            .map(|i| i.to_string())
+            .collect();
+        app.record_answer_source(&bulk, None);
+        assert_eq!(
+            app.transcript.len(),
+            1,
+            "everything older than the growing run is evicted"
+        );
+        assert_eq!(app.transcript_lines, MAX_ANSWER_RUN_LINES);
+    }
+
+    #[test]
+    fn an_oversized_answer_run_is_trimmed_instead_of_wiping_the_log() {
+        let mut app = AppState::new();
+        let bulk: Vec<String> = (0..TRANSCRIPT_MAX_LINES + 500)
+            .map(|i| i.to_string())
+            .collect();
+        app.record_answer_source(&bulk, None);
+        assert_eq!(
+            app.transcript_lines, MAX_ANSWER_RUN_LINES,
+            "a growing run is trimmed to its own bound, not left past the cap"
+        );
+        let Some(TranscriptBlock::Answer(lines)) = app.transcript.back() else {
+            panic!("expected the answer record to survive")
+        };
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some((TRANSCRIPT_MAX_LINES + 499).to_string().as_str()),
+            "the newest source is the part kept"
+        );
+
+        // Headroom is what keeps the next block from evicting the whole run.
+        app.record_block(TranscriptBlock::User("next".into()));
+        assert_eq!(app.transcript.len(), 2, "the run survived the next record");
+    }
+
+    #[test]
+    fn an_empty_answer_source_records_nothing() {
+        let mut app = AppState::new();
+        app.record_answer_source(&[], None);
+        assert!(app.transcript.is_empty());
+        assert_eq!(app.transcript_lines, 0);
+    }
+
+    #[test]
+    fn a_new_run_after_a_tool_reopens_an_interrupted_fence() {
+        let mut app = AppState::new();
+        app.record_answer_source(&["```rust".to_string(), "let a = 1;".to_string()], None);
+        app.record_block(TranscriptBlock::Tool(vec![Line::from("tool")]));
+        app.record_answer_source(&["let b = 2;".to_string()], Some("```rust".to_string()));
+        let Some(TranscriptBlock::Answer(tail)) = app.transcript.back() else {
+            panic!("expected an answer record: {}", app.transcript.len())
+        };
+        assert_eq!(
+            tail,
+            &["```rust".to_string(), "let b = 2;".to_string()],
+            "the continuation record must re-open the fence or replay renders code as prose"
+        );
+    }
+
+    #[test]
+    fn the_end_of_a_response_closes_the_run() {
+        let mut app = AppState::new();
+        app.record_answer_source(&["first turn".to_string()], None);
+        app.clear_stream();
+        app.record_answer_source(&["second turn".to_string()], None);
+        assert_eq!(
+            app.transcript.len(),
+            2,
+            "two turns' answers must not merge into one replayed document"
+        );
+    }
+
+    #[test]
     fn transcript_evicts_oldest_past_cap_but_keeps_newest() {
         let mut app = AppState::new();
         // A lone oversized block is retained — the newest block is never
-        // evicted, however large.
-        app.record_block(TranscriptBlock::Answer(vec![
+        // evicted, however large. (An `Answer` record is the one kind that gets
+        // trimmed instead; see the oversized-run test.)
+        app.record_block(TranscriptBlock::Tool(vec![
             Line::from("x");
             TRANSCRIPT_MAX_LINES + 50
         ]));

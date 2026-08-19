@@ -219,6 +219,8 @@ tiktoken-rs = "0.11"
 similar = "2"
 unicode-width = "0.2"
 unicode-normalization = "0.1"
+unicode-segmentation = "1"
+pulldown-cmark = { version = "0.13", default-features = false }
 tempfile = "3"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 walkdir = "2"
