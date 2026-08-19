@@ -375,7 +375,11 @@ Two-pane route, no tabs (multica's shape):
   comments and system events merged in third person ("lead assigned
   @dev-1", "moved to In Progress", "run #3 failed", "hired @tester").
   Bottom composer with @mentions; a hint
-  chip states what sending will do (see comment semantics below).
+  chip states what sending will do (see comment semantics below). A `#N` in a
+  comment or in the description opens that card, when the board has one — a
+  number it does not have, and one counting runs (`run #3`) rather than cards,
+  stay text. In the description, which is a live editor, it takes a
+  ⌘/Ctrl-click, so a plain click still belongs to the caret.
 - **Right rail**: properties (status, priority, assignee, stage, parent,
   dates later) with a `⋯` overflow menu carrying the destructive
   low-frequency actions — **Block…** (with reason), **Unblock**,

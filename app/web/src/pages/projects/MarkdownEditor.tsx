@@ -7,6 +7,7 @@ import { history } from '@milkdown/kit/plugin/history';
 import { listener, listenerCtx } from '@milkdown/kit/plugin/listener';
 import { math } from '@milkdown/plugin-math';
 import { replaceAll } from '@milkdown/kit/utils';
+import type { MilkdownPlugin } from '@milkdown/kit/ctx';
 
 /// A what-you-see markdown editor, shared by the card's description and the
 /// comment composer so the two behave identically.
@@ -37,6 +38,10 @@ export type MarkdownEditorProps = {
   /// Bumped by the parent to empty the editor — how the composer clears
   /// itself after a comment is sent.
   resetSignal?: number;
+  /// Anything the surface wants the editor to do beyond editing. Read once, at
+  /// mount, like `initialValue` — so hand in an array that does not change
+  /// identity, and let whatever varies ride a ref inside the plugin.
+  plugins?: MilkdownPlugin[];
 };
 
 function Editing({
@@ -48,6 +53,7 @@ function Editing({
   className,
   editable = true,
   resetSignal = 0,
+  plugins = [],
 }: MarkdownEditorProps) {
   // Whether to show the prompt, decided here rather than in CSS. An "empty"
   // ProseMirror paragraph is not `:empty` — it holds a trailing `<br>` the
@@ -82,7 +88,8 @@ function Editing({
         .use(gfm)
         .use(history)
         .use(math)
-        .use(listener),
+        .use(listener)
+        .use(plugins),
     [],
   );
 
