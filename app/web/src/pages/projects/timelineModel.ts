@@ -193,6 +193,8 @@ export function describeEvent(body: IssueEventBody): string | null {
       }
     case 'stage_completed':
       return `stage ${body.stage} finished — every step in it is done or called off`;
+    case 'filed':
+      return `filed #${body.number} out of this card's work`;
     case 'budget_exhausted':
       return `held the run — ${formatUsd(body.spent_micros)} of the ${formatUsd(body.limit_micros)} daily budget is spent`;
     case 'budget_restored':
@@ -392,6 +394,8 @@ export function feedLine(entry: FeedEntry): Span[] {
       return join(`approval ${DECISION_LABEL[body.decision]} on `, at);
     case 'stage_completed':
       return join(`stage ${body.stage} complete on `, at);
+    case 'filed':
+      return join(who(entry), ' filed ', card(body.number), ' out of ', at);
     case 'budget_exhausted':
       return join(
         'daily budget exhausted — ',

@@ -71,6 +71,7 @@ import {
   BlockedBadge,
   BranchChip,
   FailedBadge,
+  FiledFromChip,
   PinButton,
   PRIORITY_MARK,
   RunWord,
@@ -753,7 +754,10 @@ function IssueTile({
   const cancelled = issue.cancelled_at_ms != null;
   const priority = PRIORITY_MARK[issue.priority];
   const marks =
-    issue.blocked_reason != null || issue.last_run_failed || (hasDeliverable(issue) && issue.branch != null);
+    issue.blocked_reason != null ||
+    issue.last_run_failed ||
+    issue.filed_from != null ||
+    (hasDeliverable(issue) && issue.branch != null);
   return (
     <article
       // Two things this card must not do, both of which cost the Move
@@ -847,6 +851,7 @@ function IssueTile({
           {hasDeliverable(issue) && issue.branch != null ? (
             <BranchChip branch={issue.branch} />
           ) : null}
+          {issue.filed_from != null ? <FiledFromChip number={issue.filed_from} /> : null}
         </div>
       ) : null}
 

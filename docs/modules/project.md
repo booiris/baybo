@@ -806,6 +806,57 @@ reads as stalled or as awaiting review, the lead's wake takes the card's one
 run slot, and the follow-up the settling run owes is refused — a swallowed
 nudge, with a billed lead run in its place.
 
+### Two card-to-card edges, and only one of them schedules
+
+The board holds two, and conflating them is the mistake the second one exists
+to avoid.
+
+`parent_issue_id` is **hierarchy**: a planned step, one level deep, that arms
+the stage barrier below. It is the reason the board is a list of cards and
+their steps rather than a tree nobody can read at a glance, and that claim is
+about hierarchy alone.
+
+`filed_from` is **provenance**: the card whose run opened this one. Unbounded
+in depth, it gates nothing, wakes nobody, and appears in no ordering. It is
+derived from the calling session by `tools::filed_from` — never a tool
+parameter, never a request field — because a session working a card already
+carries which card with certainty, and a model asked to restate that can
+forget it, mistype it, or reach for `parent` instead. Cards opened from the
+lead's planning conversation, from a cron fire and from the operator's own
+create door carry none: they are roots, which is the truth and not a gap.
+
+It is written once, in `create_issue`, and is deliberately absent from
+`IssueUpdate` and the REST patch. Numbers are `MAX(number) + 1` per board, so
+a write-once edge to an already-existing card always points at a smaller
+number and the relation is acyclic by construction — nothing here detects a
+cycle, and making this patchable would be the change that first needs one.
+The origin is resolved through `issue_by_id`, which is project-scoped, so one
+board's card can never be another's origin.
+
+Both directions are readable. The card wears `↳ #N` on its tile, which is the
+scanning question — a Backlog where four of six cards are debt spun out of
+finished work draws them identically to the two that were planned. The origin
+gets an `IssueEventBody::Filed` entry, which is the direction nothing else
+answered: without it a Done card falls silent at the moment its review spun
+out three more. A dedupe hit (`Opened::AlreadyOpen`) opened no card and so
+files none.
+
+`Filed` **is** in `timeline::left_a_mark`, which is what a run that died
+mid-flight is judged by: a run whose whole output was three follow-up cards
+did not leave its card untouched, and `RUN_LEFT_NOTHING_ON_THE_CARD` would
+send the operator looking for work that is already on the board. It does
+**not** light the unread badge — that is `UNREAD_EVENT_PREDICATE`, a separate
+whitelist of comments, blocks and arrivals in Review — because the operator
+filed nothing and has nothing to answer. The two are different questions and
+this entry answers them differently on purpose.
+
+The one thing a scalar cannot hold: a description routinely names an origin
+the filing card is not ("#12 验收 follow-up（原卡 7）"). The field is named
+after the mechanism the board can vouch for — which card's run filed this —
+and the editorial claim of cause stays in the prose, where it can name two
+origins and a reason. Provenance here is a forest of filing edges, not a
+causal tree.
+
 ### Stages and the barrier
 
 Sub-issues are one level deep, enforced in both directions (a child cannot gain

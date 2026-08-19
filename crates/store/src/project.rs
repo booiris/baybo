@@ -219,8 +219,11 @@ pub struct IssueRow {
     /// second has-commits flag that could disagree with it.
     pub branch: Option<String>,
     /// The issue this one is a sub-issue of. One level only: a child
-    /// cannot itself be a parent, so a board is a list of cards and their
-    /// steps rather than a tree nobody can read at a glance.
+    /// cannot itself be a parent, so the board's **hierarchy** is a list of
+    /// cards and their steps rather than a tree nobody can read at a
+    /// glance. [`Self::filed_from`] is the other card-to-card edge and is
+    /// deliberately not this one: it records where a card came from, is
+    /// unbounded in depth, and schedules nothing.
     pub parent_issue_id: Option<IssueId>,
     /// Which barrier this child belongs to under its parent. Stage `N`
     /// starts when every non-cancelled child of stage `N-1` is Done.
@@ -228,6 +231,25 @@ pub struct IssueRow {
     pub stage: i64,
     /// What opened this card. See [`NewIssue::source_key`].
     pub source_key: Option<String>,
+    /// The card whose run filed this one. Provenance, not hierarchy.
+    ///
+    /// Named after the mechanism the board can actually vouch for. It knows
+    /// which card's work was executing when the card was opened; it does
+    /// not know what *caused* the finding, and a description routinely
+    /// names an origin the filing card is not. The editorial claim stays in
+    /// the prose, where it can name two origins and a reason; this holds
+    /// the one edge that is a fact.
+    ///
+    /// **Written once, at creation, and never edited** — deliberately
+    /// absent from [`IssueUpdate`]. Numbers are `MAX(number) + 1` per
+    /// board, so a write-once edge to an already-existing card always
+    /// points at a smaller number and the relation is acyclic by
+    /// construction. Nothing here detects a cycle; making this patchable
+    /// would be the change that first needs one.
+    ///
+    /// It schedules nothing: `parent_issue_id` arms the stage barrier and
+    /// wakes the parent's assignee, and this wakes nobody.
+    pub filed_from: Option<IssueId>,
     /// The terminal negative. A cancelled issue keeps its row, its number
     /// and its history; it just stops counting as live work.
     pub cancelled_at: Option<DateTime<Utc>>,
@@ -297,6 +319,8 @@ pub struct NewIssue {
     pub stage: i64,
     /// What opened this card, for a caller that must not open it twice.
     pub source_key: Option<String>,
+    /// The card whose run filed this one. See [`IssueRow::filed_from`].
+    pub filed_from: Option<IssueId>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -433,6 +457,13 @@ pub enum IssueEventBody {
     StageCompleted {
         stage: i64,
     },
+    /// A run on this card opened another one, by its number. Recorded on
+    /// the **origin**, which is the direction nothing else answers: the new
+    /// card carries where it came from, and without this the card it came
+    /// from falls silent at the moment its review spun out three more.
+    Filed {
+        number: i64,
+    },
     /// The run was recorded but not started: this project has spent its
     /// budget for the day. The row is [`RunStatus::Held`] — unsettled, so
     /// the work is not lost and the issue's dedupe slot stays taken — and it
@@ -477,6 +508,7 @@ impl IssueEventBody {
             IssueEventBody::Cancelled => "cancelled",
             IssueEventBody::WorktreeReclaimed { .. } => "worktree_reclaimed",
             IssueEventBody::WorktreeKept { .. } => "worktree_kept",
+            IssueEventBody::Filed { .. } => "filed",
             IssueEventBody::ApprovalRequested { .. } => "approval_requested",
             IssueEventBody::ApprovalResolved { .. } => "approval_resolved",
             IssueEventBody::StageCompleted { .. } => "stage_completed",

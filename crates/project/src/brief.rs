@@ -435,6 +435,7 @@ mod tests {
             parent_issue_id: None,
             stage: 0,
             source_key: None,
+            filed_from: None,
             cancelled_at: None,
             created_at: now,
             updated_at: now,

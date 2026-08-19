@@ -45,6 +45,10 @@ pub(crate) fn left_a_mark(body: &IssueEventBody) -> bool {
             | IssueEventBody::Blocked { .. }
             | IssueEventBody::Unblocked
             | IssueEventBody::Cancelled
+            // A run whose whole output was three follow-up cards did not
+            // leave the card untouched, and telling the operator it left
+            // nothing is how they stop looking for work that is there.
+            | IssueEventBody::Filed { .. }
     )
 }
 
@@ -73,6 +77,7 @@ mod tests {
             parent_issue_id: None,
             stage: 0,
             source_key: None,
+            filed_from: None,
             cancelled_at: None,
             created_at: now,
             updated_at: now,
@@ -142,6 +147,19 @@ mod tests {
                 reason: "waiting on the operator".into(),
             }],
             "otherwise the timeline keeps stating a reason that is no longer why"
+        );
+    }
+
+    #[test]
+    fn filing_a_card_counts_as_work_reaching_the_board() {
+        assert!(
+            left_a_mark(&IssueEventBody::Filed { number: 13 }),
+            "a run that spun out follow-ups before it died must not be reported as having left \
+             nothing"
+        );
+        assert!(
+            !left_a_mark(&IssueEventBody::Opened),
+            "but opening this card is not something the run did on it"
         );
     }
 

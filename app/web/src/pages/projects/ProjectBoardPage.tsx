@@ -86,6 +86,7 @@ import {
   BlockedBadge,
   BranchChip,
   FailedBadge,
+  FiledFromChip,
   PinButton,
   PRIORITY_MARK,
   RunWord,
@@ -984,6 +985,7 @@ function IssueCard({
       {issue.blocked_reason != null ? <BlockedBadge reason={issue.blocked_reason} /> : null}
       {issue.last_run_failed ? <FailedBadge /> : null}
       {hasDeliverable(issue) && issue.branch != null ? <BranchChip branch={issue.branch} /> : null}
+      {issue.filed_from != null ? <FiledFromChip number={issue.filed_from} /> : null}
       <div className="flex items-center gap-1.5">
         {issue.assignee != null ? (
           <AssigneeFace

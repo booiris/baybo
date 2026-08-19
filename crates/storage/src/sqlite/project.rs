@@ -84,7 +84,7 @@ const PROJECT_COLUMNS: &str = "id, name, description, workdir, daily_budget_micr
 /// that happen to be parsed would fail loudly.
 const ISSUE_COLUMNS: &str = "id, project_id, number, title, description, status, priority, \
      assignee, position, blocked_reason, branch, parent_issue_id, stage, source_key, \
-     cancelled_at, created_at, updated_at, attachments, pinned";
+     cancelled_at, created_at, updated_at, attachments, pinned, filed_from_issue_id";
 
 /// Shared unread predicate for agent comments, blocks, and moves to Review.
 /// Used by card badges and board attention; binds `:review`.
@@ -309,6 +309,7 @@ type RawIssue = (
     i64,
     String,
     i64,
+    Option<String>,
 );
 
 fn read_raw_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawProject> {
@@ -347,6 +348,7 @@ fn read_raw_issue(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawIssue> {
         row.get(16)?,
         row.get(17)?,
         row.get(18)?,
+        row.get(19)?,
     ))
 }
 
@@ -422,6 +424,7 @@ fn issue_from_raw(raw: RawIssue) -> Result<IssueRow> {
         updated_at,
         attachments,
         pinned,
+        filed_from,
     ) = raw;
     Ok(IssueRow {
         id: IssueId::from(id),
@@ -453,6 +456,7 @@ fn issue_from_raw(raw: RawIssue) -> Result<IssueRow> {
         parent_issue_id: parent_issue_id.map(IssueId::from),
         stage,
         source_key,
+        filed_from: filed_from.map(IssueId::from),
         cancelled_at: ts_opt("issues.cancelled_at", cancelled_at)?,
         created_at: ts("issues.created_at", created_at)?,
         updated_at: ts("issues.updated_at", updated_at)?,
@@ -764,6 +768,7 @@ impl ProjectStore for SqliteProjectStore {
             .map(|id| id.as_str().to_string());
         let stage = new.stage;
         let source_key = new.source_key.clone();
+        let filed_from = new.filed_from.as_ref().map(|id| id.as_str().to_string());
         let attachments = encode_attachments(&new.attachments)?;
         let created_at = super::time::to_us(new.created_at);
         let raw = self
@@ -785,9 +790,10 @@ impl ProjectStore for SqliteProjectStore {
                 tx.execute(
                     "INSERT INTO issues (id, project_id, number, title, description, status, \
                      priority, assignee, position, blocked_reason, parent_issue_id, stage, \
-                     source_key, cancelled_at, created_at, updated_at, attachments) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?11, ?13, NULL, \
-                             ?12, ?12, ?14)",
+                     source_key, filed_from_issue_id, cancelled_at, created_at, updated_at, \
+                     attachments) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?11, ?13, ?15, \
+                             NULL, ?12, ?12, ?14)",
                     rusqlite::params![
                         id,
                         project,
@@ -802,7 +808,8 @@ impl ProjectStore for SqliteProjectStore {
                         stage,
                         created_at,
                         source_key,
-                        attachments
+                        attachments,
+                        filed_from
                     ],
                 )?;
                 let raw = tx.query_row(
@@ -1719,6 +1726,7 @@ mod tests {
             parent_issue_id: None,
             stage: 0,
             source_key: None,
+            filed_from: None,
             created_at: chrono::Utc::now(),
         }
     }
@@ -2593,6 +2601,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_card_opened_before_the_origin_existed_migrates_in_rootless() {
+        let (_dir, store) = store().await;
+        let p = project("proj-a", "A");
+        store.create_project(&p).await.unwrap();
+        let origin = store
+            .create_issue(&new_issue(&p.id, "origin", IssueStatus::Backlog))
+            .await
+            .unwrap();
+        store
+            .create_issue(&NewIssue {
+                filed_from: Some(origin.id.clone()),
+                ..new_issue(&p.id, "filed out of it", IssueStatus::Backlog)
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.get_issue(&p.id, 2).await.unwrap().unwrap().filed_from,
+            Some(origin.id.clone()),
+            "the edge survives the round trip"
+        );
+
+        store
+            .pool
+            .interact("test.rewind_the_origin_migration", move |conn| {
+                conn.execute("ALTER TABLE issues DROP COLUMN filed_from_issue_id", [])?;
+                let migration = super::super::ADD_COLUMNS
+                    .iter()
+                    .find(|m| m.table == "issues" && m.column == "filed_from_issue_id")
+                    .expect("the origin is a listed migration");
+                migration.apply(conn)?;
+                migration.apply(conn)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        for number in [1, 2] {
+            assert_eq!(
+                store
+                    .get_issue(&p.id, number)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .filed_from,
+                None,
+                "a row that predates the column came out of nothing"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn spend_since_sums_one_board_and_never_double_counts_a_session() {
         let dir = tempfile::tempdir().unwrap();
         let pool = SqlitePool::open(dir.path().join("test.db")).await.unwrap();
@@ -2616,6 +2676,7 @@ mod tests {
             parent_issue_id: None,
             stage: 0,
             source_key: None,
+            filed_from: None,
             created_at: chrono::Utc::now(),
         };
         let ours = store.create_issue(&issue(&mine, "ours")).await.unwrap();

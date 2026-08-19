@@ -37,7 +37,13 @@ function issue(number: number, overrides: Partial<Issue> = {}): Issue {
 
 const ISSUES: Issue[] = [
   issue(1, { title: 'Wire the board', position: 0, assignee: 'dev-1' }),
-  issue(2, { title: 'Blocked one', position: 1, blocked_reason: 'waiting on tmux', unread: 2 }),
+  issue(2, {
+    title: 'Blocked one',
+    position: 1,
+    blocked_reason: 'waiting on tmux',
+    unread: 2,
+    filed_from: 1,
+  }),
   issue(3, { title: 'Cancelled one', position: 2, cancelled_at_ms: 111 }),
   issue(4, {
     title: 'Under way',
@@ -576,6 +582,17 @@ describe('ColumnPage', () => {
     await userEvent.click(cardOf(screen.getByTitle('Blocked one')));
     expect(await screen.findByText('came from /projects/01JPROJECT/board/backlog?q=blocked'))
       .toBeInTheDocument();
+  });
+
+  it('says which cards in a column are debt somebody else spun out', async () => {
+    // The question a Backlog is scanned with. Four of six cards being
+    // follow-ups drawn identically to two that were planned is the whole
+    // reason this mark is on the tile and not on the card's own page.
+    renderColumn('backlog');
+    const spun = cardOf(await screen.findByTitle('Blocked one'));
+    expect(spun.textContent).toContain('↳ #1');
+    const planned = cardOf(await screen.findByTitle('Wire the board'));
+    expect(planned.textContent).not.toContain('↳');
   });
 
   it('walks back to the board without dropping the narrowing', async () => {

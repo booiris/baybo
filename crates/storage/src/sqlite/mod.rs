@@ -348,6 +348,11 @@ const ADD_COLUMNS: &[AddColumn] = &[
         definition: "INTEGER NOT NULL DEFAULT 0",
     },
     AddColumn {
+        table: "issues",
+        column: "filed_from_issue_id",
+        definition: "TEXT",
+    },
+    AddColumn {
         table: "sessions",
         column: "parent_span_id",
         definition: "TEXT",
@@ -1421,6 +1426,10 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     -- it twice. Namespaced server-side; NULL for anything a
                     -- person or an ordinary run created.
                     source_key     TEXT,
+                    -- The card whose run filed this one. Provenance, not
+                    -- hierarchy: unbounded in depth, gates nothing, and
+                    -- written once at creation so it can never cycle.
+                    filed_from_issue_id TEXT,
                     -- The branch this issue's work landed on. NULL until it
                     -- has a commit: worktree and branch are separate ideas,
                     -- and a research issue that produced a report and no

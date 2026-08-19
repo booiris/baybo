@@ -229,6 +229,11 @@ pub struct NewIssueRequest {
     /// What is opening this card, for a caller that must not open it
     /// twice. See [`Opened`].
     pub source_key: Option<String>,
+    /// The card whose run is filing this one, when one is. Derived from the
+    /// calling session by the board tool — never taken from a model, never
+    /// taken from a request body — and written once. See
+    /// [`baybo_store::project::IssueRow::filed_from`].
+    pub filed_from: Option<IssueId>,
 }
 
 /// What happened when a card was opened.
@@ -2056,6 +2061,10 @@ impl ProjectManager {
             Some(number) => Some(self.validate_parent(project, number, None).await?),
             None => None,
         };
+        let filed_from = match new.filed_from.as_ref() {
+            Some(id) => Some(self.issue_by_id(project, id, "filed_from").await?),
+            None => None,
+        };
         if let Some(key) = new.source_key.as_deref()
             && let Some(standing) = self.store.live_issue_by_source_key(project, key).await?
         {
@@ -2075,6 +2084,7 @@ impl ProjectManager {
                 parent_issue_id: parent.as_ref().map(|p| p.id.clone()),
                 stage: if parent.is_some() { new.stage } else { 0 },
                 source_key: new.source_key,
+                filed_from: filed_from.as_ref().map(|origin| origin.id.clone()),
                 created_at: chrono::Utc::now(),
             })
             .await
@@ -2088,6 +2098,16 @@ impl ProjectManager {
         self.events.board_changed(project, Some(issue.number));
         self.record(&issue, actor.clone(), IssueEventBody::Opened)
             .await;
+        if let Some(origin) = filed_from.as_ref() {
+            self.record(
+                origin,
+                actor.clone(),
+                IssueEventBody::Filed {
+                    number: issue.number,
+                },
+            )
+            .await;
+        }
         if let Some(assignee) = issue.assignee.clone() {
             self.record(
                 &issue,
@@ -2130,7 +2150,7 @@ impl ProjectManager {
             return Err(ProjectError::invalid("update", "sets no field"));
         }
         if let Some(Some(parent_id)) = update.parent.as_ref() {
-            let parent = self.issue_by_id(project, parent_id).await?;
+            let parent = self.issue_by_id(project, parent_id, "parent").await?;
             let child = self.get_issue(project, number).await?;
             self.validate_parent_row(&parent, Some(&child)).await?;
         }
@@ -2511,14 +2531,21 @@ impl ProjectManager {
         Ok(())
     }
 
-    /// This board's issue with that ULID.
-    pub async fn issue_by_id(&self, project: &ProjectId, id: &IssueId) -> Result<IssueRow> {
+    /// This board's issue with that ULID. `field` names the caller's input
+    /// in the 400 a miss produces, so a bad parent and a bad origin do not
+    /// both report themselves as a bad parent.
+    pub async fn issue_by_id(
+        &self,
+        project: &ProjectId,
+        id: &IssueId,
+        field: &'static str,
+    ) -> Result<IssueRow> {
         self.store
             .list_issues(project)
             .await?
             .into_iter()
             .find(|issue| &issue.id == id)
-            .ok_or_else(|| ProjectError::invalid("parent", format!("no issue {id} on this board")))
+            .ok_or_else(|| ProjectError::invalid(field, format!("no issue {id} on this board")))
     }
 
     async fn validate_column_order(

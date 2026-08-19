@@ -70,6 +70,10 @@ describe('describeEvent', () => {
     expect(sentence).toBe('stage 2 finished — every step in it is done or called off');
   });
 
+  it('says what a card filed, on the card that filed it', () => {
+    expect(describeEvent({ kind: 'filed', number: 13 })).toBe("filed #13 out of this card's work");
+  });
+
   it('says nothing for a comment, because a comment is shown rather than narrated', () => {
     expect(describeEvent({ kind: 'comment', text: 'have a look' })).toBeNull();
     expect(eventShape(entry({ kind: 'comment', text: 'have a look' }))).toBe('comment');
@@ -91,6 +95,7 @@ describe('describeEvent', () => {
       { kind: 'approval_requested', call_id: 'c1', tool: 'Bash', summary: 'rm -rf build' },
       { kind: 'approval_resolved', call_id: 'c1', decision: 'approve', resolution: 'answered' },
       { kind: 'stage_completed', stage: 1 },
+      { kind: 'filed', number: 13 },
       { kind: 'budget_exhausted', spent_micros: 5_000_000, limit_micros: 5_000_000 },
       { kind: 'budget_restored', spent_micros: 1_000_000, limit_micros: 5_000_000 },
     ];
@@ -276,6 +281,11 @@ describe('feedLine', () => {
     expect(said(feed({ kind: 'blocked', reason: 'sandbox has no tmux' }))).toBe(
       '@dev-1 blocked #7: sandbox has no tmux',
     );
+  });
+
+  it('names both cards when one filed the other, and bolds both', () => {
+    expect(said(feed({ kind: 'filed', number: 13 }))).toBe('@dev-1 filed #13 out of #7');
+    expect(bold(feed({ kind: 'filed', number: 13 }))).toEqual(['@dev-1', '#13', '#7']);
   });
 
   it('bolds who acted, which card, and how a run ended', () => {

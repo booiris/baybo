@@ -48,16 +48,36 @@ impl Fixture {
             .0
     }
 
+    /// The lead's planning conversation, which is what most of these tests
+    /// are: somebody working the board rather than working a card. A card
+    /// opened from here came out of nothing, and says so.
     fn ctx(&self, project: &ProjectId, agent: &baybo_model::AgentProfileId) -> ToolContext {
         ToolContext {
-            session_trigger: baybo_model::TriggerSource::Issue {
+            session_trigger: baybo_model::TriggerSource::Project {
                 project_id: project.clone(),
-                issue_id: IssueId::generate(),
-                number: 1,
             },
             agent_id: agent.clone(),
             workspace_paths: self.paths.clone(),
             ..ToolContext::for_test()
+        }
+    }
+
+    /// A session working one card. The issue must be a real one on this
+    /// board: a run's session is minted from a row, and a context naming a
+    /// card the board does not have is a world that cannot happen.
+    fn ctx_on(
+        &self,
+        project: &ProjectId,
+        agent: &baybo_model::AgentProfileId,
+        issue: &baybo_store::project::IssueRow,
+    ) -> ToolContext {
+        ToolContext {
+            session_trigger: baybo_model::TriggerSource::Issue {
+                project_id: project.clone(),
+                issue_id: issue.id.clone(),
+                number: issue.number,
+            },
+            ..self.ctx(project, agent)
         }
     }
 
@@ -117,6 +137,7 @@ async fn every_board_tool_is_scoped_to_its_own_session() {
                 parent: None,
                 stage: 0,
                 source_key: None,
+                filed_from: None,
             },
         )
         .await
@@ -668,6 +689,7 @@ mod approvals {
                     parent: None,
                     stage: 0,
                     source_key: None,
+                    filed_from: None,
                 },
             )
             .await
@@ -783,6 +805,7 @@ mod approvals {
                     parent: None,
                     stage: 0,
                     source_key: None,
+                    filed_from: None,
                 },
             )
             .await
@@ -1229,4 +1252,89 @@ mod dedupe {
             2
         );
     }
+}
+
+#[tokio::test]
+async fn a_card_a_run_files_carries_the_card_that_run_was_on() {
+    let f = fixture().await;
+    let (project, lead) = f.open("rglide").await;
+    let origin = f
+        .manager
+        .create_issue(
+            &project,
+            baybo_store::project::IssueActor::User,
+            baybo_project::NewIssueRequest {
+                title: "HIR lowering".to_owned(),
+                description: String::new(),
+                attachments: Vec::new(),
+                status: baybo_store::project::IssueStatus::Backlog,
+                priority: baybo_store::project::IssuePriority::None,
+                assignee: None,
+                parent: None,
+                stage: 0,
+                source_key: None,
+                filed_from: None,
+            },
+        )
+        .await
+        .expect("origin")
+        .into_issue();
+
+    assert!(
+        !f.tool("IssueCreate").parameters_schema()["properties"]
+            .as_object()
+            .expect("properties")
+            .keys()
+            .any(|k| k.contains("from")),
+        "the model is never asked where a card came from — the session already knows, and a \
+         parameter it can forget, mistype, or confuse with `parent` is a worse answer than no \
+         parameter"
+    );
+
+    let filed = f
+        .call(
+            "IssueCreate",
+            &f.ctx_on(&project, &lead, &origin),
+            json!({ "title": "a parse bug the review turned up" }),
+        )
+        .await;
+    let filed = f
+        .manager
+        .get_issue(&project, filed["number"].as_i64().expect("number"))
+        .await
+        .expect("filed");
+    assert_eq!(
+        filed.filed_from,
+        Some(origin.id.clone()),
+        "a card opened from inside #1's run came out of #1"
+    );
+    assert!(
+        f.manager
+            .timeline(&project, origin.number)
+            .await
+            .expect("origin timeline")
+            .iter()
+            .any(|e| matches!(
+                &e.body,
+                baybo_store::project::IssueEventBody::Filed { number } if *number == filed.number
+            )),
+        "and #1 says so, which is the direction nothing else answered"
+    );
+
+    let planned = f
+        .call(
+            "IssueCreate",
+            &f.ctx(&project, &lead),
+            json!({ "title": "LSP alignment with gopls" }),
+        )
+        .await;
+    assert_eq!(
+        f.manager
+            .get_issue(&project, planned["number"].as_i64().expect("number"))
+            .await
+            .expect("planned")
+            .filed_from,
+        None,
+        "a card the lead planned came out of nothing, and a root is the truth rather than a gap"
+    );
 }

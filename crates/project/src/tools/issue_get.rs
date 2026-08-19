@@ -179,6 +179,7 @@ fn narrate(body: &IssueEventBody, known: &[baybo_store::AgentProfileRow]) -> Str
             Some(error) => format!("run #{attempt} {}: {error}", status.as_str()),
             None => format!("run #{attempt} {}", status.as_str()),
         },
+        IssueEventBody::Filed { number } => format!("filed #{number} from this card's work"),
         IssueEventBody::Blocked { reason } => format!("blocked it: {reason}"),
         IssueEventBody::Unblocked => "unblocked it".to_owned(),
         IssueEventBody::Cancelled => "cancelled it".to_owned(),

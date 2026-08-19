@@ -9,7 +9,7 @@ mod issue_update;
 
 use std::sync::Arc;
 
-use baybo_model::{AgentProfileId, ProjectId};
+use baybo_model::{AgentProfileId, IssueId, ProjectId};
 use baybo_store::project::{IssueActor, IssuePriority, IssueRow, IssueStatus};
 use baybo_tools::{Tool, ToolContext, ToolError, ToolManifest};
 use serde_json::{Value, json};
@@ -96,6 +96,22 @@ fn source_key(ctx: &ToolContext, suffix: Option<&str>) -> Option<String> {
         Some(suffix) => format!("{CRON_SOURCE_KEY_PREFIX}{job}:{suffix}"),
         None => format!("{CRON_SOURCE_KEY_PREFIX}{job}"),
     })
+}
+
+/// The card whose run is making this call, when the call comes from one.
+///
+/// Derived, never a parameter: the session already carries the answer with
+/// certainty, and a model asked to restate it can forget it, mistype it, or
+/// confuse it with `parent`. `source_key` above is the same trade — the
+/// server owns the identity and the model supplies at most a suffix.
+///
+/// `None` from the lead's planning conversation, from a cron fire and from
+/// the operator's own create door. Those cards are roots, which is the
+/// truth rather than a gap.
+fn filed_from(ctx: &ToolContext) -> Option<IssueId> {
+    ctx.session_trigger
+        .issue()
+        .map(|(_, issue_id, _)| issue_id.clone())
 }
 
 fn status_schema(description: &str) -> Value {

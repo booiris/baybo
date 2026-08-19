@@ -2671,6 +2671,13 @@ export interface components {
             created_at_ms: number;
             description: string;
             /**
+             * Format: int64
+             * @description The card whose run filed this one, by its number on this board.
+             *     Absent on a card nothing spun out of. Provenance and nothing else —
+             *     it gates no work and orders no column.
+             */
+            filed_from?: number | null;
+            /**
              * @description This card's newest run failed and the card is still live. The board
              *     shows it, because a failure that leaves the card looking untouched
              *     is a badge pointing at something the operator cannot find.
@@ -2799,6 +2806,11 @@ export interface components {
             kind: "stage_completed";
             /** Format: int64 */
             stage: number;
+        } | {
+            /** @enum {string} */
+            kind: "filed";
+            /** Format: int64 */
+            number: number;
         } | {
             /** @enum {string} */
             kind: "budget_exhausted";
@@ -7761,6 +7773,13 @@ export interface operations {
                             /** Format: int64 */
                             created_at_ms: number;
                             description: string;
+                            /**
+                             * Format: int64
+                             * @description The card whose run filed this one, by its number on this board.
+                             *     Absent on a card nothing spun out of. Provenance and nothing else —
+                             *     it gates no work and orders no column.
+                             */
+                            filed_from?: number | null;
                             /**
                              * @description This card's newest run failed and the card is still live. The board
                              *     shows it, because a failure that leaves the card looking untouched

@@ -128,6 +128,7 @@ fn new_issue(title: &str) -> NewIssueRequest {
         parent: None,
         stage: 0,
         source_key: None,
+        filed_from: None,
     }
 }
 
@@ -7525,5 +7526,179 @@ async fn a_board_whose_lead_handle_is_reserved_says_so_once_instead_of_looping()
                 .as_ref()
                 .is_none_or(|t| t.handle.as_str() != baybo_project::LEAD_HANDLE)),
         "and no second lead was conjured"
+    );
+}
+
+#[tokio::test]
+async fn a_card_filed_from_another_marks_the_origin_without_becoming_its_step() {
+    let f = fixture().await;
+    let project = f
+        .manager
+        .create_project(new_project("Spun out"))
+        .await
+        .expect("create");
+    let origin = f
+        .manager
+        .create_issue(&project.id, IssueActor::User, new_issue("HIR lowering"))
+        .await
+        .expect("create origin")
+        .into_issue();
+
+    let filed = f
+        .manager
+        .create_issue(
+            &project.id,
+            IssueActor::User,
+            NewIssueRequest {
+                filed_from: Some(origin.id.clone()),
+                ..new_issue("a parse bug the review turned up")
+            },
+        )
+        .await
+        .expect("create filed")
+        .into_issue();
+
+    assert_eq!(
+        filed.filed_from,
+        Some(origin.id.clone()),
+        "the card carries where it came from"
+    );
+    assert_eq!(
+        f.manager
+            .timeline(&project.id, origin.number)
+            .await
+            .expect("origin timeline")
+            .iter()
+            .map(|e| e.body.kind())
+            .collect::<Vec<_>>(),
+        vec!["opened", "filed"],
+        "and the origin stops going silent when its work spins work out"
+    );
+    assert!(
+        matches!(
+            &f.manager
+                .timeline(&project.id, origin.number)
+                .await
+                .expect("origin timeline")[1]
+                .body,
+            baybo_store::project::IssueEventBody::Filed { number } if *number == filed.number
+        ),
+        "the entry names the card that was filed"
+    );
+    assert_eq!(
+        f.manager
+            .timeline(&project.id, filed.number)
+            .await
+            .expect("filed timeline")
+            .iter()
+            .map(|e| e.body.kind())
+            .collect::<Vec<_>>(),
+        vec!["opened"],
+        "the reverse direction is the only one recorded — the card itself already says it"
+    );
+
+    assert!(
+        filed.parent_issue_id.is_none(),
+        "provenance is not hierarchy"
+    );
+    assert!(
+        f.manager
+            .children(&project.id, origin.number)
+            .await
+            .expect("children")
+            .is_empty(),
+        "and the origin gained no step, so nothing of its own now waits on this card"
+    );
+}
+
+#[tokio::test]
+async fn an_origin_on_another_board_is_refused() {
+    let f = fixture().await;
+    let mine = f
+        .manager
+        .create_project(new_project("Mine"))
+        .await
+        .expect("create mine");
+    let theirs = f
+        .manager
+        .create_project(new_project("Theirs"))
+        .await
+        .expect("create theirs");
+    let stranger = f
+        .manager
+        .create_issue(&theirs.id, IssueActor::User, new_issue("not your card"))
+        .await
+        .expect("create stranger")
+        .into_issue();
+
+    let err = f
+        .manager
+        .create_issue(
+            &mine.id,
+            IssueActor::User,
+            NewIssueRequest {
+                filed_from: Some(stranger.id.clone()),
+                ..new_issue("reaching across")
+            },
+        )
+        .await
+        .expect_err("one board's card cannot be another board's origin");
+    assert!(matches!(err, ProjectError::Invalid { .. }), "{err:?}");
+    assert_eq!(
+        f.manager
+            .timeline(&theirs.id, stranger.number)
+            .await
+            .expect("stranger timeline")
+            .len(),
+        1,
+        "and the refusal wrote nothing on the card it named"
+    );
+}
+
+#[tokio::test]
+async fn a_repeat_of_a_scheduled_check_files_nothing_on_its_origin() {
+    let f = fixture().await;
+    let project = f
+        .manager
+        .create_project(new_project("Daily"))
+        .await
+        .expect("create");
+    let origin = f
+        .manager
+        .create_issue(
+            &project.id,
+            IssueActor::User,
+            new_issue("the standing check"),
+        )
+        .await
+        .expect("create origin")
+        .into_issue();
+
+    for _ in 0..2 {
+        f.manager
+            .create_issue(
+                &project.id,
+                IssueActor::User,
+                NewIssueRequest {
+                    source_key: Some("cron:nightly".to_owned()),
+                    filed_from: Some(origin.id.clone()),
+                    ..new_issue("the recurring finding")
+                },
+            )
+            .await
+            .expect("open or find the standing card");
+    }
+
+    assert_eq!(
+        f.manager
+            .timeline(&project.id, origin.number)
+            .await
+            .expect("origin timeline")
+            .iter()
+            .filter(|e| e.body.kind() == "filed")
+            .count(),
+        1,
+        "a dedupe hit opened no card, so it filed none — 365 notes on one card is the bug this \
+         guards"
     );
 }

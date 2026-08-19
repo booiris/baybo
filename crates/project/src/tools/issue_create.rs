@@ -7,8 +7,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{
-    actor, exec_err, parse_priority, parse_status, priority_schema, project_err, render_issue,
-    resolve_handle, scope, status_schema,
+    actor, exec_err, filed_from, parse_priority, parse_status, priority_schema, project_err,
+    render_issue, resolve_handle, scope, status_schema,
 };
 use crate::{NewIssueRequest, ProjectManager};
 
@@ -124,6 +124,7 @@ Putting an issue straight into `in_progress` with an assignee starts that agent 
                     parent: p.parent,
                     stage: p.stage,
                     source_key: super::source_key(ctx, p.key.as_deref()),
+                    filed_from: filed_from(ctx),
                 },
             )
             .await

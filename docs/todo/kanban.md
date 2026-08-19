@@ -310,7 +310,8 @@ existing git repo.
   assignee avatar with a live "working" shimmer while a run is active
   (queued = dimmed), sub-issue progress ring `done/total`, blocked badge,
   branch chip once the branch has commits (never for research-shaped
-  issues), updated-ago. Cancelled issues render
+  issues), origin chip `↳ #N` on a card another card's run filed,
+  updated-ago. Cancelled issues render
   struck-through and are filterable out.
 - **Drag**: `@dnd-kit` multi-container (first such usage in `app/web`;
   `QueuePanel`/`SessionSidebar` are the existing single-list precedents).

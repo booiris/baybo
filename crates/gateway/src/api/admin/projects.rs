@@ -339,6 +339,11 @@ pub struct IssueDto {
     /// Absent on a top-level card.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<i64>,
+    /// The card whose run filed this one, by its number on this board.
+    /// Absent on a card nothing spun out of. Provenance and nothing else —
+    /// it gates no work and orders no column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filed_from: Option<i64>,
     /// Which barrier under that parent. `0` and meaningless without one.
     pub stage: i64,
     /// This card's own steps, if it has any: how many are done out of how
@@ -379,13 +384,15 @@ impl IssueDto {
     /// answers to one question.
     pub fn on_board(row: IssueRow, board: &BoardCards) -> Self {
         let signals = board.signals(&row.id);
-        let parent = row.parent_issue_id.as_ref().and_then(|id| {
+        let number_of = |id: &baybo_model::IssueId| {
             board
                 .rows
                 .iter()
                 .find(|issue| &issue.id == id)
                 .map(|issue| issue.number)
-        });
+        };
+        let parent = row.parent_issue_id.as_ref().and_then(&number_of);
+        let filed_from = row.filed_from.as_ref().and_then(&number_of);
         let children: Vec<IssueRow> = board
             .rows
             .iter()
@@ -401,6 +408,7 @@ impl IssueDto {
         });
         Self {
             parent,
+            filed_from,
             sub_issues,
             unread: signals.unread as i64,
             last_run_failed: signals.last_run_failed,
@@ -429,6 +437,7 @@ impl From<IssueRow> for IssueDto {
             branch: row.branch,
             blocked_reason: row.blocked_reason,
             parent: None,
+            filed_from: None,
             stage: row.stage,
             sub_issues: None,
             // A card built without its board is a card nobody is looking
@@ -666,6 +675,9 @@ pub enum IssueEventBodyDto {
     StageCompleted {
         stage: i64,
     },
+    Filed {
+        number: i64,
+    },
     BudgetExhausted {
         spent_micros: i64,
         limit_micros: i64,
@@ -708,6 +720,7 @@ impl IssueEventBodyDto {
                 resolution: resolution.into(),
             },
             IssueEventBody::StageCompleted { stage } => Self::StageCompleted { stage },
+            IssueEventBody::Filed { number } => Self::Filed { number },
             IssueEventBody::BudgetExhausted {
                 spent_micros,
                 limit_micros,
@@ -1296,6 +1309,7 @@ async fn create_issue(
                 // purpose. Dedupe keys are namespaced per scheduled job and
                 // exist only there.
                 source_key: None,
+                filed_from: None,
             },
         )
         .await

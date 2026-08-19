@@ -99,6 +99,27 @@ export function BranchChip({ branch }: { branch: string }) {
   );
 }
 
+/// Where a card came from, worn in the column rather than on the card's own
+/// page. The question it answers is asked while scanning: a Backlog that
+/// reads 8, 9, 15, 16, 13, 19 is four cards of debt spun out of finished
+/// work drawn identically to two that were planned, and a mark that needs
+/// the card opened to be read is no help to the eye doing the scanning.
+///
+/// Inert on purpose. Its card's own press opens the issue and on the board
+/// that same press is also the drag handle, so a second target here would
+/// have to claim two events to be reachable at all — and the origin is one
+/// click away as a live `#N` in the description the card already carries.
+export function FiledFromChip({ number }: { number: number }) {
+  return (
+    <span
+      title={`Filed from #${number} — this card came out of that card's work. It is not a step of it: nothing here waits on it and finishing this wakes nobody.`}
+      className="self-start shrink-0 border border-black/25 bg-canvas rounded px-1.5 font-mono text-[0.56rem] text-ink-soft"
+    >
+      ↳ #{number}
+    </span>
+  );
+}
+
 /// A ring, not a bar. It sits inline beside the assignee on a card whose
 /// other rows are already full-width, and a circle reads as "how far
 /// through the steps" at a glance where a fifth horizontal bar would just

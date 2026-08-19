@@ -5305,6 +5305,14 @@
                           "description": {
                             "type": "string"
                           },
+                          "filed_from": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ],
+                            "format": "int64",
+                            "description": "The card whose run filed this one, by its number on this board.\nAbsent on a card nothing spun out of. Provenance and nothing else —\nit gates no work and orders no column."
+                          },
                           "last_run_failed": {
                             "type": "boolean",
                             "description": "This card's newest run failed and the card is still live. The board\nshows it, because a failure that leaves the card looking untouched\nis a badge pointing at something the operator cannot find."
@@ -9483,6 +9491,14 @@
           "description": {
             "type": "string"
           },
+          "filed_from": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The card whose run filed this one, by its number on this board.\nAbsent on a card nothing spun out of. Provenance and nothing else —\nit gates no work and orders no column."
+          },
           "last_run_failed": {
             "type": "boolean",
             "description": "This card's newest run failed and the card is still live. The board\nshows it, because a failure that leaves the card looking untouched\nis a badge pointing at something the operator cannot find."
@@ -9876,6 +9892,25 @@
                 ]
               },
               "stage": {
+                "type": "integer",
+                "format": "int64"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "number",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "filed"
+                ]
+              },
+              "number": {
                 "type": "integer",
                 "format": "int64"
               }
