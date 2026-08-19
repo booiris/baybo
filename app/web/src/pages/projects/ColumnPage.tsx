@@ -41,6 +41,7 @@ import {
   findIssue,
   groupByStatus,
   hasDeliverable,
+  issuePath,
   readingBands,
   readingOrder,
   liveCount,
@@ -315,7 +316,7 @@ export function ColumnPage() {
 
   const openIssue = useCallback(
     (number: number) => {
-      navigate(`/projects/${encodeURIComponent(projectId)}/issues/${number}`, {
+      navigate(issuePath(projectId, number), {
         state: { from: here },
       });
     },
@@ -540,7 +541,7 @@ export function ColumnPage() {
                           <IssueTile
                             key={issue.number}
                             issue={issue}
-                            to={`/projects/${encodeURIComponent(projectId)}/issues/${issue.number}`}
+                            to={issuePath(projectId, issue.number)}
                             from={here}
                             run={runIndicator(activeRuns, issue.number)}
                             team={team}

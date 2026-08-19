@@ -4,7 +4,7 @@ import { RiCloseLine } from 'react-icons/ri';
 
 import { useAdminClient } from '../../api/auth';
 import { fetchModelPool, setAgentModel } from './api';
-import { COLUMN_LABEL, type Agent, type Issue, type IssueRun } from './boardModel';
+import { COLUMN_LABEL, issuePath, type Agent, type Issue, type IssueRun } from './boardModel';
 import { Picker } from './Picker';
 import { agentRunStates, llmOptions, llmSelected, type ModelPool } from './teamModel';
 
@@ -126,7 +126,7 @@ export function AgentProfile({
             <>
               working on{' '}
               <Link
-                to={`/projects/${encodeURIComponent(projectId)}/issues/${String(live.number)}`}
+                to={issuePath(projectId, live.number)}
                 className="font-bold underline"
               >
                 #{live.number}
@@ -218,7 +218,7 @@ export function AgentProfile({
               {assigned.map((issue) => (
                 <li key={issue.number}>
                   <Link
-                    to={`/projects/${encodeURIComponent(projectId)}/issues/${issue.number}`}
+                    to={issuePath(projectId, issue.number)}
                     className="flex items-baseline gap-1.5 border-2 border-black/15 hover:border-black rounded-md px-2 py-1 bg-surface font-mono text-[0.68rem]"
                   >
                     <span className="font-bold">#{issue.number}</span>

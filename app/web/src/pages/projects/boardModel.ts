@@ -229,6 +229,13 @@ export function readingBands(column: readonly Issue[], status: IssueStatus): Rea
   ];
 }
 
+/// Where a card lives. Everything that opens one — a sub-issue row, a tile, a
+/// parent link, a reference in a comment — asks here rather than spelling the
+/// route again.
+export function issuePath(projectId: string, number: number): string {
+  return `/projects/${encodeURIComponent(projectId)}/issues/${String(number)}`;
+}
+
 /// Where a card's page goes back to, and what that door is called.
 ///
 /// A card is opened from the board or from a stage page, and those are not

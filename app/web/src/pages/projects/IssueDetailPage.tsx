@@ -41,6 +41,7 @@ import {
   RUN_LOG_HEAD,
   STATUS_PILL,
   assignableAgents,
+  issuePath,
   runDuration,
   runIsLive,
   runLogView,
@@ -64,6 +65,8 @@ import {
   readyRequests,
   useAttachmentDraft,
 } from './Attachments';
+import { IssueRefScope } from './issueRefs';
+import { useIssueRefPlugins } from './issueRefsProse';
 import { MarkdownEditor } from './MarkdownEditor';
 import { Avatar } from './Avatar';
 import { useTeamPortraits } from './portrait';
@@ -237,6 +240,9 @@ export function IssueDetailPage() {
 
   const [issue, setIssue] = useState<Issue | null>(null);
   const [board, setBoard] = useState<Issue[]>([]);
+  // The board is what a `#12` is read against, in the description's editor as
+  // much as in a comment.
+  const issueRefPlugins = useIssueRefPlugins(projectId, board);
   const [agents, setAgents] = useState<Agent[]>([]);
   const portrait = useTeamPortraits(agents);
   const [runLog, setRunLog] = useState<RunLog | null>(null);
@@ -901,6 +907,7 @@ export function IssueDetailPage() {
             key={`${projectId}:${String(issue.number)}`}
             className="mt-1 w-full shrink-0 md-editor"
             initialValue={issue.description}
+            plugins={issueRefPlugins}
             ariaLabel="Issue description"
             placeholder="Add description…"
             onChange={(markdown) => {
@@ -954,21 +961,25 @@ export function IssueDetailPage() {
             }}
           />
 
-          <Timeline
-            events={events}
-            issue={issue}
-            runs={runs}
-            busy={saving}
-            contentRef={holdTimelineEdge}
-            onComment={(text, attachments) => {
-              void comment(text, attachments);
-            }}
-            team={agents}
-            portrait={portrait}
-            onResolveApproval={(callId, decision) => {
-              void answerApproval(callId, decision);
-            }}
-          />
+          {/* The board is what a `#12` in a comment is read against — the same list
+              the parent picker resolves from, which the page already holds. */}
+          <IssueRefScope projectId={projectId} issues={board}>
+            <Timeline
+              events={events}
+              issue={issue}
+              runs={runs}
+              busy={saving}
+              contentRef={holdTimelineEdge}
+              onComment={(text, attachments) => {
+                void comment(text, attachments);
+              }}
+              team={agents}
+              portrait={portrait}
+              onResolveApproval={(callId, decision) => {
+                void answerApproval(callId, decision);
+              }}
+            />
+          </IssueRefScope>
         </main>
 
         {newBelow ? (
@@ -1265,7 +1276,7 @@ export function IssueDetailPage() {
                   <span className="font-normal text-ink-soft">—</span>
                 ) : (
                   <Link
-                    to={`/projects/${encodeURIComponent(projectId)}/issues/${String(issue.parent)}`}
+                    to={issuePath(projectId, issue.parent)}
                     className="underline"
                   >
                     #{issue.parent} · stage {issue.stage}

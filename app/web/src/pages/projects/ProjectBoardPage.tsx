@@ -64,6 +64,7 @@ import {
   HEADER_ACTION_DEAD,
   HEADER_ACTION_OFF,
   HEADER_ACTION_ON,
+  issuePath,
   readingOrder,
   liveCount,
   moveAnnouncement,
@@ -424,7 +425,7 @@ export function ProjectBoardPage() {
 
   const openIssue = useCallback(
     (number: number) => {
-      navigate(`/projects/${encodeURIComponent(projectId)}/issues/${number}`);
+      navigate(issuePath(projectId, number));
     },
     [navigate, projectId],
   );

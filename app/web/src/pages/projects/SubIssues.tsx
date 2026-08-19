@@ -8,6 +8,7 @@ import {
   COLUMN_PILL_LABEL,
   COLUMNS,
   STATUS_PILL,
+  issuePath,
   type Agent,
   type Issue,
   type IssueStatus,
@@ -116,7 +117,7 @@ export function SubIssues({
                       #{child.number}
                     </span>
                     <Link
-                      to={`/projects/${encodeURIComponent(projectId)}/issues/${child.number}`}
+                      to={issuePath(projectId, child.number)}
                       className={`min-w-0 flex-1 truncate font-mono text-[0.7rem] hover:underline ${
                         cancelled ? 'line-through opacity-55' : ''
                       }`}

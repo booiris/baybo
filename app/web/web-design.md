@@ -721,6 +721,33 @@ had dragged posted a reorder. Sending the rendered order instead is the other
 one, and it is the quieter of the two — nothing looks wrong at the time, and
 the column stays re-ranked after the cards are read.
 
+## A card named in prose
+
+`#12` in a comment or a description opens card 12 — bold, in the link tone,
+under a **dotted** rule. Dotted because the solid one is a URL's: on a card
+whose comments are half links to CI and half references to other cards, the
+two have to be tellable apart before either is read.
+
+It is only a link when the board has that card. An unresolvable number stays
+plain text — never dimmed, never struck — because "no such card" and "the board
+has not answered yet" look identical from here, and plain text is the only
+rendering that asserts neither. The same bargain the composer strikes with an
+unknown `@handle`. Nor is a number that counts something else linked: the board
+writes a run's ordinal as `run #3`, and on a board with three cards those are
+the same three characters.
+
+The two surfaces mark it the same way and follow it differently. A comment is
+read, so a plain click opens the card. A description is an **editor**, where a
+plain click belongs to the caret — a reference you cannot put the cursor into is
+one you cannot fix — so there it takes a ⌘/Ctrl-click, and the hint rides the
+title alongside the card's own.
+
+In the editor the reference is a ProseMirror **decoration**, never a node or a
+mark. That editor re-serialises its whole document on every edit into the text
+an agent is briefed with; a decoration is drawn over the document and is never
+asked to write itself back, so no reference can change the bytes the agent
+reads.
+
 ## Iconography
 
 - **Library:** [Remix Icon](https://remixicon.com/) (via `react-icons/ri`).

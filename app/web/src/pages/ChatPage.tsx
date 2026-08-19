@@ -78,6 +78,7 @@ import { normalizeMath } from './chat/mathDelimiters';
 import { withoutArchived } from './chat/sessionBuckets';
 import { anchorRowFor, clearSearchHighlight, paintSearchHighlight } from './chat/searchJump';
 import type { SessionSummary } from './chat/types';
+import { ISSUE_REF_COMPONENTS, remarkIssueRefs } from './projects/issueRefs';
 
 type ApiTranscriptItem = components['schemas']['ChatTranscriptItem'];
 type ApiAttachment = components['schemas']['ChatAttachment'];
@@ -5961,6 +5962,7 @@ function pad2(n: number): string {
 // and bottom edges from gaining extra padding from leading/trailing
 // markdown blocks.
 const MARKDOWN_COMPONENTS: Components = {
+  ...ISSUE_REF_COMPONENTS,
   p: ({ children }) => (
     <p className="my-2 first:mt-0 last:mb-0 leading-relaxed">{children}</p>
   ),
@@ -6083,11 +6085,17 @@ const MARKDOWN_COMPONENTS: Components = {
 // punctuation (the spec-correct read), so `**done 😀**text` no longer bolds.
 // The CJK suite in `chatMarkdown.test.tsx` pins both. `/parseOnly` because the
 // default entry also ships the mdast serializer half, which nothing here runs.
+// `remarkIssueRefs` is last and unconditional. It installs no micromark
+// extension — it walks the parsed text — so its position carries no constraint,
+// and it is parameterless because the plugin list is module-level: a `#12` is
+// only *marked* here, and stays plain text everywhere no board is in scope,
+// which is everywhere but a project page.
 const REMARK_PLUGINS = [
   remarkGfm,
   remarkMath,
   remarkCjkFriendly,
   remarkCjkFriendlyGfmStrikethrough,
+  remarkIssueRefs,
 ];
 // `breaks` opts a caller into `remark-breaks`, which turns every soft line break
 // into a hard one. CommonMark folds a single newline into a space, which is right
