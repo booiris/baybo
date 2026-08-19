@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { render } from '@testing-library/react';
-import { MemoryRouter } from 'react-router-dom';
+import { render, screen } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 
 import { MarkdownBody } from '../ChatPage';
 import type { Issue } from './boardModel';
@@ -89,13 +90,35 @@ function issue(number: number): Issue {
   };
 }
 
+const READING = `/projects/${PROJECT}/issues/7`;
+
 function comment(text: string, board: Issue[] = [issue(12)]) {
   return render(
-    <MemoryRouter>
-      <IssueRefScope projectId={PROJECT} issues={board}>
-        <MarkdownBody text={text} />
-      </IssueRefScope>
+    <MemoryRouter initialEntries={[READING]}>
+      <Routes>
+        <Route
+          path="/projects/:pid/issues/:num"
+          element={
+            <IssueRefScope projectId={PROJECT} issues={board}>
+              <div data-testid="body">
+                <MarkdownBody text={text} />
+              </div>
+              <Landed />
+            </IssueRefScope>
+          }
+        />
+      </Routes>
     </MemoryRouter>,
+  );
+}
+
+/// Where the router is, and what the navigation that took it there recorded.
+function Landed() {
+  const location = useLocation();
+  return (
+    <span data-testid="landed">
+      {location.pathname} ← {String((location.state as { from?: unknown } | null)?.from)}
+    </span>
   );
 }
 
@@ -115,11 +138,23 @@ describe('a comment’s card references', () => {
     expect(link?.getAttribute('title')).toBe(ISSUE_TITLE);
   });
 
+  it('tells the card it opens where it was opened from', async () => {
+    // Otherwise the card you land on offers "← Board", and following a
+    // reference costs you the card you were reading.
+    const { container } = comment('see #12 for the rest');
+    const link = container.querySelector('a');
+    if (link === null) throw new Error('the reference did not render as a link');
+    await userEvent.click(link);
+    expect(screen.getByTestId('landed').textContent).toBe(
+      `/projects/${PROJECT}/issues/12 ← ${READING}`,
+    );
+  });
+
   it('leaves a number this board does not have as text', () => {
     const { container } = comment('see #99 for the rest');
     expect(container.querySelector('.md-failed')).toBeNull();
     expect(container.querySelector('a')).toBeNull();
-    expect(container.textContent).toBe('see #99 for the rest');
+    expect(screen.getByTestId('body').textContent).toBe('see #99 for the rest');
   });
 
   it('leaves code alone', () => {
@@ -149,7 +184,7 @@ describe('a comment’s card references', () => {
     const { container } = comment('CSS 用 \\#12 做背景');
     expect(container.querySelector('.md-failed')).toBeNull();
     expect(container.querySelector('a')).toBeNull();
-    expect(container.textContent).toBe('CSS 用 #12 做背景');
+    expect(screen.getByTestId('body').textContent).toBe('CSS 用 #12 做背景');
   });
 
   it('reads the run word out of a neighbouring emphasis', () => {

@@ -236,28 +236,47 @@ export function issuePath(projectId: string, number: number): string {
   return `/projects/${encodeURIComponent(projectId)}/issues/${String(number)}`;
 }
 
-/// Where a card's page goes back to, and what that door is called.
+/// Where a card's page goes back to, what that door is called, and whether it
+/// is the way the operator actually came.
 ///
-/// A card is opened from the board or from a stage page, and those are not
-/// the same place. A fixed "← Board" on the card sent an operator who had
-/// maximized Todo two steps from where they were — and dropped that stage's
-/// filter on the way, so the wall they returned to was not the wall they
-/// left. The opener records where it came from; this reads it back.
+/// A card is opened from the board, from a stage page, or from another card,
+/// and those are not the same place. A fixed "← Board" on the card sent an
+/// operator who had maximized Todo two steps from where they were — and
+/// dropped that stage's filter on the way, so the wall they returned to was
+/// not the wall they left. The opener records where it came from; this reads
+/// it back.
+///
+/// `retraces` says the destination is the entry behind this one in history,
+/// so the door can be walked back through rather than pushed onto. It is
+/// false for the fallback, where nothing said where the operator came from
+/// and the board is a guess rather than a memory.
 ///
 /// It refuses anything that is not a page of **this** project. The value
 /// arrives through router state, which is same-origin and not addressable
 /// from outside — but a back link is a navigation target, and one built out
 /// of a value this function did not check is the shape of an open redirect
 /// whoever writes the next opener will not be looking for.
-export function backFrom(projectId: string, from: unknown): { to: string; label: string } {
-  const board = { to: `/projects/${encodeURIComponent(projectId)}`, label: 'Board' };
+export function backFrom(
+  projectId: string,
+  from: unknown,
+): { to: string; label: string; retraces: boolean } {
+  const board = { to: `/projects/${encodeURIComponent(projectId)}`, label: 'Board', retraces: false };
   if (typeof from !== 'string') return board;
   const [path] = from.split('?');
-  const prefix = `/projects/${encodeURIComponent(projectId)}/board/`;
-  if (!from.startsWith(prefix)) return board;
-  const status = path.slice(prefix.length);
-  if (!COLUMNS.includes(status as IssueStatus)) return board;
-  return { to: from, label: COLUMN_LABEL[status as IssueStatus] };
+  const project = `/projects/${encodeURIComponent(projectId)}`;
+  const stage = `${project}/board/`;
+  if (path.startsWith(stage)) {
+    const status = path.slice(stage.length);
+    if (!COLUMNS.includes(status as IssueStatus)) return board;
+    return { to: from, label: COLUMN_LABEL[status as IssueStatus], retraces: true };
+  }
+  const card = `${project}/issues/`;
+  if (path.startsWith(card)) {
+    const number = path.slice(card.length);
+    if (!/^[1-9][0-9]*$/.test(number)) return board;
+    return { to: from, label: `#${number}`, retraces: true };
+  }
+  return board;
 }
 
 /// What one stage says about itself in its own heading.

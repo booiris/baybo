@@ -607,34 +607,55 @@ describe('backFrom', () => {
     expect(backFrom('p1', '/projects/p1/board/todo?q=blocked')).toEqual({
       to: '/projects/p1/board/todo?q=blocked',
       label: 'Todo',
+      retraces: true,
     });
     expect(backFrom('p1', '/projects/p1/board/in_progress')).toEqual({
       to: '/projects/p1/board/in_progress',
       label: 'In Progress',
+      retraces: true,
+    });
+  });
+
+  it('returns to the card that named this one', () => {
+    // A card is opened from another card by the `#12` in its prose, its
+    // parent link and its sub-issue rows — so "back" is that card, not the
+    // board two hops away.
+    expect(backFrom('p1', '/projects/p1/issues/12')).toEqual({
+      to: '/projects/p1/issues/12',
+      label: '#12',
+      retraces: true,
     });
   });
 
   it('falls back to the board when nobody said where they came from', () => {
     // A pasted URL has no history behind it, so the board is the honest
-    // answer rather than a guess.
-    expect(backFrom('p1', undefined)).toEqual({ to: '/projects/p1', label: 'Board' });
-    expect(backFrom('p1', null)).toEqual({ to: '/projects/p1', label: 'Board' });
-    expect(backFrom('p1', 42)).toEqual({ to: '/projects/p1', label: 'Board' });
+    // answer rather than a guess — and one it must not try to walk back to.
+    const board = { to: '/projects/p1', label: 'Board', retraces: false };
+    expect(backFrom('p1', undefined)).toEqual(board);
+    expect(backFrom('p1', null)).toEqual(board);
+    expect(backFrom('p1', 42)).toEqual(board);
   });
 
-  it('refuses anywhere that is not a stage of this project', () => {
+  it('refuses anywhere that is not a page of this project', () => {
     // The value becomes a navigation target, so it is checked rather than
-    // trusted: another project's board, a made-up stage, and anything
-    // pointing off-site all fall back.
+    // trusted: another project's board or card, a made-up stage, a card
+    // number that is not one, and anything pointing off-site all fall back.
     for (const hostile of [
       '/projects/other/board/todo',
+      '/projects/other/issues/3',
       '/projects/p1/board/shipping',
+      '/projects/p1/issues/none',
+      '/projects/p1/issues/3/edit',
+      '/projects/p1/issues/',
       'https://example.com/projects/p1/board/todo',
       '//example.com',
-      '/projects/p1/issues/3',
       '',
     ]) {
-      expect(backFrom('p1', hostile)).toEqual({ to: '/projects/p1', label: 'Board' });
+      expect(backFrom('p1', hostile)).toEqual({
+        to: '/projects/p1',
+        label: 'Board',
+        retraces: false,
+      });
     }
   });
 });

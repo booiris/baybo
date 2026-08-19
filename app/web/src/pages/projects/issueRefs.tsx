@@ -1,5 +1,5 @@
 import { createContext, useContext, useMemo, type ReactNode } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useLocation } from 'react-router-dom';
 
 import { issuePath, type Issue } from './boardModel';
 
@@ -172,8 +172,10 @@ export function remarkIssueRefs(): (tree: MarkdownNode) => void {
   };
 }
 
-/// Where a `#N` resolves, for the subtree that has a board to resolve it on.
-type Scope = { projectId: string; titles: ReadonlyMap<number, string> };
+/// Where a `#N` resolves, for the subtree that has a board to resolve it on —
+/// and the page it is being read on, which is what the card it opens comes
+/// back to.
+type Scope = { projectId: string; titles: ReadonlyMap<number, string>; here: string };
 
 const ScopeContext = createContext<Scope | null>(null);
 
@@ -193,9 +195,14 @@ export function IssueRefScope({
   issues: Issue[];
   children: ReactNode;
 }) {
+  const here = useLocation().pathname;
   const scope = useMemo(
-    () => ({ projectId, titles: new Map(issues.map((issue) => [issue.number, issue.title])) }),
-    [projectId, issues],
+    () => ({
+      projectId,
+      titles: new Map(issues.map((issue) => [issue.number, issue.title])),
+      here,
+    }),
+    [projectId, issues, here],
   );
   return <ScopeContext.Provider value={scope}>{children}</ScopeContext.Provider>;
 }
@@ -220,6 +227,7 @@ function IssueRef({
   return (
     <Link
       to={issuePath(scope.projectId, number)}
+      state={{ from: scope.here }}
       title={title}
       className="font-bold text-info underline decoration-dotted underline-offset-2 hover:opacity-80"
     >

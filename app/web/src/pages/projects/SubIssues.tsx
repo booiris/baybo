@@ -1,4 +1,4 @@
-import { Link } from 'react-router-dom';
+import { Link, useLocation } from 'react-router-dom';
 
 import { Avatar } from './Avatar';
 import { generatedPortrait, type Portrait } from './portrait';
@@ -50,6 +50,9 @@ export function SubIssues({
   /// operator to each child's own page to do it defeats the grouping.
   onAssignee: (number: number, assignee: string | null) => void;
 }) {
+  // Above the early return: a hook cannot sit behind one. It is what a step
+  // opened from here comes back to.
+  const here = useLocation().pathname;
   if (children.length === 0) return null;
   const stages = groupByStage(children);
   const { done, total } = stageProgress(children);
@@ -118,6 +121,7 @@ export function SubIssues({
                     </span>
                     <Link
                       to={issuePath(projectId, child.number)}
+                      state={{ from: here }}
                       className={`min-w-0 flex-1 truncate font-mono text-[0.7rem] hover:underline ${
                         cancelled ? 'line-through opacity-55' : ''
                       }`}

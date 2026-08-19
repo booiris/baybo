@@ -107,8 +107,15 @@ function issue(number: number): Issue {
 }
 
 function Where() {
-  return <span data-testid="where">{useLocation().pathname}</span>;
+  const location = useLocation();
+  return (
+    <span data-testid="where">
+      {location.pathname} ← {String((location.state as { from?: unknown } | null)?.from)}
+    </span>
+  );
 }
+
+const READING = '/start';
 
 function Description({ text, board }: { text: string; board: Issue[] }) {
   const plugins = useIssueRefPlugins(PROJECT, board);
@@ -180,11 +187,15 @@ describe('a description’s card references', () => {
     if (marked === null) throw new Error('nothing was marked');
 
     click(marked, false);
-    expect(screen.getByTestId('where').textContent).toBe('/start');
+    expect(screen.getByTestId('where').textContent).toBe(`${READING} ← undefined`);
 
+    // And the card it opens is told where it came from, so its own back door
+    // is this description rather than the board.
     click(marked, true);
     await waitFor(() => {
-      expect(screen.getByTestId('where').textContent).toBe(`/projects/${PROJECT}/issues/12`);
+      expect(screen.getByTestId('where').textContent).toBe(
+        `/projects/${PROJECT}/issues/12 ← ${READING}`,
+      );
     });
   });
 });

@@ -735,3 +735,64 @@ describe('IssueDetailPage rail', () => {
     expect(screen.getByText(/reclaimed at Done/)).toBeInTheDocument();
   });
 });
+
+describe('IssueDetailPage back door', () => {
+  /// A card reached from a card reached from a stage — the trail this door
+  /// exists to keep.
+  function renderTrail() {
+    current = issue();
+    currentRuns = RUNS;
+    currentEvents = [];
+    const stage = `/projects/${PROJECT_ID}/board/todo`;
+    const first = `/projects/${PROJECT_ID}/issues/7`;
+    return render(
+      <MemoryRouter
+        initialEntries={[
+          stage,
+          { pathname: first, state: { from: stage } },
+          { pathname: `/projects/${PROJECT_ID}/issues/12`, state: { from: first } },
+        ]}
+        initialIndex={2}
+      >
+        <Routes>
+          <Route path="/projects/:pid/board/:status" element={<span>the stage wall</span>} />
+          <Route path="/projects/:pid/issues/:num" element={<IssueDetailPage />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+  }
+
+  it('walks the trail back rather than pushing the card it names', async () => {
+    renderTrail();
+
+    // The card that named this one, not the board two hops away.
+    const back = await screen.findByRole('link', { name: '#7' });
+    await userEvent.click(back);
+
+    // Landing there by a push would arrive without state and offer "Board":
+    // one hop of trail, and the stage the operator had maximized is gone. A
+    // walk back restores the entry, so that card still offers its own door.
+    expect(await screen.findByRole('link', { name: 'Todo' })).toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'Board' })).toBeNull();
+  });
+
+  it('offers the board on a card opened cold, and goes there', async () => {
+    // A pasted URL has nothing behind it — the door is a guess rather than a
+    // memory, so it stays an ordinary link and must not walk history back to
+    // whatever the tab was showing before.
+    current = issue();
+    currentRuns = RUNS;
+    currentEvents = [];
+    render(
+      <MemoryRouter initialEntries={[`/projects/${PROJECT_ID}/issues/7`]}>
+        <Routes>
+          <Route path="/projects/:pid" element={<span>the board</span>} />
+          <Route path="/projects/:pid/issues/:num" element={<IssueDetailPage />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    await userEvent.click(await screen.findByRole('link', { name: 'Board' }));
+    expect(await screen.findByText('the board')).toBeInTheDocument();
+  });
+});

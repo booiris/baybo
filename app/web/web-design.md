@@ -748,6 +748,20 @@ an agent is briefed with; a decoration is drawn over the document and is never
 asked to write itself back, so no reference can change the bytes the agent
 reads.
 
+**A card opened from a card leaves a trail.** The three doors that do it — a
+`#12`, the parent link, a sub-issue row — record the page they were pressed on,
+and `backFrom` reads it back as `← #7` beside the stage names it already
+resolves. It still refuses anything that is not a page of this project: the
+value becomes a navigation target.
+
+And the door is *walked back through*, not pushed onto: a plain press on it
+calls `navigate(-1)` whenever the destination is a memory rather than the
+board-shaped guess. A push arrives at the destination stripped of its own
+state, so a card two hops in would offer "Board" instead of the stage the
+operator had maximized — the trail flattens to one hop exactly when it starts
+being worth having. Modified clicks are left to the browser, so the
+destination still opens in its own tab.
+
 ## Iconography
 
 - **Library:** [Remix Icon](https://remixicon.com/) (via `react-icons/ri`).

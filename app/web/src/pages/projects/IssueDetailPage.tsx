@@ -7,7 +7,7 @@ import {
   type ReactNode,
   type RefObject,
 } from 'react';
-import { Link, useLocation, useParams } from 'react-router-dom';
+import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
 import {
   RiArrowDownLine,
   RiArrowLeftLine,
@@ -236,7 +236,11 @@ export function IssueDetailPage() {
   // Router state survives a reload and is absent on a pasted URL, which is
   // exactly when the board is the honest answer. `backFrom` refuses
   // anything that is not a stage of this project.
-  const back = backFrom(projectId, (useLocation().state as { from?: unknown } | null)?.from);
+  const location = useLocation();
+  const navigate = useNavigate();
+  const back = backFrom(projectId, (location.state as { from?: unknown } | null)?.from);
+  /// What a card opened from this one is told to come back to.
+  const from = { from: location.pathname };
 
   const [issue, setIssue] = useState<Issue | null>(null);
   const [board, setBoard] = useState<Issue[]>([]);
@@ -779,6 +783,19 @@ export function IssueDetailPage() {
             operator was, and it dropped that stage's filter on the way. */}
         <Link
           to={back.to}
+          onClick={(event) => {
+            // A door that is a memory is walked back through, not pushed onto.
+            // Cards reference each other, so the trail is routinely two or
+            // three deep — and a push arrives at the destination stripped of
+            // the state that says where *it* was opened from, which is how a
+            // card two hops in offered "Board" instead of the stage the
+            // operator had maximized. Modified clicks are left to the browser,
+            // so the destination still opens in its own tab.
+            if (!back.retraces) return;
+            if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+            event.preventDefault();
+            navigate(-1);
+          }}
           className="inline-flex items-center gap-1 font-mono text-[0.72rem] text-ink-soft hover:text-ink"
         >
           <RiArrowLeftLine /> {back.label}
@@ -1277,6 +1294,7 @@ export function IssueDetailPage() {
                 ) : (
                   <Link
                     to={issuePath(projectId, issue.parent)}
+                    state={from}
                     className="underline"
                   >
                     #{issue.parent} · stage {issue.stage}

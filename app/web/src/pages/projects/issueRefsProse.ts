@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import type { MilkdownPlugin } from '@milkdown/kit/ctx';
 import { inlineCodeSchema, linkSchema } from '@milkdown/kit/preset/commonmark';
 import type { MarkType, Node as ProseNode } from '@milkdown/kit/prose/model';
@@ -143,11 +143,12 @@ export function useIssueRefPlugins(projectId: string, issues: Issue[]): Milkdown
     () => new Map(issues.map((issue) => [issue.number, issue.title])),
     [issues],
   );
+  const here = useLocation().pathname;
   const scope = useRef<EditorScope>({ titles, open: () => undefined });
   scope.current = {
     titles,
     open: (number) => {
-      navigate(issuePath(projectId, number));
+      navigate(issuePath(projectId, number), { state: { from: here } });
     },
   };
   const redraw = useRef<() => void>(() => undefined);
