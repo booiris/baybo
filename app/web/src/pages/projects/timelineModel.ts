@@ -366,11 +366,18 @@ export function feedLine(entry: FeedEntry): Span[] {
       if (to == null) return join(who(entry), ' unassigned ', at);
       return join(who(entry), ' assigned ', { text: `@${to.handle}`, strong: true }, ' → ', at);
     }
+    // The actor on a run entry is the run's **own** agent — `start_run` and
+    // the settle both record it that way — and it is the only place the feed
+    // can say who did the work. Left off, every run line in a board-wide feed
+    // was anonymous while the `assigned` line right above it named somebody,
+    // so the feed read as if the assignee had run it. On a board where a
+    // review handover is a reassignment, that is usually the wrong agent.
     case 'run_started':
-      return join(`run #${body.attempt} started on `, at);
+      return join(who(entry), `'s run #${body.attempt} started on `, at);
     case 'run_settled':
       return join(
-        `run #${body.attempt} `,
+        who(entry),
+        `'s run #${body.attempt} `,
         { text: body.status, strong: true },
         ' on ',
         at,

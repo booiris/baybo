@@ -268,6 +268,53 @@ export function UnassignedMark() {
   );
 }
 
+/// Who is *executing*, drawn only when that is not who the card is on.
+///
+/// The card's face is the assignee's — who is on the work, which does not
+/// change while somebody else runs it. But a coordination run (`review`,
+/// `stalled`, `blocked`, `triage`) executes as the board's lead by
+/// construction (`driver::takes_a_lead_question` requires the assignee not be
+/// the lead), and roughly a third of a live board's runs are those. Painting
+/// the ring on the assignee made the card say "@dev-1 is working" for a run
+/// @lead was billing — while the team strip a few pixels above, which reads
+/// `run.agent_id`, lit @lead. One screen, two answers.
+///
+/// So the ring follows the runner and the assignee's face keeps its place. No
+/// handle beside it: a card footer has room for one name, and the one that
+/// belongs there is the assignee's — this face is 18px of who-is-burning-it,
+/// with the sentence in its title.
+export function RunnerFace({
+  handle,
+  src,
+  run,
+  onOpen,
+}: {
+  handle: string;
+  src: string | null;
+  run: AvatarRun;
+  onOpen?: () => void;
+}) {
+  const title = `This card's run is @${handle}'s${runNote(run)}`;
+  const face = <Avatar handle={handle} src={src} run={run} size="sm" title={title} />;
+  if (onOpen === undefined) {
+    return <span className="shrink-0">{face}</span>;
+  }
+  // No `title` on the button: `Avatar` carries it, and nesting the two makes
+  // the tooltip depend on which pixel the cursor is over.
+  return (
+    <button
+      type="button"
+      onClick={(event) => {
+        event.stopPropagation();
+        onOpen();
+      }}
+      className="shrink-0"
+    >
+      {face}
+    </button>
+  );
+}
+
 /// The one word a card says about its run, and the one place it is spelled.
 ///
 /// Both views wrote it inline as `run === 'running' ? 'working' : 'queued'`,

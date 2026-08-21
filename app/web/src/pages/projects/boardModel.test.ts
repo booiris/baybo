@@ -24,7 +24,9 @@ import {
   persistedOrder,
   placementChanged,
   runDuration,
+  liveRunOf,
   runIndicator,
+  runState,
   stageTally,
   resolveDrop,
   resolveLanding,
@@ -270,6 +272,21 @@ describe('runIndicator', () => {
     // holding anything while the rail's dot counted two — and the board is
     // the only surface that dot points at.
     expect(runIndicator([run(4, { status: 'held' })], 4)).toBe('held');
+  });
+
+  it('keeps the run itself, so a card can say who is executing', () => {
+    // The half `runIndicator` throws away. A coordination run — Review,
+    // Stalled, Blocked, Triage — executes as the board's lead while the card
+    // stays on its assignee, so a card that only ever saw the status painted
+    // the ring on @dev-1 for a run @lead was billing, and the team strip a
+    // few pixels away read `run.agent_id` and lit @lead. One screen, two
+    // answers, which is why the two questions read one helper.
+    const active = [run(1, { status: 'running', agent_id: 'lead', trigger: 'review' })];
+    expect(liveRunOf(active, 1)?.agent_id).toBe('lead');
+    expect(liveRunOf(active, 2)).toBeNull();
+    expect(liveRunOf([], 1)).toBeNull();
+    // And the state the indicator reports is the state of that same run.
+    expect(runIndicator(active, 1)).toBe(runState(active[0].status));
   });
 });
 

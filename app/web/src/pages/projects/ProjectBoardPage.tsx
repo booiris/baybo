@@ -76,7 +76,8 @@ import {
   persistedOrder,
   placementChanged,
   resolveDrop,
-  runIndicator,
+  liveRunOf,
+  runState,
   withPin,
   withPositions,
 } from './boardModel';
@@ -89,12 +90,12 @@ import {
   FiledFromChip,
   PinButton,
   PRIORITY_MARK,
+  RunnerFace,
   RunWord,
   SubIssueRing,
   UnassignedMark,
   UnreadPill,
 } from './cardChrome';
-import type { AvatarRun } from './Avatar';
 import { FloatingPanel } from './FloatingPanel';
 import { generatedPortrait, useTeamPortraits, type Portrait } from './portrait';
 import { writeLastProjectId } from './lastProject';
@@ -827,7 +828,7 @@ function BoardColumn({
             <SortableIssueCard
               key={issue.number}
               issue={issue}
-              run={runIndicator(activeRuns, issue.number)}
+              run={liveRunOf(activeRuns, issue.number)}
               team={team}
               portrait={portrait}
               disabled={disabled}
@@ -866,7 +867,7 @@ function SortableIssueCard({
   onTogglePin,
 }: {
   issue: Issue;
-  run: AvatarRun;
+  run: IssueRun | null;
   team: Agent[];
   portrait: Portrait;
   disabled: boolean;
@@ -922,7 +923,7 @@ function IssueCard({
   onTogglePin,
 }: {
   issue: Issue;
-  run?: AvatarRun;
+  run?: IssueRun | null;
   overlay?: boolean;
   team?: Agent[];
   /// Resolved faces from the board. The drag overlay leaves it alone and
@@ -940,6 +941,10 @@ function IssueCard({
 }) {
   const cancelled = issue.cancelled_at_ms != null;
   const priority = PRIORITY_MARK[issue.priority];
+  const state = run === null ? null : runState(run.status);
+  // The ring belongs to whoever is executing, which on a coordination run is
+  // the board's lead and not the card's assignee.
+  const runner = run !== null && run.agent_id !== issue.assignee ? run.agent_id : null;
   return (
     <article
       className={`group bg-surface border-2 border-black rounded-md shadow-brutal-xs px-2.5 py-2 flex flex-col gap-1.5 cursor-pointer ${
@@ -991,7 +996,7 @@ function IssueCard({
           <AssigneeFace
             handle={handleOf(team, issue.assignee)}
             src={portrait(issue.assignee)}
-            run={run}
+            run={runner === null ? state : null}
             onOpen={
               onOpenAgent === undefined
                 ? undefined
@@ -1003,12 +1008,26 @@ function IssueCard({
         ) : (
           <UnassignedMark />
         )}
+        {runner !== null ? (
+          <RunnerFace
+            handle={handleOf(team, runner)}
+            src={portrait(runner)}
+            run={state}
+            onOpen={
+              onOpenAgent === undefined
+                ? undefined
+                : () => {
+                    onOpenAgent(runner);
+                  }
+            }
+          />
+        ) : null}
         {issue.sub_issues != null ? (
           <span className="ml-auto">
             <SubIssueRing progress={issue.sub_issues} />
           </span>
         ) : null}
-        <RunWord run={run} className={issue.sub_issues == null ? 'ml-auto' : ''} />
+        <RunWord run={state} className={issue.sub_issues == null ? 'ml-auto' : ''} />
       </div>
     </article>
   );

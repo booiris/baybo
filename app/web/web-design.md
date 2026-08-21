@@ -817,6 +817,32 @@ they arrive as object URLs via `api/blobs.ts`) and falls back to the generated
 face per agent. Components take the **resolved `src`**, never the blob id. The
 operator and the board are not agents, get no portrait, and keep a monogram.
 
+## The ring goes on whoever is running, not on the assignee
+
+A card's face is its **assignee** — who is on the work, which does not change
+while somebody else runs it. The run's ring is a different question, and
+`cardChrome.RunnerFace` is where the two are told apart: when the live run's
+`agent_id` is not the assignee, the assignee's face draws plain and a second
+18px face carries the ring beside the run word. No handle beside it — a card
+footer has room for one name, and that one is the assignee's.
+
+They differ constantly, not rarely. A coordination run — Review, Stalled,
+Blocked, Triage — executes as the board's `@lead` by construction, and about a
+third of a working board's runs are those. The card used to take the status
+alone (`runIndicator` found the run by number and threw `run.agent_id` away) and
+paint it on the assignee, so a card read "@dev-1 is working" while @lead burned
+the tokens — and the team strip a few pixels above, which keys on `agent_id`,
+lit @lead at the same moment. One screen, two answers.
+
+`boardModel.liveRunOf` is the one home for "what is on this card", with
+`runIndicator` a thin wrapper over it, because the two callers want different
+halves: `boardFilter` wants the state, a card face wants who. The same rule
+reaches three more surfaces — the issue page's header line names the live run's
+own agent (and no longer hides a run on an unstaffed card, which is exactly what
+a Triage wake is), the execution log's row leads with `@handle`, and the
+activity feed's run lines carry their actor like every neighbouring line
+already did.
+
 ## App icon (PWA)
 
 The installed app's icon is `assets/baybo.png` — the line-art robot, black on white, **not** restyled onto a brutalist gold tile. It is the same artwork the iOS app ships as its AppIcon, and one product should not wear two faces in a task switcher. The dashboard's neo-brutalism is the *interface's* language, not the brand's.

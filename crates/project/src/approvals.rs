@@ -151,26 +151,36 @@ impl TimelineApprovalGate {
         }
     }
 
-    async fn card(&self, session_id: &SessionId) -> Option<(baybo_model::ProjectId, i64)> {
+    /// The card this prompt was raised on, and **who raised it**.
+    ///
+    /// The actor is the session's own binding, not the card's assignee. A
+    /// coordination run executes as the board's lead while the card stays on
+    /// its assignee, so a prompt named off the card said "@dev-1 asked you to
+    /// approve" for a call @lead's run made — and the binding is write-once,
+    /// so it answers for the whole session where the card's assignee moves
+    /// under it.
+    async fn asker(
+        &self,
+        session_id: &SessionId,
+    ) -> Option<(baybo_model::ProjectId, i64, IssueActor)> {
         let session = self.sessions.get(session_id).await.ok().flatten()?;
-        session
-            .trigger
-            .issue()
-            .map(|(project, _, number)| (project.clone(), number))
+        let (project, _, number) = session.trigger.issue()?;
+        let actor = session
+            .state
+            .agent_id
+            .clone()
+            .map_or(IssueActor::User, IssueActor::Agent);
+        Some((project.clone(), number, actor))
     }
 }
 
 #[async_trait]
 impl ApprovalGate for TimelineApprovalGate {
     async fn request(&self, req: ApprovalRequest) -> ApprovalOutcome {
-        let Some((project, number)) = self.card(&req.session_id).await else {
+        let Some((project, number, actor)) = self.asker(&req.session_id).await else {
             return self.inner.request(req).await;
         };
         let call_id = req.call_id.clone();
-        let actor = match self.manager.get_issue(&project, number).await {
-            Ok(issue) => issue.assignee.map_or(IssueActor::User, IssueActor::Agent),
-            Err(_) => IssueActor::User,
-        };
         // Which run is parked. The dedupe guard keeps at most one run per
         // issue in flight, so "the unsettled one" is unambiguous — the same
         // reasoning the run waiter relies on.

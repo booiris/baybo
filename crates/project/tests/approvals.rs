@@ -84,12 +84,13 @@ async fn fixture() -> Fixture {
 
 impl Fixture {
     async fn card(&self, title: &str) -> (i64, SessionId) {
-        self.open_card(title, IssueStatus::Backlog, None).await
+        self.open_card(title, IssueStatus::Backlog, None, None)
+            .await
     }
 
-    async fn card_with_a_run(&self, title: &str) -> (i64, SessionId, IssueRunRow) {
-        let lead = self
-            .manager
+    /// This board's `@lead`, which is who every coordination run executes as.
+    async fn lead(&self) -> baybo_model::AgentProfileId {
+        self.manager
             .team(&self.project)
             .await
             .expect("team")
@@ -100,9 +101,18 @@ impl Fixture {
                     .is_some_and(|t| t.handle.as_str() == baybo_project::LEAD_HANDLE)
             })
             .expect("every board opens with a lead")
-            .id;
+            .id
+    }
+
+    async fn card_with_a_run(&self, title: &str) -> (i64, SessionId, IssueRunRow) {
+        let lead = self.lead().await;
         let (number, session) = self
-            .open_card(title, IssueStatus::InProgress, Some(lead))
+            .open_card(
+                title,
+                IssueStatus::InProgress,
+                Some(lead.clone()),
+                Some(lead),
+            )
             .await;
         let run = self
             .manager
@@ -115,11 +125,15 @@ impl Fixture {
         (number, session, run)
     }
 
+    /// `runner` is the agent the session is **bound** to, which is what the
+    /// router does in production and is deliberately allowed to differ from
+    /// the card's assignee: that is exactly the shape of a coordination run.
     async fn open_card(
         &self,
         title: &str,
         status: IssueStatus,
         assignee: Option<baybo_model::AgentProfileId>,
+        runner: Option<baybo_model::AgentProfileId>,
     ) -> (i64, SessionId) {
         let issue = self
             .manager
@@ -156,7 +170,10 @@ impl Fixture {
                 channel: ChannelType::owner(),
                 created_at: now,
                 last_active: now,
-                state: Default::default(),
+                state: baybo_model::SessionState {
+                    agent_id: runner,
+                    ..Default::default()
+                },
                 root_session_id: session_id.clone(),
                 trigger: TriggerSource::Issue {
                     project_id: self.project.clone(),
@@ -214,6 +231,15 @@ impl Fixture {
                 _ => None,
             })
             .collect()
+    }
+}
+
+fn new_member(name: &str) -> baybo_project::NewTeamMember {
+    baybo_project::NewTeamMember {
+        name: name.to_owned(),
+        role: "Reviews what the others build.".to_owned(),
+        framework: None,
+        llm: None,
     }
 }
 
@@ -444,4 +470,64 @@ async fn close_card_prompts_only_touches_its_own_card() {
     b.abort();
     let _ = a.await;
     let _ = b.await;
+}
+
+/// A prompt names the agent whose run raised it, and that is routinely not
+/// the card's assignee.
+///
+/// The gate used to read `issue.assignee`. A coordination run — Review,
+/// Stalled, Blocked, Triage — executes as the board's `@lead` by construction
+/// (`driver::takes_a_lead_question` refuses a card the lead is already on),
+/// and on this board roughly a third of all runs are those. So every prompt
+/// one of them raised was announced on the card under the *assignee's* name:
+/// "@dev-1 asked you to approve a Bash call" for a call @lead made. The
+/// binding on the session is the answer that cannot drift — it is written
+/// once, where the assignee moves under a live run whenever somebody is
+/// handed the card.
+#[tokio::test]
+async fn a_prompt_is_named_for_the_run_that_raised_it_not_the_cards_assignee() {
+    let f = fixture().await;
+    let lead = f.lead().await;
+    let dev = f
+        .manager
+        .hire(&f.project, new_member("dev-1"), None)
+        .await
+        .expect("hire");
+
+    // The card is @dev-1's; the run is the lead's, as a Review wake is.
+    let (number, session) = f
+        .open_card(
+            "Reviewed by somebody else",
+            IssueStatus::Review,
+            Some(dev.id.clone()),
+            Some(lead.clone()),
+        )
+        .await;
+
+    let gate = f.gate(Arc::new(FixedGate(ApprovalOutcome::answered(
+        ApprovalDecision::Deny,
+    ))));
+    gate.request(request(&session, "call-1")).await;
+
+    let actor = f
+        .manager
+        .timeline(&f.project, number)
+        .await
+        .expect("timeline")
+        .into_iter()
+        .find_map(|row| match row.body {
+            IssueEventBody::ApprovalRequested { .. } => Some(row.actor),
+            _ => None,
+        })
+        .expect("the prompt is on the card");
+    assert_eq!(
+        actor,
+        IssueActor::Agent(lead),
+        "the prompt belongs to the run that raised it"
+    );
+    assert_ne!(
+        actor,
+        IssueActor::Agent(dev.id),
+        "and never to whoever happens to be staffed on the card"
+    );
 }

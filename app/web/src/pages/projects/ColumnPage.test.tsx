@@ -66,6 +66,15 @@ const TEAM = [
     lead: false,
     created_at_ms: 0,
   },
+  {
+    id: 'lead-1',
+    handle: 'lead',
+    name: 'Lead',
+    description: '',
+    framework: 'baybo' as const,
+    lead: true,
+    created_at_ms: 0,
+  },
 ];
 
 const ok = { status: 200, ok: true } as Response;
@@ -74,6 +83,7 @@ const refused = { status: 500, ok: false } as Response;
 /// Swapped per test: the archived variant, the fail-once move.
 let projectDto: Project = PROJECT;
 let failMoves = 0;
+let activeRunsDto: unknown[] = [];
 
 function stubClient() {
   return {
@@ -85,7 +95,7 @@ function stubClient() {
         return { data: { items: ISSUES }, error: undefined, response: ok };
       }
       if (path === '/v1/projects/{project_id}/runs') {
-        return { data: { items: [] }, error: undefined, response: ok };
+        return { data: { items: activeRunsDto }, error: undefined, response: ok };
       }
       if (path === '/v1/projects/{project_id}/agents') {
         return { data: { items: TEAM }, error: undefined, response: ok };
@@ -187,10 +197,58 @@ describe('ColumnPage', () => {
   beforeEach(() => {
     projectDto = PROJECT;
     failMoves = 0;
+    activeRunsDto = [];
     stream.onFrame = undefined;
     client.POST.mockClear();
     client.PATCH.mockClear();
     client.GET.mockClear();
+  });
+
+  it("puts the run's ring on whoever is running it, not on the card's assignee", async () => {
+    // A coordination run — Review, Stalled, Blocked, Triage — executes as the
+    // board's lead by construction, while the card stays on its assignee. The
+    // card used to paint the ring on the assignee regardless, so it said
+    // "@dev-1 is working" for a run @lead was billing, while the board's team
+    // strip lit @lead off the same run's `agent_id`.
+    activeRunsDto = [
+      {
+        number: 4,
+        attempt: 2,
+        agent_id: 'lead-1',
+        status: 'running',
+        trigger: 'review',
+        created_at_ms: 0,
+      },
+    ];
+    renderColumn('in_progress');
+    const card = cardOf(await screen.findByText('Under way'));
+
+    // Both faces are on the card: who it is on, and who is burning tokens.
+    expect(within(card).getByTitle(/^@dev-1$/)).toBeTruthy();
+    expect(within(card).getByTitle("This card's run is @lead's — working")).toBeTruthy();
+    // The assignee's face carries no run state, so only one thing shimmers.
+    expect(within(card).queryByTitle('@dev-1 — working')).toBeNull();
+    expect(within(card).getByText('working')).toBeTruthy();
+  });
+
+  it("leaves one face on a card its own assignee is running", async () => {
+    // The ordinary case must look exactly as it did: no second face, and the
+    // ring back on the assignee.
+    activeRunsDto = [
+      {
+        number: 4,
+        attempt: 1,
+        agent_id: 'dev-1',
+        status: 'running',
+        trigger: 'started',
+        created_at_ms: 0,
+      },
+    ];
+    renderColumn('in_progress');
+    const card = cardOf(await screen.findByText('Under way'));
+
+    expect(within(card).getByTitle('@dev-1 — working')).toBeTruthy();
+    expect(within(card).queryByTitle(/This card's run is/)).toBeNull();
   });
 
   it('shows only the routed stage, one card per issue, unread lifted to the front', async () => {

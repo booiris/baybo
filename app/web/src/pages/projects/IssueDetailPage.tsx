@@ -128,6 +128,7 @@ function Row({ label, children }: { label: string; children: ReactNode }) {
 
 function RunRow({
   run,
+  handle,
   onCancel,
   onRead,
   open,
@@ -135,6 +136,12 @@ function RunRow({
   busy,
 }: {
   run: IssueRun;
+  /// Who executed this run. The log's rows were `#attempt · trigger ·
+  /// status · duration · cost` and named nobody, so a card whose assignee
+  /// has moved on — the ordinary shape here, since a review handover is a
+  /// reassignment — left the ledger as the only record of who did the work
+  /// and the ledger did not say either.
+  handle: string;
   onCancel: () => void;
   /// Open (or close) this run's conversation over the card.
   onRead: () => void;
@@ -167,10 +174,15 @@ function RunRow({
     <li className="py-1.5 border-b border-black/15 last:border-0 font-mono text-[0.62rem]">
       <div className="flex items-center gap-2">
         <span className="shrink-0 font-bold">#{run.attempt}</span>
+        {/* Who, then why. One truncation point and one title, because the
+            trigger labels run to 25 characters in a 340px rail and two
+            competing ellipses would cut the handle first — which is the half
+            that cannot be guessed from anywhere else on the page. */}
         <span
           className="min-w-0 flex-1 truncate text-ink-soft"
-          title={RUN_TRIGGER_LABEL[run.trigger]}
+          title={`@${handle} · ${RUN_TRIGGER_LABEL[run.trigger]}`}
         >
+          <span className="font-bold text-ink">@{handle}</span>{' '}
           {RUN_TRIGGER_LABEL[run.trigger]}
         </span>
         <span className={`${RUN_CHIP} ${RUN_TONE[run.status]}`}>{run.status}</span>
@@ -821,7 +833,17 @@ export function IssueDetailPage() {
         >
           {title.trim() === '' ? <span className="text-ink-soft">Untitled</span> : title}
         </span>
-        {live !== null && issue.assignee != null ? (
+        {live !== null ? (
+          // The run's **own** agent, not the card's assignee. A coordination
+          // run executes as the board's lead while the card stays on whoever
+          // is staffed to it, so reading this off the card named @dev-1 for
+          // a run @lead was billing — with the team strip on the board, which
+          // reads `run.agent_id`, lighting @lead at the same moment.
+          //
+          // No `issue.assignee != null` guard either: it hid the live run on
+          // an unstaffed card outright, and a triage wake is exactly a run on
+          // a card nobody is on.
+          //
           // The same run-status frame the board card and the team strip
           // read, so the shimmer means one thing everywhere.
           <span
@@ -829,12 +851,12 @@ export function IssueDetailPage() {
             title={`run #${live.attempt} · ${RUN_TRIGGER_LABEL[live.trigger]} · ${live.status}`}
           >
             <Avatar
-              handle={handleOf(agents, issue.assignee)}
-              src={portrait(issue.assignee)}
+              handle={handleOf(agents, live.agent_id)}
+              src={portrait(live.agent_id)}
               run={live.status === 'running' ? 'running' : live.status === 'held' ? 'held' : 'queued'}
               size="lg"
             />
-            @{handleOf(agents, issue.assignee)}{' '}
+            @{handleOf(agents, live.agent_id)}{' '}
             {live.status === 'running'
               ? 'is working'
               : live.status === 'held'
@@ -1343,6 +1365,7 @@ export function IssueDetailPage() {
                   <RunRow
                     key={run.attempt}
                     run={run}
+                    handle={handleOf(agents, run.agent_id)}
                     busy={saving}
                     open={openAttempt === run.attempt}
                     triggerRef={openTrigger}

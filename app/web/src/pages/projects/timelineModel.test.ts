@@ -290,11 +290,14 @@ describe('feedLine', () => {
 
   it('bolds who acted, which card, and how a run ended', () => {
     // What the eye lands on when the drawer is skimmed rather than read.
+    // The actor on a run entry is the run's own agent, not the card's
+    // assignee — which on a board where a review handover is a reassignment
+    // are routinely different agents.
     expect(bold(feed({ kind: 'run_settled', attempt: 3, status: 'failed', error: 'boom' }))).toEqual(
-      ['failed', '#7'],
+      ['@dev-1', 'failed', '#7'],
     );
     expect(said(feed({ kind: 'run_settled', attempt: 3, status: 'failed', error: 'boom' }))).toBe(
-      'run #3 failed on #7 — boom',
+      "@dev-1's run #3 failed on #7 — boom",
     );
     expect(
       bold(feed({ kind: 'assigned', from: null, to: { id: DEV_ID, handle: 'qa-2' } })),
@@ -309,12 +312,12 @@ describe('feedLine', () => {
       duration_ms: 130_000,
       cost_micros: 40_000,
     } as FeedEntry;
-    expect(said(settled)).toBe('run #1 done on #7 · 2m10s · $0.04');
+    expect(said(settled)).toBe("@dev-1's run #1 done on #7 · 2m10s · $0.04");
 
     // Absent is not zero: a run nobody claimed has no window, and "0s · $0.00"
     // would report that as a run that finished instantly having spent nothing.
     expect(said(feed({ kind: 'run_settled', attempt: 2, status: 'cancelled' }))).toBe(
-      'run #2 cancelled on #7',
+      "@dev-1's run #2 cancelled on #7",
     );
   });
 

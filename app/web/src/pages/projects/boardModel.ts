@@ -513,10 +513,21 @@ export function runState(status: RunStatus): AvatarRun {
   }
 }
 
+/// The run on this card right now, or `null` when nothing is on it.
+///
+/// The one home, because two questions read it and they want different
+/// halves: the filter wants the state, a card face wants *who* is executing.
+/// A helper that answered only the first is why every card painted its run's
+/// ring on the assignee — while a third of this board's runs are the lead's
+/// coordination wakes, which execute as the lead by construction.
+export function liveRunOf(activeRuns: IssueRun[], number: number): IssueRun | null {
+  return activeRuns.find((candidate) => candidate.number === number) ?? null;
+}
+
 /// What a card's live run is doing, or `null` when nothing is on it.
 export function runIndicator(activeRuns: IssueRun[], number: number): AvatarRun {
-  const run = activeRuns.find((candidate) => candidate.number === number);
-  return run === undefined ? null : runState(run.status);
+  const run = liveRunOf(activeRuns, number);
+  return run === null ? null : runState(run.status);
 }
 
 /// How long something took. One spelling, because the execution log measures

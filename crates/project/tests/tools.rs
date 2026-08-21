@@ -607,11 +607,15 @@ mod approvals {
         }
     }
 
+    /// An issue session as the router mints one: bound to the agent that
+    /// runs it. The binding is what names a prompt on the card, so a fixture
+    /// that left it unset would let the gate answer `the operator` and pass.
     async fn issue_session(
         store: &baybo_storage::Store,
         project: &ProjectId,
         number: i64,
         issue_id: IssueId,
+        agent: &baybo_model::AgentProfileId,
     ) -> SessionId {
         let now = chrono::Utc::now();
         let id = SessionId::new();
@@ -625,7 +629,10 @@ mod approvals {
             channel: baybo_model::ChannelType::owner(),
             created_at: now,
             last_active: now,
-            state: baybo_model::SessionState::default(),
+            state: baybo_model::SessionState {
+                agent_id: Some(agent.clone()),
+                ..baybo_model::SessionState::default()
+            },
             root_session_id: id.clone(),
             trigger: TriggerSource::Issue {
                 project_id: project.clone(),
@@ -706,7 +713,8 @@ mod approvals {
             Arc::clone(&store.session),
         );
 
-        let session = issue_session(&store, &project.id, issue.number, issue.id.clone()).await;
+        let session =
+            issue_session(&store, &project.id, issue.number, issue.id.clone(), &lead).await;
         let decision = gate.request(request(&session, "c1")).await.decision;
 
         assert_eq!(decision, ApprovalDecision::Deny);
@@ -801,7 +809,7 @@ mod approvals {
                     attachments: Vec::new(),
                     status: baybo_store::project::IssueStatus::InProgress,
                     priority: baybo_store::project::IssuePriority::None,
-                    assignee: Some(lead),
+                    assignee: Some(lead.clone()),
                     parent: None,
                     stage: 0,
                     source_key: None,
@@ -817,7 +825,8 @@ mod approvals {
             Arc::clone(&manager),
             Arc::clone(&store.session),
         );
-        let session = issue_session(&store, &project.id, issue.number, issue.id.clone()).await;
+        let session =
+            issue_session(&store, &project.id, issue.number, issue.id.clone(), &lead).await;
 
         let parked = tokio::spawn({
             let req = request(&session, "c7");

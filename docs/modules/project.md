@@ -208,6 +208,7 @@ three questions once each:
 2. **Dedupe** — the store's partial unique index. A refused write means the
    issue already has a run in flight; the caller sees `None`, which is the guard
    working, not a failure.
+
 3. **Budget** — `budget::headroom`, which is **two ceilings, not one**: a
    daily money limit and a daily token limit, both optional, both measured
    over the same UTC day and the same rows, and the board stops when
@@ -1346,6 +1347,18 @@ resolved server-side rather than against the live roster.
 what it sees onto the issue's timeline — `ApprovalRequested` before the prompt
 is answered, `ApprovalResolved` after, including on the gate's own
 deny-on-timeout. Installed once over the channel, not per run.
+
+**The prompt is named for the session that raised it, never for the card.**
+`asker` reads the actor off `SessionState::agent_id`, which the router writes
+once when it mints the issue's session. Reading `issue.assignee` instead — which
+is what it did — gets the wrong agent in the ordinary case, not an exotic one: a
+coordination run executes as the board's `@lead` by construction
+(`driver::takes_a_lead_question` refuses a card the lead is already on), so
+every prompt a Review, Stalled, Blocked or Triage run raised was announced under
+the assignee's name. The binding is also the only one of the two that cannot
+drift — the assignee moves under a live run every time somebody is handed the
+card, while a write-once binding answers for the whole session. It costs one
+fewer store read as well: the session was already loaded to find the card.
 
 **Three closers, one claim.** The gate keeps an in-memory ledger of the prompts
 this process has announced and not yet resolved. Taking an entry out of it *is*

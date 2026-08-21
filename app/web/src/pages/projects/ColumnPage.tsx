@@ -48,7 +48,8 @@ import {
   moveAnnouncement,
   moveCard,
   persistedOrder,
-  runIndicator,
+  liveRunOf,
+  runState,
   stageTally,
   statusOf,
   updatedAgo,
@@ -74,12 +75,12 @@ import {
   FiledFromChip,
   PinButton,
   PRIORITY_MARK,
+  RunnerFace,
   RunWord,
   SubIssueRing,
   UnassignedMark,
   UnreadPill,
 } from './cardChrome';
-import type { AvatarRun } from './Avatar';
 import { handleOf } from './teamModel';
 import { invalidateAttention } from './useAttention';
 import { ToastStack, useToasts } from './Toasts';
@@ -544,7 +545,7 @@ export function ColumnPage() {
                             issue={issue}
                             to={issuePath(projectId, issue.number)}
                             from={here}
-                            run={runIndicator(activeRuns, issue.number)}
+                            run={liveRunOf(activeRuns, issue.number)}
                             team={team}
                             portrait={portrait}
                             readOnly={archived}
@@ -742,7 +743,7 @@ function IssueTile({
   /// the board. Carried in router state, which survives a reload and is
   /// absent on a pasted URL — where the board is the honest answer.
   from: string;
-  run: AvatarRun;
+  run: IssueRun | null;
   team: Agent[];
   portrait: Portrait;
   readOnly: boolean;
@@ -758,6 +759,10 @@ function IssueTile({
     issue.last_run_failed ||
     issue.filed_from != null ||
     (hasDeliverable(issue) && issue.branch != null);
+  const state = run === null ? null : runState(run.status);
+  // The ring belongs to whoever is executing, which on a coordination run is
+  // the board's lead and not the card's assignee.
+  const runner = run !== null && run.agent_id !== issue.assignee ? run.agent_id : null;
   return (
     <article
       // Two things this card must not do, both of which cost the Move
@@ -864,7 +869,7 @@ function IssueTile({
             <AssigneeFace
               handle={handleOf(team, issue.assignee)}
               src={portrait(issue.assignee)}
-              run={run}
+              run={runner === null ? state : null}
               onOpen={() => {
                 onOpenAgent(issue.assignee ?? '');
               }}
@@ -872,9 +877,19 @@ function IssueTile({
           ) : (
             <UnassignedMark />
           )}
+          {runner !== null ? (
+            <RunnerFace
+              handle={handleOf(team, runner)}
+              src={portrait(runner)}
+              run={state}
+              onOpen={() => {
+                onOpenAgent(runner);
+              }}
+            />
+          ) : null}
         </span>
         {issue.sub_issues != null ? <SubIssueRing progress={issue.sub_issues} /> : null}
-        <RunWord run={run} />
+        <RunWord run={state} />
         {/* The stage this card is in is the page's own heading, so the chip
             wears the action instead of the value. Its press must not fall
             through to the card, which opens the issue. */}
