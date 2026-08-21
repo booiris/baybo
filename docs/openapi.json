@@ -9739,6 +9739,32 @@
           {
             "type": "object",
             "required": [
+              "trigger",
+              "kind"
+            ],
+            "properties": {
+              "attempt": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int64",
+                "description": "The attempt holding the card's slot. Absent when the row could\nnot be read back."
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "run_refused"
+                ]
+              },
+              "trigger": {
+                "$ref": "#/components/schemas/RunTriggerDto"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
               "reason",
               "kind"
             ],

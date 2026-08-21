@@ -6,9 +6,9 @@ use baybo_model::{
 };
 use baybo_project::{NewIssueRequest, NewProject, ProjectError, ProjectManager};
 use baybo_store::project::{
-    AttentionCounts, DEFAULT_MAX_PARALLEL_ISSUE_RUNS, IssueActor, IssueEventRow, IssuePriority,
-    IssueRow, IssueRunRow, IssueStatus, IssueUpdate, NewIssue, NewIssueEvent, NewIssueRun,
-    ProjectRow, ProjectUpdate, Result as StoreResult, RunStatus, RunTrigger,
+    AttentionCounts, DEFAULT_MAX_PARALLEL_ISSUE_RUNS, IssueActor, IssueEventBody, IssueEventRow,
+    IssuePriority, IssueRow, IssueRunRow, IssueStatus, IssueUpdate, NewIssue, NewIssueEvent,
+    NewIssueRun, ProjectRow, ProjectUpdate, Result as StoreResult, RunStatus, RunTrigger,
 };
 use baybo_workspace::WorkspacePaths;
 use chrono::{DateTime, Utc};
@@ -1072,6 +1072,87 @@ async fn assigning_work_already_in_flight_starts_it_and_never_twice() {
         "an issue holds one run at a time"
     );
     assert_eq!(f.manager.list_runs(&p.id, 1).await.expect("runs").len(), 1);
+}
+
+/// A swallowed handover says so on the card.
+///
+/// The refusal itself is the dedupe guard working, but the write that
+/// implied the run has already committed: the card names @dev-2 and the
+/// timeline carries the `Assigned` entry, while nothing started. Before
+/// this entry existed the only trace was a log line, so the board asserted
+/// a handover that never happened and `RunTrigger::Assigned` — which exists
+/// precisely to stop that — was a no-op in the one case it is for.
+#[tokio::test]
+async fn a_run_the_cards_slot_refused_is_recorded_on_the_card() {
+    let f = fixture().await;
+    let p = f.manager.create_project(new_project("p")).await.expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    let other = seed_agent(&f, &p.id, "dev-2", AgentFramework::Baybo).await;
+
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev.clone()),
+                ..new_issue("already running")
+            },
+        )
+        .await
+        .expect("issue");
+
+    f.manager
+        .update_issue(
+            &p.id,
+            1,
+            IssueActor::User,
+            IssueUpdate {
+                assignee: Some(Some(other.clone())),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("reassign");
+
+    let timeline = f.manager.timeline(&p.id, 1).await.expect("timeline");
+
+    // The handover itself stood — that is what makes the silence a defect
+    // rather than a refused write.
+    assert!(
+        timeline
+            .iter()
+            .any(|e| matches!(&e.body, IssueEventBody::Assigned { to, .. } if to.as_ref() == Some(&other))),
+        "the reassignment was recorded"
+    );
+
+    let refused = timeline
+        .iter()
+        .find(|e| matches!(e.body, IssueEventBody::RunRefused { .. }))
+        .expect("the card says the run it implied was not started");
+    assert_eq!(
+        refused.actor,
+        IssueActor::System,
+        "the board refused it, not the operator who asked"
+    );
+    let IssueEventBody::RunRefused { trigger, attempt } = &refused.body else {
+        unreachable!("matched above")
+    };
+    assert_eq!(
+        *trigger,
+        RunTrigger::Assigned,
+        "it names the run not started"
+    );
+    assert_eq!(
+        *attempt,
+        Some(1),
+        "and names the run holding the slot, which is the half you can act on"
+    );
+
+    // Still one run: the entry is a record, not a second attempt.
+    assert_eq!(f.manager.list_runs(&p.id, 1).await.expect("runs").len(), 1);
+    assert_eq!(f.dispatched.lock().len(), 1);
 }
 
 #[tokio::test]

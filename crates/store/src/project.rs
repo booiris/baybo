@@ -404,6 +404,26 @@ pub enum IssueEventBody {
         status: RunStatus,
         error: Option<String>,
     },
+    /// A door started a run and the card's live-run slot refused it.
+    ///
+    /// The board write that implied the run has already committed by the
+    /// time the ledger says no — a drag is in the new column, a handover
+    /// names the new agent, a stage says it opened — so without this entry
+    /// the card records a change that nothing acted on, and the only trace
+    /// is a log line the operator never sees. It is also the only thing in
+    /// the tree that counts how often the dedupe guard refuses anything.
+    ///
+    /// Deliberately not a `Comment`: a `System`-actored comment satisfies
+    /// `comments::somebody_asked_for_more`, so the settling run would wake
+    /// its assignee on the board's own note.
+    RunRefused {
+        /// The run that was not started.
+        trigger: RunTrigger,
+        /// Which attempt is holding the slot, addressed the way the card
+        /// addresses every other run. `None` when the row could not be read
+        /// back — the refusal still happened and is still worth saying.
+        attempt: Option<i64>,
+    },
     Blocked {
         reason: String,
     },
@@ -503,6 +523,7 @@ impl IssueEventBody {
             IssueEventBody::RunStarted { .. } => "run_started",
             IssueEventBody::RunInterrupted { .. } => "run_interrupted",
             IssueEventBody::RunSettled { .. } => "run_settled",
+            IssueEventBody::RunRefused { .. } => "run_refused",
             IssueEventBody::Blocked { .. } => "blocked",
             IssueEventBody::Unblocked => "unblocked",
             IssueEventBody::Cancelled => "cancelled",

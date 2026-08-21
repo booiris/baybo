@@ -647,6 +647,13 @@ pub enum IssueEventBodyDto {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+    RunRefused {
+        trigger: RunTriggerDto,
+        /// The attempt holding the card's slot. Absent when the row could
+        /// not be read back.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt: Option<i64>,
+    },
     Blocked {
         reason: String,
     },
@@ -720,6 +727,10 @@ impl IssueEventBodyDto {
                 resolution: resolution.into(),
             },
             IssueEventBody::StageCompleted { stage } => Self::StageCompleted { stage },
+            IssueEventBody::RunRefused { trigger, attempt } => Self::RunRefused {
+                trigger: trigger.into(),
+                attempt,
+            },
             IssueEventBody::Filed { number } => Self::Filed { number },
             IssueEventBody::BudgetExhausted {
                 spent_micros,

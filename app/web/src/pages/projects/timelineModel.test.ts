@@ -43,6 +43,20 @@ describe('describeEvent', () => {
     expect(describeEvent({ kind: 'assigned' })).toBe('unassigned it');
   });
 
+  it('says a swallowed run was not started, and which run has the card', () => {
+    // The refusal is the dedupe guard working, but the write that implied
+    // the run has already committed — the card names the new agent, or sits
+    // in its new column — so the card has to say the run did not happen.
+    // Named for the holder, because that is the half a reader can act on.
+    expect(
+      describeEvent({ kind: 'run_refused', trigger: 'assigned', attempt: 4 }),
+    ).toBe('did not start a run (assigned) — run #4 still has this card');
+    // A read failure still records the refusal; it just cannot name who.
+    expect(describeEvent({ kind: 'run_refused', trigger: 'started' })).toBe(
+      'did not start a run (moved to In Progress) — this card already had one in flight',
+    );
+  });
+
   it('carries a run’s failure reason, and omits the dash when there is none', () => {
     expect(
       describeEvent({ kind: 'run_settled', attempt: 3, status: 'failed', error: 'ran out' }),
@@ -215,6 +229,10 @@ describe('eventTone', () => {
     // that died with its run is background noise.
     expect(eventTone({ kind: 'approval_resolved', call_id: 'c', decision: 'deny', resolution: 'timed_out' })).toBe('warn');
     expect(eventTone({ kind: 'approval_resolved', call_id: 'c', decision: 'deny', resolution: 'abandoned' })).toBe('muted');
+    // Warn, not the `default:` arm's muted. This switch has no `never` stop,
+    // so a new kind compiles green and reads as background noise — which is
+    // the wrong answer for a card that records a change nothing acted on.
+    expect(eventTone({ kind: 'run_refused', trigger: 'assigned', attempt: 4 })).toBe('warn');
   });
 
   it('falls back to a neutral dot rather than throwing on an unknown entry', () => {
@@ -318,6 +336,21 @@ describe('feedLine', () => {
     // would report that as a run that finished instantly having spent nothing.
     expect(said(feed({ kind: 'run_settled', attempt: 2, status: 'cancelled' }))).toBe(
       "@dev-1's run #2 cancelled on #7",
+    );
+  });
+
+  it('names the card and the run holding it when a run was refused', () => {
+    // `feedLine`'s switch also ends in a plain `default:`, so this line
+    // exists at all only because it was written by hand — the compiler
+    // would have accepted the entry vanishing from the feed.
+    expect(said(feed({ kind: 'run_refused', trigger: 'assigned', attempt: 4 }))).toBe(
+      '#7 did not start a run (assigned) — run #4 still has it',
+    );
+    // The actor is always the board here, so the line names the card, not
+    // a who — and the card is what is bold, being the thing to press.
+    expect(bold(feed({ kind: 'run_refused', trigger: 'assigned', attempt: 4 }))).toEqual(['#7']);
+    expect(said(feed({ kind: 'run_refused', trigger: 'stage_barrier' }))).toBe(
+      '#7 did not start a run (stage barrier) — it already had one',
     );
   });
 

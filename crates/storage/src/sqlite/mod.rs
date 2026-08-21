@@ -1496,6 +1496,26 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                 -- turn' as unambiguously its own.
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_issue_runs_live
                     ON issue_runs(issue_id) WHERE settled_at IS NULL;
+                -- The narrower half of that guard, stated separately because
+                -- two rules downstream depend on *it* rather than on the one
+                -- above, and would break silently if the one above were ever
+                -- widened to allow a card more than one live run:
+                --   * `RUN_COST_WINDOW` attributes a cost row by session and
+                --     claim→settle window, and one session is shared by every
+                --     run the same agent makes on a card
+                --     (`runs::session_run_to_continue`), so two live runs of
+                --     one agent give two overlapping windows over one
+                --     transcript and bill the card twice;
+                --   * the run waiter matches a terminal turn on session and
+                --     input kind alone (`is_our_run`), so those same two runs
+                --     settle each other's rows.
+                -- Redundant today and deliberately so: it is the constraint
+                -- those two rules actually need, and a runtime check could
+                -- not replace it — at the write site the index above already
+                -- refuses first, so such a check can never fire until the
+                -- thing it defends against has already happened.
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_issue_runs_live_agent
+                    ON issue_runs(issue_id, agent_id) WHERE settled_at IS NULL;
                 -- The unfinished slice of a table that only grows: at most
                 -- one row per live issue, and every sweep works from it.
                 -- The process-start requeue rewrites it whole, `held_runs`
@@ -1763,6 +1783,77 @@ mod tests {
     /// An open pool must already hold every connection, leaving none to open
     /// lazily later.
     ///
+    /// The narrow guard the cost window and the run waiter actually depend
+    /// on is enforced, and is not the same constraint as the card's slot.
+    ///
+    /// `idx_issue_runs_live` is what stops a *card* holding two live runs;
+    /// `idx_issue_runs_live_agent` is what stops one *agent* holding two on
+    /// one card. The second is what makes `RUN_COST_WINDOW` and `is_our_run`
+    /// unambiguous — both key on the session, and one session is shared by
+    /// every run an agent makes on a card (`runs::session_run_to_continue`),
+    /// so two live runs of one agent would double-bill the card and settle
+    /// each other's rows.
+    ///
+    /// The wide index subsumes the narrow one today, so the narrow one can
+    /// only be *observed* with the wide one out of the way — which is also
+    /// exactly the future it is written down for. Dropping it here is the
+    /// test standing in for that change: widen the card's slot and this must
+    /// still refuse. A runtime check could not stand in for it, because it
+    /// could never fire while the wider index refuses first.
+    #[tokio::test]
+    async fn one_agent_may_hold_only_one_live_run_on_a_card() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pool = SqlitePool::open(dir.path().join("t.db"))
+            .await
+            .expect("open");
+        pool.interact("test.init_db", init_db)
+            .await
+            .expect("schema");
+
+        async fn run(
+            pool: &SqlitePool,
+            id: &'static str,
+            agent: &'static str,
+            settled: Option<i64>,
+        ) -> Result<usize, StorageError> {
+            pool.interact("test.insert_run", move |conn| {
+                Ok(conn.execute(
+                    "INSERT INTO issue_runs (id, issue_id, project_id, number, agent_id, \
+                     trigger, status, attempt, created_at, settled_at) \
+                     VALUES (?1, 'i-1', 'p-1', 1, ?2, 'comment', 'queued', 1, 1, ?3)",
+                    rusqlite::params![id, agent, settled],
+                )?)
+            })
+            .await
+        }
+
+        // As shipped, the card's own slot is what refuses — whoever asks.
+        run(&pool, "run-1", "agent-1", None).await.expect("first");
+        run(&pool, "run-2", "agent-2", None)
+            .await
+            .expect_err("one card, one live run");
+
+        // Now widen the card's slot, which is the change this index exists
+        // to survive, and the per-agent guard must still hold.
+        pool.interact("test.widen", |conn| {
+            Ok(conn.execute_batch("DROP INDEX idx_issue_runs_live;")?)
+        })
+        .await
+        .expect("drop the wide index");
+
+        run(&pool, "run-3", "agent-2", None)
+            .await
+            .expect("a second agent may now hold a run on the card");
+        run(&pool, "run-4", "agent-1", None)
+            .await
+            .expect_err("but one agent still may not hold two on it");
+        // Settled rows sit outside the partial index entirely, so a card's
+        // history stays unbounded: the guard is on what is *unfinished*.
+        run(&pool, "run-5", "agent-1", Some(2))
+            .await
+            .expect("a settled row is not in the index at all");
+    }
+
     /// The one path that opens a connection after `build` — the replacement
     /// branch in [`PoolInner::take`] — exists solely to recover from a
     /// panicking closure, and must stay unreached in ordinary service.

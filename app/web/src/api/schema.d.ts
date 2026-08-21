@@ -2766,6 +2766,16 @@ export interface components {
             kind: "run_settled";
             status: components["schemas"]["RunStatusDto"];
         } | {
+            /**
+             * Format: int64
+             * @description The attempt holding the card's slot. Absent when the row could
+             *     not be read back.
+             */
+            attempt?: number | null;
+            /** @enum {string} */
+            kind: "run_refused";
+            trigger: components["schemas"]["RunTriggerDto"];
+        } | {
             /** @enum {string} */
             kind: "blocked";
             reason: string;

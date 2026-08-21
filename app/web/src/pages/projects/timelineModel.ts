@@ -2,6 +2,7 @@ import type { components, paths } from '../../api/schema';
 
 import {
   COLUMN_LABEL,
+  RUN_TRIGGER_LABEL,
   formatDuration,
   unsettledRun,
   type Agent,
@@ -58,6 +59,10 @@ export function eventTone(body: IssueEventBody): Tone {
     case 'approval_requested':
     case 'budget_exhausted':
     case 'token_budget_exhausted':
+    // Warn, not muted: the write that implied this run stands on the card,
+    // and the work it implied did not happen. That is the shape of a thing
+    // the operator has to look at, not a thing the board did routinely.
+    case 'run_refused':
       return 'warn';
     case 'unblocked':
     case 'stage_completed':
@@ -193,6 +198,13 @@ export function describeEvent(body: IssueEventBody): string | null {
       }
     case 'stage_completed':
       return `stage ${body.stage} finished — every step in it is done or called off`;
+    case 'run_refused':
+      // Named for the run holding the slot, because that is the half a
+      // reader can act on: the card already shows the move or the handover
+      // that was made, and this is the run it implied not happening.
+      return body.attempt != null
+        ? `did not start a run (${RUN_TRIGGER_LABEL[body.trigger]}) — run #${body.attempt} still has this card`
+        : `did not start a run (${RUN_TRIGGER_LABEL[body.trigger]}) — this card already had one in flight`;
     case 'filed':
       return `filed #${body.number} out of this card's work`;
     case 'budget_exhausted':
@@ -374,6 +386,14 @@ export function feedLine(entry: FeedEntry): Span[] {
     // review handover is a reassignment, that is usually the wrong agent.
     case 'run_started':
       return join(who(entry), `'s run #${body.attempt} started on `, at);
+    // The actor here is always the board, so it is left off: what the line
+    // has to name is the card and the run that took its slot.
+    case 'run_refused':
+      return join(
+        at,
+        ` did not start a run (${RUN_TRIGGER_LABEL[body.trigger]})`,
+        body.attempt != null ? ` — run #${body.attempt} still has it` : ' — it already had one',
+      );
     case 'run_settled':
       return join(
         who(entry),

@@ -393,6 +393,40 @@ impl ProjectManager {
         let run = match self.store.enqueue_run(&entry).await {
             Ok(run) => run,
             Err(baybo_store::StorageError::Conflict(reason)) => {
+                // The refusal is the guard working. What is not working is
+                // the silence: the write that *implied* this run has
+                // already committed — the card is in its new column, or
+                // names its new agent, or says a stage opened — so the
+                // card has to record that the run it promised was not
+                // started. Every trigger, coordination included: this
+                // entry is also the only count of how often the card's one
+                // run slot refuses anything, and a count that saw half the
+                // refusals could not answer what it exists to answer.
+                //
+                // Named for the row holding the slot, because "refused" is
+                // not something an operator can act on and "run #4 has it"
+                // is. A read failure still records the refusal — it
+                // happened either way.
+                let held_by = match self.live_run(issue).await {
+                    Ok(run) => run.map(|run| run.attempt),
+                    Err(e) => {
+                        tracing::warn!(
+                            issue = issue.number,
+                            error = %e,
+                            "could not read which run holds this card's slot"
+                        );
+                        None
+                    }
+                };
+                self.record(
+                    issue,
+                    IssueActor::System,
+                    IssueEventBody::RunRefused {
+                        trigger,
+                        attempt: held_by,
+                    },
+                )
+                .await;
                 if trigger.is_coordination() {
                     tracing::debug!(
                         issue = issue.number,
@@ -400,11 +434,10 @@ impl ProjectManager {
                         "issue already has a run in flight; not starting a second"
                     );
                 } else {
-                    // A refused human command deserves more than a debug
-                    // line: the drag or assignment itself succeeded, so
-                    // nothing on the board says the run it implied was
-                    // swallowed — most likely by a live coordination run
-                    // holding the card's slot.
+                    // A refused human command is louder than a swept-up
+                    // lead question: the drag or assignment itself
+                    // succeeded, and what took the slot was most likely a
+                    // live coordination run.
                     tracing::info!(
                         issue = issue.number,
                         ?trigger,

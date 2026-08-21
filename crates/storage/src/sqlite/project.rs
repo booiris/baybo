@@ -172,8 +172,11 @@ const UNSEEN_FAILURE_PREDICATE: &str =
 /// only unambiguous because of two invariants that live elsewhere, and it
 /// silently double-counts if either is relaxed:
 ///
-/// - `idx_issue_runs_live` allows at most one unsettled run per issue, so
-///   two windows on one session cannot overlap.
+/// - `idx_issue_runs_live_agent` allows at most one unsettled run per
+///   (issue, agent), so two windows on one session cannot overlap. That is
+///   the narrow constraint this depends on, and it is stated separately
+///   from `idx_issue_runs_live` — which allows one per *issue* — precisely
+///   so that widening the card's slot does not silently take this with it.
 /// - `Router::issue_session` mints one session per card **per agent**, so
 ///   a session never spans two cards.
 ///

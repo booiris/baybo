@@ -209,6 +209,34 @@ three questions once each:
    issue already has a run in flight; the caller sees `None`, which is the guard
    working, not a failure.
 
+   **And the card says so** (`IssueEventBody::RunRefused`). The refusal is
+   correct, but the write that *implied* the run has already committed by
+   the time the ledger says no — the card is in its new column, or names
+   its new agent, or has just said a stage opened — so without an entry the
+   board asserts a change that nothing acted on, and the only trace is a log
+   line nobody reads. `RunTrigger::Assigned` exists precisely to stop "the
+   board showing @dev-2 on work only @dev-1 ever touched", and the dedupe
+   turns it into a no-op in exactly the case it is for: the actor best
+   placed to hand a live card over is the one holding its run slot.
+
+   The entry names the **attempt holding the slot**, not just the refusal:
+   "refused" is not something an operator can act on and "run #4 still has
+   this card" is. It is recorded for every trigger, coordination included —
+   this is also the only count in the tree of how often a card's one run
+   slot refuses anything, and a count that saw half the refusals could not
+   answer the question it exists for. Deliberately not a `Comment`: a
+   `System`-actored comment satisfies `comments::somebody_asked_for_more`,
+   so the settling run would wake its assignee on the board's own note.
+
+   What the entry does **not** do is bring the run back. `append_event`
+   never touches `issues.updated_at`, so it re-arms nothing; recovery, where
+   it exists at all, is the door's own write moving `driver::last_activity`
+   and the lead being asked a `Stalled` question about it — a billed
+   coordination run in place of the work, capped at `MAX_ASKS_PER_CARD_STATE`.
+   On a swallowed stage barrier there is no recovery to speak of: the entry
+   lands on the **parent**, whose `updated_at` the child's write does not
+   move, and what the barrier had to say — "stage N opened, drive what comes
+   next" — is never re-delivered by anything.
 3. **Budget** — `budget::headroom`, which is **two ceilings, not one**: a
    daily money limit and a daily token limit, both optional, both measured
    over the same UTC day and the same rows, and the board stops when
@@ -425,12 +453,21 @@ window anyway, which is two homes for one rule.
 The window is unambiguous **only** because of two invariants that live
 elsewhere, and it silently double-counts if either is relaxed:
 
-- `idx_issue_runs_live` permits at most one unsettled run per issue, so two
-  windows on one session cannot overlap.
+- `idx_issue_runs_live_agent` permits at most one unsettled run per
+  (issue, agent), so two windows on one session cannot overlap.
 - `Router::issue_session` mints one session per card *per agent*, so a
   session never spans two cards.
 
-Allow parallel runs on a card, or one session across cards, and
+The first of those is deliberately **not** `idx_issue_runs_live`, which is
+the card's own slot and is wider. The two are the same constraint today —
+one live run per card implies one per agent on it — and are written down
+separately because only the narrow one is what this window and the run
+waiter need. Widening the card's slot, which is what any lane scheme does,
+must not silently take the narrow guard with it; the redundant index is
+where that is caught, and a runtime check could not stand in for it,
+because it could never fire while the wider index refuses first.
+
+Allow one agent two live runs on a card, or one session across cards, and
 `cost_records.run_id` becomes the right answer.
 
 `started_at` is therefore load-bearing beyond the timeline: it is the

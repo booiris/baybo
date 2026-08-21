@@ -179,6 +179,20 @@ fn narrate(body: &IssueEventBody, known: &[baybo_store::AgentProfileRow]) -> Str
             Some(error) => format!("run #{attempt} {}: {error}", status.as_str()),
             None => format!("run #{attempt} {}", status.as_str()),
         },
+        // Worth saying to an agent, not only to the operator: an
+        // `IssueUpdate` that moved a card or handed it over is answered
+        // `ok`, and the run it implied being refused is the one thing the
+        // tool's answer cannot tell it.
+        IssueEventBody::RunRefused { trigger, attempt } => match attempt {
+            Some(attempt) => format!(
+                "a run ({}) was not started — run #{attempt} still holds this card",
+                trigger.as_str()
+            ),
+            None => format!(
+                "a run ({}) was not started — this card was busy",
+                trigger.as_str()
+            ),
+        },
         IssueEventBody::Filed { number } => format!("filed #{number} from this card's work"),
         IssueEventBody::Blocked { reason } => format!("blocked it: {reason}"),
         IssueEventBody::Unblocked => "unblocked it".to_owned(),
