@@ -899,8 +899,7 @@ pub struct ToolCallInfo {
 
 /// Token usage statistics for a single LLM call.
 ///
-/// Cache fields are zero when unreported. OpenAI subscription reports reads
-/// but no creation count.
+/// Cache fields are zero when unreported.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub input_tokens: usize,

@@ -158,10 +158,11 @@ Content-Type: application/json
   "instructions": "<system prompt>",
   "input": [...],                     // ResponseItem[]
   "tools": [...],                     // tool definitions (Responses-API shape)
-  "tool_choice": "auto",
+  "tool_choice": "auto",                // "none" when the caller forbids tool use
   "parallel_tool_calls": true,
   "stream": true,
   "store": false,
+  "prompt_cache_key": "<session id>",   // cache bucket; omitted when the caller set none
   "include": ["reasoning.encrypted_content"]  // only when reasoning effort is set (with "reasoning": {effort, summary: "auto"})
 }
 ```
@@ -169,6 +170,25 @@ Content-Type: application/json
 Response is SSE; we parse `response.output_text.delta`, `response.reasoning*.delta`, `response.output_item.added` / `response.output_item.done`, `response.function_call_arguments.*`, `response.completed`, `response.error` events into `StreamEvent`s.
 
 `originator: codex_cli_rs` is mandatory — Codex's edge rejects requests without it. Yes we're impersonating Codex CLI; the OpenClaw docs note this is the "explicitly supported" external-tool path. We do **not** spoof `User-Agent: codex_cli_rs/...` — the Responses call sends no User-Agent at all, and only the OAuth endpoints carry baybo's own UA. This is the minimum needed for the route, no more.
+
+### Prompt cache
+
+`prompt_cache_key` routes the lookup; it does not set a lifetime. The endpoint
+rejects every field it doesn't know with `400 Unsupported parameter`, and it
+knows neither `prompt_cache_retention` nor `prompt_cache_options` — both were
+tried against the live route and both 400.
+
+Usage arrives on `response.completed` as `input_tokens` with an
+`input_tokens_details` breakdown: `cached_tokens` read from the cache,
+`cache_write_tokens` written to it. Both are subsets of `input_tokens`, which is
+the split `compute_cost_usd` wants. The route has so far reported writes as 0 on
+calls that demonstrably populated the cache, so treat a zero there as "not
+reported", not as "nothing was written".
+
+Hits are best-effort even with a key: an identical prefix re-sent under the same
+key seconds later still misses often enough to see in a handful of calls, and a
+board run's cache ratio is far below what a provider with a declared cache
+contract gives. Budget for misses; don't model this route as reliably cached.
 
 ### Conversion: rig `CompletionRequest` → Codex `ResponsesApiRequest`
 
@@ -184,6 +204,8 @@ Response is SSE; we parse `response.output_text.delta`, `response.reasoning*.del
 | `tools` | `tools` | translate tool schema to the flat Responses-API shape (`{type: "function", name, description, parameters}` — no nested `function` object) |
 | `temperature` / `max_tokens` | dropped | Codex Responses rejects `temperature` with 400 "Unsupported parameter: temperature" (regression-tested: `body_drops_temperature_for_codex_responses`); `max_tokens` is likewise not forwarded |
 | (none) | `parallel_tool_calls: true`, `stream: true`, `store: false` | hard-coded |
+| `ChatRequest::tool_choice` | `tool_choice` | `auto` / `none`; `BoundBilledLlm` leaves it as the caller set it |
+| `ChatRequest::prompt_cache_key` | `prompt_cache_key` | which cache bucket the lookup routes to. `BoundBilledLlm` fills it with the session id, so concurrent runs stop evicting each other; probes carry their own constant. Omitted when unset |
 
 Tool-call return path: Responses API emits `response.function_call_arguments.delta` events; we accumulate per `call_id` (registered from `response.output_item.added`), finalise on `response.function_call_arguments.done` or `response.output_item.done` (item type `function_call`), surface as `StreamEvent::ToolCall`. Same shape the OpenAI variant already produces.
 

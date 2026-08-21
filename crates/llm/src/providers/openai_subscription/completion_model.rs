@@ -26,7 +26,13 @@ use crate::{DOCUMENT_FILENAME_PARAM, LlmError, LlmStream, StreamEvent, TokenUsag
 
 pub const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const RESPONSES_PATH: &str = "/codex/responses";
+// The endpoint 400s on any field it doesn't know, and it knows neither
+// `prompt_cache_retention` nor `prompt_cache_options`: cache lifetime is
+// not ours to set, only which bucket the lookup routes to.
 const PROMPT_CACHE_KEY_FIELD: &str = "prompt_cache_key";
+const INPUT_TOKENS_DETAILS_FIELD: &str = "input_tokens_details";
+const CACHED_TOKENS_FIELD: &str = "cached_tokens";
+const CACHE_WRITE_TOKENS_FIELD: &str = "cache_write_tokens";
 const TOOL_CHOICE_FIELD: &str = "tool_choice";
 const TOOL_CHOICE_AUTO: &str = "auto";
 const TOOL_CHOICE_NONE: &str = "none";
@@ -931,20 +937,21 @@ fn translate_event(
                     .get("output_tokens")
                     .and_then(Value::as_u64)
                     .unwrap_or(0) as usize;
-                // OpenAI Responses API reports prompt-cache hits under
-                // `input_tokens_details.cached_tokens`. There is no
-                // cache-write counter — the API doesn't separate cache
-                // creation from regular input.
-                let cached = usage
-                    .get("input_tokens_details")
-                    .and_then(|d| d.get("cached_tokens"))
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0) as usize;
+                // Both counters are subsets of `input_tokens`, which is
+                // the convention the cost math wants: reads at the cached
+                // rate, writes at the write rate, the rest at full.
+                let detail = |field: &str| {
+                    usage
+                        .get(INPUT_TOKENS_DETAILS_FIELD)
+                        .and_then(|d| d.get(field))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0) as usize
+                };
                 out.push(Ok(StreamEvent::Usage(TokenUsage {
                     input_tokens: input,
                     output_tokens: output,
-                    cached_input_tokens: cached,
-                    cache_creation_input_tokens: 0,
+                    cached_input_tokens: detail(CACHED_TOKENS_FIELD),
+                    cache_creation_input_tokens: detail(CACHE_WRITE_TOKENS_FIELD),
                 })));
             }
         }
@@ -1471,6 +1478,33 @@ mod tests {
             StreamEvent::Usage(u) => {
                 assert_eq!(u.input_tokens, 42);
                 assert_eq!(u.output_tokens, 7);
+            }
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_event_splits_cache_reads_from_cache_writes() {
+        // Shape taken verbatim from a live `POST /codex/responses`.
+        let mut calls = HashMap::new();
+        let out = translate_event(
+            &mut calls,
+            SseEvent {
+                event_type: "response.completed".into(),
+                data: r#"{"response":{"usage":{"input_tokens":100,"output_tokens":7,
+                    "input_tokens_details":{"cached_tokens":60,"cache_write_tokens":30}}}}"#
+                    .into(),
+            },
+        )
+        .unwrap();
+        match out.into_iter().next().unwrap().unwrap() {
+            StreamEvent::Usage(u) => {
+                assert_eq!(u.input_tokens, 100);
+                assert_eq!(u.cached_input_tokens, 60);
+                assert_eq!(
+                    u.cache_creation_input_tokens, 30,
+                    "the endpoint does report writes; dropping them bills them at the full rate"
+                );
             }
             other => panic!("expected Usage, got {other:?}"),
         }
