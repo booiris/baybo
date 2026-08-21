@@ -633,10 +633,9 @@ impl ToolExecutor {
                     approval: None,
                 };
             }
-            // The channel-restricted tool is already omitted from the
-            // LLM's list for this session; refusing here closes the gap
-            // a hallucinated or skill-body-prompted name would slip
-            // through.
+            // The channel-restricted tool is already omitted from the LLM's
+            // list for this session; refusing here closes the gap a
+            // hallucinated or skill-body-prompted name would slip through.
             if !manifest.allows_channel(&user.channel) {
                 return ExecutedTool {
                     output: Err(anyhow::anyhow!(
@@ -647,6 +646,18 @@ impl ToolExecutor {
                     approval: None,
                 };
             }
+        }
+        // Registry omission is not an enforcement boundary for hallucinated calls.
+        if let Some(tool) = self.tool_registry.get(tool_name)
+            && !tool.trigger_scope().allows_trigger(session_trigger)
+        {
+            return ExecutedTool {
+                output: Err(anyhow::anyhow!(
+                    "security: tool '{}' is not available to this session",
+                    tool_name
+                )),
+                approval: None,
+            };
         }
 
         let turn_id = step.turn_id;

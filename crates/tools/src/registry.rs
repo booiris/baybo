@@ -383,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn trigger_scope_shows_cron_fire_tools_only_to_a_recurring_fire() {
+    fn trigger_scope_shows_cron_tools_only_to_a_recurring_conversation() {
         use crate::{Tool, ToolContext, ToolOutput, ToolTriggerScope};
         use baybo_model::TriggerSource;
 
@@ -400,7 +400,7 @@ mod tests {
                 serde_json::json!({"type": "object"})
             }
             fn trigger_scope(&self) -> ToolTriggerScope {
-                ToolTriggerScope::CronFire
+                ToolTriggerScope::CronConversation
             }
             async fn execute(
                 &self,

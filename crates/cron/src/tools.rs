@@ -83,7 +83,7 @@ fn with_manifest(tool: Arc<dyn Tool>) -> (Arc<dyn Tool>, ToolManifest) {
 
 /// A recurring cron fire calls this to declare that its scheduled check found
 /// nothing worth telling the user, so this run should notify no one. It is
-/// visible only inside a recurring fire ([`ToolTriggerScope::CronFire`]) and
+/// visible only inside a recurring fire ([`ToolTriggerScope::CronConversation`]) and
 /// takes effect only there: it flips the fire's `NotifySilence` handle, which
 /// the agent loop reads to complete the fire without a notification (no chat
 /// row, no push, no live pulse). Where the handle is absent — a user reply in a
@@ -110,7 +110,7 @@ impl Tool for CronReportNothingTool {
     }
 
     fn trigger_scope(&self) -> ToolTriggerScope {
-        ToolTriggerScope::CronFire
+        ToolTriggerScope::CronConversation
     }
 
     async fn execute(&self, _params: Value, ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
@@ -728,7 +728,7 @@ mod tests {
     fn report_nothing_is_visible_only_to_recurring_fires() {
         assert_eq!(
             CronReportNothingTool.trigger_scope(),
-            ToolTriggerScope::CronFire
+            ToolTriggerScope::CronConversation
         );
     }
 

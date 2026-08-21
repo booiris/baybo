@@ -2806,7 +2806,7 @@ async fn recurring_fire_that_reports_nothing_notifies_no_one() {
             json!({"type": "object"})
         }
         fn trigger_scope(&self) -> baybo_tools::ToolTriggerScope {
-            baybo_tools::ToolTriggerScope::CronFire
+            baybo_tools::ToolTriggerScope::CronConversation
         }
         async fn execute(
             &self,
@@ -4784,6 +4784,95 @@ async fn stop_persists_partial_work_so_it_survives_reload() {
             .is_some_and(|t| t.contains("weighing the options")),
         "the cancelled LLM span must record the partial reasoning, got {:?}",
         cancelled.thinking
+    );
+}
+
+#[tokio::test]
+async fn an_issue_run_is_refused_a_tool_scoped_to_another_trigger() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static RAN: AtomicBool = AtomicBool::new(false);
+
+    struct CronOnlyTool;
+    #[async_trait::async_trait]
+    impl Tool for CronOnlyTool {
+        fn name(&self) -> &str {
+            "report_nothing"
+        }
+        fn description(&self) -> String {
+            "test stand-in for a cron-only tool".to_string()
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type": "object"})
+        }
+        fn trigger_scope(&self) -> baybo_tools::ToolTriggerScope {
+            baybo_tools::ToolTriggerScope::CronConversation
+        }
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _ctx: &baybo_tools::ToolContext,
+        ) -> baybo_tools::Result<ToolOutput> {
+            RAN.store(true, Ordering::SeqCst);
+            Ok(ToolOutput::Text("opened".into()))
+        }
+    }
+
+    let mut session = SessionBuilder::new().build();
+    session.trigger = TriggerSource::Issue {
+        project_id: baybo_model::ProjectId::parse("proj-a").expect("project id"),
+        issue_id: baybo_model::IssueId::from("issue-1"),
+        number: 7,
+    };
+    let manifest = baybo_tools::ToolManifest {
+        name: "report_nothing".into(),
+        description: "test stand-in for a cron-only tool".into(),
+        trust_level: baybo_model::TrustLevel::Trusted,
+        parameters_schema: json!({"type": "object"}),
+        capabilities: vec![],
+        channels: Vec::new(),
+    };
+    let mut harness = AgentTestHarness::builder()
+        .session(session)
+        .with_tool(Arc::new(CronOnlyTool) as Arc<dyn Tool>, manifest)
+        .build();
+
+    harness.stub_llm.push_response(LlmResponse {
+        content: String::new(),
+        content_blocks: vec![],
+        tool_calls: vec![ToolCallInfo {
+            id: "c1".into(),
+            name: "report_nothing".into(),
+            arguments: json!({}),
+            signature: None,
+        }],
+        usage: Default::default(),
+        thinking: None,
+    });
+    harness.stub_llm.push_response(LlmResponse {
+        content: "could not reach a browser".into(),
+        content_blocks: vec![],
+        tool_calls: vec![],
+        usage: Default::default(),
+        thinking: None,
+    });
+
+    harness
+        .mailbox
+        .send(AgentMessage::IssueRun {
+            run_id: baybo_model::IssueRunId::generate(),
+            number: 7,
+            brief: "Check the dev server renders".into(),
+            files: Vec::new(),
+            checkout: "/ws/work/projects/p/7".into(),
+        })
+        .await
+        .expect("mailbox accepts the run");
+    harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    assert!(
+        !RAN.load(Ordering::SeqCst),
+        "the tool body must never run for a session its scope excludes"
     );
 }
 

@@ -217,20 +217,19 @@ pub trait Tool: Send + Sync {
 
 /// Which session-trigger contexts a tool is visible in (see
 /// [`Tool::trigger_scope`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolTriggerScope {
-    /// Visible in every session — the default.
+    /// Every session — the default.
     #[default]
     Any,
-    /// Visible only in a recurring cron fire's own conversation
-    /// (`TriggerSource::Cron { conversation: true }`). Used by `report_nothing`,
-    /// which can only suppress a recurring fire's own notification.
-    CronFire,
-    /// Visible only in a session that names a project board — an issue's
-    /// run, or the lead's planning conversation. Used by the `Issue*` tools
-    /// and `ProjectAgentCreate`: outside a board there is no project for
-    /// them to name, so offering them would be offering an action that can
-    /// only fail.
+    /// Only a recurring cron fire's own conversation
+    /// (`TriggerSource::Cron { conversation: true }`). `report_nothing` can
+    /// suppress nothing else, so elsewhere it is an action that can only fail.
+    CronConversation,
+    /// Only a session that names a project board — an issue's run, the lead's
+    /// planning conversation, a board-patrol fire. Outside one the `Issue*`
+    /// tools and `ProjectAgentCreate` have no board to name.
     ProjectBoard,
 }
 
@@ -239,7 +238,7 @@ impl ToolTriggerScope {
     pub fn allows_trigger(&self, trigger: &TriggerSource) -> bool {
         match self {
             ToolTriggerScope::Any => true,
-            ToolTriggerScope::CronFire => trigger.is_cron_conversation(),
+            ToolTriggerScope::CronConversation => trigger.is_cron_conversation(),
             ToolTriggerScope::ProjectBoard => trigger.project().is_some(),
         }
     }

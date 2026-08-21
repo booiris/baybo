@@ -318,14 +318,16 @@ list is rendered and reused for slash-command matching.
 
 `ToolManifest` carries coarse capability ceilings (`ToolCapability`): `ReadFile`, `WriteFile`, `Http`, `ExecCommand`. The manifest answers "what *kind* of thing may this tool do"; the concrete resource per call comes from `Tool::accessed_resources(params)` as [`ResourceAccess`] and is what the approval gate routes on. Trust level is a separate axis enforced before execution.
 
-The manifest also carries `channels: Vec<ChannelType>` (empty = every channel, the norm): a channel-restricted tool is enforced twice — the agent loop assembles the LLM's tool list via `ToolRegistry::tool_definitions_for_channel(&session.channel)` so other sessions never see it (the channel is session-stable, so the list stays byte-identical across calls and the prompt-cache sort guarantee holds), and the executor refuses a call that names it anyway (omission is not a gate against a hallucinated or skill-body-prompted name). The deck tools (`DeckCardList`/`DeckCardGet`/`DeckCardCreate`/`DeckCardUpdate`) are the first restricted tools (`channels: [owner]` — the deck is the owner's surface).
+The manifest also carries `channels: Vec<ChannelType>` (empty = every channel, the norm). It is one of **two** axes that decide which tools a session is offered; the other is `Tool::trigger_scope() -> ToolTriggerScope` (`Any` / `CronConversation` / `ProjectBoard`). Both are enforced twice — the agent loop assembles the LLM's tool list via `ToolRegistry::tool_definitions_for_session(&session.channel, &session.trigger)` so other sessions never see the tool (channel and trigger are both session-stable, so the list stays byte-identical across calls and the prompt-cache sort guarantee holds), and the executor refuses a call that names it anyway (omission is not a gate against a hallucinated or skill-body-prompted name).
+
+Each `trigger_scope` variant restricts to a range: it names where the tool would have **nothing to act on** — `report_nothing` has no fire to silence outside a recurring cron conversation, `Issue*` has no board to name outside a project session — so offering it elsewhere would be offering an action that can only fail. The deck tools (`DeckCardList`/`DeckCardGet`/`DeckCardCreate`/`DeckCardUpdate`) are the first `channels`-restricted tools (`channels: [owner]` — the deck is the owner's surface).
 
 Typical rules:
 
 - `Untrusted` tools may not auto-execute
 - `Installed` tools may not declare `WriteFile` or `ExecCommand` (requires `Trusted`)
 - Concrete paths/hosts/commands are gated by user approval, not by manifest
-- A `channels`-restricted tool is invisible and refused outside its channels
+- A `channels`- or `trigger_scope`-restricted tool is invisible and refused outside its scope
 
 `Tool::output_source() -> OutputSource` is a third, independent axis: what the tool's *output is made of*. `OutputSource::DeclaredFiles` means every byte of the output came from a path the same call listed in `accessed_resources`; `OutputSource::Opaque` (the default) is everything else. Exactly one tool overrides it — `ReadTool` — and it feeds one consumer: the agent's prompt-injection scanner, which demotes a detection in workspace-local content by one severity tier (see `docs/modules/security.md`, "Severity is scoped by output provenance"). It grants no capability and relaxes no gate.
 
