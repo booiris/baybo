@@ -4,8 +4,8 @@ use baybo_model::TrustLevel;
 use baybo_workspace::WorkspacePaths;
 use serde::{Deserialize, Serialize};
 
-use crate::ToolCapability;
 use crate::mcp::error::{McpError, McpResult};
+use crate::{ToolCapability, ToolTriggerScope};
 
 /// Mirror of [`baybo_model::TrustLevel`] for the on-disk representation.
 /// Kept separate from the runtime enum so the serde format is stable
@@ -83,6 +83,11 @@ pub struct McpServerEntry {
     pub capabilities: Vec<ToolCapability>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth: Option<OAuthConfig>,
+    /// Which sessions this server's tools are offered to. Defaults to
+    /// [`ToolTriggerScope::Any`], so a config file written before this field
+    /// existed keeps every server everywhere.
+    #[serde(default)]
+    pub trigger_scope: ToolTriggerScope,
 }
 
 impl McpServerEntry {
@@ -299,6 +304,33 @@ mod tests {
         ));
     }
 
+    /// A file written before the field existed keeps every server
+    /// everywhere; naming a scope narrows exactly that server.
+    #[test]
+    fn a_server_without_a_scope_is_offered_to_every_session() {
+        let json = r#"{
+            "servers": [
+                {
+                    "name": "github",
+                    "transport": { "type": "http", "url": "https://example.invalid/mcp/" },
+                    "trust_level": "trusted"
+                },
+                {
+                    "name": "browser",
+                    "transport": { "type": "http", "url": "https://example.invalid/b/" },
+                    "trust_level": "trusted",
+                    "trigger_scope": "shared_workspace"
+                }
+            ]
+        }"#;
+        let file = McpFile::parse(json).expect("valid mcp file");
+        assert_eq!(file.servers[0].trigger_scope, ToolTriggerScope::Any);
+        assert_eq!(
+            file.servers[1].trigger_scope,
+            ToolTriggerScope::SharedWorkspace
+        );
+    }
+
     #[test]
     fn parses_stdio_entry_with_args() {
         let json = r#"{
@@ -340,6 +372,7 @@ mod tests {
             trust_level: TrustLevelConfig::Installed,
             capabilities: vec![ToolCapability::Http],
             oauth: None,
+            trigger_scope: ToolTriggerScope::Any,
         };
         let err = entry.validate().unwrap_err();
         let msg = format!("{err}");
@@ -359,6 +392,7 @@ mod tests {
             trust_level: TrustLevelConfig::Untrusted,
             capabilities: vec![ToolCapability::ExecCommand],
             oauth: None,
+            trigger_scope: ToolTriggerScope::Any,
         };
         let err = entry.validate().unwrap_err();
         assert!(matches!(err, McpError::InvalidConfig(_)));
@@ -387,6 +421,7 @@ mod tests {
             trust_level: TrustLevelConfig::Installed,
             capabilities: vec![ToolCapability::ExecCommand],
             oauth: None,
+            trigger_scope: ToolTriggerScope::Any,
         };
         let err = entry.validate().unwrap_err();
         assert!(matches!(err, McpError::InvalidConfig(_)));
@@ -412,6 +447,7 @@ mod tests {
             trust_level: TrustLevelConfig::Trusted,
             capabilities: vec![ToolCapability::Http],
             oauth: None,
+            trigger_scope: ToolTriggerScope::Any,
         });
         file.write(dir.path()).await.unwrap();
         let loaded = McpFile::load(dir.path()).await.unwrap();

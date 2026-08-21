@@ -505,4 +505,93 @@ mod tests {
             project_id: None,
         }));
     }
+
+    /// A **dynamic** tool — the shape every MCP server registers under — is
+    /// filtered on the same axis as a builtin. This is what keeps the browser
+    /// server's 24 tools out of a card's run, and only out of a card's run.
+    #[test]
+    fn a_shared_workspace_tool_reaches_every_session_but_a_card_s_run() {
+        use crate::{Tool, ToolContext, ToolOutput, ToolTriggerScope};
+        use baybo_model::TriggerSource;
+
+        struct WatchedOnly;
+        #[async_trait::async_trait]
+        impl Tool for WatchedOnly {
+            fn name(&self) -> &str {
+                "browser/navigate_page"
+            }
+            fn description(&self) -> String {
+                "x".into()
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            fn trigger_scope(&self) -> ToolTriggerScope {
+                ToolTriggerScope::SharedWorkspace
+            }
+            async fn execute(
+                &self,
+                _p: serde_json::Value,
+                _c: &ToolContext,
+            ) -> crate::Result<ToolOutput> {
+                Ok(ToolOutput::Text(String::new()))
+            }
+        }
+
+        let registry = default_registry();
+        registry.register_dynamic(
+            "browser",
+            Arc::new(WatchedOnly),
+            crate::ToolManifest {
+                name: "browser/navigate_page".into(),
+                description: "x".into(),
+                trust_level: baybo_model::TrustLevel::Trusted,
+                parameters_schema: serde_json::json!({"type": "object"}),
+                capabilities: vec![],
+                channels: Vec::new(),
+            },
+        );
+
+        let has = |trigger: &TriggerSource| {
+            registry
+                .tool_definitions_for_session(&baybo_model::ChannelType::owner(), trigger)
+                .into_iter()
+                .any(|d| d.name == "browser/navigate_page")
+        };
+        assert!(has(&TriggerSource::User));
+        assert!(
+            has(&TriggerSource::Project {
+                project_id: baybo_model::ProjectId::generate(),
+            }),
+            "a board lead plans in the shared workspace and may browse"
+        );
+        assert!(
+            has(&TriggerSource::Cron {
+                cron_job_id: "cj".into(),
+                origin_session_id: None,
+                conversation: true,
+                job_title: None,
+                project_id: None,
+            }),
+            "a cron fire may browse"
+        );
+        assert!(
+            has(&TriggerSource::Cron {
+                cron_job_id: "cj".into(),
+                origin_session_id: None,
+                conversation: false,
+                job_title: None,
+                project_id: Some(baybo_model::ProjectId::generate()),
+            }),
+            "a board-patrol fire carries a project id and is still not a card's run"
+        );
+        assert!(
+            !has(&TriggerSource::Issue {
+                project_id: baybo_model::ProjectId::generate(),
+                issue_id: baybo_model::IssueId::generate(),
+                number: 1,
+            }),
+            "a card's run has its own checkout; the shared browser is not its to hold"
+        );
+    }
 }

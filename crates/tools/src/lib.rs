@@ -231,6 +231,11 @@ pub enum ToolTriggerScope {
     /// planning conversation, a board-patrol fire. Outside one the `Issue*`
     /// tools and `ProjectAgentCreate` have no board to name.
     ProjectBoard,
+    /// Only a session that works the shared workspace. A card's run is the
+    /// one session cut its own checkout to be isolated in, so a tool backed
+    /// by a process-wide singleton — one browser, one profile, one set of
+    /// cookies — has no unshared instance to give it.
+    SharedWorkspace,
 }
 
 impl ToolTriggerScope {
@@ -240,6 +245,7 @@ impl ToolTriggerScope {
             ToolTriggerScope::Any => true,
             ToolTriggerScope::CronConversation => trigger.is_cron_conversation(),
             ToolTriggerScope::ProjectBoard => trigger.project().is_some(),
+            ToolTriggerScope::SharedWorkspace => trigger.issue().is_none(),
         }
     }
 }

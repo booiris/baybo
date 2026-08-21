@@ -27,6 +27,7 @@ pub mod browser;
 use std::collections::HashMap;
 
 use crate::ToolCapability;
+use crate::ToolTriggerScope;
 use crate::mcp::config::{McpServerEntry, McpTransportConfig, TrustLevelConfig};
 use crate::mcp::embedded::EmbeddedMcpServer;
 
@@ -52,6 +53,10 @@ pub struct EmbeddedMcpProfile {
     /// trusts the vendor; do not gate per-call approval on the
     /// transport command" (browser today).
     pub capabilities: Vec<ToolCapability>,
+    /// Which sessions this server's tools are offered to. `Any` for a
+    /// server every session can use; narrow it when the tools only make
+    /// sense somewhere (browser: [`ToolTriggerScope::SharedWorkspace`]).
+    pub trigger_scope: ToolTriggerScope,
     /// Boot-config env vars merged onto the child's env after the
     /// secret-vault load (so `mcp.<server_name>.env` vault entries
     /// retain precedence). Use this for non-secret runtime knobs the
@@ -77,6 +82,7 @@ pub fn embedded_servers(profiles: &[EmbeddedMcpProfile]) -> Vec<EmbeddedMcpServe
                 trust_level: TrustLevelConfig::Trusted,
                 capabilities: p.capabilities.clone(),
                 oauth: None,
+                trigger_scope: p.trigger_scope,
             };
             EmbeddedMcpServer::new(entry, p.extra_env.clone())
         })
@@ -101,11 +107,17 @@ mod tests {
             command: "/usr/bin/node".into(),
             args: vec!["/path/to/bundle.mjs".into()],
             capabilities: vec![ToolCapability::Http],
+            trigger_scope: ToolTriggerScope::SharedWorkspace,
             extra_env: env,
         };
         let entries = embedded_servers(std::slice::from_ref(&p));
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].entry.name, "test");
+        assert_eq!(
+            entries[0].entry.trigger_scope,
+            ToolTriggerScope::SharedWorkspace,
+            "a profile's scope has to survive into the entry the reconciler spawns"
+        );
         assert_eq!(entries[0].extra_env.get("FOO").unwrap(), "bar");
         match &entries[0].entry.transport {
             McpTransportConfig::Stdio { command, args } => {
