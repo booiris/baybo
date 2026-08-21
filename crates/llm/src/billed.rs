@@ -146,11 +146,24 @@ impl BoundBilledLlm {
         &self.attribution
     }
 
+    /// Fill the session-scoped cache bucket unless the caller supplied one.
+    /// Centralizing this keeps every billed request keyed consistently.
+    fn cache_keyed(&self, request: &ChatRequest) -> ChatRequest {
+        if request.prompt_cache_key.is_some() {
+            return request.clone();
+        }
+        ChatRequest {
+            prompt_cache_key: Some(self.attribution.session_id.to_string()),
+            ..request.clone()
+        }
+    }
+
     /// Gate → call → record. A successful return means the recorder ran (a
     /// `cost_records` row was written, or the no-op recorder waived it). A
     /// provider error short-circuits before recording — a call that
     /// produced no usage has nothing to bill.
     pub async fn chat(&self, request: &ChatRequest) -> crate::Result<BilledChatResponse> {
+        let request = &self.cache_keyed(request);
         let response = self.llm.chat(request).await?;
         let effort = self
             .llm
@@ -177,6 +190,7 @@ impl BoundBilledLlm {
     /// dropping it on a non-runtime thread would panic in that spawn.
     /// Every current caller drains it inside the agent loop, which holds.
     pub async fn chat_stream(&self, request: &ChatRequest) -> crate::Result<LlmStream> {
+        let request = &self.cache_keyed(request);
         let inner = self.llm.chat_stream(request).await?;
         let reasoning_effort = self
             .llm
@@ -299,6 +313,7 @@ mod tests {
             temperature: None,
             tools: vec![],
             reasoning_effort: reasoning_effort.map(str::to_string),
+            ..Default::default()
         }
     }
 

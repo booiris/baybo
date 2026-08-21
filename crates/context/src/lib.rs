@@ -74,7 +74,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use baybo_llm::{ChatRequest, LlmResponse};
+use baybo_llm::{ChatRequest, LlmResponse, ToolDefinitionForLlm};
 use baybo_model::{
     AgentProfileId, ChatMessage, ContentBlock, FileFingerprint, MessageSource, Role, SessionId,
 };
@@ -490,60 +490,61 @@ impl ContextManager {
         &self.messages
     }
 
-    /// The transcript shaped for an LLM request: mid-turn user interjections and
-    /// recalled-memory rows wrapped in their steering envelopes
-    /// ([`frame_interjections`] / [`frame_recalled_memories`]), then adjacent
-    /// same-role user/assistant rows coalesced ([`merge_for_llm`]) so providers
-    /// that require strict alternation accept it. An owned snapshot — the stored
-    /// transcript keeps each row separate and unframed.
-    pub fn messages_for_llm(&self) -> Vec<ChatMessage> {
-        // Skip the framing passes (and their full clones) unless the transcript
-        // actually holds a row that needs framing — the common case. The scan is
-        // O(n) with no allocation; each framing pass would otherwise clone every
-        // row before `merge_for_llm` clones again.
-        //
-        // Note what is deliberately NOT done here: superseded
-        // `SystemPromptUpdate` rows are not filtered out. Each one is a complete
-        // delta against the leading system row, so on the face of it only the
-        // newest carries information — but dropping an older one rewrites the
-        // request at whatever mid-transcript position it sits at, which
-        // invalidates the provider's cached prefix from there on. That is the
-        // exact cost appending-instead-of-rewriting exists to avoid, and it
-        // would be paid on every call after every drop. Superseded rows are
-        // cheaper carried than removed; the compaction that reseeds the system
-        // row drops them for free.
-        let needs_framing = self.messages.iter().any(|m| {
+    fn needs_framing(&self) -> bool {
+        self.messages.iter().any(|m| {
             matches!(
                 m.source(),
                 MessageSource::UserInterjection | MessageSource::RecalledMemory
             )
-        });
-        // The task reminder is appended at the tail (after framing, before
-        // coalescing) so adjacent-role merging applies to it like any other
-        // row. The no-framing / no-reminder path stays clone-free.
-        let mut base = if needs_framing {
-            frame_recalled_memories(&frame_interjections(&self.messages))
-        } else if self.task_reminder.is_some()
-            || self.progress_observation.is_some()
-            || self.active_notification_cue().is_some()
-        {
-            self.messages.clone()
+        })
+    }
+
+    /// The transcript shaped for the wire: steering envelopes applied
+    /// ([`frame_interjections`] / [`frame_recalled_memories`]), then adjacent
+    /// same-role rows coalesced ([`merge_for_llm`]). An owned snapshot.
+    ///
+    /// One home: a compaction request is exactly this and a turn's request is
+    /// this plus a tail, so they share a cached prefix only while they cannot
+    /// drift apart.
+    ///
+    /// Framing is skipped unless a row needs it. Superseded
+    /// `SystemPromptUpdate` rows are deliberately kept — dropping one rewrites
+    /// the request mid-transcript and invalidates the cached prefix from there
+    /// on, which is the cost appending exists to avoid.
+    pub(crate) fn llm_prefix(&self) -> Vec<ChatMessage> {
+        if self.needs_framing() {
+            merge_for_llm(&frame_recalled_memories(&frame_interjections(
+                &self.messages,
+            )))
         } else {
-            return merge_for_llm(&self.messages);
-        };
-        if let Some(reminder) = &self.task_reminder {
-            base.push(reminder.clone());
+            merge_for_llm(&self.messages)
         }
-        // After the checklist: the checklist says what the turn is for, and
-        // this says the last few steps did not serve it. Read in that order it
-        // is a correction; read first it is context-free scolding.
-        if let Some(observation) = &self.progress_observation {
-            base.push(observation.clone());
+    }
+
+    /// [`Self::llm_prefix`] plus this turn's transient tail — task reminder,
+    /// progress observation, notification cue — none of them a
+    /// `session_messages` row.
+    ///
+    /// Merging the prefix first and the tail after equals merging once over
+    /// everything: `merge_for_llm` folds only adjacent rows and never changes
+    /// the role of the row it produces. With no tail armed this IS the prefix,
+    /// byte for byte.
+    pub fn messages_for_llm(&self) -> Vec<ChatMessage> {
+        let mut out = self.llm_prefix();
+        // The checklist says what the turn is for; the observation says the
+        // last steps did not serve it. Reversed, it reads as scolding.
+        let tail: Vec<ChatMessage> = self
+            .task_reminder
+            .iter()
+            .chain(self.progress_observation.iter())
+            .chain(self.active_notification_cue())
+            .cloned()
+            .collect();
+        if tail.is_empty() {
+            return out;
         }
-        if let Some(cue) = self.active_notification_cue() {
-            base.push(cue.clone());
-        }
-        merge_for_llm(&base)
+        out.extend(tail);
+        merge_for_llm(&out)
     }
 
     /// The notification cue, but only when it should actually ride this
@@ -1629,6 +1630,7 @@ impl ContextManager {
     pub async fn maybe_compress<F, Fut>(
         &mut self,
         model_id: &str,
+        tools: Vec<ToolDefinitionForLlm>,
         chat: F,
     ) -> crate::Result<CompressionOutcome>
     where
@@ -1644,7 +1646,7 @@ impl ContextManager {
             return Ok(CompressionOutcome::NoSavings);
         }
 
-        self.run_compression(chat).await
+        self.run_compression(tools, chat).await
     }
 
     /// Like [`Self::maybe_compress`] but skips the threshold gate and the
@@ -1655,6 +1657,7 @@ impl ContextManager {
     pub async fn force_compress<F, Fut>(
         &mut self,
         model_id: &str,
+        tools: Vec<ToolDefinitionForLlm>,
         chat: F,
     ) -> crate::Result<CompressionOutcome>
     where
@@ -1664,17 +1667,21 @@ impl ContextManager {
         self.set_current_model(model_id);
         self.budget.update(self.count_tokens());
         self.compaction_declined_at_len = None;
-        self.run_compression(chat).await
+        self.run_compression(tools, chat).await
     }
 
-    async fn run_compression<F, Fut>(&mut self, chat: F) -> crate::Result<CompressionOutcome>
+    async fn run_compression<F, Fut>(
+        &mut self,
+        tools: Vec<ToolDefinitionForLlm>,
+        chat: F,
+    ) -> crate::Result<CompressionOutcome>
     where
         F: FnOnce(ChatRequest, LlmCallInputs) -> Fut + Send + 'static,
         Fut: Future<Output = std::result::Result<LlmResponse, ContextError>> + Send + 'static,
     {
         let chat_box: compressor::ChatCallback =
             Box::new(move |req, marker| Box::pin(chat(req, marker)));
-        let plan = self.run_compression_flow(chat_box).await?;
+        let plan = self.run_compression_flow(tools, chat_box).await?;
         let mut new_messages = match plan {
             CompressOutput::NoOp => return Ok(CompressionOutcome::StrategyDeclined),
             CompressOutput::Cancelled => return Ok(CompressionOutcome::Cancelled),
@@ -1871,15 +1878,9 @@ impl ContextManager {
         self.input_marker_with_suffix(suffix).await
     }
 
-    /// Like [`build_call_input_marker`](Self::build_call_input_marker) but
-    /// for callers whose request appends framing messages that are *not*
-    /// rows in `session_messages` (the progress observer's prompt, a
-    /// compression instruction). The persisted prefix references the
-    /// active set by ordinal; `suffix` rides inline so hydration can
-    /// rebuild the exact `request.messages` the LLM saw. Falls back to a
-    /// fully inline marker (prefix + suffix) when the store has no rows
-    /// yet, the lookup errors, or the active set diverges from the
-    /// in-memory window (a failed persist that wasn't rolled back).
+    /// Like [`build_call_input_marker`](Self::build_call_input_marker), with
+    /// non-persisted suffix rows. Falls back to inline when persisted state
+    /// does not match memory.
     pub async fn input_marker_with_suffix(&self, suffix: Vec<ChatMessage>) -> LlmCallInputs {
         // Emit a `Persisted` reference only when the anchor ordinal and the
         // prefix count are both known AND the persisted active set mirrors the
@@ -1905,14 +1906,8 @@ impl ContextManager {
         }
     }
 
-    /// `Some((last_ordinal, active_count))` only when the in-memory
-    /// transcript provably mirrors the persisted active set — the same
-    /// `active_count == len` invariant [`Compressor`](crate::compressor)'s
-    /// the marker requires. A compaction call sends `self.messages` verbatim,
-    /// so a `Persisted` trace reference is only safe to emit when hydration
-    /// would rebuild exactly that slice; otherwise the caller embeds inline.
-    /// The returned count seeds the `prefix_len` tripwire. `None` on any
-    /// mismatch or store error.
+    /// Return the last ordinal and count only when memory matches the persisted
+    /// active set; callers otherwise embed the request inline.
     async fn synced_last_ordinal(&self) -> Option<(i64, usize)> {
         let last = self
             .sessions
@@ -2859,7 +2854,9 @@ mod tests {
         assert_eq!(ctx.messages().len(), 1);
         assert_eq!(ctx.messages()[0].role, Role::User);
         assert!(matches!(
-            ctx.maybe_compress("test-model", never_chat).await.unwrap(),
+            ctx.maybe_compress("test-model", Vec::new(), never_chat)
+                .await
+                .unwrap(),
             CompressionOutcome::BelowThreshold
         ));
     }
@@ -3084,7 +3081,10 @@ mod tests {
             .await;
         ctx.append(&make_msg(Role::User, &padded("Second"))).await;
 
-        let outcome = ctx.maybe_compress("test-model", err_chat).await.unwrap();
+        let outcome = ctx
+            .maybe_compress("test-model", Vec::new(), err_chat)
+            .await
+            .unwrap();
 
         match outcome {
             CompressionOutcome::Failed { reason } => {
@@ -3114,7 +3114,7 @@ mod tests {
         ctx.append(&make_msg(Role::User, &padded("third"))).await;
 
         let outcome = ctx
-            .maybe_compress("test-model", empty_summary_chat)
+            .maybe_compress("test-model", Vec::new(), empty_summary_chat)
             .await
             .unwrap();
 
@@ -3150,7 +3150,10 @@ mod tests {
         ctx.append(&make_msg(Role::User, "hi")).await;
         ctx.append(&make_msg(Role::Assistant, "hello")).await;
 
-        let outcome = ctx.maybe_compress("test-model", never_chat).await.unwrap();
+        let outcome = ctx
+            .maybe_compress("test-model", Vec::new(), never_chat)
+            .await
+            .unwrap();
 
         assert!(matches!(outcome, CompressionOutcome::BelowThreshold));
         assert_eq!(ctx.messages().len(), 3);
@@ -3169,12 +3172,15 @@ mod tests {
         }
 
         // Sanity: budget-gated path is a no-op here.
-        let baseline = ctx.maybe_compress("test-model", never_chat).await.unwrap();
+        let baseline = ctx
+            .maybe_compress("test-model", Vec::new(), never_chat)
+            .await
+            .unwrap();
         assert!(matches!(baseline, CompressionOutcome::BelowThreshold));
         assert_eq!(ctx.messages().len(), 13);
 
         let outcome = ctx
-            .force_compress("test-model", ok_summary_chat)
+            .force_compress("test-model", Vec::new(), ok_summary_chat)
             .await
             .unwrap();
 
@@ -3188,6 +3194,120 @@ mod tests {
             ctx.messages()
         );
         assert_eq!(ctx.messages()[0].role, Role::System);
+    }
+
+    /// The turn and a compaction must send the same prefix. The compaction
+    /// test compares against `llm_prefix`, so it alone would not catch
+    /// `messages_for_llm` drifting away from it.
+    #[tokio::test]
+    async fn the_turn_and_the_compaction_share_one_prefix() {
+        let mut ctx = make_ctx(2, 100_000, 0.75);
+        ctx.append(&make_msg(Role::System, "sys")).await;
+        for i in 0..6 {
+            ctx.append(&make_msg(Role::User, &format!("m{i}"))).await;
+            ctx.append(&make_msg(Role::Assistant, &format!("a{i}")))
+                .await;
+        }
+
+        // Unarmed is the common case: byte-identical, not merely similar.
+        assert_eq!(
+            ctx.messages_for_llm(),
+            ctx.llm_prefix(),
+            "an unarmed turn sends exactly the prefix a compaction would"
+        );
+
+        // Armed, only the row the tail coalesces into may differ.
+        let now = chrono::Utc::now();
+        ctx.refresh_task_reminder(&[baybo_model::Task {
+            id: baybo_model::TaskId::new(),
+            subject: "finish the table".into(),
+            description: "body".into(),
+            status: baybo_model::TaskStatus::Pending,
+            depends_on: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        }]);
+        let armed = ctx.messages_for_llm();
+        let prefix = ctx.llm_prefix();
+        assert!(
+            armed.len() >= prefix.len(),
+            "the tail only ever adds: {} vs {}",
+            armed.len(),
+            prefix.len()
+        );
+        assert_eq!(
+            armed[..prefix.len() - 1],
+            prefix[..prefix.len() - 1],
+            "everything before the row the tail merges into is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_compaction_request_reuses_the_conversation_prefix_and_its_tools() {
+        let mut ctx = make_ctx(2, 100_000, 0.75);
+        ctx.append(&make_msg(Role::System, "sys")).await;
+        for i in 0..12 {
+            ctx.append(&make_msg(Role::User, &bulky(&format!("m{i}"))))
+                .await;
+        }
+        let prefix = ctx.llm_prefix();
+
+        let tools = vec![ToolDefinitionForLlm {
+            name: "Bash".into(),
+            description: "run a command".into(),
+            parameters_schema: serde_json::json!({"type": "object"}),
+        }];
+
+        let seen: Arc<parking_lot::Mutex<Option<ChatRequest>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let sink = Arc::clone(&seen);
+        let outcome = ctx
+            .force_compress("test-model", tools.clone(), move |req: ChatRequest, _| {
+                *sink.lock() = Some(req);
+                async move {
+                    Ok(LlmResponse {
+                        content: "<analysis>x</analysis><summary>S</summary>".into(),
+                        content_blocks: vec![],
+                        tool_calls: vec![],
+                        usage: Default::default(),
+                        thinking: None,
+                    })
+                }
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, CompressionOutcome::Compressed),
+            "{outcome:?}"
+        );
+
+        let request = seen.lock().take().expect("the summariser was called");
+        assert_eq!(
+            request.tools.len(),
+            1,
+            "the session's tool list rides the compaction call so the prefix matches"
+        );
+        assert_eq!(request.tools[0].name, "Bash");
+        assert!(
+            matches!(request.tool_choice, baybo_llm::ToolChoice::None),
+            "the carried tool list must be disabled"
+        );
+        assert_eq!(
+            request.messages.len(),
+            prefix.len() + 1,
+            "exactly one row is added to the conversation's own prefix"
+        );
+        assert_eq!(
+            request.messages[..prefix.len()],
+            prefix[..],
+            "the prefix must be byte-identical to what the turn itself sends"
+        );
+        let tail = request.messages.last().expect("a tail row");
+        assert_eq!(tail.role, Role::User);
+        assert!(
+            matches!(&tail.content[0], ContentBlock::Text(t) if t.contains("summary")),
+            "the instruction is the tail, not merged into the last transcript row"
+        );
     }
 
     #[tokio::test]
@@ -3236,7 +3356,7 @@ mod tests {
         }
 
         let outcome = ctx
-            .force_compress("test-model", ok_summary_chat)
+            .force_compress("test-model", Vec::new(), ok_summary_chat)
             .await
             .unwrap();
         // Savings gate compared the old (small) soul on both sides, so the real
@@ -3308,7 +3428,7 @@ mod tests {
         }
 
         let outcome = ctx
-            .force_compress("test-model", ok_summary_chat)
+            .force_compress("test-model", Vec::new(), ok_summary_chat)
             .await
             .unwrap();
         assert!(
@@ -4135,7 +4255,7 @@ mod tests {
         );
 
         let outcome = ctx
-            .force_compress("test-model", ok_summary_chat)
+            .force_compress("test-model", Vec::new(), ok_summary_chat)
             .await
             .expect("compress");
         assert!(
@@ -4206,7 +4326,7 @@ mod tests {
         }
 
         let outcome = ctx
-            .force_compress("test-model", ok_summary_chat)
+            .force_compress("test-model", Vec::new(), ok_summary_chat)
             .await
             .expect("compress");
         assert!(
@@ -4238,7 +4358,10 @@ mod tests {
         ctx.append(&make_msg(Role::User, "hi")).await;
         ctx.append(&make_msg(Role::Assistant, "hello")).await;
 
-        let outcome = ctx.force_compress("test-model", never_chat).await.unwrap();
+        let outcome = ctx
+            .force_compress("test-model", Vec::new(), never_chat)
+            .await
+            .unwrap();
 
         assert!(matches!(outcome, CompressionOutcome::StrategyDeclined));
         assert_eq!(ctx.messages().len(), 3);
@@ -4256,7 +4379,10 @@ mod tests {
         ctx.append(&make_msg(Role::User, "hi")).await;
         ctx.append(&make_msg(Role::Assistant, "hello")).await;
 
-        let outcome = ctx.maybe_compress("test-model", never_chat).await.unwrap();
+        let outcome = ctx
+            .maybe_compress("test-model", Vec::new(), never_chat)
+            .await
+            .unwrap();
 
         assert!(matches!(outcome, CompressionOutcome::StrategyDeclined));
         assert_eq!(ctx.messages().len(), 3);
@@ -4832,7 +4958,7 @@ mod tests {
         // Drive compression: the baseline (9_999) is past the 5_000
         // ceiling, so the threshold gate fires and the summary applies.
         let outcome = ctx
-            .maybe_compress("test-model", ok_summary_chat)
+            .maybe_compress("test-model", Vec::new(), ok_summary_chat)
             .await
             .unwrap();
         assert!(
@@ -4892,7 +5018,7 @@ mod tests {
         }
 
         let outcome = ctx
-            .maybe_compress("test-model", ok_summary_chat)
+            .maybe_compress("test-model", Vec::new(), ok_summary_chat)
             .await
             .unwrap();
         assert!(
@@ -5343,7 +5469,7 @@ mod tests {
         );
 
         let outcome = ctx
-            .force_compress("test-model", ok_summary_chat)
+            .force_compress("test-model", Vec::new(), ok_summary_chat)
             .await
             .expect("compress");
         assert!(
@@ -5693,7 +5819,7 @@ mod tests {
         let last = ctx.messages().last().cloned().expect("a last message");
 
         let outcome = ctx
-            .maybe_compress("test-model", ok_summary_chat)
+            .maybe_compress("test-model", Vec::new(), ok_summary_chat)
             .await
             .unwrap();
         assert!(matches!(outcome, CompressionOutcome::Compressed));
@@ -5736,7 +5862,7 @@ mod tests {
         assert!(ctx.budget.needs_compression(), "and must be over budget");
 
         let outcome = ctx
-            .maybe_compress("test-model", ok_summary_chat)
+            .maybe_compress("test-model", Vec::new(), ok_summary_chat)
             .await
             .unwrap();
         assert!(
@@ -5775,7 +5901,7 @@ mod tests {
         ]))
         .await;
 
-        ctx.maybe_compress("test-model", ok_summary_chat)
+        ctx.maybe_compress("test-model", Vec::new(), ok_summary_chat)
             .await
             .unwrap();
 
@@ -5811,7 +5937,7 @@ mod tests {
         }
 
         let outcome = ctx
-            .maybe_compress("test-model", ok_summary_chat)
+            .maybe_compress("test-model", Vec::new(), ok_summary_chat)
             .await
             .unwrap();
         assert!(matches!(outcome, CompressionOutcome::Compressed));
@@ -5831,7 +5957,10 @@ mod tests {
         );
 
         // `never_chat` panics if the summarizer is reached a second time.
-        let second = ctx.maybe_compress("test-model", never_chat).await.unwrap();
+        let second = ctx
+            .maybe_compress("test-model", Vec::new(), never_chat)
+            .await
+            .unwrap();
         assert!(matches!(second, CompressionOutcome::StrategyDeclined));
     }
 
@@ -5850,7 +5979,7 @@ mod tests {
                 .await;
         }
 
-        ctx.maybe_compress("test-model", move |req, marker| {
+        ctx.maybe_compress("test-model", Vec::new(), move |req, marker| {
             seen.fetch_add(1, Ordering::SeqCst);
             ok_summary_chat(req, marker)
         })
@@ -5877,7 +6006,7 @@ mod tests {
         }
 
         let first = ctx
-            .maybe_compress("test-model", ok_summary_chat)
+            .maybe_compress("test-model", Vec::new(), ok_summary_chat)
             .await
             .unwrap();
         assert!(
@@ -5886,7 +6015,10 @@ mod tests {
         );
 
         // `never_chat` panics if the summarizer is reached.
-        let second = ctx.maybe_compress("test-model", never_chat).await.unwrap();
+        let second = ctx
+            .maybe_compress("test-model", Vec::new(), never_chat)
+            .await
+            .unwrap();
         assert!(matches!(second, CompressionOutcome::NoSavings));
 
         // Growth is exactly the condition under which compaction can start
@@ -5899,7 +6031,7 @@ mod tests {
             .await;
         }
         let third = ctx
-            .maybe_compress("test-model", ok_summary_chat)
+            .maybe_compress("test-model", Vec::new(), ok_summary_chat)
             .await
             .unwrap();
         assert!(
@@ -5943,7 +6075,7 @@ mod tests {
         ctx.append(&make_msg(Role::User, &"u2 ".repeat(800))).await;
 
         let outcome = ctx
-            .maybe_compress("test-model", ok_summary_chat)
+            .maybe_compress("test-model", Vec::new(), ok_summary_chat)
             .await
             .unwrap();
         assert!(matches!(outcome, CompressionOutcome::Compressed));
@@ -5986,7 +6118,7 @@ mod tests {
         ctx.append(&make_msg(Role::User, &"u2 ".repeat(800))).await;
         assert_eq!(ctx.called_skills, vec!["foo"]);
 
-        ctx.maybe_compress("test-model", ok_summary_chat)
+        ctx.maybe_compress("test-model", Vec::new(), ok_summary_chat)
             .await
             .unwrap();
         assert!(ctx.called_skills.is_empty());
@@ -6023,7 +6155,7 @@ mod tests {
         );
 
         let outcome = ctx
-            .maybe_compress("test-model", ok_summary_chat)
+            .maybe_compress("test-model", Vec::new(), ok_summary_chat)
             .await
             .unwrap();
         assert!(matches!(outcome, CompressionOutcome::Compressed));

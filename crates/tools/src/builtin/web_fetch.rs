@@ -654,6 +654,7 @@ async fn run_summary(
         temperature: Some(0.0),
         tools: vec![],
         reasoning_effort: None,
+        ..Default::default()
     };
     tokio::select! {
         _ = ctx.cancellation_token.cancelled() => {

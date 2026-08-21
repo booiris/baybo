@@ -26,6 +26,10 @@ use crate::{DOCUMENT_FILENAME_PARAM, LlmError, LlmStream, StreamEvent, TokenUsag
 
 pub const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const RESPONSES_PATH: &str = "/codex/responses";
+const PROMPT_CACHE_KEY_FIELD: &str = "prompt_cache_key";
+const TOOL_CHOICE_FIELD: &str = "tool_choice";
+const TOOL_CHOICE_AUTO: &str = "auto";
+const TOOL_CHOICE_NONE: &str = "none";
 
 #[derive(Clone)]
 pub struct OpenAiSubscriptionCompletionModel {
@@ -76,12 +80,12 @@ impl OpenAiSubscriptionCompletionModel {
 
     /// rig-shape completion: drives the stream internally and assembles a
     /// non-streaming response. Single network call regardless.
-    pub async fn completion(
+    pub(crate) async fn completion(
         &self,
         request: CompletionRequest,
-        effort: Option<&str>,
+        extras: crate::ProviderCallExtras<'_>,
     ) -> Result<completion::CompletionResponse<()>, CompletionError> {
-        let stream = self.stream(request, effort).await?;
+        let stream = self.stream(request, extras).await?;
         let mut text_buf = String::new();
         let mut reasoning_buf = String::new();
         let mut thinking_blocks: Vec<baybo_model::ContentBlock> = Vec::new();
@@ -172,17 +176,20 @@ impl OpenAiSubscriptionCompletionModel {
 
     /// Open a streaming connection to `<base_url>/codex/responses` with
     /// pre-flight + reactive (401-once) refresh handling.
-    pub async fn stream(
+    pub(crate) async fn stream(
         &self,
         request: CompletionRequest,
-        effort: Option<&str>,
+        extras: crate::ProviderCallExtras<'_>,
     ) -> Result<LlmStream, CompletionError> {
-        let effective_effort = self.effective_effort(effort);
-        let body = build_responses_body(&self.model, effective_effort.as_deref(), &request)
-            .map_err(|msg| {
-                let err: Box<dyn std::error::Error + Send + Sync> = msg.into();
-                CompletionError::RequestError(err)
-            })?;
+        let effective_effort = self.effective_effort(extras.effort);
+        let extras = crate::ProviderCallExtras {
+            effort: effective_effort.as_deref(),
+            ..extras
+        };
+        let body = build_responses_body(&self.model, extras, &request).map_err(|msg| {
+            let err: Box<dyn std::error::Error + Send + Sync> = msg.into();
+            CompletionError::RequestError(err)
+        })?;
         let bundle = self
             .refresh
             .ensure_fresh_bundle()
@@ -314,16 +321,17 @@ impl OpenAiSubscriptionCompletionModel {
 /// rig `CompletionRequest` → Codex Responses API JSON body. Returns
 /// `Value` so tests can inspect the shape without mocking HTTP.
 ///
-/// `reasoning_effort` is the operator's already-resolved effort
+/// `extras.effort` is the operator's already-resolved effort
 /// level (clamped to whatever the model supports). When `Some`, the
 /// body includes `reasoning: { effort, summary: "auto" }` and
 /// `include: ["reasoning.encrypted_content"]` so the server emits +
 /// retains thinking state. `None` disables reasoning entirely.
 pub(crate) fn build_responses_body(
     model: &str,
-    reasoning_effort: Option<&str>,
+    extras: crate::ProviderCallExtras<'_>,
     request: &CompletionRequest,
 ) -> Result<Value, String> {
+    let reasoning_effort = extras.effort;
     let mut input: Vec<Value> = Vec::new();
     for message in request.chat_history.iter() {
         for item in convert_message(message)? {
@@ -354,17 +362,24 @@ pub(crate) fn build_responses_body(
         .unwrap_or_else(|| "You are a helpful assistant.".to_string());
     // store=false: we manage conversation state ourselves; don't ask
     // the server to retain it (matches the Codex CLI posture).
+    let tool_choice = match request.tool_choice {
+        Some(rig::message::ToolChoice::None) => TOOL_CHOICE_NONE,
+        _ => TOOL_CHOICE_AUTO,
+    };
     let mut body = json!({
         "model": model,
         "input": input,
         "instructions": instructions,
-        "tool_choice": "auto",
+        TOOL_CHOICE_FIELD: tool_choice,
         "parallel_tool_calls": true,
         "stream": true,
         "store": false,
     });
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools);
+    }
+    if let Some(key) = extras.prompt_cache_key {
+        body[PROMPT_CACHE_KEY_FIELD] = Value::String(key.to_string());
     }
     if let Some(effort) = reasoning_effort {
         body["reasoning"] = json!({
@@ -1053,8 +1068,40 @@ mod tests {
     }
 
     #[test]
+    fn body_omits_the_cache_key_until_a_caller_names_one() {
+        let body = build_responses_body("gpt-5", Default::default(), &empty_request()).unwrap();
+        assert!(
+            body.get(PROMPT_CACHE_KEY_FIELD).is_none(),
+            "an unkeyed request must not invent a bucket: {body}"
+        );
+    }
+
+    #[test]
+    fn body_carries_the_cache_key_it_was_given() {
+        let extras = crate::ProviderCallExtras {
+            prompt_cache_key: Some("session-7"),
+            ..Default::default()
+        };
+        let body = build_responses_body("gpt-5", extras, &empty_request()).unwrap();
+        assert_eq!(body[PROMPT_CACHE_KEY_FIELD], "session-7");
+    }
+
+    #[test]
+    fn tool_choice_follows_the_request() {
+        let body = build_responses_body("gpt-5", Default::default(), &empty_request()).unwrap();
+        assert_eq!(body[TOOL_CHOICE_FIELD], TOOL_CHOICE_AUTO);
+
+        let req = CompletionRequest {
+            tool_choice: Some(rig::message::ToolChoice::None),
+            ..empty_request()
+        };
+        let body = build_responses_body("gpt-5", Default::default(), &req).unwrap();
+        assert_eq!(body[TOOL_CHOICE_FIELD], TOOL_CHOICE_NONE);
+    }
+
+    #[test]
     fn body_carries_model_and_text_user_input() {
-        let body = build_responses_body("gpt-5", None, &empty_request()).unwrap();
+        let body = build_responses_body("gpt-5", Default::default(), &empty_request()).unwrap();
         assert_eq!(body["model"], "gpt-5");
         assert_eq!(body["stream"], true);
         assert_eq!(body["store"], false);
@@ -1085,7 +1132,7 @@ mod tests {
             }),
             ..empty_request()
         };
-        let body = build_responses_body("gpt-5", None, &req).unwrap();
+        let body = build_responses_body("gpt-5", Default::default(), &req).unwrap();
         let content = body["input"][0]["content"].as_array().unwrap();
         assert_eq!(content[0]["type"], "input_text");
         assert_eq!(content[1]["type"], "input_image");
@@ -1106,7 +1153,7 @@ mod tests {
             }),
             ..empty_request()
         };
-        let body = build_responses_body("gpt-5", None, &req).unwrap();
+        let body = build_responses_body("gpt-5", Default::default(), &req).unwrap();
         let image = &body["input"][0]["content"][0];
         assert_eq!(image["type"], "input_image");
         assert_eq!(image["image_url"], "https://example.test/image.webp");
@@ -1126,7 +1173,7 @@ mod tests {
             }),
             ..empty_request()
         };
-        let err = build_responses_body("gpt-5", None, &req).unwrap_err();
+        let err = build_responses_body("gpt-5", Default::default(), &req).unwrap_err();
         assert!(err.contains("missing its media type"), "{err}");
     }
 
@@ -1142,7 +1189,7 @@ mod tests {
             }),
             ..empty_request()
         };
-        let body = build_responses_body("gpt-5", None, &req).unwrap();
+        let body = build_responses_body("gpt-5", Default::default(), &req).unwrap();
         let document = &body["input"][0]["content"][0];
         assert_eq!(document["type"], "input_file");
         assert_eq!(document["file_data"], "data:application/pdf;base64,AQID");
@@ -1161,7 +1208,7 @@ mod tests {
             }),
             ..empty_request()
         };
-        let body = build_responses_body("gpt-5", None, &req).unwrap();
+        let body = build_responses_body("gpt-5", Default::default(), &req).unwrap();
         let document = &body["input"][0]["content"][0];
         assert_eq!(document["type"], "input_file");
         assert_eq!(document["file_url"], "https://example.test/report.pdf");
@@ -1172,7 +1219,7 @@ mod tests {
     fn body_lifts_preamble_into_instructions() {
         let mut req = empty_request();
         req.preamble = Some("be terse".into());
-        let body = build_responses_body("gpt-5", None, &req).unwrap();
+        let body = build_responses_body("gpt-5", Default::default(), &req).unwrap();
         assert_eq!(body["instructions"], "be terse");
     }
 
@@ -1184,7 +1231,7 @@ mod tests {
     fn body_supplies_default_instructions_when_preamble_is_absent() {
         let req = empty_request();
         assert!(req.preamble.is_none());
-        let body = build_responses_body("gpt-5", None, &req).unwrap();
+        let body = build_responses_body("gpt-5", Default::default(), &req).unwrap();
         let instructions = body["instructions"]
             .as_str()
             .expect("instructions must be present");
@@ -1199,7 +1246,7 @@ mod tests {
     fn body_drops_temperature_for_codex_responses() {
         let mut req = empty_request();
         req.temperature = Some(0.0);
-        let body = build_responses_body("gpt-5", None, &req).unwrap();
+        let body = build_responses_body("gpt-5", Default::default(), &req).unwrap();
         assert!(
             body.get("temperature").is_none(),
             "temperature must not be forwarded; got body = {body}"
@@ -1209,7 +1256,15 @@ mod tests {
     #[test]
     fn body_emits_reasoning_when_effort_is_set() {
         let req = empty_request();
-        let body = build_responses_body("gpt-5", Some("high"), &req).unwrap();
+        let body = build_responses_body(
+            "gpt-5",
+            crate::ProviderCallExtras {
+                effort: Some("high"),
+                ..Default::default()
+            },
+            &req,
+        )
+        .unwrap();
         assert_eq!(body["reasoning"]["effort"], "high");
         assert_eq!(body["reasoning"]["summary"], "auto");
         assert_eq!(body["include"][0], "reasoning.encrypted_content");
@@ -1218,7 +1273,7 @@ mod tests {
     #[test]
     fn body_omits_reasoning_when_effort_is_none() {
         let req = empty_request();
-        let body = build_responses_body("gpt-5", None, &req).unwrap();
+        let body = build_responses_body("gpt-5", Default::default(), &req).unwrap();
         assert!(
             body.get("reasoning").is_none(),
             "reasoning must be absent when effort is None"
@@ -1253,7 +1308,7 @@ mod tests {
             description: "snap".into(),
             parameters: json!({"type":"object","properties":{}}),
         });
-        let body = build_responses_body("gpt-5", None, &req).unwrap();
+        let body = build_responses_body("gpt-5", Default::default(), &req).unwrap();
         let tools = body["tools"].as_array().unwrap();
         assert_eq!(tools[0]["name"], "browser__take_screenshot");
     }
@@ -1266,7 +1321,7 @@ mod tests {
             description: "look stuff up".into(),
             parameters: json!({"type": "object", "properties": {"q": {"type": "string"}}}),
         });
-        let body = build_responses_body("gpt-5", None, &req).unwrap();
+        let body = build_responses_body("gpt-5", Default::default(), &req).unwrap();
         let tools = body["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["type"], "function");
@@ -1290,7 +1345,7 @@ mod tests {
                 additional_params: None,
             })),
         });
-        let body = build_responses_body("gpt-5", None, &req).unwrap();
+        let body = build_responses_body("gpt-5", Default::default(), &req).unwrap();
         let input = body["input"].as_array().unwrap();
         let call_item = input
             .iter()
@@ -1314,7 +1369,7 @@ mod tests {
                 })),
             })),
         });
-        let body = build_responses_body("gpt-5", None, &req).unwrap();
+        let body = build_responses_body("gpt-5", Default::default(), &req).unwrap();
         let input = body["input"].as_array().unwrap();
         let result_item = input
             .iter()

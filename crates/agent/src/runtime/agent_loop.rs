@@ -1811,20 +1811,7 @@ impl AgentLoop {
     ) -> anyhow::Result<(LlmResponse, baybo_model::SpanId)> {
         let model_info = self.llm_client.model_info();
 
-        // Filtered by the session's channel (owner-only deck tools) and its
-        // trigger (`report_nothing`, visible only in a recurring cron fire).
-        // Both are session-stable, so the list stays byte-identical across this
-        // session's calls and prompt caching holds.
-        let tool_defs: Vec<ToolDefinitionForLlm> = self
-            .tool_registry
-            .tool_definitions_for_session(&session.channel, &session.trigger)
-            .into_iter()
-            .map(|td| ToolDefinitionForLlm {
-                name: td.name,
-                description: td.description,
-                parameters_schema: td.parameters_schema,
-            })
-            .collect();
+        let tool_defs = self.session_tool_defs(session);
 
         // Mirrored off the wire list rather than re-read from the registry:
         // the trace has to record what this request actually carried, and a
@@ -1853,6 +1840,7 @@ impl AgentLoop {
             temperature: None,
             tools: tool_defs,
             reasoning_effort: self.initial_effort.clone(),
+            ..Default::default()
         };
 
         let input_messages = self.context_manager.build_call_input_marker().await;
@@ -2841,6 +2829,7 @@ impl AgentLoop {
             CompressionTrigger::Threshold,
         );
         let model_id = runner.model_info.id.clone();
+        let tool_defs = self.session_tool_defs(session);
         // `needs_compression` mirrors `maybe_compress`'s gate, so we only
         // report the phase when a pass will actually run.
         let compacting = self.context_manager.needs_compression(&model_id);
@@ -2850,7 +2839,7 @@ impl AgentLoop {
         }
         let result = self
             .context_manager
-            .maybe_compress(&model_id, |req, marker| async move {
+            .maybe_compress(&model_id, tool_defs, |req, marker| async move {
                 runner.run(req, marker).await
             })
             .await;
@@ -2912,6 +2901,20 @@ impl AgentLoop {
                 },
             })
             .await;
+    }
+
+    /// Build the session-stable tool list shared by normal, compaction, and
+    /// observer requests so their cached prefixes agree.
+    fn session_tool_defs(&self, session: &Session) -> Vec<ToolDefinitionForLlm> {
+        self.tool_registry
+            .tool_definitions_for_session(&session.channel, &session.trigger)
+            .into_iter()
+            .map(|td| ToolDefinitionForLlm {
+                name: td.name,
+                description: td.description,
+                parameters_schema: td.parameters_schema,
+            })
+            .collect()
     }
 
     fn build_compression_runner(
@@ -3005,13 +3008,8 @@ impl AgentLoop {
             return;
         }
 
-        // Reuse the main call's prefix (cache hit) + a summarize turn that
-        // also carries the lines already shown this turn so the model
-        // advances instead of repeating. The prior lines + instruction are
-        // the appended suffix — `messages_for_llm()` (the cached prefix) is
-        // untouched. No tools, so the observer only narrates. Clone the
-        // snapshot NOW, synchronously at the boundary, so the detached task
-        // owns a coherent frozen copy and never reads live context.
+        // Snapshot the cached prefix and observer suffix before spawning so the
+        // detached task never reads live context.
         let mut messages = self.context_manager.messages_for_llm();
         let prompt_msg = ChatMessage::user(vec![ContentBlock::Text(build_observer_prompt(
             &observer_state.sent_notices,
@@ -3028,8 +3026,11 @@ impl AgentLoop {
         let request = ChatRequest {
             messages,
             temperature: None,
-            tools: Vec::new(),
+            // Preserve the cached tool prefix while keeping the observer read-only.
+            tools: self.session_tool_defs(session),
+            tool_choice: baybo_llm::ToolChoice::None,
             reasoning_effort: self.initial_effort.clone(),
+            ..Default::default()
         };
 
         // Throttle on attempt, not just success — a failing or empty call
@@ -3161,9 +3162,10 @@ impl AgentLoop {
                     CompressionTrigger::Forced,
                 );
                 let model_id = runner.model_info.id.clone();
+                let tool_defs = self.session_tool_defs(session);
                 let outcome = self
                     .context_manager
-                    .force_compress(&model_id, |req, marker| async move {
+                    .force_compress(&model_id, tool_defs, |req, marker| async move {
                         runner.run(req, marker).await
                     })
                     .await?;

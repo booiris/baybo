@@ -53,6 +53,7 @@ impl TitleRunner {
             // runs on the session entry's lite model and never carries the
             // session's thinking-level pin.
             reasoning_effort: None,
+            ..Default::default()
         };
 
         let cancel_ctx = Some((&cancel_token, baybo_turn::CancelReason::ParentCancelled));

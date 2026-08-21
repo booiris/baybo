@@ -148,6 +148,7 @@ mod tests {
             temperature: Some(0.0),
             tools: vec![],
             reasoning_effort: None,
+            ..Default::default()
         };
 
         let billed_response = billed.chat(&request).await.expect("chat ok");
