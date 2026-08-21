@@ -1189,6 +1189,16 @@ impl ProjectStore for SqliteProjectStore {
                 // The live index rejects a second unfinished run. Returned as
                 // data rather than an error because a non-Internal
                 // StorageError cannot be built inside this closure.
+                //
+                // **Only** a constraint refusal comes out that way. Every
+                // other failure here — a busy database, a full disk, a
+                // datatype mismatch — is propagated as the error it is,
+                // because the caller turns this side of the fork into
+                // "issue already has a run in flight" and, since
+                // `enqueue_as` began recording a `RunRefused` entry on it,
+                // into a permanent line on the card saying a dedupe
+                // refusal happened. A transient sqlite failure must not be
+                // written into a card's history as one.
                 if let Err(e) = tx.execute(
                     "INSERT INTO issue_runs (id, issue_id, project_id, number, agent_id, \
                      session_id, trigger, status, attempt, error, created_at, started_at, \
@@ -1197,6 +1207,9 @@ impl ProjectStore for SqliteProjectStore {
                     rusqlite::params![id, issue_id, project, number, agent, trigger, attempt, now],
                 ) {
                     drop(tx);
+                    if !super::already_there(&e) {
+                        return Err(e.into());
+                    }
                     return Ok(Err(e.to_string()));
                 }
                 let raw = tx.query_row(
@@ -2121,6 +2134,61 @@ mod tests {
             backlog,
             vec![(1, 0), (3, 1), (4, 2)],
             "the survivors keep their order and take consecutive ranks"
+        );
+    }
+
+    /// A write that could not run at all is not a card that already had a
+    /// run.
+    ///
+    /// Every `tx.execute` failure used to come out of the closure as a bare
+    /// string and get labelled `Conflict("issue already has a run in
+    /// flight")` — so a busy database, a full disk or a broken statement
+    /// all told the operator something that had not happened. It matters
+    /// more than a wrong log line: `enqueue_as` records a `RunRefused`
+    /// entry on that arm, so a transient failure would be written into the
+    /// card's history, permanently, as a dedupe refusal.
+    #[tokio::test]
+    async fn only_a_row_that_was_already_there_is_reported_as_a_conflict() {
+        let (_dir, store) = store().await;
+        let p = project("proj-a", "A");
+        store.create_project(&p).await.unwrap();
+        let busy = store
+            .create_issue(&new_issue(&p.id, "one", IssueStatus::Backlog))
+            .await
+            .unwrap();
+        let idle = store
+            .create_issue(&new_issue(&p.id, "two", IssueStatus::Backlog))
+            .await
+            .unwrap();
+
+        store.enqueue_run(&new_run(&busy)).await.unwrap();
+        let refused = store
+            .enqueue_run(&new_run(&busy))
+            .await
+            .expect_err("the card's slot is taken");
+        assert!(
+            matches!(refused, StorageError::Conflict(_)),
+            "a uniqueness refusal is a conflict: {refused:?}"
+        );
+
+        // Break the INSERT without breaking the statements around it: the
+        // attempt lookup still reads, and only the write cannot run. A
+        // missing column is `SQLITE_ERROR`, not a constraint of any kind.
+        store
+            .pool
+            .interact("test.break_insert", |conn| {
+                Ok(conn.execute_batch("ALTER TABLE issue_runs DROP COLUMN error;")?)
+            })
+            .await
+            .unwrap();
+
+        let broken = store
+            .enqueue_run(&new_run(&idle))
+            .await
+            .expect_err("the insert cannot run");
+        assert!(
+            !matches!(broken, StorageError::Conflict(_)),
+            "a statement that could not run is not a slot that was taken: {broken:?}"
         );
     }
 

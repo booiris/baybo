@@ -714,6 +714,43 @@ pub(crate) fn in_placeholders(n: usize) -> String {
     std::iter::repeat_n("?", n).collect::<Vec<_>>().join(",")
 }
 
+/// Whether a write failed because a **uniqueness** constraint refused it —
+/// the row is already there — rather than for any other reason.
+///
+/// The distinction is between "this was already there" and "sqlite is busy
+/// / the disk is full / that column takes another type", and a caller that
+/// reports the second as the first tells its user something that never
+/// happened.
+///
+/// The **extended** code, not `ErrorCode::ConstraintViolation`. That wider
+/// bucket also holds NOT NULL and CHECK, which are bugs in the statement
+/// rather than a row that lost a race, and reporting one of those as
+/// "somebody got there first" is the same lie one altitude down. (It holds
+/// FOREIGN KEY too, which genuinely *can* be a lost race — a parent deleted
+/// concurrently — but this codebase never enables `PRAGMA foreign_keys`, so
+/// there is no such case to classify.)
+///
+/// Both uniqueness codes are needed. A duplicate `TEXT PRIMARY KEY` reports
+/// `SQLITE_CONSTRAINT_PRIMARYKEY` while its *message* still reads "UNIQUE
+/// constraint failed", so matching on UNIQUE alone would misfile it.
+///
+/// Asked of the code, and therefore only answerable *inside* the pool
+/// closure while the `rusqlite::Error` still exists: once a failure has been
+/// stringified out of one, all that is left to go on is the message. Two
+/// older stores (`device`, `agent_profile`) sniff that string for
+/// `"constraint"` from outside — which does separate a constraint from a
+/// busy database or a broken statement, since neither of those messages
+/// carries the word, but cannot tell a uniqueness refusal from a NOT NULL or
+/// CHECK one. They are worth moving onto this.
+pub(crate) fn already_there(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(err, _)
+            if err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                || err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+    )
+}
+
 /// Create all required tables if they do not already exist.
 ///
 /// Timestamp columns (`created_at`, `started_at` on `turns`, etc.) are Unix
@@ -1783,6 +1820,74 @@ mod tests {
     /// An open pool must already hold every connection, leaving none to open
     /// lazily later.
     ///
+    /// `already_there` is asked of the extended code, so this pins what
+    /// sqlite actually reports — every claim in its doc comment is
+    /// measurable, and a rusqlite bump that changed any of them would
+    /// otherwise turn a refusal into an internal error, or the reverse.
+    #[tokio::test]
+    async fn already_there_separates_a_duplicate_row_from_every_other_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pool = SqlitePool::open(dir.path().join("t.db"))
+            .await
+            .expect("open");
+
+        let verdicts = pool
+            .interact("test.classify", |conn| {
+                conn.execute_batch(
+                    "CREATE TABLE t (id TEXT PRIMARY KEY, uniq TEXT UNIQUE, needed TEXT NOT NULL,                      checked INTEGER CHECK (checked > 0));
+                     INSERT INTO t VALUES ('a', 'a', 'x', 1);",
+                )?;
+                let classify = |sql: &str| {
+                    let e = conn.execute(sql, []).expect_err("the statement must fail");
+                    (already_there(&e), e.to_string())
+                };
+                Ok(vec![
+                    // Both uniqueness codes, and the reason the PK arm is
+                    // needed: its message says UNIQUE while its code does not.
+                    classify("INSERT INTO t VALUES ('a', 'b', 'x', 1)"),
+                    classify("INSERT INTO t VALUES ('b', 'a', 'x', 1)"),
+                    // A constraint, but not a row that was already there.
+                    classify("INSERT INTO t (id, uniq, checked) VALUES ('c', 'c', 1)"),
+                    classify("INSERT INTO t VALUES ('d', 'd', 'x', 0)"),
+                    // Not a constraint at all.
+                    classify("INSERT INTO t (nope) VALUES ('e')"),
+                ])
+            })
+            .await
+            .expect("classify");
+
+        let (duplicate_pk, duplicate_unique, not_null, check, no_column) = (
+            &verdicts[0],
+            &verdicts[1],
+            &verdicts[2],
+            &verdicts[3],
+            &verdicts[4],
+        );
+
+        assert!(
+            duplicate_pk.0,
+            "a duplicate primary key is a row already there: {duplicate_pk:?}"
+        );
+        assert!(
+            duplicate_pk.1.contains("UNIQUE"),
+            "and it says UNIQUE in its message while reporting the PRIMARYKEY code — which is              why matching on the UNIQUE code alone would misfile it: {duplicate_pk:?}"
+        );
+        assert!(
+            duplicate_unique.0,
+            "so is a duplicate unique index: {duplicate_unique:?}"
+        );
+
+        assert!(
+            !not_null.0,
+            "a missing NOT NULL column is a broken statement: {not_null:?}"
+        );
+        assert!(!check.0, "so is a failed CHECK: {check:?}");
+        assert!(
+            !no_column.0,
+            "and a column that does not exist: {no_column:?}"
+        );
+    }
+
     /// The narrow guard the cost window and the run waiter actually depend
     /// on is enforced, and is not the same constraint as the card's slot.
     ///
