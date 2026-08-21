@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use baybo_model::{AgentProfileId, MediaBlock};
 use baybo_store::project::{
-    IssueAttachment, IssueEventBody, IssueEventRow, IssueRow, IssueRunRow, ProjectStore, RunTrigger,
+    IssueAttachment, IssueEventBody, IssueEventRow, IssuePriority, IssueRow, IssueRunRow,
+    ProjectStore, RunTrigger,
 };
 use baybo_store::{AgentProfileStore, BlobStore};
 
@@ -53,6 +54,29 @@ pub(crate) struct Comment {
 
 const BLOCKED_ON: &str = "\n\nThis card is blocked. The reason on it reads:\n";
 
+const ON_THE_CARD: &str = "\n\nOn the card: ";
+
+const PROPERTY_SEPARATOR: &str = " · ";
+
+const STATUS_LABEL: &str = "status ";
+const PRIORITY_LABEL: &str = "priority ";
+const BRANCH_LABEL: &str = "branch ";
+const UNASSIGNED: &str = "unassigned";
+
+/// Render the fields whose absence previously forced a redundant `IssueGet`.
+/// Parent is omitted because resolving its board number requires a scan.
+fn properties_line(issue: &IssueRow, assignee: Option<&str>) -> String {
+    let mut parts = vec![format!("{STATUS_LABEL}{}", issue.status.as_str())];
+    if issue.priority != IssuePriority::None {
+        parts.push(format!("{PRIORITY_LABEL}{}", issue.priority.as_str()));
+    }
+    parts.push(assignee.unwrap_or(UNASSIGNED).to_string());
+    if let Some(branch) = issue.branch.as_deref() {
+        parts.push(format!("{BRANCH_LABEL}{branch}"));
+    }
+    format!("{ON_THE_CARD}{}", parts.join(PROPERTY_SEPARATOR))
+}
+
 const SAID_SINCE_LAST_RUN: &str = "\n\nSaid since your last run:\n";
 
 const SAID_ON_THE_CARD: &str = "\n\nSaid on the card so far:\n";
@@ -91,19 +115,15 @@ const MAX_BRIEF_MEDIA: usize = 8;
 const EARLIER_COMMENTS_TRIMMED: &str =
     "(earlier comments are not repeated here — the card itself has all of them)";
 
-const TRIAGE_PREAMBLE: &str = r#"You are this board's lead, woken because this card sits in Todo with nobody on it. Staff it — assign a teammate with the board's tools, or take it yourself — or deliberately leave it unstaffed. Do not do the card's own work in this run."#;
+const TRIAGE_PREAMBLE: &str = r#"You are this board's lead. This run is for staffing this card: assign a teammate with the board's tools, take it yourself, or deliberately leave it unstaffed. Do not do the card's own work in this run."#;
 
-const REVIEW_PREAMBLE: &str = r#"You are this board's lead, woken because this card sits in Review with nothing running on it. Arrange the review: hand it to a reviewer (reassign and say what to check), or check it yourself, and once the verdict is in move the card onward — Done, or back for fixes with a comment saying what to fix."#;
+const REVIEW_PREAMBLE: &str = r#"You are this board's lead. This run is for arranging a review: hand the card to a reviewer (reassign and say what to check), or check it yourself, then move it onward — Done, or back for fixes with a comment saying what to fix."#;
 
-const STALLED_PREAMBLE: &str = r#"You are this board's lead, woken because this card sits in In Progress with no run working it and nothing queued. Decide what happens to it: wake its assignee with a comment asking for a status or the next step, restaff it, move it back to Todo, or block it with a reason. Do not do the card's own work in this run."#;
+const STALLED_PREAMBLE: &str = r#"You are this board's lead. Work on this card has stopped: no run is active or queued. Wake its assignee with a comment asking for the next step, restaff it, move it back to Todo, or block it with a reason. Do not do the card's own work in this run."#;
 
-const BLOCKED_PREAMBLE: &str = r#"You are this board's lead, woken because this card is blocked and its reason is a question, not a status. Read the reason and decide: answer it and unblock the card, hand it back with a comment saying what to do instead, escalate it to the operator in a comment, or cancel the card. Do not do the card's own work in this run."#;
+const BLOCKED_PREAMBLE: &str = r#"You are this board's lead. The block below needs a decision: answer it and unblock the card, hand it back with a comment saying what to do instead, escalate it to the operator in a comment, or cancel the card. Do not do the card's own work in this run."#;
 
-/// The framing a coordination run opens with. An ordinary run is briefed by
-/// the card alone; the lead's wakes carry *why* it was woken, because the
-/// card itself does not say — the brief has no status line, and "staff
-/// this", "review this" and "this stalled" are three different asks over
-/// the same card.
+/// State why the lead was woken; the card properties do not encode the ask.
 fn coordination_preamble(trigger: RunTrigger) -> Option<&'static str> {
     match trigger {
         RunTrigger::Triage => Some(TRIAGE_PREAMBLE),
@@ -178,7 +198,12 @@ fn comment_block(comments: &[Comment]) -> String {
     block
 }
 
-pub(crate) fn issue_brief(issue: &IssueRow, said: &Said, trigger: RunTrigger) -> String {
+pub(crate) fn issue_brief(
+    issue: &IssueRow,
+    said: &Said,
+    trigger: RunTrigger,
+    assignee: Option<&str>,
+) -> String {
     let mut brief = String::new();
     if let Some(preamble) = coordination_preamble(trigger) {
         brief.push_str(preamble);
@@ -189,6 +214,7 @@ pub(crate) fn issue_brief(issue: &IssueRow, said: &Said, trigger: RunTrigger) ->
     } else {
         brief.push_str(&format!("{}\n\n{}", issue.title, issue.description));
     };
+    brief.push_str(&properties_line(issue, assignee));
     if let Some(reason) = issue.blocked_reason.as_deref() {
         brief.push_str(BLOCKED_ON);
         // Indentation distinguishes quoted prose from the brief's voice.
@@ -491,6 +517,48 @@ mod tests {
     }
 
     #[test]
+    fn the_brief_names_the_card_properties_the_way_the_board_does() {
+        let mut issue = card();
+        issue.status = IssueStatus::InProgress;
+        issue.priority = IssuePriority::High;
+        issue.branch = Some("issue/7-parser".into());
+
+        let brief = issue_brief(
+            &issue,
+            &Said {
+                window: BriefWindow::WholeCard,
+                inherited_worktree: false,
+                comments: Vec::new(),
+            },
+            RunTrigger::Started,
+            Some("@parser-engineer"),
+        );
+
+        assert!(brief.contains("status in_progress"), "{brief}");
+        assert!(brief.contains("priority high"), "{brief}");
+        assert!(brief.contains("@parser-engineer"), "{brief}");
+        assert!(brief.contains("branch issue/7-parser"), "{brief}");
+    }
+
+    #[test]
+    fn an_unassigned_card_with_no_priority_says_both() {
+        let issue = card();
+        let brief = issue_brief(
+            &issue,
+            &Said {
+                window: BriefWindow::WholeCard,
+                inherited_worktree: false,
+                comments: Vec::new(),
+            },
+            RunTrigger::Started,
+            None,
+        );
+        assert!(brief.contains(UNASSIGNED), "{brief}");
+        assert!(!brief.contains(PRIORITY_LABEL), "{brief}");
+        assert!(!brief.contains(BRANCH_LABEL), "{brief}");
+    }
+
+    #[test]
     fn a_cards_first_run_reads_the_whole_card_as_its_own() {
         let issue = card();
         let dev_1 = AgentProfileId::parse("dev-1").expect("agent id");
@@ -507,6 +575,7 @@ mod tests {
                 comments: vec![said(actors::OPERATOR, "start with the CSV path")],
             },
             RunTrigger::Started,
+            None,
         );
         assert!(
             !brief.contains(INHERITED_WORKTREE),
@@ -539,6 +608,7 @@ mod tests {
                 comments: vec![said(actors::OPERATOR, "also handle the empty case")],
             },
             RunTrigger::Started,
+            None,
         );
         assert!(
             brief.contains(SAID_SINCE_LAST_RUN.trim()),
@@ -594,6 +664,7 @@ mod tests {
                 ],
             },
             RunTrigger::Started,
+            None,
         );
         assert!(
             brief.contains(SAID_ON_THE_CARD.trim()),
@@ -636,6 +707,7 @@ mod tests {
                 comments: Vec::new(),
             },
             RunTrigger::Started,
+            None,
         );
         assert!(
             brief.contains(INHERITED_WORKTREE),
@@ -680,6 +752,7 @@ mod tests {
                 comments,
             },
             RunTrigger::Started,
+            None,
         );
 
         assert!(
@@ -715,6 +788,7 @@ mod tests {
                 ],
             },
             RunTrigger::Started,
+            None,
         );
         assert!(brief.contains("- the operator: start with the CSV path\n"));
         assert!(brief.contains("- @qa: also handle the empty case\n"));
@@ -737,6 +811,7 @@ mod tests {
                 ],
             },
             RunTrigger::Started,
+            None,
         );
 
         // Who is asking is what says whether an answer is owed, and to whom:
@@ -769,6 +844,7 @@ mod tests {
                 ],
             },
             RunTrigger::Started,
+            None,
         );
 
         assert!(
@@ -794,13 +870,13 @@ mod tests {
             (RunTrigger::Review, REVIEW_PREAMBLE),
             (RunTrigger::Stalled, STALLED_PREAMBLE),
         ] {
-            let brief = issue_brief(&issue, &with_files(Vec::new()), trigger);
+            let brief = issue_brief(&issue, &with_files(Vec::new()), trigger, None);
             assert!(
                 brief.starts_with(preamble),
                 "a {trigger:?} brief must open with its own preamble: {brief}"
             );
         }
-        let ordinary = issue_brief(&issue, &with_files(Vec::new()), RunTrigger::Started);
+        let ordinary = issue_brief(&issue, &with_files(Vec::new()), RunTrigger::Started, None);
         assert!(
             ordinary.starts_with(&issue.title),
             "an ordinary run is briefed by the card alone: {ordinary}"
@@ -813,7 +889,7 @@ mod tests {
         issue.blocked_reason =
             Some("the card asks for behaviour the Go spec forbids — which wins?".to_owned());
 
-        let woken = issue_brief(&issue, &with_files(Vec::new()), RunTrigger::Blocked);
+        let woken = issue_brief(&issue, &with_files(Vec::new()), RunTrigger::Blocked, None);
         assert!(
             woken.starts_with(BLOCKED_PREAMBLE),
             "the wake still says why it happened: {woken}"
@@ -823,13 +899,13 @@ mod tests {
             "and the one field the whole question is about is in it: {woken}"
         );
 
-        let ordinary = issue_brief(&issue, &with_files(Vec::new()), RunTrigger::Started);
+        let ordinary = issue_brief(&issue, &with_files(Vec::new()), RunTrigger::Started, None);
         assert!(
             ordinary.contains("This card is blocked."),
             "a block is a standing fact about the card, not a fact about one trigger: {ordinary}"
         );
         assert!(
-            !issue_brief(&card(), &with_files(Vec::new()), RunTrigger::Started)
+            !issue_brief(&card(), &with_files(Vec::new()), RunTrigger::Started, None)
                 .contains("This card is blocked."),
             "and a card nothing has stopped says nothing about a block"
         );
@@ -839,7 +915,7 @@ mod tests {
     fn the_cards_own_files_are_named_with_their_type_and_weight() {
         let mut issue = card();
         issue.attachments = vec![file("mockup.png", "image/png")];
-        let brief = issue_brief(&issue, &with_files(Vec::new()), RunTrigger::Started);
+        let brief = issue_brief(&issue, &with_files(Vec::new()), RunTrigger::Started, None);
         assert!(
             brief.contains("Files on this card:\n- mockup.png (image/png, 1 KB)"),
             "{brief}"
@@ -851,7 +927,12 @@ mod tests {
         let issue = card();
         let mut only_a_file = said(actors::OPERATOR, "");
         only_a_file.attachments = vec![file("trace.log", "text/plain")];
-        let brief = issue_brief(&issue, &with_files(vec![only_a_file]), RunTrigger::Started);
+        let brief = issue_brief(
+            &issue,
+            &with_files(vec![only_a_file]),
+            RunTrigger::Started,
+            None,
+        );
         assert!(
             brief.contains("- the operator: [attached trace.log (text/plain, 1 KB)]"),
             "an attachment-only comment must not read as an empty line:\n{brief}"
@@ -895,7 +976,7 @@ mod tests {
         );
         assert_eq!(named(&issue, &said).len(), 11);
 
-        let brief = issue_brief(&issue, &said, RunTrigger::Started);
+        let brief = issue_brief(&issue, &said, RunTrigger::Started, None);
         assert!(
             brief.contains("Not every file above could be shown to you"),
             "a brief that quietly showed eight of eleven files would be lying:\n{brief}"
@@ -922,7 +1003,7 @@ mod tests {
             delivered(&issue, &follow_up).is_empty(),
             "the card's files were already delivered into this transcript"
         );
-        let brief = issue_brief(&issue, &follow_up, RunTrigger::Started);
+        let brief = issue_brief(&issue, &follow_up, RunTrigger::Started, None);
         assert!(brief.contains("mockup.png"), "still named: {brief}");
         assert!(
             brief.contains("already earlier in this conversation"),
@@ -954,7 +1035,7 @@ mod tests {
         huge.attachments = vec![file("new.png", "image/png")];
         let said = with_files(vec![old, huge]);
 
-        let brief = issue_brief(&issue, &said, RunTrigger::Started);
+        let brief = issue_brief(&issue, &said, RunTrigger::Started, None);
         assert!(
             !brief.contains("old.png"),
             "its whole line was trimmed, so nothing in the prose names it:\n{brief}"
@@ -975,7 +1056,7 @@ mod tests {
     fn a_card_within_the_budget_says_nothing_about_trimming() {
         let mut issue = card();
         issue.attachments = vec![file("one.png", "image/png")];
-        let brief = issue_brief(&issue, &with_files(Vec::new()), RunTrigger::Started);
+        let brief = issue_brief(&issue, &with_files(Vec::new()), RunTrigger::Started, None);
         assert!(!brief.contains("Not every file"), "{brief}");
     }
 }

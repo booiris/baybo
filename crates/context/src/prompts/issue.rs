@@ -8,7 +8,7 @@ const FRAMING_BODY: &str = r#"You are working on this issue as its assignee. Thi
 project board, not a message from a person — nobody is waiting at a
 keyboard for a reply. Do the work, and let what you write be the record
 of it: what you changed, what you found, and anything the operator has to
-decide."#;
+decide. Read the brief below before fetching this card again."#;
 
 const INSTRUCTION_LABEL: &str = "The issue:";
 
@@ -16,10 +16,9 @@ const CHECKOUT_BODY: &str = r#"Your checkout for this issue is:
 
   {{checkout}}
 
-Commands run there by default and your branch is already checked out, so
-work in place: no `cd`, and no clone. Other issues have their own
-checkouts of the same repository — treat anything outside this one as
-somebody else's."#;
+Its branch is already checked out; do not clone the repository again.
+Other issues have their own checkouts of the same repository — treat
+anything outside this one as somebody else's."#;
 
 /// Frame an issue's brief for the run that will execute it.
 pub fn frame_issue_brief(number: i64, checkout: &str, brief: &str) -> String {
@@ -60,9 +59,6 @@ mod tests {
             framed.ends_with("The issue:\nFix the reconnect storm"),
             "the instruction is the tail, so a reader knows where framing ends: {framed}"
         );
-        // The run is told where it is, because nothing else tells it: the
-        // Bash description is rendered per process and names the workspace
-        // work dir for every session.
         assert!(
             framed.contains("/ws/work/projects/p/7"),
             "the framing must name the checkout: {framed}"

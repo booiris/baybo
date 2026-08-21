@@ -37,7 +37,7 @@ impl Tool for IssueGetTool {
     }
 
     fn description(&self) -> String {
-        r#"Read one issue on this project's board in full: its description, properties, and its timeline — the comments and system events, in order, that say what has happened to it. Use it before acting on a card somebody else has been working, so you answer what was actually said rather than what the title suggests."#
+        r#"Read an issue's description, properties, and recent timeline, including comments and system events. The current brief already carries this card's properties, description, and unread comments; use IssueGet for another card, omitted history or system events, or after the brief has left context."#
             .to_string()
     }
 

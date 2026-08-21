@@ -129,7 +129,15 @@ async fn prepare(config: &DispatchConfig, run: IssueRunRow) -> Option<IssueRunEv
     // side that over-reads rather than the side that drops it.
     let briefed_at = Utc::now();
     let said = comments_for_brief(store, agents, &run).await;
-    let brief = issue_brief(&issue, &said, run.trigger);
+    // Resolve the board handle here so issue_brief stays a pure renderer.
+    let assignee = match issue.assignee.as_ref() {
+        Some(id) => {
+            let known = crate::actors::profiles(agents, &run.project_id, [id.clone()]).await;
+            Some(crate::actors::handle_of(&known, id))
+        }
+        None => None,
+    };
+    let brief = issue_brief(&issue, &said, run.trigger, assignee.as_deref());
     let files = issue_brief_media(blobs, &issue, &said).await;
 
     let checkout = match worktree::prepare_for_issue(store, paths, &issue).await {

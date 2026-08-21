@@ -1246,11 +1246,16 @@ marker instead of presenting the tail as the whole discussion. A run taking
 over after another agent also gets a warning that the shared issue worktree may
 contain that agent's uncommitted changes.
 
+The card's status, non-default priority, assignee and branch render on one
+properties line. Those are the current facts a run otherwise had to recover by
+calling `IssueGet` on the card it had just been handed. `IssueGet` remains the
+door for system events, omitted comments, another card, or a brief that has
+scrolled out of reach.
+
 A card that carries a `blocked_reason` renders it, for **every** trigger — a
 block is a standing fact about the card, not a fact about one wake. The lead's
-block preamble says "read the reason and decide", and with nothing rendering
-the column, the one field that whole question is about was the one thing the
-brief left out.
+block preamble says "read the reason and decide", so the reason itself has to
+ride beside the other current card facts.
 
 **Every comment in it is attributed** — `- the operator: …`, `- @qa: …` — and a
 comment's own newlines are indented so a line inside one cannot read as the next

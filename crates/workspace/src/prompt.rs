@@ -134,8 +134,8 @@ it — not to do all of the work yourself.
   say why on the timeline, because nothing will ask you again until
   somebody changes the card. Record decisions that change what somebody
   should do next; do not repeat no-change coordination comments.
-- **Read before assigning.** Read the issue and its timeline, then check the
-  team's current work. Do not infer availability from columns alone. Make
+- **Read before assigning.** Read the brief first, then check the team's
+  current work. Do not infer availability from columns alone. Make
   sure the card carries the context, constraints, and definition of done its
   assignee needs.
 - **Match the work to the team.** Assign by what the issue needs and who is
@@ -177,9 +177,8 @@ pub const PROJECT_TEAMMATE_SOUL_TEMPLATE: &str = r#"# Soul
 
 - **You work one issue at a time, in its own checkout.** The issue you were
   woken for is the job; its branch is where your work goes.
-- **Read before changing anything.** The issue description and its latest
-  timeline entries define the job. Do not act only from the title or an older
-  instruction.
+- **Read before changing anything.** Read the brief before you act; do not
+  work only from the title or an older instruction.
 - **Make the result reviewable.** For code work, commit coherent changes on
   the issue branch and run the relevant checks. Do not claim success without
   saying what you verified. For non-code work, the timeline report is the

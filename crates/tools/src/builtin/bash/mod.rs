@@ -112,7 +112,7 @@ Reserve Bash for system commands, git, build/test, and anything that genuinely n
 
 {{approval}}
 
-DEFAULT CWD: If `cwd` is omitted, Baybo runs the command from {{work_dir}} and exports `PWD` with the same value.
+DEFAULT CWD: If `cwd` is omitted, the command runs in this session's own working directory — the issue checkout when the session was given one, otherwise {{work_dir}} — and `PWD` is exported to match.
 
 PATHS: Every directory or file argument, and `cwd` itself, MUST be absolute; relative values are rejected. Quote paths containing spaces.
 
@@ -123,7 +123,6 @@ BEFORE BROAD SCANS: Do not run `find`, `du`, recursive `ls`, or similar walks ag
 {{python_runtime}}
 
 ENVIRONMENT:
-- Working directory: {{work_dir}}
 - Platform: {{platform}}"#;
 
 #[cfg(not(feature = "bench-bash"))]
@@ -132,7 +131,7 @@ const SANDBOXED_ISOLATION: &str = r#"SANDBOX: The shell has read+write access to
 #[cfg(not(feature = "bench-bash"))]
 const SANDBOXED_WORK_DIR_SCOPE: &str = r#"WORK-DIR SCOPE: Inside the workspace, Bash may only name {{work_dir}} (read+write), `skills/` (read+execute, never write), and blob payload paths returned by `GetBlob` (read-only). Every other path under the workspace root is rejected up front, `cwd` included — reach those through `Read`/`Edit`/`Write` instead. Paths outside the workspace are unaffected by this rule.
 
-SCRATCH: Put disposable/intermediate files (probe scripts, one-off downloads, temp build output) under {{work_tmp_dir}} — it is swept automatically after {{work_tmp_ttl_days}} days. Deliverables the user should keep belong elsewhere under {{work_dir}}."#;
+SCRATCH: Put disposable/intermediate files (probe scripts, one-off downloads, temp build output) under {{work_tmp_dir}} — it is swept automatically after {{work_tmp_ttl_days}} days. Anything meant to be kept belongs in your checkout when you have one, and elsewhere under {{work_dir}} otherwise."#;
 
 #[cfg(not(feature = "bench-bash"))]
 const SANDBOXED_PYTHON: &str = r#"PYTHON: `python`, `python3`, and `pip` are shimmed to `uv run python` / `uv pip` inside this shell. For one-file scripts with third-party deps, declare them via PEP 723 inline metadata (`# /// script` block) so `uv run --script my.py` resolves them per-call. The shims are shell functions scoped to the outer `sh -c` — `bash -c '…'` subshells, `/usr/bin/python`, and Python's own `subprocess` calls bypass them."#;
