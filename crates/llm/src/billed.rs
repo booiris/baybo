@@ -317,6 +317,57 @@ mod tests {
         }
     }
 
+    /// Every billed call is cache-keyed because the binding does it, not
+    /// because sixteen callers remember to. A caller that picked its own
+    /// bucket keeps it.
+    #[tokio::test]
+    async fn a_bound_call_carries_the_session_as_its_cache_bucket() {
+        let stub = Arc::new(StubLlm::new());
+        stub.push_response(LlmResponse {
+            content: "ok".into(),
+            content_blocks: vec![],
+            tool_calls: vec![],
+            usage: usage(1, 2),
+            thinking: None,
+        });
+        stub.push_response(LlmResponse {
+            content: "ok".into(),
+            content_blocks: vec![],
+            tool_calls: vec![],
+            usage: usage(1, 2),
+            thinking: None,
+        });
+        let guarded = BillableLlm::new(
+            Arc::clone(&stub) as Arc<dyn LlmCompletion>,
+            billing_with_probe(Arc::new(RecorderProbe::default())),
+        );
+        let bound = guarded.bind(Attribution::system("unit-test"));
+
+        bound
+            .chat(&request_with_effort(None))
+            .await
+            .expect("chat ok");
+        bound
+            .chat(&ChatRequest {
+                prompt_cache_key: Some("caller-picked".into()),
+                ..request_with_effort(None)
+            })
+            .await
+            .expect("chat ok");
+
+        let sent = stub.captured_requests();
+        assert_eq!(
+            sent[0].prompt_cache_key.as_deref(),
+            Some("system:unit-test"),
+            "an unkeyed request must reach the provider keyed by its session"
+        );
+        assert_eq!(
+            sent[1].prompt_cache_key.as_deref(),
+            Some("caller-picked"),
+            "a caller that set a bucket keeps it — the probe depends on this"
+        );
+    }
+
     #[test]
     fn system_attribution_uses_reserved_identity() {
         let attr = Attribution::system("skill-assessor");

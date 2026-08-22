@@ -24,16 +24,20 @@ const MAX_LINE_BYTES: usize = 2000;
 const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_FILE_MIB: u64 = MAX_FILE_BYTES / 1024 / 1024;
 
-/// Format one line of `Read`-style output: a right-aligned 1-based line
-/// number, a tab, then the line truncated to [`MAX_LINE_BYTES`] at a UTF-8
-/// boundary (with a `… [truncated]` marker when cut). Used by both the
-/// filesystem read loop and the virtual-file path below.
+/// Format one line of `Read`-style output: a 1-based line number, a tab,
+/// then the line truncated to [`MAX_LINE_BYTES`] at a UTF-8 boundary (with a
+/// `… [truncated]` marker when cut). Used by both the filesystem read loop
+/// and the virtual-file path below.
+///
+/// The number is not padded to a column. Alignment is for a human scanning a
+/// page; the model reads the tab, and a gutter of spaces on every line of
+/// every read is the single largest avoidable share of what `Read` spends.
 fn format_numbered_line(line_no: usize, line: &str) -> String {
     let cut = line.floor_char_boundary(MAX_LINE_BYTES);
     if cut < line.len() {
-        format!("{:>6}\t{}… [truncated]\n", line_no, &line[..cut])
+        format!("{}\t{}… [truncated]\n", line_no, &line[..cut])
     } else {
-        format!("{:>6}\t{}\n", line_no, line)
+        format!("{}\t{}\n", line_no, line)
     }
 }
 
@@ -462,8 +466,8 @@ mod tests {
     #[test]
     fn paginate_numbers_lines_and_honors_offset_limit() {
         let out = paginate_numbered("l1\nl2\nl3\nl4", Some(2), Some(2));
-        assert!(out.contains("     2\tl2"));
-        assert!(out.contains("     3\tl3"));
+        assert!(out.contains("2\tl2"));
+        assert!(out.contains("3\tl3"));
         assert!(!out.contains("l1"));
         assert!(!out.contains("l4"));
     }
@@ -490,7 +494,7 @@ mod tests {
             .await
             .unwrap();
         let ToolOutput::Text(s) = out else { panic!() };
-        assert!(s.contains("     1\tv1"));
+        assert!(s.contains("1\tv1"));
         assert!(
             !s.contains("v2"),
             "limit=1 must stop before the second line"

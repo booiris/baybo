@@ -297,7 +297,7 @@ fn cap_trace_output(value: Value) -> (Value, Option<usize>) {
 }
 
 pub(crate) fn cap_trace_output_with_len(value: Value, full_len: usize) -> (Value, Option<usize>) {
-    use baybo_context::prompts::tool_output::MAX_TOOL_OUTPUT_BYTES;
+    use baybo_model::MAX_TOOL_OUTPUT_BYTES;
 
     if full_len <= MAX_TOOL_OUTPUT_BYTES {
         return (value, None);
@@ -1051,7 +1051,7 @@ impl ToolExecutor {
                         // for tiny outputs, which then need no join. Media
                         // blocks ride the pointer since they never enter the
                         // `ToolResult` text.
-                        use baybo_context::prompts::tool_output::MAX_TOOL_OUTPUT_BYTES;
+                        use baybo_model::MAX_TOOL_OUTPUT_BYTES;
                         let output_value = tool_output_to_trace_value_uncapped(&output);
                         let full_len = serde_json::to_string(&output_value).map_or(0, |s| s.len());
                         let output_truncated_from =
@@ -1630,7 +1630,7 @@ mod tests {
         );
     }
 
-    use baybo_context::prompts::tool_output::MAX_TOOL_OUTPUT_BYTES;
+    use baybo_model::MAX_TOOL_OUTPUT_BYTES;
 
     #[test]
     fn trace_value_preserves_text_payload() {

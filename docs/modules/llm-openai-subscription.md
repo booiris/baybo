@@ -231,9 +231,12 @@ The rejected alternative for both is the per-entry `pricing` override in `regist
 | Refresh permanent failure | `Config("openai-subscription: refresh token expired/revoked — re-login required")` (auto-clear bundle) |
 | Refresh transient failure | surfaced as a rig `CompletionError::ProviderError`, classified to `LlmError::Transient` by `rig_completion_to_error` |
 | Responses API 401 after refresh | rig `CompletionError::ProviderError("openai-subscription: unauthorized after refresh — ...")` (completion_model.rs), classified to `LlmError::Transient` by `rig_completion_to_error` |
-| Responses API 429 | `RateLimited { retry_after, message }` (via `status_to_error`) — agent's `ErrorHandler` already retries |
+| Responses API 429, body `error.type == "usage_limit_reached"` | `QuotaExhausted { resets_in, message }` — **not** retriable. The plan's quota resets hours out (98,178 s in the case this was found on), so the agent's retry ladder would spend ten attempts against a wall. Keyed on the body's `type`, never the status |
+| Responses API 429, any other body | `RateLimited { retry_after, message }` (via `status_to_error`) — agent's `ErrorHandler` already retries |
 | Responses API 5xx | `Transient(...)` (via `status_to_error`) — agent retries through its existing path |
 | SSE / response parse error | `Decode(...)` (via `reqwest_to_error`) or a rig `ProviderError` on the streaming path |
+
+On the non-streaming path (`completion`, which drains the stream internally — a compaction takes it) a mid-stream error is boxed into `CompletionError::RequestError` rather than stringified into `ProviderError`, and `rig_completion_to_error` downcasts it back. Stringifying it there erased the classification: every mid-stream failure re-emerged as `Transient` and retriable, `QuotaExhausted` included.
 
 ## Security & TOS
 

@@ -33,6 +33,10 @@ const PROMPT_CACHE_KEY_FIELD: &str = "prompt_cache_key";
 const INPUT_TOKENS_DETAILS_FIELD: &str = "input_tokens_details";
 const CACHED_TOKENS_FIELD: &str = "cached_tokens";
 const CACHE_WRITE_TOKENS_FIELD: &str = "cache_write_tokens";
+const ERROR_FIELD: &str = "error";
+const ERROR_TYPE_FIELD: &str = "type";
+const RESETS_IN_SECONDS_FIELD: &str = "resets_in_seconds";
+const USAGE_LIMIT_REACHED: &str = "usage_limit_reached";
 const TOOL_CHOICE_FIELD: &str = "tool_choice";
 const TOOL_CHOICE_AUTO: &str = "auto";
 const TOOL_CHOICE_NONE: &str = "none";
@@ -99,7 +103,11 @@ impl OpenAiSubscriptionCompletionModel {
         let mut usage = TokenUsage::default();
         let mut stream = stream;
         while let Some(event) = stream.next().await {
-            match event.map_err(|e| CompletionError::ProviderError(e.to_string()))? {
+            // Boxed rather than stringified: this path is what a compaction
+            // takes, and a `QuotaExhausted` flattened to text comes back out
+            // of the mapper as a retriable `Transient` — ten doomed attempts
+            // against a wall that stands for hours.
+            match event.map_err(|e| CompletionError::RequestError(Box::new(e)))? {
                 StreamEvent::Text(chunk) => text_buf.push_str(&chunk),
                 StreamEvent::Reasoning(delta) => reasoning_buf.push_str(&delta),
                 StreamEvent::ThinkingBlock(block) => thinking_blocks.push(block),
@@ -313,15 +321,40 @@ impl OpenAiSubscriptionCompletionModel {
             // provider message rather than an empty stream.
             let stream = stream::once(async move {
                 let body = response.text().await.unwrap_or_default();
-                Err(crate::status_to_error(
-                    status.as_u16(),
-                    format!("openai-subscription: Codex Responses returned {status}: {body}"),
-                ))
+                let message =
+                    format!("openai-subscription: Codex Responses returned {status}: {body}");
+                Err(quota_exhausted(&body)
+                    .map(|resets_in| LlmError::QuotaExhausted {
+                        resets_in,
+                        message: message.clone(),
+                    })
+                    .unwrap_or_else(|| crate::status_to_error(status.as_u16(), message)))
             });
             return LlmStream::from_inner(Box::pin(stream));
         }
         LlmStream::from_inner(Box::pin(parse_sse_stream(response)))
     }
+}
+
+/// The plan's quota is spent, not a throttle to back off from. Codex sends
+/// it as a 429 with a typed body, which is the only thing that separates the
+/// two: `Some(resets_in)` when the body says so, `None` for any other
+/// rejection. Keyed on the body's `type` and never on the status, so an
+/// ordinary per-minute throttle from any provider stays retriable.
+fn quota_exhausted(body: &str) -> Option<Option<std::time::Duration>> {
+    let error = serde_json::from_str::<Value>(body)
+        .ok()?
+        .get(ERROR_FIELD)?
+        .clone();
+    if error.get(ERROR_TYPE_FIELD).and_then(Value::as_str)? != USAGE_LIMIT_REACHED {
+        return None;
+    }
+    Some(
+        error
+            .get(RESETS_IN_SECONDS_FIELD)
+            .and_then(Value::as_u64)
+            .map(std::time::Duration::from_secs),
+    )
 }
 
 /// rig `CompletionRequest` → Codex Responses API JSON body. Returns
@@ -1508,6 +1541,33 @@ mod tests {
             }
             other => panic!("expected Usage, got {other:?}"),
         }
+    }
+
+    /// Body taken verbatim from a `429` this workspace actually received.
+    #[test]
+    fn a_spent_quota_is_told_apart_from_an_ordinary_throttle() {
+        let spent = r#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"prolite","resets_at":1787198413,"eligible_promo":null,"resets_in_seconds":98178}}"#;
+        assert_eq!(
+            quota_exhausted(spent),
+            Some(Some(std::time::Duration::from_secs(98_178))),
+            "27 hours away is not a backoff"
+        );
+
+        // Same status, ordinary throttle — must stay retriable.
+        assert_eq!(
+            quota_exhausted(r#"{"error":{"type":"rate_limit_exceeded","message":"slow down"}}"#),
+            None
+        );
+        assert_eq!(
+            quota_exhausted(r#"{"detail":"Unsupported parameter: x"}"#),
+            None
+        );
+        assert_eq!(quota_exhausted("not json at all"), None);
+        // Typed but without the hint: still the wall, just unsaid.
+        assert_eq!(
+            quota_exhausted(r#"{"error":{"type":"usage_limit_reached"}}"#),
+            Some(None)
+        );
     }
 
     #[test]

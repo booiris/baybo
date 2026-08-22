@@ -74,4 +74,4 @@ pub use task::{
     TASK_CREATE_TOOL_NAME, TASK_GET_TOOL_NAME, TASK_LIST_TOOL_NAME, TASK_MUTATING_TOOL_NAMES,
     TASK_UPDATE_TOOL_NAME, Task, TaskStatus,
 };
-pub use tool_output::wrap_tool_output;
+pub use tool_output::{MAX_TOOL_OUTPUT_BYTES, wrap_tool_output};

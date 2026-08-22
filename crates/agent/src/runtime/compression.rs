@@ -200,9 +200,10 @@ impl CompressionRunner {
                                         let call_result = LlmCallResult {
                                             output_content: response.content.clone(),
                                             thinking: response.thinking.clone(),
-                                            // The compaction request offers no
-                                            // tools, so there is never
-                                            // anything to record here.
+                                            // The request carries the session's
+                                            // tools to hold the cached prefix,
+                                            // but forbids their use, so there is
+                                            // never anything to record here.
                                             tool_calls: Vec::new(),
                                             input_tokens: response.usage.input_tokens,
                                             output_tokens: response.usage.output_tokens,

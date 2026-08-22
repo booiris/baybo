@@ -1566,7 +1566,7 @@ impl ContextManager {
     /// [`baybo_model::wrap_tool_output`] with the capped text.
     pub async fn cap_tool_output(&self, content: String) -> String {
         use crate::prompts::tool_output;
-        if content.len() <= tool_output::MAX_TOOL_OUTPUT_BYTES {
+        if content.len() <= baybo_model::MAX_TOOL_OUTPUT_BYTES {
             return content;
         }
         let spill =

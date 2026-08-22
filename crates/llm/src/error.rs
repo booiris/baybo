@@ -21,6 +21,17 @@ pub enum LlmError {
         message: String,
     },
 
+    /// The account's plan quota is spent until it resets. Arrives as a
+    /// 429 like an ordinary throttle and is nothing like one: the wall
+    /// stands for hours, so every retry is a call that cannot succeed.
+    /// Not retriable — `resets_in` is how long the caller would have to
+    /// wait, not a backoff to sleep through.
+    #[error("LLM quota exhausted: {message}")]
+    QuotaExhausted {
+        resets_in: Option<Duration>,
+        message: String,
+    },
+
     /// Provider rejected the request as malformed or unsupported (4xx
     /// other than 408 / 429). Not retriable: the same input will
     /// produce the same rejection.
@@ -64,13 +75,14 @@ impl LlmError {
     /// Whether retrying with the same input might succeed.
     ///
     /// Only `Transient` and `RateLimited` are retriable. Every other
-    /// variant represents a deterministic failure (bad input, bad
-    /// auth, malformed response, local guard, config) that retrying
-    /// won't fix.
+    /// variant represents a failure that retrying won't fix — bad
+    /// input, bad auth, malformed response, local guard, config, or a
+    /// spent quota that resets hours from now.
     pub fn is_retriable(&self) -> bool {
         match self {
             LlmError::Transient(_) | LlmError::RateLimited { .. } => true,
-            LlmError::BadRequest(_)
+            LlmError::QuotaExhausted { .. }
+            | LlmError::BadRequest(_)
             | LlmError::Auth(_)
             | LlmError::Decode(_)
             | LlmError::Config(_)
@@ -195,7 +207,13 @@ pub(crate) fn rig_completion_to_error(e: rig::completion::CompletionError) -> Ll
         Rig::JsonError(inner) => LlmError::Decode(format!("rig json: {inner}")),
         Rig::ResponseError(msg) => LlmError::Decode(format!("rig response: {msg}")),
         Rig::UrlError(inner) => LlmError::Config(format!("rig url: {inner}")),
-        Rig::RequestError(inner) => LlmError::Internal(anyhow::anyhow!("rig request: {inner}")),
+        // Our own providers box their `LlmError` here to carry the
+        // classification through rig's error type, which has no typed slot
+        // for it. Anything else really is a request-construction failure.
+        Rig::RequestError(inner) => match inner.downcast::<LlmError>() {
+            Ok(ours) => *ours,
+            Err(inner) => LlmError::Internal(anyhow::anyhow!("rig request: {inner}")),
+        },
         Rig::ProviderError(msg) => LlmError::Transient(format!("rig provider: {msg}")),
     }
 }
@@ -206,6 +224,46 @@ mod tests {
     use reqwest::StatusCode;
     use rig::completion::CompletionError;
     use rig::http_client::Error as RigHttp;
+
+    /// A spent plan quota arrives as a 429 and must not be retried like
+    /// one, and the classification has to survive rig's error type — the
+    /// compaction path boxes it through `RequestError`, and a round trip
+    /// that loses it puts the caller back on ten doomed attempts.
+    #[test]
+    fn a_spent_quota_does_not_retry_and_survives_the_rig_boundary() {
+        let spent = LlmError::QuotaExhausted {
+            resets_in: Some(Duration::from_secs(98_178)),
+            message: "openai-subscription: 429".into(),
+        };
+        assert!(!spent.is_retriable());
+
+        let round_tripped = rig_completion_to_error(CompletionError::RequestError(Box::new(spent)));
+        assert!(
+            matches!(
+                round_tripped,
+                LlmError::QuotaExhausted { resets_in: Some(d), .. } if d == Duration::from_secs(98_178)
+            ),
+            "got {round_tripped:?}"
+        );
+        assert!(!round_tripped.is_retriable());
+
+        // A rate limit still retries — the two must not collapse.
+        assert!(
+            rig_completion_to_error(CompletionError::RequestError(Box::new(
+                LlmError::RateLimited {
+                    retry_after: None,
+                    message: "slow down".into(),
+                }
+            )))
+            .is_retriable()
+        );
+
+        // Something that is not ours stays a request-construction failure.
+        let foreign = rig_completion_to_error(CompletionError::RequestError(Box::new(
+            std::io::Error::other("boom"),
+        )));
+        assert!(matches!(foreign, LlmError::Internal(_)));
+    }
 
     /// Status-driven routing: 401/403 must NOT retry, 429/5xx must
     /// retry, 4xx other than 408/429 must NOT retry. Without this

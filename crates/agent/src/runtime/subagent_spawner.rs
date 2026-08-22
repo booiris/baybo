@@ -1336,7 +1336,7 @@ async fn append_subagent_message(
 /// rewritten and never deleted, so an unbounded row is permanent. The bound is
 /// prospective only — existing rows stay exactly as they are.
 fn cap_external_agent_blocks(msg: &mut ChatMessage) {
-    use baybo_context::prompts::tool_output::MAX_TOOL_OUTPUT_BYTES;
+    use baybo_model::MAX_TOOL_OUTPUT_BYTES;
 
     for block in msg.content.iter_mut() {
         match block {
@@ -1447,7 +1447,7 @@ async fn deliver_background_result(
 #[cfg(test)]
 mod external_agent_cap_tests {
     use super::*;
-    use baybo_context::prompts::tool_output::MAX_TOOL_OUTPUT_BYTES;
+    use baybo_model::MAX_TOOL_OUTPUT_BYTES;
 
     /// The external-agent leg writes to `session_messages` without passing
     /// through the agent loop's `cap_tool_output`, so a child that read a big

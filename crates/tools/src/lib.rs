@@ -204,10 +204,13 @@ pub trait Tool: Send + Sync {
     /// only meaningful inside a specific kind of turn (e.g. `report_nothing`,
     /// which suppresses a recurring cron fire's notification) narrows it so it
     /// never appears where it cannot act. Mirrors the manifest's `channels`
-    /// axis — the agent loop omits an out-of-scope tool from the LLM's list
-    /// (`ToolRegistry::tool_definitions_for_session`), keeping the list
-    /// byte-stable within a session (the trigger, like the channel, never
-    /// changes) so the prompt cache holds.
+    /// axis, and is enforced on both doors: the agent loop omits an
+    /// out-of-scope tool from the LLM's list
+    /// (`ToolRegistry::tool_definitions_for_session`), and the executor
+    /// refuses a call that names one anyway — omission is not a gate against
+    /// a name the model produced from somewhere else. Omitting it also keeps
+    /// the list byte-stable within a session, since the trigger, like the
+    /// channel, never changes.
     fn trigger_scope(&self) -> ToolTriggerScope {
         ToolTriggerScope::Any
     }

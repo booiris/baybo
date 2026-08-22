@@ -3029,7 +3029,7 @@ impl AgentLoop {
             // Preserve the cached tool prefix while keeping the observer read-only.
             tools: self.session_tool_defs(session),
             tool_choice: baybo_llm::ToolChoice::None,
-            reasoning_effort: self.initial_effort.clone(),
+            reasoning_effort: Some(baybo_llm::effort::OUT_OF_BAND_EFFORT.as_str().to_string()),
             ..Default::default()
         };
 

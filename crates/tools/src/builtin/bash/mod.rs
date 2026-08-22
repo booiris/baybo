@@ -72,8 +72,12 @@ use parse::{
     parse_program, split_into_subcommands, truncate_for_event,
 };
 
-const MAX_OUTPUT_BYTES: usize = 64 * 1024;
-const MAX_OUTPUT_KIB: usize = MAX_OUTPUT_BYTES / 1024;
+/// Per-stream ceiling applied before the streams are packed into the result.
+/// Twice [`baybo_model::MAX_TOOL_OUTPUT_BYTES`] so a large stdout is trimmed
+/// by the transcript cap — which spills the full text to a file the notice
+/// names — rather than being silently cut here first. Not quoted to the
+/// model: what it receives is the capped result, not one stream.
+const MAX_OUTPUT_BYTES: usize = 2 * baybo_model::MAX_TOOL_OUTPUT_BYTES;
 /// Cap for the one-line command digest logged on sandbox-bypass events.
 const COMMAND_HEAD_MAX_CHARS: usize = 160;
 
@@ -104,7 +108,7 @@ fn command_head(command: &str) -> String {
 /// re-skins exactly what changed and nothing is said twice. Work-dir/platform
 /// live here, not the system prompt, so they sit next to the tool that
 /// consumes them.
-const DESCRIPTION_TEMPLATE: &str = r#"Execute a shell command in a fresh `sh -c` process. Environment changes and `cd` do not persist across invocations. Each of stdout and stderr is truncated at {{max_output_kib}} KiB.
+const DESCRIPTION_TEMPLATE: &str = r#"Execute a shell command in a fresh `sh -c` process. Environment changes and `cd` do not persist across invocations. The result you get back is capped at {{max_output_kib}} KiB, with a notice naming the file the full text spilled to.
 
 Reserve Bash for system commands, git, build/test, and anything that genuinely needs a shell. Reading, writing, and searching files have dedicated tools — `Read`, `Write`, `Edit`, `Glob`, `Grep` — and a leading `cat`/`head`/`tail`/`less`/`sed`/`awk` against a file is rejected here with the redirect spelled out. Downloading a file to disk IS Bash's job (`curl`/`wget`): WebFetch only returns rendered text into the conversation and never writes to disk.
 
@@ -471,7 +475,10 @@ fn render_description(
         .replace("{{work_dir_scope}}", work_dir_scope)
         .replace("{{python_runtime}}", python_runtime)
         .replace("{{approval}}", approval)
-        .replace("{{max_output_kib}}", &MAX_OUTPUT_KIB.to_string())
+        .replace(
+            "{{max_output_kib}}",
+            &(baybo_model::MAX_TOOL_OUTPUT_BYTES / 1024).to_string(),
+        )
         .replace(
             "{{work_tmp_dir}}",
             &work_dir

@@ -187,9 +187,6 @@ where
     cursor
 }
 
-const SUMMARIZER_EFFORT: baybo_llm::effort::ReasoningEffort =
-    baybo_llm::effort::ReasoningEffort::Low;
-
 /// Adjust a candidate cut index over `messages` so the kept tail
 /// (`messages[cut..]`) contains every `ToolUse` whose matching
 /// `ToolResult` is in the tail. Returning a smaller index than the
@@ -348,8 +345,7 @@ impl ContextManager {
             // Keep the session tool block in the cached prefix; forbid its use.
             tools,
             tool_choice: baybo_llm::ToolChoice::None,
-            // Compression uses a fixed low effort instead of inheriting the session setting.
-            reasoning_effort: Some(SUMMARIZER_EFFORT.as_str().to_string()),
+            reasoning_effort: Some(baybo_llm::effort::OUT_OF_BAND_EFFORT.as_str().to_string()),
             ..Default::default()
         };
 
