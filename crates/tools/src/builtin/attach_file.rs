@@ -17,6 +17,7 @@ use super::blob_upload::{
 };
 use crate::{
     ResourceAccess, Tool, ToolCapability, ToolContext, ToolError, ToolManifest, ToolOutput,
+    ToolTriggerScope,
 };
 
 const TOOL_NAME: &str = "AttachFile";
@@ -54,6 +55,10 @@ struct Params {
 impl Tool for AttachFileTool {
     fn name(&self) -> &str {
         TOOL_NAME
+    }
+
+    fn trigger_scope(&self) -> ToolTriggerScope {
+        ToolTriggerScope::SharedWorkspace
     }
 
     fn description(&self) -> String {

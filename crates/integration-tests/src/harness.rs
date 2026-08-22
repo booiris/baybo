@@ -485,6 +485,7 @@ impl AgentTestHarnessBuilder {
             source: baybo_model::ArtifactSource::Inline,
             trust_level: baybo_model::TrustLevel::Trusted,
             source_path: None,
+            tools: None,
         });
         let context_manager = ContextManager::from_config(ContextManagerConfig {
             agent: None,

@@ -460,6 +460,14 @@ pub struct SessionState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_type: Option<String>,
 
+    /// The only tools this subagent session is offered, from its profile's
+    /// `tools:` list and pinned here at genesis like `subagent_type` — so the
+    /// list a session runs with cannot move when the profile file does, and
+    /// the tool block stays byte-stable for the prompt cache. `None` for a
+    /// session that is not a subagent, and for a profile that named none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_allowlist: Option<Vec<String>>,
+
     /// Per-session LLM pin: the `baybo.json` entry name this session's
     /// turns should resolve against, overriding `default-llm`. `None`
     /// (the default) means "follow the pool default", so a session that

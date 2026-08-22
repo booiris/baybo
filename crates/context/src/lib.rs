@@ -3402,6 +3402,7 @@ mod tests {
             source: baybo_model::ArtifactSource::Inline,
             trust_level: baybo_model::TrustLevel::Trusted,
             source_path: None,
+            tools: None,
         });
 
         let mut ctx = ContextManager::from_config(ContextManagerConfig {

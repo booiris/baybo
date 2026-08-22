@@ -12,6 +12,7 @@ description: |
   general-purpose, with the change spelled out in the brief).
 version: 0.1.0
 default_tier: lite
+tools: Read, Grep, Glob, Bash, WebFetch, IssueGet, IssueList, GetBlob, Skill, Now
 ---
 # Identity
 

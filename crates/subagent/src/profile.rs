@@ -53,6 +53,16 @@ pub struct SubagentProfile {
     /// the upcoming risk-assessor pass and surfaced in audit traces.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_path: Option<PathBuf>,
+    /// The only tools a child on this profile is offered, or `None` for
+    /// every tool its channel and trigger already allow. A profile that
+    /// names a set pays for it: an omitted tool is invisible AND refused,
+    /// so the set has to cover what the body tells the child to do.
+    ///
+    /// `None` rather than an empty vec is the unrestricted case, so a
+    /// profile written before this key — or one from an external source
+    /// that never learned it — keeps what it has today.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
 }
 
 /// Lightweight projection used by hot paths that only need

@@ -12,6 +12,7 @@ description: |
   dispatch (general-purpose with the findings already cited).
 version: 0.1.0
 default_tier: deep
+tools: Read, Grep, Glob, Bash, WebFetch, IssueGet, IssueList, GetBlob, Skill, Now, JobList, JobStop
 ---
 # Identity
 

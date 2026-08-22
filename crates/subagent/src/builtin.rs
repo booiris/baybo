@@ -104,6 +104,39 @@ mod tests {
         }
     }
 
+    /// The three read-only profiles carry a tool list; the one that exists
+    /// to change things does not. Each list must cover what its own body
+    /// tells the child to use — an omitted tool is one the child is told
+    /// about and never offered.
+    #[test]
+    fn the_read_only_builtins_name_their_tools_and_omit_the_mutating_ones() {
+        let by_name: std::collections::HashMap<String, _> =
+            all().into_iter().map(|p| (p.name.clone(), p)).collect();
+
+        for name in ["explorer", "planner", "reviewer"] {
+            let tools = by_name[name]
+                .tools
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name} must name its tools"));
+            for needed in ["Read", "Grep", "Glob", "Bash"] {
+                assert!(
+                    tools.iter().any(|t| t == needed),
+                    "{name}'s body tells the child to use {needed}"
+                );
+            }
+            for forbidden in ["Edit", "Write", "spawn_subagent"] {
+                assert!(
+                    !tools.iter().any(|t| t == forbidden),
+                    "{name} is read-only; {forbidden} does not belong in its list"
+                );
+            }
+        }
+        assert_eq!(
+            by_name["general-purpose"].tools, None,
+            "general-purpose exists to mutate the workspace; restricting it would be a lie"
+        );
+    }
+
     #[test]
     fn explorer_defaults_to_fast_tier() {
         let p = all().into_iter().find(|p| p.name == "explorer").unwrap();

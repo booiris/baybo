@@ -94,6 +94,26 @@ pub fn parse_profile_md(content: &str, default_name: &str) -> Result<SubagentPro
         ));
     }
 
+    // Comma-separated, because the frontmatter parser here is a scalar-only
+    // subset — see `parse_yaml_subset`.
+    let tools = match read_scalar(&fm, "tools") {
+        Some(list) => {
+            let names: Vec<String> = list
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+            if names.is_empty() {
+                return Err(format!(
+                    "subagent profile '{name}' declares `tools` but names none; drop the key to leave the child unrestricted"
+                ));
+            }
+            Some(names)
+        }
+        None => None,
+    };
+
     let system_prompt = body.trim_start_matches('\n').trim_end().to_string();
     if system_prompt.is_empty() {
         return Err(format!(
@@ -110,6 +130,7 @@ pub fn parse_profile_md(content: &str, default_name: &str) -> Result<SubagentPro
         source: ArtifactSource::Workspace,
         trust_level: TrustLevel::Trusted,
         source_path: None,
+        tools,
     })
 }
 
@@ -262,6 +283,34 @@ fn unquote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A profile that names its tools gets exactly those; one that does not
+    /// keeps every tool its channel and trigger already allow.
+    #[test]
+    fn a_profile_names_the_tools_its_child_needs() {
+        let with = parse_profile_md(
+            "---\nname: explorer\ndescription: d\ntools: Read, Grep,  Glob \n---\nbody",
+            "x",
+        )
+        .expect("parses");
+        assert_eq!(
+            with.tools.as_deref(),
+            Some(["Read".to_string(), "Grep".to_string(), "Glob".to_string()].as_slice())
+        );
+
+        let without = parse_profile_md("---\nname: explorer\ndescription: d\n---\nbody", "x")
+            .expect("parses");
+        assert_eq!(without.tools, None, "no key means unrestricted, not empty");
+
+        let empty = parse_profile_md(
+            "---\nname: explorer\ndescription: d\ntools: ,  ,\n---\nbody",
+            "x",
+        );
+        assert!(
+            empty.is_err(),
+            "a key that names nothing would hand the child an empty toolbox in silence"
+        );
+    }
 
     #[test]
     fn parses_minimal_profile() {

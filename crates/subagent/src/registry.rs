@@ -236,6 +236,7 @@ mod tests {
             source: ArtifactSource::Workspace,
             trust_level: TrustLevel::Trusted,
             source_path: None,
+            tools: None,
         }
     }
 

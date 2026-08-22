@@ -230,6 +230,7 @@ fn parse_spawn_request(value: &Value, registry: &SubagentRegistry) -> Result<Par
     Ok(ParsedSpawn {
         request: SubagentSpawnRequest {
             subagent_type: profile.name.clone(),
+            tool_allowlist: profile.tools.clone(),
             task_summary: p.description,
             prompt: p.prompt,
             model_tier,
@@ -1299,6 +1300,35 @@ mod tests {
         // tool's fallback must release the slot itself — `spawn` was never
         // reached, so nothing else will release.
         assert_eq!(limiter.events(), vec!["reserve", "release"]);
+    }
+
+    /// The profile's list rides the spawn request, because the spawner has
+    /// the child's session row and the tool has the profile. If it stopped
+    /// riding, the child would silently get every tool again.
+    #[test]
+    fn parse_spawn_request_carries_the_profile_s_tool_list() {
+        let reg = registry_with_builtins();
+        let ask = |t: &str| {
+            parse_spawn_request(
+                &json!({"subagent_type": t, "description": "d", "prompt": "p"}),
+                &reg,
+            )
+            .unwrap()
+            .request
+            .tool_allowlist
+        };
+
+        let explorer = ask("explorer").expect("explorer names its tools");
+        assert!(explorer.iter().any(|t| t == "Read"));
+        assert!(
+            !explorer.iter().any(|t| t == "Edit"),
+            "explorer is read-only: {explorer:?}"
+        );
+        assert_eq!(
+            ask("general-purpose"),
+            None,
+            "a profile that names none leaves the child unrestricted"
+        );
     }
 
     #[test]

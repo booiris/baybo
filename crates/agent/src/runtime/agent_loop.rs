@@ -2907,7 +2907,11 @@ impl AgentLoop {
     /// observer requests so their cached prefixes agree.
     fn session_tool_defs(&self, session: &Session) -> Vec<ToolDefinitionForLlm> {
         self.tool_registry
-            .tool_definitions_for_session(&session.channel, &session.trigger)
+            .tool_definitions_for_session(
+                &session.channel,
+                &session.trigger,
+                session.state.tool_allowlist.as_deref(),
+            )
             .into_iter()
             .map(|td| ToolDefinitionForLlm {
                 name: td.name,

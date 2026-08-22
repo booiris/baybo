@@ -688,6 +688,7 @@ impl ActorSubagentSpawner {
                 }
             });
             child.state.subagent_type = Some(request.subagent_type.clone());
+            child.state.tool_allowlist = request.tool_allowlist.clone();
             if let Err(e) = self.session_manager.store().save(&child).await {
                 return Err(SubagentResult::failed(format!(
                     "persist subagent identity on {}: {e}",

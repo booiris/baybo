@@ -13,6 +13,7 @@ description: |
   scoped and wants implemented in one shot.
 version: 0.1.0
 default_tier: deep
+tools: Read, Grep, Glob, Bash, WebFetch, IssueGet, IssueList, GetBlob, Skill, Now
 ---
 # Identity
 

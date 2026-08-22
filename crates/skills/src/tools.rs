@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use baybo_model::TrustLevel;
 use baybo_tools::{
     ApprovalDecision, NoticeLevel, ResourceAccess as ToolResourceAccess, Tool, ToolCapability,
-    ToolConcurrency, ToolContext, ToolError, ToolManifest, ToolOutput,
+    ToolConcurrency, ToolContext, ToolError, ToolManifest, ToolOutput, ToolTriggerScope,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -527,6 +527,10 @@ impl Tool for SkillInstallTool {
         "SkillInstall"
     }
 
+    fn trigger_scope(&self) -> ToolTriggerScope {
+        ToolTriggerScope::SharedWorkspace
+    }
+
     fn description(&self) -> String {
         "Install a skill from an on-disk directory into this session's own \
          skills folder. Every agent has one of its own, so the skill lands in \
@@ -711,6 +715,10 @@ struct UninstallParams {
 impl Tool for SkillUninstallTool {
     fn name(&self) -> &str {
         "SkillUninstall"
+    }
+
+    fn trigger_scope(&self) -> ToolTriggerScope {
+        ToolTriggerScope::SharedWorkspace
     }
 
     fn description(&self) -> String {
