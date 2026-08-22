@@ -133,6 +133,15 @@ impl ReadTracker {
         }
     }
 
+    /// Record a file the **system prompt** delivered verbatim. Committed, not
+    /// staged: unlike a `Read` whose result the model only sees on a later
+    /// response, `messages[0]` was in front of it before it said anything. The
+    /// caller must have verified the file still holds the bytes the prompt
+    /// carried. `pub` because the caller is in `baybo-agent`.
+    pub fn record_prompt_delivered(&self, path: &Path, fingerprint: FileFingerprint) {
+        self.record_committed(path, fingerprint);
+    }
+
     /// Insert directly into the committed set (already-seen reads: tool
     /// re-anchors and transcript hydration).
     fn record_committed(&self, path: &Path, fingerprint: FileFingerprint) {

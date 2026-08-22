@@ -120,6 +120,11 @@ pub struct AssembledPrompt {
 }
 
 impl AssembledPrompt {
+    #[cfg(test)]
+    pub(crate) fn from_parts(parts: Vec<PromptPart>) -> Self {
+        Self { parts }
+    }
+
     /// A prompt with no seams: a subagent's profile, which comes from the
     /// in-process registry rather than from anything the workspace assembles.
     /// It changes as one block or not at all, so it is one part.
@@ -127,6 +132,16 @@ impl AssembledPrompt {
         Self {
             parts: vec![PromptPart::Hint(text)],
         }
+    }
+
+    /// Every file this prompt carries verbatim, with the body it carried.
+    /// A caller that can prove the file still holds those bytes knows the
+    /// model has already been handed them.
+    pub fn sections(&self) -> impl Iterator<Item = (&Path, &str)> {
+        self.parts.iter().filter_map(|part| match part {
+            PromptPart::Section { path, body, .. } => Some((path.as_path(), body.as_str())),
+            PromptPart::Hint(_) => None,
+        })
     }
 
     /// The prompt as the leading `Role::System` row carries it.

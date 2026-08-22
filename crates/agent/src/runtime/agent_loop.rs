@@ -1386,6 +1386,16 @@ impl AgentLoop {
         // can't authorize each other: the read stays staged until the next
         // response boundary (by when the model has actually seen its result).
         self.read_tracker.begin_response();
+        // A file the system prompt carries verbatim is one the model has
+        // already been handed — MEMORY.md, IDENTITY.md, SOUL.md. Committed
+        // rather than staged: `messages[0]` was in front of it before it said
+        // anything. `ContextManager` lists only files still holding the bytes
+        // the prompt carried, so one rewritten since (a dream pass in another
+        // session) is absent and its edit is still stopped.
+        for (path, fingerprint) in self.context_manager.take_prompt_anchors() {
+            self.read_tracker
+                .record_prompt_delivered(&path, fingerprint);
+        }
         let read_tracker_for_calls = self.read_tracker.clone();
         let notify_silence_for_calls = notify_silence.clone();
         let concurrency_limiter = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TOOL_CALLS));

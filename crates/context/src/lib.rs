@@ -311,6 +311,14 @@ pub struct ContextManager {
     /// `reseed_system_row` after each compaction, so a source edit (workspace
     /// soul *or* subagent profile) lands on the next compaction.
     subagent_profile: Option<(Arc<baybo_subagent::SubagentRegistry>, String)>,
+    /// Files the system prompt just delivered verbatim, and the fingerprint
+    /// each had when it did — drained by the agent loop into the
+    /// read-before-write tracker. A prompt that carries a file IS the model
+    /// having read it, so demanding a `Read` before editing MEMORY.md or
+    /// IDENTITY.md costs a round trip and proves nothing. Only files still
+    /// holding those exact bytes are listed: one the dream pass rewrote in
+    /// another session is absent, and its edit is stopped as before.
+    pending_prompt_anchors: Vec<(PathBuf, baybo_model::FileFingerprint)>,
     /// The agent this session runs as, when it is bound to one. Names the
     /// persona files to read and the skill overlay to see. `None` for an
     /// unbound session, which reads the workspace persona and the shared
@@ -465,6 +473,7 @@ impl ContextManager {
             session_id: config.session_id,
             sessions: config.sessions,
             subagent_profile: config.subagent_profile,
+            pending_prompt_anchors: Vec::new(),
             agent: config.agent,
             builtin_memory: config.builtin_memory,
             compaction_declined_at_len: None,
@@ -1083,6 +1092,34 @@ impl ContextManager {
     /// The skill reminder rides as a `Role::User` `agent_context` row, not a
     /// `system` row — some providers reject `system` outside the leading slot;
     /// `merge_for_llm` folds it into the first real user message.
+    /// Note the files `prompt` delivered verbatim, for the read-before-write
+    /// tracker. Stat first, then read, then compare against the body the
+    /// prompt carries: a file that changed after assembly fails the compare
+    /// and is left out, and one that changes during the read keeps the older
+    /// fingerprint — the direction that forces a re-read rather than blessing
+    /// bytes the model never saw. Same convention `ReadTool` records with.
+    async fn note_prompt_anchors(&mut self, prompt: &crate::prompts::soul::AssembledPrompt) {
+        for (path, body) in prompt.sections() {
+            let Ok(meta) = tokio::fs::metadata(path).await else {
+                continue;
+            };
+            let fingerprint = baybo_model::FileFingerprint::from_metadata(&meta);
+            if tokio::fs::read_to_string(path)
+                .await
+                .is_ok_and(|current| current == body)
+            {
+                self.pending_prompt_anchors
+                    .push((path.to_path_buf(), fingerprint));
+            }
+        }
+    }
+
+    /// Hand over the anchors noted since the last call. The agent loop owns
+    /// the tracker; this crate only knows which files the prompt delivered.
+    pub fn take_prompt_anchors(&mut self) -> Vec<(PathBuf, baybo_model::FileFingerprint)> {
+        std::mem::take(&mut self.pending_prompt_anchors)
+    }
+
     pub async fn ensure_seeded(&mut self) {
         if self
             .messages
@@ -1108,8 +1145,9 @@ impl ContextManager {
         //
         // Read after the resolve, not before: assembly auto-seeds a missing
         // identity file, so the fingerprints only settle once it has run.
-        if resolved.is_some() {
+        if let Some(resolved) = resolved.as_ref() {
             self.system_prompt_version = Some(self.current_system_prompt_version().await);
+            self.note_prompt_anchors(resolved).await;
         }
         // Stamped from the same summaries the row is rendered from, so the
         // version and the listing the model was shown agree by construction.
@@ -2647,6 +2685,49 @@ mod tests {
     use super::*;
     use baybo_model::{ContentBlock, Role};
     use baybo_workspace::IdentityKind;
+
+    /// The prompt hands the model MEMORY.md and the identity files verbatim,
+    /// so editing one should not cost a round trip proving it read them. The
+    /// anchor is only offered while the file still holds those bytes.
+    #[tokio::test]
+    async fn a_file_the_prompt_delivered_is_anchored_until_it_changes() {
+        use crate::prompts::soul::{AssembledPrompt, PromptPart, SectionTag};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("MEMORY.md");
+        tokio::fs::write(&path, "- [A](a.md) — hook\n")
+            .await
+            .expect("write");
+        let body = tokio::fs::read_to_string(&path).await.expect("read");
+
+        let mut ctx = make_ctx(4, 8_000, 0.8);
+        let prompt = AssembledPrompt::from_parts(vec![PromptPart::Section {
+            tag: SectionTag::Memory,
+            path: path.clone(),
+            body: body.clone(),
+        }]);
+
+        ctx.note_prompt_anchors(&prompt).await;
+        let anchors = ctx.take_prompt_anchors();
+        assert_eq!(anchors.len(), 1, "unchanged file is anchored");
+        assert_eq!(anchors[0].0, path);
+        assert!(
+            ctx.take_prompt_anchors().is_empty(),
+            "draining hands each anchor over once"
+        );
+
+        // Somebody else rewrote it after the prompt was assembled — a dream
+        // pass in another session. The model has not seen this, so it gets no
+        // anchor and its edit is stopped exactly as before.
+        tokio::fs::write(&path, "- [A](a.md) — hook\n- [B](b.md) — hook\n")
+            .await
+            .expect("rewrite");
+        ctx.note_prompt_anchors(&prompt).await;
+        assert!(
+            ctx.take_prompt_anchors().is_empty(),
+            "a file that no longer holds the delivered bytes must not be anchored"
+        );
+    }
 
     struct SimpleTokenizer;
 
