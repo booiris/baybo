@@ -61,14 +61,11 @@ impl Tool for WriteTool {
 
     fn description(&self) -> String {
         "Create or overwrite a file with the provided content. \
-         Always use this instead of Bash commands like echo with \
-         redirection or cat with heredoc. Prefer `Edit` for modifying \
+         Prefer `Edit` for modifying \
          existing files — only use `Write` for new files or complete \
          rewrites. Overwriting a file that already exists requires you to \
          have Read it first (and it must be unchanged since); creating a new \
-         file does not. Parent directories must already exist.\n\n\
-         PATHS: `file_path` MUST be an absolute filesystem path. Relative \
-         paths are rejected."
+         file does not. Parent directories must already exist."
             .to_string()
     }
 
@@ -76,7 +73,7 @@ impl Tool for WriteTool {
         json!({
             "type": "object",
             "properties": {
-                "file_path": { "type": "string", "description": "Absolute path of the file to write" },
+                "file_path": { "type": "string", "description": "Absolute path; relative is rejected" },
                 "content":   { "type": "string", "description": "Full file content" }
             },
             "required": ["file_path", "content"]

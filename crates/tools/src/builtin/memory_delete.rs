@@ -41,9 +41,7 @@ const DESCRIPTION: &str = r#"Delete one file from your memory directory, when wh
 
 Only paths inside a memory tree are accepted — anything else is refused outright, so this can never be used as a general-purpose delete. Remove the file's line from MEMORY.md in the same breath, or the index will point at nothing.
 
-The deletion is committed to the memory directory's git history, so it can be recovered later if it turns out to have been a mistake.
-
-PATHS: `file_path` MUST be an absolute filesystem path."#;
+The deletion is committed to the memory directory's git history, so it can be recovered later if it turns out to have been a mistake."#;
 
 pub struct MemoryDeleteTool {
     roots: ManagedRoots,

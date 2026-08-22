@@ -119,15 +119,12 @@ pub fn paginate_numbered(content: &str, offset: Option<usize>, limit: Option<usi
 static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
     format!(
         "Read the contents of a file from the local filesystem. \
-         Always use this instead of Bash commands like cat, head, or tail. \
          Supports optional `offset` (1-based starting line) and `limit` \
          (max lines, default {DEFAULT_LIMIT}, capped at {MAX_LIMIT}). Long \
          individual lines are truncated to {MAX_LINE_BYTES} bytes (at a \
          UTF-8 char boundary). Files larger than {MAX_FILE_MIB} MiB are \
          only scanned for the first {MAX_FILE_MIB} MiB of content. Output \
-         is formatted with line numbers for easy reference.\n\n\
-         PATHS: `file_path` MUST be an absolute filesystem path. Relative \
-         paths are rejected."
+         is formatted with line numbers for easy reference."
     )
 });
 
@@ -160,7 +157,7 @@ impl Tool for ReadTool {
         json!({
             "type": "object",
             "properties": {
-                "file_path": { "type": "string", "description": "Absolute path to the file" },
+                "file_path": { "type": "string", "description": "Absolute path; relative is rejected" },
                 "offset": { "type": "integer", "minimum": 1, "description": "Line number to start reading from (1-based)" },
                 "limit": { "type": "integer", "minimum": 1, "description": &*LIMIT_DESC }
             },

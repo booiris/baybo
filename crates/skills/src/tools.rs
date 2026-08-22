@@ -83,8 +83,9 @@ impl Tool for SkillTool {
 
     fn description(&self) -> String {
         "Load a registered skill so its instructions enter the conversation. \
-         Available skills are listed in a system reminder each turn — invoke \
-         this tool with `skill: \"<name>\"` to pull one in. Pass `args` to \
+         Available skills are listed in a system reminder near the top of \
+         this conversation — invoke this tool with `skill: \"<name>\"` to \
+         pull one in. Pass `args` to \
          forward free-form arguments. Pass `file_path` to fetch a sub-file \
          (relative path inside the skill's directory) referenced from the \
          main SKILL.md. Skills the operator marked untrusted or marked \
@@ -98,7 +99,7 @@ impl Tool for SkillTool {
             "properties": {
                 SKILL_INPUT_NAME_FIELD: {
                     "type": "string",
-                    "description": "Name of the skill to load — must match an entry from the system-reminder skill list."
+                    "description": "Name of the skill to load — must match an entry from the skill listing."
                 },
                 "args": {
                     "type": "string",

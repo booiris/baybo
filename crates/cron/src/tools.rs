@@ -162,7 +162,7 @@ impl Tool for CronCreateTool {
     }
 
     fn description(&self) -> String {
-        r#"Schedule a job whose `prompt` is run as a task on a timer. `title`, `timezone` and `prompt` are required: on every fire the agent executes `prompt` in a fresh session as an instruction to carry out — NOT as a message from the user — and all times in inputs and outputs are anchored to `timezone`. Supply exactly one of `schedule` (recurring cron expression, e.g. "0 9 * * *") or `at` (one-shot timestamp); an `at` job fires once and then stops, staying in the list as `executed`. Write `prompt` as a self-contained task instruction (see its description) so the fire does the right thing. A recurring fire opens its own conversation named after `title`; a one-shot fire reports its result back into THIS conversation."#
+        r#"Schedule a job whose `prompt` is run as a task on a timer. `title`, `timezone` and `prompt` are required; all times in and out are anchored to `timezone`. Supply exactly one of `schedule` (recurring cron expression, e.g. "0 9 * * *") or `at` (one-shot timestamp). A recurring fire opens its own conversation named after `title`; a one-shot fire reports its result back into THIS conversation and then stops, staying in the list as `executed`."#
             .to_string()
     }
 
@@ -387,7 +387,7 @@ impl Tool for CronUpdateTool {
                 },
                 "prompt": {
                     "type": "string",
-                    "description": r#"New instruction to execute when the job fires. Omit to keep the current one. As with CronCreate, each fire runs in a fresh session with NO memory of this conversation and the text is handed to the agent as a task to perform — NOT as a message from the user — so write it as a self-contained, imperative instruction with every detail inlined."#
+                    "description": "New instruction to execute when the job fires. Omit to keep the current one. Same rules as CronCreate's `prompt`."
                 },
                 "schedule": {
                     "type": "string",

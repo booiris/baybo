@@ -591,9 +591,8 @@ pub async fn build_managers(
     // --- Skill tool — registered with the risk assessor as the
     // gate. Lives in baybo-skills (parallel to baybo-cron::tools)
     // because it needs the registry + assessor; both are constructed
-    // above. Always registered: when the registry is empty the
-    // per-turn system reminder is suppressed and the LLM never tries
-    // the call.
+    // above. Always registered: when the registry is empty no listing
+    // row is seeded and the LLM never tries the call.
     {
         let risk_check: Arc<dyn baybo_skills::SkillRiskCheck> = Arc::clone(&skill_assessor) as _;
         let (tool, manifest) =

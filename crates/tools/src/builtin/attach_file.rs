@@ -25,9 +25,7 @@ const MAX_BYTES: u64 = MAX_LOCAL_BLOB_BYTES;
 
 const DESCRIPTION_TEMPLATE: &str = r#"Give the user a local file — it arrives as an attachment in the chat. Any MIME type, up to {{max_mib}} MiB. Use it instead of pasting binary or large text into a message, and don't paste the contents after attaching.
 
-DELIVERY: the file attaches to your FINAL reply, not to this call; several calls in one turn share that reply.
-
-PATHS: `path` MUST be absolute. Sensitive paths (SSH keys, .env, /etc/shadow, …) are blocked."#;
+DELIVERY: the file attaches to your FINAL reply, not to this call; several calls in one turn share that reply."#;
 
 static DESCRIPTION: LazyLock<String> =
     LazyLock::new(|| DESCRIPTION_TEMPLATE.replace("{{max_mib}}", &MAX_LOCAL_BLOB_MIB.to_string()));
@@ -71,7 +69,7 @@ impl Tool for AttachFileTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Absolute path to the file to attach."
+                    "description": "Absolute path; relative is rejected. Sensitive paths (SSH keys, .env, …) are blocked."
                 },
                 "filename": {
                     "type": "string",

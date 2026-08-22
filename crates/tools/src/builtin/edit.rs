@@ -110,17 +110,14 @@ impl Tool for EditTool {
     }
 
     fn description(&self) -> String {
-        "Perform targeted string replacement inside a file. Always use \
-         this instead of Bash commands like sed or awk for editing files. \
+        "Perform targeted string replacement inside a file. \
          Replace `old_string` with `new_string`; when `replace_all` is \
          false (default), `old_string` must appear exactly once — otherwise \
          the tool fails without touching the file. Provide enough surrounding \
          context in `old_string` to ensure a unique match.\n\n\
          READ FIRST: you must Read the file before editing it. If it changed \
          on disk since your last Read, Read it again — the edit is rejected \
-         until your view is current.\n\n\
-         PATHS: `file_path` MUST be an absolute filesystem path. Relative \
-         paths are rejected."
+         until your view is current."
             .to_string()
     }
 
@@ -128,7 +125,7 @@ impl Tool for EditTool {
         json!({
             "type": "object",
             "properties": {
-                "file_path":   { "type": "string" },
+                "file_path":   { "type": "string", "description": "Absolute path; relative is rejected" },
                 "old_string":  { "type": "string" },
                 "new_string":  { "type": "string" },
                 "replace_all": { "type": "boolean", "default": false }
