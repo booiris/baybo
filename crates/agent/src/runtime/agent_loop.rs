@@ -1856,10 +1856,11 @@ impl AgentLoop {
         let input_messages = self.context_manager.build_call_input_marker().await;
 
         // What the model was allowed to call, recorded beside what it was
-        // shown. Stored content-addressed, so a session-stable list costs
-        // one row rather than one copy per call. A failure to persist it
-        // must not fail the turn — the span keeps everything else and the
-        // detail panel simply has no tool list for that call.
+        // shown. Stored content-addressed, so a list that does not change
+        // costs one row rather than one copy per call — and when it does
+        // change mid-session, the new hash is the record of it. A failure
+        // to persist it must not fail the turn — the span keeps everything
+        // else and the detail panel simply has no tool list for that call.
         let tools = match span_recorder.record_tool_set(trace_tool_defs).await {
             Ok(reference) => Some(reference),
             Err(e) => {
@@ -2913,8 +2914,14 @@ impl AgentLoop {
             .await;
     }
 
-    /// Build the session-stable tool list shared by normal, compaction, and
-    /// observer requests so their cached prefixes agree.
+    /// Build the tool list shared by normal, compaction and observer requests
+    /// so their cached prefixes agree.
+    ///
+    /// Rebuilt per call, and *usually* identical: the channel, trigger and
+    /// allowlist it filters on are all fixed for the session. The set they
+    /// filter is not — see
+    /// [`ToolRegistry::tool_definitions_for_session`] for what changes it
+    /// underneath a live session, and what that costs.
     fn session_tool_defs(&self, session: &Session) -> Vec<ToolDefinitionForLlm> {
         self.tool_registry
             .tool_definitions_for_session(

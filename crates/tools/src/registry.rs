@@ -148,18 +148,34 @@ impl ToolRegistry {
     /// `channel` started by `trigger`: the manifest's `channels` axis (e.g.
     /// owner-only deck tools) and the tool's [`Tool::trigger_scope`] axis (e.g.
     /// `report_nothing`, visible only in a recurring cron fire). This is what
-    /// the agent loop sends the LLM: a session's channel *and* trigger are both
-    /// fixed for its whole life, so the filtered list stays byte-stable within a
-    /// session and the prompt-cache constraint above still holds. A tool with no
-    /// manifest is treated as channel-unrestricted (defensive — `register`
-    /// always stores one).
+    /// the agent loop sends the LLM. A tool with no manifest is treated as
+    /// channel-unrestricted (defensive — `register` always stores one).
+    ///
+    /// All three axes below are fixed for a session, and it is tempting to
+    /// conclude the answer is too. It is not: the axes are fixed, the set they
+    /// filter is not. The MCP reconciler adds and drops dynamic tools
+    /// underneath live sessions (`register_dynamic` / `unregister_for_source`),
+    /// and the agent loop calls this afresh for every request, so a server
+    /// connecting or dropping changes the tool block **mid-session, mid-turn**
+    /// — including between one request and its own compaction, which F2 went
+    /// out of its way to give a shared prefix.
+    ///
+    /// So the prompt-cache constraint above is a best effort here, not an
+    /// invariant. Measured over 16 days of board runs: 17 mid-session changes,
+    /// of which 5 were real shrinkages with a live turn inside the window. The
+    /// upside is that a server the user adds mid-conversation reaches that
+    /// conversation immediately. Snapshotting per turn would buy the invariant
+    /// and keep that upside; it is deliberately not done, because after the
+    /// `SharedWorkspace` scope took `browser/*` out of issue runs, the churn
+    /// that was actually measured is gone and the rest is unquantified.
     ///
     /// `allowlist` is the third axis and the only one that is not a boundary:
     /// a subagent profile naming the tools its child needs (`Some`) keeps the
     /// rest out of the child's prefix, which is a budget, not a gate — the
     /// executor still runs a name that arrives anyway, exactly as it would
-    /// today. `None` leaves the other two axes to decide. Like them, it is
-    /// fixed for the session's life, so the list stays byte-stable.
+    /// today. `None` leaves the other two axes to decide. Unlike them it never
+    /// changes under a session at all: it is written once, at spawn, before
+    /// the child's actor exists.
     pub fn tool_definitions_for_session(
         &self,
         channel: &baybo_model::ChannelType,

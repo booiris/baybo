@@ -123,11 +123,17 @@ server-side, while the per-turn web endpoint leaves them compact and
 `LlmCallBegin.tools` records **what the model was allowed to call**, the other
 half of "what did the LLM see" beside `input_messages`. It is an
 `Option<LlmToolSetRef> { hash: ToolSetHash, count: usize }` — a reference, for
-the same reason `LlmCallInputs::Persisted` is one. A session's tool list is
-session-stable by construction (`tool_definitions_for_session` filters on the
-channel and the trigger, both fixed for the session, which is also what keeps
-prompt caching alive) and runs to tens of KB of JSON schema. Inlining it per
-call would make the schemas the largest thing in the `spans` table.
+the same reason `LlmCallInputs::Persisted` is one — the list runs to tens of KB
+of JSON schema, and inlining it per call would make the schemas the largest
+thing in the `spans` table.
+
+A session's list is *mostly* stable, which is what keeps prompt caching alive,
+but it is not stable **by construction** and the hash is the place that shows
+it: `tool_definitions_for_session` is called afresh per request, and the MCP
+reconciler connects and drops servers underneath live sessions. So one session
+can legitimately record more than one hash, and a hash changing mid-session is
+a real event worth reading — the model was handed a different set — not a bug
+in the recorder.
 
 The definitions live in `llm_tool_sets(hash TEXT PRIMARY KEY, data TEXT)`,
 keyed by the SHA-256 of their own serialized body — so writes are
