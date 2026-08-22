@@ -275,6 +275,9 @@ pub struct ContextManager {
     /// a skill whose `channels:` frontmatter excludes this channel is
     /// invisible to the session.
     pub(crate) channel: baybo_model::ChannelType,
+    /// Which preamble [`Self::system_prompt`] opens with; see
+    /// [`crate::prompts::soul::PromptShape`].
+    shape: crate::prompts::soul::PromptShape,
     /// Owned conversation transcript — the sole source of truth.
     pub(crate) messages: Vec<ChatMessage>,
     /// Per-message token count, kept in lockstep with `messages`.
@@ -433,6 +436,11 @@ pub struct ContextManagerConfig {
     /// Channel of the session (from the session row). Skills restricted
     /// via `channels:` frontmatter are filtered against it.
     pub channel: baybo_model::ChannelType,
+    /// Which preamble the system prompt opens with. Resolved by the caller
+    /// via [`crate::prompts::soul::PromptShape::for_trigger`] — the shape is
+    /// fixed for a session's whole life, so it is a construction-time value
+    /// rather than something re-derived per assembly.
+    pub shape: crate::prompts::soul::PromptShape,
     pub session_id: SessionId,
     pub sessions: Arc<SessionManager>,
     /// For a subagent session: `(profile registry, profile name)` — context
@@ -465,6 +473,7 @@ impl ContextManager {
             calibration: config.calibration,
             skill_registry: config.skill_registry,
             channel: config.channel,
+            shape: config.shape,
             messages: Vec::new(),
             per_message_tokens: Vec::new(),
             called_skills: Vec::new(),
@@ -671,7 +680,7 @@ impl ContextManager {
         }
 
         let sources = self.resolve_persona_sources();
-        match crate::prompts::soul::assemble_for(&self.workspace, &sources).await {
+        match crate::prompts::soul::assemble_for(&self.workspace, &sources, self.shape).await {
             Ok(prompt) => Some(prompt),
             Err(e) => {
                 // Deliberately no fall back to the workspace persona. Serving
@@ -2875,6 +2884,7 @@ mod tests {
             calibration: Arc::new(TokenCalibration::new()),
             skill_registry: Arc::new(SkillRegistry::new()),
             channel: baybo_model::ChannelType::owner(),
+            shape: crate::prompts::soul::PromptShape::Chat,
             session_id: test_session_id(),
             sessions,
             subagent_profile: None,
@@ -2904,6 +2914,7 @@ mod tests {
             calibration,
             skill_registry: Arc::new(SkillRegistry::new()),
             channel: baybo_model::ChannelType::owner(),
+            shape: crate::prompts::soul::PromptShape::Chat,
             session_id: test_session_id(),
             sessions: test_sessions(),
             subagent_profile: None,
@@ -3424,6 +3435,7 @@ mod tests {
             calibration: Arc::new(TokenCalibration::new()),
             skill_registry: Arc::new(SkillRegistry::new()),
             channel: baybo_model::ChannelType::owner(),
+            shape: crate::prompts::soul::PromptShape::Chat,
             session_id: test_session_id(),
             sessions: test_sessions(),
             subagent_profile: None,
@@ -3496,6 +3508,7 @@ mod tests {
             calibration: Arc::new(TokenCalibration::new()),
             skill_registry: Arc::new(SkillRegistry::new()),
             channel: baybo_model::ChannelType::owner(),
+            shape: crate::prompts::soul::PromptShape::Chat,
             session_id: test_session_id(),
             sessions: test_sessions(),
             subagent_profile: Some((Arc::clone(&registry), "test-agent".to_string())),
@@ -3549,6 +3562,7 @@ mod tests {
             calibration: Arc::new(TokenCalibration::new()),
             skill_registry: Arc::new(SkillRegistry::new()),
             channel: baybo_model::ChannelType::owner(),
+            shape: crate::prompts::soul::PromptShape::Chat,
             session_id: test_session_id(),
             sessions: test_sessions(),
             subagent_profile: None,
@@ -3719,6 +3733,7 @@ mod tests {
             calibration: Arc::new(TokenCalibration::new()),
             skill_registry: Arc::new(SkillRegistry::new()),
             channel: baybo_model::ChannelType::owner(),
+            shape: crate::prompts::soul::PromptShape::Chat,
             session_id: test_session_id(),
             sessions: test_sessions(),
             subagent_profile: None,
@@ -4318,6 +4333,7 @@ mod tests {
             calibration: Arc::new(TokenCalibration::new()),
             skill_registry: Arc::new(SkillRegistry::new()),
             channel: baybo_model::ChannelType::owner(),
+            shape: crate::prompts::soul::PromptShape::Chat,
             session_id: test_session_id(),
             sessions: test_sessions(),
             subagent_profile: None,
@@ -4396,6 +4412,7 @@ mod tests {
             calibration: Arc::new(TokenCalibration::new()),
             skill_registry: Arc::new(SkillRegistry::new()),
             channel: baybo_model::ChannelType::owner(),
+            shape: crate::prompts::soul::PromptShape::Chat,
             session_id: test_session_id(),
             sessions: Arc::clone(&sessions),
             subagent_profile: None,
@@ -5254,6 +5271,7 @@ mod tests {
             calibration: Arc::new(TokenCalibration::new()),
             skill_registry: registry,
             channel: baybo_model::ChannelType::owner(),
+            shape: crate::prompts::soul::PromptShape::Chat,
             session_id: test_session_id(),
             sessions: test_sessions(),
             subagent_profile: None,

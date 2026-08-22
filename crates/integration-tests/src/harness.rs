@@ -500,6 +500,7 @@ impl AgentTestHarnessBuilder {
             calibration: Arc::clone(&token_calibration),
             skill_registry: Arc::clone(&skill_registry),
             channel: session.channel.clone(),
+            shape: baybo_context::prompts::soul::PromptShape::for_trigger(&session.trigger),
             session_id: session.id.clone(),
             sessions: Arc::clone(&session_manager),
             subagent_profile: Some((subagent_registry, "harness".to_string())),

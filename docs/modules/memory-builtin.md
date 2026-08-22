@@ -81,6 +81,14 @@ contract the identity files have.
 carrying `MEMORY.md` verbatim, **`MEMORY_HINT`**, then the background-work
 and tag-handling hints. Declarative content first, operating rules last.
 
+Which top hint is `PromptShape`'s one job. `Chat` — a conversation a person
+can speak into, the board's own planning session included — gets the Edit
+affordance that tells the model to keep its attribute files current from the
+conversation. `Issue`, a card's run (`TriggerSource::Issue`), does not: there
+is no such conversation there, and the sentence made runs open by editing
+`IDENTITY.md` instead of starting the card. `PromptShape::for_trigger` is the
+only constructor, so the question keeps one home.
+
 Only the **index** is injected. A memory's body costs nothing until the model
 decides an index line is worth a `Read` — which is what lets the tree grow
 past what any prompt budget could hold. The hint teaches the shape:

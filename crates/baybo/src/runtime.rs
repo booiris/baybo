@@ -987,6 +987,9 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                         calibration: Arc::clone(&token_calibration),
                         skill_registry: Arc::clone(&skill_registry),
                         channel: session.channel.clone(),
+                        shape: baybo_context::prompts::soul::PromptShape::for_trigger(
+                            &session.trigger,
+                        ),
                         session_id: session.id.clone(),
                         sessions: Arc::clone(&sessions),
                         subagent_profile: session

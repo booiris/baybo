@@ -20,6 +20,57 @@ pub const FALLBACK_SYSTEM_PROMPT: &str = "You are Baybo, an intelligent assistan
 /// agent role and points at the per-attribute Edit affordance.
 const TOP_HINT: &str = r#"You are an intelligent AI assistant. The following are your core attributes. You should use Edit tool to update the corresponding attribute file according to the conversation content."#;
 
+/// [`TOP_HINT`] minus the Edit affordance, for a card's run.
+///
+/// The affordance says to keep the attribute files current "according to the
+/// conversation content". A card's run has no such conversation: its input is
+/// a card and its identity files were written for it by whoever staffed the
+/// board. Told to do it anyway, models spent the opening turn of 7 of 45
+/// observed runs editing `IDENTITY.md` instead of starting the card — a whole
+/// round trip, plus a write to a file nobody asked them to change.
+///
+/// Nothing replaces the sentence. The failure was an instruction being
+/// followed, so the fix is its absence; a "do not edit these" in its place
+/// would spend tokens raising the same subject.
+const TOP_HINT_ISSUE: &str =
+    r#"You are an intelligent AI assistant. The following are your core attributes."#;
+
+/// Which shape of session a prompt is being assembled for.
+///
+/// The line is whether a person is in the conversation. A chat and a cron
+/// fire are both replyable, so the agent's own record of its human is worth
+/// keeping current. A card's run is not: it is handed work and judged on the
+/// work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptShape {
+    /// A conversation a person can speak into. The board's own planning
+    /// session ([`baybo_model::TriggerSource::Project`]) is one of these:
+    /// the lead talks to the operator there.
+    Chat,
+    /// A run the board dispatched for one card
+    /// ([`baybo_model::TriggerSource::Issue`]).
+    Issue,
+}
+
+impl PromptShape {
+    /// Read off [`baybo_model::TriggerSource::issue`], the one accessor that
+    /// answers "is this a card's run", so the question keeps a single home
+    /// rather than growing a second spelling here.
+    pub fn for_trigger(trigger: &baybo_model::TriggerSource) -> Self {
+        match trigger.issue() {
+            Some(_) => Self::Issue,
+            None => Self::Chat,
+        }
+    }
+
+    fn top_hint(self) -> &'static str {
+        match self {
+            Self::Chat => TOP_HINT,
+            Self::Issue => TOP_HINT_ISSUE,
+        }
+    }
+}
+
 /// Operating rule for background work, inserted after the identity sections
 /// so it reads as runtime behaviour rather than persona. Counters the observed
 /// failure where a model, having backgrounded its only remaining task,
@@ -246,9 +297,11 @@ impl PersonaSources {
 pub async fn assemble_for(
     paths: &WorkspacePaths,
     sources: &PersonaSources,
+    shape: PromptShape,
 ) -> anyhow::Result<AssembledPrompt> {
     assemble(
         paths,
+        shape,
         IdentitySource::new(&sources.soul_path, &sources.soul_seed),
         IdentitySource::new(&sources.self_image_path, &sources.self_image_seed),
         IdentitySource::new(&sources.user_notes_path, &sources.user_notes_seed),
@@ -291,8 +344,8 @@ metadata:
 
 Then add its line to `{{memory_dir}}/MEMORY.md` in the same breath — `- [Title](file.md) — hook` — because a memory the index does not name will never be found again. Before creating a file, check whether one already covers the fact and update that one instead. When a memory turns out to be wrong or obsolete, delete it with `MemoryDelete` and drop its index line. Keep the index skimmable: it rides every prompt you will ever run."#;
 
-/// Assemble the system prompt: [`TOP_HINT`] up front (agent role + Edit
-/// affordance), the identity sections, the `<memory>` index plus
+/// Assemble the system prompt: the preamble [`PromptShape`] picks up front,
+/// the identity sections, the `<memory>` index plus
 /// [`MEMORY_HINT`], then [`BACKGROUND_TASKS_HINT`] and [`TAIL_HINT`]
 /// (operating rules last, so the declarative content reads as one block).
 ///
@@ -312,6 +365,7 @@ Then add its line to `{{memory_dir}}/MEMORY.md` in the same breath — `- [Title
 /// agent and is always emitted as its own `<shared_user_profile>` section.
 pub async fn assemble(
     paths: &WorkspacePaths,
+    shape: PromptShape,
     soul: IdentitySource<'_>,
     self_image: IdentitySource<'_>,
     user_notes: IdentitySource<'_>,
@@ -321,7 +375,7 @@ pub async fn assemble(
         baybo_workspace::identity::load_identity_files(paths.root(), soul, self_image, user_notes)
             .await?;
     let mut parts = vec![
-        PromptPart::Hint(TOP_HINT.to_string()),
+        PromptPart::Hint(shape.top_hint().to_string()),
         section(SectionTag::Soul, soul.path, &identity.soul),
         section(SectionTag::Identity, self_image.path, &identity.identity),
         section(
@@ -397,6 +451,57 @@ mod tests {
     use super::*;
     use baybo_workspace::IdentityKind;
 
+    /// A card's run is not told to keep its attribute files current. The
+    /// affordance is written for a conversation with a person, and a run that
+    /// has none spent its opening turn editing `IDENTITY.md` instead of
+    /// starting the card.
+    #[tokio::test]
+    async fn a_card_s_run_is_not_told_to_edit_its_attribute_files() {
+        const AFFORDANCE: &str = "use Edit tool to update the corresponding attribute file";
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = WorkspacePaths::new(dir.path().to_path_buf());
+        let file =
+            |kind| paths.persona_identity_file(baybo_workspace::paths::BUILTIN_PERSONA_DIR, kind);
+        let (soul_path, identity_path, user_path) = (
+            file(IdentityKind::Soul),
+            file(IdentityKind::Identity),
+            file(IdentityKind::User),
+        );
+        let render = async |shape| {
+            assemble(
+                &paths,
+                shape,
+                IdentitySource::new(&soul_path, IdentityKind::Soul.default_content()),
+                IdentitySource::new(&identity_path, IdentityKind::Identity.default_content()),
+                IdentitySource::new(&user_path, IdentityKind::User.default_content()),
+                None,
+            )
+            .await
+            .expect("assemble")
+            .text()
+        };
+
+        let chat = render(PromptShape::Chat).await;
+        assert!(
+            chat.contains(AFFORDANCE),
+            "a conversation keeps the affordance: {chat}"
+        );
+
+        let issue = render(PromptShape::Issue).await;
+        assert!(
+            !issue.contains(AFFORDANCE),
+            "a card's run must not be told to edit them: {issue}"
+        );
+        // Nothing takes its place — the failure was an instruction obeyed, so
+        // the fix is its absence, not a louder one pointing the other way.
+        assert!(!issue.to_lowercase().contains("do not edit"), "{issue}");
+        assert!(
+            issue.starts_with("You are an intelligent AI assistant."),
+            "the role framing still opens it: {issue}"
+        );
+    }
+
     #[tokio::test]
     async fn assembles_hint_sections_and_tail_in_order() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -410,6 +515,7 @@ mod tests {
         );
         let prompt = assemble(
             &paths,
+            PromptShape::Chat,
             IdentitySource::new(&soul_path, IdentityKind::Soul.default_content()),
             IdentitySource::new(&identity_path, IdentityKind::Identity.default_content()),
             IdentitySource::new(&user_path, IdentityKind::User.default_content()),
@@ -451,6 +557,7 @@ mod tests {
 
         let prompt = assemble(
             &paths,
+            PromptShape::Chat,
             IdentitySource::new(
                 &paths.persona_identity_file("baybo", IdentityKind::Soul),
                 "s",
@@ -488,6 +595,7 @@ mod tests {
 
         let prompt = assemble(
             &paths,
+            PromptShape::Chat,
             IdentitySource::new(
                 &paths.persona_identity_file("baybo", IdentityKind::Soul),
                 "s",
