@@ -64,11 +64,8 @@ or perform a focused sub-task. Use when the work is decomposable: the
 parent agent stays focused on the conversation while the subagent
 runs to completion and returns a single final message.
 
-The subagent does NOT see your transcript. It starts empty, with the
-system prompt its `subagent_type` profile fixes and the self-contained
-`prompt` you authored — see that parameter for how to write one. The
-call blocks until its final message, which is all you get back;
-intermediate tool output is not surfaced.
+The call blocks until the subagent's final message, which is all you
+get back; intermediate tool output is not surfaced.
 
 Pick the most specific `subagent_type` from the catalogue below, and
 fall back to `general-purpose` only when none fits; an unknown one is a
@@ -430,19 +427,34 @@ const MAX_CATALOGUE_BLURB_CHARS: usize = 240;
 /// truncated line reads as truncated rather than as a sentence that trails off.
 const BLURB_ELLIPSIS: &str = "…";
 
-/// One profile's catalogue line, bounded. Cuts on a char boundary (profile
-/// descriptions are author-written and routinely non-ASCII) and prefers the
-/// last word break in the final quarter, so the cut lands between words when
-/// one is near enough to matter.
+/// One profile's catalogue line, held to [`MAX_CATALOGUE_BLURB_CHARS`].
+///
+/// A description that fits is used whole. One that does not falls back to its
+/// first sentence, because these lines all read "what I am. When to pick me
+/// over X", and a cut that lands mid-clause takes the second half — the only
+/// half that answers the question the catalogue exists to answer. A first
+/// sentence that is itself too long is cut on a char boundary (descriptions
+/// are author-written and routinely non-ASCII), preferring the last word break
+/// in the final quarter so the cut lands between words when one is near enough.
 fn catalogue_blurb(description: &str) -> std::borrow::Cow<'_, str> {
     if description.chars().count() <= MAX_CATALOGUE_BLURB_CHARS {
         return std::borrow::Cow::Borrowed(description);
     }
-    let hard = description
+    // Only past the budget, and only here: the renderer indents a multi-line
+    // blurb's continuation lines, and a sentence break can straddle a newline.
+    let flat = description.replace('\n', " ");
+    let sentence = match flat.split_once(". ") {
+        Some((first, _)) => format!("{first}."),
+        None => flat.to_string(),
+    };
+    if sentence.chars().count() <= MAX_CATALOGUE_BLURB_CHARS {
+        return std::borrow::Cow::Owned(sentence);
+    }
+    let hard = sentence
         .char_indices()
         .nth(MAX_CATALOGUE_BLURB_CHARS)
-        .map_or(description.len(), |(i, _)| i);
-    let head = &description[..hard];
+        .map_or(sentence.len(), |(i, _)| i);
+    let head = &sentence[..hard];
     let keep = head
         .rfind(char::is_whitespace)
         .filter(|i| *i * 4 >= hard * 3)
@@ -483,7 +495,7 @@ fn parameters_schema() -> Value {
             "backend": {
                 "type": "string",
                 "enum": ["baybo", "claude", "codex"],
-                "description": "Backend that runs the subagent. 'baybo' (default) spawns a full in-process baybo agent that uses the configured LLMs/tools/skills. 'claude' delegates to a local Claude Code subprocess and 'codex' to OpenAI's codex CLI — both are one-shot, run their own internal tool loops with bypassed permissions, and are best for heavy autonomous tasks where you want that external agent (not baybo) to drive. Each is available only when its CLI is installed on this host; a call naming a missing one fails with a clear error."
+                "description": "Who runs it. 'baybo' (default) is an in-process agent with the configured LLMs, tools and skills. 'claude' and 'codex' hand the whole task to that CLI instead — one-shot, own tool loop, permissions bypassed — for heavy autonomous work. A backend whose CLI is not installed fails with a clear error."
             },
             "background": {
                 "type": "boolean",
@@ -492,7 +504,7 @@ fn parameters_schema() -> Value {
             "on_timeout": {
                 "type": "string",
                 "enum": ["background", "kill"],
-                "description": "What to do if a foreground (background=false) subagent is still running after a 2-minute foreground wait. 'background' (default) detaches it — you get a handle now and a notification when it finishes — so a slow subagent never blocks you. 'kill' cancels it and returns a timeout instead. Ignored when background=true, during a scheduled job's own run, and in nested subagents — those always block until the child finishes."
+                "description": "After a 2-minute foreground wait: 'background' (default) detaches it — handle now, notification later — and 'kill' cancels it. Ignored when background=true, inside a scheduled run, and in nested subagents, which always block."
             },
             "group": {
                 "type": "string",
@@ -500,7 +512,7 @@ fn parameters_schema() -> Value {
             },
             "resume_session_id": {
                 "type": "string",
-                "description": "Continue a prior subagent's conversation. Use a child_session_id value the user previously saw in a 'subagent_session_id: ...' tail on this same parent session — passing an arbitrary id will be rejected. The new prompt is appended to that child's existing context (for claude / codex, via the agent's own --resume). Leave unset to start a fresh subagent."
+                "description": "Continue a prior subagent instead of starting one: a child_session_id from a 'subagent_session_id: ...' tail on THIS parent session. Any other id is rejected. The prompt is appended to that child's context."
             }
         }
     })
@@ -1154,6 +1166,48 @@ mod tests {
             "{cut}"
         );
         assert!(cut.ends_with(BLURB_ELLIPSIS), "{cut}");
+    }
+
+    /// The catalogue is what the parent picks from, so the line each profile
+    /// gets must be the part that distinguishes it. All four built-ins used to
+    /// be cut at the character budget exactly where their "pick this over X"
+    /// clause began, which is the one thing the catalogue is for.
+    #[test]
+    fn every_builtin_s_catalogue_line_survives_the_budget_intact() {
+        for profile in crate::builtin::all() {
+            let line = catalogue_blurb(&profile.description);
+            assert!(
+                !line.ends_with(BLURB_ELLIPSIS),
+                "{}'s catalogue line is cut: {line}",
+                profile.name
+            );
+            assert!(
+                line.to_lowercase().contains("pick"),
+                "{}'s line must say when to pick it over its neighbours: {line}",
+                profile.name
+            );
+        }
+    }
+
+    /// An over-budget description loses its tail at a sentence boundary, not
+    /// mid-clause — the half that says when to pick it survives or nothing does.
+    #[test]
+    fn an_overlong_description_is_cut_at_a_sentence_not_mid_clause() {
+        let long = format!(
+            "Finds things{}. Pick it when you want finding.",
+            ".".repeat(300)
+        );
+        let cut = catalogue_blurb(&long);
+        assert!(cut.ends_with(BLURB_ELLIPSIS), "{cut}");
+
+        let sentence = format!(
+            "Finds {}things. Pick it when you want finding.",
+            "many ".repeat(40)
+        );
+        assert_eq!(
+            catalogue_blurb(&sentence),
+            format!("Finds {}things.", "many ".repeat(40))
+        );
     }
 
     #[test]
