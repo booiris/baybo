@@ -388,7 +388,7 @@ pub(crate) async fn comments_for_brief(
         BriefWindow::WholeCard => store.list_events(&run.issue_id).await,
     };
     let comments = match events {
-        Ok(events) => attributed(agents, run, events).await,
+        Ok(events) => attributed(agents, run, window, events).await,
         Err(e) => {
             tracing::warn!(run = %run.id, error = %e, "could not read comments for the brief");
             Vec::new()
@@ -403,14 +403,32 @@ pub(crate) async fn comments_for_brief(
 
 /// The comments among `events`, each under the name the board knows its
 /// author by.
+///
+/// A run continuing its own transcript does not get its own words back. It
+/// wrote them as tool calls that are still above it in the conversation, and
+/// reading them again under its own name is worse than redundant: [`Comment`]
+/// attributes precisely so the agent can tell who is waiting on an answer,
+/// and a block that quotes the agent to itself spends that signal saying
+/// nothing.
+///
+/// Only in [`BriefWindow::SinceItsLastRun`], which is the one window where
+/// "already in this conversation" is guaranteed. A [`BriefWindow::WholeCard`]
+/// run opens an empty transcript, so its own older words are not in it and
+/// have to be shown.
 async fn attributed(
     agents: &Arc<dyn AgentProfileStore>,
     run: &IssueRunRow,
+    window: BriefWindow,
     events: Vec<IssueEventRow>,
 ) -> Vec<Comment> {
+    let its_own = |event: &IssueEventRow| {
+        matches!(window, BriefWindow::SinceItsLastRun(_))
+            && actors::named_agent(&event.actor).is_some_and(|id| id == run.agent_id)
+    };
     let spoken: Vec<IssueEventRow> = events
         .into_iter()
         .filter(|event| matches!(event.body, IssueEventBody::Comment { .. }))
+        .filter(|event| !its_own(event))
         .collect();
     let mut ids: Vec<AgentProfileId> = Vec::new();
     for id in spoken
@@ -439,7 +457,7 @@ async fn attributed(
 mod tests {
     use super::*;
     use baybo_model::{AgentProfileId, IssueId, IssueRunId, ProjectId, SessionId};
-    use baybo_store::project::{IssuePriority, IssueStatus, RunStatus, RunTrigger};
+    use baybo_store::project::{IssueActor, IssuePriority, IssueStatus, RunStatus, RunTrigger};
     use chrono::{Duration, Utc};
 
     fn card() -> IssueRow {
@@ -613,6 +631,66 @@ mod tests {
         assert!(
             brief.contains(SAID_SINCE_LAST_RUN.trim()),
             "an agent that has read the rest is told only what is new:\n{brief}"
+        );
+    }
+
+    fn commented(
+        issue: &IssueRow,
+        actor: IssueActor,
+        text: &str,
+    ) -> baybo_store::project::IssueEventRow {
+        baybo_store::project::IssueEventRow {
+            id: baybo_model::IssueEventId::generate(),
+            issue_id: issue.id.clone(),
+            project_id: issue.project_id.clone(),
+            number: issue.number,
+            actor,
+            body: IssueEventBody::Comment {
+                text: text.to_owned(),
+                attachments: Vec::new(),
+            },
+            created_at: issue.created_at,
+        }
+    }
+
+    /// A run continuing its own transcript is not told what it itself said
+    /// last time: those words are already above it, written by its own tool
+    /// call. Everyone else's still arrive.
+    #[tokio::test]
+    async fn a_continuing_run_is_not_read_its_own_words_back() {
+        let issue = card();
+        let dev_1 = AgentProfileId::parse("dev-1").expect("agent id");
+        let qa = AgentProfileId::parse("qa").expect("agent id");
+        let first = ran(&issue, &dev_1, 1);
+        let second = run(&issue, &dev_1, 2);
+        let agents: Arc<dyn AgentProfileStore> =
+            Arc::new(baybo_store::test_support::MemoryAgentProfileStore::new());
+        let events = vec![
+            commented(&issue, IssueActor::User, "start with the CSV path"),
+            commented(&issue, IssueActor::Agent(qa), "does it skip empty rows?"),
+            commented(&issue, IssueActor::Agent(dev_1.clone()), "picking this up"),
+        ];
+
+        let continuing = attributed(
+            &agents,
+            &second,
+            BriefWindow::SinceItsLastRun(first.created_at),
+            events.clone(),
+        )
+        .await;
+        let said: Vec<&str> = continuing.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(
+            said,
+            vec!["start with the CSV path", "does it skip empty rows?"],
+            "only its own words are dropped"
+        );
+
+        // A fresh transcript has none of them, so it gets all three back.
+        let opening = attributed(&agents, &second, BriefWindow::WholeCard, events).await;
+        assert_eq!(
+            opening.len(),
+            3,
+            "a run opening an empty transcript needs even its own history"
         );
     }
 
