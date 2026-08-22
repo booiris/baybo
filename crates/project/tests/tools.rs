@@ -358,6 +358,72 @@ async fn a_read_returns_the_card_and_what_has_been_said_on_it() {
     assert_eq!(timeline.last().expect("entry")["event"], "reproduced it");
 }
 
+/// Three tools, one vocabulary. Each of these spellings was refused by at
+/// least one of them before: `IssueList` took only "unassigned",
+/// `IssueUpdate` only "" and "none", and `IssueCreate` guarded nothing at all.
+#[tokio::test]
+async fn every_issue_tool_takes_every_word_for_nobody() {
+    let f = fixture().await;
+    let (project, lead) = f.open("Vocabulary").await;
+    let ctx = f.ctx(&project, &lead);
+    f.call(
+        "ProjectAgentCreate",
+        &ctx,
+        json!({ "name": "dev", "role": "Codes." }),
+    )
+    .await;
+
+    // Create: a sentinel means nobody, not a handle to look up.
+    for (n, word) in ["none", "unassigned", "nobody", ""].iter().enumerate() {
+        let created = f
+            .call(
+                "IssueCreate",
+                &ctx,
+                json!({ "title": format!("open {n}"), "assignee": word }),
+            )
+            .await;
+        assert!(
+            created["assignee"].is_null(),
+            "IssueCreate with {word:?} must leave the card unassigned: {created}"
+        );
+    }
+
+    // List: every sentinel filters to the unassigned set...
+    for word in ["none", "unassigned", "nobody"] {
+        let listed = f.call("IssueList", &ctx, json!({ "assignee": word })).await;
+        assert_eq!(listed["count"], 4, "IssueList with {word:?}: {listed}");
+    }
+    // ...and an empty one asks nothing, which is what every logged `""` meant.
+    f.call(
+        "IssueCreate",
+        &ctx,
+        json!({ "title": "taken", "assignee": "@dev" }),
+    )
+    .await;
+    let unfiltered = f.call("IssueList", &ctx, json!({ "assignee": "" })).await;
+    assert_eq!(
+        unfiltered["count"], 5,
+        "an empty assignee filter excludes nothing: {unfiltered}"
+    );
+
+    // Update: the same words take whoever is on it off.
+    let taken = f
+        .call("IssueList", &ctx, json!({ "assignee": "@dev" }))
+        .await;
+    let number = taken["issues"][0]["number"].clone();
+    let updated = f
+        .call(
+            "IssueUpdate",
+            &ctx,
+            json!({ "number": number, "assignee": "nobody" }),
+        )
+        .await;
+    assert!(
+        updated["assignee"].is_null(),
+        "IssueUpdate with \"nobody\" must unassign: {updated}"
+    );
+}
+
 #[tokio::test]
 async fn the_triage_filter_finds_the_cards_nobody_is_on() {
     let f = fixture().await;

@@ -130,6 +130,70 @@ fn priority_schema(description: &str) -> Value {
     })
 }
 
+/// The words that mean "nobody" wherever a tool takes an assignee. All three
+/// are accepted everywhere, because a model that learned one on `IssueUpdate`
+/// should not be refused for using it on `IssueList`.
+const NOBODY: &[&str] = &["none", "unassigned", "nobody"];
+
+fn is_nobody(raw: &str) -> bool {
+    NOBODY.iter().any(|w| raw.eq_ignore_ascii_case(w))
+}
+
+/// The word the schemas quote when they mean "nobody". One spelling in the
+/// prose, all of [`NOBODY`] accepted at the door.
+const NOBODY_WORD: &str = NOBODY[0];
+
+/// What the `assignee` parameter says, in the two shapes it has. Written
+/// once because a model that reads one of these tools is about to use the
+/// others, and three spellings of one rule is how it learns a wrong one.
+fn assignee_schema(setting: bool) -> Value {
+    let description = if setting {
+        format!("An `@handle` from this project's team, or `{NOBODY_WORD}` for nobody.")
+    } else {
+        format!(
+            "Keep only issues assigned to this `@handle`, or `{NOBODY_WORD}` for the ones \
+             nobody is on. Omit it (or pass an empty string) to filter by something else."
+        )
+    };
+    json!({ "type": "string", "description": description })
+}
+
+/// An assignee a tool is about to **set**: `Some(None)` unassigns.
+/// An empty string counts as "nobody" here — the field carries a value, and
+/// an empty one is the absence of an assignee.
+async fn parse_assignee_value(
+    manager: &ProjectManager,
+    project: &ProjectId,
+    raw: Option<&str>,
+) -> Result<Option<Option<AgentProfileId>>, ToolError> {
+    match raw.map(str::trim) {
+        None => Ok(None),
+        Some(raw) if raw.is_empty() || is_nobody(raw) => Ok(Some(None)),
+        Some(raw) => Ok(Some(Some(resolve_handle(manager, project, raw).await?))),
+    }
+}
+
+/// An assignee a tool is about to **filter** by: `Some(None)` keeps only
+/// unassigned cards.
+///
+/// An empty string is "no filter" here, the opposite of what it means when
+/// setting — a filter is a question, and an empty question excludes nothing.
+/// Every logged `assignee: ""` came paired with a status filter, i.e. "list
+/// in-progress cards, whoever holds them", and answering it with the
+/// unassigned ones would be a wrong list rather than a loud error.
+async fn parse_assignee_filter(
+    manager: &ProjectManager,
+    project: &ProjectId,
+    raw: Option<&str>,
+) -> Result<Option<Option<AgentProfileId>>, ToolError> {
+    match raw.map(str::trim) {
+        None => Ok(None),
+        Some("") => Ok(None),
+        Some(raw) if is_nobody(raw) => Ok(Some(None)),
+        Some(raw) => Ok(Some(Some(resolve_handle(manager, project, raw).await?))),
+    }
+}
+
 fn parse_status(raw: &str) -> Result<IssueStatus, ToolError> {
     IssueStatus::parse(raw)
         .ok_or_else(|| ToolError::InvalidParams(format!("unknown status {raw:?}")))
@@ -202,5 +266,41 @@ fn project_err(e: crate::ProjectError) -> ToolError {
         | crate::ProjectError::NoSuchIssue { .. }
         | crate::ProjectError::Archived(_) => ToolError::InvalidParams(e.to_string()),
         other => ToolError::Execution(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every tool takes every word for "nobody"; a model that learned one on
+    /// `IssueUpdate` is not refused for using it on `IssueList`.
+    #[test]
+    fn the_words_for_nobody_are_the_same_everywhere() {
+        for word in ["none", "NONE", "unassigned", "Nobody"] {
+            assert!(is_nobody(word), "{word}");
+        }
+        for word in ["nobody-else", "@none", "n"] {
+            assert!(!is_nobody(word), "{word}");
+        }
+    }
+
+    /// The one place the two shapes deliberately disagree, pinned so a later
+    /// reader cannot quietly invert it: an empty string sets nobody, and
+    /// filters nobody out of the question.
+    #[test]
+    fn an_empty_assignee_unassigns_when_set_and_filters_nothing_when_asked() {
+        assert!(
+            assignee_schema(true)["description"]
+                .as_str()
+                .is_some_and(|d| d.contains("nobody")),
+            "the setting shape must name the word that unassigns"
+        );
+        assert!(
+            assignee_schema(false)["description"]
+                .as_str()
+                .is_some_and(|d| d.contains("empty string")),
+            "the filter shape must say what an empty one does"
+        );
     }
 }

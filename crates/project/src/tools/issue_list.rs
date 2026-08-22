@@ -6,7 +6,7 @@ use baybo_tools::{Tool, ToolConcurrency, ToolContext, ToolError, ToolOutput, Too
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{exec_err, parse_status, render_issue, scope, status_schema, tokens, usd};
+use super::{NOBODY_WORD, exec_err, parse_status, render_issue, scope, status_schema, tokens, usd};
 use crate::ProjectManager;
 
 pub const ISSUE_LIST_TOOL_NAME: &str = "IssueList";
@@ -32,8 +32,6 @@ struct Params {
     include_cancelled: bool,
 }
 
-const UNASSIGNED: &str = "unassigned";
-
 #[async_trait]
 impl Tool for IssueListTool {
     fn name(&self) -> &str {
@@ -42,7 +40,7 @@ impl Tool for IssueListTool {
 
     fn description(&self) -> String {
         format!(
-            r#"List the issues on this project's board. Returns each card's number, title, status, priority, assignee handle, and branch if it has produced one. Filter with `status` (one column) and `assignee` (an `@handle`, or `{UNASSIGNED}` for the cards nobody has picked up — that set is what triage is about). Cancelled issues are left out unless you ask for them.
+            r#"List the issues on this project's board. Returns each card's number, title, status, priority, assignee handle, and branch if it has produced one. Filter with `status` (one column) and `assignee` (an `@handle`, or `{NOBODY_WORD}` for the cards nobody has picked up — that set is what triage is about). Cancelled issues are left out unless you ask for them.
 
 Rows come back **most urgent first within each column**, so the order is already a triage order.
 
@@ -55,10 +53,7 @@ Alongside them: `team`, where each member's `working_on` is what they have in fl
             "type": "object",
             "properties": {
                 "status": status_schema("Only issues in this column."),
-                "assignee": {
-                    "type": "string",
-                    "description": format!("Only issues assigned to this `@handle`, or `{UNASSIGNED}` for the ones nobody is on."),
-                },
+                "assignee": super::assignee_schema(false),
                 "include_cancelled": {
                     "type": "boolean",
                     "description": "Include cancelled issues. Default false — they are not live work.",
@@ -87,13 +82,8 @@ Alongside them: `team`, where each member's `working_on` is what they have in fl
         let team = self.manager.team(&project).await.map_err(exec_err)?;
         let load = self.manager.board_load(&project).await.map_err(exec_err)?;
         let board = self.manager.list_issues(&project).await.map_err(exec_err)?;
-        let wanted_assignee = match p.assignee.as_deref().map(str::trim) {
-            None => None,
-            Some(raw) if raw.eq_ignore_ascii_case(UNASSIGNED) => Some(None),
-            Some(raw) => Some(Some(
-                super::resolve_handle(&self.manager, &project, raw).await?,
-            )),
-        };
+        let wanted_assignee =
+            super::parse_assignee_filter(&self.manager, &project, p.assignee.as_deref()).await?;
 
         let mut issues = board.clone();
         issues.retain(|issue| {

@@ -7,14 +7,12 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{
-    actor, exec_err, parse_priority, parse_status, priority_schema, project_err, render_issue,
-    resolve_handle, scope, status_schema,
+    NOBODY_WORD, actor, exec_err, parse_priority, parse_status, priority_schema, project_err,
+    render_issue, scope, status_schema,
 };
 use crate::ProjectManager;
 
 pub const ISSUE_UPDATE_TOOL_NAME: &str = "IssueUpdate";
-
-const UNASSIGN: &str = "none";
 
 pub(super) struct IssueUpdateTool {
     manager: Arc<ProjectManager>,
@@ -88,7 +86,7 @@ Two of these do more than edit a row:
 - Moving an issue to `in_progress` with an assignee **starts that agent**. Move work there when it is being done now, not when it is next.
 - Setting `blocked` to a reason marks the card blocked and says why on its timeline; an empty string unblocks it.
 
-`assignee` takes an `@handle`, or `{UNASSIGN}` to take whoever is on it off. `cancelled: true` is the terminal negative — the row and its history stay, it just stops counting as live work. Say why in a comment before you cancel somebody else's card."#
+`assignee` takes an `@handle`, or `{NOBODY_WORD}` to take whoever is on it off. `cancelled: true` is the terminal negative — the row and its history stay, it just stops counting as live work. Say why in a comment before you cancel somebody else's card."#
         )
     }
 
@@ -101,7 +99,7 @@ Two of these do more than edit a row:
                 "description": { "type": "string" },
                 "status": status_schema("Move it to this column. `in_progress` with an assignee starts a run."),
                 "priority": priority_schema("Informs triage."),
-                "assignee": { "type": "string", "description": format!("An `@handle` from the team, or `{UNASSIGN}` to unassign.") },
+                "assignee": super::assignee_schema(true),
                 "blocked": { "type": "string", "description": "Why it is blocked; an empty string unblocks it." },
                 "cancelled": { "type": "boolean", "description": "Cancel (or un-cancel) the issue." },
                 "parent": { "type": "integer", "description": "Make this a sub-issue of that issue's number; `0` detaches it. One level only." },
@@ -126,11 +124,8 @@ Two of these do more than edit a row:
         let p: Params =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
         let project = scope(ctx)?;
-        let assignee = match p.assignee.as_deref().map(str::trim) {
-            None => None,
-            Some(raw) if raw.is_empty() || raw.eq_ignore_ascii_case(UNASSIGN) => Some(None),
-            Some(raw) => Some(Some(resolve_handle(&self.manager, &project, raw).await?)),
-        };
+        let assignee =
+            super::parse_assignee_value(&self.manager, &project, p.assignee.as_deref()).await?;
         let status = p.status.as_deref().map(parse_status).transpose()?;
         // The model addresses the parent by number, like everything else on
         // the board; the store wants an id. Resolving here rather than

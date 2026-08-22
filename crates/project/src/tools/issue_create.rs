@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 
 use super::{
     actor, exec_err, filed_from, parse_priority, parse_status, priority_schema, project_err,
-    render_issue, resolve_handle, scope, status_schema,
+    render_issue, scope, status_schema,
 };
 use crate::{NewIssueRequest, ProjectManager};
 
@@ -67,7 +67,7 @@ Putting an issue straight into `in_progress` with an assignee starts that agent 
                 "description": { "type": "string", "description": "What the assignee needs to know: context, constraints, what done looks like." },
                 "status": status_schema("Which column it opens in. Defaults to `backlog`."),
                 "priority": priority_schema("Informs triage; it never reorders the board on its own."),
-                "assignee": { "type": "string", "description": "An `@handle` from this project's team." },
+                "assignee": super::assignee_schema(true),
                 "parent": { "type": "integer", "description": "Open it as a step of that issue's number. One level only — a step cannot have steps." },
                 "stage": { "type": "integer", "description": "Which barrier under the parent (default 0). Stage N starts when every step of stage N-1 is done." },
                 "key": { "type": "string", "description": "Only inside a scheduled check: distinguishes several cards this check files. Omit it and the check keeps one open card, which is what you want for a recurring finding." },
@@ -91,10 +91,9 @@ Putting an issue straight into `in_progress` with an assignee starts that agent 
         let p: Params =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
         let project = scope(ctx)?;
-        let assignee = match p.assignee.as_deref() {
-            Some(handle) => Some(resolve_handle(&self.manager, &project, handle).await?),
-            None => None,
-        };
+        let assignee = super::parse_assignee_value(&self.manager, &project, p.assignee.as_deref())
+            .await?
+            .flatten();
         let issue = self
             .manager
             .create_issue(
