@@ -146,6 +146,22 @@ pub trait Tool: Send + Sync {
 
     fn parameters_schema(&self) -> Value;
 
+    /// The schema a session started by `trigger` is actually offered.
+    ///
+    /// Defaults to [`Self::parameters_schema`], which is also what the
+    /// governance manifest keeps — that is the tool's whole surface, and the
+    /// executor still accepts a parameter this trims. What this removes is
+    /// the *offer*: a knob the runtime will refuse in this session should not
+    /// be in front of the model at all. Naming it and then explaining when it
+    /// does nothing costs tokens on every request and still gets tried.
+    ///
+    /// Vary only on the trigger. It is fixed for a session's whole life, so
+    /// the offered schema is too, which is what the prompt-cache prefix
+    /// needs.
+    fn parameters_schema_for(&self, _trigger: &TriggerSource) -> Value {
+        self.parameters_schema()
+    }
+
     /// Resources this call will touch, derived from the parameters.
     ///
     /// The approval gate consults these at runtime before execution.
@@ -239,6 +255,18 @@ pub enum ToolTriggerScope {
     /// by a process-wide singleton — one browser, one profile, one set of
     /// cookies — has no unshared instance to give it.
     SharedWorkspace,
+    /// Only a session a background job's completion could be delivered into.
+    /// `JobList` and `JobStop` address work in flight, and a card's run can
+    /// never have any: `Session::can_host_background_jobs` refuses it, so a
+    /// detached subagent blocks anyway and a slow command is killed rather
+    /// than detached. Offered there, the pair are a listing that is always
+    /// empty and a stop with nothing to stop.
+    ///
+    /// The predicate defers to `TriggerSource::can_host_background_jobs`
+    /// rather than restating it. It sees only the trigger, so it is the
+    /// weaker half of that gate — a subagent session passes here and is
+    /// refused by the executor's own check, which is the safe direction.
+    BackgroundHost,
 }
 
 impl ToolTriggerScope {
@@ -249,6 +277,7 @@ impl ToolTriggerScope {
             ToolTriggerScope::CronConversation => trigger.is_cron_conversation(),
             ToolTriggerScope::ProjectBoard => trigger.project().is_some(),
             ToolTriggerScope::SharedWorkspace => trigger.issue().is_none(),
+            ToolTriggerScope::BackgroundHost => trigger.can_host_background_jobs(),
         }
     }
 }
@@ -1262,5 +1291,42 @@ mod output_source_tests {
     #[test]
     fn command_output_stays_opaque() {
         assert_eq!(BashTool::for_test().output_source(), OutputSource::Opaque);
+    }
+}
+
+#[cfg(test)]
+mod background_scope_tests {
+    use super::*;
+    use baybo_model::TriggerSource;
+
+    fn issue_run() -> TriggerSource {
+        TriggerSource::Issue {
+            project_id: baybo_model::ProjectId::generate(),
+            issue_id: baybo_model::IssueId::generate(),
+            number: 1,
+        }
+    }
+
+    /// A card's run never sees `JobList`/`JobStop`. Nothing can be in flight
+    /// there — `can_host_background_jobs` refuses it — so the pair are a
+    /// listing that is always empty and a stop with nothing to stop.
+    #[test]
+    fn a_card_s_run_is_offered_no_job_tools() {
+        assert!(!ToolTriggerScope::BackgroundHost.allows_trigger(&issue_run()));
+        assert!(ToolTriggerScope::BackgroundHost.allows_trigger(&TriggerSource::User));
+    }
+
+    /// The scope defers to the trigger's own answer rather than restating it.
+    /// Three tool descriptions each hand-wrote this exemption list and all
+    /// three had drifted, promising a card's run a detach it would not get.
+    #[test]
+    fn the_scope_and_the_trigger_give_the_same_answer() {
+        for trigger in [TriggerSource::User, issue_run()] {
+            assert_eq!(
+                ToolTriggerScope::BackgroundHost.allows_trigger(&trigger),
+                trigger.can_host_background_jobs(),
+                "{trigger:?}"
+            );
+        }
     }
 }

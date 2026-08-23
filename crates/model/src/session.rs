@@ -181,6 +181,22 @@ impl TriggerSource {
         }
     }
 
+    /// The trigger half of [`Session::can_host_background_jobs`]. Lives here
+    /// so the tool layer can ask the same question without a `Session`: a
+    /// scope only ever sees a `TriggerSource`, and a second hand-written
+    /// spelling of this is how the `on_timeout` descriptions came to promise
+    /// a card's run something the runtime then refused it.
+    ///
+    /// The lineage half — a subagent's turn ends with the child — stays on
+    /// [`Session`], which is the only place that knows it.
+    pub fn can_host_background_jobs(&self) -> bool {
+        match self {
+            TriggerSource::User => true,
+            TriggerSource::Cron { .. } => self.is_cron_conversation(),
+            TriggerSource::Issue { .. } => false,
+        }
+    }
+
     /// The issue this session works on, if it is an issue session.
     pub fn issue(&self) -> Option<(&crate::ProjectId, &crate::IssueId, i64)> {
         match self {
@@ -384,12 +400,7 @@ impl Session {
     /// complete by the time it notifies. See
     /// `agent::runtime::background_jobs::background_eligible`.
     pub fn can_host_background_jobs(&self) -> bool {
-        let hostable = match &self.trigger {
-            TriggerSource::User => true,
-            TriggerSource::Cron { .. } => self.trigger.is_cron_conversation(),
-            TriggerSource::Issue { .. } => false,
-        };
-        hostable
+        self.trigger.can_host_background_jobs()
             && match &self.lineage {
                 None => true,
                 Some(l) => !matches!(l.kind, LineageKind::Subagent),

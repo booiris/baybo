@@ -16,6 +16,10 @@ pub struct JobListTool;
 
 #[async_trait]
 impl Tool for JobListTool {
+    fn trigger_scope(&self) -> crate::ToolTriggerScope {
+        crate::ToolTriggerScope::BackgroundHost
+    }
+
     fn name(&self) -> &str {
         "JobList"
     }
@@ -55,6 +59,10 @@ pub struct JobStopTool;
 
 #[async_trait]
 impl Tool for JobStopTool {
+    fn trigger_scope(&self) -> crate::ToolTriggerScope {
+        crate::ToolTriggerScope::BackgroundHost
+    }
+
     fn name(&self) -> &str {
         "JobStop"
     }
