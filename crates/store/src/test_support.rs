@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use baybo_model::{AgentProfileId, LlmEntryName};
+use baybo_model::{AgentProfileId, LlmPin};
 use parking_lot::Mutex;
 
 use crate::agent_profile::{AgentProfileRow, AgentProfileStore, AgentProfileUpdate, Result};
@@ -107,12 +107,12 @@ impl AgentProfileStore for MemoryAgentProfileStore {
         Ok(true)
     }
 
-    async fn set_llm(&self, id: &AgentProfileId, llm: Option<&LlmEntryName>) -> Result<bool> {
+    async fn set_llm(&self, id: &AgentProfileId, pin: &LlmPin) -> Result<bool> {
         let mut rows = self.rows.lock();
         let Some(row) = rows.get_mut(id) else {
             return Ok(false);
         };
-        row.llm = llm.cloned();
+        row.llm = pin.clone();
         Ok(true)
     }
 
@@ -156,7 +156,7 @@ pub fn agent_profile_row(id: &AgentProfileId) -> AgentProfileRow {
         description: String::new(),
         avatar_blob_id: None,
         framework: baybo_model::AgentFramework::Baybo,
-        llm: None,
+        llm: LlmPin::unpinned(),
         builtin: false,
         team: None,
         hired_by: None,

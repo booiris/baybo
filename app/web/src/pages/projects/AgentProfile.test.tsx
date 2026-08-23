@@ -3,6 +3,7 @@ import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 
+import { setAgentModel } from './api';
 import { AgentProfile } from './AgentProfile';
 import type { Agent, Issue, IssueRun } from './boardModel';
 
@@ -13,9 +14,16 @@ vi.mock('../../api/auth', () => ({
 // The model pool is a network read the panel makes on mount; the tests
 // here are about what it renders, not about which models exist.
 vi.mock('./api', () => ({
-  fetchModelPool: vi
-    .fn()
-    .mockResolvedValue({ kind: 'ok', value: { names: ['deepseek', 'gpt-5'], defaultName: 'deepseek' } }),
+  fetchModelPool: vi.fn().mockResolvedValue({
+    kind: 'ok',
+    value: {
+      defaultName: 'deepseek',
+      entries: [
+        { name: 'deepseek', models: ['deepseek-chat'], efforts: [] },
+        { name: 'gpt-5', models: ['gpt-5.5', 'o3'], efforts: ['low', 'high'] },
+      ],
+    },
+  }),
   setAgentModel: vi.fn().mockResolvedValue({ kind: 'ok', value: null }),
 }));
 
@@ -87,22 +95,58 @@ describe('AgentProfile', () => {
     expect(screen.getByText('1')).toBeInTheDocument();
   });
 
-  it('lists each model once, the default one standing for "not pinned"', async () => {
-    renderProfile(agent('dev-1'));
-    // The trigger names what it is set to — an unpinned agent shows the
-    // default's own row, because that row *is* the unpinned choice.
-    const trigger = await screen.findByLabelText('llm: deepseek');
-    await userEvent.click(trigger);
-
-    // No separate "default" row beside the model it resolves to: the two are
-    // indistinguishable until the default moves, and reading `deepseek` twice
-    // is worse than losing that distinction.
-    // The trigger carries `aria-haspopup`; everything else here is a row.
-    const rows = screen
+  /// Rows of whichever picker is open. The trigger carries `aria-haspopup`;
+  /// everything else inside the panel is a row.
+  function openRows() {
+    return screen
       .getAllByRole('button')
       .filter((one) => !one.hasAttribute('aria-haspopup') && one.closest('[style]') !== null)
       .map((one) => one.textContent);
-    expect(rows).toEqual(['deepseek', 'gpt-5']);
+  }
+
+  it('offers an inherit row plus every entry, the current default named on it', async () => {
+    renderProfile(agent('dev-1'));
+    // An unpinned agent sits on the inherit row, which says what it resolves
+    // to today without pinning it.
+    const trigger = await screen.findByLabelText('llm: Default · deepseek');
+    await userEvent.click(trigger);
+
+    // The default entry keeps its own named row: picking it by name is the
+    // only way to then choose a model inside it.
+    expect(openRows()).toEqual(['Default · deepseek', 'deepseek', 'gpt-5']);
+  });
+
+  it('offers the pinned entry’s models, and its rungs when it has any', async () => {
+    renderProfile(agent('dev-1', { llm: 'gpt-5' }));
+
+    await userEvent.click(await screen.findByLabelText('model: gpt-5.5 (entry default)'));
+    expect(openRows()).toEqual(['gpt-5.5 (entry default)', 'gpt-5.5', 'o3']);
+
+    await userEvent.click(screen.getByLabelText('thinking: entry default'));
+    expect(openRows()).toEqual(['entry default', 'low', 'high']);
+  });
+
+  /// An entry whose provider baybo sends no effort to gets no field at all —
+  /// a disabled row would advertise a knob that does not exist.
+  it('draws no thinking field for a provider that takes no effort', async () => {
+    renderProfile(agent('dev-1', { llm: 'deepseek' }));
+    await screen.findByLabelText('llm: deepseek');
+    expect(screen.queryByLabelText(/^thinking:/)).not.toBeInTheDocument();
+  });
+
+  /// The pin is written whole. Changing the entry drops the model with it,
+  /// because a model of the old entry is one the new entry cannot serve.
+  it('writes the whole pin, and clears the model when the entry moves', async () => {
+    renderProfile(agent('dev-1', { llm: 'gpt-5', model: 'o3', reasoning_effort: 'high' }));
+
+    await userEvent.click(await screen.findByLabelText('llm: gpt-5'));
+    await userEvent.click(screen.getByRole('button', { name: 'deepseek' }));
+
+    expect(vi.mocked(setAgentModel)).toHaveBeenCalledWith({}, 'id-dev-1', {
+      llm: 'deepseek',
+      model: '',
+      effort: 'high',
+    });
   });
 
   it('says who added it, and notes a hirer who has since gone', () => {

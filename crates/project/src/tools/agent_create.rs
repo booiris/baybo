@@ -82,7 +82,7 @@ The `role` becomes the new agent's own soul: write what it is for, in its own te
                     name: p.name,
                     role: p.role,
                     framework: None,
-                    llm: None,
+                    llm: baybo_model::LlmPin::unpinned(),
                 },
                 // The audit line the whole cap exists to make readable: this
                 // hire names the agent that made it, so a hiring loop is

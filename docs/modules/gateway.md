@@ -616,7 +616,7 @@ POST   /v1/agents                       create an agent profile
 GET    /v1/agents/:agent_id
 PUT    /v1/agents/:agent_id             edit an agent profile
 PUT    /v1/agents/:agent_id/name        { name } → rename; 204
-PUT    /v1/agents/:agent_id/model       { llm } → pin this agent's LLM entry (null ⇒ default-llm); 204
+PUT    /v1/agents/:agent_id/model       { llm, model, reasoning_effort } → replace this agent's whole LLM pin (each null ⇒ inherit); 204
 GET    /v1/agents/:agent_id/soul        the agent's SOUL.md (personality, tone) + its content version
 PUT    /v1/agents/:agent_id/soul        replace SOUL.md; a stale `version` is 409 → 200 the new version
 GET    /v1/agents/:agent_id/identity    the agent's IDENTITY.md self-image (name, creature, vibe, emoji, avatar)

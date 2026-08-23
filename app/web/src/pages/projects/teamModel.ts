@@ -32,32 +32,108 @@ export function handleOf(team: Agent[], agentId: string): string {
   return team.find((agent) => agent.id === agentId)?.handle ?? agentId;
 }
 
-export type ModelPool = { names: string[]; defaultName: string } | null;
+/// One `baybo.json` LLM entry, as the board's pickers need it.
+export type LlmEntry = {
+  name: string;
+  /// Every model this entry can be pinned to: its own `model` first, then
+  /// each `model_list` id, de-duped. The server validates a pick against
+  /// exactly this set.
+  models: string[];
+  /// The thinking rungs this entry's provider can express. **Empty is
+  /// meaningful**: it says baybo sends this provider no effort at all, so
+  /// offering a ladder would be offering a pick that never reaches the wire.
+  efforts: string[];
+};
 
-/// The llm picker's rows: one per configured model, no more.
-///
-/// The default's row carries the **empty value** — that is, picking it pins
-/// nothing and the agent follows `default-llm` wherever it moves. There is
-/// deliberately no way to pin the model that is default today: the two are
-/// indistinguishable until the default moves, and a picker listing `deepseek`
-/// twice — once as itself, once as "default" — is a worse thing to read than
-/// the distinction is worth keeping.
-export function llmOptions(pool: ModelPool): { value: string; label: string }[] {
-  if (pool === null) return [];
-  return pool.names.map((name) => ({
-    value: name === pool.defaultName ? '' : name,
-    label: name,
-  }));
+export type ModelPool = { entries: LlmEntry[]; defaultName: string } | null;
+
+/// An agent's LLM pin as the form holds it. `''` is "inherit" at every
+/// level — the empty row of each picker — which is what the wire sends as
+/// `null`.
+export type LlmPinValue = { llm: string; model: string; effort: string };
+
+export const UNPINNED: LlmPinValue = { llm: '', model: '', effort: '' };
+
+/// Which entry a pin actually runs on: the one it names, or `default-llm`
+/// when it names none. What the model and thinking rows are drawn from —
+/// they describe the entry the agent *will* use, not the one it spelled out.
+export function effectiveEntry(pool: ModelPool, pinned: string): LlmEntry | null {
+  if (pool === null) return null;
+  const name = pinned === '' ? pool.defaultName : pinned;
+  return pool.entries.find((entry) => entry.name === name) ?? null;
 }
 
-/// Which row is showing, for an agent's stored pin.
+/// One home for the rule that a pin the pool has never heard of stays
+/// **visible and clearable** rather than vanishing: an entry dropped from
+/// `baybo.json`, a model taken off a `model_list`, a rung a provider stopped
+/// expressing. A row that disappears leaves the picker showing something
+/// else and the agent still failing on the old value; a row that says
+/// "(unavailable)" is the visible version of a pin that will not work.
+function withStale(rows: { value: string; label: string }[], pinned: string) {
+  if (pinned === '' || rows.some((row) => row.value === pinned)) return rows;
+  return [...rows, { value: pinned, label: `${pinned} (unavailable)` }];
+}
+
+/// The entry picker's rows: the inherit row first, then one per entry by
+/// name.
 ///
-/// An agent pinned to the model that is *currently* default shows as that
-/// model's row, which is the unpinned one — the only row it could show as,
-/// now that there is one row per model.
-export function llmSelected(pinned: string | null | undefined, pool: ModelPool): string {
-  if (pinned == null || pinned === '') return '';
-  return pool !== null && pinned === pool.defaultName ? '' : pinned;
+/// The inherit row is labelled with the entry it resolves to today
+/// (`Default · deepseek`) but carries the **empty** value, so an agent that
+/// takes it follows `default-llm` wherever that moves.
+///
+/// The entry which *is* default today still gets its own named row. It has
+/// to: a model can only be picked within a named entry — the server refuses
+/// a model with no entry — so collapsing the two, as this picker did when
+/// the entry was the only level, made every model inside the deployment's
+/// most-used entry unreachable.
+export function llmOptions(pool: ModelPool, pinned: string): { value: string; label: string }[] {
+  if (pool === null) return [];
+  return withStale(
+    [
+      { value: '', label: `Default · ${pool.defaultName}` },
+      ...pool.entries.map((entry) => ({ value: entry.name, label: entry.name })),
+    ],
+    pinned,
+  );
+}
+
+/// The model picker's rows for whichever entry the pin resolves to. The
+/// empty row follows that entry's own default model, so an entry serving one
+/// model needs nothing set.
+export function modelOptions(
+  pool: ModelPool,
+  entry: string,
+  pinned: string,
+): { value: string; label: string }[] {
+  const resolved = effectiveEntry(pool, entry);
+  if (resolved === null) return [];
+  return withStale(
+    [
+      { value: '', label: `${resolved.models[0] ?? 'default'} (entry default)` },
+      ...resolved.models.map((model) => ({ value: model, label: model })),
+    ],
+    pinned,
+  );
+}
+
+/// The thinking picker's rows — taken from the ENTRY, never a local ladder:
+/// each provider speaks its own effort vocabulary, and a rung its dialect
+/// cannot say is a pick the gateway refuses. An entry with no rungs at all
+/// gets no rows, and the caller draws no field.
+export function effortOptions(
+  pool: ModelPool,
+  entry: string,
+  pinned: string,
+): { value: string; label: string }[] {
+  const resolved = effectiveEntry(pool, entry);
+  if (resolved === null || resolved.efforts.length === 0) return [];
+  return withStale(
+    [
+      { value: '', label: 'entry default' },
+      ...resolved.efforts.map((level) => ({ value: level, label: level })),
+    ],
+    pinned,
+  );
 }
 
 /// Longest handle the grammar accepts. Mirrors `MAX_AGENT_HANDLE_CHARS`.

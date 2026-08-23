@@ -240,7 +240,7 @@ fn new_member(name: &str) -> baybo_project::NewTeamMember {
         name: name.to_owned(),
         role: "Reviews what the others build.".to_owned(),
         framework: None,
-        llm: None,
+        llm: baybo_model::LlmPin::unpinned(),
     }
 }
 

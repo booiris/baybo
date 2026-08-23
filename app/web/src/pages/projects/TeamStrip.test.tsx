@@ -17,9 +17,16 @@ vi.mock('../../api/auth', () => ({
 // The model pool is a network read the panel makes on mount; the tests
 // here are about what it renders, not about which models exist.
 vi.mock('./api', () => ({
-  fetchModelPool: vi
-    .fn()
-    .mockResolvedValue({ kind: 'ok', value: { names: ['deepseek', 'gpt-5'], defaultName: 'deepseek' } }),
+  fetchModelPool: vi.fn().mockResolvedValue({
+    kind: 'ok',
+    value: {
+      defaultName: 'deepseek',
+      entries: [
+        { name: 'deepseek', models: ['deepseek-chat'], efforts: [] },
+        { name: 'gpt-5', models: ['gpt-5.5', 'o3'], efforts: ['low', 'high'] },
+      ],
+    },
+  }),
   setAgentModel: vi.fn().mockResolvedValue({ kind: 'ok', value: null }),
 }));
 
@@ -173,17 +180,22 @@ describe('TeamStrip', () => {
     expect(screen.getByRole('button', { name: 'Create agent' })).toBeDisabled();
   });
 
-  it('picks framework and llm by press, not by an OS menu', async () => {
+  it('picks framework and the whole llm pin by press, not by an OS menu', async () => {
     const { onHire } = renderStrip();
     await userEvent.click(screen.getByRole('button', { name: /Add an agent/ }));
     await userEvent.type(screen.getByLabelText(/Name/), 'qa');
     await userEvent.type(screen.getByLabelText(/Role/), 'Tests things.');
 
-    // Both fields name what they are set to, and open the board's own panel.
+    // Every field names what it is set to, and opens the board's own panel.
     await userEvent.click(screen.getByLabelText('Framework: native'));
     await userEvent.click(screen.getByRole('button', { name: 'codex' }));
-    await userEvent.click(screen.getByLabelText('llm: deepseek'));
+    await userEvent.click(screen.getByLabelText('llm: Default · deepseek'));
     await userEvent.click(screen.getByRole('button', { name: 'gpt-5' }));
+    // The model and the rungs follow the entry just chosen.
+    await userEvent.click(screen.getByLabelText('model: gpt-5.5 (entry default)'));
+    await userEvent.click(screen.getByRole('button', { name: 'o3' }));
+    await userEvent.click(screen.getByLabelText('thinking: entry default'));
+    await userEvent.click(screen.getByRole('button', { name: 'high' }));
 
     await userEvent.click(screen.getByRole('button', { name: 'Create agent' }));
     expect(onHire).toHaveBeenCalledWith({
@@ -191,6 +203,24 @@ describe('TeamStrip', () => {
       role: 'Tests things.',
       framework: 'codex',
       llm: 'gpt-5',
+      model: 'o3',
+      reasoning_effort: 'high',
+    });
+  });
+
+  /// A hire that chose nothing sends nothing: an inherit level is said on
+  /// the wire by leaving the field out, not by an empty string.
+  it('sends no pin at all when none was chosen', async () => {
+    const { onHire } = renderStrip();
+    await userEvent.click(screen.getByRole('button', { name: /Add an agent/ }));
+    await userEvent.type(screen.getByLabelText(/Name/), 'qa');
+    await userEvent.type(screen.getByLabelText(/Role/), 'Tests things.');
+    await userEvent.click(screen.getByRole('button', { name: 'Create agent' }));
+
+    expect(onHire).toHaveBeenCalledWith({
+      name: 'qa',
+      role: 'Tests things.',
+      framework: 'baybo',
     });
   });
 

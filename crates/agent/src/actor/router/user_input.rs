@@ -177,7 +177,7 @@ impl Router {
                         let actor_token = parent_token.child_token();
                         actor_spawner(
                             session,
-                            pins.llm,
+                            pins.entry,
                             pins.model,
                             pins.effort,
                             response_tx,
@@ -387,7 +387,7 @@ impl Router {
                 let actor_token = parent_token.child_token();
                 actor_spawner(
                     session,
-                    pins.llm,
+                    pins.entry,
                     pins.model,
                     pins.effort,
                     response_tx,

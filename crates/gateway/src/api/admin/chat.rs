@@ -49,8 +49,8 @@ use baybo_channels::wire::{
 use baybo_channels::{STOP_CANCELLED_REPLY_LINE, STOP_COMMAND_NAME, StampedEvent};
 use baybo_model::{
     AgentBinding, AgentFramework, ApprovalDecision, ChannelType, ChatMessage, ContentBlock,
-    ControlEvent, ControlEventKind, FolderId, FolderSummary, LineageKind, LlmEntryName, Role,
-    Session, SessionId, TOOL_RESULT_ERROR_PREFIX, ThinkingContent, TriggerSource, User,
+    ControlEvent, ControlEventKind, FolderId, FolderSummary, LineageKind, Role, Session, SessionId,
+    TOOL_RESULT_ERROR_PREFIX, ThinkingContent, TriggerSource, User,
 };
 use baybo_session::SessionError;
 use baybo_store::SearchScope;
@@ -1916,10 +1916,11 @@ pub struct SetSessionModelRequest {
     #[serde(default)]
     pub model: Option<String>,
     /// Per-session reasoning effort
-    /// (`none`/`minimal`/`low`/`medium`/`high`/`xhigh`), or `null`/absent for
-    /// the entry's default. Applies to every turn of THIS session only (not a
-    /// global entry edit); consumed by providers that support it
-    /// (openai-subscription), clamped per model at runtime.
+    /// (`off`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`), or `null`/absent
+    /// for the entry's default. Applies to every turn of THIS session only
+    /// (not a global entry edit). Which rungs a given entry can express is
+    /// `GET /v1/llm/models` → `items[].available_efforts`; one outside
+    /// baybo's ladder is a 400.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
 }
@@ -1970,43 +1971,19 @@ async fn set_session_model(
     // persistence goes through the targeted `set_last_llm` below.
     let (sid, _) = load_scoped_chat_session(&state, &session_id, authed).await?;
 
-    let pin: Option<LlmEntryName> = super::validate_llm_pin(&state, req.llm.as_deref())?;
-
-    // A model pick only means something within an entry. Reject
-    // `{llm: null, model: "x"}` rather than silently dropping it; clear the
-    // model when no entry is pinned. Otherwise validate the model belongs to
-    // the entry's `[model] + model_candidates` (rejects a stranded pick up
-    // front instead of letting it degrade to the entry default at run time).
-    let model_pick: Option<String> = match (&pin, req.model.as_deref()) {
-        (_, None) => None,
-        (None, Some(_)) => {
-            return Err(GatewayError::BadRequest(
-                "model pick requires an llm entry; send llm together with model".to_string(),
-            ));
-        }
-        (Some(entry), Some(model)) => {
-            super::validate_llm_model(&state, entry, model)?;
-            Some(model.to_string())
-        }
-    };
-
-    // Reasoning effort is a free per-session knob (the runtime clamps it per
-    // model), but reject a value outside the known ladder so a typo surfaces
-    // as a 400 rather than silently degrading to the default every turn.
-    let effort_pick: Option<String> = match req.reasoning_effort.as_deref().map(str::trim) {
-        None | Some("") => None,
-        // Canonicalised on the way in, so `none` and `off` do not persist as
-        // two spellings of one rung.
-        Some(level) => match baybo_llm::effort::ReasoningEffort::parse(level) {
-            Some(rung) => Some(rung.as_str().to_string()),
-            None => {
-                return Err(GatewayError::BadRequest(format!(
-                    "unknown reasoning_effort {level:?}; expected one of {}",
-                    effort_ladder()
-                )));
-            }
-        },
-    };
+    // Entry, model-within-entry and rung are one pick, and the rules that
+    // govern them have one home — `validate_llm_pin`, which the agent-profile
+    // pin comes through too.
+    let baybo_model::LlmPin {
+        entry: pin,
+        model: model_pick,
+        effort: effort_pick,
+    } = super::validate_llm_pin(
+        &state,
+        req.llm.as_deref(),
+        req.model.as_deref(),
+        req.reasoning_effort.as_deref(),
+    )?;
 
     // Persist the pin durably FIRST, via targeted flat-column writes
     // (`set_last_llm` / `set_last_model`). Unlike a full-session `save`,
@@ -2057,17 +2034,6 @@ async fn set_session_model(
         last_effort: effort_pick,
         applied_to_live_actor,
     }))
-}
-
-/// The rungs the per-session pin accepts, for the 400's message. The ladder
-/// itself lives in `baybo_llm::effort` — mirroring it here is how the gateway
-/// ended up two rungs behind it.
-fn effort_ladder() -> String {
-    baybo_llm::effort::ReasoningEffort::ALL
-        .iter()
-        .map(|l| l.as_str())
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 /// Request body for `PUT /v1/chat/sessions/{session_id}/pin`.

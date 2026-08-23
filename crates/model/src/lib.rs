@@ -9,6 +9,7 @@ mod folder;
 mod governance;
 mod ids;
 mod llm_entry_name;
+mod llm_pin;
 mod message;
 mod model_tier;
 mod money;
@@ -45,6 +46,7 @@ pub use ids::{
     ToolSetHashParseError, TurnId,
 };
 pub use llm_entry_name::LlmEntryName;
+pub use llm_pin::LlmPin;
 pub use message::{
     BlobRef, ChatMessage, ContentBlock, MediaBlock, MediaKind, MessageMetadata, MessageSource,
     Role, SHA256_PREFIX, TOOL_OUTPUT_CLOSE_PREFIX, TOOL_OUTPUT_OPEN_PREFIX,

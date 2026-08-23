@@ -675,7 +675,7 @@ impl Router {
                 let actor_token = parent_token.child_token();
                 actor_spawner(
                     session,
-                    pins.llm,
+                    pins.entry,
                     pins.model,
                     pins.effort,
                     response_tx,
@@ -711,7 +711,7 @@ impl Router {
         let response_tx = self.supervisor.response_tx().clone();
         let (mailbox, actor_token) = self.spawn_oneshot_actor(
             session,
-            pins.llm,
+            pins.entry,
             pins.model,
             pins.effort,
             response_tx,
@@ -1108,7 +1108,7 @@ impl CronResultDelivery {
                     let actor_token = parent_token.child_token();
                     actor_spawner(
                         origin,
-                        pins.llm,
+                        pins.entry,
                         pins.model,
                         pins.effort,
                         response_tx,
@@ -1526,7 +1526,7 @@ mod tests {
                 description: String::new(),
                 avatar_blob_id: None,
                 framework: AgentFramework::Baybo,
-                llm: None,
+                llm: baybo_model::LlmPin::unpinned(),
                 builtin: false,
                 team: None,
                 hired_by: None,
@@ -1972,7 +1972,7 @@ mod tests {
                 description: String::new(),
                 avatar_blob_id: None,
                 framework: AgentFramework::Codex,
-                llm: None,
+                llm: baybo_model::LlmPin::unpinned(),
                 builtin: false,
                 team: None,
                 hired_by: None,

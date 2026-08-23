@@ -641,7 +641,7 @@ fn member(name: &str) -> baybo_project::NewTeamMember {
         name: name.to_owned(),
         role: "does things".to_owned(),
         framework: None,
-        llm: None,
+        llm: baybo_model::LlmPin::unpinned(),
     }
 }
 

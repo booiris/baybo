@@ -356,15 +356,26 @@ deferred rather than shipped as a profile flag.
 
 ## LLM resolution
 
-`last_llm ?? profile.llm ?? default-llm`, resolved at actor spawn/hydration (not
-per turn), with the existing stale-pin tolerance (`warn!` + default). An
-explicit per-session switch always wins; a profile edit reaches sessions that
-never switched at their next hydration — a cold start or an idle reap.
-`last_model` and `last_effort` stay session-level: the profile pins the
-`baybo.json` *entry*, and the model-within-entry plus reasoning effort are the
-chat header's business. A profile-level model allow-list and effort default are a
-separate follow-on feature — they change what the picker offers, not how a
-session binds.
+`session pin ?? profile pin ?? deployment default`, resolved at actor
+spawn/hydration (not per turn) by `resolve_spawn_pins`, with the existing
+stale-pin tolerance (`warn!` + default). An explicit per-session switch always
+wins; a profile edit reaches sessions that never switched at their next
+hydration — a cold start or an idle reap.
+
+The profile carries the **whole** pin — entry, model-within-entry and
+reasoning rung (`baybo_model::LlmPin`) — not just the entry. It had to grow
+the other two once boards shipped: a card's run is spawned by the board with
+nothing on its session, so a chat header it does not have was the only place
+those two could be set, and every board agent ran its entry's default model at
+its entry's default rung.
+
+The fallback granularity differs by level, and the asymmetry is deliberate.
+Entry and model fall back **together**, because a model id is a model *of an
+entry* and carrying one across would pin a model the new entry cannot serve.
+The rung falls back **on its own** (`last_effort ?? profile.effort`), because
+effort is a provider-level knob rather than a property of one model — an agent
+set to think hard keeps doing so on a session that only re-pointed which entry
+to use. See [`../modules/agent-profiles.md`](../modules/agent-profiles.md).
 
 ## Runtime wiring (baybo framework)
 

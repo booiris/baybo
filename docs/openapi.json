@@ -31,7 +31,7 @@
                       "type": "array",
                       "items": {
                         "type": "object",
-                        "description": "One agent profile. Absent `llm` = follow `default-llm`.\n\nNeither the soul nor the skills are fields here. An agent's soul is its\nown `SOUL.md` (`GET`/`PUT /v1/agents/{agent_id}/soul`) and its skills are\nread live from the registry (`GET /v1/skills?agent_id=`) — both are\nfiles, so they stay editable by hand, by git, and by the agent itself.",
+                        "description": "One agent profile. An absent pin level inherits: `llm` → `default-llm`,\n`model` → that entry's own default model, `reasoning_effort` → that\nentry's own configured rung.\n\nNeither the soul nor the skills are fields here. An agent's soul is its\nown `SOUL.md` (`GET`/`PUT /v1/agents/{agent_id}/soul`) and its skills are\nread live from the registry (`GET /v1/skills?agent_id=`) — both are\nfiles, so they stay editable by hand, by git, and by the agent itself.",
                         "required": [
                           "id",
                           "name",
@@ -71,8 +71,22 @@
                               "null"
                             ]
                           },
+                          "model": {
+                            "type": [
+                              "string",
+                              "null"
+                            ],
+                            "description": "The model this agent runs WITHIN `llm`'s entry — one of that entry's\n`[model] + model_candidates`. Absent = the entry's default model."
+                          },
                           "name": {
                             "type": "string"
+                          },
+                          "reasoning_effort": {
+                            "type": [
+                              "string",
+                              "null"
+                            ],
+                            "description": "How hard this agent thinks: a rung of baybo's ladder, absent for the\nentry's own configured level. The rungs a given entry can express are\n`GET /v1/llm/models` → `items[].available_efforts`."
                           },
                           "updated_at": {
                             "type": "string",
@@ -4820,11 +4834,26 @@
                             "type": [
                               "string",
                               "null"
-                            ]
+                            ],
+                            "description": "The `baybo.json` entry this teammate's runs go through; absent\nfollows `default-llm`."
+                          },
+                          "model": {
+                            "type": [
+                              "string",
+                              "null"
+                            ],
+                            "description": "The model within that entry; absent is the entry's default model."
                           },
                           "name": {
                             "type": "string",
                             "description": "Display name from the agent's own `IDENTITY.md`. Fixed at hire, like\nthe handle derived from it."
+                          },
+                          "reasoning_effort": {
+                            "type": [
+                              "string",
+                              "null"
+                            ],
+                            "description": "How hard this teammate thinks; absent is the entry's own rung. The\nboard is the only place this is set — a card's run has no header to\npick one from, so what the profile says is what the run gets."
                           }
                         }
                       }
@@ -7617,7 +7646,7 @@
       },
       "AgentProfileDto": {
         "type": "object",
-        "description": "One agent profile. Absent `llm` = follow `default-llm`.\n\nNeither the soul nor the skills are fields here. An agent's soul is its\nown `SOUL.md` (`GET`/`PUT /v1/agents/{agent_id}/soul`) and its skills are\nread live from the registry (`GET /v1/skills?agent_id=`) — both are\nfiles, so they stay editable by hand, by git, and by the agent itself.",
+        "description": "One agent profile. An absent pin level inherits: `llm` → `default-llm`,\n`model` → that entry's own default model, `reasoning_effort` → that\nentry's own configured rung.\n\nNeither the soul nor the skills are fields here. An agent's soul is its\nown `SOUL.md` (`GET`/`PUT /v1/agents/{agent_id}/soul`) and its skills are\nread live from the registry (`GET /v1/skills?agent_id=`) — both are\nfiles, so they stay editable by hand, by git, and by the agent itself.",
         "required": [
           "id",
           "name",
@@ -7657,8 +7686,22 @@
               "null"
             ]
           },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The model this agent runs WITHIN `llm`'s entry — one of that entry's\n`[model] + model_candidates`. Absent = the entry's default model."
+          },
           "name": {
             "type": "string"
+          },
+          "reasoning_effort": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "How hard this agent thinks: a rung of baybo's ladder, absent for the\nentry's own configured level. The rungs a given entry can express are\n`GET /v1/llm/models` → `items[].available_efforts`."
           },
           "updated_at": {
             "type": "string",
@@ -8729,8 +8772,22 @@
             ],
             "description": "`baybo.json` LLM entry name; must match a configured entry — see\n`GET /v1/llm/models`."
           },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The model within `llm`'s entry, or absent for that entry's default.\nRequires `llm`."
+          },
           "name": {
             "type": "string"
+          },
+          "reasoning_effort": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Thinking rung, or absent for the entry's own level."
           },
           "soul": {
             "type": [
@@ -9356,9 +9413,23 @@
             ],
             "description": "`baybo.json` LLM entry name; must match a configured entry."
           },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The model within `llm`'s entry, or absent for that entry's default.\nRequires `llm`."
+          },
           "name": {
             "type": "string",
             "description": "Display name, and the only chance to choose one: the `@handle` is\nderived from it here, and neither can be changed afterwards — a board\nthat called an agent one thing while everybody addressed it as another\nwould be lying on every card."
+          },
+          "reasoning_effort": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Thinking rung, or absent for the entry's own level."
           },
           "role": {
             "type": "string",
@@ -11069,7 +11140,7 @@
       },
       "SetAgentModelRequest": {
         "type": "object",
-        "description": "Request body for `PUT /v1/agents/{agent_id}/model`.",
+        "description": "Request body for `PUT /v1/agents/{agent_id}/model` — the agent's whole\nLLM pin, replaced as one. Absent means \"inherit\" at each level, so an\nempty body clears the pin entirely rather than leaving two thirds of it\npointing at an entry the agent no longer uses.",
         "properties": {
           "llm": {
             "type": [
@@ -11077,6 +11148,20 @@
               "null"
             ],
             "description": "`baybo.json` LLM entry name, or `null`/absent to follow `default-llm`."
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The model to run WITHIN `llm`'s entry — one of that entry's\n`[model] + model_candidates` from `GET /v1/llm/models`.\n`null`/absent uses the entry's default model; sending one without\n`llm` is a 400, since there is no entry to pick a model within."
+          },
+          "reasoning_effort": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "How hard this agent should think\n(`off`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`), or\n`null`/absent for the entry's configured level. Applies to every run\nthis agent starts. The rungs a given entry can express are\n`GET /v1/llm/models` → `items[].available_efforts`; one outside\nbaybo's ladder is a 400."
           }
         }
       },
@@ -11194,7 +11279,7 @@
               "string",
               "null"
             ],
-            "description": "Per-session reasoning effort\n(`none`/`minimal`/`low`/`medium`/`high`/`xhigh`), or `null`/absent for\nthe entry's default. Applies to every turn of THIS session only (not a\nglobal entry edit); consumed by providers that support it\n(openai-subscription), clamped per model at runtime."
+            "description": "Per-session reasoning effort\n(`off`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`), or `null`/absent\nfor the entry's default. Applies to every turn of THIS session only\n(not a global entry edit). Which rungs a given entry can express is\n`GET /v1/llm/models` → `items[].available_efforts`; one outside\nbaybo's ladder is a 400."
           }
         }
       },
@@ -11372,11 +11457,26 @@
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "The `baybo.json` entry this teammate's runs go through; absent\nfollows `default-llm`."
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The model within that entry; absent is the entry's default model."
           },
           "name": {
             "type": "string",
             "description": "Display name from the agent's own `IDENTITY.md`. Fixed at hire, like\nthe handle derived from it."
+          },
+          "reasoning_effort": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "How hard this teammate thinks; absent is the entry's own rung. The\nboard is the only place this is set — a card's run has no header to\npick one from, so what the profile says is what the run gets."
           }
         }
       },

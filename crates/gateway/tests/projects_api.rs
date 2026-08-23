@@ -41,7 +41,7 @@ async fn seed_teammate_with_id(
             description: String::new(),
             avatar_blob_id: None,
             framework: baybo_model::AgentFramework::Baybo,
-            llm: None,
+            llm: baybo_model::LlmPin::unpinned(),
             builtin: false,
             team: Some(baybo_model::TeamMembership {
                 project_id: baybo_model::ProjectId::parse(project.to_owned()).expect("project id"),
@@ -540,7 +540,7 @@ async fn in_progress_is_refused_without_an_assignee() {
 
 #[tokio::test]
 async fn a_board_staffs_itself_through_its_own_roster() {
-    let (router, _tg) = router().await;
+    let (router, tg) = router().await;
     let p = open_project(&router, "staffing").await;
 
     let team = get(&router, &format!("/v1/projects/{p}/agents"), StatusCode::OK).await;
@@ -563,6 +563,49 @@ async fn a_board_staffs_itself_through_its_own_roster() {
     assert_eq!(hired["lead"], false);
     assert_eq!(hired["description"], "Writes the tests.");
     assert!(hired.get("hired_by").is_none());
+    // Nothing was pinned, so every level of the pin inherits and none of
+    // them reaches the wire.
+    for level in ["llm", "model", "reasoning_effort"] {
+        assert!(hired.get(level).is_none(), "{level} in {hired:?}");
+    }
+
+    // A hire can be staffed in one call, pin included — the operator's form
+    // is the only door a teammate's model and thinking rung have, since a
+    // card's run carries no header to pick them from.
+    let entry = tg
+        .deps
+        .llm_pool
+        .read()
+        .entry_names()
+        .first()
+        .expect("test pool has one entry")
+        .to_string();
+    let staffed = post(
+        &router,
+        &format!("/v1/projects/{p}/agents"),
+        json!({
+            "name": "designer",
+            "role": "Draws things.",
+            "llm": entry,
+            "model": entry,
+            "reasoning_effort": "high",
+        }),
+        StatusCode::CREATED,
+    )
+    .await;
+    assert_eq!(staffed["llm"].as_str(), Some(entry.as_str()));
+    assert_eq!(staffed["model"].as_str(), Some(entry.as_str()));
+    assert_eq!(staffed["reasoning_effort"].as_str(), Some("high"));
+
+    // And the same rule the profile pin answers to: a model names nothing
+    // without the entry it belongs to.
+    post(
+        &router,
+        &format!("/v1/projects/{p}/agents"),
+        json!({ "name": "refused", "role": "n/a", "model": entry }),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
 
     let global = get(&router, "/v1/agents", StatusCode::OK).await;
     let ids: Vec<&str> = global["items"]

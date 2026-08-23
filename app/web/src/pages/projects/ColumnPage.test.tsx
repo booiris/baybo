@@ -105,7 +105,12 @@ function stubClient() {
       }
       if (path === '/v1/llm/models') {
         return {
-          data: { items: [{ name: 'model-1' }], default_name: 'model-1' },
+          data: {
+            items: [
+              { name: 'model-1', model: 'model-1', model_list: [], available_efforts: [] },
+            ],
+            default_name: 'model-1',
+          },
           error: undefined,
           response: ok,
         };

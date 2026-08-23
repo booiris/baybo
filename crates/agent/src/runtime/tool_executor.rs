@@ -1224,7 +1224,7 @@ mod tests {
             description: String::new(),
             avatar_blob_id: None,
             framework: baybo_model::AgentFramework::Baybo,
-            llm: None,
+            llm: baybo_model::LlmPin::unpinned(),
             builtin: false,
             team,
             hired_by: None,

@@ -396,8 +396,13 @@ existing git repo.
   the agent's own `Edit` — birth audit line
   (`created_by` — user-created or hired by the lead), live run state
   shared with the board's status frames, assigned issues, recent runs
-  with transcript links, the **llm pin editor** (`profile.llm`; empty
-  follows `default-llm`; pool-only choices), persona file editors
+  with transcript links, the **llm pin editor** — three fields, entry /
+  model-within-entry / thinking, each empty row inheriting (the entry
+  follows `default-llm`, the model that entry's own, the rung that
+  entry's own); pool-only choices, and the thinking field is absent for
+  a provider baybo sends no effort to. A card's run has no header to
+  pick a model from, so this panel is the only thing that decides what
+  a teammate costs and how hard it thinks — persona file editors
   (SOUL/IDENTITY/memory — audited commits, same pipeline as agent
   self-edits), and the user-only **Remove from project** tombstone
   action. No profile panel carries a chat button; agents are reached by
@@ -407,9 +412,9 @@ existing git repo.
   (handle grammar, refused in the form and again on the server), a
   one-line role
   description that seeds `SOUL.md`, optional framework
-  (native/claude/codex) and llm pin. Unlike `ProjectAgentCreate` (which
-  deliberately exposes neither knob), the user form may set framework and
-  llm. Creations stamp `created_by = User` and share the `max_agents`
+  (native/claude/codex) and the same three-field llm pin the profile
+  panel carries. Unlike `ProjectAgentCreate` (which deliberately exposes
+  neither knob), the user form may set framework and the pin. Creations stamp `created_by = User` and share the `max_agents`
   cap with lead hires. The strip is the one place a team is managed;
   ⚙ carries the board's own knobs and nothing else.
 - Live updates ride the existing owner-channel WS frame family (board and

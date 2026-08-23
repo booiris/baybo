@@ -2,8 +2,8 @@
 
 use async_trait::async_trait;
 use baybo_model::{
-    AgentFramework, AgentHandle, AgentProfileId, BUILTIN_AGENT_PROFILE_ID, LlmEntryName, ProjectId,
-    TeamMembership,
+    AgentFramework, AgentHandle, AgentProfileId, BUILTIN_AGENT_PROFILE_ID, LlmEntryName, LlmPin,
+    ProjectId, TeamMembership,
 };
 use rusqlite::OptionalExtension;
 
@@ -18,7 +18,8 @@ const BUILTIN_AGENT_PROFILE_DESCRIPTION: &str =
     "Baybo's default persona: workspace Soul prompt, default model, full skill and tool set.";
 
 const SELECT_COLS: &str = "id, description, avatar_blob_id, framework, \
-                           llm, builtin, project_id, handle, hired_by, \
+                           llm, llm_model, llm_effort, builtin, \
+                           project_id, handle, hired_by, \
                            deleted_at, created_at, updated_at";
 
 pub struct SqliteAgentProfileStore {
@@ -86,6 +87,8 @@ type RawProfileRow = (
     Option<String>,
     String,
     Option<String>,
+    Option<String>,
+    Option<String>,
     i64,
     Option<String>,
     Option<String>,
@@ -109,6 +112,8 @@ fn read_raw_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawProfileRow> {
         row.get(9)?,
         row.get(10)?,
         row.get(11)?,
+        row.get(12)?,
+        row.get(13)?,
     ))
 }
 
@@ -118,7 +123,9 @@ fn row_from_raw(raw: RawProfileRow) -> Result<AgentProfileRow> {
         description,
         avatar_blob_id,
         framework_raw,
-        llm,
+        llm_entry,
+        llm_model,
+        llm_effort,
         builtin_col,
         project_id,
         handle,
@@ -166,7 +173,11 @@ fn row_from_raw(raw: RawProfileRow) -> Result<AgentProfileRow> {
         description,
         avatar_blob_id,
         framework,
-        llm: llm.map(LlmEntryName::from),
+        llm: LlmPin {
+            entry: llm_entry.map(LlmEntryName::from),
+            model: llm_model,
+            effort: llm_effort,
+        },
         builtin: builtin_col != 0,
         team,
         hired_by: hired_by
@@ -262,7 +273,9 @@ impl AgentProfileStore for SqliteAgentProfileStore {
         let description = row.description.clone();
         let avatar_blob_id = row.avatar_blob_id.clone();
         let framework = row.framework.as_str();
-        let llm = row.llm.as_ref().map(|l| l.as_str().to_string());
+        let llm = row.llm.entry.as_ref().map(|l| l.as_str().to_string());
+        let llm_model = row.llm.model.clone();
+        let llm_effort = row.llm.effort.clone();
         let project_id = row.team.as_ref().map(|t| t.project_id.as_str().to_string());
         let handle = row.team.as_ref().map(|t| t.handle.as_str().to_string());
         let hired_by = row.hired_by.as_ref().map(|id| id.as_str().to_string());
@@ -279,14 +292,17 @@ impl AgentProfileStore for SqliteAgentProfileStore {
                 match conn.execute(
                     "INSERT INTO agent_profiles \
                      (id, description, avatar_blob_id, framework, \
-                      llm, project_id, handle, hired_by, created_at, updated_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                      llm, llm_model, llm_effort, \
+                      project_id, handle, hired_by, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                     rusqlite::params![
                         id,
                         description,
                         avatar_blob_id,
                         framework,
                         llm,
+                        llm_model,
+                        llm_effort,
                         project_id,
                         handle,
                         hired_by,
@@ -351,22 +367,29 @@ impl AgentProfileStore for SqliteAgentProfileStore {
         Ok(affected > 0)
     }
 
-    async fn set_llm(&self, id: &AgentProfileId, llm: Option<&LlmEntryName>) -> Result<bool> {
+    async fn set_llm(&self, id: &AgentProfileId, pin: &LlmPin) -> Result<bool> {
         let id = id.as_str().to_string();
-        let llm = llm.map(|l| l.as_str().to_string());
+        let entry = pin.entry.as_ref().map(|l| l.as_str().to_string());
+        let model = pin.model.clone();
+        let effort = pin.effort.clone();
         let now = super::time::now_us();
         let affected = self
             .pool
             .interact("agent_profiles.set_llm", move |conn| {
                 Ok(conn.execute(
-                    // The builtin follows `default-llm` by definition, so its
-                    // pin is forced empty rather than merely left alone —
-                    // that also clears anything an earlier build stored.
+                    // One statement for all three levels, so the row can
+                    // never hold a model belonging to an entry it no longer
+                    // names. The builtin follows `default-llm` by definition,
+                    // so its pin is forced empty rather than merely left
+                    // alone — that also clears anything an earlier build
+                    // stored, at every level.
                     "UPDATE agent_profiles SET \
-                     llm = CASE WHEN builtin = 1 THEN NULL ELSE ?2 END, \
-                     updated_at = ?3 \
+                     llm        = CASE WHEN builtin = 1 THEN NULL ELSE ?2 END, \
+                     llm_model  = CASE WHEN builtin = 1 THEN NULL ELSE ?3 END, \
+                     llm_effort = CASE WHEN builtin = 1 THEN NULL ELSE ?4 END, \
+                     updated_at = ?5 \
                      WHERE id = ?1",
-                    rusqlite::params![id, llm, now],
+                    rusqlite::params![id, entry, model, effort, now],
                 )?)
             })
             .await?;
@@ -434,7 +457,11 @@ mod tests {
             description: "a test persona".to_owned(),
             avatar_blob_id: None,
             framework: AgentFramework::Claude,
-            llm: Some(LlmEntryName::from("primary")),
+            llm: LlmPin {
+                entry: Some(LlmEntryName::from("primary")),
+                model: Some("primary-pro".to_owned()),
+                effort: Some("high".to_owned()),
+            },
             builtin: false,
             team: None,
             hired_by: None,
@@ -477,7 +504,7 @@ mod tests {
         assert_eq!(b.description, BUILTIN_AGENT_PROFILE_DESCRIPTION);
         assert!(b.builtin);
         assert_eq!(b.framework, AgentFramework::Baybo);
-        assert!(b.llm.is_none());
+        assert!(b.llm.is_unpinned());
         assert!(b.avatar_blob_id.is_none());
     }
 
@@ -511,7 +538,10 @@ mod tests {
         let back = store.get(&row.id).await.unwrap().unwrap();
         assert!(!back.builtin, "create must never mint a builtin row");
         assert_eq!(back.framework, AgentFramework::Claude);
-        assert_eq!(back.llm, Some(LlmEntryName::from("primary")));
+        assert_eq!(
+            back.llm, row.llm,
+            "all three levels of the pin survive the insert, not just the entry"
+        );
         assert_eq!(back.created_at, row.created_at);
     }
 
@@ -599,28 +629,67 @@ mod tests {
         assert!(!store.delete(&builtin).await.unwrap());
     }
 
-    /// A custom agent's pin is its own; the builtin's is always empty,
-    /// because that row *is* `default-llm`.
+    /// A custom agent's pin is its own — all three levels of it; the
+    /// builtin's is always empty, because that row *is* `default-llm`.
     #[tokio::test]
     async fn set_llm_pins_a_custom_agent_and_never_the_builtin() {
         let store = open_store().await;
-        let pin = LlmEntryName::from("fast");
+        let pin = LlmPin {
+            entry: Some(LlmEntryName::from("fast")),
+            model: Some("fast-mini".to_owned()),
+            effort: Some("low".to_owned()),
+        };
 
         let row = custom_row();
         store.create(&row).await.unwrap();
-        assert!(store.set_llm(&row.id, Some(&pin)).await.unwrap());
-        assert_eq!(
-            store.get(&row.id).await.unwrap().unwrap().llm,
-            Some(pin.clone())
-        );
-        assert!(store.set_llm(&row.id, None).await.unwrap());
-        assert!(store.get(&row.id).await.unwrap().unwrap().llm.is_none());
+        assert!(store.set_llm(&row.id, &pin).await.unwrap());
+        assert_eq!(store.get(&row.id).await.unwrap().unwrap().llm, pin);
+
+        // Clearing clears every level: a leftover model or rung would be a
+        // pick still being billed for an entry nobody selected.
+        assert!(store.set_llm(&row.id, &LlmPin::unpinned()).await.unwrap());
+        assert!(store.get(&row.id).await.unwrap().unwrap().llm.is_unpinned());
 
         // The builtin absorbs the write and stays unpinned — which also
         // normalises a row an earlier build allowed to drift.
         let builtin = AgentProfileId::builtin();
-        assert!(store.set_llm(&builtin, Some(&pin)).await.unwrap());
-        assert!(store.get(&builtin).await.unwrap().unwrap().llm.is_none());
+        assert!(store.set_llm(&builtin, &pin).await.unwrap());
+        assert!(
+            store
+                .get(&builtin)
+                .await
+                .unwrap()
+                .unwrap()
+                .llm
+                .is_unpinned()
+        );
+    }
+
+    /// The model and the rung are not writable apart from the entry — a
+    /// half-write is exactly the state that makes a board name a model its
+    /// run is not using.
+    #[tokio::test]
+    async fn clearing_the_entry_takes_the_model_and_the_rung_with_it() {
+        let store = open_store().await;
+        let row = custom_row();
+        store.create(&row).await.unwrap();
+
+        assert!(
+            store
+                .set_llm(
+                    &row.id,
+                    &LlmPin {
+                        entry: Some(LlmEntryName::from("other")),
+                        ..Default::default()
+                    }
+                )
+                .await
+                .unwrap()
+        );
+        let back = store.get(&row.id).await.unwrap().unwrap().llm;
+        assert_eq!(back.entry, Some(LlmEntryName::from("other")));
+        assert_eq!(back.model, None, "the old entry's model did not survive");
+        assert_eq!(back.effort, None);
     }
 
     #[tokio::test]

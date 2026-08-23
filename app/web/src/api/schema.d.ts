@@ -1566,7 +1566,9 @@ export interface components {
             version: string;
         };
         /**
-         * @description One agent profile. Absent `llm` = follow `default-llm`.
+         * @description One agent profile. An absent pin level inherits: `llm` → `default-llm`,
+         *     `model` → that entry's own default model, `reasoning_effort` → that
+         *     entry's own configured rung.
          *
          *     Neither the soul nor the skills are fields here. An agent's soul is its
          *     own `SOUL.md` (`GET`/`PUT /v1/agents/{agent_id}/soul`) and its skills are
@@ -1586,7 +1588,18 @@ export interface components {
             framework: components["schemas"]["AgentFrameworkDto"];
             id: string;
             llm?: string | null;
+            /**
+             * @description The model this agent runs WITHIN `llm`'s entry — one of that entry's
+             *     `[model] + model_candidates`. Absent = the entry's default model.
+             */
+            model?: string | null;
             name: string;
+            /**
+             * @description How hard this agent thinks: a rung of baybo's ladder, absent for the
+             *     entry's own configured level. The rungs a given entry can express are
+             *     `GET /v1/llm/models` → `items[].available_efforts`.
+             */
+            reasoning_effort?: string | null;
             /** Format: date-time */
             updated_at: string;
         };
@@ -2307,7 +2320,14 @@ export interface components {
              *     `GET /v1/llm/models`.
              */
             llm?: string | null;
+            /**
+             * @description The model within `llm`'s entry, or absent for that entry's default.
+             *     Requires `llm`.
+             */
+            model?: string | null;
             name: string;
+            /** @description Thinking rung, or absent for the entry's own level. */
+            reasoning_effort?: string | null;
             /**
              * @description Initial soul body. Written once into `personas/<id>/SOUL.md`;
              *     absent seeds the shipped template. Later edits go through
@@ -2601,12 +2621,19 @@ export interface components {
             /** @description `baybo.json` LLM entry name; must match a configured entry. */
             llm?: string | null;
             /**
+             * @description The model within `llm`'s entry, or absent for that entry's default.
+             *     Requires `llm`.
+             */
+            model?: string | null;
+            /**
              * @description Display name, and the only chance to choose one: the `@handle` is
              *     derived from it here, and neither can be changed afterwards — a board
              *     that called an agent one thing while everybody addressed it as another
              *     would be lying on every card.
              */
             name: string;
+            /** @description Thinking rung, or absent for the entry's own level. */
+            reasoning_effort?: string | null;
             /**
              * @description One line saying what this agent is for. Seeds its `SOUL.md` and
              *     becomes its roster description.
@@ -3356,10 +3383,31 @@ export interface components {
              */
             version?: string | null;
         };
-        /** @description Request body for `PUT /v1/agents/{agent_id}/model`. */
+        /**
+         * @description Request body for `PUT /v1/agents/{agent_id}/model` — the agent's whole
+         *     LLM pin, replaced as one. Absent means "inherit" at each level, so an
+         *     empty body clears the pin entirely rather than leaving two thirds of it
+         *     pointing at an entry the agent no longer uses.
+         */
         SetAgentModelRequest: {
             /** @description `baybo.json` LLM entry name, or `null`/absent to follow `default-llm`. */
             llm?: string | null;
+            /**
+             * @description The model to run WITHIN `llm`'s entry — one of that entry's
+             *     `[model] + model_candidates` from `GET /v1/llm/models`.
+             *     `null`/absent uses the entry's default model; sending one without
+             *     `llm` is a 400, since there is no entry to pick a model within.
+             */
+            model?: string | null;
+            /**
+             * @description How hard this agent should think
+             *     (`off`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`), or
+             *     `null`/absent for the entry's configured level. Applies to every run
+             *     this agent starts. The rungs a given entry can express are
+             *     `GET /v1/llm/models` → `items[].available_efforts`; one outside
+             *     baybo's ladder is a 400.
+             */
+            reasoning_effort?: string | null;
         };
         /**
          * @description Request body for `PUT /v1/agents/{agent_id}/name`.
@@ -3422,10 +3470,11 @@ export interface components {
             model?: string | null;
             /**
              * @description Per-session reasoning effort
-             *     (`none`/`minimal`/`low`/`medium`/`high`/`xhigh`), or `null`/absent for
-             *     the entry's default. Applies to every turn of THIS session only (not a
-             *     global entry edit); consumed by providers that support it
-             *     (openai-subscription), clamped per model at runtime.
+             *     (`off`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`), or `null`/absent
+             *     for the entry's default. Applies to every turn of THIS session only
+             *     (not a global entry edit). Which rungs a given entry can express is
+             *     `GET /v1/llm/models` → `items[].available_efforts`; one outside
+             *     baybo's ladder is a 400.
              */
             reasoning_effort?: string | null;
         };
@@ -3509,12 +3558,24 @@ export interface components {
             id: string;
             /** @description The coordinator, which every board has and none may remove. */
             lead: boolean;
+            /**
+             * @description The `baybo.json` entry this teammate's runs go through; absent
+             *     follows `default-llm`.
+             */
             llm?: string | null;
+            /** @description The model within that entry; absent is the entry's default model. */
+            model?: string | null;
             /**
              * @description Display name from the agent's own `IDENTITY.md`. Fixed at hire, like
              *     the handle derived from it.
              */
             name: string;
+            /**
+             * @description How hard this teammate thinks; absent is the entry's own rung. The
+             *     board is the only place this is set — a card's run has no header to
+             *     pick one from, so what the profile says is what the run gets.
+             */
+            reasoning_effort?: string | null;
         };
         /**
          * @description One row of the trace browser list view. Mirrors
@@ -3782,7 +3843,18 @@ export interface operations {
                             framework: components["schemas"]["AgentFrameworkDto"];
                             id: string;
                             llm?: string | null;
+                            /**
+                             * @description The model this agent runs WITHIN `llm`'s entry — one of that entry's
+                             *     `[model] + model_candidates`. Absent = the entry's default model.
+                             */
+                            model?: string | null;
                             name: string;
+                            /**
+                             * @description How hard this agent thinks: a rung of baybo's ladder, absent for the
+                             *     entry's own configured level. The rungs a given entry can express are
+                             *     `GET /v1/llm/models` → `items[].available_efforts`.
+                             */
+                            reasoning_effort?: string | null;
                             /** Format: date-time */
                             updated_at: string;
                         }[];
@@ -7466,12 +7538,24 @@ export interface operations {
                             id: string;
                             /** @description The coordinator, which every board has and none may remove. */
                             lead: boolean;
+                            /**
+                             * @description The `baybo.json` entry this teammate's runs go through; absent
+                             *     follows `default-llm`.
+                             */
                             llm?: string | null;
+                            /** @description The model within that entry; absent is the entry's default model. */
+                            model?: string | null;
                             /**
                              * @description Display name from the agent's own `IDENTITY.md`. Fixed at hire, like
                              *     the handle derived from it.
                              */
                             name: string;
+                            /**
+                             * @description How hard this teammate thinks; absent is the entry's own rung. The
+                             *     board is the only place this is set — a card's run has no header to
+                             *     pick one from, so what the profile says is what the run gets.
+                             */
+                            reasoning_effort?: string | null;
                         }[];
                         next_cursor?: string | null;
                     };

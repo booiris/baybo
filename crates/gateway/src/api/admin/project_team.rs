@@ -45,8 +45,18 @@ pub struct TeamMemberDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avatar_blob_id: Option<String>,
     pub framework: AgentFrameworkDto,
+    /// The `baybo.json` entry this teammate's runs go through; absent
+    /// follows `default-llm`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm: Option<String>,
+    /// The model within that entry; absent is the entry's default model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// How hard this teammate thinks; absent is the entry's own rung. The
+    /// board is the only place this is set — a card's run has no header to
+    /// pick one from, so what the profile says is what the run gets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     /// The coordinator, which every board has and none may remove.
     pub lead: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -72,6 +82,13 @@ pub struct HireAgentRequest {
     /// `baybo.json` LLM entry name; must match a configured entry.
     #[serde(default)]
     pub llm: Option<String>,
+    /// The model within `llm`'s entry, or absent for that entry's default.
+    /// Requires `llm`.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Thinking rung, or absent for the entry's own level.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 async fn member_dto(state: &AdminState, row: AgentProfileRow) -> TeamMemberDto {
@@ -107,7 +124,9 @@ async fn member_dto(state: &AdminState, row: AgentProfileRow) -> TeamMemberDto {
         description: row.description,
         avatar_blob_id: row.avatar_blob_id,
         framework: row.framework.into(),
-        llm: row.llm.map(|l| l.to_string()),
+        llm: row.llm.entry.map(|l| l.to_string()),
+        model: row.llm.model,
+        reasoning_effort: row.llm.effort,
         hired_by,
         created_at_ms: row.created_at.timestamp_millis(),
     }
@@ -157,7 +176,12 @@ async fn hire_agent(
     Json(req): Json<HireAgentRequest>,
 ) -> Result<(StatusCode, Json<TeamMemberDto>)> {
     let id = parse_project_id(&project_id)?;
-    let llm = super::validate_llm_pin(&state, req.llm.as_deref())?;
+    let llm = super::validate_llm_pin(
+        &state,
+        req.llm.as_deref(),
+        req.model.as_deref(),
+        req.reasoning_effort.as_deref(),
+    )?;
     let row = state
         .project_manager
         .hire(

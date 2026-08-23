@@ -303,6 +303,16 @@ const ADD_COLUMNS: &[AddColumn] = &[
         definition: "INTEGER",
     },
     AddColumn {
+        table: "agent_profiles",
+        column: "llm_model",
+        definition: "TEXT",
+    },
+    AddColumn {
+        table: "agent_profiles",
+        column: "llm_effort",
+        definition: "TEXT",
+    },
+    AddColumn {
         table: "projects",
         column: "daily_budget_micros",
         definition: "INTEGER",
@@ -1298,7 +1308,13 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     description     TEXT NOT NULL,
                     avatar_blob_id  TEXT,
                     framework       TEXT NOT NULL,
+                    -- What this agent runs on, one column per level of
+                    -- `LlmPin`: the entry, the model within it, the thinking
+                    -- rung. NULL inherits at each level, and the three are
+                    -- only ever written together.
                     llm             TEXT,
+                    llm_model       TEXT,
+                    llm_effort      TEXT,
                     builtin         INTEGER NOT NULL DEFAULT 0,
                     -- A project team member. Both NULL for a global agent;
                     -- both set for a teammate. Nothing sets one alone —
@@ -2183,6 +2199,17 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
             assert_eq!((project_id, handle), (None, None));
+            // The other two levels of the LLM pin arrived by ALTER as well,
+            // reading NULL — an agent configured before they existed inherits
+            // the entry's own model and rung. Every read selects them by
+            // name, so a missing ALTER is not a degraded profile, it is every
+            // profile read failing.
+            let (model, effort): (Option<String>, Option<String>) = conn.query_row(
+                "SELECT llm_model, llm_effort FROM agent_profiles WHERE id = '01JOLD'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            assert_eq!((model, effort), (None, None));
             Ok(())
         })
         .await

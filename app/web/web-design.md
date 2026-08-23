@@ -96,8 +96,10 @@ In the chat view the **thread sits on `surface`** (`#fffdf7`) while all **side p
   chip in a row takes the default, a **form field** passes `className="w-full"`
   and `panelClassName="left-0"` so the trigger fills its row and the panel
   spans the same width. Every chosen value on the board goes through it — the
-  issue rail, the create modal's chip row, and the new-agent form's framework
-  and llm — so no screen here draws an operating-system menu.
+  issue rail, the create modal's chip row, and the framework plus the three
+  `LlmPinFields` rows (entry / model / thinking) that the new-agent form and
+  the agent profile panel share — so no screen here draws an operating-system
+  menu.
 
 ### Popovers
 

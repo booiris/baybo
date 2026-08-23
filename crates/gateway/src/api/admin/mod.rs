@@ -21,7 +21,7 @@ pub mod traces;
 pub mod turns;
 
 use axum::Router;
-use baybo_model::LlmEntryName;
+use baybo_model::{LlmEntryName, LlmPin};
 use utoipa::OpenApi;
 use utoipa::openapi::OpenApi as OpenApiDoc;
 use utoipa_axum::router::OpenApiRouter;
@@ -30,17 +30,34 @@ use crate::api::openapi;
 use crate::server::AdminState;
 use crate::{GatewayError, Result};
 
-/// Validate an optional LLM pin against the live pool. `None`/empty clears
-/// the pin; an unknown name is a 400 so the operator gets a crisp error at
-/// write time instead of a silent fallback later (`resolve` would fall back
-/// safely on a stranded name). Shared by the session model switch and the
-/// agent-profile endpoints so the contract and wording can't drift.
+/// Validate a whole LLM pin — entry, the model within it, and the thinking
+/// rung — against the live pool. The single home of that rule: the session
+/// model switch, the agent-profile pin and the hire form all come through
+/// here, so what a client may send cannot drift between them.
+///
+/// Three checks, and each rejects rather than degrades, because every one of
+/// them is a pick that would otherwise be silently discarded at run time and
+/// leave the UI showing a choice nobody is running:
+///
+/// - an unknown entry is a 400 (`resolve` would fall back safely on a
+///   stranded name, which is exactly what makes it invisible);
+/// - a model is only meaningful *within* an entry, so `model` without `llm`
+///   is refused rather than dropped, and a model outside that entry's
+///   `[model] + model_candidates` is refused rather than degraded to the
+///   entry default;
+/// - a rung outside baybo's ladder is refused so a typo surfaces here
+///   instead of every turn. It is canonicalised on the way in, so `none` and
+///   `off` cannot persist as two spellings of one rung.
+///
+/// Empty strings read as absent throughout: a cleared `<select>` posts `""`.
 pub(crate) fn validate_llm_pin(
     state: &AdminState,
     llm: Option<&str>,
-) -> Result<Option<LlmEntryName>> {
-    match llm.map(str::trim) {
-        None | Some("") => Ok(None),
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> Result<LlmPin> {
+    let entry = match llm.map(str::trim) {
+        None | Some("") => None,
         Some(name) => {
             let known = state
                 .llm_pool
@@ -53,28 +70,61 @@ pub(crate) fn validate_llm_pin(
                     "unknown LLM entry {name:?}; see GET /v1/llm/models for valid names"
                 )));
             }
-            Ok(Some(LlmEntryName::from(name)))
+            Some(LlmEntryName::from(name))
         }
-    }
+    };
+
+    let model = match (&entry, model.map(str::trim)) {
+        (_, None | Some("")) => None,
+        (None, Some(_)) => {
+            return Err(GatewayError::BadRequest(
+                "model pick requires an llm entry; send llm together with model".to_string(),
+            ));
+        }
+        (Some(entry), Some(model)) => {
+            let pool = state.llm_pool.read();
+            match pool.entry_model_ids(entry) {
+                Some(ids) if ids.iter().any(|m| m == model) => {}
+                _ => {
+                    return Err(GatewayError::BadRequest(format!(
+                        "model {model:?} is not a configured model of LLM entry {entry:?}; \
+                         see GET /v1/llm/models for its model + model_candidates"
+                    )));
+                }
+            }
+            Some(model.to_string())
+        }
+    };
+
+    let effort = match effort.map(str::trim) {
+        None | Some("") => None,
+        Some(level) => match baybo_llm::effort::ReasoningEffort::parse(level) {
+            Some(rung) => Some(rung.as_str().to_string()),
+            None => {
+                return Err(GatewayError::BadRequest(format!(
+                    "unknown reasoning_effort {level:?}; expected one of {}",
+                    effort_ladder()
+                )));
+            }
+        },
+    };
+
+    Ok(LlmPin {
+        entry,
+        model,
+        effort,
+    })
 }
 
-/// Validate that `model` is one of `entry`'s pinnable models (its default
-/// `[model] + model_candidates` that actually built a client). Call after
-/// [`validate_llm_pin`] has confirmed the entry. A model outside that set is
-/// a `BadRequest` — the client picked something the entry can't serve.
-pub(crate) fn validate_llm_model(
-    state: &AdminState,
-    entry: &LlmEntryName,
-    model: &str,
-) -> Result<()> {
-    let pool = state.llm_pool.read();
-    match pool.entry_model_ids(entry) {
-        Some(ids) if ids.iter().any(|m| m == model) => Ok(()),
-        _ => Err(GatewayError::BadRequest(format!(
-            "model {model:?} is not a configured model of LLM entry {entry:?}; \
-             see GET /v1/llm/models for its model + model_candidates"
-        ))),
-    }
+/// The rungs a pin accepts, for the 400's message. The ladder itself lives in
+/// `baybo_llm::effort` — mirroring it here is how the gateway ended up two
+/// rungs behind it.
+fn effort_ladder() -> String {
+    baybo_llm::effort::ReasoningEffort::ALL
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Minimal top-level OpenAPI descriptor. Concrete paths and component

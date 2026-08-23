@@ -71,7 +71,9 @@ impl From<AgentFrameworkDto> for AgentFramework {
     }
 }
 
-/// One agent profile. Absent `llm` = follow `default-llm`.
+/// One agent profile. An absent pin level inherits: `llm` → `default-llm`,
+/// `model` → that entry's own default model, `reasoning_effort` → that
+/// entry's own configured rung.
 ///
 /// Neither the soul nor the skills are fields here. An agent's soul is its
 /// own `SOUL.md` (`GET`/`PUT /v1/agents/{agent_id}/soul`) and its skills are
@@ -87,6 +89,15 @@ pub struct AgentProfileDto {
     pub framework: AgentFrameworkDto,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm: Option<String>,
+    /// The model this agent runs WITHIN `llm`'s entry — one of that entry's
+    /// `[model] + model_candidates`. Absent = the entry's default model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// How hard this agent thinks: a rung of baybo's ladder, absent for the
+    /// entry's own configured level. The rungs a given entry can express are
+    /// `GET /v1/llm/models` → `items[].available_efforts`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     /// The seeded built-in profile: read-only except its avatar,
     /// cannot be deleted.
     pub builtin: bool,
@@ -104,7 +115,9 @@ impl AgentProfileDto {
             description: r.description,
             avatar_blob_id: r.avatar_blob_id,
             framework: r.framework.into(),
-            llm: r.llm.map(|l| l.to_string()),
+            llm: r.llm.entry.map(|l| l.to_string()),
+            model: r.llm.model,
+            reasoning_effort: r.llm.effort,
             builtin: r.builtin,
             created_at: r.created_at,
             updated_at: r.updated_at,
@@ -291,6 +304,13 @@ pub struct CreateAgentProfileRequest {
     /// `GET /v1/llm/models`.
     #[serde(default)]
     pub llm: Option<String>,
+    /// The model within `llm`'s entry, or absent for that entry's default.
+    /// Requires `llm`.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Thinking rung, or absent for the entry's own level.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     /// Optional avatar (full blob id from `POST /v1/blobs`); validated
     /// exactly like `PUT /v1/agents/{agent_id}/avatar`.
     #[serde(default)]
@@ -317,12 +337,29 @@ pub struct SetAgentNameRequest {
     pub name: String,
 }
 
-/// Request body for `PUT /v1/agents/{agent_id}/model`.
+/// Request body for `PUT /v1/agents/{agent_id}/model` — the agent's whole
+/// LLM pin, replaced as one. Absent means "inherit" at each level, so an
+/// empty body clears the pin entirely rather than leaving two thirds of it
+/// pointing at an entry the agent no longer uses.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetAgentModelRequest {
     /// `baybo.json` LLM entry name, or `null`/absent to follow `default-llm`.
     #[serde(default)]
     pub llm: Option<String>,
+    /// The model to run WITHIN `llm`'s entry — one of that entry's
+    /// `[model] + model_candidates` from `GET /v1/llm/models`.
+    /// `null`/absent uses the entry's default model; sending one without
+    /// `llm` is a 400, since there is no entry to pick a model within.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// How hard this agent should think
+    /// (`off`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`), or
+    /// `null`/absent for the entry's configured level. Applies to every run
+    /// this agent starts. The rungs a given entry can express are
+    /// `GET /v1/llm/models` → `items[].available_efforts`; one outside
+    /// baybo's ladder is a 400.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 /// Request body for `PUT /v1/agents/{agent_id}/avatar`.
@@ -480,7 +517,12 @@ async fn create_agent(
     Json(req): Json<CreateAgentProfileRequest>,
 ) -> Result<Json<AgentProfileDto>> {
     let name = validate_name(&req.name)?;
-    let llm = super::validate_llm_pin(&state, req.llm.as_deref())?;
+    let llm = super::validate_llm_pin(
+        &state,
+        req.llm.as_deref(),
+        req.model.as_deref(),
+        req.reasoning_effort.as_deref(),
+    )?;
     if let Some(blob_id) = req.avatar_blob_id.as_deref() {
         validate_avatar_blob(&state, blob_id).await?;
     }
@@ -637,17 +679,24 @@ async fn set_agent_model(
     Json(req): Json<SetAgentModelRequest>,
 ) -> Result<axum::http::StatusCode> {
     let row = load_agent(&state, &agent_id).await?;
-    let llm = super::validate_llm_pin(&state, req.llm.as_deref())?;
+    let pin = super::validate_llm_pin(
+        &state,
+        req.llm.as_deref(),
+        req.model.as_deref(),
+        req.reasoning_effort.as_deref(),
+    )?;
     // The builtin follows `default-llm`; pinning it would put the same
-    // decision in two places. Clearing is a no-op it can accept.
-    if row.builtin && llm.is_some() {
+    // decision in two places. Clearing is a no-op it can accept — and
+    // "cleared" means every level, a rung included, since a thinking level
+    // is spend the operator chose in a second place too.
+    if row.builtin && !pin.is_unpinned() {
         return Err(GatewayError::BadRequest(
             BUILTIN_MODEL_FOLLOWS_DEFAULT.to_owned(),
         ));
     }
     let matched = state
         .agent_profile_store
-        .set_llm(&row.id, llm.as_ref())
+        .set_llm(&row.id, &pin)
         .await
         .map_err(|e| store_err("set agent llm", e))?;
     if !matched {

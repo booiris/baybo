@@ -38,7 +38,7 @@ async fn seed_agent(
             description: String::new(),
             avatar_blob_id: None,
             framework,
-            llm: None,
+            llm: baybo_model::LlmPin::unpinned(),
             builtin: false,
             team: Some(TeamMembership {
                 project_id: project.clone(),
@@ -257,7 +257,7 @@ fn new_member(name: &str) -> baybo_project::NewTeamMember {
         name: name.to_owned(),
         role: "Writes the tests nobody else wants to.".to_owned(),
         framework: None,
-        llm: None,
+        llm: baybo_model::LlmPin::unpinned(),
     }
 }
 
@@ -924,7 +924,7 @@ async fn an_assignee_must_be_on_this_board() {
             description: String::new(),
             avatar_blob_id: None,
             framework: AgentFramework::Baybo,
-            llm: None,
+            llm: baybo_model::LlmPin::unpinned(),
             builtin: false,
             team: None,
             hired_by: None,

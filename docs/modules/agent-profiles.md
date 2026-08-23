@@ -35,7 +35,7 @@ pub struct AgentProfileRow {
     pub description: String,
     pub avatar_blob_id: Option<String>,// full blob id incl. read token, from POST /v1/blobs
     pub framework: AgentFramework,     // baybo | claude | codex
-    pub llm: Option<LlmEntryName>,     // None = follow default-llm; meaningful for baybo only
+    pub llm: LlmPin,                   // entry + model-within-it + thinking rung; baybo-only
     pub builtin: bool,                 // the seeded `baybo` row; locked except avatar
     pub team: Option<TeamMembership>,  // project_id + @handle; None = a global agent
     pub hired_by: Option<AgentProfileId>, // None = the operator created it
@@ -52,6 +52,22 @@ pub struct AgentProfileRow {
 | Field | `NULL` / `None` | `Some(...)` |
 |---|---|---|
 | `llm` | follow `default-llm` | pin to this `baybo.json` entry name |
+| `llm_model` | that entry's own `model` | pin to one of its `[model] + model_list` ids |
+| `llm_effort` | that entry's own `reasoning_effort` | pin to a rung of baybo's thinking ladder |
+
+The three are one value, `baybo_model::LlmPin`, and one write. Two of them
+mean nothing alone — a model id is a model *of an entry*, and a rung is
+translated into the entry's provider dialect — so a setter that could move
+one without the others would leave a row naming a model the entry it names
+cannot serve. `set_llm` takes the whole pin; clearing clears all three.
+
+They exist because a **card's run has no header to pick from**. A chat session
+carries its own `last_llm` / `last_model` / `last_effort`, set by the
+model picker the operator presses per conversation; a board run's session is
+minted by the board with nothing on it, so what the profile says is the only
+thing that decides what that run costs and how hard it thinks. Carrying only
+the entry meant every board agent ran that entry's default model at that
+entry's default rung, with no way to say otherwise.
 
 **There is no prompt column, and no name column.** An agent's prompt is its
 own persona's `SOUL.md`, and its name is the `Name:` line in that persona's
@@ -92,7 +108,12 @@ where a caller who replaces the document means it — restoring the shipped
 template leaves it nameless, which is exactly why an unnamed agent has a
 defined rendering (its id).
 
-`llm` is stored regardless of `framework` (the server never clears it on a framework switch, so switching never destroys data), but it is genuinely baybo-only: it names a `baybo.json` LLM-pool entry, which an external CLI (billed against its own subscription) can't route through — the editor greys it out for external frameworks. It is read at actor spawn, behind the session's own `last_llm` pin — see [`../todo/multi-agent-chat.md`](../todo/multi-agent-chat.md).
+The pin is stored regardless of `framework` (the server never clears it on a framework switch, so switching never destroys data), but it is genuinely baybo-only: it names a `baybo.json` LLM-pool entry, which an external CLI (billed against its own subscription) can't route through, so on a `claude`/`codex` agent the whole pin is inert. The board's panel still offers it — it does not read `framework` — which is a gap worth naming rather than a claim to make: a pin set there is stored and then ignored.
+
+It is read at actor spawn by `resolve_spawn_pins`, behind the session's own pin, and the two levels fall back on **different granularities** on purpose:
+
+- **entry and model fall back together.** A session that named its own entry keeps its own model — an empty one meaning that entry's default — and never inherits a model chosen for a different entry, which is a model that entry cannot serve.
+- **the rung falls back on its own** (`last_effort ?? profile.effort`). Effort is a provider-level knob rather than a property of one model, so an agent deliberately set to think hard keeps doing so across a session that only re-pointed which entry to use.
 
 **Neither skills nor tools are stored on the profile.** Skills are managed by the skill system, not configured per agent — the editor reads them live from the skill registry (`GET /v1/skills`) and shows them read-only; when a future per-agent-workspace model lands, that readout reads the agent's own skill folder instead. Tools are a runtime-global concern (`ToolRegistry` is process-wide by design) and Claude Code / Codex manage their own tool permissions. Storing either as a per-agent allow-list would be dead data in v1, so both are left out.
 
@@ -109,9 +130,9 @@ Exactly one row is seeded with `id = BUILTIN_AGENT_PROFILE_ID` (`"baybo"`), `bui
 | avatar | editable (`…/avatar`) | row column, via `set_avatar` |
 | description | editable (content `PUT`) | row column |
 | **framework** | **pinned to `baybo`** | row column |
-| **model / llm** | **pinned empty** — follows `default-llm` | row column |
+| **model / llm** | **pinned empty at all three levels** — follows `default-llm` | row columns |
 
-Both pins are structural rather than handler checks. `update` writes `framework = CASE WHEN builtin = 1 THEN framework ELSE ?N END`, so the builtin's column self-references and no caller can move it; `set_llm` writes `llm = CASE WHEN builtin = 1 THEN NULL ELSE ?N END`, which both refuses a pin and normalises a row an earlier build let drift. Pinning a model on the builtin would put one decision — "what does this deployment run on?" — in two places that could then disagree; `default-llm` is that decision, and the LLM page is where it lives.
+Both pins are structural rather than handler checks. `update` writes `framework = CASE WHEN builtin = 1 THEN framework ELSE ?N END`, so the builtin's column self-references and no caller can move it; `set_llm` writes `CASE WHEN builtin = 1 THEN NULL ELSE ?N END` over each of `llm` / `llm_model` / `llm_effort`, which both refuses a pin and normalises a row an earlier build let drift — a leftover rung is spend the operator chose in a second place, so "cleared" has to mean every level. Pinning a model on the builtin would put one decision — "what does this deployment run on?" — in two places that could then disagree; `default-llm` is that decision, and the LLM page is where it lives.
 
 The gateway still answers an *explicit* attempt with a 400 rather than silently dropping it — a caller that asked deserves to hear no — and refuses before writing, so the rest of the body does not land either. `delete` keeps its plain `WHERE builtin = 0`.
 
@@ -133,7 +154,11 @@ Web CRUD is the primary interface, avatars are binary, and edits are concurrent 
 
 ### The `llm` pin is validated at write, tolerated at read
 
-`llm` is validated against the live pool on write (via the shared `validate_llm_pin`, exactly like the session model switch) — a crisp 400 at edit time beats a silent fallback. Staleness later (the entry removed from `baybo.json` after the profile saved it) is tolerated the same way `sessions.last_llm` staleness is: the pool's `resolve` falls back to default with a `warn!` when consumption arrives; the editor renders a stale pin as "(unavailable)" so it stays visible and clearable.
+The whole pin is validated against the live pool on write, by the shared `validate_llm_pin` — the **single home** of that rule, which the session model switch, the profile pin and the hire form all come through, so what a client may send cannot drift between them. Three checks, each rejecting rather than degrading: an unknown entry, a model that is not one of that entry's `[model] + model_list` (or a model sent with no entry at all, which means nothing), and a rung outside baybo's ladder. A crisp 400 at edit time beats a silent fallback, because every one of these would otherwise be discarded at run time while the UI kept showing the choice. The rung is canonicalised on the way in, so `none` and `off` cannot persist as two spellings of one rung.
+
+Staleness *later* is tolerated the same way `sessions.last_llm` staleness is — an entry removed from `baybo.json`, a model dropped from a `model_list`, a rung a provider stopped expressing: the pool's `resolve` falls back to default with a `warn!` when consumption arrives, and the editor renders a stale pick as "(unavailable)" at whichever level it went stale, so it stays visible and clearable. One helper in `teamModel.ts` answers that for all three pickers.
+
+Note the two sources are not the same: the pickers are filled from `GET /v1/llm/models`, which reads the **config on disk**, while `validate_llm_pin` checks the **live pool**. An entry whose client failed to build is therefore offered and then refused — which is the right direction (visible failure, not a silent downgrade), and why the panel keeps the 400 on screen.
 
 ### Full-replace `PUT`, targeted avatar endpoint
 
@@ -159,7 +184,9 @@ CREATE TABLE IF NOT EXISTS agent_profiles (
     description     TEXT NOT NULL,
     avatar_blob_id  TEXT,
     framework       TEXT NOT NULL,          -- AgentFramework::as_str()
-    llm             TEXT,
+    llm             TEXT,                   -- one column per LlmPin level;
+    llm_model       TEXT,                   -- NULL inherits at each, and the
+    llm_effort      TEXT,                   -- three are only written together
     builtin         INTEGER NOT NULL DEFAULT 0,
     created_at      INTEGER NOT NULL,       -- Unix µs (sqlite/time.rs)
     updated_at      INTEGER NOT NULL
@@ -179,7 +206,7 @@ pub trait AgentProfileStore: Send + Sync {
     async fn create(&self, row: &AgentProfileRow) -> Result<()>;     // duplicate id → Conflict; never binds `builtin`
     async fn update(&self, id: &AgentProfileId, update: &AgentProfileUpdate) -> Result<bool>; // reaches the builtin, never its framework
     async fn set_avatar(&self, id: &AgentProfileId, blob_id: Option<&str>) -> Result<bool>;   // builtin allowed
-    async fn set_llm(&self, id: &AgentProfileId, llm: Option<&LlmEntryName>) -> Result<bool>; // never the builtin
+    async fn set_llm(&self, id: &AgentProfileId, pin: &LlmPin) -> Result<bool>;             // whole pin; never the builtin
     async fn delete(&self, id: &AgentProfileId) -> Result<bool>;     // WHERE builtin = 0 AND project_id IS NULL; plain row DELETE
     async fn remove_from_team(&self, id: &AgentProfileId) -> Result<bool>;                  // stamps `deleted_at`
 }
@@ -194,14 +221,16 @@ Route module `crates/gateway/src/api/admin/agents.rs`, tag `agents`, DTOs inline
 | Endpoint | Success | Errors |
 |---|---|---|
 | `GET /v1/agents` | 200 `ListResponse<AgentProfileDto>` | 401 |
-| `POST /v1/agents` | 200 `AgentProfileDto` | 400 name invalid/duplicate, unknown `llm`, unknown/non-image `avatar_blob_id`; 401 |
+| `POST /v1/agents` | 200 `AgentProfileDto` | 400 name invalid/duplicate, bad llm pin, unknown/non-image `avatar_blob_id`; 401 |
 | `GET /v1/agents/{agent_id}` | 200 `AgentProfileDto` | 401, 404 |
-| `PUT /v1/agents/{agent_id}` | 204 | 400 builtin locked, name invalid/duplicate, unknown `llm`; 401, 404 |
+| `PUT /v1/agents/{agent_id}` | 204 | 400 builtin locked, name invalid/duplicate; 401, 404 |
+| `PUT /v1/agents/{agent_id}/model` | 204 | 400 builtin locked, unknown entry / model not of that entry / model without an entry / unknown rung; 401, 404 |
 | `PUT /v1/agents/{agent_id}/avatar` | 204 | 400 unknown blob id / non-image mime; 401, 404 |
 | `DELETE /v1/agents/{agent_id}` | 204 | 400 builtin; 401, 404 |
 
 - `POST` body = full content state (`name` required; `description` defaults empty; `framework` defaults `baybo`; nullable fields absent = `NULL`) **plus** optional `avatar_blob_id` — create can't hit the builtin lock, so no avatar asymmetry is needed there. `PUT` body = the same shape minus `avatar_blob_id`, with `name`/`description`/`framework` required.
 - `PUT …/avatar` body = `{ "blob_id": "sha256:…" | null }`; `null` clears the avatar.
+- `PUT …/model` body = `{ llm, model, reasoning_effort }`, each nullable — the **whole pin, replaced as one**, deliberately named the same as `SetSessionModelRequest` so the two write surfaces read identically. An empty body clears the pin entirely rather than leaving two thirds of it pointing at an entry the agent no longer uses. The same three fields are optional on `POST /v1/agents` and on the board's `POST /v1/projects/{project_id}/agents`, so a hire can be staffed in one call.
 - Builtin refusals are `GatewayError::BadRequest` (the admin surface's "operation not allowed" convention — there is no `Forbidden` variant), with the store's `builtin = 0` guard as backstop.
 - `AdminState` carries `agent_profile_store` and `blob_store` (for the avatar `stat`), both off `deps.stores`.
 
@@ -209,10 +238,10 @@ Shape changes ride the standard openapi regen chain — see the header of `crate
 
 ## Web UI
 
-There is no standalone Agents page and no `/agents` route: the surface lives inside the board page, as `TeamStrip.tsx` (the roster strip plus the hire form, over `POST /v1/projects/{project_id}/agents`) and the `AgentProfile.tsx` panel it opens (per-agent detail, and the LLM pin via `PUT /v1/agents/{agent_id}/model`). Both follow the house conventions (hand-rolled fetch with refetch-after-mutation, `useAdminClient()`, 401 → `logout()`, `?mock=true` with every mutation short-circuited in mock mode). The panel is a `FloatingPanel` over the board (one per agent, keyed by id), not a page of its own — it is also mounted from `ColumnPage`.
+There is no standalone Agents page and no `/agents` route: the surface lives inside the board page, as `TeamStrip.tsx` (the roster strip plus the hire form, over `POST /v1/projects/{project_id}/agents`) and the `AgentProfile.tsx` panel it opens (per-agent detail, and the LLM pin via `PUT /v1/agents/{agent_id}/model`). Both draw the pin with the same `LlmPinFields.tsx` — one component, because both must offer the same three rows under the same rules, and those rules go wrong quietly when written twice. Both follow the house conventions (hand-rolled fetch with refetch-after-mutation, `useAdminClient()`, 401 → `logout()`, `?mock=true` with every mutation short-circuited in mock mode). The panel is a `FloatingPanel` over the board (one per agent, keyed by id), not a page of its own — it is also mounted from `ColumnPage`.
 
 - **Roster strip**: one avatar per teammate (uploaded blob, else a deterministic generated face from `botttsFace(agent_id)`), tooltipped `name (@handle)` + run note + description, capped at `MAX_AGENTS = 16` mirroring the server's `MAX_TEAM_AGENTS`; a `+` button opens the hire form (name, role/description, framework picker — `native` / `claude` / `codex`), which `POST`s to `/v1/projects/{project_id}/agents`.
-- **Profile panel**: opened from the strip, keyed by agent. Header `@handle`, then description, `framework (fixed at hire)`, who hired it (`— hired by @x`, flagged `(since removed)` when the hirer has left), the LLM pin as a `Picker` writing `PUT /v1/agents/{agent_id}/model`, and a read-only skills readout ("the shared set, in v1") since skills aren't per-profile. Footer: **Remove from project** behind an inline confirm, hidden for a read-only board and for the lead.
+- **Profile panel**: opened from the strip, keyed by agent. Header `@handle`, then description, `framework (fixed at hire)`, who hired it (`— hired by @x`, flagged `(since removed)` when the hirer has left), the LLM pin as the three `Picker`s of `LlmPinFields` — entry, the model within it, and thinking — writing the whole triple with one `PUT /v1/agents/{agent_id}/model`, and a read-only skills readout ("the shared set, in v1") since skills aren't per-profile. Footer: **Remove from project** behind an inline confirm, hidden for a read-only board and for the lead.
 - **Avatar**: rendered, not uploaded. `useTeamPortraits` fetches each agent's blob once per board with the bearer into an object URL (an `<img>` can't carry the auth header) and falls back to the generated face; no web path calls `PUT /v1/agents/{agent_id}/avatar`, which stays API-only.
 - **Live over WS**: the roster refetches on `Frame::ProjectChanged` for this board — `useBoardStream` bumps the `refreshKey` the board's `fetchTeam` effect is keyed on — so a hire or a removal made elsewhere lands without a reload.
 

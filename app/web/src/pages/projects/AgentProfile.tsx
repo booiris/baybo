@@ -5,8 +5,8 @@ import { RiCloseLine } from 'react-icons/ri';
 import { useAdminClient } from '../../api/auth';
 import { fetchModelPool, setAgentModel } from './api';
 import { COLUMN_LABEL, issuePath, type Agent, type Issue, type IssueRun } from './boardModel';
-import { Picker } from './Picker';
-import { agentRunStates, llmOptions, llmSelected, type ModelPool } from './teamModel';
+import { LlmPinFields } from './LlmPinFields';
+import { agentRunStates, type LlmPinValue, type ModelPool } from './teamModel';
 
 export function AgentProfile({
   agent,
@@ -48,8 +48,13 @@ export function AgentProfile({
   const [pinError, setPinError] = useState<string | null>(null);
   const [pool, setPool] = useState<ModelPool>(null);
   const client = useAdminClient();
-  const models = llmOptions(pool);
-  const showing = llmSelected(agent.llm, pool);
+  // The roster row is the source of truth: the panel refetches after every
+  // write (`onChanged`), so there is no local copy of the pin to drift.
+  const pin: LlmPinValue = {
+    llm: agent.llm ?? '',
+    model: agent.model ?? '',
+    effort: agent.reasoning_effort ?? '',
+  };
 
   useEffect(() => {
     let canceled = false;
@@ -166,30 +171,28 @@ export function AgentProfile({
           <h3 className="font-mono text-[0.6rem] font-bold uppercase tracking-wider text-ink-soft">
             Setup
           </h3>
-          <label className="block mt-1">
-            <span className="font-mono text-[0.58rem] text-ink-soft">llm</span>
-            {/* Pool-only: a pin outside it is a teammate that fails every
-                time it is woken, so the picker never offers one. */}
-            <Picker
-              label="llm"
-              className="w-full mt-0.5"
-              triggerClassName="w-full justify-between text-left border-2 border-black rounded-md bg-surface px-1.5 py-0.5 font-mono text-[0.66rem]"
-              panelClassName="left-0"
-              value={showing}
-              disabled={readOnly || pinning || pool === null}
-              options={models}
-              onPick={(picked) => {
+          <div className="mt-1 flex flex-col gap-1.5">
+            <LlmPinFields
+              value={pin}
+              pool={pool}
+              disabled={readOnly || pinning}
+              fieldLabelClass="font-mono text-[0.58rem] text-ink-soft"
+              pickerProps={{
+                className: 'w-full',
+                triggerClassName:
+                  'w-full justify-between text-left border-2 border-black rounded-md bg-surface px-1.5 py-0.5 font-mono text-[0.66rem]',
+                panelClassName: 'left-0',
+              }}
+              onChange={(next) => {
                 setPinning(true);
-                void setAgentModel(client, agent.id, picked).then((outcome) => {
+                void setAgentModel(client, agent.id, next).then((outcome) => {
                   setPinning(false);
                   setPinError(outcome.kind === 'failed' ? outcome.message : null);
                   if (outcome.kind === 'ok') onChanged();
                 });
               }}
-            >
-              {models.find((one) => one.value === showing)?.label ?? showing}
-            </Picker>
-          </label>
+            />
+          </div>
           {pinError == null ? null : (
             <p className="mt-1 font-mono text-[0.58rem] text-err break-words">{pinError}</p>
           )}

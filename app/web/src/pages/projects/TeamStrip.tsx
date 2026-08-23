@@ -4,7 +4,14 @@ import { RiAddLine } from 'react-icons/ri';
 import { useAdminClient } from '../../api/auth';
 import { fetchModelPool } from './api';
 import type { Agent, IssueRun } from './boardModel';
-import { agentRunStates, handleProblem, llmOptions, type ModelPool } from './teamModel';
+import { LlmPinFields } from './LlmPinFields';
+import {
+  agentRunStates,
+  handleProblem,
+  UNPINNED,
+  type LlmPinValue,
+  type ModelPool,
+} from './teamModel';
 import { Avatar, AVATAR_BOX, runNote, type AvatarRun } from './Avatar';
 import { Picker, type PickerOption } from './Picker';
 import type { Portrait } from './portrait';
@@ -176,6 +183,8 @@ function HireAgentForm({
     role: string;
     framework?: Agent['framework'];
     llm?: string;
+    model?: string;
+    reasoning_effort?: string;
   }) => Promise<string | null>;
   /// How many of the board's seats are taken, and how many there are. The
   /// cap is shared with the lead's own hiring tool, and the only other way
@@ -186,13 +195,12 @@ function HireAgentForm({
   const [name, setName] = useState('');
   const [role, setRole] = useState('');
   const [framework, setFramework] = useState<Agent['framework']>('baybo');
-  const [llm, setLlm] = useState('');
+  const [pin, setPin] = useState<LlmPinValue>(UNPINNED);
   const [pool, setPool] = useState<ModelPool>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const client = useAdminClient();
   const problem = handleProblem(name);
-  const models = llmOptions(pool);
 
   useEffect(() => {
     let canceled = false;
@@ -235,7 +243,11 @@ function HireAgentForm({
             name,
             role,
             framework,
-            ...(llm === '' ? {} : { llm }),
+            // Only the levels actually chosen: an empty one means "inherit",
+            // which the wire says by leaving the field out.
+            ...(pin.llm === '' ? {} : { llm: pin.llm }),
+            ...(pin.model === '' ? {} : { model: pin.model }),
+            ...(pin.effort === '' ? {} : { reasoning_effort: pin.effort }),
           }).then((failure) => {
             setBusy(false);
             setError(failure);
@@ -304,19 +316,14 @@ function HireAgentForm({
                 {FRAMEWORKS.find((one) => one.value === framework)?.label ?? framework}
               </Picker>
             </label>
-            <label className="flex flex-col gap-1">
-              <span className={fieldLabel}>llm</span>
-              <Picker
-                {...pickerField}
-                label="llm"
-                value={llm}
-                disabled={busy || pool === null}
-                options={models}
-                onPick={setLlm}
-              >
-                {models.find((one) => one.value === llm)?.label ?? '…'}
-              </Picker>
-            </label>
+            <LlmPinFields
+              value={pin}
+              pool={pool}
+              disabled={busy}
+              fieldLabelClass={fieldLabel}
+              pickerProps={pickerField}
+              onChange={setPin}
+            />
           </div>
           {error !== null ? (
             <p className="border-2 border-err text-err rounded-md px-2 py-1 font-mono text-[0.68rem] break-words">

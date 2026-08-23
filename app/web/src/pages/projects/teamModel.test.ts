@@ -1,7 +1,14 @@
 import { describe, expect, it } from 'vitest';
 
 import type { Agent, IssueRun } from './boardModel';
-import { agentRunStates, handleOf, handleProblem, llmOptions, llmSelected } from './teamModel';
+import {
+  agentRunStates,
+  effortOptions,
+  handleOf,
+  handleProblem,
+  llmOptions,
+  modelOptions,
+} from './teamModel';
 
 function run(agentId: string, status: IssueRun['status']): IssueRun {
   return {
@@ -90,33 +97,81 @@ describe('handleProblem', () => {
   });
 });
 
-describe('llmOptions / llmSelected', () => {
-  const pool = { names: ['deepseek', 'gpt-5'], defaultName: 'deepseek' };
+describe('the llm pin pickers', () => {
+  const pool = {
+    defaultName: 'deepseek',
+    entries: [
+      { name: 'deepseek', models: ['deepseek-chat'], efforts: [] },
+      {
+        name: 'gpt-5',
+        models: ['gpt-5.5', 'o3'],
+        efforts: ['low', 'medium', 'high'],
+      },
+    ],
+  };
 
-  it('lists each model once, the default one carrying the empty value', () => {
-    // Not a "default" row beside the model it resolves to. Picking the
-    // default's row pins nothing, so the agent follows it wherever it moves.
-    expect(llmOptions(pool)).toEqual([
-      { value: '', label: 'deepseek' },
+  it('offers an inherit row that names what it resolves to, then every entry', () => {
+    // The entry that is default *today* still gets its own named row: a
+    // model can only be picked within a named entry, so folding it into the
+    // inherit row would make every model inside the deployment's most-used
+    // entry unreachable.
+    expect(llmOptions(pool, '')).toEqual([
+      { value: '', label: 'Default · deepseek' },
+      { value: 'deepseek', label: 'deepseek' },
       { value: 'gpt-5', label: 'gpt-5' },
     ]);
   });
 
   it('has nothing to offer before the pool has loaded', () => {
-    expect(llmOptions(null)).toEqual([]);
+    expect(llmOptions(null, '')).toEqual([]);
+    expect(modelOptions(null, 'gpt-5', '')).toEqual([]);
+    expect(effortOptions(null, 'gpt-5', '')).toEqual([]);
   });
 
-  it('shows an agent pinned to the current default on that model’s row', () => {
-    // The only row it could show as, now that there is one per model — and
-    // the row means the same thing to look at either way.
-    expect(llmSelected('deepseek', pool)).toBe('');
-    expect(llmSelected(null, pool)).toBe('');
-    expect(llmSelected('gpt-5', pool)).toBe('gpt-5');
+  it('keeps a pin the pool has never heard of, marked unavailable', () => {
+    // An entry dropped from baybo.json: a row that vanished would leave the
+    // picker showing something else while the agent still failed on the old
+    // value. Visible, and therefore clearable.
+    expect(llmOptions(pool, 'retired')).toContainEqual({
+      value: 'retired',
+      label: 'retired (unavailable)',
+    });
+    expect(modelOptions(pool, 'gpt-5', 'o1')).toContainEqual({
+      value: 'o1',
+      label: 'o1 (unavailable)',
+    });
+    expect(effortOptions(pool, 'gpt-5', 'ultra')).toContainEqual({
+      value: 'ultra',
+      label: 'ultra (unavailable)',
+    });
   });
 
-  it('keeps a pin the pool has never heard of rather than silently dropping it', () => {
-    // A model removed from baybo.json: the select shows no matching row, which
-    // is the visible version of a pin that will fail when it is woken.
-    expect(llmSelected('retired-model', pool)).toBe('retired-model');
+  it('lists the models of the entry a pin resolves to', () => {
+    expect(modelOptions(pool, 'gpt-5', '')).toEqual([
+      { value: '', label: 'gpt-5.5 (entry default)' },
+      { value: 'gpt-5.5', label: 'gpt-5.5' },
+      { value: 'o3', label: 'o3' },
+    ]);
+  });
+
+  it('falls back to the default entry when the pin names none', () => {
+    // An unpinned agent runs on `default-llm`, so that is the entry whose
+    // models and rungs the fields describe.
+    expect(modelOptions(pool, '', '')).toEqual([
+      { value: '', label: 'deepseek-chat (entry default)' },
+      { value: 'deepseek-chat', label: 'deepseek-chat' },
+    ]);
+  });
+
+  it('offers the rungs the entry can express, and none at all when it can express none', () => {
+    // The ladder comes from the entry, never a local list: a rung the
+    // provider's dialect cannot say is a pick that never reaches the wire.
+    expect(effortOptions(pool, 'gpt-5', '')).toEqual([
+      { value: '', label: 'entry default' },
+      { value: 'low', label: 'low' },
+      { value: 'medium', label: 'medium' },
+      { value: 'high', label: 'high' },
+    ]);
+    expect(effortOptions(pool, 'deepseek', '')).toEqual([]);
   });
 });

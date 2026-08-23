@@ -184,8 +184,9 @@ pub struct NewTeamMember {
     /// `None` follows the workspace default (baybo). Only the operator's
     /// form sets this; `ProjectAgentCreate` deliberately does not.
     pub framework: Option<AgentFramework>,
-    /// `None` follows `default-llm`.
-    pub llm: Option<baybo_model::LlmEntryName>,
+    /// What this teammate runs on. [`LlmPin::unpinned`] follows the
+    /// deployment's defaults at every level.
+    pub llm: baybo_model::LlmPin,
 }
 
 /// What a caller supplies to open a project.
@@ -1958,7 +1959,7 @@ impl ProjectManager {
                 description: LEAD_DESCRIPTION.to_owned(),
                 avatar_blob_id: None,
                 framework: AgentFramework::Baybo,
-                llm: None,
+                llm: baybo_model::LlmPin::unpinned(),
                 builtin: false,
                 team: Some(TeamMembership {
                     project_id: project.clone(),

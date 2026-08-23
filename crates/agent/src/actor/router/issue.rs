@@ -77,7 +77,7 @@ impl Router {
         let response_tx = self.supervisor.response_tx().clone();
         let (mailbox, actor_token) = self.spawn_oneshot_actor(
             session,
-            pins.llm,
+            pins.entry,
             pins.model,
             pins.effort,
             response_tx,
@@ -455,7 +455,7 @@ mod tests {
                     description: String::new(),
                     avatar_blob_id: None,
                     framework: AgentFramework::Baybo,
-                    llm: None,
+                    llm: baybo_model::LlmPin::unpinned(),
                     builtin: false,
                     team: Some(TeamMembership {
                         project_id: self.project.id.clone(),

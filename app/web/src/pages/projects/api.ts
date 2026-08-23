@@ -1,6 +1,7 @@
 import type { AdminClient } from '../../api/client';
 import type { components } from '../../api/schema';
 import type { Agent, Issue, IssueRun, IssueStatus, Project, RunLog } from './boardModel';
+import type { LlmEntry, LlmPinValue } from './teamModel';
 import type { FeedEntry, IssueEvent } from './timelineModel';
 
 export type CreateIssueRequest = components['schemas']['CreateIssueRequest'];
@@ -63,7 +64,14 @@ export async function hireAgent(
   // Framework and LLM pin are both on `HireAgentRequest` already; the
   // client narrowed them away, so the user form could not offer the two
   // knobs the spec deliberately gives it over the lead's own hiring tool.
-  body: { name: string; role: string; framework?: Agent['framework']; llm?: string },
+  body: {
+    name: string;
+    role: string;
+    framework?: Agent['framework'];
+    llm?: string;
+    model?: string;
+    reasoning_effort?: string;
+  },
 ): Promise<Outcome<Agent>> {
   try {
     const { data, error, response } = await client.POST('/v1/projects/{project_id}/agents', {
@@ -530,15 +538,24 @@ export async function retryRun(
 
 /// Pin (or unpin) an agent's model. Same door the Agents page uses — the
 /// profile is a second view of one roster, not a second way to edit it.
+/// Replace an agent's LLM pin — all three levels at once.
+///
+/// Whole, never per-field: entry, model and rung are one choice, and a save
+/// that wrote two of them would leave the row naming a model belonging to an
+/// entry it no longer names. `''` at any level clears that level.
 export async function setAgentModel(
   client: AdminClient,
   agentId: string,
-  llm: string,
+  pin: LlmPinValue,
 ): Promise<Outcome<null>> {
   try {
     const { error, response } = await client.PUT('/v1/agents/{agent_id}/model', {
       params: { path: { agent_id: agentId } },
-      body: { llm },
+      body: {
+        llm: pin.llm === '' ? null : pin.llm,
+        model: pin.model === '' ? null : pin.model,
+        reasoning_effort: pin.effort === '' ? null : pin.effort,
+      },
     });
     if (response.status === 401) return { kind: 'unauthorized' };
     if (error !== undefined) return failure(response.status, error.error);
@@ -549,12 +566,15 @@ export async function setAgentModel(
   }
 }
 
-/// The models this deployment can actually run, and which one `default-llm`
-/// points at. A pin outside the pool is a teammate that fails every time it
-/// is woken, so the picker offers the pool and nothing else.
+/// What this deployment can actually run, at every level a pin has: each
+/// configured entry, the models it serves, the thinking rungs its provider
+/// can express — and which entry `default-llm` points at.
+///
+/// A pin outside the pool is a teammate that fails every time it is woken,
+/// so the pickers offer the pool and nothing else.
 export async function fetchModelPool(
   client: AdminClient,
-): Promise<Outcome<{ names: string[]; defaultName: string }>> {
+): Promise<Outcome<{ entries: LlmEntry[]; defaultName: string }>> {
   try {
     const { data, error, response } = await client.GET('/v1/llm/models');
     if (response.status === 401) return { kind: 'unauthorized' };
@@ -563,7 +583,16 @@ export async function fetchModelPool(
     return {
       kind: 'ok',
       value: {
-        names: data.items.map((model) => model.name),
+        entries: data.items.map((entry) => ({
+          name: entry.name,
+          // The entry's own model first, then its candidates, de-duped: an
+          // entry that lists its default in `model_list` too must not draw
+          // the same row twice.
+          models: [...new Set([entry.model, ...(entry.model_list ?? []).map((one) => one.model)])],
+          // Always present — an entry whose provider takes no effort sends
+          // an empty list, and empty is the meaningful answer: no ladder.
+          efforts: entry.available_efforts,
+        })),
         defaultName: data.default_name,
       },
     };
