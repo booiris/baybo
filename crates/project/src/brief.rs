@@ -123,6 +123,8 @@ const STALLED_PREAMBLE: &str = r#"You are this board's lead. Work on this card h
 
 const BLOCKED_PREAMBLE: &str = r#"You are this board's lead. The block below needs a decision: answer it and unblock the card, hand it back with a comment saying what to do instead, escalate it to the operator in a comment, or cancel the card. Do not do the card's own work in this run."#;
 
+const GROOMING_PREAMBLE: &str = r#"You are this board's lead. This card is parked in Backlog, which the board never starts anything from. Decide what it is: move it to Todo with an assignee if the work is ready to pick up, leave it in Backlog if it is not yet, or cancel it if it is no longer wanted. Say which and why in a comment. Do not do the card's own work in this run."#;
+
 /// State why the lead was woken; the card properties do not encode the ask.
 fn coordination_preamble(trigger: RunTrigger) -> Option<&'static str> {
     match trigger {
@@ -130,6 +132,7 @@ fn coordination_preamble(trigger: RunTrigger) -> Option<&'static str> {
         RunTrigger::Review => Some(REVIEW_PREAMBLE),
         RunTrigger::Stalled => Some(STALLED_PREAMBLE),
         RunTrigger::Blocked => Some(BLOCKED_PREAMBLE),
+        RunTrigger::Grooming => Some(GROOMING_PREAMBLE),
         RunTrigger::Started
         | RunTrigger::Assigned
         | RunTrigger::Retry
@@ -947,6 +950,7 @@ mod tests {
             (RunTrigger::Triage, TRIAGE_PREAMBLE),
             (RunTrigger::Review, REVIEW_PREAMBLE),
             (RunTrigger::Stalled, STALLED_PREAMBLE),
+            (RunTrigger::Grooming, GROOMING_PREAMBLE),
         ] {
             let brief = issue_brief(&issue, &with_files(Vec::new()), trigger, None);
             assert!(

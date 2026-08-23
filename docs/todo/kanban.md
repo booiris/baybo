@@ -281,6 +281,51 @@ the behaviour was verified against its source (clone inspected 2026-08-05).
     wrong, but the rename is cosmetic and churns four files nothing else
     needs to touch.
 
+21. **Backlog is asked about, never pulled from — and only the half the
+    board filed itself** (2026-08-23), from eleven days of a live board
+    doing nothing. `rglide` settled its last run at 13:33 and went silent
+    for three hours with five cards on it; the operator's only way back in
+    was to comment on the lead's own card, twice in one afternoon. Decision
+    18's four questions were faithful to the cron they replaced, and the
+    cron had the same hole: neither ever looked at Backlog. So a board
+    whose Todo, In Progress and non-lead Review are all empty had **no
+    remaining wake at all** — every other one is downstream of a card
+    already sitting in a column the driver reads — and it failed silently,
+    indistinguishably from a healthy idle board.
+
+    A fifth question, `RunTrigger::Grooming`, asked last:
+
+    - **Asked, not pulled.** `driver::is_waiting` still opens on `Todo`, so
+      nothing is started out of Backlog and decision 17's promoter is
+      untouched. The wake hands the lead the card; the lead moves it to
+      Todo, and the ordinary promoter takes it from there on the next tick.
+      Relaxing `is_waiting` instead would have made every staffed Backlog
+      card start within one tick, which is the column's whole purpose gone.
+    - **Only the cards an agent filed.** Backlog is where a *person* parks
+      work, and the board reopening their parked card is the same overreach
+      as adjudicating their block — so the split is the same one decision
+      18 already draws for `block_is_an_agents_question`, read off the
+      `Opened` entry's actor. The operator's Backlog is untouched, forever,
+      by design; theirs moves when they move it. A card with no `Opened`
+      entry counts as nobody's and stays parked.
+    - **One query per board, not a timeline per card.**
+      `ProjectStore::agent_opened_issues` exists because this question is
+      asked every 5s pass and the measured board has 18 operator-filed
+      Backlog cards: per-card event lists would be 18 full timeline reads
+      per tick, forever, for an answer that is always "no".
+    - **Assignee-agnostic**, unlike Triage. Of the five stranded cards,
+      three were staffed — a staffed Backlog card is not work waiting for a
+      slot, nothing is coming for it either, and asking only about the
+      unstaffed ones strands exactly the cards a lead had already thought
+      about.
+    - `already_asked` bounds it like every other question, so a lead that
+      looks and decides "not yet" is not asked again until the card changes.
+
+    `IssueCreate` still defaults to `backlog`, deliberately: filing into a
+    column that starts nothing is how an agent sequences work it is not
+    ready to hand out. This decision is what makes that default safe rather
+    than a hole.
+
 ## Pages and interactions (`app/web`)
 
 New rail destination **Projects** (`components/IconRail.tsx` `DESTINATIONS`).

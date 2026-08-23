@@ -512,6 +512,7 @@ pub enum RunTriggerDto {
     Review,
     Stalled,
     Blocked,
+    Grooming,
 }
 
 impl From<RunTrigger> for RunTriggerDto {
@@ -527,6 +528,7 @@ impl From<RunTrigger> for RunTriggerDto {
             RunTrigger::Review => Self::Review,
             RunTrigger::Stalled => Self::Stalled,
             RunTrigger::Blocked => Self::Blocked,
+            RunTrigger::Grooming => Self::Grooming,
         }
     }
 }

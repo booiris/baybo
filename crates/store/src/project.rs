@@ -331,6 +331,11 @@ pub(crate) const ACTOR_USER: &str = "user";
 /// See [`ACTOR_USER`].
 pub(crate) const ACTOR_SYSTEM: &str = "system";
 
+/// What an agent's storage spelling starts with. Named because SQL that
+/// asks "did an agent do this" has to spell it too, and a prefix with
+/// three spellings is one of them being wrong.
+pub const ACTOR_AGENT_PREFIX: &str = "agent:";
+
 /// Who did the thing a timeline entry records.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IssueActor {
@@ -347,7 +352,7 @@ impl IssueActor {
         match self {
             IssueActor::User => ACTOR_USER.to_owned(),
             IssueActor::System => ACTOR_SYSTEM.to_owned(),
-            IssueActor::Agent(id) => format!("agent:{}", id.as_str()),
+            IssueActor::Agent(id) => format!("{ACTOR_AGENT_PREFIX}{}", id.as_str()),
         }
     }
 
@@ -356,7 +361,7 @@ impl IssueActor {
             ACTOR_USER => Some(IssueActor::User),
             ACTOR_SYSTEM => Some(IssueActor::System),
             other => other
-                .strip_prefix("agent:")
+                .strip_prefix(ACTOR_AGENT_PREFIX)
                 .and_then(|id| AgentProfileId::parse(id.to_owned()).ok())
                 .map(IssueActor::Agent),
         }
@@ -637,6 +642,15 @@ pub trait ProjectStore: Send + Sync {
         project: &ProjectId,
     ) -> Result<std::collections::HashMap<IssueId, CardSignals>>;
 
+    /// The cards on this board an **agent** opened, by number.
+    ///
+    /// Card authorship is recorded nowhere but the timeline, and this is
+    /// one query rather than a timeline read per card on purpose: the board
+    /// driver asks it every pass, and a Backlog full of the operator's own
+    /// cards would otherwise cost a full event list each, every tick,
+    /// forever.
+    async fn agent_opened_issues(&self, project: &ProjectId) -> Result<Vec<i64>>;
+
     async fn set_project_archived(&self, id: &ProjectId, archived: bool) -> Result<bool>;
 
     async fn list_issues(&self, project: &ProjectId) -> Result<Vec<IssueRow>>;
@@ -759,6 +773,14 @@ pub enum RunTrigger {
     Stalled,
     /// Lead coordination triggered by a blocked card.
     Blocked,
+    /// The lead was woken because an **agent** parked this card in Backlog,
+    /// a column the board never pulls from. Like [`RunTrigger::Triage`],
+    /// the runner is not the card's assignee; unlike it, the question is
+    /// asked only about the board's own work breakdown. A card the operator
+    /// filed into Backlog is a decision to leave it alone, and the board
+    /// does not reopen it — the same rule that keeps a person's block from
+    /// waking anybody.
+    Grooming,
 }
 
 impl RunTrigger {
@@ -774,6 +796,7 @@ impl RunTrigger {
             RunTrigger::Review => "review",
             RunTrigger::Stalled => "stalled",
             RunTrigger::Blocked => "blocked",
+            RunTrigger::Grooming => "grooming",
         }
     }
 
@@ -789,6 +812,7 @@ impl RunTrigger {
             "review" => Some(RunTrigger::Review),
             "stalled" => Some(RunTrigger::Stalled),
             "blocked" => Some(RunTrigger::Blocked),
+            "grooming" => Some(RunTrigger::Grooming),
             _ => None,
         }
     }
@@ -797,7 +821,11 @@ impl RunTrigger {
     pub fn is_coordination(self) -> bool {
         matches!(
             self,
-            RunTrigger::Triage | RunTrigger::Review | RunTrigger::Stalled | RunTrigger::Blocked
+            RunTrigger::Triage
+                | RunTrigger::Review
+                | RunTrigger::Stalled
+                | RunTrigger::Blocked
+                | RunTrigger::Grooming
         )
     }
 }

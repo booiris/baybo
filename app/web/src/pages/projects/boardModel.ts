@@ -596,6 +596,7 @@ export const RUN_TRIGGER_LABEL: Record<IssueRun['trigger'], string> = {
   review: 'awaiting review',
   stalled: 'work stopped',
   blocked: 'blocked, needs a decision',
+  grooming: 'parked in Backlog',
 };
 
 /// How many runs the execution log shows before the rest fold away. A run is

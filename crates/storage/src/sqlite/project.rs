@@ -7,10 +7,10 @@ use rusqlite::OptionalExtension;
 use super::SqlitePool;
 use baybo_store::StorageError;
 use baybo_store::project::{
-    AttentionCounts, BoardActivity, CardSignals, IssueActor, IssueAttachment, IssueEventRow,
-    IssuePriority, IssueRow, IssueRunRow, IssueStatus, IssueUpdate, NewIssue, NewIssueEvent,
-    NewIssueRun, ProjectRow, ProjectStore, ProjectUpdate, Result, RunSpend, RunStatus, RunTrigger,
-    SettledRunFacts, Spend,
+    ACTOR_AGENT_PREFIX, AttentionCounts, BoardActivity, CardSignals, IssueActor, IssueAttachment,
+    IssueEventBody, IssueEventRow, IssuePriority, IssueRow, IssueRunRow, IssueStatus, IssueUpdate,
+    NewIssue, NewIssueEvent, NewIssueRun, ProjectRow, ProjectStore, ProjectUpdate, Result,
+    RunSpend, RunStatus, RunTrigger, SettledRunFacts, Spend,
 };
 
 pub struct SqliteProjectStore {
@@ -115,11 +115,20 @@ macro_rules! newest_run {
             "(SELECT r.",
             $column,
             " FROM issue_runs r WHERE r.issue_id = i.id \
-             AND r.trigger NOT IN ('triage', 'review', 'stalled', 'blocked') \
+             AND r.trigger NOT IN ('triage', 'review', 'stalled', 'blocked', 'grooming') \
              ORDER BY r.created_at DESC, r.id DESC LIMIT 1)"
         )
     };
 }
+
+/// The board's cards an agent opened, by number. Binds the project, the
+/// `Opened` discriminator and the agent actor prefix, so neither the kind
+/// column nor the actor spelling is written a second time here.
+///
+/// `DISTINCT` guards a hand-edited row rather than anything the runtime
+/// writes: a card is opened once.
+const AGENT_OPENED_ISSUES: &str = "SELECT DISTINCT number FROM issue_events \
+     WHERE project_id = ?1 AND kind = ?2 AND actor LIKE ?3";
 
 /// A live card whose newest run failed, written once. Written against
 /// `issues i`; binds `:done` and `:failed`.
@@ -700,6 +709,21 @@ impl ProjectStore for SqliteProjectStore {
             .into_iter()
             .map(|(issue, signals)| (IssueId::from(issue), signals))
             .collect())
+    }
+
+    async fn agent_opened_issues(&self, project: &ProjectId) -> Result<Vec<i64>> {
+        let project = project.as_str().to_string();
+        let opened = IssueEventBody::Opened.kind();
+        let prefix = format!("{ACTOR_AGENT_PREFIX}%");
+        self.pool
+            .interact("issues.agent_opened", move |conn| {
+                let mut stmt = conn.prepare(AGENT_OPENED_ISSUES)?;
+                let rows = stmt
+                    .query_map(rusqlite::params![project, opened, prefix], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<i64>>>()?;
+                Ok(rows)
+            })
+            .await
     }
 
     async fn set_project_archived(&self, id: &ProjectId, archived: bool) -> Result<bool> {
@@ -1631,14 +1655,14 @@ impl ProjectStore for SqliteProjectStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use baybo_store::project::{DEFAULT_MAX_PARALLEL_ISSUE_RUNS, IssueEventBody};
+    use baybo_store::project::DEFAULT_MAX_PARALLEL_ISSUE_RUNS;
 
     /// Pins `newest_run!`'s literal trigger list to the enum's own idea of
     /// coordination, so a variant added to one cannot silently miss the
     /// other.
     #[test]
     fn coordination_triggers_match_the_enum() {
-        let listed = ["triage", "review", "stalled", "blocked"];
+        let listed = ["triage", "review", "stalled", "blocked", "grooming"];
         let probe = newest_run!("status");
         for name in listed {
             assert!(
@@ -1659,6 +1683,7 @@ mod tests {
             RunTrigger::Review,
             RunTrigger::Stalled,
             RunTrigger::Blocked,
+            RunTrigger::Grooming,
         ]
         .into_iter()
         .filter(|t| t.is_coordination())
@@ -1792,6 +1817,57 @@ mod tests {
             "oldest first — reading order, not newest-first like the run log"
         );
         assert!(timeline.iter().all(|e| e.actor == IssueActor::User));
+    }
+
+    #[tokio::test]
+    async fn who_opened_a_card_is_read_off_the_timeline_and_stays_on_its_own_board() {
+        let (_dir, store) = store().await;
+        let mine = project("proj-o", "O");
+        let theirs = project("proj-x", "X");
+        for row in [&mine, &theirs] {
+            store.create_project(row).await.unwrap();
+        }
+        let agent = IssueActor::Agent(AgentProfileId::parse("dev-1".to_owned()).unwrap());
+        async fn opened(
+            store: &SqliteProjectStore,
+            project: &ProjectRow,
+            title: &str,
+            by: IssueActor,
+        ) -> IssueRow {
+            let issue = store
+                .create_issue(&new_issue(&project.id, title, IssueStatus::Backlog))
+                .await
+                .unwrap();
+            store
+                .append_event(&event(&issue, by, IssueEventBody::Opened))
+                .await
+                .unwrap();
+            issue
+        }
+
+        let ours = opened(&store, &mine, "spun out", agent.clone()).await;
+        opened(&store, &mine, "someday", IssueActor::User).await;
+        // A card with no `Opened` row at all: older than the entry, and
+        // deliberately not counted — an unknown author is not an agent.
+        store
+            .create_issue(&new_issue(
+                &mine.id,
+                "predates the entry",
+                IssueStatus::Backlog,
+            ))
+            .await
+            .unwrap();
+        let elsewhere = opened(&store, &theirs, "another board's", agent).await;
+
+        assert_eq!(
+            store.agent_opened_issues(&mine.id).await.unwrap(),
+            vec![ours.number],
+            "only the cards an agent opened, and only on the board asked about"
+        );
+        assert_eq!(
+            store.agent_opened_issues(&theirs.id).await.unwrap(),
+            vec![elsewhere.number]
+        );
     }
 
     #[tokio::test]

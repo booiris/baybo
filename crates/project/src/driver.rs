@@ -11,13 +11,20 @@
 //!   is right now, what should be running?", so running it twice on an
 //!   unchanged board promotes nothing the second time and a missed call
 //!   costs a delay rather than a card.
-//! - The lead asks ([`awaiting_triage`], [`awaiting_review`],
-//!   [`stalled`]) are level-triggered too, but waking the lead does not
-//!   change what they look at — an unassigned card the lead decided to
-//!   leave alone is still an unassigned card. [`already_asked`] is what
-//!   stops that from being a loop that bills for the same question every
-//!   time a run ends anywhere on the board: the lead is asked again only
-//!   when the card has *changed* since it last looked.
+//! - The lead asks ([`awaiting_triage`], [`awaiting_review`], [`stalled`],
+//!   [`blocked`], [`awaiting_grooming`]) are level-triggered too, but
+//!   waking the lead does not change what they look at — an unassigned card
+//!   the lead decided to leave alone is still an unassigned card.
+//!   [`already_asked`] is what stops that from being a loop that bills for
+//!   the same question every time a run ends anywhere on the board: the
+//!   lead is asked again only when the card has *changed* since it last
+//!   looked.
+//!
+//! Backlog is the one column the board **pulls** nothing from and still
+//! **asks** about, and the two halves of that are deliberate: a card only
+//! ever leaves Backlog because somebody decided it should, and
+//! [`awaiting_grooming`] asks the lead to be that somebody — but only for
+//! the cards the board itself filed there.
 
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
@@ -245,6 +252,41 @@ fn newest_block(
         .iter()
         .rev()
         .find(|e| matches!(e.body, baybo_store::project::IssueEventBody::Blocked { .. }))
+}
+
+/// The cards an **agent** parked in Backlog, in the order the lead should
+/// be asked about them.
+///
+/// Backlog is the one live column [`is_waiting`] does not open on, so a
+/// card left there is work nothing will ever start. When a person put it
+/// there that is the column doing its job — parked work the board is to
+/// leave alone, the same standing as a block a person set. When the board
+/// filled it itself it is a dead end, and `agent_opened` is what tells the
+/// two apart. Authorship, not the assignee: who *filed* the card is who
+/// decided where it sits.
+///
+/// Deliberately assignee-agnostic, unlike [`awaiting_triage`]. A staffed
+/// Backlog card is not work waiting for a slot — nothing is coming for it —
+/// so asking only about unstaffed ones would strand precisely the cards a
+/// lead had already thought about.
+pub(crate) fn awaiting_grooming(
+    issues: &[IssueRow],
+    in_flight: &BTreeSet<i64>,
+    agent_opened: &BTreeSet<i64>,
+    lead: &baybo_model::AgentProfileId,
+) -> Vec<IssueRow> {
+    let mut parked: Vec<IssueRow> = issues
+        .iter()
+        .filter(|i| {
+            i.status == IssueStatus::Backlog
+                && agent_opened.contains(&i.number)
+                && board_may_start(i)
+                && takes_a_lead_question(i, in_flight, lead)
+        })
+        .cloned()
+        .collect();
+    parked.sort_by(promotion_order);
+    parked
 }
 
 /// A card whose newest run was **cancelled** is not stalled: a cancel is a
@@ -603,6 +645,85 @@ mod tests {
         assert!(
             stalled(&[stuck], &busy([4]), &lead).is_empty(),
             "a card with a run recorded against it is not stalled"
+        );
+    }
+
+    #[test]
+    fn only_a_card_an_agent_parked_is_the_leads_to_groom() {
+        let lead = AgentProfileId::parse("lead".to_owned()).expect("agent");
+        let parked = |number: i64| {
+            let mut card = ready(number);
+            card.status = IssueStatus::Backlog;
+            card
+        };
+
+        let agents = parked(1);
+        let mut agents_unstaffed = parked(2);
+        agents_unstaffed.assignee = None;
+        let operators = parked(3);
+        let mut agents_blocked = parked(4);
+        agents_blocked.blocked_reason = Some("waiting on the operator".to_owned());
+        let mut agents_cancelled = parked(5);
+        agents_cancelled.cancelled_at = Some(Utc::now());
+        let mut leads_own = parked(6);
+        leads_own.assignee = Some(lead.clone());
+        let agents_running = parked(7);
+
+        let board = [
+            agents.clone(),
+            agents_unstaffed,
+            operators,
+            agents_blocked,
+            agents_cancelled,
+            leads_own,
+            agents_running,
+        ];
+        // Every card here but #3 was opened by an agent; #3 is the
+        // operator's, and is the whole point of the set.
+        let opened = busy([1, 2, 4, 5, 6, 7]);
+        assert_eq!(
+            numbers(&awaiting_grooming(&board, &busy([7]), &opened, &lead)),
+            vec![1, 2],
+            "the board asks about the cards it parked itself — staffed or not — and leaves the \
+             operator's card, a block, a cancelled card, the lead's own and a card already \
+             running exactly where they are"
+        );
+        assert!(
+            awaiting_grooming(&board, &busy([]), &busy([]), &lead).is_empty(),
+            "a board whose Backlog is entirely the operator's has no grooming question at all"
+        );
+        assert!(
+            awaiting_grooming(&[ready(1)], &busy([]), &busy([1]), &lead).is_empty(),
+            "and a Todo card is somebody else's question — grooming reads Backlog only"
+        );
+    }
+
+    #[test]
+    fn asking_about_backlog_does_not_make_it_a_queue() {
+        let lead = AgentProfileId::parse("lead".to_owned()).expect("agent");
+        let mut parked = ready(1);
+        parked.status = IssueStatus::Backlog;
+        let board = [parked.clone()];
+        let opened = busy([1]);
+
+        assert_eq!(
+            numbers(&awaiting_grooming(&board, &busy([]), &opened, &lead)),
+            vec![1],
+            "the control: this card is the lead's to groom"
+        );
+        assert!(
+            !is_promotable(&parked, &idle()),
+            "and the board still starts nothing out of Backlog"
+        );
+        assert!(
+            slate(&board, &idle(), 3).is_empty(),
+            "…however much room it has"
+        );
+        let mut unstaffed = parked.clone();
+        unstaffed.assignee = None;
+        assert!(
+            awaiting_triage(&[unstaffed], &idle()).is_empty(),
+            "…and an unstaffed one is a grooming question, not a triage one"
         );
     }
 

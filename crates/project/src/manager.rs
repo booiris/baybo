@@ -952,6 +952,10 @@ impl ProjectManager {
         let Some(lead) = self.coordinator(project).await else {
             return;
         };
+        // Only the timeline records who opened a card, and only the
+        // grooming question asks. One board-level read, skipped entirely
+        // when nothing is parked.
+        let agent_opened = self.agent_opened_cards(project, issues).await;
         let questions = [
             (
                 RunTrigger::Blocked,
@@ -972,6 +976,13 @@ impl ProjectManager {
                 RunTrigger::Triage,
                 crate::driver::awaiting_triage(issues, in_flight),
                 "asked the lead to staff an unassigned card",
+            ),
+            // Last: parked work is the least urgent thing on a board, and
+            // every question above it is about work already under way.
+            (
+                RunTrigger::Grooming,
+                crate::driver::awaiting_grooming(issues, in_flight, &agent_opened, &lead),
+                "asked the lead about a card an agent parked in Backlog",
             ),
         ];
         for (question, candidates, told) in questions {
@@ -1014,6 +1025,28 @@ impl ProjectManager {
                     tracing::info!(%project, issue = issue.number, "{told}");
                     return;
                 }
+            }
+        }
+    }
+
+    /// The cards on this board an agent opened.
+    ///
+    /// Empty when nothing sits in Backlog — the only question that asks —
+    /// and empty on a read failure, which leaves the operator's own parked
+    /// cards alone rather than waking the lead about them on a guess.
+    async fn agent_opened_cards(
+        &self,
+        project: &ProjectId,
+        issues: &[IssueRow],
+    ) -> std::collections::BTreeSet<i64> {
+        if !issues.iter().any(|i| i.status == IssueStatus::Backlog) {
+            return std::collections::BTreeSet::new();
+        }
+        match self.store.agent_opened_issues(project).await {
+            Ok(numbers) => numbers.into_iter().collect(),
+            Err(e) => {
+                tracing::warn!(%project, error = %e, "could not read who opened this board's cards");
+                std::collections::BTreeSet::new()
             }
         }
     }

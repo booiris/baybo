@@ -11021,7 +11021,8 @@
           "stage_barrier",
           "review",
           "stalled",
-          "blocked"
+          "blocked",
+          "grooming"
         ]
       },
       "SessionKind": {

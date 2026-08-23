@@ -2140,6 +2140,7 @@ forwards_everything_else! {
     enqueue_run(new: &NewIssueRun) -> StoreResult<IssueRunRow>;
     append_event(new: &NewIssueEvent) -> StoreResult<IssueEventRow>;
     list_events(issue: &IssueId) -> StoreResult<Vec<IssueEventRow>>;
+    agent_opened_issues(project: &ProjectId) -> StoreResult<Vec<i64>>;
     events_since(issue: &IssueId, since: DateTime<Utc>) -> StoreResult<Vec<IssueEventRow>>;
     set_issue_branch(id: &IssueId, branch: &str) -> StoreResult<bool>;
     list_runs(issue: &IssueId) -> StoreResult<Vec<IssueRunRow>>;
@@ -5671,6 +5672,29 @@ async fn queue_card(
         .into_issue()
 }
 
+/// Open a card straight into Backlog, as whoever filed it.
+async fn park_card(
+    f: &Fixture,
+    project: &ProjectId,
+    title: &str,
+    filed_by: IssueActor,
+    assignee: Option<AgentProfileId>,
+) -> IssueRow {
+    f.manager
+        .create_issue(
+            project,
+            filed_by,
+            NewIssueRequest {
+                status: IssueStatus::Backlog,
+                assignee,
+                ..new_issue(title)
+            },
+        )
+        .await
+        .expect("park")
+        .into_issue()
+}
+
 async fn set_ceiling(f: &Fixture, project: &ProjectRow, slots: usize) {
     f.manager
         .update_project(
@@ -6031,6 +6055,123 @@ async fn an_unstaffed_card_in_todo_wakes_the_lead_once() {
         1,
         "and it is not asked the same question again on every later pass"
     );
+}
+
+#[tokio::test]
+async fn the_lead_is_asked_about_the_backlog_the_board_filed_and_never_about_the_operators() {
+    let f = fixture().await;
+    let (p, dev) = driven_board(&f, 3).await;
+    let lead = lead_of(&f, &p.id).await;
+
+    let theirs = park_card(&f, &p.id, "someday, maybe", IssueActor::User, None).await;
+    let ours = park_card(
+        &f,
+        &p.id,
+        "spun out of the last run",
+        IssueActor::Agent(dev.clone()),
+        Some(dev.clone()),
+    )
+    .await;
+
+    tick(&f, &p.id).await;
+    let asked = f.dispatched.lock().clone();
+    assert_eq!(asked.len(), 1, "one question, and only one card can be it");
+    assert_eq!(asked[0].trigger, RunTrigger::Grooming);
+    assert_eq!(
+        asked[0].number, ours.number,
+        "the board asks about the card it filed itself, not the one the operator parked"
+    );
+    assert_eq!(
+        asked[0].agent_id, lead,
+        "and the lead is who answers for it"
+    );
+    assert_eq!(
+        column_of(&f, &p.id, ours.number).await,
+        IssueStatus::Backlog,
+        "asking is not moving: Backlog is left for the lead to empty"
+    );
+    assert_eq!(
+        column_of(&f, &p.id, theirs.number).await,
+        IssueStatus::Backlog,
+        "and the operator's parked card is not touched at all"
+    );
+
+    // The lead looks and decides it is not ready yet, which is an answer.
+    let grooming = asked[0].clone();
+    f.manager
+        .finish_run(
+            &grooming,
+            std::path::Path::new("/nonexistent/checkout"),
+            grooming.created_at,
+            baybo_project::RunOutcome {
+                status: RunStatus::Done,
+                error: None,
+                stopped_by_a_human: false,
+            },
+        )
+        .await;
+    tick(&f, &p.id).await;
+    tick(&f, &p.id).await;
+    assert_eq!(
+        f.dispatched.lock().len(),
+        1,
+        "and a card nothing changed about is not raised again every pass"
+    );
+}
+
+#[tokio::test]
+async fn grooming_a_card_into_todo_is_what_starts_it() {
+    let f = fixture().await;
+    let (p, dev) = driven_board(&f, 3).await;
+    let ours = park_card(
+        &f,
+        &p.id,
+        "ready when somebody says so",
+        IssueActor::Agent(dev.clone()),
+        Some(dev.clone()),
+    )
+    .await;
+    tick(&f, &p.id).await;
+    let grooming = f.dispatched.lock()[0].clone();
+    assert_eq!(grooming.trigger, RunTrigger::Grooming);
+
+    // The lead answers by moving it up, from inside its own grooming run.
+    f.manager
+        .move_issue(
+            &p.id,
+            ours.number,
+            IssueActor::Agent(grooming.agent_id.clone()),
+            IssueStatus::Todo,
+            &[ours.number],
+        )
+        .await
+        .expect("groom");
+    f.manager
+        .finish_run(
+            &grooming,
+            std::path::Path::new("/nonexistent/checkout"),
+            grooming.created_at,
+            baybo_project::RunOutcome {
+                status: RunStatus::Done,
+                error: None,
+                stopped_by_a_human: false,
+            },
+        )
+        .await;
+
+    assert_eq!(tick(&f, &p.id).await, 1, "now the board has a card to pull");
+    assert_eq!(
+        column_of(&f, &p.id, ours.number).await,
+        IssueStatus::InProgress
+    );
+    let runs = f.dispatched.lock().clone();
+    assert_eq!(runs.len(), 2);
+    assert_eq!(
+        runs[1].trigger,
+        RunTrigger::Promoted,
+        "and it starts the way every other Todo card does"
+    );
+    assert_eq!(runs[1].agent_id, dev, "as the card's own assignee");
 }
 
 #[tokio::test]

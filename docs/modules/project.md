@@ -48,7 +48,7 @@ every door leads through it.
 | `actors.rs` | What an agent-facing surface calls the somebody a timeline entry names |
 | `mentions.rs` | `@handle` scanning, and when a mention is a handover |
 | `stages.rs` | Sub-issues, `is_finished`, the stage barrier's two questions, the progress ring |
-| `driver.rs` | Which Todo cards the board starts by itself, in what order, and which cards the lead is asked about (staffing, review, stalled work) |
+| `driver.rs` | Which Todo cards the board starts by itself, in what order, and which cards the lead is asked about (staffing, review, stalled work, blocks, the Backlog the board filed) |
 | `budget.rs` | `Headroom` and the UTC-day window a daily ceiling measures |
 | `timeline.rs` | `diff_events` — an edit reduced to the entries worth writing |
 | `worktree.rs` | The per-issue git worktree: create, branch, resolve the commit identity, reclaim |
@@ -800,7 +800,7 @@ it is woken. One card **that was actually asked**: a candidate whose enqueue
 answers `None` woke nobody, so the pass goes on to the next one. Returning
 there instead let a single card the board can never start a run on — a
 finished one still carrying a block reason, an agent moved off baybo —
-swallow every question behind it, on every tick, in silence. Four questions,
+swallow every question behind it, on every tick, in silence. Five questions,
 in the order they matter, each its own trigger so the execution log says which
 was asked (`RunTrigger::is_coordination`):
 
@@ -873,6 +873,38 @@ was asked (`RunTrigger::is_coordination`):
   on the card.
 - **Triage** — a card that reached Todo with nobody on it: the board cannot
   start it, so the question is *who should do this*.
+- **Grooming** — a card parked in **Backlog** that an **agent** filed there.
+  Asked last, because everything above it is about work already under way and
+  this is about work that has not started.
+
+  Backlog is the one live column the board **pulls** nothing from and still
+  **asks** about, and both halves are deliberate. `driver::is_waiting` opens
+  on `Todo`, so a card in Backlog is work nothing will ever start on its own;
+  when a *person* put it there that is the column doing its job, and the board
+  reopening it would be overruling them the same way adjudicating their block
+  would. When the **board** put it there it is a dead end, and before this
+  question existed it was the board's only unreachable state: with Todo, In
+  Progress and the non-lead half of Review all empty, every remaining wake is
+  downstream of a card sitting in a column the driver reads, so a board that
+  finished its last card went quiet with no error, no log line and no badge,
+  until a person commented on something.
+
+  Authorship, not the assignee, is what tells the two apart, and it lives only
+  on the timeline — the same shape as `block_is_an_agents_question`, but asked
+  as **one query per board** (`ProjectStore::agent_opened_issues`) rather than
+  a timeline read per card: this question is asked every pass, and a Backlog
+  full of the operator's own cards would otherwise cost a full event list each,
+  every tick, forever. A card with no `Opened` entry at all — older than the
+  entry — counts as nobody's, which leaves it parked.
+
+  Deliberately **assignee-agnostic**, unlike Triage. A staffed Backlog card is
+  not work waiting for a slot; nothing is coming for it either. Asking only
+  about the unstaffed ones would strand precisely the cards a lead had already
+  thought about.
+
+  Asking is not moving: the wake hands the lead the card, and only the lead
+  moves it to Todo — where the ordinary promoter takes it on the next tick, as
+  `RunTrigger::Promoted`, run by its own assignee.
 
 Cards whose assignee *is* the lead take no question at all
 (`driver::takes_a_lead_question`) — those are the lead's own, its
