@@ -29,14 +29,6 @@
       "count": 1
     }
   },
-  "src/pages/AgentsPage.tsx": {
-    "@typescript-eslint/no-unnecessary-condition": {
-      "count": 1
-    },
-    "@typescript-eslint/strict-boolean-expressions": {
-      "count": 1
-    }
-  },
   "src/pages/AnalyticsPage.tsx": {
     "@typescript-eslint/no-unnecessary-condition": {
       "count": 1

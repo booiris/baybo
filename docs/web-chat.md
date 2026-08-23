@@ -568,7 +568,7 @@ The header model picker is a per-session pin (`SessionView.model` ↔ `session.s
 
 Layout, top to bottom:
 - **Chat** (`RiChat3Line`) — the primary destination, linking `/chat`. Rendered as a distinct bordered tile separated from the rest by a hairline rule (`border-t-2 border-black/25`). Its tooltip is `Chat · Baybo v<version>` when a `version` prop is passed, else just `Chat` (`version` is threaded down from `App.tsx`).
-- **Admin surfaces** — a `<nav>` mapping the `DESTINATIONS` array, in order: `Log` → `/logs` (`RiFileList3Line`), `Trace` → `/traces` (`RiGitMergeLine`), `Cron` → `/cron` (`RiAlarmLine`), `Jobs` → `/jobs` (`RiStackLine`), `Analytics` → `/analytics` (`RiBarChartBoxLine`), `Agents` → `/agents` (`RiRobot2Line`), `LLM` → `/llm` (`RiCpuLine`).
+- **Admin surfaces** — a `<nav>` mapping the `DESTINATIONS` array, in order: `Log` → `/logs` (`RiFileList3Line`), `Trace` → `/traces` (`RiGitMergeLine`), `Cron` → `/cron` (`RiAlarmLine`), `Jobs` → `/jobs` (`RiStackLine`), `Analytics` → `/analytics` (`RiBarChartBoxLine`), `LLM` → `/llm` (`RiCpuLine`).
 - **Logout** (`RiLogoutBoxRLine`) — pinned to the bottom (`mt-auto`); calls `logout()` from `useAuth()`. It is a `<button>`, not a route link.
 
 Each label surfaces only as the native `title` hover tooltip; the rail shows icons exclusively. Links use react-router `NavLink`, so the active route's tile gets the pressed/active styling (`railActive`: `bg-surface`, hard shadow, push-down on `:active`) vs. the idle hover treatment (`railIdle`).
