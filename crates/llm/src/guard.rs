@@ -105,10 +105,10 @@ impl BillableLlm {
     }
 
     /// The effort the wrapped client will actually apply, given a
-    /// per-request override. `pub(crate)` because its one consumer is
-    /// [`BoundBilledLlm`]'s recorder — the value belongs on the cost row,
-    /// not in caller-visible control flow.
-    pub(crate) fn effective_effort(&self, requested: Option<&str>) -> Option<String> {
+    /// per-request override. Describes the outgoing request, so it resolves
+    /// before the call and lands on both the cost row and the `LlmCall`
+    /// span's begin payload.
+    pub fn effective_effort(&self, requested: Option<&str>) -> Option<String> {
         self.inner.effective_effort(requested)
     }
 

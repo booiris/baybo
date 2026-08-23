@@ -84,6 +84,8 @@ impl CompressionRunner {
             trigger,
         } = self;
 
+        let reasoning_effort = llm_client.effective_effort(request.reasoning_effort.as_deref());
+
         // `cancel_ctx` borrows the token for span/step outcome classification;
         // the loop body needs its own handle to race the provider call.
         let cancel = cancel_token.clone();
@@ -102,7 +104,7 @@ impl CompressionRunner {
                     let begin = LlmCallBegin {
                         model_id: model_info.id.clone(),
                         provider: model_info.provider.clone(),
-                        provider_config_hash: String::new(),
+                        reasoning_effort: reasoning_effort.clone(),
                         // A `Persisted` ordinal reference to the transcript
                         // prefix (so the span doesn't re-embed the whole
                         // summarized window) plus an inline suffix for the

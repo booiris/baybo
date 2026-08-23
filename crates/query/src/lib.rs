@@ -3102,7 +3102,7 @@ mod tests {
                         begin: LlmCallBegin {
                             model_id: "claude".into(),
                             provider: "anthropic".into(),
-                            provider_config_hash: String::new(),
+                            reasoning_effort: None,
                             input_messages: LlmCallInputs::Persisted {
                                 last_ordinal: last,
                                 prefix_len: active.len(),
@@ -3205,7 +3205,6 @@ mod tests {
                     kind: SpanKind::ToolCall {
                         begin: ToolCallBegin {
                             tool_name: "Read".into(),
-                            tool_artifact_hash: String::new(),
                             triggered_by: None,
                             params: serde_json::json!({}),
                         },
@@ -3326,7 +3325,7 @@ mod tests {
                         begin: LlmCallBegin {
                             model_id: "claude".into(),
                             provider: "anthropic".into(),
-                            provider_config_hash: String::new(),
+                            reasoning_effort: None,
                             input_messages: LlmCallInputs::Persisted {
                                 last_ordinal: n,
                                 prefix_len: 99,
@@ -3477,7 +3476,7 @@ mod tests {
                         begin: LlmCallBegin {
                             model_id: "claude".into(),
                             provider: "anthropic".into(),
-                            provider_config_hash: String::new(),
+                            reasoning_effort: None,
                             input_messages: LlmCallInputs::Persisted {
                                 last_ordinal: pre_last,
                                 prefix_len: pre_active.len(),
@@ -3566,7 +3565,7 @@ mod tests {
                         begin: LlmCallBegin {
                             model_id: "claude".into(),
                             provider: "anthropic".into(),
-                            provider_config_hash: String::new(),
+                            reasoning_effort: None,
                             input_messages: LlmCallInputs::Persisted {
                                 last_ordinal: post_last,
                                 prefix_len: post_active_count,
@@ -3775,7 +3774,7 @@ mod tests {
                     begin: LlmCallBegin {
                         model_id: "m".into(),
                         provider: "p".into(),
-                        provider_config_hash: "h".into(),
+                        reasoning_effort: None,
                         input_messages: LlmCallInputs::empty(),
                         temperature: None,
                         tools: None,
@@ -3951,7 +3950,7 @@ mod tests {
                         begin: LlmCallBegin {
                             model_id: "claude".into(),
                             provider: "anthropic".into(),
-                            provider_config_hash: String::new(),
+                            reasoning_effort: None,
                             input_messages: LlmCallInputs::Persisted {
                                 last_ordinal: last,
                                 prefix_len: 1,
@@ -4072,7 +4071,7 @@ mod tests {
                         begin: LlmCallBegin {
                             model_id: "claude".into(),
                             provider: "anthropic".into(),
-                            provider_config_hash: String::new(),
+                            reasoning_effort: None,
                             input_messages: LlmCallInputs::Persisted {
                                 last_ordinal: last,
                                 prefix_len: 2,
@@ -4167,7 +4166,6 @@ mod tests {
                     kind: SpanKind::ToolCall {
                         begin: ToolCallBegin {
                             tool_name: "bash".into(),
-                            tool_artifact_hash: String::new(),
                             triggered_by: None,
                             params: serde_json::json!({}),
                         },

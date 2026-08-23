@@ -445,7 +445,6 @@ Both previews are bounded by `SPAN_EVENT_TEXT_MAX_BYTES`. They used to carry the
 - Depends on `baybo-llm`, `baybo-model`, `baybo-security`, `baybo-storage`, `baybo-workspace`, plus `rmcp` + `oauth2` + `axum` (callback listener) for the MCP client
 - Does not install third-party artifacts
 - Defines the `ApprovalGate` trait but never implements the user-facing UX — the per-connection gate is built by the gateway's WS sidecar (`ChannelApprovalGate` backed by an `ApprovalQueue`), and the TUI renders the resulting prompts inline in its scrollback
-- `artifact_hash` must be recorded as `tool_artifact_hash` on the `ToolCall` span's `trace::ToolCallBegin` — today `ToolManifest` carries no artifact hash, so the executor writes an empty string
 
 ## Collaboration
 

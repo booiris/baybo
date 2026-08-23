@@ -534,7 +534,6 @@ impl ToolExecutor {
                 begin: ToolCallBegin {
                     tool_name: tool_name_owned.clone(),
                     // ToolManifest does not yet carry an artifact hash.
-                    tool_artifact_hash: String::new(),
                     triggered_by: triggering_llm_span.map(|llm_span_id| ToolCallOrigin {
                         llm_span_id,
                         tool_use_id: tool_use_id.clone(),

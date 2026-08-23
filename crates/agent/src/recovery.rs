@@ -510,7 +510,7 @@ mod tests {
             begin: LlmCallBegin {
                 model_id: "test-model".into(),
                 provider: "test".into(),
-                provider_config_hash: String::new(),
+                reasoning_effort: None,
                 input_messages: LlmCallInputs::empty(),
                 temperature: None,
                 tools: None,
@@ -523,7 +523,6 @@ mod tests {
         SpanKind::ToolCall {
             begin: ToolCallBegin {
                 tool_name: "test_tool".into(),
-                tool_artifact_hash: String::new(),
                 triggered_by: None,
                 params: serde_json::Value::Null,
             },

@@ -236,7 +236,7 @@ async fn seed_llm_span(
                     begin: LlmCallBegin {
                         model_id: "claude".into(),
                         provider: "anthropic".into(),
-                        provider_config_hash: String::new(),
+                        reasoning_effort: None,
                         input_messages: LlmCallInputs::Inline(vec![
                             ChatMessage::system(vec![ContentBlock::Text(
                                 "you are a careful assistant".into(),
@@ -381,7 +381,6 @@ async fn a_tool_span_has_no_context_to_break_down() {
                 kind: SpanKind::ToolCall {
                     begin: ToolCallBegin {
                         tool_name: "bash".into(),
-                        tool_artifact_hash: String::new(),
                         triggered_by: None,
                         params: serde_json::json!({}),
                     },

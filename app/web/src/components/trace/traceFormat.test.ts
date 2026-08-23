@@ -21,7 +21,7 @@ const T0 = '2026-01-01T00:00:00.000Z';
 const T1 = '2026-01-01T00:00:01.000Z';
 
 function llmBegin() {
-  return { model_id: 'm', provider: 'p', provider_config_hash: 'h', input_messages: [] };
+  return { model_id: 'm', provider: 'p', input_messages: [] };
 }
 
 function llmSpan(result: LlmCallResult): Span {
@@ -121,7 +121,7 @@ describe('turnInputText / turnOutputText — meta steps riding the turn', () => 
       step_id: `step-${id}`,
       kind: {
         kind: 'llm_call',
-        begin: { model_id: 'm', provider: 'p', provider_config_hash: 'h', input_messages: messages },
+        begin: { model_id: 'm', provider: 'p', input_messages: messages },
         result: { output_content: output },
       },
       parallel_group: null,

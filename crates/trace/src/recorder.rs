@@ -388,7 +388,7 @@ mod tests {
             begin: crate::LlmCallBegin {
                 model_id: "claude".into(),
                 provider: "anthropic".into(),
-                provider_config_hash: "h".into(),
+                reasoning_effort: None,
                 input_messages: crate::LlmCallInputs::empty(),
                 temperature: None,
                 tools: None,

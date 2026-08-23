@@ -55,11 +55,13 @@ impl TitleRunner {
             reasoning_effort: None,
         };
 
+        let reasoning_effort = llm_client.effective_effort(request.reasoning_effort.as_deref());
+
         let cancel_ctx = Some((&cancel_token, baybo_turn::CancelReason::ParentCancelled));
         let begin = LlmCallBegin {
             model_id: model_info.id.clone(),
             provider: model_info.provider.clone(),
-            provider_config_hash: String::new(),
+            reasoning_effort,
             input_messages: LlmCallInputs::Inline(messages),
             temperature: request.temperature,
             tools: None,

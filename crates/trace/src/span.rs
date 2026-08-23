@@ -100,7 +100,6 @@ impl SpanKind {
 pub struct LlmCallBegin {
     pub model_id: String,
     pub provider: String,
-    pub provider_config_hash: String,
     /// What the LLM saw on this call. The two variants split based on
     /// whether the input is in the per-session append-only log:
     ///
@@ -114,6 +113,14 @@ pub struct LlmCallBegin {
     pub input_messages: LlmCallInputs,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
+    /// The thinking level this call actually ran at, on baybo's ladder:
+    /// the session's pin when set, else the entry's configured level, else
+    /// whatever the provider resolves for itself. `None` when the provider's
+    /// dialect carries no effort at all, and on spans recorded before the
+    /// field existed. Same spelling as `cost_records.reasoning_effort`, so
+    /// a span and its spend row agree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     /// The tool set this call offered the model, as a reference into the
     /// content-addressed `llm_tool_sets` table. `None` when the call
     /// offered no tools (compression, title generation, the progress
@@ -270,7 +277,6 @@ pub struct LlmCallResult {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCallBegin {
     pub tool_name: String,
-    pub tool_artifact_hash: String,
     /// Pairing back to the LLM `Span` that emitted the tool_use block.
     /// Currently always `Some` — every tool call goes through the agent
     /// loop. The field stays optional for storage backwards compat with
@@ -517,7 +523,7 @@ mod tests {
             begin: LlmCallBegin {
                 model_id: "claude-sonnet-4-6".into(),
                 provider: "anthropic".into(),
-                provider_config_hash: "cfg-hash".into(),
+                reasoning_effort: Some("high".into()),
                 input_messages: LlmCallInputs::empty(),
                 temperature: Some(0.7),
                 tools: None,
@@ -530,7 +536,6 @@ mod tests {
         SpanKind::ToolCall {
             begin: ToolCallBegin {
                 tool_name: "bash".into(),
-                tool_artifact_hash: "tool-hash".into(),
                 triggered_by: Some(ToolCallOrigin {
                     llm_span_id: SpanId::new(),
                     tool_use_id: "tu-1".into(),

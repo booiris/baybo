@@ -1798,6 +1798,10 @@ impl AgentLoop {
             reasoning_effort: self.initial_effort.clone(),
         };
 
+        let reasoning_effort = self
+            .llm_client
+            .effective_effort(request.reasoning_effort.as_deref());
+
         let input_messages = self.context_manager.build_call_input_marker().await;
 
         // What the model was allowed to call, recorded beside what it was
@@ -1821,7 +1825,7 @@ impl AgentLoop {
             LlmCallBegin {
                 model_id: model_info.id.clone(),
                 provider: model_info.provider.clone(),
-                provider_config_hash: String::new(),
+                reasoning_effort,
                 input_messages,
                 temperature: None,
                 tools,

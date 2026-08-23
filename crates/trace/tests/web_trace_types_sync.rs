@@ -371,3 +371,189 @@ fn web_trace_types_cover_the_turn_input_kinds() {
         );
     }
 }
+
+/// The field names one hand-maintained TS interface declares.
+///
+/// Scraped by line, so the doc comments interleaved through these interfaces
+/// can't masquerade as fields: a continuation line starts with `*`, which no
+/// identifier does.
+fn declared_fields(ts: &str, ty: &str) -> Vec<String> {
+    let header = format!("export interface {ty} {{");
+    let Some(start) = ts.find(&header) else {
+        panic!("the mirror has no `{header}` — did the interface get renamed?")
+    };
+    let body = &ts[start + header.len()..];
+    let body = &body[..body.find("\n}").unwrap_or(body.len())];
+    body.lines()
+        .filter_map(|line| {
+            let name = line.trim().split(['?', ':']).next()?.trim();
+            let ok = !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+                && line.trim_start().starts_with(name)
+                && line.contains(':');
+            ok.then(|| name.to_string())
+        })
+        .collect()
+}
+
+/// The keys a fully populated Rust value actually serializes to.
+///
+/// Populated, not defaulted: every optional field on these types carries
+/// `skip_serializing_if`, so a `None`/empty sample would report a wire shape
+/// far smaller than the real one and the comparison below would pass while
+/// guarding nothing.
+fn wire_fields<T: serde::Serialize>(sample: &T, ty: &str) -> Vec<String> {
+    serde_json::to_value(sample)
+        .unwrap_or_else(|e| panic!("{ty} serializes ({e})"))
+        .as_object()
+        .unwrap_or_else(|| panic!("{ty} serializes to a JSON object"))
+        .keys()
+        .cloned()
+        .collect()
+}
+
+fn assert_fields_match(ty: &str, wire: &[String], mirror: &str, ts: &str) {
+    let declared = declared_fields(ts, ty);
+    assert!(
+        !declared.is_empty(),
+        "scraped no fields out of `{ty}` in {mirror} — the scraper is broken, \
+         not the mirror"
+    );
+    for field in wire {
+        assert!(
+            declared.contains(field),
+            "`{ty}.{field}` is emitted by Rust but missing from {mirror}. The \
+             viewer there cannot render a field it does not know about, and \
+             nothing else catches this — both mirrors are hand-maintained. \
+             Fix: declare it on `{ty}` in that file."
+        );
+    }
+    for field in &declared {
+        assert!(
+            wire.contains(field),
+            "{mirror} declares `{ty}.{field}`, which Rust does not emit. Either \
+             it was removed from `baybo_trace` and the mirror kept it, or it was \
+             never real — delete it there, or add the Rust field."
+        );
+    }
+}
+
+/// Span payload fields, both directions, against both mirrors.
+///
+/// The kind tests above pin the `SpanKind` / `StepKind` *tags*; nothing pinned
+/// the payloads behind them. A field added to `LlmCallBegin` and missed by a
+/// mirror renders as nothing at all — no fallback, no white screen, no failing
+/// test — and a field deleted here lingers as a row bound to `undefined`.
+///
+/// Only pure serializations of these structs belong here. `LlmToolSet` is
+/// deliberately absent: its REST body is assembled by hand in
+/// `crates/gateway/src/api/admin/traces.rs` (`get_tool_set` adds `hash`
+/// alongside the struct's `tools`), so it is an envelope, not a mirror.
+#[test]
+fn web_trace_types_cover_every_span_payload_field() {
+    use baybo_model::{SpanId, ToolSetHash};
+    use baybo_trace::{
+        LlmCallBegin, LlmCallInputs, LlmCallResult, LlmToolCallRecord, LlmToolSetRef,
+        ToolCallBegin, ToolCallOrigin, ToolCallOutput, ToolCallResult,
+    };
+
+    let origin = ToolCallOrigin {
+        llm_span_id: SpanId::new(),
+        tool_use_id: "toolu_1".into(),
+    };
+    let record = LlmToolCallRecord {
+        id: "toolu_1".into(),
+        name: "bash".into(),
+        arguments: serde_json::json!({}),
+    };
+    let tool_set = LlmToolSetRef {
+        hash: ToolSetHash::from_digest(&[0u8; 32]),
+        count: 1,
+    };
+
+    let begin = LlmCallBegin {
+        model_id: "claude-sonnet-4-6".into(),
+        provider: "anthropic".into(),
+        input_messages: LlmCallInputs::empty(),
+        temperature: Some(0.7),
+        reasoning_effort: Some("high".into()),
+        tools: Some(tool_set.clone()),
+    };
+    let result = LlmCallResult {
+        output_content: "hi".into(),
+        thinking: Some("...".into()),
+        tool_calls: vec![record.clone()],
+        input_tokens: 1,
+        output_tokens: 1,
+        cached_input_tokens: 1,
+        cache_creation_input_tokens: 1,
+    };
+    let tool_begin = ToolCallBegin {
+        tool_name: "bash".into(),
+        triggered_by: Some(origin.clone()),
+        params: serde_json::json!({}),
+    };
+    let tool_result = ToolCallResult {
+        output: ToolCallOutput::Inline(serde_json::json!("ok")),
+        success: true,
+        output_truncated_from: Some(4096),
+    };
+
+    let payloads: Vec<(&str, Vec<String>)> = vec![
+        ("LlmCallBegin", wire_fields(&begin, "LlmCallBegin")),
+        ("LlmCallResult", wire_fields(&result, "LlmCallResult")),
+        ("ToolCallBegin", wire_fields(&tool_begin, "ToolCallBegin")),
+        (
+            "ToolCallResult",
+            wire_fields(&tool_result, "ToolCallResult"),
+        ),
+        (
+            "LlmToolCallRecord",
+            wire_fields(&record, "LlmToolCallRecord"),
+        ),
+        ("ToolCallOrigin", wire_fields(&origin, "ToolCallOrigin")),
+        ("LlmToolSetRef", wire_fields(&tool_set, "LlmToolSetRef")),
+    ];
+
+    for (mirror, ts) in mirrors() {
+        for (ty, wire) in &payloads {
+            assert_fields_match(ty, wire, mirror, &ts);
+        }
+    }
+}
+
+/// The payload types only the dashboard mirrors.
+///
+/// `bench/bench-web` reads exported trace files and renders a tool result as
+/// an opaque value, so it declares neither the persisted-output marker nor the
+/// tool definitions the dashboard fetches per hash.
+#[test]
+fn dashboard_trace_types_cover_the_dashboard_only_payload_fields() {
+    use baybo_model::ContentBlock;
+    use baybo_trace::{LlmToolDefinition, PersistedToolCallOutput};
+
+    let ts = web_trace_types();
+
+    let block = || vec![ContentBlock::Text("x".into())];
+    let persisted = PersistedToolCallOutput::new("toolu_1".into(), block(), block());
+    let definition = LlmToolDefinition {
+        name: "bash".into(),
+        description: "run a command".into(),
+        parameters_schema: serde_json::json!({}),
+    };
+
+    assert_fields_match(
+        "PersistedToolCallOutput",
+        &wire_fields(&persisted, "PersistedToolCallOutput"),
+        MIRRORS[0],
+        &ts,
+    );
+    assert_fields_match(
+        "LlmToolDefinition",
+        &wire_fields(&definition, "LlmToolDefinition"),
+        MIRRORS[0],
+        &ts,
+    );
+}
