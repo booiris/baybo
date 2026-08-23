@@ -17,6 +17,7 @@ struct Fixture {
     manager: ProjectManager,
     store: Arc<dyn baybo_store::project::ProjectStore>,
     dispatched: Arc<parking_lot::Mutex<Vec<IssueRunRow>>>,
+    stopped: Arc<parking_lot::Mutex<Vec<(SessionId, baybo_project::RunStopReason)>>>,
     agents: Arc<dyn baybo_store::AgentProfileStore>,
     blobs: Arc<dyn baybo_store::BlobStore>,
     paths: WorkspacePaths,
@@ -63,6 +64,8 @@ async fn fixture() -> Fixture {
         .await
         .expect("store");
     let dispatched: Arc<parking_lot::Mutex<Vec<IssueRunRow>>> = Arc::default();
+    let stopped: Arc<parking_lot::Mutex<Vec<(SessionId, baybo_project::RunStopReason)>>> =
+        Arc::default();
     Fixture {
         manager: ProjectManager::new(
             Arc::clone(&store.project),
@@ -74,11 +77,15 @@ async fn fixture() -> Fixture {
                 let seen = Arc::clone(&dispatched);
                 Arc::new(move |run| seen.lock().push(run))
             },
+            Arc::new(RecordingStopper {
+                stopped: Arc::clone(&stopped),
+            }),
         ),
         agents: Arc::clone(&store.agent_profile),
         blobs: Arc::clone(&store.blob),
         store: Arc::clone(&store.project),
         dispatched,
+        stopped,
         paths,
         _workspace: workspace,
     }
@@ -1072,6 +1079,93 @@ async fn assigning_work_already_in_flight_starts_it_and_never_twice() {
         "an issue holds one run at a time"
     );
     assert_eq!(f.manager.list_runs(&p.id, 1).await.expect("runs").len(), 1);
+}
+
+/// An agent that refuses itself leaves nothing on the card.
+///
+/// A reviewer bouncing a card back — comment, reassign, move Review → In
+/// Progress — does all three from inside its own live run, so the move's
+/// implied run is refused by the very run asking for it. Nothing is lost:
+/// settling that run enqueues the follow-up that does the work. Recording
+/// it told the operator "did not start a run — run #N still has this card"
+/// about the run that asked, which is the one refusal nobody can act on.
+#[tokio::test]
+async fn an_agent_that_takes_its_own_cards_slot_records_nothing() {
+    let f = fixture().await;
+    let p = f.manager.create_project(new_project("p")).await.expect("p");
+    let reviewer = seed_agent(&f, &p.id, "reviewer", AgentFramework::Baybo).await;
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(reviewer.clone()),
+                ..new_issue("under review")
+            },
+        )
+        .await
+        .expect("issue");
+    let run = f.dispatched.lock()[0].clone();
+    assert!(
+        f.manager
+            .start_run(&run, &SessionId::from("sess-review"))
+            .await
+            .expect("claim"),
+        "the reviewer's run is live before it touches the card"
+    );
+    f.manager
+        .move_issue(
+            &p.id,
+            1,
+            IssueActor::Agent(reviewer.clone()),
+            IssueStatus::Review,
+            &[1],
+        )
+        .await
+        .expect("park it in review");
+
+    // Exactly what the reviewer's tool calls do: hand the card over, then
+    // put it back in the working column. Only the move implies a run.
+    f.manager
+        .update_issue(
+            &p.id,
+            1,
+            IssueActor::Agent(reviewer.clone()),
+            IssueUpdate {
+                assignee: Some(Some(dev.clone())),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("hand it over");
+    f.manager
+        .move_issue(
+            &p.id,
+            1,
+            IssueActor::Agent(reviewer.clone()),
+            IssueStatus::InProgress,
+            &[1],
+        )
+        .await
+        .expect("bounce it back");
+
+    let timeline = f.manager.timeline(&p.id, 1).await.expect("timeline");
+    assert!(
+        timeline.iter().any(
+            |e| matches!(&e.body, IssueEventBody::Assigned { to, .. } if to.as_ref() == Some(&dev))
+        ),
+        "the handover itself still stands"
+    );
+    assert!(
+        !timeline
+            .iter()
+            .any(|e| matches!(e.body, IssueEventBody::RunRefused { .. })),
+        "but the run its own live run refused is not a refusal the card reports"
+    );
 }
 
 /// A swallowed handover says so on the card.
@@ -2094,6 +2188,7 @@ async fn a_board_that_cannot_read_its_holds_still_reports_what_it_re_drove() {
             let seen = Arc::clone(&dispatched);
             Arc::new(move |run| seen.lock().push(run))
         },
+        baybo_project::no_stopper(),
     );
 
     assert_eq!(
@@ -4846,14 +4941,9 @@ async fn cancelling_a_resumed_run_settles_it_rather_than_chasing_a_dead_turn() {
         .expect("claim");
     f.manager.resume_unsettled_runs().await.expect("boot sweep");
 
-    assert!(
-        f.manager
-            .cancel_run(&p.id, 1)
-            .await
-            .expect("cancel")
-            .is_none(),
-        "a queued run has no live turn to stop, session or no session"
-    );
+    // No live turn to stop, session or no session: the row is settled where
+    // it stands rather than handed to a stopper that would find nothing.
+    f.manager.cancel_run(&p.id, 1).await.expect("cancel");
     assert_eq!(
         f.manager.list_runs(&p.id, 1).await.expect("runs")[0].status,
         RunStatus::Cancelled
@@ -4888,6 +4978,160 @@ async fn card_being_worked() -> (Fixture, ProjectRow, AgentProfileId, IssueRunRo
     );
     f.dispatched.lock().clear();
     (f, p, dev, run)
+}
+
+/// Records what the board asked to stop, and stops nothing: the executor
+/// that would settle the row is not running in these tests.
+struct RecordingStopper {
+    stopped: Arc<parking_lot::Mutex<Vec<(SessionId, baybo_project::RunStopReason)>>>,
+}
+
+#[async_trait::async_trait]
+impl baybo_project::IssueRunStopper for RecordingStopper {
+    async fn stop_run(
+        &self,
+        session: &SessionId,
+        reason: baybo_project::RunStopReason,
+    ) -> Result<(), String> {
+        self.stopped.lock().push((session.clone(), reason));
+        Ok(())
+    }
+}
+
+/// A live run is its executor's, even when the card it is on is finished.
+///
+/// `redrive_after_unblock` is the one door into `card_for` that does not
+/// filter by status, and `verdict` used to answer `CallOff` on a finished
+/// card before it looked at the row. So a single `update_issue` that lifted
+/// a block *and* cancelled the card settled the row `Cancelled` underneath
+/// the agent still working it — and stamped it "interrupted before it could
+/// resume", which it was not. Two writes then raced to record one outcome.
+#[tokio::test]
+async fn unblocking_and_cancelling_at_once_leaves_a_live_run_to_its_executor() {
+    let (f, p, _dev, run) = card_being_worked().await;
+    f.manager
+        .update_issue(
+            &p.id,
+            1,
+            IssueActor::User,
+            IssueUpdate {
+                blocked_reason: Some(Some("waiting on a decision".into())),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("block it");
+
+    // Both halves in one patch: the unblock is what reaches
+    // `redrive_after_unblock`, the cancel is what makes the card stop
+    // accepting runs. Either alone leaves the row alone.
+    f.manager
+        .update_issue(
+            &p.id,
+            1,
+            IssueActor::User,
+            IssueUpdate {
+                blocked_reason: Some(None),
+                cancelled: Some(true),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("unblock and cancel");
+
+    let after = f.manager.list_runs(&p.id, 1).await.expect("runs")[0].clone();
+    assert_eq!(after.id, run.id);
+    assert_eq!(
+        after.status,
+        RunStatus::Running,
+        "the board does not settle a row its executor owns"
+    );
+    assert!(
+        after.settled_at.is_none(),
+        "and leaves the settle to whoever is watching the turn"
+    );
+}
+
+/// A board over its money ceiling stops the run that is spending it.
+///
+/// The enqueue gate only ever decided whether the *next* run starts, so a
+/// ceiling bounded nothing: one run's spend is unbounded, and the observed
+/// overshoot was 2x-55x the daily limit.
+#[tokio::test]
+async fn a_board_over_its_money_ceiling_stops_the_run_that_is_spending_it() {
+    let (f, p, _dev, run) = card_being_worked().await;
+
+    f.manager
+        .update_project(
+            &p.id,
+            ProjectUpdate {
+                name: p.name.clone(),
+                description: String::new(),
+                daily_budget: Some(baybo_model::MicroUsd::ZERO),
+                daily_budget_tokens: None,
+                max_parallel_issue_runs: 3,
+            },
+        )
+        .await
+        .expect("skint");
+
+    tick(&f, &p.id).await;
+
+    assert_eq!(
+        f.stopped.lock().as_slice(),
+        [(
+            SessionId::from("sess-1"),
+            baybo_project::RunStopReason::BudgetExhausted
+        )],
+        "the live run is interrupted, not left to spend the rest of the day"
+    );
+
+    // The cancel is asynchronous, so the row is still `Running` on the next
+    // pass. Telling it again would spam both the turn layer and the card.
+    tick(&f, &p.id).await;
+    assert_eq!(
+        f.stopped.lock().len(),
+        1,
+        "a run already told to stop is not told again while it winds down"
+    );
+    assert_eq!(
+        f.manager.list_runs(&p.id, 1).await.expect("runs")[0].id,
+        run.id,
+        "and nothing here settles the row — its executor does that"
+    );
+}
+
+/// A token ceiling is soft on purpose.
+///
+/// Tokens measure subscription plans, where the turn is paid for whether or
+/// not it is allowed to finish, so throwing it away buys nothing. The board
+/// still refuses to *start* more work — that half is unchanged.
+#[tokio::test]
+async fn a_spent_token_ceiling_lets_the_run_it_is_measuring_finish() {
+    let (f, p, _dev, _run) = card_being_worked().await;
+
+    f.manager
+        .update_project(
+            &p.id,
+            ProjectUpdate {
+                name: p.name.clone(),
+                description: String::new(),
+                daily_budget: None,
+                daily_budget_tokens: Some(0),
+                max_parallel_issue_runs: 3,
+            },
+        )
+        .await
+        .expect("out of tokens");
+
+    tick(&f, &p.id).await;
+
+    assert!(
+        f.stopped.lock().is_empty(),
+        "nothing in flight is stopped for a ceiling that costs no money"
+    );
 }
 
 fn settled_entries(timeline: &[IssueEventRow]) -> Vec<&IssueEventRow> {
@@ -4950,13 +5194,11 @@ async fn cancelling_a_run_that_never_started_says_so_on_the_card() {
         .await
         .expect("issue");
 
-    assert!(
-        f.manager
-            .cancel_run(&p.id, 1)
-            .await
-            .expect("cancel")
-            .is_none(),
-        "a queued run is settled where it stands; there is no session to stop"
+    // A queued run is settled where it stands; there is no session to stop.
+    f.manager.cancel_run(&p.id, 1).await.expect("cancel");
+    assert_eq!(
+        f.manager.list_runs(&p.id, 1).await.expect("runs")[0].status,
+        RunStatus::Cancelled
     );
 
     let timeline = f.manager.timeline(&p.id, 1).await.expect("timeline");
@@ -6589,6 +6831,7 @@ async fn a_re_claimed_run_still_announces_that_it_is_running() {
         f.paths.clone(),
         Arc::new(RecordingEvents(tx)),
         baybo_project::no_dispatch(),
+        baybo_project::no_stopper(),
     );
     let p = manager
         .create_project(new_project("watched"))

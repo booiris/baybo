@@ -29,6 +29,7 @@ async fn fixture() -> Fixture {
         paths.clone(),
         Arc::new(baybo_project::NoopProjectEvents),
         baybo_project::no_dispatch(),
+        baybo_project::no_stopper(),
     ));
     Fixture {
         tools: baybo_project::tools::agent_tools(Arc::clone(&manager)),
@@ -738,6 +739,7 @@ mod approvals {
             paths,
             Arc::new(baybo_project::NoopProjectEvents),
             baybo_project::no_dispatch(),
+            baybo_project::no_stopper(),
         ));
         let project = manager
             .create_project(NewProject {
@@ -855,6 +857,7 @@ mod approvals {
             paths,
             Arc::new(baybo_project::NoopProjectEvents),
             baybo_project::no_dispatch(),
+            baybo_project::no_stopper(),
         ));
         let project = manager
             .create_project(NewProject {
@@ -965,6 +968,7 @@ mod approvals {
             paths,
             Arc::new(baybo_project::NoopProjectEvents),
             baybo_project::no_dispatch(),
+            baybo_project::no_stopper(),
         ));
         let asked: Arc<parking_lot::Mutex<Vec<String>>> = Arc::default();
         let gate = baybo_project::TimelineApprovalGate::new(

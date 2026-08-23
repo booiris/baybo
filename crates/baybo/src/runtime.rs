@@ -653,6 +653,7 @@ pub async fn build_managers(
         baybo_workspace::WorkspacePaths::new(workspace_paths.root().to_path_buf()),
         project_events,
         issue_dispatch,
+        baybo_project::turn_run_stopper(Arc::clone(&turn_lifecycle)),
     ));
     for (tool, manifest) in baybo_project::tools::agent_tools(Arc::clone(&project_manager)) {
         tool_registry.register(tool, manifest);

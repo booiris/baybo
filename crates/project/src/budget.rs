@@ -124,6 +124,24 @@ impl Headroom {
         }
     }
 
+    /// Whether the **money** ceiling alone is spent.
+    ///
+    /// Separate from [`is_exhausted`](Self::is_exhausted), which answers
+    /// whether the board may *start* more work and so counts both meters.
+    /// Only money stops a run already in flight: a token ceiling measures
+    /// subscription plans, where the turn is paid for whether or not it is
+    /// allowed to finish, so throwing it away buys nothing.
+    pub(crate) fn money_exhausted(self) -> bool {
+        self.money().is_some_and(Meter::is_exhausted)
+    }
+
+    fn money(self) -> Option<Meter> {
+        match self {
+            Headroom::Unlimited => None,
+            Headroom::Limited { money, .. } => money,
+        }
+    }
+
     /// Figures for the tightest configured meter.
     pub(crate) fn figures(self) -> Option<Figures> {
         let Headroom::Limited { money, tokens } = self else {
@@ -222,6 +240,34 @@ mod tests {
         assert!(headroom(usd(100), Some(999_999), day).is_exhausted());
         assert!(headroom(usd(999_999), Some(100), day).is_exhausted());
         assert!(!headroom(usd(999_999), Some(999_999), day).is_exhausted());
+    }
+
+    #[test]
+    fn only_the_money_meter_stops_work_already_in_flight() {
+        // A subscription day: the token ceiling is blown many times over and
+        // the money ceiling is untouched, because those tokens price at zero.
+        let subscription_day = spend(0, 4_000_000, 1_000_000);
+        let h = headroom(usd(1_000_000), Some(1_000), subscription_day);
+        assert!(h.is_exhausted(), "the board may not start more work");
+        assert!(
+            !h.money_exhausted(),
+            "but nothing in flight is stopped for a ceiling that costs nothing"
+        );
+
+        let priced_day = spend(2_000, 10, 10);
+        let h = headroom(usd(1_000), Some(999_999), priced_day);
+        assert!(
+            h.money_exhausted(),
+            "real money over the ceiling does stop it"
+        );
+    }
+
+    #[test]
+    fn a_board_with_no_money_ceiling_never_stops_a_run() {
+        let h = headroom(None, Some(100), spend(999_999_999, 999, 999));
+        assert!(h.is_exhausted());
+        assert!(!h.money_exhausted());
+        assert!(!headroom(None, None, spend(1, 1, 1)).money_exhausted());
     }
 
     #[test]

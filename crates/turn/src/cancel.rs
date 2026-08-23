@@ -36,6 +36,10 @@ pub enum CancelReason {
     /// Distinct from hook / system-driven cancels so cost-attribution
     /// and replay UIs can split user-initiated work.
     OperatorCancel,
+    /// The board this run belongs to crossed its money ceiling while the
+    /// turn was still working. Nobody asked for it, so it is not an
+    /// `OperatorCancel`; the work itself was fine, so it is not a failure.
+    BudgetExhausted,
     /// The user ran `/stop` on the session, cancelling the in-flight turn
     /// and every in-flight subagent it spawned. Distinct from
     /// `ParentCancelled` so the subagent wait task can suppress the
@@ -54,6 +58,7 @@ impl CancelReason {
             CancelReason::ParentCancelled => "parent_cancelled",
             CancelReason::ParentDeleted => "parent_deleted",
             CancelReason::OperatorCancel => "operator_cancel",
+            CancelReason::BudgetExhausted => "budget_exhausted",
             CancelReason::UserStopped => "user_stopped",
         }
     }

@@ -288,6 +288,13 @@ pub struct ProjectManager {
     leadless: parking_lot::Mutex<std::collections::HashSet<ProjectId>>,
     /// Optional closer for prompts abandoned by settled runs.
     prompts: parking_lot::Mutex<Option<Arc<dyn crate::CardPromptCloser>>>,
+    /// What interrupts a live run. See [`crate::IssueRunStopper`].
+    stopper: Arc<dyn crate::IssueRunStopper>,
+    /// Runs already told to stop, so the driver's next pass does not tell
+    /// them again: a cancel is asynchronous, and the row stays `Running`
+    /// until its executor settles it. Pruned against what is still running,
+    /// so it cannot outgrow the board.
+    stopping: parking_lot::Mutex<std::collections::HashSet<IssueRunId>>,
 }
 
 /// The seam between recording a run and executing it. A channel rather
@@ -299,6 +306,25 @@ pub type RunDispatch = Arc<dyn Fn(IssueRunRow) + Send + Sync>;
 /// headless assembly and every store-level test wants.
 pub fn no_dispatch() -> RunDispatch {
     Arc::new(|_run| {})
+}
+
+/// The [`no_dispatch`] of stoppers: nothing is executing in an assembly that
+/// never dispatched anything, so there is nothing to interrupt.
+pub fn no_stopper() -> Arc<dyn crate::IssueRunStopper> {
+    struct StopNothing;
+
+    #[async_trait::async_trait]
+    impl crate::IssueRunStopper for StopNothing {
+        async fn stop_run(
+            &self,
+            _session: &baybo_model::SessionId,
+            _reason: crate::RunStopReason,
+        ) -> std::result::Result<(), String> {
+            Ok(())
+        }
+    }
+
+    Arc::new(StopNothing)
 }
 
 #[async_trait::async_trait]
@@ -323,6 +349,7 @@ impl ProjectManager {
         paths: WorkspacePaths,
         events: Arc<dyn ProjectEvents>,
         dispatch: RunDispatch,
+        stopper: Arc<dyn crate::IssueRunStopper>,
     ) -> Self {
         Self {
             store,
@@ -334,6 +361,8 @@ impl ProjectManager {
             driving: tokio::sync::Mutex::new(()),
             leadless: parking_lot::Mutex::default(),
             prompts: parking_lot::Mutex::default(),
+            stopper,
+            stopping: parking_lot::Mutex::default(),
         }
     }
 
@@ -343,6 +372,21 @@ impl ProjectManager {
 
     fn prompt_closer(&self) -> Option<Arc<dyn crate::CardPromptCloser>> {
         self.prompts.lock().clone()
+    }
+
+    /// Interrupt a live run, leaving its executor to settle the ledger.
+    async fn stop_live_run(&self, run: &IssueRunRow, reason: crate::RunStopReason) {
+        let Some(session) = run.session_id.as_ref() else {
+            tracing::error!(
+                run = %run.id,
+                ?reason,
+                "a run that never reached a session has nothing to interrupt"
+            );
+            return;
+        };
+        if let Err(e) = self.stopper.stop_run(session, reason).await {
+            tracing::error!(run = %run.id, ?reason, error = %e, "could not stop a live run");
+        }
     }
 
     /// The workspace this board's checkouts live under. Crate-internal:
@@ -361,13 +405,19 @@ impl ProjectManager {
         &self,
         transition: Transition,
         issue: &IssueRow,
+        actor: &IssueActor,
     ) -> Option<IssueRunRow> {
         let trigger = triggers_run(transition)?;
-        self.enqueue(issue, trigger).await
+        self.enqueue(issue, trigger, actor).await
     }
 
-    async fn enqueue(&self, issue: &IssueRow, trigger: RunTrigger) -> Option<IssueRunRow> {
-        self.enqueue_as(issue, trigger, issue.assignee.clone()?)
+    async fn enqueue(
+        &self,
+        issue: &IssueRow,
+        trigger: RunTrigger,
+        actor: &IssueActor,
+    ) -> Option<IssueRunRow> {
+        self.enqueue_as(issue, trigger, issue.assignee.clone()?, actor)
             .await
     }
 
@@ -380,6 +430,7 @@ impl ProjectManager {
         issue: &IssueRow,
         trigger: RunTrigger,
         agent: AgentProfileId,
+        actor: &IssueActor,
     ) -> Option<IssueRunRow> {
         if let Some(why) = self.enqueue_refusal(issue, &agent).await {
             tracing::debug!(issue = issue.number, ?trigger, %agent, "{why}");
@@ -398,17 +449,18 @@ impl ProjectManager {
                 // already committed — the card is in its new column, or
                 // names its new agent, or says a stage opened — so the
                 // card has to record that the run it promised was not
-                // started. Every trigger, coordination included: this
-                // entry is also the only count of how often the card's one
-                // run slot refuses anything, and a count that saw half the
-                // refusals could not answer what it exists to answer.
+                // started. Every trigger, coordination included, with one
+                // exception below: this entry is also the count of how
+                // often one card's run slot was lost to *another* run, and
+                // a count that saw half of those could not answer what it
+                // exists to answer.
                 //
                 // Named for the row holding the slot, because "refused" is
                 // not something an operator can act on and "run #4 has it"
                 // is. A read failure still records the refusal — it
                 // happened either way.
-                let held_by = match self.live_run(issue).await {
-                    Ok(run) => run.map(|run| run.attempt),
+                let holder = match self.live_run(issue).await {
+                    Ok(run) => run,
                     Err(e) => {
                         tracing::warn!(
                             issue = issue.number,
@@ -418,12 +470,24 @@ impl ProjectManager {
                         None
                     }
                 };
+                if let Some(holder) = holder
+                    .as_ref()
+                    .filter(|holder| crate::runs::refused_itself(holder, actor))
+                {
+                    tracing::debug!(
+                        issue = issue.number,
+                        ?trigger,
+                        run = %holder.id,
+                        "an agent moved its own card from inside its own run; only its own run held the slot"
+                    );
+                    return None;
+                }
                 self.record(
                     issue,
                     IssueActor::System,
                     IssueEventBody::RunRefused {
                         trigger,
-                        attempt: held_by,
+                        attempt: holder.map(|holder| holder.attempt),
                     },
                 )
                 .await;
@@ -627,6 +691,7 @@ impl ProjectManager {
         // of queries with no long await in it.
         let _driving = self.driving.lock().await;
         self.call_off_dead_holds(project).await;
+        self.stop_runs_over_the_money_cap(project).await;
         match self.promotions(project).await {
             Ok(moved) => moved,
             Err(e) => {
@@ -660,6 +725,62 @@ impl ProjectManager {
             // call is for is its other half — a run whose card stopped
             // accepting work is settled on the way past.
             let _ = self.card_for(run).await;
+        }
+    }
+
+    /// Stop every run still working on a board that has spent its money.
+    ///
+    /// The enqueue gate decides whether the *next* run starts; this is the
+    /// only thing that decides whether the current one continues, and
+    /// without it a ceiling bounds nothing — one run's spend is unbounded,
+    /// so a board overshoots by whatever its longest run costs. Money only:
+    /// a token ceiling measures subscription plans, where the turn is paid
+    /// for whether or not it is allowed to finish.
+    ///
+    /// Runs above [`promotions`](Self::promotions) for the same reason
+    /// [`call_off_dead_holds`](Self::call_off_dead_holds) does — that
+    /// function bails on an exhausted budget, which is exactly the state
+    /// this one exists to act on.
+    async fn stop_runs_over_the_money_cap(&self, project: &ProjectId) {
+        let headroom = self.headroom(project).await;
+        let working = match self.store.active_runs(project).await {
+            Ok(runs) => runs,
+            Err(e) => {
+                tracing::error!(%project, error = %e, "could not read the board's live runs");
+                return;
+            }
+        };
+        let running: Vec<IssueRunRow> = working
+            .into_iter()
+            .filter(|run| run.status == RunStatus::Running)
+            .collect();
+        // Pruned every pass, whether or not the board is over: a run that
+        // settled is no longer something to skip, and the board is the only
+        // bound on how big this can get.
+        {
+            let live: std::collections::HashSet<&IssueRunId> =
+                running.iter().map(|run| &run.id).collect();
+            self.stopping.lock().retain(|id| live.contains(id));
+        }
+        if !headroom.money_exhausted() {
+            return;
+        }
+        for run in &running {
+            if !self.stopping.lock().insert(run.id.clone()) {
+                continue;
+            }
+            tracing::warn!(
+                %project,
+                issue = run.number,
+                run = %run.id,
+                "the board spent its money ceiling; stopping this run mid-flight"
+            );
+            // No `BudgetExhausted` entry here: that one says "held the run",
+            // which is what the enqueue gate does and the opposite of this.
+            // The card learns why from the settle its executor writes —
+            // `RunSettled` carries the cancel's own note.
+            self.stop_live_run(run, crate::RunStopReason::BudgetExhausted)
+                .await;
         }
     }
 
@@ -798,7 +919,11 @@ impl ProjectManager {
             issue = issue.number,
             "the board had room and started this card"
         );
-        if self.enqueue(&after, RunTrigger::Promoted).await.is_some() {
+        if self
+            .enqueue(&after, RunTrigger::Promoted, &IssueActor::System)
+            .await
+            .is_some()
+        {
             return true;
         }
         // The pre-checks passed and the enqueue still refused, so something
@@ -882,7 +1007,7 @@ impl ProjectManager {
                     self.stand_down_for_the_question(&issue, &runs).await;
                 }
                 if self
-                    .enqueue_as(&issue, question, lead.clone())
+                    .enqueue_as(&issue, question, lead.clone(), &IssueActor::System)
                     .await
                     .is_some()
                 {
@@ -1479,7 +1604,8 @@ impl ProjectManager {
         if self.delivery_for(issue).await != CommentDelivery::Wake {
             return None;
         }
-        self.enqueue(issue, RunTrigger::Comment).await
+        self.enqueue(issue, RunTrigger::Comment, &IssueActor::System)
+            .await
     }
 
     /// Resolve comment mentions without overriding a block.
@@ -1581,11 +1707,15 @@ impl ProjectManager {
     }
 
     /// Stop an issue's run.
-    pub async fn cancel_run(
-        &self,
-        project: &ProjectId,
-        number: i64,
-    ) -> Result<Option<baybo_model::SessionId>> {
+    ///
+    /// The whole job, not half of it: a run that reached a session is
+    /// interrupted through [`IssueRunStopper`](crate::IssueRunStopper) and
+    /// settled by the executor watching its turn, and one that never
+    /// reached one is settled here. Callers used to be handed the
+    /// `SessionId` and left to do the interrupting, which put "how a run is
+    /// stopped" in two places — and only one of them learned about the
+    /// money ceiling.
+    pub async fn cancel_run(&self, project: &ProjectId, number: i64) -> Result<()> {
         let issue = self.get_issue(project, number).await?;
         let Some(run) = self.live_run(&issue).await? else {
             return Err(ProjectError::invalid(
@@ -1596,27 +1726,23 @@ impl ProjectManager {
         // A run with a session is stopped by cancelling its turn, and the
         // executor settles it on the way out. Only a run that never reached
         // one — `Queued` or `Held` — is settled here.
-        let live_session = run
-            .session_id
-            .clone()
-            .filter(|_| run.status == RunStatus::Running);
-        match live_session {
-            Some(session) => Ok(Some(session)),
-            None => {
-                let prompts = self.prompt_closer();
-                crate::settle::settle_run(
-                    &self.store,
-                    &self.events,
-                    prompts.as_deref(),
-                    &run,
-                    IssueActor::User,
-                    RunStatus::Cancelled,
-                    Some(RUN_CANCELLED_BEFORE_STARTING),
-                )
-                .await?;
-                Ok(None)
-            }
+        if run.status == RunStatus::Running && run.session_id.is_some() {
+            self.stop_live_run(&run, crate::RunStopReason::Operator)
+                .await;
+            return Ok(());
         }
+        let prompts = self.prompt_closer();
+        crate::settle::settle_run(
+            &self.store,
+            &self.events,
+            prompts.as_deref(),
+            &run,
+            IssueActor::User,
+            RunStatus::Cancelled,
+            Some(RUN_CANCELLED_BEFORE_STARTING),
+        )
+        .await?;
+        Ok(())
     }
 
     /// Run an issue again, unless another run or block already holds the card.
@@ -1649,7 +1775,10 @@ impl ProjectManager {
             .await?
             .filter(|run| run.status == RunStatus::Held);
 
-        if let Some(run) = self.enqueue(&issue, RunTrigger::Retry).await {
+        if let Some(run) = self
+            .enqueue(&issue, RunTrigger::Retry, &IssueActor::User)
+            .await
+        {
             return Ok(run);
         }
         match held {
@@ -2144,7 +2273,7 @@ impl ProjectManager {
         if let Some(assignee) = issue.assignee.clone() {
             self.record(
                 &issue,
-                actor,
+                actor.clone(),
                 IssueEventBody::Assigned {
                     from: None,
                     to: Some(assignee),
@@ -2153,7 +2282,7 @@ impl ProjectManager {
             .await;
         }
         let _ = self
-            .dispatch_if_triggered(Transition::created(&issue), &issue)
+            .dispatch_if_triggered(Transition::created(&issue), &issue, &actor)
             .await;
         Ok(Opened::Created(issue))
     }
@@ -2228,7 +2357,7 @@ impl ProjectManager {
         self.reclaim_if_finished(&before, &after, actor.clone())
             .await;
         let started = self
-            .dispatch_if_triggered(Transition::between(&before, &after), &after)
+            .dispatch_if_triggered(Transition::between(&before, &after), &after, &actor)
             .await;
         self.check_stage_barrier(&before, &after, actor).await;
         if before.blocked_reason.is_some() && after.blocked_reason.is_none() {
@@ -2268,7 +2397,7 @@ impl ProjectManager {
         };
         self.record(
             &parent,
-            actor,
+            actor.clone(),
             IssueEventBody::StageCompleted { stage: after.stage },
         )
         .await;
@@ -2282,7 +2411,8 @@ impl ProjectManager {
             && crate::driver::board_may_start(&parent)
             && crate::stages::barrier_opens(&children, after.stage)
         {
-            self.enqueue(&parent, RunTrigger::StageBarrier).await;
+            self.enqueue(&parent, RunTrigger::StageBarrier, &actor)
+                .await;
         }
     }
 
@@ -2316,7 +2446,7 @@ impl ProjectManager {
         self.reclaim_if_finished(&before, &after, actor.clone())
             .await;
         let _ = self
-            .dispatch_if_triggered(Transition::between(&before, &after), &after)
+            .dispatch_if_triggered(Transition::between(&before, &after), &after, &actor)
             .await;
         self.check_stage_barrier(&before, &after, actor).await;
         Ok(after)

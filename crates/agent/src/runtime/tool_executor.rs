@@ -1466,6 +1466,7 @@ mod tests {
                     paths_for_board,
                     Arc::new(baybo_project::NoopProjectEvents),
                     baybo_project::no_dispatch(),
+                    baybo_project::no_stopper(),
                 )),
                 agents: Arc::clone(&store.agent_profile),
             }),

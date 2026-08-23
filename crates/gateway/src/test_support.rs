@@ -245,6 +245,7 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
         )),
         // The test harness has no router, so a recorded run waits.
         baybo_project::no_dispatch(),
+        baybo_project::no_stopper(),
     ));
 
     let deps = GatewayDeps {

@@ -17,6 +17,7 @@ mod mentions;
 mod runs;
 mod settle;
 mod stages;
+mod stopper;
 mod timeline;
 pub mod tools;
 pub mod worktree;
@@ -30,7 +31,7 @@ pub use error::{ProjectError, Result};
 pub use events::{NoopProjectEvents, ProjectEvents};
 pub use manager::{
     FeedEntry, IssueRunLog, LEAD_HANDLE, MAX_FEED_PAGE, MAX_TEAM_AGENTS, NewIssueRequest,
-    NewProject, NewTeamMember, ProjectManager, RunDispatch, RunWithSpend, no_dispatch,
+    NewProject, NewTeamMember, ProjectManager, RunDispatch, RunWithSpend, no_dispatch, no_stopper,
     validate_workdir,
 };
 /// Reachable only from a test build. The agent crate's tests assert that
@@ -41,4 +42,5 @@ pub use manager::{
 pub use runs::session_run_before;
 pub use runs::{RunOutcome, can_host_a_session, session_run_to_continue};
 pub use stages::progress;
+pub use stopper::{IssueRunStopper, RunStopReason, turn_run_stopper};
 pub use worktree::{Checkout, ProjectRepo};

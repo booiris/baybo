@@ -61,6 +61,7 @@ async fn fixture() -> Fixture {
         paths,
         Arc::new(baybo_project::NoopProjectEvents),
         baybo_project::no_dispatch(),
+        baybo_project::no_stopper(),
     ));
     let project = manager
         .create_project(NewProject {

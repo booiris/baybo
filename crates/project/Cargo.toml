@@ -15,6 +15,7 @@ test-support = []
 baybo-model = { workspace = true }
 baybo-store = { workspace = true }
 baybo-tools = { workspace = true }
+baybo-turn = { workspace = true }
 baybo-workspace = { workspace = true, features = ["io"] }
 anyhow = { workspace = true }
 async-trait = { workspace = true }

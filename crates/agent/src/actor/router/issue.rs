@@ -365,6 +365,9 @@ fn cancel_note(reason: CancelReason) -> Option<&'static str> {
         CancelReason::SubagentTimeout => Some("a subagent it was waiting on hit its idle timeout"),
         CancelReason::ParentCancelled => Some("the session it ran under was cancelled"),
         CancelReason::ParentDeleted => Some("the session it ran under was deleted"),
+        CancelReason::BudgetExhausted => {
+            Some("the board spent its money ceiling while this run was working")
+        }
         CancelReason::UserPreempt => {
             Some("something else was sent into its session while it was working")
         }
@@ -504,6 +507,7 @@ mod tests {
                 let seen = Arc::clone(&dispatched);
                 Arc::new(move |run| seen.lock().push(run))
             },
+            baybo_project::no_stopper(),
         ));
         let project = projects
             .create_project(NewProject {
@@ -934,13 +938,20 @@ mod tests {
         let (board, first) = board_with_in_progress_card().await;
         let harness = router_for(&board);
 
-        assert!(
+        // A queued run is settled where it stands; there is no session to stop.
+        board
+            .projects
+            .cancel_run(&board.project.id, 1)
+            .await
+            .expect("cancel");
+        assert_eq!(
             board
                 .projects
-                .cancel_run(&board.project.id, 1)
+                .list_runs(&board.project.id, 1)
                 .await
-                .expect("cancel")
-                .is_none(),
+                .expect("runs")[0]
+                .status,
+            RunStatus::Cancelled,
             "a queued run is settled where it stands; there is no session to stop"
         );
         board

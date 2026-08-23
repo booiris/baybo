@@ -3,7 +3,7 @@
 
 use baybo_model::{AgentFramework, AgentProfileId, IssueRunId};
 use baybo_store::project::{
-    IssueRow, IssueRunRow, IssueStatus, NewIssueRun, RunStatus, RunTrigger,
+    IssueActor, IssueRow, IssueRunRow, IssueStatus, NewIssueRun, RunStatus, RunTrigger,
 };
 
 /// How a run ended, as the executor that ran it saw it.
@@ -90,6 +90,22 @@ pub(crate) fn unsettled(runs: &[IssueRunRow]) -> Option<&IssueRunRow> {
     runs.iter().find(|run| is_unsettled(run))
 }
 
+/// Whether the run holding this card's slot is the very run that asked for
+/// another one.
+///
+/// An agent that moves or reassigns its own card from inside its own turn
+/// refuses itself: the slot is taken by the run doing the asking, which is
+/// the one refusal an operator cannot act on. Settling that run enqueues the
+/// follow-up when somebody commented during it; when nobody did, the card is
+/// left In Progress with nothing running, and the lead's `Stalled` question
+/// is what notices — see `docs/modules/project.md`. Only a *running* holder
+/// counts: a queued or budget-held row of the same agent's is a real refusal
+/// an operator can act on.
+pub(crate) fn refused_itself(holder: &IssueRunRow, actor: &IssueActor) -> bool {
+    holder.status == RunStatus::Running
+        && matches!(actor, IssueActor::Agent(id) if *id == holder.agent_id)
+}
+
 /// The run whose session this one continues: the newest run of the same
 /// agent's that actually executed. `None` opens a fresh session.
 pub fn session_run_to_continue<'a>(
@@ -170,11 +186,24 @@ pub(crate) enum Verdict {
 }
 
 /// Decide whether a recorded row may run now.
+///
+/// A `Running` row is its executor's, and this answers `Stands` for one
+/// before anything else — including before the card is read. The rule lives
+/// here rather than at the call sites because only three of the four filter
+/// by status on the way in (`resume_project_runs` sees `Queued` rows,
+/// `release_holds` and `call_off_dead_holds` `Held` ones);
+/// `redrive_after_unblock` hands over whatever is unsettled. It used to
+/// reach the call-off below, so one `update_issue` that lifted a block *and*
+/// cancelled the card settled a live row under the agent still working it,
+/// and stamped it "interrupted before it could resume" — which it was not.
 pub(crate) fn verdict(
     run: &IssueRunRow,
     card: Option<&IssueRow>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Verdict {
+    if run.status == RunStatus::Running {
+        return Verdict::Stands;
+    }
     let Some(card) = card.filter(|card| accepts_runs(card)) else {
         return Verdict::CallOff;
     };

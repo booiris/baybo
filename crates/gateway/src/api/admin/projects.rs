@@ -2048,31 +2048,15 @@ async fn cancel_run(
     Path((project_id, number)): Path<(String, i64)>,
 ) -> Result<StatusCode> {
     let id = parse_project_id(&project_id)?;
-    let Some(session) = state
+    // A run that is executing stops the way `/stop` stops a reply — the
+    // waiter watching that turn is what settles the ledger row, so the two
+    // never race to record an outcome. The board owns both halves; this
+    // route only reports that it asked.
+    state
         .project_manager
         .cancel_run(&id, number)
         .await
-        .map_err(project_err)?
-    else {
-        // It never started; the manager settled it.
-        return Ok(StatusCode::NO_CONTENT);
-    };
-
-    // A run that is executing stops the way `/stop` stops a reply — the
-    // waiter watching that turn is what settles the ledger row, so the two
-    // never race to record an outcome.
-    let turns = state
-        .turn_lifecycle
-        .list_active_chat_turns_by_session(&session)
-        .await
-        .map_err(|e| GatewayError::Internal(format!("issue run turns: {e}")))?;
-    for turn in turns {
-        state
-            .turn_lifecycle
-            .cancel(&turn.id, baybo_turn::CancelReason::OperatorCancel, vec![])
-            .await
-            .map_err(|e| GatewayError::Internal(format!("cancel issue run: {e}")))?;
-    }
+        .map_err(project_err)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
