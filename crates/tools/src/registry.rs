@@ -471,7 +471,7 @@ mod tests {
     }
 
     #[test]
-    fn trigger_scope_shows_board_tools_only_to_a_project_session() {
+    fn trigger_scope_shows_board_tools_only_to_project_linked_sessions() {
         use crate::{Tool, ToolContext, ToolOutput, ToolTriggerScope};
         use baybo_model::TriggerSource;
 
@@ -522,6 +522,13 @@ mod tests {
             project_id: baybo_model::ProjectId::generate(),
             issue_id: baybo_model::IssueId::generate(),
             number: 1,
+        }));
+        assert!(has(&TriggerSource::Cron {
+            cron_job_id: "cj".into(),
+            origin_session_id: None,
+            conversation: true,
+            job_title: None,
+            project_id: Some(baybo_model::ProjectId::generate()),
         }));
         assert!(!has(&TriggerSource::User));
         assert!(!has(&TriggerSource::Cron {
@@ -694,12 +701,6 @@ mod tests {
                 .any(|d| d.name == "browser/navigate_page")
         };
         assert!(has(&TriggerSource::User));
-        assert!(
-            has(&TriggerSource::Project {
-                project_id: baybo_model::ProjectId::generate(),
-            }),
-            "a board lead plans in the shared workspace and may browse"
-        );
         assert!(
             has(&TriggerSource::Cron {
                 cron_job_id: "cj".into(),

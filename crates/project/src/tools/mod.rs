@@ -105,9 +105,8 @@ fn source_key(ctx: &ToolContext, suffix: Option<&str>) -> Option<String> {
 /// confuse it with `parent`. `source_key` above is the same trade — the
 /// server owns the identity and the model supplies at most a suffix.
 ///
-/// `None` from the lead's planning conversation, from a cron fire and from
-/// the operator's own create door. Those cards are roots, which is the
-/// truth rather than a gap.
+/// `None` from a cron fire and from the operator's own create door. Those
+/// cards are roots, which is the truth rather than a gap.
 fn filed_from(ctx: &ToolContext) -> Option<IssueId> {
     ctx.session_trigger
         .issue()

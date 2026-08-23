@@ -1095,7 +1095,7 @@ async fn list_sessions(
     let visible: Vec<Session> = scoped
         .into_iter()
         .filter(|s| query.include_hidden || !s.hidden)
-        .filter(|s| !s.trigger.is_project_session())
+        .filter(|s| !s.trigger.is_issue_session())
         .filter(|s| query.include_cron || !is_private_cron_session(s))
         .collect();
     // One grouped scan for every per-session aggregate the sidebar
@@ -3196,11 +3196,11 @@ pub(crate) fn is_private_cron_session(session: &Session) -> bool {
 
 /// Whether a session belongs outside the global chat surface.
 ///
-/// Private cron workspaces have no conversation of their own. Board
-/// conversations instead belong to the board: an issue session is reached
-/// through its card and transcript, never through the global chat list.
+/// Private cron workspaces have no conversation of their own. An issue
+/// session is reached through its card and transcript, never through the
+/// global chat list.
 pub(crate) fn is_excluded_from_global_chat(session: &Session) -> bool {
-    session.trigger.is_project_session() || is_private_cron_session(session)
+    session.trigger.is_issue_session() || is_private_cron_session(session)
 }
 
 async fn transcript_attachments(

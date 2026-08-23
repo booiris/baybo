@@ -195,13 +195,7 @@ fn derive_session_kind(session: &Session) -> SessionKind {
     }
     match session.trigger {
         baybo_model::TriggerSource::Cron { .. } => SessionKind::Cron,
-        // A board's planning conversation shares the issue kind: both are
-        // work on a project, and the trace surface groups them the same
-        // way. A separate kind would be a wire break for a distinction no
-        // reader of that surface makes.
-        baybo_model::TriggerSource::Project { .. } | baybo_model::TriggerSource::Issue { .. } => {
-            SessionKind::Issue
-        }
+        baybo_model::TriggerSource::Issue { .. } => SessionKind::Issue,
         baybo_model::TriggerSource::User => SessionKind::User,
     }
 }

@@ -230,9 +230,9 @@ pub enum ToolTriggerScope {
     /// (`TriggerSource::Cron { conversation: true }`). `report_nothing` can
     /// suppress nothing else, so elsewhere it is an action that can only fail.
     CronConversation,
-    /// Only a session that names a project board — an issue's run, the lead's
-    /// planning conversation, a board-patrol fire. Outside one the `Issue*`
-    /// tools and `ProjectAgentCreate` have no board to name.
+    /// Only a session that names a project board — an issue run or a
+    /// project-linked cron fire. Outside one the `Issue*` tools and
+    /// `ProjectAgentCreate` have no board to name.
     ProjectBoard,
     /// Only a session that works the shared workspace. A card's run is the
     /// one session cut its own checkout to be isolated in, so a tool backed

@@ -54,7 +54,7 @@ export const STATUS_PILL: Record<IssueStatus, string> = {
   done: 'border-ok/50 bg-ok/15 text-ok font-bold',
 };
 
-/// The board header's action group — filter, lead chat, activity, settings.
+/// The board header's action group — filter, activity, settings.
 /// One skin, because four buttons sitting in a row are read as a set and a
 /// hand-copied class string is how a set stops being one.
 export const HEADER_ACTION =

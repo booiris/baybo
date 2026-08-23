@@ -466,7 +466,7 @@ fn is_subagent(session: &Session) -> bool {
 fn should_fire_session_end(session: &Session) -> bool {
     let user_trigger = match &session.trigger {
         TriggerSource::User | TriggerSource::Cron { .. } => true,
-        TriggerSource::Project { .. } | TriggerSource::Issue { .. } => false,
+        TriggerSource::Issue { .. } => false,
     };
     user_trigger && !is_subagent(session)
 }
@@ -3822,8 +3822,8 @@ mod session_end_gate_tests {
     //! predicate that gates the background-summary pass (subagents skip it).
     use super::{is_subagent, should_fire_session_end};
     use baybo_model::{
-        ChannelType, Lineage, LineageKind, Session, SessionId, SessionState, TriggerSource, TurnId,
-        User,
+        ChannelType, IssueId, Lineage, LineageKind, ProjectId, Session, SessionId, SessionState,
+        TriggerSource, TurnId, User,
     };
     use chrono::Utc;
 
@@ -3873,6 +3873,19 @@ mod session_end_gate_tests {
             None,
         );
         assert!(should_fire_session_end(&s));
+    }
+
+    #[test]
+    fn skips_issue_run_session() {
+        let s = session_with(
+            TriggerSource::Issue {
+                project_id: ProjectId::generate(),
+                issue_id: IssueId::generate(),
+                number: 1,
+            },
+            None,
+        );
+        assert!(!should_fire_session_end(&s));
     }
 
     #[test]

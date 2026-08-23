@@ -4921,7 +4921,7 @@ async fn an_issue_run_executes_as_its_own_kind_of_turn() {
         .find(|t| t.contains("[issue #7]"))
         .expect("a user turn carrying the issue framing");
     assert!(
-        framed.contains("not a message from a person"),
+        framed.contains("project-board task") && framed.contains("nobody is waiting at a keyboard"),
         "the run must not read as a chat turn: {framed}"
     );
     assert!(

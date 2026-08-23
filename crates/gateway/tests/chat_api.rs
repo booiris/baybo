@@ -1911,10 +1911,10 @@ async fn list_sessions_exposes_last_user_text_preview() {
 // private workspace — its result is reported into the conversation that
 // scheduled it — so it stays out of the list and cannot be attached to. The
 // opt-in `?include_cron=true` query admits that private cron workspace, but
-// board-owned conversations remain on the board.
+// issue run sessions remain reachable only through their cards.
 #[tokio::test]
-async fn chat_visibility_distinguishes_recurring_private_cron_and_project_sessions() {
-    use baybo_model::{ChannelType, ProjectId, TriggerSource, User};
+async fn chat_visibility_distinguishes_recurring_private_cron_and_issue_sessions() {
+    use baybo_model::{ChannelType, IssueId, ProjectId, TriggerSource, User};
 
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let state = build_admin_state(&tg);
@@ -1954,19 +1954,21 @@ async fn chat_visibility_distinguishes_recurring_private_cron_and_project_sessio
         ids.push(session.id.to_string());
     }
     let (recurring_id, one_shot_id) = (ids[0].clone(), ids[1].clone());
-    let project_session = tg
+    let issue_session = tg
         .deps
         .session_manager
         .create_session_with_trigger(
             operator,
             ChannelType::owner(),
-            TriggerSource::Project {
+            TriggerSource::Issue {
                 project_id: ProjectId::generate(),
+                issue_id: IssueId::generate(),
+                number: 1,
             },
         )
         .await
-        .expect("create project session");
-    let project_session_id = project_session.id.to_string();
+        .expect("create issue session");
+    let issue_session_id = issue_session.id.to_string();
 
     let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
     let items = list["items"].as_array().expect("items");
@@ -1988,8 +1990,8 @@ async fn chat_visibility_distinguishes_recurring_private_cron_and_project_sessio
         "a one-shot fire session has no conversation to show, got {items:?}",
     );
     assert!(
-        !listed(&project_session_id),
-        "a board-owned conversation must stay out of global chat, got {items:?}",
+        !listed(&issue_session_id),
+        "an issue run session must stay out of global chat, got {items:?}",
     );
 
     let list_inc = get(
@@ -2008,12 +2010,12 @@ async fn chat_visibility_distinguishes_recurring_private_cron_and_project_sessio
     assert!(
         !items_inc
             .iter()
-            .any(|row| row["session_id"].as_str() == Some(project_session_id.as_str())),
-        "include_cron=true must not leak board-owned conversations into global chat",
+            .any(|row| row["session_id"].as_str() == Some(issue_session_id.as_str())),
+        "include_cron=true must not leak issue run sessions into global chat",
     );
 
     // Attaching: a recurring fire's conversation can be continued (the user
-    // replies to what the fire reported); private cron and board workspaces
+    // replies to what the fire reported); private cron and issue workspaces
     // cannot be entered through global chat.
     post(
         &router,
@@ -2032,7 +2034,7 @@ async fn chat_visibility_distinguishes_recurring_private_cron_and_project_sessio
     post(
         &router,
         "/v1/chat/sessions",
-        Body::from(json!({ "session_id": project_session_id }).to_string()),
+        Body::from(json!({ "session_id": issue_session_id }).to_string()),
         StatusCode::NOT_FOUND,
     )
     .await;

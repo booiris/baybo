@@ -859,9 +859,9 @@ in depth, it gates nothing, wakes nobody, and appears in no ordering. It is
 derived from the calling session by `tools::filed_from` — never a tool
 parameter, never a request field — because a session working a card already
 carries which card with certainty, and a model asked to restate that can
-forget it, mistype it, or reach for `parent` instead. Cards opened from the
-lead's planning conversation, from a cron fire and from the operator's own
-create door carry none: they are roots, which is the truth and not a gap.
+forget it, mistype it, or reach for `parent` instead. Cards opened from a cron
+fire and from the operator's own create door carry none: they are roots, which
+is the truth and not a gap.
 
 It is written once, in `create_issue`, and is deliberately absent from
 `IssueUpdate` and the REST patch. Numbers are `MAX(number) + 1` per board, so
@@ -1294,8 +1294,8 @@ opened a transcript and never touched the checkout, so none of the three
 questions — whose session this run continues, whose uncommitted changes are
 waiting in the tree it is handed, what its call-off says — counts it at all.
 
-No project session appears in the global chat list — issue runs and the lead's
-planning session alike.
+Issue run sessions do not appear in the global chat list; their transcripts are
+reached through their cards.
 
 ### The team
 

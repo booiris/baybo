@@ -37,10 +37,10 @@ the behaviour was verified against its source (clone inspected 2026-08-05).
 5. **Full self-staffing is kept**: the lead triages unassigned Backlog
    issues (takes them or assigns teammates) and may hire new agents via
    tool, capped and audited. The user can always assign manually.
-6. Discussion surfaces: per-issue **timeline** (comments + system events),
-   a read-only per-project **activity feed**, and a **direct chat with the
-   lead** for planning (the lead turns conclusions into issues via tools).
-   No free-form rooms.
+6. Discussion surfaces: per-issue **timeline** (comments + system events)
+   and a read-only per-project **activity feed**. A persistent
+   **project ↔ lead planning conversation is deferred**; there is no
+   session kind, API, or board entry point for it today. No free-form rooms.
 7. **Five columns** — `Backlog / Todo / In Progress / Review / Done`.
    Entering **In Progress** is the single execution trigger. *Blocked* and
    *Cancelled* are issue flags (badge / strikethrough), not columns.
@@ -336,12 +336,12 @@ existing git repo.
   (right drawer: the feed of status changes, run results, blockers, hires,
   budget events), settings (budget knobs, the board's markdown
   description, archive behind a confirmation).
-- **There is no chat with the lead.** The board is the whole control
-  surface: work is described on cards and agents are directed by
-  @mention on a card, so a conversation running beside the board would be
-  a second place where a board's intent lives, and the one place the
-  timeline could not audit. The lead stays a *role* — it is hired with
-  the board, coordinates, and cannot be removed.
+- **Project ↔ lead chat is deferred.** The current control surface is the
+  board: work is described on cards and agents are directed by @mention on
+  a card. Before adding a second planning surface, decide how its conclusions
+  become auditable board state and how its session is reached and retained.
+  The lead stays a *role* — it is hired with the board, coordinates, and
+  cannot be removed.
 - Clicking any avatar (team strip, card face, timeline, execution log)
   slides out the **agent profile panel** (same layer as the activity
   drawer, mutually exclusive; no dedicated route in v1): its name from
@@ -355,8 +355,8 @@ existing git repo.
   follows `default-llm`; pool-only choices), persona file editors
   (SOUL/IDENTITY/memory — audited commits, same pipeline as agent
   self-edits), and the user-only **Remove from project** tombstone
-  action. Only the lead's panel carries a chat button; other agents are
-  reached by @mention in issue comments (no DM in v1).
+  action. No profile panel carries a chat button; agents are reached by
+  @mention in issue comments.
 - The team strip ends in a dashed **＋ (new agent)**: a small form — the
   name, which is the `@handle` itself and the only moment it is chosen
   (handle grammar, refused in the form and again on the server), a
@@ -494,10 +494,9 @@ announces which of these will happen before sending.
   session hosting many runs would hand run #3 run #1's outcome. What makes
   it safe is the dedupe guard — at most one run per issue is ever in flight
   — so the newest terminal turn at or after the run's own enqueue is
-  unambiguously the one being waited on. **No project session appears in the global chat list**
-  — issue runs and the lead's planning session alike (the old
-  filter-project-sessions todo lands here); the lead session is reached
-  only through the in-board panel. The run brief = issue
+  unambiguously the one being waited on. **Issue run sessions do not appear
+  in the global chat list**; they are reached only through the card's run
+  transcript. The run brief = issue
   title/description + timeline delta since the last run + PROJECT.md +
   project memory, via the context crate's prompt assembly.
 - Assignee is **any baybo-framework agent profile**. The claim that
@@ -816,7 +815,7 @@ announces which of these will happen before sending.
      (`project_id` on the job, riding the `data` blob), the execution
      snapshots it so the boot re-dispatch rebuilds a bound fire, and the
      fire's `TriggerSource::Cron` carries it. `project()` — not `issue()`,
-     not `is_project_session()` — is what makes the board's tools visible
+     not `is_issue_session()` — is what makes the board's tools visible
      and scoped, so a bound fire stays an ordinary cron conversation:
      listed, pushable, and still able to call `report_nothing`. The fire
      runs as the board's **lead**, or its cards would be signed with a raw
@@ -866,7 +865,7 @@ announces which of these will happen before sending.
 
 ## What is still not built
 
-Everything in "Pages and interactions" above now exists. Three things
+Everything in "Pages and interactions" above now exists. Four things
 remain, all recorded with their reasons rather than left to be re-derived:
 
 - **Mid-turn injection.** A comment on a card whose run is *executing* is
@@ -881,7 +880,7 @@ remain, all recorded with their reasons rather than left to be re-derived:
 - **Push about a board.** Not one predicate away: the iOS Projects tab is a
   placeholder, a push payload can only address a session, and the tap
   handler touches that session into the phone's chat list — which is what
-  the project-session exclusion exists to prevent. `APPROVAL_TIMEOUT` is
+  the issue-session exclusion exists to prevent. `APPROVAL_TIMEOUT` is
   also a gateway-wide 300s, so pushing an approval deadline to a locked
   phone is theatre. Its own phase. The rail badge reaches an operator with
   a tab open, not one away from their machine; say so rather than letting
@@ -889,6 +888,11 @@ remain, all recorded with their reasons rather than left to be re-derived:
 - **Re-pointing a cron job at a different board.** Refused on purpose: its
   past fires filed cards on the old board, so its execution history would
   describe work on a board it no longer touches.
+- **Project ↔ lead planning conversation.** Requirement TBD. No placeholder
+  trigger, hidden session, API, or UI control remains. Revisit only after
+  choosing whether this second surface is worth having and, if so, how it
+  writes conclusions back to the board instead of creating a parallel source
+  of intent.
 
 ## Defaults chosen without a grill question (veto anytime)
 

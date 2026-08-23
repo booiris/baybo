@@ -113,7 +113,7 @@ The chat sidebar's own menus predate the hook and still hand-roll it.
 ## Board header
 
 Everything that acts on the **whole board** lives in the header's right-hand
-group — mark read, filter, the lead chat, activity, settings — and the board
+group — mark read, filter, activity, settings — and the board
 itself starts directly under it. There is no second toolbar row: a strip that
 existed to hold four filter controls cost every board 30px of column height to
 show controls that are set once and then looked past.

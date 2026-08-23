@@ -567,9 +567,6 @@ mod tests {
             issue_id: IssueId::from("issue-1"),
             number: 7,
         };
-        let planning = TriggerSource::Project {
-            project_id: project_id.clone(),
-        };
         let board_cron = TriggerSource::Cron {
             cron_job_id: "cron-1".into(),
             origin_session_id: Some(SessionId::from("origin")),
@@ -586,7 +583,7 @@ mod tests {
         };
 
         assert_eq!(PromptShape::for_trigger(&issue), PromptShape::Issue);
-        for trigger in [&TriggerSource::User, &planning, &board_cron, &ordinary_cron] {
+        for trigger in [&TriggerSource::User, &board_cron, &ordinary_cron] {
             assert_eq!(PromptShape::for_trigger(trigger), PromptShape::Chat);
         }
     }

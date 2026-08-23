@@ -593,7 +593,7 @@ impl PushDispatcher {
         // An issue run is board work, not a message to the operator: the
         // card shows its state, and buzzing a phone for every run of every
         // issue is exactly the noise a board exists to absorb.
-        if session.trigger.is_project_session() {
+        if session.trigger.is_issue_session() {
             tracing::debug!(
                 session = %ev.session_id,
                 "push: issue runs report on their card; not pushing"

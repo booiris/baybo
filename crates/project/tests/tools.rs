@@ -48,13 +48,16 @@ impl Fixture {
             .0
     }
 
-    /// The lead's planning conversation, which is what most of these tests
-    /// are: somebody working the board rather than working a card. A card
-    /// opened from here came out of nothing, and says so.
+    /// A project-linked cron fire: the production board-wide context for
+    /// these tools when the caller is not working from inside one card.
     fn ctx(&self, project: &ProjectId, agent: &baybo_model::AgentProfileId) -> ToolContext {
         ToolContext {
-            session_trigger: baybo_model::TriggerSource::Project {
-                project_id: project.clone(),
+            session_trigger: baybo_model::TriggerSource::Cron {
+                cron_job_id: "project-tools-test".to_owned(),
+                origin_session_id: None,
+                conversation: false,
+                job_title: None,
+                project_id: Some(project.clone()),
             },
             agent_id: agent.clone(),
             workspace_paths: self.paths.clone(),
@@ -379,7 +382,7 @@ async fn every_issue_tool_takes_every_word_for_nobody() {
             .call(
                 "IssueCreate",
                 &ctx,
-                json!({ "title": format!("open {n}"), "assignee": word }),
+                json!({ "title": format!("open {n}"), "assignee": word, "key": format!("open-{n}") }),
             )
             .await;
         assert!(
@@ -397,7 +400,7 @@ async fn every_issue_tool_takes_every_word_for_nobody() {
     f.call(
         "IssueCreate",
         &ctx,
-        json!({ "title": "taken", "assignee": "@dev" }),
+        json!({ "title": "taken", "assignee": "@dev", "key": "taken" }),
     )
     .await;
     let unfiltered = f.call("IssueList", &ctx, json!({ "assignee": "" })).await;
@@ -439,14 +442,14 @@ async fn the_triage_filter_finds_the_cards_nobody_is_on() {
         f.call(
             "IssueCreate",
             &ctx,
-            json!({ "title": title, "priority": priority }),
+            json!({ "title": title, "priority": priority, "key": title }),
         )
         .await;
     }
     f.call(
         "IssueCreate",
         &ctx,
-        json!({ "title": "taken", "assignee": "@dev" }),
+        json!({ "title": "taken", "assignee": "@dev", "key": "taken" }),
     )
     .await;
 
@@ -997,11 +1000,15 @@ async fn the_triage_read_says_who_is_free_and_what_is_stuck() {
     f.call(
         "IssueCreate",
         &ctx,
-        json!({ "title": "in flight", "assignee": "@dev", "status": "in_progress" }),
+        json!({ "title": "in flight", "assignee": "@dev", "status": "in_progress", "key": "in-flight" }),
     )
     .await;
-    f.call("IssueCreate", &ctx, json!({ "title": "waiting" }))
-        .await;
+    f.call(
+        "IssueCreate",
+        &ctx,
+        json!({ "title": "waiting", "key": "waiting" }),
+    )
+    .await;
 
     let listed = f
         .call("IssueList", &ctx, json!({ "assignee": "unassigned" }))
@@ -1131,13 +1138,17 @@ async fn a_parent_row_carries_its_progress_and_open_stages() {
     let f = fixture().await;
     let (project, lead) = f.open("Stages").await;
     let ctx = f.ctx(&project, &lead);
-    f.call("IssueCreate", &ctx, json!({ "title": "the whole thing" }))
-        .await;
+    f.call(
+        "IssueCreate",
+        &ctx,
+        json!({ "title": "the whole thing", "key": "parent" }),
+    )
+    .await;
     for (title, stage) in [("design", 0), ("build", 1)] {
         f.call(
             "IssueCreate",
             &ctx,
-            json!({ "title": title, "parent": 1, "stage": stage }),
+            json!({ "title": title, "parent": 1, "stage": stage, "key": title }),
         )
         .await;
     }
@@ -1314,17 +1325,38 @@ mod dedupe {
     }
 
     #[tokio::test]
-    async fn an_ordinary_run_gets_no_key_and_so_never_dedupes() {
+    async fn an_issue_run_gets_no_key_and_so_never_dedupes() {
         let f = fixture().await;
         let (project, lead) = f.open("Runs").await;
-        let ctx = f.ctx(&project, &lead);
+        let origin = f
+            .manager
+            .create_issue(
+                &project,
+                baybo_store::project::IssueActor::User,
+                baybo_project::NewIssueRequest {
+                    title: "origin".to_owned(),
+                    description: String::new(),
+                    attachments: Vec::new(),
+                    status: baybo_store::project::IssueStatus::Backlog,
+                    priority: baybo_store::project::IssuePriority::None,
+                    assignee: None,
+                    parent: None,
+                    stage: 0,
+                    source_key: None,
+                    filed_from: None,
+                },
+            )
+            .await
+            .expect("origin")
+            .into_issue();
+        let ctx = f.ctx_on(&project, &lead, &origin);
         for _ in 0..2 {
             f.call("IssueCreate", &ctx, json!({ "title": "same title" }))
                 .await;
         }
         assert_eq!(
             f.manager.list_issues(&project).await.expect("issues").len(),
-            2
+            3
         );
     }
 }
@@ -1396,7 +1428,7 @@ async fn a_card_a_run_files_carries_the_card_that_run_was_on() {
         "and #1 says so, which is the direction nothing else answered"
     );
 
-    let planned = f
+    let scheduled = f
         .call(
             "IssueCreate",
             &f.ctx(&project, &lead),
@@ -1405,11 +1437,11 @@ async fn a_card_a_run_files_carries_the_card_that_run_was_on() {
         .await;
     assert_eq!(
         f.manager
-            .get_issue(&project, planned["number"].as_i64().expect("number"))
+            .get_issue(&project, scheduled["number"].as_i64().expect("number"))
             .await
-            .expect("planned")
+            .expect("scheduled")
             .filed_from,
         None,
-        "a card the lead planned came out of nothing, and a root is the truth rather than a gap"
+        "a card opened by a project cron came out of no card, so it is a root"
     );
 }

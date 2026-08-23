@@ -211,7 +211,6 @@ impl SessionManager {
             TriggerSource::User => "",
             TriggerSource::Cron { .. } => "cron-",
             TriggerSource::Issue { .. } => "issue-",
-            TriggerSource::Project { .. } => "board-",
         };
         let id = if prefix.is_empty() {
             SessionId::new()
