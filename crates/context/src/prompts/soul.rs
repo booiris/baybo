@@ -87,6 +87,15 @@ impl PromptShape {
     /// Empty is also not inert. A seed template reads as an instruction to
     /// fill it in, which is the same failure [`TOP_HINT_ISSUE`] exists to
     /// stop, arriving through the other half of the prompt.
+    /// Whether the prompt carries the standing [`BACKGROUND_TASKS_HINT`].
+    /// See that constant for why a card's run does not.
+    fn carries_background_hint(self) -> bool {
+        match self {
+            Self::Chat => true,
+            Self::Issue => false,
+        }
+    }
+
     fn carries_user_sections(self) -> bool {
         match self {
             Self::Chat => true,
@@ -101,6 +110,13 @@ impl PromptShape {
 /// busy-waits with `sleep` + `JobList` for minutes instead of yielding the
 /// turn — the result can only be delivered once the turn ends, so waiting is
 /// self-defeating.
+///
+/// Standing only for [`PromptShape::Chat`]. A card's run barely backgrounds
+/// anything — `spawn_subagent background: true` 4 times in 51 sessions and
+/// `Bash`'s `background` 0 times in 3,558 calls — so 775 bytes of it rode
+/// every request to cover the rare one. Every dispatch that *does* background
+/// hands back [`baybo_model::BACKGROUND_DISPATCH_YIELD_GUIDANCE`], which says
+/// the same thing at the moment it becomes actionable.
 const BACKGROUND_TASKS_HINT: &str = r#"# Background work
 
 When a subagent or command runs in the background — you spawned it with `background: true`, or a slow foreground one was auto-converted after its wait — its result is delivered to you automatically as a fresh turn once the CURRENT turn ends. It can never arrive while this turn is still running. So once the only thing left to do is that background job, end the turn: stop calling tools and hand control back. Do NOT `sleep`, and do NOT poll `JobList`, to wait for it — neither can surface the result, they only delay it. `JobList` is a status peek, not a wait or a result channel; an empty `JobList` means nothing is in flight, not that a result is ready. Keep working after backgrounding only if you have other genuinely independent work to do right now."#;
@@ -438,7 +454,9 @@ pub async fn assemble(
     if let Some(index_path) = memory_index {
         parts.extend(memory_parts(index_path, shape).await);
     }
-    parts.push(PromptPart::Hint(BACKGROUND_TASKS_HINT.to_string()));
+    if shape.carries_background_hint() {
+        parts.push(PromptPart::Hint(BACKGROUND_TASKS_HINT.to_string()));
+    }
     parts.push(PromptPart::Hint(TAIL_HINT.to_string()));
     Ok(AssembledPrompt { parts })
 }
@@ -647,6 +665,18 @@ mod tests {
                 tag.as_str()
             );
         }
+        // The standing background rule goes too. Every dispatch that
+        // actually backgrounds hands the same sentence back instead, which is
+        // where it can be acted on.
+        assert!(
+            chat.contains("# Background work"),
+            "a conversation keeps the standing rule: {chat}"
+        );
+        assert!(
+            !issue.contains("# Background work"),
+            "a card's run must not carry it: {issue}"
+        );
+
         for tag in [SectionTag::Soul, SectionTag::Identity] {
             assert!(
                 issue.contains(&format!("<{}", tag.as_str())),

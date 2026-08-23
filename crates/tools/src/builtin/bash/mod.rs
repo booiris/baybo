@@ -1280,13 +1280,37 @@ async fn run_detached(
                 stderr_path,
             };
             let returned = sink.detach_command(turn).await;
-            Ok(Some(ToolOutput::Text(format!(
-                "Command still running after {timeout:?}; moved to the background as `{returned}`. \
-                 Output is streaming to `{display_path}` (Read it for progress). You'll get a \
-                 notification when it finishes — keep working in the meantime.{secret_risk_note}"
+            Ok(Some(ToolOutput::Text(background_handoff(
+                timeout,
+                &returned,
+                &display_path,
+                secret_risk_note,
             ))))
         }
     }
+}
+
+/// What a command pushed to the background hands back.
+///
+/// Carries [`baybo_model::BACKGROUND_DISPATCH_YIELD_GUIDANCE`] rather than a
+/// second wording of it: that rule has one home, and this is one of the three
+/// dispatch points that deliver it (the other two are the subagent spawner's
+/// explicit and auto-converted paths). Delivering it here rather than from the
+/// system prompt is also what lets `PromptShape::Issue` drop the standing
+/// version — the rule only becomes actionable once something is actually in
+/// the background.
+fn background_handoff(
+    timeout: std::time::Duration,
+    handle: &str,
+    display_path: &str,
+    secret_risk_note: &str,
+) -> String {
+    format!(
+        "Command still running after {timeout:?}; moved to the background as `{handle}`. \
+         Output is streaming to `{display_path}` (Read it for progress). {guidance}\
+         {secret_risk_note}",
+        guidance = baybo_model::BACKGROUND_DISPATCH_YIELD_GUIDANCE
+    )
 }
 
 async fn spawn_detached_child(
@@ -6240,5 +6264,30 @@ mod tests {
                 .any(|l| l == "BAYBO_TEST_SECRET=injected-value"),
             "injected env var must reach the child:\n{stdout}"
         );
+    }
+}
+
+#[cfg(test)]
+mod background_handoff_tests {
+    use super::background_handoff;
+
+    /// The handoff carries the yield rule verbatim. This is the only place it
+    /// reaches a card's run: `PromptShape::Issue` drops the standing hint
+    /// because every dispatch delivers it here instead, so a reworded copy
+    /// here would silently leave that run with no rule at all.
+    #[test]
+    fn a_backgrounded_command_hands_back_the_one_yield_rule() {
+        let text = background_handoff(
+            std::time::Duration::from_secs(120),
+            "bg-7",
+            "/w/out.log",
+            "",
+        );
+        assert!(
+            text.contains(baybo_model::BACKGROUND_DISPATCH_YIELD_GUIDANCE),
+            "the shared rule must be present verbatim: {text}"
+        );
+        assert!(text.contains("bg-7"), "{text}");
+        assert!(text.contains("/w/out.log"), "{text}");
     }
 }
