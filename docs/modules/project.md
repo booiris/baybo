@@ -54,6 +54,7 @@ every door leads through it.
 | `worktree.rs` | The per-issue git worktree: create, branch, resolve the commit identity, reclaim |
 | `approvals.rs` | `TimelineApprovalGate` — a run's approval prompts, on the card |
 | `events.rs` | The `ProjectEvents` push port (the gateway implements it) |
+| `stopper.rs` | The `IssueRunStopper` port — interrupt the turn under a live run — and the `TurnLifecycle` adapter a real assembly hands it |
 | `tools/` | The six board tools an agent working a project can call |
 
 Everything under `runs`/`comments`/`mentions`/`stages`/`budget`/`timeline`/`driver`
@@ -108,6 +109,21 @@ door goes through it: the executor's `finish_run`, the operator's `cancel_run`,
 the sweep's `call_off`, and the dispatcher settling a checkout it could not cut.
 The actor differs per door and is the caller's to supply; the sequence is not.
 
+`cancel_run` is that door for a run with no live turn to interrupt, and the
+split is on **status**, not on whether a session was ever opened: a `Running`
+row carrying a session is interrupted instead, through the `IssueRunStopper`
+port, and settled by the executor watching its turn, so a stop and a settle
+never race to record how the run ended. Everything else settles here — a
+`Queued` or `Held` row that never started, and equally a `Queued` row that ran
+for an hour before the process died, because `requeue_unsettled` rolls a
+crashed row back without clearing `session_id` (the same reason the dispatcher's
+ownership test below has to read `status` and not `session_id IS NULL`). A
+session on the row is not evidence a turn is alive under it. `cancel_run` does
+both halves itself: a caller asks the board to stop a
+run, and is never handed the `SessionId` to interrupt on its own, because "how
+a run is stopped" spelled in the route and again in the crate is one home too
+many — and only one of the two would learn about the money ceiling below.
+
 Nothing in `settle.rs` consults `writable_project`, deliberately. A run archived
 out from under mid-flight still has to finish its own bookkeeping — refusing
 that write would strand the card, which is the failure settling exists to
@@ -121,13 +137,21 @@ Held ──(released)──► Queued ──(claimed)──► Running ──(se
   └────────────────────┴─────(cancelled, or called off)───────────────┘
 ```
 
-Nothing calls off a row that is *running*: the sweeps are the only callers and
-both filter by status first — `release_holds` sees only `Held` rows,
-`resume_project_runs` only `Queued` ones. A `Queued` row may still be one that
-ran, because the process-start requeue rolls an interrupted `Running` row back
-to `Queued` and leaves its session on it — the card carries `RunStarted` for it
-and the transcript exists — which is why the call-off has two sentences and
-picks between them per row rather than per caller.
+Nothing calls off a row that is *running*, and that rule lives in
+`runs::verdict` rather than at the call sites: it answers `Stands` for a
+`Running` row first, before it so much as reads the card. Three of the four
+doors do filter by status on the way in — `resume_project_runs` sees only
+`Queued` rows, `release_holds` and `call_off_dead_holds` only `Held` ones — but
+`redrive_after_unblock` hands over whatever is unsettled, so a rule spelled at
+the callers is a rule the fourth door does not have: one `update_issue`
+carrying both an unblock and a cancel would settle the executing row under its
+own executor, and stamp it interrupted, which it was not.
+
+A `Queued` row may still be one that ran, because the process-start requeue
+rolls an interrupted `Running` row back to `Queued` and leaves its session on
+it — the card carries `RunStarted` for it and the transcript exists — which is
+why the call-off has two sentences and picks between them per row rather than
+per caller.
 
 `Held`, `Queued` and `Running` are the **unsettled** states, and a partial
 unique index makes at most one of them exist per issue. That index is the
@@ -221,10 +245,30 @@ three questions once each:
 
    The entry names the **attempt holding the slot**, not just the refusal:
    "refused" is not something an operator can act on and "run #4 still has
-   this card" is. It is recorded for every trigger, coordination included —
-   this is also the only count in the tree of how often a card's one run
-   slot refuses anything, and a count that saw half the refusals could not
-   answer the question it exists for. Deliberately not a `Comment`: a
+   this card" is. It is recorded for every trigger, coordination included,
+   with one exception (`runs::refused_itself`): a `Running` holder whose
+   `agent_id` is the agent now asking. The intended case is an agent moving
+   or reassigning its own card from inside its own turn — the slot is held
+   by the run doing the asking, and a comment landing during that run makes
+   its settle enqueue the follow-up, so the card has nothing to report. A
+   `Queued` or `Held` holder of the same agent's is a real refusal an
+   operator can act on, and does record.
+
+   The follow-up is what the exception is betting on, and it does not
+   always come: it fires only when somebody commented during the run
+   (`wake_after_run` → `was_told_something_during` →
+   `comments::somebody_asked_for_more`). A reassignment or a Review → In
+   Progress bounce with no comment in the window leaves the card in its new
+   column, naming a new assignee, with nothing running under it and no entry
+   saying so. What catches it is the lead's `Stalled` question one tick
+   later — a billed coordination run for a state `RunTrigger::Assigned`
+   exists to prevent. The trade is deliberate: the entry being suppressed
+   names the asker's own run as the holder, which is the one refusal an
+   operator cannot act on, while "In Progress with nothing running" is a
+   state the board already watches for.
+
+   So what the entry counts is every refusal by another run, plus the
+   asker's own queued and held ones. Deliberately not a `Comment`: a
    `System`-actored comment satisfies `comments::somebody_asked_for_more`,
    so the settling run would wake its assignee on the board's own note.
 
@@ -244,6 +288,23 @@ three questions once each:
    hold release below needs it), but it never decides *whether* the row is
    written — only what happens to it afterwards. So an exhausted board
    records the work it owes as `Held` rather than dropping it.
+
+   **The two ceilings are symmetric at this gate and asymmetric above it.**
+   Neither drops a row here; both hold it. But `stop_runs_over_the_money_cap`
+   — the sweep `drive` runs above the promotion gate — cancels the turn under
+   every `Running` row on a board whose *money* ceiling is spent
+   (`Headroom::money_exhausted`, a narrower question than the `is_exhausted`
+   this gate asks; `IssueRunStopper` and `RunStopReason::BudgetExhausted` do
+   the stopping). Without it a ceiling bounds nothing: this gate decides
+   whether the *next* run starts, and one run's own spend is unbounded, so a
+   board overshoots by whatever its longest run costs. A token ceiling never
+   stops work in flight — it measures subscription plans, where the turn is
+   paid for whether or not it is allowed to finish, so throwing it away buys
+   nothing and loses the work.
+   That stop writes no `BudgetExhausted` entry, because that entry says the
+   run was *held*, which is this gate's doing and the opposite of the sweep's;
+   the card learns why from the settle its executor writes, since a cancel
+   nobody asked for names its `CancelReason`.
 
    One read serves both meters: `ProjectStore::spend_since` returns a
    `Spend`, so there is one answer to "what has this board burned today"
@@ -563,16 +624,21 @@ router mints, so it is a real reordering rather than a `WHERE` clause.
 An exhausted board records work instead of dropping it. The card says so
 twice — `held` where its live run's state is drawn, and a timeline entry
 carrying the figures (`BudgetExhausted`) — and it starts the moment there is
-headroom again.
+headroom again. That is what the board does with work it has not started; a
+run already executing when the *money* ceiling goes is stopped instead, by
+`stop_runs_over_the_money_cap` rather than by anything in this section.
 
-Holds are released **by activity, not by a clock**. Four things reach
-`release_holds`: a budget change, the boot sweep, a board coming back off the
-shelf, and every enqueue that gets past the liveness gate onto a card with
-somebody on it — which is every enqueue that was going to write anything. (An
-enqueue the liveness gate refuses releases nothing; the board's other holds wait
-for the next thing that happens on it.) A daily ceiling that rolls over while
-nothing is happening therefore needs no timer — the first thing that happens
-next releases the hold, and if nothing happens, nothing needed releasing.
+Holds are released **by activity, and once a tick by the driver**. Five doors
+reach `release_holds` on activity: a budget change, the boot sweep, a board
+coming back off the shelf, an unblock that finds a held row, and every enqueue
+that gets past the liveness gate onto a card with somebody on it — which is
+every enqueue that was going to write anything. (An enqueue the liveness gate
+refuses releases nothing; the board's other holds wait for the next thing that
+happens on it.) The sixth is the driver: `promotions` releases unconditionally
+at the top of every `DRIVE_INTERVAL` pass over a board that is neither archived
+nor set to zero parallelism. That is what covers the one thing no activity
+announces — the UTC day rolling over. Why that release sits *before* the pass
+counts slots is in the driver section below.
 
 The restore is the same idiom applied to the other read-only state: a board
 nobody may write is a board where nothing happens, so its work waits, and the
@@ -642,11 +708,13 @@ freed by a settling run, waits up to `DRIVE_INTERVAL` before anything happens.
 That is the trade, and it is why the interval is seconds rather than the
 minute a pure safety net would want.
 
-This is *not* the shape `release_holds` uses — that one is edge-driven off
-activity, and the difference is worth knowing: a hold only matters to the card
-holding it, so the next thing that happens on that board releases it. A
-promotion is about the board's spare capacity, which the card that would use
-it has no way to observe.
+This is *not* the shape a hold's release is mostly driven by — that one is
+edge-driven off activity, and the difference is worth knowing: a hold only
+matters to the card holding it, so the next thing that happens on that board
+releases it. A promotion is about the board's spare capacity, which the card
+that would use it has no way to observe. The tick releases holds too, and the
+paragraph below is why: one event on a budget-limited board is announced by no
+activity at all.
 
 `drive` takes a process-wide lock. Reading the load and acting on it is not
 atomic against the store, and three runs settling together would otherwise each
@@ -710,7 +778,9 @@ Five things it will not do, each of which is a rule and not a coincidence:
   on one says nothing about the other.
 - **It will not start work while either ceiling is exhausted.** `enqueue` would
   record the run and hold it, leaving a card in In Progress with nothing running
-  under it. The existing hold/release path already owes that work.
+  under it. The existing hold/release path already owes that work. Stopping
+  work is the other half and not this gate's: `stop_runs_over_the_money_cap`
+  runs earlier in the same pass, above the promotion gate and only for money.
 - **It will not preempt.** Priority decides who gets the *next* free slot, not
   who keeps one. A card already running keeps running when something more
   urgent arrives.
@@ -718,9 +788,10 @@ Five things it will not do, each of which is a rule and not a coincidence:
 Ordering is `(priority, position, number)` — the same order `IssueList` already
 reads a column in, deliberately, so "what is next in Todo" has one answer
 whether an agent asks or the board acts. Note that the **web board renders in
-`position` order with unread cards lifted above it** (`hoistUnread`, a reading
-order that writes nothing), so on a column with mixed priorities the card the
-board takes next is not necessarily the one rendered at the top.
+`position` order with pinned cards lifted first and unread cards lifted within
+each partition** (`readingOrder`, a reading order that writes nothing), so on a
+column with mixed priorities the card the board takes next is not necessarily
+the one rendered at the top.
 
 **Asking the lead.** Some cards are not work the board can start — they are
 questions only the lead can answer, and the same pass that promotes asks them
@@ -1285,9 +1356,11 @@ use the same ledger predicate so they cannot disagree about the boundary.
 `IssueRunRow::was_claimed()` in `baybo-store`, on the row it is about, in the
 crate `baybo-project` and `baybo-agent` both depend on (`runs::ever_ran` is that
 function under this crate's own name). It reads the **session**, not
-`started_at`: the executor stamps both when it claims a run, but the boot sweep
-clears `started_at` and leaves the session, so only the session still answers
-for a run the process died in the middle of. This crate asks the same predicate
+`started_at`: the executor stamps both when it claims a run, and both survive
+the process-start requeue — `started_at` deliberately, because it is the left
+edge of the run's spend window and `claim_run` re-stamps it only through
+`COALESCE`. The session is what the three questions below are actually about,
+so it is what the predicate reads. This crate asks the same predicate
 for a different reason — a run being called off after a restart is told it was
 interrupted, not that it never started. A row that never claimed a session never
 opened a transcript and never touched the checkout, so none of the three

@@ -200,8 +200,12 @@ wrong input. A `Persisted` marker is only emitted when the count is known, so
 every reference is validated — there is no skip path. A hydration *code* bug is
 recoverable (the truth lives in durable `session_messages`; `replay` is pure and
 re-runnable after the fix) — the tripwire only makes drift loud, not silent. The
-write-side / read-side filter equivalence is pinned by a differential test, the
-marker path by a negative test.
+marker path is pinned by a negative test
+(`replay_flags_prefix_len_tripwire_mismatch`). There is no second, write-side
+copy of the active-message filter to keep in lockstep with it: the
+`superseded_by > N` form is applied only by the read-side reconstruction, while
+the write side anchors on `latest_session_ordinal` + `count_active_messages` and
+emits an inline copy whenever those disagree with the in-memory window.
 
 ### Synchronous lifecycle writes
 

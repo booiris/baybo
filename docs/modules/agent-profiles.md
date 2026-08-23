@@ -2,7 +2,7 @@
 
 ## Overview
 
-Agent profiles are user-managed personas: a named, avatar-carrying row bundling an execution framework (`baybo` / `claude` / `codex`) and an optional LLM pin. The operator creates and edits them from the web dashboard, and a chat session binds to one at creation.
+Agent profiles are user-managed personas: a named, avatar-carrying row bundling an execution framework (`baybo` / `claude` / `codex`) and an optional LLM pin. The operator creates and edits them from a board's team strip in the web dashboard, and a chat session binds to one at creation.
 
 **The row is half of an agent.** The other half is its persona directory,
 holding the `SOUL.md` and `IDENTITY.md` it reads and the `skills/` directory
@@ -10,8 +10,8 @@ only it sees. Global agents use `<workspace>/personas/<agent_id>/`; newly
 created project agents have a `project-<ULID>` id and use
 `<workspace>/personas/project/<agent_id>/`. Older unprefixed project ids remain
 at their original flat location. The split is by kind of content: the row
-carries what the system queries (a unique name to sort and pick by, a binary
-avatar, a framework), the directory carries the prose the agent itself
+carries what the system queries (a framework, an LLM pin, an avatar blob,
+and a board membership), the directory carries the prose the agent itself
 rewrites. Neither a prompt nor a skill list is a column. See
 [`../todo/multi-agent-chat.md`](../todo/multi-agent-chat.md) for the binding,
 the resolution rules, and what is still unbuilt.
@@ -22,7 +22,7 @@ This is a cross-crate feature subsystem, not a crate. The pieces live where thei
 - `crates/store/src/agent_profile.rs` — `AgentProfileRow`, `AgentProfileUpdate`, the `AgentProfileStore` trait.
 - `crates/storage/src/sqlite/agent_profile.rs` — `SqliteAgentProfileStore` + the `agent_profiles` table in `init_db()`.
 - `crates/gateway/src/api/admin/agents.rs` — the `/v1/agents` handlers and DTOs.
-- `app/web/src/pages/AgentsPage.tsx` — the management page.
+- `app/web/src/pages/projects/TeamStrip.tsx` + `AgentProfile.tsx` — the management surface, inside the board page.
 
 **What this is NOT.** It is not `SubagentProfile` ([`subagent.md`](subagent.md)): that is the filesystem-authoritative registry (`<workspace>/agents/<name>.md`, `DashMap`, disk wins on `reload`) that types *spawned subagents*. Agent profiles are DB-authoritative, web-managed, and aimed at *top-level* sessions. The two registries do not read each other, share no types beyond `baybo-model`, and a name appearing in both means nothing. It is also not the Soul itself: a soul is a file, and the row only names which agent's file to read. The built-in's persona is an ordinary directory, `personas/baybo/`, so an unbound session and a built-in-bound one assemble byte-identical prompts.
 
@@ -37,6 +37,9 @@ pub struct AgentProfileRow {
     pub framework: AgentFramework,     // baybo | claude | codex
     pub llm: Option<LlmEntryName>,     // None = follow default-llm; meaningful for baybo only
     pub builtin: bool,                 // the seeded `baybo` row; locked except avatar
+    pub team: Option<TeamMembership>,  // project_id + @handle; None = a global agent
+    pub hired_by: Option<AgentProfileId>, // None = the operator created it
+    pub deleted_at: Option<DateTime<Utc>>, // team members tombstone; globals are deleted outright
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -169,16 +172,20 @@ House encodings throughout: timestamps µs via `super::time`, booleans `INTEGER`
 // crates/store/src/agent_profile.rs
 #[async_trait]
 pub trait AgentProfileStore: Send + Sync {
-    async fn list(&self) -> Result<Vec<AgentProfileRow>>;            // ORDER BY builtin DESC, name COLLATE NOCASE
-    async fn get(&self, id: &AgentProfileId) -> Result<Option<AgentProfileRow>>;
-    async fn create(&self, row: &AgentProfileRow) -> Result<()>;     // duplicate name → Conflict; never binds `builtin`
-    async fn update(&self, id: &AgentProfileId, update: &AgentProfileUpdate) -> Result<bool>; // WHERE builtin = 0; duplicate name → Conflict
+    async fn list(&self) -> Result<Vec<AgentProfileRow>>;            // global agents only; ORDER BY builtin DESC, id
+    async fn list_team(&self, project: &ProjectId) -> Result<Vec<AgentProfileRow>>;         // live roster; ORDER BY handle
+    async fn list_team_history(&self, project: &ProjectId) -> Result<Vec<AgentProfileRow>>; // tombstones included, oldest first
+    async fn get(&self, id: &AgentProfileId) -> Result<Option<AgentProfileRow>>;            // reaches removed team members
+    async fn create(&self, row: &AgentProfileRow) -> Result<()>;     // duplicate id → Conflict; never binds `builtin`
+    async fn update(&self, id: &AgentProfileId, update: &AgentProfileUpdate) -> Result<bool>; // reaches the builtin, never its framework
     async fn set_avatar(&self, id: &AgentProfileId, blob_id: Option<&str>) -> Result<bool>;   // builtin allowed
-    async fn delete(&self, id: &AgentProfileId) -> Result<bool>;     // WHERE builtin = 0; plain row DELETE
+    async fn set_llm(&self, id: &AgentProfileId, llm: Option<&LlmEntryName>) -> Result<bool>; // never the builtin
+    async fn delete(&self, id: &AgentProfileId) -> Result<bool>;     // WHERE builtin = 0 AND project_id IS NULL; plain row DELETE
+    async fn remove_from_team(&self, id: &AgentProfileId) -> Result<bool>;                  // stamps `deleted_at`
 }
 ```
 
-`AgentProfileUpdate` is the row's remaining content state minus `id`/`avatar_blob_id`/`builtin`/timestamps (so: description, framework); `update`, `set_llm` and `set_avatar` bump `updated_at`. `project_id`/`handle` are absent from every one of these, and that is enforced by the schema rather than by this list staying short: an `agent_profiles_team_is_insert_only` trigger aborts any `UPDATE` that moves either (see [`storage.md`](storage.md)). It is the store-side twin of the fixed name above — the same identity, split across a column SQL can guard and a file it cannot. No write can conflict on content — the one `UNIQUE` column went away with `name`. `Ok(false)` = no row matched (missing id, or the builtin behind the guard) — the gateway `get`s first to disambiguate, and reads `Ok(false)` after a non-builtin `get` as a concurrent delete → 404. The store stays a dumb writer — name/llm/blob validation lives in the gateway handlers — and rides the `Store.agent_profile` bundle field out of `Store::open`.
+`AgentProfileUpdate` is the row's remaining content state minus `id`/`avatar_blob_id`/`builtin`/`team`/`hired_by`/`deleted_at`/timestamps (so: description, framework); `update`, `set_llm` and `set_avatar` bump `updated_at`. `project_id`/`handle` are absent from every one of these, and that is enforced by the schema rather than by this list staying short: an `agent_profiles_team_is_insert_only` trigger aborts any `UPDATE` that moves either (see [`storage.md`](storage.md)). It is the store-side twin of the fixed name above — the same identity, split across a column SQL can guard and a file it cannot. No write can conflict on content — the one `UNIQUE` column went away with `name`. `Ok(false)` = no row matched (missing id, or the builtin behind the guard) — the gateway `get`s first to disambiguate, and reads `Ok(false)` after a non-builtin `get` as a concurrent delete → 404. The store stays a dumb writer — name/llm/blob validation lives in the gateway handlers — and rides the `Store.agent_profile` bundle field out of `Store::open`.
 
 ## HTTP API
 
@@ -202,12 +209,12 @@ Shape changes ride the standard openapi regen chain — see the header of `crate
 
 ## Web UI
 
-`AgentsPage.tsx` + an `/agents` route + an `IconRail` destination, following the house conventions (hand-rolled fetch with refetch-after-mutation, `useAdminClient()`, 401 → `logout()`, `?mock=true` with every mutation short-circuited in mock mode). Layout is a `[sidebar | detail]` split like the chat page.
+There is no standalone Agents page and no `/agents` route: the surface lives inside the board page, as `TeamStrip.tsx` (the roster strip plus the hire form, over `POST /v1/projects/{project_id}/agents`) and the `AgentProfile.tsx` panel it opens (per-agent detail, and the LLM pin via `PUT /v1/agents/{agent_id}/model`). Both follow the house conventions (hand-rolled fetch with refetch-after-mutation, `useAdminClient()`, 401 → `logout()`, `?mock=true` with every mutation short-circuited in mock mode). The panel is a `FloatingPanel` over the board (one per agent, keyed by id), not a page of its own — it is also mounted from `ColumnPage`.
 
-- **Sidebar**: the agent roster — per-row character face (uploaded avatar > bundled brand image for the builtin > monogram on a deterministic per-agent tint), name (+ lock icon on the builtin), `framework · model` subtitle, coral highlight on the active row; a "New agent" button switches the detail pane to the create form.
-- **Detail**: an inline character-sheet editor (no modal, centered single column), keyed by selection. Header: large avatar portrait + image/remove controls beside the name field, a fixed-min-height meta row (builtin lock badge / id) so switching agents never jumps the layout. Body: description, framework, LLM pin, system prompt, then a full-width **read-only skills readout** — every registered skill listed with its `SKILL.md` description (from `GET /v1/skills`, which returns `{name, description}`), the same live registry for every agent since skills aren't per-profile in v1. A removed LLM entry renders as "(unavailable)"; the LLM pin greys out for external frameworks ("baybo only"). Footer: destructive Delete on the left (custom agents; a confirm dialog follows), Save on the right. For the builtin everything except the avatar is disabled and Save is live only when the avatar changed.
-- **Avatar**: file input → `POST /v1/blobs` → `PUT /v1/agents/{agent_id}/avatar`; rendering fetches the blob with the bearer into an object URL (an `<img>` can't carry the auth header). The bundled builtin default is `app/web/src/assets/baybo-avatar.webp` (a 256² webp squeezed from `assets/baybo.png`; `avatar_blob_id` stays `NULL`).
-- **No WS**: nothing consumes agent profiles live — no `Frame` variant, no store/context. A `FolderView`-style broadcast can be added when binding lands.
+- **Roster strip**: one avatar per teammate (uploaded blob, else a deterministic generated face from `botttsFace(agent_id)`), tooltipped `name (@handle)` + run note + description, capped at `MAX_AGENTS = 16` mirroring the server's `MAX_TEAM_AGENTS`; a `+` button opens the hire form (name, role/description, framework picker — `native` / `claude` / `codex`), which `POST`s to `/v1/projects/{project_id}/agents`.
+- **Profile panel**: opened from the strip, keyed by agent. Header `@handle`, then description, `framework (fixed at hire)`, who hired it (`— hired by @x`, flagged `(since removed)` when the hirer has left), the LLM pin as a `Picker` writing `PUT /v1/agents/{agent_id}/model`, and a read-only skills readout ("the shared set, in v1") since skills aren't per-profile. Footer: **Remove from project** behind an inline confirm, hidden for a read-only board and for the lead.
+- **Avatar**: rendered, not uploaded. `useTeamPortraits` fetches each agent's blob once per board with the bearer into an object URL (an `<img>` can't carry the auth header) and falls back to the generated face; no web path calls `PUT /v1/agents/{agent_id}/avatar`, which stays API-only.
+- **Live over WS**: the roster refetches on `Frame::ProjectChanged` for this board — `useBoardStream` bumps the `refreshKey` the board's `fetchTeam` effect is keyed on — so a hire or a removal made elsewhere lands without a reload.
 
 ## Constraints
 
@@ -244,8 +251,8 @@ authoritative for all three. What is left:
 | `model` | `AgentProfileId` (ULID / `project-<ULID>` string newtype), `AgentFramework` (+ `to_backend_kind`), `BUILTIN_AGENT_PROFILE_ID`, `MAX_AGENT_PROFILE_NAME_CHARS` |
 | `store` | `AgentProfileRow` / `AgentProfileUpdate` / `AgentProfileStore` port; `StorageError::Conflict` carries duplicate names |
 | `storage` | `SqliteAgentProfileStore` (async `open` seeds the builtin), `agent_profiles` DDL in `init_db()`, `Store.agent_profile` bundle field |
-| `gateway` | `api/admin/agents.rs` handlers + DTOs, `AdminState.{agent_profile_store, blob_store}`, the shared `validate_llm_pin`; `GET /v1/skills` (now `{name, description}` from `all_summaries_sorted`) and `GET /v1/llm/models` feed the read-only skills readout and the model picker |
-| `skills` | `SkillRegistry::all_summaries_sorted()` is the live source rendered read-only in the skills readout |
+| `gateway` | `api/admin/agents.rs` handlers + DTOs, `AdminState.{agent_profile_store, blob_store}`, the shared `validate_llm_pin`; `GET /v1/skills` (`{name, description, universal}` from `SkillRegistry::summaries_for(agent_id)`) and `GET /v1/llm/models` feed the read-only skills readout and the model picker |
+| `skills` | `SkillRegistry::summaries_for(agent_id)` is the live source rendered read-only in the skills readout — per-agent scoped, so the readout is the agent's own set, not the whole registry |
 | `agent` | the `LlmPoolHandle` on `AdminState` validates the `llm` pin at write time |
-| `web` | `AgentsPage.tsx`, route + `IconRail` entry, blob upload/render reuse |
+| `web` | `projects/TeamStrip.tsx` + `projects/AgentProfile.tsx` on the board page, `projects/portrait.ts` avatar-blob rendering (`botttsFace` fallback); no avatar *upload* path in the web client — `PUT /v1/agents/{agent_id}/avatar` is API-only |
 | `subagent` / `context` | **none in v1** — first coupling arrives with session binding (Deferred) |

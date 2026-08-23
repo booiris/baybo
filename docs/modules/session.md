@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `session` crate owns the session lifecycle vertical: `SessionError` and the `SessionManager` business-logic facade. The `SessionStore` / `SessionSummaryStore` traits and their per-row `StoredMessage` / `SessionSummaryRow` value types live in the `baybo-store` ports crate; domain types (`Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `Lineage`, `LineageKind`) live in `baybo-model`. The sqlite implementations of both store traits live in `baybo-storage`, which implements the `baybo-store` contracts; `baybo-session` calls them.
+The `session` crate owns the session lifecycle vertical: `SessionError` and the `SessionManager` business-logic facade. The `SessionStore` / `SessionFolderStore` traits and their per-row `StoredMessage` / `SessionFolderRow` value types live in the `baybo-store` ports crate; domain types (`Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `Lineage`, `LineageKind`) live in `baybo-model`. The sqlite implementations of both store traits live in `baybo-storage`, which implements the `baybo-store` contracts; `baybo-session` calls them.
 
 A session may be **bound to an agent profile** at creation:
 `create_session_with_agent` / `get_or_create_with_agent` seed
@@ -21,11 +21,11 @@ The conversation transcript itself is **not** carried on `Session`. It lives in 
 
 ## Manager surface
 
-`SessionManager` wraps three stores — `store: Arc<dyn SessionStore>` (session rows + transcript), `summary_store: Arc<dyn SessionSummaryStore>` (per-session summary-cursor metadata), and `folder_store: Arc<dyn SessionFolderStore>` (chat-list folders) — all required at `new()`. It exposes:
+`SessionManager` wraps two stores — `store: Arc<dyn SessionStore>` (session rows + transcript) and `folder_store: Arc<dyn SessionFolderStore>` (chat-list folders) — both required at `new()`. It exposes:
 
 - Lifecycle: `create_session` / `create_session_with_trigger` / `create_spawned_session` / `get_or_create` / `get` / `list` / `list_by_channel` / `delete` / `idle_sessions` / `touch`. `idle_sessions(threshold)` only **returns** the IDs of sessions idle past the threshold — it never deletes a row (its sole consumer is the actor reaper, which evicts in-memory actors, not rows).
-- Transcript brokerage (thin pass-throughs to `SessionStore`): `append_session_message`, `append_session_message_idempotent`, `apply_session_compaction`, `load_active_session_messages`, `load_active_session_messages_up_to`, `active_index_of_ordinal`, `count_active_messages`, `latest_session_ordinal`, `load_session_messages_with_supersede`, `history`, `full_transcript`. The idempotent append atomically claims a per-session `source_event_id` for crash-replayed internal notifications; ordinary turn rows use the regular append. The agent loop keeps the in-memory `ContextManager` synchronized with both outcomes.
-- Chat-list + sync surface: the per-row toggles `set_hidden` / `set_pinned` / `set_archived` / `set_folder` / `set_title` / `set_title_if_absent` / `set_user_title` / `set_last_llm` / `set_read_cursor` / `unread_reply_count`; the title pair is asymmetric on purpose — `set_user_title` validates a user-submitted name (trim, collapse interior whitespace, non-empty, `MAX_SESSION_TITLE_LEN`, reporting `SessionError::InvalidArgument` → 400) and overwrites, while `set_title_if_absent` is the only path a machine-generated title may take, so a title pass that resolves after a rename cannot clobber it; folder CRUD `list_folders` / `create_folder` / `rename_folder` / `reparent_folder` / `reorder_folders` / `delete_folder` (depth and cycle validation live here, not in the store); pagination and point lookups `history_tail` / `history_since` / `find_message_ordinal_by_platform_msg_id`; the grouped chat-list reads `chat_list_scan` (first-line previews + second-line tail windows + unread counts for a whole visible list in three window-function queries) / `session_titles` / `session_channels`; control events `append_control_event` / `list_control_events` / `list_control_events_in_range` (page-scoped); and summary-cursor metadata `summary_metadata` / `record_summary_success` / `record_summary_failure`.
+- Transcript brokerage (thin pass-throughs to `SessionStore`): `append_session_message`, `append_session_message_idempotent`, `apply_session_compaction`, `load_active_session_messages`, `active_index_of_ordinal`, `count_active_messages`, `latest_session_ordinal`, `load_session_messages_with_supersede`, `history`, `full_transcript`. The idempotent append atomically claims a per-session `source_event_id` for crash-replayed internal notifications; ordinary turn rows use the regular append. The agent loop keeps the in-memory `ContextManager` synchronized with both outcomes.
+- Chat-list + sync surface: the per-row toggles `set_hidden` / `set_pinned` / `set_archived` / `set_folder` / `set_title` / `set_title_if_absent` / `set_user_title` / `set_last_llm` / `set_read_cursor` / `unread_reply_count`; the title pair is asymmetric on purpose — `set_user_title` validates a user-submitted name (trim, collapse interior whitespace, non-empty, `MAX_SESSION_TITLE_LEN`, reporting `SessionError::InvalidArgument` → 400) and overwrites, while `set_title_if_absent` is the only path a machine-generated title may take, so a title pass that resolves after a rename cannot clobber it; folder CRUD `list_folders` / `create_folder` / `rename_folder` / `reparent_folder` / `reorder_folders` / `delete_folder` (depth and cycle validation live here, not in the store); pagination and point lookups `history_tail` / `history_since` / `find_message_ordinal_by_platform_msg_id`; the grouped chat-list reads `chat_list_scan` (first-line previews + second-line tail windows + unread counts for a whole visible list in three window-function queries) / `session_titles` / `session_channels`; and control events `append_control_event` / `list_control_events` / `list_control_events_in_range` (page-scoped).
 
 ## Design Decisions
 
@@ -82,14 +82,14 @@ Session rows and their transcripts are core user data and are **never** dropped 
 1. The actor reaper (`AgentSupervisor::reap_idle`) periodically calls `SessionManager::idle_sessions(threshold)`.
 2. That computes `cutoff = now - threshold` and returns `SessionStore::list_expired(cutoff)` — a list of candidate session IDs and nothing more. The method's doc-comment states it "must never become a delete."
 3. For each candidate that has a live registered actor (and no in-flight background subagents), the supervisor sends `AgentMessage::ActorStop`, which trips the actor's cancellation token and lets the registry guard drop the in-memory entry.
-4. The session row, transcript, summary cursor, and channel binding all stay live; the next user message re-hydrates a fresh actor from the store. Dropping the actor is therefore lossless.
+4. The session row, transcript, and channel binding all stay live; the next user message re-hydrates a fresh actor from the store. Dropping the actor is therefore lossless.
 
 ## Collaboration
 
 | Module    | Role                                                                                                |
 | --------- | --------------------------------------------------------------------------------------------------- |
 | `model`   | Defines `Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `Lineage`               |
-| `storage` | Implements `SessionStore` / `SessionSummaryStore` / `SessionFolderStore` against sqlite; pulls the traits from `baybo-store` (no `baybo-session` dependency) |
+| `storage` | Implements `SessionStore` / `SessionFolderStore` against sqlite; pulls the traits from `baybo-store` (no `baybo-session` dependency) |
 | `context` | Owns the in-memory transcript via `ContextManager`; agent loop brokers persistence via this crate  |
 | `agent`   | Re-exports `SessionManager`; Router calls it; `AgentActor` holds the `Session` instance            |
 | `cli` / `gateway` | Operator-facing surfaces consume `baybo_agent::SessionManager`                              |

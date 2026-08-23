@@ -7,15 +7,15 @@ The `storage` crate is the **sqlite adapter**: it implements every `*Store` trai
 Its job is:
 
 - Implement every `*Store` trait from `baybo-store` (`SessionStore`,
-  `SessionSummaryStore`, `SessionFolderStore`, `TaskStore`, `TurnStore`,
+  `SessionFolderStore`, `MessageSearchStore`, `TaskStore`, `TurnStore`,
   `TraceStore`, `CostStore`, `SecretStore`, `CronStore`, `BlobStore`,
   `ChannelSessionStore`, `ChannelBotStore`, `ChannelPairingStore`,
-  `DeviceStore`, `SkillRiskStore`, `AgentProfileStore`,
+  `DeviceStore`, `SkillRiskStore`, `AgentProfileStore`, `ProjectStore`,
   `DeckCardStore`) via sqlite
 - Provide `Store` for dependency injection
 - Manage database schema initialization
 
-Because the trait contracts and their row/DTO types live in `baybo-store` (a leaf over `baybo-model`), `baybo-storage` no longer depends on any of the domain crates whose stores it implements — its only normal dependencies are `baybo-store` + `baybo-model`. `baybo-turn` and `baybo-trace` stay on as `dev-dependencies` alone, so the sqlite round-trip tests can build the rich `Turn` / `Step` / `Span` types and call their `to_row` / `from_row` helpers. Domain crates depend on `baybo-store` to *call* a store; the assembly layer wires in `baybo-storage`.
+Because the trait contracts and their row/DTO types live in `baybo-store` (a leaf over `baybo-model`), `baybo-storage` no longer depends on any of the domain crates whose stores it implements — its normal dependencies are `baybo-store`, `baybo-model`, and `baybo-workspace`, whose path constants name the blob subdirectory on the `Store::open` path. `baybo-workspace` is itself a leaf with no `baybo-*` dependencies, so it opens no edge into a domain. `baybo-turn` and `baybo-trace` stay on as `dev-dependencies` alone, so the sqlite round-trip tests can build the rich `Turn` / `Step` / `Span` types and call their `to_row` / `from_row` helpers. Domain crates depend on `baybo-store` to *call* a store; the assembly layer wires in `baybo-storage`.
 
 ## Design Decisions
 
@@ -24,7 +24,7 @@ Because the trait contracts and their row/DTO types live in `baybo-store` (a lea
 `SqlitePool` (`sqlite/mod.rs`) is a real pool of `rusqlite::Connection`s (`POOL_SIZE = 8`). Stores never hold a connection; they reach the database only through:
 
 ```rust
-pool.interact("sessions.load_last_user_message", move |conn| { … }).await
+pool.interact("sessions.last_user_messages", move |conn| { … }).await
 ```
 
 which checks a connection out **exclusively for the whole closure** — prepare, step, *and every `row.get()`*.
@@ -50,7 +50,7 @@ Every `*Store` trait contract lives in `baybo-store`; `baybo-storage` only *impl
 
 ```
 sqlite/session.rs         → impl SessionStore                         (trait + StoredMessage from baybo-store)
-sqlite/session_summary.rs → impl SessionSummaryStore                  (trait + SessionSummaryRow from baybo-store)
+sqlite/search.rs          → impl MessageSearchStore                   (trait + SearchHit / SearchScope from baybo-store; also owns the message_fts DDL)
 sqlite/trace.rs           → impl TraceStore                           (trait from baybo-store; rows ↔ Step/Span/SpanEvent via baybo-trace)
 sqlite/secret.rs          → impl SecretStore                          (trait from baybo-store; one secrets table shared by minted placeholders, mcp.* creds, and user_env.* user secrets)
 sqlite/turn.rs            → impl TurnStore                            (trait from baybo-store; rows ↔ Turn via baybo-turn)
@@ -65,12 +65,13 @@ sqlite/session_folder.rs  → impl SessionFolderStore                   (trait +
 sqlite/task.rs            → impl TaskStore                            (trait + TaskPatch from baybo-store)
 sqlite/device.rs          → impl DeviceStore                          (trait + DeviceRow / DeviceStatus from baybo-store)
 sqlite/agent_profile.rs   → impl AgentProfileStore                    (trait + AgentProfileRow / AgentProfileUpdate from baybo-store)
+sqlite/project.rs         → impl ProjectStore                         (trait + ProjectRow / IssueRow / IssueRunRow / IssueEventRow and their update/new types from baybo-store)
 sqlite/deck.rs            → impl DeckCardStore                        (trait + DeckCardRow / DeckSnapshotRow / DeckLayoutEntry / DeckSize from baybo-store; deck_cards + latest-N-pruned deck_snapshots)
 ```
 
-Each file above holds its store's queries, but the table DDL is not colocated: every `CREATE TABLE` lives in `sqlite/mod.rs`'s schema initialization — the single place to read the full set of persisted tables or add a new one.
+Each file above holds its store's queries, but the table DDL is not colocated: every `CREATE TABLE` lives in `sqlite/mod.rs`'s schema initialization — the single place to read the full set of persisted tables or add a new one. One table is deliberately outside it: the FTS5 index `message_fts` is owned by `sqlite/search.rs`, which drops and recreates it from `search::rebuild_if_stale` whenever the segmenter fingerprint changes, because `CREATE ... IF NOT EXISTS` cannot migrate a column onto a table that already exists. It is therefore the one table whose DDL is not `IF NOT EXISTS` and not in `mod.rs`; only its fingerprint row's table, `search_meta`, is (see [`search.md`](../search.md)).
 
-`Session`, `User`, `ChannelType`, and `SessionState` live in `baybo-model` so that both `baybo-session` (the `SessionManager` facade) and `baybo-storage` (sqlite impl) can type against them without either crate dragging the other along. The `SessionStore` / `SessionSummaryStore` traits and their `StoredMessage` / `SessionSummaryRow` row types live in `baybo-store`; `baybo-storage` implements them and `baybo-session` calls them.
+`Session`, `User`, `ChannelType`, and `SessionState` live in `baybo-model` so that both `baybo-session` (the `SessionManager` facade) and `baybo-storage` (sqlite impl) can type against them without either crate dragging the other along. The `SessionStore` trait and its `StoredMessage` row type live in `baybo-store`; `baybo-storage` implements it and `baybo-session` calls it.
 
 The conversation transcript itself is **not** stored on `Session` — it's owned by `baybo_context::ContextManager` while the actor is alive and persisted via the per-message `SessionStore` log: `append_session_message` for ordinary turns, `append_session_message_idempotent` for replayable source events, `apply_session_compaction` for `/compact`, and `load_active_session_messages` for cold-start hydration. Rows live in the `session_messages` table (append-only, with a `superseded_by` marker for compactions).
 
@@ -93,9 +94,13 @@ The conversation transcript lives in `session_messages` as a per-session
 sequence assigned at append time (`MAX(ordinal) + 1`). Rows are never deleted
 or rewritten — this is user-facing core data (see the never-delete rule in the
 repo `CLAUDE.md`). Columns: `role`, `content` (serialized `ContentBlock`s),
-`created_at`, `source` (`MessageSource`: `user` / `cron` / `agent` — tells a
-genuine prompt and a cron fire apart from the agent's own injected `user`-role
-rows), `platform_msg_id` (client send idempotency key — sync-redelivery dedup, optimistic-row reconciliation, and the outbox durability point lookup), `source_event_id` (nullable durable idempotency key for internal replayable events), and `superseded_by`.
+`created_at`, `source` (`MessageSource` — the provenance axis every framing and
+rendering decision keys on: `user`, `user_interjection`, `issue_brief`, `cron`,
+`cron_notification`, `recalled_memory`, `system_prompt_update`, `skill_listing`,
+`skills_update`, `subagent_seed`, `agent`. Role does not follow from it:
+`cron_notification` is the one assistant-role source besides `agent`, and
+`user_interjection` renders as a genuine user turn — `ChatMessage::from_user`
+matches it alongside `user`), `platform_msg_id` (client send idempotency key — sync-redelivery dedup, optimistic-row reconciliation, and the outbox durability point lookup), `source_event_id` (nullable durable idempotency key for internal replayable events), and `superseded_by`.
 
 `source_event_id` is unique per session across the **full** transcript, including
 superseded rows. `append_session_message_idempotent` performs the row insert and
@@ -128,7 +133,7 @@ ordinal.
 
 - **Active set** — rows where `superseded_by IS NULL`, ordered by `ordinal`:
   the live LLM context (machinery included). Served by
-  `load_active_session_messages` / `_up_to`; a partial index
+  `load_active_session_messages`; a partial index
   `idx_session_messages_active` on `(session_id, ordinal) WHERE superseded_by IS
   NULL` makes it a back-of-index walk, never a full scan. **The context reads
   never filter `compaction_inserted`** — the re-injected turns ARE what the model
@@ -159,16 +164,14 @@ A row superseded by a *later* compaction (`superseded_by > N`) was still part of
 the snapshot at `N`; a row superseded at or before `N` was not. This filter is
 what makes the ordinal references above replay-stable across compaction.
 
-**Two implementations of that filter, kept in lockstep.** The write-side
-snapshot — `load_active_session_messages_up_to(session, N)`, plain SQL
-`superseded_by IS NULL AND ordinal <= N` — is *time-sensitive*: it returns what
-is active *right now*. The read-side reconstruction (trace hydration over
-`load_session_messages_with_supersede`, which loads every row plus its marker)
-applies the `superseded_by > N` form above. They agree only at the instant
-before the referenced rows are superseded — which holds because a reference is
-captured at call time (rows still active) and the at-most-one-compaction-in-
-flight invariant rules out a concurrent supersede. A differential test pins the
-equivalence so the two filters can't drift apart silently. Three anchoring
+**One implementation of that filter.** The write side takes no ordinal-bounded
+snapshot at all: `ContextManager::input_marker_with_suffix` anchors a reference
+on `latest_session_ordinal` + `count_active_messages` and emits `Persisted` only
+while the persisted active count still mirrors the in-memory window, falling
+back to a self-contained inline copy when it does not. So only the read-side
+reconstruction — trace hydration over `load_session_messages_with_supersede`,
+which loads every row plus its marker — applies the `superseded_by > N` form
+above, and there is no second filter to keep in lockstep. Three anchoring
 helpers — `latest_session_ordinal`, `count_active_messages`,
 `active_index_of_ordinal` — exist to anchor and validate those references; the
 sync/backfill read surface (`load_active_session_messages_tail` / `_since`,
@@ -193,8 +196,8 @@ loading `end = offset + limit` rows always covers an `end`-line window, so
 offsets) and sequential full pagination stays O(N²) without a per-session render
 cache — disproportionate for a rare path until real sessions grow large. A true
 sqlite row-cursor (`rows.next()` is lazy, stop early) is avoided because the
-`dyn SessionStore` boundary would force `Pin<Box<dyn Stream>>` and the single
-shared `Arc<sqlite::Connection>` would be held open across the render.
+`dyn SessionStore` boundary would force `Pin<Box<dyn Stream>>` and a pooled
+connection would be checked out for the whole render.
 
 ### Session planning checklist: the `session_tasks` table
 
@@ -218,7 +221,7 @@ rows themselves carry no unread/acknowledged state.
 
 ### Single backend: sqlite
 
-All store implementations use sqlite (async-native, SQLite-compatible). There is no rusqlite or separate in-memory backend. `Store::open(path)` opens (or creates) a file-backed sqlite database (creating parent directories if missing). There is **one** way to open a pool and tests use it too — a temp-dir path — rather than a test-only in-memory mode: a store with no on-disk home reports `StoreIdentity::Ephemeral`, which tells cross-process coordination there is no peer to synchronise with, and that is a silent footgun to leave reachable from production code. `SqlitePool` wraps a shared `sqlite::Connection` behind `Arc` for cheap cloning across async tasks.
+All store implementations are rusqlite over a file-backed SQLite database, and there is no separate in-memory backend. `Store::open(path)` opens (or creates) that file (creating parent directories if missing). There is **one** way to open a pool and tests use it too — a temp-dir path — rather than a test-only in-memory mode: a store with no on-disk home reports `StoreIdentity::Ephemeral`, which tells cross-process coordination there is no peer to synchronise with, and that is a silent footgun to leave reachable from production code. rusqlite is synchronous, so a `SqlitePool` handle is how async callers reach it at all; the mechanics of that — eight connections, one checked out exclusively per closure on a `spawn_blocking` thread, and what that makes load-bearing — are above under *One connection per in-flight operation*.
 
 The database file path is not a user-facing config knob. Bootstrap composes it from the project root via `boot::storage_db_path()` — storage always lives at `<workspace.path>/state/storage.db`. Operators pick the project root; the storage layout underneath it is fixed by convention.
 
@@ -329,7 +332,7 @@ It is also half of an invariant that SQL alone cannot hold. The display name the
 
 ## Constraints
 
-- Normal dependencies are just `baybo-store` (trait contracts + row/DTO types) and `baybo-model` (domain types) — no domain crate; reverse edges from any domain crate back to `baybo-storage` do not exist. `baybo-turn` / `baybo-trace` are `dev-dependencies` only (round-trip tests)
+- Normal dependencies are `baybo-store` (trait contracts + row/DTO types), `baybo-model` (domain types), and `baybo-workspace` (path constants — a leaf with no `baybo-*` deps of its own, so it introduces no domain edge) — no domain crate; reverse edges from any domain crate back to `baybo-storage` do not exist. `baybo-turn` / `baybo-trace` are `dev-dependencies` only (round-trip tests)
 - Exposes trait objects externally, not concrete backend types
 - Assumes upper layers have already sanitized data before persistence
 
@@ -338,8 +341,8 @@ It is also half of an invariant that SQL alone cannot hold. The display name the
 | Module                                   | Role                                                                                      |
 | ---------------------------------------- | ----------------------------------------------------------------------------------------- |
 | `storage` (self)                         | Provides sqlite implementations for every Store trait from `baybo-store`; owns queries and schema initialization |
-| `store`                                  | Owns every `*Store` trait contract + its row/DTO types; `storage` implements them and depends only on this crate (+ `model`) |
+| `store`                                  | Owns every `*Store` trait contract + its row/DTO types; `storage` implements them and takes no domain dependency beyond this crate (+ `model`, + the `workspace` path leaf) |
 | `model` / `trace` / `turn`               | Provide domain types the sqlite impls round-trip (`trace` / `turn` are `dev-dependencies` only, for the round-trip tests) |
 | `context`                                | Owns `ContextManager`; pure in-memory                                                     |
-| `session`                                | Owns the `SessionManager` facade and calls `SessionStore` / `SessionSummaryStore` (whose traits live in `baybo-store`); `storage` does **not** depend on `session` |
+| `session`                                | Owns the `SessionManager` facade and calls `SessionStore` (whose trait lives in `baybo-store`); `storage` does **not** depend on `session` |
 | `agent`                                  | Injects stores into managers (TurnLifecycle, etc.); re-exports SessionManager |

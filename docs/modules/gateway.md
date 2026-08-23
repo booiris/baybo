@@ -9,8 +9,11 @@ by side against the same manager graph:
    operator controls (config, turns, cron, traces, skills, tools,
    channels-list, llm, status) that mirror the CLI command families, plus
    the `/v1/chat/*` web-chat family that backs the embedded React
-   dashboard and the `/v1/deck/*` live-card family
-   ([`deck.md`](./deck.md)). The admin listener also **co-hosts** the admin/device-
+   dashboard, the `/v1/deck/*` live-card family
+   ([`deck.md`](./deck.md)), and the `/v1/projects/*` board family —
+   projects, issues, runs, approvals, comments, per-issue timelines, the
+   cross-board activity/attention feeds, and each board's hired agents
+   ([`project.md`](./project.md)). The admin listener also **co-hosts** the admin/device-
    authed `/v1/channel-ws` + `/v1/blobs` subrouter (see
    `build_admin_router` in `src/server.rs`) so a browser chat tab loaded
    from the admin origin can open its WebSocket without discovering the
@@ -327,18 +330,25 @@ would force a cross-crate refactor of every `crates/cli/src/commands/`
 module. The duplicated surface is small and the independence is worth
 more than the line count saved.
 
-`api/dto.rs` is also the **only** place in the workspace that depends
+`baybo-gateway` is the only **crate** in the workspace that depends
 on `utoipa`. Domain crates (`baybo-model`, `baybo-turn`, `baybo-cron`,
 `baybo-tools`) stay HTTP-framework-agnostic — no `#[derive(ToSchema)]`,
 no `#[schema(...)]` attributes leaking into them. The gateway defines
 a mirror type for every domain type that appears on the wire and
 provides `From<Domain>` conversions; handlers build DTOs at the seam
-via `.map(DomainDto::from)`. Mirror types keep their bare name
-(`Turn`, `CronJob`, `ChannelType`, …) so the generated
-OpenAPI schemas — and the TypeScript types downstream — are stable
+via `.map(DomainDto::from)`. `api/dto.rs` holds the shared envelopes
+(`ListResponse`, `ErrorBody`) and the mirrors for the CLI-parity
+families (status, config, llm, cron, channels, turns, traces, logs,
+analytics, tools); the handler modules define their own endpoint DTOs the same
+way, next to the routes that serve them (`admin/chat.rs`,
+`admin/projects.rs`, `admin/agents.rs`, `admin/deck.rs`,
+`admin/push.rs`, `admin/project_team.rs`, `admin/skills.rs`). Mirror
+types keep their bare name (`Turn`, `CronJob`, `ChannelType`, …) so the
+generated OpenAPI schemas — and the TypeScript types downstream — are stable
 across the refactor. Adding a field to a domain type now requires an
-explicit edit in `dto.rs` to surface it on HTTP; that's a feature, not
-a bug, because the drift test below will force the question.
+explicit edit wherever that type's mirror lives to surface it on HTTP;
+that's a feature, not a bug, because the drift test below will force
+the question.
 
 ### OpenAPI spec generation and the TypeScript client
 
@@ -526,7 +536,7 @@ inherit the invoking shell's env, so the capture is load-bearing.
 
 Both unit files include a small restart delay (`RestartSec=2s` on
 systemd, `ThrottleInterval=2` on launchd). The per-workspace singleton
-lock (`crates/baybo/src/singleton.rs`) will reject a second `start` invocation that
+lock (`crates/workspace/src/singleton.rs`) will reject a second `start` invocation that
 fires before the previous process has unwound; without the delay a
 restart loop can thrash the lock. The systemd unit also sets
 `TimeoutStopSec=30s` to match `GatewayConfig::shutdown_grace_secs`.
@@ -588,9 +598,11 @@ DELETE /v1/cron/:id                     move to the recycle bin: stops firing, l
 POST   /v1/cron/:id/pause               status → disabled, next trigger cleared
 POST   /v1/cron/:id/resume              status → enabled, next trigger recomputed from now (no backfill)
 POST   /v1/cron/:id/restore             out of the recycle bin, with the status it was deleted with
+PUT    /v1/cron/:id/pin                 { pinned } — lift this job's cron group to the chat list's Pinned block; 204
 
 GET    /v1/traces                       ?status=&since=&until=&limit=&cursor=  filtered session-summary list
 GET    /v1/traces/:session_id           session overview (message log + turn summaries)
+GET    /v1/traces/:session_id/lineage   every subagent session descended from this one, flattened, each with its attach point and turn summaries
 GET    /v1/traces/:session_id/turns/:turn_id  per-turn step/span tree
 GET    /v1/traces/tool-sets/:hash       tool definitions an LlmCall span's `tools.hash` names
 GET    /v1/traces/:session_id/spans/:span_id/context  where one LLM call's input tokens went
@@ -603,6 +615,12 @@ GET    /v1/agents                       agent-profile list
 POST   /v1/agents                       create an agent profile
 GET    /v1/agents/:agent_id
 PUT    /v1/agents/:agent_id             edit an agent profile
+PUT    /v1/agents/:agent_id/name        { name } → rename; 204
+PUT    /v1/agents/:agent_id/model       { llm } → pin this agent's LLM entry (null ⇒ default-llm); 204
+GET    /v1/agents/:agent_id/soul        the agent's SOUL.md (personality, tone) + its content version
+PUT    /v1/agents/:agent_id/soul        replace SOUL.md; a stale `version` is 409 → 200 the new version
+GET    /v1/agents/:agent_id/identity    the agent's IDENTITY.md self-image (name, creature, vibe, emoji, avatar)
+PUT    /v1/agents/:agent_id/identity    replace IDENTITY.md; a stale `version` is 409 → 200 the new version
 PUT    /v1/agents/:agent_id/avatar      set the profile's avatar
 DELETE /v1/agents/:agent_id
 
@@ -613,17 +631,24 @@ POST   /v1/llm/models/:name/test        probe the entry's provider
 PUT    /v1/llm/default                  set default-llm (hot-reloaded)
 GET    /v1/llm/usage                    ?since=&until=  per-entry usage aggregates
 
-POST   /v1/chat/sessions                create http session
+POST   /v1/chat/sessions                create an owner chat session
 GET    /v1/chat/sessions                ?include_hidden=&include_cron=  newest-first list
+GET    /v1/chat/search                  full-text search across transcript prose, best match first
 GET    /v1/chat/sessions/:id            ?before_ordinal=&limit=  detail + transcript slice (+ last_llm pin); backward paging (backfill)
 GET    /v1/chat/sessions/:id/sync       ?since_ordinal=&limit=  the one forward-recovery pull (difference after cursor, or newest-page baseline / rebase)
 GET    /v1/chat/sessions/:id/messages   ?platform_msg_id=  per-send durability point lookup for the client outbox
+GET    /v1/chat/sessions/:id/subagents  this session's direct subagent children, ascending
+GET    /v1/chat/subagents/:id           a child's detail + transcript slice
+GET    /v1/chat/subagents/:id/sync      forward-recovery pull for a child transcript
 PUT    /v1/chat/sessions/:id/model      pin this session's LLM (re-pins live actor; null ⇒ default-llm)
 PUT    /v1/chat/sessions/:id/pin        pin/unpin (lifts to the sidebar's Pinned block)
+PUT    /v1/chat/sessions/:id/title      rename the conversation; 204
 PUT    /v1/chat/sessions/:id/archive    archive/unarchive the session
 PUT    /v1/chat/sessions/:id/read       clear the unread badge
+POST   /v1/chat/sessions/read           bulk: advance every named session's read cursor to its newest ordinal; 204
 PUT    /v1/chat/sessions/:id/folder     file into a folder (null ⇒ Uncategorized)
 DELETE /v1/chat/sessions/:id            hide (row preserved); 204
+POST   /v1/chat/sessions/hide           bulk hide (rows preserved); 204
 POST   /v1/chat/sessions/:id/unhide     restore a hidden session
 GET    /v1/chat/slash-manifest          slash commands for the composer's /-autocomplete
 GET    /v1/chat/folders                 the conversation-folder tree
@@ -648,6 +673,33 @@ POST   /v1/deck/cards/:card_id/purge    hard-delete a recycled card: row, snapsh
 GET    /v1/deck/cards/:card_id/bundle   the card's frontend (card.html) for the deck shell
 GET    /v1/deck/services/:card_id/openapi.json   the card's own op contract
 POST   /v1/deck/services/:card_id/:op   invoke a card op (admitted against that contract first)
+
+GET    /v1/projects                     ?include_archived=  boards, most recently touched first
+POST   /v1/projects                     create a board; `workdir` is an absolute path to an existing repo, or omitted for one cut under the workspace's `work/`
+GET    /v1/projects/:project_id         the board
+PUT    /v1/projects/:project_id         edit it; 409 while archived
+POST   /v1/projects/:project_id/archive { archived } → shelve the board or bring it back
+GET    /v1/projects/activity            ?since_ms=  every board's live working count and its burn since that instant; boards with neither are absent
+GET    /v1/projects/attention           boards with work stuck on the operator; boards with nothing waiting are absent
+GET    /v1/projects/:project_id/issues  the whole board, column by column, in order
+POST   /v1/projects/:project_id/issues  create a card; the board numbers and places it
+GET    /v1/projects/:project_id/issues/:number          the card
+PATCH  /v1/projects/:project_id/issues/:number          partial edit; omitted fields are unchanged
+POST   /v1/projects/:project_id/issues/:number/move     { status, ordered_numbers } — one drag: where the card lands plus that column's full contents in their new order
+GET    /v1/projects/:project_id/issues/:number/runs     every run of this card, newest first, priced
+GET    /v1/projects/:project_id/issues/:number/runs/:attempt/transcript  the conversation that run worked in — a SESSION, so one agent's runs on a card share it
+POST   /v1/projects/:project_id/issues/:number/runs/cancel  ask the board to call the run off: an executing one stops the way `/stop` stops a reply, one no executor claimed is cancelled outright; 204
+POST   /v1/projects/:project_id/issues/:number/runs/retry   run the card again → 201 the new run
+GET    /v1/projects/:project_id/issues/:number/events   the card's timeline, oldest first
+POST   /v1/projects/:project_id/issues/:number/comments  record a comment → the timeline entry it became
+POST   /v1/projects/:project_id/issues/:number/approvals/:call_id  answer the prompt parked on that call; 204
+POST   /v1/projects/:project_id/issues/:number/read     this card's unread count resets; 204
+POST   /v1/projects/:project_id/read    every card on the board reads zero; 204
+GET    /v1/projects/:project_id/feed    ?before_ms=&limit=  the board's activity, newest first
+GET    /v1/projects/:project_id/runs    the board's unfinished runs — which cards are working
+GET    /v1/projects/:project_id/agents  this board's team, by handle
+POST   /v1/projects/:project_id/agents  hire a teammate onto the board → 201
+DELETE /v1/projects/:project_id/agents/:agent_id  take a teammate off the board
 
 GET    /v1/analytics                    aggregated tokens / cost / sessions, with model / reason / reasoning-effort breakdowns
 GET    /v1/logs                         paged snapshot from LogBuffer
@@ -678,11 +730,14 @@ Every item carries a stable row `id` (`m<ordinal>` / `w<ordinal>` /
 `n<seq>`) — the client's render key and redelivery dedup key — and
 message rows carry their send's `platform_msg_id`. Control-event items
 are not ordinal-addressed (`ordinal` is absent; they anchor at an
-ordinal server-side). The sidebar preview (`GET /v1/chat/sessions`) uses
-a single indexed `load_last_user_message` lookup, so a prompt buried
-under a long tool loop is still found. See `docs/sync-protocol.md` for
-the full sync model and `docs/turn-progress-events.md` for the
-operator-only raw-tool-output disclosure.
+ordinal server-side). The sidebar preview (`GET /v1/chat/sessions`) is
+served by one `SessionManager::chat_list_scan` over the whole page —
+three grouped store reads (`last_user_messages`, `active_tails`,
+`unread_scan`), not a per-session fan-out — and it is the first of those
+that finds a prompt buried under a long tool loop. See
+`docs/sync-protocol.md` for the full sync model and
+`docs/turn-progress-events.md` for the operator-only raw-tool-output
+disclosure.
 
 `GET /v1/chat/sessions/:id/sync?since_ordinal=N&limit=M` is the one
 forward-recovery pull (see `docs/sync-protocol.md`): full-fidelity rows
@@ -705,6 +760,21 @@ is validated against the card's own `openapi.json` admission contract
 before any card code runs. See [`deck.md`](./deck.md) for the whole
 subsystem (`crates/deck`, the `DeckCard*` agent tools, the sandboxed
 service runtime).
+
+`/v1/projects/*` is the board family (`api/admin/projects.rs` and
+`api/admin/project_team.rs`, OpenAPI tag `projects`). Board state — the
+project row, the cards, the run ledger, the timeline, the team — moves
+through `AdminState.project_manager`. Two things are answered by the
+surface that owns them instead: a run's transcript is read through
+`SessionManager`, because a run works in a chat session and one agent's
+runs on a card share it, and an approval is resolved against the owner
+channel's live queue, the same queue `/v1/projects/attention` counts
+from. Board changes reach the browser as `Frame::ProjectChanged` over
+the owner channel
+(`src/project_events.rs`) — an invalidation, not a patch; the frame's
+bullet below carries why. See
+[`project.md`](./project.md) for the board model, the run ledger, and the
+budget ceilings.
 
 **Channel listener (loopback TCP, vault-issued tokens)** —
 `auth::channel::require_channel_auth`:
@@ -732,9 +802,11 @@ The WS protocol is defined by [`baybo_channels::wire::Frame`]
 chat leaves the legacy `token` field empty because HTTP auth already
 ran); the server validates it via `channel::handshake::validate_register` against
 the [`auth::channel::AuthedClient`] the middleware already attached:
-`Tui` → must claim `"tui"`; `Web` → must claim `"http"` (the only path
-that may claim the reserved `http` type); `Device` → must claim `"device"`;
-`Subprocess` → must match the minted identity's `(pid, label)`, respect
+`Tui` → must claim `"tui"`; `Web` and `Device` → must both claim
+`"owner"` (the only two paths that may claim the reserved `owner` type,
+which is why a leaked web or device token still can't be redirected onto
+another channel's session stream); `Subprocess` → must match the minted
+identity's `(pid, label)`, respect
 its `bound_channel_type`, and claim a non-reserved type; `Tool` →
 rejected outright (tool sidecars don't register channels). The validator returns only the channel type —
 per-session interest is negotiated **after** the handshake via
@@ -806,6 +878,17 @@ The full frame set (see `crates/wire/src/lib.rs`):
   apply it iff `seq` beats their cached per-card cursor. `DeckChanged`
   (no payload) — deck structure changed; clients refetch `GET /v1/deck`.
   Clients without deck UI ignore both. See [`deck.md`](./deck.md).
+- **Board (server → client, the `owner` subscribed channel):**
+  `ProjectChanged { project_id, scope, issue_number? }` — something
+  changed inside a project; `scope` (`project` / `board` / `run` /
+  `timeline`) names the plane to refetch, and `issue_number` is present
+  when the change is about one card so a detail page can ignore the
+  rest. Broadcast to every owner connection regardless of subscription,
+  exactly like the deck frames: a board has no session to subscribe to.
+  Deliberately not a patch — a move renumbers the whole destination
+  column in one transaction, so a per-issue delta would have to carry
+  the column anyway. Clients without board UI ignore it. See
+  [`project.md`](./project.md).
 
 A note on `AnswerDelta`: `agent_output_to_frame` maps
 `AgentEvent::AnswerDelta` to `Frame::AnswerDelta` and the
@@ -929,10 +1012,24 @@ subcommands use it for the same reason.
   stack in `crates/baybo/src/tracing_init.rs`). `BAYBO_LOG_FORMAT=json`
   is honoured. Request spans carry a `listener` field (`admin` /
   `channel`) so the origin of each request is obvious in logs.
-- **Every mutation goes through a manager.** Route handlers call
-  `SessionManager`, `TurnLifecycle`, `CronScheduler` and
-  friends directly; there are no side-channel writes that bypass
-  Trace/Turn observability.
+- **Conversation and board mutations go through a manager.** Those route
+  handlers call `SessionManager`, `TurnLifecycle`, `CronScheduler`,
+  `ProjectManager` and friends directly, and nothing that moves a
+  session, a turn, a cron job or a card writes underneath them. What is
+  *not* behind a manager is the state no domain crate owns a manager
+  for, and it is more than one route: `/v1/agents` drives
+  `AdminState.agent_profile_store`
+  (`create` / `update` / `set_llm` / `set_avatar` / `delete`) plus the
+  persona's `SOUL.md` / `IDENTITY.md` on disk, because the validation —
+  the LLM pin, the avatar blob, the rename guard, the per-file write
+  lock — lives in the handlers (see
+  [`agent-profiles.md`](./agent-profiles.md)); `POST /v1/blobs` writes
+  `Arc<dyn BlobStore>` straight from `channel/blobs.rs`; `/v1/push/*`
+  persists APNs registrations with `secret_vault.store_secret`
+  (`admin/push.rs`); and `/v1/config` and `/v1/llm/models/{name}` write
+  the config file with `write_to_file` and, for the latter, an API key
+  into the vault. None of those start agent work, which is why they cost
+  no Trace/Turn coverage — but do not read this bullet as a chokepoint.
 - **Singleton lock applies only to the gateway.** `start` acquires
   the per-workspace lock on `<workspace>/state/baybo.lock`. `baybo tui` is a
   `/v1/channel-ws` client (see [`tui.md`](./tui.md)) and **does not**
@@ -957,6 +1054,7 @@ crates/gateway/
 │   ├── reload.rs            # ConfigReloader trait + ReloadOutcome/ReloadError (in-process config hot-reload)
 │   ├── log_buffer.rs        # LogBuffer ring + tracing Layer behind /v1/logs[/stream]
 │   ├── deck_events.rs       # GatewayDeckEvents — DeckCardData/DeckChanged fan-out over the owner channel
+│   ├── project_events.rs    # GatewayProjectEvents — ProjectChanged fan-out over the owner channel
 │   ├── device.rs            # the gateway's long-term static Noise identity (device pairing + E2E sessions)
 │   ├── push/                # A-side push dispatcher
 │   │   ├── mod.rs           #   push dispatch fan-out
@@ -1001,12 +1099,13 @@ crates/gateway/
 │   ├── test_support.rs      # cfg(test-support) build_test_deps + TestGateway
 │   ├── api/
 │   │   ├── mod.rs           # health::routes()
-│   │   ├── dto.rs           # mirror DTOs + From<Domain> conversions — the only utoipa user
+│   │   ├── dto.rs           # shared envelopes + the CLI-parity mirror DTOs and their From<Domain> conversions
 │   │   ├── openapi.rs       # GET /v1/openapi.json handler
 │   │   ├── health.rs        # /healthz + /readyz (shared between listeners)
 │   │   ├── webui.rs         # admin-fallback handler; include!s $OUT_DIR/webui_assets.rs
 │   │   └── admin/           # mod.rs: v1_router_and_spec() → (Router, OpenApi), mounted on admin TCP
-│   │       └── {status,config,turns,cron,traces,analytics,skills,tools,channels,chat,push,agents,llm,logs,deck}.rs
+│   │       └── {status,config,turns,cron,traces,analytics,skills,tools,channels,chat,push,agents,
+│   │            llm,logs,deck,projects,project_team}.rs
 │   └── installer/
 │       ├── mod.rs           # ServiceInstaller trait, InstallContext, ServiceStatus,
 │       │                    # for_current_platform, resolve_exec_start
@@ -1018,7 +1117,10 @@ crates/gateway/
     ├── agents_api.rs            # /v1/agents agent-profile REST surface
     ├── channel_ws.rs            # full loopback-TCP WS round-trip via tokio-tungstenite
     ├── chat_api.rs              # /v1/chat/* web-chat session + token-mint surface
+    ├── cron_api.rs              # /v1/cron pause/resume, the recycle bin, and the in-place edit
     ├── device_channel_ws.rs     # device-token auth on /v1/channel-ws against the real ChannelServer
+    ├── projects_api.rs          # /v1/projects/* boards, cards, moves, ceilings, team, runs
+    ├── traces_api.rs            # /v1/traces tool-set + span-context resolution (a routing test as much as a payload one)
     ├── turns_pagination.rs      # /v1/turns cursor pagination + filters
     ├── llm_endpoint.rs          # /v1/llm* models/default/usage surface
     ├── logs_endpoint.rs         # /v1/logs + /v1/logs/stream SSE
@@ -1059,8 +1161,14 @@ at runtime and stored in the per-workspace vault.
   reveal path. The admin token and the per-start TUI token are
   registered as `LeakDetector::Replace` rules at detector-construction
   time.
-- **config** — `BayboConfig::gateway` drives admin bind address, channel
-  socket path, CORS origins, and shutdown grace.
+- **config** — `BayboConfig::gateway` drives admin bind address and port,
+  CORS origins, and shutdown grace. The channel listener is not
+  configurable: it binds loopback on an ephemeral port and publishes the
+  port it got to `<workspace>/state/channel.port`.
+- **project** — `ProjectManager` behind `/v1/projects/*`, and
+  `GatewayProjectEvents` (`src/project_events.rs`) implementing
+  `baybo_project::ProjectEvents` so board invalidations ride the owner
+  channel as `Frame::ProjectChanged` like every other live signal.
 - **storage** — `Store::open` for vault bootstrap in `gateway_cmd`; the
   `TraceStore` trait behind `/v1/traces/:session_id`.
 - **tui** — the TUI is a `/v1/channel-ws` client like any other

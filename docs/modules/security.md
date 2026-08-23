@@ -59,7 +59,7 @@ For the flushable prefix the gateway runs the scan/mint/vault pipeline, and the 
 Injection markers (`ignore previous`, fake turn prefixes, ChatML/LLaMA control tokens, forged `<tool_output>` tags, etc.) are scanned at two points:
 
 - **Inbound messages** (`sanitize_input`): every text block is scanned; hits are logged via `tracing` at a level that scales with severity. User input is not blocked — legitimate prose contains many of these literals — but the logs give operators a signal.
-- **Tool output** (`sanitize_tool_output` in this crate + `wrap_tool_output` in `baybo-context`): warnings are logged the same way, and `wrap_tool_output` prepends an inline security banner naming the triggered rules (passed in as `warning_rules`) inside the `<tool_output>` envelope so the LLM treats the content as untrusted data rather than instructions.
+- **Tool output** (`sanitize_tool_output` in this crate + `wrap_tool_output` in `baybo-model`): warnings are logged the same way, and `wrap_tool_output` prepends an inline security banner naming the triggered rules (passed in as `warning_rules`) inside the `<tool_output>` envelope so the LLM treats the content as untrusted data rather than instructions.
 
 #### Severity is scoped by output provenance
 
@@ -84,7 +84,7 @@ The LLM-facing side is deliberately unchanged: `wrap_tool_output`'s security ban
 
 ### Tool-output structural wrapping
 
-`baybo_context::prompts::tool_output::wrap_tool_output(tool_name, content, warning_rules)` (in `baybo-context`, not this crate) wraps the result in `<tool_output name="...">...</tool_output>`. The tool name is XML-attribute-escaped; any literal `</tool_output` inside the body is neutralized with a zero-width space between the `<` and the slash so untrusted content cannot forge the closing boundary. `warning_rules` are the injection-marker rule names the caller pulled from this crate's `InjectionDetector::scan`; passing them as plain strings keeps `baybo-context` free of an `baybo-security` dependency. The agent loop applies this wrap to every tool result before appending it to `ContentBlock::ToolResult`.
+`baybo_model::wrap_tool_output(tool_name, content, warning_rules)` (in `baybo-model`, not this crate — `baybo-tools` frames its out-of-band judge prompts with the same envelope and cannot depend on `baybo-context`) wraps the result in `<tool_output name="...">...</tool_output>`. The tool name is XML-attribute-escaped; any literal `</tool_output` inside the body is neutralized with a zero-width space between the `<` and the slash so untrusted content cannot forge the closing boundary. `warning_rules` are the injection-marker rule names the caller pulled from this crate's `InjectionDetector::scan`; passing them as plain strings keeps `baybo-model` free of a `baybo-security` dependency. The agent loop applies this wrap to every tool result before appending it to `ContentBlock::ToolResult`.
 
 ### Tool-output length cap
 

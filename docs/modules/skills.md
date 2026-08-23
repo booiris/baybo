@@ -180,7 +180,9 @@ non-`Untrusted` skill whose `channels:` restriction (if any) admits the
 session's channel (name, description, optional
 `argument-hint`); the LLM pulls one in by calling the `Skill` tool
 (see [`tools.md`](./tools.md#skill-tool)). The list comes from
-`SkillRegistry::all_summaries_sorted()` — a lightweight projection
+`SkillRegistry::summaries_for(skill_scope())` — per-agent scoped (the
+compiled-in builtins that scope may see, layered with the bound agent's own
+`personas/<id>/skills/`), returning a lightweight projection
 (`SkillSummary`) carrying only the fields needed for the listing.
 Cloning every `SkillDefinition`'s `prompt_template` / `allowed_tools`
 / `requirements` per turn would burn allocator pressure proportional
@@ -221,7 +223,7 @@ slash command is treated as authorized. Sub-file fetches the model
 issues afterwards still go through the gated `Skill` tool.
 
 Slash matching goes through `detect_slash_invocation` in `baybo-context`
-and the per-turn list through `all_summaries_sorted`. There is no ranking
+and the per-turn list through `summaries_for`. There is no ranking
 stage: no registry method scores or filters by relevance, and none is
 declared in anticipation of one.
 

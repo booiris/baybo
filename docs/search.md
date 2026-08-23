@@ -160,8 +160,9 @@ pub fn is_searchable(&self) -> bool {
 ```
 
 `from_user()` already existed and already means `User | UserInterjection` — reuse it rather than
-restate it. `Role::Assistant` covers every agent turn, including the subagent-completion reply
-(`append_background_completion_reply_once`, a real assistant bubble) and `CronNotification`'s
+restate it. `Role::Assistant` covers every agent turn, including the reply the agent writes when a
+background job wakes it (a real assistant bubble; the hidden prompt that seeds it,
+`append_background_notification_prompt_once`, is excluded below) and `CronNotification`'s
 scheduled-task badge. `MessageSource::Cron` is the cron fire's own prompt. What stays out is text
 nobody composed:
 
