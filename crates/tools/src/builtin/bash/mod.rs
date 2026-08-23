@@ -680,6 +680,21 @@ impl Tool for BashTool {
         out
     }
 
+    /// Withholds `on_timeout` where detaching is refused. Without a
+    /// background host a slow command is killed whatever this says, so
+    /// offering the knob is offering a choice the runtime does not have —
+    /// and the timeout the model picks is then the only thing standing
+    /// between a long build and losing its work.
+    fn parameters_schema_for(&self, trigger: &baybo_model::TriggerSource) -> Value {
+        let mut schema = self.parameters_schema();
+        if !trigger.can_host_background_jobs()
+            && let Some(props) = schema.get_mut("properties").and_then(Value::as_object_mut)
+        {
+            props.remove("on_timeout");
+        }
+        schema
+    }
+
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",
@@ -688,7 +703,7 @@ impl Tool for BashTool {
                 "timeout_ms": { "type": "integer", "minimum": 1, "description": "Per-command timeout in ms (falls back to the tool context timeout)" },
                 "cwd":        { "type": "string", "description": "Working directory for the command" },
                 "secret_env": { "type": "array", "items": { "type": "string" }, "description": "Names of stored user secrets to inject as environment variables for THIS command only. Values are pulled from the vault, never shown to you, and scrubbed from the output. Discover names with SecretList / SecretCheck." },
-                "on_timeout": { "type": "string", "enum": ["background", "kill"], "description": "What to do if the command exceeds its timeout. 'background' (default) detaches it — you get a handle now and a notification when it finishes, with full output streamed to a file you can Read — so a long build/test never blocks you or loses its work. 'kill' keeps the old behaviour (terminate + return a timeout error). Ignored during a scheduled job's own run and in nested subagents, which always kill on timeout." }
+                "on_timeout": { "type": "string", "enum": ["background", "kill"], "description": "What to do if the command exceeds its timeout. 'background' (default) detaches it — you get a handle now and a notification when it finishes, with full output streamed to a file you can Read — so a long build/test never blocks you or loses its work. 'kill' terminates it and returns a timeout error." }
             },
             "required": ["command"]
         })

@@ -190,7 +190,7 @@ impl ToolRegistry {
                 .get(name)
                 .is_none_or(|m| m.allows_channel(channel));
             if channel_ok && tool.trigger_scope().allows_trigger(trigger) && allowed(name) {
-                let def = tool_definition_for(tool.as_ref());
+                let def = tool_definition_offered(tool.as_ref(), trigger);
                 defs.insert(def.name.clone(), def);
             }
         }
@@ -201,7 +201,7 @@ impl ToolRegistry {
                 .get(name)
                 .is_none_or(|m| m.allows_channel(channel));
             if channel_ok && tool.trigger_scope().allows_trigger(trigger) && allowed(name) {
-                let def = tool_definition_for(tool.as_ref());
+                let def = tool_definition_offered(tool.as_ref(), trigger);
                 defs.insert(def.name.clone(), def);
             } else {
                 // A restricted dynamic tool must not fall back to a
@@ -264,11 +264,27 @@ impl ToolRegistry {
     }
 }
 
+/// A tool's whole declared surface, for inventory views (`baybo status`, the
+/// admin tools listing). Not what a session is offered — see
+/// [`tool_definition_offered`].
 fn tool_definition_for(tool: &dyn Tool) -> ToolDefinition {
     ToolDefinition {
         name: tool.name().to_string(),
         description: tool.description(),
         parameters_schema: tool.parameters_schema(),
+    }
+}
+
+/// What a session started by `trigger` is actually handed: the surface minus
+/// any parameter [`Tool::parameters_schema_for`] withholds from it.
+fn tool_definition_offered(
+    tool: &dyn Tool,
+    trigger: &baybo_model::TriggerSource,
+) -> ToolDefinition {
+    ToolDefinition {
+        name: tool.name().to_string(),
+        description: tool.description(),
+        parameters_schema: tool.parameters_schema_for(trigger),
     }
 }
 
@@ -728,6 +744,97 @@ mod tests {
                 number: 1,
             }),
             "a card's run has its own checkout; the shared browser is not its to hold"
+        );
+    }
+}
+
+#[cfg(test)]
+mod offered_schema_tests {
+    use super::*;
+    use baybo_model::TriggerSource;
+    use baybo_storage::test_support::MemoryBlobStore;
+    use std::sync::Arc;
+
+    fn registry() -> ToolRegistry {
+        ToolRegistry::with_defaults(crate::builtin::DefaultToolsConfig {
+            blob_store: Arc::new(MemoryBlobStore::new()) as Arc<dyn baybo_store::BlobStore>,
+            process_manager: baybo_process::ProcessManager::transient(),
+            workspace_paths: baybo_workspace::WorkspacePaths::new("/tmp"),
+            proxy: None,
+            permission: Arc::new(crate::builtin::LivePermissionMode::new(
+                crate::builtin::BashPermissionMode::Manual,
+            )),
+            builtin_memory: true,
+        })
+    }
+
+    fn issue_run() -> TriggerSource {
+        TriggerSource::Issue {
+            project_id: baybo_model::ProjectId::generate(),
+            issue_id: baybo_model::IssueId::generate(),
+            number: 1,
+        }
+    }
+
+    fn props(def: &ToolDefinition) -> Vec<String> {
+        def.parameters_schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// A knob the runtime will refuse is not offered. `bash`'s `on_timeout`
+    /// only chooses between detaching and killing, and without a background
+    /// host there is nothing to detach into — the command is killed whatever
+    /// the model picks.
+    #[test]
+    fn a_card_s_run_is_not_offered_a_knob_its_runtime_refuses() {
+        let registry = registry();
+        let owner = baybo_model::ChannelType::owner();
+
+        let in_chat = registry.tool_definitions_for_session(&owner, &TriggerSource::User, None);
+        let bash = in_chat
+            .iter()
+            .find(|d| d.name == "Bash")
+            .expect("Bash is registered");
+        assert!(
+            props(bash).iter().any(|p| p == "on_timeout"),
+            "a session that can host background work keeps the choice: {:?}",
+            props(bash)
+        );
+
+        let in_run = registry.tool_definitions_for_session(&owner, &issue_run(), None);
+        let bash = in_run
+            .iter()
+            .find(|d| d.name == "Bash")
+            .expect("Bash is registered");
+        assert!(
+            !props(bash).iter().any(|p| p == "on_timeout"),
+            "a card's run must not be offered it: {:?}",
+            props(bash)
+        );
+        assert!(
+            props(bash).iter().any(|p| p == "command"),
+            "the rest of the schema survives: {:?}",
+            props(bash)
+        );
+    }
+
+    /// The full surface still exists — the manifest and the inventory views
+    /// carry it, because the executor accepts a parameter this withholds.
+    #[test]
+    fn withholding_a_parameter_does_not_narrow_the_declared_surface() {
+        let registry = registry();
+        let all = registry.tool_definitions();
+        let bash = all
+            .iter()
+            .find(|d| d.name == "Bash")
+            .expect("Bash is registered");
+        assert!(
+            props(bash).iter().any(|p| p == "on_timeout"),
+            "{:?}",
+            props(bash)
         );
     }
 }

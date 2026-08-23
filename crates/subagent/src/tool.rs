@@ -504,7 +504,7 @@ fn parameters_schema() -> Value {
             "on_timeout": {
                 "type": "string",
                 "enum": ["background", "kill"],
-                "description": "After a 2-minute foreground wait: 'background' (default) detaches it — handle now, notification later — and 'kill' cancels it. Ignored when background=true, inside a scheduled run, and in nested subagents, which always block."
+                "description": "After a 2-minute foreground wait: 'background' (default) detaches it — handle now, notification later — and 'kill' cancels it. Ignored when background=true."
             },
             "group": {
                 "type": "string",
@@ -526,6 +526,27 @@ impl Tool for SpawnSubagentTool {
 
     fn description(&self) -> String {
         (*self.cached_description()).clone()
+    }
+
+    /// Withholds every knob that only chooses *how* to background, where
+    /// backgrounding is refused. A card's run, a scheduled job's own run and
+    /// a nested subagent block regardless of all three.
+    ///
+    /// `group` belongs with them: it forces `background` on, and its whole
+    /// payoff — parallel fan-out, one merged notification — lives inside the
+    /// spawner's `if background` arm, so on this path it is read and dropped
+    /// while its description promises the opposite. `background: true` was
+    /// already being sent and silently ignored.
+    fn parameters_schema_for(&self, trigger: &baybo_model::TriggerSource) -> Value {
+        let mut schema = self.parameters_schema();
+        if !trigger.can_host_background_jobs()
+            && let Some(props) = schema.get_mut("properties").and_then(Value::as_object_mut)
+        {
+            for knob in ["background", "on_timeout", "group"] {
+                props.remove(knob);
+            }
+        }
+        schema
     }
 
     fn parameters_schema(&self) -> Value {
@@ -1413,6 +1434,91 @@ mod tests {
             "backend": "nope",
         });
         assert!(parse_spawn_request(&v, &reg).is_err());
+    }
+
+    /// A card's run loses all three background knobs, and only those. The
+    /// negative half matters as much: `subagent_type`, `prompt` and the rest
+    /// still do their job there, so trimming by hand would be a slow leak.
+    #[test]
+    fn a_card_s_run_loses_the_background_knobs_and_nothing_else() {
+        use baybo_model::TriggerSource;
+
+        let tool = SpawnSubagentTool::from_config(SpawnSubagentToolConfig {
+            spawner: unwired_spawner(),
+            registry: registry_with_builtins(),
+            sessions: empty_session_manager(),
+            dispatch_limiter: unbounded_limiter(),
+            max_depth: DEFAULT_MAX_SUBAGENT_DEPTH,
+            max_subagents_per_root: DEFAULT_MAX_SUBAGENTS_PER_ROOT,
+        });
+        let names = |t: &TriggerSource| {
+            let schema = tool.parameters_schema_for(t);
+            let mut v: Vec<String> = schema["properties"]
+                .as_object()
+                .expect("an object schema")
+                .keys()
+                .cloned()
+                .collect();
+            v.sort();
+            v
+        };
+        let chat = names(&TriggerSource::User);
+        let run = names(&TriggerSource::Issue {
+            project_id: baybo_model::ProjectId::generate(),
+            issue_id: baybo_model::IssueId::generate(),
+            number: 1,
+        });
+        assert!(!chat.is_empty(), "the schema must have properties at all");
+
+        let missing: Vec<&String> = chat.iter().filter(|p| !run.contains(p)).collect();
+        assert_eq!(
+            missing,
+            vec!["background", "group", "on_timeout"],
+            "exactly the knobs that only choose how to background"
+        );
+        for required in ["subagent_type", "description", "prompt"] {
+            assert!(
+                run.contains(&required.to_string()),
+                "{required} must survive: {run:?}"
+            );
+        }
+    }
+
+    /// Withholding a knob from the schema must not narrow what the executor
+    /// accepts. A model that learned `background` elsewhere — from another
+    /// session's prefix, from a skill, from its own transcript before a
+    /// compaction — still gets its call parsed and run, exactly as before.
+    #[test]
+    fn a_withheld_knob_sent_anyway_still_parses_and_behaves() {
+        let reg = registry_with_builtins();
+        let bare = parse_spawn_request(
+            &json!({"subagent_type": "general-purpose", "description": "x", "prompt": "x"}),
+            &reg,
+        )
+        .unwrap()
+        .request;
+        assert!(!bare.background);
+        assert_eq!(bare.on_timeout, OnTimeout::Background);
+        assert!(bare.group.is_none());
+
+        let sent = parse_spawn_request(
+            &json!({
+                "subagent_type": "general-purpose",
+                "description": "x",
+                "prompt": "x",
+                "background": true,
+                "on_timeout": "kill",
+                "group": "batch",
+            }),
+            &reg,
+        )
+        .unwrap()
+        .request;
+        assert!(sent.background, "still honoured at the door");
+        assert_eq!(sent.on_timeout, OnTimeout::Kill);
+        assert!(sent.group.is_some());
+        // The spawner is where an ineligible turn downgrades all three; the
+        // parser stays a parser.
     }
 
     #[test]
