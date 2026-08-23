@@ -198,32 +198,22 @@ already told you not to do, what context recurs.*
 together.)*
 "#;
 
-/// Seed body for a **project** agent's `IDENTITY.md`, whose name the board
-/// fills in immediately afterwards.
+/// A project agent's self-image: its handle, and nothing else.
 ///
-/// The fields mirror [`DEFAULT_IDENTITY_CONTENT`]; only the framing around
-/// the name differs, and that difference is the whole reason this exists. The
-/// default template invites the agent to pick a name — which for a project
-/// agent is an invitation to an act that is refused, since its `@handle` was
-/// derived from the name it was hired under. A system prompt that asks every
-/// turn for something the tools will not allow is a prompt bug, not a
-/// harmless nicety.
+/// No "fill this in" line and no empty Creature/Vibe/Emoji/Avatar fields. The
+/// pair of them — this template plus the Edit affordance the chat preamble
+/// used to carry — spent the opening turn of 7 of 45 observed board runs
+/// reading and rewriting `IDENTITY.md` before touching the card, with the
+/// thinking summary reading "Planning identity attribute update".
+///
+/// `Name` stays because it is the one line anything reads: `with_display_name`
+/// splices the handle into it at hire and `agents.rs` reads it back for the
+/// team roster. The rest was prose no code has ever parsed.
 pub const PROJECT_PERSONA_IDENTITY_TEMPLATE: &str = r#"# Who Am I?
-
-*Fill this in during your first conversation. Make it yours — all but your
-name, which is the one thing here you do not choose.*
 
 * **Name:**
   *(set when you joined this board: your `@handle` came from it, so the two
   have to keep saying the same thing. Leave it be.)*
-* **Creature:**
-  *(AI? robot? familiar? ghost in the machine? something weirder?)*
-* **Vibe:**
-  *(how do you come across? sharp? warm? chaotic? calm?)*
-* **Emoji:**
-  *(your signature — pick one that feels right)*
-* **Avatar:**
-  *(workspace-relative path, http(s) URL, or data URI)*
 "#;
 
 pub(crate) const DEFAULT_IDENTITY_CONTENT: &str = r#"# Who Am I?
@@ -270,6 +260,33 @@ mod tests {
             teammate_words <= MAX_TEAMMATE_WORDS,
             "teammate has {teammate_words} words"
         );
+    }
+
+    /// A board agent's self-image seed is its handle and nothing else. The
+    /// "fill this in" line plus four empty display fields spent the opening
+    /// turn of 7 of 45 runs rewriting `IDENTITY.md`; only `Name` is ever read
+    /// back (`with_display_name` writes it, the team roster reads it).
+    #[test]
+    fn a_board_agent_s_identity_seed_is_its_handle_and_nothing_else() {
+        let t = PROJECT_PERSONA_IDENTITY_TEMPLATE;
+        assert!(
+            t.contains("**Name:**"),
+            "the one line anything reads has to stay: {t}"
+        );
+        assert!(
+            !t.contains("Fill this in"),
+            "the instruction that produced the rewrites must be gone: {t}"
+        );
+        for field in ["Creature", "Vibe", "Emoji", "Avatar"] {
+            assert!(
+                !t.contains(field),
+                "{field} is an empty form nothing parses: {t}"
+            );
+        }
+        // A chat agent still gets the full invitation: it has a conversation
+        // to form a self-image in, and no card waiting on it.
+        assert!(DEFAULT_IDENTITY_CONTENT.contains("Fill this in"));
+        assert!(DEFAULT_IDENTITY_CONTENT.contains("Creature"));
     }
 
     /// The teammate template is the lead's only lever on a new hire: it
