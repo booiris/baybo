@@ -153,6 +153,9 @@ honest, in ascending order of cost:
    fallback for everything a diff cannot beat: a hint (no tag, so no prior copy to
    address), a section `messages[0]` never carried, and a wholesale rewrite, whose
    diff quotes both copies and is measured against the body before it is chosen.
+   A section the fresh assembly no longer carries is not retracted mid-session:
+   the leading row stays immutable, and the next compaction reseeds the current
+   prompt without that section.
    Each explanatory paragraph is likewise carried only by an update that needs it,
    so the common single-section delta explains neither diffs nor self-edits.
 

@@ -112,6 +112,12 @@ one agent's accumulated read on the user is not another's, and sharing the file
 would be a write channel between agents that the partition does not cover.
 Empirically it is also the only one agents actually maintain.
 
+Project-agent SOUL seeds are deliberately short: they hold only durable role,
+board, reporting, and safety rules. Current-card state, wake reasons, brief
+semantics, and tool-selection guidance belong to runtime framing, where they
+can stay accurate without permanently taxing every turn or overwriting an
+agent's editable identity.
+
 The stable facts the operator curates live in `personas/USER.md`, which every
 agent reads as a separate `<shared_user_profile>` section alongside its own
 `<user_notes>`.

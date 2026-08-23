@@ -4,11 +4,14 @@
 /// transcript read on its own still says which card the work belongs to.
 pub const ISSUE_TAG_PREFIX: &str = "[issue #";
 
-const FRAMING_BODY: &str = r#"You are working on this issue as its assignee. This is a task from a
-project board, not a message from a person — nobody is waiting at a
-keyboard for a reply. Do the work, and let what you write be the record
-of it: what you changed, what you found, and anything the operator has to
-decide. Read the brief below before fetching this card again."#;
+const FRAMING_BODY: &str = r#"You are this issue's assignee. This is a project-board task, not a message
+from a person; nobody is waiting at a keyboard. Do the work and record what
+you changed, found, and anything the operator must decide.
+
+Start from the brief below. It contains the card's description, current
+properties, and the new comments included for this run. Call `IssueGet` for
+this card only if the brief says history was omitted, you need system events,
+or the brief has left context."#;
 
 const INSTRUCTION_LABEL: &str = "The issue:";
 
@@ -34,7 +37,7 @@ pub fn frame_issue_brief(number: i64, checkout: &str, brief: &str) -> String {
 /// The framing is written for the model: who it is, that nobody is waiting at
 /// a keyboard, where its checkout is. An operator reading a run already knows
 /// all of that, and rendering it as the opening bubble buries the one line
-/// they came for under six hundred characters of machinery.
+/// they came for under runtime machinery.
 ///
 /// Split on [`INSTRUCTION_LABEL`], which the framer deliberately puts last so
 /// that the instruction is the tail. A row that carries no label is handed
@@ -63,6 +66,11 @@ mod tests {
             framed.contains("/ws/work/projects/p/7"),
             "the framing must name the checkout: {framed}"
         );
+        assert!(
+            framed.contains("Call `IssueGet` for\nthis card only if"),
+            "the runtime brief must own the fetch rule for every agent: {framed}"
+        );
+        assert!(!framed.contains("brief above"), "{framed}");
     }
 
     #[test]

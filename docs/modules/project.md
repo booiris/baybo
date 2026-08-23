@@ -1250,7 +1250,11 @@ The card's status, non-default priority, assignee and branch render on one
 properties line. Those are the current facts a run otherwise had to recover by
 calling `IssueGet` on the card it had just been handed. `IssueGet` remains the
 door for system events, omitted comments, another card, or a brief that has
-scrolled out of reach.
+scrolled out of reach. The runtime brief states those exact exceptions before
+the card, and the tool description repeats them at the decision point; neither
+claims the brief holds the whole timeline. Project-agent SOUL seeds carry only
+durable board and role invariants; current-card and fetch instructions live
+entirely in runtime framing instead of an agent's editable identity.
 
 A card that carries a `blocked_reason` renders it, for **every** trigger — a
 block is a standing fact about the card, not a fact about one wake. The lead's

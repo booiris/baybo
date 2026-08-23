@@ -13,6 +13,8 @@ use crate::actors::{OPERATOR, handle_of, label, named_agent};
 
 pub const ISSUE_GET_TOOL_NAME: &str = "IssueGet";
 
+const ISSUE_GET_DESCRIPTION: &str = r#"Read an issue's description, current properties, and recent timeline, including comments and system events. Do not call this for the current issue at run start: its brief already contains the description, properties, and new comments. Use it for another issue, omitted history or system events, or after the brief has left context."#;
+
 const MAX_TIMELINE_ENTRIES: usize = 40;
 
 pub(super) struct IssueGetTool {
@@ -37,8 +39,7 @@ impl Tool for IssueGetTool {
     }
 
     fn description(&self) -> String {
-        r#"Read an issue's description, properties, and recent timeline, including comments and system events. The current brief already carries this card's properties, description, and unread comments; use IssueGet for another card, omitted history or system events, or after the brief has left context."#
-            .to_string()
+        ISSUE_GET_DESCRIPTION.to_string()
     }
 
     fn parameters_schema(&self) -> Value {
@@ -274,5 +275,20 @@ fn narrate(body: &IssueEventBody, known: &[baybo_store::AgentProfileRow]) -> Str
             tokens(*spent_tokens),
             tokens(*limit_tokens)
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn description_names_when_the_current_card_needs_fetching() {
+        assert!(
+            ISSUE_GET_DESCRIPTION.contains("Do not call this for the current issue at run start")
+        );
+        for reason in ["omitted history", "system events", "brief has left context"] {
+            assert!(ISSUE_GET_DESCRIPTION.contains(reason), "missing {reason}");
+        }
     }
 }

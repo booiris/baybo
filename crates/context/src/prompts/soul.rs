@@ -37,15 +37,11 @@ const TOP_HINT_ISSUE: &str =
 
 /// Which shape of session a prompt is being assembled for.
 ///
-/// The line is whether a person is in the conversation. A chat and a cron
-/// fire are both replyable, so the agent's own record of its human is worth
-/// keeping current. A card's run is not: it is handed work and judged on the
-/// work.
+/// Card runs omit conversational persona affordances and keep card state on
+/// the board. Every other session uses the ordinary conversation prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptShape {
-    /// A conversation a person can speak into. The board's own planning
-    /// session ([`baybo_model::TriggerSource::Project`]) is one of these:
-    /// the lead talks to the operator there.
+    /// Any session that is not a card run.
     Chat,
     /// A run the board dispatched for one card
     /// ([`baybo_model::TriggerSource::Issue`]).
@@ -53,13 +49,13 @@ pub enum PromptShape {
 }
 
 impl PromptShape {
-    /// Read off [`baybo_model::TriggerSource::issue`], the one accessor that
-    /// answers "is this a card's run", so the question keeps a single home
-    /// rather than growing a second spelling here.
+    /// Read issue scope from [`baybo_model::TriggerSource`] through its
+    /// canonical accessor, so that question keeps one home.
     pub fn for_trigger(trigger: &baybo_model::TriggerSource) -> Self {
-        match trigger.issue() {
-            Some(_) => Self::Issue,
-            None => Self::Chat,
+        if trigger.issue().is_some() {
+            Self::Issue
+        } else {
+            Self::Chat
         }
     }
 
@@ -67,6 +63,34 @@ impl PromptShape {
         match self {
             Self::Chat => TOP_HINT,
             Self::Issue => TOP_HINT_ISSUE,
+        }
+    }
+
+    /// What [`MEMORY_HINT`] says is worth writing down, and what its four
+    /// types mean.
+    fn memory_rules(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Chat => (WHAT_TO_WRITE_CHAT, TYPES_CHAT),
+            Self::Issue => (WHAT_TO_WRITE_BOARD, TYPES_BOARD),
+        }
+    }
+
+    /// Whether the prompt carries the two sections that describe the person:
+    /// the shared `personas/USER.md` and the agent's own notes about them.
+    ///
+    /// A card's run does not. Nobody is at a keyboard, the work is specified
+    /// by the card, and on the board these two measured as pure overhead: all
+    /// seven agents' `USER.md` were byte-identical unmodified seed templates,
+    /// and the shared file had every field blank — 806 bytes of empty form on
+    /// every request of every run.
+    ///
+    /// Empty is also not inert. A seed template reads as an instruction to
+    /// fill it in, which is the same failure [`TOP_HINT_ISSUE`] exists to
+    /// stop, arriving through the other half of the prompt.
+    fn carries_user_sections(self) -> bool {
+        match self {
+            Self::Chat => true,
+            Self::Issue => false,
         }
     }
 }
@@ -327,7 +351,7 @@ const MEMORY_HINT: &str = r#"# Memory
 
 Your memory lives in `{{memory_dir}}`: one markdown file per remembered fact, indexed by the `<memory>` block above. The index is always in front of you; the files are not. When an index line looks relevant to what you are doing, `Read` that file — never answer from the one-line hook alone.
 
-Write a memory as soon as you learn something worth carrying into a later conversation: a durable fact about your human, a correction they gave you, the state of ongoing work, a pointer to something external. Do not record what the sections above already say, what matters only inside this conversation, or anything you could re-derive by looking it up.
+{{what_to_write}}
 
 One fact per file. Create it at `{{memory_dir}}/<slug>.md`:
 
@@ -340,9 +364,29 @@ metadata:
 
 <the fact; link related memories with [[their-name]]>
 
-`user` — who your human is. `feedback` — how they have asked you to work, and why. `project` — ongoing work and where it stands; write dates absolutely, never "last week". `reference` — pointers to external things (URLs, dashboards, tickets).
+{{types}}
 
 Then add its line to `{{memory_dir}}/MEMORY.md` in the same breath — `- [Title](file.md) — hook` — because a memory the index does not name will never be found again. Before creating a file, check whether one already covers the fact and update that one instead. When a memory turns out to be wrong or obsolete, delete it with `MemoryDelete` and drop its index line. Keep the index skimmable: it rides every prompt you will ever run."#;
+
+/// The two paragraphs of [`MEMORY_HINT`] that differ by [`PromptShape`]: what
+/// is worth writing down, and what the four types mean.
+///
+/// Split out because on the board they were producing the opposite of memory.
+/// Of 32 memories the live board's agents had written, **18 were copies of
+/// card state** — "Issue #4 reviewed & approved 2026-08-14", "#12 approved,
+/// lead merge pending" — invited by "the state of ongoing work" here and by
+/// "ongoing work and where it stands" in the type glossary, while the soul
+/// template says the opposite ("Somebody reads the card, not the transcript").
+/// The model obeyed both: it reported on the timeline and then copied itself
+/// into memory. The copy has no writer to keep it current, so it is wrong from
+/// the moment the card moves, and it rides the index on every later request.
+const WHAT_TO_WRITE_CHAT: &str = r#"Write a memory as soon as you learn something worth carrying into a later conversation: a durable fact about your human, a correction they gave you, the state of ongoing work, a pointer to something external. Do not record what the sections above already say, what matters only inside this conversation, or anything you could re-derive by looking it up."#;
+
+const WHAT_TO_WRITE_BOARD: &str = r#"Never store card-local state in memory: status, review verdict, branch, commits, completed work, and next steps belong on the board. Store only facts reusable on other cards: environment behavior, board-wide instructions, codebase traps, and expensive-to-rediscover references. Skip anything already stated above or only relevant to the current task."#;
+
+const TYPES_CHAT: &str = r#"`user` — who your human is. `feedback` — how they have asked you to work, and why. `project` — ongoing work and where it stands; write dates absolutely, never "last week". `reference` — pointers to external things (URLs, dashboards, tickets)."#;
+
+const TYPES_BOARD: &str = r#"`user` — explicit, durable facts about the operator. `feedback` — explicit, durable ways the operator or lead wants the board to work. `project` — durable codebase or environment facts, never card state; write dates absolutely, never "last week". `reference` — reusable URLs, dashboards, tickets, or tool versions."#;
 
 /// Assemble the system prompt: the preamble [`PromptShape`] picks up front,
 /// the identity sections, the `<memory>` index plus
@@ -378,15 +422,21 @@ pub async fn assemble(
         PromptPart::Hint(shape.top_hint().to_string()),
         section(SectionTag::Soul, soul.path, &identity.soul),
         section(SectionTag::Identity, self_image.path, &identity.identity),
-        section(
+    ];
+    if shape.carries_user_sections() {
+        parts.push(section(
             SectionTag::SharedUserProfile,
             &paths.shared_user_file(),
             &identity.shared_user,
-        ),
-        section(SectionTag::UserNotes, user_notes.path, &identity.user),
-    ];
+        ));
+        parts.push(section(
+            SectionTag::UserNotes,
+            user_notes.path,
+            &identity.user,
+        ));
+    }
     if let Some(index_path) = memory_index {
-        parts.extend(memory_parts(index_path).await);
+        parts.extend(memory_parts(index_path, shape).await);
     }
     parts.push(PromptPart::Hint(BACKGROUND_TASKS_HINT.to_string()));
     parts.push(PromptPart::Hint(TAIL_HINT.to_string()));
@@ -400,7 +450,7 @@ pub async fn assemble(
 /// unreadable should still get a coherent system prompt, so this failure
 /// warns and degrades to "no memory this session" instead of failing the
 /// assembly and dropping the session to [`FALLBACK_SYSTEM_PROMPT`].
-async fn memory_parts(index_path: &Path) -> Vec<PromptPart> {
+async fn memory_parts(index_path: &Path, shape: PromptShape) -> Vec<PromptPart> {
     let index = match baybo_workspace::load_memory_index(index_path).await {
         Ok(index) => index,
         Err(e) => {
@@ -428,9 +478,15 @@ async fn memory_parts(index_path: &Path) -> Vec<PromptPart> {
         .parent()
         .map(absolutise)
         .unwrap_or_else(|| absolutise(index_path));
+    let (what_to_write, types) = shape.memory_rules();
     vec![
         section(SectionTag::Memory, index_path, &index),
-        PromptPart::Hint(MEMORY_HINT.replace("{{memory_dir}}", &dir.display().to_string())),
+        PromptPart::Hint(
+            MEMORY_HINT
+                .replace("{{memory_dir}}", &dir.display().to_string())
+                .replace("{{what_to_write}}", what_to_write)
+                .replace("{{types}}", types),
+        ),
     ]
 }
 
@@ -451,12 +507,97 @@ mod tests {
     use super::*;
     use baybo_workspace::IdentityKind;
 
-    /// A card's run is not told to keep its attribute files current. The
-    /// affordance is written for a conversation with a person, and a run that
-    /// has none spent its opening turn editing `IDENTITY.md` instead of
-    /// starting the card.
+    /// Every card run is told the board is where card state lives, not memory.
+    /// The generic rule invited the copy — of 32 memories the live board had
+    /// written, 18 were stale card-state snapshots.
     #[tokio::test]
-    async fn a_card_s_run_is_not_told_to_edit_its_attribute_files() {
+    async fn card_runs_are_told_not_to_copy_cards_into_memory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let index = dir.path().join("MEMORY.md");
+        tokio::fs::write(&index, "- [A](a.md) \u{2014} hook\n")
+            .await
+            .expect("seed index");
+
+        let render = async |shape| {
+            memory_parts(&index, shape)
+                .await
+                .iter()
+                .map(PromptPart::render)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let issue = render(PromptShape::Issue).await;
+        assert!(
+            !issue.contains("the state of ongoing work"),
+            "the clause that invited the copies must be gone: {issue}"
+        );
+        assert!(
+            issue.contains("Never store card-local state in memory"),
+            "the board must be named as the current home instead: {issue}"
+        );
+
+        let chat = render(PromptShape::Chat).await;
+        assert!(
+            chat.contains("the state of ongoing work"),
+            "a conversation has no board to defer to: {chat}"
+        );
+
+        // Whatever varies, the frontmatter contract does not: both shapes
+        // still name the four types the loader accepts.
+        for rendered in [&issue, &chat] {
+            assert!(rendered.contains("type: user | feedback | project | reference"));
+            for t in ["`user`", "`feedback`", "`project`", "`reference`"] {
+                assert!(rendered.contains(t), "{t} missing from:\n{rendered}");
+            }
+            assert!(
+                !rendered.contains("{{"),
+                "an unsubstituted placeholder shipped:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_issue_triggers_select_the_card_run_shape() {
+        use baybo_model::{IssueId, ProjectId, SessionId, TriggerSource};
+
+        let project_id = ProjectId::generate();
+        let issue = TriggerSource::Issue {
+            project_id: project_id.clone(),
+            issue_id: IssueId::from("issue-1"),
+            number: 7,
+        };
+        let planning = TriggerSource::Project {
+            project_id: project_id.clone(),
+        };
+        let board_cron = TriggerSource::Cron {
+            cron_job_id: "cron-1".into(),
+            origin_session_id: Some(SessionId::from("origin")),
+            conversation: true,
+            job_title: Some("Triage".into()),
+            project_id: Some(project_id),
+        };
+        let ordinary_cron = TriggerSource::Cron {
+            cron_job_id: "cron-2".into(),
+            origin_session_id: None,
+            conversation: true,
+            job_title: Some("Digest".into()),
+            project_id: None,
+        };
+
+        assert_eq!(PromptShape::for_trigger(&issue), PromptShape::Issue);
+        for trigger in [&TriggerSource::User, &planning, &board_cron, &ordinary_cron] {
+            assert_eq!(PromptShape::for_trigger(trigger), PromptShape::Chat);
+        }
+    }
+
+    /// A card's run gets neither the Edit affordance nor the two sections that
+    /// describe the person. Both are written for a conversation with someone
+    /// at a keyboard; a run has none, and paid for them twice — the affordance
+    /// cost runs their opening turn editing `IDENTITY.md`, and the two
+    /// sections were 806 bytes of unmodified seed template on every request.
+    #[tokio::test]
+    async fn a_card_s_run_carries_neither_the_edit_affordance_nor_the_person() {
         const AFFORDANCE: &str = "use Edit tool to update the corresponding attribute file";
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -493,6 +634,29 @@ mod tests {
             !issue.contains(AFFORDANCE),
             "a card's run must not be told to edit them: {issue}"
         );
+        // The two sections about the person go with it: nobody is at a
+        // keyboard, and an empty seed template is itself an instruction to
+        // fill one in.
+        for tag in [SectionTag::SharedUserProfile, SectionTag::UserNotes] {
+            let opening = format!("<{}", tag.as_str());
+            assert!(
+                chat.contains(&opening),
+                "a conversation keeps {}: {chat}",
+                tag.as_str()
+            );
+            assert!(
+                !issue.contains(&opening),
+                "a card's run must not carry {}: {issue}",
+                tag.as_str()
+            );
+        }
+        for tag in [SectionTag::Soul, SectionTag::Identity] {
+            assert!(
+                issue.contains(&format!("<{}", tag.as_str())),
+                "a card's run still gets {}: {issue}",
+                tag.as_str()
+            );
+        }
         // Nothing takes its place — the failure was an instruction obeyed, so
         // the fix is its absence, not a louder one pointing the other way.
         assert!(!issue.to_lowercase().contains("do not edit"), "{issue}");
