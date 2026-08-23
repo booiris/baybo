@@ -15,11 +15,15 @@
 //!   enabled, and a fresh fullscreen-viewport terminal is constructed.
 //!   On exit the reverse happens and the live chat region reappears.
 //!
-//! Terminal I/O: stdin is driven by [`crossterm::event::EventStream`];
-//! do **not** read stdin via tokio here, as raw mode would conflict with
-//! line-buffered readers.
+//! Terminal I/O: stdin is driven by [`crossterm::event::EventStream`],
+//! and it is the process's **only** stdin reader — the inline viewport is
+//! anchored from bookkeeping rather than a `ESC[6n` round trip (see
+//! [`backend::AnchoredBackend`]), so nothing else ever competes for the
+//! terminal's input. Do **not** read stdin via tokio here either, as raw
+//! mode would conflict with line-buffered readers.
 
 mod app;
+mod backend;
 mod chat;
 pub mod client;
 mod dashboard;
@@ -40,6 +44,7 @@ use std::panic;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
+use crate::backend::AnchoredBackend;
 use baybo_channels::{
     ChannelError, DashboardProvider, IncomingMessage, Message, NoticeLevel, Result, STOP_COMMAND,
     STOP_COMMAND_NAME, SlashHandler, SlashOutcome, ViewKind,
@@ -47,6 +52,7 @@ use baybo_channels::{
 use baybo_model::{ChannelType, SessionId, User};
 use baybo_model::{ContentBlock, MessageMetadata};
 use chrono::Utc;
+use crossterm::cursor::MoveTo;
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, EventStream, KeyEvent,
     KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
@@ -60,6 +66,7 @@ use futures::StreamExt;
 use parking_lot::Mutex;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Position;
 use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Widget, Wrap};
 use ratatui::{TerminalOptions, Viewport};
@@ -311,15 +318,16 @@ impl Drop for TuiTeardownGuard {
     }
 }
 
-type Term = Terminal<CrosstermBackend<Stdout>>;
+type Term = Terminal<AnchoredBackend<CrosstermBackend<Stdout>>>;
 
 /// Build a fresh `Terminal` configured for chat mode (inline viewport)
 /// at the given height. The viewport is sized to exactly fit the live
 /// content, so there's no empty gap between the latest scrollback message
-/// and the live region. The cursor is left wherever the shell put it —
-/// ratatui's `compute_inline_size` anchors the viewport at that row.
-fn new_chat_terminal(viewport_h: u16) -> io::Result<Term> {
-    let backend = CrosstermBackend::new(io::stdout());
+/// and the live region. `anchor` is where the cursor currently sits —
+/// ratatui's `compute_inline_size` anchors the viewport at that row, and
+/// [`AnchoredBackend`] reports it without asking the terminal.
+fn new_chat_terminal(viewport_h: u16, anchor: Position) -> io::Result<Term> {
+    let backend = AnchoredBackend::new(io::stdout(), anchor);
     Terminal::with_options(
         backend,
         TerminalOptions {
@@ -345,9 +353,11 @@ fn desired_viewport_height(state: &AppState) -> u16 {
 
 /// Build a fresh `Terminal` configured for dashboard mode (fullscreen).
 /// The session is already inside the alternate screen; the caller toggles
-/// mouse capture around this if dashboard interactions need it.
-fn new_dashboard_terminal() -> io::Result<Term> {
-    let backend = CrosstermBackend::new(io::stdout());
+/// mouse capture around this if dashboard interactions need it. A fullscreen
+/// viewport never consults the cursor, so `anchor` only matters as the seed
+/// [`AnchoredBackend`] reports until the first `set_cursor_position`.
+fn new_dashboard_terminal(anchor: Position) -> io::Result<Term> {
+    let backend = AnchoredBackend::new(io::stdout(), anchor);
     Terminal::new(backend)
 }
 
@@ -408,7 +418,7 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
     // inline terminal is created so its viewport anchors at the top.
     home_and_clear_screen()?;
     let mut current_viewport_h = desired_viewport_height(&state);
-    let mut terminal = new_chat_terminal(current_viewport_h)
+    let mut terminal = new_chat_terminal(current_viewport_h, Position::ORIGIN)
         .map_err(|e| anyhow::anyhow!("new_chat_terminal: {e}"))?;
     let mut term_events = EventStream::new();
 
@@ -513,13 +523,7 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                                 next,
                             ).await?;
                         }
-                        // This redraw can rebuild the inline terminal (a pending
-                        // resize, or a viewport-height change as an approval
-                        // clears) — a cursor query. We're on a non-keyboard
-                        // wake-up with the reader parked, so route it through the
-                        // guard that drops the stream around any such query.
-                        term_events = redraw_after_event(
-                            term_events,
+                        redraw_after_event(
                             &mut terminal,
                             &mut state,
                             &mut current_viewport_h,
@@ -530,16 +534,14 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                         state.ensure_working_clock();
                         state.append_stream_delta(&delta);
                         if matches!(state.mode, ViewMode::Chat) {
-                            term_events = resize_chat_viewport_before_scrollback(
-                                term_events,
+                            resize_chat_viewport_before_scrollback(
                                 &mut terminal,
                                 &mut state,
                                 &mut current_viewport_h,
                             )?;
                             flush_complete_stream_lines(&mut state, &mut terminal)?;
                         }
-                        term_events = redraw_after_event(
-                            term_events,
+                        redraw_after_event(
                             &mut terminal,
                             &mut state,
                             &mut current_viewport_h,
@@ -553,8 +555,7 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                     } => {
                         state.ensure_working_clock();
                         if matches!(state.mode, ViewMode::Chat) {
-                            term_events = resize_chat_viewport_before_scrollback(
-                                term_events,
+                            resize_chat_viewport_before_scrollback(
                                 &mut terminal,
                                 &mut state,
                                 &mut current_viewport_h,
@@ -569,8 +570,7 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                         // its `⎿` result only on completion, so concurrent tools
                         // never detach their results. See docs/modules/tui.md.
                         state.push_running_tool(call_id, tool, label);
-                        term_events = redraw_after_event(
-                            term_events,
+                        redraw_after_event(
                             &mut terminal,
                             &mut state,
                             &mut current_viewport_h,
@@ -591,8 +591,7 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                         if let Some(running) = state.take_running_tool(&call_id)
                             && matches!(state.mode, ViewMode::Chat)
                         {
-                            term_events = resize_chat_viewport_before_scrollback(
-                                term_events,
+                            resize_chat_viewport_before_scrollback(
                                 &mut terminal,
                                 &mut state,
                                 &mut current_viewport_h,
@@ -615,8 +614,7 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                                 commit_pending_interjections(&mut state, &mut terminal)?;
                             }
                         }
-                        term_events = redraw_after_event(
-                            term_events,
+                        redraw_after_event(
                             &mut terminal,
                             &mut state,
                             &mut current_viewport_h,
@@ -631,8 +629,7 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                                 chat::render_status_line(&phase),
                             )?;
                         }
-                        term_events = redraw_after_event(
-                            term_events,
+                        redraw_after_event(
                             &mut terminal,
                             &mut state,
                             &mut current_viewport_h,
@@ -651,8 +648,7 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                                 snapshot,
                             )?;
                         }
-                        term_events = redraw_after_event(
-                            term_events,
+                        redraw_after_event(
                             &mut terminal,
                             &mut state,
                             &mut current_viewport_h,
@@ -663,8 +659,7 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                         if matches!(state.mode, ViewMode::Chat) {
                             commit_below_answer(&mut state, &mut terminal, chat::render_log_lines(&record))?;
                         }
-                        term_events = redraw_after_event(
-                            term_events,
+                        redraw_after_event(
                             &mut terminal,
                             &mut state,
                             &mut current_viewport_h,
@@ -685,10 +680,8 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                             });
                         }
                         // Showing the approval grows the viewport, so this draw
-                        // rebuilds the inline terminal (a cursor query) on a
-                        // non-keyboard wake-up — the guard pauses the reader for it.
-                        term_events = redraw_after_event(
-                            term_events,
+                        // rebuilds the inline terminal.
+                        redraw_after_event(
                             &mut terminal,
                             &mut state,
                             &mut current_viewport_h,
@@ -702,10 +695,9 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                 // The resize burst settled with no AppEvent in between (the idle
                 // path — an interleaved AppEvent would have applied the resize via
                 // `redraw_after_event` and cleared the flag, disabling this arm).
-                // Re-anchor the inline viewport at the new size; the guard drops
-                // the stream for the cursor query and clears `resize_pending`.
-                term_events = redraw_after_event(
-                    term_events,
+                // Re-anchor the inline viewport at the new size and clear
+                // `resize_pending`.
+                redraw_after_event(
                     &mut terminal,
                     &mut state,
                     &mut current_viewport_h,
@@ -715,11 +707,9 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
             _ = working_refresh.tick(), if working => {
                 // Advance the dot's colour pulse and repaint (also refreshes
                 // the elapsed counter). No scrollback commit and (steady
-                // state) no height change, so `redraw_after_event` does a
-                // cheap in-place draw without a cursor query.
+                // state) no height change, so this is a cheap in-place draw.
                 state.tick_spinner();
-                term_events = redraw_after_event(
-                    term_events,
+                redraw_after_event(
                     &mut terminal,
                     &mut state,
                     &mut current_viewport_h,
@@ -763,8 +753,13 @@ fn resize_chat_viewport_if_needed(
     if desired == *current {
         return Ok(());
     }
+    // The rebuilt viewport has to re-anchor where the old one started, so read
+    // that row before clearing and put the cursor back on it afterwards —
+    // `Terminal::clear` leaves the cursor in a version-dependent spot.
+    let anchor = terminal.get_frame().area().as_position();
     terminal.clear()?;
-    *terminal = new_chat_terminal(desired)?;
+    execute!(io::stdout(), MoveTo(anchor.x, anchor.y))?;
+    *terminal = new_chat_terminal(desired, anchor)?;
     *current = desired;
     Ok(())
 }
@@ -774,18 +769,15 @@ fn resize_chat_viewport_if_needed(
 /// growing the viewport can put the new line where the live region is about to
 /// be, making tool/status text appear to overwrite the working indicator.
 fn resize_chat_viewport_before_scrollback(
-    term_events: EventStream,
     terminal: &mut Term,
     state: &mut AppState,
     current_viewport_h: &mut u16,
-) -> anyhow::Result<EventStream> {
+) -> io::Result<()> {
     if desired_viewport_height(state) == *current_viewport_h {
-        return Ok(term_events);
+        return Ok(());
     }
-    drop(term_events);
     resize_chat_viewport_if_needed(state, terminal, current_viewport_h)?;
-    terminal.draw(|f| render_chat(f, state))?;
-    Ok(EventStream::new())
+    terminal.draw(|f| render_chat(f, state)).map(|_| ())
 }
 
 /// Refresh the screen after a terminal-resize burst settles.
@@ -821,7 +813,7 @@ fn rebuild_chat_terminal_after_resize(
     // the new viewport anchors. See [`home_and_clear_screen`].
     home_and_clear_screen()?;
     let desired = desired_viewport_height(state);
-    *terminal = new_chat_terminal(desired)?;
+    *terminal = new_chat_terminal(desired, Position::ORIGIN)?;
     *current = desired;
     let session_id = state.session_id.clone();
     commit_banner(state, terminal, &session_id)?;
@@ -840,7 +832,7 @@ fn reset_chat_scrollback(
 ) -> io::Result<()> {
     home_and_clear_screen()?;
     let desired = desired_viewport_height(state);
-    *terminal = new_chat_terminal(desired)?;
+    *terminal = new_chat_terminal(desired, Position::ORIGIN)?;
     *current = desired;
     state.clear_transcript();
     commit_banner(state, terminal, session_id)?;
@@ -896,52 +888,25 @@ fn replay_answer(
 }
 
 /// Redraw after a non-keyboard wake-up (an `AppEvent`, or the resize debounce),
-/// dropping the terminal event stream around the draw when it will query the
-/// cursor. Two things make a chat-mode draw query the cursor (DSR `ESC[6n`):
+/// applying any coalesced terminal resize first.
 ///
-/// - **A pending terminal resize** we haven't applied yet: `terminal`'s known
-///   size is stale, so `draw_active`'s `autoresize` re-anchors the inline
-///   viewport via `cursor::position()`. We pre-empt that with our own clean
-///   rebuild ([`rebuild_chat_terminal_after_resize`]) so the viewport doesn't
-///   get the stale-offset garble, then let the draw run without a resize.
-/// - **A live-region height change** (approval shown/cleared, input grew):
-///   `resize_chat_viewport_if_needed` inside `draw_active` rebuilds.
-///
-/// `crossterm::cursor::position()` can only read its reply off stdin when no
-/// `EventStream` is polling it; on these wake-ups the stream's reader thread is
-/// parked holding crossterm's internal reader, so the query would time out and
-/// the error would tear down the loop. Dropping the stream releases the reader
-/// for the query; we recreate it after (keys typed meanwhile stay buffered in
-/// the tty). `resize_pending` is consumed — this redraw applies it.
-///
-/// Returns the (possibly recreated) stream so the caller can rebind it.
-/// Keyboard-event redraws don't use this: they run while the reader is free
-/// (the key was just delivered), so a plain `draw_active` is safe there.
+/// A pending resize means `terminal`'s known size is stale, so a plain draw
+/// would let ratatui's `autoresize` re-anchor the inline viewport from a
+/// pre-reflow offset and garble the live region. Pre-empting it with a clean
+/// [`rebuild_chat_terminal_after_resize`] avoids that; the draw then runs with
+/// the size already settled. `resize_pending` is consumed either way — a
+/// dashboard repaints fullscreen and needs no inline re-anchor.
 fn redraw_after_event(
-    term_events: EventStream,
     terminal: &mut Term,
     state: &mut AppState,
     current_viewport_h: &mut u16,
     resize_pending: &mut bool,
-) -> anyhow::Result<EventStream> {
+) -> io::Result<()> {
     let pending_resize = std::mem::replace(resize_pending, false);
-    let queries_cursor = matches!(state.mode, ViewMode::Chat)
-        && (pending_resize || desired_viewport_height(state) != *current_viewport_h);
-    if !queries_cursor {
-        draw_active(terminal, state, current_viewport_h)?;
-        return Ok(term_events);
+    if pending_resize && matches!(state.mode, ViewMode::Chat) {
+        rebuild_chat_terminal_after_resize(terminal, state, current_viewport_h)?;
     }
-    drop(term_events);
-    let mut result: io::Result<()> = Ok(());
-    if pending_resize {
-        result = rebuild_chat_terminal_after_resize(terminal, state, current_viewport_h);
-    }
-    if result.is_ok() {
-        result = draw_active(terminal, state, current_viewport_h);
-    }
-    let stream = EventStream::new();
-    result?;
-    Ok(stream)
+    draw_active(terminal, state, current_viewport_h)
 }
 
 /// Commit a single blank scrollback row.
@@ -1748,9 +1713,12 @@ fn enter_dashboard_mode(
     kind: ViewKind,
     snapshot: baybo_channels::DashboardSnapshot,
 ) -> io::Result<()> {
+    // Carried across the alt-screen round trip so the chat viewport re-anchors
+    // on the row it left, without asking the terminal where that was.
+    let anchor = terminal.backend().cursor()?;
     execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
     in_alt_screen.store(true, std::sync::atomic::Ordering::Relaxed);
-    *terminal = new_dashboard_terminal()?;
+    *terminal = new_dashboard_terminal(anchor)?;
     state.enter_dashboard(kind, snapshot);
     Ok(())
 }
@@ -1768,10 +1736,16 @@ fn exit_dashboard_mode(
     current_viewport_h: &mut u16,
 ) -> io::Result<()> {
     state.exit_dashboard();
-    execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
+    let anchor = terminal.backend().cursor()?;
+    execute!(
+        io::stdout(),
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+        MoveTo(anchor.x, anchor.y)
+    )?;
     in_alt_screen.store(false, std::sync::atomic::Ordering::Relaxed);
     *current_viewport_h = desired_viewport_height(state);
-    *terminal = new_chat_terminal(*current_viewport_h)?;
+    *terminal = new_chat_terminal(*current_viewport_h, anchor)?;
     Ok(())
 }
 

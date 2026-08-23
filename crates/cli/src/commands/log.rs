@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use baybo_workspace::paths::LOG_FILE_PREFIX;
+use baybo_workspace::paths::{LOG_FILE_PREFIX, TUI_LOG_FILE_PREFIX};
 use chrono::{NaiveDate, Utc};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -25,6 +25,11 @@ pub async fn handle(ctx: &CommandContext, cmd: LogCmd) -> Result<CommandOutput> 
             limit,
             follow,
         } => read_main(ctx, date.as_deref(), limit, follow).await,
+        LogCmd::Tui {
+            date,
+            limit,
+            follow,
+        } => read_tui(ctx, date.as_deref(), limit, follow).await,
         LogCmd::Channel {
             channel,
             date,
@@ -53,6 +58,20 @@ async fn read_main(
         .logs_dir()
         .join(format!("{LOG_FILE_PREFIX}.{date}"));
     read_log_file(ctx, "main", &path, limit, follow).await
+}
+
+async fn read_tui(
+    ctx: &CommandContext,
+    date: Option<&str>,
+    limit: usize,
+    follow: bool,
+) -> Result<CommandOutput> {
+    let date = resolve_date(date)?;
+    let path = ctx
+        .workspace
+        .logs_dir()
+        .join(format!("{TUI_LOG_FILE_PREFIX}.{date}"));
+    read_log_file(ctx, "tui", &path, limit, follow).await
 }
 
 async fn read_channel(

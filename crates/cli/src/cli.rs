@@ -181,9 +181,11 @@ pub enum Commands {
     },
     /// Read the rolling tracing log files on disk. `main` reads
     /// `<workspace>/logs/baybo.log.<date>` (gateway/agent output);
+    /// `tui` reads `<workspace>/logs/tui.log.<date>` (the chat TUI, a
+    /// separate process from the gateway);
     /// `channel <type>` reads
     /// `<workspace>/logs/channel/<type>.log.<date>` (sidecar output).
-    /// Both tail the last `-n` lines (default 200) and `--follow`
+    /// Each tails the last `-n` lines (default 200) and `--follow`
     /// streams new lines until Ctrl-C. For structured session
     /// traces (LLM calls, tool calls) use `baybo session export`
     /// instead — different store, different read shape.
@@ -821,6 +823,22 @@ pub enum LogCmd {
     /// Read the main gateway / agent log
     /// (`<workspace>/logs/baybo.log.<date>`).
     Main {
+        /// Date of the rolling log to read, in `YYYY-MM-DD`.
+        /// Defaults to today (UTC — matches the appender's daily rotation).
+        #[arg(long)]
+        date: Option<String>,
+        /// Return only the last N lines (default: 200).
+        #[arg(long, short = 'n', default_value_t = 200)]
+        limit: usize,
+        /// After printing the tail, stream new lines as they are
+        /// appended (tail-f). Exits on Ctrl-C. Incompatible with `--json`.
+        #[arg(long, short = 'f')]
+        follow: bool,
+    },
+    /// Read the chat TUI's own log (`<workspace>/logs/tui.log.<date>`).
+    /// The TUI is a separate process from the gateway and keeps its own
+    /// file — ratatui owns its stdout, so this is where its diagnostics go.
+    Tui {
         /// Date of the rolling log to read, in `YYYY-MM-DD`.
         /// Defaults to today (UTC — matches the appender's daily rotation).
         #[arg(long)]

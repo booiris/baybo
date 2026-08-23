@@ -22,6 +22,7 @@
 //! `cfg(debug_assertions)`, so release builds never see it.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use baybo_agent::service::ShutdownSignal;
@@ -53,8 +54,12 @@ pub struct Options {
 pub async fn run(config: Arc<BayboConfig>, opts: Options) -> anyhow::Result<()> {
     let process_manager = baybo_process::ProcessManager::transient();
     let tui_log_sink: Arc<OnceLock<TuiLogSink>> = Arc::new(OnceLock::new());
+    let log_dir =
+        baybo_workspace::WorkspacePaths::new(PathBuf::from(&config.workspace.path)).logs_dir();
     let _tracing_guards = init_tracing(TracingMode::Tui {
         tui_sink: Arc::clone(&tui_log_sink),
+        log_dir: &log_dir,
+        leak_detector: crate::runtime::build_leak_detector(&config.security, &[]),
     });
     info!("Baybo - Intelligent Assistant Framework starting");
 
