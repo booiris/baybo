@@ -11,6 +11,14 @@ use crate::ProjectManager;
 
 pub const ISSUE_LIST_TOOL_NAME: &str = "IssueList";
 
+/// How much of the Done column one read returns.
+///
+/// The live columns are a working set someone keeps small, so they come
+/// back whole. Done is the one column that only grows — nothing purges an
+/// issue row — and on a real board it is already most of the response, so
+/// it is the only one that needs a ceiling.
+const MAX_DONE_CARDS: usize = 15;
+
 pub(super) struct IssueListTool {
     manager: Arc<ProjectManager>,
 }
@@ -30,6 +38,20 @@ struct Params {
     assignee: Option<String>,
     #[serde(default)]
     include_cancelled: bool,
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    before: Option<i64>,
+}
+
+/// Case-insensitive substring over the card's own prose.
+///
+/// The description is matched but never returned: it is the biggest field
+/// on the row and the reason this tool omits it, so searching it costs the
+/// caller nothing, while leaving out the one place a card is described in
+/// its own words would make the search miss most of what it is asked for.
+fn matches(issue: &IssueRow, needle: &str) -> bool {
+    issue.title.to_lowercase().contains(needle) || issue.description.to_lowercase().contains(needle)
 }
 
 #[async_trait]
@@ -44,6 +66,8 @@ impl Tool for IssueListTool {
 
 Rows come back **most urgent first within each column**, so the order is already a triage order.
 
+Every live column comes back whole. **Done does not**: it is the one column that only grows, so a read returns its {MAX_DONE_CARDS} highest-numbered cards and a `done_omitted` count for the rest. That is card order, not finish order — the board records when a card was opened, not when it landed. To read further back, pass the response's `done_continue_before` as `before`. To find one card you remember but cannot number, use `query` rather than walking back a page at a time.
+
 Alongside them: `team`, where each member's `working_on` is what they have in flight **right now** — which is not the same as which column a card sits in, because a run outlives the column it started in. `you` marks your own entry, so you know the handle to assign work to yourself. And `board`, which says what is held and what is left of today's budget: promoting a card on an exhausted board records a run that does not start."#
         )
     }
@@ -56,7 +80,15 @@ Alongside them: `team`, where each member's `working_on` is what they have in fl
                 "assignee": super::assignee_schema(false),
                 "include_cancelled": {
                     "type": "boolean",
-                    "description": "Include cancelled issues. Default false — they are not live work.",
+                    "description": "Include cancelled issues. Default false — they are not live work. Not consulted while `query` is set: a search already spans them.",
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Keep only cards whose title or description contains this text, case-insensitively. A search spans the whole board — every column, and cancelled cards too, which come back marked — because a search that hides a match reads as `no such card`. This is the door for `there was a card about X`; use `IssueGet` once you have its number.",
+                },
+                "before": {
+                    "type": "integer",
+                    "description": "Keep only cards numbered below this. Pass the response's `done_continue_before` to read the next page further back in Done.",
                 },
             },
         })
@@ -78,6 +110,14 @@ Alongside them: `team`, where each member's `working_on` is what they have in fl
         };
         let project = scope(ctx)?;
         let status = p.status.as_deref().map(parse_status).transpose()?;
+        // An empty query is no question, so it excludes nothing — the same
+        // reading `parse_assignee_filter` gives an empty filter.
+        let query = p
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|q| !q.is_empty())
+            .map(str::to_lowercase);
 
         let team = self.manager.team(&project).await.map_err(exec_err)?;
         let load = self.manager.board_load(&project).await.map_err(exec_err)?;
@@ -87,12 +127,35 @@ Alongside them: `team`, where each member's `working_on` is what they have in fl
 
         let mut issues = board.clone();
         issues.retain(|issue| {
-            (p.include_cancelled || issue.cancelled_at.is_none())
+            // A search spans cancelled cards whatever `include_cancelled`
+            // says. Leaving out a match would answer "no such card", and a
+            // wrong answer to a question about existence is worse than a
+            // longer list — the row comes back marked either way.
+            (query.is_some() || p.include_cancelled || issue.cancelled_at.is_none())
                 && status.is_none_or(|s| issue.status == s)
                 && wanted_assignee
                     .as_ref()
                     .is_none_or(|wanted| &issue.assignee == wanted)
+                && p.before.is_none_or(|before| issue.number < before)
+                && query.as_deref().is_none_or(|needle| matches(issue, needle))
         });
+
+        // `number` is the only key a page can be cut on: it is dense,
+        // unique per board and never rewritten, where `position` is
+        // whatever order the operator last dragged the column into and no
+        // column records when a card was finished.
+        let (mut issues, mut done): (Vec<IssueRow>, Vec<IssueRow>) = issues
+            .into_iter()
+            .partition(|issue| issue.status != IssueStatus::Done);
+        done.sort_by_key(|issue| std::cmp::Reverse(issue.number));
+        let done_omitted = done.len().saturating_sub(MAX_DONE_CARDS);
+        done.truncate(MAX_DONE_CARDS);
+        let done_continue_before = done
+            .last()
+            .map(|issue| issue.number)
+            .filter(|_| done_omitted > 0);
+        issues.append(&mut done);
+
         issues.sort_by_key(|issue| {
             (
                 IssueStatus::ALL.iter().position(|s| *s == issue.status),
@@ -162,7 +225,10 @@ Alongside them: `team`, where each member's `working_on` is what they have in fl
         // One pass over the board rather than a rescan per card.
         let mut children: std::collections::HashMap<&baybo_model::IssueId, Vec<&IssueRow>> =
             std::collections::HashMap::new();
+        let mut by_id: std::collections::HashMap<&baybo_model::IssueId, &IssueRow> =
+            std::collections::HashMap::new();
         for issue in &board {
+            by_id.insert(&issue.id, issue);
             if let Some(parent) = issue.parent_issue_id.as_ref() {
                 children.entry(parent).or_default().push(issue);
             }
@@ -177,7 +243,7 @@ Alongside them: `team`, where each member's `working_on` is what they have in fl
                 if let Some(parent) = issue
                     .parent_issue_id
                     .as_ref()
-                    .and_then(|id| board.iter().find(|candidate| &candidate.id == id))
+                    .and_then(|id| by_id.get(id).copied())
                 {
                     map.insert("parent".into(), json!(parent.number));
                     map.insert("stage".into(), json!(issue.stage));
@@ -198,11 +264,17 @@ Alongside them: `team`, where each member's `working_on` is what they have in fl
             })
             .collect();
 
-        Ok(ToolOutput::Json(json!({
-            "count": rows.len(),
-            "issues": rows,
-            "team": roster,
-            "board": Value::Object(board_facts),
-        })))
+        let mut out = serde_json::Map::new();
+        out.insert("count".into(), json!(rows.len()));
+        out.insert("issues".into(), json!(rows));
+        if done_omitted > 0 {
+            out.insert("done_omitted".into(), json!(done_omitted));
+        }
+        if let Some(before) = done_continue_before {
+            out.insert("done_continue_before".into(), json!(before));
+        }
+        out.insert("team".into(), json!(roster));
+        out.insert("board".into(), Value::Object(board_facts));
+        Ok(ToolOutput::Json(Value::Object(out)))
     }
 }

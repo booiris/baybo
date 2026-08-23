@@ -1714,6 +1714,24 @@ operator's refer to the same things by the same names. `IssueGet` narrates the
 timeline as prose rather than tagged JSON, because its reader is a model
 assembling context.
 
+**`IssueList` returns the live columns whole and pages Done.** Every column but
+Done is a working set somebody keeps small, so capping one would make a triage
+read quietly partial — a wrong triage rather than a short list. Done is the
+column nothing bounds, because no path deletes an issue row; a read returns its
+`MAX_DONE_CARDS` highest-numbered cards with a `done_omitted` count, and
+`done_continue_before` walks back a page at a time. The cursor is `number`: it
+is the only key that is dense, unique per board and never rewritten, where
+`position` is whatever order the operator last dragged the column into. Nothing
+records when a card was *finished*, so the cap keeps the newest cards opened
+rather than the last ones landed, and the tool's own description says so instead
+of implying a timestamp the schema does not have.
+
+Finding one card is `query`, not the cursor. It matches title and description —
+the description is searched but never returned, being the field the row omits to
+stay lean — and it spans every column and the cancelled cards, because a search
+that hides a match answers "no such card" and the caller opens a duplicate.
+`IssueGet` is where the number goes once `query` has produced one.
+
 ### Push
 
 `ProjectEvents` is a port with four hooks — `project_changed`,

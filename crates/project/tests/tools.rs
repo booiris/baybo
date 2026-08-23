@@ -1193,6 +1193,232 @@ async fn a_parent_row_carries_its_progress_and_open_stages() {
     assert_eq!(child["stage"], 1);
 }
 
+fn numbers(listed: &Value) -> Vec<i64> {
+    listed["issues"]
+        .as_array()
+        .expect("issues")
+        .iter()
+        .map(|issue| issue["number"].as_i64().expect("number"))
+        .collect()
+}
+
+/// Files `count` cards on a fresh board and finishes every one of them.
+/// A distinct `key` per card because the context is a cron fire, where a
+/// card filed without one dedupes onto the last.
+async fn done_board(f: &Fixture, name: &str, count: i64) -> (ProjectId, ToolContext) {
+    let (project, lead) = f.open(name).await;
+    let ctx = f.ctx(&project, &lead);
+    for n in 1..=count {
+        f.call(
+            "IssueCreate",
+            &ctx,
+            json!({ "title": format!("card {n}"), "key": format!("c{n}") }),
+        )
+        .await;
+        f.call(
+            "IssueUpdate",
+            &ctx,
+            json!({ "number": n, "status": "done" }),
+        )
+        .await;
+    }
+    (project, ctx)
+}
+
+/// Done is the one column that only grows — nothing purges an issue row —
+/// so a read caps it. A capped read must not read as a short board: what
+/// it held back and where to continue are both on the response.
+#[tokio::test]
+async fn a_read_caps_the_done_column_and_says_what_it_left_out() {
+    let f = fixture().await;
+    let (_project, ctx) = done_board(&f, "History", 18).await;
+
+    let listed = f.call("IssueList", &ctx, json!({})).await;
+    assert_eq!(listed["count"], 15, "{listed}");
+    assert_eq!(listed["done_omitted"], 3);
+    assert_eq!(
+        listed["done_continue_before"], 4,
+        "the oldest card this read returned"
+    );
+    assert!(
+        numbers(&listed).iter().all(|n| *n >= 4),
+        "a read keeps the newest cards: {:?}",
+        numbers(&listed)
+    );
+}
+
+/// The cursor is what makes the cap honest rather than lossy: every card
+/// it held back is reachable, exactly once.
+#[tokio::test]
+async fn paging_back_through_done_reaches_every_card_the_cap_held_back() {
+    let f = fixture().await;
+    let (_project, ctx) = done_board(&f, "History", 20).await;
+
+    let mut before: Option<i64> = None;
+    let mut seen: Vec<i64> = Vec::new();
+    let mut pages = 0;
+    for _ in 0..5 {
+        let params = match before {
+            Some(n) => json!({ "status": "done", "before": n }),
+            None => json!({ "status": "done" }),
+        };
+        let page = f.call("IssueList", &ctx, params).await;
+        pages += 1;
+        seen.extend(numbers(&page));
+        before = page.get("done_continue_before").and_then(Value::as_i64);
+        if before.is_none() {
+            break;
+        }
+    }
+
+    assert!(before.is_none(), "the walk back never ended");
+    assert_eq!(pages, 2, "20 cards past a cap of 15 is two reads, not one");
+    seen.sort_unstable();
+    assert_eq!(
+        seen,
+        (1..=20).collect::<Vec<i64>>(),
+        "every card once, no gap and no repeat"
+    );
+}
+
+/// The cap is Done's alone. A live column is a working set somebody keeps
+/// small, and triage reading a silently partial board is worse than a long
+/// one.
+#[tokio::test]
+async fn the_live_columns_are_never_capped() {
+    let f = fixture().await;
+    let (project, lead) = f.open("Backlog").await;
+    let ctx = f.ctx(&project, &lead);
+    for n in 1..=18 {
+        f.call(
+            "IssueCreate",
+            &ctx,
+            json!({ "title": format!("card {n}"), "key": format!("c{n}") }),
+        )
+        .await;
+    }
+
+    let listed = f.call("IssueList", &ctx, json!({})).await;
+    assert_eq!(listed["count"], 18, "{listed}");
+    assert!(
+        listed.get("done_omitted").is_none(),
+        "nothing was held back: {listed}"
+    );
+}
+
+/// A card is written up in its description, which the row deliberately
+/// never carries — so a search reading only titles would miss most of what
+/// it is asked to find.
+#[tokio::test]
+async fn a_search_matches_the_description_it_does_not_return() {
+    let f = fixture().await;
+    let (project, lead) = f.open("Search").await;
+    let ctx = f.ctx(&project, &lead);
+    f.call(
+        "IssueCreate",
+        &ctx,
+        json!({
+            "title": "parser follow-up",
+            "description": "doc comments split by a blank line are dropped by LexedStr",
+            "key": "a",
+        }),
+    )
+    .await;
+    f.call(
+        "IssueCreate",
+        &ctx,
+        json!({ "title": "unrelated", "key": "b" }),
+    )
+    .await;
+
+    let hit = f
+        .call("IssueList", &ctx, json!({ "query": "LEXEDSTR" }))
+        .await;
+    assert_eq!(hit["count"], 1, "case does not matter: {hit}");
+    assert_eq!(hit["issues"][0]["number"], 1);
+    assert!(
+        hit["issues"][0].get("description").is_none(),
+        "the description is matched, never returned"
+    );
+
+    let all = f.call("IssueList", &ctx, json!({ "query": "  " })).await;
+    assert_eq!(all["count"], 2, "an empty query is no question");
+}
+
+/// A search is a question about existence, so it reaches both places a
+/// plain read hides a card: past the Done cap, and among the cancelled.
+/// Answering "nothing" is how the same card gets filed twice.
+#[tokio::test]
+async fn a_search_reaches_past_the_cap_and_into_cancelled_cards() {
+    let f = fixture().await;
+    let (project, lead) = f.open("Search").await;
+    let ctx = f.ctx(&project, &lead);
+    f.call(
+        "IssueCreate",
+        &ctx,
+        json!({ "title": "the salsa rework", "key": "old" }),
+    )
+    .await;
+    f.call(
+        "IssueUpdate",
+        &ctx,
+        json!({ "number": 1, "status": "done" }),
+    )
+    .await;
+    f.call(
+        "IssueCreate",
+        &ctx,
+        json!({ "title": "the salsa spike", "key": "gone" }),
+    )
+    .await;
+    f.call(
+        "IssueUpdate",
+        &ctx,
+        json!({ "number": 2, "cancelled": true }),
+    )
+    .await;
+    for n in 3..=20 {
+        f.call(
+            "IssueCreate",
+            &ctx,
+            json!({ "title": format!("card {n}"), "key": format!("c{n}") }),
+        )
+        .await;
+        f.call(
+            "IssueUpdate",
+            &ctx,
+            json!({ "number": n, "status": "done" }),
+        )
+        .await;
+    }
+
+    let plain = f.call("IssueList", &ctx, json!({})).await;
+    assert!(
+        !numbers(&plain).contains(&1),
+        "the cap holds the oldest finished card back: {:?}",
+        numbers(&plain)
+    );
+    assert!(
+        !numbers(&plain).contains(&2),
+        "a cancelled card is not live work"
+    );
+
+    let found = f.call("IssueList", &ctx, json!({ "query": "salsa" })).await;
+    let mut hits = numbers(&found);
+    hits.sort_unstable();
+    assert_eq!(hits, vec![1, 2], "both, though a plain read shows neither");
+    let cancelled = found["issues"]
+        .as_array()
+        .expect("issues")
+        .iter()
+        .find(|issue| issue["number"] == 2)
+        .expect("the cancelled card");
+    assert_eq!(
+        cancelled["cancelled"], true,
+        "a search hides nothing, so the row has to say what it is"
+    );
+}
+
 mod dedupe {
     use super::*;
     use baybo_model::TriggerSource;
