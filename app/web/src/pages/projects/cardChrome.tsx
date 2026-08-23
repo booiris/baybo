@@ -120,6 +120,29 @@ export function FiledFromChip({ number }: { number: number }) {
   );
 }
 
+/// Marked when an **agent** filed the card, bare when the operator did.
+///
+/// The two are not the same card. `RunTrigger::Grooming` wakes the lead
+/// about an agent's card parked in Backlog and leaves the operator's alone
+/// forever, so without a mark that column is one pile under two rules and
+/// nothing on screen says which card is which.
+///
+/// Deliberately quiet — the meta row's own `text-ink-soft`, no border, no
+/// tone. On a board the team has been filing its own work breakdown into,
+/// most cards carry this; a mark most cards wear has to whisper or it is
+/// furniture, and furniture stops being looked at.
+export function AgentFiledMark() {
+  return (
+    <span
+      aria-hidden
+      title="Filed by an agent, not by you. While it sits in Backlog the board may ask its lead whether it is ready; a card you filed there is left where you put it."
+      className="shrink-0 opacity-70"
+    >
+      ⌁
+    </span>
+  );
+}
+
 /// A ring, not a bar. It sits inline beside the assignee on a card whose
 /// other rows are already full-width, and a circle reads as "how far
 /// through the steps" at a glance where a fifth horizontal bar would just

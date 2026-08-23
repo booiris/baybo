@@ -906,6 +906,14 @@ was asked (`RunTrigger::is_coordination`):
   moves it to Todo — where the ordinary promoter takes it on the next tick, as
   `RunTrigger::Promoted`, run by its own assignee.
 
+  The card face says which kind it is. `BoardCards` carries the same answer
+  through to `IssueDto.opened_by_agent`, resolved once beside `CardSignals`
+  rather than left to whoever draws a card — an operator looking at a Backlog
+  column is looking at two rules, and a face that re-derived authorship could
+  mark a card the board will never ask about. It sits on `BoardCards` and not
+  in `CardSignals`, whose map is sparse on purpose: absent there means
+  "nothing waiting", and most cards on a working board are an agent's.
+
 Cards whose assignee *is* the lead take no question at all
 (`driver::takes_a_lead_question`) — those are the lead's own, its
 communication thread included, and a question about them has no other party.

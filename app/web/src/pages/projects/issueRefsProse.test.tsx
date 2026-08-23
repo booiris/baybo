@@ -101,6 +101,7 @@ function issue(number: number): Issue {
     stage: 1,
     unread: 0,
     last_run_failed: false,
+    opened_by_agent: false,
     created_at_ms: 0,
     updated_at_ms: 0,
   };

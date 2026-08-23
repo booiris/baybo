@@ -360,6 +360,14 @@ pub struct IssueDto {
     /// shows it, because a failure that leaves the card looking untouched
     /// is a badge pointing at something the operator cannot find.
     pub last_run_failed: bool,
+    /// An agent filed this card, rather than the operator. The board's own
+    /// work breakdown, and the same fact `RunTrigger::Grooming` turns on —
+    /// a card the operator parked in Backlog is left alone, so the card
+    /// face has to say which kind it is or the column reads as one pile
+    /// with two rules. Resolved server-side off the timeline, never
+    /// re-derived here from `filed_from`, which answers a different
+    /// question and is set on almost none of them.
+    pub opened_by_agent: bool,
     /// Present once the issue is cancelled. The row is never deleted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancelled_at_ms: Option<i64>,
@@ -412,6 +420,7 @@ impl IssueDto {
             sub_issues,
             unread: signals.unread as i64,
             last_run_failed: signals.last_run_failed,
+            opened_by_agent: board.opened_by_agent(row.number),
             ..Self::from(row)
         }
     }
@@ -441,10 +450,12 @@ impl From<IssueRow> for IssueDto {
             stage: row.stage,
             sub_issues: None,
             // A card built without its board is a card nobody is looking
-            // at yet — the two signals are derived over the board, and
-            // guessing them here is how they would drift.
+            // at yet — these are all derived over the board, and guessing
+            // them here is how they would drift. `opened_by_agent` reads
+            // as the operator's, the direction that leaves work parked.
             unread: 0,
             last_run_failed: false,
+            opened_by_agent: false,
             cancelled_at_ms: row.cancelled_at.map(|t| t.timestamp_millis()),
             created_at_ms: row.created_at.timestamp_millis(),
             updated_at_ms: row.updated_at.timestamp_millis(),

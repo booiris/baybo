@@ -2716,6 +2716,16 @@ export interface components {
              */
             number: number;
             /**
+             * @description An agent filed this card, rather than the operator. The board's own
+             *     work breakdown, and the same fact `RunTrigger::Grooming` turns on —
+             *     a card the operator parked in Backlog is left alone, so the card
+             *     face has to say which kind it is or the column reads as one pile
+             *     with two rules. Resolved server-side off the timeline, never
+             *     re-derived here from `filed_from`, which answers a different
+             *     question and is set on almost none of them.
+             */
+            opened_by_agent: boolean;
+            /**
              * Format: int64
              * @description The issue this one is a step of, by its number on this board.
              *     Absent on a top-level card.
@@ -7885,6 +7895,16 @@ export interface operations {
                              * @description The human address, unique within its project: `#3`.
                              */
                             number: number;
+                            /**
+                             * @description An agent filed this card, rather than the operator. The board's own
+                             *     work breakdown, and the same fact `RunTrigger::Grooming` turns on —
+                             *     a card the operator parked in Backlog is left alone, so the card
+                             *     face has to say which kind it is or the column reads as one pile
+                             *     with two rules. Resolved server-side off the timeline, never
+                             *     re-derived here from `filed_from`, which answers a different
+                             *     question and is set on almost none of them.
+                             */
+                            opened_by_agent: boolean;
                             /**
                              * Format: int64
                              * @description The issue this one is a step of, by its number on this board.

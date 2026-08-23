@@ -73,6 +73,7 @@ import {
   BranchChip,
   FailedBadge,
   FiledFromChip,
+  AgentFiledMark,
   PinButton,
   PRIORITY_MARK,
   RunnerFace,
@@ -797,6 +798,7 @@ function IssueTile({
             {priority.glyph} {PRIORITY_LABEL[issue.priority]}
           </span>
         )}
+        {issue.opened_by_agent ? <AgentFiledMark /> : null}
         {/* In front of the time, at the line's other end: the head of the
             meta line is where the card is identified — its number, its
             priority — and a press standing in that queue is read as one more

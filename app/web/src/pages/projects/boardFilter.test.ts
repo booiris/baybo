@@ -27,6 +27,7 @@ function issue(number: number, overrides: Partial<Issue> = {}): Issue {
     updated_at_ms: 0,
     unread: 0,
     last_run_failed: false,
+    opened_by_agent: false,
     pinned: false,
     ...overrides,
   };

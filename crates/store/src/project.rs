@@ -945,14 +945,24 @@ pub struct CardSignals {
 pub struct BoardCards {
     pub rows: Vec<IssueRow>,
     signals: std::collections::HashMap<IssueId, CardSignals>,
+    /// By number rather than by id, because that is how the timeline
+    /// denormalises a card and one board's numbers are unique. Kept apart
+    /// from [`CardSignals`], whose map is sparse on purpose — absent there
+    /// means "nothing waiting", and authorship is true of most cards.
+    opened_by_agent: std::collections::BTreeSet<i64>,
 }
 
 impl BoardCards {
     pub fn new(
         rows: Vec<IssueRow>,
         signals: std::collections::HashMap<IssueId, CardSignals>,
+        opened_by_agent: std::collections::BTreeSet<i64>,
     ) -> Self {
-        Self { rows, signals }
+        Self {
+            rows,
+            signals,
+            opened_by_agent,
+        }
     }
 
     /// A card with nothing waiting on it has no row in the map, rather
@@ -960,6 +970,17 @@ impl BoardCards {
     /// missing.
     pub fn signals(&self, issue: &IssueId) -> CardSignals {
         self.signals.get(issue).copied().unwrap_or_default()
+    }
+
+    /// Whether an agent opened this card, rather than the operator.
+    ///
+    /// The same fact `RunTrigger::Grooming` is decided by, resolved here
+    /// rather than left to each caller: a card face that answered it a
+    /// second time could mark a card the board will never ask about.
+    /// A card with no `Opened` entry reads as the operator's, which is the
+    /// direction that leaves work parked.
+    pub fn opened_by_agent(&self, number: i64) -> bool {
+        self.opened_by_agent.contains(&number)
     }
 }
 

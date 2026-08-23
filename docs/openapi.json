@@ -5287,6 +5287,7 @@
                           "stage",
                           "unread",
                           "last_run_failed",
+                          "opened_by_agent",
                           "created_at_ms",
                           "updated_at_ms"
                         ],
@@ -5350,6 +5351,10 @@
                             "type": "integer",
                             "format": "int64",
                             "description": "The human address, unique within its project: `#3`."
+                          },
+                          "opened_by_agent": {
+                            "type": "boolean",
+                            "description": "An agent filed this card, rather than the operator. The board's own\nwork breakdown, and the same fact `RunTrigger::Grooming` turns on —\na card the operator parked in Backlog is left alone, so the card\nface has to say which kind it is or the column reads as one pile\nwith two rules. Resolved server-side off the timeline, never\nre-derived here from `filed_from`, which answers a different\nquestion and is set on almost none of them."
                           },
                           "parent": {
                             "type": [
@@ -9515,6 +9520,7 @@
           "stage",
           "unread",
           "last_run_failed",
+          "opened_by_agent",
           "created_at_ms",
           "updated_at_ms"
         ],
@@ -9578,6 +9584,10 @@
             "type": "integer",
             "format": "int64",
             "description": "The human address, unique within its project: `#3`."
+          },
+          "opened_by_agent": {
+            "type": "boolean",
+            "description": "An agent filed this card, rather than the operator. The board's own\nwork breakdown, and the same fact `RunTrigger::Grooming` turns on —\na card the operator parked in Backlog is left alone, so the card\nface has to say which kind it is or the column reads as one pile\nwith two rules. Resolved server-side off the timeline, never\nre-derived here from `filed_from`, which answers a different\nquestion and is set on almost none of them."
           },
           "parent": {
             "type": [

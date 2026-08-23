@@ -31,13 +31,14 @@ function issue(number: number, overrides: Partial<Issue> = {}): Issue {
     updated_at_ms: 0,
     unread: 0,
     last_run_failed: false,
+    opened_by_agent: false,
     pinned: false,
     ...overrides,
   };
 }
 
 const ISSUES: Issue[] = [
-  issue(1, { title: 'Wire the board', position: 0, assignee: 'dev-1' }),
+  issue(1, { title: 'Wire the board', position: 0, assignee: 'dev-1', opened_by_agent: true }),
   issue(2, { title: 'Blocked one', position: 1, blocked_reason: 'waiting on tmux', unread: 2 }),
   issue(3, { title: 'Cancelled one', position: 2, cancelled_at_ms: 111 }),
   issue(4, {
@@ -371,6 +372,20 @@ describe('ProjectBoardPage', () => {
     // The press must not also open the card — the card's own click
     // navigates, so the pin has to claim the event.
     expect(screen.getByRole('heading', { name: 'Backlog' })).toBeInTheDocument();
+  });
+
+  it('marks the cards an agent filed, at the head of the meta row', async () => {
+    // Only these cards are the board's to groom out of Backlog; the
+    // operator's stay where they were put. Unmarked has to mean the second
+    // one, so the mark sits with the number that identifies the card.
+    renderBoard();
+    const ours = (await screen.findByText('Wire the board')).closest('article') as HTMLElement;
+    const mark = within(ours).getByTitle(/^Filed by an agent/);
+    const number = within(ours).getByText('#1');
+    expect(number.compareDocumentPosition(mark) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    const theirs = screen.getByText('Blocked one').closest('article') as HTMLElement;
+    expect(within(theirs).queryByTitle(/^Filed by an agent/)).toBeNull();
   });
 
   it("wears the pin at the meta row's right end, in front of the time", async () => {

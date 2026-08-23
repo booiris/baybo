@@ -88,6 +88,7 @@ import {
   BranchChip,
   FailedBadge,
   FiledFromChip,
+  AgentFiledMark,
   PinButton,
   PRIORITY_MARK,
   RunnerFace,
@@ -956,6 +957,7 @@ function IssueCard({
           <span className={`${priority.tone} font-bold`}>{priority.glyph}</span>
         ) : null}
         <span className="font-bold">#{issue.number}</span>
+        {issue.opened_by_agent ? <AgentFiledMark /> : null}
         {/* In front of the time, at the row's other end: the head of the meta
             row is where the card is identified — its mark and its number —
             and a press standing in that queue reads as one more fact about

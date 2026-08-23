@@ -39,6 +39,7 @@ const ISSUE: Issue = {
   stage: 0,
   unread: 0,
   last_run_failed: false,
+  opened_by_agent: false,
   pinned: false,
   created_at_ms: 0,
   updated_at_ms: 0,

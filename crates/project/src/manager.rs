@@ -2598,7 +2598,13 @@ impl ProjectManager {
     pub async fn board_cards(&self, project: &ProjectId) -> Result<BoardCards> {
         let rows = self.list_issues(project).await?;
         let signals = self.store.card_signals(project).await?;
-        Ok(BoardCards::new(rows, signals))
+        let opened_by_agent = self
+            .store
+            .agent_opened_issues(project)
+            .await?
+            .into_iter()
+            .collect();
+        Ok(BoardCards::new(rows, signals, opened_by_agent))
     }
 
     /// The whole board's activity, newest first. Two sources merged here

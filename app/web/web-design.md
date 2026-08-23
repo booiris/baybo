@@ -439,6 +439,29 @@ one mark here whose truth is the server's.
 Nothing is written to the timeline. A pin changes nothing about the work —
 priority, which genuinely decides what the board starts, is silent too.
 
+## Who filed the card
+
+A `⌁` at the head of the meta row, immediately after the number, on cards an
+**agent** filed. The operator's own cards wear nothing.
+
+It is not decoration. Backlog is one column under two rules: the board wakes
+its lead about a card *it* parked there (`RunTrigger::Grooming`) and leaves a
+card the operator parked alone, forever. Unmarked, the column is one pile and
+nothing on screen says which half the board will act on — the failure that had
+a live board sit still for three hours with five cards on it.
+
+It **whispers**. No border, no tone, the meta row's own `text-ink-soft` at 70%
+opacity — because on a board whose team has been filing its own work breakdown
+most cards carry it, and a mark most cards wear is furniture the moment it
+raises its voice. That is the same trade the `0 · 0 · 0` stat row and the
+always-on ceiling banner both lost.
+
+`cardChrome.AgentFiledMark` renders it and both surfaces read it the same way,
+the board tile and the stage card. The fact is `IssueDto.opened_by_agent`,
+resolved server-side off the `Opened` timeline entry and handed over already
+answered — never re-derived here from `filed_from`, which answers a different
+question ("which card spun this one out") and is set on almost none of them.
+
 ## A card's three properties
 
 Status, priority and assignee are set in two places — the issue page's rail and

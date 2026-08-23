@@ -6120,6 +6120,29 @@ async fn the_lead_is_asked_about_the_backlog_the_board_filed_and_never_about_the
 }
 
 #[tokio::test]
+async fn a_card_face_is_told_who_filed_it() {
+    // The same fact the grooming question turns on, resolved once for
+    // whoever draws a card: a face that answered it a second time could
+    // mark a card the board will never ask about.
+    let f = fixture().await;
+    let (p, dev) = driven_board(&f, 3).await;
+
+    let theirs = park_card(&f, &p.id, "someday", IssueActor::User, None).await;
+    let ours = park_card(&f, &p.id, "spun out", IssueActor::Agent(dev), None).await;
+
+    let board = f.manager.board_cards(&p.id).await.expect("board");
+    assert!(board.opened_by_agent(ours.number));
+    assert!(
+        !board.opened_by_agent(theirs.number),
+        "the operator's own card is not the board's work breakdown"
+    );
+    assert!(
+        !board.opened_by_agent(theirs.number + 999),
+        "and a number this board does not have reads as nobody's"
+    );
+}
+
+#[tokio::test]
 async fn grooming_a_card_into_todo_is_what_starts_it() {
     let f = fixture().await;
     let (p, dev) = driven_board(&f, 3).await;

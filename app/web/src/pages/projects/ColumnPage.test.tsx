@@ -30,13 +30,14 @@ function issue(number: number, overrides: Partial<Issue> = {}): Issue {
     updated_at_ms: 0,
     unread: 0,
     last_run_failed: false,
+    opened_by_agent: false,
     pinned: false,
     ...overrides,
   };
 }
 
 const ISSUES: Issue[] = [
-  issue(1, { title: 'Wire the board', position: 0, assignee: 'dev-1' }),
+  issue(1, { title: 'Wire the board', position: 0, assignee: 'dev-1', opened_by_agent: true }),
   issue(2, {
     title: 'Blocked one',
     position: 1,
@@ -254,6 +255,18 @@ describe('ColumnPage', () => {
 
     expect(within(card).getByTitle('@dev-1 — working')).toBeTruthy();
     expect(within(card).queryByTitle(/This card's run is/)).toBeNull();
+  });
+
+  it('says which cards the board filed itself and which the operator did', async () => {
+    // Backlog is one column under two rules — the board wakes its lead about
+    // the cards it filed there and leaves the operator's alone — so a column
+    // that marked neither would be showing one pile.
+    renderColumn();
+    const ours = cardOf(await screen.findByText('Wire the board'));
+    expect(within(ours).getByTitle(/^Filed by an agent/)).toBeTruthy();
+
+    const theirs = cardOf(screen.getByText('Blocked one'));
+    expect(within(theirs).queryByTitle(/^Filed by an agent/)).toBeNull();
   });
 
   it('shows only the routed stage, one card per issue, unread lifted to the front', async () => {
