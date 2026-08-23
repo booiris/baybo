@@ -35,7 +35,7 @@ pub use external_agent::{
 };
 pub use fingerprint::FileFingerprint;
 pub use folder::{FolderId, FolderSummary, MAX_FOLDER_NAME_LEN};
-pub use governance::{ArtifactSource, ExtensionKind, ExtensionManifest, TrustLevel};
+pub use governance::{ArtifactSource, TrustLevel};
 pub use ids::{
     CostRecordId, ParallelGroup, SessionId, SpanId, StepId, TaskId, ToolSetHash,
     ToolSetHashParseError, TurnId,

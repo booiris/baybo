@@ -13,7 +13,7 @@ Contents:
 - **Control events**: `ControlEvent`, `ControlEventKind`
 - **Folder types**: `FolderId`, `FolderSummary`, `MAX_FOLDER_NAME_LEN`
 - **Agent-profile types**: `AgentProfileId`, `AgentFramework`, `BUILTIN_AGENT_PROFILE_ID`, `MAX_AGENT_PROFILE_NAME_CHARS`
-- **Governance types**: `TrustLevel`, `ArtifactSource`, `ExtensionManifest`, `ExtensionKind`
+- **Governance types**: `TrustLevel`, `ArtifactSource`
 - **Security types**: `PlaceholderId`, `SecretKind`
 - **Cost & money types**: `CostRecord`, `CostSummary`, `CallReason`, `TimeRange`, `MicroUsd` (integer micro-USD; the project never uses floats for money)
 - **Cron types**: `CronJob`, `CronExecution`, `CronSchedule`, `CronStatus`, `ExecutionStatus`
