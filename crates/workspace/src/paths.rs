@@ -227,6 +227,13 @@ pub const BLOBS_SUBDIR: &str = "blobs";
 /// File-name prefix for the gateway's rolling log files (`baybo.log.YYYY-MM-DD`).
 pub const LOG_FILE_PREFIX: &str = "baybo.log";
 
+/// File-name prefix for the chat TUI's rolling log files
+/// (`tui.log.YYYY-MM-DD`). Separate from [`LOG_FILE_PREFIX`] because the TUI is
+/// its own process: ratatui owns its stdout, so the file is where its
+/// diagnostics land, and appending them to the gateway's log would interleave
+/// two writers into one file.
+pub const TUI_LOG_FILE_PREFIX: &str = "tui.log";
+
 /// Subdirectory under [`LOGS_DIR`] holding per-channel sidecar log files
 /// (`<channel_type>.log.YYYY-MM-DD`).
 pub const CHANNEL_LOGS_SUBDIR: &str = "channel";

@@ -224,15 +224,12 @@ Current real-terminal suites:
     stays structural too — the inline-viewport resize has a known,
     accepted cosmetic ghost frame, so a golden there would be flaky.
 
-  Driving the chat UI exposes a known, accepted race: a non-keyboard
-  viewport rebuild queries cursor position (`ESC[6n`), and because
-  dropping crossterm's `EventStream` doesn't synchronously stop its reader
-  thread, a lingering `stdin` read can steal the reply, time out, and exit
-  the process mid-turn. That's orthogonal to rendering correctness, so the
-  harness returns a distinct `HarnessError::ProcessDied` (rather than
-  burning the whole timeout on a dead pane) and the test retries the
-  scenario on a fresh process; a genuine render mismatch (process alive,
-  output wrong) still fails fast.
+  A probe that dies mid-scenario fails the test. The harness surfaces that
+  as a distinct `HarnessError::ProcessDied` (rather than burning the whole
+  timeout on a dead pane), and the chat TUI issues no terminal queries at
+  all — the inline viewport anchors from bookkeeping, so `EventStream` is
+  the only stdin reader and there is no race left to tolerate. A death here
+  means the event loop took an error path, which is a real regression.
 
 ## Running tests
 

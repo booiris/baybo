@@ -2,9 +2,9 @@
 //!
 //! Three disjoint modes: `Stdout` for one-shot argv, `File` for the
 //! long-running gateway server (rolling daily log under the workspace,
-//! redacted on disk), and `Tui` for the chat client (warn/error mirrored
-//! into the ratatui scrollback — no file, since the TUI is a thin client
-//! of the gateway which already owns the authoritative log).
+//! redacted on disk), and `Tui` for the chat client, which gets both a
+//! rolling file of its own and a warn/error mirror into the ratatui
+//! scrollback.
 //!
 //! Keeping all three here means any tweak (filter default, timestamp
 //! format, JSON switch, redaction wiring) lands in one place instead
@@ -22,7 +22,8 @@ use std::sync::{Arc, OnceLock};
 use baybo_gateway::{LogBuffer, LogBufferLayer};
 use baybo_security::{LeakDetector, RedactingMakeWriter};
 use baybo_tui::TuiLogSink;
-use tracing_appender::non_blocking::WorkerGuard;
+use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::time::FormatTime;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
@@ -55,12 +56,58 @@ pub enum TracingMode<'a> {
         log_dir: &'a Path,
         leak_detector: Arc<LeakDetector>,
     },
-    /// TUI chat path: no file on disk (the TUI is a thin gateway
-    /// client — the gateway owns the authoritative log file), just a
-    /// [`TuiLogLayer`] that mirrors warn/error events into the chat
-    /// scrollback via `tui_sink` once the caller populates it. Info
-    /// and below are silently dropped because ratatui owns stdout.
-    Tui { tui_sink: Arc<OnceLock<TuiLogSink>> },
+    /// TUI chat path: a rolling daily log at
+    /// `<log_dir>/tui.log.YYYY-MM-DD` (its own file — the TUI is a separate
+    /// process from the gateway that owns `baybo.log`), plus a
+    /// [`TuiLogLayer`] mirroring warn/error events into the chat scrollback
+    /// via `tui_sink` once the caller populates it.
+    ///
+    /// The file is what makes a TUI failure diagnosable at all: the mirror
+    /// drains into the event loop, so anything logged while that loop is
+    /// unwinding — the exit reason above all — reaches no reader but the
+    /// file. Never fall back to stdout here; ratatui owns it.
+    Tui {
+        tui_sink: Arc<OnceLock<TuiLogSink>>,
+        log_dir: &'a Path,
+        leak_detector: Arc<LeakDetector>,
+    },
+}
+
+/// Build the rolling daily writer for `<log_dir>/<prefix>.YYYY-MM-DD`, masked
+/// through the shared [`LeakDetector`]. `None` when the file can't be opened —
+/// each caller decides what to do without one.
+///
+/// Built through `RollingFileAppender::builder` rather than the `rolling::daily`
+/// convenience wrapper, which `.expect()`s on the initial open: a read-only or
+/// full log directory would abort the process at startup instead of degrading.
+fn rolling_file_writer(
+    log_dir: &Path,
+    prefix: &str,
+    leak_detector: Arc<LeakDetector>,
+) -> Option<(RedactingMakeWriter<NonBlocking>, WorkerGuard)> {
+    if let Err(e) = std::fs::create_dir_all(log_dir) {
+        eprintln!(
+            "warning: could not create log dir {}: {e}",
+            log_dir.display()
+        );
+        return None;
+    }
+    let appender = match RollingFileAppender::builder()
+        .rotation(Rotation::DAILY)
+        .filename_prefix(prefix)
+        .build(log_dir)
+    {
+        Ok(appender) => appender,
+        Err(e) => {
+            eprintln!(
+                "warning: could not open log file {}/{prefix}: {e}",
+                log_dir.display()
+            );
+            return None;
+        }
+    };
+    let (writer, guard) = tracing_appender::non_blocking(appender);
+    Some((RedactingMakeWriter::new(leak_detector, writer), guard))
 }
 
 pub struct TracingGuards {
@@ -179,17 +226,14 @@ pub fn init_tracing(mode: TracingMode<'_>) -> TracingGuards {
             log_dir,
             leak_detector,
         } => {
-            if let Err(e) = std::fs::create_dir_all(log_dir) {
-                eprintln!(
-                    "warning: could not create log dir {}: {e}. Falling back to stdout logging.",
-                    log_dir.display()
-                );
+            let Some((writer, guard)) = rolling_file_writer(
+                log_dir,
+                baybo_workspace::paths::LOG_FILE_PREFIX,
+                leak_detector,
+            ) else {
+                eprintln!("warning: falling back to stdout logging.");
                 return init_tracing(TracingMode::Stdout);
-            }
-            let appender =
-                tracing_appender::rolling::daily(log_dir, baybo_workspace::paths::LOG_FILE_PREFIX);
-            let (writer, guard) = tracing_appender::non_blocking(appender);
-            let writer = RedactingMakeWriter::new(leak_detector, writer);
+            };
             let fmt_layer = fmt::layer()
                 .with_writer(writer)
                 .with_ansi(false)
@@ -218,17 +262,49 @@ pub fn init_tracing(mode: TracingMode<'_>) -> TracingGuards {
                 log_buffer,
             }
         }
-        TracingMode::Tui { tui_sink } => {
-            let result = tracing_subscriber::registry()
-                .with(env_filter)
-                .with(buffer_layer)
-                .with(TuiLogLayer::new(tui_sink))
-                .try_init();
+        TracingMode::Tui {
+            tui_sink,
+            log_dir,
+            leak_detector,
+        } => {
+            let file = rolling_file_writer(
+                log_dir,
+                baybo_workspace::paths::TUI_LOG_FILE_PREFIX,
+                leak_detector,
+            );
+            let (writer, worker) = match file {
+                Some((writer, guard)) => (Some(writer), Some(guard)),
+                None => (None, None),
+            };
+            let fmt_layer = writer.map(|writer| {
+                fmt::layer()
+                    .with_writer(writer)
+                    .with_ansi(false)
+                    .with_timer(SecondPrecisionTimer)
+                    .with_target(true)
+                    .with_file(true)
+                    .with_line_number(true)
+            });
+            let result = if json {
+                tracing_subscriber::registry()
+                    .with(env_filter)
+                    .with(buffer_layer)
+                    .with(fmt_layer.map(|l| l.json().with_span_list(true)))
+                    .with(TuiLogLayer::new(tui_sink))
+                    .try_init()
+            } else {
+                tracing_subscriber::registry()
+                    .with(env_filter)
+                    .with(buffer_layer)
+                    .with(fmt_layer)
+                    .with(TuiLogLayer::new(tui_sink))
+                    .try_init()
+            };
             if let Err(e) = result {
                 eprintln!("warning: tracing subscriber already initialized: {e}");
             }
             TracingGuards {
-                _worker: None,
+                _worker: worker,
                 log_buffer,
             }
         }

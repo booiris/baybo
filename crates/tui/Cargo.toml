@@ -41,6 +41,8 @@ tokio-stream = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 unicode-width = { workspace = true }
+unicode-segmentation = { workspace = true }
+pulldown-cmark = { workspace = true }
 shell-words = { workspace = true }
 
 [dev-dependencies]

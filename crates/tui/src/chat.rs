@@ -26,6 +26,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::{AppState, ApprovalChatEntry, ApprovalChatState, RunningTool};
 use crate::event::{LogLevel, LogRecord};
+use crate::markdown::{self, Gutter};
 
 /// Maximum rows the input box grows to before it clips. Beyond this, the
 /// cursor may scroll off-screen.
@@ -383,6 +384,33 @@ const ANSWER_DOT: &str = "●";
 /// so wrapped/continued lines align under the text rather than the dot.
 const ANSWER_INDENT: &str = "  ";
 
+/// Display width of [`ANSWER_DOT`] plus its trailing space, reserved on every
+/// answer row so wrapped markdown aligns under the text rather than the dot.
+pub(crate) const ANSWER_LEADER_WIDTH: usize = 2;
+
+/// Columns a rendered answer's markdown content may occupy at `width`.
+pub(crate) fn answer_content_width(width: u16) -> usize {
+    (width as usize).saturating_sub(ANSWER_LEADER_WIDTH).max(1)
+}
+
+/// Prefix already-wrapped markdown rows with the answer leader: the pale dot on
+/// the response's very first row, the matching indent on every row after it.
+/// `continuation` mirrors `AppState::streaming_committed_any`.
+pub(crate) fn render_answer_rows(
+    rows: Vec<Line<'static>>,
+    continuation: bool,
+) -> Vec<Line<'static>> {
+    let mut out = Vec::with_capacity(rows.len());
+    let mut first = !continuation;
+    for row in rows {
+        let mut spans = vec![answer_leader(!first)];
+        spans.extend(row.spans);
+        out.push(Line::from(spans));
+        first = false;
+    }
+    out
+}
+
 /// Leading span for an assistant answer line: a pale dot on the first line,
 /// a matching blank indent on continuations.
 fn answer_leader(is_continuation: bool) -> Span<'static> {
@@ -396,6 +424,11 @@ fn answer_leader(is_continuation: bool) -> Span<'static> {
     }
 }
 
+/// Quote leader opening a user message's highlighted bar.
+const USER_LEADER: &str = "> ";
+/// Continuation indent for a user message's wrapped and subsequent rows.
+const USER_INDENT: &str = "  ";
+
 pub(crate) fn render_user_lines(text: &str, width: u16) -> Vec<Line<'static>> {
     // The user's own messages render as a full-width highlighted bar: a `> `
     // quote leader on the first line, then the row padded out with spaces so
@@ -403,64 +436,68 @@ pub(crate) fn render_user_lines(text: &str, width: u16) -> Vec<Line<'static>> {
     // commit time. Explicit bright-white bg + black fg (rather than
     // `REVERSED`, which renders muted/grey on many terminals) keeps the bar
     // bright and theme-independent.
+    //
+    // Rows are wrapped here rather than by `Paragraph`: `wrapped_height` would
+    // under-count the word-wrapped rows and the tail would be dropped from
+    // scrollback, and only a display-width wrap breaks an unspaced Han message
+    // at all.
     let style = Style::default().bg(Color::White).fg(Color::Black);
-    let total = width as usize;
+    let total = (width as usize).max(USER_LEADER.width());
     let mut out = Vec::new();
-    let mut first = true;
-    for line in text.lines() {
-        let body = format!("{}{line}", if first { "> " } else { "  " });
-        out.push(Line::from(Span::styled(pad_to_width(body, total), style)));
-        first = false;
+    for (index, line) in text.lines().enumerate() {
+        let gutter = if index == 0 {
+            Gutter::hanging(vec![Span::raw(USER_LEADER)], vec![Span::raw(USER_INDENT)])
+        } else {
+            Gutter::uniform(vec![Span::raw(USER_INDENT)])
+        };
+        for row in markdown::wrap(&[Span::raw(line.to_string())], total, &gutter) {
+            let body: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
+            out.push(Line::from(Span::styled(markdown::pad(&body, total), style)));
+        }
     }
-    if first {
+    if out.is_empty() {
         out.push(Line::from(Span::styled(
-            pad_to_width("> ".to_string(), total),
+            markdown::pad(USER_LEADER, total),
             style,
         )));
     }
     out
 }
 
-/// Right-pad `s` with spaces so its display width fills `width` columns (a
-/// no-op when it already meets or exceeds it), so a styled background covers
-/// the whole row.
-fn pad_to_width(s: String, width: usize) -> String {
-    let w = s.width();
-    if w >= width {
-        s
-    } else {
-        format!("{s}{}", " ".repeat(width - w))
-    }
+/// A whole assistant response rendered from its final blocks, for a delivery
+/// that never streamed (a cron trigger, or a synthetic completion message).
+pub(crate) fn render_assistant_lines(blocks: &[ContentBlock], width: u16) -> Vec<Line<'static>> {
+    render_answer_rows(block_rows(blocks, false, width), false)
 }
 
-pub(crate) fn render_assistant_lines(blocks: &[ContentBlock]) -> Vec<Line<'static>> {
-    let mut out = Vec::new();
-    let mut first = true;
+/// Markdown-render the text blocks and wrap the rest, separating blocks with a
+/// blank row. `text_only` skips [`ContentBlock::Text`], for a response whose
+/// prose already streamed.
+fn block_rows(blocks: &[ContentBlock], skip_text: bool, width: u16) -> Vec<Line<'static>> {
+    let content = answer_content_width(width);
+    let mut out: Vec<Line<'static>> = Vec::new();
     for block in blocks {
-        let Some(rendered) = render_block(block) else {
+        let is_text = matches!(block, ContentBlock::Text(_));
+        if skip_text && is_text {
+            continue;
+        }
+        let Some(rendered) = block_source_text(block) else {
             continue;
         };
-        for (i, text) in rendered.lines().enumerate() {
-            out.push(Line::from(vec![
-                answer_leader(!(first && i == 0)),
-                Span::raw(text.to_string()),
-            ]));
+        let rows = if is_text {
+            markdown::render_document(&rendered, content)
+        } else {
+            markdown::wrap(&[Span::raw(rendered)], content, &Gutter::none())
+        };
+        if rows.is_empty() {
+            continue;
         }
-        first = false;
+        if !out.is_empty() {
+            out.push(Line::default());
+        }
+        out.extend(rows);
     }
     out
-}
-
-/// One rendered line of a streaming agent response. The first line of the
-/// response carries the pale answer dot; every subsequent line uses the
-/// matching continuation indent so the answer reads as one coherent block.
-/// Callers set `is_continuation` based on `AppState::streaming_committed_any`
-/// — see [`crate::app`].
-pub(crate) fn render_stream_line(text: &str, is_continuation: bool) -> Vec<Line<'static>> {
-    vec![Line::from(vec![
-        answer_leader(is_continuation),
-        Span::raw(text.to_string()),
-    ])]
 }
 
 /// The `● tool(label)` head line of a tool block. The bullet matches the
@@ -559,30 +596,17 @@ pub(crate) fn render_status_line(phase: &str) -> Vec<Line<'static>> {
 /// Render the non-text portion of a finalised assistant response. Text
 /// blocks are skipped because they've already been streamed line-by-line
 /// to scrollback; only blocks that aren't covered by the stream
-/// (currently just the CronCreate hint via [`render_block`]) need to be
+/// (currently just the CronCreate hint via [`block_source_text`]) need to be
 /// flushed at `Outgoing` time. `started` should mirror
 /// `AppState::streaming_committed_any` so the leader is correct: if the
 /// response opened with no streamed text at all, the first non-text line
 /// still gets the pale answer dot.
-pub(crate) fn render_non_text_blocks(blocks: &[ContentBlock], started: bool) -> Vec<Line<'static>> {
-    let mut out = Vec::new();
-    let mut first = !started;
-    for block in blocks {
-        if matches!(block, ContentBlock::Text(_)) {
-            continue;
-        }
-        let Some(rendered) = render_block(block) else {
-            continue;
-        };
-        for line in rendered.lines() {
-            out.push(Line::from(vec![
-                answer_leader(!first),
-                Span::raw(line.to_string()),
-            ]));
-            first = false;
-        }
-    }
-    out
+pub(crate) fn render_non_text_blocks(
+    blocks: &[ContentBlock],
+    started: bool,
+    width: u16,
+) -> Vec<Line<'static>> {
+    render_answer_rows(block_rows(blocks, true, width), started)
 }
 
 pub(crate) fn render_system_lines(text: &str) -> Vec<Line<'static>> {
@@ -901,7 +925,9 @@ const TUI_CRON_RECURRING_HINT: &str = "⚠ This cron is tied to the TUI channel.
     long-lived recurring turns, prefer a persistent channel \
     (telegram/discord/http).";
 
-fn render_block(block: &ContentBlock) -> Option<String> {
+/// The markdown (or placeholder) source a content block contributes to an
+/// answer. `None` for a block that renders nothing.
+pub(crate) fn block_source_text(block: &ContentBlock) -> Option<String> {
     match block {
         ContentBlock::Text(text) => Some(text.clone()),
         ContentBlock::Image { mime_type, .. } => Some(format!("[Image: {mime_type}]")),
@@ -1185,7 +1211,7 @@ mod tests {
         let text = line_text(line);
         assert!(text.starts_with("● cooked for "), "got {text:?}");
         assert!(text.contains("1m 15s"), "minutes formatting: {text:?}");
-        let answer = render_stream_line("answer", false);
+        let answer = render_answer_rows(vec![Line::from("answer")], false);
         let answer_text_fg = answer[0].spans[1].style.fg;
         assert!(
             line.spans.iter().all(|s| s.style.fg == answer_text_fg),
@@ -1214,16 +1240,60 @@ mod tests {
     }
 
     #[test]
-    fn stream_line_uses_answer_dot_then_indent() {
-        let first = line_text(&render_stream_line("hi", false)[0]);
-        let cont = line_text(&render_stream_line("more", true)[0]);
+    fn a_han_user_message_wraps_instead_of_losing_its_tail() {
+        // Before wrapping here, this went out as one over-wide logical line and
+        // `wrapped_height` under-counted the rows `Paragraph` needed, so the
+        // tail was dropped from scrollback outright.
+        let text = "帮我把这个函数重构一下谢谢";
+        for width in 8u16..40 {
+            let lines = render_user_lines(text, width);
+            let joined: String = lines.iter().map(line_text).collect();
+            for ch in text.chars() {
+                assert!(
+                    joined.contains(ch),
+                    "width {width} lost {ch:?} from {joined:?}"
+                );
+            }
+            for line in &lines {
+                assert_eq!(
+                    line_text(line).width(),
+                    width as usize,
+                    "every row fills the bar exactly at width {width}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_long_user_message_wraps_onto_more_rows() {
+        let lines = render_user_lines("alpha bravo charlie delta echo foxtrot", 16);
+        assert!(lines.len() > 1, "a message wider than the bar must wrap");
+        assert!(line_text(&lines[0]).starts_with("> "));
+        for line in lines.iter().skip(1) {
+            assert!(line_text(line).starts_with("  "), "{:?}", line_text(line));
+        }
+    }
+
+    #[test]
+    fn answer_rows_use_the_dot_then_the_indent() {
+        let rows = vec![Line::from("hi"), Line::from("there")];
+        let fresh = render_answer_rows(rows.clone(), false);
         assert!(
-            first.starts_with("● "),
-            "first line gets the dot: {first:?}"
+            line_text(&fresh[0]).starts_with("● "),
+            "the response's first row gets the dot: {:?}",
+            line_text(&fresh[0])
         );
         assert!(
-            cont.starts_with("  ") && !cont.contains('●'),
-            "continuation indents, no dot: {cont:?}"
+            line_text(&fresh[1]).starts_with("  ") && !line_text(&fresh[1]).contains('●'),
+            "later rows indent, no dot: {:?}",
+            line_text(&fresh[1])
+        );
+        let continued = render_answer_rows(rows, true);
+        assert!(
+            continued
+                .iter()
+                .all(|r| line_text(r).starts_with("  ") && !line_text(r).contains('●')),
+            "a continued response never re-draws the dot"
         );
     }
 

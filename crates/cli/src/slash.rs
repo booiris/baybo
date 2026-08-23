@@ -346,10 +346,12 @@ fn slash_admissible(cmd: &Commands) -> Result<(), &'static str> {
             CronCmd::List | CronCmd::Show { .. } => Ok(()),
         },
         Commands::Log { cmd } => match cmd {
-            LogCmd::Main { follow: true, .. } | LogCmd::Channel { follow: true, .. } => {
+            LogCmd::Main { follow: true, .. }
+            | LogCmd::Tui { follow: true, .. }
+            | LogCmd::Channel { follow: true, .. } => {
                 Err("`--follow` streams indefinitely and is not supported in slash mode")
             }
-            LogCmd::Main { .. } | LogCmd::Channel { .. } => Ok(()),
+            LogCmd::Main { .. } | LogCmd::Tui { .. } | LogCmd::Channel { .. } => Ok(()),
         },
         Commands::Cost {
             cmd: CostCmd::Show { .. },

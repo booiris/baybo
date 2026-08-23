@@ -6,7 +6,7 @@
 
 The layout is intentionally minimal:
 
-- **Scrollback pane** — rendered chat lines (user, assistant, system, approval).
+- **Scrollback pane** — rendered chat lines (user, assistant, system, approval). Assistant answers are rendered **markdown** — see [Markdown rendering](#markdown-rendering).
 - **Input line** — editor with emacs-style cursor motions, a history ring, and a compact current-model footer below it when the gateway reports one.
 - **Dashboard view** (modal) — opened by dashboard-style slash commands; returns to chat on `Esc`.
 
@@ -32,19 +32,163 @@ server side.
 
 ### Chat
 
-- The live chat history lives in the terminal's **native** scrollback, not an in-memory display buffer: completed lines (user / assistant / system / log / resolved approval) are committed straight in via `Terminal::insert_before`, and the TUI owns only a small inline live region (the animated working indicator, any queued-message lines, the pending-approval prompt, the input box, and the optional current-model footer — see [Working indicator & mid-turn steering](#working-indicator--mid-turn-steering)). A **bounded** `TranscriptBlock` log on `AppState` (capped at `TRANSCRIPT_MAX_LINES`, oldest blocks evicted) shadows what was committed, used **only** to re-render the conversation on a resize refresh (below) — never as the display source. The commit helpers record into it as they `insert_before`; width-dependent blocks (the user bar) store their **source text** so replay re-renders them at the new width, everything else stores rendered lines that re-wrap.
-- **Resize = refresh, then replay.** A terminal **width** change reflows the native scrollback and leaves stale fragments from the old full-width live region (input box / message bars) that the inline viewport can't precisely erase (no post-reflow layout is exposed by ratatui/crossterm). Rather than live with the ghosting, a settled resize burst (coalesced by `RESIZE_COALESCE_WINDOW`) triggers `rebuild_chat_terminal_after_resize`, which **clears the screen + scrollback, reprints the banner, then replays the `TranscriptBlock` log** (`replay_transcript`) so the conversation re-renders cleanly at the new width. Replay goes through the same commit helpers, so the leading-separator spacing is reproduced exactly. `AppState.session_id` is carried so the banner can be reprinted without a transport handle. What does **not** come back: history beyond the transcript cap, and any shell output above the original launch point (the entry clear wiped it). `/clear`, `/new`, and `Ctrl-L` call `clear_transcript`, so a later resize doesn't resurrect intentionally-cleared history.
-- Assistant lines render each `ContentBlock`: text inline, and `Image`/`Audio`/`File` as a bracketed placeholder.
+- The live chat history lives in the terminal's **native** scrollback, not an in-memory display buffer: completed lines (user / assistant / system / log / resolved approval) are committed straight in via `Terminal::insert_before`, and the TUI owns only a small inline live region (the animated working indicator, any queued-message lines, the pending-approval prompt, the input box, and the optional current-model footer — see [Working indicator & mid-turn steering](#working-indicator--mid-turn-steering)). A **bounded** `TranscriptBlock` log on `AppState` (capped at `TRANSCRIPT_MAX_LINES`, oldest blocks evicted) shadows what was committed, used **only** to re-render the conversation on a resize refresh (below) — never as the display source. The commit helpers record into it as they `insert_before`. Width-dependent blocks store their **source** so replay re-renders them at the new width: the user bar its text, and an assistant answer its **markdown source lines** (consecutive answer commits append to one record, so a code fence spanning several commits re-parses as a fence). Tool / status / log blocks store rendered lines, which re-wrap.
+- **Resize = refresh, then replay.** A terminal **width** change reflows the native scrollback and leaves stale fragments from the old full-width live region (input box / message bars) that the inline viewport can't precisely erase (no post-reflow layout is exposed by ratatui/crossterm). Rather than live with the ghosting, a settled resize burst (coalesced by `RESIZE_COALESCE_WINDOW`) triggers `rebuild_chat_terminal_after_resize`, which **clears the screen + scrollback, reprints the banner, then replays the `TranscriptBlock` log** (`replay_transcript`) so the conversation re-renders cleanly at the new width. Replay goes through the same commit helpers, so the leading-separator spacing is reproduced exactly. `AppState.session_id` is carried so the banner can be reprinted without a transport handle. A resize **flushes the answer buffer first**, so no recorded source line is replayed before its rows have rendered (which would otherwise print the block twice — once from replay, once when it closes). One answer run's retained source is bounded by `MAX_ANSWER_RUN_LINES`, because a record is never evicted while it is the only one and an unbounded run would be dropped whole by the next block, wiping the log. What does **not** come back: history beyond the transcript cap, and any shell output above the original launch point (the entry clear wiped it). `/clear`, `/new`, and `Ctrl-L` call `clear_transcript`, so a later resize doesn't resurrect intentionally-cleared history.
+- Assistant lines render each `ContentBlock`: `Text` as **markdown** ([below](#markdown-rendering)), and `Image`/`Audio`/`File` as a bracketed placeholder.
 - Input history keeps up to `HISTORY_CAP = 500` non-empty submissions with trivial de-duplication of consecutive identical lines. The ring is **persistent**: see [Persistent input history](#persistent-input-history) below.
 - Chat scrolling is the terminal's own (mouse wheel / the emulator's scrollback); the TUI keeps no scroll offset for chat. `PageUp`/`PageDown` page the **dashboard** table only (`DashboardPageUp`/`DashboardPageDown`, ±10 rows).
-- While the LLM is responding, an ephemeral streaming buffer is drawn immediately below the scrollback tail. Each `AgentEvent::AnswerDelta` extends it; complete lines are committed to the terminal scrollback (`insert_before`) as they arrive, leaving only the trailing partial in the buffer. The agent loop streams deltas on **every** iteration, so a final answer that lands after tool calls still streams.
-- The final `AgentEvent::Message` does **not** replace the streamed text — those lines are already committed. `finalize_stream` (via the pure `finalize_lines`) commits the trailing partial plus any non-text extras the stream didn't carry (e.g. the CronCreate hint). When a Message has no preceding stream — a cron fire (`delta_tx = None`) or a direct synthetic Message such as the background-completion reply — it renders the full body from the blocks so the text isn't dropped. The subsequent background analysis turn streams normally.
-- **Message styling.** There are no `you>` / `baybo>` prefixes. A user message is a **full-width highlighted bar** — bright white background, black text (not `REVERSED`, which renders muted on many terminals) — with a `> ` quote leader, the row padded with spaces (via `render_user_lines(text, width)`) so the background spans the whole line. Everything else leads with a same-size `●` dot: an assistant answer (**pale `●`**, continuation lines indented under it), the tool line (cyan `●`), the resolved-approval summary, and the `cooked for` footer using the answer text foreground.
+- While the LLM is responding, `AppState.streaming` accumulates the raw delta bytes. It is **not drawn anywhere** — the live region has no streaming section, so text becomes visible only when it is committed to scrollback; the animated working indicator is what covers the gap. Each `AgentEvent::AnswerDelta` extends the buffer, every newline-terminated line is drained into the markdown stream, and whatever **blocks** that closes are committed via `insert_before`. The agent loop streams deltas on **every** iteration, so a final answer that lands after tool calls still streams.
+- The final `AgentEvent::Message` does **not** replace the streamed text — those lines are already committed. `finalize_stream` feeds the trailing partial to the markdown stream, closes it, and commits whatever that produces, plus any non-text extras the stream didn't carry (e.g. the CronCreate hint — the streamed-vs-not split is the pure `finalize_extras`). When a Message has no preceding stream — a cron fire (`delta_tx = None`) or a direct synthetic Message such as the background-completion reply — it renders the full body from the blocks so the text isn't dropped. The subsequent background analysis turn streams normally.
+- **Message styling.** There are no `you>` / `baybo>` prefixes. A user message is a **full-width highlighted bar** — bright white background, black text (not `REVERSED`, which renders muted on many terminals) — with a `> ` quote leader and a two-space hanging indent on continuation rows, each row padded with spaces (via `render_user_lines(text, width)`) so the background spans the whole line. Rows are wrapped **by display width** here rather than by `Paragraph`, because a word-wrapped over-wide row exceeds what `wrapped_height` estimates and its tail was being dropped from scrollback outright — an unspaced Han message lost several characters. Everything else leads with a same-size `●` dot: an assistant answer (**pale `●`**, continuation lines indented under it), the tool line (cyan `●`), the resolved-approval summary, and the `cooked for` footer using the answer text foreground.
 - **Spacing (leading separators, no trailing blanks).** Blocks are separated by **exactly one** blank row via a *leading* separator: `begin_block(kind)` emits one blank when the block kind changes (always for `Other`; same-kind `Answer`/`Tool` lines stack tight as one block). It's deduped against `AppState.last_row_blank` so it never doubles, and there are **no** trailing blanks — the reserved working row (below) separates the last block from the input, and the next block adds its own leading separator. `AppState.last_block: Option<BlockKind>` tracks the kind.
 - **Turn-done footer.** When a turn finishes, `finalize_stream` commits a `● cooked for <elapsed>` stamp (same foreground as answer text) with its own deduped separator above it, so it sits one blank below the answer/tool block. It's the turn's wall-clock from when its `working_since` clock armed; only turns the TUI actually clocked get it (a cancelled `/stop` turn or a non-streaming cron delivery does not).
 - **Model footer.** At startup `baybo tui` queries the gateway admin endpoint `GET /v1/llm` with the local admin bearer token and passes the active `provider/model_id` label into `TuiAdapter::with_model_label`. When present, `AppState.model_label` adds one dim, slightly indented row below the input box (`chat::model_footer_height`); if the query fails, the footer is omitted and chat continues normally.
-- **Turn-progress events** (see [`docs/turn-progress-events.md`](../turn-progress-events.md)) interleave with the answer, so a turn reads as `● answer → ● Tool(label) → ⎿ summary → ● answer`. A tool's scrollback block is **deferred and committed as one unit on completion**: `ToolStarted` records a `RunningTool` (rendered live in the working zone — see [Working indicator & mid-turn steering](#working-indicator--mid-turn-steering)) but commits nothing; `ToolCompleted` (matched by `call_id`) pops it and commits the whole `Tool` block at once — the `● tool(label)` head, any resolved-approval line buffered mid-call, then the `⎿ summary` (`chat::tool_completed_block`). This is the fix for the **concurrent-tool ordering bug**: the agent emits *every* `ToolStarted` for a response up front, runs the calls in parallel, then emits *every* `ToolCompleted` — so committing the `●` head at start would strand all the `⎿` results below all the heads in append-only native scrollback (`insert_before` can't insert under an earlier line). Deferring keeps each result directly under its own tool. A `ToolCompleted` whose `call_id` matches **no** tracked `RunningTool` is **dropped**, not rendered headless — after `/stop`, `reset_working` clears the running set, but a tool that observed cancellation can still emit a late completion, and committing it would strand a stray `⎿` result in the now-idle scrollback. The final `Message`'s `ToolUse` blocks are **not** a duplicate source — `render_block` only renders the CronCreate hint, never general tool calls.
+- **Turn-progress events** (see [`docs/turn-progress-events.md`](../turn-progress-events.md)) interleave with the answer, so a turn reads as `● answer → ● Tool(label) → ⎿ summary → ● answer`. A tool's scrollback block is **deferred and committed as one unit on completion**: `ToolStarted` records a `RunningTool` (rendered live in the working zone — see [Working indicator & mid-turn steering](#working-indicator--mid-turn-steering)) but commits nothing; `ToolCompleted` (matched by `call_id`) pops it and commits the whole `Tool` block at once — the `● tool(label)` head, any resolved-approval line buffered mid-call, then the `⎿ summary` (`chat::tool_completed_block`). This is the fix for the **concurrent-tool ordering bug**: the agent emits *every* `ToolStarted` for a response up front, runs the calls in parallel, then emits *every* `ToolCompleted` — so committing the `●` head at start would strand all the `⎿` results below all the heads in append-only native scrollback (`insert_before` can't insert under an earlier line). Deferring keeps each result directly under its own tool. A `ToolCompleted` whose `call_id` matches **no** tracked `RunningTool` is **dropped**, not rendered headless — after `/stop`, `reset_working` clears the running set, but a tool that observed cancellation can still emit a late completion, and committing it would strand a stray `⎿` result in the now-idle scrollback. The final `Message`'s `ToolUse` blocks are **not** a duplicate source — `chat::block_source_text` only renders the CronCreate hint, never general tool calls.
 - **Reasoning is not rendered.** `Frame::Reasoning` ("thinking") chunks are dropped by the WS pump (`map_frame` returns `None`); the TUI shows an animated *working* indicator in the live region instead of the model's reasoning trace. The wire frame still flows to other channels (e.g. the web UI). See [Working indicator & mid-turn steering](#working-indicator--mid-turn-steering).
+
+### Markdown rendering
+
+Assistant answer text is rendered markdown, parsed with
+[`pulldown-cmark`] (CommonMark + GFM, `default-features = false`). The
+renderer is a private `markdown` module inside `crates/tui` — not a
+crate — because no second Rust consumer exists: `ratatui` is a
+dependency of exactly one crate, and `baybo prompt` prints raw markdown
+to stdout on purpose so `--json` round-trips the source.
+
+Nothing upstream is involved. The wire type stays `ContentBlock::Text`
+carrying raw markdown, because every other client renders it its own way
+(web and iOS run `react-markdown`, Telegram runs `telegramifyMarkdown`)
+and the column width is a client property. No prompt tells the model how
+to format; markdown simply arrives and is now rendered instead of being
+printed as source.
+
+#### Why blocks, not lines
+
+`insert_before` can only append rows **above** the live viewport — a
+committed row can never be rewritten, and the only repair is a full
+screen+scrollback wipe plus replay. Markdown's unit of correct layout is
+the block, not the line: a source line's rendering can be changed by the
+*next* line (a setext underline, a table delimiter row promoting the line
+above into a header) and a table's column widths are unknown until its
+last row. Committing per line would therefore print text that is
+permanently wrong.
+
+So `markdown::Scanner` emits a block only once appending more source
+cannot change how it renders, and `MarkdownStream` renders and spaces
+what it emits.
+
+Block granularity is affordable because the source lines are drained on
+`\n` and an LLM paragraph is a single such line: for the common case a
+block boundary *is* a line boundary, so nothing waits longer than it
+would to fill one line. A hard-wrapped paragraph waits one extra source
+line. The buffer is drawn nowhere, so what covers any wait is the
+animated working indicator, not a preview.
+
+| block | emitted when | granularity |
+|---|---|---|
+| ATX heading, thematic break | its own line | one line |
+| paragraph (and setext heading) | a blank line, a line opening another block, or a boundary | whole block |
+| fenced code — opener | its own line | the language label row |
+| fenced code — body | each line's own newline | **one line** |
+| fenced code — close | its own line | nothing |
+| list item | the next marker, a dedent, or a boundary | one item |
+| blockquote (incl. GFM alerts) | a non-`>` line or a boundary | whole quote |
+| table | a non-row line or a boundary | **whole table** (column widths need every row) |
+
+A fenced body streams per line because nothing later reinterprets an
+earlier code row — that is what keeps a 300-line code dump from
+stalling. A table is the one block that must buffer.
+
+A blank line does **not** end a list item: a loose list, and an indented
+block inside an item, both continue past one, so blanks are held until a
+non-blank line decides. An item's continuation lines are dedented by the
+item's own content indent, not trimmed, so indentation *inside* the item
+survives — and a fence opened inside an item suspends the termination
+checks entirely, since a blank or a `- `-shaped line inside a code block
+is content, not structure. A fence's body is dedented by the opening
+fence's own indent, as CommonMark specifies.
+
+**Boundaries.** `flush_answer_boundary` empties the trailing partial
+*and* any block still accumulating. Because `insert_before` only appends
+above the viewport, every commit of a non-answer block has to flush
+first, or held-back answer text resurfaces *under* it. Rather than
+enumerate those sites, they all go through `commit_below_answer`, which
+flushes then commits — `ToolStarted`, `ToolCompleted`, `Status`, log and
+notice lines, system lines, slash output, the untracked-approval
+fallback, `/stop`, and `finalize_stream`. `replay_transcript`
+deliberately does not flush: replay must not inject live buffered
+content into recorded history. A resize flushes before it replays, so
+recorded source and screen agree before either is reprinted.
+
+An open **fence** is deliberately left open across a boundary — it
+buffers nothing, so its tail keeps rendering as code after the tool
+block. Because that ends the transcript record, the record that
+continues the answer re-opens the fence (`Scanner::fence_continuation`,
+which carries the tick run and indent but *not* the info string, so the
+language label is not drawn twice on replay). A forced flush also records
+a blank source line, so replay re-parses the block boundary the flush
+created instead of merging it into what follows.
+
+#### Width and wrapping
+
+Rows are wrapped by the renderer, not by `Paragraph`, and committed
+through the no-wrap insert so the buffer height is `rows.len()` exactly.
+Two reasons:
+
+- `chat::wrapped_height` estimates `ceil(display_width / area_width)`,
+  which **under-counts** ratatui's word wrap; `insert_before` allocates
+  exactly that many rows and silently discards the overflow, so an answer
+  lost its tail. Pre-wrapping removes the estimate.
+- ratatui's `WordWrapper` segments only on ASCII whitespace, so an
+  unspaced Han sentence broke wherever the column budget ran out, and a
+  wrapped row could never keep a hanging indent.
+
+`markdown::wrap` works on **grapheme clusters** measured by display
+width, so an emoji is never split and never mis-measured. It breaks at
+spaces first, then between wide glyphs, applying kinsoku: a row never
+opens with closing CJK punctuation (`。，、）」`) nor ends with an opening
+bracket (`（「`). It never drops an atom and never returns an over-wide
+row; where a gutter would crowd out the widest glyph the **gutter** is
+dropped, never the text.
+
+The layout width comes from `scrollback_width` —
+`Terminal::get_frame().area().width`, the field `insert_before` actually
+sizes its buffer from — not `Terminal::size()`, which is a live backend
+query that disagrees while a resize is still debounced.
+
+#### Scope
+
+Rendered: headings (ATX + setext, `#` markers kept dim for level), bold,
+italic, strikethrough, inline code, links (target appended dim when it
+differs from the text), bullet/ordered/task lists with per-depth glyphs
+and hanging indents, fenced code with a language label and gutter,
+blockquotes and GFM alerts (`[!WARNING]`) with a gutter, thematic
+breaks, and GFM tables laid out on display width — degrading to
+`header: value` rows when no column layout fits rather than losing a
+cell. Control characters — and only those — are stripped at ingest: a
+stray `ESC` desynchronises every following row, and `"\n"` measures one
+column as a string but none as a char, so control bytes corrupt width
+accounting too. Zero-width characters are **kept**, because filtering on
+width instead would delete combining marks, ZWJ, and variation selectors,
+silently rewriting a decomposed `é` to `e` and splitting emoji sequences.
+A tab in a code block expands before that filter, or its indentation
+would be dropped with it.
+
+Deliberately not rendered: **syntax highlighting** (`syntect` costs
+~2.3 MB of binary, six times the whole parser, and no other baybo client
+highlights either), **math** (the web clients run KaTeX; a terminal
+cannot), and **raw HTML** (every client drops it — it renders dim and
+literal here).
+
+Known gap: emphasis whose content ends in punctuation and is followed
+immediately by a letter does not parse — `**要点：**说明` keeps its
+asterisks. This is CommonMark's flanking rule, not a CJK special case
+(`**note:**text` fails identically), but it only bites languages that
+omit spaces; `**要点：** 说明` and `**要点**：说明` both render. The web
+clients fix it with `remark-cjk-friendly`, which has no Rust equivalent,
+so the behaviour is pinned by a test rather than worked around.
+
+[`pulldown-cmark`]: https://docs.rs/pulldown-cmark
 
 ### Working indicator & mid-turn steering
 
@@ -289,7 +433,7 @@ All output flows through the `subscribe` stream. The loop translates
 each `TransportEvent` onto an `AppEvent` variant so rendering code
 does not need to know about the transport:
 
-- `StreamDelta(text)` → `AppEvent::StreamDelta(String)`. Appended to `AppState.streaming`, redrawn live.
+- `StreamDelta(text)` → `AppEvent::StreamDelta(String)`. Appended to `AppState.streaming`, then every completed source line is fed to the markdown stream and any closed block is committed to scrollback. Nothing about the buffer is drawn live.
 - `ToolStarted { call_id, tool, label }` / `ToolCompleted { call_id, status, summary }` → the matching `AppEvent` variants. `ToolStarted` records a live `RunningTool` (working-zone row) and commits nothing; `ToolCompleted` pops it and commits the whole `● tool` + (buffered approval) + `⎿ summary` block as one unit, so results stay under their tool across concurrent calls — see [Chat](#chat). `Frame::Reasoning` has no `TransportEvent`/`AppEvent` mapping — the pump drops it (the working indicator stands in for the thinking trace).
 - `Response(blocks)` → `AppEvent::Outgoing(Vec<ContentBlock>)`. Finalises the response via `finalize_stream` (commit the trailing partial + non-text extras, or render the body from blocks when nothing streamed — see [Chat](#chat)), then clears `AppState.streaming`.
 - `Notice { level, text }` → `AppEvent::Log(LogRecord { level, target: "agent", message })`. Reuses the log surface.
@@ -303,17 +447,19 @@ Single-consumer ordering on the mpsc keeps delta/response ordering correct as WS
 - Alternate screen + mouse capture are **dashboard-only**: `enter_dashboard_mode` issues `EnterAlternateScreen` + `EnableMouseCapture` and flips an `in_alt_screen` flag; leaving the dashboard reverses both.
 - Teardown is RAII via `TuiTeardownGuard::drop`, so any early return restores the terminal: pop the keyboard-enhancement flags (if pushed), `LeaveAlternateScreen` + `DisableMouseCapture` **only if** `in_alt_screen`, `disable_raw_mode()`, then fire `on_exit`. Best-effort, logged on failure.
 - Panic hook: installed once via `OnceLock` — pops the keyboard flags, disables raw mode, and best-effort leaves the alt screen + mouse capture, then delegates to the previous hook. Without it a panic would leave the terminal unusable.
+- **The TUI sends the terminal no queries, and `EventStream` is the only stdin reader.** ratatui anchors an inline viewport by asking the backend for the cursor position, which `CrosstermBackend` answers with a DSR round-trip (`ESC[6n` out, `ESC[row;colR` back on stdin). That read contends with the `EventStream` reader thread over crossterm's single global input reader, and losing is fatal rather than cosmetic: the query errors, the error unwinds `run_loop`, and the reply lands in the shell's input buffer after the process is gone. `backend::AnchoredBackend` (`crates/tui/src/backend.rs`) wraps `CrosstermBackend` and answers `get_cursor_position` from bookkeeping instead, so no query is ever emitted. Every `Terminal` construction therefore takes an explicit **anchor**: `Position::ORIGIN` right after `home_and_clear_screen` (entry, `/clear`-style reset, resize refresh), the pre-clear viewport top in `resize_chat_viewport_if_needed`, and the carried chat cursor across the dashboard's alt-screen round trip (which also `MoveTo`s it back rather than trusting the terminal's own restore). A wrong anchor is cosmetic — the live region draws a row off, and the next refresh re-anchors it. Keep this invariant: nothing in the TUI process may read stdin except `EventStream`.
 
 ### Logging in chat mode
 
-Writing `tracing` records to stdout while ratatui owns raw mode corrupts the frame. Chat mode (`TracingMode::Tui`, `crates/baybo/src/tracing_init.rs`) therefore uses a two-layer subscriber, and writes **no file on disk** — the TUI is a thin gateway client, and the gateway process owns the authoritative log file:
+Writing `tracing` records to stdout while ratatui owns raw mode corrupts the frame. Chat mode (`TracingMode::Tui`, `crates/baybo/src/tracing_init.rs`) therefore uses a three-layer subscriber:
 
-- **Buffer layer** — `LogBufferLayer` keeps recent events in the bounded in-memory `LogBuffer`. There is no file appender (`TracingGuards { _worker: None, .. }`); the `tracing_appender::rolling::daily` writer belongs to `TracingMode::File`, the gateway-server path.
+- **File layer** — a `tracing_appender::rolling::daily` writer at `<workspace>/logs/tui.log.<date>`, masked through the shared `LeakDetector` exactly like the gateway's. Its own prefix (`TUI_LOG_FILE_PREFIX`), because the TUI is a separate process from the gateway that owns `baybo.log` and two writers appending to one file would interleave. Read it with `baybo log tui`. This layer is what makes a TUI failure diagnosable: the echo layer below drains into the event loop, so anything logged **while that loop is unwinding** — the exit reason above all — reaches no reader but the file. A `create_dir_all` failure drops the layer and leaves the other two; it must never fall back to stdout, which ratatui owns.
+- **Buffer layer** — `LogBufferLayer` keeps recent events in the bounded in-memory `LogBuffer`.
 - **TUI echo layer** — `TuiLogLayer` (`crates/baybo/src/tui_log.rs`) filters **tracing** events to `WARN` and `ERROR` (lower `tracing` levels are kept only in the in-memory `LogBuffer`), extracts `message` + structured fields, and forwards them through `TuiLogSink::emit` as `AppEvent::Log(LogRecord)`. The event loop pushes the record onto the scrollback as a coloured line (`warn` yellow, `error` red, with the event `target` in grey).
 
 The `WARN`/`ERROR` cut applies only to this tracing-echo layer. Agent **notices** take a separate route: the transport maps `Frame::Notice` → `TransportEvent::Notice` → `AppEvent::Log` (see [Output path](#output-path)), preserving all three `NoticeLevel`s — `Info` notices reach the same `LogRecord` surface and render as a cyan `info` line (`LogLevel::Info`), so an agent-emitted info notice is not filtered out the way a `tracing` INFO event is.
 
-The sink is plumbed into the layer via `Arc<OnceLock<TuiLogSink>>`: `init_tracing` allocates the cell, then `main` sets it from `TuiAdapter::log_sink()` after the adapter is constructed. Events emitted before the cell is filled reach only the in-memory `LogBuffer`; they don't appear in the TUI (and TUI-process events are never written to disk — the gateway owns the log file).
+The sink is plumbed into the layer via `Arc<OnceLock<TuiLogSink>>`: `init_tracing` allocates the cell, then `main` sets it from `TuiAdapter::log_sink()` after the adapter is constructed. Events emitted before the cell is filled don't appear in the TUI — but they do reach the file and the in-memory `LogBuffer`.
 
 Argv mode keeps the old stdout layer — one-shot commands don't own the terminal, so normal formatting works.
 
@@ -324,9 +470,9 @@ Argv mode keeps the old stdout layer — one-shot commands don't own the termina
 
 ## Constraints
 
-- The streamed deltas and the final `AgentEvent::Message` are **not** redundant: deltas commit the body to scrollback line-by-line as it streams, and the final Message only finalises it (trailing partial + non-text extras). A Message re-renders the body from its blocks **only** when nothing preceded it (a cron result or direct synthetic completion reply), so the body is never both streamed and re-rendered.
+- The streamed deltas and the final `AgentEvent::Message` are **not** redundant: deltas commit the body to scrollback block-by-block as it streams, and the final Message only finalises it (trailing partial + non-text extras). A Message re-renders the body from its blocks **only** when nothing preceded it (a cron result or direct synthetic completion reply), so the body is never both streamed and re-rendered.
 - Renderer state (`AppState`) is mutated only on the event-loop task. External code uses the mpsc event channel; there is no shared `Mutex<AppState>`.
-- Input/state mutation in `app.rs` and key translation in `keymap.rs` are pure — unit tests exercise them without a terminal. Line-rendering helpers (e.g. `finalize_lines`, the `render_*` functions) are pure too — they return `Vec<Line>`, so tests assert on them directly; the one buffer-level fixup (`elide_wide_char_continuations`) is tested against a ratatui `Buffer`.
+- Input/state mutation in `app.rs` and key translation in `keymap.rs` are pure — unit tests exercise them without a terminal. Line-rendering helpers (e.g. `finalize_extras`, the `render_*` functions, the whole `markdown` module) are pure too — they return `Vec<Line>`, so tests assert on them directly; the one buffer-level fixup (`elide_wide_char_continuations`) is tested against a ratatui `Buffer`.
 - Dashboard providers must not block; the `DashboardProvider` trait method is `async` and the bundled `TuiDashboardProvider` returns synchronously without I/O.
 
 ## Collaboration
@@ -341,7 +487,8 @@ Argv mode keeps the old stdout layer — one-shot commands don't own the termina
 ## Verification
 
 ```bash
-cargo test -p baybo-tui             # keymap, AppState, transport, slash, frame codec, WS client
+cargo test -p baybo-tui             # keymap, AppState, markdown, transport, slash, frame codec, WS client
+cargo test -p baybo-tui --test chat_render -- --include-ignored   # real-terminal tmux render tests
 cargo run -- gateway start         # terminal A: long-lived backend
 cargo run -- tui                   # terminal B: WS+MessagePack client
 ```
@@ -351,7 +498,8 @@ Manual smoke:
 - `baybo tui` against a running `baybo gateway` opens the Ratatui UI and the chat pane is live. Bare `baybo` prints help instead.
 - With no gateway reachable, `baybo tui` exits with the concrete "no baybo gateway reachable at <addr>" block.
 - `cargo run -- tui --dev-auto-gateway` (debug build) in a fresh workspace with no gateway running spawns the backend inline, prints the banner, and connects.
-- Typing + `Enter` appends a user line and sends a `Frame::Message` to the gateway; inbound `Frame::AnswerDelta`s render live and commit to scrollback line-by-line, and the final `Frame::Message` only finalises the trailing partial (it does **not** replace the already-committed lines).
+- Typing + `Enter` appends a user line and sends a `Frame::Message` to the gateway; inbound `Frame::AnswerDelta`s commit to scrollback a markdown block at a time, and the final `Frame::Message` only finalises the trailing partial (it does **not** replace the already-committed lines).
+- Typing `markdown` at the `chat_smoke` probe renders every markdown block kind (the `markdown_blocks_render_as_layout_not_source` render test drives the same scenario and asserts no markup punctuation survives on screen).
 - `/skills` opens the admin-placeholder skills view (footer points at the `baybo` CLI); `r` refreshes; `Esc` returns to chat.
 - A tool call that requires approval queues an inline prompt; `a` resolves it, the gateway-side gate unblocks, and the tool result renders.
 - Killing the gateway mid-session surfaces the next inbound frame as an error notice rather than crashing the TUI.

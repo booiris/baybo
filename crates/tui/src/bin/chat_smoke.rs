@@ -123,6 +123,45 @@ async fn dispatch(sink: &mut SplitWsSink, sid: &SessionId, text: &str) {
             send(sink, &approval_request(sid)).await;
             // The follow-up reply is sent when the TUI returns ResolveApproval.
         }
+        SAY_MARKDOWN => {
+            for delta in MARKDOWN_DELTAS {
+                send(
+                    sink,
+                    &Frame::AnswerDelta {
+                        session_id: sid.clone(),
+                        user_id: String::new(),
+                        text: (*delta).to_string(),
+                    },
+                )
+                .await;
+            }
+            send(sink, &reply(sid, &MARKDOWN_DELTAS.concat())).await;
+        }
+        SAY_MARKDOWN_TOOL => {
+            for delta in MDTOOL_BEFORE {
+                send(
+                    sink,
+                    &Frame::AnswerDelta {
+                        session_id: sid.clone(),
+                        user_id: String::new(),
+                        text: (*delta).to_string(),
+                    },
+                )
+                .await;
+            }
+            tool_call(sink, sid, "c-mdtool", TOOL_NAME, TOOL_LABEL, TOOL_SUMMARY).await;
+            send(
+                sink,
+                &Frame::AnswerDelta {
+                    session_id: sid.clone(),
+                    user_id: String::new(),
+                    text: MDTOOL_AFTER.to_string(),
+                },
+            )
+            .await;
+            let body = format!("{}{MDTOOL_AFTER}", MDTOOL_BEFORE.concat());
+            send(sink, &reply(sid, &body)).await;
+        }
         SAY_TASK => {
             // The TUI drops TaskList (web-dashboard-only), so the subject
             // must never render; only the trailing reply should.

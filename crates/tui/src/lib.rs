@@ -15,16 +15,21 @@
 //!   enabled, and a fresh fullscreen-viewport terminal is constructed.
 //!   On exit the reverse happens and the live chat region reappears.
 //!
-//! Terminal I/O: stdin is driven by [`crossterm::event::EventStream`];
-//! do **not** read stdin via tokio here, as raw mode would conflict with
-//! line-buffered readers.
+//! Terminal I/O: stdin is driven by [`crossterm::event::EventStream`],
+//! and it is the process's **only** stdin reader — the inline viewport is
+//! anchored from bookkeeping rather than a `ESC[6n` round trip (see
+//! [`backend::AnchoredBackend`]), so nothing else ever competes for the
+//! terminal's input. Do **not** read stdin via tokio here either, as raw
+//! mode would conflict with line-buffered readers.
 
 mod app;
+mod backend;
 mod chat;
 pub mod client;
 mod dashboard;
 pub(crate) mod event;
 mod keymap;
+mod markdown;
 /// Scenario contract shared by the `chat_smoke` probe and its render test.
 #[cfg(any(test, feature = "test-support"))]
 pub mod smoke_contract;
@@ -39,6 +44,7 @@ use std::panic;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
+use crate::backend::AnchoredBackend;
 use baybo_channels::{
     ChannelError, DashboardProvider, IncomingMessage, Message, NoticeLevel, Result, STOP_COMMAND,
     STOP_COMMAND_NAME, SlashHandler, SlashOutcome, ViewKind,
@@ -46,6 +52,7 @@ use baybo_channels::{
 use baybo_model::{ChannelType, SessionId, User};
 use baybo_model::{ContentBlock, MessageMetadata};
 use chrono::Utc;
+use crossterm::cursor::MoveTo;
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, EventStream, KeyEvent,
     KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
@@ -59,6 +66,7 @@ use futures::StreamExt;
 use parking_lot::Mutex;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Position;
 use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Widget, Wrap};
 use ratatui::{TerminalOptions, Viewport};
@@ -310,15 +318,16 @@ impl Drop for TuiTeardownGuard {
     }
 }
 
-type Term = Terminal<CrosstermBackend<Stdout>>;
+type Term = Terminal<AnchoredBackend<CrosstermBackend<Stdout>>>;
 
 /// Build a fresh `Terminal` configured for chat mode (inline viewport)
 /// at the given height. The viewport is sized to exactly fit the live
 /// content, so there's no empty gap between the latest scrollback message
-/// and the live region. The cursor is left wherever the shell put it —
-/// ratatui's `compute_inline_size` anchors the viewport at that row.
-fn new_chat_terminal(viewport_h: u16) -> io::Result<Term> {
-    let backend = CrosstermBackend::new(io::stdout());
+/// and the live region. `anchor` is where the cursor currently sits —
+/// ratatui's `compute_inline_size` anchors the viewport at that row, and
+/// [`AnchoredBackend`] reports it without asking the terminal.
+fn new_chat_terminal(viewport_h: u16, anchor: Position) -> io::Result<Term> {
+    let backend = AnchoredBackend::new(io::stdout(), anchor);
     Terminal::with_options(
         backend,
         TerminalOptions {
@@ -344,9 +353,11 @@ fn desired_viewport_height(state: &AppState) -> u16 {
 
 /// Build a fresh `Terminal` configured for dashboard mode (fullscreen).
 /// The session is already inside the alternate screen; the caller toggles
-/// mouse capture around this if dashboard interactions need it.
-fn new_dashboard_terminal() -> io::Result<Term> {
-    let backend = CrosstermBackend::new(io::stdout());
+/// mouse capture around this if dashboard interactions need it. A fullscreen
+/// viewport never consults the cursor, so `anchor` only matters as the seed
+/// [`AnchoredBackend`] reports until the first `set_cursor_position`.
+fn new_dashboard_terminal(anchor: Position) -> io::Result<Term> {
+    let backend = AnchoredBackend::new(io::stdout(), anchor);
     Terminal::new(backend)
 }
 
@@ -407,7 +418,7 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
     // inline terminal is created so its viewport anchors at the top.
     home_and_clear_screen()?;
     let mut current_viewport_h = desired_viewport_height(&state);
-    let mut terminal = new_chat_terminal(current_viewport_h)
+    let mut terminal = new_chat_terminal(current_viewport_h, Position::ORIGIN)
         .map_err(|e| anyhow::anyhow!("new_chat_terminal: {e}"))?;
     let mut term_events = EventStream::new();
 
@@ -512,13 +523,7 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                                 next,
                             ).await?;
                         }
-                        // This redraw can rebuild the inline terminal (a pending
-                        // resize, or a viewport-height change as an approval
-                        // clears) — a cursor query. We're on a non-keyboard
-                        // wake-up with the reader parked, so route it through the
-                        // guard that drops the stream around any such query.
-                        term_events = redraw_after_event(
-                            term_events,
+                        redraw_after_event(
                             &mut terminal,
                             &mut state,
                             &mut current_viewport_h,
@@ -529,16 +534,14 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                         state.ensure_working_clock();
                         state.append_stream_delta(&delta);
                         if matches!(state.mode, ViewMode::Chat) {
-                            term_events = resize_chat_viewport_before_scrollback(
-                                term_events,
+                            resize_chat_viewport_before_scrollback(
                                 &mut terminal,
                                 &mut state,
                                 &mut current_viewport_h,
                             )?;
                             flush_complete_stream_lines(&mut state, &mut terminal)?;
                         }
-                        term_events = redraw_after_event(
-                            term_events,
+                        redraw_after_event(
                             &mut terminal,
                             &mut state,
                             &mut current_viewport_h,
@@ -552,8 +555,7 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                     } => {
                         state.ensure_working_clock();
                         if matches!(state.mode, ViewMode::Chat) {
-                            term_events = resize_chat_viewport_before_scrollback(
-                                term_events,
+                            resize_chat_viewport_before_scrollback(
                                 &mut terminal,
                                 &mut state,
                                 &mut current_viewport_h,
@@ -561,15 +563,14 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                             // Flush any answer text the model emitted before
                             // invoking the tool, so it lands above the tool
                             // block.
-                            flush_stream_partial(&mut state, &mut terminal)?;
+                            flush_answer_boundary(&mut state, &mut terminal)?;
                         }
                         // The `● tool` line is deferred: it renders live in the
                         // working zone now and commits to scrollback paired with
                         // its `⎿` result only on completion, so concurrent tools
                         // never detach their results. See docs/modules/tui.md.
                         state.push_running_tool(call_id, tool, label);
-                        term_events = redraw_after_event(
-                            term_events,
+                        redraw_after_event(
                             &mut terminal,
                             &mut state,
                             &mut current_viewport_h,
@@ -590,13 +591,12 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                         if let Some(running) = state.take_running_tool(&call_id)
                             && matches!(state.mode, ViewMode::Chat)
                         {
-                            term_events = resize_chat_viewport_before_scrollback(
-                                term_events,
+                            resize_chat_viewport_before_scrollback(
                                 &mut terminal,
                                 &mut state,
                                 &mut current_viewport_h,
                             )?;
-                            flush_stream_partial(&mut state, &mut terminal)?;
+                            flush_answer_boundary(&mut state, &mut terminal)?;
                             // Commit the whole tool block as one unit now that it
                             // is done — the deferred `● tool` head, any approval
                             // resolved mid-call, then the `⎿` result — so the
@@ -614,8 +614,7 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                                 commit_pending_interjections(&mut state, &mut terminal)?;
                             }
                         }
-                        term_events = redraw_after_event(
-                            term_events,
+                        redraw_after_event(
                             &mut terminal,
                             &mut state,
                             &mut current_viewport_h,
@@ -624,11 +623,13 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                     }
                     AppEvent::Status { phase } => {
                         if matches!(state.mode, ViewMode::Chat) {
-                            flush_stream_partial(&mut state, &mut terminal)?;
-                            commit_lines(&mut state, &mut terminal, chat::render_status_line(&phase))?;
+                            commit_below_answer(
+                                &mut state,
+                                &mut terminal,
+                                chat::render_status_line(&phase),
+                            )?;
                         }
-                        term_events = redraw_after_event(
-                            term_events,
+                        redraw_after_event(
                             &mut terminal,
                             &mut state,
                             &mut current_viewport_h,
@@ -647,8 +648,7 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                                 snapshot,
                             )?;
                         }
-                        term_events = redraw_after_event(
-                            term_events,
+                        redraw_after_event(
                             &mut terminal,
                             &mut state,
                             &mut current_viewport_h,
@@ -657,10 +657,9 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                     }
                     AppEvent::Log(record) => {
                         if matches!(state.mode, ViewMode::Chat) {
-                            commit_lines(&mut state, &mut terminal, chat::render_log_lines(&record))?;
+                            commit_below_answer(&mut state, &mut terminal, chat::render_log_lines(&record))?;
                         }
-                        term_events = redraw_after_event(
-                            term_events,
+                        redraw_after_event(
                             &mut terminal,
                             &mut state,
                             &mut current_viewport_h,
@@ -681,10 +680,8 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                             });
                         }
                         // Showing the approval grows the viewport, so this draw
-                        // rebuilds the inline terminal (a cursor query) on a
-                        // non-keyboard wake-up — the guard pauses the reader for it.
-                        term_events = redraw_after_event(
-                            term_events,
+                        // rebuilds the inline terminal.
+                        redraw_after_event(
                             &mut terminal,
                             &mut state,
                             &mut current_viewport_h,
@@ -698,10 +695,9 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                 // The resize burst settled with no AppEvent in between (the idle
                 // path — an interleaved AppEvent would have applied the resize via
                 // `redraw_after_event` and cleared the flag, disabling this arm).
-                // Re-anchor the inline viewport at the new size; the guard drops
-                // the stream for the cursor query and clears `resize_pending`.
-                term_events = redraw_after_event(
-                    term_events,
+                // Re-anchor the inline viewport at the new size and clear
+                // `resize_pending`.
+                redraw_after_event(
                     &mut terminal,
                     &mut state,
                     &mut current_viewport_h,
@@ -711,11 +707,9 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
             _ = working_refresh.tick(), if working => {
                 // Advance the dot's colour pulse and repaint (also refreshes
                 // the elapsed counter). No scrollback commit and (steady
-                // state) no height change, so `redraw_after_event` does a
-                // cheap in-place draw without a cursor query.
+                // state) no height change, so this is a cheap in-place draw.
                 state.tick_spinner();
-                term_events = redraw_after_event(
-                    term_events,
+                redraw_after_event(
                     &mut terminal,
                     &mut state,
                     &mut current_viewport_h,
@@ -759,8 +753,13 @@ fn resize_chat_viewport_if_needed(
     if desired == *current {
         return Ok(());
     }
+    // The rebuilt viewport has to re-anchor where the old one started, so read
+    // that row before clearing and put the cursor back on it afterwards —
+    // `Terminal::clear` leaves the cursor in a version-dependent spot.
+    let anchor = terminal.get_frame().area().as_position();
     terminal.clear()?;
-    *terminal = new_chat_terminal(desired)?;
+    execute!(io::stdout(), MoveTo(anchor.x, anchor.y))?;
+    *terminal = new_chat_terminal(desired, anchor)?;
     *current = desired;
     Ok(())
 }
@@ -770,18 +769,15 @@ fn resize_chat_viewport_if_needed(
 /// growing the viewport can put the new line where the live region is about to
 /// be, making tool/status text appear to overwrite the working indicator.
 fn resize_chat_viewport_before_scrollback(
-    term_events: EventStream,
     terminal: &mut Term,
     state: &mut AppState,
     current_viewport_h: &mut u16,
-) -> anyhow::Result<EventStream> {
+) -> io::Result<()> {
     if desired_viewport_height(state) == *current_viewport_h {
-        return Ok(term_events);
+        return Ok(());
     }
-    drop(term_events);
     resize_chat_viewport_if_needed(state, terminal, current_viewport_h)?;
-    terminal.draw(|f| render_chat(f, state))?;
-    Ok(EventStream::new())
+    terminal.draw(|f| render_chat(f, state)).map(|_| ())
 }
 
 /// Refresh the screen after a terminal-resize burst settles.
@@ -806,13 +802,18 @@ fn rebuild_chat_terminal_after_resize(
     state: &mut AppState,
     current: &mut u16,
 ) -> io::Result<()> {
+    // A resize mid-turn would otherwise replay answer source whose rows were
+    // never rendered, and the block would commit again when it closes —
+    // duplicating the text. Flushing first makes record and screen agree before
+    // either is reprinted.
+    flush_answer_boundary(state, terminal)?;
     // Home the cursor + wipe, then drop the old terminal for a fresh one whose
     // viewport anchors at the homed cursor (row 0) — so the banner lands at the
     // top. Calling `Terminal::clear` here would move the cursor off home before
     // the new viewport anchors. See [`home_and_clear_screen`].
     home_and_clear_screen()?;
     let desired = desired_viewport_height(state);
-    *terminal = new_chat_terminal(desired)?;
+    *terminal = new_chat_terminal(desired, Position::ORIGIN)?;
     *current = desired;
     let session_id = state.session_id.clone();
     commit_banner(state, terminal, &session_id)?;
@@ -831,7 +832,7 @@ fn reset_chat_scrollback(
 ) -> io::Result<()> {
     home_and_clear_screen()?;
     let desired = desired_viewport_height(state);
-    *terminal = new_chat_terminal(desired)?;
+    *terminal = new_chat_terminal(desired, Position::ORIGIN)?;
     *current = desired;
     state.clear_transcript();
     commit_banner(state, terminal, session_id)?;
@@ -844,65 +845,68 @@ fn reset_chat_scrollback(
 /// each block — rebuilding `state.transcript` to the same content (taking it
 /// out first avoids a borrow clash and double-counting against the cap).
 fn replay_transcript(state: &mut AppState, terminal: &mut Term) -> io::Result<()> {
+    // Live, a response draws the `● ` dot once and indents every row after it,
+    // even across an interleaved tool block. Replay sees that response as several
+    // `Answer` records, so it has to remember whether the dot is already spent.
+    // A user message opens a response; the `cooked for` footer closes it.
+    let mut answered = false;
     for block in state.take_transcript() {
         match block {
-            TranscriptBlock::User(text) => commit_user_message(state, terminal, &text)?,
-            TranscriptBlock::Answer(lines) => commit_answer_lines(state, terminal, lines)?,
+            TranscriptBlock::User(text) => {
+                answered = false;
+                commit_user_message(state, terminal, &text)?;
+            }
+            TranscriptBlock::Answer(source) => {
+                replay_answer(state, terminal, source, answered)?;
+                answered = true;
+            }
             TranscriptBlock::Tool(lines) => commit_tool_lines(state, terminal, lines)?,
             TranscriptBlock::Other(lines) => commit_lines(state, terminal, lines)?,
-            TranscriptBlock::Cooked(elapsed) => commit_cooked(state, terminal, elapsed)?,
+            TranscriptBlock::Cooked(elapsed) => {
+                answered = false;
+                commit_cooked(state, terminal, elapsed)?;
+            }
         }
     }
     Ok(())
 }
 
+/// Re-render a recorded answer run at the current width and re-commit it. The
+/// run's whole source is re-parsed as one document, so a code fence that spanned
+/// several live commits comes back as a fence, and every row is re-wrapped to the
+/// new width instead of replaying the old geometry.
+fn replay_answer(
+    state: &mut AppState,
+    terminal: &mut Term,
+    source: Vec<String>,
+    continuation: bool,
+) -> io::Result<()> {
+    let width = chat::answer_content_width(scrollback_width(terminal));
+    let rows = markdown::render_document(&source.join("\n"), width);
+    let rows = chat::render_answer_rows(rows, continuation);
+    commit_answer(state, terminal, rows, &source, None)
+}
+
 /// Redraw after a non-keyboard wake-up (an `AppEvent`, or the resize debounce),
-/// dropping the terminal event stream around the draw when it will query the
-/// cursor. Two things make a chat-mode draw query the cursor (DSR `ESC[6n`):
+/// applying any coalesced terminal resize first.
 ///
-/// - **A pending terminal resize** we haven't applied yet: `terminal`'s known
-///   size is stale, so `draw_active`'s `autoresize` re-anchors the inline
-///   viewport via `cursor::position()`. We pre-empt that with our own clean
-///   rebuild ([`rebuild_chat_terminal_after_resize`]) so the viewport doesn't
-///   get the stale-offset garble, then let the draw run without a resize.
-/// - **A live-region height change** (approval shown/cleared, input grew):
-///   `resize_chat_viewport_if_needed` inside `draw_active` rebuilds.
-///
-/// `crossterm::cursor::position()` can only read its reply off stdin when no
-/// `EventStream` is polling it; on these wake-ups the stream's reader thread is
-/// parked holding crossterm's internal reader, so the query would time out and
-/// the error would tear down the loop. Dropping the stream releases the reader
-/// for the query; we recreate it after (keys typed meanwhile stay buffered in
-/// the tty). `resize_pending` is consumed — this redraw applies it.
-///
-/// Returns the (possibly recreated) stream so the caller can rebind it.
-/// Keyboard-event redraws don't use this: they run while the reader is free
-/// (the key was just delivered), so a plain `draw_active` is safe there.
+/// A pending resize means `terminal`'s known size is stale, so a plain draw
+/// would let ratatui's `autoresize` re-anchor the inline viewport from a
+/// pre-reflow offset and garble the live region. Pre-empting it with a clean
+/// [`rebuild_chat_terminal_after_resize`] avoids that; the draw then runs with
+/// the size already settled. `resize_pending` is consumed either way — a
+/// dashboard repaints fullscreen and needs no inline re-anchor.
 fn redraw_after_event(
-    term_events: EventStream,
     terminal: &mut Term,
     state: &mut AppState,
     current_viewport_h: &mut u16,
     resize_pending: &mut bool,
-) -> anyhow::Result<EventStream> {
+) -> io::Result<()> {
     let pending_resize = std::mem::replace(resize_pending, false);
-    let queries_cursor = matches!(state.mode, ViewMode::Chat)
-        && (pending_resize || desired_viewport_height(state) != *current_viewport_h);
-    if !queries_cursor {
-        draw_active(terminal, state, current_viewport_h)?;
-        return Ok(term_events);
+    if pending_resize && matches!(state.mode, ViewMode::Chat) {
+        rebuild_chat_terminal_after_resize(terminal, state, current_viewport_h)?;
     }
-    drop(term_events);
-    let mut result: io::Result<()> = Ok(());
-    if pending_resize {
-        result = rebuild_chat_terminal_after_resize(terminal, state, current_viewport_h);
-    }
-    if result.is_ok() {
-        result = draw_active(terminal, state, current_viewport_h);
-    }
-    let stream = EventStream::new();
-    result?;
-    Ok(stream)
+    draw_active(terminal, state, current_viewport_h)
 }
 
 /// Commit a single blank scrollback row.
@@ -952,21 +956,48 @@ fn commit_tool_lines(
 }
 
 /// Commit an assistant-answer block (opening it with a leading separator if the
-/// previous block was a different kind) and record it for resize replay. The
-/// `● `/indent leader is already baked into `lines`, so replay needs no
-/// `streaming_committed_any` state.
-fn commit_answer_lines(
+/// previous block was a different kind) and record its markdown `source` for
+/// resize replay.
+///
+/// `rows` are already wrapped to [`scrollback_width`], so this takes the no-wrap
+/// insert where the buffer height is `rows.len()` exactly — `wrapped_height`'s
+/// word-wrap estimate under-counts and would drop the tail. `source` is recorded
+/// even when a chunk renders no rows (a bare fence opener), because replay
+/// re-parses the run as one document and needs every source line.
+fn commit_answer(
     state: &mut AppState,
     terminal: &mut Term,
-    lines: Vec<Line<'static>>,
+    rows: Vec<Line<'static>>,
+    source: &[String],
+    reopen_fence: Option<String>,
 ) -> io::Result<()> {
-    if lines.is_empty() {
+    if !rows.is_empty() {
+        begin_block(state, terminal, BlockKind::Answer)?;
+        commit_lines_no_wrap(state, terminal, rows)?;
+    }
+    state.record_answer_source(source, reopen_fence);
+    Ok(())
+}
+
+/// Render the answer rows a markdown chunk produced, tag them with the answer
+/// leader, commit them, and latch `streaming_committed_any` once a row has
+/// actually reached the screen (which is what selects the `● ` dot).
+fn commit_answer_rows(
+    state: &mut AppState,
+    terminal: &mut Term,
+    rows: Vec<Line<'static>>,
+    source: &[String],
+    reopen_fence: Option<String>,
+) -> io::Result<()> {
+    if rows.is_empty() && source.is_empty() {
         return Ok(());
     }
-    let recorded = lines.clone();
-    begin_block(state, terminal, BlockKind::Answer)?;
-    commit_lines_compact(state, terminal, lines)?;
-    state.record_block(TranscriptBlock::Answer(recorded));
+    let rows = chat::render_answer_rows(rows, state.streaming_committed_any);
+    let committed = !rows.is_empty();
+    commit_answer(state, terminal, rows, source, reopen_fence)?;
+    if committed {
+        state.streaming_committed_any = true;
+    }
     Ok(())
 }
 
@@ -980,23 +1011,23 @@ fn commit_cooked(state: &mut AppState, terminal: &mut Term, elapsed: Duration) -
     Ok(())
 }
 
-/// Stream-mode helpers — see [`AppState::streaming`] / `streaming_committed_any`.
+/// Feed every newly-completed source line to the markdown stream and commit
+/// whatever blocks that closed. A line inside an open block produces no rows
+/// yet — see [`crate::markdown`] for why a block cannot be committed early.
 fn flush_complete_stream_lines(state: &mut AppState, terminal: &mut Term) -> io::Result<()> {
     let drained = state.drain_complete_stream_lines();
     if drained.is_empty() {
         return Ok(());
     }
-    // Render every newly-completed line in one Answer block: the first uses the
-    // `● ` leader iff nothing committed yet, the rest the continuation indent.
-    let mut continuation = state.streaming_committed_any;
-    let mut rendered = Vec::new();
+    let width = chat::answer_content_width(scrollback_width(terminal));
+    // Captured before the push: it describes the fence these lines continue, not
+    // one they may open themselves.
+    let reopen_fence = state.markdown.fence_continuation();
+    let mut rows = Vec::new();
     for line in &drained {
-        rendered.extend(chat::render_stream_line(line, continuation));
-        continuation = true;
+        rows.extend(state.markdown.push_line(line, width));
     }
-    commit_answer_lines(state, terminal, rendered)?;
-    state.streaming_committed_any = true;
-    Ok(())
+    commit_answer_rows(state, terminal, rows, &drained, reopen_fence)
 }
 
 /// Commit every pending mid-turn steer to scrollback as a user block,
@@ -1014,22 +1045,50 @@ fn commit_pending_interjections(state: &mut AppState, terminal: &mut Term) -> io
     Ok(())
 }
 
-/// Commit the trailing answer partial (text streamed without a closing
-/// newline) so the next scrollback commit — a tool line or finalize —
-/// lands *below* it. Without this, answer text the model emitted before a
-/// tool call would sit in `state.streaming` and only surface at finalize,
-/// i.e. *under* the tool line, reordering the turn.
-fn flush_stream_partial(state: &mut AppState, terminal: &mut Term) -> io::Result<()> {
-    if let Some(partial) = state.take_stream_partial() {
-        let continuation = state.streaming_committed_any;
-        commit_answer_lines(
-            state,
-            terminal,
-            chat::render_stream_line(&partial, continuation),
-        )?;
-        state.streaming_committed_any = true;
+/// Commit every scrap of answer text held back so far — the trailing partial
+/// line *and* any block the markdown stream is still accumulating — so the next
+/// scrollback commit (a tool line, a status line, finalize) lands *below* it.
+/// Without this, held-back answer text would surface at finalize *under* that
+/// block, reordering the turn: `insert_before` can only append above the
+/// viewport, never insert beneath a committed row.
+///
+/// An open code fence is deliberately left open: it buffers nothing, so its tail
+/// keeps rendering as code after the interruption.
+fn flush_answer_boundary(state: &mut AppState, terminal: &mut Term) -> io::Result<()> {
+    let width = chat::answer_content_width(scrollback_width(terminal));
+    let reopen_fence = state.markdown.fence_continuation();
+    let (mut rows, mut source) = drain_answer_source(state, width);
+    let closed = state.markdown.flush(width);
+    if !closed.is_empty() {
+        // The forced flush ended a block early. Record that boundary as a blank
+        // source line, or replay re-parses the block it closed as continuing
+        // into whatever the answer says next. A flush inside a fence emits
+        // nothing, so this can never inject a blank into a code body.
+        source.push(String::new());
+        rows.extend(closed);
     }
-    Ok(())
+    commit_answer_rows(state, terminal, rows, &source, reopen_fence)
+}
+
+/// Hand every source line still buffered to the markdown stream: the complete
+/// lines first, then the trailing partial as its own line.
+///
+/// Draining before taking the partial matters because the buffer can hold
+/// several lines — `flush_complete_stream_lines` only runs in Chat mode, so a
+/// dashboard visit leaves whole lines behind — and `push_line` takes exactly one
+/// line, so a multi-line blob would be mis-scanned.
+fn drain_answer_source(state: &mut AppState, width: usize) -> (Vec<Line<'static>>, Vec<String>) {
+    let mut rows = Vec::new();
+    let mut source = Vec::new();
+    for line in state.drain_complete_stream_lines() {
+        rows.extend(state.markdown.push_line(&line, width));
+        source.push(line);
+    }
+    if let Some(partial) = state.take_stream_partial() {
+        rows.extend(state.markdown.push_line(&partial, width));
+        source.push(partial);
+    }
+    (rows, source)
 }
 
 /// Build the scrollback lines for a finalised agent response.
@@ -1046,51 +1105,75 @@ fn flush_stream_partial(state: &mut AppState, terminal: &mut Term) -> io::Result
 /// reached the scrollback, so the full message is rendered from `blocks`. The
 /// `cooked for` footer is committed separately by [`finalize_stream`] (with its
 /// own separator), not here.
-fn finalize_lines(
-    blocks: &[ContentBlock],
-    started: bool,
-    partial: Option<String>,
-) -> Vec<Line<'static>> {
-    let mut out = Vec::new();
-    let mut committed = started;
-    if let Some(partial) = partial {
-        out.extend(chat::render_stream_line(&partial, committed));
-        committed = true;
-    }
-    if committed {
-        out.extend(chat::render_non_text_blocks(blocks, true));
-    } else {
-        out.extend(chat::render_assistant_lines(blocks));
-    }
-    out
-}
-
-/// Finalise the in-flight agent response and commit it to scrollback.
-/// See [`finalize_lines`] for the streamed-vs-non-streamed split. Caller
-/// clears streaming state and decrements the outstanding-response
-/// counter afterwards.
 fn finalize_stream(
     state: &mut AppState,
     terminal: &mut Term,
     blocks: &[ContentBlock],
 ) -> io::Result<()> {
-    let started = state.streaming_committed_any;
-    let partial = state.take_stream_partial();
+    let term_width = scrollback_width(terminal);
+    let width = chat::answer_content_width(term_width);
     // Stamp the elapsed turn time only when we actually clocked this turn
     // (a local dispatch / streaming turn). Cron / non-streaming deliveries
     // leave `working_since` unset and get no footer.
     let cooked = state.working_since.map(|since| since.elapsed());
-    let body = finalize_lines(blocks, started, partial);
-    if !body.is_empty() {
-        // Part of the answer block: continues tight after a streamed answer,
-        // or gets a leading separator after a tool / fresh (non-streamed) body.
+
+    let reopen_fence = state.markdown.fence_continuation();
+    let (mut rows, source) = drain_answer_source(state, width);
+    rows.extend(state.markdown.finish(width));
+    commit_answer_rows(state, terminal, rows, &source, reopen_fence)?;
+
+    // When the body streamed it is already in scrollback, so only the extras
+    // the stream never carried remain (today the CronCreate hint). When nothing
+    // streamed — a cron trigger with no `delta_tx`, or a synthetic message — the
+    // whole body still has to be rendered from `blocks`.
+    let streamed = state.streaming_committed_any;
+    let extras = finalize_extras(blocks, streamed, term_width);
+    if !extras.is_empty() {
+        let mut source = block_source(blocks, streamed);
+        if streamed && !source.is_empty() {
+            // The extras render as their own block below the streamed body, so
+            // the recorded source needs the separator that implies.
+            source.insert(0, String::new());
+        }
         state.streaming_committed_any = true;
-        commit_answer_lines(state, terminal, body)?;
+        commit_answer(state, terminal, extras, &source, None)?;
     }
+
     if let Some(elapsed) = cooked {
         commit_cooked(state, terminal, elapsed)?;
     }
     Ok(())
+}
+
+/// What a finalised response still owes scrollback. A body that streamed is
+/// already there, so only the blocks the stream never carried remain (today the
+/// CronCreate hint); a body that never streamed — a cron trigger with no
+/// `delta_tx`, or a synthetic message — has to render in full.
+fn finalize_extras(blocks: &[ContentBlock], streamed: bool, width: u16) -> Vec<Line<'static>> {
+    if streamed {
+        chat::render_non_text_blocks(blocks, true, width)
+    } else {
+        chat::render_assistant_lines(blocks, width)
+    }
+}
+
+/// The markdown source behind a finalised response's blocks, for resize replay.
+/// Mirrors the `skip_text` split in [`chat::render_non_text_blocks`] so replay
+/// reproduces exactly what was committed.
+fn block_source(blocks: &[ContentBlock], streamed: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    for block in blocks {
+        if streamed && matches!(block, ContentBlock::Text(_)) {
+            continue;
+        }
+        if let Some(text) = chat::block_source_text(block) {
+            if !out.is_empty() {
+                out.push(String::new());
+            }
+            out.extend(text.lines().map(str::to_string));
+        }
+    }
+    out
 }
 
 fn render_chat(frame: &mut ratatui::Frame, state: &mut AppState) {
@@ -1103,6 +1186,33 @@ fn render_dashboard(frame: &mut ratatui::Frame, state: &mut AppState) {
 
 /// Whether a rendered line is visually blank (no non-whitespace content) —
 /// used to keep [`AppState::last_row_blank`] accurate so separators dedup.
+/// Commit a non-answer block that must land *below* the answer text so far.
+///
+/// The flush is the ordering invariant: `insert_before` only appends above the
+/// viewport, so answer text the markdown stream is still holding would resurface
+/// *under* this block. Every event-driven non-answer commit goes through here so
+/// a new one cannot forget — [`replay_transcript`] deliberately does not, since
+/// replay must not inject live buffered content into recorded history.
+fn commit_below_answer(
+    state: &mut AppState,
+    terminal: &mut Term,
+    lines: Vec<Line<'static>>,
+) -> io::Result<()> {
+    flush_answer_boundary(state, terminal)?;
+    commit_lines(state, terminal, lines)
+}
+
+/// The width the next `insert_before` buffer will actually have.
+///
+/// `Terminal::size` is a live backend query, but `insert_before` builds its
+/// buffer from `viewport_area.width`, and the run loop deliberately defers
+/// applying a resize (`resize_pending` plus a debounce). Pre-wrapped rows must
+/// be laid out for the buffer they land in, or a row would overflow it and be
+/// truncated. `Frame::area` returns that exact field.
+fn scrollback_width(terminal: &mut Term) -> u16 {
+    terminal.get_frame().area().width.max(1)
+}
+
 fn is_blank_line(line: &Line<'_>) -> bool {
     line.spans.iter().all(|s| s.content.trim().is_empty())
 }
@@ -1347,7 +1457,7 @@ async fn handle_key(
                         "Press Ctrl-D again within {}s to exit.",
                         CONFIRM_EXIT_WINDOW.as_secs()
                     );
-                    commit_lines(state, terminal, chat::render_system_lines(&msg))?;
+                    commit_below_answer(state, terminal, chat::render_system_lines(&msg))?;
                 }
             }
         }
@@ -1487,7 +1597,7 @@ async fn interrupt_turn(
     ctx: &LoopCtx,
     terminal: &mut Term,
 ) -> io::Result<()> {
-    flush_stream_partial(state, terminal)?;
+    flush_answer_boundary(state, terminal)?;
     commit_pending_interjections(state, terminal)?;
     state.reset_working();
     state.clear_deferred_submissions();
@@ -1510,6 +1620,7 @@ fn resolve_approval(
     };
     let lines = chat::render_approval_resolved_lines(&outcome.resolved);
     if let Err(lines) = state.buffer_approval_line(&outcome.resolved.call_id, lines) {
+        flush_answer_boundary(state, terminal)?;
         commit_tool_lines(state, terminal, lines)?;
     }
     Ok(())
@@ -1524,12 +1635,17 @@ async fn handle_slash(
 ) -> io::Result<()> {
     let Some(handler) = ctx.slash_handler.as_ref() else {
         let msg = format!("(no slash handler; ignored: {text})");
-        commit_lines(state, terminal, chat::render_system_lines(&msg))?;
+        commit_below_answer(state, terminal, chat::render_system_lines(&msg))?;
         return Ok(());
     };
     match handler.handle(&text).await {
         SlashOutcome::Handled(blocks) => {
-            commit_lines(state, terminal, chat::render_assistant_lines(&blocks))?;
+            let width = scrollback_width(terminal);
+            commit_below_answer(
+                state,
+                terminal,
+                chat::render_assistant_lines(&blocks, width),
+            )?;
         }
         SlashOutcome::OpenView(kind) => match ctx.dashboard_provider.as_ref() {
             Some(provider) => {
@@ -1537,7 +1653,7 @@ async fn handle_slash(
             }
             None => {
                 let msg = format!("(no dashboard provider; cannot open view: {kind:?})");
-                commit_lines(state, terminal, chat::render_system_lines(&msg))?;
+                commit_below_answer(state, terminal, chat::render_system_lines(&msg))?;
             }
         },
         SlashOutcome::PassThrough => {
@@ -1555,11 +1671,11 @@ async fn handle_slash(
                     state.session_id = new_id.clone();
                     reset_chat_scrollback(state, terminal, current_viewport_h, &new_id)?;
                     let msg = format!("Started a fresh session: {new_id}");
-                    commit_lines(state, terminal, chat::render_system_lines(&msg))?;
+                    commit_below_answer(state, terminal, chat::render_system_lines(&msg))?;
                 }
                 Err(e) => {
                     let msg = format!("/new failed: {e}");
-                    commit_lines(state, terminal, chat::render_system_lines(&msg))?;
+                    commit_below_answer(state, terminal, chat::render_system_lines(&msg))?;
                 }
             }
         }
@@ -1597,9 +1713,12 @@ fn enter_dashboard_mode(
     kind: ViewKind,
     snapshot: baybo_channels::DashboardSnapshot,
 ) -> io::Result<()> {
+    // Carried across the alt-screen round trip so the chat viewport re-anchors
+    // on the row it left, without asking the terminal where that was.
+    let anchor = terminal.backend().cursor()?;
     execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
     in_alt_screen.store(true, std::sync::atomic::Ordering::Relaxed);
-    *terminal = new_dashboard_terminal()?;
+    *terminal = new_dashboard_terminal(anchor)?;
     state.enter_dashboard(kind, snapshot);
     Ok(())
 }
@@ -1617,10 +1736,16 @@ fn exit_dashboard_mode(
     current_viewport_h: &mut u16,
 ) -> io::Result<()> {
     state.exit_dashboard();
-    execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
+    let anchor = terminal.backend().cursor()?;
+    execute!(
+        io::stdout(),
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+        MoveTo(anchor.x, anchor.y)
+    )?;
     in_alt_screen.store(false, std::sync::atomic::Ordering::Relaxed);
     *current_viewport_h = desired_viewport_height(state);
-    *terminal = new_chat_terminal(*current_viewport_h)?;
+    *terminal = new_chat_terminal(*current_viewport_h, anchor)?;
     Ok(())
 }
 
@@ -1725,13 +1850,15 @@ mod tests {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
 
+    const TEST_WIDTH: u16 = 40;
+
     #[test]
     fn finalize_renders_body_when_nothing_streamed() {
         // Direct/non-streaming delivery (cron or a synthetic completion
         // reply): the Message arrives with no preceding deltas, so its text
         // must render from the blocks rather than be dropped.
         let blocks = vec![ContentBlock::Text("cron result".into())];
-        let lines = finalize_lines(&blocks, false, None);
+        let lines = finalize_extras(&blocks, false, TEST_WIDTH);
         let joined = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(
             joined.contains("cron result"),
@@ -1746,11 +1873,25 @@ mod tests {
     }
 
     #[test]
+    fn finalize_renders_a_non_streamed_body_as_markdown() {
+        let blocks = vec![ContentBlock::Text("a **bold** claim".into())];
+        let joined = finalize_extras(&blocks, false, TEST_WIDTH)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("a bold claim") && !joined.contains("**"),
+            "markup must be styled away, not printed: {joined:?}"
+        );
+    }
+
+    #[test]
     fn finalize_skips_text_when_body_streamed() {
-        // A streamed response already committed its text line-by-line, so
+        // A streamed response already committed its text block by block, so
         // the final blocks' Text must not be re-rendered (no duplicate).
         let blocks = vec![ContentBlock::Text("already streamed".into())];
-        let lines = finalize_lines(&blocks, true, None);
+        let lines = finalize_extras(&blocks, true, TEST_WIDTH);
         let joined = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(
             !joined.contains("already streamed"),
@@ -1759,32 +1900,76 @@ mod tests {
     }
 
     #[test]
-    fn finalize_uses_partial_not_blocks_for_short_stream() {
-        // A short streamed response leaves a trailing partial (no newline)
-        // without ever committing a complete line. The partial is the
-        // body — render it once, don't also re-render from blocks.
-        let blocks = vec![ContentBlock::Text("hello".into())];
-        let lines = finalize_lines(&blocks, false, Some("hello".into()));
-        let hits = lines
-            .iter()
-            .map(line_text)
-            .filter(|t| t.contains("hello"))
-            .count();
-        assert_eq!(hits, 1, "exactly one 'hello' line, no duplicate");
-    }
-
-    #[test]
     fn finalize_empty_message_is_noop() {
         // Nothing streamed and no renderable blocks → no body lines. The
-        // `cooked for` footer is committed separately by `finalize_stream`,
-        // not part of `finalize_lines`.
-        assert!(finalize_lines(&[], false, None).is_empty());
-        let body = finalize_lines(&[ContentBlock::Text("x".into())], true, None);
+        // `cooked for` footer is committed separately by `finalize_stream`.
+        assert!(finalize_extras(&[], false, TEST_WIDTH).is_empty());
+        let body = finalize_extras(&[ContentBlock::Text("x".into())], true, TEST_WIDTH);
         let joined = body.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(
             !joined.contains("cooked for"),
             "footer is not in the body: {joined:?}"
         );
+    }
+
+    #[test]
+    fn block_source_keeps_text_only_when_it_did_not_stream() {
+        let blocks = vec![ContentBlock::Text("prose".into())];
+        assert_eq!(block_source(&blocks, false), vec!["prose".to_string()]);
+        assert!(block_source(&blocks, true).is_empty());
+    }
+
+    /// What `finalize_extras` commits and what `block_source` records must render
+    /// the same rows, or a resize rewrites the end of a non-streamed response.
+    #[test]
+    fn finalize_extras_and_block_source_render_the_same_rows() {
+        let cases: Vec<Vec<ContentBlock>> = vec![
+            vec![ContentBlock::Text("a **bold** claim".into())],
+            vec![ContentBlock::Text(
+                "# Heading
+
+body text"
+                    .into(),
+            )],
+            vec![
+                ContentBlock::Text("prose".into()),
+                ContentBlock::Image {
+                    blob: baybo_model::BlobRef {
+                        blob_id: "b-1".into(),
+                    },
+                    mime_type: "image/png".into(),
+                    filename: None,
+                    width: None,
+                    height: None,
+                },
+            ],
+            vec![ContentBlock::Text(
+                "列表：
+
+- 第一项
+- 第二项"
+                    .into(),
+            )],
+        ];
+        for blocks in cases {
+            let live = finalize_extras(&blocks, false, TEST_WIDTH);
+            let source = block_source(&blocks, false);
+            let replayed = chat::render_answer_rows(
+                markdown::render_document(
+                    &source.join(
+                        "
+",
+                    ),
+                    chat::answer_content_width(TEST_WIDTH),
+                ),
+                false,
+            );
+            assert_eq!(
+                live.iter().map(line_text).collect::<Vec<_>>(),
+                replayed.iter().map(line_text).collect::<Vec<_>>(),
+                "live and replayed extras diverged for {blocks:?}"
+            );
+        }
     }
 
     #[test]

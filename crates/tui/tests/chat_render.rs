@@ -17,17 +17,10 @@
 //!   subagent-as-tool, approval modal, dropped task list), where a golden
 //!   would be flaky or where the contract is "this must NOT render".
 //!
-//! ## The retry wrapper
-//!
-//! Driving the chat UI exposes a known, accepted race ([the resize-reflow
-//! notes]): a non-keyboard viewport rebuild queries cursor position
-//! (`ESC[6n`), and because dropping crossterm's `EventStream` doesn't
-//! synchronously stop its reader thread, a lingering blocking `stdin` read
-//! can steal the reply — the query then times out and the TUI process
-//! exits mid-turn. That race is orthogonal to what these tests check
-//! (rendering correctness), so [`run_chat`] retries a scenario on a fresh
-//! process when it *dies*, while a genuine render mismatch (process alive,
-//! output wrong/absent) still fails fast.
+//! A probe that *dies* mid-scenario fails the test outright. The TUI emits no
+//! terminal queries (see `crate::backend::AnchoredBackend` in the library), so
+//! nothing racy remains to absorb: a death here means the event loop took an
+//! error path, which is exactly the regression this suite should catch.
 //!
 //! Each test self-skips when tmux is absent so CI without tmux stays green.
 
@@ -58,18 +51,35 @@ const WAIT: Duration = Duration::from_secs(15);
 /// Fixed pane size so the golden snapshots are deterministic.
 const COLS: u16 = 90;
 const ROWS: u16 = 24;
-/// Fresh-process attempts before giving up — see the module note on the
-/// cursor-position race. Each death is *fast* (the probe exits early the moment
-/// the race steals the `ESC[6n` reply), so retries cost little wall-clock; 8
-/// keeps the all-attempts-die odds negligible even under heavy CI load (4 lost
-/// every attempt on a contended runner once). Genuine render failures don't
-/// consume these (they panic immediately).
-const ATTEMPTS: usize = 8;
-
-/// Launch the probe, wait for the first frame, run `body`, and retry on a
-/// process death from the known cursor-position race. Self-skips without
-/// tmux. A render mismatch inside `body` panics and is *not* retried.
+/// Launch the probe, wait for the first frame, then run `body`. Self-skips
+/// without tmux. Both a probe death and a render mismatch fail the test.
+///
+/// `body` returning `Ok` is not on its own proof the probe survived: tmux's
+/// `remain-on-exit` freezes the last frame in the pane, so a predicate that was
+/// already satisfied still matches against a dead probe. The liveness check
+/// after `body` is what turns that into a failure. Scenarios that *expect* the
+/// probe to exit use [`run_chat_until_exit`].
 fn run_chat<F>(name: &str, body: F)
+where
+    F: Fn(&TmuxSession) -> Result<(), String>,
+{
+    run_scenario(name, body, ExitExpectation::StaysAlive);
+}
+
+/// [`run_chat`] for a scenario whose whole point is that the probe exits.
+fn run_chat_until_exit<F>(name: &str, body: F)
+where
+    F: Fn(&TmuxSession) -> Result<(), String>,
+{
+    run_scenario(name, body, ExitExpectation::Exits);
+}
+
+enum ExitExpectation {
+    StaysAlive,
+    Exits,
+}
+
+fn run_scenario<F>(name: &str, body: F, expectation: ExitExpectation)
 where
     F: Fn(&TmuxSession) -> Result<(), String>,
 {
@@ -77,31 +87,28 @@ where
         eprintln!("skipping chat_render::{name}: tmux not on PATH");
         return;
     }
-    // Held for the whole scenario (all retry attempts) so probes run one at a
-    // time — see `SERIAL`.
+    // Held for the whole scenario so probes run one at a time — see `SERIAL`.
     let _serial = SERIAL.lock();
-    let mut last = String::new();
-    for attempt in 1..=ATTEMPTS {
-        let session =
-            TmuxSession::launch(LaunchSpec::new(SMOKE_BIN, COLS, ROWS)).expect("launch chat_smoke");
-        let result = wait_render(&session, "chat banner + input box", |c| {
-            c.contains("Baybo TUI") && c.contains("input")
-        })
-        .and_then(|_| body(&session));
-        match result {
-            Ok(()) => return,
-            Err(e) => {
-                last = e;
-                eprintln!("chat_render::{name}: attempt {attempt}/{ATTEMPTS} died: {last}");
-            }
-        }
+    let session =
+        TmuxSession::launch(LaunchSpec::new(SMOKE_BIN, COLS, ROWS)).expect("launch chat_smoke");
+    let result = wait_render(&session, "chat banner + input box", |c| {
+        c.contains("Baybo TUI") && c.contains("input")
+    })
+    .and_then(|_| body(&session));
+    if let Err(e) = result {
+        panic!("chat_render::{name}: {e}");
     }
-    panic!("chat_render::{name}: failed after {ATTEMPTS} attempts: {last}");
+    if matches!(expectation, ExitExpectation::StaysAlive) {
+        assert!(
+            !session.is_dead(),
+            "chat_render::{name}: the probe died before the scenario ended"
+        );
+    }
 }
 
-/// Wait for `pred`. The harness tells death (`ProcessDied`, the known race
-/// → `Err` so the caller retries) apart from a real render failure
-/// (`Timeout` — process alive but output never appeared → panic, fail fast).
+/// Wait for `pred`, reporting a probe death (`ProcessDied`) and a real render
+/// failure (`Timeout` — process alive but output never appeared) alike; both
+/// end the scenario.
 fn wait_render(
     session: &TmuxSession,
     what: &str,
@@ -248,6 +255,83 @@ fn user_message_streams_an_assistant_reply() {
     });
 }
 
+/// Markdown blocks reach a real terminal as rendered layout, not as source.
+/// `capture-pane -p` carries no styling, so this pins the *glyphs and layout*
+/// markdown produces (bullets, code gutter, table rules) and — the part that
+/// matters most — that no markup punctuation is left on screen.
+#[test]
+#[ignore = "tmux render test; flaky under load — run in CI with --ignored"]
+fn markdown_blocks_render_as_layout_not_source() {
+    run_chat("markdown_blocks_render_as_layout_not_source", |s| {
+        say(s, SAY_MARKDOWN);
+        wait_render(s, "markdown answer", |c| c.contains(MARKDOWN_TAIL))?;
+        let history = s.capture_with_scrollback(400).map_err(|e| e.to_string())?;
+
+        for (label, needle) in [
+            ("heading text", MARKDOWN_HEADING),
+            ("emphasised word", MARKDOWN_EMPHASISED),
+            ("bullet glyph", "•"),
+            ("ordered marker", "1. step one"),
+            ("code gutter", "│ fn main() {}"),
+            ("code language label", "┌ rust"),
+            ("table rule", "├"),
+            ("quote gutter", "▌"),
+            ("han paragraph", MARKDOWN_TAIL),
+        ] {
+            assert!(
+                history.contains(needle),
+                "{label} ({needle:?}) missing from:\n{history}"
+            );
+        }
+
+        for (label, marker) in [
+            ("bold markers", "**"),
+            ("fence markers", "```"),
+            ("table pipes", "| lang |"),
+            ("list dashes", "- first point"),
+        ] {
+            assert!(
+                !history.contains(marker),
+                "{label} ({marker:?}) left as literal source in:\n{history}"
+            );
+        }
+        Ok(())
+    });
+}
+
+/// Answer text held back by the markdown block scanner must reach scrollback
+/// *above* a tool block that arrives while it is still buffered. `insert_before`
+/// cannot write beneath a committed row, so getting this wrong inverts the turn's
+/// reading order permanently.
+#[test]
+#[ignore = "tmux render test; flaky under load — run in CI with --ignored"]
+fn buffered_answer_text_commits_above_a_tool_block() {
+    run_chat("buffered_answer_text_commits_above_a_tool_block", |s| {
+        say(s, SAY_MARKDOWN_TOOL);
+        wait_render(s, "markdown + tool turn", |c| c.contains(MDTOOL_TAIL))?;
+        let history = s.capture_with_scrollback(400).map_err(|e| e.to_string())?;
+
+        let held = history
+            .find(MDTOOL_HELD)
+            .ok_or_else(|| format!("held-back prose missing:\n{history}"))?;
+        let tool = history
+            .find(TOOL_SUMMARY)
+            .ok_or_else(|| format!("tool result missing:\n{history}"))?;
+        let tail = history
+            .find(MDTOOL_TAIL)
+            .ok_or_else(|| format!("post-tool prose missing:\n{history}"))?;
+        assert!(
+            held < tool,
+            "buffered prose landed BELOW its tool block:\n{history}"
+        );
+        assert!(
+            tool < tail,
+            "post-tool prose landed above the tool block:\n{history}"
+        );
+        Ok(())
+    });
+}
+
 #[test]
 #[ignore = "tmux render test; flaky under load — run in CI with --ignored"]
 fn live_region_survives_a_resize() {
@@ -262,9 +346,9 @@ fn live_region_survives_a_resize() {
         // that can be sampled mid-reflow. The inline-viewport resize momentarily
         // drops the input box (a known cosmetic ghost), so a single stable capture
         // could land on a frame without it; `wait_render` keeps polling past that
-        // transient. A genuine miss still times out → fail-fast; a process death
-        // (the cursor-position race) is retried by `run_chat`. Smoke-level: assert
-        // the live region rebuilt + transcript survived, not a pixel-exact layout.
+        // transient. A genuine miss still times out → fail-fast. Smoke-level:
+        // assert the live region rebuilt + transcript survived, not a
+        // pixel-exact layout.
         wait_render(s, "input box + transcript after resize", |c| {
             c.contains("input") && c.contains(&reply)
         })?;
@@ -275,7 +359,7 @@ fn live_region_survives_a_resize() {
 #[test]
 #[ignore = "tmux render test; flaky under load — run in CI with --ignored"]
 fn ctrl_c_on_empty_prompt_exits() {
-    run_chat("ctrl_c_on_empty_prompt_exits", |s| {
+    run_chat_until_exit("ctrl_c_on_empty_prompt_exits", |s| {
         s.send_key(Key::Ctrl('c')).expect("send Ctrl+C");
         s.wait_for_exit(WAIT).map(|_| ()).map_err(|e| e.to_string())
     });
