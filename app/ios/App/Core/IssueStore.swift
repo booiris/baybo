@@ -45,6 +45,7 @@ final class IssueStore: ObservableObject, WebMediaTarget {
     /// The card is stamped read once its timeline has rendered, and once —
     /// re-stamping per delivery would spend a round trip per comment.
     private var stampedRead = false
+    private var invalidations: ProjectInvalidations.Token?
 
     private lazy var media: TranscriptMedia = {
         let media = TranscriptMedia(client: client)
@@ -67,10 +68,20 @@ final class IssueStore: ObservableObject, WebMediaTarget {
     func attach(_ bridge: IssueBridge) {
         self.bridge = bridge
         media.attach(bridge)
+        invalidations = ProjectInvalidations.shared.observe { [weak self] change in
+            guard let self else { return }
+            // A stale broadcast names no board, and every scope means dirty —
+            // the card is small enough that refetching it whole beats being
+            // right about which part moved.
+            guard change.scope == "stale" || change.projectId == self.projectId else { return }
+            guard change.issueNumber == nil || change.issueNumber == self.number else { return }
+            self.invalidated()
+        }
     }
 
     func detach(_ bridge: IssueBridge) {
         guard self.bridge === bridge else { return }
+        invalidations = nil
         media.detach(bridge)
         self.bridge = nil
     }

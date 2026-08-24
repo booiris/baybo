@@ -21,6 +21,10 @@ struct ProjectIssueScreen: View {
     @State private var host: IssueHost?
     @State private var confirmingStop = false
     @State private var picking: String?
+    /// The run whose transcript is open. Addressed by attempt, never by
+    /// session id — an attempt that never started has no session and is
+    /// still a row somebody wants to read.
+    @State private var openRun: ProjectRunRoute?
 
     init(projectId: String, number: Int64) {
         self.projectId = projectId
@@ -44,10 +48,13 @@ struct ProjectIssueScreen: View {
         .task {
             if host == nil {
                 let created = IssueHost(store: store)
-                created.bridge.onOpenRun = { _ in
-                    // The run transcript sheet lands in P6; until then the row
-                    // is inert rather than absent, so the card's shape is the
-                    // one it will keep.
+                created.bridge.onOpenRun = { attempt in
+                    guard let run = store.runs.first(where: { $0.attempt == attempt }),
+                        let sessionId = run.sessionId
+                    else { return }
+                    openRun = ProjectRunRoute(
+                        projectId: projectId, number: number, attempt: attempt,
+                        sessionId: sessionId, status: run.status)
                 }
                 created.bridge.onPick = { field in picking = field }
                 host = created
@@ -59,6 +66,13 @@ struct ProjectIssueScreen: View {
         .onChange(of: store.editing) { _, active in host?.bridge.setEditing(active) }
         .onDisappear {
             if let host { host.teardown(store: store) }
+        }
+        .sheet(item: $openRun) { route in
+            ProjectRunSheet(route: route) { confirmingStop = true }
+                .presentationDetents([.large])
+                .presentationDragIndicator(.hidden)
+                .presentationBackground(Theme.paper)
+                .presentationCornerRadius(Theme.radiusModal)
         }
         .confirmationDialog(
             lang.t("issue.stopTitle"), isPresented: $confirmingStop, titleVisibility: .visible

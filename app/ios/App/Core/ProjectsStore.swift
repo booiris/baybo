@@ -919,6 +919,12 @@ final class ProjectEventsRelay: ProjectSink {
             MainActor.assumeIsolated {
                 store()?.projectChanged(
                     projectId: projectId, scope: scope, issueNumber: issueNumber)
+                // Everything else that might be on screen — an open card, a run
+                // sheet — hears it here rather than through the boards store,
+                // which has no business knowing they exist.
+                ProjectInvalidations.shared.publish(
+                    projectId: projectId, scope: scope,
+                    issueNumber: issueNumber.map(Int64.init))
             }
         }
     }
@@ -928,6 +934,7 @@ final class ProjectEventsRelay: ProjectSink {
         DispatchQueue.main.async {
             MainActor.assumeIsolated {
                 store()?.invalidationsMayHaveBeenDropped()
+                ProjectInvalidations.shared.publishStale()
             }
         }
     }

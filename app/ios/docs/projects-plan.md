@@ -156,10 +156,28 @@ a comment, and the run-transcript sheet the card's run rows point at (P6). The
 the one it keeps.
 
 
-## P6 · Run transcript sheet
+## P6 · Run transcript sheet — **done**
 
 - `ProjectRunReadStore: TranscriptTarget` (`SubagentReadStore.swift:14-28`: `connEpoch 0`, `listed false`, **`mirrored false`**); data through P1's `project_fetch_run_history`; a live page re-reads the newest page on `ProjectChanged{run|timeline}` (the sink notification threading into the store), degrading to a 2s poll when frames are unavailable, with one read after it settles.
 - The sheet shell is the `SubagentSheet` grammar (its own NavigationStack, `.large`); the header carries the run row and Stop (with the confirm).
+
+**One thing the plan under-specified.** The design said "the sink notification
+threading into the store", which would have made `ProjectsStore` reach into an
+open card and an open run sheet to nudge them — every new surface an edit to
+every existing one. `ProjectInvalidations` is the seam instead: the relay
+publishes, and whoever is on screen listens. A run sheet has no business
+holding the boards store to learn that its own run moved, and the board has no
+business knowing a run sheet exists.
+
+**A run has no SYNC route**, only backward pages — so `requestSync` asks for
+the NEWEST page rather than a difference. Passing the cursor would ask the
+gateway a question it has no route to answer, and a run only ever grows at the
+tail, so the page's own merge is enough.
+
+The poll takes **one more page after the run settles**: a run that just
+finished writes its last rows after the settle stamp, so stopping at the stamp
+would leave the final answer off the page.
+
 
 ## P7 · Team / profile / Activity / Settings
 
