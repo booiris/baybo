@@ -4,13 +4,15 @@ import {
   clampVideoRatio,
   formatBytes,
   formatTime,
-  formatTimestampShort,
   isVectorImage,
   isVideoAttachment,
-  ordinalFromMessageId,
-  rowOrdinal,
   splitForMiddleEllipsis,
   typeLabel,
+} from "./attachments";
+import {
+  formatTimestampShort,
+  ordinalFromMessageId,
+  rowOrdinal,
   workStepKey,
 } from "./Transcript";
 import type { WireAttachment, WorkStep } from "./types";

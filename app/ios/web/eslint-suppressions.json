@@ -9,7 +9,7 @@
       "count": 13
     },
     "@typescript-eslint/strict-boolean-expressions": {
-      "count": 49
+      "count": 41
     }
   },
   "src/WorkBlock.tsx": {
