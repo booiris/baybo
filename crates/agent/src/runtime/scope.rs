@@ -524,7 +524,6 @@ mod tests {
         SpanKind::ToolCall {
             begin: ToolCallBegin {
                 tool_name: "Bash".into(),
-                tool_artifact_hash: String::new(),
                 triggered_by: None,
                 params: serde_json::Value::Null,
             },

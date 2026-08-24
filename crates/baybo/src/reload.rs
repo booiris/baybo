@@ -25,7 +25,7 @@ use baybo_security::SecretVault;
 use baybo_store::BlobStore;
 use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::boot;
 
@@ -441,6 +441,67 @@ impl CostReloader {
     }
 }
 
+/// Web-search consumer: rebuilds the `WebSearch` tool and republishes it into
+/// the frozen tool registry.
+///
+/// The tool lives under a dynamic-registry source rather than as a builtin
+/// precisely so this is possible — see `baybo_search::boot::WEB_SEARCH_SOURCE`.
+pub(crate) struct WebSearchReloader {
+    registry: Arc<baybo_tools::ToolRegistry>,
+    vault: Arc<SecretVault>,
+    /// Egress proxy, fixed at boot for the same reason [`LlmReloader`]'s is:
+    /// `proxy` is not hot-reloadable, so a change rejects the whole reload
+    /// before this runs.
+    proxy: Option<baybo_security::http::ProxySettings>,
+}
+
+struct PreparedWebSearch {
+    tools: Vec<(Arc<dyn baybo_tools::Tool>, baybo_tools::ToolManifest)>,
+}
+
+impl WebSearchReloader {
+    pub(crate) fn new(
+        registry: Arc<baybo_tools::ToolRegistry>,
+        vault: Arc<SecretVault>,
+        proxy: Option<baybo_security::http::ProxySettings>,
+    ) -> Self {
+        Self {
+            registry,
+            vault,
+            proxy,
+        }
+    }
+
+    /// Rebuild unconditionally, for the same reason the LLM pool does: an API
+    /// key can rotate in the vault with nothing to show for it in the config
+    /// diff, so gating the rebuild on the diff would keep serving the old
+    /// credential. A rebuild is a vault read and a client construction, and a
+    /// no-op reload republishes a byte-identical tool definition, so the
+    /// prompt cache is undisturbed.
+    ///
+    /// Infallible by construction: every failure path inside
+    /// `build_search_tools` logs and yields no tool, because a broken search
+    /// credential must not abort a reload that is also carrying an LLM change.
+    async fn prepare(&self, new: &BayboConfig) -> PreparedWebSearch {
+        PreparedWebSearch {
+            tools: baybo_search::boot::build_search_tools(
+                &new.web_search,
+                Some(self.vault.as_ref()),
+                self.proxy.as_ref(),
+            )
+            .await,
+        }
+    }
+
+    fn commit(&self, prepared: PreparedWebSearch) {
+        let registered = !self
+            .registry
+            .replace_source(baybo_search::boot::WEB_SEARCH_SOURCE, prepared.tools)
+            .is_empty();
+        debug!(registered, "web search reloaded");
+    }
+}
+
 /// Orchestrator: validate → diff → prepare-all → commit-all → swap
 /// config. Serialized by `reload_lock` so concurrent triggers (admin
 /// endpoint + SIGHUP) never interleave.
@@ -450,26 +511,42 @@ pub struct RuntimeConfigReloader {
     reload_lock: tokio::sync::Mutex<()>,
     llm: LlmReloader,
     cost: CostReloader,
+    web_search: WebSearchReloader,
     /// Shared Bash permission mode; a hot reload swaps it (see `commit` below) so
     /// running `BashTool`s pick up the new isolation/approval behavior and
     /// description live.
     bash_permission: Arc<baybo_tools::builtin::LivePermissionMode>,
 }
 
+/// Everything [`RuntimeConfigReloader`] needs. A struct rather than six
+/// positional parameters because four of them are consumers that read the
+/// same way in any order.
+pub struct RuntimeConfigReloaderConfig {
+    pub config_path: Option<PathBuf>,
+    pub handle: ConfigHandle,
+    pub llm: LlmReloader,
+    pub cost: CostReloader,
+    pub web_search: WebSearchReloader,
+    pub bash_permission: Arc<baybo_tools::builtin::LivePermissionMode>,
+}
+
 impl RuntimeConfigReloader {
-    pub fn new(
-        config_path: Option<PathBuf>,
-        handle: ConfigHandle,
-        llm: LlmReloader,
-        cost: CostReloader,
-        bash_permission: Arc<baybo_tools::builtin::LivePermissionMode>,
-    ) -> Self {
+    pub fn from_config(config: RuntimeConfigReloaderConfig) -> Self {
+        let RuntimeConfigReloaderConfig {
+            config_path,
+            handle,
+            llm,
+            cost,
+            web_search,
+            bash_permission,
+        } = config;
         Self {
             config_path,
             handle,
             reload_lock: tokio::sync::Mutex::new(()),
             llm,
             cost,
+            web_search,
             bash_permission,
         }
     }
@@ -521,11 +598,17 @@ impl ConfigReloader for RuntimeConfigReloader {
             .await
             .map_err(ReloadError::LlmRebuild)?;
         let prepared_cost = self.cost.prepare(&new);
+        // Rebuilt unconditionally for the same reason as the pool: a rotated
+        // search key is invisible in the config diff. Its own failures never
+        // abort the reload — a broken search credential must not block an LLM
+        // change riding the same reload.
+        let prepared_web_search = self.web_search.prepare(&new).await;
 
         // Commit (infallible): swaps + live setters. Pricing is reseeded
         // before the pool swap inside `llm.commit`.
         let outcome = self.llm.commit(prepared_llm);
         self.cost.commit(prepared_cost);
+        self.web_search.commit(prepared_web_search);
         // Swap the Bash permission mode live: the next command (and the next tool
         // description the LLM sees) observes the new isolation/approval policy.
         self.bash_permission
@@ -621,5 +704,98 @@ mod tests {
             entry("b", "openai", "gpt-5", vec![]),
         ]);
         assert_eq!(refresh_pairs(&cfg).len(), 1);
+    }
+
+    // -- web search ---------------------------------------------------------
+
+    const SEARCH_TOOL: &str = "WebSearch";
+
+    fn vault() -> Arc<SecretVault> {
+        let key = baybo_security::EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec())
+            .expect("32-byte key");
+        Arc::new(SecretVault::new(
+            key,
+            Arc::new(baybo_security::test_support::MemorySecretStore::new()),
+        ))
+    }
+
+    fn search_config(enabled: bool) -> BayboConfig {
+        let mut cfg = config_with(vec![entry("a", "openai", "gpt-5", vec![])]);
+        cfg.web_search = baybo_config::WebSearchConfig {
+            enabled,
+            provider: baybo_config::WebSearchProvider::Tavily,
+            api_key_name: Some("BAYBO_TEST_RELOAD_SEARCH_KEY".into()),
+            ..Default::default()
+        };
+        cfg
+    }
+
+    async fn apply(reloader: &WebSearchReloader, cfg: &BayboConfig) {
+        let prepared = reloader.prepare(cfg).await;
+        reloader.commit(prepared);
+    }
+
+    /// The whole point of making the section hot: enabling and disabling
+    /// search takes effect on a running process.
+    #[tokio::test]
+    async fn web_search_reload_installs_and_uninstalls_the_tool() {
+        let vault = vault();
+        vault
+            .store_secret("user_env.BAYBO_TEST_RELOAD_SEARCH_KEY", b"k")
+            .await
+            .expect("seed key");
+        let registry = Arc::new(baybo_tools::ToolRegistry::new());
+        let reloader = WebSearchReloader::new(Arc::clone(&registry), Arc::clone(&vault), None);
+
+        apply(&reloader, &search_config(false)).await;
+        assert!(registry.get(SEARCH_TOOL).is_none());
+
+        apply(&reloader, &search_config(true)).await;
+        assert!(registry.get(SEARCH_TOOL).is_some());
+
+        apply(&reloader, &search_config(false)).await;
+        assert!(
+            registry.get(SEARCH_TOOL).is_none(),
+            "disabling must take the verb away, not leave a dead one"
+        );
+    }
+
+    /// The reason the rebuild is unconditional rather than gated on the
+    /// config diff: rotating the key in the vault changes nothing in the
+    /// config, and a diff-gated rebuild would keep serving the old credential.
+    #[tokio::test]
+    async fn a_vault_key_rotation_alone_rebuilds_the_tool() {
+        let vault = vault();
+        let registry = Arc::new(baybo_tools::ToolRegistry::new());
+        let reloader = WebSearchReloader::new(Arc::clone(&registry), Arc::clone(&vault), None);
+        let cfg = search_config(true);
+
+        // No key yet: enabled, but nothing to register.
+        apply(&reloader, &cfg).await;
+        assert!(registry.get(SEARCH_TOOL).is_none());
+
+        // The operator runs `baybo secret add`. The config is byte-identical.
+        vault
+            .store_secret("user_env.BAYBO_TEST_RELOAD_SEARCH_KEY", b"rotated")
+            .await
+            .expect("store key");
+        apply(&reloader, &cfg).await;
+        assert!(
+            registry.get(SEARCH_TOOL).is_some(),
+            "an unchanged config must still pick up a newly-available credential"
+        );
+    }
+
+    /// A search failure must not take an LLM change down with it — `prepare`
+    /// is infallible by construction.
+    #[tokio::test]
+    async fn a_broken_search_config_leaves_the_registry_clean_and_does_not_fail() {
+        let registry = Arc::new(baybo_tools::ToolRegistry::new());
+        let reloader = WebSearchReloader::new(Arc::clone(&registry), vault(), None);
+        let mut cfg = search_config(true);
+        cfg.web_search.base_url = Some("https://user:pass@evil.tld".into());
+
+        apply(&reloader, &cfg).await;
+        assert!(registry.get(SEARCH_TOOL).is_none());
     }
 }

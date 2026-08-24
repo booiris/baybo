@@ -95,6 +95,51 @@ impl ToolRegistry {
             .push(name);
     }
 
+    /// Atomically make `tools` the complete set registered under `source`,
+    /// returning the names registered afterwards.
+    ///
+    /// Not [`Self::unregister_for_source`] followed by
+    /// [`Self::register_dynamic`]: those take the write lock twice, and a
+    /// lookup landing in the gap resolves to `NotFound` for a tool that is
+    /// about to exist again. A consumer that republishes its whole set on
+    /// every config reload — including reloads that change nothing about it —
+    /// would hit that gap routinely rather than rarely.
+    pub fn replace_source(
+        &self,
+        source: &str,
+        tools: Vec<(Arc<dyn Tool>, ToolManifest)>,
+    ) -> Vec<String> {
+        let mut state = self.dynamic.write();
+        for name in state.by_source.remove(source).unwrap_or_default() {
+            state.tools.remove(&name);
+            state.manifests.remove(&name);
+        }
+        let mut names = Vec::with_capacity(tools.len());
+        for (tool, manifest) in tools {
+            let name = tool.name().to_string();
+            debug_assert_eq!(
+                name, manifest.name,
+                "tool name does not match manifest name"
+            );
+            if self.builtin.contains_key(&name) {
+                tracing::warn!(
+                    tool = %name,
+                    source = %source,
+                    "dynamic tool shadows a builtin; the dynamic registration wins"
+                );
+            }
+            state.tools.insert(name.clone(), tool);
+            state.manifests.insert(name.clone(), manifest);
+            names.push(name);
+        }
+        if names.is_empty() {
+            state.by_source.remove(source);
+        } else {
+            state.by_source.insert(source.to_string(), names.clone());
+        }
+        names
+    }
+
     /// Drop every dynamic tool previously registered under `source`.
     /// Returns the names that were removed.
     pub fn unregister_for_source(&self, source: &str) -> Vec<String> {
@@ -745,6 +790,63 @@ mod tests {
             }),
             "a card's run has its own checkout; the shared browser is not its to hold"
         );
+    }
+
+    fn recording(name: &str) -> (Arc<dyn crate::Tool>, crate::ToolManifest) {
+        let tool = crate::test_support::RecordingTool::new(name);
+        let manifest = tool.manifest();
+        (Arc::new(tool), manifest)
+    }
+
+    #[test]
+    fn replace_source_swaps_the_whole_set() {
+        let registry = default_registry();
+        registry.replace_source("s", vec![recording("a"), recording("b")]);
+        assert!(registry.get("a").is_some());
+        assert!(registry.get("b").is_some());
+
+        // The new set is the whole set — `b` goes, `c` arrives, `a` stays.
+        let names = registry.replace_source("s", vec![recording("a"), recording("c")]);
+        assert_eq!(names, vec!["a".to_string(), "c".to_string()]);
+        assert!(registry.get("a").is_some());
+        assert!(registry.get("b").is_none(), "dropped tool still resolves");
+        assert!(registry.get("c").is_some());
+        assert!(registry.get_manifest("b").is_none());
+    }
+
+    /// Republishing the identical set must not accumulate `by_source`
+    /// entries — a reload runs this on every trigger, changed or not.
+    #[test]
+    fn replace_source_is_idempotent() {
+        let registry = default_registry();
+        for _ in 0..3 {
+            registry.replace_source("s", vec![recording("a")]);
+        }
+        assert_eq!(
+            registry.dynamic_names_for_source("s"),
+            vec!["a".to_string()]
+        );
+        assert_eq!(
+            registry
+                .tool_definitions()
+                .iter()
+                .filter(|d| d.name == "a")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn replace_source_with_nothing_clears_the_source() {
+        let registry = default_registry();
+        registry.replace_source("s", vec![recording("a")]);
+        assert!(registry.replace_source("s", Vec::new()).is_empty());
+        assert!(registry.get("a").is_none());
+        assert!(registry.dynamic_names_for_source("s").is_empty());
+        // …and it leaves another source alone.
+        registry.replace_source("other", vec![recording("z")]);
+        registry.replace_source("s", Vec::new());
+        assert!(registry.get("z").is_some());
     }
 }
 

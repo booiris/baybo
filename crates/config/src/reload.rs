@@ -75,6 +75,14 @@ pub fn hot_reload_diff(old: &BayboConfig, new: &BayboConfig) -> Result<()> {
         external_agents,
         proxy,
         memory,
+        // Hot: the runtime reloader rebuilds the `WebSearch` tool and
+        // republishes it into the frozen tool registry, so enabling,
+        // disabling, re-providering or re-keying search all apply live. The
+        // tool is a dynamic registration rather than a builtin precisely so
+        // this is possible. Adding or removing it does change a live
+        // conversation's tool list on its next turn — the same thing an MCP
+        // server connecting already does.
+        web_search: _,
         // Hot: the runtime reloader swaps the live `BashTool` permission policy
         // (and the tool description it advertises). Ignored here so a
         // `permission`-only change is hot-reloadable rather than rejected.
@@ -246,6 +254,18 @@ mod tests {
             Err(ConfigError::NotHotReloadable { section }) => assert_eq!(section, "security"),
             other => panic!("expected security rejection, got {other:?}"),
         }
+    }
+
+    /// Web search applies live: the runtime rebuilds the tool and
+    /// republishes it into the registry, so nothing here rejects it.
+    #[test]
+    fn web_search_change_is_hot() {
+        let old = base();
+        let mut new = base();
+        new.web_search.enabled = !old.web_search.enabled;
+        new.web_search.provider = crate::WebSearchProvider::Tavily;
+        new.web_search.max_results = 3;
+        assert!(hot_reload_diff(&old, &new).is_ok());
     }
 
     #[test]

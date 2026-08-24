@@ -324,11 +324,11 @@ function MetaTab({ span, order }: { span: Span; order: SpanOrder | null }) {
     baseRows.push(['Parallel group', <code className="break-all">{span.parallel_group}</code>]);
   }
   if (span.kind.kind === 'llm_call') {
-    baseRows.push(
-      ['Model', span.kind.begin.model_id],
-      ['Provider', span.kind.begin.provider],
-      ['Provider config', <code className="break-all">{span.kind.begin.provider_config_hash}</code>],
-    );
+    baseRows.push(['Model', span.kind.begin.model_id], ['Provider', span.kind.begin.provider]);
+    const effort = span.kind.begin.reasoning_effort;
+    if (effort != null && effort !== '') {
+      baseRows.push(['Thinking effort', effort]);
+    }
     if (span.kind.begin.temperature !== null && span.kind.begin.temperature !== undefined) {
       baseRows.push(['Temperature', span.kind.begin.temperature.toString()]);
     }
@@ -347,16 +347,10 @@ function MetaTab({ span, order }: { span: Span; order: SpanOrder | null }) {
       }
     }
     if (span.kind.begin.tools) {
-      baseRows.push(
-        ['Tools offered', span.kind.begin.tools.count.toLocaleString()],
-        ['Tool set', <code className="break-all">{span.kind.begin.tools.hash}</code>],
-      );
+      baseRows.push(['Tools offered', span.kind.begin.tools.count.toLocaleString()]);
     }
   } else {
-    baseRows.push(
-      ['Tool name', span.kind.begin.tool_name],
-      ['Tool artifact', <code className="break-all">{span.kind.begin.tool_artifact_hash}</code>],
-    );
+    baseRows.push(['Tool name', span.kind.begin.tool_name]);
     if (span.kind.begin.triggered_by) {
       baseRows.push([
         'Triggered by',

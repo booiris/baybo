@@ -10,6 +10,7 @@ use crate::cost::CostConfig;
 use crate::error::{ConfigError, ValidationError};
 use crate::gateway::GatewayConfig;
 use crate::llm::LlmEntry;
+use crate::web_search::{MAX_RESULTS_CEILING, WebSearchConfig};
 use crate::workspace::WorkspaceConfig;
 
 impl BayboConfig {
@@ -26,6 +27,7 @@ impl BayboConfig {
         validate_browser(&self.browser, &mut errors);
         validate_gateway(&self.gateway, &mut errors);
         validate_proxy(self.proxy.as_ref(), &mut errors);
+        validate_web_search(&self.web_search, &mut errors);
         validate_cross_section(self, &mut errors);
         if errors.is_empty() {
             Ok(())
@@ -292,6 +294,53 @@ fn validate_proxy(proxy: Option<&crate::proxy::ProxyConfig>, errors: &mut Vec<Va
             "must start with a supported scheme: http://, https://, socks5://, \
              socks5h://, socks4:// or socks4a://",
         ));
+    }
+}
+
+/// Rules that hold without touching the vault or the network. Whether the
+/// referenced secret actually exists is deliberately **not** checked here —
+/// `validate()` is pure, and reading the vault is async sqlite. A missing key
+/// surfaces at boot as a skipped registration with an actionable log line.
+fn validate_web_search(cfg: &WebSearchConfig, errors: &mut Vec<ValidationError>) {
+    if let Some(url) = &cfg.base_url
+        && !is_http_url(url)
+    {
+        errors.push(ValidationError::new(
+            "web_search.base_url",
+            "must start with http:// or https://",
+        ));
+    }
+    if cfg.enabled && cfg.provider.requires_base_url() && cfg.base_url.is_none() {
+        errors.push(ValidationError::new(
+            "web_search.base_url",
+            "is required for this provider — it has no hosted endpoint, so the \
+             address of your own instance is the only one there is",
+        ));
+    }
+    if cfg.max_results == 0 {
+        errors.push(ValidationError::new(
+            "web_search.max_results",
+            "must be >= 1",
+        ));
+    } else if cfg.max_results > MAX_RESULTS_CEILING {
+        errors.push(ValidationError::new(
+            "web_search.max_results",
+            format!("must be <= {MAX_RESULTS_CEILING} (every provider caps one page there)"),
+        ));
+    }
+    if let Some(name) = &cfg.api_key_name {
+        if name.trim().is_empty() {
+            errors.push(ValidationError::new(
+                "web_search.api_key_name",
+                "must be non-empty when set (omit the field to use the provider default)",
+            ));
+        } else if !is_env_var_name(name) {
+            errors.push(ValidationError::new(
+                "web_search.api_key_name",
+                "must be a valid environment variable name (letters, digits, underscores; \
+                 not starting with a digit). This field names the secret; it never holds one.",
+            ));
+        }
     }
 }
 

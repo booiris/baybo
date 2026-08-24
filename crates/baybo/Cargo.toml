@@ -28,6 +28,7 @@ baybo-workspace = { workspace = true, features = ["io"] }
 baybo-context = { workspace = true }
 baybo-turn = { workspace = true }
 baybo-memory = { workspace = true }
+baybo-search = { workspace = true }
 baybo-cost = { workspace = true }
 baybo-trace = { workspace = true }
 baybo-security = { workspace = true }
@@ -66,3 +67,7 @@ clap = { workspace = true }
 parking_lot = { workspace = true }
 regex = { workspace = true }
 futures = { workspace = true }
+
+[dev-dependencies]
+# `SecretVault` over an in-memory store, for the hot-reload consumer tests.
+baybo-security = { workspace = true, features = ["test-support"] }

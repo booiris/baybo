@@ -7,7 +7,7 @@ This is the approved design for config hot-reload. It folds together what were o
 
 Apply a subset of `baybo.json` changes to a running gateway without a restart, honoring the contract in [`docs/modules/config.md`](modules/config.md) §"Reload semantics": an explicit hot-updatable whitelist, an atomic swap, validation rollback, and in-flight isolation.
 
-The headline win is **LLM identity** (`provider`, `model`, `model_list` — including its per-model `pricing` / `context_window` — `base_url`, `api_key`, `default-llm`, `model_tiers`) — today a restart, full stop — plus **cost limits** (`cost.rate_limit`, `cost.spending_limits`).
+The headline win is **LLM identity** (`provider`, `model`, `model_list` — including its per-model `pricing` / `context_window` — `base_url`, `api_key`, `default-llm`, `model_tiers`) — today a restart, full stop — plus **cost limits** (`cost.rate_limit`, `cost.spending_limits`) and web-search configuration.
 
 ## Non-goals
 
@@ -20,10 +20,20 @@ The headline win is **LLM identity** (`provider`, `model`, `model_list` — incl
 
 Restated from `config.md` §"Reload semantics", made concrete for this work:
 
-- **Hot-updatable whitelist:** `llm`, `default_llm`, `agent.model_tiers`, `cost.rate_limit`, `cost.spending_limits`, and `permission` (commit swaps the live `BashTool` permission policy — isolation/approval behavior and the advertised tool description — via a shared `LivePermissionMode`). Any diff touching a field outside this set rejects the **entire** reload (atomic — nothing swaps) with an error naming the offending section. An operator who edits a model *and* a port in one shot gets the model change rejected too and must restart; this is deliberate and predictable.
-- **Atomic swap:** a successful reload swaps a single `Arc<BayboConfig>` holding all whitelisted changes together. Partial application is forbidden. *(Implementation note: commit publishes in four sub-publishes — pool, cost limits + rate atomics, the Bash permission mode, then the config handle — not one compare-and-swap. Each value is individually valid, so there's no torn read, but a turn starting in the ~ns gap can observe new-pool + old-limits. Practically fine; not a literal single publish.)*
+- **Hot-updatable whitelist:** `llm`, `default_llm`, `agent.model_tiers`, `cost.rate_limit`, `cost.spending_limits`, `web_search` (commit rebuilds the `WebSearch` tool and republishes it into the frozen `ToolRegistry` under its own dynamic source — see below), and `permission` (commit swaps the live `BashTool` permission policy — isolation/approval behavior and the advertised tool description — via a shared `LivePermissionMode`). Any diff touching a field outside this set rejects the **entire** reload (atomic — nothing swaps) with an error naming the offending section. An operator who edits a model *and* a port in one shot gets the model change rejected too and must restart; this is deliberate and predictable.
+- **Atomic swap:** a successful reload swaps a single `Arc<BayboConfig>` holding all whitelisted changes together. Partial application is forbidden. *(Implementation note: commit publishes in five sub-publishes — pool, cost limits + rate atomics, the web-search tool set, the Bash permission mode, then the config handle — not one compare-and-swap. Each value is individually valid, so there's no torn read, but a turn starting in the ~ns gap can observe new-pool + old-limits. Practically fine; not a literal single publish.)*
 - **Validation rollback:** a reload that fails `validate()` leaves the running config untouched and returns `ConfigError`; no observable partial state.
 - **In-flight behavior:** an LLM turn already running finishes on the client it resolved at turn start; only the next turn sees the new pool.
+
+### Web search tool replacement
+
+`web_search` atomically replaces the dynamic `web_search` tool source through
+the same `baybo_search::boot::install` path used at startup. Rebuilding is
+unconditional so vault-only key rotations take effect. A provider that cannot
+be constructed logs the error and yields no tool without aborting unrelated
+reload changes. Tool-list changes are visible on the next turn and invalidate
+that session's prompt-cache prefix once; an in-flight turn may still call a tool
+removed during the reload and receive `ToolError::NotFound`.
 
 ## Architecture
 

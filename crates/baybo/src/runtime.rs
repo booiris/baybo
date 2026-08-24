@@ -443,29 +443,20 @@ pub async fn build_managers(
         .transpose()
         .map_err(|e| anyhow::anyhow!("invalid proxy.url: {e}"))?;
 
-    // Hot-reload orchestrator. The `LlmReloader` owns the pricing-refresh
-    // loop from here on (it spawns the initial one), so a reload can
-    // cancel + respawn it against the new model set.
-    let config_reloader: Arc<dyn baybo_gateway::ConfigReloader> = {
-        let llm_reloader = crate::reload::LlmReloader::new(
-            Arc::clone(&llm_pool),
-            Arc::clone(&cost_manager),
-            stores.blob.clone(),
-            Arc::clone(&secret_vault),
-            shutdown.clone(),
-            crate::reload::refresh_pairs(&config),
-            proxy.clone(),
-        );
-        let cost_reloader =
-            crate::reload::CostReloader::new(Arc::clone(&cost_manager), Arc::clone(&rate_limit));
-        Arc::new(crate::reload::RuntimeConfigReloader::new(
-            config_path,
-            baybo_config::ConfigHandle::new(Arc::clone(&config)),
-            llm_reloader,
-            cost_reloader,
-            Arc::clone(&bash_permission),
-        ))
-    };
+    // Built here, not with the orchestrator below, because it spawns the
+    // initial pricing-refresh loop (a reload cancels + respawns it against
+    // the new model set) and that should not wait on the rest of boot.
+    let llm_reloader = crate::reload::LlmReloader::new(
+        Arc::clone(&llm_pool),
+        Arc::clone(&cost_manager),
+        stores.blob.clone(),
+        Arc::clone(&secret_vault),
+        shutdown.clone(),
+        crate::reload::refresh_pairs(&config),
+        proxy.clone(),
+    );
+    let cost_reloader =
+        crate::reload::CostReloader::new(Arc::clone(&cost_manager), Arc::clone(&rate_limit));
 
     let mut tool_registry = ToolRegistry::with_defaults(DefaultToolsConfig {
         blob_store: stores.blob.clone(),
@@ -706,6 +697,40 @@ pub async fn build_managers(
     // consumers (`tool_executor`, `McpReconciler`, the actor spawner)
     // need an `Arc<ToolRegistry>` for sharing across tasks.
     let tool_registry = Arc::new(tool_registry);
+
+    // Web search installs *after* the freeze, through the same dynamic-source
+    // seam a config reload uses, so boot and reload cannot drift. It registers
+    // only when it can actually run — a disabled section, an unselected
+    // provider or an unresolvable key all install nothing (and log) rather
+    // than showing the model a verb it cannot execute. Argv mode never reaches
+    // here, which is why this is not part of `DefaultToolsConfig`: that
+    // factory has neither the vault nor the config.
+    baybo_search::boot::install(
+        &tool_registry,
+        &config.web_search,
+        Some(secret_vault.as_ref()),
+        proxy.as_ref(),
+    )
+    .await;
+
+    // Hot-reload orchestrator. Built here rather than beside its LLM/cost
+    // consumers because the web-search consumer republishes into the frozen
+    // registry above.
+    let config_reloader: Arc<dyn baybo_gateway::ConfigReloader> =
+        Arc::new(crate::reload::RuntimeConfigReloader::from_config(
+            crate::reload::RuntimeConfigReloaderConfig {
+                config_path,
+                handle: baybo_config::ConfigHandle::new(Arc::clone(&config)),
+                llm: llm_reloader,
+                cost: cost_reloader,
+                web_search: crate::reload::WebSearchReloader::new(
+                    Arc::clone(&tool_registry),
+                    Arc::clone(&secret_vault),
+                    proxy.clone(),
+                ),
+                bash_permission: Arc::clone(&bash_permission),
+            },
+        ));
 
     // Sandbox FS scope is the workspace `work/` directory — the
     // ephemeral scratch root for tool-generated files. `ensure_layout`

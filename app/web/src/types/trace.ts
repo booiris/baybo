@@ -161,9 +161,15 @@ export type LlmCallInputs =
 export interface LlmCallBegin {
   model_id: string;
   provider: string;
-  provider_config_hash: string;
   input_messages: LlmCallInputs;
   temperature?: number | null;
+  /**
+   * The thinking level this call actually ran at, on baybo's ladder: the
+   * session's pin when set, else the entry's configured level, else whatever
+   * the provider resolves for itself. Absent when the provider's dialect
+   * carries no effort at all, and on spans recorded before the field existed.
+   */
+  reasoning_effort?: string | null;
   /**
    * The tool set this call offered the model. A reference, not the
    * definitions: every span in a session points at the same tens-of-KB set,
@@ -259,7 +265,6 @@ export interface LlmCallResult {
 
 export interface ToolCallBegin {
   tool_name: string;
-  tool_artifact_hash: string;
   triggered_by?: ToolCallOrigin | null;
   params: unknown;
 }

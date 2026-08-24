@@ -29,6 +29,7 @@ pub mod security;
 pub mod skills;
 pub mod tools;
 mod validate;
+pub mod web_search;
 pub mod workspace;
 
 use std::path::Path;
@@ -52,6 +53,7 @@ pub use crate::reload::{ConfigHandle, hot_reload_diff};
 pub use crate::security::SecurityConfig;
 pub use crate::skills::{RiskCheckConfig, SkillsConfig};
 pub use crate::tools::TrustLevelConfig;
+pub use crate::web_search::{WebSearchConfig, WebSearchProvider};
 pub use crate::workspace::WorkspaceConfig;
 pub use baybo_model::LlmEntryName;
 
@@ -84,6 +86,8 @@ pub struct BayboConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<ProxyConfig>,
     pub memory: MemoryConfig,
+    /// Pluggable web-search provider backing the `WebSearch` tool.
+    pub web_search: WebSearchConfig,
     /// Permission policy for shell-out tools. Hot-reloadable.
     #[serde(default)]
     pub permission: PermissionPolicy,

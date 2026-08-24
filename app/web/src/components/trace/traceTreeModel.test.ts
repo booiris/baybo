@@ -39,7 +39,7 @@ function mkSpan(id: string, stepId: string, outcome: LifecycleState): Span {
     step_id: stepId,
     kind: {
       kind: 'llm_call',
-      begin: { model_id: 'm', provider: 'p', provider_config_hash: 'h', input_messages: [] },
+      begin: { model_id: 'm', provider: 'p', input_messages: [] },
       result: null,
     },
     parallel_group: null,

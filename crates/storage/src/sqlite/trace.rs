@@ -353,7 +353,7 @@ mod tests {
                 begin: baybo_trace::LlmCallBegin {
                     model_id: "claude".into(),
                     provider: "anthropic".into(),
-                    provider_config_hash: "h".into(),
+                    reasoning_effort: None,
                     input_messages: LlmCallInputs::empty(),
                     temperature: None,
                     tools: None,
@@ -375,7 +375,6 @@ mod tests {
             kind: SpanKind::ToolCall {
                 begin: baybo_trace::ToolCallBegin {
                     tool_name: "bash".into(),
-                    tool_artifact_hash: "h".into(),
                     triggered_by: Some(ToolCallOrigin {
                         llm_span_id,
                         tool_use_id: "tu1".into(),

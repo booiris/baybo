@@ -59,6 +59,11 @@
       }
     }
   },
+  "web_search": {
+    "enabled": false,
+    "provider": "tavily",
+    "max_results": 8
+  },
   "workspace": {
     "path": "/home/YOUR_USER/.baybo"
   },

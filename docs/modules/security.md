@@ -105,7 +105,7 @@ Out of scope: the SSRF floor is an RFC-level deny list, not topology-aware. A li
 
 The floor's second consumer sits outside the tools layer: deck's host-mediated `ctx.fetch` (`crates/deck/src/host.rs`) reimplements both layers over `is_blocked_ip` — literal IPs are rejected at parse time; hostnames are resolved once, blocked addresses dropped, and the connection pinned to the vetted survivors (`resolve_to_addrs`), with redirects disabled outright.
 
-Any future HTTP-emitting builtin must apply the same two layers (`validate_url_with` + a `SafeResolver`-equivalent custom DNS resolver) at its entry point — the approval gate alone is not a substitute for the SSRF floor.
+Any future HTTP-emitting builtin must apply the same two layers (`validate_url_with` + a `SafeResolver`-equivalent custom DNS resolver) at its entry point — the approval gate alone is not a substitute for the SSRF floor — unless the destination is fixed by code or the operator and model input cannot change it. `WebSearch` is this exception: provider constructors validate HTTP(S) endpoints and disable redirects, but permit private addresses for self-hosted SearXNG. The exception does not extend to returned URLs; only `WebFetch` may dereference them under the full SSRF floor.
 
 ### SecretVault encryption
 
@@ -240,7 +240,7 @@ Security only decides allow/deny. It does not execute network access. There is n
 - Injection detection is log-only at inbound and log-plus-wrap at tool output; never auto-block user input on injection markers alone
 - Injection log severity is scoped by provenance, and provenance is decided by `ToolExecutor` and delivered on `ScanOrigin` — the detector never infers it from the text. Only `OutputSource::DeclaredFiles` tools reading inside the session's own checkout are demoted, and a tool may claim `DeclaredFiles` only if it enumerates every file its output came from (which rules out directory-rooted searches like `Grep` / `Glob`); nothing is suppressed, and inbound channel input is always `Foreign`
 - Any tool that reads filesystem paths MUST apply `is_sensitive_path` at its entry point, regardless of approval-gate status
-- Any tool that emits HTTP MUST apply both layers of the SSRF floor (`validate_url_with`-equivalent literal-IP rejection + a `SafeResolver`-equivalent DNS-time resolved-IP filter using `is_blocked_ip`) at its entry point, regardless of approval-gate status
+- Any tool that emits HTTP MUST apply both layers of the SSRF floor unless its destination is fixed by code or the operator and cannot be changed by model input; such a tool must still validate the endpoint and must not dereference returned URLs
 
 ## Collaboration
 

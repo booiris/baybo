@@ -333,7 +333,7 @@ function llmSpan(
       begin: {
         model_id: model,
         provider: 'anthropic',
-        provider_config_hash: 'mock-hash',
+        reasoning_effort: 'high',
         input_messages: messages,
         temperature: 0.7,
         tools: { hash: MOCK_TOOL_SET_HASH, count: MOCK_TOOL_SET.length },
@@ -375,7 +375,6 @@ function toolSpan(
       kind: 'tool_call',
       begin: {
         tool_name: toolName,
-        tool_artifact_hash: 'mock-tool-hash',
         triggered_by: { llm_span_id: llmSpanId, tool_use_id: toolUseId },
         params,
       },

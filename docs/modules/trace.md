@@ -35,11 +35,12 @@ pub enum StepKind {
 
 pub enum SpanKind {
     LlmCall {
-        begin: LlmCallBegin,            // model_id, provider, provider_config_hash, input_messages, temperature, tools
+        begin: LlmCallBegin,            // model_id, provider, input_messages,
+                                        // temperature, reasoning_effort, tools
         result: Option<LlmCallResult>,  // output_content, thinking, tool_calls, *_tokens (None while Pending)
     },
     ToolCall {
-        begin: ToolCallBegin,           // tool_name, tool_artifact_hash, triggered_by, params
+        begin: ToolCallBegin,           // tool_name, triggered_by, params
         result: Option<ToolCallResult>, // Inline/Persisted output, success (None while Pending)
     },
 }
@@ -56,7 +57,7 @@ pub enum SpanKind {
 
 ### Provenance lives on Span variants, not on Step
 
-Each `SpanKind` variant carries the provenance fields that apply to it (`model_id` and `provider` on `LlmCall`, `tool_artifact_hash` on `ToolCall`). Step is a pure container with no provenance.
+Each `SpanKind` variant carries the provenance fields that apply to it — `model_id`, `provider`, and `reasoning_effort` on `LlmCall`; `tool_name` on `ToolCall`. Step is a pure container with no provenance.
 
 ### SpanEvent is sanitize / approval audit, not control flow
 

@@ -163,6 +163,8 @@ impl ProgressObserverRunner {
             cancel_token,
         } = self;
 
+        let reasoning_effort = llm_client.effective_effort(request.reasoning_effort.as_deref());
+
         let cancel_ctx = Some((&cancel_token, baybo_turn::CancelReason::ParentCancelled));
         // Owned handle so the call below can `select!` on cancellation: an
         // undrainable last summary aborts instead of billing a discarded result.
@@ -170,7 +172,7 @@ impl ProgressObserverRunner {
         let begin = LlmCallBegin {
             model_id: model_info.id.clone(),
             provider: model_info.provider.clone(),
-            provider_config_hash: String::new(),
+            reasoning_effort,
             // Marker built at the iteration boundary: the cached transcript
             // prefix referenced by ordinal, the observer prompt inline as
             // the suffix — so each fire's span no longer re-embeds the whole

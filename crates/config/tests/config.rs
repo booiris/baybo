@@ -636,3 +636,108 @@ fn write_to_file_round_trips_through_load() {
     assert_eq!(loaded.agent.max_iterations, 7);
     std::fs::remove_file(&tmp).ok();
 }
+
+// -- web_search ---------------------------------------------------------------
+
+fn web_search_config(section: baybo_config::WebSearchConfig) -> BayboConfig {
+    BayboConfig {
+        web_search: section,
+        ..config_with_default_entry()
+    }
+}
+
+#[test]
+fn web_search_is_absent_from_a_config_that_predates_it() {
+    let c = BayboConfig::load_from_str(r#"{ "permission": "auto" }"#).expect("parse");
+    assert!(!c.web_search.enabled);
+    assert_eq!(c.web_search.provider, baybo_config::WebSearchProvider::Noop);
+}
+
+#[test]
+fn web_search_example_block_parses_and_is_off() {
+    let example = include_str!("../../../baybo.example.json");
+    let c = BayboConfig::load_from_str(example).expect("example config parses");
+    assert!(!c.web_search.enabled, "the example must not enable egress");
+    assert_eq!(
+        c.web_search.provider,
+        baybo_config::WebSearchProvider::Tavily
+    );
+
+    let raw: serde_json::Value = serde_json::from_str(example).expect("json");
+    let section = raw.get("web_search").expect("web_search block present");
+    assert!(
+        section.get("api_key").is_none() && section.get("api_key_name").is_none(),
+        "the example must show no credential — not even the name, so operators \
+         learn the per-provider default"
+    );
+}
+
+#[test]
+fn web_search_base_url_must_be_http() {
+    let c = web_search_config(baybo_config::WebSearchConfig {
+        base_url: Some("ftp://example.com".into()),
+        ..Default::default()
+    });
+    let errors = unwrap_validation(c.validate().expect_err("bad scheme"));
+    assert!(has_field(&errors, "web_search.base_url"));
+}
+
+#[test]
+fn searxng_without_a_base_url_fails_validation() {
+    let c = web_search_config(baybo_config::WebSearchConfig {
+        enabled: true,
+        provider: baybo_config::WebSearchProvider::Searxng,
+        ..Default::default()
+    });
+    let errors = unwrap_validation(c.validate().expect_err("no base_url"));
+    assert!(has_field(&errors, "web_search.base_url"));
+
+    // …and with one it is fine.
+    let c = web_search_config(baybo_config::WebSearchConfig {
+        enabled: true,
+        provider: baybo_config::WebSearchProvider::Searxng,
+        base_url: Some("http://searxng.internal:8080".into()),
+        ..Default::default()
+    });
+    assert!(c.validate().is_ok());
+}
+
+#[test]
+fn web_search_max_results_is_bounded_at_both_ends() {
+    let c = web_search_config(baybo_config::WebSearchConfig {
+        max_results: 0,
+        ..Default::default()
+    });
+    let errors = unwrap_validation(c.validate().expect_err("zero"));
+    assert!(has_field(&errors, "web_search.max_results"));
+
+    let c = web_search_config(baybo_config::WebSearchConfig {
+        max_results: baybo_config::web_search::MAX_RESULTS_CEILING + 1,
+        ..Default::default()
+    });
+    let errors = unwrap_validation(c.validate().expect_err("over ceiling"));
+    assert!(has_field(&errors, "web_search.max_results"));
+}
+
+/// The mistake this catches is pasting the key itself into the field that
+/// names it — which would write a live credential into `baybo.json`.
+#[test]
+fn web_search_api_key_name_rejects_a_literal_key() {
+    for bad in ["tvly-abc123", "", "  "] {
+        let c = web_search_config(baybo_config::WebSearchConfig {
+            api_key_name: Some(bad.into()),
+            ..Default::default()
+        });
+        let errors = unwrap_validation(c.validate().expect_err("literal key or blank"));
+        assert!(
+            has_field(&errors, "web_search.api_key_name"),
+            "accepted {bad:?}"
+        );
+    }
+
+    let c = web_search_config(baybo_config::WebSearchConfig {
+        api_key_name: Some("TAVILY_API_KEY".into()),
+        ..Default::default()
+    });
+    assert!(c.validate().is_ok());
+}
