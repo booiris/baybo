@@ -26,6 +26,9 @@ struct ProjectBoardScreen: View {
     @State private var assigning: IssueInfo?
     @State private var assignThenMoveTo: IssueStatus?
     @State private var showsFilter = false
+    @State private var showsTeam = false
+    @State private var showsActivity = false
+    @State private var showsSettings = false
     @State private var filter = BoardFilter()
     /// What the last move said, and — only when it can be taken back — how.
     @State private var toast: Toast?
@@ -121,6 +124,28 @@ struct ProjectBoardScreen: View {
         }
         .sheet(isPresented: $showsFilter) {
             BoardFilterSheet(filter: $filter, team: board?.team ?? [])
+        }
+        .sheet(isPresented: $showsTeam) {
+            ProjectTeamSheet(projectId: projectId)
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+                .presentationBackground(Theme.paper)
+        }
+        .sheet(isPresented: $showsActivity) {
+            ProjectActivityScreen(projectId: projectId)
+                .presentationDetents([.large])
+                .presentationDragIndicator(.visible)
+                .presentationBackground(Theme.paper)
+        }
+        .sheet(isPresented: $showsSettings) {
+            if let project {
+                ProjectSettingsSheet(project: project) {
+                    Task { await projects.refreshRoot() }
+                }
+                .presentationDetents([.large])
+                .presentationDragIndicator(.visible)
+                .presentationBackground(Theme.paper)
+            }
         }
     }
 
@@ -372,10 +397,8 @@ struct ProjectBoardScreen: View {
             Spacer(minLength: 6)
             if let meter = budgetMeter, meter.burn == .over {
                 Button {
-                    // Settings lands in P7; until then the chip still says
-                    // which ceiling stopped the board, which is the part an
-                    // operator acts on.
                     Haptics.tap()
+                    showsSettings = true
                 } label: {
                     HStack(spacing: 4) {
                         Image(systemName: "pause.circle")
@@ -426,11 +449,30 @@ struct ProjectBoardScreen: View {
         Menu {
             Button {
                 Haptics.tap()
+                showsActivity = true
+            } label: {
+                Label(lang.t("activity.title"), systemImage: "clock.arrow.circlepath")
+            }
+            Button {
+                Haptics.tap()
+                showsTeam = true
+            } label: {
+                Label(lang.t("team.title"), systemImage: "person.2")
+            }
+            Button {
+                Haptics.tap()
                 markAllRead()
             } label: {
                 Label(lang.t("board.markAllRead", "\(unreadTotal)"), systemImage: "envelope.open")
             }
             .disabled(unreadTotal == 0 || isReadOnly)
+            Button {
+                Haptics.tap()
+                showsSettings = true
+            } label: {
+                Label(lang.t("settings.title"), systemImage: "gearshape")
+            }
+            .disabled(project == nil)
         } label: {
             Image(systemName: "ellipsis")
                 .font(.system(size: 13, weight: .semibold))

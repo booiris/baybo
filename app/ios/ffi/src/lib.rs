@@ -885,6 +885,26 @@ impl BayboClient {
         .await
     }
 
+    /// Pin (or clear) an agent's LLM, model and thinking level.
+    ///
+    /// The pin is replaced WHOLE: absent at each level means inherit, so
+    /// clearing means passing all three as `None` rather than one. The
+    /// builtin lead follows `default-llm` and refuses a pin — clearing it is
+    /// the no-op it accepts.
+    pub async fn agent_set_model(
+        self: Arc<Self>,
+        agent_id: String,
+        llm: Option<String>,
+        model: Option<String>,
+        reasoning_effort: Option<String>,
+    ) -> Result<(), BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::set_agent_model(&client, agent_id, llm, model, reasoning_effort).await
+        })
+        .await
+    }
+
     /// Take an agent off a board. Refused for the lead, and for an agent
     /// with a run in flight.
     pub async fn project_remove_agent(

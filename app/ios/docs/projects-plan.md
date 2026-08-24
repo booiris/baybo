@@ -179,9 +179,35 @@ finished writes its last rows after the settle stamp, so stopping at the stamp
 would leave the final answer off the page.
 
 
-## P7 · Team / profile / Activity / Settings
+## P7 · Team / profile / Activity / Settings — **done**
 
 - Team sheet and Agent profile (model pin through `agent_set_model`; Remove hidden for the lead, explained for a busy agent); the Activity push screen (unknown kinds fall back rather than crash); Project settings (the PUT full replace means the form must send every field back; Archive behind a `ConfirmDialog`).
+
+`agent_set_model` was P1's one deferral and lands here — with the rule the
+gateway's own doc states and nothing else enforces: **the pin is replaced
+whole**. Absent means "inherit" at each level, so clearing is all three levels
+at once and a partial body leaves two thirds of a pin pointing at an entry the
+agent no longer uses. Three ffi tests pin it, including that the nulls are
+SENT rather than skipped.
+
+**The profile offers entries only**, not the entry→model→effort ladder the chat
+header's picker walks. An agent's pin is a board-level decision made rarely,
+and three levels of menu on a sheet inside a sheet is a place to get lost; the
+entry's own default model and level are what the server uses, which is the
+honest thing for a screen this size to promise.
+
+**Project settings send every field on every save**, because the PUT is a full
+replace — a partial body clears a budget by omitting it, which fails exactly as
+silently as a partial agent pin.
+
+Archive's confirm says the part an operator gets wrong: archiving does **not**
+stop what is already running. Runs in flight finish; the board stops taking
+writes and stops answering approvals.
+
+**`LocalizedKeyTests` earned its keep again**: the Activity screen reached for
+`issue.system`, which exists in the WEB locales and not in the Swift catalog —
+a row that would have printed the raw key.
+
 
 ## P8 · Wrap-up
 

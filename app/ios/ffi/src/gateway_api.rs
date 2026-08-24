@@ -22,6 +22,7 @@ const PATH_CHAT_SUBAGENTS: &str = "/v1/chat/subagents";
 const PATH_CHAT_SEARCH: &str = "/v1/chat/search";
 const PATH_CRON: &str = "/v1/cron";
 const PATH_LLM_MODELS: &str = "/v1/llm/models";
+const PATH_AGENTS: &str = "/v1/agents";
 const PATH_DECK: &str = "/v1/deck";
 /// The kanban boards. Every card, run, comment and approval on the phone
 /// rides this path space — see `app/ios/docs/projects.md`.
@@ -2177,6 +2178,37 @@ pub(crate) async fn list_team<C: GatewayJsonClient + Sync>(
         .collect())
 }
 
+/// Pin (or clear) an agent's LLM, model and thinking level.
+///
+/// **The whole pin, replaced as one.** Absent means "inherit" at each level,
+/// so an empty body clears it entirely rather than leaving two thirds of it
+/// pointing at an entry the agent no longer uses. Sending a model without an
+/// entry is a 400 — there is no entry to pick it within — which is why the
+/// caller must send both or neither.
+pub(crate) async fn set_agent_model<C: GatewayJsonClient + Sync>(
+    client: &C,
+    agent_id: String,
+    llm: Option<String>,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+) -> Result<(), String> {
+    validate_path_segment(&agent_id, "agent_id")?;
+    #[derive(serde::Serialize)]
+    struct SetAgentModelRequest {
+        llm: Option<String>,
+        model: Option<String>,
+        reasoning_effort: Option<String>,
+    }
+    let path = format!("{PATH_AGENTS}/{}/model", percent_encode(&agent_id));
+    let body = serde_json::to_vec(&SetAgentModelRequest {
+        llm,
+        model,
+        reasoning_effort,
+    })
+    .map_err(|e| format!("encode agent model: {e}"))?;
+    client.put_empty(&path, body).await
+}
+
 pub(crate) async fn remove_team_member<C: GatewayJsonClient + Sync>(
     client: &C,
     project: String,
@@ -3805,4 +3837,62 @@ mod tests {
             r#"{"kind":"history_page","rows":[{"id":"r1"}],"oldest_ordinal":4,"newest_ordinal":9,"has_more":true}"#
         );
     }
+
+    /// The pin is replaced WHOLE, so every level is sent — including the ones
+    /// that are `null`. An encoder that skipped them would leave two thirds of
+    /// a pin pointing at an entry the agent no longer uses, and clearing would
+    /// be unreachable.
+    #[tokio::test]
+    async fn an_agent_model_pin_sends_every_level_including_the_cleared_ones() {
+        let client = RecordingClient::empty();
+        set_agent_model(
+            &client,
+            "a-dev".into(),
+            Some("claude".into()),
+            Some("claude-sonnet-5".into()),
+            None,
+        )
+        .await
+        .expect("set model");
+        let call = client.only_call();
+        assert_eq!(call.method, "PUT");
+        assert_eq!(call.path, "/v1/agents/a-dev/model");
+        assert!(call.body.contains("\"llm\":\"claude\""), "{}", call.body);
+        assert!(
+            call.body.contains("\"model\":\"claude-sonnet-5\""),
+            "{}",
+            call.body
+        );
+        assert!(
+            call.body.contains("\"reasoning_effort\":null"),
+            "an absent level must be sent as null, not omitted: {}",
+            call.body
+        );
+    }
+
+    /// Clearing is all three at once. Anything less leaves a partial pin.
+    #[tokio::test]
+    async fn clearing_a_pin_sends_three_nulls() {
+        let client = RecordingClient::empty();
+        set_agent_model(&client, "a-dev".into(), None, None, None)
+            .await
+            .expect("clear model");
+        let call = client.only_call();
+        assert_eq!(
+            call.body, r#"{"llm":null,"model":null,"reasoning_effort":null}"#,
+            "clearing must name every level"
+        );
+    }
+
+    /// An agent id reaches the PATH, so a traversal attempt is refused rather
+    /// than encoded — the same gate every other path segment goes through.
+    #[tokio::test]
+    async fn an_agent_id_may_not_name_a_path() {
+        let client = RecordingClient::empty();
+        let err = set_agent_model(&client, "../admin".into(), None, None, None)
+            .await
+            .expect_err("a traversal must be refused");
+        assert!(err.contains("agent_id"), "{err}");
+    }
 }
+

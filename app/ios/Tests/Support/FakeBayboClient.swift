@@ -664,6 +664,11 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     func projectRemoveAgent(projectId: String, agentId: String) async throws {
         throw Self.unsupported
     }
+    func agentSetModel(
+        agentId: String, llm: String?, model: String?, reasoningEffort: String?
+    ) async throws {
+        throw Self.unsupported
+    }
     func projectsAttention() async throws -> [ProjectAttention] {
         try refuseIfOffline()
         return stubAttention
