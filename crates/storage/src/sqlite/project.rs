@@ -196,9 +196,53 @@ const UNSEEN_FAILURE_PREDICATE: &str =
 /// A run that was never claimed has a NULL `started_at`, which makes every
 /// comparison NULL: it matches nothing and reads zero rather than
 /// inheriting the session's whole history.
-const RUN_COST_WINDOW: &str = "c.session_id = r.session_id \
+/// The session test is a spawn *tree*, not one id: a subagent bills against
+/// its own session, and billing the run only for the session it works in
+/// directly would let a subagent-heavy run read near zero. A subagent
+/// inherits `root_session_id` from the ultimate ancestor and a run's session
+/// is itself a root, so `root_session_id = r.session_id` is exactly that
+/// run's tree. The direct `c.session_id = r.session_id` disjunct stays in
+/// front of it deliberately: it needs no `sessions` row, so a run's own
+/// spend is never contingent on a second table resolving.
+const RUN_COST_WINDOW: &str = "(c.session_id = r.session_id \
+          OR c.session_id IN (SELECT s.id FROM sessions s \
+                              WHERE s.root_session_id = r.session_id)) \
      AND c.timestamp >= r.started_at \
      AND (r.settled_at IS NULL OR c.timestamp < r.settled_at)";
+
+/// Every session one board answers for, as a predicate over `cost_records c`
+/// with the board id bound at `?1`. Three membership sources, united rather
+/// than reduced to the one that subsumes the others in practice:
+///
+/// - the board's own run sessions, straight off `issue_runs` — the only
+///   source that needs no `sessions` row, and so the one that keeps a
+///   board's burn from depending on a second table;
+/// - every session whose trigger names the board. That is what brings a
+///   board-bound **cron fire** inside the ceiling: it files work on the
+///   board and bills real tokens, but it is nobody's run, so no
+///   `issue_runs` row will ever point at it;
+/// - every session rooted at one of those run sessions — the same spawn
+///   tree [`RUN_COST_WINDOW`] bills a run for.
+///
+/// The third is redundant with the second while subagents inherit their
+/// parent's trigger, and is kept anyway because it is what makes
+/// `board ⊇ every run on it` true *structurally*. The card-level and
+/// board-level meters have to widen together; a card whose total exceeded
+/// its board's would be the exact failure this pairing exists to prevent.
+///
+/// Written as a session *set* the row must fall in, and deliberately not as
+/// a per-row `COALESCE(...)` that resolves each cost row's board: the set is
+/// built once from three indexed reads, while the per-row form costs three
+/// probes on every cost record in the window. Measured on 220k sessions /
+/// 400k cost records, one day's window: 1.9 ms for this, 235 ms for the
+/// per-row form. The window holds far more cost rows than a board has
+/// sessions, and that is the ordinary shape.
+const BOARD_SESSIONS: &str = "(c.session_id IN (SELECT session_id FROM issue_runs \
+                                  WHERE project_id = ?1 AND session_id IS NOT NULL) \
+      OR c.session_id IN (SELECT s.id FROM sessions s \
+                          WHERE s.project_id = ?1 \
+                             OR s.root_session_id IN (SELECT session_id FROM issue_runs \
+                                  WHERE project_id = ?1 AND session_id IS NOT NULL)))";
 
 /// Shared money/token aggregates; cached-token columns are input subsets.
 const SPEND_SUMS: &str = "COALESCE(SUM(c.input_tokens), 0), COALESCE(SUM(c.output_tokens), 0), \
@@ -613,9 +657,7 @@ impl ProjectStore for SqliteProjectStore {
                 Ok(conn.query_row(
                     &format!(
                         "SELECT {SPEND_SUMS} FROM cost_records c \
-                         WHERE c.timestamp >= ?2 AND c.session_id IN ( \
-                             SELECT session_id FROM issue_runs \
-                             WHERE project_id = ?1 AND session_id IS NOT NULL)"
+                         WHERE c.timestamp >= ?2 AND {BOARD_SESSIONS}"
                     ),
                     rusqlite::params![project, since],
                     |row| spend_from_row(row, 0),
@@ -1471,13 +1513,26 @@ impl ProjectStore for SqliteProjectStore {
                     // budget in the dropdown, and a burn that measured
                     // something else than the gate does would accuse the
                     // board of overspending a ceiling it never crossed.
-                    // `DISTINCT` is what stops a session shared by several
-                    // runs being counted once per run.
+                    // Hence the same three membership sources
+                    // `BOARD_SESSIONS` unites, spelled here as the
+                    // (board, session) pairs this has to GROUP BY. `UNION`
+                    // and not `UNION ALL`: a session reachable two ways —
+                    // the ordinary case, since a run session also carries
+                    // the board on its trigger — must contribute once, and
+                    // so must a session shared by several runs.
                     let mut stmt = conn.prepare(&format!(
                         "SELECT r.project_id, {SPEND_SUMS} \
                          FROM cost_records c \
-                         JOIN (SELECT DISTINCT project_id, session_id FROM issue_runs \
-                               WHERE session_id IS NOT NULL) r \
+                         JOIN (SELECT project_id, session_id FROM issue_runs \
+                                 WHERE session_id IS NOT NULL \
+                               UNION \
+                               SELECT s.project_id, s.id FROM sessions s \
+                                 WHERE s.project_id IS NOT NULL \
+                               UNION \
+                               SELECT r2.project_id, s.id \
+                                 FROM sessions s \
+                                 JOIN issue_runs r2 ON r2.session_id = s.root_session_id \
+                                 WHERE r2.session_id IS NOT NULL) r \
                            ON r.session_id = c.session_id \
                          WHERE c.timestamp >= ?1 \
                          GROUP BY r.project_id"
@@ -3229,6 +3284,263 @@ mod tests {
         assert_eq!(rows.len(), 1, "the queued run is still listed");
         assert_eq!(rows[0].run_id, queued.id);
         assert_eq!(rows[0].spend, baybo_store::project::Spend::default());
+    }
+
+    /// The bare `sessions` row the spend readers join against. Raw SQL and
+    /// not a `Session`: the only columns under test are the id, the root
+    /// that ties a subagent to the run that spawned it, and the trigger the
+    /// `project_id` column is generated from.
+    async fn session_row(pool: &SqlitePool, id: &str, root: &str, trigger: &str) {
+        let (id, root, trigger) = (id.to_owned(), root.to_owned(), trigger.to_owned());
+        pool.interact("test.session_row", move |conn| {
+            conn.execute(
+                "INSERT INTO sessions \
+                     (id, root_session_id, trigger_kind, created_at, last_active, data) \
+                 VALUES (?1, ?2, 'issue', 0, 0, ?3)",
+                rusqlite::params![id, root, trigger],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn record_cost(
+        costs: &crate::sqlite::cost::SqliteCostStore,
+        session: &str,
+        at: chrono::DateTime<chrono::Utc>,
+        micros: i64,
+    ) {
+        baybo_store::cost::CostStore::record(
+            costs,
+            &baybo_model::CostRecord {
+                user_id: "u".into(),
+                session_id: SessionId::from(session.to_owned()),
+                turn_id: baybo_model::TurnId::new(),
+                span_id: baybo_model::SpanId::new(),
+                reason: baybo_model::CallReason::default(),
+                model: "m".into(),
+                reasoning_effort: None,
+                input_tokens: 1,
+                output_tokens: 1,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cost_usd: baybo_model::MicroUsd::from_micros(micros),
+                timestamp: at,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    /// A subagent bills against its own session id, so the run that spawned
+    /// it only sees that spend through `root_session_id`. Without the
+    /// rollup a subagent-heavy run reads near zero — and, worse, escapes
+    /// the ceiling that is supposed to stop it.
+    #[tokio::test]
+    async fn a_subagents_spend_bills_the_run_that_spawned_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(dir.path().join("test.db")).await.unwrap();
+        let store = SqliteProjectStore::new(pool.clone());
+        let costs = crate::sqlite::cost::SqliteCostStore::new(pool.clone());
+
+        let p = project("01JSUBAGENT", "delegating");
+        store.create_project(&p).await.unwrap();
+        let issue = store
+            .create_issue(&new_issue(&p.id, "spawns helpers", IssueStatus::Todo))
+            .await
+            .unwrap();
+
+        let root = "sess-root";
+        let trigger = format!(
+            r#"{{"trigger":{{"kind":"issue","project_id":"{}","issue_id":"{}","number":{}}}}}"#,
+            p.id.as_str(),
+            issue.id.as_str(),
+            issue.number
+        );
+        session_row(&pool, root, root, &trigger).await;
+        session_row(&pool, "subagent-1", root, &trigger).await;
+
+        let run = store.enqueue_run(&new_run(&issue)).await.unwrap();
+        store
+            .claim_run(&run.id, &SessionId::from(root.to_owned()))
+            .await
+            .unwrap();
+
+        // The negative control, and the whole reason a second board is here:
+        // the rollup has to be scoped to *this* run's root. Without a tree
+        // that must stay out, `root_session_id = r.session_id` and
+        // `root_session_id IS NOT NULL` are indistinguishable — every
+        // assertion below passes while each run bills for every subagent in
+        // the database.
+        let other = project("01JOTHERBOARD", "someone else");
+        store.create_project(&other).await.unwrap();
+        let other_issue = store
+            .create_issue(&new_issue(&other.id, "elsewhere", IssueStatus::Todo))
+            .await
+            .unwrap();
+        let other_trigger = format!(
+            r#"{{"trigger":{{"kind":"issue","project_id":"{}","issue_id":"{}","number":{}}}}}"#,
+            other.id.as_str(),
+            other_issue.id.as_str(),
+            other_issue.number
+        );
+        session_row(&pool, "sess-other", "sess-other", &other_trigger).await;
+        session_row(&pool, "subagent-other", "sess-other", &other_trigger).await;
+        let other_run = store.enqueue_run(&new_run(&other_issue)).await.unwrap();
+        store
+            .claim_run(&other_run.id, &SessionId::from("sess-other".to_owned()))
+            .await
+            .unwrap();
+
+        let now = chrono::Utc::now();
+        record_cost(&costs, root, now, 1_000).await;
+        record_cost(&costs, "subagent-1", now, 500).await;
+        record_cost(&costs, "sess-other", now, 4_000).await;
+        record_cost(&costs, "subagent-other", now, 9_000).await;
+
+        let rows = store.run_spend(&issue.id).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].spend.cost,
+            baybo_model::MicroUsd::from_micros(1_500),
+            "the run pays for what its subagent spent"
+        );
+        assert_eq!(rows[0].spend.tokens(), 4, "…tokens along with the money");
+
+        let facts = store
+            .settled_run_facts(std::slice::from_ref(&run.id))
+            .await
+            .unwrap();
+        assert_eq!(
+            facts[0].spend, rows[0].spend,
+            "the feed and the execution log are the same predicate"
+        );
+
+        let since = now - chrono::Duration::hours(1);
+        assert_eq!(
+            store.spend_since(&p.id, since).await.unwrap().cost,
+            baybo_model::MicroUsd::from_micros(1_500),
+            "and the board's meter sees at least what its cards do"
+        );
+        let board = store.board_activity(since).await.unwrap();
+        let burn = |id: &ProjectId| {
+            board
+                .iter()
+                .find(|(row, _)| row == id)
+                .map(|(_, a)| a.burn)
+                .unwrap()
+        };
+        assert_eq!(
+            burn(&p.id).cost,
+            baybo_model::MicroUsd::from_micros(1_500),
+            "the dropdown's burn measures the same thing the gate does"
+        );
+        assert_eq!(burn(&p.id).tokens(), 4);
+
+        // The control read back: the other board's tree is wholly its own,
+        // at every altitude.
+        assert_eq!(
+            store.run_spend(&other_issue.id).await.unwrap()[0]
+                .spend
+                .cost,
+            baybo_model::MicroUsd::from_micros(13_000)
+        );
+        assert_eq!(
+            store.spend_since(&other.id, since).await.unwrap().cost,
+            baybo_model::MicroUsd::from_micros(13_000)
+        );
+        assert_eq!(
+            burn(&other.id).cost,
+            baybo_model::MicroUsd::from_micros(13_000)
+        );
+    }
+
+    /// A cron fire that files onto a board burns real tokens and is nobody's
+    /// run, so no `issue_runs` row will ever point at its session. The board
+    /// it names on its trigger is the only thing that can bill it.
+    #[tokio::test]
+    async fn a_board_bound_cron_fire_bills_the_board_it_files_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(dir.path().join("test.db")).await.unwrap();
+        let store = SqliteProjectStore::new(pool.clone());
+        let costs = crate::sqlite::cost::SqliteCostStore::new(pool.clone());
+
+        let p = project("01JCRONBOARD", "swept");
+        store.create_project(&p).await.unwrap();
+
+        let fire = "cron-fire-1";
+        session_row(
+            &pool,
+            fire,
+            fire,
+            &format!(
+                r#"{{"trigger":{{"kind":"cron","cron_job_id":"j1","project_id":"{}"}}}}"#,
+                p.id.as_str()
+            ),
+        )
+        .await;
+        // Two controls, because the two ways to get this wrong are
+        // different. A fire on no board at all catches a predicate that
+        // forgot to require one…
+        session_row(
+            &pool,
+            "cron-fire-loose",
+            "cron-fire-loose",
+            r#"{"trigger":{"kind":"cron","cron_job_id":"j2"}}"#,
+        )
+        .await;
+        // …and a fire bound to a *different* board catches one that
+        // required a board but not *this* board — which the loose fire
+        // cannot, since it is excluded either way.
+        let other = project("01JOTHERCRON", "not swept here");
+        store.create_project(&other).await.unwrap();
+        session_row(
+            &pool,
+            "cron-fire-elsewhere",
+            "cron-fire-elsewhere",
+            &format!(
+                r#"{{"trigger":{{"kind":"cron","cron_job_id":"j3","project_id":"{}"}}}}"#,
+                other.id.as_str()
+            ),
+        )
+        .await;
+
+        let now = chrono::Utc::now();
+        record_cost(&costs, fire, now, 700).await;
+        record_cost(&costs, "cron-fire-loose", now, 900).await;
+        record_cost(&costs, "cron-fire-elsewhere", now, 1_300).await;
+
+        let since = now - chrono::Duration::hours(1);
+        assert_eq!(
+            store.spend_since(&p.id, since).await.unwrap().cost,
+            baybo_model::MicroUsd::from_micros(700),
+            "the bound fire is inside the ceiling; neither control is"
+        );
+        assert_eq!(
+            store.spend_since(&other.id, since).await.unwrap().cost,
+            baybo_model::MicroUsd::from_micros(1_300),
+            "and the other board bills its own fire, not this one's"
+        );
+
+        let board = store.board_activity(since).await.unwrap();
+        let burn = |id: &ProjectId| {
+            board
+                .iter()
+                .find(|(row, _)| row == id)
+                .map(|(_, a)| a.burn)
+                .unwrap()
+        };
+        assert_eq!(burn(&p.id).cost, baybo_model::MicroUsd::from_micros(700));
+        assert_eq!(burn(&p.id).tokens(), 2);
+        assert_eq!(
+            burn(&other.id).cost,
+            baybo_model::MicroUsd::from_micros(1_300)
+        );
+        assert!(
+            board.len() == 2,
+            "the loose fire creates no board row at all"
+        );
     }
 
     #[tokio::test]

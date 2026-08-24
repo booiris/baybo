@@ -509,7 +509,9 @@ announces which of these will happen before sending.
   created_at. The activity feed is a project-wide query over this table —
   derived, not stored twice (the cron-groups lesson).
 - `issue_runs` — id, issue_id, agent_id, session_id, trigger, status
-  (`queued|running|done|failed|cancelled`), attempt, timestamps, cost.
+  (`queued|running|done|failed|cancelled`), attempt, timestamps. No `cost`
+  column: spend is derived from `cost_records` through the run's session
+  tree and claim→settle window (see `docs/modules/project.md`).
 - Project agents reuse `agent_profiles` exactly as the multi-project
   design specified: nullable `project_id`, `handle`, `created_by`,
   `deleted_at`; global rosters filter `project_id IS NULL`.

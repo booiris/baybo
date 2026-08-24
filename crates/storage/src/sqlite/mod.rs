@@ -522,6 +522,14 @@ const ADD_COLUMNS: &[AddColumn] = &[
         column: "resumes",
         definition: "INTEGER NOT NULL DEFAULT 0",
     },
+    // VIRTUAL, so this reads existing rows the moment it is added: there is
+    // no backfill to write and nothing to keep in step with `data`. STORED
+    // would need both.
+    AddColumn {
+        table: "sessions",
+        column: "project_id",
+        definition: "TEXT GENERATED ALWAYS AS (json_extract(data, '$.trigger.project_id')) VIRTUAL",
+    },
 ];
 
 /// Pool of sqlite connections.
@@ -901,13 +909,26 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     -- max-wins) and omitted from save's DO UPDATE like every
                     -- other flat column. See docs/modules/memory-builtin.md.
                     dreamed_through_ordinal INTEGER,
-                    data                  TEXT NOT NULL
+                    data                  TEXT NOT NULL,
+                    -- The board this session's work belongs to, extracted
+                    -- from the trigger rather than stored a second time.
+                    -- Both board-bearing triggers keep it at the same JSON
+                    -- path: `Issue` always carries one, `Cron` carries one
+                    -- when the job files onto a board. A subagent inherits
+                    -- its parent's trigger, so a whole spawn tree answers
+                    -- this column identically without walking lineage.
+                    -- NULL for ordinary chat and for board-less cron.
+                    project_id            TEXT GENERATED ALWAYS AS
+                                          (json_extract(data, '$.trigger.project_id')) VIRTUAL
                 );
-                -- idx_sessions_root is no longer created (2026-07
-                -- unused-column audit: it indexed a column no query
-                -- filters on). Old DBs keep their orphan copy. The
-                -- root_session_id column itself stays written — the data
-                -- blob's copy is what consumers read today.
+                -- Serves the board spend readers, which bill a run for what
+                -- its subagents spent: a subagent session's root is the
+                -- session the run works in, so this is the edge from one
+                -- run to its whole spawn tree. (Dropped in the 2026-07
+                -- unused-column audit when nothing filtered on the column;
+                -- the budget gate now does.)
+                CREATE INDEX IF NOT EXISTS idx_sessions_root
+                    ON sessions(root_session_id);
                 -- User-created folders for organising the chat-session list.
                 -- Two-level tree via self-referential `parent_id` (NULL =
                 -- top-level; the depth cap of 2 is enforced in the session
@@ -1563,9 +1584,9 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                 -- two rules downstream depend on *it* rather than on the one
                 -- above, and would break silently if the one above were ever
                 -- widened to allow a card more than one live run:
-                --   * `RUN_COST_WINDOW` attributes a cost row by session and
-                --     claim→settle window, and one session is shared by every
-                --     run the same agent makes on a card
+                --   * `RUN_COST_WINDOW` attributes a cost row by session tree
+                --     and claim→settle window, and one session is shared by
+                --     every run the same agent makes on a card
                 --     (`runs::session_run_to_continue`), so two live runs of
                 --     one agent give two overlapping windows over one
                 --     transcript and bill the card twice;
@@ -1681,10 +1702,25 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
          CREATE INDEX IF NOT EXISTS idx_agent_profiles_team
              ON agent_profiles(project_id)
              WHERE project_id IS NOT NULL AND deleted_at IS NULL;
+         -- The other half of the budget gate's membership test: every
+         -- session whose trigger names the board, which is what brings a
+         -- board-bound cron fire — and every subagent of one — inside the
+         -- ceiling. On the migration-added generated column, so it is
+         -- created here rather than in the schema batch.
+         CREATE INDEX IF NOT EXISTS idx_sessions_project
+             ON sessions(project_id) WHERE project_id IS NOT NULL;
          -- Serves the budget gate: one board's run sessions, which the
          -- spend query joins `cost_records` against.
          CREATE INDEX IF NOT EXISTS idx_issue_runs_project_session
              ON issue_runs(project_id, session_id) WHERE session_id IS NOT NULL;
+         -- The same rows addressed the other way, for `board_activity`:
+         -- it asks every board at once, so it holds no board id to lead
+         -- the index above with, and two of its three union arms read
+         -- `issue_runs` by session alone. Session-first is the only
+         -- ordering that answers that, and carrying `project_id` second
+         -- keeps both arms covering.
+         CREATE INDEX IF NOT EXISTS idx_issue_runs_session
+             ON issue_runs(session_id, project_id) WHERE session_id IS NOT NULL;
          -- Serves the stage barrier and the card's progress ring: one
          -- parent's children, in stage order.
          -- One LIVE card per key per board. The card leaves the index when
@@ -2220,6 +2256,87 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
             assert_eq!((model, effort), (None, None));
+            Ok(())
+        })
+        .await
+        .expect("assert interact");
+    }
+
+    /// `sessions.project_id` is GENERATED, which puts it on the one pragma
+    /// that reports generated columns: `table_xinfo` sees it, `table_info`
+    /// does not. `has_column` reads `table_xinfo` — read the other and the
+    /// ALTER is re-attempted on every boot and trips `duplicate column
+    /// name`, so the second start of an upgraded install fails, not the
+    /// first. Being VIRTUAL, it also has to read rows written long before
+    /// it existed with no backfill.
+    #[tokio::test]
+    async fn a_pre_board_database_gains_the_generated_project_column_and_reopens() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("legacy.db");
+        // The pre-change shape is this schema minus the one column, taken by
+        // dropping it rather than by hand-copying the CREATE TABLE — a copy
+        // rots the moment any other column moves, and would then be testing
+        // a database no install ever had.
+        {
+            SqlitePool::open(&path).await.expect("build current");
+            let conn = rusqlite::Connection::open(&path).expect("open raw");
+            conn.execute_batch(
+                "DROP INDEX IF EXISTS idx_sessions_project;
+                 ALTER TABLE sessions DROP COLUMN project_id;
+                 INSERT INTO sessions
+                     (id, root_session_id, trigger_kind, created_at, last_active, data)
+                 VALUES
+                     ('s-board', 's-board', 'issue', 1, 1,
+                      '{\"trigger\":{\"kind\":\"issue\",\"project_id\":\"01JBOARD\"}}'),
+                     ('s-chat', 's-chat', 'user', 1, 1,
+                      '{\"trigger\":{\"kind\":\"user\"}}');",
+            )
+            .expect("seed the pre-board shape");
+            let gone: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM pragma_table_xinfo('sessions') WHERE name = 'project_id'",
+                    [],
+                    |r| r.get(0),
+                )
+                .expect("probe");
+            assert_eq!(gone, 0, "the fixture must actually predate the column");
+        }
+
+        for _ in 0..3 {
+            SqlitePool::open(&path).await.expect("reopen must migrate");
+        }
+
+        let pool = SqlitePool::open(&path).await.expect("open must migrate");
+        pool.interact("test.assert_project_column", |conn| {
+            let declared: i64 = conn.query_row(
+                "SELECT count(*) FROM pragma_table_xinfo('sessions') WHERE name = 'project_id'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(declared, 1, "added exactly once across repeated boots");
+            let indexed: i64 = conn.query_row(
+                "SELECT count(*) FROM sqlite_master \
+                 WHERE type = 'index' AND name = 'idx_sessions_project'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(indexed, 1, "and its index is created after the ALTER");
+            let board: Option<String> = conn.query_row(
+                "SELECT project_id FROM sessions WHERE id = 's-board'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(
+                board.as_deref(),
+                Some("01JBOARD"),
+                "a row written before the column reads its board with no backfill"
+            );
+            let chat: Option<String> = conn.query_row(
+                "SELECT project_id FROM sessions WHERE id = 's-chat'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(chat, None, "ordinary chat belongs to no board");
             Ok(())
         })
         .await

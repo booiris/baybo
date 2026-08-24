@@ -538,14 +538,36 @@ daemon died under keeps everything it had already spent. The cost of that
 is a duration spanning the downtime — the honest number for a window that
 bills those hours.
 
-Two things the window does not see, both named here so they are not
-rediscovered as bugs: a **subagent** spawned by a run bills against its own
-session id, so it is invisible to `run_spend` *and* to both of the budget
-gate's meters (widening them together, via `sessions.root_session_id`, is
-the fix — widening one alone would make a card's total exceed its board's).
-That hole is *worse* under a token ceiling than under a money one, because
-on a subscription board tokens are the only meter that moves at all, so a
-subagent-heavy run is invisible to the only ceiling that can fire.
+A **subagent** spawned by a run bills against its own session id, so the
+window is a spawn *tree* and not one session: a subagent inherits
+`root_session_id` from the ultimate ancestor and a run's session is itself a
+root, so `root_session_id = r.session_id` is exactly that run's tree.
+`c.session_id = r.session_id` stays in front of it as the first disjunct
+because it needs no `sessions` row — a run's own spend is never contingent
+on a second table resolving.
+
+The card-level and board-level meters were widened **together**, which is
+the only safe way to do it: a card whose total exceeded its board's is the
+failure the pairing exists to prevent. `BOARD_SESSIONS` therefore unites
+three membership sources — the board's run sessions straight off
+`issue_runs`, every session whose trigger names the board, and every session
+rooted at one of those run sessions. The third is redundant with the second
+while subagents inherit their parent's trigger, and is kept anyway so
+`board ⊇ every run on it` holds structurally rather than by that inheritance
+continuing to be true.
+
+The second source is what brings a **board-bound cron fire** inside the
+ceiling. A cron job that files onto a board burns real tokens deciding what
+to file, and it is nobody's run — no `issue_runs` row will ever point at its
+session — so before this it contributed exactly zero to the board it worked
+for. `TriggerSource::Cron` has carried `project_id` all along; nothing read
+it. The `sessions.project_id` generated column is that read, extracted from
+`$.trigger.project_id` rather than stored a second time, and both
+board-bearing triggers keep it at the same path.
+
+Both holes were *worse* under a token ceiling than under a money one,
+because on a subscription board tokens are the only meter that moves at all
+— so the spend that escaped was escaping the only ceiling that can fire.
 
 And a run **priced at $0.00 with real tokens is the ordinary case, not an
 unreachable one** — this paragraph used to claim it was gated off by

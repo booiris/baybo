@@ -622,6 +622,13 @@ pub trait ProjectStore: Send + Sync {
     async fn update_project(&self, id: &ProjectId, update: &ProjectUpdate) -> Result<bool>;
 
     /// Return money and token spend from the same rows since `since`.
+    ///
+    /// The board answers for every session its work happens in, which is
+    /// wider than its runs: a subagent spawned by a run, and a cron fire
+    /// that files onto the board without being anybody's run, both spend on
+    /// the board's behalf. Wider than [`Self::run_spend`] by construction —
+    /// a card whose total exceeded its board's would break the pairing the
+    /// budget gate rests on.
     async fn spend_since(&self, project: &ProjectId, since: DateTime<Utc>) -> Result<Spend>;
 
     async fn attention(&self) -> Result<Vec<(ProjectId, AttentionCounts)>>;
@@ -740,6 +747,10 @@ pub trait ProjectStore: Send + Sync {
     /// because the enqueue dedupe guard keeps at most one run per issue in
     /// flight, so two windows on one session can never overlap. A run
     /// nobody claimed has no window and reads zero.
+    ///
+    /// The window covers the run's whole spawn tree, not just the session it
+    /// works in directly: a subagent bills against its own session, and a
+    /// run charged only for its own would let delegated work read as free.
     async fn run_spend(&self, issue: &IssueId) -> Result<Vec<RunSpend>>;
 
     /// The same derivation as [`Self::run_spend`], addressed by run rather
