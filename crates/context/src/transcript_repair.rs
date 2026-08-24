@@ -12,22 +12,25 @@
 //! crash-during-tool-execution window by repairing the transcript when
 //! the actor rehydrates — before any new turn runs.
 //!
-//! [`repair_tool_pairing`] does two things in one deterministic pass:
+//! [`repair_tool_pairing`] does three things in one deterministic pass:
 //!
-//! 1. **Fill**: every dangling `ToolUse` id gets a synthetic `ToolResult`
+//! 1. **Quarantine**: a `ToolResult` with no matching `ToolUse`, or a second
+//!    result for an already-answered call, is omitted from the in-memory LLM
+//!    window. Its durable row is untouched so the user-facing transcript stays
+//!    recoverable.
+//! 2. **Fill**: every dangling `ToolUse` id gets a synthetic `ToolResult`
 //!    saying the execution was interrupted. Fills are returned separately
 //!    so the caller can persist them (append-only — session rows are
 //!    never rewritten).
-//! 2. **Reposition**: every tool-result row is emitted immediately after
+//! 3. **Reposition**: every tool-result row is emitted immediately after
 //!    the assistant row that issued it, in `ToolUse` block order. On a
 //!    healthy transcript this is a no-op; on an already-wedged one (a
 //!    resume nudge was appended after the dangling row before this repair
 //!    existed, or a prior repair's fills were persisted at the tail) it
 //!    restores the adjacency both OpenAI and Anthropic validate. The
 //!    in-memory window may therefore diverge from strict ordinal order
-//!    for such sessions; only the order diverges — the row set is
-//!    identical, which is the invariant the persisted/in-memory mirror
-//!    checks care about.
+//!    for such sessions. Quarantined blocks are the other intentional
+//!    divergence: they remain in storage but never reach a provider request.
 
 use std::collections::{HashMap, HashSet};
 
@@ -38,6 +41,13 @@ use baybo_model::{ChatMessage, ContentBlock};
 /// by a crash/restart before it produced a result.
 const INTERRUPTED_TOOL_RESULT_BODY: &str =
     "[tool execution was interrupted by a crash or restart before it produced a result]";
+
+pub(crate) struct ToolPairingRepair {
+    pub(crate) messages: Vec<ChatMessage>,
+    pub(crate) fills: Vec<ChatMessage>,
+    pub(crate) orphan_result_ids: Vec<String>,
+    pub(crate) duplicate_result_ids: Vec<String>,
+}
 
 /// True when every block of `msg` is a `ToolResult` — the shape of a
 /// persisted tool-result row (`ChatMessage::tool_result_with_meta`).
@@ -67,14 +77,49 @@ fn synthetic_fill(id: &str, tool_name: &str) -> ChatMessage {
     )
 }
 
-/// Normalize tool pairing over a restored transcript. Returns the
-/// repaired message list and the synthetic fill rows that were inserted
-/// (in insertion order) so the caller can persist them. When the
-/// transcript is already well-formed the input is returned unchanged and
-/// the fill list is empty.
-pub(crate) fn repair_tool_pairing(
-    messages: Vec<ChatMessage>,
-) -> (Vec<ChatMessage>, Vec<ChatMessage>) {
+fn quarantine_invalid_results(
+    mut messages: Vec<ChatMessage>,
+) -> (Vec<ChatMessage>, Vec<String>, Vec<String>) {
+    let tool_use_ids: HashSet<String> = messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+    let mut seen_result_ids = HashSet::new();
+    let mut orphan_result_ids = Vec::new();
+    let mut duplicate_result_ids = Vec::new();
+
+    for message in &mut messages {
+        message.content.retain(|block| {
+            let ContentBlock::ToolResult { tool_use_id, .. } = block else {
+                return true;
+            };
+            if !tool_use_ids.contains(tool_use_id) {
+                orphan_result_ids.push(tool_use_id.clone());
+                return false;
+            }
+            if !seen_result_ids.insert(tool_use_id.clone()) {
+                duplicate_result_ids.push(tool_use_id.clone());
+                return false;
+            }
+            true
+        });
+    }
+    messages.retain(|message| !message.content.is_empty());
+
+    (messages, orphan_result_ids, duplicate_result_ids)
+}
+
+/// Normalize tool pairing over a restored transcript. Synthetic fill rows are
+/// returned separately so the caller can persist them. Quarantined result ids
+/// are diagnostic only: their original durable rows must not be rewritten or
+/// deleted.
+pub(crate) fn repair_tool_pairing(messages: Vec<ChatMessage>) -> ToolPairingRepair {
+    let (messages, orphan_result_ids, duplicate_result_ids) = quarantine_invalid_results(messages);
+
     // Index every tool-result row by the ids it carries. Persisted rows
     // hold one ToolResult each, so a plain id → position map suffices;
     // a (hypothetical) multi-result row is consumed when its first id is
@@ -118,7 +163,12 @@ pub(crate) fn repair_tool_pairing(
         needs_repair = true; // dangling ToolUse at the tail
     }
     if !needs_repair {
-        return (messages, Vec::new());
+        return ToolPairingRepair {
+            messages,
+            fills: Vec::new(),
+            orphan_result_ids,
+            duplicate_result_ids,
+        };
     }
 
     let mut consumed: HashSet<usize> = HashSet::new();
@@ -129,10 +179,9 @@ pub(crate) fn repair_tool_pairing(
         if consumed.contains(&i) {
             continue;
         }
-        // A result row not yet claimed by its assistant row: either an
-        // orphan (no matching ToolUse — keep it in place; providers only
-        // validate use→result, not the reverse) or it will have been
-        // consumed already when its assistant row was emitted.
+        if is_tool_result_row(msg) {
+            continue;
+        }
         repaired.push(msg.clone());
         let uses: Vec<(String, String)> = msg
             .content
@@ -158,7 +207,12 @@ pub(crate) fn repair_tool_pairing(
         }
     }
 
-    (repaired, fills)
+    ToolPairingRepair {
+        messages: repaired,
+        fills,
+        orphan_result_ids,
+        duplicate_result_ids,
+    }
 }
 
 #[cfg(test)]
@@ -210,10 +264,12 @@ mod tests {
             result("b"),
             ChatMessage::assistant(vec![ContentBlock::Text("done".into())]),
         ];
-        let (repaired, fills) = repair_tool_pairing(msgs.clone());
-        assert!(fills.is_empty());
-        assert_eq!(repaired.len(), msgs.len());
-        assert_eq!(ids_in_order(&repaired), ids_in_order(&msgs));
+        let repair = repair_tool_pairing(msgs.clone());
+        assert!(repair.fills.is_empty());
+        assert!(repair.orphan_result_ids.is_empty());
+        assert!(repair.duplicate_result_ids.is_empty());
+        assert_eq!(repair.messages.len(), msgs.len());
+        assert_eq!(ids_in_order(&repair.messages), ids_in_order(&msgs));
     }
 
     #[test]
@@ -225,13 +281,13 @@ mod tests {
             assistant_with_uses(&["a", "b", "c"]),
             result("a"),
         ];
-        let (repaired, fills) = repair_tool_pairing(msgs);
-        assert_eq!(fills.len(), 2);
+        let repair = repair_tool_pairing(msgs);
+        assert_eq!(repair.fills.len(), 2);
         assert_eq!(
-            ids_in_order(&repaired),
+            ids_in_order(&repair.messages),
             vec!["use:a", "use:b", "use:c", "res:a", "res:b", "res:c"]
         );
-        let body = match &fills[0].content[0] {
+        let body = match &repair.fills[0].content[0] {
             ContentBlock::ToolResult { content, .. } => content.clone(),
             other => panic!("expected ToolResult fill, got {other:?}"),
         };
@@ -250,17 +306,17 @@ mod tests {
         // The already-wedged shape: a resume nudge was appended after the
         // dangling assistant row before this repair existed.
         let msgs = vec![assistant_with_uses(&["a"]), user_text("请立即返回最终结果")];
-        let (repaired, fills) = repair_tool_pairing(msgs);
-        assert_eq!(fills.len(), 1);
-        assert_eq!(repaired.len(), 3);
+        let repair = repair_tool_pairing(msgs);
+        assert_eq!(repair.fills.len(), 1);
+        assert_eq!(repair.messages.len(), 3);
         assert!(matches!(
-            repaired[0].content[0],
+            repair.messages[0].content[0],
             ContentBlock::ToolUse { .. }
         ));
         assert!(
-            matches!(&repaired[1].content[0], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "a")
+            matches!(&repair.messages[1].content[0], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "a")
         );
-        assert_eq!(repaired[2].role, Role::User);
+        assert_eq!(repair.messages[2].role, Role::User);
     }
 
     #[test]
@@ -269,21 +325,35 @@ mod tests {
         // a fresh hydration loads them AFTER the nudge; the normalize pass
         // must move them back adjacent without creating new fills.
         let msgs = vec![assistant_with_uses(&["a"]), user_text("nudge"), result("a")];
-        let (repaired, fills) = repair_tool_pairing(msgs);
+        let repair = repair_tool_pairing(msgs);
         assert!(
-            fills.is_empty(),
+            repair.fills.is_empty(),
             "existing result must be reused, not re-filled"
         );
-        assert_eq!(ids_in_order(&repaired), vec!["use:a", "res:a"]);
-        assert_eq!(repaired[2].role, Role::User);
+        assert_eq!(ids_in_order(&repair.messages), vec!["use:a", "res:a"]);
+        assert_eq!(repair.messages[2].role, Role::User);
     }
 
     #[test]
-    fn orphan_result_stays_in_place_without_fills() {
+    fn orphan_result_is_quarantined_without_mutating_the_input_row() {
         let msgs = vec![user_text("q"), result("ghost")];
-        let (repaired, fills) = repair_tool_pairing(msgs.clone());
-        assert!(fills.is_empty());
-        assert_eq!(repaired.len(), msgs.len());
+        let original = msgs.clone();
+        let repair = repair_tool_pairing(msgs);
+        assert!(repair.fills.is_empty());
+        assert_eq!(repair.orphan_result_ids, vec!["ghost"]);
+        assert!(repair.duplicate_result_ids.is_empty());
+        assert_eq!(repair.messages, vec![user_text("q")]);
+        assert_eq!(original[1], result("ghost"));
+    }
+
+    #[test]
+    fn duplicate_result_is_quarantined() {
+        let msgs = vec![assistant_with_uses(&["a"]), result("a"), result("a")];
+        let repair = repair_tool_pairing(msgs);
+        assert!(repair.fills.is_empty());
+        assert!(repair.orphan_result_ids.is_empty());
+        assert_eq!(repair.duplicate_result_ids, vec!["a"]);
+        assert_eq!(ids_in_order(&repair.messages), vec!["use:a", "res:a"]);
     }
 
     #[test]
@@ -294,10 +364,10 @@ mod tests {
             assistant_with_uses(&["b", "c"]),
             result("b"),
         ];
-        let (repaired, fills) = repair_tool_pairing(msgs);
-        assert_eq!(fills.len(), 2);
+        let repair = repair_tool_pairing(msgs);
+        assert_eq!(repair.fills.len(), 2);
         assert_eq!(
-            ids_in_order(&repaired),
+            ids_in_order(&repair.messages),
             vec!["use:a", "res:a", "use:b", "use:c", "res:b", "res:c"]
         );
     }

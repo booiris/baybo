@@ -223,7 +223,10 @@ rebuilt, `ContextManager::restore_from_store` runs
 `baybo-context`'s `transcript_repair::repair_tool_pairing`: dangling ids get a
 persisted synthetic "interrupted" `ToolResult` (append-only), and displaced
 result rows are repositioned adjacent to their issuing assistant row in the
-in-memory window. The streaming twin of this guard is
+in-memory window. The reverse crash tear is also contained: an orphan or
+duplicate `ToolResult` is quarantined from that provider-facing window and
+logged with its call id, while its durable transcript row remains untouched.
+The streaming twin of the dangling-use guard is
 `salvage_partial_blocks`, which drops streamed-but-undispatched `ToolUse` on
 mid-stream cancel so the dangling row is never persisted in the first place.
 

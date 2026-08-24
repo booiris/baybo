@@ -98,6 +98,23 @@ use tracing::{debug, warn};
 /// surfaces enough context to be useful without crowding out the rest.
 const PER_SKILL_TOKEN_CAP: usize = 5_000;
 
+const MAX_LOGGED_PROTOCOL_CALL_IDS: usize = 16;
+
+fn protocol_call_ids(message: &ChatMessage) -> (Vec<&str>, Vec<&str>) {
+    let mut tool_use_ids = Vec::new();
+    let mut tool_result_ids = Vec::new();
+    for block in &message.content {
+        match block {
+            ContentBlock::ToolUse { id, .. } => tool_use_ids.push(id.as_str()),
+            ContentBlock::ToolResult { tool_use_id, .. } => {
+                tool_result_ids.push(tool_use_id.as_str());
+            }
+            _ => {}
+        }
+    }
+    (tool_use_ids, tool_result_ids)
+}
+
 /// Cumulative token cap across every skill detail block we attach
 /// after a summary. Skills near the end of the called-list get
 /// truncated harder to fit whatever budget remains; once nothing fits,
@@ -1630,8 +1647,13 @@ impl ContextManager {
         {
             Ok(ordinal) => Some(ordinal),
             Err(e) => {
+                let (tool_use_ids, tool_result_ids) = protocol_call_ids(msg);
                 warn!(
                     session_id = %self.session_id,
+                    role = msg.role.as_str(),
+                    source = msg.source().as_str(),
+                    ?tool_use_ids,
+                    ?tool_result_ids,
                     error = %e,
                     "failed to append message to session_messages log"
                 );
@@ -1879,7 +1901,32 @@ impl ContextManager {
         // repaired order is what the loop builds requests from.
         match sessions.load_active_session_messages(&session_id).await {
             Ok(messages) if !messages.is_empty() => {
-                let (repaired, fills) = transcript_repair::repair_tool_pairing(messages);
+                let transcript_repair::ToolPairingRepair {
+                    messages: repaired,
+                    fills,
+                    orphan_result_ids,
+                    duplicate_result_ids,
+                } = transcript_repair::repair_tool_pairing(messages);
+                if !orphan_result_ids.is_empty() || !duplicate_result_ids.is_empty() {
+                    let orphan_result_id_sample: Vec<&str> = orphan_result_ids
+                        .iter()
+                        .take(MAX_LOGGED_PROTOCOL_CALL_IDS)
+                        .map(String::as_str)
+                        .collect();
+                    let duplicate_result_id_sample: Vec<&str> = duplicate_result_ids
+                        .iter()
+                        .take(MAX_LOGGED_PROTOCOL_CALL_IDS)
+                        .map(String::as_str)
+                        .collect();
+                    warn!(
+                        session_id = %session_id,
+                        orphan_results = orphan_result_ids.len(),
+                        duplicate_results = duplicate_result_ids.len(),
+                        ?orphan_result_id_sample,
+                        ?duplicate_result_id_sample,
+                        "hydration: quarantined invalid tool_result blocks from the LLM window"
+                    );
+                }
                 if !fills.is_empty() {
                     warn!(
                         session_id = %session_id,
@@ -2951,6 +2998,35 @@ mod tests {
                 .unwrap(),
             CompressionOutcome::BelowThreshold
         ));
+    }
+
+    #[tokio::test]
+    async fn restore_quarantines_orphan_result_without_deleting_the_durable_row() {
+        let sessions = test_sessions();
+        let user = make_msg(Role::User, "question");
+        let orphan =
+            ChatMessage::tool_result_with_meta("call-orphan".into(), "orphan output".into(), None);
+        sessions
+            .append_session_message(&test_session_id(), &user)
+            .await
+            .expect("persist user row");
+        sessions
+            .append_session_message(&test_session_id(), &orphan)
+            .await
+            .expect("persist orphan row");
+
+        let mut restored = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
+        restored.restore_from_store().await;
+
+        assert_eq!(restored.messages(), std::slice::from_ref(&user));
+        assert_eq!(
+            sessions
+                .load_active_session_messages(&test_session_id())
+                .await
+                .expect("load durable transcript"),
+            vec![user, orphan],
+            "repair must not rewrite or delete user-facing transcript rows"
+        );
     }
 
     #[tokio::test]
