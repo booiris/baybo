@@ -556,7 +556,55 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     // that catches UniFFI seam drift — and a live call landing in one is a
     // test relying on a call it never declared.
 
-    func projectList(includeArchived: Bool) async throws -> [ProjectInfo] { throw Self.unsupported }
+    /// The board reads a store drives. Programmable rather than throwing,
+    /// because `ProjectsStore` is exercised through this fake — the writes
+    /// below stay unsupported until a phase has a caller for one.
+    private var _stubProjects: [ProjectInfo] = []
+    private var _stubIssues: [IssueInfo] = []
+    private var _stubRuns: [IssueRunInfo] = []
+    private var _stubTeam: [TeamMemberInfo] = []
+    private var _stubAttention: [ProjectAttention] = []
+    private var _stubActivity: [ProjectActivity] = []
+    /// Make the board unreachable, which is how the store learns it is offline.
+    private var _failProjects = false
+
+    var stubProjects: [ProjectInfo] {
+        get { lock.withLock { _stubProjects } }
+        set { lock.withLock { _stubProjects = newValue } }
+    }
+    var stubIssues: [IssueInfo] {
+        get { lock.withLock { _stubIssues } }
+        set { lock.withLock { _stubIssues = newValue } }
+    }
+    var stubRuns: [IssueRunInfo] {
+        get { lock.withLock { _stubRuns } }
+        set { lock.withLock { _stubRuns = newValue } }
+    }
+    var stubTeam: [TeamMemberInfo] {
+        get { lock.withLock { _stubTeam } }
+        set { lock.withLock { _stubTeam = newValue } }
+    }
+    var stubAttention: [ProjectAttention] {
+        get { lock.withLock { _stubAttention } }
+        set { lock.withLock { _stubAttention = newValue } }
+    }
+    var stubActivity: [ProjectActivity] {
+        get { lock.withLock { _stubActivity } }
+        set { lock.withLock { _stubActivity = newValue } }
+    }
+    var failProjects: Bool {
+        get { lock.withLock { _failProjects } }
+        set { lock.withLock { _failProjects = newValue } }
+    }
+
+    private func refuseIfOffline() throws {
+        if lock.withLock({ _failProjects }) { throw BayboError.NotConnected }
+    }
+
+    func projectList(includeArchived: Bool) async throws -> [ProjectInfo] {
+        try refuseIfOffline()
+        return stubProjects
+    }
     func projectGet(projectId: String) async throws -> ProjectInfo { throw Self.unsupported }
     func projectCreate(new: NewProject) async throws -> ProjectInfo { throw Self.unsupported }
     func projectUpdate(projectId: String, settings: ProjectSettings) async throws {
@@ -565,7 +613,10 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     func projectSetArchived(projectId: String, archived: Bool) async throws -> ProjectInfo {
         throw Self.unsupported
     }
-    func projectIssues(projectId: String) async throws -> [IssueInfo] { throw Self.unsupported }
+    func projectIssues(projectId: String) async throws -> [IssueInfo] {
+        try refuseIfOffline()
+        return stubIssues
+    }
     func projectIssueGet(projectId: String, number: Int64) async throws -> IssueInfo {
         throw Self.unsupported
     }
@@ -579,7 +630,8 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
         projectId: String, number: Int64, status: IssueStatus, orderedNumbers: [Int64]
     ) async throws -> IssueInfo { throw Self.unsupported }
     func projectActiveRuns(projectId: String) async throws -> [IssueRunInfo] {
-        throw Self.unsupported
+        try refuseIfOffline()
+        return stubRuns
     }
     func projectIssueRuns(projectId: String, number: Int64) async throws -> IssueRunLog {
         throw Self.unsupported
@@ -605,13 +657,20 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     func projectFeed(projectId: String, beforeMs: Int64?, limit: UInt32?) async throws -> String {
         throw Self.unsupported
     }
-    func projectTeam(projectId: String) async throws -> [TeamMemberInfo] { throw Self.unsupported }
+    func projectTeam(projectId: String) async throws -> [TeamMemberInfo] {
+        try refuseIfOffline()
+        return stubTeam
+    }
     func projectRemoveAgent(projectId: String, agentId: String) async throws {
         throw Self.unsupported
     }
-    func projectsAttention() async throws -> [ProjectAttention] { throw Self.unsupported }
+    func projectsAttention() async throws -> [ProjectAttention] {
+        try refuseIfOffline()
+        return stubAttention
+    }
     func projectsActivity(sinceMs: Int64?) async throws -> [ProjectActivity] {
-        throw Self.unsupported
+        try refuseIfOffline()
+        return stubActivity
     }
     func setProjectSink(sink: ProjectSink) {}
 

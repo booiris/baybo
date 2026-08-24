@@ -1,0 +1,513 @@
+{
+  "comment": [
+    {
+      "name": "nobody assigned",
+      "issue": {
+        "status": "todo"
+      },
+      "runs": [],
+      "team": [
+        {
+          "id": "a-dev",
+          "handle": "dev-1"
+        },
+        {
+          "id": "a-lead",
+          "handle": "lead"
+        }
+      ],
+      "hint": "Records only — nobody is assigned to this issue yet."
+    },
+    {
+      "name": "nobody assigned, and a run somehow live",
+      "issue": {
+        "status": "in_progress"
+      },
+      "runs": [
+        {
+          "status": "running"
+        }
+      ],
+      "team": [
+        {
+          "id": "a-dev",
+          "handle": "dev-1"
+        },
+        {
+          "id": "a-lead",
+          "handle": "lead"
+        }
+      ],
+      "hint": "Records only — nobody is assigned to this issue yet."
+    },
+    {
+      "name": "cancelled outranks everything",
+      "issue": {
+        "status": "in_progress",
+        "assignee": "a-dev",
+        "cancelled_at_ms": 5
+      },
+      "runs": [
+        {
+          "status": "running"
+        }
+      ],
+      "team": [
+        {
+          "id": "a-dev",
+          "handle": "dev-1"
+        },
+        {
+          "id": "a-lead",
+          "handle": "lead"
+        }
+      ],
+      "hint": "Records only — this issue is cancelled."
+    },
+    {
+      "name": "backlog records only",
+      "issue": {
+        "status": "backlog",
+        "assignee": "a-dev"
+      },
+      "runs": [],
+      "team": [
+        {
+          "id": "a-dev",
+          "handle": "dev-1"
+        },
+        {
+          "id": "a-lead",
+          "handle": "lead"
+        }
+      ],
+      "hint": "Records only — @dev-1 is not working on this right now."
+    },
+    {
+      "name": "done records only",
+      "issue": {
+        "status": "done",
+        "assignee": "a-dev"
+      },
+      "runs": [],
+      "team": [
+        {
+          "id": "a-dev",
+          "handle": "dev-1"
+        },
+        {
+          "id": "a-lead",
+          "handle": "lead"
+        }
+      ],
+      "hint": "Records only — @dev-1 is not working on this right now."
+    },
+    {
+      "name": "a block outranks a live run",
+      "issue": {
+        "status": "in_progress",
+        "assignee": "a-dev",
+        "blocked_reason": "needs the token format"
+      },
+      "runs": [
+        {
+          "status": "running"
+        }
+      ],
+      "team": [
+        {
+          "id": "a-dev",
+          "handle": "dev-1"
+        },
+        {
+          "id": "a-lead",
+          "handle": "lead"
+        }
+      ],
+      "hint": "Records only — a block has stopped this issue; @dev-1 picks this up when it is lifted."
+    },
+    {
+      "name": "a block in todo",
+      "issue": {
+        "status": "todo",
+        "assignee": "a-dev",
+        "blocked_reason": "why"
+      },
+      "runs": [],
+      "team": [
+        {
+          "id": "a-dev",
+          "handle": "dev-1"
+        },
+        {
+          "id": "a-lead",
+          "handle": "lead"
+        }
+      ],
+      "hint": "Records only — a block has stopped this issue; @dev-1 picks this up when it is lifted."
+    },
+    {
+      "name": "held names the ceiling without naming money",
+      "issue": {
+        "status": "in_progress",
+        "assignee": "a-dev"
+      },
+      "runs": [
+        {
+          "status": "held"
+        }
+      ],
+      "team": [
+        {
+          "id": "a-dev",
+          "handle": "dev-1"
+        },
+        {
+          "id": "a-lead",
+          "handle": "lead"
+        }
+      ],
+      "hint": "@dev-1 will read this when the held run starts — the project is over one of its daily ceilings."
+    },
+    {
+      "name": "queued",
+      "issue": {
+        "status": "in_progress",
+        "assignee": "a-dev"
+      },
+      "runs": [
+        {
+          "status": "queued"
+        }
+      ],
+      "team": [
+        {
+          "id": "a-dev",
+          "handle": "dev-1"
+        },
+        {
+          "id": "a-lead",
+          "handle": "lead"
+        }
+      ],
+      "hint": "@dev-1 will read this when the queued run starts."
+    },
+    {
+      "name": "running",
+      "issue": {
+        "status": "in_progress",
+        "assignee": "a-dev"
+      },
+      "runs": [
+        {
+          "status": "running"
+        }
+      ],
+      "team": [
+        {
+          "id": "a-dev",
+          "handle": "dev-1"
+        },
+        {
+          "id": "a-lead",
+          "handle": "lead"
+        }
+      ],
+      "hint": "@dev-1 is mid-run — this is picked up when that run finishes."
+    },
+    {
+      "name": "idle in progress starts a run",
+      "issue": {
+        "status": "in_progress",
+        "assignee": "a-dev"
+      },
+      "runs": [],
+      "team": [
+        {
+          "id": "a-dev",
+          "handle": "dev-1"
+        },
+        {
+          "id": "a-lead",
+          "handle": "lead"
+        }
+      ],
+      "hint": "Starts a run: @dev-1 will read this now."
+    },
+    {
+      "name": "idle in todo starts a run where it stands",
+      "issue": {
+        "status": "todo",
+        "assignee": "a-dev"
+      },
+      "runs": [],
+      "team": [
+        {
+          "id": "a-dev",
+          "handle": "dev-1"
+        },
+        {
+          "id": "a-lead",
+          "handle": "lead"
+        }
+      ],
+      "hint": "Starts a run: @dev-1 will read this now."
+    },
+    {
+      "name": "idle in review starts a run",
+      "issue": {
+        "status": "review",
+        "assignee": "a-dev"
+      },
+      "runs": [],
+      "team": [
+        {
+          "id": "a-dev",
+          "handle": "dev-1"
+        },
+        {
+          "id": "a-lead",
+          "handle": "lead"
+        }
+      ],
+      "hint": "Starts a run: @dev-1 will read this now."
+    },
+    {
+      "name": "a settled run is not a live one",
+      "issue": {
+        "status": "in_progress",
+        "assignee": "a-dev"
+      },
+      "runs": [
+        {
+          "status": "done"
+        },
+        {
+          "status": "failed"
+        }
+      ],
+      "team": [
+        {
+          "id": "a-dev",
+          "handle": "dev-1"
+        },
+        {
+          "id": "a-lead",
+          "handle": "lead"
+        }
+      ],
+      "hint": "Starts a run: @dev-1 will read this now."
+    },
+    {
+      "name": "the live run is found past settled ones",
+      "issue": {
+        "status": "in_progress",
+        "assignee": "a-dev"
+      },
+      "runs": [
+        {
+          "status": "done"
+        },
+        {
+          "status": "queued"
+        }
+      ],
+      "team": [
+        {
+          "id": "a-dev",
+          "handle": "dev-1"
+        },
+        {
+          "id": "a-lead",
+          "handle": "lead"
+        }
+      ],
+      "hint": "@dev-1 will read this when the queued run starts."
+    },
+    {
+      "name": "an agent off this board still reads as itself",
+      "issue": {
+        "status": "in_progress",
+        "assignee": "a-stranger"
+      },
+      "runs": [],
+      "team": [
+        {
+          "id": "a-dev",
+          "handle": "dev-1"
+        },
+        {
+          "id": "a-lead",
+          "handle": "lead"
+        }
+      ],
+      "hint": "Starts a run: @a-stranger will read this now."
+    }
+  ],
+  "mention": [
+    {
+      "name": "a staffed card takes no handover",
+      "issue": {
+        "assignee": "a-dev"
+      },
+      "draft": "hey @lead",
+      "team": [
+        {
+          "id": "a-dev",
+          "handle": "dev-1"
+        },
+        {
+          "id": "a-lead",
+          "handle": "lead"
+        }
+      ],
+      "hint": null
+    },
+    {
+      "name": "no mention at all",
+      "issue": {},
+      "draft": "just a comment",
+      "team": [
+        {
+          "id": "a-dev",
+          "handle": "dev-1"
+        },
+        {
+          "id": "a-lead",
+          "handle": "lead"
+        }
+      ],
+      "hint": null
+    },
+    {
+      "name": "an unknown handle staffs nobody",
+      "issue": {},
+      "draft": "@nobody take this",
+      "team": [
+        {
+          "id": "a-dev",
+          "handle": "dev-1"
+        },
+        {
+          "id": "a-lead",
+          "handle": "lead"
+        }
+      ],
+      "hint": null
+    },
+    {
+      "name": "the first mention wins",
+      "issue": {},
+      "draft": "@lead and @dev-1",
+      "team": [
+        {
+          "id": "a-dev",
+          "handle": "dev-1"
+        },
+        {
+          "id": "a-lead",
+          "handle": "lead"
+        }
+      ],
+      "hint": "Sending this puts @lead on the issue."
+    },
+    {
+      "name": "a mention at the start",
+      "issue": {},
+      "draft": "@dev-1 please look",
+      "team": [
+        {
+          "id": "a-dev",
+          "handle": "dev-1"
+        },
+        {
+          "id": "a-lead",
+          "handle": "lead"
+        }
+      ],
+      "hint": "Sending this puts @dev-1 on the issue."
+    },
+    {
+      "name": "a mention after whitespace",
+      "issue": {},
+      "draft": "please @dev-1 look",
+      "team": [
+        {
+          "id": "a-dev",
+          "handle": "dev-1"
+        },
+        {
+          "id": "a-lead",
+          "handle": "lead"
+        }
+      ],
+      "hint": "Sending this puts @dev-1 on the issue."
+    },
+    {
+      "name": "a mention in parens",
+      "issue": {},
+      "draft": "(cc @dev-1)",
+      "team": [
+        {
+          "id": "a-dev",
+          "handle": "dev-1"
+        },
+        {
+          "id": "a-lead",
+          "handle": "lead"
+        }
+      ],
+      "hint": "Sending this puts @dev-1 on the issue."
+    },
+    {
+      "name": "an email is not a mention",
+      "issue": {},
+      "draft": "mail me@dev-1.com",
+      "team": [
+        {
+          "id": "a-dev",
+          "handle": "dev-1"
+        },
+        {
+          "id": "a-lead",
+          "handle": "lead"
+        }
+      ],
+      "hint": null
+    },
+    {
+      "name": "a trailing hyphen is trimmed",
+      "issue": {},
+      "draft": "ask @dev-1- about it",
+      "team": [
+        {
+          "id": "a-dev",
+          "handle": "dev-1"
+        },
+        {
+          "id": "a-lead",
+          "handle": "lead"
+        }
+      ],
+      "hint": "Sending this puts @dev-1 on the issue."
+    },
+    {
+      "name": "a blocked card records the mention and staffs nobody",
+      "issue": {
+        "blocked_reason": "why"
+      },
+      "draft": "@dev-1 help",
+      "team": [
+        {
+          "id": "a-dev",
+          "handle": "dev-1"
+        },
+        {
+          "id": "a-lead",
+          "handle": "lead"
+        }
+      ],
+      "hint": "Records only — a block has stopped this issue; @dev-1 is not put on it until it is lifted."
+    }
+  ]
+}

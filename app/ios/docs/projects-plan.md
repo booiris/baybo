@@ -38,7 +38,16 @@ Every enum decodes through an `Unknown` arm and refuses to *encode* one — a ca
 6. `FakeBayboClient` (`Tests/Support/FakeBayboClient.swift:13`) gains every new method (conformance breaks at compile time, which is the point); `transport/tests.rs` gets a `ProjectChanged` routing test modelled on the deck arm tests (:363-405); regenerate bindings with `scripts/build-core.sh` — but **its default run deletes the signed device xcframework**, so Swift/web loops use `build-app.sh --skip-rust`.
 - Gates: from `app/ios/`, `cargo fmt --all --check && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo nextest run --workspace`. Compiling BayboTests is the only thing in the repo that catches UniFFI seam drift.
 
-## P2 · Swift data layer, pure models, fixtures
+## P2 · Swift data layer, pure models, fixtures — **done**
+
+Six pure models (`BoardOrder`, `RunLabels`, `MoveConsequence`, `CommentHint`, `IssueTimeline`, `BudgetMeter`), `ProjectsStore` with its mirror and `ProjectEventsRelay`, and the shared golden vectors. Notes against the sketch below:
+
+- **The mirror carries its own structs.** UniFFI generates `Equatable`/`Hashable` but not `Codable`, so the on-disk shape is written out by hand — which is the right answer anyway: a mirror is a file format an upgrade has to keep reading, and pinning it to the transport's shape means a gateway field that moves invalidates a mirror the user already has. A run's cost is deliberately never mirrored (`nil` is not zero, and the active-run poll does not price runs).
+- **`IssueApprovalPrompt`, not `PendingApproval`.** The chat surface already owns that name, and the two are genuinely different planes: a chat prompt is derived from a subscribed session's frames and answered over the WS; a board prompt is read off a card's timeline and answered by `call_id` over REST.
+- **`-baybo-demo-projects` moved to P3.** A demo fixture's only observable effect is on screen, and there is no Projects screen yet — writing it here would be code no test could assert.
+- The cross-end gate is `app/web/src/pages/projects/commentHintVectors.json`: 16 comment + 10 mention vectors, generated from the web's own `commentHint`/`mentionHint`, asserted by `commentHintVectors.test.ts` (web) and `CommentHintVectorTests` (Swift) over the same file. Regenerate with `pnpm --filter baybo-web gen:comment-hint-vectors`; the Swift suite going red after a regen is the gate working.
+
+### Original sketch
 
 1. **ProjectsStore** (`App/Core/`): DeckStore's REPLACE plus SessionIndex's injected support directory (so parallel Swift Testing suites stay isolated — `TempSupportDir`). Mirrors `projects.json` and `board-<id>.json`; reads on init so the first frame paints; `refreshNow()` replaces wholesale and persists; `removeMirror()` hangs off `AppStore.resetChatStores` (:1433); a lazy `clientProvider` (DeckStore :191-216) so constructing it in a test never boots the FFI; a failed write rolls back to the mirror (there is no outbox). Done keeps only its first page plus the count.
 2. **ProjectEventsRelay** (the `DeckEventsRelay` shape at :909-933, main-actor hop, not named `*Impl`), registered at launch beside AppStore:300-303; 300ms debounce; any scope refreshes the open board; refreshes are held while a swipe panel is open.

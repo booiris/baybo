@@ -241,6 +241,7 @@ final class AppStore: ObservableObject {
     /// The Deck tab's engine + its kept-warm shell webview (the app's second
     /// webview; prewarmed once a binding reaches home, torn down with the binding).
     let deckStore = DeckStore()
+    let projectsStore = ProjectsStore()
     private var _deckHost: DeckHost?
     /// Sessions with an archive/hide request on the wire — the per-session
     /// serialization gate (`pumpSessionMutation`).
@@ -301,6 +302,11 @@ final class AppStore: ObservableObject {
         // Deck pushes are session-less by design; the connection-global sink
         // is the only way they reach a user parked on the Deck tab.
         Baybo.client.setDeckSink(sink: DeckEventsRelay(store: { AppStore.shared?.deckStore }))
+        // Board invalidations are session-less broadcasts like the deck's, and
+        // this is the only way the phone learns a board moved — nothing about a
+        // board is ever pushed.
+        Baybo.client.setProjectSink(
+            sink: ProjectEventsRelay(store: { AppStore.shared?.projectsStore }))
         #if DEBUG
         // UI-verification hooks: land straight on interaction-gated screens so
         // they are screenshotable/log-verifiable headlessly on the simulator.
@@ -1431,6 +1437,9 @@ final class AppStore: ObservableObject {
         _deckHost?.teardown()
         _deckHost = nil
         DeckStore.removeMirror()
+        // So do the boards: a mirror that outlived a binding is somebody
+        // else's account on screen.
+        ProjectsStore.removeMirror()
         // As does the model catalog — a rebind must not offer the departed
         // gateway's LLM entries.
         ModelCatalog.shared.reset()

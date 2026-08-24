@@ -12,7 +12,8 @@
     "type-check": "tsc -b --noEmit",
     "lint": "eslint src",
     "gen:api": "openapi-typescript ../../docs/openapi.json -o src/api/schema.d.ts",
-    "gen:snippet-vectors": "tsx scripts/gen-search-snippet-vectors.mjs"
+    "gen:snippet-vectors": "tsx scripts/gen-search-snippet-vectors.mjs",
+    "gen:comment-hint-vectors": "tsx scripts/gen-comment-hint-vectors.mjs"
   },
   "dependencies": {
     "@dicebear/bottts": "^9.4.2",
