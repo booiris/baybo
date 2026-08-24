@@ -28,6 +28,7 @@ members = [
     "crates/cron",
     "crates/deck",
     "crates/config",
+    "crates/search",
     "crates/cli",
     "crates/gateway",
     "crates/tui",
@@ -88,6 +89,7 @@ baybo-task = { path = "crates/task" }
 baybo-cron = { path = "crates/cron" }
 baybo-deck = { path = "crates/deck" }
 baybo-config = { path = "crates/config" }
+baybo-search = { path = "crates/search" }
 baybo-cli = { path = "crates/cli" }
 baybo-gateway = { path = "crates/gateway" }
 baybo-tui = { path = "crates/tui" }

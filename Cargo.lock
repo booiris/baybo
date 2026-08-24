@@ -334,6 +334,7 @@ dependencies = [
  "baybo-pairing",
  "baybo-process",
  "baybo-sandbox",
+ "baybo-search",
  "baybo-security",
  "baybo-setup",
  "baybo-skills",
@@ -928,6 +929,28 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "baybo-search"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "baybo-config",
+ "baybo-model",
+ "baybo-security",
+ "baybo-tools",
+ "baybo-trace",
+ "parking_lot",
+ "reqwest 0.13.2",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
 ]
 
 [[package]]
@@ -4764,6 +4787,7 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",

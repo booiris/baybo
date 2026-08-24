@@ -6,7 +6,7 @@ The `config` crate owns the root `BayboConfig` struct, JSON loading, and the `va
 
 A single JSON file — typically `baybo.json` — maps 1:1 to `BayboConfig`. Consumers (the `baybo` bin crate's boot/runtime layer, plus `baybo-cli`, `baybo-gateway`, `baybo-memory`, and `baybo-setup`) map each section into the corresponding domain type.
 
-Top-level entries: `llm` (a `Vec<LlmEntry>`) plus `default-llm: LlmEntryName`, `agent`, `channels`, `security`, `skills`, `cost`, `workspace`, `gateway`, `browser`, `external_agents`, `memory`, `permission`, and an optional `proxy`.
+Top-level entries: `llm` (a `Vec<LlmEntry>`) plus `default-llm: LlmEntryName`, `agent`, `channels`, `security`, `skills`, `cost`, `workspace`, `gateway`, `browser`, `external_agents`, `memory`, `web_search`, `permission`, and an optional `proxy`.
 
 > **Proxy.** `proxy` is an optional `{ url, no_proxy? }` block (omitted ⇒ direct
 > connections). When set, every outbound HTTP call — LLM providers, model
@@ -107,6 +107,7 @@ The `PUT /v1/llm/models/{name}` admin endpoint and `baybo llm edit` both address
 Config does **not** store live secret values; it stores references:
 
 - `LlmEntry::api_key_env` is a reference to an env-var name (e.g., `"OPENAI_API_KEY"`), not raw key material. `llm.md` §Constraints prohibits inline keys. When absent, `baybo_llm::credentials::resolve_api_key` falls back to the per-entry vault key (`llm.entry.<name>.api_key`) and then to provider-specific defaults (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `MINIMAX_API_KEY`).
+- `WebSearchConfig::api_key_name` names a user secret, resolved from vault entry `user_env.<name>` and then the process environment variable of the same name. It never stores the key itself.
 - `SecurityConfig::encryption_key_file` is the only encryption-key source: an absolute path to a hex-encoded 32-byte file (mode 0600). `baybo setup` mints one at `<workspace>/.key/encryption.key`. A missing or unreadable file is a hard error at startup — there is no env-var alternative and no dev-key fallback.
 
 ### Section boundaries
@@ -126,6 +127,7 @@ Sections mirror Baybo's real runtime concerns, not a 1:1 copy of any external re
 | `browser`  | `baybo_tools::browser` configuration                         | Browser sidecar launch settings (docker mode, profile path).                                                                                                                                         |
 | `external_agents` | `baybo_agent::external_agent` registry                | Per-kind switch for the host-execution external agents — `claude`, `codex` (each `{ enabled, binary_path? }`). `enabled` defaults to **`true`**: boot probes `PATH` and registers whichever binary is actually installed, so having the CLI on the host is the opt-in. Set `false` to withhold an installed backend — worth knowing that these run their own tool loops with approvals bypassed. `binary_path` records the resolved absolute path `setup` probed, so the gateway (different cwd, narrower `PATH`) pins the same binary. |
 | `memory`   | `baybo-memory` backend selection                             | `{ enabled (default false), provider: noop\|mem0\|openviking, llm?, extra? }` — `llm` names the entry used for salience/extraction (unset ⇒ `default-llm`); `extra` is an opaque per-plugin bag (a documented exception to the typed-over-`Value` rule). Not hot-reloadable. See [`memory.md`](memory.md). |
+| `web_search` | `baybo-search` provider selection                            | Opt-in `noop\|tavily\|brave\|searxng` provider, credential reference, endpoint, locale, result limit, and operator blocklist. Hot-reloadable. See [`web-search.md`](web-search.md). |
 | `permission` | `baybo_tools::builtin::BashPermissionMode`                   | Shell-out permission policy: `auto` (default), `manual`, or `free` (`open`/`none` accepted as legacy aliases for `free`). Hot-reloadable through `LivePermissionMode`; see [`../permission.md`](../permission.md). |
 
 `registry` and `cron` currently have no top-level section. See §"Out-of-scope modules" for rationale and planned placement.
@@ -157,7 +159,7 @@ Principle: a module earns a config section when operators need to tune it in pro
 `baybo-config` ships the reload **primitives**, not the orchestration. As a leaf crate it owns two pure pieces in `reload.rs`: a live, swappable handle to the applied config (`ConfigHandle`) and the whitelist gate (`hot_reload_diff`). The fallible derived-state rebuilds (the LLM pool, cost limits) and the end-to-end reload flow live in consumer crates — see [`docs/config-hot-reload.md`](../config-hot-reload.md) before touching reload code. The contract below is the part `baybo-config` itself enforces.
 
 - **Live handle** — `ConfigHandle` wraps `Arc<parking_lot::RwLock<Arc<BayboConfig>>>`. `current()` clones out the applied `Arc`; `store()` is the infallible commit half that swaps a new `Arc` in. Reads happen per-turn / per-request (resolving the active model, dashboard reads), never per-token, so a plain `RwLock<Arc<_>>` is ample — no `ArcSwap` dependency. The previous `Arc` stays alive until its last in-flight reader drops it, which gives the "in-flight requests finish on the old config" behaviour below.
-- **Hot-updatable whitelist** — `hot_reload_diff(old, new)` enforces an explicit allowlist: `llm`, `default_llm`, `agent.model_tiers`, `cost.rate_limit`, `cost.spending_limits`, and `permission`. Any reload whose diff touches a field **outside** this set hard-rejects the entire reload (atomic — nothing swaps) with `ConfigError::NotHotReloadable { section }` naming the offending section. Not hot-updatable: `gateway.*`, `workspace.path`, `security.*`, `channels.*`, `skills.*`, `browser.*`, `external_agents.*`, `proxy`, `memory.*`, and the rest of `agent` (`max_iterations`, `context`, `max_subagent_depth`, `max_subagents_per_root`). `new` is destructured field-by-field so adding a field to `BayboConfig` or `AgentConfig` forces a hot/non-hot classification here rather than silently defaulting to "hot, unchecked".
+- **Hot-updatable whitelist** — `hot_reload_diff(old, new)` enforces an explicit allowlist: `llm`, `default_llm`, `agent.model_tiers`, `cost.rate_limit`, `cost.spending_limits`, `web_search`, and `permission`. Any reload whose diff touches a field **outside** this set hard-rejects the entire reload (atomic — nothing swaps) with `ConfigError::NotHotReloadable { section }` naming the offending section. Not hot-updatable: `gateway.*`, `workspace.path`, `security.*`, `channels.*`, `skills.*`, `browser.*`, `external_agents.*`, `proxy`, `memory.*`, and the rest of `agent` (`max_iterations`, `context`, `max_subagent_depth`, `max_subagents_per_root`). `new` is destructured field-by-field so adding a field to `BayboConfig` or `AgentConfig` forces a hot/non-hot classification here rather than silently defaulting to "hot, unchecked".
 - **Atomic swap** — a successful reload swaps a single `Arc<BayboConfig>` holding all whitelisted changes together. Partial application is forbidden.
 - **Validation rollback** — a reload that fails `validate()` leaves the running config untouched and returns `ConfigError` to the caller; no partial state is exposed.
 - **In-flight behavior** — requests already running against the old config continue with its values; only new requests pick up the new config. For LLM turns this is per-turn: a turn finishes on the client it resolved at turn start.
@@ -199,6 +201,9 @@ Principle: a module earns a config section when operators need to tune it in pro
 | `gateway.shutdown_grace_secs`         | ≥ 1                                                  |
 | `gateway.cors_allowed_origins[i]`     | non-empty                                            |
 | `proxy.url`                           | when `proxy` is set: non-empty; scheme one of `http`/`https`/`socks5`/`socks5h`/`socks4`/`socks4a` |
+| `web_search.base_url`                 | HTTP(S); required for enabled SearXNG. Provider construction also rejects credentials, query strings, and fragments. |
+| `web_search.max_results`              | in `1..=20` (`MAX_RESULTS_CEILING` — every supported provider caps one page there) |
+| `web_search.api_key_name`             | if set, valid env-var identifier (so a pasted literal key is refused at load) |
 
 ### Cross-section rules
 

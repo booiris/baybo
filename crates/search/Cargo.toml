@@ -1,0 +1,31 @@
+[package]
+name = "baybo-search"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+baybo-config = { workspace = true }
+baybo-model = { workspace = true }
+baybo-security = { workspace = true }
+baybo-tools = { workspace = true }
+baybo-trace = { workspace = true }
+async-trait = { workspace = true }
+# `query` for the GET-based providers (Brave, SearXNG): reqwest 0.13 gates
+# `RequestBuilder::query` behind it and the workspace default omits it.
+reqwest = { workspace = true, features = ["query"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+baybo-tools = { workspace = true, features = ["test-support"] }
+parking_lot = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+tokio-util = { workspace = true }

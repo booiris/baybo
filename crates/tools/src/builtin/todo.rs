@@ -145,14 +145,6 @@ todo_tool!(
     reason = "deferred-tool registry is not yet modeled"
 );
 
-// -- Web search --------------------------------------------------------------
-todo_tool!(
-    WebSearchTool,
-    name = "WebSearch",
-    desc = "Perform a web search.",
-    reason = "no search-engine provider is configured"
-);
-
 // -- Agent teams -------------------------------------------------------------
 todo_tool!(
     TeamCreateTool,
