@@ -530,6 +530,7 @@ pub enum RunTriggerDto {
     Stalled,
     Blocked,
     Grooming,
+    BoardIdle,
 }
 
 impl From<RunTrigger> for RunTriggerDto {
@@ -546,6 +547,7 @@ impl From<RunTrigger> for RunTriggerDto {
             RunTrigger::Stalled => Self::Stalled,
             RunTrigger::Blocked => Self::Blocked,
             RunTrigger::Grooming => Self::Grooming,
+            RunTrigger::BoardIdle => Self::BoardIdle,
         }
     }
 }

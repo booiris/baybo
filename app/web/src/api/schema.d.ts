@@ -3380,7 +3380,7 @@ export interface components {
          * @description Why a run was started.
          * @enum {string}
          */
-        RunTriggerDto: "started" | "assigned" | "retry" | "comment" | "promoted" | "triage" | "stage_barrier" | "review" | "stalled" | "blocked" | "grooming";
+        RunTriggerDto: "started" | "assigned" | "retry" | "comment" | "promoted" | "triage" | "stage_barrier" | "review" | "stalled" | "blocked" | "grooming" | "board_idle";
         /**
          * @description Wire mirror of [`baybo_query::SessionKind`]. Coarse trigger/lineage
          *     label for the trace browser list view.

@@ -1398,6 +1398,7 @@ mod tests {
                 daily_budget: None,
                 daily_budget_tokens: None,
                 max_parallel_issue_runs: baybo_store::project::DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
+                rules_changed_at: now,
                 archived_at: None,
                 created_at: now,
                 updated_at: now,

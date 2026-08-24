@@ -48,7 +48,7 @@ every door leads through it.
 | `actors.rs` | What an agent-facing surface calls the somebody a timeline entry names |
 | `mentions.rs` | `@handle` scanning, and when a mention is a handover |
 | `stages.rs` | Sub-issues, `is_finished`, the stage barrier's two questions, the progress ring |
-| `driver.rs` | Which Todo cards the board starts by itself, in what order, and which cards the lead is asked about (staffing, review, stalled work, blocks, the Backlog the board filed) |
+| `driver.rs` | Which Todo cards the board starts by itself, in what order, which cards the lead is asked about (staffing, review, stalled work, blocks, the Backlog the board filed), and when the board itself has run dry |
 | `budget.rs` | `Headroom` and the UTC-day window a daily ceiling measures |
 | `timeline.rs` | `diff_events` — an edit reduced to the entries worth writing |
 | `worktree.rs` | The per-issue git worktree: create, branch, resolve the commit identity, merge, reclaim |
@@ -822,9 +822,10 @@ it is woken. One card **that was actually asked**: a candidate whose enqueue
 answers `None` woke nobody, so the pass goes on to the next one. Returning
 there instead let a single card the board can never start a run on — a
 finished one still carrying a block reason, an agent moved off baybo —
-swallow every question behind it, on every tick, in silence. Five questions,
+swallow every question behind it, on every tick, in silence. Six questions,
 in the order they matter, each its own trigger so the execution log says which
-was asked (`RunTrigger::is_coordination`):
+was asked (`RunTrigger::is_coordination`). The first five are about **a card**;
+the last is about **the board**, and is asked only once all five have declined:
 
 - **Blocked** — a card a block has stopped, whose reason is an **agent's**
   question rather than a person's stop. It goes first: review and stalled work
@@ -909,7 +910,11 @@ was asked (`RunTrigger::is_coordination`):
   Progress and the non-lead half of Review all empty, every remaining wake is
   downstream of a card sitting in a column the driver reads, so a board that
   finished its last card went quiet with no error, no log line and no badge,
-  until a person commented on something.
+  until a person commented on something. Asking is not the same as never
+  going quiet again — a groomed card the lead deferred is answered, and stays
+  answered however long the reason it was waiting on has since stopped
+  holding. That second silence is what the **Board idle** question below
+  reaches.
 
   Authorship, not the assignee, is what tells the two apart, and it lives only
   on the timeline — the same shape as `block_is_an_agents_question`, but asked
@@ -935,6 +940,40 @@ was asked (`RunTrigger::is_coordination`):
   mark a card the board will never ask about. It sits on `BoardCards` and not
   in `CardSignals`, whose map is sparse on purpose: absent there means
   "nothing waiting", and most cards on a working board are an agent's.
+- **Board idle** — the board itself has run dry: nothing executing, nothing
+  this pass promoted, and live cards still on it (`driver::ran_dry`). The one
+  question here that is not about a card, and it exists because the five above
+  share a blind spot: each is answered **about a card**, and a card cannot see
+  a premise that lives somewhere else. "Not yet — wait for #8" is a complete
+  answer to a grooming question while #8 is running and a dead end the moment
+  #8 lands, and #8 landing touches nothing #9 carries. Every per-card question
+  declining is precisely the state in which that has happened, which is what
+  makes the situation worth a run rather than a log line.
+
+  Its run is filed against an anchor card (`driver::drain_anchor`): a run is a
+  row on a card, and this question has no card of its own. The pick is
+  `promotion_order` over the live cards the board may act on — a blocked one
+  would have its run parked by `runs::parked_by_a_block` rather than delivered
+  — and deliberately **not** `takes_a_lead_question`, since a board whose only
+  live card is the lead's own is exactly a board with nothing else to anchor
+  to. No anchor at all means every live card is blocked, and each of those
+  blocks has already been put to the lead once by the question above; there is
+  nothing here the board may act on.
+
+  The guard is `driver::nothing_has_happened_since_the_lead_looked`, over
+  `ProjectStore::drain_marks`, and its two marks are deliberately asymmetric.
+  **Any** coordination run counts as the lead having looked, because a
+  coordination brief hands it the whole board — telling it again inside the
+  same lull buys a billed run and no new information. Only **work** counts as
+  something having happened, so the lead answering, and the runs that answer
+  generates, never re-arm the question. What survives that pair is one shape:
+  the board did work, the work is over, and nobody has read the board since.
+  A dead ask does not count as a look, on `already_asked`'s own rule. The
+  drain question is itself coordination, so being asked is being looked at and
+  the spin closes for free.
+
+  The store read is behind `ran_dry` rather than beside it: it is the only
+  board-wide query in the pass, and a board that is working never pays for it.
 
 Cards whose assignee *is* the lead take no question at all
 (`driver::takes_a_lead_question`) — those are the lead's own, its
@@ -946,7 +985,7 @@ assignee — and the brief they are handed opens with *why* the lead was woken
 
 The spin this could obviously become is closed by `driver::already_asked`,
 which compares each question's newest run against the card's **last
-activity**: its `updated_at`, or the settle of its newest *work* run,
+activity**: `driver::reopened_at`, or the settle of its newest *work* run,
 whichever is later. A lead that read the card and left it alone changed
 nothing, so it is not asked again; editing the card, moving it, or a work run
 settling on it (a reviewer's verdict, say) makes it a new question. Coordination
@@ -954,6 +993,26 @@ runs count on neither side — the lead looking at a card is not the card
 changing. The guard is a comparison rather than a flag precisely so that "has
 anything changed since the lead looked?" has no second copy that could
 disagree.
+
+`reopened_at` is that question's other half, and the half the card cannot
+answer: the card's own `updated_at`, **or** `ProjectRow::rules_changed_at`,
+whichever is later. An answer is given under the board's rules as much as
+under the card's state — "escalate this to somebody who may merge" is complete
+while `agents_may_merge` is off, and the operator turning it on is the only
+thing that ever happens next. It touches no card, so a guard reading the card
+alone goes on holding an answer whose premise is gone. The stamp moves for
+either ceiling, `max_parallel_issue_runs`, `agents_may_merge`, and a restore
+from the archive — the fields a board *schedules* by, spelled once in
+`A_BOARD_RULE_CHANGED` and written in the same `UPDATE` that compares them, so
+the stamp cannot be written against a row other than the one it read. A rename
+is not a rule. Deliberately the whole board at once rather than an edge per
+rule: which card a given rule could unstick is not knowable — the reason lives
+in the lead's prose — and one re-ask per operator action is the bound that
+makes guessing unnecessary. It is safe in both directions, because every rule
+change that *stops* a board is caught by a gate above the questions:
+`promotions` returns early on `max_parallel_issue_runs == 0` and
+`release_holds` on an exhausted ceiling, so a stamp can never be the thing
+that starts a board the operator just stopped.
 
 Two refinements on that guard, both mechanical bounds the comparison alone
 does not give:
@@ -963,7 +1022,10 @@ does not give:
   answers, the settle re-arms the wake, two billed runs per cycle — so one
   question is asked at most `MAX_ASKS_PER_CARD_STATE` (2) times while the
   card row itself stands unchanged. Past the cap, only somebody editing,
-  moving or restaffing the card asks it again.
+  moving or restaffing the card — or the board changing a rule, on the same
+  `reopened_at` mark — asks it again. Counted against that mark and not
+  against `updated_at` alone, because a card that spent its two asks under
+  the old rules has not been asked once under these.
 - **A dead ask is not an ask.** A coordination run the dispatcher settled
   `Failed` before it was ever claimed never put a brief in front of the
   lead, so it does not satisfy the guard — the question stays open for the

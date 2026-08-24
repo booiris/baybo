@@ -2430,6 +2430,7 @@ forwards_everything_else! {
     board_activity(since: DateTime<Utc>)
         -> StoreResult<Vec<(ProjectId, baybo_store::project::BoardActivity)>>;
     active_runs(project: &ProjectId) -> StoreResult<Vec<IssueRunRow>>;
+    drain_marks(project: &ProjectId) -> StoreResult<baybo_store::project::DrainMarks>;
     get_run(id: &IssueRunId) -> StoreResult<Option<IssueRunRow>>;
     claim_run(id: &IssueRunId, session: &SessionId) -> StoreResult<bool>;
     settle_run(id: &IssueRunId, status: RunStatus, error: Option<&str>) -> StoreResult<bool>;
@@ -6004,6 +6005,28 @@ async fn set_ceiling(f: &Fixture, project: &ProjectRow, slots: usize) {
         .expect("ceiling");
 }
 
+async fn set_merge(f: &Fixture, project: &ProjectRow, may_merge: bool) {
+    f.manager
+        .update_project(
+            &project.id,
+            ProjectUpdate {
+                name: project.name.clone(),
+                description: project.description.clone(),
+                daily_budget: project.daily_budget,
+                daily_budget_tokens: project.daily_budget_tokens,
+                max_parallel_issue_runs: project.max_parallel_issue_runs,
+                agents_may_merge: may_merge,
+            },
+        )
+        .await
+        .expect("merge rule");
+}
+
+/// Every run the board has handed out, by why it handed it out.
+fn asks(f: &Fixture) -> Vec<RunTrigger> {
+    f.dispatched.lock().iter().map(|run| run.trigger).collect()
+}
+
 async fn set_budget(f: &Fixture, project: &ProjectRow, budget: Option<baybo_model::MicroUsd>) {
     f.manager
         .update_project(
@@ -6411,6 +6434,150 @@ async fn the_lead_is_asked_about_the_backlog_the_board_filed_and_never_about_the
         f.dispatched.lock().len(),
         1,
         "and a card nothing changed about is not raised again every pass"
+    );
+}
+
+#[tokio::test]
+async fn a_deferral_the_board_outlived_is_put_back_to_the_lead() {
+    let f = fixture().await;
+    let (p, dev) = driven_board(&f, 3).await;
+    let lead = lead_of(&f, &p.id).await;
+
+    // The shape this exists for. The board filed a card and parked it; the
+    // lead looked and deferred it on the *other* card — a complete answer,
+    // and one whose premise is nowhere on the card it was given about.
+    let parked = park_card(
+        &f,
+        &p.id,
+        "after the other one lands",
+        IssueActor::Agent(dev.clone()),
+        None,
+    )
+    .await;
+    let working = queue_card(
+        &f,
+        &p.id,
+        "the other one",
+        Some(dev.clone()),
+        IssuePriority::High,
+    )
+    .await;
+
+    tick(&f, &p.id).await;
+    assert_eq!(
+        asks(&f),
+        vec![RunTrigger::Promoted, RunTrigger::Grooming],
+        "the staffed card starts, and the parked one goes to the lead"
+    );
+    let (started, grooming) = {
+        let dispatched = f.dispatched.lock();
+        (dispatched[0].clone(), dispatched[1].clone())
+    };
+    settle_clean(&f, &grooming).await;
+
+    // Nothing on the parked card changed, so nothing about it is asked
+    // again — correctly, while the card it is waiting on is still running.
+    tick(&f, &p.id).await;
+    assert_eq!(
+        asks(&f).len(),
+        2,
+        "a deferral is an answer, and the board does not overrule it"
+    );
+
+    // The thing it was waiting for happens. It touches the parked card in
+    // no way at all, which is the whole difficulty.
+    f.manager
+        .move_issue(
+            &p.id,
+            working.number,
+            IssueActor::Agent(dev.clone()),
+            IssueStatus::Done,
+            &[working.number],
+        )
+        .await
+        .expect("close it");
+    settle_clean(&f, &started).await;
+
+    tick(&f, &p.id).await;
+    assert_eq!(
+        asks(&f),
+        vec![
+            RunTrigger::Promoted,
+            RunTrigger::Grooming,
+            RunTrigger::BoardIdle
+        ],
+        "work outlived the lead's last look and the board is empty behind \
+         it — which is where the board used to stop for good"
+    );
+    let told = f.dispatched.lock()[2].clone();
+    assert_eq!(
+        told.number, parked.number,
+        "a run is a row on a card, so the only live card is what it anchors to"
+    );
+    assert_eq!(
+        told.agent_id, lead,
+        "and the lead is who answers for a board"
+    );
+
+    // Told once. The lead answering is not the board working, so sitting
+    // still is not a second question.
+    settle_clean(&f, &told).await;
+    tick(&f, &p.id).await;
+    tick(&f, &p.id).await;
+    assert_eq!(
+        asks(&f).len(),
+        3,
+        "and it is told once per drain, not per tick"
+    );
+}
+
+#[tokio::test]
+async fn a_rule_the_board_changed_re_opens_what_the_lead_answered_under_the_old_one() {
+    let f = fixture().await;
+    let (p, _dev) = driven_board(&f, 3).await;
+
+    // A card in Review with nobody on it: the lead's question to arrange,
+    // and the lead escalates it rather than answering — the board may not
+    // land its own work, so there is nothing else it can say.
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::Review,
+                assignee: None,
+                ..new_issue("approved, and going nowhere")
+            },
+        )
+        .await
+        .expect("card");
+    tick(&f, &p.id).await;
+    let review = f.dispatched.lock()[0].clone();
+    assert_eq!(review.trigger, RunTrigger::Review);
+    settle_clean(&f, &review).await;
+
+    tick(&f, &p.id).await;
+    tick(&f, &p.id).await;
+    assert_eq!(
+        asks(&f),
+        vec![RunTrigger::Review],
+        "an unchanged card is not the same question twice"
+    );
+
+    // The operator turns on the one thing that answer was waiting for. It
+    // touches no card, so nothing anywhere on the board records it.
+    set_merge(&f, &p, true).await;
+    tick(&f, &p.id).await;
+    assert_eq!(
+        asks(&f),
+        vec![RunTrigger::Review, RunTrigger::Review],
+        "the answer was given under rules the board no longer has, so the \
+         question is a question again"
+    );
+    assert_eq!(
+        f.dispatched.lock()[1].number,
+        review.number,
+        "and it is the same card, asked again rather than a new one"
     );
 }
 
@@ -8220,6 +8387,7 @@ async fn leadless_board(f: &Fixture, name: &str) -> (ProjectRow, AgentProfileId)
         daily_budget: None,
         daily_budget_tokens: None,
         max_parallel_issue_runs: 3,
+        rules_changed_at: now,
         archived_at: None,
         created_at: now,
         updated_at: now,

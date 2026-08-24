@@ -522,6 +522,11 @@ const ADD_COLUMNS: &[AddColumn] = &[
         column: "resumes",
         definition: "INTEGER NOT NULL DEFAULT 0",
     },
+    AddColumn {
+        table: "projects",
+        column: "rules_changed_at",
+        definition: "INTEGER",
+    },
     // VIRTUAL, so this reads existing rows the moment it is added: there is
     // no backfill to write and nothing to keep in step with `data`. STORED
     // would need both.

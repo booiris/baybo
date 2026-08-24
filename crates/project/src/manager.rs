@@ -870,7 +870,8 @@ impl ProjectManager {
         // is on. A board with no capacity left says nothing rather than
         // queueing a question it cannot act on the answer to.
         if slots > moved {
-            self.ask_the_lead(project, &issues, &in_flight).await;
+            self.ask_the_lead(project, &issues, &in_flight, row.rules_changed_at, moved)
+                .await;
         }
         Ok(moved)
     }
@@ -982,6 +983,8 @@ impl ProjectManager {
         project: &ProjectId,
         issues: &[IssueRow],
         in_flight: &std::collections::BTreeSet<i64>,
+        rules_changed_at: chrono::DateTime<chrono::Utc>,
+        promoted: usize,
     ) {
         let Some(lead) = self.coordinator(project).await else {
             return;
@@ -1032,7 +1035,7 @@ impl ProjectManager {
                 {
                     continue;
                 }
-                if crate::driver::already_asked(&issue, &runs, question) {
+                if crate::driver::already_asked(&issue, &runs, question, rules_changed_at) {
                     continue;
                 }
                 if question == RunTrigger::Blocked {
@@ -1060,6 +1063,64 @@ impl ProjectManager {
                     return;
                 }
             }
+        }
+        self.tell_the_lead_the_board_ran_dry(project, issues, in_flight, promoted, lead)
+            .await;
+    }
+
+    /// Wake the lead about the **board** once it has run dry, having asked
+    /// it about every card first.
+    ///
+    /// Reached only when every question above it declined, which is what
+    /// makes it worth a run: each of those declines is the lead having
+    /// already answered about that card, and a board where all of them have
+    /// is a board that will now sit still for as long as it is left alone.
+    /// The answers were not wrong when they were given — "wait for #8" is
+    /// correct while #8 is running — they simply have no reader once the
+    /// thing they were waiting for happens somewhere else.
+    ///
+    /// The store read comes **last**, behind both rules that can be answered
+    /// from rows already in hand: it is the only board-wide query in the
+    /// pass, and a board that is working — or one with nothing the question
+    /// could be filed against — never pays for it.
+    async fn tell_the_lead_the_board_ran_dry(
+        &self,
+        project: &ProjectId,
+        issues: &[IssueRow],
+        in_flight: &std::collections::BTreeSet<i64>,
+        promoted: usize,
+        lead: AgentProfileId,
+    ) {
+        if !crate::driver::ran_dry(issues, in_flight, promoted) {
+            return;
+        }
+        // No anchor is a board whose every live card is blocked, and each of
+        // those blocks is a standing decision somebody made. There is
+        // nothing here the board may act on, and `blocked` has already put
+        // each of them to the lead once.
+        let Some(anchor) = crate::driver::drain_anchor(issues, in_flight) else {
+            return;
+        };
+        let marks = match self.store.drain_marks(project).await {
+            Ok(marks) => marks,
+            Err(e) => {
+                tracing::error!(%project, error = %e, "could not read the board's drain marks");
+                return;
+            }
+        };
+        if crate::driver::nothing_has_happened_since_the_lead_looked(&marks) {
+            return;
+        }
+        if self
+            .enqueue_as(&anchor, RunTrigger::BoardIdle, lead, &IssueActor::System)
+            .await
+            .is_some()
+        {
+            tracing::info!(
+                %project,
+                issue = anchor.number,
+                "told the lead the board has run dry"
+            );
         }
     }
 
@@ -1964,6 +2025,9 @@ impl ProjectManager {
                 .max_parallel_issue_runs
                 .unwrap_or(DEFAULT_MAX_PARALLEL_ISSUE_RUNS),
             agents_may_merge: new.agents_may_merge,
+            // A board opens with the rules it was created under, so nothing
+            // on it has been answered under any others yet.
+            rules_changed_at: now,
             // Never read, so a board's first agent comment is unread even
             // if it lands before anybody opens it.
             archived_at: None,

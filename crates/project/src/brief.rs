@@ -145,6 +145,8 @@ const BLOCKED_PREAMBLE: &str = r#"You are this board's lead. The block below nee
 
 const GROOMING_PREAMBLE: &str = r#"You are this board's lead. This card is parked in Backlog, which the board never starts anything from. Decide what it is: move it to Todo with an assignee if the work is ready to pick up, leave it in Backlog if it is not yet, or cancel it if it is no longer wanted. Say which and why in a comment. Do not do the card's own work in this run."#;
 
+const BOARD_IDLE_PREAMBLE: &str = r#"You are this board's lead. Nothing is running on this board and nothing is queued, but there is still live work on it — and every question the board asks about one card has already been asked and answered. This run is about the board, not about the card it is filed against: that card is only where a run has to live. Read the whole board and decide what should happen next — move something to Todo with an assignee, restaff a card, lift a block whose reason no longer holds, or cancel what is no longer wanted. If a card was left waiting on something that has since happened, this is the moment nobody else will notice it. If the board is genuinely finished for now, say so in a comment and leave it: you will not be asked this again until work actually happens here. Do not do any card's own work in this run."#;
+
 /// State why the lead was woken; the card properties do not encode the ask.
 fn coordination_preamble(trigger: RunTrigger) -> Option<&'static str> {
     match trigger {
@@ -153,6 +155,7 @@ fn coordination_preamble(trigger: RunTrigger) -> Option<&'static str> {
         RunTrigger::Stalled => Some(STALLED_PREAMBLE),
         RunTrigger::Blocked => Some(BLOCKED_PREAMBLE),
         RunTrigger::Grooming => Some(GROOMING_PREAMBLE),
+        RunTrigger::BoardIdle => Some(BOARD_IDLE_PREAMBLE),
         RunTrigger::Started
         | RunTrigger::Assigned
         | RunTrigger::Retry

@@ -597,6 +597,7 @@ export const RUN_TRIGGER_LABEL: Record<IssueRun['trigger'], string> = {
   stalled: 'work stopped',
   blocked: 'blocked, needs a decision',
   grooming: 'parked in Backlog',
+  board_idle: 'the board had nothing to start',
 };
 
 /// How many runs the execution log shows before the rest fold away. A run is

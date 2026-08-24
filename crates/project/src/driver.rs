@@ -5,7 +5,7 @@
 //! already read — the manager owns the reads, the writes, and the order
 //! they happen in; this module owns *which cards*, and nothing else.
 //!
-//! Two rules, and they are deliberately different shapes:
+//! Three rules, and they are deliberately different shapes:
 //!
 //! - [`slate`] is **level-triggered**. It answers "given the board as it
 //!   is right now, what should be running?", so running it twice on an
@@ -18,7 +18,16 @@
 //!   [`already_asked`] is what stops that from being a loop that bills for
 //!   the same question every time a run ends anywhere on the board: the
 //!   lead is asked again only when the card has *changed* since it last
-//!   looked.
+//!   looked — or when the board changed a rule the answer was given under
+//!   ([`reopened_at`]).
+//! - [`ran_dry`] is the one question about the **board**, and it is asked
+//!   only once every rule above it has declined. Each of those reads a
+//!   single card, and a card cannot see the thing that most often strands
+//!   it: an answer given about it whose premise was somewhere else. Every
+//!   per-card question declining is exactly the state in which that has
+//!   happened, which is what makes "the board has looked at all of it and
+//!   has no move left" a fact worth spending a run on.
+//!   [`nothing_has_happened_since_the_lead_looked`] is its guard.
 //!
 //! Backlog is the one column the board **pulls** nothing from and still
 //! **asks** about, and the two halves of that are deliberate: a card only
@@ -30,7 +39,7 @@ use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
 use baybo_store::project::{
-    IssuePriority, IssueRow, IssueRunRow, IssueStatus, RunStatus, RunTrigger,
+    DrainMarks, IssuePriority, IssueRow, IssueRunRow, IssueStatus, RunStatus, RunTrigger,
 };
 
 /// The cards that already have a run recorded against them, by number.
@@ -289,6 +298,73 @@ pub(crate) fn awaiting_grooming(
     parked
 }
 
+/// Whether the board has run dry: nothing executing, nothing this pass
+/// promoted, and live work still sitting on it.
+///
+/// The one board-scale question in this module, and it has to be one: it is
+/// asked last, after every per-card question declined, so what it reports is
+/// not a fact about any card but a fact about the board — every card on it
+/// has been asked about and answered, and there is no move left. No row
+/// carries that, which is exactly why the hole it closes stayed open. A
+/// lead's "not yet, wait for #8" is a complete answer while #8 is running
+/// and a dead end the moment #8 lands, and #8 landing touches nothing on
+/// the deferred card.
+///
+/// Capacity is the caller's gate, as it is for every other question here:
+/// `ask_the_lead` runs only with a slot to spare, and a board an operator
+/// stopped by setting its parallelism to zero is stopped, not drained.
+pub(crate) fn ran_dry(issues: &[IssueRow], in_flight: &BTreeSet<i64>, promoted: usize) -> bool {
+    promoted == 0 && in_flight.is_empty() && issues.iter().any(crate::runs::accepts_runs)
+}
+
+/// Whether the board has done anything since the lead last had it in front
+/// of it — the guard on the drain question.
+///
+/// The board-scale twin of [`already_asked`], and a comparison for the same
+/// reason. What it compares is deliberately asymmetric: **any** wake counts
+/// as the lead having looked, because a coordination brief hands it the
+/// whole board, but only **work** counts as something having happened. So
+/// the question survives exactly one shape — the board did work, that work
+/// is now over, and nobody has read the board since. That is the shape a
+/// deferral rots in: "not yet, wait for the other card" is a complete
+/// answer when it is given and a dead end the moment the other card lands,
+/// and the landing touches nothing the deferred card carries.
+///
+/// It also closes the obvious spin for free: the drain question is itself a
+/// wake, so being asked is being looked at, and answering it is not work.
+///
+/// A board nothing has ever run on has never been looked at, and that is the
+/// truth rather than an edge case: cards were filed and nothing came.
+pub(crate) fn nothing_has_happened_since_the_lead_looked(marks: &DrainMarks) -> bool {
+    match (marks.looked_at, marks.worked_at) {
+        (None, _) => false,
+        (Some(looked), worked) => worked.is_none_or(|worked| worked <= looked),
+    }
+}
+
+/// The card a board-scale question is filed against.
+///
+/// A run is a row on a card, so a question that has no card of its own still
+/// needs one to live on. The pick is the order every column is already read
+/// in, over the cards the board could act on — filing it against a blocked
+/// card would put a run on work an operator paused, and `parked_by_a_block`
+/// would hold that run rather than deliver it.
+///
+/// Deliberately **not** [`takes_a_lead_question`]: a card whose assignee is
+/// the lead is excluded from every question *about a card*, because the
+/// lead's own card has no other party. This question is not about the card,
+/// and a board whose only live card is the lead's is precisely a board with
+/// nothing else to anchor to.
+pub(crate) fn drain_anchor(issues: &[IssueRow], in_flight: &BTreeSet<i64>) -> Option<IssueRow> {
+    issues
+        .iter()
+        .filter(|i| {
+            crate::runs::accepts_runs(i) && board_may_start(i) && !in_flight.contains(&i.number)
+        })
+        .min_by(|a, b| promotion_order(a, b))
+        .cloned()
+}
+
 /// A card whose newest run was **cancelled** is not stalled: a cancel is a
 /// decision — a human's stop, or the board calling a row off — and waking
 /// the lead to get the work going again would countermand it within one
@@ -300,16 +376,44 @@ pub(crate) fn newest_run_was_cancelled(runs: &[IssueRunRow]) -> bool {
         .is_some_and(|run| run.status == RunStatus::Cancelled)
 }
 
-/// When this card last changed in a way the lead has not seen: the card's
-/// own `updated_at`, or the settle of its newest *work* run, whichever is
+/// When this card last became a fresh question, before any run is weighed:
+/// its own row changing, or the board changing a rule it schedules by.
+///
+/// The second half is the part a card cannot see about itself. "Escalate
+/// this to somebody who may merge" is a *complete* answer while the board's
+/// agents may not merge, and the board being told they now may is the only
+/// thing that ever happens next — it touches no card, so a guard reading the
+/// card alone goes on holding an answer whose premise is gone. Same shape
+/// for a ceiling raised, a parallelism raised off zero, and a board restored
+/// from the archive: the operator changed what the board may do, and every
+/// standing answer was given under the old rules.
+///
+/// Deliberately the whole board at once rather than an edge per rule. Which
+/// card a given rule could unstick is not knowable here — the reason lives
+/// in the lead's prose — and one re-ask per operator action is the bound
+/// that makes guessing unnecessary.
+fn reopened_at(
+    issue: &IssueRow,
+    rules_changed_at: chrono::DateTime<chrono::Utc>,
+) -> chrono::DateTime<chrono::Utc> {
+    issue.updated_at.max(rules_changed_at)
+}
+
+/// When this card last changed in a way the lead has not seen:
+/// [`reopened_at`], or the settle of its newest *work* run, whichever is
 /// later. Coordination runs are excluded on both sides of the question —
 /// the lead looking at a card is not the card changing.
-fn last_activity(issue: &IssueRow, runs: &[IssueRunRow]) -> chrono::DateTime<chrono::Utc> {
+fn last_activity(
+    issue: &IssueRow,
+    runs: &[IssueRunRow],
+    rules_changed_at: chrono::DateTime<chrono::Utc>,
+) -> chrono::DateTime<chrono::Utc> {
+    let reopened = reopened_at(issue, rules_changed_at);
     runs.iter()
         .filter(|run| !run.trigger.is_coordination())
         .filter_map(|run| run.settled_at)
         .max()
-        .map_or(issue.updated_at, |settled| settled.max(issue.updated_at))
+        .map_or(reopened, |settled| settled.max(reopened))
 }
 
 /// How many times one question may be re-asked while the card row itself
@@ -336,15 +440,24 @@ const MAX_ASKS_PER_CARD_STATE: usize = 2;
 /// count as the question having been asked. It still counts against the
 /// cap: a card whose checkout refuses to cut should not be retried every
 /// tick forever.
-pub(crate) fn already_asked(issue: &IssueRow, runs: &[IssueRunRow], question: RunTrigger) -> bool {
-    let activity = last_activity(issue, runs);
+pub(crate) fn already_asked(
+    issue: &IssueRow,
+    runs: &[IssueRunRow],
+    question: RunTrigger,
+    rules_changed_at: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let activity = last_activity(issue, runs, rules_changed_at);
     let asks = runs.iter().filter(|run| run.trigger == question);
     let delivered = asks.clone().any(|run| {
         run.created_at >= activity && !(run.status == RunStatus::Failed && !run.was_claimed())
     });
+    // The cap counts against the same mark, and not against `updated_at`
+    // alone: a board whose rules changed has not asked this question under
+    // them at all, so a card that spent its two asks under the old ones is
+    // not a card that has been asked.
     delivered
         || asks
-            .filter(|run| run.created_at >= issue.updated_at)
+            .filter(|run| run.created_at >= reopened_at(issue, rules_changed_at))
             .count()
             >= MAX_ASKS_PER_CARD_STATE
 }
@@ -393,6 +506,13 @@ mod tests {
     /// A board with nothing recorded against any card.
     fn idle() -> BTreeSet<i64> {
         BTreeSet::new()
+    }
+
+    /// A board whose rules the operator has never touched. Older than every
+    /// card the tests build, so it re-opens nothing and the guard reads
+    /// exactly as it did before boards could change their own rules.
+    fn rules_never_changed() -> chrono::DateTime<chrono::Utc> {
+        Utc::now() - Duration::days(365)
     }
 
     /// One reason to leave a card alone: why, and how to put a card in that
@@ -548,19 +668,29 @@ mod tests {
         let mut card = ready(1);
         card.assignee = None;
         assert!(
-            !already_asked(&card, &[], RunTrigger::Triage),
+            !already_asked(&card, &[], RunTrigger::Triage, rules_never_changed()),
             "a card nobody has looked at is a fresh question"
         );
 
         let asked = triage_run(&card, card.updated_at + Duration::seconds(1));
         assert!(
-            already_asked(&card, std::slice::from_ref(&asked), RunTrigger::Triage),
+            already_asked(
+                &card,
+                std::slice::from_ref(&asked),
+                RunTrigger::Triage,
+                rules_never_changed()
+            ),
             "a lead that read the card and left it alone must not be asked again"
         );
 
         card.updated_at = asked.created_at + Duration::seconds(1);
         assert!(
-            !already_asked(&card, std::slice::from_ref(&asked), RunTrigger::Triage),
+            !already_asked(
+                &card,
+                std::slice::from_ref(&asked),
+                RunTrigger::Triage,
+                rules_never_changed()
+            ),
             "but editing the card makes it a question the lead has not answered"
         );
 
@@ -569,8 +699,163 @@ mod tests {
             ..triage_run(&card, card.updated_at + Duration::seconds(1))
         };
         assert!(
-            !already_asked(&card, &[asked, other], RunTrigger::Triage),
+            !already_asked(
+                &card,
+                &[asked, other],
+                RunTrigger::Triage,
+                rules_never_changed()
+            ),
             "and a run that was not a triage is not an answer to one"
+        );
+    }
+
+    #[test]
+    fn a_board_has_run_dry_only_with_work_left_on_it_and_nothing_moving() {
+        let live = issue(1, IssueStatus::Backlog);
+        assert!(
+            ran_dry(std::slice::from_ref(&live), &idle(), 0),
+            "a card nothing will ever start, and nothing running to start it"
+        );
+        assert!(
+            !ran_dry(std::slice::from_ref(&live), &busy([2]), 0),
+            "a board with a run on it is working, whatever that run is on"
+        );
+        assert!(
+            !ran_dry(std::slice::from_ref(&live), &idle(), 1),
+            "and a pass that just promoted something has not run dry — the \
+             slate it filled is not in flight yet"
+        );
+
+        let finished = issue(1, IssueStatus::Done);
+        let mut cancelled = issue(2, IssueStatus::Todo);
+        cancelled.cancelled_at = Some(Utc::now());
+        assert!(
+            !ran_dry(&[finished, cancelled], &idle(), 0),
+            "a board the work is over on is quiet, not stuck"
+        );
+    }
+
+    #[test]
+    fn the_board_is_told_it_ran_dry_only_when_work_outlived_the_leads_last_look() {
+        let looked = Utc::now();
+        assert!(
+            !nothing_has_happened_since_the_lead_looked(&DrainMarks::default()),
+            "a board nothing ever ran on has never been looked at; cards were \
+             filed and nothing came for them"
+        );
+        assert!(
+            nothing_has_happened_since_the_lead_looked(&DrainMarks {
+                looked_at: Some(looked),
+                worked_at: None,
+            }),
+            "a lead woken on a board nothing has run on has been shown all of it"
+        );
+        assert!(
+            nothing_has_happened_since_the_lead_looked(&DrainMarks {
+                looked_at: Some(looked),
+                worked_at: Some(looked - Duration::seconds(1)),
+            }),
+            "and work that settled before that look is work the look covered"
+        );
+        assert!(
+            !nothing_has_happened_since_the_lead_looked(&DrainMarks {
+                looked_at: Some(looked),
+                worked_at: Some(looked + Duration::seconds(1)),
+            }),
+            "but work that outlived the last look is a board nobody has read \
+             since it stopped — the one shape a stale deferral hides in"
+        );
+    }
+
+    #[test]
+    fn the_drain_anchor_is_a_card_a_run_can_live_on_and_not_a_question_about_it() {
+        let lead = AgentProfileId::parse("lead".to_owned()).expect("agent");
+        let mut urgent = issue(2, IssueStatus::Backlog);
+        urgent.priority = IssuePriority::Urgent;
+        let ordinary = issue(1, IssueStatus::Backlog);
+        assert_eq!(
+            drain_anchor(&[ordinary.clone(), urgent.clone()], &idle()).map(|i| i.number),
+            Some(2),
+            "the same order every column is read in"
+        );
+
+        let mut the_leads_own = issue(3, IssueStatus::Review);
+        the_leads_own.assignee = Some(lead);
+        assert_eq!(
+            drain_anchor(std::slice::from_ref(&the_leads_own), &idle()).map(|i| i.number),
+            Some(3),
+            "a board whose only live card is the lead's still has a board to \
+             ask about — the question is not about the card"
+        );
+
+        let mut paused = ordinary;
+        paused.blocked_reason = Some("waiting on the operator".into());
+        let mut also_paused = urgent;
+        also_paused.blocked_reason = Some("waiting on the operator".into());
+        assert!(
+            drain_anchor(&[paused, also_paused], &idle()).is_none(),
+            "every live card paused is nothing the board may act on, and each \
+             block has already been put to the lead once"
+        );
+    }
+
+    #[test]
+    fn a_rule_the_board_changed_re_opens_a_question_the_card_cannot_see() {
+        let mut card = ready(1);
+        card.assignee = None;
+        let asked = triage_run(&card, card.updated_at + Duration::seconds(1));
+        let runs = std::slice::from_ref(&asked);
+
+        assert!(
+            already_asked(&card, runs, RunTrigger::Triage, rules_never_changed()),
+            "the control: answered, and the card has not moved since"
+        );
+        assert!(
+            already_asked(
+                &card,
+                runs,
+                RunTrigger::Triage,
+                asked.created_at - Duration::seconds(1)
+            ),
+            "a rule changed before the lead answered is a rule it answered under"
+        );
+        assert!(
+            !already_asked(
+                &card,
+                runs,
+                RunTrigger::Triage,
+                asked.created_at + Duration::seconds(1)
+            ),
+            "but an answer given under rules the board no longer has is not an              answer to the board as it stands, and nothing on the card says so"
+        );
+    }
+
+    #[test]
+    fn a_rule_change_hands_back_the_asks_a_card_spent_under_the_old_ones() {
+        let card = ready(1);
+        // Two asks that died before their brief: they never reached the
+        // lead, so only the cap is holding the question shut.
+        let spent: Vec<IssueRunRow> = (1..=2)
+            .map(|n| IssueRunRow {
+                status: RunStatus::Failed,
+                settled_at: Some(card.updated_at + Duration::seconds(n * 2)),
+                ..triage_run(&card, card.updated_at + Duration::seconds(n * 2 - 1))
+            })
+            .collect();
+        assert!(
+            already_asked(&card, &spent, RunTrigger::Triage, rules_never_changed()),
+            "the control: the cap is what stops a card that will not dispatch"
+        );
+
+        let newest_ask = spent.iter().map(|run| run.created_at).max().expect("asks");
+        assert!(
+            !already_asked(
+                &card,
+                &spent,
+                RunTrigger::Triage,
+                newest_ask + Duration::seconds(1)
+            ),
+            "a cap spent under the old rules is not a cap spent under these:              the board has not asked this question once since they changed"
         );
     }
 
@@ -585,7 +870,12 @@ mod tests {
             ..triage_run(&card, card.updated_at)
         };
         assert!(
-            !already_asked(&card, &[asked.clone(), worked], RunTrigger::Triage),
+            !already_asked(
+                &card,
+                &[asked.clone(), worked],
+                RunTrigger::Triage,
+                rules_never_changed()
+            ),
             "a work run settling after the lead looked is news the lead has not seen"
         );
 
@@ -595,7 +885,12 @@ mod tests {
             ..triage_run(&card, card.updated_at)
         };
         assert!(
-            already_asked(&card, &[asked, looked_again], RunTrigger::Triage),
+            already_asked(
+                &card,
+                &[asked, looked_again],
+                RunTrigger::Triage,
+                rules_never_changed()
+            ),
             "but the lead's own coordination runs are not the card changing"
         );
     }
@@ -840,7 +1135,12 @@ mod tests {
             ..triage_run(&card, card.updated_at + Duration::seconds(1))
         };
         assert!(
-            !already_asked(&card, std::slice::from_ref(&failed_ask), RunTrigger::Triage),
+            !already_asked(
+                &card,
+                std::slice::from_ref(&failed_ask),
+                RunTrigger::Triage,
+                rules_never_changed()
+            ),
             "an ask that died before its brief is not the lead having looked"
         );
         // — but a card that keeps refusing to dispatch is not retried
@@ -851,7 +1151,12 @@ mod tests {
             ..triage_run(&card, card.updated_at + Duration::seconds(3))
         };
         assert!(
-            already_asked(&card, &[failed_ask, second_failed], RunTrigger::Triage),
+            already_asked(
+                &card,
+                &[failed_ask, second_failed],
+                RunTrigger::Triage,
+                rules_never_changed()
+            ),
             "two dead asks on an unchanged card stop the retry loop"
         );
     }
@@ -880,14 +1185,14 @@ mod tests {
             at += Duration::seconds(2);
         }
         assert!(
-            already_asked(&card, &runs, RunTrigger::Triage),
+            already_asked(&card, &runs, RunTrigger::Triage, rules_never_changed()),
             "the machinery's own echo cannot re-raise the question a third time"
         );
 
         let mut edited = card.clone();
         edited.updated_at = at + Duration::seconds(1);
         assert!(
-            !already_asked(&edited, &runs, RunTrigger::Triage),
+            !already_asked(&edited, &runs, RunTrigger::Triage, rules_never_changed()),
             "but somebody changing the card resets the cap"
         );
     }

@@ -11145,7 +11145,8 @@
           "review",
           "stalled",
           "blocked",
-          "grooming"
+          "grooming",
+          "board_idle"
         ]
       },
       "SessionKind": {

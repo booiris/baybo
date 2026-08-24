@@ -153,6 +153,23 @@ pub struct ProjectRow {
     /// row written before the column existed resolves to
     /// [`DEFAULT_AGENTS_MAY_MERGE`] at the storage edge.
     pub agents_may_merge: bool,
+    /// When an operator last changed a **rule** this board schedules by:
+    /// either ceiling, [`Self::max_parallel_issue_runs`],
+    /// [`Self::agents_may_merge`], or a restore from the archive.
+    ///
+    /// Scheduling state rather than content, and nothing draws it. The
+    /// driver's `already_asked` reads it so that a standing question the
+    /// lead has already answered becomes a question again when the premise
+    /// of that answer changed: "escalate this to somebody who may merge" is
+    /// the answer to a board that could not, and the board turning that on
+    /// is the only thing that ever happens next.
+    ///
+    /// Not `Option`, for [`Self::max_parallel_issue_runs`]'s reason: a row
+    /// written before the column existed resolves to its `created_at` at
+    /// the storage edge. Every card is younger than its board, so a board
+    /// whose rules never changed is exactly a board this re-opens nothing
+    /// on.
+    pub rules_changed_at: DateTime<Utc>,
     /// Soft archive. There is no hard delete in any production path.
     pub archived_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
@@ -611,6 +628,32 @@ pub struct NewIssueEvent {
     pub body: IssueEventBody,
 }
 
+/// The two marks the "should the lead be told this board ran dry" question
+/// is answered by.
+///
+/// Both are `None` on a board nothing has ever run on. Timestamps rather
+/// than a `bool` for the reason every other guard in this crate is a
+/// comparison: a stored flag is a second copy of the answer, free to
+/// disagree with the rows it came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DrainMarks {
+    /// When the lead was last woken about **anything** on this board — any
+    /// coordination run, not only a previous drain.
+    ///
+    /// Deliberately wider than the question it guards. A coordination brief
+    /// tells the lead to read the whole board, so a lead woken since the
+    /// last work settled has already been shown everything a drain question
+    /// could show it, and telling it again inside the same lull buys a
+    /// billed run and no new information. An ask the dispatcher killed
+    /// before it was claimed never reached the lead and does not count, on
+    /// the same rule `driver::already_asked` applies to a dead ask.
+    pub looked_at: Option<DateTime<Utc>>,
+    /// When a **work** run on this board last settled. Coordination is
+    /// excluded on both sides: the lead being asked a question, and
+    /// answering it, is not the board doing work.
+    pub worked_at: Option<DateTime<Utc>>,
+}
+
 #[async_trait]
 pub trait ProjectStore: Send + Sync {
     async fn list_projects(&self, include_archived: bool) -> Result<Vec<ProjectRow>>;
@@ -771,6 +814,14 @@ pub trait ProjectStore: Send + Sync {
 
     async fn active_runs(&self, project: &ProjectId) -> Result<Vec<IssueRunRow>>;
 
+    /// The marks behind the board-scale "is there anything to say" guard.
+    ///
+    /// Board-scoped by necessity: [`RunTrigger::BoardIdle`] is a question
+    /// about the whole board, so the run that asked it last may be filed
+    /// against a different card each time and no card's own run list can
+    /// answer whether the lead has seen the board since.
+    async fn drain_marks(&self, project: &ProjectId) -> Result<DrainMarks>;
+
     async fn get_run(&self, id: &IssueRunId) -> Result<Option<IssueRunRow>>;
 
     async fn claim_run(&self, id: &IssueRunId, session: &SessionId) -> Result<bool>;
@@ -835,6 +886,17 @@ pub enum RunTrigger {
     /// does not reopen it — the same rule that keeps a person's block from
     /// waking anybody.
     Grooming,
+    /// The lead was woken because the **board** has run dry: nothing
+    /// executing, nothing queued, room to start something, and live cards
+    /// still on it.
+    ///
+    /// The only question here that is about the board rather than about the
+    /// card its run is filed against — that card is an anchor, because a run
+    /// is a row on a card and this question has no card of its own. It is
+    /// asked last and only when every per-card question declined, so it is
+    /// by construction the board saying "I have looked at all of it and I
+    /// have no move left".
+    BoardIdle,
 }
 
 impl RunTrigger {
@@ -851,6 +913,7 @@ impl RunTrigger {
             RunTrigger::Stalled => "stalled",
             RunTrigger::Blocked => "blocked",
             RunTrigger::Grooming => "grooming",
+            RunTrigger::BoardIdle => "board_idle",
         }
     }
 
@@ -867,6 +930,7 @@ impl RunTrigger {
             "stalled" => Some(RunTrigger::Stalled),
             "blocked" => Some(RunTrigger::Blocked),
             "grooming" => Some(RunTrigger::Grooming),
+            "board_idle" => Some(RunTrigger::BoardIdle),
             _ => None,
         }
     }
@@ -880,6 +944,7 @@ impl RunTrigger {
                 | RunTrigger::Stalled
                 | RunTrigger::Blocked
                 | RunTrigger::Grooming
+                | RunTrigger::BoardIdle
         )
     }
 }

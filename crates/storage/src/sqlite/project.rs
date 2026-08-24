@@ -7,10 +7,10 @@ use rusqlite::OptionalExtension;
 use super::SqlitePool;
 use baybo_store::StorageError;
 use baybo_store::project::{
-    ACTOR_AGENT_PREFIX, AttentionCounts, BoardActivity, CardSignals, IssueActor, IssueAttachment,
-    IssueEventBody, IssueEventRow, IssuePriority, IssueRow, IssueRunRow, IssueStatus, IssueUpdate,
-    NewIssue, NewIssueEvent, NewIssueRun, ProjectRow, ProjectStore, ProjectUpdate, Result,
-    RunSpend, RunStatus, RunTrigger, SettledRunFacts, Spend,
+    ACTOR_AGENT_PREFIX, AttentionCounts, BoardActivity, CardSignals, DrainMarks, IssueActor,
+    IssueAttachment, IssueEventBody, IssueEventRow, IssuePriority, IssueRow, IssueRunRow,
+    IssueStatus, IssueUpdate, NewIssue, NewIssueEvent, NewIssueRun, ProjectRow, ProjectStore,
+    ProjectUpdate, Result, RunSpend, RunStatus, RunTrigger, SettledRunFacts, Spend,
 };
 
 pub struct SqliteProjectStore {
@@ -80,7 +80,21 @@ fn event_from_raw(raw: RawEvent) -> Result<IssueEventRow> {
 /// see [`ISSUE_COLUMNS`] for what inserting one mid-list does.
 const PROJECT_COLUMNS: &str = "id, name, description, workdir, daily_budget_micros, \
      daily_budget_tokens, max_parallel_issue_runs, archived_at, created_at, updated_at, \
-     agents_may_merge";
+     agents_may_merge, COALESCE(rules_changed_at, created_at)";
+
+/// Which of a project's editable fields are **rules the board schedules
+/// by**: the ones whose change makes every question the lead has already
+/// answered a question again ([`ProjectRow::rules_changed_at`]). Name and
+/// description are deliberately absent — renaming a board changes no answer.
+///
+/// Read against the pre-update row with the incoming values bound, which is
+/// what makes it a comparison rather than a flag. The `COALESCE` pair is why
+/// a legacy `NULL` that resolves to the same effective value is not a
+/// change; `IS NOT` is SQLite's null-safe inequality.
+const A_BOARD_RULE_CHANGED: &str = "daily_budget_micros IS NOT ?4 \
+     OR daily_budget_tokens IS NOT ?5 \
+     OR COALESCE(max_parallel_issue_runs, ?9) IS NOT ?6 \
+     OR COALESCE(agents_may_merge, ?10) IS NOT ?7";
 
 /// The projection order **is** [`RawIssue`]'s tuple order, and nothing links
 /// the two at compile time. A new column goes on the end, always: inserting
@@ -97,6 +111,19 @@ const UNREAD_EVENT_PREDICATE: &str = "e.created_at > COALESCE(i.read_at, 0) \
      AND (e.kind = 'comment' \
           OR e.kind = 'blocked' \
           OR (e.kind = 'moved' AND json_extract(e.body, '$.to') = :review))";
+
+/// The coordination triggers as a SQL list, with one home.
+///
+/// A macro rather than a `const` because `concat!` takes only literals, and
+/// the queries that must tell the lead's wakes from the card's own work are
+/// built at compile time. `coordination_triggers_match_the_enum` pins it to
+/// [`RunTrigger::is_coordination`], so a variant added to one cannot quietly
+/// miss the other.
+macro_rules! coordination_triggers {
+    () => {
+        "'triage', 'review', 'stalled', 'blocked', 'grooming', 'board_idle'"
+    };
+}
 
 /// One column off the card's newest **work** run, by the one ordering every
 /// reader of "the newest run" must share. A macro so that the two
@@ -118,9 +145,9 @@ macro_rules! newest_run {
         concat!(
             "(SELECT r.",
             $column,
-            " FROM issue_runs r WHERE r.issue_id = i.id \
-             AND r.trigger NOT IN ('triage', 'review', 'stalled', 'blocked', 'grooming') \
-             ORDER BY r.created_at DESC, r.id DESC LIMIT 1)"
+            " FROM issue_runs r WHERE r.issue_id = i.id AND r.trigger NOT IN (",
+            coordination_triggers!(),
+            ") ORDER BY r.created_at DESC, r.id DESC LIMIT 1)"
         )
     };
 }
@@ -348,6 +375,7 @@ type RawProject = (
     i64,
     i64,
     Option<i64>,
+    i64,
 );
 
 type RawIssue = (
@@ -386,6 +414,7 @@ fn read_raw_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawProject> {
         row.get(8)?,
         row.get(9)?,
         row.get(10)?,
+        row.get(11)?,
     ))
 }
 
@@ -444,6 +473,7 @@ fn project_from_raw(raw: RawProject) -> Result<ProjectRow> {
         created_at,
         updated_at,
         agents_may_merge,
+        rules_changed_at,
     ) = raw;
     Ok(ProjectRow {
         // A stored id runs the grammar again on the way out: the row is the
@@ -465,6 +495,11 @@ fn project_from_raw(raw: RawProject) -> Result<ProjectRow> {
         agents_may_merge: agents_may_merge
             .map(|n| n != 0)
             .unwrap_or(baybo_store::project::DEFAULT_AGENTS_MAY_MERGE),
+        // The projection coalesces this to the board's own `created_at`, so
+        // a row written before the column existed reads as "no rule has
+        // changed since this board opened" rather than as a rule change at
+        // the epoch.
+        rules_changed_at: ts("projects.rules_changed_at", rules_changed_at)?,
         archived_at: ts_opt("projects.archived_at", archived_at)?,
         created_at: ts("projects.created_at", created_at)?,
         updated_at: ts("projects.updated_at", updated_at)?,
@@ -582,6 +617,7 @@ impl ProjectStore for SqliteProjectStore {
         let max_parallel_issue_runs =
             i64::try_from(row.max_parallel_issue_runs).unwrap_or(i64::MAX);
         let agents_may_merge = i64::from(row.agents_may_merge);
+        let rules_changed_at = super::time::to_us(row.rules_changed_at);
         let created_at = super::time::to_us(row.created_at);
         let updated_at = super::time::to_us(row.updated_at);
         self.pool
@@ -590,8 +626,8 @@ impl ProjectStore for SqliteProjectStore {
                     "INSERT INTO projects \
                      (id, name, description, workdir, daily_budget_micros, \
                       daily_budget_tokens, max_parallel_issue_runs, agents_may_merge, \
-                      archived_at, created_at, updated_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10)",
+                      rules_changed_at, archived_at, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?11)",
                     rusqlite::params![
                         id,
                         name,
@@ -601,6 +637,7 @@ impl ProjectStore for SqliteProjectStore {
                         daily_budget_tokens,
                         max_parallel_issue_runs,
                         agents_may_merge,
+                        rules_changed_at,
                         created_at,
                         updated_at
                     ],
@@ -619,16 +656,27 @@ impl ProjectStore for SqliteProjectStore {
         let max_parallel_issue_runs =
             i64::try_from(update.max_parallel_issue_runs).unwrap_or(i64::MAX);
         let agents_may_merge = i64::from(update.agents_may_merge);
+        let default_parallel = i64::try_from(baybo_store::project::DEFAULT_MAX_PARALLEL_ISSUE_RUNS)
+            .unwrap_or(i64::MAX);
+        let default_may_merge = i64::from(baybo_store::project::DEFAULT_AGENTS_MAY_MERGE);
         let now = super::time::now_us();
         let affected = self
             .pool
             .interact("projects.update", move |conn| {
+                // One statement, so the stamp cannot be written against a
+                // row other than the one it compared. SQLite evaluates every
+                // expression in an UPDATE against the pre-update row, which
+                // is what lets the CASE read the old values by name.
                 Ok(conn.execute(
-                    "UPDATE projects SET name = ?2, description = ?3, \
-                     daily_budget_micros = ?4, daily_budget_tokens = ?5, \
-                     max_parallel_issue_runs = ?6, agents_may_merge = ?7, \
-                     updated_at = ?8 \
-                     WHERE id = ?1",
+                    &format!(
+                        "UPDATE projects SET name = ?2, description = ?3, \
+                         daily_budget_micros = ?4, daily_budget_tokens = ?5, \
+                         max_parallel_issue_runs = ?6, agents_may_merge = ?7, \
+                         rules_changed_at = CASE WHEN {A_BOARD_RULE_CHANGED} \
+                             THEN ?8 ELSE rules_changed_at END, \
+                         updated_at = ?8 \
+                         WHERE id = ?1"
+                    ),
                     rusqlite::params![
                         id,
                         name,
@@ -637,7 +685,9 @@ impl ProjectStore for SqliteProjectStore {
                         daily_budget_tokens,
                         max_parallel_issue_runs,
                         agents_may_merge,
-                        now
+                        now,
+                        default_parallel,
+                        default_may_merge
                     ],
                 )?)
             })
@@ -792,8 +842,12 @@ impl ProjectStore for SqliteProjectStore {
         let affected = self
             .pool
             .interact("projects.set_archived", move |conn| {
+                // Restoring is an operator turning a board back on, which is
+                // the same class of change as raising a ceiling; shelving one
+                // starts nothing, so it stamps nothing.
                 Ok(conn.execute(
-                    "UPDATE projects SET archived_at = ?2, updated_at = ?3 \
+                    "UPDATE projects SET archived_at = ?2, updated_at = ?3, \
+                     rules_changed_at = CASE WHEN ?4 THEN rules_changed_at ELSE ?3 END \
                      WHERE id = ?1 AND (archived_at IS NOT NULL) <> ?4",
                     rusqlite::params![id, stamp, now, archived],
                 )?)
@@ -1578,6 +1632,38 @@ impl ProjectStore for SqliteProjectStore {
         raws.into_iter().map(run_from_raw).collect()
     }
 
+    async fn drain_marks(&self, project: &ProjectId) -> Result<DrainMarks> {
+        let project = project.as_str().to_string();
+        let failed = RunStatus::Failed.as_str();
+        let (looked_at, worked_at) = self
+            .pool
+            .interact("issue_runs.drain_marks", move |conn| {
+                // The one list, expanded twice with opposite senses: what
+                // wakes the lead, and what counts as the board working.
+                Ok(conn.query_row(
+                    concat!(
+                        "SELECT \
+                         (SELECT MAX(created_at) FROM issue_runs \
+                            WHERE project_id = ?1 AND trigger IN (",
+                        coordination_triggers!(),
+                        ") AND NOT (status = ?2 AND session_id IS NULL)), \
+                         (SELECT MAX(settled_at) FROM issue_runs \
+                            WHERE project_id = ?1 AND settled_at IS NOT NULL \
+                              AND trigger NOT IN (",
+                        coordination_triggers!(),
+                        "))"
+                    ),
+                    rusqlite::params![project, failed],
+                    |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+                )?)
+            })
+            .await?;
+        Ok(DrainMarks {
+            looked_at: ts_opt("issue_runs.created_at", looked_at)?,
+            worked_at: ts_opt("issue_runs.settled_at", worked_at)?,
+        })
+    }
+
     async fn get_run(&self, id: &IssueRunId) -> Result<Option<IssueRunRow>> {
         let id = id.as_str().to_string();
         let raw = self
@@ -1734,7 +1820,14 @@ mod tests {
     /// other.
     #[test]
     fn coordination_triggers_match_the_enum() {
-        let listed = ["triage", "review", "stalled", "blocked", "grooming"];
+        let listed = [
+            "triage",
+            "review",
+            "stalled",
+            "blocked",
+            "grooming",
+            "board_idle",
+        ];
         let probe = newest_run!("status");
         for name in listed {
             assert!(
@@ -1756,6 +1849,7 @@ mod tests {
             RunTrigger::Stalled,
             RunTrigger::Blocked,
             RunTrigger::Grooming,
+            RunTrigger::BoardIdle,
         ]
         .into_iter()
         .filter(|t| t.is_coordination())
@@ -1783,6 +1877,7 @@ mod tests {
             daily_budget: None,
             daily_budget_tokens: None,
             max_parallel_issue_runs: DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
+            rules_changed_at: now,
             archived_at: None,
             created_at: now,
             updated_at: now,
@@ -1813,6 +1908,123 @@ mod tests {
         assert_eq!(
             read.max_parallel_issue_runs, DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
             "and the column beside it still resolves its own NULL, for its own reason"
+        );
+    }
+
+    /// The update that changes nothing about the board it is applied to.
+    fn same_rules(row: &ProjectRow) -> ProjectUpdate {
+        ProjectUpdate {
+            name: row.name.clone(),
+            description: row.description.clone(),
+            daily_budget: row.daily_budget,
+            daily_budget_tokens: row.daily_budget_tokens,
+            max_parallel_issue_runs: row.max_parallel_issue_runs,
+            agents_may_merge: row.agents_may_merge,
+        }
+    }
+
+    #[tokio::test]
+    async fn only_a_rule_the_board_schedules_by_stamps_a_rule_change() {
+        let (_dir, store) = store().await;
+        let row = project("01JRULES", "board");
+        store.create_project(&row).await.unwrap();
+        let opened = store.get_project(&row.id).await.unwrap().expect("row");
+
+        store
+            .update_project(
+                &row.id,
+                &ProjectUpdate {
+                    name: "renamed".to_owned(),
+                    description: "now with prose".to_owned(),
+                    ..same_rules(&opened)
+                },
+            )
+            .await
+            .unwrap();
+        let renamed = store.get_project(&row.id).await.unwrap().expect("row");
+        assert_eq!(
+            renamed.rules_changed_at, opened.rules_changed_at,
+            "renaming a board changes no answer anybody gave on it"
+        );
+
+        store
+            .update_project(
+                &row.id,
+                &ProjectUpdate {
+                    agents_may_merge: !opened.agents_may_merge,
+                    ..same_rules(&renamed)
+                },
+            )
+            .await
+            .unwrap();
+        let merging = store.get_project(&row.id).await.unwrap().expect("row");
+        assert!(
+            merging.rules_changed_at > opened.rules_changed_at,
+            "but whether the board may land its own work is a rule, and every              standing answer was given while it could not"
+        );
+
+        store
+            .update_project(&row.id, &same_rules(&merging))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_project(&row.id)
+                .await
+                .unwrap()
+                .expect("row")
+                .rules_changed_at,
+            merging.rules_changed_at,
+            "and a save that re-writes the same values changed no rule"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_board_coming_back_from_the_archive_is_a_rule_change_and_going_is_not() {
+        let (_dir, store) = store().await;
+        let row = project("01JSHELF", "board");
+        store.create_project(&row).await.unwrap();
+        let opened = store.get_project(&row.id).await.unwrap().expect("row");
+
+        store.set_project_archived(&row.id, true).await.unwrap();
+        let shelved = store.get_project(&row.id).await.unwrap().expect("row");
+        assert_eq!(
+            shelved.rules_changed_at, opened.rules_changed_at,
+            "shelving a board starts nothing, so it re-opens nothing"
+        );
+
+        store.set_project_archived(&row.id, false).await.unwrap();
+        assert!(
+            store
+                .get_project(&row.id)
+                .await
+                .unwrap()
+                .expect("row")
+                .rules_changed_at
+                > opened.rules_changed_at,
+            "coming back is the operator turning the board on again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_row_written_before_rules_changed_at_existed_has_never_changed_a_rule() {
+        let (_dir, store) = store().await;
+        let row = project("01JOLDRULES", "grandfathered");
+        store.create_project(&row).await.unwrap();
+
+        store
+            .pool
+            .interact("test.blank_the_column", |conn| {
+                conn.execute("UPDATE projects SET rules_changed_at = NULL", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let read = store.get_project(&row.id).await.unwrap().expect("row");
+        assert_eq!(
+            read.rules_changed_at, read.created_at,
+            "every card on a board is younger than the board, so resolving to              its own opening re-opens nothing"
         );
     }
 
