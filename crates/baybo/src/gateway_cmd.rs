@@ -32,6 +32,30 @@ use crate::boot;
 use crate::runtime;
 use crate::tracing_init::{TracingMode, init_tracing};
 
+/// Lets the janitor ask the boards to give back the build output under
+/// checkouts nobody is working in.
+///
+/// The adapter lives here, in the composition root, rather than in either
+/// crate: the janitor knows a cadence and would otherwise have to learn
+/// what a card is, and `baybo-project` would otherwise depend on a
+/// maintenance loop to be allowed to answer it.
+struct BoardBuildArtifacts(Arc<baybo_project::ProjectManager>);
+
+#[async_trait::async_trait]
+impl baybo_janitor::BuildArtifactSource for BoardBuildArtifacts {
+    async fn reclaim_idle(
+        &self,
+        idle_for: std::time::Duration,
+    ) -> baybo_janitor::ReclaimedArtifacts {
+        use baybo_project::BuildArtifacts;
+        let freed = self.0.reclaim_idle_build_artifacts(idle_for).await;
+        baybo_janitor::ReclaimedArtifacts {
+            dirs_removed: freed.dirs_removed,
+            bytes_freed: freed.bytes_freed,
+        }
+    }
+}
+
 /// Entry point — routes the parsed subcommand to the right handler.
 pub async fn run(cmd: GatewayCmd) -> anyhow::Result<()> {
     let config = boot::load_config().await?;
@@ -285,8 +309,8 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
         leak_detector: Arc::clone(&leak_detector),
     });
     let log_buffer = tracing_guards.log_buffer();
-    tracing::info!(token_len = token.len(), "gateway token loaded from vault");
-    tracing::info!(
+    tracing::debug!(token_len = token.len(), "gateway token loaded from vault");
+    tracing::debug!(
         token_len = tui_token.len(),
         "fresh TUI token published to vault"
     );
@@ -404,7 +428,10 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
 
     {
         let mut janitor = baybo_janitor::Janitor::new(workspace_paths.clone())
-            .with_pairing_store(graph.stores.channel_pairing.clone());
+            .with_pairing_store(graph.stores.channel_pairing.clone())
+            .with_build_artifacts(Arc::new(BoardBuildArtifacts(Arc::clone(
+                &graph.project_manager,
+            ))));
         if let Some(runtime) = sidecar_runtime.as_ref()
             && let Some(cache_root) = runtime.sidecars_cache_root()
         {
@@ -490,7 +517,7 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
             approval_stream,
             async move { push_shutdown.wait().await },
         ));
-        tracing::info!(
+        tracing::debug!(
             approval_pushes = approval_wired,
             "push: dispatcher started (turn lifecycle bus + approval gate)"
         );
@@ -506,6 +533,30 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
             deck.boot().await;
             deck_shutdown.wait().await;
             deck.shutdown().await;
+        }));
+    }
+
+    // The board's whole lifecycle, in the one order it has: recover what the
+    // last process left in flight, then drive.
+    //
+    // `resume_unsettled_runs` is once-per-process and cannot be folded into
+    // the tick — it rolls every `running` row back to `queued`, which on a
+    // live board would orphan the runs actually executing. Sequencing it
+    // here instead of racing it in a second task is what makes the driver's
+    // first tick see a settled board: two tasks would leave a re-dispatch
+    // and a promotion to be sorted out by `claim_run` alone.
+    {
+        let projects = Arc::clone(&graph.project_manager);
+        let driver_shutdown = shutdown.clone();
+        task_tracker.track(tokio::spawn(async move {
+            match projects.resume_unsettled_runs().await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(runs = n, "resumed issue runs interrupted by shutdown"),
+                Err(e) => tracing::warn!(error = %e, "could not resume interrupted issue runs"),
+            }
+            projects
+                .run_driver(async move { driver_shutdown.wait().await })
+                .await;
         }));
     }
 
@@ -533,6 +584,7 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
         channel_control,
         bot_reconciler: Arc::clone(&bot_reconciler),
         deck_manager: Arc::clone(&graph.deck_manager),
+        project_manager: Arc::clone(&graph.project_manager),
         workspace_paths: Arc::new(baybo_workspace::WorkspacePaths::new(
             graph.workspace.root().to_path_buf(),
         )),
@@ -557,11 +609,11 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
     if let Some(runtime) = sidecar_runtime.as_ref() {
         let domains: Vec<&str> = runtime.domains().collect();
         if domains.is_empty() {
-            tracing::info!("no embedded sidecars in this build");
+            tracing::debug!("no embedded sidecars in this build");
         } else {
             for domain in &domains {
                 let names: Vec<&str> = runtime.names_in_domain(domain).collect();
-                tracing::info!(
+                tracing::debug!(
                     domain = %domain,
                     sidecars = ?names,
                     channel_port,
@@ -618,7 +670,11 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
     println!("Web dashboard: http://{banner_bind}");
     println!("Admin token:   {token}");
 
-    tracing::info!(bind = %banner_bind, "gateway start: all components initialized");
+    tracing::info!(
+        bind = %banner_bind,
+        channel_port,
+        "gateway start: all components initialized"
+    );
 
     let admin_shutdown = shutdown.clone();
     let channel_shutdown = shutdown.clone();
@@ -642,7 +698,7 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
             Ok(())
         }
         _ = router_shutdown.wait() => {
-            tracing::info!("shutdown signal received, stopping gateway");
+            tracing::debug!("shutdown signal received, stopping gateway");
             Ok(())
         }
     };

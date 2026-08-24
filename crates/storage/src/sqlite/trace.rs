@@ -31,7 +31,7 @@ impl TraceStore for SqliteTraceStore {
         let id = step.id.to_string();
         let data = step.data.clone();
         self.pool
-            .interact("trace.save_step", move |conn| {
+            .interact_write("trace.save_step", move |conn| {
                 conn.execute(
                     "INSERT OR REPLACE INTO steps (id, data) VALUES (?1, ?2)",
                     rusqlite::params![id, data],
@@ -118,7 +118,7 @@ impl TraceStore for SqliteTraceStore {
         let id = span.id.to_string();
         let data = span.data.clone();
         self.pool
-            .interact("trace.save_span", move |conn| {
+            .interact_write("trace.save_span", move |conn| {
                 conn.execute(
                     "INSERT OR REPLACE INTO spans (id, data) VALUES (?1, ?2)",
                     rusqlite::params![id, data],
@@ -214,7 +214,7 @@ impl TraceStore for SqliteTraceStore {
         let hash = set.hash.to_string();
         let data = set.data.clone();
         self.pool
-            .interact("trace.save_tool_set", move |conn| {
+            .interact_write("trace.save_tool_set", move |conn| {
                 // OR IGNORE, not OR REPLACE: the key IS the digest of the
                 // body, so a second write of the same hash carries the same
                 // bytes and rewriting them would only churn the page.
@@ -249,7 +249,7 @@ impl TraceStore for SqliteTraceStore {
         let seq = event.seq as i64;
         let data = event.data.clone();
         self.pool
-            .interact("trace.append_span_event", move |conn| {
+            .interact_write("trace.append_span_event", move |conn| {
                 conn.execute(
                     "INSERT OR REPLACE INTO span_events (span_id, seq, data) VALUES (?1, ?2, ?3)",
                     rusqlite::params![span_id, seq, data],

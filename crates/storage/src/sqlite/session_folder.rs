@@ -100,7 +100,7 @@ impl SessionFolderStore for SqliteSessionFolderStore {
         let position = row.position;
         let created_at = super::time::to_us(row.created_at);
         self.pool
-            .interact("session_folders.create", move |conn| {
+            .interact_write("session_folders.create", move |conn| {
                 conn.execute(
                     "INSERT INTO session_folders (id, parent_id, name, position, created_at) \
                      VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -116,7 +116,7 @@ impl SessionFolderStore for SqliteSessionFolderStore {
         let name = name.to_string();
         let affected = self
             .pool
-            .interact("session_folders.rename", move |conn| {
+            .interact_write("session_folders.rename", move |conn| {
                 Ok(conn.execute(
                     "UPDATE session_folders SET name = ?2 WHERE id = ?1",
                     rusqlite::params![id, name],
@@ -136,7 +136,7 @@ impl SessionFolderStore for SqliteSessionFolderStore {
         let parent_id = parent_id.map(|p| p.as_str().to_string());
         let affected = self
             .pool
-            .interact("session_folders.reparent", move |conn| {
+            .interact_write("session_folders.reparent", move |conn| {
                 Ok(conn.execute(
                     "UPDATE session_folders SET parent_id = ?2, position = ?3 WHERE id = ?1",
                     rusqlite::params![id, parent_id, position],
@@ -150,7 +150,7 @@ impl SessionFolderStore for SqliteSessionFolderStore {
         let parent = parent_id.map(|p| p.as_str().to_string());
         let ordered: Vec<String> = ordered_ids.iter().map(|i| i.as_str().to_string()).collect();
         self.pool
-            .interact("session_folders.reorder", move |conn| {
+            .interact_write("session_folders.reorder", move |conn| {
                 let tx =
                     conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 for (idx, id) in ordered.iter().enumerate() {
@@ -172,7 +172,7 @@ impl SessionFolderStore for SqliteSessionFolderStore {
     async fn delete(&self, id: &FolderId) -> Result<Option<Vec<SessionId>>> {
         let id_str = id.as_str().to_string();
         self.pool
-            .interact("session_folders.delete", move |conn| {
+            .interact_write("session_folders.delete", move |conn| {
                 let tx =
                     conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 

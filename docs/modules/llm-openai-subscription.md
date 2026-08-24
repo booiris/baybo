@@ -135,7 +135,7 @@ Three layers, in order of how often they fire:
 - **Refresh failure**: `refresh_token_expired` / `refresh_token_reused` / `refresh_token_invalidated` → return a typed error and clear the vault entry (so a stale bundle doesn't keep failing). Other 4xx from refresh → transient error, don't clear, surface to caller (or just log + retry-next-tick if the background task hit it).
 - **Concurrency**: two nested gates, because the credential outlives any one process.
   - *In-process*: a `tokio::sync::Mutex` around the cached bundle; one in-flight refresh per credential. Cache and gate live on a `RefreshCoordinator` interned in a process-wide table keyed by `CredentialKey { StoreIdentity, vault_key }` (`refresh_coordinator.rs`) — NOT on the client, because one credential backs many clients (the entry's default model, every `model_candidates` model, every hot-reload generation, every admin probe), and NOT on the `SecretVault` handle, because two vaults over one store are still one credential. The background task takes the same lock as the request path, so a request hitting 401 mid-refresh simply awaits the release.
-  - *Cross-process*: an advisory `flock` on `<store>.<vault-key>.refresh.lock`, held across the network call and the vault write. A gateway and a `baybo llm probe` share the vault but not the table, and the CLI paths deliberately do **not** take the workspace singleton lock (`crates/baybo/src/singleton.rs` is acquired only by `gateway_cmd` and `prompt_cmd`) — so without this they would both POST the same refresh_token and the loser's `refresh_token_reused` would wipe the vault. Once the lock is held the vault is authoritative: a rotation that landed while we queued is adopted instead of re-spent. The lock is an *aid*, not a dependency — an unopenable lock file or an in-memory store (no on-disk home, hence no peers) logs `openai_subscription_refresh_lock` and proceeds, degrading to the previous racy-but-working behaviour rather than blocking the user's chat. Regression tested against a stub issuer that counts wire hits (`peer_processes_do_not_both_burn_the_refresh_token`, `refresh_works_without_a_lock_path`).
+  - *Cross-process*: an advisory `flock` on `<store>.<vault-key>.refresh.lock`, held across the network call and the vault write. A gateway and a `baybo llm probe` share the vault but not the table, and `probe` deliberately does **not** take the workspace singleton lock (`crates/workspace/src/singleton.rs`, held for their whole run by `gateway_cmd::start`, `prompt_cmd`'s in-process leg, and `baybo vault rotate`) — so without this they would both POST the same refresh_token and the loser's `refresh_token_reused` would wipe the vault. Once the lock is held the vault is authoritative: a rotation that landed while we queued is adopted instead of re-spent. The lock is an *aid*, not a dependency — an unopenable lock file or an in-memory store (no on-disk home, hence no peers) logs `openai_subscription_refresh_lock` and proceeds, degrading to the previous racy-but-working behaviour rather than blocking the user's chat. Regression tested against a stub issuer that counts wire hits (`peer_processes_do_not_both_burn_the_refresh_token`, `refresh_works_without_a_lock_path`).
 
 Why 1 hour and not "every minute"? Each refresh can trigger server-side `refresh_token` rotation; spinning the rotation counter for no reason wastes one of the few server-side guarantees we have. 1 hr is well below typical access-token TTL and well above the cost of a single refresh, so the background task always finds a bundle either fresh enough to skip or just barely inside the margin.
 
@@ -158,10 +158,11 @@ Content-Type: application/json
   "instructions": "<system prompt>",
   "input": [...],                     // ResponseItem[]
   "tools": [...],                     // tool definitions (Responses-API shape)
-  "tool_choice": "auto",
+  "tool_choice": "auto",                // "none" when the caller forbids tool use
   "parallel_tool_calls": true,
   "stream": true,
   "store": false,
+  "prompt_cache_key": "<session id>",   // cache bucket; omitted when the caller set none
   "include": ["reasoning.encrypted_content"]  // only when reasoning effort is set (with "reasoning": {effort, summary: "auto"})
 }
 ```
@@ -169,6 +170,25 @@ Content-Type: application/json
 Response is SSE; we parse `response.output_text.delta`, `response.reasoning*.delta`, `response.output_item.added` / `response.output_item.done`, `response.function_call_arguments.*`, `response.completed`, `response.error` events into `StreamEvent`s.
 
 `originator: codex_cli_rs` is mandatory — Codex's edge rejects requests without it. Yes we're impersonating Codex CLI; the OpenClaw docs note this is the "explicitly supported" external-tool path. We do **not** spoof `User-Agent: codex_cli_rs/...` — the Responses call sends no User-Agent at all, and only the OAuth endpoints carry baybo's own UA. This is the minimum needed for the route, no more.
+
+### Prompt cache
+
+`prompt_cache_key` routes the lookup; it does not set a lifetime. The endpoint
+rejects every field it doesn't know with `400 Unsupported parameter`, and it
+knows neither `prompt_cache_retention` nor `prompt_cache_options` — both were
+tried against the live route and both 400.
+
+Usage arrives on `response.completed` as `input_tokens` with an
+`input_tokens_details` breakdown: `cached_tokens` read from the cache,
+`cache_write_tokens` written to it. Both are subsets of `input_tokens`, which is
+the split `compute_cost_usd` wants. The route has so far reported writes as 0 on
+calls that demonstrably populated the cache, so treat a zero there as "not
+reported", not as "nothing was written".
+
+Hits are best-effort even with a key: an identical prefix re-sent under the same
+key seconds later still misses often enough to see in a handful of calls, and a
+board run's cache ratio is far below what a provider with a declared cache
+contract gives. Budget for misses; don't model this route as reliably cached.
 
 ### Conversion: rig `CompletionRequest` → Codex `ResponsesApiRequest`
 
@@ -184,8 +204,23 @@ Response is SSE; we parse `response.output_text.delta`, `response.reasoning*.del
 | `tools` | `tools` | translate tool schema to the flat Responses-API shape (`{type: "function", name, description, parameters}` — no nested `function` object) |
 | `temperature` / `max_tokens` | dropped | Codex Responses rejects `temperature` with 400 "Unsupported parameter: temperature" (regression-tested: `body_drops_temperature_for_codex_responses`); `max_tokens` is likewise not forwarded |
 | (none) | `parallel_tool_calls: true`, `stream: true`, `store: false` | hard-coded |
+| `ChatRequest::tool_choice` | `tool_choice` | `auto` / `none`; `BoundBilledLlm` leaves it as the caller set it |
+| `ChatRequest::prompt_cache_key` | `prompt_cache_key` | which cache bucket the lookup routes to. `BoundBilledLlm` fills it with the session id, so concurrent runs stop evicting each other; probes carry their own constant. Omitted when unset |
 
 Tool-call return path: Responses API emits `response.function_call_arguments.delta` events; we accumulate per `call_id` (registered from `response.output_item.added`), finalise on `response.function_call_arguments.done` or `response.output_item.done` (item type `function_call`), surface as `StreamEvent::ToolCall`. Same shape the OpenAI variant already produces.
+
+## Billing: every call records $0 with real tokens
+
+`factory.rs` sets `pricing: ModelPricing::default()` and points at "the design doc" for the reason — this section is that reason, which until now it did not contain, and the omission is why the consequence went unnoticed for as long as it did.
+
+Subscription billing is account-level, not per-token, so there is no honest per-call dollar figure to record. Two independent paths both land on zero: the provider has no entry in `openrouter_prefix.rs`, so `openrouter::pricing_for` misses and `pricing_for_model` falls back to `flat_default_pricing` (zero); and the factory sets zero pricing on the `ModelInfo` regardless. `cost_records` rows are written with real `input_tokens`/`output_tokens` and `cost_usd = 0`.
+
+**The consequence, stated plainly: every gate that measures money is inert for this provider.**
+
+- `CostManager::check` — the global `cost.spending_limits` daily/monthly caps — never trips. Unfixed.
+- The kanban board's per-project **daily budget** (`projects.daily_budget_micros`) can never be reached, however low it is set. This one *is* addressed: a board carries a second, token-denominated ceiling (`projects.daily_budget_tokens`) over the same window, and stops when either is reached. See [`project.md`](project.md).
+
+The rejected alternative for both is the per-entry `pricing` override in `registry.rs`, which an operator can hand-write and which does reach this client. It is a made-up price for money that does not exist; it would make the meters move without making them mean anything.
 
 ## Error mapping
 
@@ -196,9 +231,12 @@ Tool-call return path: Responses API emits `response.function_call_arguments.del
 | Refresh permanent failure | `Config("openai-subscription: refresh token expired/revoked — re-login required")` (auto-clear bundle) |
 | Refresh transient failure | surfaced as a rig `CompletionError::ProviderError`, classified to `LlmError::Transient` by `rig_completion_to_error` |
 | Responses API 401 after refresh | rig `CompletionError::ProviderError("openai-subscription: unauthorized after refresh — ...")` (completion_model.rs), classified to `LlmError::Transient` by `rig_completion_to_error` |
-| Responses API 429 | `RateLimited { retry_after, message }` (via `status_to_error`) — agent's `ErrorHandler` already retries |
+| Responses API 429, body `error.type == "usage_limit_reached"` | `QuotaExhausted { resets_in, message }` — **not** retriable. The plan's quota resets hours out (98,178 s in the case this was found on), so the agent's retry ladder would spend ten attempts against a wall. Keyed on the body's `type`, never the status |
+| Responses API 429, any other body | `RateLimited { retry_after, message }` (via `status_to_error`) — agent's `ErrorHandler` already retries |
 | Responses API 5xx | `Transient(...)` (via `status_to_error`) — agent retries through its existing path |
 | SSE / response parse error | `Decode(...)` (via `reqwest_to_error`) or a rig `ProviderError` on the streaming path |
+
+On the non-streaming path (`completion`, which drains the stream internally — a compaction takes it) a mid-stream error is boxed into `CompletionError::RequestError` rather than stringified into `ProviderError`, and `rig_completion_to_error` downcasts it back. Stringifying it there erased the classification: every mid-stream failure re-emerged as `Transient` and retriable, `QuotaExhausted` included.
 
 ## Security & TOS
 

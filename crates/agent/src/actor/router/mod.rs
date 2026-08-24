@@ -14,6 +14,7 @@
 //! `spawn_subagent` tool calls directly.
 
 mod cron;
+mod issue;
 mod output;
 mod user_input;
 
@@ -24,11 +25,12 @@ use std::time::Instant;
 
 use baybo_channels::{AgentOutput, ChannelRegistry, RouterInbound};
 use baybo_cron::CronTriggerEvent;
-use baybo_model::{LlmEntryName, Session};
+use baybo_model::{LlmEntryName, LlmPin, Session};
+use baybo_project::IssueRunEvent;
 use baybo_store::agent_profile::AgentProfileStore;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::actor::AgentMessage;
 use crate::actor::mailbox::MailboxSender;
@@ -166,25 +168,28 @@ pub(crate) fn build_oneshot_actor(
     (mailbox, actor_token)
 }
 
-/// The model a cold spawn — or a post-eviction hydration — pins its loop to.
-///
-/// Only `llm` has a fallback beyond the session: the entry name can come from
-/// the bound agent's profile. The model-within-entry and the reasoning effort
-/// stay session-only, because those are the chat header's per-conversation
-/// choices, not part of what an agent *is*.
-pub(crate) struct SpawnPins {
-    pub llm: Option<LlmEntryName>,
-    pub model: Option<String>,
-    pub effort: Option<String>,
-}
-
-/// Resolve what a cold spawn pins to: `last_llm ?? profile.llm ?? default`.
+/// Resolve what a cold spawn — or a post-eviction hydration — pins its loop
+/// to: the session's own pick, else the bound agent's, else the deployment
+/// default.
 ///
 /// An explicit per-session switch always wins — the user pressed that button
 /// for this conversation. Otherwise a session bound to a custom agent follows
 /// that agent's pin, so editing a profile reaches its sessions at their next
 /// hydration (a cold start or an idle reap), which is the same latency a
 /// profile edit already has for the soul.
+///
+/// **Entry and model fall back together.** A model id is a model *of an
+/// entry*, so a session that named its own entry keeps its own model — an
+/// empty one meaning that entry's default — and never inherits a model chosen
+/// for some other entry. The rung falls back on its own: effort is a
+/// provider-level knob, not a property of one model, and a board agent
+/// deliberately set to think hard must keep doing so on a session that only
+/// re-pointed which entry to use.
+///
+/// This is also the only door a card's run has. A run's session is spawned by
+/// the board with nothing pinned on it, so *everything* it runs on comes from
+/// the profile here — which is why the profile carries the whole
+/// [`LlmPin`] and not just its entry.
 ///
 /// Unbound and built-in sessions short-circuit without touching the store:
 /// the built-in follows `default-llm` by definition, so there is nothing of
@@ -193,35 +198,42 @@ pub(crate) struct SpawnPins {
 pub(crate) async fn resolve_spawn_pins(
     session: &Session,
     agent_profiles: &Arc<dyn AgentProfileStore>,
-) -> SpawnPins {
-    let llm = match session.state.last_llm.clone() {
-        Some(pinned) => Some(pinned),
-        None => agent_profile_llm(session, agent_profiles).await,
-    };
-    SpawnPins {
-        llm,
-        model: session.state.last_model.clone(),
-        effort: session.state.last_effort.clone(),
+) -> LlmPin {
+    let profile = agent_profile_pin(session, agent_profiles).await;
+    match session.state.last_llm.clone() {
+        Some(entry) => LlmPin {
+            entry: Some(entry),
+            model: session.state.last_model.clone(),
+            effort: session.state.last_effort.clone().or(profile.effort),
+        },
+        None => LlmPin {
+            entry: profile.entry,
+            model: profile.model,
+            effort: session.state.last_effort.clone().or(profile.effort),
+        },
     }
 }
 
-async fn agent_profile_llm(
+async fn agent_profile_pin(
     session: &Session,
     agent_profiles: &Arc<dyn AgentProfileStore>,
-) -> Option<LlmEntryName> {
-    let agent_id = session.state.agent_id.as_ref()?;
+) -> LlmPin {
+    let unpinned = LlmPin::unpinned();
+    let Some(agent_id) = session.state.agent_id.as_ref() else {
+        return unpinned;
+    };
     if agent_id.is_builtin() {
-        return None;
+        return unpinned;
     }
     match agent_profiles.get(agent_id).await {
         Ok(Some(row)) => row.llm,
         Ok(None) => {
             warn!(agent_id = %agent_id, "bound agent profile is gone; using the default llm");
-            None
+            unpinned
         }
         Err(e) => {
             warn!(agent_id = %agent_id, error = %e, "failed to read bound agent profile; using the default llm");
-            None
+            unpinned
         }
     }
 }
@@ -247,6 +259,14 @@ pub struct Router {
     /// `self` to drive in a `select!` arm; populated unconditionally from
     /// `RouterConfig` at construction.
     cron_trigger_rx: Option<mpsc::Receiver<CronTriggerEvent>>,
+    /// Recorded issue runs waiting to execute. Same `Option<Receiver>`
+    /// shape and reason as `cron_trigger_rx`.
+    issue_run_rx: Option<mpsc::Receiver<IssueRunEvent>>,
+    /// The board a run belongs to. The manager and nothing under it: this
+    /// crate reports how a run went and the board decides what that costs
+    /// the card. `None` in assemblies with no board (the TUI's embedded
+    /// runtime), which also have no `issue_run_rx`.
+    board: Option<Arc<baybo_project::ProjectManager>>,
     /// Cancellation parent passed to every top-level actor the router
     /// spawns. Bridged to the process-wide `ShutdownSignal` upstream;
     /// each actor derives its `actor_token` as a child of this so
@@ -282,6 +302,11 @@ pub struct RouterConfig {
     /// [`resolve_spawn_pins`].
     pub agent_profiles: Arc<dyn AgentProfileStore>,
     pub cron_trigger_rx: mpsc::Receiver<CronTriggerEvent>,
+    /// Recorded issue runs waiting to execute. `None` in an assembly with
+    /// no board.
+    pub issue_run_rx: Option<mpsc::Receiver<IssueRunEvent>>,
+    /// See [`Router::board`]. `None` in an assembly with no board.
+    pub board: Option<Arc<baybo_project::ProjectManager>>,
     /// Cancellation parent passed to every top-level actor the router
     /// spawns. Bridged to the process-wide `ShutdownSignal` upstream.
     pub actor_parent_token: CancellationToken,
@@ -309,6 +334,8 @@ impl Router {
             cron_store,
             agent_profiles,
             cron_trigger_rx,
+            issue_run_rx,
+            board,
             actor_parent_token,
             rate_limit,
             workspace,
@@ -326,6 +353,8 @@ impl Router {
             cron_store,
             agent_profiles,
             cron_trigger_rx: Some(cron_trigger_rx),
+            issue_run_rx,
+            board,
             actor_parent_token,
             workspace,
             inbound_dedup,
@@ -339,7 +368,7 @@ impl Router {
         mut response_rx: mpsc::Receiver<AgentOutput>,
     ) {
         let channel_count = self.channels.len();
-        info!(channel_count, "router starting");
+        debug!(channel_count, "router starting");
 
         // Before any live traffic: hand over one-shot cron results whose
         // delivery a crash interrupted. Idempotent — an origin that already
@@ -347,6 +376,7 @@ impl Router {
         self.redrive_cron_deliveries().await;
 
         let mut cron_rx = self.cron_trigger_rx.take();
+        let mut issue_rx = self.issue_run_rx.take();
 
         loop {
             tokio::select! {
@@ -376,6 +406,14 @@ impl Router {
                     if let Err(e) = self.handle_cron_trigger(event).await {
                         error!(error = %e, "failed to handle cron trigger");
                     }
+                }
+                Some(event) = async {
+                    match issue_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.handle_issue_run(event).await;
                 }
                 else => {
                     info!("router channels closed, shutting down");
@@ -426,5 +464,118 @@ mod tests {
         // is admitted without rebuilding the limiter.
         limit.set(10, std::time::Duration::from_secs(60));
         assert!(limiter.check("u"), "swapped-in cap must be seen by check");
+    }
+
+    fn bound_session(agent: &baybo_model::AgentProfileId) -> Session {
+        let id = baybo_model::SessionId::from("s1");
+        Session {
+            id: id.clone(),
+            user: baybo_model::User {
+                id: "u1".into(),
+                name: None,
+                channel: baybo_model::ChannelType::tui(),
+            },
+            channel: baybo_model::ChannelType::tui(),
+            created_at: chrono::Utc::now(),
+            last_active: chrono::Utc::now(),
+            state: baybo_model::SessionState {
+                agent_id: Some(agent.clone()),
+                ..Default::default()
+            },
+            root_session_id: id,
+            trigger: baybo_model::TriggerSource::User,
+            lineage: None,
+            hidden: false,
+            pinned: false,
+            archived: false,
+            folder_id: None,
+            title: None,
+        }
+    }
+
+    async fn store_with(pin: LlmPin) -> (baybo_model::AgentProfileId, Arc<dyn AgentProfileStore>) {
+        let agent = baybo_model::AgentProfileId::generate();
+        let mut row = baybo_store::test_support::agent_profile_row(&agent);
+        row.llm = pin;
+        let store = baybo_store::test_support::MemoryAgentProfileStore::new();
+        store.create(&row).await.expect("seed the profile");
+        (agent, Arc::new(store))
+    }
+
+    /// A card's run is spawned with nothing pinned on its session, so the
+    /// profile is the only thing that decides what it runs on — all three
+    /// levels of it, not just the entry.
+    #[tokio::test]
+    async fn an_unpinned_session_takes_the_whole_profile_pin() {
+        let profile = LlmPin {
+            entry: Some(LlmEntryName::from("fast")),
+            model: Some("fast-mini".to_owned()),
+            effort: Some("high".to_owned()),
+        };
+        let (agent, store) = store_with(profile.clone()).await;
+
+        let pins = resolve_spawn_pins(&bound_session(&agent), &store).await;
+        assert_eq!(pins, profile);
+    }
+
+    /// The asymmetry that makes the fallback correct: a session that named
+    /// its own entry must not inherit a model chosen for a different one —
+    /// but the rung is a provider-level knob, not a property of one model,
+    /// so an agent deliberately set to think hard keeps doing so.
+    #[tokio::test]
+    async fn a_session_entry_drops_the_profile_model_but_keeps_its_rung() {
+        let (agent, store) = store_with(LlmPin {
+            entry: Some(LlmEntryName::from("fast")),
+            model: Some("fast-mini".to_owned()),
+            effort: Some("high".to_owned()),
+        })
+        .await;
+
+        let mut session = bound_session(&agent);
+        session.state.last_llm = Some(LlmEntryName::from("slow"));
+
+        let pins = resolve_spawn_pins(&session, &store).await;
+        assert_eq!(pins.entry, Some(LlmEntryName::from("slow")));
+        assert_eq!(
+            pins.model, None,
+            "`fast-mini` is a model of `fast`; carrying it onto `slow` would pin a model that entry cannot serve"
+        );
+        assert_eq!(pins.effort, Some("high".to_owned()));
+    }
+
+    /// And the session still outranks the profile on every level it does
+    /// state — that is what the chat header's button means.
+    #[tokio::test]
+    async fn an_explicit_session_pick_outranks_the_profile() {
+        let (agent, store) = store_with(LlmPin {
+            entry: Some(LlmEntryName::from("fast")),
+            model: Some("fast-mini".to_owned()),
+            effort: Some("high".to_owned()),
+        })
+        .await;
+
+        let mut session = bound_session(&agent);
+        session.state.last_llm = Some(LlmEntryName::from("slow"));
+        session.state.last_model = Some("slow-pro".to_owned());
+        session.state.last_effort = Some("low".to_owned());
+
+        let pins = resolve_spawn_pins(&session, &store).await;
+        assert_eq!(
+            pins,
+            LlmPin {
+                entry: Some(LlmEntryName::from("slow")),
+                model: Some("slow-pro".to_owned()),
+                effort: Some("low".to_owned()),
+            }
+        );
+    }
+
+    /// The built-in *is* `default-llm`, so a session bound to it resolves
+    /// to nothing without the store being asked at all.
+    #[tokio::test]
+    async fn the_builtin_resolves_unpinned() {
+        let (_, store) = store_with(LlmPin::unpinned()).await;
+        let session = bound_session(&baybo_model::AgentProfileId::builtin());
+        assert!(resolve_spawn_pins(&session, &store).await.is_unpinned());
     }
 }

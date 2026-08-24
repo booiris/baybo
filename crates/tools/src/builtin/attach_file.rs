@@ -17,6 +17,7 @@ use super::blob_upload::{
 };
 use crate::{
     ResourceAccess, Tool, ToolCapability, ToolContext, ToolError, ToolManifest, ToolOutput,
+    ToolTriggerScope,
 };
 
 const TOOL_NAME: &str = "AttachFile";
@@ -24,9 +25,7 @@ const MAX_BYTES: u64 = MAX_LOCAL_BLOB_BYTES;
 
 const DESCRIPTION_TEMPLATE: &str = r#"Give the user a local file — it arrives as an attachment in the chat. Any MIME type, up to {{max_mib}} MiB. Use it instead of pasting binary or large text into a message, and don't paste the contents after attaching.
 
-DELIVERY: the file attaches to your FINAL reply, not to this call; several calls in one turn share that reply.
-
-PATHS: `path` MUST be absolute. Sensitive paths (SSH keys, .env, /etc/shadow, …) are blocked."#;
+DELIVERY: the file attaches to your FINAL reply, not to this call; several calls in one turn share that reply."#;
 
 static DESCRIPTION: LazyLock<String> =
     LazyLock::new(|| DESCRIPTION_TEMPLATE.replace("{{max_mib}}", &MAX_LOCAL_BLOB_MIB.to_string()));
@@ -56,6 +55,10 @@ impl Tool for AttachFileTool {
         TOOL_NAME
     }
 
+    fn trigger_scope(&self) -> ToolTriggerScope {
+        ToolTriggerScope::SharedWorkspace
+    }
+
     fn description(&self) -> String {
         DESCRIPTION.to_string()
     }
@@ -66,7 +69,7 @@ impl Tool for AttachFileTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Absolute path to the file to attach."
+                    "description": "Absolute path; relative is rejected. Sensitive paths (SSH keys, .env, …) are blocked."
                 },
                 "filename": {
                     "type": "string",
@@ -281,30 +284,31 @@ fn media_block(
     mime_type: String,
     probed: ProbedMedia,
 ) -> ContentBlock {
-    if mime_type.starts_with("image/") {
-        ContentBlock::Image {
+    // The same reading `blob_media` and the board's brief use — one answer to
+    // "which block is this", next to the enum it chooses between, rather than
+    // a `starts_with` per producer that a `IMAGE/PNG` would split.
+    match baybo_model::MediaKind::of_mime(&mime_type) {
+        baybo_model::MediaKind::Image => ContentBlock::Image {
             blob,
             mime_type,
             filename: Some(filename),
             width: probed.width,
             height: probed.height,
-        }
-    } else if mime_type.starts_with("audio/") {
-        ContentBlock::Audio {
+        },
+        baybo_model::MediaKind::Audio => ContentBlock::Audio {
             blob,
             mime_type,
             filename: Some(filename),
             duration_ms: probed.duration_ms,
-        }
-    } else {
-        ContentBlock::File {
+        },
+        baybo_model::MediaKind::File => ContentBlock::File {
             blob,
             filename,
             mime_type,
             duration_ms: probed.duration_ms,
             page_count: probed.page_count,
             size_bytes: probed.size_bytes,
-        }
+        },
     }
 }
 

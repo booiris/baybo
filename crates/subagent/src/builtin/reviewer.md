@@ -1,17 +1,12 @@
 ---
 name: reviewer
 description: |
-  Independent code review. Spawn when the parent has changes
-  (staged, in a branch, in a file, or a specific diff hunk) and
-  wants a second pass — correctness issues, security concerns,
-  design smells, missing tests. The reviewer reads the change but
-  does not amend it.
-  Pick this over general-purpose when the parent specifically wants
-  judgement on existing work, not new work. Avoid for tasks that
-  ask the reviewer to *fix* what it finds — fixing is a different
-  dispatch (general-purpose with the findings already cited).
+  Judges a change already made: correctness, safety, missing tests. Reads
+  but never amends. Pick over general-purpose when you want an opinion,
+  not an edit.
 version: 0.1.0
 default_tier: deep
+tools: Read, Grep, Glob, Bash, WebFetch, IssueGet, IssueList, GetBlob, Skill, Now, JobList, JobStop
 ---
 # Identity
 

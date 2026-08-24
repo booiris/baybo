@@ -98,6 +98,7 @@ pub async fn run(ctx: &CommandContext, args: AddArgs) -> Result<CommandOutput> {
         trust_level,
         capabilities,
         oauth,
+        trigger_scope: baybo_tools::ToolTriggerScope::Any,
     };
     entry
         .validate()

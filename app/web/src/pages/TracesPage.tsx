@@ -49,12 +49,14 @@ const KIND_BADGE_CLASS: Record<SessionKind, string> = {
   user: 'bg-white text-ink',
   cron: 'bg-warn/15 text-warn',
   subagent: 'bg-brand/10 text-brand',
+  issue: 'bg-info/15 text-info',
 };
 
 const KIND_BADGE_LABEL: Record<SessionKind, string> = {
   user: 'user',
   cron: 'cron',
   subagent: 'subagent',
+  issue: 'issue',
 };
 
 // Only genuinely in-flight kinds keep the list poll alive. `stuck` is

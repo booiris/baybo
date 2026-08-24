@@ -56,6 +56,17 @@ impl Default for AgentConfig {
     }
 }
 
+/// How much active context a conversation carries before it is compacted,
+/// whatever the model's window allows.
+///
+/// Sized from measured behaviour rather than from a window: on a real
+/// board, two runs grew to 226K and 295K input tokens over ~200 calls each
+/// and never compacted, because 0.65 of a million-token window is 681K.
+/// Every call past ~120K pays for a prefix that a summary could have
+/// replaced — in cache reads when the provider caches, and in full-price
+/// prefill plus tail latency the moment it does not.
+pub const DEFAULT_MAX_ACTIVE_TOKENS: usize = 120_000;
+
 /// Context window budget and compression settings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -63,6 +74,16 @@ pub struct ContextConfig {
     /// Fraction of the active model's context window at which
     /// compression triggers. Must be in `(0.0, 1.0]`.
     pub compression_threshold: f64,
+    /// Absolute ceiling on the active context, whatever the model's window
+    /// allows. `0` turns it off, leaving [`Self::compression_threshold`]
+    /// as the only rule.
+    ///
+    /// A share of the window stopped being a bound once providers began
+    /// advertising million-token ones: the cost and the latency of a long
+    /// prefix are paid on *every* call long before the window is anywhere
+    /// near full, and a conversation that only compacts at 681K never
+    /// compacts at all.
+    pub max_active_tokens: usize,
     /// How many non-system messages still count as a *short* conversation.
     /// Compaction declines outright below this count when the transcript is
     /// also under the minimum compactable token size — a summary of that
@@ -74,6 +95,7 @@ impl Default for ContextConfig {
     fn default() -> Self {
         Self {
             compression_threshold: 0.65,
+            max_active_tokens: DEFAULT_MAX_ACTIVE_TOKENS,
             keep_recent: 10,
         }
     }

@@ -47,7 +47,7 @@ impl ChannelSessionStore for SqliteChannelSessionStore {
         let user_id = user_id.to_string();
         let session_id = session_id.as_str().to_string();
         self.pool
-            .interact("channel_sessions.put", move |conn| {
+            .interact_write("channel_sessions.put", move |conn| {
                 // Live row wins: `INSERT OR IGNORE` keeps the existing
                 // `session_id` so two racing inserts don't split the mapping.
                 conn.execute(
@@ -64,7 +64,7 @@ impl ChannelSessionStore for SqliteChannelSessionStore {
         let channel_type = channel_type.as_str().to_string();
         let user_id = user_id.to_string();
         self.pool
-            .interact("channel_sessions.delete", move |conn| {
+            .interact_write("channel_sessions.delete", move |conn| {
                 conn.execute(
                     "DELETE FROM channel_sessions
              WHERE channel_type = ?1 AND user_id = ?2",

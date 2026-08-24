@@ -140,6 +140,10 @@ async fn probe(ctx: &CommandContext, name: Option<String>) -> Result<CommandOutp
                         report.tokens.input_tokens,
                         report.tokens.output_tokens,
                     );
+                    human.push_str(&format!(
+                        "  cached_in={}",
+                        report.tokens.cached_input_tokens
+                    ));
                     if let Some(chars) = report.thinking_chars {
                         human.push_str(&format!("\nthinking  ={chars} chars"));
                         if let Some(preview) = &report.thinking_preview
@@ -158,6 +162,7 @@ async fn probe(ctx: &CommandContext, name: Option<String>) -> Result<CommandOutp
                             "latency_ms": report.latency_ms,
                             "input_tokens": report.tokens.input_tokens,
                             "output_tokens": report.tokens.output_tokens,
+                            "cached_input_tokens": report.tokens.cached_input_tokens,
                             "thinking_chars": report.thinking_chars,
                             "thinking_preview": report.thinking_preview,
                         })),

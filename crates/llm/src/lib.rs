@@ -899,11 +899,7 @@ pub struct ToolCallInfo {
 
 /// Token usage statistics for a single LLM call.
 ///
-/// `cached_input_tokens` and `cache_creation_input_tokens` carry
-/// Anthropic-style prompt-cache accounting: how many input tokens were
-/// served from the provider's prompt cache vs. written into it. Both
-/// are 0 when the provider doesn't report cache usage (OpenAI
-/// subscription path, providers without prompt caching, etc.).
+/// Cache fields are zero when unreported.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub input_tokens: usize,
@@ -912,8 +908,17 @@ pub struct TokenUsage {
     pub cache_creation_input_tokens: usize,
 }
 
+/// Whether a request may invoke its advertised tools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolChoice {
+    #[default]
+    Auto,
+    None,
+}
+
 /// A chat request to be sent to an LLM provider.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChatRequest {
     pub messages: Vec<baybo_model::ChatMessage>,
     pub temperature: Option<f32>,
@@ -926,6 +931,12 @@ pub struct ChatRequest {
     /// chat header's thinking level is PER-SESSION, not a global entry edit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub tool_choice: ToolChoice,
+    /// Provider cache bucket. Billed calls default it to the session id; probes
+    /// use a separate constant bucket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
 }
 
 /// A tool definition in the format expected by the LLM layer.
@@ -1143,7 +1154,13 @@ fn convert_stream_event<R: GetTokenUsage>(
     }
 }
 
-/// Enum-dispatched completion model supporting multiple providers.
+/// Provider-specific fields absent from rig's `CompletionRequest`.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ProviderCallExtras<'a> {
+    pub effort: Option<&'a str>,
+    pub prompt_cache_key: Option<&'a str>,
+}
+
 pub(crate) enum AnyCompletionModel {
     OpenAI(openai::completion::CompletionModel),
     Anthropic(anthropic::completion::CompletionModel),
@@ -1272,14 +1289,10 @@ impl AnyCompletionModel {
         }
     }
 
-    /// `effort` is the per-request reasoning-effort override from
-    /// [`ChatRequest::reasoning_effort`]. Only the `openai-subscription` arm
-    /// consumes it; every other provider ignores it (its effort, if any, is
-    /// baked in at client construction).
     async fn completion(
         &self,
         request: CompletionRequest,
-        effort: Option<&str>,
+        extras: ProviderCallExtras<'_>,
     ) -> std::result::Result<completion::CompletionResponse<()>, CompletionError> {
         match self {
             Self::OpenAI(m) => {
@@ -1345,14 +1358,14 @@ impl AnyCompletionModel {
             Self::Llamafile(m) => Ok(repack_completion(m.completion(request).await?)),
             Self::Hyperbolic(m) => Ok(repack_completion(m.completion(request).await?)),
             Self::HuggingFace(m) => Ok(repack_completion(m.completion(request).await?)),
-            Self::OpenAiSubscription(m) => m.completion(request, effort).await,
+            Self::OpenAiSubscription(m) => m.completion(request, extras).await,
         }
     }
 
     async fn stream(
         &self,
         request: CompletionRequest,
-        effort: Option<&str>,
+        extras: ProviderCallExtras<'_>,
     ) -> std::result::Result<LlmStream, CompletionError> {
         match self {
             Self::OpenAI(m) => {
@@ -1382,7 +1395,7 @@ impl AnyCompletionModel {
             Self::Llamafile(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
             Self::Hyperbolic(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
             Self::HuggingFace(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
-            Self::OpenAiSubscription(m) => m.stream(request, effort).await,
+            Self::OpenAiSubscription(m) => m.stream(request, extras).await,
         }
     }
 }
@@ -1504,9 +1517,13 @@ impl LlmClient {
         // Providers that build their own body take the level directly,
         // already translated into their dialect.
         let native_effort = self.wire_effort(request.reasoning_effort.as_deref());
+        let extras = ProviderCallExtras {
+            effort: native_effort.as_deref(),
+            prompt_cache_key: request.prompt_cache_key.as_deref(),
+        };
         let response = self
             .model
-            .completion(rig_request, native_effort.as_deref())
+            .completion(rig_request, extras)
             .await
             .map_err(rig_completion_to_error)?;
 
@@ -1534,9 +1551,13 @@ impl LlmClient {
         let rig_request = self.build_completion_request(request).await;
 
         let native_effort = self.wire_effort(request.reasoning_effort.as_deref());
+        let extras = ProviderCallExtras {
+            effort: native_effort.as_deref(),
+            prompt_cache_key: request.prompt_cache_key.as_deref(),
+        };
         let stream = self
             .model
-            .stream(rig_request, native_effort.as_deref())
+            .stream(rig_request, extras)
             .await
             .map_err(rig_completion_to_error)?;
 
@@ -1696,6 +1717,12 @@ impl LlmClient {
             .wire_effort(request.reasoning_effort.as_deref())
             .and_then(|level| self.effort_wire().params(&level));
 
+        // OpenAI-compatible providers reject tool_choice without tools.
+        let tool_choice = (!tools.is_empty()).then_some(match request.tool_choice {
+            ToolChoice::Auto => rig::message::ToolChoice::Auto,
+            ToolChoice::None => rig::message::ToolChoice::None,
+        });
+
         CompletionRequest {
             model: None,
             preamble,
@@ -1704,7 +1731,7 @@ impl LlmClient {
             tools,
             temperature: request.temperature.map(|t| t as f64),
             max_tokens: Some(4096),
-            tool_choice: None,
+            tool_choice,
             additional_params,
             output_schema: None,
         }
@@ -2109,6 +2136,7 @@ impl LlmClient {
             temperature: Some(0.0),
             tools: vec![],
             reasoning_effort: None,
+            ..Default::default()
         };
         let start = std::time::Instant::now();
         let response = self.chat(&req).await?;
@@ -2125,6 +2153,8 @@ impl LlmClient {
         })
     }
 }
+
+pub(crate) const PROBE_PROMPT_CACHE_KEY: &str = "baybo-llm-probe";
 
 /// Result of a successful `LlmClient::probe()`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3071,6 +3101,7 @@ mod document_dispatch_tests {
             temperature: None,
             tools: Vec::new(),
             reasoning_effort: None,
+            ..Default::default()
         };
 
         let _ephemeral_wire_request = client.build_completion_request(&request).await;
@@ -3096,6 +3127,7 @@ mod document_dispatch_tests {
             temperature: None,
             tools: Vec::new(),
             reasoning_effort: None,
+            ..Default::default()
         };
 
         let _ephemeral_wire_request = client.build_completion_request(&request).await;
@@ -3108,18 +3140,59 @@ mod document_dispatch_tests {
         );
     }
 
-    /// [`delivers_media`] must say exactly what the conversion does, for
-    /// every role — `baybo-context`'s budget prices media off the
-    /// predicate and can see nothing else (`content_block_tokens` takes a
-    /// bare block). Identical blocks, identical client, only the role
-    /// differs.
-    ///
-    /// Drift here is asymmetric. A role that stops delivering and is
-    /// still charged over-counts, which only compacts early; a role that
-    /// starts delivering and is not charged under-counts, and an
-    /// over-window request is rejected by the provider on every turn —
-    /// `build_completion_request` re-walks the whole history, so the
-    /// rejection repeats until compaction evicts the row.
+    #[tokio::test]
+    async fn tool_choice_rides_only_when_the_request_carries_tools() {
+        let client = with_bytes(media_probe::fixture::png(1, 1));
+        let toolless = client
+            .build_completion_request(&ChatRequest {
+                messages: vec![baybo_model::ChatMessage::user(vec![ContentBlock::Text(
+                    "hi".into(),
+                )])],
+                ..Default::default()
+            })
+            .await;
+        assert!(
+            toolless.tool_choice.is_none(),
+            "a body with no tools must not name a tool_choice"
+        );
+
+        let tool = ToolDefinitionForLlm {
+            name: "Bash".into(),
+            description: "run a command".into(),
+            parameters_schema: serde_json::json!({"type": "object"}),
+        };
+        let with_tools = client
+            .build_completion_request(&ChatRequest {
+                messages: vec![baybo_model::ChatMessage::user(vec![ContentBlock::Text(
+                    "hi".into(),
+                )])],
+                tools: vec![tool.clone()],
+                ..Default::default()
+            })
+            .await;
+        assert!(matches!(
+            with_tools.tool_choice,
+            Some(rig::message::ToolChoice::Auto)
+        ));
+
+        let summariser = client
+            .build_completion_request(&ChatRequest {
+                messages: vec![baybo_model::ChatMessage::user(vec![ContentBlock::Text(
+                    "hi".into(),
+                )])],
+                tools: vec![tool],
+                tool_choice: ToolChoice::None,
+                ..Default::default()
+            })
+            .await;
+        assert!(matches!(
+            summariser.tool_choice,
+            Some(rig::message::ToolChoice::None)
+        ));
+    }
+
+    /// [`delivers_media`] must match conversion for every role because context
+    /// budgeting relies on the predicate alone.
     #[tokio::test]
     async fn delivers_media_matches_the_conversion_for_every_role() {
         let client = with_bytes(media_probe::fixture::png(640, 480));
@@ -3138,6 +3211,7 @@ mod document_dispatch_tests {
                     temperature: None,
                     tools: Vec::new(),
                     reasoning_effort: None,
+                    ..Default::default()
                 })
                 .await;
 
@@ -3941,6 +4015,7 @@ mod effort_wiring_tests {
             temperature: None,
             tools: vec![],
             reasoning_effort: pin.map(str::to_string),
+            ..Default::default()
         }
     }
 

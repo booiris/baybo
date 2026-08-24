@@ -121,6 +121,141 @@ pub enum ContentBlock {
     },
 }
 
+/// Which media [`ContentBlock`] a stored blob becomes, decided from its MIME
+/// type alone.
+///
+/// Lives next to `ContentBlock` because it names that enum's three media
+/// arms and nothing else. Deliberately **not** `baybo_wire::AttachmentKind`:
+/// that one is a *client's declaration* on the wire, carried alongside the
+/// mime and free to disagree with it. This one is the server's own reading
+/// of bytes it has already stat'd, so a producer that never accepted a
+/// declaration in the first place has nothing to reconcile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaKind {
+    Image,
+    Audio,
+    File,
+}
+
+impl MediaKind {
+    /// `image/*` and `audio/*` are the two the providers render natively;
+    /// everything else — video included, which rides `File` for the reason
+    /// [`ContentBlock::File::duration_ms`] gives — is a file.
+    pub fn of_mime(mime_type: &str) -> Self {
+        let mime = mime_type.trim();
+        // `get`, not a `[..n]` slice: the type is whatever a `Content-Type`
+        // header or a tool parameter said, so it need not be ASCII — and a
+        // byte range that lands inside a multi-byte character panics. A
+        // length check does not rule that out. `get` simply answers `None`.
+        if starts_with_ignore_ascii_case(mime, IMAGE_MIME_PREFIX) {
+            Self::Image
+        } else if starts_with_ignore_ascii_case(mime, AUDIO_MIME_PREFIX) {
+            Self::Audio
+        } else {
+            Self::File
+        }
+    }
+}
+
+/// A [`ContentBlock`] known to be one of the three **media** arms.
+///
+/// Exists for the places that carry attachments and nothing else — a card's
+/// files on their way to a run, say. Typing those as `Vec<ContentBlock>`
+/// admits `ToolUse`, `Thinking` and bare `Text`, none of which a file can be,
+/// and leaves every reader to wonder whether it has to handle them.
+///
+/// **A wrapper rather than a parallel three-variant enum**, deliberately: a
+/// copy of `Image`/`Audio`/`File` would have to restate six field lists, and
+/// the day `ContentBlock::Image` grows a seventh the copy would keep
+/// compiling while quietly dropping it. Here the constructors below are the
+/// only way in, so the same change breaks them and forces a decision.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MediaBlock(ContentBlock);
+
+impl MediaBlock {
+    pub fn image(
+        blob: BlobRef,
+        mime_type: String,
+        filename: Option<String>,
+        width: Option<u32>,
+        height: Option<u32>,
+    ) -> Self {
+        Self(ContentBlock::Image {
+            blob,
+            mime_type,
+            filename,
+            width,
+            height,
+        })
+    }
+
+    pub fn audio(
+        blob: BlobRef,
+        mime_type: String,
+        filename: Option<String>,
+        duration_ms: Option<u32>,
+    ) -> Self {
+        Self(ContentBlock::Audio {
+            blob,
+            mime_type,
+            filename,
+            duration_ms,
+        })
+    }
+
+    pub fn file(
+        blob: BlobRef,
+        filename: String,
+        mime_type: String,
+        duration_ms: Option<u32>,
+        page_count: Option<u32>,
+        size_bytes: Option<u32>,
+    ) -> Self {
+        Self(ContentBlock::File {
+            blob,
+            filename,
+            mime_type,
+            duration_ms,
+            page_count,
+            size_bytes,
+        })
+    }
+
+    pub fn as_block(&self) -> &ContentBlock {
+        &self.0
+    }
+}
+
+impl From<MediaBlock> for ContentBlock {
+    fn from(media: MediaBlock) -> Self {
+        media.0
+    }
+}
+
+/// A message body: the prose, then the media that came with it.
+///
+/// The single spelling of an ordering the prompt framings depend on — a
+/// framing wraps the **text** block and the media follows it, which is the
+/// whole reason those two are carried as separate values in the first place.
+/// It had been hand-rolled twice, once as `once().chain()` and once as
+/// `vec![].extend()`, in two functions that call each other; a reader's first
+/// question was whether the difference meant something.
+pub fn prose_with_media(text: String, files: &[MediaBlock]) -> Vec<ContentBlock> {
+    std::iter::once(ContentBlock::Text(text))
+        .chain(files.iter().cloned().map(ContentBlock::from))
+        .collect()
+}
+
+const IMAGE_MIME_PREFIX: &str = "image/";
+
+const AUDIO_MIME_PREFIX: &str = "audio/";
+
+fn starts_with_ignore_ascii_case(haystack: &str, prefix: &str) -> bool {
+    haystack
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
 /// Side-band metadata for a [`ContentBlock::ToolResult`]: data the runtime
 /// needs to persist with the transcript but that must stay off the universal
 /// `content` string (so it never reaches the LLM). A typed extension point —
@@ -245,6 +380,13 @@ pub enum MessageSource {
     /// (`baybo_context::prompts::interjection`). See
     /// `docs/mid-turn-user-interjection.md`.
     UserInterjection,
+    /// A board issue's brief, framed at run time: synthesized by the agent
+    /// rather than typed by anyone, but tracked distinctly so a card's work
+    /// log can tell "this is the instruction" from "this is what the agent
+    /// said about it" — which is what lets a run's transcript open on the ask
+    /// it answers, with the model-facing framing taken back off
+    /// (`baybo_context::prompts::issue::unframe_issue_brief`).
+    IssueBrief,
     /// A cron job's fire-time framed prompt: synthesized by the agent and
     /// hidden from the chat transcript, but tracked distinctly so operator
     /// surfaces identify a fire by provenance rather than by sniffing the
@@ -325,6 +467,7 @@ impl MessageSource {
             MessageSource::User => "user",
             MessageSource::UserInterjection => "user_interjection",
             MessageSource::Cron => "cron",
+            MessageSource::IssueBrief => "issue_brief",
             MessageSource::CronNotification => "cron_notification",
             MessageSource::RecalledMemory => "recalled_memory",
             MessageSource::SystemPromptUpdate => "system_prompt_update",
@@ -342,6 +485,7 @@ impl std::str::FromStr for MessageSource {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "user" => Ok(MessageSource::User),
+            "issue_brief" => Ok(MessageSource::IssueBrief),
             "user_interjection" => Ok(MessageSource::UserInterjection),
             "cron" => Ok(MessageSource::Cron),
             "cron_notification" => Ok(MessageSource::CronNotification),
@@ -411,6 +555,16 @@ impl ChatMessage {
     /// `baybo_context::prompts::cron::frame_cron_prompt`). Carries [`MessageSource::Cron`] so
     /// the operator cron inbox can locate it by provenance instead of sniffing
     /// the `[cron:<id>]` framing tag, while the chat transcript still hides it.
+    /// A board issue's brief, as the run reads it.
+    pub fn issue_brief(content: Vec<ContentBlock>) -> Self {
+        Self {
+            role: Role::User,
+            content,
+            platform_msg_id: String::new(),
+            source: MessageSource::IssueBrief,
+        }
+    }
+
     pub fn cron_fire(content: Vec<ContentBlock>) -> Self {
         Self {
             role: Role::User,
@@ -686,6 +840,145 @@ impl std::str::FromStr for Role {
 pub struct MessageMetadata {}
 
 #[cfg(test)]
+mod media_kind_tests {
+    use super::MediaKind;
+
+    #[test]
+    fn a_mime_decides_which_block_a_blob_becomes() {
+        assert_eq!(MediaKind::of_mime("image/png"), MediaKind::Image);
+        assert_eq!(MediaKind::of_mime("audio/mpeg"), MediaKind::Audio);
+        assert_eq!(MediaKind::of_mime("application/pdf"), MediaKind::File);
+        assert_eq!(
+            MediaKind::of_mime("video/mp4"),
+            MediaKind::File,
+            "video rides `File`, which is why `File` carries a duration at all"
+        );
+    }
+
+    #[test]
+    fn the_reading_survives_what_a_real_content_type_header_looks_like() {
+        assert_eq!(MediaKind::of_mime("IMAGE/PNG"), MediaKind::Image);
+        assert_eq!(MediaKind::of_mime("  image/jpeg"), MediaKind::Image);
+        assert_eq!(
+            MediaKind::of_mime(""),
+            MediaKind::File,
+            "an unknown type is a file, never an image the renderer would try to draw"
+        );
+        assert_eq!(
+            MediaKind::of_mime("image"),
+            MediaKind::File,
+            "the slash is part of the prefix: a type that merely starts with the word is not one"
+        );
+    }
+
+    #[test]
+    fn a_media_block_is_the_block_it_says_it_is() {
+        use super::{BlobRef, ContentBlock, MediaBlock};
+
+        let blob = || BlobRef {
+            blob_id: "sha256:aa.bb".to_owned(),
+        };
+        // The wrapper is transparent — it narrows what can be *put in*, and
+        // hands back exactly what a `Vec<ContentBlock>` consumer expects.
+        assert!(matches!(
+            ContentBlock::from(MediaBlock::image(
+                blob(),
+                "image/png".to_owned(),
+                Some("a.png".to_owned()),
+                Some(10),
+                Some(20),
+            )),
+            ContentBlock::Image {
+                width: Some(10),
+                height: Some(20),
+                ..
+            }
+        ));
+        assert!(matches!(
+            ContentBlock::from(MediaBlock::audio(
+                blob(),
+                "audio/mpeg".to_owned(),
+                None,
+                Some(1_000)
+            )),
+            ContentBlock::Audio {
+                duration_ms: Some(1_000),
+                ..
+            }
+        ));
+        assert!(matches!(
+            ContentBlock::from(MediaBlock::file(
+                blob(),
+                "r.pdf".to_owned(),
+                "application/pdf".to_owned(),
+                None,
+                Some(3),
+                Some(99),
+            )),
+            ContentBlock::File {
+                page_count: Some(3),
+                ..
+            }
+        ));
+        // The field is private and these three are the only constructors, so
+        // there is no `MediaBlock` holding a `Text`, a `ToolUse` or a
+        // `Thinking` for a reader to have to consider.
+    }
+
+    #[test]
+    fn a_body_puts_the_prose_first_and_the_files_after_it() {
+        use super::{BlobRef, ContentBlock, MediaBlock, prose_with_media};
+
+        let files = vec![
+            MediaBlock::image(
+                BlobRef {
+                    blob_id: "sha256:a.b".to_owned(),
+                },
+                "image/png".to_owned(),
+                None,
+                None,
+                None,
+            ),
+            MediaBlock::file(
+                BlobRef {
+                    blob_id: "sha256:c.d".to_owned(),
+                },
+                "r.pdf".to_owned(),
+                "application/pdf".to_owned(),
+                None,
+                None,
+                None,
+            ),
+        ];
+        let body = prose_with_media("the card".to_owned(), &files);
+        // The framings wrap the block at index 0 and nothing else, so the
+        // text being first is the contract, not a formatting preference.
+        assert!(matches!(&body[0], ContentBlock::Text(t) if t == "the card"));
+        assert!(matches!(body[1], ContentBlock::Image { .. }));
+        assert!(matches!(body[2], ContentBlock::File { .. }));
+        assert_eq!(body.len(), 3);
+
+        assert_eq!(
+            prose_with_media("alone".to_owned(), &[]).len(),
+            1,
+            "a card with no files is still a body, not an empty one"
+        );
+    }
+
+    #[test]
+    fn a_mime_that_is_not_ascii_is_answered_rather_than_panicked_on() {
+        // A `&str[..6]` here panics: byte 6 lands inside the second emoji.
+        // The type is whatever a Content-Type header or a tool parameter
+        // said, so this is a reachable input, not a hypothetical one — and
+        // the caller is the gateway and the board's run dispatcher.
+        assert_eq!(MediaKind::of_mime("😀😀"), MediaKind::File);
+        assert_eq!(MediaKind::of_mime("imagé/png"), MediaKind::File);
+        assert_eq!(MediaKind::of_mime("é"), MediaKind::File);
+        assert_eq!(MediaKind::of_mime("image/é"), MediaKind::Image);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
@@ -814,6 +1107,7 @@ mod tests {
                 MessageSource::User
                 | MessageSource::UserInterjection
                 | MessageSource::Cron
+                | MessageSource::IssueBrief
                 | MessageSource::CronNotification
                 | MessageSource::RecalledMemory
                 | MessageSource::SystemPromptUpdate
@@ -824,6 +1118,7 @@ mod tests {
             }
         }
         vec![
+            MessageSource::IssueBrief,
             MessageSource::User,
             MessageSource::UserInterjection,
             MessageSource::Cron,

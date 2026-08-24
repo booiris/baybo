@@ -333,6 +333,7 @@ dependencies = [
  "baybo-model",
  "baybo-pairing",
  "baybo-process",
+ "baybo-project",
  "baybo-sandbox",
  "baybo-search",
  "baybo-security",
@@ -379,6 +380,7 @@ dependencies = [
  "baybo-memory",
  "baybo-model",
  "baybo-process",
+ "baybo-project",
  "baybo-sandbox",
  "baybo-security",
  "baybo-session",
@@ -678,6 +680,7 @@ dependencies = [
  "baybo-model",
  "baybo-pairing",
  "baybo-process",
+ "baybo-project",
  "baybo-query",
  "baybo-security",
  "baybo-session",
@@ -771,10 +774,12 @@ dependencies = [
 name = "baybo-janitor"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "baybo-model",
  "baybo-store",
  "baybo-workspace",
  "chrono",
+ "parking_lot",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -889,6 +894,29 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "baybo-project"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "baybo-model",
+ "baybo-session",
+ "baybo-storage",
+ "baybo-store",
+ "baybo-tools",
+ "baybo-turn",
+ "baybo-workspace",
+ "chrono",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
 ]

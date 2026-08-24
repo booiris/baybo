@@ -12,7 +12,7 @@
 //! <root>/
 //!   config/            # standalone git repo: baybo.json, .mcp.json
 //!   agents/            # standalone git repo: subagent profile definitions
-//!   personas/          # standalone git repo: USER.md (shared) + <agent>/{SOUL,IDENTITY,USER}.md + skills/ + memory/
+//!   personas/          # standalone git repo: USER.md (shared) + per-agent identity, skills, and memory
 //!   .key/              # not version-controlled: encryption.key
 //!   state/             # not version-controlled: storage.db, baybo.lock, channel.port, browser/profile
 //!   work/              # not version-controlled: sandbox FS scope; .uv/ (uv cache + downloaded pythons + tools), tmp/ (disposable, swept), other scratch
@@ -42,9 +42,9 @@ pub const CONFIG_DIR: &str = "config";
 /// crate's job.
 pub const BUILTIN_PERSONA_DIR: &str = "baybo";
 
-/// One agent's skills, at `<root>/personas/<id>/skills/`, one directory per
-/// skill. Every agent has its own and no agent shares one; the built-in is
-/// not an exception, at `personas/baybo/skills/`.
+/// One agent's skills below its persona directory, one directory per skill.
+/// Every agent has its own and no agent shares one; the built-in is not an
+/// exception, at `personas/baybo/skills/`.
 pub const SKILLS_DIR: &str = "skills";
 
 /// Standalone git repo at `<root>/agents/`: workspace-local subagent
@@ -53,9 +53,10 @@ pub const SKILLS_DIR: &str = "skills";
 /// concern, only a frontmatter + system-prompt body).
 pub const AGENTS_DIR: &str = "agents";
 
-/// Standalone git repo at `<root>/personas/`: one directory per agent —
-/// the built-in included, at `personas/baybo/` — each carrying that agent's
-/// `SOUL.md`, `IDENTITY.md`, `USER.md`, its own `skills/`, and its `memory/`.
+/// Standalone git repo at `<root>/personas/`: global agents are direct
+/// children, while project agents are grouped below [`PROJECT_PERSONAS_DIR`].
+/// Each persona carries that agent's `SOUL.md`, `IDENTITY.md`, `USER.md`, its
+/// own `skills/`, and its `memory/`.
 ///
 /// The one entry directly inside it that belongs to no agent is
 /// [`SHARED_USER_FILE`], the human's profile that every agent reads. It is
@@ -63,13 +64,32 @@ pub const AGENTS_DIR: &str = "agents";
 /// [`classify_persona_path`].
 pub const PERSONAS_DIR: &str = "personas";
 
+/// Project-owned personas, at `<root>/personas/project/<agent_id>/`.
+///
+/// Global chat personas keep their original `<root>/personas/<agent_id>/`
+/// layout. Project agents are grouped separately because they are managed as
+/// one board-facing roster rather than from the global Agents page.
+pub const PROJECT_PERSONAS_DIR: &str = "project";
+
+/// Prefix on newly minted project-agent ids. It is the stable discriminator
+/// that keeps [`WorkspacePaths::persona_dir`] pure while preserving the flat
+/// location of project agents created by older builds.
+pub const PROJECT_PERSONA_ID_PREFIX: &str = "project-";
+
+/// Whether an agent id selects the grouped project-persona layout.
+pub fn is_project_persona_id(agent_id: &str) -> bool {
+    agent_id
+        .strip_prefix(PROJECT_PERSONA_ID_PREFIX)
+        .is_some_and(|suffix| !suffix.is_empty())
+}
+
 /// The shared human profile at `<root>/personas/USER.md`. Read by every
 /// agent alongside its own `USER.md` notes, and owned by none of them —
 /// which is why it sits beside the agent directories rather than inside one.
 pub const SHARED_USER_FILE: &str = "USER.md";
 
-/// One agent's long-term memory, at `<root>/personas/<id>/memory/` — one
-/// markdown file per remembered fact, indexed by [`MEMORY_INDEX_FILE`].
+/// One agent's long-term memory below its persona directory — one markdown
+/// file per remembered fact, indexed by [`MEMORY_INDEX_FILE`].
 /// Agent-authored: the model writes here through `Edit` / `Write` and
 /// prunes through `MemoryDelete`, and every write is audit-committed into
 /// the `personas/` repo.
@@ -118,7 +138,7 @@ pub const IDENTITY_USER_FILE: &str = "USER.md";
 pub const IDENTITY_IDENTITY_FILE: &str = "IDENTITY.md";
 
 // ---------------------------------------------------------------------------
-// Files inside a memory dir (`personas/<id>/memory/`)
+// Files inside a persona's memory dir
 // ---------------------------------------------------------------------------
 
 /// The one file in a memory dir that is not a memory: the index the
@@ -372,11 +392,15 @@ pub fn has_git_component(path: &Path) -> bool {
 pub enum PersonaPath<'a> {
     /// `personas/USER.md` — the human profile every agent shares.
     SharedUser,
-    /// `personas/<agent_id>/{SOUL,IDENTITY,USER}.md`. Which of the three
-    /// is deliberately not carried: every caller so far asks only whose the
-    /// file is, and a field nobody reads is a field nobody maintains.
-    Identity { agent_id: &'a str },
-    /// A file under `personas/<agent_id>/memory/`.
+    /// An agent's `{SOUL,IDENTITY,USER}.md`, in either the flat legacy/global
+    /// layout or `personas/project/<agent_id>/`. Carries which of the three,
+    /// because `IDENTITY.md` has a rule about its contents that its siblings
+    /// — and a memory file that merely happens to share its name — do not.
+    Identity {
+        agent_id: &'a str,
+        kind: IdentityKind,
+    },
+    /// A file under an agent's `memory/` directory in either layout.
     Memory { agent_id: &'a str },
     /// Anything else: an agent's skills directory, a bare directory, a stray
     /// file, or a path this crate cannot read as UTF-8.
@@ -397,11 +421,24 @@ pub fn classify_persona_path(relative: &Path) -> PersonaPath<'_> {
     }
     match parts.as_slice() {
         [SHARED_USER_FILE] => PersonaPath::SharedUser,
-        [agent_id, name] if IdentityKind::all().iter().any(|k| k.file_name() == *name) => {
-            PersonaPath::Identity { agent_id }
+        // Exactly three components, so this never shadows the memory arm
+        // below (four or more). A name that is not one of the three identity
+        // files lands where it did before: `Other`.
+        [PROJECT_PERSONAS_DIR, agent_id, name] => match IdentityKind::from_file_name(name) {
+            Some(kind) => PersonaPath::Identity { agent_id, kind },
+            None => PersonaPath::Other,
+        },
+        [PROJECT_PERSONAS_DIR, agent_id, dir, _rest @ ..]
+            if *dir == PERSONA_MEMORY_DIR && parts.len() >= 4 =>
+        {
+            PersonaPath::Memory { agent_id }
         }
-        // `<agent_id>/memory/<something>` — a bare `<agent_id>/memory` is
-        // the directory itself, not a file in it.
+        [PROJECT_PERSONAS_DIR, ..] => PersonaPath::Other,
+        [agent_id, name] => match IdentityKind::from_file_name(name) {
+            Some(kind) => PersonaPath::Identity { agent_id, kind },
+            None => PersonaPath::Other,
+        },
+        // A bare `<agent_id>/memory` is the directory itself, not a file in it.
         [agent_id, dir, _rest @ ..] if *dir == PERSONA_MEMORY_DIR && parts.len() >= 3 => {
             PersonaPath::Memory { agent_id }
         }
@@ -430,6 +467,14 @@ impl IdentityKind {
             Self::User => IDENTITY_USER_FILE,
             Self::Identity => IDENTITY_IDENTITY_FILE,
         }
+    }
+
+    /// The kind stored under `file_name`, or `None` for any other name.
+    /// The exact-cased inverse of [`Self::file_name`] — unlike
+    /// [`Self::from_label`], which is a tolerant parser for what a person
+    /// types, this one decides what a path on disk *is*.
+    pub fn from_file_name(file_name: &str) -> Option<Self> {
+        Self::all().into_iter().find(|k| k.file_name() == file_name)
     }
 
     /// Default initial markdown body used to seed this identity file on
@@ -508,17 +553,38 @@ impl WorkspacePaths {
         self.root.join(PERSONAS_DIR)
     }
 
-    /// One agent's persona directory: `<root>/personas/<agent_id>/`.
+    /// One agent's persona directory.
     ///
-    /// Callers hold an `AgentProfileId`, whose grammar is what keeps the
+    /// Global and legacy project agents live at
+    /// `<root>/personas/<agent_id>/`; newly materialised project agents carry
+    /// [`PROJECT_PERSONA_ID_PREFIX`] and live at
+    /// `<root>/personas/project/<agent_id>/`. Routing from the id keeps this
+    /// path constructor free of I/O and leaves older unprefixed ids untouched.
+    ///
+    /// Callers hold an `AgentProfileId`, whose grammar is what keeps each
     /// joined component inside `personas/`; this crate is leaf-level and
     /// takes the id as a `&str`.
     pub fn persona_dir(&self, agent_id: &str) -> PathBuf {
-        self.personas_dir().join(agent_id)
+        if is_project_persona_id(agent_id) {
+            self.project_persona_dir(agent_id)
+        } else {
+            self.personas_dir().join(agent_id)
+        }
+    }
+
+    /// Root of project-owned personas: `<root>/personas/project/`.
+    pub fn project_personas_dir(&self) -> PathBuf {
+        self.personas_dir().join(PROJECT_PERSONAS_DIR)
+    }
+
+    /// One project-owned persona: `<root>/personas/project/<agent_id>/`.
+    pub fn project_persona_dir(&self, agent_id: &str) -> PathBuf {
+        self.project_personas_dir().join(agent_id)
     }
 
     /// One agent's own copy of an identity file:
-    /// `<root>/personas/<agent_id>/<FILE>.md`.
+    /// `<root>/personas/<agent_id>/<FILE>.md`, or the corresponding path
+    /// below `personas/project/` for a project-owned persona.
     ///
     /// Only `SOUL.md` and `IDENTITY.md` are ever addressed this way —
     /// personality and self-image belong to the agent, while `USER.md`
@@ -529,20 +595,17 @@ impl WorkspacePaths {
         self.persona_dir(agent_id).join(kind.file_name())
     }
 
-    /// One agent's private skill overlay:
-    /// `<root>/personas/<agent_id>/skills/`.
+    /// One agent's private skill overlay below its resolved persona directory.
     pub fn persona_skills_dir(&self, agent_id: &str) -> PathBuf {
         self.persona_dir(agent_id).join(SKILLS_DIR)
     }
 
-    /// One agent's private memory tree:
-    /// `<root>/personas/<agent_id>/memory/`.
+    /// One agent's private memory tree below its resolved persona directory.
     pub fn persona_memory_dir(&self, agent_id: &str) -> PathBuf {
         self.persona_dir(agent_id).join(PERSONA_MEMORY_DIR)
     }
 
-    /// Index of one agent's memory:
-    /// `<root>/personas/<agent_id>/memory/MEMORY.md`.
+    /// Index of one agent's memory below its resolved persona directory.
     pub fn persona_memory_index_file(&self, agent_id: &str) -> PathBuf {
         self.persona_memory_dir(agent_id).join(MEMORY_INDEX_FILE)
     }
@@ -761,6 +824,22 @@ mod tests {
         assert_eq!(p.mcp_config(), PathBuf::from("/var/baybo/config/.mcp.json"));
         assert_eq!(p.personas_dir(), PathBuf::from("/var/baybo/personas"));
         assert_eq!(
+            p.project_personas_dir(),
+            PathBuf::from("/var/baybo/personas/project")
+        );
+        assert_eq!(
+            p.project_persona_dir("agt_1"),
+            PathBuf::from("/var/baybo/personas/project/agt_1")
+        );
+        assert_eq!(
+            p.persona_dir("project-01JAGENT"),
+            PathBuf::from("/var/baybo/personas/project/project-01JAGENT")
+        );
+        assert_eq!(
+            p.persona_dir("01JLEGACY"),
+            PathBuf::from("/var/baybo/personas/01JLEGACY")
+        );
+        assert_eq!(
             p.shared_user_file(),
             PathBuf::from("/var/baybo/personas/USER.md")
         );
@@ -847,13 +926,44 @@ mod tests {
         for kind in IdentityKind::all() {
             assert_eq!(
                 classify_persona_path(&rel(p.persona_identity_file("agt_1", kind))),
-                PersonaPath::Identity { agent_id: "agt_1" },
+                PersonaPath::Identity {
+                    agent_id: "agt_1",
+                    kind
+                },
                 "{kind:?}",
             );
         }
         assert_eq!(
             classify_persona_path(&rel(p.persona_memory_index_file("agt_1"))),
             PersonaPath::Memory { agent_id: "agt_1" }
+        );
+
+        let project = p.project_persona_dir("agt_project");
+        for kind in IdentityKind::all() {
+            assert_eq!(
+                classify_persona_path(&rel(project.join(kind.file_name()))),
+                PersonaPath::Identity {
+                    agent_id: "agt_project",
+                    kind
+                },
+                "{kind:?}",
+            );
+        }
+        assert_eq!(
+            classify_persona_path(&rel(project
+                .join(PERSONA_MEMORY_DIR)
+                .join(MEMORY_INDEX_FILE))),
+            PersonaPath::Memory {
+                agent_id: "agt_project"
+            }
+        );
+        assert_eq!(
+            classify_persona_path(Path::new("project/IDENTITY.md")),
+            PersonaPath::Other
+        );
+        assert_eq!(
+            classify_persona_path(Path::new("project/memory/fact.md")),
+            PersonaPath::Other
         );
 
         // The tree root is a directory, not a file in it; a skills overlay

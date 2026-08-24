@@ -125,6 +125,9 @@ impl BillableLlm {
             temperature: Some(0.0),
             tools: vec![],
             reasoning_effort: None,
+            // Keep probes out of live session cache buckets.
+            prompt_cache_key: Some(crate::PROBE_PROMPT_CACHE_KEY.to_string()),
+            ..Default::default()
         };
         let start = std::time::Instant::now();
         let response = self.chat(&req).await?;
@@ -215,6 +218,7 @@ mod tests {
             temperature: None,
             tools: vec![],
             reasoning_effort: None,
+            ..Default::default()
         }
     }
 

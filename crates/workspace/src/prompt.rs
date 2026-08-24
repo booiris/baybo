@@ -89,6 +89,81 @@ self-image live beside it in `IDENTITY.md`; the shared `personas/USER.md`
 *(Anything this agent must never touch, or must always confirm first.)*
 "#;
 
+/// Seed body for the coordinator agent every project is opened with.
+///
+/// Substitution-free for the same reason [`PERSONA_SOUL_TEMPLATE`] is: the
+/// project's name and description live on its row and reach the agent
+/// through each run's brief, so baking them in here would mint a copy that
+/// goes stale the first time the project is renamed. What the file carries
+/// is the disposition — what a coordinator is *for* — which does not change
+/// when the board does.
+///
+/// Written once, at project creation. The lead may rewrite it afterwards
+/// like any agent rewrites its own soul.
+pub const PROJECT_LEAD_SOUL_TEMPLATE: &str = r#"# Soul
+
+You coordinate one project's board. Keep work moving through the team; do not
+do all of the work yourself.
+
+## Core Truths
+
+- **The board is the shared truth.** Put decisions, questions, blockers, and
+  results on the relevant issue. A conclusion left only in a run cannot guide
+  anyone else.
+- **Use columns deliberately.** Backlog is untriaged; Todo is ready and waiting;
+  In Progress has active work; Review awaits a verdict; Done is accepted. Todo
+  automatically starts staffed cards when capacity opens, so placing one there
+  schedules it. Block work that must not start.
+- **Staff for the work.** Check the team's actual current work, then assign by
+  requirements and capacity. Hire only for a durable capability gap.
+- **Close the loop.** If you take a card, assign yourself, work in its checkout,
+  verify and report the result, then move ready work to Review. Record no-change
+  decisions and their reasons on the timeline so the board can act on them.
+
+## Boundaries
+
+- Never rewrite a teammate's work. Review by inspecting the result and
+  recording a verdict on the timeline.
+- Land a branch only through `IssueMerge`, never by hand. It refuses where a
+  board does not merge its own work.
+- Do not cancel or reassign active work without first explaining why on its
+  timeline.
+"#;
+
+/// Seed body for a teammate added to a project, with `{{role}}` replaced by
+/// the one-line role the operator (or the lead) wrote.
+///
+/// The role *is* substituted here, unlike in [`PERSONA_SOUL_TEMPLATE`] and
+/// [`PROJECT_LEAD_SOUL_TEMPLATE`], because it is the whole reason this agent
+/// was created and there is nowhere else it would be read from. It is a
+/// seed, not a mirror: the roster line and this file drift apart the moment
+/// either is edited, which is correct — one is the operator's label, the
+/// other is the agent's own account of itself.
+pub const PROJECT_TEAMMATE_SOUL_TEMPLATE: &str = r#"# Soul
+
+## Standing Role
+
+{{role}}
+
+## Core Truths
+
+- **Own one issue at a time.** Work only in its checkout and branch.
+- **Make the result reviewable.** For code, commit coherent changes and run
+  relevant checks. For non-code work, the timeline report is the deliverable.
+- **Keep the card current.** Report findings, changes, verification, remaining
+  risk, and artifacts on the timeline. Record blockers with what is missing
+  and what would unblock them; never stop quietly.
+- **Close the loop.** Move ready work to Review. Use Done only when accepting
+  the result is explicitly your responsibility.
+
+## Boundaries
+
+- Land a branch only through `IssueMerge`, never by hand.
+- Do not reassign or close work that is not yours.
+- Ask on the issue timeline when missing requirements would materially change
+  the result.
+"#;
+
 /// Seed body for an empty memory index (`MEMORY.md`) in an agent's
 /// `personas/<id>/memory/`.
 ///
@@ -125,6 +200,24 @@ already told you not to do, what context recurs.*
 together.)*
 "#;
 
+/// A project agent's self-image: its handle, and nothing else.
+///
+/// No "fill this in" line and no empty Creature/Vibe/Emoji/Avatar fields. The
+/// pair of them — this template plus the Edit affordance the chat preamble
+/// used to carry — spent the opening turn of 7 of 45 observed board runs
+/// reading and rewriting `IDENTITY.md` before touching the card, with the
+/// thinking summary reading "Planning identity attribute update".
+///
+/// `Name` stays because it is the one line anything reads: `with_display_name`
+/// splices the handle into it at hire and `agents.rs` reads it back for the
+/// team roster. The rest was prose no code has ever parsed.
+pub const PROJECT_PERSONA_IDENTITY_TEMPLATE: &str = r#"# Who Am I?
+
+* **Name:**
+  *(set when you joined this board: your `@handle` came from it, so the two
+  have to keep saying the same thing. Leave it be.)*
+"#;
+
 pub(crate) const DEFAULT_IDENTITY_CONTENT: &str = r#"# Who Am I?
 
 *Fill this in during your first conversation. Make it yours.*
@@ -140,3 +233,105 @@ pub(crate) const DEFAULT_IDENTITY_CONTENT: &str = r#"# Who Am I?
 * **Avatar:**
   *(workspace-relative path, http(s) URL, or data URI)*
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_souls_leave_run_instructions_to_runtime_framing() {
+        for (name, template) in [
+            ("teammate", PROJECT_TEAMMATE_SOUL_TEMPLATE),
+            ("lead", PROJECT_LEAD_SOUL_TEMPLATE),
+        ] {
+            assert!(!template.contains("brief"), "{name}: {template}");
+            assert!(!template.contains("IssueGet"), "{name}: {template}");
+        }
+    }
+
+    /// Both souls point at the one door rather than each carrying its own
+    /// verdict on merging.
+    ///
+    /// They used to disagree — the lead's boundary was absolute ("never
+    /// merge branches"), the teammate's conditional ("unless the issue
+    /// explicitly asks") — so which agent could land a reviewed branch
+    /// depended on which file it read. Whether a board merges at all is now
+    /// a project setting the tool enforces, and a soul that repeated the
+    /// answer would be the second home for it.
+    #[test]
+    fn no_soul_decides_for_itself_whether_it_may_merge() {
+        for (name, template) in [
+            ("teammate", PROJECT_TEAMMATE_SOUL_TEMPLATE),
+            ("lead", PROJECT_LEAD_SOUL_TEMPLATE),
+        ] {
+            assert!(
+                template.contains("only through `IssueMerge`"),
+                "{name} must route merging through the one door: {template}"
+            );
+            assert!(
+                !template.contains("Never merge") && !template.contains("Do not merge"),
+                "{name} must not carry its own verdict on merging: {template}"
+            );
+        }
+    }
+
+    #[test]
+    fn project_souls_stay_within_their_context_budget() {
+        const MAX_LEAD_WORDS: usize = 220;
+        const MAX_TEAMMATE_WORDS: usize = 140;
+
+        let lead_words = PROJECT_LEAD_SOUL_TEMPLATE.split_whitespace().count();
+        let teammate_words = PROJECT_TEAMMATE_SOUL_TEMPLATE.split_whitespace().count();
+
+        assert!(lead_words <= MAX_LEAD_WORDS, "lead has {lead_words} words");
+        assert!(
+            teammate_words <= MAX_TEAMMATE_WORDS,
+            "teammate has {teammate_words} words"
+        );
+    }
+
+    /// A board agent's self-image seed is its handle and nothing else. The
+    /// "fill this in" line plus four empty display fields spent the opening
+    /// turn of 7 of 45 runs rewriting `IDENTITY.md`; only `Name` is ever read
+    /// back (`with_display_name` writes it, the team roster reads it).
+    #[test]
+    fn a_board_agent_s_identity_seed_is_its_handle_and_nothing_else() {
+        let t = PROJECT_PERSONA_IDENTITY_TEMPLATE;
+        assert!(
+            t.contains("**Name:**"),
+            "the one line anything reads has to stay: {t}"
+        );
+        assert!(
+            !t.contains("Fill this in"),
+            "the instruction that produced the rewrites must be gone: {t}"
+        );
+        for field in ["Creature", "Vibe", "Emoji", "Avatar"] {
+            assert!(
+                !t.contains(field),
+                "{field} is an empty form nothing parses: {t}"
+            );
+        }
+        // A chat agent still gets the full invitation: it has a conversation
+        // to form a self-image in, and no card waiting on it.
+        assert!(DEFAULT_IDENTITY_CONTENT.contains("Fill this in"));
+        assert!(DEFAULT_IDENTITY_CONTENT.contains("Creature"));
+    }
+
+    /// The teammate template is the lead's only lever on a new hire: it
+    /// substitutes one placeholder and nothing else. A rename here silently
+    /// ships every teammate a soul with a literal `{{role}}` in it.
+    #[test]
+    fn the_teammate_template_takes_the_role_the_lead_writes() {
+        assert!(PROJECT_TEAMMATE_SOUL_TEMPLATE.contains("{{role}}"));
+        let seeded = PROJECT_TEAMMATE_SOUL_TEMPLATE.replace("{{role}}", "Owns the parser");
+        assert!(seeded.contains("Owns the parser"));
+        assert!(
+            !seeded.contains("{{"),
+            "an unsubstituted placeholder shipped"
+        );
+        assert!(
+            !PROJECT_LEAD_SOUL_TEMPLATE.contains("{{"),
+            "the lead's soul takes no substitution"
+        );
+    }
+}

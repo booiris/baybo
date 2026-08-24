@@ -451,6 +451,7 @@ impl AgentTestHarnessBuilder {
             virtual_reads,
             None,
             None,
+            None,
         ));
 
         // Tokenizer model id must match the LLM client's so
@@ -484,6 +485,7 @@ impl AgentTestHarnessBuilder {
             source: baybo_model::ArtifactSource::Inline,
             trust_level: baybo_model::TrustLevel::Trusted,
             source_path: None,
+            tools: None,
         });
         let context_manager = ContextManager::from_config(ContextManagerConfig {
             agent: None,
@@ -491,9 +493,14 @@ impl AgentTestHarnessBuilder {
             workspace,
             keep_recent,
             compression_threshold,
+            // The harness drives compaction through the window share and a
+            // deliberately small stub window; an absolute cap on top would
+            // be a second trigger every such test has to reason about.
+            max_active_tokens: 0,
             calibration: Arc::clone(&token_calibration),
             skill_registry: Arc::clone(&skill_registry),
             channel: session.channel.clone(),
+            shape: baybo_context::prompts::soul::PromptShape::for_trigger(&session.trigger),
             session_id: session.id.clone(),
             sessions: Arc::clone(&session_manager),
             subagent_profile: Some((subagent_registry, "harness".to_string())),

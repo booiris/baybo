@@ -14,13 +14,12 @@ It is **not** a reusable library. Alternative entry points (e.g. integration tes
 | `crates/baybo/src/boot.rs` | Config → domain translation layer. Pure mappings and small loaders, unit-tested. No `Arc`, no channels, no actor spawning. |
 | `crates/baybo/src/runtime.rs` | Shared chat-loop assembly: `build_managers`, `wire_router`, `install_signal_handler`, `build_secret_vault`, `force_exit_watchdog`. Used by the gateway boot path and by `baybo prompt`'s in-process (no-gateway) fallback; the TUI only borrows the small helpers (`build_secret_vault`, `install_signal_handler`, `force_exit_watchdog`). Vault construction goes through `boot::load_encryption_key` directly. |
 | `crates/baybo/src/sandbox_boot.rs` | Boot-time Bash sandbox policy: bench skip, outer-container detection, backend warm-up, and downgrade reason selection. |
-| `crates/baybo/src/gateway_cmd.rs` | Long-running entry point for `baybo gateway start` and the supporting installer / token / status subcommands. |
+| `crates/baybo/src/gateway_cmd.rs` | Long-running entry point for `baybo gateway start` and the supporting installer / token / status subcommands. `start` acquires the per-workspace `flock` (`baybo_workspace::acquire_workspace_lock`; the lock itself belongs to [`workspace.md`](workspace.md)). |
 | `crates/baybo/src/setup_cmd.rs` | First-run wizard (`baybo setup`). |
 | `crates/baybo/src/tui_cmd.rs` | Interactive `baybo tui` entry point: connects to a running gateway over the channel WS. |
-| `crates/baybo/src/prompt_cmd.rs` | Headless one-shot `baybo prompt`. Keys off the per-workspace singleton lock: a live gateway holds it → route the turn over WS; the lock is free → acquire it and build the agent runtime in-process for this one turn via `runtime::build_managers` / `runtime::wire_router`. |
+| `crates/baybo/src/prompt_cmd.rs` | Headless one-shot `baybo prompt`. Keys off the same per-workspace singleton lock as a presence probe: a live gateway holds it → route the turn over WS; the lock is free → acquire it and build the agent runtime in-process for this one turn via `runtime::build_managers` / `runtime::wire_router`. |
 | `crates/baybo/src/gateway_client.rs` | Shared dial path for the WS channel clients (`tui_cmd`, `prompt_cmd`): resolves the gateway's admin listener from config, reads the per-start TUI token from the vault, and connects `WsTransport` to `/v1/channel-ws`. |
 | `crates/baybo/src/reload.rs` | In-process config hot-reload orchestrator. Implements `baybo_gateway::ConfigReloader` with a two-phase prepare→commit swap; lives here because rebuilding the LLM pool needs `boot::build_llm_client_for_entry`. |
-| `crates/baybo/src/singleton.rs` | Per-workspace `flock` lock acquired by `gateway_cmd::start`. |
 | `crates/baybo/src/tracing_init.rs` / `crates/baybo/src/tui_log.rs` | Tracing setup variants (stdout, stderr, file, TUI) plus the in-memory `LogBuffer` and TUI mirror sink. |
 
 ## The `boot` module

@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use baybo_tools::{Tool, ToolContext, ToolError, ToolManifest, ToolOutput};
+use baybo_tools::{Tool, ToolContext, ToolError, ToolManifest, ToolOutput, ToolTriggerScope};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -92,6 +92,10 @@ impl Tool for DeckCardListTool {
         "DeckCardList"
     }
 
+    fn trigger_scope(&self) -> ToolTriggerScope {
+        ToolTriggerScope::SharedWorkspace
+    }
+
     fn description(&self) -> String {
         "List the user's live deck cards (card_id, title, size, sizes, maximize, enabled, spec_hash) — use it to resolve the user's description to a card_id before updating.".to_string()
     }
@@ -134,6 +138,10 @@ struct GetParams {
 impl Tool for DeckCardGetTool {
     fn name(&self) -> &str {
         "DeckCardGet"
+    }
+
+    fn trigger_scope(&self) -> ToolTriggerScope {
+        ToolTriggerScope::SharedWorkspace
     }
 
     fn description(&self) -> String {
@@ -201,6 +209,10 @@ impl Tool for DeckCardCreateTool {
         "DeckCardCreate"
     }
 
+    fn trigger_scope(&self) -> ToolTriggerScope {
+        ToolTriggerScope::SharedWorkspace
+    }
+
     fn description(&self) -> String {
         "Install a new deck card from a staged bundle directory (absolute path). Runs the dry-run gate and returns any failure (including the service's stderr) so you can fix and retry. The /deck skill carries the bundle contract and templates.".to_string()
     }
@@ -254,6 +266,10 @@ struct UpdateParams {
 impl Tool for DeckCardUpdateTool {
     fn name(&self) -> &str {
         "DeckCardUpdate"
+    }
+
+    fn trigger_scope(&self) -> ToolTriggerScope {
+        ToolTriggerScope::SharedWorkspace
     }
 
     fn description(&self) -> String {

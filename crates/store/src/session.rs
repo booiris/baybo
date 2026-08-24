@@ -212,15 +212,6 @@ pub trait SessionStore: Send + Sync {
     /// conversation. Checking at write time is what makes a rename durable.
     async fn set_title_if_absent(&self, session_id: &SessionId, title: &str) -> Result<bool>;
 
-    /// Hard-delete the session.
-    ///
-    /// Returns `Ok(true)` if the row existed and was removed, `Ok(false)`
-    /// if it did not exist (idempotent).
-    ///
-    /// Does **not** drain in-flight subagents — that is the
-    /// `SessionManager`'s responsibility (cancel propagation through
-    /// the actor token tree happens before this call).
-    async fn delete(&self, session_id: &SessionId) -> Result<bool>;
     /// Return session ids whose `last_active` is older than `before`.
     async fn list_expired(&self, before: DateTime<Utc>) -> Result<Vec<SessionId>>;
     /// Return every live session, ordered by `last_active` descending.

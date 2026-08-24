@@ -590,6 +590,16 @@ impl PushDispatcher {
         // delivery pushes (as a `CronNotification`). Pushing here as well would
         // buzz the phone twice for one scheduled task, with the deep link
         // pointing at a session the user cannot even open.
+        // An issue run is board work, not a message to the operator: the
+        // card shows its state, and buzzing a phone for every run of every
+        // issue is exactly the noise a board exists to absorb.
+        if session.trigger.is_issue_session() {
+            tracing::debug!(
+                session = %ev.session_id,
+                "push: issue runs report on their card; not pushing"
+            );
+            return;
+        }
         if ev.kind == TurnInputKind::Cron && !session.trigger.is_cron_conversation() {
             tracing::debug!(
                 session = %ev.session_id,
@@ -700,12 +710,13 @@ impl PushDispatcher {
             );
             return;
         }
-        // A one-shot cron fire's workspace is not a conversation the app can
-        // open, so a notification deep-linking into it would be a dead end.
-        if crate::api::admin::chat::is_hidden_cron_session(&session) {
+        // A session owned by a board or a private cron workspace cannot be
+        // opened from global chat, so a notification deep-link would be a
+        // dead end.
+        if crate::api::admin::chat::is_excluded_from_global_chat(&session) {
             tracing::debug!(
                 session = %push.session_id,
-                "push: approval prompt is in a private cron workspace; not pushing"
+                "push: approval prompt is outside global chat; not pushing"
             );
             return;
         }

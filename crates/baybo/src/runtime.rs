@@ -26,7 +26,7 @@ use baybo_agent::agent_loop::{AgentLoop, AgentLoopConfig};
 use baybo_agent::router::Router;
 use baybo_agent::service::{ShutdownSignal, TaskTracker};
 use baybo_agent::supervisor::AgentSupervisor;
-use baybo_agent::tool_executor::ToolExecutor;
+use baybo_agent::tool_executor::{BoardStores, ToolExecutor};
 use baybo_agent::{CronScheduler, CronTriggerEvent, SecretVault, SecurityGateway, SessionManager};
 use baybo_channels::{AgentOutput, ChannelRegistry, RouterInbound};
 use baybo_config::{BayboConfig, LlmEntryName};
@@ -46,7 +46,7 @@ use baybo_turn::TurnLifecycle;
 use regex::Regex;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::boot;
 
@@ -178,6 +178,10 @@ pub struct ManagerGraph {
     /// Deck card manager (`/v1/deck/*` + the DeckCard* tools). Boot and
     /// shutdown are the gateway entrypoint's responsibility.
     pub deck_manager: Arc<baybo_deck::DeckManager>,
+    /// Kanban projects and their boards (`/v1/projects/*`). One per
+    /// process: later phases hang the run ledger's wake signal off it, and
+    /// a second instance would raise signals nobody is listening for.
+    pub project_manager: Arc<baybo_project::ProjectManager>,
     /// Cloneable bundle of every sqlite-backed store handle. Keeping the
     /// whole [`Store`] in one field means adding a new store only
     /// touches [`Store`] itself — the graph and its downstream consumers
@@ -200,6 +204,9 @@ pub struct ManagerGraph {
     /// `wire_router` twice panics loudly instead of silently handing
     /// out a dummy receiver.
     pub cron_trigger_rx: Option<mpsc::Receiver<CronTriggerEvent>>,
+    /// Recorded issue runs waiting to execute. A one-shot like
+    /// `cron_trigger_rx` — [`wire_router`] consumes it.
+    pub issue_run_rx: Option<mpsc::Receiver<baybo_project::IssueRunEvent>>,
 
     /// Late-set slot for the actor-backed subagent spawner. The
     /// `spawn_subagent` tool holds a clone (taken at build time, before the
@@ -212,6 +219,9 @@ pub struct ManagerGraph {
     /// shared `ShutdownSignal` in [`build_managers`]; cancelling it
     /// cascades down through every actor's per-turn cancel tree.
     pub actor_parent_token: CancellationToken,
+
+    /// Approval wrapper retained so shutdown can close parked card prompts.
+    pub timeline_approvals: Option<Arc<baybo_project::TimelineApprovalGate>>,
 
     /// Fan-out limiter shared between `spawn_subagent` (reserves at
     /// dispatch) and the router (releases on terminal). The CLI /
@@ -227,6 +237,10 @@ const SHUTDOWN_WATCHDOG_MARGIN: std::time::Duration = std::time::Duration::from_
 
 impl ManagerGraph {
     pub async fn shutdown(&mut self, deadline: tokio::time::Instant) {
+        // Close before cancellation because `Drop` cannot await runtime teardown.
+        if let Some(approvals) = &self.timeline_approvals {
+            approvals.close_open_prompts().await;
+        }
         self.actor_parent_token.cancel();
         let sandbox_runner = self.sandbox_runner.clone();
         tokio::join!(self.mcp_runtime.shutdown(deadline), async move {
@@ -283,7 +297,7 @@ pub async fn build_managers(
         let reg = Arc::new(SkillRegistry::new());
         let builtins = reg.register_builtins();
         if builtins > 0 {
-            info!(count = builtins, "registered built-in skills");
+            debug!(count = builtins, "registered built-in skills");
         }
         // The built-in's own directory, eagerly: every other agent is loaded
         // lazily at actor build because the set of agents is DB state, but
@@ -292,7 +306,7 @@ pub async fn build_managers(
         let builtin = baybo_model::AgentProfileId::builtin();
         let loaded = reg.ensure_agent_skills(&builtin, &workspace_paths);
         if loaded > 0 {
-            info!(
+            debug!(
                 count = loaded,
                 path = %builtin.skills_dir(&workspace_paths).display(),
                 "loaded skills from the built-in persona"
@@ -304,12 +318,12 @@ pub async fn build_managers(
         let reg = Arc::new(baybo_subagent::SubagentRegistry::new());
         let builtins = reg.register_builtins();
         if builtins > 0 {
-            info!(count = builtins, "registered built-in subagent profiles");
+            debug!(count = builtins, "registered built-in subagent profiles");
         }
         let workspace_agents = workspace_paths.agents_dir();
         let loaded = reg.load_dir(&workspace_agents);
         if loaded > 0 {
-            info!(
+            debug!(
                 count = loaded,
                 path = %workspace_agents.display(),
                 "loaded subagent profiles from workspace"
@@ -404,7 +418,7 @@ pub async fn build_managers(
     .map_err(|e| anyhow::anyhow!("build LLM client pool: {e}"))?;
     let llm_client = pool.default_client();
     let info = llm_client.model_info();
-    info!(
+    debug!(
         provider = %info.provider,
         model = %info.id,
         pool_entries = %pool
@@ -568,9 +582,8 @@ pub async fn build_managers(
     // --- Skill tool — registered with the risk assessor as the
     // gate. Lives in baybo-skills (parallel to baybo-cron::tools)
     // because it needs the registry + assessor; both are constructed
-    // above. Always registered: when the registry is empty the
-    // per-turn system reminder is suppressed and the LLM never tries
-    // the call.
+    // above. Always registered: when the registry is empty no listing
+    // row is seeded and the LLM never tries the call.
     {
         let risk_check: Arc<dyn baybo_skills::SkillRiskCheck> = Arc::clone(&skill_assessor) as _;
         let (tool, manifest) =
@@ -605,6 +618,38 @@ pub async fn build_managers(
         tool_registry.register(tool, manifest);
     }
 
+    // One hook, shared by everything that writes the board: the manager and
+    // the dispatcher both announce, and a board watched through two hooks
+    // would be a board where which writer you went through decides whether
+    // anybody sees it.
+    let project_events: Arc<dyn baybo_project::ProjectEvents> = Arc::new(
+        baybo_gateway::project_events::GatewayProjectEvents::new(Arc::clone(&channels_registry)),
+    );
+
+    let (issue_dispatch, issue_run_rx) =
+        baybo_project::dispatch::build(baybo_project::DispatchConfig {
+            store: stores.project.clone(),
+            agents: stores.agent_profile.clone(),
+            blobs: stores.blob.clone(),
+            events: Arc::clone(&project_events),
+            paths: baybo_workspace::WorkspacePaths::new(workspace_paths.root().to_path_buf()),
+            user_id: baybo_gateway::auth::OWNER_USER_ID.to_string(),
+            channel: baybo_model::ChannelType::owner(),
+        });
+
+    let project_manager = Arc::new(baybo_project::ProjectManager::new(
+        stores.project.clone(),
+        stores.agent_profile.clone(),
+        stores.blob.clone(),
+        baybo_workspace::WorkspacePaths::new(workspace_paths.root().to_path_buf()),
+        project_events,
+        issue_dispatch,
+        baybo_project::turn_run_stopper(Arc::clone(&turn_lifecycle)),
+    ));
+    for (tool, manifest) in baybo_project::tools::agent_tools(Arc::clone(&project_manager)) {
+        tool_registry.register(tool, manifest);
+    }
+
     // --- security gateway + tool executor
     // Tool-output spill now lives in `baybo-context` (resolved from the
     // session's workspace handle); the gateway only does scan + sanitize.
@@ -613,6 +658,12 @@ pub async fn build_managers(
         Arc::clone(&secret_vault),
     ));
     let gate_map = channels_registry.approval_gates();
+    let timeline_approvals = baybo_gateway::channel::boot::install_timeline_approval_gate(
+        &channels_registry,
+        Arc::clone(&project_manager),
+        stores.session.clone(),
+    );
+
     let sandbox_boot = crate::sandbox_boot::resolve_sandbox_runner(
         config.permission,
         Arc::clone(&process_manager),
@@ -695,7 +746,7 @@ pub async fn build_managers(
         );
         work_dir
     });
-    info!(path = %sandbox_root.display(), "sandbox FS scope rooted at workspace work/");
+    debug!(path = %sandbox_root.display(), "sandbox FS scope rooted at workspace work/");
     // Resolver consulted on `Read` before the filesystem: serves the session
     // transcript from the store for post-compaction recovery, with per-session
     // access control. `ReadTool` consults it; `None` would disable virtual reads.
@@ -748,6 +799,10 @@ pub async fn build_managers(
         virtual_reads,
         background_jobs,
         background_control,
+        Some(BoardStores {
+            projects: Arc::clone(&project_manager) as Arc<dyn baybo_project::ProjectRepo>,
+            agents: stores.agent_profile.clone(),
+        }),
     ));
 
     // --- per-actor parent token. The spawner factory derives each
@@ -806,11 +861,14 @@ pub async fn build_managers(
         channels_registry,
         secret_vault,
         deck_manager,
+        project_manager,
         stores,
         memory,
         cron_trigger_rx: Some(cron_trigger_rx),
+        issue_run_rx: Some(issue_run_rx),
         subagent_spawner_slot,
         actor_parent_token,
+        timeline_approvals,
         subagent_dispatch_limiter,
     })
 }
@@ -851,6 +909,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
 
     let max_iterations = graph.config.agent.max_iterations;
     let compression_threshold = graph.config.agent.context.compression_threshold;
+    let max_active_tokens = graph.config.agent.context.max_active_tokens;
     let keep_recent = graph.config.agent.context.keep_recent;
     let builtin_memory = graph.config.memory.builtin.enabled;
 
@@ -950,9 +1009,13 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                         workspace: Arc::clone(&workspace_paths_arc),
                         keep_recent,
                         compression_threshold,
+                        max_active_tokens,
                         calibration: Arc::clone(&token_calibration),
                         skill_registry: Arc::clone(&skill_registry),
                         channel: session.channel.clone(),
+                        shape: baybo_context::prompts::soul::PromptShape::for_trigger(
+                            &session.trigger,
+                        ),
                         session_id: session.id.clone(),
                         sessions: Arc::clone(&sessions),
                         subagent_profile: session
@@ -1098,6 +1161,8 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         turn_lifecycle: Arc::clone(&graph.turn_lifecycle),
         cron_store: graph.stores.cron.clone(),
         cron_trigger_rx,
+        issue_run_rx: graph.issue_run_rx.take(),
+        board: Some(Arc::clone(&graph.project_manager)),
         actor_parent_token: graph.actor_parent_token.clone(),
         rate_limit: Arc::clone(&graph.rate_limit),
         inbound_dedup: Arc::clone(&graph.inbound_dedup),

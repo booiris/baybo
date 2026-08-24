@@ -91,7 +91,7 @@ impl TurnStore for SqliteTurnStore {
         let ended_at = turn.ended_at.map(super::time::to_us);
         let data = turn.data.clone();
         self.pool
-            .interact("turns.create", move |conn| {
+            .interact_write("turns.create", move |conn| {
                 conn.execute(
                     "INSERT INTO turns \
                      (id, session_id, parent_turn_id, kind, status_kind, \
@@ -138,7 +138,7 @@ impl TurnStore for SqliteTurnStore {
         let id = turn.id.to_string();
         let rows_affected = self
             .pool
-            .interact("turns.save", move |conn| {
+            .interact_write("turns.save", move |conn| {
                 Ok(conn.execute(
                     "UPDATE turns SET status_kind = ?1, started_at = ?2, ended_at = ?3, data = ?4 \
                      WHERE id = ?5",

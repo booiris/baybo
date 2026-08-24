@@ -94,6 +94,12 @@ pub struct SubagentSpawnRequest {
     /// for the session's life. Stored as a plain `String` so this crate stays
     /// a leaf (no dependency on `baybo-subagent`).
     pub subagent_type: String,
+    /// The tools the profile named, already resolved — the spawn tool holds
+    /// the profile, this crate cannot (it is a leaf). Pinned onto the child's
+    /// session beside `subagent_type` so the list is fixed at genesis rather
+    /// than re-derived on every hydration. `None` ⇒ the profile named none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_allowlist: Option<Vec<String>>,
     /// 3-5 word summary the parent LLM authored. Trace display only;
     /// not part of the child's initial prompt.
     pub task_summary: String,

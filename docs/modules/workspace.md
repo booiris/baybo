@@ -23,8 +23,9 @@ The workspace root is the single **project root** for the entire runtime: every 
 <workspace_root>/
   config/          # standalone git repo: baybo.json, .mcp.json
   agents/          # standalone git repo: subagent profile definitions
-  personas/        # standalone git repo: one dir per agent — SOUL.md + IDENTITY.md
-                   # + skills/ + memory/, plus the shared USER.md
+  personas/        # standalone git repo: global personas plus project/<agent_id>/
+                   # project personas; each has identity + skills + memory
+                   # alongside the shared USER.md
   .key/            # not version-controlled: encryption.key (mode 0600)
   state/           # not version-controlled: storage.db, baybo.lock, channel.port, browser/profile
   work/            # not version-controlled: .uv/ (uv cache + downloaded pythons + tools), .fonts/, .baybo-tool-spills/, tmp/ (disposable scratch, swept), agent scratch
@@ -43,11 +44,11 @@ checkout rather than polluting the real user home.
 | ---------------- | ------------------------------------------ |
 | config           | `<workspace.path>/config/baybo.json`        |
 | MCP servers      | `<workspace.path>/config/.mcp.json`        |
-| agent skills     | `<workspace.path>/personas/<agent_id>/skills/` |
-| agent identity files | `<workspace.path>/personas/<agent_id>/{SOUL,IDENTITY,USER}.md` |
+| global/legacy agent skills | `<workspace.path>/personas/<agent_id>/skills/` |
+| global/legacy agent identity files | `<workspace.path>/personas/<agent_id>/{SOUL,IDENTITY,USER}.md` |
+| newly created project agent | `<workspace.path>/personas/project/project-<ULID>/…` |
 | built-in's identity files | `<workspace.path>/personas/baybo/…` — it is an ordinary persona dir |
 | shared user profile | `<workspace.path>/personas/USER.md` (owned by no agent) |
-| agent skills     | `<workspace.path>/personas/<agent_id>/skills/` |
 | encryption key   | `<workspace.path>/.key/encryption.key`     |
 | storage          | `<workspace.path>/state/storage.db`        |
 | singleton lock   | `<workspace.path>/state/baybo.lock`         |
@@ -70,10 +71,15 @@ New subsystem files belong as a method on `WorkspacePaths`, not as another `work
 - Creates `config/`, `agents/`, `personas/`, `personas/baybo/skills/`, `.key/`, `state/`, `work/`, `work/tmp/`, `logs/` if missing. The built-in's skill directory is the one persona-internal path created here rather than by `ensure_persona_layout` — every other agent is DB state, but the built-in's id is a constant, so its folder is layout.
 - Runs `git init --quiet` inside `config/`, `agents/`, and `personas/` if the directory isn't already a git repo (`<dir>/.git` check). Skill directories get no repo of their own — they live inside `personas/`, which already is one, and a nested `.git` there would give git two answers to which repo owns a file.
 
-Per-agent subdirectories under `personas/` are created on demand by
-`ensure_persona_layout` (at profile creation, and defensively when a bound
-session's actor is built), not by `ensure_layout` — the set of agents is
-DB-state, not layout.
+Per-agent subdirectories are created on demand by `ensure_persona_layout` (at
+profile creation, and defensively when a bound session's actor is built), not
+by `ensure_layout` — the set of agents is DB-state, not layout. Global agents
+remain direct children of `personas/`; project leads and teammates created by
+the project manager receive a `project-<ULID>` id and are grouped under
+`personas/project/`. That prefix lets every id-only path lookup select the
+project tree without filesystem I/O. A flat project persona created by an older
+build keeps its unprefixed id, stays where it is, and remains readable; no
+background migration moves user-authored identity or memory files.
 
 `config/`, `personas/`, and `agents/` are each their own standalone git repo. The workspace root itself is **not** version-controlled — there is no top-level `.gitignore`, and `.key/`, `state/`, `work/`, `logs/` simply live next to the three declarative dirs without needing an ignore list to keep them out of any tree above them. Users who want to back up or sync their config commit inside `config/`; identity edits and skills both commit inside `personas/`, which is the repo that spans the whole declarative agent surface — every agent's identity, memory, and skills; subagent profiles commit inside `agents/`. **Never** commit anything from `.key/` — `baybo setup` mints the master encryption key there with mode 0600, and treating that file as version-controllable would leak every secret in the vault.
 
@@ -93,9 +99,11 @@ The `ENV_CONFIG_PATH` constant holds the env-var name `BAYBO_CONFIG_PATH`; setti
 - **IDENTITY.md**: system or instance identity description
 
 **All three identity files are per-agent, and the built-in is an ordinary
-persona directory** (`personas/baybo/`). One directory, one rule:
-`personas/<id>/` is an agent, and the single file directly inside `personas/`
-is the shared human profile that belongs to none of them.
+persona directory** (`personas/baybo/`). Global personas and legacy project
+personas use `personas/<id>/`; newly created project personas use
+`personas/project/project-<ULID>/`. In either layout the leaf directory owns
+one agent, while `personas/USER.md` is the shared human profile that belongs to
+none of them.
 
 `SOUL.md` (personality) and `IDENTITY.md` (self-image: name, creature, vibe,
 emoji, avatar) answer "who is this assistant". `USER.md` is the agent's **own
@@ -103,6 +111,12 @@ notes** about the human, per-agent for the same reason memory is partitioned:
 one agent's accumulated read on the user is not another's, and sharing the file
 would be a write channel between agents that the partition does not cover.
 Empirically it is also the only one agents actually maintain.
+
+Project-agent SOUL seeds are deliberately short: they hold only durable role,
+board, reporting, and safety rules. Current-card state, wake reasons, brief
+semantics, and tool-selection guidance belong to runtime framing, where they
+can stay accurate without permanently taxing every turn or overwriting an
+agent's editable identity.
 
 The stable facts the operator curates live in `personas/USER.md`, which every
 agent reads as a separate `<shared_user_profile>` section alongside its own
@@ -134,7 +148,7 @@ Two different things are called memory, and only one of them is a boundary:
   retrievable store (mem0, OpenViking). That one genuinely does not overlap:
   this crate holds files, that one holds recall.
 - The **file-based memory tree** ([`memory-builtin.md`](memory-builtin.md)) —
-  `personas/<id>/memory/`, which lives *inside* this crate's layout and is
+  `<persona>/memory/`, which lives *inside* this crate's layout and is
   addressed and seeded by it, exactly like the identity files. The split
   there is not workspace-vs-memory but always-loaded-vs-loaded-on-demand:
   identity files ride every prompt in full, memory files cost nothing until

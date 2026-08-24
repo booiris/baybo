@@ -24,6 +24,7 @@ use serde_json::{Value, json};
 
 use super::managed_repo::{
     ChangeKind, ManagedRoots, append_audit_line, commit_change, reject_oversized_content,
+    write_managed_file,
 };
 use super::paths::require_absolute;
 use crate::{ResourceAccess, Tool, ToolContext, ToolError, ToolOutput};
@@ -60,14 +61,11 @@ impl Tool for WriteTool {
 
     fn description(&self) -> String {
         "Create or overwrite a file with the provided content. \
-         Always use this instead of Bash commands like echo with \
-         redirection or cat with heredoc. Prefer `Edit` for modifying \
+         Prefer `Edit` for modifying \
          existing files — only use `Write` for new files or complete \
          rewrites. Overwriting a file that already exists requires you to \
          have Read it first (and it must be unchanged since); creating a new \
-         file does not. Parent directories must already exist.\n\n\
-         PATHS: `file_path` MUST be an absolute filesystem path. Relative \
-         paths are rejected."
+         file does not. Parent directories must already exist."
             .to_string()
     }
 
@@ -75,7 +73,7 @@ impl Tool for WriteTool {
         json!({
             "type": "object",
             "properties": {
-                "file_path": { "type": "string", "description": "Absolute path of the file to write" },
+                "file_path": { "type": "string", "description": "Absolute path; relative is rejected" },
                 "content":   { "type": "string", "description": "Full file content" }
             },
             "required": ["file_path", "content"]
@@ -136,9 +134,18 @@ impl Tool for WriteTool {
             return Err(ToolError::Execution(reason));
         }
 
-        tokio::fs::write(&p.file_path, &p.content)
-            .await
-            .map_err(|e| ToolError::Execution(format!("write {}: {e}", p.file_path.display())))?;
+        match &audit_target {
+            // Inside `personas/`: the write itself applies whatever governs
+            // that file's contents — see `write_managed_file`.
+            Some(target) => {
+                write_managed_file(target, &ctx.agent_id, &p.file_path, &p.content).await?
+            }
+            None => tokio::fs::write(&p.file_path, &p.content)
+                .await
+                .map_err(|e| {
+                    ToolError::Execution(format!("write {}: {e}", p.file_path.display()))
+                })?,
+        }
 
         // Anchor the read baseline to the file we just wrote so an Edit that
         // follows this Write does not demand a separate Read.
@@ -514,6 +521,58 @@ mod tests {
                 .any(|r| matches!(r, ResourceAccess::WriteFile { .. })),
             "a soul overwrite must still meet the approval gate"
         );
+    }
+
+    #[tokio::test]
+    async fn overwriting_an_identity_file_cannot_rename_a_project_agent() {
+        // `Edit` is not the only door into that `Name:` line — a whole-file
+        // overwrite reaches it too, and it is the more destructive verb.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = memory_workspace(tmp.path()).await;
+        let write = WriteTool::new(paths.clone());
+        let hired = "project-01JDEV";
+        let named = "# Who Am I?\n\n* **Name:** Dev\n";
+        let mine = paths.persona_identity_file(hired, baybo_workspace::IdentityKind::Identity);
+        tokio::fs::create_dir_all(paths.persona_dir(hired))
+            .await
+            .expect("mkdir");
+        tokio::fs::write(&mine, named).await.expect("seed");
+        let ctx = ToolContext {
+            agent_id: baybo_model::AgentProfileId::parse(hired).expect("valid id"),
+            ..ctx_for(&paths)
+        };
+
+        let err = write
+            .execute(
+                json!({
+                    "file_path": mine.to_string_lossy(),
+                    "content": "# Who Am I?\n\n* **Name:** Aster\n",
+                }),
+                &ctx,
+            )
+            .await
+            .expect_err("the @handle its board uses came from that name");
+        assert!(
+            matches!(err, ToolError::InvalidParams(ref m) if m.contains("@handle")),
+            "got: {err:?}"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&mine).await.expect("read"),
+            named,
+            "a refused write leaves the file alone"
+        );
+
+        // Rewriting everything around the name is what the file is for.
+        write
+            .execute(
+                json!({
+                    "file_path": mine.to_string_lossy(),
+                    "content": "# Who Am I?\n\n* **Name:** Dev\n* **Vibe:** warm\n",
+                }),
+                &ctx,
+            )
+            .await
+            .expect("only the name is fixed");
     }
 
     #[tokio::test]

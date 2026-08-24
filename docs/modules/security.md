@@ -58,12 +58,33 @@ For the flushable prefix the gateway runs the scan/mint/vault pipeline, and the 
 
 Injection markers (`ignore previous`, fake turn prefixes, ChatML/LLaMA control tokens, forged `<tool_output>` tags, etc.) are scanned at two points:
 
-- **Inbound messages** (`sanitize_input`): every text block is scanned; hits are logged via `tracing` at a level that scales with severity (`Critical`/`High` → `warn`, `Medium` → `info`, `Low` → `debug`). User input is not blocked — legitimate prose contains many of these literals — but the logs give operators a signal.
-- **Tool output** (`sanitize_tool_output` in this crate + `wrap_tool_output` in `baybo-context`): warnings are logged the same way, and `wrap_tool_output` prepends an inline security banner naming the triggered rules (passed in as `warning_rules`) inside the `<tool_output>` envelope so the LLM treats the content as untrusted data rather than instructions.
+- **Inbound messages** (`sanitize_input`): every text block is scanned; hits are logged via `tracing` at a level that scales with severity. User input is not blocked — legitimate prose contains many of these literals — but the logs give operators a signal.
+- **Tool output** (`sanitize_tool_output` in this crate + `wrap_tool_output` in `baybo-model`): warnings are logged the same way, and `wrap_tool_output` prepends an inline security banner naming the triggered rules (passed in as `warning_rules`) inside the `<tool_output>` envelope so the LLM treats the content as untrusted data rather than instructions.
+
+#### Severity is scoped by output provenance
+
+The emitted level is a function of severity **and** where the scanned text came from. `emitted_level(severity, provenance)`:
+
+| provenance | `Critical` / `High` | `Medium` | `Low` |
+| --- | --- | --- | --- |
+| `Foreign` | `warn` | `info` | `debug` |
+| `WorkspaceLocal` | `info` | `debug` | `debug` |
+
+An agent reading its own project's source trips these rules constantly — a `system:` line in a fixture is not an attack — and a stream of `Critical`s nobody can act on is how the one that matters gets ignored. Nothing is ever suppressed: every event keeps its `rules` and `severity` fields and gains `provenance`, so a demoted line is still greppable by severity.
+
+`provenance` is a **resolved verdict**, not something the detector infers from the text. `ToolExecutor` computes it per call via `OutputProvenance::classify(source, accesses, checkout_root)` and puts it on `ScanOrigin`. `WorkspaceLocal` requires *all* of: the tool declares `OutputSource::DeclaredFiles`; the session has a checkout; the call declared at least one access; every access is a `ReadFile`; no declared path contains a `..` component; and every path is under the checkout root (component-wise, so `/data/kanban-evil` does not match `/data/kanban`).
+
+That check is only sound because `DeclaredFiles` means *enumerated*, not *contained* — `classify` inspects the declared paths, so the declared paths have to be the paths the output came from. `ReadTool` is the only tool that qualifies. `GrepTool` and `GlobTool` read nothing but local files and are deliberately `Opaque`: they declare their search **root** and return content from every file beneath it, so a declared path that passes the checkout test says nothing about where the matched bytes actually live (a symlinked subtree, a vendored dependency). See `docs/modules/tools.md` → `Tool::output_source()`.
+
+`ScanOrigin::default()` is `Foreign`, so anything unclassified keeps full severity. That covers inbound channel input (`sanitize_input` builds its origin with `..Default::default()`) and every `OutputSource::Opaque` tool — `Grep`, `Glob`, `WebFetch`, the browser and MCP tools, and `Bash`, whose output is whatever the command printed.
+
+**Accepted residual:** a `Read` of a symlink inside the checkout whose target is outside it makes the declared path pass while the bytes come from elsewhere. The consequence is a `Critical` logged at `info` — a monitoring miss, not an escalation — and an attacker able to plant that symlink can plant the injection text directly. Not worth a `canonicalize` on every tool call.
+
+The LLM-facing side is deliberately unchanged: `wrap_tool_output`'s security banner is emitted from the agent loop's own `detect_injection` and never sees `provenance`. The model keeps treating file content as untrusted data wherever the file lives; this is the operator's log channel only.
 
 ### Tool-output structural wrapping
 
-`baybo_context::prompts::tool_output::wrap_tool_output(tool_name, content, warning_rules)` (in `baybo-context`, not this crate) wraps the result in `<tool_output name="...">...</tool_output>`. The tool name is XML-attribute-escaped; any literal `</tool_output` inside the body is neutralized with a zero-width space between the `<` and the slash so untrusted content cannot forge the closing boundary. `warning_rules` are the injection-marker rule names the caller pulled from this crate's `InjectionDetector::scan`; passing them as plain strings keeps `baybo-context` free of an `baybo-security` dependency. The agent loop applies this wrap to every tool result before appending it to `ContentBlock::ToolResult`.
+`baybo_model::wrap_tool_output(tool_name, content, warning_rules)` (in `baybo-model`, not this crate — `baybo-tools` frames its out-of-band judge prompts with the same envelope and cannot depend on `baybo-context`) wraps the result in `<tool_output name="...">...</tool_output>`. The tool name is XML-attribute-escaped; any literal `</tool_output` inside the body is neutralized with a zero-width space between the `<` and the slash so untrusted content cannot forge the closing boundary. `warning_rules` are the injection-marker rule names the caller pulled from this crate's `InjectionDetector::scan`; passing them as plain strings keeps `baybo-model` free of a `baybo-security` dependency. The agent loop applies this wrap to every tool result before appending it to `ContentBlock::ToolResult`.
 
 ### Tool-output length cap
 
@@ -217,6 +238,7 @@ Security only decides allow/deny. It does not execute network access. There is n
 - Placeholder generation is deterministic per secret — same secret → same placeholder → single vault entry
 - Plaintext at egress is permitted only at four points: the tool executor's post-reveal `params_revealed` into `tool_registry.execute`, `reveal_llm_response` on tool-side LLM replies (`billed_chat`), `SecretAccess::resolve_env` for child-process env injection, and deck's host-mediated `ctx.fetch` reveal (`crates/deck/src/host.rs` — URL/header/body placeholders revealed at egress, audit-logged with card id + host); stream deltas, outgoing messages, trace, memory, and persistence all carry placeholder form
 - Injection detection is log-only at inbound and log-plus-wrap at tool output; never auto-block user input on injection markers alone
+- Injection log severity is scoped by provenance, and provenance is decided by `ToolExecutor` and delivered on `ScanOrigin` — the detector never infers it from the text. Only `OutputSource::DeclaredFiles` tools reading inside the session's own checkout are demoted, and a tool may claim `DeclaredFiles` only if it enumerates every file its output came from (which rules out directory-rooted searches like `Grep` / `Glob`); nothing is suppressed, and inbound channel input is always `Foreign`
 - Any tool that reads filesystem paths MUST apply `is_sensitive_path` at its entry point, regardless of approval-gate status
 - Any tool that emits HTTP MUST apply both layers of the SSRF floor unless its destination is fixed by code or the operator and cannot be changed by model input; such a tool must still validate the endpoint and must not dereference returned URLs
 

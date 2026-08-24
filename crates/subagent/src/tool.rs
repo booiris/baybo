@@ -64,11 +64,8 @@ or perform a focused sub-task. Use when the work is decomposable: the
 parent agent stays focused on the conversation while the subagent
 runs to completion and returns a single final message.
 
-The subagent does NOT see your transcript. It starts empty, with the
-system prompt its `subagent_type` profile fixes and the self-contained
-`prompt` you authored — see that parameter for how to write one. The
-call blocks until its final message, which is all you get back;
-intermediate tool output is not surfaced.
+The call blocks until the subagent's final message, which is all you
+get back; intermediate tool output is not surfaced.
 
 Pick the most specific `subagent_type` from the catalogue below, and
 fall back to `general-purpose` only when none fits; an unknown one is a
@@ -230,6 +227,7 @@ fn parse_spawn_request(value: &Value, registry: &SubagentRegistry) -> Result<Par
     Ok(ParsedSpawn {
         request: SubagentSpawnRequest {
             subagent_type: profile.name.clone(),
+            tool_allowlist: profile.tools.clone(),
             task_summary: p.description,
             prompt: p.prompt,
             model_tier,
@@ -429,19 +427,34 @@ const MAX_CATALOGUE_BLURB_CHARS: usize = 240;
 /// truncated line reads as truncated rather than as a sentence that trails off.
 const BLURB_ELLIPSIS: &str = "…";
 
-/// One profile's catalogue line, bounded. Cuts on a char boundary (profile
-/// descriptions are author-written and routinely non-ASCII) and prefers the
-/// last word break in the final quarter, so the cut lands between words when
-/// one is near enough to matter.
+/// One profile's catalogue line, held to [`MAX_CATALOGUE_BLURB_CHARS`].
+///
+/// A description that fits is used whole. One that does not falls back to its
+/// first sentence, because these lines all read "what I am. When to pick me
+/// over X", and a cut that lands mid-clause takes the second half — the only
+/// half that answers the question the catalogue exists to answer. A first
+/// sentence that is itself too long is cut on a char boundary (descriptions
+/// are author-written and routinely non-ASCII), preferring the last word break
+/// in the final quarter so the cut lands between words when one is near enough.
 fn catalogue_blurb(description: &str) -> std::borrow::Cow<'_, str> {
     if description.chars().count() <= MAX_CATALOGUE_BLURB_CHARS {
         return std::borrow::Cow::Borrowed(description);
     }
-    let hard = description
+    // Only past the budget, and only here: the renderer indents a multi-line
+    // blurb's continuation lines, and a sentence break can straddle a newline.
+    let flat = description.replace('\n', " ");
+    let sentence = match flat.split_once(". ") {
+        Some((first, _)) => format!("{first}."),
+        None => flat.to_string(),
+    };
+    if sentence.chars().count() <= MAX_CATALOGUE_BLURB_CHARS {
+        return std::borrow::Cow::Owned(sentence);
+    }
+    let hard = sentence
         .char_indices()
         .nth(MAX_CATALOGUE_BLURB_CHARS)
-        .map_or(description.len(), |(i, _)| i);
-    let head = &description[..hard];
+        .map_or(sentence.len(), |(i, _)| i);
+    let head = &sentence[..hard];
     let keep = head
         .rfind(char::is_whitespace)
         .filter(|i| *i * 4 >= hard * 3)
@@ -482,7 +495,7 @@ fn parameters_schema() -> Value {
             "backend": {
                 "type": "string",
                 "enum": ["baybo", "claude", "codex"],
-                "description": "Backend that runs the subagent. 'baybo' (default) spawns a full in-process baybo agent that uses the configured LLMs/tools/skills. 'claude' delegates to a local Claude Code subprocess and 'codex' to OpenAI's codex CLI — both are one-shot, run their own internal tool loops with bypassed permissions, and are best for heavy autonomous tasks where you want that external agent (not baybo) to drive. Each is available only when its CLI is installed on this host; a call naming a missing one fails with a clear error."
+                "description": "Who runs it. 'baybo' (default) is an in-process agent with the configured LLMs, tools and skills. 'claude' and 'codex' hand the whole task to that CLI instead — one-shot, own tool loop, permissions bypassed — for heavy autonomous work. A backend whose CLI is not installed fails with a clear error."
             },
             "background": {
                 "type": "boolean",
@@ -491,7 +504,7 @@ fn parameters_schema() -> Value {
             "on_timeout": {
                 "type": "string",
                 "enum": ["background", "kill"],
-                "description": "What to do if a foreground (background=false) subagent is still running after a 2-minute foreground wait. 'background' (default) detaches it — you get a handle now and a notification when it finishes — so a slow subagent never blocks you. 'kill' cancels it and returns a timeout instead. Ignored when background=true, during a scheduled job's own run, and in nested subagents — those always block until the child finishes."
+                "description": "After a 2-minute foreground wait: 'background' (default) detaches it — handle now, notification later — and 'kill' cancels it. Ignored when background=true."
             },
             "group": {
                 "type": "string",
@@ -499,7 +512,7 @@ fn parameters_schema() -> Value {
             },
             "resume_session_id": {
                 "type": "string",
-                "description": "Continue a prior subagent's conversation. Use a child_session_id value the user previously saw in a 'subagent_session_id: ...' tail on this same parent session — passing an arbitrary id will be rejected. The new prompt is appended to that child's existing context (for claude / codex, via the agent's own --resume). Leave unset to start a fresh subagent."
+                "description": "Continue a prior subagent instead of starting one: a child_session_id from a 'subagent_session_id: ...' tail on THIS parent session. Any other id is rejected. The prompt is appended to that child's context."
             }
         }
     })
@@ -513,6 +526,27 @@ impl Tool for SpawnSubagentTool {
 
     fn description(&self) -> String {
         (*self.cached_description()).clone()
+    }
+
+    /// Withholds every knob that only chooses *how* to background, where
+    /// backgrounding is refused. A card's run, a scheduled job's own run and
+    /// a nested subagent block regardless of all three.
+    ///
+    /// `group` belongs with them: it forces `background` on, and its whole
+    /// payoff — parallel fan-out, one merged notification — lives inside the
+    /// spawner's `if background` arm, so on this path it is read and dropped
+    /// while its description promises the opposite. `background: true` was
+    /// already being sent and silently ignored.
+    fn parameters_schema_for(&self, trigger: &baybo_model::TriggerSource) -> Value {
+        let mut schema = self.parameters_schema();
+        if !trigger.can_host_background_jobs()
+            && let Some(props) = schema.get_mut("properties").and_then(Value::as_object_mut)
+        {
+            for knob in ["background", "on_timeout", "group"] {
+                props.remove(knob);
+            }
+        }
+        schema
     }
 
     fn parameters_schema(&self) -> Value {
@@ -1155,6 +1189,48 @@ mod tests {
         assert!(cut.ends_with(BLURB_ELLIPSIS), "{cut}");
     }
 
+    /// The catalogue is what the parent picks from, so the line each profile
+    /// gets must be the part that distinguishes it. All four built-ins used to
+    /// be cut at the character budget exactly where their "pick this over X"
+    /// clause began, which is the one thing the catalogue is for.
+    #[test]
+    fn every_builtin_s_catalogue_line_survives_the_budget_intact() {
+        for profile in crate::builtin::all() {
+            let line = catalogue_blurb(&profile.description);
+            assert!(
+                !line.ends_with(BLURB_ELLIPSIS),
+                "{}'s catalogue line is cut: {line}",
+                profile.name
+            );
+            assert!(
+                line.to_lowercase().contains("pick"),
+                "{}'s line must say when to pick it over its neighbours: {line}",
+                profile.name
+            );
+        }
+    }
+
+    /// An over-budget description loses its tail at a sentence boundary, not
+    /// mid-clause — the half that says when to pick it survives or nothing does.
+    #[test]
+    fn an_overlong_description_is_cut_at_a_sentence_not_mid_clause() {
+        let long = format!(
+            "Finds things{}. Pick it when you want finding.",
+            ".".repeat(300)
+        );
+        let cut = catalogue_blurb(&long);
+        assert!(cut.ends_with(BLURB_ELLIPSIS), "{cut}");
+
+        let sentence = format!(
+            "Finds {}things. Pick it when you want finding.",
+            "many ".repeat(40)
+        );
+        assert_eq!(
+            catalogue_blurb(&sentence),
+            format!("Finds {}things.", "many ".repeat(40))
+        );
+    }
+
     #[test]
     fn description_appends_type_catalogue() {
         let tool = SpawnSubagentTool::from_config(SpawnSubagentToolConfig {
@@ -1301,6 +1377,35 @@ mod tests {
         assert_eq!(limiter.events(), vec!["reserve", "release"]);
     }
 
+    /// The profile's list rides the spawn request, because the spawner has
+    /// the child's session row and the tool has the profile. If it stopped
+    /// riding, the child would silently get every tool again.
+    #[test]
+    fn parse_spawn_request_carries_the_profile_s_tool_list() {
+        let reg = registry_with_builtins();
+        let ask = |t: &str| {
+            parse_spawn_request(
+                &json!({"subagent_type": t, "description": "d", "prompt": "p"}),
+                &reg,
+            )
+            .unwrap()
+            .request
+            .tool_allowlist
+        };
+
+        let explorer = ask("explorer").expect("explorer names its tools");
+        assert!(explorer.iter().any(|t| t == "Read"));
+        assert!(
+            !explorer.iter().any(|t| t == "Edit"),
+            "explorer is read-only: {explorer:?}"
+        );
+        assert_eq!(
+            ask("general-purpose"),
+            None,
+            "a profile that names none leaves the child unrestricted"
+        );
+    }
+
     #[test]
     fn parse_spawn_request_backend_claude() {
         let reg = registry_with_builtins();
@@ -1329,6 +1434,91 @@ mod tests {
             "backend": "nope",
         });
         assert!(parse_spawn_request(&v, &reg).is_err());
+    }
+
+    /// A card's run loses all three background knobs, and only those. The
+    /// negative half matters as much: `subagent_type`, `prompt` and the rest
+    /// still do their job there, so trimming by hand would be a slow leak.
+    #[test]
+    fn a_card_s_run_loses_the_background_knobs_and_nothing_else() {
+        use baybo_model::TriggerSource;
+
+        let tool = SpawnSubagentTool::from_config(SpawnSubagentToolConfig {
+            spawner: unwired_spawner(),
+            registry: registry_with_builtins(),
+            sessions: empty_session_manager(),
+            dispatch_limiter: unbounded_limiter(),
+            max_depth: DEFAULT_MAX_SUBAGENT_DEPTH,
+            max_subagents_per_root: DEFAULT_MAX_SUBAGENTS_PER_ROOT,
+        });
+        let names = |t: &TriggerSource| {
+            let schema = tool.parameters_schema_for(t);
+            let mut v: Vec<String> = schema["properties"]
+                .as_object()
+                .expect("an object schema")
+                .keys()
+                .cloned()
+                .collect();
+            v.sort();
+            v
+        };
+        let chat = names(&TriggerSource::User);
+        let run = names(&TriggerSource::Issue {
+            project_id: baybo_model::ProjectId::generate(),
+            issue_id: baybo_model::IssueId::generate(),
+            number: 1,
+        });
+        assert!(!chat.is_empty(), "the schema must have properties at all");
+
+        let missing: Vec<&String> = chat.iter().filter(|p| !run.contains(p)).collect();
+        assert_eq!(
+            missing,
+            vec!["background", "group", "on_timeout"],
+            "exactly the knobs that only choose how to background"
+        );
+        for required in ["subagent_type", "description", "prompt"] {
+            assert!(
+                run.contains(&required.to_string()),
+                "{required} must survive: {run:?}"
+            );
+        }
+    }
+
+    /// Withholding a knob from the schema must not narrow what the executor
+    /// accepts. A model that learned `background` elsewhere — from another
+    /// session's prefix, from a skill, from its own transcript before a
+    /// compaction — still gets its call parsed and run, exactly as before.
+    #[test]
+    fn a_withheld_knob_sent_anyway_still_parses_and_behaves() {
+        let reg = registry_with_builtins();
+        let bare = parse_spawn_request(
+            &json!({"subagent_type": "general-purpose", "description": "x", "prompt": "x"}),
+            &reg,
+        )
+        .unwrap()
+        .request;
+        assert!(!bare.background);
+        assert_eq!(bare.on_timeout, OnTimeout::Background);
+        assert!(bare.group.is_none());
+
+        let sent = parse_spawn_request(
+            &json!({
+                "subagent_type": "general-purpose",
+                "description": "x",
+                "prompt": "x",
+                "background": true,
+                "on_timeout": "kill",
+                "group": "batch",
+            }),
+            &reg,
+        )
+        .unwrap()
+        .request;
+        assert!(sent.background, "still honoured at the door");
+        assert_eq!(sent.on_timeout, OnTimeout::Kill);
+        assert!(sent.group.is_some());
+        // The spawner is where an ineligible turn downgrades all three; the
+        // parser stays a parser.
     }
 
     #[test]

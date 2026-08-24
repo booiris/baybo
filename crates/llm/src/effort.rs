@@ -27,6 +27,13 @@ const OPENAI_FIELD: &str = "reasoning_effort";
 /// turns this into an omitted `reasoning` field.
 const CODEX_OFF: &str = "none";
 
+/// The rung a call the session never asked for runs at: a compaction
+/// summary, a progress observation. Their output is short and mechanical
+/// and their input is a transcript the session already paid to think
+/// about, so inheriting the session's rung buys nothing and is billed at
+/// the session's rate.
+pub const OUT_OF_BAND_EFFORT: ReasoningEffort = ReasoningEffort::Low;
+
 /// How hard the model should think, on baybo's own ladder.
 ///
 /// The union of what the wired providers offer, ordered cheapest first, so

@@ -99,6 +99,27 @@ impl CompressionRunner {
             },
             cancel_ctx,
             |step| async move {
+                // Record what the request carried; registry state may have changed.
+                let tool_set = match recorder_inner
+                    .record_tool_set(
+                        request
+                            .tools
+                            .iter()
+                            .map(|td| baybo_trace::LlmToolDefinition {
+                                name: td.name.clone(),
+                                description: td.description.clone(),
+                                parameters_schema: td.parameters_schema.clone(),
+                            })
+                            .collect(),
+                    )
+                    .await
+                {
+                    Ok(reference) => Some(reference),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to record the compaction tool set");
+                        None
+                    }
+                };
                 let mut last_error: Option<String> = None;
                 for attempt in 0..MAX_COMPACTION_ATTEMPTS {
                     let begin = LlmCallBegin {
@@ -113,7 +134,7 @@ impl CompressionRunner {
                         // layer that knows which slice is persisted.
                         input_messages: input_marker.clone(),
                         temperature: request.temperature,
-                        tools: None,
+                        tools: tool_set.clone(),
                     };
                     // Whether the failure this attempt saw is worth a second
                     // call. Decided on the TYPED error inside the span body,
@@ -181,9 +202,10 @@ impl CompressionRunner {
                                         let call_result = LlmCallResult {
                                             output_content: response.content.clone(),
                                             thinking: response.thinking.clone(),
-                                            // The compaction request offers no
-                                            // tools, so there is never
-                                            // anything to record here.
+                                            // The request carries the session's
+                                            // tools to hold the cached prefix,
+                                            // but forbids their use, so there is
+                                            // never anything to record here.
                                             tool_calls: Vec::new(),
                                             input_tokens: response.usage.input_tokens,
                                             output_tokens: response.usage.output_tokens,

@@ -210,6 +210,7 @@ impl SessionManager {
         let prefix = match &trigger {
             TriggerSource::User => "",
             TriggerSource::Cron { .. } => "cron-",
+            TriggerSource::Issue { .. } => "issue-",
         };
         let id = if prefix.is_empty() {
             SessionId::new()
@@ -755,17 +756,6 @@ impl SessionManager {
             .count_active_messages(session_id)
             .await
             .map_err(SessionError::from)
-    }
-
-    /// Hard-delete a session by id. Errors with `SessionError::NotFound`
-    /// if the session did not exist at the time of the call.
-    pub async fn delete(&self, session_id: &SessionId) -> Result<()> {
-        let deleted = self.store.delete(session_id).await?;
-        if !deleted {
-            return Err(SessionError::NotFound(format!("session {session_id}")));
-        }
-        debug!(session_id = %session_id, "deleted session");
-        Ok(())
     }
 
     /// Flip the session's `hidden` flag. The row is **not** removed
@@ -1710,32 +1700,6 @@ mod tests {
 
         let err = mgr
             .full_transcript(&SessionId::from("nonexistent"))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, SessionError::NotFound(_)));
-    }
-
-    #[tokio::test]
-    async fn delete_removes_existing_session() {
-        let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(store, Arc::new(MemorySessionFolderStore::new()));
-
-        let session = mgr
-            .create_session(test_user(), ChannelType::tui())
-            .await
-            .unwrap();
-
-        mgr.delete(&session.id).await.unwrap();
-        assert!(mgr.get(&session.id).await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn delete_errors_for_missing_session() {
-        let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(store, Arc::new(MemorySessionFolderStore::new()));
-
-        let err = mgr
-            .delete(&SessionId::from("nonexistent"))
             .await
             .unwrap_err();
         assert!(matches!(err, SessionError::NotFound(_)));

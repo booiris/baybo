@@ -688,6 +688,7 @@ impl ActorSubagentSpawner {
                 }
             });
             child.state.subagent_type = Some(request.subagent_type.clone());
+            child.state.tool_allowlist = request.tool_allowlist.clone();
             if let Err(e) = self.session_manager.store().save(&child).await {
                 return Err(SubagentResult::failed(format!(
                     "persist subagent identity on {}: {e}",
@@ -1186,7 +1187,7 @@ async fn run_external_agent(
     // Persist the operator-supplied task up-front so the transcript
     // shows something even if the external agent crashes before
     // emitting its first event.
-    append_subagent_message(
+    if let Err(error) = append_subagent_message(
         &session_manager,
         &child_session_id,
         // The task is the parent agent's instruction to the subagent, not a
@@ -1195,7 +1196,19 @@ async fn run_external_agent(
         // same as the baybo-backend path's `append_spawned_prompt`).
         ChatMessage::subagent_seed(vec![ContentBlock::Text(request.task.clone())]),
     )
-    .await;
+    .await
+    {
+        return (
+            SubagentResult {
+                child_session_id,
+                final_content: None,
+                status: SubagentExitStatus::Failed {
+                    reason: format!("persist external agent task: {error}"),
+                },
+            },
+            None,
+        );
+    }
 
     let cancel = request.cancel.clone();
     let mut stream = match agent.run(request).await {
@@ -1259,7 +1272,14 @@ async fn run_external_agent(
                 }
             }
             Some(Ok(ExternalAgentEvent::Intermediate(msg))) => {
-                append_subagent_message(&session_manager, &child_session_id, msg).await;
+                if let Err(error) =
+                    append_subagent_message(&session_manager, &child_session_id, msg).await
+                {
+                    final_status = Some(SubagentExitStatus::Failed {
+                        reason: format!("persist external agent turn: {error}"),
+                    });
+                    break;
+                }
             }
             Some(Ok(ExternalAgentEvent::FinalContent(blocks))) => {
                 final_content = Some(blocks);
@@ -1308,19 +1328,13 @@ async fn append_subagent_message(
     session_manager: &Arc<baybo_session::SessionManager>,
     session_id: &SessionId,
     mut msg: ChatMessage,
-) {
+) -> anyhow::Result<()> {
     cap_external_agent_blocks(&mut msg);
-    if let Err(e) = session_manager
+    session_manager
         .append_session_message(session_id, &msg)
         .await
-    {
-        warn!(
-            session_id = %session_id,
-            role = ?msg.role,
-            error = %e,
-            "failed to persist external-agent turn to session_messages",
-        );
-    }
+        .map(|_| ())
+        .map_err(anyhow::Error::new)
 }
 
 /// Bound the text an external agent's turn writes into `session_messages`.
@@ -1336,7 +1350,7 @@ async fn append_subagent_message(
 /// rewritten and never deleted, so an unbounded row is permanent. The bound is
 /// prospective only — existing rows stay exactly as they are.
 fn cap_external_agent_blocks(msg: &mut ChatMessage) {
-    use baybo_context::prompts::tool_output::MAX_TOOL_OUTPUT_BYTES;
+    use baybo_model::MAX_TOOL_OUTPUT_BYTES;
 
     for block in msg.content.iter_mut() {
         match block {
@@ -1447,7 +1461,7 @@ async fn deliver_background_result(
 #[cfg(test)]
 mod external_agent_cap_tests {
     use super::*;
-    use baybo_context::prompts::tool_output::MAX_TOOL_OUTPUT_BYTES;
+    use baybo_model::MAX_TOOL_OUTPUT_BYTES;
 
     /// The external-agent leg writes to `session_messages` without passing
     /// through the agent loop's `cap_tool_output`, so a child that read a big
@@ -1543,6 +1557,7 @@ mod resume_validation_tests {
             origin_session_id: None,
             conversation,
             job_title: None,
+            project_id: None,
         };
         s
     }

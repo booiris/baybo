@@ -1,12 +1,9 @@
 ---
 name: general-purpose
 description: |
-  Catch-all subagent for ad-hoc tasks that don't fit a more specialised
-  profile. Use when the work is open-ended: investigation across
-  multiple files, multi-step refactors, or any "go do this thing"
-  request the parent can't decompose into a clear single-tool action.
-  Avoid for tasks where a specialised profile (planner, reviewer,
-  explorer) exists — those carry tighter behaviour contracts.
+  Does the work: multi-step tasks that change the tree. Pick when no
+  specialised profile fits — planner, reviewer and explorer are cheaper
+  and sharper at what they do.
 version: 0.1.0
 default_tier: balanced
 ---

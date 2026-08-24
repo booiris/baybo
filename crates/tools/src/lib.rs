@@ -1,4 +1,5 @@
 pub mod approval;
+pub mod blob_media;
 pub mod builtin;
 pub mod error;
 pub mod mcp;
@@ -17,7 +18,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 #[cfg(any(test, feature = "test-support"))]
 use baybo_model::ChannelType;
-use baybo_model::{AgentProfileId, SessionId, SpanId, TriggerSource, TurnId, User};
+use baybo_model::{AgentHandle, AgentProfileId, SessionId, SpanId, TriggerSource, TurnId, User};
 use baybo_trace::ToolEventPayload;
 use baybo_workspace::WorkspacePaths;
 use serde::{Deserialize, Serialize};
@@ -25,9 +26,9 @@ use serde_json::Value;
 use uuid::Uuid;
 
 pub use approval::{
-    ApprovalDecision, ApprovalGate, ApprovalGateMap, ApprovalQueue, ApprovalRequest,
-    ApprovedResource, AutoDenyGate, ChannelApprovalGate, HostPattern, PendingEdge, PendingWatcher,
-    ResourceAccess,
+    ApprovalDecision, ApprovalGate, ApprovalGateMap, ApprovalOutcome, ApprovalQueue,
+    ApprovalRequest, ApprovalResolution, ApprovedResource, AutoDenyGate, ChannelApprovalGate,
+    HostPattern, PendingEdge, PendingWatcher, ResourceAccess, refusal_reason,
 };
 pub(crate) use baybo_model::FileFingerprint;
 pub use builtin::paths::shell_reachable_workspace_roots;
@@ -118,6 +119,16 @@ pub enum ToolConcurrency {
     Independent,
 }
 
+/// Whether output is exactly attributable to declared file resources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputSource {
+    /// Every output byte came from an enumerated file.
+    DeclaredFiles,
+    /// Any source not enumerated exactly.
+    #[default]
+    Opaque,
+}
+
 // ---------------------------------------------------------------------------
 // Tool trait
 // ---------------------------------------------------------------------------
@@ -135,12 +146,33 @@ pub trait Tool: Send + Sync {
 
     fn parameters_schema(&self) -> Value;
 
+    /// The schema a session started by `trigger` is actually offered.
+    ///
+    /// Defaults to [`Self::parameters_schema`], which is also what the
+    /// governance manifest keeps — that is the tool's whole surface, and the
+    /// executor still accepts a parameter this trims. What this removes is
+    /// the *offer*: a knob the runtime will refuse in this session should not
+    /// be in front of the model at all. Naming it and then explaining when it
+    /// does nothing costs tokens on every request and still gets tried.
+    ///
+    /// Vary only on the trigger. It is fixed for a session's whole life, so
+    /// the offered schema is too, which is what the prompt-cache prefix
+    /// needs.
+    fn parameters_schema_for(&self, _trigger: &TriggerSource) -> Value {
+        self.parameters_schema()
+    }
+
     /// Resources this call will touch, derived from the parameters.
     ///
     /// The approval gate consults these at runtime before execution.
     /// Tools with no side effects return an empty vec (the default).
     fn accessed_resources(&self, _params: &Value) -> Vec<ResourceAccess> {
         Vec::new()
+    }
+
+    /// Output provenance for prompt-injection severity; defaults to opaque.
+    fn output_source(&self) -> OutputSource {
+        OutputSource::default()
     }
 
     /// Caller-supplied human-readable label for this call (typically a
@@ -188,10 +220,13 @@ pub trait Tool: Send + Sync {
     /// only meaningful inside a specific kind of turn (e.g. `report_nothing`,
     /// which suppresses a recurring cron fire's notification) narrows it so it
     /// never appears where it cannot act. Mirrors the manifest's `channels`
-    /// axis — the agent loop omits an out-of-scope tool from the LLM's list
-    /// (`ToolRegistry::tool_definitions_for_session`), keeping the list
-    /// byte-stable within a session (the trigger, like the channel, never
-    /// changes) so the prompt cache holds.
+    /// axis, and is enforced on both doors: the agent loop omits an
+    /// out-of-scope tool from the LLM's list
+    /// (`ToolRegistry::tool_definitions_for_session`), and the executor
+    /// refuses a call that names one anyway — omission is not a gate against
+    /// a name the model produced from somewhere else. Omitting it also keeps
+    /// the list byte-stable within a session, since the trigger, like the
+    /// channel, never changes.
     fn trigger_scope(&self) -> ToolTriggerScope {
         ToolTriggerScope::Any
     }
@@ -201,15 +236,37 @@ pub trait Tool: Send + Sync {
 
 /// Which session-trigger contexts a tool is visible in (see
 /// [`Tool::trigger_scope`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolTriggerScope {
-    /// Visible in every session — the default.
+    /// Every session — the default.
     #[default]
     Any,
-    /// Visible only in a recurring cron fire's own conversation
-    /// (`TriggerSource::Cron { conversation: true }`). Used by `report_nothing`,
-    /// which can only suppress a recurring fire's own notification.
-    CronFire,
+    /// Only a recurring cron fire's own conversation
+    /// (`TriggerSource::Cron { conversation: true }`). `report_nothing` can
+    /// suppress nothing else, so elsewhere it is an action that can only fail.
+    CronConversation,
+    /// Only a session that names a project board — an issue run or a
+    /// project-linked cron fire. Outside one the `Issue*` tools and
+    /// `ProjectAgentCreate` have no board to name.
+    ProjectBoard,
+    /// Only a session that works the shared workspace. A card's run is the
+    /// one session cut its own checkout to be isolated in, so a tool backed
+    /// by a process-wide singleton — one browser, one profile, one set of
+    /// cookies — has no unshared instance to give it.
+    SharedWorkspace,
+    /// Only a session a background job's completion could be delivered into.
+    /// `JobList` and `JobStop` address work in flight, and a card's run can
+    /// never have any: `Session::can_host_background_jobs` refuses it, so a
+    /// detached subagent blocks anyway and a slow command is killed rather
+    /// than detached. Offered there, the pair are a listing that is always
+    /// empty and a stop with nothing to stop.
+    ///
+    /// The predicate defers to `TriggerSource::can_host_background_jobs`
+    /// rather than restating it. It sees only the trigger, so it is the
+    /// weaker half of that gate — a subagent session passes here and is
+    /// refused by the executor's own check, which is the safe direction.
+    BackgroundHost,
 }
 
 impl ToolTriggerScope {
@@ -217,7 +274,10 @@ impl ToolTriggerScope {
     pub fn allows_trigger(&self, trigger: &TriggerSource) -> bool {
         match self {
             ToolTriggerScope::Any => true,
-            ToolTriggerScope::CronFire => trigger.is_cron_conversation(),
+            ToolTriggerScope::CronConversation => trigger.is_cron_conversation(),
+            ToolTriggerScope::ProjectBoard => trigger.project().is_some(),
+            ToolTriggerScope::SharedWorkspace => trigger.issue().is_none(),
+            ToolTriggerScope::BackgroundHost => trigger.can_host_background_jobs(),
         }
     }
 }
@@ -379,6 +439,24 @@ pub struct ToolContext {
     /// else, so the tool no-ops on a user reply, a one-shot fire, or any
     /// ordinary turn. See [`NotifySilence`].
     pub notify_silence: Option<NotifySilence>,
+    /// The checkout this session owns, when it is a kanban issue's run: the
+    /// git worktree cut for that issue. Shell commands default their cwd to
+    /// it, so an unqualified `git status` describes the project the card is
+    /// about rather than baybo's own work directory. `None` for every
+    /// ordinary session, which keeps the existing default.
+    pub checkout_root: Option<PathBuf>,
+    /// What this session's agent is called on the board its card belongs
+    /// to: the `@handle` a person types into a comment, not the ULID that
+    /// names its persona directory. Populated only alongside
+    /// [`Self::checkout_root`], because its one consumer is the
+    /// `Co-authored-by:` trailer an issue run's commits carry.
+    pub agent_handle: Option<AgentHandle>,
+    /// Git config naming who [`Self::checkout_root`]'s commits belong to,
+    /// resolved on the host by `baybo-project` and handed over already
+    /// answered. The shell is pointed at it with `GIT_CONFIG_GLOBAL`, because
+    /// the sandbox remaps `HOME` and the operator's own config is therefore
+    /// not where git looks. `None` for every session that is not an issue run.
+    pub checkout_git_config: Option<PathBuf>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -425,6 +503,9 @@ impl ToolContext {
             background_jobs: None,
             background_control: None,
             notify_silence: None,
+            checkout_root: None,
+            agent_handle: None,
+            checkout_git_config: None,
         }
     }
 }
@@ -588,6 +669,8 @@ impl ApprovalHandle {
     /// entry covers the original privilege but not the elevated one,
     /// so we must always re-prompt. Never persists the decision —
     /// follow-up calls always re-prompt too.
+    ///
+    /// Returns the full outcome so callers can distinguish denial from expiry.
     pub async fn request_uncached(
         &self,
         tool: &str,
@@ -595,7 +678,7 @@ impl ApprovalHandle {
         user: &User,
         accesses: Vec<ResourceAccess>,
         params_preview: String,
-    ) -> ApprovalDecision {
+    ) -> ApprovalOutcome {
         let req = ApprovalRequest {
             call_id: Uuid::new_v4().to_string(),
             tool_call_id: self.tool_call_id.clone(),
@@ -606,9 +689,9 @@ impl ApprovalHandle {
             params_preview,
             description: None,
         };
-        let decision = self.gate.request(req).await;
-        *self.last_decision.lock() = Some(decision);
-        decision
+        let outcome = self.gate.request(req).await;
+        *self.last_decision.lock() = Some(outcome.decision);
+        outcome
     }
 
     /// Forward a request to the gate, filtered by the session approval
@@ -622,7 +705,7 @@ impl ApprovalHandle {
         user: &User,
         accesses: Vec<ResourceAccess>,
         params_preview: String,
-    ) -> ApprovalDecision {
+    ) -> ApprovalOutcome {
         // Filter against the cache up front. Read-only file accesses
         // were already a no-op for the pre-execute gate (see
         // `ToolExecutor::execute`); preserve that behaviour here so
@@ -642,7 +725,7 @@ impl ApprovalHandle {
         };
 
         if uncovered.is_empty() {
-            return ApprovalDecision::Approve;
+            return ApprovalOutcome::policy(ApprovalDecision::Approve);
         }
 
         let req = ApprovalRequest {
@@ -655,9 +738,9 @@ impl ApprovalHandle {
             params_preview,
             description: None,
         };
-        let decision = self.gate.request(req).await;
-        *self.last_decision.lock() = Some(decision);
-        if decision == ApprovalDecision::ApproveAlways {
+        let outcome = self.gate.request(req).await;
+        *self.last_decision.lock() = Some(outcome.decision);
+        if outcome.decision == ApprovalDecision::ApproveAlways {
             let mut cache = self.approved_cache.lock();
             for access in &uncovered {
                 let entry = access.to_approved();
@@ -666,7 +749,7 @@ impl ApprovalHandle {
                 }
             }
         }
-        decision
+        outcome
     }
 }
 
@@ -1055,13 +1138,13 @@ mod approval_handle_tests {
 
     #[async_trait]
     impl ApprovalGate for FixedGate {
-        async fn request(&self, req: ApprovalRequest) -> ApprovalDecision {
+        async fn request(&self, req: ApprovalRequest) -> ApprovalOutcome {
             assert_eq!(
                 req.tool_call_id.as_deref(),
                 Some("use-1"),
                 "prompt carries the tool call id"
             );
-            self.0
+            ApprovalOutcome::answered(self.0)
         }
     }
 
@@ -1097,7 +1180,7 @@ mod approval_handle_tests {
                 "{}".into(),
             )
             .await;
-        assert_eq!(d, ApprovalDecision::Deny);
+        assert_eq!(d, ApprovalOutcome::answered(ApprovalDecision::Deny));
         assert_eq!(probe.last_decision(), Some(ApprovalDecision::Deny));
     }
 
@@ -1119,8 +1202,36 @@ mod approval_handle_tests {
                 "{}".into(),
             )
             .await;
-        assert_eq!(d, ApprovalDecision::Approve);
+        assert_eq!(d, ApprovalOutcome::policy(ApprovalDecision::Approve));
         assert_eq!(probe.last_decision(), None, "no prompt raised, no record");
+    }
+
+    #[tokio::test]
+    async fn a_cached_hit_resolves_as_policy_not_answered() {
+        let cache = Arc::new(parking_lot::Mutex::new(vec![
+            ResourceAccess::ExecCommand {
+                command: "x".into(),
+            }
+            .to_approved(),
+        ]));
+        let h = ApprovalHandle::new(
+            Arc::new(FixedGate(ApprovalDecision::Deny)),
+            cache,
+            Some("use-1".into()),
+        );
+        let out = h
+            .request(
+                "Bash",
+                &"s".into(),
+                &user(),
+                vec![ResourceAccess::ExecCommand {
+                    command: "x".into(),
+                }],
+                "{}".into(),
+            )
+            .await;
+        assert_eq!(out, ApprovalOutcome::policy(ApprovalDecision::Approve));
+        assert_eq!(h.last_decision(), None);
     }
 
     #[tokio::test]
@@ -1138,5 +1249,84 @@ mod approval_handle_tests {
             )
             .await;
         assert_eq!(h.last_decision(), Some(ApprovalDecision::ApproveAlways));
+    }
+}
+
+#[cfg(test)]
+mod output_source_tests {
+    use super::*;
+    use crate::builtin::{BashTool, GlobTool, GrepTool, ReadTool};
+
+    #[test]
+    fn read_declares_the_one_file_its_output_came_from() {
+        assert_eq!(ReadTool.output_source(), OutputSource::DeclaredFiles);
+    }
+
+    #[test]
+    fn a_search_root_is_not_an_enumeration_of_what_was_read() {
+        let pm = baybo_process::ProcessManager::transient();
+        let root = serde_json::json!({ "path": "/data/kanban", "pattern": "x" });
+        for (name, tool) in [
+            (
+                "Grep",
+                Box::new(GrepTool::new(std::sync::Arc::clone(&pm))) as Box<dyn Tool>,
+            ),
+            ("Glob", Box::new(GlobTool::new(pm)) as Box<dyn Tool>),
+        ] {
+            assert_eq!(
+                tool.accessed_resources(&root),
+                vec![ResourceAccess::ReadFile {
+                    path: std::path::PathBuf::from("/data/kanban"),
+                }],
+                "{name} declares only its search root"
+            );
+            assert_eq!(
+                tool.output_source(),
+                OutputSource::Opaque,
+                "{name} must not claim its output is limited to that root"
+            );
+        }
+    }
+
+    #[test]
+    fn command_output_stays_opaque() {
+        assert_eq!(BashTool::for_test().output_source(), OutputSource::Opaque);
+    }
+}
+
+#[cfg(test)]
+mod background_scope_tests {
+    use super::*;
+    use baybo_model::TriggerSource;
+
+    fn issue_run() -> TriggerSource {
+        TriggerSource::Issue {
+            project_id: baybo_model::ProjectId::generate(),
+            issue_id: baybo_model::IssueId::generate(),
+            number: 1,
+        }
+    }
+
+    /// A card's run never sees `JobList`/`JobStop`. Nothing can be in flight
+    /// there — `can_host_background_jobs` refuses it — so the pair are a
+    /// listing that is always empty and a stop with nothing to stop.
+    #[test]
+    fn a_card_s_run_is_offered_no_job_tools() {
+        assert!(!ToolTriggerScope::BackgroundHost.allows_trigger(&issue_run()));
+        assert!(ToolTriggerScope::BackgroundHost.allows_trigger(&TriggerSource::User));
+    }
+
+    /// The scope defers to the trigger's own answer rather than restating it.
+    /// Three tool descriptions each hand-wrote this exemption list and all
+    /// three had drifted, promising a card's run a detach it would not get.
+    #[test]
+    fn the_scope_and_the_trigger_give_the_same_answer() {
+        for trigger in [TriggerSource::User, issue_run()] {
+            assert_eq!(
+                ToolTriggerScope::BackgroundHost.allows_trigger(&trigger),
+                trigger.can_host_background_jobs(),
+                "{trigger:?}"
+            );
+        }
     }
 }

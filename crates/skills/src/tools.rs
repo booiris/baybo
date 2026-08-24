@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use baybo_model::TrustLevel;
 use baybo_tools::{
     ApprovalDecision, NoticeLevel, ResourceAccess as ToolResourceAccess, Tool, ToolCapability,
-    ToolConcurrency, ToolContext, ToolError, ToolManifest, ToolOutput,
+    ToolConcurrency, ToolContext, ToolError, ToolManifest, ToolOutput, ToolTriggerScope,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -83,8 +83,9 @@ impl Tool for SkillTool {
 
     fn description(&self) -> String {
         "Load a registered skill so its instructions enter the conversation. \
-         Available skills are listed in a system reminder each turn — invoke \
-         this tool with `skill: \"<name>\"` to pull one in. Pass `args` to \
+         Available skills are listed in a system reminder near the top of \
+         this conversation — invoke this tool with `skill: \"<name>\"` to \
+         pull one in. Pass `args` to \
          forward free-form arguments. Pass `file_path` to fetch a sub-file \
          (relative path inside the skill's directory) referenced from the \
          main SKILL.md. Skills the operator marked untrusted or marked \
@@ -98,7 +99,7 @@ impl Tool for SkillTool {
             "properties": {
                 SKILL_INPUT_NAME_FIELD: {
                     "type": "string",
-                    "description": "Name of the skill to load — must match an entry from the system-reminder skill list."
+                    "description": "Name of the skill to load — must match an entry from the skill listing."
                 },
                 "args": {
                     "type": "string",
@@ -276,7 +277,7 @@ async fn check_env_or_prompt(
     })?;
 
     let preview = format!("Skill '{}' env vars: {}", skill.name, required.join(", "));
-    let decision = approval
+    let outcome = approval
         .request_uncached(
             tool_name,
             &ctx.session_id,
@@ -287,13 +288,14 @@ async fn check_env_or_prompt(
             preview,
         )
         .await;
-    match decision {
+    match outcome.decision {
         ApprovalDecision::Approve | ApprovalDecision::ApproveAlways => Ok(()),
         ApprovalDecision::Deny => Err(ToolError::Denied {
             tool: tool_name.to_string(),
             reason: format!(
-                "user declined env-var access required by skill '{}'",
-                skill.name
+                "env-var access required by skill '{}' was not approved — {}",
+                skill.name,
+                baybo_tools::refusal_reason(outcome.resolution)
             ),
         }),
     }
@@ -526,6 +528,10 @@ impl Tool for SkillInstallTool {
         "SkillInstall"
     }
 
+    fn trigger_scope(&self) -> ToolTriggerScope {
+        ToolTriggerScope::SharedWorkspace
+    }
+
     fn description(&self) -> String {
         "Install a skill from an on-disk directory into this session's own \
          skills folder. Every agent has one of its own, so the skill lands in \
@@ -710,6 +716,10 @@ struct UninstallParams {
 impl Tool for SkillUninstallTool {
     fn name(&self) -> &str {
         "SkillUninstall"
+    }
+
+    fn trigger_scope(&self) -> ToolTriggerScope {
+        ToolTriggerScope::SharedWorkspace
     }
 
     fn description(&self) -> String {

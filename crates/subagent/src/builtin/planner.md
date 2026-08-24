@@ -1,18 +1,12 @@
 ---
 name: planner
 description: |
-  Architectural planning. Spawn when the parent has a non-trivial
-  goal that needs decomposition before any code lands — "design the
-  migration from X to Y", "lay out the steps to add feature Z",
-  "propose two alternatives for refactoring W". The output IS the
-  plan; the planner does not implement it.
-  Pick this over explorer when the work needs *synthesis* (alternatives,
-  trade-offs, ordering, risk), not just discovery. Pick this over
-  general-purpose when the parent wants to see the plan before
-  committing to changes. Avoid for tasks the parent has already
-  scoped and wants implemented in one shot.
+  Designs a plan and stops. Pick over explorer when the work needs
+  synthesis — alternatives, ordering, risk — and over general-purpose when
+  you want the plan before any change lands.
 version: 0.1.0
 default_tier: deep
+tools: Read, Grep, Glob, Bash, WebFetch, IssueGet, IssueList, GetBlob, Skill, Now
 ---
 # Identity
 

@@ -434,6 +434,7 @@ impl McpReconciler {
                 entry.name.clone(),
                 descriptor.clone(),
                 resources.clone(),
+                entry.trigger_scope,
                 session.peer(),
                 self.blob_store.clone(),
             );
@@ -497,6 +498,9 @@ fn identity_hash(entry: &McpServerEntry, extra_env: &HashMap<String, String>) ->
     }
     let trust_str = format!("{:?}", entry.trust_level);
     trust_str.hash(&mut hasher);
+    // Each registered tool captures the scope, so an edit has to go
+    // through a reconnect to reach them.
+    format!("{:?}", entry.trigger_scope).hash(&mut hasher);
     let mut caps: Vec<String> = entry
         .capabilities
         .iter()
@@ -619,6 +623,7 @@ mod tests {
                 trust_level: crate::mcp::config::TrustLevelConfig::Trusted,
                 capabilities: Vec::new(),
                 oauth: None,
+                trigger_scope: crate::ToolTriggerScope::Any,
             }],
         }
         .write(&root)
@@ -722,6 +727,7 @@ mod tests {
             trust_level: TrustLevelConfig::Trusted,
             capabilities: vec![],
             oauth: None,
+            trigger_scope: crate::ToolTriggerScope::Any,
         };
         let embedded = resource_access_for(&entry, true);
         assert!(
@@ -758,12 +764,44 @@ mod tests {
             trust_level: TrustLevelConfig::Trusted,
             capabilities: vec![ToolCapability::ExecCommand],
             oauth: None,
+            trigger_scope: crate::ToolTriggerScope::Any,
         };
         let access = resource_access_for(&entry, true);
         assert_eq!(
             access.len(),
             1,
             "embedded server with declared capabilities still gets approval gate",
+        );
+    }
+
+    /// The tools registered for a server capture its scope at connect time,
+    /// so narrowing the scope in config has to move the identity — otherwise
+    /// the reconciler sees no change and the old, wide-open tools stay
+    /// registered until the next restart.
+    #[test]
+    fn narrowing_a_server_s_scope_changes_its_identity() {
+        use crate::mcp::config::{McpServerEntry, McpTransportConfig, TrustLevelConfig};
+
+        let base = McpServerEntry {
+            name: "browser".into(),
+            transport: McpTransportConfig::Stdio {
+                command: "node".into(),
+                args: vec!["/path/to/bundle.mjs".into()],
+            },
+            trust_level: TrustLevelConfig::Trusted,
+            capabilities: Vec::new(),
+            oauth: None,
+            trigger_scope: crate::ToolTriggerScope::Any,
+        };
+        let narrowed = McpServerEntry {
+            trigger_scope: crate::ToolTriggerScope::SharedWorkspace,
+            ..base.clone()
+        };
+        let env = HashMap::new();
+        assert_ne!(
+            identity_hash(&base, &env),
+            identity_hash(&narrowed, &env),
+            "a scope edit must reach the registered tools"
         );
     }
 }

@@ -17,7 +17,7 @@
 use baybo_model::SessionId;
 use baybo_session::SessionManager;
 
-use crate::api::admin::chat::{UNREAD_COUNT_CAP, is_hidden_cron_session};
+use crate::api::admin::chat::{UNREAD_COUNT_CAP, is_excluded_from_global_chat};
 
 /// Ceiling on the icon badge. iOS renders large numbers as a wide pill that
 /// crowds the icon, and past a point the digit stops being information.
@@ -48,7 +48,7 @@ pub(crate) async fn unread_badge_total(session_manager: &SessionManager) -> Opti
     };
     let ids: Vec<SessionId> = sessions
         .into_iter()
-        .filter(|s| !s.hidden && !s.archived && !is_hidden_cron_session(s))
+        .filter(|s| !s.hidden && !s.archived && !is_excluded_from_global_chat(s))
         .map(|s| s.id)
         .collect();
     match session_manager.unread_total(&ids, UNREAD_COUNT_CAP).await {

@@ -11,7 +11,9 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use crate::{SecretAccess, Tool, ToolConcurrency, ToolContext, ToolError, ToolOutput};
+use crate::{
+    SecretAccess, Tool, ToolConcurrency, ToolContext, ToolError, ToolOutput, ToolTriggerScope,
+};
 
 /// Borrow the secret accessor or fail closed when the context has none wired.
 fn secrets(ctx: &ToolContext) -> crate::Result<&dyn SecretAccess> {
@@ -34,6 +36,10 @@ struct AddParams {
 impl Tool for SecretAddTool {
     fn name(&self) -> &str {
         "SecretAdd"
+    }
+
+    fn trigger_scope(&self) -> ToolTriggerScope {
+        ToolTriggerScope::SharedWorkspace
     }
 
     fn description(&self) -> String {

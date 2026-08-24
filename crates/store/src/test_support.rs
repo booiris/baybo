@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use baybo_model::{AgentProfileId, LlmEntryName};
+use baybo_model::{AgentProfileId, LlmPin};
 use parking_lot::Mutex;
 
 use crate::agent_profile::{AgentProfileRow, AgentProfileStore, AgentProfileUpdate, Result};
@@ -42,8 +42,49 @@ impl MemoryAgentProfileStore {
 #[async_trait]
 impl AgentProfileStore for MemoryAgentProfileStore {
     async fn list(&self) -> Result<Vec<AgentProfileRow>> {
-        let mut rows: Vec<AgentProfileRow> = self.rows.lock().values().cloned().collect();
+        let mut rows: Vec<AgentProfileRow> = self
+            .rows
+            .lock()
+            .values()
+            .filter(|row| row.team.is_none())
+            .cloned()
+            .collect();
         rows.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(rows)
+    }
+
+    async fn list_team(&self, project: &baybo_model::ProjectId) -> Result<Vec<AgentProfileRow>> {
+        let mut rows: Vec<AgentProfileRow> = self
+            .rows
+            .lock()
+            .values()
+            .filter(|row| {
+                row.deleted_at.is_none()
+                    && row.team.as_ref().is_some_and(|t| &t.project_id == project)
+            })
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            a.team
+                .as_ref()
+                .map(|t| &t.handle)
+                .cmp(&b.team.as_ref().map(|t| &t.handle))
+        });
+        Ok(rows)
+    }
+
+    async fn list_team_history(
+        &self,
+        project: &baybo_model::ProjectId,
+    ) -> Result<Vec<AgentProfileRow>> {
+        let mut rows: Vec<AgentProfileRow> = self
+            .rows
+            .lock()
+            .values()
+            .filter(|row| row.team.as_ref().is_some_and(|t| &t.project_id == project))
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
         Ok(rows)
     }
 
@@ -66,12 +107,12 @@ impl AgentProfileStore for MemoryAgentProfileStore {
         Ok(true)
     }
 
-    async fn set_llm(&self, id: &AgentProfileId, llm: Option<&LlmEntryName>) -> Result<bool> {
+    async fn set_llm(&self, id: &AgentProfileId, pin: &LlmPin) -> Result<bool> {
         let mut rows = self.rows.lock();
         let Some(row) = rows.get_mut(id) else {
             return Ok(false);
         };
-        row.llm = llm.cloned();
+        row.llm = pin.clone();
         Ok(true)
     }
 
@@ -85,7 +126,23 @@ impl AgentProfileStore for MemoryAgentProfileStore {
     }
 
     async fn delete(&self, id: &AgentProfileId) -> Result<bool> {
-        Ok(self.rows.lock().remove(id).is_some())
+        let mut rows = self.rows.lock();
+        if rows.get(id).is_some_and(|row| row.team.is_some()) {
+            return Ok(false);
+        }
+        Ok(rows.remove(id).is_some())
+    }
+
+    async fn remove_from_team(&self, id: &AgentProfileId) -> Result<bool> {
+        let mut rows = self.rows.lock();
+        let Some(row) = rows.get_mut(id) else {
+            return Ok(false);
+        };
+        if row.team.is_none() || row.deleted_at.is_some() {
+            return Ok(false);
+        }
+        row.deleted_at = Some(chrono::Utc::now());
+        Ok(true)
     }
 }
 
@@ -99,8 +156,11 @@ pub fn agent_profile_row(id: &AgentProfileId) -> AgentProfileRow {
         description: String::new(),
         avatar_blob_id: None,
         framework: baybo_model::AgentFramework::Baybo,
-        llm: None,
+        llm: LlmPin::unpinned(),
         builtin: false,
+        team: None,
+        hired_by: None,
+        deleted_at: None,
         created_at: now,
         updated_at: now,
     }

@@ -316,24 +316,11 @@ impl Tool for WebFetchTool {
     }
 
     fn description(&self) -> String {
-        r#"
-- Fetches content from a specified URL and processes it using an AI model
-- Takes a URL and a prompt as input
-- Fetches the URL content, converts HTML to markdown
-- Returns the model's response about the content
-- Use this tool when you need to retrieve and analyze web content
+        r#"Fetch a web page and read it as markdown. `url` is upgraded to HTTPS; `prompt` says what you want from the page, and a side LLM answers it when the page is large.
 
-Usage notes:
-  - The URL must be a fully-formed valid URL
-  - HTTP URLs will be automatically upgraded to HTTPS
-  - The prompt should describe what information you want to extract from the page
-  - This tool is read-only and does not modify any files
-  - Results may be summarized if the content is very large
-  - The reply is prefixed with a metadata header line: `[WebFetch] summarized=<bool> raw_content_file=<absolute path>`. `summarized=true` means a side LLM rewrote the body to answer your `prompt`; `summarized=false` means the body is the verbatim rendered page (possibly truncated). The full pre-summary rendered page is always archived to `raw_content_file` — use the `Read` tool on that path when you need the untruncated/unsummarised content.
-  - The archived file lives under `<workspace>/state/blobs/` and persists across turns; still, prefer re-fetching over relying on a stale archived copy when freshness matters.
-  - Binary/non-text content types are still refused; for downloading `.zip`/images/archives use Bash with `curl` or `wget` instead.
-  - For GitHub URLs, prefer using the gh CLI via Bash instead (e.g., gh pr view, gh issue view, gh api).
-"#
+The reply opens with `[WebFetch] summarized=<bool> raw_content_file=<absolute path>`. `summarized=true` means you are reading that side LLM's answer rather than the page; either way the full rendered page is archived at `raw_content_file` (under `<workspace>/state/blobs/`, and it outlives the turn), so `Read` it when the answer is not enough. Prefer re-fetching over an old archive when freshness matters.
+
+REFUSED, so do not retry the same way: a URL resolving to loopback, a private or link-local range, or a cloud metadata address — including a public hostname that resolves to one — and any non-text content type. To download a `.zip`, an image or an archive, use Bash with `curl`/`wget`; WebFetch never writes to disk. For GitHub, `gh` via Bash (`gh pr view`, `gh issue view`, `gh api`) beats scraping the HTML."#
         .to_string()
     }
 
@@ -654,6 +641,7 @@ async fn run_summary(
         temperature: Some(0.0),
         tools: vec![],
         reasoning_effort: None,
+        ..Default::default()
     };
     tokio::select! {
         _ = ctx.cancellation_token.cancelled() => {

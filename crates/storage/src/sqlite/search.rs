@@ -355,7 +355,7 @@ impl baybo_store::MessageSearchStore for SqliteMessageSearchStore {
                 // them and return short.
                 //
                 // The cron predicate mirrors the gateway's
-                // `is_hidden_cron_session`: a fire that is not a conversation of
+                // `is_private_cron_session`: a fire that is not a conversation of
                 // its own is unlistable and unattachable, so a hit there names
                 // something no client can open. `trigger_kind` is flat and is
                 // tested FIRST so the `json_extract` is reached only by the cron
@@ -949,6 +949,7 @@ mod tests {
             origin_session_id: None,
             conversation,
             job_title: None,
+            project_id: None,
         };
         mk("workspace", cron(false), "共同的检索词 一次性").await;
         mk("recurring", cron(true), "共同的检索词 周期性").await;
@@ -1145,7 +1146,7 @@ mod tests {
 
         // Simulate an index built by a different segmenter: wrong rows, wrong
         // stamp. A rebuild must discard all of it and re-derive from the source.
-        pool.interact("test.corrupt_index", |conn| {
+        pool.interact_write("test.corrupt_index", |conn| {
             conn.execute("DELETE FROM message_fts", [])?;
             conn.execute(
                 "INSERT INTO message_fts (segmented, session_id, ordinal) VALUES ('garbage', 'x', 99)",
@@ -1170,7 +1171,7 @@ mod tests {
             "precondition: the corrupted index cannot answer"
         );
 
-        pool.interact("test.rebuild", rebuild_if_stale)
+        pool.interact_write("test.rebuild", rebuild_if_stale)
             .await
             .unwrap();
 
@@ -1234,7 +1235,7 @@ mod tests {
             .unwrap();
 
         // Roll the table back to a prior shape: no `channel` column.
-        pool.interact("test.downgrade_schema", |conn| {
+        pool.interact_write("test.downgrade_schema", |conn| {
             conn.execute("DROP TABLE message_fts", [])?;
             conn.execute(
                 "CREATE VIRTUAL TABLE message_fts USING fts5(\
@@ -1251,7 +1252,7 @@ mod tests {
         .await
         .unwrap();
 
-        pool.interact("test.rebuild", rebuild_if_stale)
+        pool.interact_write("test.rebuild", rebuild_if_stale)
             .await
             .expect("an older index schema must migrate, not fail the open");
 
@@ -1282,7 +1283,7 @@ mod tests {
 
         // Would double every row if the rebuild ran without clearing, and would
         // drop rows if it ran off a stale stamp.
-        pool.interact("test.rebuild", rebuild_if_stale)
+        pool.interact_write("test.rebuild", rebuild_if_stale)
             .await
             .unwrap();
         assert_eq!(

@@ -112,6 +112,16 @@ fn classify(message: &ChatMessage) -> ContextPart {
         MessageSource::User | MessageSource::UserInterjection | MessageSource::SubagentSeed => {
             ContextPart::User
         }
+        // A board card handed to a run: framed and assembled by the board, not
+        // typed by anyone, so not `User`. [`ContextPart::Agent`]'s own
+        // definition — "task prompts, reminders, framing" — is what this is.
+        //
+        // Worth revisiting rather than settling: by the `Cron` precedent above,
+        // a framed prompt that drives an autonomous turn earned its own bucket,
+        // and an issue brief now carries the card's files as well as its prose.
+        // Splitting it out is a public enum change that reaches the analytics
+        // UI, so it is not something to slip into a merge.
+        MessageSource::IssueBrief => ContextPart::Agent,
         MessageSource::Agent => match message.role {
             Role::System => ContextPart::SystemPrompt,
             Role::Assistant => ContextPart::Assistant,

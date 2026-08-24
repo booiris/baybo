@@ -8,11 +8,13 @@ import {
   RiFileList3Line,
   RiGitMergeLine,
   RiInstallLine,
+  RiKanbanView2,
   RiLogoutBoxRLine,
   RiStackLine,
 } from 'react-icons/ri';
 import type { IconType } from 'react-icons';
 import { useAuth } from '../api/auth';
+import { attentionSummary, needsAttention, useAttention } from '../pages/projects/useAttention';
 import { installPrompt } from '../pwa/registerSW';
 
 // Global app rail (replaces the old text sidebar): a solid amber, icon-only
@@ -28,6 +30,7 @@ const railActive =
   'bg-surface border-black shadow-brutal-sm active:translate-x-[1px] active:translate-y-[1px] active:shadow-none';
 
 const DESTINATIONS: { to: string; label: string; Icon: IconType }[] = [
+  { to: '/projects', label: 'Projects', Icon: RiKanbanView2 },
   { to: '/logs', label: 'Log', Icon: RiFileList3Line },
   { to: '/traces', label: 'Trace', Icon: RiGitMergeLine },
   { to: '/cron', label: 'Cron', Icon: RiAlarmLine },
@@ -38,6 +41,7 @@ const DESTINATIONS: { to: string; label: string; Icon: IconType }[] = [
 
 export function IconRail({ version }: { version?: string }) {
   const { logout } = useAuth();
+  const waiting = useAttention();
   // Chromium hands the install prompt to whoever wants it; the rail is where a
   // user already looks for app-level actions. Absent everywhere else (Safari
   // installs via Share → Add to Home Screen), and gone once installed.
@@ -64,16 +68,34 @@ export function IconRail({ version }: { version?: string }) {
       <div className="w-6 border-t-2 border-black/25" />
 
       <nav className="flex flex-col items-center gap-3">
-        {DESTINATIONS.map(({ to, label, Icon }) => (
-          <NavLink
-            key={to}
-            to={to}
-            title={label}
-            className={({ isActive }) => `${railBtn} ${isActive ? railActive : railIdle}`}
-          >
-            <Icon className="text-lg" />
-          </NavLink>
-        ))}
+        {DESTINATIONS.map(({ to, label, Icon }) => {
+          // A dot, not a count. The entry opens exactly one board, so any
+          // number here is one the click cannot discharge — it said "3"
+          // and stayed at "3" through everything the operator did on the
+          // board it actually opened. The countable form of this signal
+          // lives on the cards, where each number is one card away from
+          // being cleared.
+          const lit = to === '/projects' && needsAttention(waiting);
+          return (
+            <NavLink
+              key={to}
+              to={to}
+              title={lit ? `${label} — ${attentionSummary(waiting)}` : label}
+              className={({ isActive }) =>
+                `relative ${railBtn} ${isActive ? railActive : railIdle}`
+              }
+            >
+              <Icon className="text-lg" />
+              {lit ? (
+                <span
+                  role="status"
+                  aria-label={attentionSummary(waiting)}
+                  className="absolute -top-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-2 border-black bg-err"
+                />
+              ) : null}
+            </NavLink>
+          );
+        })}
       </nav>
 
       <div className="mt-auto flex flex-col items-center gap-3">

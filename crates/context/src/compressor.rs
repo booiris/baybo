@@ -22,7 +22,7 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 
-use baybo_llm::{ChatRequest, LlmResponse};
+use baybo_llm::{ChatRequest, LlmResponse, ToolDefinitionForLlm};
 use baybo_model::{ChatMessage, ContentBlock, MessageSource};
 use baybo_trace::LlmCallInputs;
 use tracing::{debug, warn};
@@ -244,6 +244,7 @@ pub(crate) fn pair_preserving_cut(messages: &[ChatMessage], cut: usize) -> usize
 impl ContextManager {
     pub(crate) async fn run_compression_flow(
         &self,
+        tools: Vec<ToolDefinitionForLlm>,
         chat: ChatCallback,
     ) -> crate::Result<CompressOutput> {
         // Decline only when there is genuinely nothing to gain: few enough
@@ -263,14 +264,18 @@ impl ContextManager {
             return Ok(CompressOutput::NoOp);
         }
 
-        Ok(self.summarize(chat).await)
+        Ok(self.summarize(tools, chat).await)
     }
 
     /// The compaction itself: one summarizer call, then assemble.
     ///
     /// Anything short of a usable summary leaves the transcript untouched —
     /// `Cancelled` for a `/stop`, `Failed` for an errored or unusable call.
-    async fn summarize(&self, chat: ChatCallback) -> CompressOutput {
+    async fn summarize(
+        &self,
+        tools: Vec<ToolDefinitionForLlm>,
+        chat: ChatCallback,
+    ) -> CompressOutput {
         let (system_msgs, non_system) = partition_system(&self.messages);
         // Drop the system-prompt updates before anything is assembled from
         // them. `reseed_system_row` is about to rewrite `messages[0]` from the
@@ -312,7 +317,8 @@ impl ContextManager {
 
         let instruction =
             ChatMessage::agent_context(vec![ContentBlock::Text(SUMMARIZE_INSTRUCTION.to_string())]);
-        let mut request_messages: Vec<ChatMessage> = self.messages.to_vec();
+        // Append after coalescing so the marker's suffix remains a separate row.
+        let mut request_messages: Vec<ChatMessage> = self.llm_prefix();
         request_messages.push(instruction.clone());
 
         // Reference the (large) transcript prefix by ordinal in the trace
@@ -336,8 +342,11 @@ impl ContextManager {
         let request = ChatRequest {
             messages: request_messages,
             temperature: None,
-            tools: Vec::new(),
-            reasoning_effort: None,
+            // Keep the session tool block in the cached prefix; forbid its use.
+            tools,
+            tool_choice: baybo_llm::ToolChoice::None,
+            reasoning_effort: Some(baybo_llm::effort::OUT_OF_BAND_EFFORT.as_str().to_string()),
+            ..Default::default()
         };
 
         let summary = match chat(request, input_marker).await {

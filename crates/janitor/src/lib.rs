@@ -38,6 +38,17 @@ const PAIRING_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 // versions side-by-side for >7 days without restarting either is well
 // outside the realistic case.
 const SIDECAR_CACHE_TTL: Duration = Duration::from_secs(7 * 86_400);
+// Tool-output spills are content-addressed transcripts of results too big
+// to inline; the model reads one during the turn that produced it and
+// essentially never after. The same window as `work/tmp` because they are
+// the same kind of thing — scratch the agent left behind.
+const TOOL_SPILL_TTL: Duration = WORK_TMP_TTL;
+// How long an issue checkout must go untouched before its build output is
+// considered regenerable rather than in use. Longer than the scratch
+// windows above by an order of magnitude: the cost of being wrong is a
+// rebuild on the next run, but a card picked up again after a weekend
+// should still find its cache warm.
+const IDLE_CHECKOUT_TTL: Duration = Duration::from_secs(3 * 86_400);
 const TICK_INTERVAL: Duration = Duration::from_secs(12 * 60 * 60);
 // Sidecar-cache cleanup is much rarer than the other sweeps — it only
 // reclaims after a binary upgrade lands a fresh content hash, and the
@@ -49,8 +60,30 @@ const SIDECAR_SWEEP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 pub struct JanitorReport {
     pub log_files_removed: usize,
     pub work_tmp_removed: usize,
+    pub tool_spills_removed: usize,
     pub sidecar_dirs_removed: usize,
     pub pairings_purged: u64,
+    pub build_dirs_removed: usize,
+    pub build_bytes_freed: u64,
+}
+
+/// What one build-artifact sweep freed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ReclaimedArtifacts {
+    pub dirs_removed: usize,
+    pub bytes_freed: u64,
+}
+
+/// Regenerable build output somebody else owns the rules for.
+///
+/// The janitor knows a cadence and a TTL and nothing else: which checkouts
+/// exist, whether one is between runs, and what inside it a build tool can
+/// make again are all questions for whoever owns those trees. This is the
+/// whole surface of that arrangement — a verb the janitor may call, never a
+/// store it may read.
+#[async_trait::async_trait]
+pub trait BuildArtifactSource: Send + Sync {
+    async fn reclaim_idle(&self, idle_for: Duration) -> ReclaimedArtifacts;
 }
 
 /// Live-set view consumed by the sidecar-cache sweep. `cache_root` is
@@ -68,6 +101,7 @@ pub struct Janitor {
     paths: WorkspacePaths,
     sidecar_cache: Option<SidecarCache>,
     pairings: Option<Arc<dyn ChannelPairingStore>>,
+    build_artifacts: Option<Arc<dyn BuildArtifactSource>>,
 }
 
 impl Janitor {
@@ -76,6 +110,7 @@ impl Janitor {
             paths,
             sidecar_cache: None,
             pairings: None,
+            build_artifacts: None,
         }
     }
 
@@ -94,6 +129,14 @@ impl Janitor {
     #[must_use]
     pub fn with_pairing_store(mut self, pairings: Arc<dyn ChannelPairingStore>) -> Self {
         self.pairings = Some(pairings);
+        self
+    }
+
+    /// Wire the build-artifact sweep. Without this call it does not run —
+    /// a workspace with no boards has no checkouts to sweep.
+    #[must_use]
+    pub fn with_build_artifacts(mut self, source: Arc<dyn BuildArtifactSource>) -> Self {
+        self.build_artifacts = Some(source);
         self
     }
 
@@ -125,6 +168,20 @@ impl Janitor {
             }
         }
 
+        let spills = self.paths.tool_spills_dir();
+        match sweep_tree_entries(&spills, TOOL_SPILL_TTL).await {
+            Ok(n) => report.tool_spills_removed = n,
+            Err(e) => {
+                tracing::warn!(error = %e, dir = %spills.display(), "tool-spill sweep failed")
+            }
+        }
+
+        if let Some(source) = self.build_artifacts.as_ref() {
+            let freed = source.reclaim_idle(IDLE_CHECKOUT_TTL).await;
+            report.build_dirs_removed = freed.dirs_removed;
+            report.build_bytes_freed = freed.bytes_freed;
+        }
+
         // Pairings get a daily sweep here too so a long-running process
         // that never trips the hourly tick (e.g. heavy load deferring
         // every interval fire) still eventually reaps stale rows.
@@ -132,18 +189,26 @@ impl Janitor {
             report.pairings_purged += self.sweep_pairings_once(chrono::Utc::now()).await;
         }
 
-        if report.log_files_removed > 0 || report.work_tmp_removed > 0 || report.pairings_purged > 0
+        if report.log_files_removed > 0
+            || report.work_tmp_removed > 0
+            || report.tool_spills_removed > 0
+            || report.pairings_purged > 0
+            || report.build_dirs_removed > 0
         {
             tracing::info!(
                 log_files_removed = report.log_files_removed,
                 work_tmp_removed = report.work_tmp_removed,
+                tool_spills_removed = report.tool_spills_removed,
                 pairings_purged = report.pairings_purged,
+                build_dirs_removed = report.build_dirs_removed,
+                build_bytes_freed = report.build_bytes_freed,
                 "janitor sweep complete",
             );
         } else {
             tracing::debug!(
                 log_files_removed = report.log_files_removed,
                 work_tmp_removed = report.work_tmp_removed,
+                tool_spills_removed = report.tool_spills_removed,
                 pairings_purged = report.pairings_purged,
                 "janitor sweep complete",
             );
@@ -190,7 +255,7 @@ impl Janitor {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut pairing_interval = tokio::time::interval(PAIRING_SWEEP_INTERVAL);
         pairing_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        tracing::info!(tick_secs = TICK_INTERVAL.as_secs(), "janitor started",);
+        tracing::debug!(tick_secs = TICK_INTERVAL.as_secs(), "janitor started",);
         // First-tick sentinel: sweep immediately on boot, then space
         // subsequent runs by `SIDECAR_SWEEP_INTERVAL`.
         let mut last_sidecar_sweep: Option<Instant> = None;
@@ -210,7 +275,7 @@ impl Janitor {
                     let _ = self.sweep_pairings_once(chrono::Utc::now()).await;
                 }
                 _ = &mut shutdown => {
-                    tracing::info!("janitor shutting down");
+                    tracing::debug!("janitor shutting down");
                     break;
                 }
             }
@@ -457,6 +522,45 @@ mod tests {
         let paths = workspace_paths(tmp.path());
         let report = Janitor::new(paths).sweep_once().await;
         assert_eq!(report.log_files_removed, 0);
+    }
+
+    #[tokio::test]
+    async fn the_build_artifact_sweep_runs_only_when_it_is_wired() {
+        struct Recording(Arc<parking_lot::Mutex<Vec<Duration>>>);
+
+        #[async_trait::async_trait]
+        impl BuildArtifactSource for Recording {
+            async fn reclaim_idle(&self, idle_for: Duration) -> ReclaimedArtifacts {
+                self.0.lock().push(idle_for);
+                ReclaimedArtifacts {
+                    dirs_removed: 2,
+                    bytes_freed: 5_000_000_000,
+                }
+            }
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let paths = workspace_paths(tmp.path());
+
+        let unwired = Janitor::new(paths.clone()).sweep_once().await;
+        assert_eq!(
+            (unwired.build_dirs_removed, unwired.build_bytes_freed),
+            (0, 0),
+            "a workspace with no boards sweeps no checkouts"
+        );
+
+        let asked: Arc<parking_lot::Mutex<Vec<Duration>>> = Arc::default();
+        let report = Janitor::new(paths)
+            .with_build_artifacts(Arc::new(Recording(Arc::clone(&asked))))
+            .sweep_once()
+            .await;
+        assert_eq!(
+            *asked.lock(),
+            vec![IDLE_CHECKOUT_TTL],
+            "asked once, with the TTL"
+        );
+        assert_eq!(report.build_dirs_removed, 2);
+        assert_eq!(report.build_bytes_freed, 5_000_000_000);
     }
 
     #[tokio::test]

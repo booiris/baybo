@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use baybo_context::prompts::cron::{DreamDigestGroup, DreamDigestSession, frame_dream_digest};
-use baybo_context::prompts::soul::{PersonaSources, PromptBudget, assemble_for};
+use baybo_context::prompts::soul::{PersonaSources, PromptBudget, PromptShape, assemble_for};
 use baybo_context::tokenizer::TiktokenTokenizer;
 use baybo_cron::{CronTriggerEvent, ExecutionCompletion};
 use baybo_model::{
@@ -281,6 +281,10 @@ impl Router {
                     origin_session_id: None,
                     conversation: true,
                     job_title: Some(event.title.clone()),
+                    // The dream pass is a per-agent reflection, not board
+                    // work: it must not acquire the board's tools even when
+                    // the job that woke it is bound to one.
+                    project_id: None,
                 },
                 Some(binding),
             )
@@ -467,7 +471,9 @@ impl Router {
     /// answer, while threading the fire's model down here would.
     async fn dream_prompt_budget(&self, agent: &AgentProfileId) -> Option<PromptBudget> {
         let sources = PersonaSources::for_agent(&self.workspace, agent, true);
-        match assemble_for(&self.workspace, &sources).await {
+        // A dream fire is a cron session, so it is priced with the preamble a
+        // cron session actually runs — see `PromptShape`.
+        match assemble_for(&self.workspace, &sources, PromptShape::Chat).await {
             Ok(prompt) => Some(prompt.budget(&TiktokenTokenizer::for_model(""))),
             Err(e) => {
                 warn!(agent_id = %agent, error = %e, "dream: cannot price the identity files; firing without a budget");
@@ -531,9 +537,15 @@ impl Router {
                     origin_session_id: event.origin_session_id.clone(),
                     conversation,
                     job_title: Some(event.title.clone()),
+                    project_id: event.project_id.clone(),
                 },
-                self.inherited_binding(event.origin_session_id.as_ref())
-                    .await?,
+                match event.project_id.as_ref() {
+                    Some(project) => self.lead_binding(project).await?,
+                    None => {
+                        self.inherited_binding(event.origin_session_id.as_ref())
+                            .await?
+                    }
+                },
             )
             .await?;
         Ok(session)
@@ -557,6 +569,33 @@ impl Router {
     /// would answer in the wrong persona, write into the wrong memory
     /// partition, and leave nothing but a `warn!` to say so. Failing the
     /// mint surfaces it and leaves the schedule to retry.
+    /// The board's coordinator, for a fire pointed at a project.
+    ///
+    /// `None` when the board has no lead — which is not a state project
+    /// creation can produce, but a fire must not invent one, so it runs
+    /// unbound and files nothing rather than filing as somebody else.
+    async fn lead_binding(
+        &self,
+        project: &baybo_model::ProjectId,
+    ) -> anyhow::Result<Option<AgentBinding>> {
+        let team = self
+            .agent_profiles
+            .list_team(project)
+            .await
+            .map_err(|e| anyhow::anyhow!("read the team of project {project}: {e}"))?;
+        Ok(team
+            .into_iter()
+            .find(|row| {
+                row.team
+                    .as_ref()
+                    .is_some_and(|t| t.handle.as_str() == baybo_project::LEAD_HANDLE)
+            })
+            .map(|row| AgentBinding {
+                agent_id: row.id,
+                framework: row.framework,
+            }))
+    }
+
     async fn inherited_binding(
         &self,
         origin: Option<&SessionId>,
@@ -636,7 +675,7 @@ impl Router {
                 let actor_token = parent_token.child_token();
                 actor_spawner(
                     session,
-                    pins.llm,
+                    pins.entry,
                     pins.model,
                     pins.effort,
                     response_tx,
@@ -672,7 +711,7 @@ impl Router {
         let response_tx = self.supervisor.response_tx().clone();
         let (mailbox, actor_token) = self.spawn_oneshot_actor(
             session,
-            pins.llm,
+            pins.entry,
             pins.model,
             pins.effort,
             response_tx,
@@ -1069,7 +1108,7 @@ impl CronResultDelivery {
                     let actor_token = parent_token.child_token();
                     actor_spawner(
                         origin,
-                        pins.llm,
+                        pins.entry,
                         pins.model,
                         pins.effort,
                         response_tx,
@@ -1303,6 +1342,8 @@ mod tests {
                 turn_lifecycle: Arc::clone(&turn_lifecycle),
                 cron_store: Arc::clone(&cron_store) as Arc<dyn CronStore>,
                 cron_trigger_rx,
+                issue_run_rx: None,
+                board: None,
                 actor_parent_token: CancellationToken::new(),
                 rate_limit: LiveRateLimit::new(100, std::time::Duration::from_secs(60)),
             });
@@ -1331,6 +1372,7 @@ mod tests {
                 timezone: "UTC".into(),
                 prompt: "Summarise the news".into(),
                 one_shot,
+                project_id: None,
                 origin_session_id: Some(SessionId::from("sess-user")),
                 previous_fire_at: None,
             }
@@ -1484,8 +1526,11 @@ mod tests {
                 description: String::new(),
                 avatar_blob_id: None,
                 framework: AgentFramework::Baybo,
-                llm: None,
+                llm: baybo_model::LlmPin::unpinned(),
                 builtin: false,
+                team: None,
+                hired_by: None,
+                deleted_at: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             },
@@ -1927,8 +1972,11 @@ mod tests {
                 description: String::new(),
                 avatar_blob_id: None,
                 framework: AgentFramework::Codex,
-                llm: None,
+                llm: baybo_model::LlmPin::unpinned(),
                 builtin: false,
+                team: None,
+                hired_by: None,
+                deleted_at: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             },
@@ -2171,6 +2219,7 @@ mod tests {
             next_trigger_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            project_id: None,
             origin_session_id: None,
             deleted_at: None,
             pinned: false,
@@ -2231,6 +2280,7 @@ mod tests {
                     origin_session_id: Some(convo.id.clone()),
                     conversation: true,
                     job_title: Some("Daily news".into()),
+                    project_id: None,
                 },
             )
             .await
@@ -2255,6 +2305,7 @@ mod tests {
                     origin_session_id: Some(convo.id.clone()),
                     conversation: false,
                     job_title: None,
+                    project_id: None,
                 },
             )
             .await

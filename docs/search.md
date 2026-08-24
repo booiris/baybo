@@ -160,8 +160,9 @@ pub fn is_searchable(&self) -> bool {
 ```
 
 `from_user()` already existed and already means `User | UserInterjection` — reuse it rather than
-restate it. `Role::Assistant` covers every agent turn, including the subagent-completion reply
-(`append_background_completion_reply_once`, a real assistant bubble) and `CronNotification`'s
+restate it. `Role::Assistant` covers every agent turn, including the reply the agent writes when a
+background job wakes it (a real assistant bubble; the hidden prompt that seeds it,
+`append_background_notification_prompt_once`, is excluded below) and `CronNotification`'s
 scheduled-task badge. `MessageSource::Cron` is the cron fire's own prompt. What stays out is text
 nobody composed:
 
@@ -297,13 +298,13 @@ conversation takes effect on the next query, with no reindex and no fingerprint 
 `include_cron_workspaces` is the axis the other three do not cover, and it exists because the corpus
 is wider than any client's list. A cron fire that is **not a conversation of its own** — a one-shot's
 private workspace, or any fire from before recurring fires became conversations — is dropped by
-`/v1/chat/sessions` (`is_hidden_cron_session`) and 404s on the REST attach path. Its prose is still
+`/v1/chat/sessions` (`is_private_cron_session`) and 404s on the REST attach path. Its prose is still
 indexed (`MessageSource::Cron` is searchable), so without this flag search returns conversations no
 client can list, and the phone can then subscribe to and even post into them — the read path
 (`load_scoped_chat_session`) and the device channel's `Subscribe` both scope by channel **only**.
 A *recurring* fire is a real conversation and is never affected.
 
-The predicate mirrors `is_hidden_cron_session` in SQL:
+The predicate mirrors `is_private_cron_session` in SQL:
 
 ```sql
 AND (?6 OR NOT (COALESCE(s.trigger_kind, '') = 'cron'

@@ -20,6 +20,8 @@ mod llm_endpoint;
 mod logs_endpoint;
 #[path = "openapi_spec_sync.rs"]
 mod openapi_spec_sync;
+#[path = "projects_api.rs"]
+mod projects_api;
 #[path = "traces_api.rs"]
 mod traces_api;
 #[path = "turns_pagination.rs"]

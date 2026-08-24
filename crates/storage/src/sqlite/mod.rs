@@ -7,6 +7,7 @@ mod cost;
 mod cron;
 mod deck;
 mod device;
+mod project;
 mod search;
 mod secret;
 mod session;
@@ -26,6 +27,7 @@ pub use cost::SqliteCostStore;
 pub use cron::SqliteCronStore;
 pub use deck::SqliteDeckCardStore;
 pub use device::SqliteDeviceStore;
+pub use project::SqliteProjectStore;
 pub use search::SqliteMessageSearchStore;
 pub use secret::SqliteSecretStore;
 pub use session::SqliteSessionStore;
@@ -38,7 +40,7 @@ pub use turn::SqliteTurnStore;
 use baybo_store::{StorageError, StoreIdentity};
 use parking_lot::Mutex;
 use std::sync::Arc;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Connections kept open by the pool. Readers never block each other under
 /// WAL; writers serialise on the write lock regardless of how many handles
@@ -61,12 +63,11 @@ const POOL_SIZE: usize = 8;
 /// truncate-and-regrow churn.
 const WAL_SIZE_LIMIT: i64 = 64 * 1024 * 1024;
 
-/// A second writer waits for the current one rather than failing. Concurrent
-/// writers are routine here — the agent loop and the trace sink write while the
-/// gateway serves reads — and sqlite's default of 0 would turn that normal
-/// overlap into spurious `SQLITE_BUSY`. Contention that outlives this timeout is
-/// a different animal (a *cross-process* writer, i.e. the CLI holding the file
-/// against a running gateway) and is handled by [`crate::retry`].
+/// A writer outside this pool waits for the current one rather than failing.
+/// Writers sharing the pool queue on `PoolInner::writer`, while a CLI process
+/// or a separately opened pool can still contend inside SQLite. Its default of
+/// 0 would turn that overlap into a spurious `SQLITE_BUSY`; CLI operations
+/// retry contention that outlives this timeout via [`crate::retry`].
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Owner-only. Sqlite would otherwise create the file at whatever the umask
@@ -281,6 +282,86 @@ fn migrate_turn_entity_rename(conn: &mut rusqlite::Connection) -> anyhow::Result
 /// Columns added after their `CREATE TABLE` shipped.
 const ADD_COLUMNS: &[AddColumn] = &[
     AddColumn {
+        table: "agent_profiles",
+        column: "project_id",
+        definition: "TEXT",
+    },
+    AddColumn {
+        table: "agent_profiles",
+        column: "handle",
+        definition: "TEXT",
+    },
+    AddColumn {
+        table: "agent_profiles",
+        column: "hired_by",
+        definition: "TEXT",
+    },
+    AddColumn {
+        table: "agent_profiles",
+        column: "deleted_at",
+        definition: "INTEGER",
+    },
+    AddColumn {
+        table: "agent_profiles",
+        column: "llm_model",
+        definition: "TEXT",
+    },
+    AddColumn {
+        table: "agent_profiles",
+        column: "llm_effort",
+        definition: "TEXT",
+    },
+    AddColumn {
+        table: "projects",
+        column: "daily_budget_micros",
+        definition: "INTEGER",
+    },
+    AddColumn {
+        table: "issues",
+        column: "parent_issue_id",
+        definition: "TEXT",
+    },
+    AddColumn {
+        table: "issues",
+        column: "stage",
+        definition: "INTEGER NOT NULL DEFAULT 0",
+    },
+    AddColumn {
+        table: "issues",
+        column: "source_key",
+        definition: "TEXT",
+    },
+    AddColumn {
+        table: "issues",
+        column: "branch",
+        definition: "TEXT",
+    },
+    AddColumn {
+        table: "issues",
+        column: "assignee",
+        definition: "TEXT",
+    },
+    AddColumn {
+        table: "issues",
+        column: "attachments",
+        definition: "TEXT NOT NULL DEFAULT '[]'",
+    },
+    AddColumn {
+        table: "issues",
+        column: "read_at",
+        definition: "INTEGER",
+    },
+    AddColumn {
+        table: "issues",
+        column: "pinned",
+        definition: "INTEGER NOT NULL DEFAULT 0",
+    },
+    AddColumn {
+        table: "issues",
+        column: "filed_from_issue_id",
+        definition: "TEXT",
+    },
+    AddColumn {
         table: "sessions",
         column: "parent_span_id",
         definition: "TEXT",
@@ -420,13 +501,47 @@ const ADD_COLUMNS: &[AddColumn] = &[
         column: "dreamed_through_ordinal",
         definition: "INTEGER",
     },
+    AddColumn {
+        table: "projects",
+        column: "max_parallel_issue_runs",
+        definition: "INTEGER",
+    },
+    AddColumn {
+        table: "projects",
+        column: "daily_budget_tokens",
+        definition: "INTEGER",
+    },
+    AddColumn {
+        table: "projects",
+        column: "agents_may_merge",
+        definition: "INTEGER",
+    },
+    AddColumn {
+        table: "issue_runs",
+        column: "resumes",
+        definition: "INTEGER NOT NULL DEFAULT 0",
+    },
+    AddColumn {
+        table: "projects",
+        column: "rules_changed_at",
+        definition: "INTEGER",
+    },
+    // VIRTUAL, so this reads existing rows the moment it is added: there is
+    // no backfill to write and nothing to keep in step with `data`. STORED
+    // would need both.
+    AddColumn {
+        table: "sessions",
+        column: "project_id",
+        definition: "TEXT GENERATED ALWAYS AS (json_extract(data, '$.trigger.project_id')) VIRTUAL",
+    },
 ];
 
 /// Pool of sqlite connections.
 ///
 /// Cheap to clone (the state is one `Arc`) and shared by every store. Callers
-/// reach the database only through [`SqlitePool::interact`], which checks a
-/// connection out *exclusively* for the whole closure.
+/// reach the database only through [`SqlitePool::interact`] for reads or
+/// [`SqlitePool::interact_write`] for mutations. Both check a connection out
+/// *exclusively* for the whole closure; writes also queue before checkout.
 ///
 /// That exclusivity is a memory-safety contract, not a throughput knob. A
 /// sqlite connection owns an unsynchronised private heap — its lookaside
@@ -445,7 +560,7 @@ pub struct SqlitePool {
     identity: StoreIdentity,
 }
 
-/// The connections, and the gate that hands them out one at a time.
+/// The connections, and the gates that hand them out safely.
 struct PoolInner {
     /// Where a replacement connection comes from. Kept as the path the caller
     /// opened rather than the canonicalized one so a replacement resolves
@@ -459,6 +574,9 @@ struct PoolInner {
     /// permit outlives this borrow: it rides into the blocking task and is
     /// released only once the connection is back.
     permits: Arc<Semaphore>,
+    /// SQLite permits one writer at a time. Queue writers here instead of
+    /// making unrelated connections contend inside SQLite until busy_timeout.
+    writer: Arc<Semaphore>,
 }
 
 impl PoolInner {
@@ -572,21 +690,82 @@ impl SqlitePool {
                 path,
                 idle: Mutex::new(connections),
                 permits: Arc::new(Semaphore::new(POOL_SIZE)),
+                writer: Arc::new(Semaphore::new(1)),
             }),
             identity,
         };
-        pool.interact("sqlite.init_db", init_db)
+        pool.interact_write("sqlite.init_db", init_db)
             .await
             .map_err(|e| anyhow::anyhow!("failed to initialize schema for {what}: {e}"))?;
         Ok(pool)
     }
 
-    /// Run `f` against a connection held exclusively for the whole closure.
+    /// Run a read-only `f` against a connection held exclusively for the whole
+    /// closure.
     ///
     /// `f` runs on a blocking thread (rusqlite is synchronous), so it must own
-    /// its inputs — bind every parameter as an owned value. `op` names the
-    /// call-site and prefixes any error.
+    /// its inputs -- bind every parameter as an owned value. The query-only
+    /// guard makes an accidentally misclassified write fail rather than bypass
+    /// the process-wide writer queue. `op` names the call-site and prefixes
+    /// any error.
     pub(crate) async fn interact<F, T>(&self, op: &'static str, f: F) -> Result<T, StorageError>
+    where
+        F: FnOnce(&mut rusqlite::Connection) -> anyhow::Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.interact_inner(op, true, None, f).await
+    }
+
+    /// Run a mutating `f` after joining this pool's single-writer queue.
+    ///
+    /// The queue makes an in-process `SQLITE_BUSY` unreachable, so a `BUSY` that
+    /// still arrives here is by construction the *cross-process* case — a CLI
+    /// invocation writing the file a gateway is live on — which is exactly what
+    /// [`crate::retry`] exists for. Hence the retry wrapper on every write
+    /// rather than on a hand-picked few.
+    ///
+    /// `f` is `Fn`, not `FnOnce`, because a retry re-runs it. That is only sound
+    /// because a write closure is either a single statement or wraps its
+    /// statements in one transaction, so a retried attempt cannot double-apply
+    /// a half-finished one — `write_closures_are_retry_safe` guards the rule.
+    /// The writer permit is taken *inside* each attempt so the backoff does not
+    /// hold the queue shut against writers that would succeed.
+    pub(crate) async fn interact_write<F, T>(
+        &self,
+        op: &'static str,
+        f: F,
+    ) -> Result<T, StorageError>
+    where
+        F: Fn(&mut rusqlite::Connection) -> anyhow::Result<T> + Send + Sync + 'static,
+        T: Send + 'static,
+    {
+        let f = Arc::new(f);
+        crate::retry::retry_on_busy(op, || {
+            let f = Arc::clone(&f);
+            async move {
+                let writer = self
+                    .inner
+                    .writer
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|e| {
+                        StorageError::Internal(anyhow::anyhow!("{op}: writer queue: {e}"))
+                    })?;
+                self.interact_inner(op, false, Some(writer), move |conn| f(conn))
+                    .await
+            }
+        })
+        .await
+    }
+
+    async fn interact_inner<F, T>(
+        &self,
+        op: &'static str,
+        read_only: bool,
+        writer: Option<OwnedSemaphorePermit>,
+        f: F,
+    ) -> Result<T, StorageError>
     where
         F: FnOnce(&mut rusqlite::Connection) -> anyhow::Result<T> + Send + 'static,
         T: Send + 'static,
@@ -600,6 +779,7 @@ impl SqlitePool {
             .map_err(|e| StorageError::Internal(anyhow::anyhow!("{op}: pool checkout: {e}")))?;
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || {
+            let _writer = writer;
             // Moved in so it is released on the blocking thread, after the
             // connection is back in `idle` — a permit handed on while the
             // connection is still out would admit a caller with nothing to
@@ -608,8 +788,12 @@ impl SqlitePool {
             let mut conn = inner
                 .take()
                 .map_err(|e| StorageError::Internal(anyhow::anyhow!("{op}: {e}")))?;
-            let out =
-                f(&mut conn).map_err(|e| StorageError::Internal(anyhow::anyhow!("{op}: {e}")));
+            let result = if read_only {
+                interact_read_only(&mut conn, f)
+            } else {
+                f(&mut conn)
+            };
+            let out = result.map_err(|e| StorageError::Internal(anyhow::anyhow!("{op}: {e}")));
             inner.give_back(conn);
             out
         })
@@ -620,11 +804,67 @@ impl SqlitePool {
     }
 }
 
+fn interact_read_only<F, T>(conn: &mut rusqlite::Connection, f: F) -> anyhow::Result<T>
+where
+    F: FnOnce(&mut rusqlite::Connection) -> anyhow::Result<T>,
+{
+    conn.pragma_update(None, "query_only", true)?;
+    let result = f(conn);
+    let reset = conn.pragma_update(None, "query_only", false);
+    match (result, reset) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(anyhow::anyhow!(
+            "failed to leave sqlite read-only checkout: {error}"
+        )),
+        (Err(error), Err(reset_error)) => Err(error.context(format!(
+            "also failed to leave sqlite read-only checkout: {reset_error}"
+        ))),
+    }
+}
+
 /// `?,?,...,?` for an `IN (...)` list of `n` bound values. Callers
 /// chunk large lists (see `IN_CHUNK` sites) to stay under sqlite's
 /// bound-variable limit.
 pub(crate) fn in_placeholders(n: usize) -> String {
     std::iter::repeat_n("?", n).collect::<Vec<_>>().join(",")
+}
+
+/// Whether a write failed because a **uniqueness** constraint refused it —
+/// the row is already there — rather than for any other reason.
+///
+/// The distinction is between "this was already there" and "sqlite is busy
+/// / the disk is full / that column takes another type", and a caller that
+/// reports the second as the first tells its user something that never
+/// happened.
+///
+/// The **extended** code, not `ErrorCode::ConstraintViolation`. That wider
+/// bucket also holds NOT NULL and CHECK, which are bugs in the statement
+/// rather than a row that lost a race, and reporting one of those as
+/// "somebody got there first" is the same lie one altitude down. (It holds
+/// FOREIGN KEY too, which genuinely *can* be a lost race — a parent deleted
+/// concurrently — but this codebase never enables `PRAGMA foreign_keys`, so
+/// there is no such case to classify.)
+///
+/// Both uniqueness codes are needed. A duplicate `TEXT PRIMARY KEY` reports
+/// `SQLITE_CONSTRAINT_PRIMARYKEY` while its *message* still reads "UNIQUE
+/// constraint failed", so matching on UNIQUE alone would misfile it.
+///
+/// Asked of the code, and therefore only answerable *inside* the pool
+/// closure while the `rusqlite::Error` still exists: once a failure has been
+/// stringified out of one, all that is left to go on is the message. Two
+/// older stores (`device`, `agent_profile`) sniff that string for
+/// `"constraint"` from outside — which does separate a constraint from a
+/// busy database or a broken statement, since neither of those messages
+/// carries the word, but cannot tell a uniqueness refusal from a NOT NULL or
+/// CHECK one. They are worth moving onto this.
+pub(crate) fn already_there(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(err, _)
+            if err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                || err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+    )
 }
 
 /// Create all required tables if they do not already exist.
@@ -762,13 +1002,26 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     -- max-wins) and omitted from save's DO UPDATE like every
                     -- other flat column. See docs/modules/memory-builtin.md.
                     dreamed_through_ordinal INTEGER,
-                    data                  TEXT NOT NULL
+                    data                  TEXT NOT NULL,
+                    -- The board this session's work belongs to, extracted
+                    -- from the trigger rather than stored a second time.
+                    -- Both board-bearing triggers keep it at the same JSON
+                    -- path: `Issue` always carries one, `Cron` carries one
+                    -- when the job files onto a board. A subagent inherits
+                    -- its parent's trigger, so a whole spawn tree answers
+                    -- this column identically without walking lineage.
+                    -- NULL for ordinary chat and for board-less cron.
+                    project_id            TEXT GENERATED ALWAYS AS
+                                          (json_extract(data, '$.trigger.project_id')) VIRTUAL
                 );
-                -- idx_sessions_root is no longer created (2026-07
-                -- unused-column audit: it indexed a column no query
-                -- filters on). Old DBs keep their orphan copy. The
-                -- root_session_id column itself stays written — the data
-                -- blob's copy is what consumers read today.
+                -- Serves the board spend readers, which bill a run for what
+                -- its subagents spent: a subagent session's root is the
+                -- session the run works in, so this is the edge from one
+                -- run to its whole spawn tree. (Dropped in the 2026-07
+                -- unused-column audit when nothing filtered on the column;
+                -- the budget gate now does.)
+                CREATE INDEX IF NOT EXISTS idx_sessions_root
+                    ON sessions(root_session_id);
                 -- User-created folders for organising the chat-session list.
                 -- Two-level tree via self-referential `parent_id` (NULL =
                 -- top-level; the depth cap of 2 is enforced in the session
@@ -1174,8 +1427,24 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     description     TEXT NOT NULL,
                     avatar_blob_id  TEXT,
                     framework       TEXT NOT NULL,
+                    -- What this agent runs on, one column per level of
+                    -- `LlmPin`: the entry, the model within it, the thinking
+                    -- rung. NULL inherits at each level, and the three are
+                    -- only ever written together.
                     llm             TEXT,
+                    llm_model       TEXT,
+                    llm_effort      TEXT,
                     builtin         INTEGER NOT NULL DEFAULT 0,
+                    -- A project team member. Both NULL for a global agent;
+                    -- both set for a teammate. Nothing sets one alone —
+                    -- see `TeamMembership`.
+                    project_id      TEXT,
+                    handle          TEXT,
+                    -- Which agent hired this one. NULL is the operator.
+                    hired_by        TEXT,
+                    -- Removed from its team. The row stays: issues, runs and
+                    -- timeline entries all name agents by id.
+                    deleted_at      INTEGER,
                     created_at      INTEGER NOT NULL,
                     updated_at      INTEGER NOT NULL
                 );
@@ -1259,7 +1528,210 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     fetched_at INTEGER NOT NULL,
                     error      TEXT,
                     PRIMARY KEY (card_id, seq)
-                );",
+                );
+
+                -- Kanban projects (docs/todo/kanban.md). The id is also the
+                -- project's directory name under workspace/projects/, which
+                -- is why ProjectId carries a grammar rather than being
+                -- opaque. archived_at is the soft-archive recycle bin (the
+                -- cron_jobs pattern); there is no hard delete.
+                CREATE TABLE IF NOT EXISTS projects (
+                    id          TEXT    PRIMARY KEY,
+                    name        TEXT    NOT NULL,
+                    description TEXT    NOT NULL DEFAULT '',
+                    -- Absolute path to the git repo the team works in.
+                    workdir     TEXT    NOT NULL,
+                    -- Micro-USD this board's agents may spend per UTC day.
+                    -- NULL is no ceiling. INTEGER, never REAL — see
+                    -- `cost_records.cost_usd`.
+                    daily_budget_micros INTEGER,
+                    -- Tokens this board's agents may spend per UTC day,
+                    -- over the same window and the same rows as
+                    -- `daily_budget_micros`. NULL is no ceiling. The meter
+                    -- that still measures something on a subscription
+                    -- plan, where every `cost_records.cost_usd` is 0.
+                    daily_budget_tokens INTEGER,
+                    -- How many runs this board may start on its own by
+                    -- promoting Todo cards. NULL on a row written before
+                    -- the column existed, and resolved on the way out to
+                    -- `DEFAULT_MAX_PARALLEL_ISSUE_RUNS` rather than to a SQL
+                    -- default that would be the number's second home.
+                    max_parallel_issue_runs INTEGER,
+                    -- Whether this board's agents may land a card's branch
+                    -- in the repository's own checkout, through
+                    -- `IssueMerge`. NULL resolves to
+                    -- `DEFAULT_AGENTS_MAY_MERGE`, for the reason above.
+                    agents_may_merge INTEGER,
+                    archived_at INTEGER,
+                    created_at  INTEGER NOT NULL,
+                    updated_at  INTEGER NOT NULL
+                );
+
+                -- One card on one board. `number` is the human address and
+                -- is per-project, assigned inside the insert transaction;
+                -- the unique index below is the backstop that turns a race
+                -- into a constraint trip rather than two issues called #3.
+                -- The ULID `id` is what child tables (runs, events) will
+                -- reference — the REST surface never addresses by it, so a
+                -- request cannot name an issue without naming its project.
+                CREATE TABLE IF NOT EXISTS issues (
+                    id             TEXT    PRIMARY KEY,
+                    project_id     TEXT    NOT NULL,
+                    number         INTEGER NOT NULL,
+                    title          TEXT    NOT NULL,
+                    description    TEXT    NOT NULL DEFAULT '',
+                    -- Files hung on the description, as a JSON array of
+                    -- `IssueAttachment`. A blob store id is a capability,
+                    -- so this column holds read tokens: it is as sensitive
+                    -- as the bytes it points at.
+                    attachments    TEXT    NOT NULL DEFAULT '[]',
+                    status         TEXT    NOT NULL,
+                    priority       TEXT    NOT NULL DEFAULT 'none',
+                    -- Who is on it. An agent profile id, or NULL for work
+                    -- nobody has picked up.
+                    assignee       TEXT,
+                    -- Dense rank within (project_id, status); a move
+                    -- renumbers the whole target column in one transaction.
+                    position       INTEGER NOT NULL,
+                    blocked_reason TEXT,
+                    -- Sub-issues, one level deep. `stage` is the barrier a
+                    -- child belongs to under its parent; it is 0 and
+                    -- meaningless on a top-level issue.
+                    parent_issue_id TEXT,
+                    stage          INTEGER NOT NULL DEFAULT 0,
+                    -- What opened this card, for callers that must not open
+                    -- it twice. Namespaced server-side; NULL for anything a
+                    -- person or an ordinary run created.
+                    source_key     TEXT,
+                    -- The card whose run filed this one. Provenance, not
+                    -- hierarchy: unbounded in depth, gates nothing, and
+                    -- written once at creation so it can never cycle.
+                    filed_from_issue_id TEXT,
+                    -- The branch this issue's work landed on. NULL until it
+                    -- has a commit: worktree and branch are separate ideas,
+                    -- and a research issue that produced a report and no
+                    -- code should show no branch anywhere.
+                    branch         TEXT,
+                    -- Kept in front of the operator: a pinned card is read
+                    -- first in its column. Reading order only — it is not a
+                    -- second `position` and not a second `priority`, and no
+                    -- query orders by it.
+                    pinned         INTEGER NOT NULL DEFAULT 0,
+                    -- When the operator last opened this card. The only read
+                    -- state in the feature: an agent's comment and a card
+                    -- arriving in Review leave no other trace when read, and
+                    -- it lives per card rather than per board so that opening
+                    -- one card cannot silence a question asked on another.
+                    read_at        INTEGER,
+                    cancelled_at   INTEGER,
+                    created_at     INTEGER NOT NULL,
+                    updated_at     INTEGER NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_issues_number
+                    ON issues(project_id, number);
+                -- Serves the board's only read: one project's cards,
+                -- column by column, in order.
+                CREATE INDEX IF NOT EXISTS idx_issues_board
+                    ON issues(project_id, status, position);
+
+                -- One execution of one issue by its assignee. The row IS the
+                -- delivery ledger entry: it is written before anything is
+                -- dispatched, stamped on resolution, and re-driven at boot,
+                -- so a crash anywhere in between leaves work that resumes
+                -- rather than a card that shimmers forever.
+                CREATE TABLE IF NOT EXISTS issue_runs (
+                    id         TEXT    PRIMARY KEY,
+                    issue_id   TEXT    NOT NULL,
+                    project_id TEXT    NOT NULL,
+                    number     INTEGER NOT NULL,
+                    agent_id   TEXT    NOT NULL,
+                    -- The issue's session, stamped when the run is claimed
+                    -- and null until then. NOT cleared by the boot sweep: a
+                    -- run returned to the queue keeps the session it was
+                    -- already working in, so the resumed run continues one
+                    -- transcript instead of opening a second.
+                    session_id TEXT,
+                    trigger    TEXT    NOT NULL,
+                    status     TEXT    NOT NULL,
+                    attempt    INTEGER NOT NULL,
+                    -- How many process starts have found this run in flight
+                    -- and handed it back to the queue. Zero on a row written
+                    -- before the meter existed, which reads as never
+                    -- interrupted: the counter starts when the meter does,
+                    -- and back-filling it from timeline entries would be a
+                    -- second home for the rule that bounds it.
+                    resumes    INTEGER NOT NULL DEFAULT 0,
+                    error      TEXT,
+                    created_at INTEGER NOT NULL,
+                    started_at INTEGER,
+                    settled_at INTEGER
+                );
+                -- The dedupe guard, structural rather than checked: an issue
+                -- may hold at most one unfinished run. Two drags racing trip
+                -- the constraint instead of starting the same work twice —
+                -- and it is what lets the waiter treat 'the newest terminal
+                -- turn' as unambiguously its own.
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_issue_runs_live
+                    ON issue_runs(issue_id) WHERE settled_at IS NULL;
+                -- The narrower half of that guard, stated separately because
+                -- two rules downstream depend on *it* rather than on the one
+                -- above, and would break silently if the one above were ever
+                -- widened to allow a card more than one live run:
+                --   * `RUN_COST_WINDOW` attributes a cost row by session tree
+                --     and claim→settle window, and one session is shared by
+                --     every run the same agent makes on a card
+                --     (`runs::session_run_to_continue`), so two live runs of
+                --     one agent give two overlapping windows over one
+                --     transcript and bill the card twice;
+                --   * the run waiter matches a terminal turn on session and
+                --     input kind alone (`is_our_run`), so those same two runs
+                --     settle each other's rows.
+                -- Redundant today and deliberately so: it is the constraint
+                -- those two rules actually need, and a runtime check could
+                -- not replace it — at the write site the index above already
+                -- refuses first, so such a check can never fire until the
+                -- thing it defends against has already happened.
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_issue_runs_live_agent
+                    ON issue_runs(issue_id, agent_id) WHERE settled_at IS NULL;
+                -- The unfinished slice of a table that only grows: at most
+                -- one row per live issue, and every sweep works from it.
+                -- The process-start requeue rewrites it whole, `held_runs`
+                -- reads it in this order, and `active_runs` narrows it to
+                -- one board (re-sorting a handful of rows by issue number,
+                -- which is cheaper than a second index to serve).
+                CREATE INDEX IF NOT EXISTS idx_issue_runs_unsettled
+                    ON issue_runs(created_at) WHERE settled_at IS NULL;
+                -- The per-issue execution log, newest attempt first.
+                CREATE INDEX IF NOT EXISTS idx_issue_runs_log
+                    ON issue_runs(issue_id, created_at DESC);
+                -- The issue timeline: comments and system events in one
+                -- stream, because a reader wants them interleaved and a
+                -- second table would only have to be merged back.
+                CREATE TABLE IF NOT EXISTS issue_events (
+                    id         TEXT    PRIMARY KEY,
+                    issue_id   TEXT    NOT NULL,
+                    project_id TEXT    NOT NULL,
+                    number     INTEGER NOT NULL,
+                    -- 'user', 'system' or 'agent:<id>' — the three forms
+                    -- `IssueActor::to_storage` writes. The read is
+                    -- fail-closed (an unrecognised value fails the whole
+                    -- timeline), so anything writing this column has to
+                    -- spell it the way that enum does.
+                    actor      TEXT    NOT NULL,
+                    -- Derived from `body`, stored so a filter by kind does
+                    -- not have to parse every row's JSON.
+                    kind       TEXT    NOT NULL,
+                    body       TEXT    NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+                -- Reading order for one issue, and the range scan a
+                -- follow-up run's brief uses to take only the delta.
+                CREATE INDEX IF NOT EXISTS idx_issue_events_timeline
+                    ON issue_events(issue_id, created_at);
+                -- The project-wide activity feed, derived from this same
+                -- table rather than stored a second time.
+                CREATE INDEX IF NOT EXISTS idx_issue_events_feed
+                    ON issue_events(project_id, created_at DESC);",
     )
     .map_err(|e| anyhow::anyhow!("failed to initialize sqlite schema: {e}"))?;
 
@@ -1270,11 +1742,11 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
         migration.apply(conn)?;
     }
 
-    // Indexes on migration-added columns. Created AFTER the ALTER loop,
-    // not in the schema batch above: on a legacy DB the column doesn't
-    // exist until the ALTER runs, so a batch-time CREATE INDEX referencing
-    // it would fail. `IF NOT EXISTS` keeps them idempotent on every
-    // subsequent boot.
+    // Indexes and triggers on migration-added columns. Created AFTER the
+    // ALTER loop, not in the schema batch above: on a legacy DB the column
+    // doesn't exist until the ALTER runs, so a batch-time statement
+    // referencing it would fail. `IF NOT EXISTS` keeps them idempotent on
+    // every subsequent boot.
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_sessions_folder
              ON sessions(folder_id) WHERE folder_id IS NOT NULL;
@@ -1291,9 +1763,71 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
              WHERE source_event_id IS NOT NULL;
          -- Serves the chat-list base query (channel scope + newest-first).
          CREATE INDEX IF NOT EXISTS idx_sessions_channel_active
-             ON sessions(channel, last_active DESC);",
+             ON sessions(channel, last_active DESC);
+         -- A handle is unique within its board and stays reserved after the
+         -- agent is removed: reissuing it would silently repoint every
+         -- timeline entry that already said '@dev-1'. Hence no
+         -- `deleted_at IS NULL` here.
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_profiles_handle
+             ON agent_profiles(project_id, handle) WHERE project_id IS NOT NULL;
+         -- …and unique is only half of it: the pair is also INSERT-only. A
+         -- membership is granted when the agent is hired and never moves,
+         -- because `issues.assignee`, `issue_runs.agent_id` and every
+         -- timeline `actor` resolve through it, and the '@dev-1' already
+         -- typed into a comment resolves through nothing else at all.
+         --
+         -- Stated here rather than left to the store's statements happening
+         -- not to name these columns: that is a coincidence, and one future
+         -- `UPDATE` ends it. It is also the store's half of a fixed identity
+         -- — the display name the handle was derived from is frozen too, and
+         -- freezing one without the other only moves the drift. That name is
+         -- a line in the agent's own IDENTITY.md, which no column here can
+         -- hold, so its rule lives in `baybo_workspace::name`; this is the
+         -- half SQL *can* keep.
+         CREATE TRIGGER IF NOT EXISTS agent_profiles_team_is_insert_only
+             BEFORE UPDATE OF project_id, handle ON agent_profiles
+             WHEN NEW.project_id IS NOT OLD.project_id
+               OR NEW.handle IS NOT OLD.handle
+             BEGIN
+                 SELECT RAISE(ABORT, 'an agent''s board and @handle are fixed when it is hired');
+             END;
+         -- Serves the board's roster read.
+         CREATE INDEX IF NOT EXISTS idx_agent_profiles_team
+             ON agent_profiles(project_id)
+             WHERE project_id IS NOT NULL AND deleted_at IS NULL;
+         -- The other half of the budget gate's membership test: every
+         -- session whose trigger names the board, which is what brings a
+         -- board-bound cron fire — and every subagent of one — inside the
+         -- ceiling. On the migration-added generated column, so it is
+         -- created here rather than in the schema batch.
+         CREATE INDEX IF NOT EXISTS idx_sessions_project
+             ON sessions(project_id) WHERE project_id IS NOT NULL;
+         -- Serves the budget gate: one board's run sessions, which the
+         -- spend query joins `cost_records` against.
+         CREATE INDEX IF NOT EXISTS idx_issue_runs_project_session
+             ON issue_runs(project_id, session_id) WHERE session_id IS NOT NULL;
+         -- The same rows addressed the other way, for `board_activity`:
+         -- it asks every board at once, so it holds no board id to lead
+         -- the index above with, and two of its three union arms read
+         -- `issue_runs` by session alone. Session-first is the only
+         -- ordering that answers that, and carrying `project_id` second
+         -- keeps both arms covering.
+         CREATE INDEX IF NOT EXISTS idx_issue_runs_session
+             ON issue_runs(session_id, project_id) WHERE session_id IS NOT NULL;
+         -- Serves the stage barrier and the card's progress ring: one
+         -- parent's children, in stage order.
+         -- One LIVE card per key per board. The card leaves the index when
+         -- it is finished or cancelled, which is the whole design: this
+         -- month's build failure gets a fresh card, and this month's does
+         -- not get thirty.
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_issues_source_key
+             ON issues(project_id, source_key)
+             WHERE source_key IS NOT NULL AND cancelled_at IS NULL AND status <> 'done';
+         CREATE INDEX IF NOT EXISTS idx_issues_children
+             ON issues(parent_issue_id, stage, position)
+             WHERE parent_issue_id IS NOT NULL;",
     )
-    .map_err(|e| anyhow::anyhow!("failed to create post-migration indexes: {e}"))?;
+    .map_err(|e| anyhow::anyhow!("failed to create post-migration indexes and triggers: {e}"))?;
 
     // One-time data collapse: the retired per-surface channel tags `http`
     // (web) and `device` (mobile) were unified into a single `owner` pool
@@ -1377,7 +1911,7 @@ mod tests {
         let pool = SqlitePool::open(tmpdir.path().join("test.db"))
             .await
             .expect("open");
-        pool.interact("test.write", |conn| {
+        pool.interact_write("test.write", |conn| {
             conn.execute(
                 "INSERT INTO secrets (name, encrypted_value) VALUES ('k', x'01')",
                 [],
@@ -1413,7 +1947,7 @@ mod tests {
             tasks.push(tokio::spawn(async move {
                 for i in 0..25 {
                     let name = format!("k{w}-{i}");
-                    pool.interact("test.concurrent_write", move |conn| {
+                    pool.interact_write("test.concurrent_write", move |conn| {
                         conn.execute(
                             "INSERT INTO secrets (name, encrypted_value) VALUES (?1, x'01')",
                             rusqlite::params![name],
@@ -1438,9 +1972,291 @@ mod tests {
         assert_eq!(n, 200, "no writer was silently dropped");
     }
 
+    /// `interact_write` re-runs its closure on a `SQLITE_BUSY`, and in
+    /// autocommit mode each statement commits on its own — so a closure with
+    /// two bare writes can land the first, fail BUSY on the second, and
+    /// double-apply the first on the retry. Every write closure must therefore
+    /// issue at most one mutating statement or wrap them in one transaction.
+    ///
+    /// Checked against the source because the rule is about a shape the type
+    /// system cannot express, and the failure is silent: it needs cross-process
+    /// contention to show up at all, and then it corrupts rather than errors.
+    #[test]
+    fn write_closures_are_retry_safe() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sqlite");
+        let mut offenders = Vec::new();
+
+        for entry in std::fs::read_dir(&dir).expect("sqlite module dir") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("read source");
+            // Inline `mod tests` hand-writes throwaway schema surgery that no
+            // retry ever sees; the rule is about the production write surface.
+            let production = source.split("#[cfg(test)]").next().unwrap_or(&source);
+            let lines: Vec<&str> = production.lines().collect();
+
+            for (i, line) in lines.iter().enumerate() {
+                let Some(col) = line.find(".interact_write(") else {
+                    continue;
+                };
+                // Closure body: down to the first line no deeper than the call
+                // that closes it.
+                let mut body = String::new();
+                for next in &lines[i + 1..] {
+                    let indent = next.len() - next.trim_start().len();
+                    if !next.trim().is_empty() && indent <= col && next.contains("})") {
+                        break;
+                    }
+                    body.push_str(next);
+                    body.push('\n');
+                }
+                if body.contains(".transaction") || body.contains("tx.") {
+                    continue;
+                }
+                let writes = body.matches(".execute").count();
+                if writes > 1 {
+                    offenders.push(format!(
+                        "{}:{} — {writes} bare mutating statements, no transaction",
+                        path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+                        i + 1
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "retry-unsafe write closures (wrap them in one transaction): {offenders:#?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn write_checkouts_are_serialized_before_entering_sqlite() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .expect("open");
+        let start = Arc::new(tokio::sync::Barrier::new(9));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+
+        for writer_id in 0..8 {
+            let pool = pool.clone();
+            let start = start.clone();
+            let active = active.clone();
+            let peak = peak.clone();
+            tasks.push(tokio::spawn(async move {
+                start.wait().await;
+                pool.interact_write("test.writer_queue", move |conn| {
+                    let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now_active, Ordering::SeqCst);
+                    for _ in 0..1_000 {
+                        std::thread::yield_now();
+                    }
+                    conn.execute(
+                        "INSERT INTO secrets (name, encrypted_value) VALUES (?1, x'01')",
+                        rusqlite::params![format!("writer-{writer_id}")],
+                    )?;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await
+                .expect("queued write");
+            }));
+        }
+
+        start.wait().await;
+        for task in tasks {
+            task.await.expect("writer task");
+        }
+
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "only one write closure may enter SQLite at a time"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_checkout_rejects_writes_and_resets_the_connection() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .expect("open");
+
+        let error = pool
+            .interact("test.misclassified_write", |conn| {
+                conn.execute(
+                    "INSERT INTO secrets (name, encrypted_value) VALUES ('wrong-gate', x'01')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect_err("read checkout must reject a write");
+        assert!(
+            error.to_string().contains("readonly"),
+            "sqlite should identify the query-only refusal: {error}"
+        );
+
+        pool.interact_write("test.write_after_read_refusal", |conn| {
+            conn.execute(
+                "INSERT INTO secrets (name, encrypted_value) VALUES ('right-gate', x'01')",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("query_only must be reset before the connection is returned");
+    }
+
     /// An open pool must already hold every connection, leaving none to open
     /// lazily later.
     ///
+    /// `already_there` is asked of the extended code, so this pins what
+    /// sqlite actually reports — every claim in its doc comment is
+    /// measurable, and a rusqlite bump that changed any of them would
+    /// otherwise turn a refusal into an internal error, or the reverse.
+    #[tokio::test]
+    async fn already_there_separates_a_duplicate_row_from_every_other_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pool = SqlitePool::open(dir.path().join("t.db"))
+            .await
+            .expect("open");
+
+        let verdicts = pool
+            .interact_write("test.classify", |conn| {
+                conn.execute_batch(
+                    "CREATE TABLE t (id TEXT PRIMARY KEY, uniq TEXT UNIQUE, needed TEXT NOT NULL,                      checked INTEGER CHECK (checked > 0));
+                     INSERT INTO t VALUES ('a', 'a', 'x', 1);",
+                )?;
+                let classify = |sql: &str| {
+                    let e = conn.execute(sql, []).expect_err("the statement must fail");
+                    (already_there(&e), e.to_string())
+                };
+                Ok(vec![
+                    // Both uniqueness codes, and the reason the PK arm is
+                    // needed: its message says UNIQUE while its code does not.
+                    classify("INSERT INTO t VALUES ('a', 'b', 'x', 1)"),
+                    classify("INSERT INTO t VALUES ('b', 'a', 'x', 1)"),
+                    // A constraint, but not a row that was already there.
+                    classify("INSERT INTO t (id, uniq, checked) VALUES ('c', 'c', 1)"),
+                    classify("INSERT INTO t VALUES ('d', 'd', 'x', 0)"),
+                    // Not a constraint at all.
+                    classify("INSERT INTO t (nope) VALUES ('e')"),
+                ])
+            })
+            .await
+            .expect("classify");
+
+        let (duplicate_pk, duplicate_unique, not_null, check, no_column) = (
+            &verdicts[0],
+            &verdicts[1],
+            &verdicts[2],
+            &verdicts[3],
+            &verdicts[4],
+        );
+
+        assert!(
+            duplicate_pk.0,
+            "a duplicate primary key is a row already there: {duplicate_pk:?}"
+        );
+        assert!(
+            duplicate_pk.1.contains("UNIQUE"),
+            "and it says UNIQUE in its message while reporting the PRIMARYKEY code — which is              why matching on the UNIQUE code alone would misfile it: {duplicate_pk:?}"
+        );
+        assert!(
+            duplicate_unique.0,
+            "so is a duplicate unique index: {duplicate_unique:?}"
+        );
+
+        assert!(
+            !not_null.0,
+            "a missing NOT NULL column is a broken statement: {not_null:?}"
+        );
+        assert!(!check.0, "so is a failed CHECK: {check:?}");
+        assert!(
+            !no_column.0,
+            "and a column that does not exist: {no_column:?}"
+        );
+    }
+
+    /// The narrow guard the cost window and the run waiter actually depend
+    /// on is enforced, and is not the same constraint as the card's slot.
+    ///
+    /// `idx_issue_runs_live` is what stops a *card* holding two live runs;
+    /// `idx_issue_runs_live_agent` is what stops one *agent* holding two on
+    /// one card. The second is what makes `RUN_COST_WINDOW` and `is_our_run`
+    /// unambiguous — both key on the session, and one session is shared by
+    /// every run an agent makes on a card (`runs::session_run_to_continue`),
+    /// so two live runs of one agent would double-bill the card and settle
+    /// each other's rows.
+    ///
+    /// The wide index subsumes the narrow one today, so the narrow one can
+    /// only be *observed* with the wide one out of the way — which is also
+    /// exactly the future it is written down for. Dropping it here is the
+    /// test standing in for that change: widen the card's slot and this must
+    /// still refuse. A runtime check could not stand in for it, because it
+    /// could never fire while the wider index refuses first.
+    #[tokio::test]
+    async fn one_agent_may_hold_only_one_live_run_on_a_card() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pool = SqlitePool::open(dir.path().join("t.db"))
+            .await
+            .expect("open");
+        pool.interact_write("test.init_db", init_db)
+            .await
+            .expect("schema");
+
+        async fn run(
+            pool: &SqlitePool,
+            id: &'static str,
+            agent: &'static str,
+            settled: Option<i64>,
+        ) -> Result<usize, StorageError> {
+            pool.interact_write("test.insert_run", move |conn| {
+                Ok(conn.execute(
+                    "INSERT INTO issue_runs (id, issue_id, project_id, number, agent_id, \
+                     trigger, status, attempt, created_at, settled_at) \
+                     VALUES (?1, 'i-1', 'p-1', 1, ?2, 'comment', 'queued', 1, 1, ?3)",
+                    rusqlite::params![id, agent, settled],
+                )?)
+            })
+            .await
+        }
+
+        // As shipped, the card's own slot is what refuses — whoever asks.
+        run(&pool, "run-1", "agent-1", None).await.expect("first");
+        run(&pool, "run-2", "agent-2", None)
+            .await
+            .expect_err("one card, one live run");
+
+        // Now widen the card's slot, which is the change this index exists
+        // to survive, and the per-agent guard must still hold.
+        pool.interact_write("test.widen", |conn| {
+            Ok(conn.execute_batch("DROP INDEX idx_issue_runs_live;")?)
+        })
+        .await
+        .expect("drop the wide index");
+
+        run(&pool, "run-3", "agent-2", None)
+            .await
+            .expect("a second agent may now hold a run on the card");
+        run(&pool, "run-4", "agent-1", None)
+            .await
+            .expect_err("but one agent still may not hold two on it");
+        // Settled rows sit outside the partial index entirely, so a card's
+        // history stays unbounded: the guard is on what is *unfinished*.
+        run(&pool, "run-5", "agent-1", Some(2))
+            .await
+            .expect("a settled row is not in the index at all");
+    }
+
     /// The one path that opens a connection after `build` — the replacement
     /// branch in [`PoolInner::take`] — exists solely to recover from a
     /// panicking closure, and must stay unreached in ordinary service.
@@ -1497,7 +2313,7 @@ mod tests {
             let pool = pool.clone();
             tasks.push(tokio::spawn(async move {
                 let name = format!("k{w}");
-                pool.interact("test.after_panic", move |conn| {
+                pool.interact_write("test.after_panic", move |conn| {
                     conn.execute(
                         "INSERT INTO secrets (name, encrypted_value) VALUES (?1, x'01')",
                         rusqlite::params![name],
@@ -1529,7 +2345,7 @@ mod tests {
         let path = dir.path().join("t.db");
         let pool = SqlitePool::open(&path).await.expect("open");
         // Force a WAL write so the sidecars exist for the assertion below.
-        pool.interact("test.write", |conn| {
+        pool.interact_write("test.write", |conn| {
             Ok(conn.execute(
                 "INSERT INTO secrets (name, encrypted_value) VALUES ('k', x'00')",
                 [],
@@ -1588,7 +2404,7 @@ mod tests {
             definition: "TEXT NOT NULL DEFAULT 'seed'",
         };
 
-        pool.interact("test.migrate", move |conn| {
+        pool.interact_write("test.migrate", move |conn| {
             conn.execute("CREATE TABLE legacy (id INTEGER PRIMARY KEY)", [])?;
             conn.execute("INSERT INTO legacy (id) VALUES (1)", [])?;
 
@@ -1616,6 +2432,153 @@ mod tests {
         .expect("migration interact");
     }
 
+    #[tokio::test]
+    async fn a_pre_team_database_migrates_and_gains_the_handle_index_and_trigger() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("legacy.db");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("open raw");
+            conn.execute_batch(
+                "CREATE TABLE agent_profiles (
+                     id             TEXT PRIMARY KEY,
+                     description    TEXT NOT NULL,
+                     avatar_blob_id TEXT,
+                     framework      TEXT NOT NULL,
+                     llm            TEXT,
+                     builtin        INTEGER NOT NULL DEFAULT 0,
+                     created_at     INTEGER NOT NULL,
+                     updated_at     INTEGER NOT NULL
+                 );
+                 INSERT INTO agent_profiles
+                     (id, description, framework, created_at, updated_at)
+                     VALUES ('01JOLD', 'a persona from before', 'baybo', 1, 1);",
+            )
+            .expect("seed the pre-migration shape");
+        }
+
+        let pool = SqlitePool::open(&path).await.expect("open must migrate");
+        pool.interact("test.assert_migrated", |conn| {
+            let indexed: i64 = conn.query_row(
+                "SELECT count(*) FROM sqlite_master \
+                 WHERE type = 'index' AND name = 'idx_agent_profiles_handle'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(indexed, 1, "the handle index must exist after migration");
+            // Both statements name columns the ALTER loop adds, so both have
+            // to be created after it — a DB that migrated without the trigger
+            // would enforce nothing and say nothing.
+            let triggered: i64 = conn.query_row(
+                "SELECT count(*) FROM sqlite_master \
+                 WHERE type = 'trigger' AND name = 'agent_profiles_team_is_insert_only'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(triggered, 1, "the membership trigger must exist too");
+            let (project_id, handle): (Option<String>, Option<String>) = conn.query_row(
+                "SELECT project_id, handle FROM agent_profiles WHERE id = '01JOLD'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            assert_eq!((project_id, handle), (None, None));
+            // The other two levels of the LLM pin arrived by ALTER as well,
+            // reading NULL — an agent configured before they existed inherits
+            // the entry's own model and rung. Every read selects them by
+            // name, so a missing ALTER is not a degraded profile, it is every
+            // profile read failing.
+            let (model, effort): (Option<String>, Option<String>) = conn.query_row(
+                "SELECT llm_model, llm_effort FROM agent_profiles WHERE id = '01JOLD'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            assert_eq!((model, effort), (None, None));
+            Ok(())
+        })
+        .await
+        .expect("assert interact");
+    }
+
+    /// `sessions.project_id` is GENERATED, which puts it on the one pragma
+    /// that reports generated columns: `table_xinfo` sees it, `table_info`
+    /// does not. `has_column` reads `table_xinfo` — read the other and the
+    /// ALTER is re-attempted on every boot and trips `duplicate column
+    /// name`, so the second start of an upgraded install fails, not the
+    /// first. Being VIRTUAL, it also has to read rows written long before
+    /// it existed with no backfill.
+    #[tokio::test]
+    async fn a_pre_board_database_gains_the_generated_project_column_and_reopens() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("legacy.db");
+        // The pre-change shape is this schema minus the one column, taken by
+        // dropping it rather than by hand-copying the CREATE TABLE — a copy
+        // rots the moment any other column moves, and would then be testing
+        // a database no install ever had.
+        {
+            SqlitePool::open(&path).await.expect("build current");
+            let conn = rusqlite::Connection::open(&path).expect("open raw");
+            conn.execute_batch(
+                "DROP INDEX IF EXISTS idx_sessions_project;
+                 ALTER TABLE sessions DROP COLUMN project_id;
+                 INSERT INTO sessions
+                     (id, root_session_id, trigger_kind, created_at, last_active, data)
+                 VALUES
+                     ('s-board', 's-board', 'issue', 1, 1,
+                      '{\"trigger\":{\"kind\":\"issue\",\"project_id\":\"01JBOARD\"}}'),
+                     ('s-chat', 's-chat', 'user', 1, 1,
+                      '{\"trigger\":{\"kind\":\"user\"}}');",
+            )
+            .expect("seed the pre-board shape");
+            let gone: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM pragma_table_xinfo('sessions') WHERE name = 'project_id'",
+                    [],
+                    |r| r.get(0),
+                )
+                .expect("probe");
+            assert_eq!(gone, 0, "the fixture must actually predate the column");
+        }
+
+        for _ in 0..3 {
+            SqlitePool::open(&path).await.expect("reopen must migrate");
+        }
+
+        let pool = SqlitePool::open(&path).await.expect("open must migrate");
+        pool.interact("test.assert_project_column", |conn| {
+            let declared: i64 = conn.query_row(
+                "SELECT count(*) FROM pragma_table_xinfo('sessions') WHERE name = 'project_id'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(declared, 1, "added exactly once across repeated boots");
+            let indexed: i64 = conn.query_row(
+                "SELECT count(*) FROM sqlite_master \
+                 WHERE type = 'index' AND name = 'idx_sessions_project'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(indexed, 1, "and its index is created after the ALTER");
+            let board: Option<String> = conn.query_row(
+                "SELECT project_id FROM sessions WHERE id = 's-board'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(
+                board.as_deref(),
+                Some("01JBOARD"),
+                "a row written before the column reads its board with no backfill"
+            );
+            let chat: Option<String> = conn.query_row(
+                "SELECT project_id FROM sessions WHERE id = 's-chat'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(chat, None, "ordinary chat belongs to no board");
+            Ok(())
+        })
+        .await
+        .expect("assert interact");
+    }
+
     /// A migration naming a missing table is a programming error in
     /// [`ADD_COLUMNS`], not a benign already-applied case, and must surface as
     /// one.
@@ -1633,7 +2596,7 @@ mod tests {
         };
 
         let err = pool
-            .interact("test.migrate", move |conn| {
+            .interact_write("test.migrate", move |conn| {
                 migration
                     .apply(conn)
                     .map_err(|e| StorageError::Storage(e.to_string()))?;
@@ -1661,7 +2624,7 @@ mod tests {
 
         let plaintext = "b7f3c1d9e2a48605f1c3d7b9e0a2f4c68d1b3e5a7c9f0b2d4e6a8c0f2b4d6e81";
         let seed = plaintext.to_string();
-        pool.interact("test.seed", move |conn| {
+        pool.interact_write("test.seed", move |conn| {
             conn.execute(
                 "INSERT INTO devices
                    (device_id, device_pubkey, auth_token, status, created_at, approved_at)
@@ -1696,7 +2659,7 @@ mod tests {
         let b = SqlitePool::open(dir_b.path().join("test.db"))
             .await
             .expect("open b");
-        a.interact("test.write", |conn| {
+        a.interact_write("test.write", |conn| {
             conn.execute(
                 "INSERT INTO secrets (name, encrypted_value) VALUES ('k', x'01')",
                 [],

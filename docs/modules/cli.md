@@ -166,7 +166,7 @@ baybo prompt`); an argument *plus* piped stdin are concatenated. Lives in
 dispatch (same as `tui`).
 
 **Hybrid runtime, keyed off the singleton lock.** A running gateway holds
-the `<workspace>/state/baybo.lock` flock for its lifetime (`crates/baybo/src/singleton.rs`),
+the `<workspace>/state/baybo.lock` flock for its lifetime (`crates/workspace/src/singleton.rs`),
 so `prompt` uses lock acquisition as a gateway-presence probe:
 
 - **Lock held** (a gateway is up) → connect over the same `/v1/channel-ws`

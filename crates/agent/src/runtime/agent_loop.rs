@@ -421,6 +421,10 @@ fn memory_recall_query(input: &TurnInput) -> Option<Vec<ContentBlock>> {
     match input {
         TurnInput::UserChat { content } => Some(content.clone()),
         TurnInput::Cron { action_payload } => Some(cron_prompt_blocks(action_payload)),
+        // An issue run recalls: the brief is the assignee's instruction,
+        // and prior work on the same repository is exactly the context
+        // that keeps a second run from repeating the first.
+        TurnInput::IssueRun { brief, .. } => Some(brief.clone()),
         TurnInput::Compact
         | TurnInput::Spawned { .. }
         | TurnInput::SubagentNotification { .. }
@@ -462,6 +466,7 @@ fn is_subagent(session: &Session) -> bool {
 fn should_fire_session_end(session: &Session) -> bool {
     let user_trigger = match &session.trigger {
         TriggerSource::User | TriggerSource::Cron { .. } => true,
+        TriggerSource::Issue { .. } => false,
     };
     user_trigger && !is_subagent(session)
 }
@@ -933,7 +938,7 @@ impl AgentLoop {
         let is_user_turn = matches!(turn_kind, TurnInputKind::UserChat);
         let background_eligible =
             crate::runtime::background_jobs::background_eligible(session, turn_kind);
-        self.context_manager.ensure_seeded().await;
+        self.context_manager.ensure_seeded().await?;
         // Churn is a within-turn property. Editing a file back to how it was
         // is exactly what "undo that" means when the user asks between turns.
         self.progress_ledger.clear();
@@ -961,14 +966,14 @@ impl AgentLoop {
         // Expand an explicit `/command` skill invocation before the loop:
         // context reads the matching skill's body and appends it (persisted +
         // JSONL-logged) as a hidden agent-context row for the loop to act on.
-        self.context_manager.expand_slash_command().await;
+        self.context_manager.expand_slash_command().await?;
 
         // Recall relevant long-term memories for the triggering input and
         // inject them (framed) before the first LLM call. No-op without a
         // memory impl or for ineligible turn kinds (`memory_query` is `None`).
         if let Some(query) = memory_query.as_deref() {
             self.recall_and_inject(query, session, span_recorder, turn_id, &cancel_token)
-                .await;
+                .await?;
         }
         // Accumulates this turn's user-authored input (initial prompt + any
         // mid-turn interjections) for the `on_turn_complete` write at turn end.
@@ -1035,7 +1040,7 @@ impl AgentLoop {
                 // so the user can steer an in-progress turn. Messages that don't
                 // make a boundary fall through to the next turn. See
                 // docs/mid-turn-user-interjection.md.
-                let drained = self.drain_user_interjections(&mut interjections).await;
+                let drained = self.drain_user_interjections(&mut interjections).await?;
                 // Recall against each freshly-drained interjection so the next
                 // LLM call also sees memory relevant to the steering message,
                 // and fold it into this turn's input for the end-of-turn write.
@@ -1048,7 +1053,7 @@ impl AgentLoop {
                             turn_id,
                             &cancel_token,
                         )
-                        .await;
+                        .await?;
                         turn_user_input.extend(content.iter().cloned());
                     }
                 }
@@ -1069,11 +1074,11 @@ impl AgentLoop {
             // source file unless something actually changed. Before the
             // compression gate for the same reason the checklist above is: the
             // delta rides this request, so the gate has to see its tokens.
-            self.context_manager.reconcile_system_prompt().await;
+            self.context_manager.reconcile_system_prompt().await?;
             // Same contract for the skill listing, which has its own baseline
             // row and its own envelope: a render of this session's invocable
             // set unless the registry actually moved under it.
-            self.context_manager.reconcile_skills().await;
+            self.context_manager.reconcile_skills().await?;
 
             // Proactive compression before building the ChatRequest.
             self.compress_if_needed(
@@ -1194,6 +1199,22 @@ impl AgentLoop {
         ))
     }
 
+    /// Persist cancellation-safe partial blocks, excluding dangling tool uses.
+    async fn persist_cancelled_partial(&mut self, e: anyhow::Error) -> anyhow::Error {
+        if let Some(cancelled) = e.downcast_ref::<CancelledTurn>()
+            && !cancelled.partial.is_empty()
+            && let Err(append_error) = self
+                .context_manager
+                .append(&ChatMessage::assistant(cancelled.partial.clone()))
+                .await
+        {
+            return e.context(format!(
+                "failed to persist cancellation-safe partial response: {append_error}"
+            ));
+        }
+        e
+    }
+
     /// One iteration of the agentic loop, scoped to a single
     /// `LlmIteration` step (opened by [`crate::runtime::scope::with_step`] in
     /// the caller). Calls the LLM, then executes the response's tool
@@ -1228,22 +1249,7 @@ impl AgentLoop {
             .await
         {
             Ok(pair) => pair,
-            Err(e) => {
-                // Cancelled mid-call: persist any partial assistant content
-                // the stream produced before the abort, so the cancelled
-                // turn's work block survives a page reload (reconstruction
-                // reads it back from `session_messages`). Only text + thinking
-                // are salvaged — never a dangling tool_use — so the row is a
-                // valid standalone assistant turn for the next request.
-                if let Some(cancelled) = e.downcast_ref::<CancelledTurn>()
-                    && !cancelled.partial.is_empty()
-                {
-                    self.context_manager
-                        .append(&ChatMessage::assistant(cancelled.partial.clone()))
-                        .await;
-                }
-                return Err(e);
-            }
+            Err(e) => return Err(self.persist_cancelled_partial(e).await),
         };
         // The observation has now ridden a request, so retire it. Leaving it
         // mounted would re-raise, on every later iteration, an objection the
@@ -1277,7 +1283,7 @@ impl AgentLoop {
             // persisted assistant row. Capture the persisted ordinal so the
             // channel adapter can stamp the live `Frame::Message`.
             let assistant_msg = ChatMessage::assistant(response_blocks.clone());
-            let ordinal = self.context_manager.append(&assistant_msg).await;
+            let ordinal = self.context_manager.append(&assistant_msg).await?;
 
             return Ok(IterationOutcome::Final {
                 outgoing: OutgoingMessage {
@@ -1287,9 +1293,19 @@ impl AgentLoop {
                     content: response_blocks,
                     reply_to: None,
                     metadata: Default::default(),
-                    ordinal,
+                    ordinal: Some(ordinal),
                 },
             });
+        }
+
+        // Bail before persisting tool-use ids, but let an already-finished answer win.
+        if cancel_token.is_cancelled() {
+            let cancelled = CancelledTurn {
+                partial: salvage_partial_blocks(&response),
+            };
+            return Err(self
+                .persist_cancelled_partial(anyhow::Error::new(cancelled))
+                .await);
         }
 
         // Append assistant message including thinking and tool-call
@@ -1314,7 +1330,7 @@ impl AgentLoop {
             });
         }
         let assistant_msg = ChatMessage::assistant(assistant_blocks);
-        self.context_manager.append(&assistant_msg).await;
+        self.context_manager.append(&assistant_msg).await?;
 
         // Surface each tool call as a live progress line before dispatch
         // (streaming turns only; cron passes `delta_tx = None`).
@@ -1374,6 +1390,16 @@ impl AgentLoop {
         // can't authorize each other: the read stays staged until the next
         // response boundary (by when the model has actually seen its result).
         self.read_tracker.begin_response();
+        // A file the system prompt carries verbatim is one the model has
+        // already been handed — MEMORY.md, IDENTITY.md, SOUL.md. Committed
+        // rather than staged: `messages[0]` was in front of it before it said
+        // anything. `ContextManager` lists only files still holding the bytes
+        // the prompt carried, so one rewritten since (a dream pass in another
+        // session) is absent and its edit is still stopped.
+        for (path, fingerprint) in self.context_manager.take_prompt_anchors() {
+            self.read_tracker
+                .record_prompt_delivered(&path, fingerprint);
+        }
         let read_tracker_for_calls = self.read_tracker.clone();
         let notify_silence_for_calls = notify_silence.clone();
         let concurrency_limiter = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TOOL_CALLS));
@@ -1441,12 +1467,52 @@ impl AgentLoop {
                     .await
             }
         });
-        let tool_results = futures::future::join_all(exec_futures).await;
+        // Race cancellation so tools that ignore the token cannot delay `/stop`.
+        // Drain ready results first; dropping the remaining futures cancels them.
+        let mut tool_results: Vec<Option<ExecutedTool>> = std::iter::repeat_with(|| None)
+            .take(response.tool_calls.len())
+            .collect();
+        let mut pending = futures::stream::FuturesUnordered::new();
+        for (idx, fut) in exec_futures.enumerate() {
+            pending.push(async move { (idx, fut.await) });
+        }
+        let cancelled_mid_batch = loop {
+            tokio::select! {
+                biased;
+                next = futures::StreamExt::next(&mut pending) => match next {
+                    Some((idx, executed)) => tool_results[idx] = Some(executed),
+                    None => break false,
+                },
+                _ = cancel_token.cancelled() => break true,
+            }
+        };
+        drop(pending);
 
         // Sequential post-processing: append results in `tool_calls`
         // order so context state stays byte-stable across calls.
         let mut llm_visible_images: Vec<ContentBlock> = Vec::new();
         for (tool_call, executed) in response.tool_calls.iter().zip(tool_results) {
+            // Every persisted tool use needs a result in the live context window.
+            let Some(executed) = executed else {
+                self.emit_tool_completed(
+                    delta_tx,
+                    session,
+                    tool_call.id.clone(),
+                    ToolStatus::Error,
+                    "cancelled".to_string(),
+                    None,
+                )
+                .await;
+                let wrapped = baybo_model::wrap_tool_output(
+                    &tool_call.name,
+                    baybo_context::prompts::cancelled_turn::TOOL_RESULT_BODY,
+                    &[],
+                );
+                let tool_msg =
+                    ChatMessage::tool_result_with_meta(tool_call.id.clone(), wrapped, None);
+                self.context_manager.append(&tool_msg).await?;
+                continue;
+            };
             let (status, raw_summary) = tool_completion_summary(&executed);
             let call_approval = executed.approval;
             self.emit_tool_completed(
@@ -1601,7 +1667,7 @@ impl AgentLoop {
                 approval: call_approval,
             });
             let tool_msg = ChatMessage::tool_result_with_meta(tool_call.id.clone(), wrapped, meta);
-            self.context_manager.append(&tool_msg).await;
+            self.context_manager.append(&tool_msg).await?;
         }
 
         // Images a tool returned for the model (`MultiModalText`, e.g. a
@@ -1619,11 +1685,16 @@ impl AgentLoop {
             content.append(&mut llm_visible_images);
             self.context_manager
                 .append(&ChatMessage::agent_context(content))
-                .await;
+                .await?;
         }
 
-        // Flush accumulated approvals back into session state.
+        // Completed calls keep their approval grants even when the batch is cancelled.
         session.state.approved_resources = approved.lock().clone();
+
+        // `with_step` maps this unwind to the turn's cancellation outcome.
+        if cancelled_mid_batch {
+            return Err(anyhow::anyhow!("turn cancelled during tool execution"));
+        }
 
         let task_mutated = response
             .tool_calls
@@ -1754,20 +1825,7 @@ impl AgentLoop {
     ) -> anyhow::Result<(LlmResponse, baybo_model::SpanId)> {
         let model_info = self.llm_client.model_info();
 
-        // Filtered by the session's channel (owner-only deck tools) and its
-        // trigger (`report_nothing`, visible only in a recurring cron fire).
-        // Both are session-stable, so the list stays byte-identical across this
-        // session's calls and prompt caching holds.
-        let tool_defs: Vec<ToolDefinitionForLlm> = self
-            .tool_registry
-            .tool_definitions_for_session(&session.channel, &session.trigger)
-            .into_iter()
-            .map(|td| ToolDefinitionForLlm {
-                name: td.name,
-                description: td.description,
-                parameters_schema: td.parameters_schema,
-            })
-            .collect();
+        let tool_defs = self.session_tool_defs(session);
 
         // Mirrored off the wire list rather than re-read from the registry:
         // the trace has to record what this request actually carried, and a
@@ -1796,6 +1854,7 @@ impl AgentLoop {
             temperature: None,
             tools: tool_defs,
             reasoning_effort: self.initial_effort.clone(),
+            ..Default::default()
         };
 
         let reasoning_effort = self
@@ -1805,10 +1864,11 @@ impl AgentLoop {
         let input_messages = self.context_manager.build_call_input_marker().await;
 
         // What the model was allowed to call, recorded beside what it was
-        // shown. Stored content-addressed, so a session-stable list costs
-        // one row rather than one copy per call. A failure to persist it
-        // must not fail the turn — the span keeps everything else and the
-        // detail panel simply has no tool list for that call.
+        // shown. Stored content-addressed, so a list that does not change
+        // costs one row rather than one copy per call — and when it does
+        // change mid-session, the new hash is the record of it. A failure
+        // to persist it must not fail the turn — the span keeps everything
+        // else and the detail panel simply has no tool list for that call.
         let tools = match span_recorder.record_tool_set(trace_tool_defs).await {
             Ok(reference) => Some(reference),
             Err(e) => {
@@ -1992,13 +2052,13 @@ impl AgentLoop {
     async fn drain_user_interjections(
         &mut self,
         src: &mut Option<&mut dyn InterjectionSource>,
-    ) -> Vec<Vec<ContentBlock>> {
+    ) -> anyhow::Result<Vec<Vec<ContentBlock>>> {
         let Some(src) = src.as_deref_mut() else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let drained = src.drain_injectable();
         if drained.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let count = drained.len();
         let mut content = Vec::with_capacity(count);
@@ -2009,14 +2069,14 @@ impl AgentLoop {
                     input.content.clone(),
                     input.platform_msg_id,
                 )
-                .await;
+                .await?;
             content.push(input.content);
         }
         info!(
             interjections = count,
             "injected mid-turn user interjection(s) before the next LLM call"
         );
-        content
+        Ok(content)
     }
 
     /// Recall memories relevant to `query` and inject each as a framed
@@ -2032,20 +2092,20 @@ impl AgentLoop {
         span_recorder: &Arc<SpanRecorder>,
         turn_id: TurnId,
         cancel_token: &CancellationToken,
-    ) {
+    ) -> anyhow::Result<()> {
         // A prompt-less trigger (e.g. a tool-only cron fire whose payload has no
         // `prompt`) yields an empty query — skip recall so a real backend never
         // opens a `MemoryRecall` step or embeds the empty string.
         if query.is_empty() {
-            return;
+            return Ok(());
         }
         // If cancellation already tripped before we even called the backend,
         // there's no turn to enrich — skip without opening a step or billing.
         if cancel_token.is_cancelled() {
-            return;
+            return Ok(());
         }
         let Some(memory) = self.memory.clone() else {
-            return;
+            return Ok(());
         };
         let user_id = session.user.id.clone();
         let session_id = session.id.clone();
@@ -2079,7 +2139,7 @@ impl AgentLoop {
             Ok(mems) => mems,
             Err(e) => {
                 warn!(error = %e, "memory recall failed; continuing without recalled context");
-                return;
+                return Ok(());
             }
         };
         // Re-check: cancellation may have tripped while `memory.recall` was
@@ -2087,7 +2147,7 @@ impl AgentLoop {
         // abort — the next iteration-boundary cancel check would return Err
         // immediately and leave dangling memory rows on the transcript.
         if cancel_token.is_cancelled() {
-            return;
+            return Ok(());
         }
         // Belt-and-braces dedup: the `Memory` trait says per-session
         // de-duplication is the impl's turn, but mem0 / openviking don't do
@@ -2121,8 +2181,9 @@ impl AgentLoop {
             }
             self.context_manager
                 .append_recalled_memory(vec![ContentBlock::Text(mem.content)])
-                .await;
+                .await?;
         }
+        Ok(())
     }
 
     /// Fire-and-forget the [`Memory::on_session_end`] consolidation write at
@@ -2279,9 +2340,9 @@ impl AgentLoop {
         // appends; seed the system prompt first so it never lands *after*
         // user content. `ensure_seeded` keys off `messages[0]`, so a leading
         // user row would otherwise make every later turn re-seed.
-        self.context_manager.ensure_seeded().await;
+        self.context_manager.ensure_seeded().await?;
         let msg = ChatMessage::user(content).with_platform_msg_id(platform_msg_id);
-        self.context_manager.append(&msg).await;
+        self.context_manager.append(&msg).await?;
         Ok(())
     }
 
@@ -2291,17 +2352,37 @@ impl AgentLoop {
     /// user message; `MessageSource::Cron` lets the operator inbox find the
     /// row. Seeds the system prompt first so a fresh cron session never lands
     /// the fire ahead of `messages[0]`.
+    /// Append a board issue's brief as the run's input row.
+    /// Append the card a run was handed. `files` are the card's own
+    /// attachments, already resolved into blocks: they follow the framed
+    /// prose rather than being wrapped by it, so the framing's contract —
+    /// that the instruction is the tail of the *text* — still holds with a
+    /// picture in the message.
+    pub async fn append_issue_brief(
+        &mut self,
+        number: i64,
+        checkout: &str,
+        brief: &str,
+        files: &[baybo_model::MediaBlock],
+    ) -> anyhow::Result<()> {
+        self.context_manager.ensure_seeded().await?;
+        let framed = baybo_context::prompts::issue::frame_issue_brief(number, checkout, brief);
+        let msg = ChatMessage::issue_brief(baybo_model::prose_with_media(framed, files));
+        self.context_manager.append(&msg).await?;
+        Ok(())
+    }
+
     pub async fn append_cron_fire(
         &mut self,
         turn_id: &str,
         prompt: &str,
         context: Option<&str>,
     ) -> anyhow::Result<()> {
-        self.context_manager.ensure_seeded().await;
+        self.context_manager.ensure_seeded().await?;
         let framed =
             baybo_context::prompts::cron::frame_cron_prompt_with_context(turn_id, prompt, context);
         let msg = ChatMessage::cron_fire(vec![ContentBlock::Text(framed)]);
-        self.context_manager.append(&msg).await;
+        self.context_manager.append(&msg).await?;
         Ok(())
     }
 
@@ -2318,26 +2399,22 @@ impl AgentLoop {
     /// assistant already reported. Seeds the system prompt first — the
     /// notification can be the first thing an otherwise-cold session appends.
     ///
-    /// `None` when the session runs with no durable store (tests); the caller
-    /// then has no ordinal to push or to record on the turn.
     pub async fn append_cron_notification(
         &mut self,
         content: Vec<ContentBlock>,
         source_event_id: Option<&str>,
-    ) -> Option<baybo_session::SessionMessageAppendOutcome> {
-        self.context_manager.ensure_seeded().await;
+    ) -> anyhow::Result<baybo_session::SessionMessageAppendOutcome> {
+        self.context_manager.ensure_seeded().await?;
         let message = ChatMessage::cron_notification(content);
         match source_event_id {
-            Some(source_event_id) => {
-                self.context_manager
-                    .append_idempotent(source_event_id, &message)
-                    .await
-            }
-            None => self
+            Some(source_event_id) => Ok(self
                 .context_manager
-                .append(&message)
-                .await
-                .map(|ordinal| baybo_session::SessionMessageAppendOutcome::Inserted { ordinal }),
+                .append_idempotent(source_event_id, &message)
+                .await?),
+            None => {
+                let ordinal = self.context_manager.append(&message).await?;
+                Ok(baybo_session::SessionMessageAppendOutcome::Inserted { ordinal })
+            }
         }
     }
 
@@ -2348,9 +2425,9 @@ impl AgentLoop {
         &mut self,
         content: Vec<ContentBlock>,
     ) -> anyhow::Result<()> {
-        self.context_manager.ensure_seeded().await;
+        self.context_manager.ensure_seeded().await?;
         let msg = ChatMessage::subagent_seed(content);
-        self.context_manager.append(&msg).await;
+        self.context_manager.append(&msg).await?;
         Ok(())
     }
 
@@ -2361,11 +2438,12 @@ impl AgentLoop {
         &mut self,
         content: Vec<ContentBlock>,
         source_event_id: &str,
-    ) -> Option<baybo_session::SessionMessageAppendOutcome> {
-        self.context_manager.ensure_seeded().await;
-        self.context_manager
+    ) -> anyhow::Result<baybo_session::SessionMessageAppendOutcome> {
+        self.context_manager.ensure_seeded().await?;
+        Ok(self
+            .context_manager
             .append_idempotent(source_event_id, &ChatMessage::agent_context(content))
-            .await
+            .await?)
     }
 
     /// Arm or clear the request-time background-notification retry cue. Applied
@@ -2768,6 +2846,7 @@ impl AgentLoop {
             CompressionTrigger::Threshold,
         );
         let model_id = runner.model_info.id.clone();
+        let tool_defs = self.session_tool_defs(session);
         // `needs_compression` mirrors `maybe_compress`'s gate, so we only
         // report the phase when a pass will actually run.
         let compacting = self.context_manager.needs_compression(&model_id);
@@ -2777,7 +2856,7 @@ impl AgentLoop {
         }
         let result = self
             .context_manager
-            .maybe_compress(&model_id, |req, marker| async move {
+            .maybe_compress(&model_id, tool_defs, |req, marker| async move {
                 runner.run(req, marker).await
             })
             .await;
@@ -2839,6 +2918,30 @@ impl AgentLoop {
                 },
             })
             .await;
+    }
+
+    /// Build the tool list shared by normal, compaction and observer requests
+    /// so their cached prefixes agree.
+    ///
+    /// Rebuilt per call, and *usually* identical: the channel, trigger and
+    /// allowlist it filters on are all fixed for the session. The set they
+    /// filter is not — see
+    /// [`ToolRegistry::tool_definitions_for_session`] for what changes it
+    /// underneath a live session, and what that costs.
+    fn session_tool_defs(&self, session: &Session) -> Vec<ToolDefinitionForLlm> {
+        self.tool_registry
+            .tool_definitions_for_session(
+                &session.channel,
+                &session.trigger,
+                session.state.tool_allowlist.as_deref(),
+            )
+            .into_iter()
+            .map(|td| ToolDefinitionForLlm {
+                name: td.name,
+                description: td.description,
+                parameters_schema: td.parameters_schema,
+            })
+            .collect()
     }
 
     fn build_compression_runner(
@@ -2932,13 +3035,8 @@ impl AgentLoop {
             return;
         }
 
-        // Reuse the main call's prefix (cache hit) + a summarize turn that
-        // also carries the lines already shown this turn so the model
-        // advances instead of repeating. The prior lines + instruction are
-        // the appended suffix — `messages_for_llm()` (the cached prefix) is
-        // untouched. No tools, so the observer only narrates. Clone the
-        // snapshot NOW, synchronously at the boundary, so the detached task
-        // owns a coherent frozen copy and never reads live context.
+        // Snapshot the cached prefix and observer suffix before spawning so the
+        // detached task never reads live context.
         let mut messages = self.context_manager.messages_for_llm();
         let prompt_msg = ChatMessage::user(vec![ContentBlock::Text(build_observer_prompt(
             &observer_state.sent_notices,
@@ -2955,8 +3053,11 @@ impl AgentLoop {
         let request = ChatRequest {
             messages,
             temperature: None,
-            tools: Vec::new(),
-            reasoning_effort: self.initial_effort.clone(),
+            // Preserve the cached tool prefix while keeping the observer read-only.
+            tools: self.session_tool_defs(session),
+            tool_choice: baybo_llm::ToolChoice::None,
+            reasoning_effort: Some(baybo_llm::effort::OUT_OF_BAND_EFFORT.as_str().to_string()),
+            ..Default::default()
         };
 
         // Throttle on attempt, not just success — a failing or empty call
@@ -3088,9 +3189,10 @@ impl AgentLoop {
                     CompressionTrigger::Forced,
                 );
                 let model_id = runner.model_info.id.clone();
+                let tool_defs = self.session_tool_defs(session);
                 let outcome = self
                     .context_manager
-                    .force_compress(&model_id, |req, marker| async move {
+                    .force_compress(&model_id, tool_defs, |req, marker| async move {
                         runner.run(req, marker).await
                     })
                     .await?;
@@ -3726,8 +3828,8 @@ mod session_end_gate_tests {
     //! predicate that gates the background-summary pass (subagents skip it).
     use super::{is_subagent, should_fire_session_end};
     use baybo_model::{
-        ChannelType, Lineage, LineageKind, Session, SessionId, SessionState, TriggerSource, TurnId,
-        User,
+        ChannelType, IssueId, Lineage, LineageKind, ProjectId, Session, SessionId, SessionState,
+        TriggerSource, TurnId, User,
     };
     use chrono::Utc;
 
@@ -3772,10 +3874,24 @@ mod session_end_gate_tests {
                 origin_session_id: None,
                 conversation: true,
                 job_title: None,
+                project_id: None,
             },
             None,
         );
         assert!(should_fire_session_end(&s));
+    }
+
+    #[test]
+    fn skips_issue_run_session() {
+        let s = session_with(
+            TriggerSource::Issue {
+                project_id: ProjectId::generate(),
+                issue_id: IssueId::generate(),
+                number: 1,
+            },
+            None,
+        );
+        assert!(!should_fire_session_end(&s));
     }
 
     #[test]

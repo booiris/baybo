@@ -3,6 +3,7 @@ import { describe, it, expect } from 'vitest';
 import {
   applySyncMerge,
   applyTurnState,
+  openLiveTail,
   routeInboundFrame,
   transcriptItemToRow,
   type SessionView,
@@ -537,5 +538,50 @@ describe('multi-tab turn sync via routeInboundFrame', () => {
         },
       ],
     });
+  });
+});
+
+describe('openLiveTail', () => {
+  // The board's run panel reads its liveness from the run ledger rather than
+  // from a socket, so it is the one reader that can re-open a block a REST
+  // page reconstructed collapsed. Everything here is about not over-reaching.
+  const say = (key: string, role: 'user' | 'assistant'): TranscriptRow => ({
+    key,
+    role,
+    text: key,
+  });
+
+  it('re-opens the block of the turn that is still going', () => {
+    const rows = [say('m1', 'user'), workRow({ startedAt: 100, active: false, endedAt: 140 })];
+    const open = openLiveTail(rows, 100);
+    expect(open[1].workActive).toBe(true);
+    expect(open[1].workStartedAt).toBe(100);
+    expect(open[1].workEndedAt).toBeUndefined();
+  });
+
+  it('reaches past the answer and notices the turn left below its block', () => {
+    const rows = [
+      workRow({ startedAt: 100, active: false, endedAt: 140 }),
+      say('m2', 'assistant'),
+    ];
+    expect(openLiveTail(rows, 100)[0].workActive).toBe(true);
+  });
+
+  it('leaves a block that predates the live work exactly as it was', () => {
+    // A session hosts every run one agent made on a card, so the first
+    // seconds of a new run still show the last one's finished block —
+    // lighting that one as Working is the phantom this guards.
+    const rows = [workRow({ startedAt: 100, active: false, endedAt: 140 })];
+    expect(openLiveTail(rows, 500)).toBe(rows);
+  });
+
+  it('opens nothing when the tail is not a block at all', () => {
+    const rows = [say('m1', 'user')];
+    expect(openLiveTail(rows, 0)).toBe(rows);
+  });
+
+  it('never fabricates a start for a block that has none', () => {
+    const rows: TranscriptRow[] = [{ key: 'w1', role: 'system', text: '', kind: 'work' }];
+    expect(openLiveTail(rows, 0)).toBe(rows);
   });
 });

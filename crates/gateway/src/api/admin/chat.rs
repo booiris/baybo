@@ -49,8 +49,8 @@ use baybo_channels::wire::{
 use baybo_channels::{STOP_CANCELLED_REPLY_LINE, STOP_COMMAND_NAME, StampedEvent};
 use baybo_model::{
     AgentBinding, AgentFramework, ApprovalDecision, ChannelType, ChatMessage, ContentBlock,
-    ControlEvent, ControlEventKind, FolderId, FolderSummary, LineageKind, LlmEntryName, Role,
-    Session, SessionId, TOOL_RESULT_ERROR_PREFIX, ThinkingContent, TriggerSource, User,
+    ControlEvent, ControlEventKind, FolderId, FolderSummary, LineageKind, Role, Session, SessionId,
+    TOOL_RESULT_ERROR_PREFIX, ThinkingContent, TriggerSource, User,
 };
 use baybo_session::SessionError;
 use baybo_store::SearchScope;
@@ -1095,7 +1095,8 @@ async fn list_sessions(
     let visible: Vec<Session> = scoped
         .into_iter()
         .filter(|s| query.include_hidden || !s.hidden)
-        .filter(|s| query.include_cron || !is_hidden_cron_session(s))
+        .filter(|s| !s.trigger.is_issue_session())
+        .filter(|s| query.include_cron || !is_private_cron_session(s))
         .collect();
     // One grouped scan for every per-session aggregate the sidebar
     // needs (first-line previews, second-line tail windows, unread
@@ -1268,10 +1269,11 @@ async fn get_session(
     .await
 }
 
-/// The read half of `GET /chat/sessions/{id}` and `GET /chat/subagents/{id}`.
-/// Only ADMISSION differs between those two routes; what they return must not,
-/// so the page is built once here rather than transcribed per route.
-async fn session_detail(
+/// The read half of `GET /chat/sessions/{id}`, `GET /chat/subagents/{id}` and
+/// the board's `GET /projects/{id}/issues/{n}/runs/{attempt}/transcript`.
+/// Only ADMISSION differs between those routes; what they return must not, so
+/// the page is built once here rather than transcribed per route.
+pub(crate) async fn session_detail(
     state: &AdminState,
     sid: SessionId,
     session: Session,
@@ -1914,10 +1916,11 @@ pub struct SetSessionModelRequest {
     #[serde(default)]
     pub model: Option<String>,
     /// Per-session reasoning effort
-    /// (`none`/`minimal`/`low`/`medium`/`high`/`xhigh`), or `null`/absent for
-    /// the entry's default. Applies to every turn of THIS session only (not a
-    /// global entry edit); consumed by providers that support it
-    /// (openai-subscription), clamped per model at runtime.
+    /// (`off`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`), or `null`/absent
+    /// for the entry's default. Applies to every turn of THIS session only
+    /// (not a global entry edit). Which rungs a given entry can express is
+    /// `GET /v1/llm/models` → `items[].available_efforts`; one outside
+    /// baybo's ladder is a 400.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
 }
@@ -1968,43 +1971,19 @@ async fn set_session_model(
     // persistence goes through the targeted `set_last_llm` below.
     let (sid, _) = load_scoped_chat_session(&state, &session_id, authed).await?;
 
-    let pin: Option<LlmEntryName> = super::validate_llm_pin(&state, req.llm.as_deref())?;
-
-    // A model pick only means something within an entry. Reject
-    // `{llm: null, model: "x"}` rather than silently dropping it; clear the
-    // model when no entry is pinned. Otherwise validate the model belongs to
-    // the entry's `[model] + model_candidates` (rejects a stranded pick up
-    // front instead of letting it degrade to the entry default at run time).
-    let model_pick: Option<String> = match (&pin, req.model.as_deref()) {
-        (_, None) => None,
-        (None, Some(_)) => {
-            return Err(GatewayError::BadRequest(
-                "model pick requires an llm entry; send llm together with model".to_string(),
-            ));
-        }
-        (Some(entry), Some(model)) => {
-            super::validate_llm_model(&state, entry, model)?;
-            Some(model.to_string())
-        }
-    };
-
-    // Reasoning effort is a free per-session knob (the runtime clamps it per
-    // model), but reject a value outside the known ladder so a typo surfaces
-    // as a 400 rather than silently degrading to the default every turn.
-    let effort_pick: Option<String> = match req.reasoning_effort.as_deref().map(str::trim) {
-        None | Some("") => None,
-        // Canonicalised on the way in, so `none` and `off` do not persist as
-        // two spellings of one rung.
-        Some(level) => match baybo_llm::effort::ReasoningEffort::parse(level) {
-            Some(rung) => Some(rung.as_str().to_string()),
-            None => {
-                return Err(GatewayError::BadRequest(format!(
-                    "unknown reasoning_effort {level:?}; expected one of {}",
-                    effort_ladder()
-                )));
-            }
-        },
-    };
+    // Entry, model-within-entry and rung are one pick, and the rules that
+    // govern them have one home — `validate_llm_pin`, which the agent-profile
+    // pin comes through too.
+    let baybo_model::LlmPin {
+        entry: pin,
+        model: model_pick,
+        effort: effort_pick,
+    } = super::validate_llm_pin(
+        &state,
+        req.llm.as_deref(),
+        req.model.as_deref(),
+        req.reasoning_effort.as_deref(),
+    )?;
 
     // Persist the pin durably FIRST, via targeted flat-column writes
     // (`set_last_llm` / `set_last_model`). Unlike a full-session `save`,
@@ -2055,17 +2034,6 @@ async fn set_session_model(
         last_effort: effort_pick,
         applied_to_live_actor,
     }))
-}
-
-/// The rungs the per-session pin accepts, for the 400's message. The ladder
-/// itself lives in `baybo_llm::effort` — mirroring it here is how the gateway
-/// ended up two rungs behind it.
-fn effort_ladder() -> String {
-    baybo_llm::effort::ReasoningEffort::ALL
-        .iter()
-        .map(|l| l.as_str())
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 /// Request body for `PUT /v1/chat/sessions/{session_id}/pin`.
@@ -2921,7 +2889,7 @@ async fn create_or_load_chat_session(
         // gone: one gateway is one owner, and pre-unification rows still carry
         // the old `web-operator`/`device_id` ids in `user.id` (only the
         // `channel` is migrated), so equating it would 404 legacy sessions.
-        if existing.channel != channel_type || is_hidden_cron_session(&existing) {
+        if existing.channel != channel_type || is_excluded_from_global_chat(&existing) {
             return Err(GatewayError::NotFound(format!("chat session {session_id}")));
         }
         return Ok(existing);
@@ -3095,7 +3063,7 @@ async fn load_readable_subagent_session(
     if root.lineage.is_some() {
         return Err(not_found());
     }
-    if root.channel != chat_list_channel(authed) || is_hidden_cron_session(&root) {
+    if root.channel != chat_list_channel(authed) || is_private_cron_session(&root) {
         return Err(not_found());
     }
     Ok((sid, child))
@@ -3117,7 +3085,7 @@ async fn load_readable_parent_session(
     authed: Option<&AuthedClient>,
 ) -> Result<(SessionId, Session)> {
     match load_scoped_chat_session(state, session_id, authed).await {
-        Ok((sid, session)) if !is_hidden_cron_session(&session) => Ok((sid, session)),
+        Ok((sid, session)) if !is_private_cron_session(&session) => Ok((sid, session)),
         _ => load_readable_subagent_session(state, session_id, authed).await,
     }
 }
@@ -3183,16 +3151,22 @@ pub(crate) fn broadcast_session_list_stale(state: &AdminState, channel: &Channel
     }
 }
 
-/// True for a cron fire session that is **not** a conversation of its own: a
-/// one-shot's private workspace (its result is reported into the conversation
-/// that scheduled it), or a historical fire from before recurring fires became
-/// conversations. Such a session is kept out of the chat list and cannot be
-/// attached to — there is nothing there for a user to read or continue.
+/// Whether a cron fire owns no conversation the user can read or continue.
 ///
-/// A recurring fire's session *is* the notification, so it is listed and
-/// replyable like any other conversation.
-pub(crate) fn is_hidden_cron_session(session: &Session) -> bool {
+/// This covers one-shot private workspaces and historical fires from before
+/// recurring fires became conversations. A recurring fire's session *is* its
+/// notification, so it is listed and replyable like any other conversation.
+pub(crate) fn is_private_cron_session(session: &Session) -> bool {
     matches!(session.trigger, TriggerSource::Cron { .. }) && !session.trigger.is_cron_conversation()
+}
+
+/// Whether a session belongs outside the global chat surface.
+///
+/// Private cron workspaces have no conversation of their own. An issue
+/// session is reached through its card and transcript, never through the
+/// global chat list.
+pub(crate) fn is_excluded_from_global_chat(session: &Session) -> bool {
+    session.trigger.is_issue_session() || is_private_cron_session(session)
 }
 
 async fn transcript_attachments(
@@ -3268,7 +3242,14 @@ fn last_user_preview(
 /// provenance, never content-sniffing, is what separates the errand from the
 /// skill-reminder machinery that shares its shape).
 fn renders_as_user_bubble(msg: &baybo_model::ChatMessage) -> bool {
-    msg.from_user() || msg.source() == baybo_model::MessageSource::SubagentSeed
+    msg.from_user()
+        || msg.source() == baybo_model::MessageSource::SubagentSeed
+        // A board run's brief is the ask its whole transcript answers, and the
+        // ONLY transcripts holding one are issue runs' — so this needs no
+        // per-reader knob. It used to be one, and a shared read path carrying
+        // a parameter for a single caller is a parameter that can be passed
+        // wrong; the row's own provenance cannot be.
+        || msg.source() == baybo_model::MessageSource::IssueBrief
 }
 
 fn last_message_preview(
@@ -3562,7 +3543,7 @@ fn reconstruct_transcript_with_attachments(
             Role::User if renders_as_user_bubble(&msg) => {
                 work.flush(&mut items, None, true);
                 turn_started = Some(created_at);
-                if let Some(item) = message_item(
+                if let Some(mut item) = message_item(
                     ordinal,
                     created_at,
                     "user",
@@ -3572,6 +3553,20 @@ fn reconstruct_transcript_with_attachments(
                         .cloned()
                         .unwrap_or_default(),
                 ) {
+                    // The board shows a brief to a PERSON, and the framing
+                    // around it is written for the model — who it is, that
+                    // nobody is waiting at a keyboard, where its checkout is.
+                    // Rendered whole it buries the one line the reader opened
+                    // the panel for. Same shape as the cancelled-turn marker
+                    // below: strip what the prompt module added, on the way
+                    // out, at the one surface that shows it.
+                    if msg.source() == baybo_model::MessageSource::IssueBrief {
+                        item.text = baybo_context::prompts::issue::unframe_issue_brief(&item.text)
+                            .to_string();
+                    }
+                    if item.text.is_empty() && !item.has_attachments {
+                        continue;
+                    }
                     items.push(item);
                 }
             }
@@ -4079,6 +4074,50 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn a_brief_reconstructs_as_the_ask_it_answers() {
+        // One reading, not one per reader: the only transcripts holding a
+        // brief are issue runs', so there is nothing for a knob to choose
+        // between — and the framing the prompt module wrapped it in comes back
+        // off, because that half is written for the model.
+        let tail = vec![
+            (
+                1,
+                ts(1),
+                ChatMessage::issue_brief(vec![text(
+                    &baybo_context::prompts::issue::frame_issue_brief(
+                        7,
+                        "/ws/work/projects/p/7",
+                        "fix the retry",
+                    ),
+                )]),
+            ),
+            (
+                2,
+                ts(4),
+                ChatMessage::assistant(vec![
+                    text("looking"),
+                    tool_use("c1", "Read", serde_json::json!({"path": "/x"})),
+                ]),
+            ),
+            (
+                3,
+                ts(6),
+                ChatMessage::tool_result("c1".to_owned(), "ok".to_owned()),
+            ),
+            (4, ts(9), ChatMessage::assistant(vec![text("fixed")])),
+        ];
+
+        let items = reconstruct_transcript(tail, Vec::new(), None, Vec::new());
+        assert!(matches!(items[0].kind, TranscriptItemKind::Message));
+        assert_eq!(items[0].role, "user");
+        assert_eq!(items[0].text, "fix the retry", "the ask, not the framing");
+        // And it opens the turn, so the run's work is timed from the moment it
+        // was asked rather than from its first persisted iteration.
+        assert!(matches!(items[1].kind, TranscriptItemKind::Work));
+        assert_eq!(items[1].work_started_at, Some(ts(1)));
     }
 
     #[test]

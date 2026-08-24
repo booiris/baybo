@@ -46,6 +46,46 @@ impl ApprovalDecision {
     }
 }
 
+/// *How* an approval request resolved, alongside what was decided. A bare
+/// [`ApprovalDecision::Deny`] is ambiguous — a human's "no", an expired
+/// window, a torn-down prompt and a no-UX standing rule all return it — and
+/// a ledger that narrates one as another tells the operator somebody
+/// answered when nobody was there.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-export",
+    ts(export, export_to = "../../../sidecars/sdk/channel-ts/src/generated/")
+)]
+pub enum ApprovalResolution {
+    /// Somebody actually decided on the approval surface. The default, so
+    /// rows written before this distinction existed read as answered.
+    #[default]
+    Answered,
+    /// Nobody answered within the gate's window; denied by default.
+    TimedOut,
+    /// The prompt went away undecided — its turn was cancelled or its
+    /// process shut down. Denied by default.
+    Abandoned,
+    /// A standing rule decided without prompting anyone (no approval UX,
+    /// or an explicit allow-all).
+    Policy,
+}
+
+impl ApprovalResolution {
+    /// Canonical lowercase db/wire spelling, matching the
+    /// `#[serde(rename_all = "snake_case")]` form.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ApprovalResolution::Answered => "answered",
+            ApprovalResolution::TimedOut => "timed_out",
+            ApprovalResolution::Abandoned => "abandoned",
+            ApprovalResolution::Policy => "policy",
+        }
+    }
+}
+
 /// Concrete resource a single tool call touches, derived from its parameters.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]

@@ -200,7 +200,7 @@ where
         };
         match result {
             Ok(agent) => {
-                tracing::info!(kind = kind.as_str(), "external agent registered");
+                tracing::debug!(kind = kind.as_str(), "external agent registered");
                 registry.register(agent);
             }
             // Enabled-by-default means every boot probes every kind, so

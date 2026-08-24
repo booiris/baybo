@@ -24,16 +24,20 @@ const MAX_LINE_BYTES: usize = 2000;
 const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_FILE_MIB: u64 = MAX_FILE_BYTES / 1024 / 1024;
 
-/// Format one line of `Read`-style output: a right-aligned 1-based line
-/// number, a tab, then the line truncated to [`MAX_LINE_BYTES`] at a UTF-8
-/// boundary (with a `… [truncated]` marker when cut). Used by both the
-/// filesystem read loop and the virtual-file path below.
+/// Format one line of `Read`-style output: a 1-based line number, a tab,
+/// then the line truncated to [`MAX_LINE_BYTES`] at a UTF-8 boundary (with a
+/// `… [truncated]` marker when cut). Used by both the filesystem read loop
+/// and the virtual-file path below.
+///
+/// The number is not padded to a column. Alignment is for a human scanning a
+/// page; the model reads the tab, and a gutter of spaces on every line of
+/// every read is the single largest avoidable share of what `Read` spends.
 fn format_numbered_line(line_no: usize, line: &str) -> String {
     let cut = line.floor_char_boundary(MAX_LINE_BYTES);
     if cut < line.len() {
-        format!("{:>6}\t{}… [truncated]\n", line_no, &line[..cut])
+        format!("{}\t{}… [truncated]\n", line_no, &line[..cut])
     } else {
-        format!("{:>6}\t{}\n", line_no, line)
+        format!("{}\t{}\n", line_no, line)
     }
 }
 
@@ -115,15 +119,12 @@ pub fn paginate_numbered(content: &str, offset: Option<usize>, limit: Option<usi
 static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
     format!(
         "Read the contents of a file from the local filesystem. \
-         Always use this instead of Bash commands like cat, head, or tail. \
          Supports optional `offset` (1-based starting line) and `limit` \
          (max lines, default {DEFAULT_LIMIT}, capped at {MAX_LIMIT}). Long \
          individual lines are truncated to {MAX_LINE_BYTES} bytes (at a \
          UTF-8 char boundary). Files larger than {MAX_FILE_MIB} MiB are \
          only scanned for the first {MAX_FILE_MIB} MiB of content. Output \
-         is formatted with line numbers for easy reference.\n\n\
-         PATHS: `file_path` MUST be an absolute filesystem path. Relative \
-         paths are rejected."
+         is formatted with line numbers for easy reference."
     )
 });
 
@@ -156,7 +157,7 @@ impl Tool for ReadTool {
         json!({
             "type": "object",
             "properties": {
-                "file_path": { "type": "string", "description": "Absolute path to the file" },
+                "file_path": { "type": "string", "description": "Absolute path; relative is rejected" },
                 "offset": { "type": "integer", "minimum": 1, "description": "Line number to start reading from (1-based)" },
                 "limit": { "type": "integer", "minimum": 1, "description": &*LIMIT_DESC }
             },
@@ -181,6 +182,10 @@ impl Tool for ReadTool {
                 }]
             })
             .unwrap_or_default()
+    }
+
+    fn output_source(&self) -> crate::OutputSource {
+        crate::OutputSource::DeclaredFiles
     }
 
     /// Read-only (filesystem or virtual transcript); mutates no shared
@@ -458,8 +463,8 @@ mod tests {
     #[test]
     fn paginate_numbers_lines_and_honors_offset_limit() {
         let out = paginate_numbered("l1\nl2\nl3\nl4", Some(2), Some(2));
-        assert!(out.contains("     2\tl2"));
-        assert!(out.contains("     3\tl3"));
+        assert!(out.contains("2\tl2"));
+        assert!(out.contains("3\tl3"));
         assert!(!out.contains("l1"));
         assert!(!out.contains("l4"));
     }
@@ -486,7 +491,7 @@ mod tests {
             .await
             .unwrap();
         let ToolOutput::Text(s) = out else { panic!() };
-        assert!(s.contains("     1\tv1"));
+        assert!(s.contains("1\tv1"));
         assert!(
             !s.contains("v2"),
             "limit=1 must stop before the second line"

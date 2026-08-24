@@ -27,6 +27,7 @@ members = [
     "crates/task",
     "crates/cron",
     "crates/deck",
+    "crates/project",
     "crates/config",
     "crates/search",
     "crates/cli",
@@ -88,6 +89,7 @@ baybo-subagent = { path = "crates/subagent" }
 baybo-task = { path = "crates/task" }
 baybo-cron = { path = "crates/cron" }
 baybo-deck = { path = "crates/deck" }
+baybo-project = { path = "crates/project" }
 baybo-config = { path = "crates/config" }
 baybo-search = { path = "crates/search" }
 baybo-cli = { path = "crates/cli" }

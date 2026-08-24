@@ -34,7 +34,7 @@ impl BwrapRunner {
         let binary = locate_binary("bwrap")?;
         let systemd_run = probe_systemd_run(&process_manager).await;
         match &systemd_run {
-            Some(p) => tracing::info!(
+            Some(p) => tracing::debug!(
                 path = %p.display(),
                 "systemd-run available; bwrap calls will run inside transient user scopes"
             ),

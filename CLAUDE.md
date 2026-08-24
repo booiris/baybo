@@ -126,6 +126,22 @@ Prefer generic/extensible architectures over hardcoding specific integrations. A
 
 All I/O is async with tokio. Use `Arc<T>` for shared state, `RwLock` for concurrent access.
 
+**Crate boundaries — what crosses, and what doesn't**:
+
+- **Hand over verbs, not stores.** A consumer crate gets a narrow, task-shaped port owned by the domain crate — `start_run`, `finish_run`, `workdir` — never that domain's `Arc<dyn XxxStore>`, `Arc<dyn XxxEvents>`, or any other general-purpose handle. The handle you pass is the only real bound on what the caller can do, and a CRUD trait bounds nothing: once the store is in the caller's struct, its *next* question gets answered locally in two lines instead of by a round-trip to the domain crate, a new method, and a review. Code doesn't get *decided* into the wrong crate; it accretes wherever the caller already holds everything it needs. Check with: no `dyn <Domain>Store` / `dyn <Domain>Events` outside the crate that owns the domain (test modules excepted).
+- **A port per caller role, not per table.** If a caller must compose two or more domain writes to finish one job, that sequence belongs to the domain — give it one method and let the domain own the order. Composing primitives at the call site is exactly where policy gets re-invented, and re-invented differently the second time. The test to apply *before* writing it in the caller: **would a second caller have to copy this?** If yes, it belongs in the domain crate now, not after the second caller shows up.
+- **Ship the resolved value, not the ingredients.** When the domain has already computed something — a display handle, a validated checkout, a policy verdict — pass that across the boundary, not the raw id/path/row plus the recipe. Whoever holds the ingredients will cook, and will get it subtly wrong.
+- **One home per rule, predicates included.** The no-magic-values rule in Code Style applies to *questions*, not just literals. If two places answer "can this session host a run" / "does this card need attention" / "what handle does this id have", one of them is already wrong.
+- **Don't write a chokepoint claim the types can't keep.** A `docs/modules/*.md` may say "X is the whole write surface" only when nothing else *can* write; otherwise name who else does. A doc that asserts a chokepoint is what the next reader trusts *instead of* reading the code, so a stale one hides drift rather than catching it.
+
+Base cases, all real and all in-tree:
+
+- `baybo-agent` held `Arc<dyn ProjectStore>` + `Arc<dyn ProjectEvents>` and grew four functions in `router/issue.rs` that settled runs, appended timeline entries and wrote `issue.branch` — while `docs/modules/project.md` called `ProjectManager` "the whole write surface". Four rules drifted out of `baybo-project` through that gap, each a real defect (`4a86d125`).
+- Settling a run is three writes — ledger row, invalidation, timeline entry. Every caller that did only two left a card saying something the ledger under it contradicted.
+- **Live now, unfixed:** `crates/cron/src/scheduler.rs` exports `record_execution_completion` / `mark_execution_notified` and documents them as the agent layer's door — and they have **zero callers**, because `router/cron.rs` was handed `Arc<dyn CronStore>` and writes the ledger straight past them. Building the port doesn't help if the store rides along beside it.
+- `worktree::prepare_for_issue` returned a bare `PathBuf` instead of the `Checkout` it had just cut, so the workdir-overlap rule got written a second time in `validate_workdir`. The API ships `project-<ULID>` and the web client re-derives `@dev-1` from it — wrongly.
+- `can_host_a_session` has four spellings, and two doors that skip it entirely.
+
 ## Module Design Specs
 
 **Before working on any crate, always read its corresponding design document in `docs/modules/` first.** The design doc is the source of truth for that module's architecture, trait definitions, and implementation details. Code should follow the spec; the spec is the tiebreaker when in doubt.

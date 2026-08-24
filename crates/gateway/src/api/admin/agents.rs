@@ -71,7 +71,9 @@ impl From<AgentFrameworkDto> for AgentFramework {
     }
 }
 
-/// One agent profile. Absent `llm` = follow `default-llm`.
+/// One agent profile. An absent pin level inherits: `llm` → `default-llm`,
+/// `model` → that entry's own default model, `reasoning_effort` → that
+/// entry's own configured rung.
 ///
 /// Neither the soul nor the skills are fields here. An agent's soul is its
 /// own `SOUL.md` (`GET`/`PUT /v1/agents/{agent_id}/soul`) and its skills are
@@ -87,6 +89,15 @@ pub struct AgentProfileDto {
     pub framework: AgentFrameworkDto,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm: Option<String>,
+    /// The model this agent runs WITHIN `llm`'s entry — one of that entry's
+    /// `[model] + model_candidates`. Absent = the entry's default model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// How hard this agent thinks: a rung of baybo's ladder, absent for the
+    /// entry's own configured level. The rungs a given entry can express are
+    /// `GET /v1/llm/models` → `items[].available_efforts`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     /// The seeded built-in profile: read-only except its avatar,
     /// cannot be deleted.
     pub builtin: bool,
@@ -104,7 +115,9 @@ impl AgentProfileDto {
             description: r.description,
             avatar_blob_id: r.avatar_blob_id,
             framework: r.framework.into(),
-            llm: r.llm.map(|l| l.to_string()),
+            llm: r.llm.entry.map(|l| l.to_string()),
+            model: r.llm.model,
+            reasoning_effort: r.llm.effort,
             builtin: r.builtin,
             created_at: r.created_at,
             updated_at: r.updated_at,
@@ -125,7 +138,7 @@ fn fallback_display_name(row: &AgentProfileRow) -> String {
 /// A file that is missing, unreadable, or has been reformatted past
 /// recognition falls back rather than failing the request: the roster must
 /// still render, and the agent owns that file.
-async fn read_display_name(state: &AdminState, row: &AgentProfileRow) -> String {
+pub(super) async fn read_display_name(state: &AdminState, row: &AgentProfileRow) -> String {
     let path = row
         .id
         .identity_file(&state.workspace_paths, IdentityKind::Identity);
@@ -149,6 +162,9 @@ async fn read_display_name(state: &AdminState, row: &AgentProfileRow) -> String 
 /// one field, not replacing the document, and the splice preserves every
 /// other line — so unlike a whole-file `PUT` it cannot delete what the agent
 /// wrote around it.
+///
+/// The naming rule reaches it through [`replace_identity_file`], which is the
+/// one writer both this and the whole-file `PUT` go through.
 async fn set_display_name(state: &AdminState, row: &AgentProfileRow, name: &str) -> Result<()> {
     let path = row
         .id
@@ -164,10 +180,49 @@ async fn set_display_name(state: &AdminState, row: &AgentProfileRow, name: &str)
     if updated == current {
         return Ok(());
     }
-    write_file_atomic(&path, &updated)
+    replace_identity_file(
+        state,
+        row,
+        IdentityKind::Identity,
+        &path,
+        &current,
+        &updated,
+    )
+    .await
+}
+
+/// Put `content` in one of an agent's identity files, after whatever governs
+/// that file's contents has passed, and record it in the persona repo.
+///
+/// **The** gateway write path for these files, for the same reason
+/// `baybo-tools` has exactly one: a rule each endpoint remembers to ask about
+/// before its own write is a rule the third endpoint will not ask about. Here
+/// the check is not a step a handler takes first — it is part of writing.
+///
+/// `current` is what is on disk *now*, read under the caller's
+/// [`identity_write_lock`]: the rules are about the change, and a caller
+/// re-reading here would be reading outside its own compare-and-set.
+async fn replace_identity_file(
+    state: &AdminState,
+    row: &AgentProfileRow,
+    kind: IdentityKind,
+    path: &std::path::Path,
+    current: &str,
+    content: &str,
+) -> Result<()> {
+    // Only the rename half. A caller replacing the whole document may leave
+    // it without a name — restoring the shipped template does exactly that —
+    // which is why an unnamed agent has a defined rendering at all. Losing
+    // the line by accident is the *tools'* risk, and their writer refuses it.
+    if kind == IdentityKind::Identity
+        && let Some(reason) = baybo_workspace::rejected_rename(row.id.as_str(), current, content)
+    {
+        return Err(GatewayError::BadRequest(reason));
+    }
+    write_file_atomic(path, content)
         .await
-        .map_err(|e| GatewayError::Internal(format!("write agent identity: {e}")))?;
-    commit_persona_edit(state, row.id.as_str(), IdentityKind::Identity.file_name()).await;
+        .map_err(|e| GatewayError::Internal(format!("write agent {kind:?} file: {e}")))?;
+    commit_persona_edit(state, row.id.as_str(), kind.file_name()).await;
     Ok(())
 }
 
@@ -225,7 +280,7 @@ async fn commit_persona_edit(state: &AdminState, agent_id: &str, file: &str) {
 }
 
 /// [`AgentProfileDto`] for one row, with its name read from disk.
-async fn agent_dto(state: &AdminState, row: AgentProfileRow) -> AgentProfileDto {
+pub(super) async fn agent_dto(state: &AdminState, row: AgentProfileRow) -> AgentProfileDto {
     let name = read_display_name(state, &row).await;
     AgentProfileDto::from_parts(row, name)
 }
@@ -249,6 +304,13 @@ pub struct CreateAgentProfileRequest {
     /// `GET /v1/llm/models`.
     #[serde(default)]
     pub llm: Option<String>,
+    /// The model within `llm`'s entry, or absent for that entry's default.
+    /// Requires `llm`.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Thinking rung, or absent for the entry's own level.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     /// Optional avatar (full blob id from `POST /v1/blobs`); validated
     /// exactly like `PUT /v1/agents/{agent_id}/avatar`.
     #[serde(default)]
@@ -266,17 +328,38 @@ pub struct UpdateAgentProfileRequest {
 }
 
 /// Request body for `PUT /v1/agents/{agent_id}/name`.
+///
+/// Rejected for an agent on a project team: the `@handle` its board addresses
+/// it by was derived from its name when it was hired, so the name is fixed for
+/// as long as the agent exists.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetAgentNameRequest {
     pub name: String,
 }
 
-/// Request body for `PUT /v1/agents/{agent_id}/model`.
+/// Request body for `PUT /v1/agents/{agent_id}/model` — the agent's whole
+/// LLM pin, replaced as one. Absent means "inherit" at each level, so an
+/// empty body clears the pin entirely rather than leaving two thirds of it
+/// pointing at an entry the agent no longer uses.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetAgentModelRequest {
     /// `baybo.json` LLM entry name, or `null`/absent to follow `default-llm`.
     #[serde(default)]
     pub llm: Option<String>,
+    /// The model to run WITHIN `llm`'s entry — one of that entry's
+    /// `[model] + model_candidates` from `GET /v1/llm/models`.
+    /// `null`/absent uses the entry's default model; sending one without
+    /// `llm` is a 400, since there is no entry to pick a model within.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// How hard this agent should think
+    /// (`off`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`), or
+    /// `null`/absent for the entry's configured level. Applies to every run
+    /// this agent starts. The rungs a given entry can express are
+    /// `GET /v1/llm/models` → `items[].available_efforts`; one outside
+    /// baybo's ladder is a 400.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 /// Request body for `PUT /v1/agents/{agent_id}/avatar`.
@@ -434,7 +517,12 @@ async fn create_agent(
     Json(req): Json<CreateAgentProfileRequest>,
 ) -> Result<Json<AgentProfileDto>> {
     let name = validate_name(&req.name)?;
-    let llm = super::validate_llm_pin(&state, req.llm.as_deref())?;
+    let llm = super::validate_llm_pin(
+        &state,
+        req.llm.as_deref(),
+        req.model.as_deref(),
+        req.reasoning_effort.as_deref(),
+    )?;
     if let Some(blob_id) = req.avatar_blob_id.as_deref() {
         validate_avatar_blob(&state, blob_id).await?;
     }
@@ -449,6 +537,12 @@ async fn create_agent(
         framework: req.framework.into(),
         llm,
         builtin: false,
+        // `POST /v1/agents` opens a global chat persona. A project's team is
+        // staffed through its own board (`/v1/projects/{pid}/agents`), which
+        // is the only surface that mints a handle.
+        team: None,
+        hired_by: None,
+        deleted_at: None,
         created_at: now,
         updated_at: now,
     };
@@ -547,7 +641,7 @@ async fn update_agent(
     request_body = SetAgentNameRequest,
     responses(
         (status = 204, description = "Name set"),
-        (status = 400, description = "Malformed agent id or name", body = ErrorBody),
+        (status = 400, description = "Malformed agent id or name, or a project agent, whose name its @handle was derived from and cannot outlive", body = ErrorBody),
         (status = 401, description = "Unauthorized", body = ErrorBody),
         (status = 404, description = "No such agent profile", body = ErrorBody),
     )
@@ -585,17 +679,24 @@ async fn set_agent_model(
     Json(req): Json<SetAgentModelRequest>,
 ) -> Result<axum::http::StatusCode> {
     let row = load_agent(&state, &agent_id).await?;
-    let llm = super::validate_llm_pin(&state, req.llm.as_deref())?;
+    let pin = super::validate_llm_pin(
+        &state,
+        req.llm.as_deref(),
+        req.model.as_deref(),
+        req.reasoning_effort.as_deref(),
+    )?;
     // The builtin follows `default-llm`; pinning it would put the same
-    // decision in two places. Clearing is a no-op it can accept.
-    if row.builtin && llm.is_some() {
+    // decision in two places. Clearing is a no-op it can accept — and
+    // "cleared" means every level, a rung included, since a thinking level
+    // is spend the operator chose in a second place too.
+    if row.builtin && !pin.is_unpinned() {
         return Err(GatewayError::BadRequest(
             BUILTIN_MODEL_FOLLOWS_DEFAULT.to_owned(),
         ));
     }
     let matched = state
         .agent_profile_store
-        .set_llm(&row.id, llm.as_ref())
+        .set_llm(&row.id, &pin)
         .await
         .map_err(|e| store_err("set agent llm", e))?;
     if !matched {
@@ -708,24 +809,21 @@ async fn write_agent_identity_file(
     // Held across the read, the comparison and the write: a compare-and-set
     // whose three steps another request can interleave with is not one.
     let _guard = identity_write_lock(&path).await;
-    if let Some(expected) = req.version.as_deref() {
-        // Read what is actually on disk now, not what this request thinks was
-        // there. A missing file hashes as empty, so a fresh write after a
-        // delete conflicts rather than silently resurrecting old content.
-        let current = tokio::fs::read_to_string(&path).await.unwrap_or_default();
-        let actual = content_version(&current);
-        if actual != expected {
-            return Err(GatewayError::Conflict(format!(
-                "{} changed since it was read (the agent may have rewritten it); \
-                 re-read it and reapply the edit",
-                path.display()
-            )));
-        }
+    // What is actually on disk now, not what this request thinks was there. A
+    // missing file reads as empty, so a fresh write after a delete conflicts
+    // rather than silently resurrecting old content — and carries no name to
+    // protect, which is how a deleted `IDENTITY.md` can be named again.
+    let current = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+    if let Some(expected) = req.version.as_deref()
+        && content_version(&current) != expected
+    {
+        return Err(GatewayError::Conflict(format!(
+            "{} changed since it was read (the agent may have rewritten it); \
+             re-read it and reapply the edit",
+            path.display()
+        )));
     }
-    write_file_atomic(&path, &req.content)
-        .await
-        .map_err(|e| GatewayError::Internal(format!("write agent {kind:?} file: {e}")))?;
-    commit_persona_edit(state, agent_id, kind.file_name()).await;
+    replace_identity_file(state, &row, kind, &path, &current, &req.content).await?;
     // Return the new state, so an editor that stays open holds a fresh base
     // for its next conditional write instead of conflicting with itself.
     Ok(Json(AgentIdentityFileDto {
@@ -803,7 +901,7 @@ async fn get_agent_identity(
     request_body = SetAgentIdentityFileRequest,
     responses(
         (status = 200, description = "Self-image replaced; carries the new version", body = AgentIdentityFileDto),
-        (status = 400, description = "Malformed agent id", body = ErrorBody),
+        (status = 400, description = "Malformed agent id, or a body that renames a project agent — its @handle came from that name", body = ErrorBody),
         (status = 401, description = "Unauthorized", body = ErrorBody),
         (status = 404, description = "No such agent profile", body = ErrorBody),
         (status = 409, description = "The file changed since it was read", body = ErrorBody),

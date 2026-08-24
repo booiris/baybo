@@ -1,0 +1,40 @@
+[package]
+name = "baybo-project"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+doctest = false
+
+[features]
+# Test-only items other crates' tests reach for. Never enabled by a
+# release build.
+test-support = []
+
+[dependencies]
+baybo-model = { workspace = true }
+baybo-store = { workspace = true }
+baybo-tools = { workspace = true }
+baybo-turn = { workspace = true }
+baybo-workspace = { workspace = true, features = ["io"] }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["fs", "process"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+baybo-session = { workspace = true, features = ["test-support"] }
+baybo-store = { workspace = true, features = ["test-support"] }
+baybo-storage = { workspace = true, features = ["test-support"] }
+baybo-tools = { workspace = true, features = ["test-support"] }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+# `test-util` (not in the `full` feature set) backs
+# `#[tokio::test(start_paused = true)]` in the board-driver sweep test, which
+# would otherwise have to sleep on the real tick interval.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }

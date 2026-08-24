@@ -13,6 +13,13 @@
 
 use crate::{TOOL_OUTPUT_CLOSE_PREFIX, TOOL_OUTPUT_OPEN_PREFIX};
 
+/// Bytes of tool output a model receives before the cap truncates with a
+/// notice. Lives here rather than beside the code that applies it so a tool
+/// can describe its own limit truthfully — `baybo-tools` cannot depend on
+/// `baybo-context`, and a tool that names a different number in its
+/// description is promising output the transcript will never carry.
+pub const MAX_TOOL_OUTPUT_BYTES: usize = 32 * 1024;
+
 /// Wrap untrusted tool output in `<tool_output name="...">` delimiters so that
 /// text lines inside can't forge a boundary the LLM parses as new
 /// instructions. The close tag inside the body is neutralized via a

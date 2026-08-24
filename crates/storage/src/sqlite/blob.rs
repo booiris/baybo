@@ -111,7 +111,7 @@ impl SqliteBlobStore {
         let uploader_identity = uploader_identity.map(|s| s.to_string());
         let read_token = read_token.to_string();
         self.pool
-            .interact("blobs.record_metadata", move |conn| {
+            .interact_write("blobs.record_metadata", move |conn| {
                 conn.execute(
                     "INSERT INTO blobs (blob_id, mime_type, size, uploader_identity, read_token, created_at, last_accessed_at) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6) \
@@ -141,7 +141,7 @@ impl SqliteBlobStore {
         let now = now_unix();
         if let Err(e) = self
             .pool
-            .interact("blobs.touch", move |conn| {
+            .interact_write("blobs.touch", move |conn| {
                 conn.execute(
                     "UPDATE blobs SET last_accessed_at = ?2 \
                      WHERE blob_id = ?1",
@@ -574,7 +574,7 @@ impl BlobStore for SqliteBlobStore {
         let id_param = blob_id.to_string();
         let mime_type: Option<String> = self
             .pool
-            .interact("blobs.delete_lookup", move |conn| {
+            .interact_write("blobs.delete_lookup", move |conn| {
                 Ok(conn
                     .query_row(
                         "SELECT mime_type FROM blobs WHERE blob_id = ?1",
@@ -592,7 +592,7 @@ impl BlobStore for SqliteBlobStore {
             let id_param = blob_id.to_string();
             let affected = self
                 .pool
-                .interact("blobs.delete", move |conn| {
+                .interact_write("blobs.delete", move |conn| {
                     Ok(conn.execute(
                         "DELETE FROM blobs WHERE blob_id = ?1",
                         rusqlite::params![id_param],
@@ -1158,7 +1158,7 @@ mod tests {
         let now = now_unix();
         store
             .pool
-            .interact("test.blobs.unreadable_mime", move |conn| {
+            .interact_write("test.blobs.unreadable_mime", move |conn| {
                 conn.execute(
                     "INSERT INTO blobs (blob_id, mime_type, size, read_token, created_at, last_accessed_at) \
                      VALUES (?1, ?2, 0, NULL, ?3, ?3)",

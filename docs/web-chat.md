@@ -370,6 +370,21 @@ Attachments persist as **blob refs** (`WireAttachment` = `{ kind, blob_id, mime_
 
 The transcript is a flat array of `TranscriptRow`s (`app/web/src/pages/ChatPage.tsx`, type at lines 68-128) held per-session in `SessionView.transcript`. The list renders inside a centered `max-w-4xl` reading band (`flex flex-col gap-3 ... mx-auto`, ~line 2247); each row is a `MessageBubble` (line 4043). A `TranscriptRow` is one of: a user/assistant **message bubble**, a `kind === 'work'` **work block**, or a `notice` row — `MessageBubble` dispatches on `row.kind === 'work'` → `WorkBlock`, then `row.notice` → notice card, else a message bubble. Rows are keyed by the server's stable row id where one exists (`m<ordinal>` / `w<ordinal>` / `n<seq>` — the sync/backfill DTO's `id`, doubling as the redelivery dedup key) and by synthetic `stream-…`/`pending-…`/`notice-…` keys for live rows that don't have one yet; a redelivered row reconciles against what's already on screen instead of duplicating it. All source below is `app/web/src/pages/ChatPage.tsx` unless noted.
 
+The row loop itself is `ThreadView` — an exported component, not inline JSX,
+because it has a **second reader**: the board's run panel
+(`app/web/src/pages/projects/RunTranscriptPanel.tsx`) shows a card's run as the
+conversation it was. Its props are therefore a contract, not page-private
+state. Four decisions live in that loop — where a compaction divider lands,
+that a `/stop` echo is never painted, that adjacent acknowledgements collapse
+to one `Stopped` indicator, and where the cancelled-turn mark goes — and a
+second reader that re-derived any of them would be the second place deciding
+what a transcript looks like. Everything live stays the caller's: `head` takes
+the scroll-up affordance and `children` the composer-side chrome (deferred
+bubbles, the working indicator, an approval card), so a read-only reader
+passes neither. It has to live in `ChatPage.tsx` rather than its own module —
+it renders `MessageBubble` / `CompactionDivider` / `StoppedIndicator` /
+`CancelledTurnIndicator`, which would make a separate file a circular import.
+
 ### Message bubbles: layout, alignment, attachments
 
 `MessageBubble` (line 4043) splits on `row.role === 'user'`. The outer wrapper is `items-end` for user, `items-start` for assistant; the inner column is `w-fit` capped at `max-w-2xl` (user) / `max-w-4xl` (assistant) so bubbles shrink to content. **User bubbles** carry a 2px border, horizontal padding, and a 60%-opacity brand-gold fill (`border-2 border-black px-3 bg-brand/60 shadow-brutal-sm`); **assistant replies are borderless prose** on the canvas with no horizontal padding, so the text sits flush at the band's left edge. User text renders as `font-mono whitespace-pre-wrap` plain text (markdown is deliberately *not* applied to user input so paths/hashes/HTML show verbatim); assistant text renders through `MarkdownBody` (`ReactMarkdown` + `remark-gfm` + `remark-math`/`rehype-katex`, brutalist component overrides in `MARKDOWN_COMPONENTS` ~line 3902, `.chat-prose` class). Markdown is gated on `!isUser && !row.notice && body.length > 0`. See *LaTeX math* below.

@@ -8,7 +8,7 @@
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use crate::{Tool, ToolContext, ToolOutput};
+use crate::{Tool, ToolContext, ToolOutput, ToolTriggerScope};
 
 pub struct EchoTool;
 
@@ -16,6 +16,10 @@ pub struct EchoTool;
 impl Tool for EchoTool {
     fn name(&self) -> &str {
         "echo"
+    }
+
+    fn trigger_scope(&self) -> ToolTriggerScope {
+        ToolTriggerScope::SharedWorkspace
     }
 
     fn description(&self) -> String {

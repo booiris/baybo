@@ -36,6 +36,7 @@ baybo-sandbox = { workspace = true }
 baybo-agent = { workspace = true }
 baybo-cron = { workspace = true }
 baybo-deck = { workspace = true }
+baybo-project = { workspace = true }
 baybo-janitor = { workspace = true }
 baybo-storage = { workspace = true }
 baybo-store = { workspace = true }

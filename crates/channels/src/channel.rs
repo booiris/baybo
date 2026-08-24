@@ -612,6 +612,23 @@ impl<'a> SubscribedView<'a> {
         self.0.broadcast_frame(Frame::DeckChanged);
     }
 
+    /// Broadcast a [`Frame::ProjectChanged`] invalidation to every
+    /// connection on this channel. Session-less by design: a board has no
+    /// session to subscribe to, so clients answer by refetching the named
+    /// plane.
+    pub fn broadcast_project_changed(
+        &self,
+        project_id: String,
+        scope: crate::wire::ProjectChangeScope,
+        issue_number: Option<u32>,
+    ) {
+        self.0.broadcast_frame(Frame::ProjectChanged {
+            project_id,
+            scope,
+            issue_number,
+        });
+    }
+
     /// Broadcast a [`Frame::SessionActivity`] pulse for sidebar
     /// freshness / unread accounting. Fan-out is best-effort and
     /// throttled by the caller (see `SessionPulse`).

@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use super::EmbeddedMcpProfile;
+use crate::ToolTriggerScope;
 
 /// Policy inputs for [`browser_mcp_profile`].
 ///
@@ -232,6 +233,11 @@ pub fn browser_mcp_profile(params: BrowserProfileParams<'_>) -> Option<EmbeddedM
         server_name: "browser".into(),
         command,
         args: vec![bundle_path.display().to_string()],
+        // One Chrome, one profile, one cookie jar for the whole process —
+        // so the sessions that share the workspace can share it, and the
+        // card runs that were cut their own checkout cannot. Keeping it off
+        // them also takes 24 tools / ~19 KB off every request they make.
+        trigger_scope: ToolTriggerScope::SharedWorkspace,
         // Empty by design — see the doc comment above. The McpTool
         // wrapper's `accessed_resources()` returns this list verbatim,
         // so an empty capability ceiling means the agent loop's
@@ -547,5 +553,11 @@ mod tests {
                 .contains_key("BAYBO_BROWSER_DOCKER_MEMORY_LIMIT"),
             "None means uncapped — the wrapper must not receive a --memory value at all",
         );
+    }
+
+    #[test]
+    fn the_browser_is_offered_to_every_session_but_a_card_s_run() {
+        let p = browser_mcp_profile(params(true)).expect("profile when enabled");
+        assert_eq!(p.trigger_scope, ToolTriggerScope::SharedWorkspace);
     }
 }

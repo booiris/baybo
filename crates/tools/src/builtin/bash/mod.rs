@@ -72,8 +72,12 @@ use parse::{
     parse_program, split_into_subcommands, truncate_for_event,
 };
 
-const MAX_OUTPUT_BYTES: usize = 64 * 1024;
-const MAX_OUTPUT_KIB: usize = MAX_OUTPUT_BYTES / 1024;
+/// Per-stream ceiling applied before the streams are packed into the result.
+/// Twice [`baybo_model::MAX_TOOL_OUTPUT_BYTES`] so a large stdout is trimmed
+/// by the transcript cap — which spills the full text to a file the notice
+/// names — rather than being silently cut here first. Not quoted to the
+/// model: what it receives is the capped result, not one stream.
+const MAX_OUTPUT_BYTES: usize = 2 * baybo_model::MAX_TOOL_OUTPUT_BYTES;
 /// Cap for the one-line command digest logged on sandbox-bypass events.
 const COMMAND_HEAD_MAX_CHARS: usize = 160;
 
@@ -104,15 +108,15 @@ fn command_head(command: &str) -> String {
 /// re-skins exactly what changed and nothing is said twice. Work-dir/platform
 /// live here, not the system prompt, so they sit next to the tool that
 /// consumes them.
-const DESCRIPTION_TEMPLATE: &str = r#"Execute a shell command in a fresh `sh -c` process. Environment changes and `cd` do not persist across invocations. Each of stdout and stderr is truncated at {{max_output_kib}} KiB.
+const DESCRIPTION_TEMPLATE: &str = r#"Execute a shell command in a fresh `sh -c` process. Environment changes and `cd` do not persist across invocations. The result you get back is capped at {{max_output_kib}} KiB, with a notice naming the file the full text spilled to.
 
-Reserve Bash for system commands, git, build/test, and anything that genuinely needs a shell. Reading, writing, and searching files have dedicated tools — `Read`, `Write`, `Edit`, `Glob`, `Grep` — and a leading `cat`/`head`/`tail`/`less`/`sed`/`awk` against a file is rejected here with the redirect spelled out. Downloading a file to disk IS Bash's job (`curl`/`wget`): WebFetch only returns rendered text into the conversation and never writes to disk.
+Reserve Bash for system commands, git, build/test, and anything that genuinely needs a shell. A plain `cat`/`head` of one absolute path is answered by `Read` (you get Read's line numbers); every other leading `cat`/`head`/`tail`/`less`/`sed`/`awk` against a file is rejected — use `Read`/`Write`/`Edit`/`Glob`/`Grep`, or keep the command after a pipe so it reads stdin. Downloading a file to disk IS Bash's job (`curl`/`wget`) — WebFetch only returns rendered text and never writes to disk.
 
 {{isolation}}
 
 {{approval}}
 
-DEFAULT CWD: If `cwd` is omitted, Baybo runs the command from {{work_dir}} and exports `PWD` with the same value.
+DEFAULT CWD: If `cwd` is omitted, the command runs in this session's own working directory — the issue checkout when the session was given one, otherwise {{work_dir}} — and `PWD` is exported to match.
 
 PATHS: Every directory or file argument, and `cwd` itself, MUST be absolute; relative values are rejected. Quote paths containing spaces.
 
@@ -123,7 +127,6 @@ BEFORE BROAD SCANS: Do not run `find`, `du`, recursive `ls`, or similar walks ag
 {{python_runtime}}
 
 ENVIRONMENT:
-- Working directory: {{work_dir}}
 - Platform: {{platform}}"#;
 
 #[cfg(not(feature = "bench-bash"))]
@@ -132,7 +135,7 @@ const SANDBOXED_ISOLATION: &str = r#"SANDBOX: The shell has read+write access to
 #[cfg(not(feature = "bench-bash"))]
 const SANDBOXED_WORK_DIR_SCOPE: &str = r#"WORK-DIR SCOPE: Inside the workspace, Bash may only name {{work_dir}} (read+write), `skills/` (read+execute, never write), and blob payload paths returned by `GetBlob` (read-only). Every other path under the workspace root is rejected up front, `cwd` included — reach those through `Read`/`Edit`/`Write` instead. Paths outside the workspace are unaffected by this rule.
 
-SCRATCH: Put disposable/intermediate files (probe scripts, one-off downloads, temp build output) under {{work_tmp_dir}} — it is swept automatically after {{work_tmp_ttl_days}} days. Deliverables the user should keep belong elsewhere under {{work_dir}}."#;
+SCRATCH: Put disposable/intermediate files (probe scripts, one-off downloads, temp build output) under {{work_tmp_dir}} — it is swept automatically after {{work_tmp_ttl_days}} days. Anything meant to be kept belongs in your checkout when you have one, and elsewhere under {{work_dir}} otherwise."#;
 
 #[cfg(not(feature = "bench-bash"))]
 const SANDBOXED_PYTHON: &str = r#"PYTHON: `python`, `python3`, and `pip` are shimmed to `uv run python` / `uv pip` inside this shell. For one-file scripts with third-party deps, declare them via PEP 723 inline metadata (`# /// script` block) so `uv run --script my.py` resolves them per-call. The shims are shell functions scoped to the outer `sh -c` — `bash -c '…'` subshells, `/usr/bin/python`, and Python's own `subprocess` calls bypass them."#;
@@ -227,6 +230,77 @@ impl LivePermissionMode {
     }
 }
 
+/// What a command's child is given, and what must never come back out.
+#[derive(Debug, Default, Clone)]
+struct ChildEnv {
+    /// Every variable the child process gets.
+    vars: Vec<(String, String)>,
+    /// Values scrubbed from stdout and stderr before anything sees them.
+    /// The resolved user secrets and nothing else — this is a filter, not
+    /// a record of what was injected.
+    secret_values: Vec<String>,
+}
+
+/// The trailer an issue run's commits carry, and `None` for every other
+/// session. A trailer rather than `GIT_AUTHOR_*`/`GIT_COMMITTER_*` because
+/// those outrank every config file git consults, so the operator's own
+/// identity vanished from work they are still accountable for. The address
+/// is the persona ULID rather than the `@handle` so renaming an agent does
+/// not repoint historic commits, and `.local` resolves nowhere, so no
+/// GitHub account is ever credited for them.
+fn commit_trailer(ctx: &ToolContext) -> Option<String> {
+    match (&ctx.checkout_root, &ctx.agent_handle) {
+        (Some(_), Some(handle)) => Some(format!(
+            "Co-authored-by: {} <{}@baybo.local>",
+            handle.as_str(),
+            ctx.agent_id.as_str()
+        )),
+        _ => None,
+    }
+}
+
+/// Carries [`commit_trailer`]'s line to the `git()` shim instead of splicing
+/// it into shell source, so a handle never has to be quoted into a script.
+const COMMIT_TRAILER_ENV: &str = "BAYBO_COMMIT_TRAILER";
+
+/// `git()` shell function that splices [`commit_trailer`]'s line into a
+/// `commit` invocation. Reaches exactly as far as [`UV_SHELL_SHIMS`] — the
+/// immediate `sh -c` body, not `bash -c '…'` subshells, scripts, or
+/// `/usr/bin/git`; a commit that misses it is still authored as the
+/// operator, it just carries no attribution.
+///
+/// The trailer is inserted straight after the `commit` word rather than
+/// appended, because `git commit -m x -- path` ends in a pathspec list where
+/// a trailing `--trailer` would be read as a file name. The scan skips git's
+/// own leading options — and the values of the ones that take a separate
+/// argument — so `git -C dir commit` is still recognised.
+static GIT_COMMIT_TRAILER_SHIM: LazyLock<String> = LazyLock::new(|| {
+    GIT_COMMIT_TRAILER_SHIM_TEMPLATE.replace("{{trailer_env}}", COMMIT_TRAILER_ENV)
+});
+
+const GIT_COMMIT_TRAILER_SHIM_TEMPLATE: &str = r##"git() {
+    __bb_at=0; __bb_i=0; __bb_skip=0
+    for __bb_a in "$@"; do
+        __bb_i=$((__bb_i + 1))
+        if [ "$__bb_skip" = 1 ]; then __bb_skip=0; continue; fi
+        case "$__bb_a" in
+            -C|-c|--git-dir|--work-tree|--namespace|--exec-path|--super-prefix|--attr-source) __bb_skip=1 ;;
+            -*) ;;
+            commit) __bb_at=$__bb_i; break ;;
+            *) break ;;
+        esac
+    done
+    if [ "$__bb_at" = 0 ] || [ -z "${{trailer_env}}" ]; then command git "$@"; return; fi
+    __bb_n=$#; __bb_i=0
+    while [ "$__bb_i" -lt "$__bb_n" ]; do
+        __bb_i=$((__bb_i + 1)); __bb_v=$1; shift
+        set -- "$@" "$__bb_v"
+        if [ "$__bb_i" = "$__bb_at" ]; then set -- "$@" --trailer "${{trailer_env}}"; fi
+    done
+    command git "$@"
+}
+"##;
+
 pub struct BashTool {
     /// Tool descriptions pre-rendered per [`BashPermissionMode`], indexed by
     /// the permission's encoded byte. [`Tool::description`] returns the one for the
@@ -313,12 +387,12 @@ impl BashTool {
         permission_skips_os_sandbox(self.permission())
     }
 
-    /// Prefix `command` with the workspace-scoped UV exports and the
-    /// Baybo-CLI env injection. Two callers (the sandboxed `execute` path
-    /// and the unsandboxed retry below) compose the same `sh -c` body —
-    /// keep the ordering in one place so a future reshuffle doesn't
+    /// Prefix `command` with the workspace-scoped UV exports, the commit-trailer
+    /// `git()` shim, and the Baybo-CLI env injection. Two callers (the sandboxed
+    /// `execute` path and the unsandboxed retry below) compose the same `sh -c`
+    /// body — keep the ordering in one place so a future reshuffle doesn't
     /// drift between them.
-    fn wrap_command(&self, command: &str) -> String {
+    fn wrap_command(&self, command: &str, ctx: &ToolContext) -> String {
         let injected = inject_baybo_env(command);
         // Only the bench profile skips the uv shims/exports: that container ships
         // its own python/pip and has no `uv`, so the `python() { uv run python …; }`
@@ -327,8 +401,14 @@ impl BashTool {
         if BENCH {
             return injected;
         }
-        let mut out = String::with_capacity(self.uv_env_prefix.len() + injected.len());
+        let git_shim = match commit_trailer(ctx) {
+            Some(_) => GIT_COMMIT_TRAILER_SHIM.as_str(),
+            None => "",
+        };
+        let mut out =
+            String::with_capacity(self.uv_env_prefix.len() + git_shim.len() + injected.len());
         out.push_str(&self.uv_env_prefix);
+        out.push_str(git_shim);
         out.push_str(&injected);
         out
     }
@@ -395,7 +475,10 @@ fn render_description(
         .replace("{{work_dir_scope}}", work_dir_scope)
         .replace("{{python_runtime}}", python_runtime)
         .replace("{{approval}}", approval)
-        .replace("{{max_output_kib}}", &MAX_OUTPUT_KIB.to_string())
+        .replace(
+            "{{max_output_kib}}",
+            &(baybo_model::MAX_TOOL_OUTPUT_BYTES / 1024).to_string(),
+        )
         .replace(
             "{{work_tmp_dir}}",
             &work_dir
@@ -597,6 +680,21 @@ impl Tool for BashTool {
         out
     }
 
+    /// Withholds `on_timeout` where detaching is refused. Without a
+    /// background host a slow command is killed whatever this says, so
+    /// offering the knob is offering a choice the runtime does not have —
+    /// and the timeout the model picks is then the only thing standing
+    /// between a long build and losing its work.
+    fn parameters_schema_for(&self, trigger: &baybo_model::TriggerSource) -> Value {
+        let mut schema = self.parameters_schema();
+        if !trigger.can_host_background_jobs()
+            && let Some(props) = schema.get_mut("properties").and_then(Value::as_object_mut)
+        {
+            props.remove("on_timeout");
+        }
+        schema
+    }
+
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",
@@ -605,7 +703,7 @@ impl Tool for BashTool {
                 "timeout_ms": { "type": "integer", "minimum": 1, "description": "Per-command timeout in ms (falls back to the tool context timeout)" },
                 "cwd":        { "type": "string", "description": "Working directory for the command" },
                 "secret_env": { "type": "array", "items": { "type": "string" }, "description": "Names of stored user secrets to inject as environment variables for THIS command only. Values are pulled from the vault, never shown to you, and scrubbed from the output. Discover names with SecretList / SecretCheck." },
-                "on_timeout": { "type": "string", "enum": ["background", "kill"], "description": "What to do if the command exceeds its timeout. 'background' (default) detaches it — you get a handle now and a notification when it finishes, with full output streamed to a file you can Read — so a long build/test never blocks you or loses its work. 'kill' keeps the old behaviour (terminate + return a timeout error). Ignored during a scheduled job's own run and in nested subagents, which always kill on timeout." }
+                "on_timeout": { "type": "string", "enum": ["background", "kill"], "description": "What to do if the command exceeds its timeout. 'background' (default) detaches it — you get a handle now and a notification when it finishes, with full output streamed to a file you can Read — so a long build/test never blocks you or loses its work. 'kill' terminates it and returns a timeout error." }
             },
             "required": ["command"]
         })
@@ -710,9 +808,38 @@ impl Tool for BashTool {
             .cwd
             .as_deref()
             .or(inherited_cwd.as_deref())
+            .or(ctx.checkout_root.as_deref())
             .or(Some(ctx.workspace_root.as_path()));
 
         if is_file_tool_redirect(&command) {
+            // Do the read rather than send the model back for another turn.
+            // Through `ReadTool` itself, so the path policy is the one a
+            // direct `Read` gets — a shell read that authorized nothing
+            // would be worse than the refusal it replaces.
+            //
+            // It anchors the read tracker for this process only: the durable
+            // anchor is rebuilt from the transcript by tool NAME plus a
+            // `file_path` argument (`READ_TRACKER_ANCHORING_TOOLS`), and this
+            // call carries neither. So an `Edit` after a rehydrate asks for a
+            // real `Read` first — the conservative direction, and why the
+            // notice below promises nothing about it.
+            if let Some((file_path, limit)) = as_plain_file_read(&command) {
+                let mut params = json!({ crate::TOOL_FILE_PATH_ARG: file_path });
+                if let Some(limit) = limit {
+                    params[READ_LIMIT_ARG] = json!(limit);
+                }
+                let read = crate::builtin::read::ReadTool.execute(params, ctx).await?;
+                let stdout = match read {
+                    ToolOutput::Text(text) => text,
+                    other => format!("{other:?}"),
+                };
+                return Ok(ToolOutput::Json(json!({
+                    "exit_code": 0,
+                    "stdout": stdout,
+                    "stderr": "",
+                    REDIRECTED_TO_FIELD: REDIRECTED_TO_READ,
+                })));
+            }
             let argv0 = first_token(&command).unwrap_or("?");
             return Err(ToolError::InvalidParams(format!(
                 "Refusing to run `{argv0}` against a file via Bash. Use the right tool \
@@ -764,9 +891,8 @@ impl Tool for BashTool {
         // Fail closed if requested but the secret store isn't wired. The names
         // (never the values) are recorded for audit; the values are scrubbed
         // back out of the output below. See docs/secret-management.md.
-        let extra_env = if p.secret_env.is_empty() {
-            Vec::new()
-        } else {
+        let mut extra_env = ChildEnv::default();
+        if !p.secret_env.is_empty() {
             let handle = ctx.secrets.as_deref().ok_or_else(|| {
                 ToolError::Execution(
                     "secret_env was requested but no secret store is available in this context"
@@ -778,8 +904,19 @@ impl Tool for BashTool {
                 secrets = ?p.secret_env,
                 "bash: injecting user secrets as environment variables"
             );
-            handle.resolve_env(&p.secret_env).await?
-        };
+            extra_env.vars = handle.resolve_env(&p.secret_env).await?;
+            extra_env.secret_values = extra_env.vars.iter().map(|(_, v)| v.clone()).collect();
+        }
+        if let Some(trailer) = commit_trailer(ctx) {
+            extra_env
+                .vars
+                .push((COMMIT_TRAILER_ENV.to_owned(), trailer));
+        }
+        if let Some(config) = ctx.checkout_git_config.as_deref() {
+            extra_env
+                .vars
+                .push(("GIT_CONFIG_GLOBAL".to_owned(), config.display().to_string()));
+        }
 
         // Auto permission, destructive-token command: the LLM judge decides before
         // running whether this needs human approval (replacing the blunt
@@ -793,7 +930,7 @@ impl Tool for BashTool {
             self.notify_sandbox_bypass(ctx, &command);
         }
 
-        let args = vec!["-c".into(), self.wrap_command(&command)];
+        let args = vec!["-c".into(), self.wrap_command(&command, ctx)];
         let detached_route = if sandbox_bypassed {
             Some(DetachedExecutionRoute::Unsandboxed)
         } else {
@@ -845,7 +982,7 @@ impl Tool for BashTool {
                 _ = ctx.cancellation_token.cancelled() => {
                     return Err(ToolError::Execution("cancelled".into()));
                 }
-                res = run_unsandboxed(&self.process_manager, "sh", &args, cwd_ref, &extra_env, timeout) => res?,
+                res = run_unsandboxed(&self.process_manager, "sh", &args, cwd_ref, &extra_env.vars, timeout) => res?,
             }
         } else if execution_route.is_sandboxed() {
             if let Some(sandbox) = ctx.sandbox.as_ref() {
@@ -859,7 +996,7 @@ impl Tool for BashTool {
                         SpawnOpts {
                             cwd: cwd_ref.map(Path::to_path_buf),
                             stdin: None,
-                            extra_env: extra_env.clone(),
+                            extra_env: extra_env.vars.clone(),
                             timeout,
                         },
                     ) => res,
@@ -932,7 +1069,7 @@ impl Tool for BashTool {
 async fn format_command_result(
     command: &str,
     out: &crate::SandboxedOutput,
-    extra_env: &[(String, String)],
+    extra_env: &ChildEnv,
     ctx: &ToolContext,
     escalation_note: Option<&str>,
     sandbox: Option<&dyn ExecSandbox>,
@@ -943,12 +1080,11 @@ async fn format_command_result(
     // Scrub injected secret values out of the output before it reaches the
     // agent / LLM / trace — the leak detector only catches known formats,
     // so arbitrary user tokens are redacted here by exact match.
-    if !extra_env.is_empty()
+    if !extra_env.secret_values.is_empty()
         && let Some(handle) = ctx.secrets.as_deref()
     {
-        let values: Vec<String> = extra_env.iter().map(|(_, v)| v.clone()).collect();
-        stdout = handle.redact(&stdout, &values).await?;
-        stderr = handle.redact(&stderr, &values).await?;
+        stdout = handle.redact(&stdout, &extra_env.secret_values).await?;
+        stderr = handle.redact(&stderr, &extra_env.secret_values).await?;
     }
     let mut result = json!({
         "exit_code": exit_code,
@@ -1035,7 +1171,7 @@ async fn run_detached(
     command: &str,
     args: &[String],
     cwd: Option<&Path>,
-    extra_env: &[(String, String)],
+    extra_env: &ChildEnv,
     timeout: Duration,
     ctx: &ToolContext,
     sink: &Arc<dyn BackgroundJobSink>,
@@ -1046,7 +1182,7 @@ async fn run_detached(
         route,
         args,
         cwd,
-        extra_env,
+        &extra_env.vars,
         timeout,
         ctx,
     )
@@ -1136,13 +1272,13 @@ async fn run_detached(
         DetachedOutcome::Backgrounded => {
             let display_path = stdout_path.display().to_string();
             let stderr_display_path = stderr_path.display().to_string();
-            let secret_risk_note = if extra_env.is_empty() {
+            let secret_risk_note = if extra_env.secret_values.is_empty() {
                 ""
             } else {
                 tracing::warn!(
                     target: "baybo::tools::bash",
                     command = %command,
-                    secret_env_count = extra_env.len(),
+                    secret_env_count = extra_env.secret_values.len(),
                     stdout_path = %display_path,
                     stderr_path = %stderr_display_path,
                     "background Bash command injected secret_env; output files are not redacted"
@@ -1159,13 +1295,37 @@ async fn run_detached(
                 stderr_path,
             };
             let returned = sink.detach_command(turn).await;
-            Ok(Some(ToolOutput::Text(format!(
-                "Command still running after {timeout:?}; moved to the background as `{returned}`. \
-                 Output is streaming to `{display_path}` (Read it for progress). You'll get a \
-                 notification when it finishes — keep working in the meantime.{secret_risk_note}"
+            Ok(Some(ToolOutput::Text(background_handoff(
+                timeout,
+                &returned,
+                &display_path,
+                secret_risk_note,
             ))))
         }
     }
+}
+
+/// What a command pushed to the background hands back.
+///
+/// Carries [`baybo_model::BACKGROUND_DISPATCH_YIELD_GUIDANCE`] rather than a
+/// second wording of it: that rule has one home, and this is one of the three
+/// dispatch points that deliver it (the other two are the subagent spawner's
+/// explicit and auto-converted paths). Delivering it here rather than from the
+/// system prompt is also what lets `PromptShape::Issue` drop the standing
+/// version — the rule only becomes actionable once something is actually in
+/// the background.
+fn background_handoff(
+    timeout: std::time::Duration,
+    handle: &str,
+    display_path: &str,
+    secret_risk_note: &str,
+) -> String {
+    format!(
+        "Command still running after {timeout:?}; moved to the background as `{handle}`. \
+         Output is streaming to `{display_path}` (Read it for progress). {guidance}\
+         {secret_risk_note}",
+        guidance = baybo_model::BACKGROUND_DISPATCH_YIELD_GUIDANCE
+    )
 }
 
 async fn spawn_detached_child(
@@ -1366,6 +1526,61 @@ fn interpret_exit(command: &str, exit_code: i32) -> Option<&'static str> {
 const FILE_TOOL_REDIRECT_COMMANDS: &[&str] = &[
     "cat", "head", "tail", "less", "more", "tac", "sed", "awk", "gawk", "mawk",
 ];
+
+/// Shell punctuation that makes a command more than "open this one file":
+/// a pipeline, a redirect, a chain, a substitution. Any of them and the
+/// redirect below declines to translate rather than guess.
+const SHELL_PUNCTUATION: &[char] = &['|', '<', '>', '&', ';', '(', ')', '`', '$', '\n'];
+
+/// Default lines `head` prints when no `-n` is given.
+const HEAD_DEFAULT_LINES: usize = 10;
+
+/// `Read`'s line-count parameter, the one `head -n` maps onto.
+const READ_LIMIT_ARG: &str = "limit";
+
+/// Result field naming the tool that actually served a translated read, and
+/// what that changes about the output.
+const REDIRECTED_TO_FIELD: &str = "redirected_to";
+const REDIRECTED_TO_READ: &str = "Read — a plain `cat`/`head` against one file is served by the Read tool, \
+so the line numbers you see are Read's. Call `Read` directly next time.";
+
+/// A `cat`/`head` that is only asking to read one file — no pipeline, no
+/// redirect, no chaining, no flags beyond `head -n`. `Some((path, limit))`
+/// is what [`ReadTool`](crate::builtin::read::ReadTool) would be called with;
+/// `None` means refuse as before, which is what every exotic form still gets.
+fn as_plain_file_read(command: &str) -> Option<(PathBuf, Option<usize>)> {
+    if command.contains(SHELL_PUNCTUATION) {
+        return None;
+    }
+    // A relative path keeps the refusal on purpose: `Read` would reject it
+    // anyway, and its own message names the tools, which is what a model
+    // that reached for `cat` needs to hear.
+    let tokens = shell_words::split(command).ok()?;
+    let (argv0, args) = tokens.split_first()?;
+    let argv0 = Path::new(argv0).file_name()?.to_str()?;
+    let absolute = |file: &String| {
+        let p = PathBuf::from(file);
+        p.is_absolute().then_some(p)
+    };
+    match argv0 {
+        "cat" => match args {
+            [file] if !file.starts_with('-') => Some((absolute(file)?, None)),
+            _ => None,
+        },
+        "head" => match args {
+            [file] if !file.starts_with('-') => Some((absolute(file)?, Some(HEAD_DEFAULT_LINES))),
+            [n, file] if !file.starts_with('-') => {
+                let n = n.strip_prefix("-n").or_else(|| n.strip_prefix('-'))?;
+                Some((absolute(file)?, Some(n.parse().ok()?)))
+            }
+            [flag, n, file] if flag == "-n" && !file.starts_with('-') => {
+                Some((absolute(file)?, Some(n.parse().ok()?)))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
 
 fn is_file_tool_redirect(command: &str) -> bool {
     first_token(command).is_some_and(|t| FILE_TOOL_REDIRECT_COMMANDS.contains(&t))
@@ -1768,7 +1983,7 @@ impl BashTool {
         &self,
         command: &str,
         cwd: Option<&Path>,
-        extra_env: &[(String, String)],
+        extra_env: &ChildEnv,
         timeout: Duration,
         ctx: &ToolContext,
         sandbox_err: ToolError,
@@ -1792,7 +2007,7 @@ impl BashTool {
             SandboxEscapeDecision::Run(rationale) => {
                 self.notify_escape(ctx, command, &rationale);
                 return self
-                    .run_unsandboxed_wrapped(command, cwd, extra_env, timeout, ctx)
+                    .run_unsandboxed_wrapped(command, cwd, &extra_env.vars, timeout, ctx)
                     .await;
             }
             SandboxEscapeDecision::Prompt(rationale) => rationale,
@@ -1807,7 +2022,7 @@ impl BashTool {
             .await?
         {
             self.notify_escape(ctx, command, &rationale);
-            self.run_unsandboxed_wrapped(command, cwd, extra_env, timeout, ctx)
+            self.run_unsandboxed_wrapped(command, cwd, &extra_env.vars, timeout, ctx)
                 .await
         } else {
             Err(ToolError::Execution(format!(
@@ -1828,7 +2043,7 @@ impl BashTool {
         timeout: Duration,
         ctx: &ToolContext,
     ) -> crate::Result<crate::SandboxedOutput> {
-        let args = ["-c".to_string(), self.wrap_command(command)];
+        let args = ["-c".to_string(), self.wrap_command(command, ctx)];
         tokio::select! {
             _ = ctx.cancellation_token.cancelled() => {
                 Err(ToolError::Execution("cancelled".into()))
@@ -1875,7 +2090,7 @@ impl BashTool {
              Reason  : {rationale}\n\
              Approve to run it ({run_location})."
         );
-        let decision = approval
+        let outcome = approval
             .request(
                 "Bash",
                 &ctx.session_id,
@@ -1886,7 +2101,7 @@ impl BashTool {
                 preview,
             )
             .await;
-        match decision {
+        match outcome.decision {
             ApprovalDecision::Approve | ApprovalDecision::ApproveAlways => Ok(()),
             ApprovalDecision::Deny => Err(ToolError::Execution(format!(
                 "destructive command denied ({rationale})"
@@ -1902,7 +2117,7 @@ impl BashTool {
         exit_code: i32,
         stdout: &str,
         stderr: &str,
-        extra_env: &[(String, String)],
+        extra_env: &ChildEnv,
         ctx: &ToolContext,
     ) -> crate::Result<SandboxEscapeDecision> {
         let Some(llm) = ctx.lite_llm.as_deref() else {
@@ -1931,10 +2146,9 @@ impl BashTool {
         let mut stdout_s = stdout.to_string();
         let mut stderr_s = stderr.to_string();
         if let Some(handle) = ctx.secrets.as_deref() {
-            if !extra_env.is_empty() {
-                let values: Vec<String> = extra_env.iter().map(|(_, v)| v.clone()).collect();
-                stdout_s = handle.redact(&stdout_s, &values).await?;
-                stderr_s = handle.redact(&stderr_s, &values).await?;
+            if !extra_env.secret_values.is_empty() {
+                stdout_s = handle.redact(&stdout_s, &extra_env.secret_values).await?;
+                stderr_s = handle.redact(&stderr_s, &extra_env.secret_values).await?;
             }
             stdout_s = handle.sanitize(&stdout_s).await?;
             stderr_s = handle.sanitize(&stderr_s).await?;
@@ -1980,7 +2194,7 @@ impl BashTool {
              Reason  : {rationale}\n\
              Approve to retry WITHOUT the OS sandbox (full shell, no workspace guard)."
         );
-        let decision = approval
+        let outcome = approval
             .request_uncached(
                 "Bash",
                 &ctx.session_id,
@@ -1992,7 +2206,7 @@ impl BashTool {
             )
             .await;
         Ok(matches!(
-            decision,
+            outcome.decision,
             ApprovalDecision::Approve | ApprovalDecision::ApproveAlways
         ))
     }
@@ -2010,7 +2224,7 @@ impl BashTool {
         command: &str,
         cwd: Option<&Path>,
         out: crate::SandboxedOutput,
-        extra_env: &[(String, String)],
+        extra_env: &ChildEnv,
         timeout: Duration,
         ctx: &ToolContext,
         policy: SandboxEscapePolicy,
@@ -2046,7 +2260,7 @@ impl BashTool {
             SandboxEscapeDecision::Run(rationale) => {
                 self.notify_escape(ctx, command, &rationale);
                 let new = self
-                    .run_unsandboxed_wrapped(command, cwd, extra_env, timeout, ctx)
+                    .run_unsandboxed_wrapped(command, cwd, &extra_env.vars, timeout, ctx)
                     .await?;
                 Ok((
                     new,
@@ -2063,7 +2277,7 @@ impl BashTool {
                 {
                     self.notify_escape(ctx, command, &rationale);
                     let new = self
-                        .run_unsandboxed_wrapped(command, cwd, extra_env, timeout, ctx)
+                        .run_unsandboxed_wrapped(command, cwd, &extra_env.vars, timeout, ctx)
                         .await?;
                     Ok((
                         new,
@@ -2090,6 +2304,9 @@ impl BashTool {
         };
         tracing::warn!(
             target: "baybo::tools::bash",
+            session_id = %ctx.session_id,
+            turn_id = %ctx.turn_id,
+            span_id = %ctx.span_id,
             command_head = %command_head(command),
             command_len = command.len(),
             reason = %reason,
@@ -2109,6 +2326,9 @@ impl BashTool {
     fn notify_escape(&self, ctx: &ToolContext, command: &str, rationale: &str) {
         tracing::warn!(
             target: "baybo::tools::bash",
+            session_id = %ctx.session_id,
+            turn_id = %ctx.turn_id,
+            span_id = %ctx.span_id,
             command_head = %command_head(command),
             command_len = command.len(),
             rationale = %rationale,
@@ -2288,6 +2508,7 @@ mod tests {
     use crate::{ApprovalHandle, ApprovedResource};
     use baybo_model::{ChannelType, User};
     use parking_lot::Mutex;
+    use std::os::unix::fs::PermissionsExt;
 
     /// A phrase only the sandboxed `{{isolation}}` section carries, so a test
     /// can tell "the OS sandbox is on" from `free`'s "no credential-vault
@@ -3211,7 +3432,7 @@ mod tests {
             baybo_process::ProcessManager::transient(),
         )
         .with_permission(BashPermissionMode::Free);
-        let wrapped = free.wrap_command("python -c 'x'");
+        let wrapped = free.wrap_command("python -c 'x'", &ToolContext::for_test());
         assert!(
             wrapped.contains("uv run python"),
             "free must keep the uv shim: {wrapped}"
@@ -3261,7 +3482,7 @@ mod tests {
                 baybo_workspace::WorkspacePaths::new("/tmp"),
                 baybo_process::ProcessManager::transient(),
             )
-            .wrap_command("python -c 'x'");
+            .wrap_command("python -c 'x'", &ToolContext::for_test());
             assert!(!w.contains("uv run"), "bench leaked uv shim: {w}");
             assert!(!w.contains("UV_CACHE_DIR"), "bench leaked uv exports: {w}");
         }
@@ -3362,7 +3583,7 @@ mod tests {
                 "true",
                 None,
                 ok,
-                &[],
+                &ChildEnv::default(),
                 Duration::from_secs(5),
                 &ctx,
                 SandboxEscapePolicy::AutoJudge,
@@ -3382,7 +3603,7 @@ mod tests {
                 "x",
                 None,
                 failed_out(),
-                &[],
+                &ChildEnv::default(),
                 Duration::from_secs(5),
                 &ctx,
                 SandboxEscapePolicy::None,
@@ -3403,7 +3624,7 @@ mod tests {
                 "true",
                 None,
                 failed_out(),
-                &[],
+                &ChildEnv::default(),
                 Duration::from_secs(5),
                 &ctx,
                 SandboxEscapePolicy::AutoJudge,
@@ -3429,7 +3650,7 @@ mod tests {
                 "true",
                 None,
                 failed_out(),
-                &[],
+                &ChildEnv::default(),
                 Duration::from_secs(5),
                 &ctx,
                 SandboxEscapePolicy::AutoJudge,
@@ -3456,7 +3677,7 @@ mod tests {
                 "true",
                 None,
                 failed_out(),
-                &[],
+                &ChildEnv::default(),
                 Duration::from_secs(5),
                 &ctx,
                 SandboxEscapePolicy::AutoJudge,
@@ -3478,7 +3699,7 @@ mod tests {
                 "true",
                 None,
                 failed_out(),
-                &[],
+                &ChildEnv::default(),
                 Duration::from_secs(5),
                 &ctx,
                 SandboxEscapePolicy::AutoJudge,
@@ -3500,7 +3721,7 @@ mod tests {
                 "true",
                 None,
                 failed_out(),
-                &[],
+                &ChildEnv::default(),
                 Duration::from_secs(5),
                 &ctx,
                 SandboxEscapePolicy::AutoJudge,
@@ -3521,7 +3742,7 @@ mod tests {
                 "true",
                 None,
                 failed_out(),
-                &[],
+                &ChildEnv::default(),
                 Duration::from_secs(5),
                 &ctx,
                 SandboxEscapePolicy::AutoJudge,
@@ -3549,7 +3770,7 @@ mod tests {
                 "true",
                 None,
                 failed_out(),
-                &[],
+                &ChildEnv::default(),
                 Duration::from_secs(5),
                 &ctx,
                 SandboxEscapePolicy::AutoJudge,
@@ -3637,7 +3858,7 @@ mod tests {
             "curl https://example.com",
             None,
             leaky,
-            &[], // no injected secrets — the path that skipped redaction entirely
+            &ChildEnv::default(), // no injected secrets — the path that skipped redaction
             Duration::from_secs(5),
             &ctx,
             SandboxEscapePolicy::AutoJudge,
@@ -3790,7 +4011,7 @@ mod tests {
             "echo hi",
             &args,
             None,
-            &[],
+            &ChildEnv::default(),
             Duration::from_secs(5),
             &ctx,
             &sink,
@@ -3821,7 +4042,7 @@ mod tests {
             "sleep 30",
             &args,
             None,
-            &[],
+            &ChildEnv::default(),
             Duration::from_millis(150),
             &ctx,
             &sink,
@@ -3963,7 +4184,7 @@ mod tests {
             &script,
             &args,
             None,
-            &[],
+            &ChildEnv::default(),
             Duration::from_millis(150),
             &ctx,
             &sink,
@@ -4015,6 +4236,321 @@ mod tests {
         assert!(!f.exists(), "an aged-out file must be pruned");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_issue_runs_commands_in_its_checkout_by_default() {
+        let (fake, sandbox) = fake_with_response(SandboxedOutput {
+            exit_code: 0,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            timed_out: false,
+        });
+        let mut ctx = ctx_with(Some(sandbox));
+        let checkout = PathBuf::from("/tmp/work/projects/p/4");
+        ctx.checkout_root = Some(checkout.clone());
+
+        BashTool::for_test()
+            .execute(json!({ "command": "git status" }), &ctx)
+            .await
+            .expect("bash runs");
+
+        assert_eq!(fake.calls()[0].cwd.as_ref(), Some(&checkout));
+    }
+
+    #[tokio::test]
+    async fn an_explicit_cwd_still_beats_the_checkout() {
+        let (fake, sandbox) = fake_with_response(SandboxedOutput {
+            exit_code: 0,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            timed_out: false,
+        });
+        let mut ctx = ctx_with(Some(sandbox));
+        ctx.checkout_root = Some(PathBuf::from("/tmp/work/projects/p/4"));
+
+        BashTool::for_test()
+            .execute(
+                json!({ "command": "ls", "cwd": "/tmp/work/elsewhere" }),
+                &ctx,
+            )
+            .await
+            .expect("bash runs");
+
+        assert_eq!(
+            fake.calls()[0].cwd.as_deref(),
+            Some(Path::new("/tmp/work/elsewhere")),
+            "the checkout is a default, not an override"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_with_no_checkout_still_defaults_to_the_work_dir() {
+        let (fake, sandbox) = fake_with_response(SandboxedOutput {
+            exit_code: 0,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            timed_out: false,
+        });
+        let ctx = ctx_with(Some(sandbox));
+
+        BashTool::for_test()
+            .execute(json!({ "command": "ls" }), &ctx)
+            .await
+            .expect("bash runs");
+
+        assert_eq!(
+            fake.calls()[0].cwd.as_deref(),
+            Some(ctx.workspace_root.as_path()),
+            "an ordinary session must be unchanged by the checkout default"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_issue_run_credits_the_agent_without_taking_over_the_authorship() {
+        let (fake, sandbox) = fake_with_response(SandboxedOutput {
+            exit_code: 0,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            timed_out: false,
+        });
+        let mut ctx = ctx_with(Some(sandbox));
+        let id = baybo_model::AgentProfileId::generate();
+        ctx.checkout_root = Some(PathBuf::from("/tmp/work/projects/p/4"));
+        ctx.agent_id = id.clone();
+        ctx.agent_handle = Some(baybo_model::AgentHandle::parse("dev-1").expect("handle"));
+
+        BashTool::for_test()
+            .execute(json!({ "command": "git commit -m x" }), &ctx)
+            .await
+            .expect("bash runs");
+
+        let call = &fake.calls()[0];
+        let env = &call.extra_env;
+        assert_eq!(
+            env.iter()
+                .find(|(k, _)| k == COMMIT_TRAILER_ENV)
+                .map(|(_, v)| v.as_str()),
+            Some(format!("Co-authored-by: dev-1 <{id}@baybo.local>").as_str()),
+            "the agent is credited in the message: {env:?}"
+        );
+        assert!(
+            !env.iter()
+                .any(|(k, _)| k.starts_with("GIT_AUTHOR") || k.starts_with("GIT_COMMITTER")),
+            "an identity env var outranks every config file, so it would erase the \
+             operator whose work this still is: {env:?}"
+        );
+        assert!(
+            call.args.iter().any(|a| a.contains("git() {")),
+            "the shim that splices the trailer must reach the shell: {:?}",
+            call.args
+        );
+    }
+
+    #[tokio::test]
+    async fn an_issue_run_whose_agent_has_no_handle_is_left_entirely_alone() {
+        let (fake, sandbox) = fake_with_response(SandboxedOutput {
+            exit_code: 0,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            timed_out: false,
+        });
+        let mut ctx = ctx_with(Some(sandbox));
+        ctx.checkout_root = Some(PathBuf::from("/tmp/work/projects/p/4"));
+        ctx.agent_id = baybo_model::AgentProfileId::generate();
+
+        BashTool::for_test()
+            .execute(json!({ "command": "git commit -m x" }), &ctx)
+            .await
+            .expect("bash runs");
+
+        let call = &fake.calls()[0];
+        assert!(
+            !call
+                .extra_env
+                .iter()
+                .any(|(k, _)| k.starts_with("GIT_") || k == COMMIT_TRAILER_ENV),
+            "there is no board name to credit, so the commit is an ordinary one"
+        );
+        assert!(
+            !call.args.iter().any(|a| a.contains("git() {")),
+            "no trailer to splice means no reason to wrap git: {:?}",
+            call.args
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_session_carries_no_git_env() {
+        let (fake, sandbox) = fake_with_response(SandboxedOutput {
+            exit_code: 0,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            timed_out: false,
+        });
+        let ctx = ctx_with(Some(sandbox));
+
+        BashTool::for_test()
+            .execute(json!({ "command": "ls" }), &ctx)
+            .await
+            .expect("bash runs");
+
+        assert!(
+            !fake.calls()[0]
+                .extra_env
+                .iter()
+                .any(|(k, _)| k.starts_with("GIT_") || k == COMMIT_TRAILER_ENV),
+            "a session that never commits gains nothing from a trailer"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_issue_run_is_pointed_at_the_identity_resolved_for_its_checkout() {
+        let (fake, sandbox) = fake_with_response(SandboxedOutput {
+            exit_code: 0,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            timed_out: false,
+        });
+        let mut ctx = ctx_with(Some(sandbox));
+        ctx.checkout_root = Some(PathBuf::from("/tmp/work/projects/p/4"));
+        ctx.agent_handle = Some(baybo_model::AgentHandle::parse("dev-1").expect("handle"));
+        ctx.checkout_git_config = Some(PathBuf::from("/tmp/work/projects/p/4.gitconfig"));
+
+        BashTool::for_test()
+            .execute(json!({ "command": "git commit -m x" }), &ctx)
+            .await
+            .expect("bash runs");
+
+        assert_eq!(
+            fake.calls()[0]
+                .extra_env
+                .iter()
+                .find(|(k, _)| k == "GIT_CONFIG_GLOBAL")
+                .map(|(_, v)| v.as_str()),
+            Some("/tmp/work/projects/p/4.gitconfig"),
+            "the sandbox remaps HOME, so git has to be told where to look"
+        );
+    }
+
+    /// The shim rebuilds the argument list by hand, which is exactly the kind
+    /// of shell that reads fine and is wrong — so run it, against a `git` that
+    /// records the argv it was handed.
+    fn shim_argv(command: &str, trailer: &str) -> Vec<String> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorded = dir.path().join("argv");
+        let fake_git = dir.path().join("git");
+        std::fs::write(
+            &fake_git,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > {}\n",
+                recorded.display()
+            ),
+        )
+        .expect("write fake git");
+        std::fs::set_permissions(&fake_git, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake git");
+
+        let script = format!(
+            "export PATH={}:$PATH; export {COMMIT_TRAILER_ENV}={}; {}{command}",
+            sh_quote(&dir.path().to_string_lossy()),
+            sh_quote(trailer),
+            GIT_COMMIT_TRAILER_SHIM.as_str(),
+        );
+        let out = std::process::Command::new("sh")
+            .args(["-c", &script])
+            .output()
+            .expect("sh runs");
+        assert!(out.status.success(), "shim script failed: {out:?}");
+        std::fs::read_to_string(&recorded)
+            .expect("fake git ran")
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn the_shim_splices_the_trailer_before_a_pathspec_list() {
+        // Appending at the end would land the trailer *after* `--`, where git
+        // reads it as a file name rather than an option.
+        assert_eq!(
+            shim_argv(
+                "git commit -m x -- a.rs",
+                "Co-authored-by: dev-1 <x@baybo.local>"
+            ),
+            [
+                "commit",
+                "--trailer",
+                "Co-authored-by: dev-1 <x@baybo.local>",
+                "-m",
+                "x",
+                "--",
+                "a.rs"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_shim_sees_through_gits_own_leading_options() {
+        assert_eq!(
+            shim_argv("git -C /some/repo -c core.pager=cat commit --amend", "T: t"),
+            [
+                "-C",
+                "/some/repo",
+                "-c",
+                "core.pager=cat",
+                "commit",
+                "--trailer",
+                "T: t",
+                "--amend"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_shim_leaves_every_other_subcommand_untouched() {
+        // `--grep=commit` must not be mistaken for the subcommand, and a value
+        // that happens to be `commit` sits after one, so the scan has to stop
+        // at the first non-option word either way.
+        assert_eq!(
+            shim_argv("git log --grep=commit -- commit", "T: t"),
+            ["log", "--grep=commit", "--", "commit"]
+        );
+        assert_eq!(shim_argv("git status", "T: t"), ["status"]);
+    }
+
+    #[test]
+    fn the_shim_stays_out_of_the_way_when_no_trailer_is_set() {
+        assert_eq!(shim_argv("git commit -m x", ""), ["commit", "-m", "x"]);
+    }
+
+    #[tokio::test]
+    async fn the_agents_own_id_is_not_scrubbed_out_of_its_output() {
+        let id = baybo_model::AgentProfileId::generate();
+        let (_fake, sandbox) = fake_with_response(SandboxedOutput {
+            exit_code: 0,
+            stdout: format!("switched to branch issue/4-x by dev-1 ({id})\n").into_bytes(),
+            stderr: Vec::new(),
+            timed_out: false,
+        });
+        let mut ctx = ctx_with(Some(sandbox));
+        ctx.secrets = Some(Arc::new(StubSecrets));
+        ctx.checkout_root = Some(PathBuf::from("/tmp/work/projects/p/4"));
+        ctx.agent_id = id.clone();
+        ctx.agent_handle = Some(baybo_model::AgentHandle::parse("dev-1").expect("handle"));
+
+        let out = BashTool::for_test()
+            .execute(json!({ "command": "git status" }), &ctx)
+            .await
+            .expect("bash runs");
+
+        let ToolOutput::Json(v) = out else {
+            panic!("bash returns json");
+        };
+        let stdout = v["stdout"].as_str().expect("stdout");
+        assert!(
+            stdout.contains("dev-1") && stdout.contains(id.as_str()),
+            "the agent's own handle and id must survive its own output: {stdout}"
+        );
     }
 
     fn fake_with_response(
@@ -4940,6 +5476,107 @@ mod tests {
         );
     }
 
+    /// The round trip a run used to pay for 72 times: `cat` came back as a
+    /// refusal and the model had to spend another turn on `Read`.
+    #[tokio::test]
+    async fn a_plain_cat_comes_back_with_the_file_instead_of_a_refusal() {
+        // Under `/tmp/work`, because the work-dir jail runs BEFORE the
+        // redirect and still governs which files a shell may name at all.
+        tokio::fs::create_dir_all("/tmp/work")
+            .await
+            .expect("work dir");
+        let dir = tempfile::tempdir_in("/tmp/work").expect("tempdir under the work dir");
+        let file = dir.path().join("note.txt");
+        tokio::fs::write(&file, "alpha\nbeta\ngamma\n")
+            .await
+            .expect("write");
+
+        let out = BashTool::for_test()
+            .execute(
+                json!({ "command": format!("cat {}", file.display()) }),
+                &ctx_with(None),
+            )
+            .await
+            .expect("a plain cat is served, not refused");
+        let ToolOutput::Json(v) = out else {
+            panic!("bash keeps its result shape")
+        };
+        assert_eq!(v["exit_code"], 0);
+        let stdout = v["stdout"].as_str().expect("stdout");
+        assert!(stdout.contains("alpha"), "{stdout:?}");
+        assert!(stdout.contains("3\tgamma"), "Read's numbering: {stdout:?}");
+        assert!(
+            v[REDIRECTED_TO_FIELD]
+                .as_str()
+                .is_some_and(|s| s.starts_with("Read")),
+            "the model must be told which tool answered: {v}"
+        );
+
+        // Everything the translation cannot honour still refuses.
+        let refused = BashTool::for_test()
+            .execute(
+                json!({ "command": format!("cat {} | head -1", file.display()) }),
+                &ctx_with(None),
+            )
+            .await;
+        assert!(refused.is_err(), "a pipeline is not a one-file read");
+
+        // And the jail still decides what a shell may name: a workspace path
+        // outside `work/` is refused before the redirect is even consulted.
+        let jailed = BashTool::for_test()
+            .execute(
+                json!({ "command": "cat /tmp/state/storage.db" }),
+                &ctx_with(None),
+            )
+            .await;
+        assert!(jailed.is_err(), "the redirect must not widen shell reach");
+    }
+
+    #[test]
+    fn a_plain_one_file_cat_or_head_maps_onto_read() {
+        assert_eq!(
+            as_plain_file_read("cat /w/a.txt"),
+            Some((PathBuf::from("/w/a.txt"), None))
+        );
+        assert_eq!(
+            as_plain_file_read("/usr/bin/cat '/w/a b.txt'"),
+            Some((PathBuf::from("/w/a b.txt"), None))
+        );
+        assert_eq!(
+            as_plain_file_read("head /w/f.log"),
+            Some((PathBuf::from("/w/f.log"), Some(HEAD_DEFAULT_LINES)))
+        );
+        for form in [
+            "head -n 20 /w/f.log",
+            "head -n20 /w/f.log",
+            "head -20 /w/f.log",
+        ] {
+            assert_eq!(
+                as_plain_file_read(form),
+                Some((PathBuf::from("/w/f.log"), Some(20))),
+                "{form}"
+            );
+        }
+
+        // Anything that is more than opening one file keeps the refusal: the
+        // translation has no way to honour the rest of it.
+        for form in [
+            "cat foo.txt",         // relative — Read would reject it anyway
+            "cat /w/a /w/b",       // two files — Read takes one
+            "cat",                 // stdin
+            "cat /w/a | grep x",   // pipeline
+            "cat /w/a > /w/b",     // redirect
+            "cat /w/a && rm /w/b", // chain
+            "cat $(ls)",           // substitution
+            "cat -n /w/a",         // a flag Read has no answer for
+            "tail -f /w/a",        // Read has no negative offset
+            "sed -i 's/a/b/' f",   // a write wearing a read's clothes
+            "head -q -n 2 /w/a",   // more than the one flag
+        ] {
+            assert_eq!(as_plain_file_read(form), None, "{form}");
+        }
+    }
+
     #[test]
     fn is_file_tool_redirect_catches_leading_argv0_only() {
         // FileToolRedirect is a tool-layer policy: only the literal
@@ -5642,5 +6279,30 @@ mod tests {
                 .any(|l| l == "BAYBO_TEST_SECRET=injected-value"),
             "injected env var must reach the child:\n{stdout}"
         );
+    }
+}
+
+#[cfg(test)]
+mod background_handoff_tests {
+    use super::background_handoff;
+
+    /// The handoff carries the yield rule verbatim. This is the only place it
+    /// reaches a card's run: `PromptShape::Issue` drops the standing hint
+    /// because every dispatch delivers it here instead, so a reworded copy
+    /// here would silently leave that run with no rule at all.
+    #[test]
+    fn a_backgrounded_command_hands_back_the_one_yield_rule() {
+        let text = background_handoff(
+            std::time::Duration::from_secs(120),
+            "bg-7",
+            "/w/out.log",
+            "",
+        );
+        assert!(
+            text.contains(baybo_model::BACKGROUND_DISPATCH_YIELD_GUIDANCE),
+            "the shared rule must be present verbatim: {text}"
+        );
+        assert!(text.contains("bg-7"), "{text}");
+        assert!(text.contains("/w/out.log"), "{text}");
     }
 }

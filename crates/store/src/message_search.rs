@@ -70,7 +70,7 @@ pub struct SearchScope {
     /// recurring fires became conversations.
     ///
     /// Off by default because such a session is unreachable by construction on
-    /// the other side: the chat list drops it (`is_hidden_cron_session`) and the
+    /// the other side: the chat list drops it (`is_private_cron_session`) and the
     /// REST attach path 404s it, so a hit there names a conversation no client
     /// can list. A recurring fire IS a conversation and is never affected by
     /// this flag.

@@ -83,7 +83,7 @@ fn with_manifest(tool: Arc<dyn Tool>) -> (Arc<dyn Tool>, ToolManifest) {
 
 /// A recurring cron fire calls this to declare that its scheduled check found
 /// nothing worth telling the user, so this run should notify no one. It is
-/// visible only inside a recurring fire ([`ToolTriggerScope::CronFire`]) and
+/// visible only inside a recurring fire ([`ToolTriggerScope::CronConversation`]) and
 /// takes effect only there: it flips the fire's `NotifySilence` handle, which
 /// the agent loop reads to complete the fire without a notification (no chat
 /// row, no push, no live pulse). Where the handle is absent — a user reply in a
@@ -110,7 +110,7 @@ impl Tool for CronReportNothingTool {
     }
 
     fn trigger_scope(&self) -> ToolTriggerScope {
-        ToolTriggerScope::CronFire
+        ToolTriggerScope::CronConversation
     }
 
     async fn execute(&self, _params: Value, ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
@@ -162,7 +162,7 @@ impl Tool for CronCreateTool {
     }
 
     fn description(&self) -> String {
-        r#"Schedule a job whose `prompt` is run as a task on a timer. `title`, `timezone` and `prompt` are required: on every fire the agent executes `prompt` in a fresh session as an instruction to carry out — NOT as a message from the user — and all times in inputs and outputs are anchored to `timezone`. Supply exactly one of `schedule` (recurring cron expression, e.g. "0 9 * * *") or `at` (one-shot timestamp); an `at` job fires once and then stops, staying in the list as `executed`. Write `prompt` as a self-contained task instruction (see its description) so the fire does the right thing. A recurring fire opens its own conversation named after `title`; a one-shot fire reports its result back into THIS conversation."#
+        r#"Schedule a job whose `prompt` is run as a task on a timer. `title`, `timezone` and `prompt` are required; all times in and out are anchored to `timezone`. Supply exactly one of `schedule` (recurring cron expression, e.g. "0 9 * * *") or `at` (one-shot timestamp). A recurring fire opens its own conversation named after `title`; a one-shot fire reports its result back into THIS conversation and then stops, staying in the list as `executed`."#
             .to_string()
     }
 
@@ -234,6 +234,13 @@ impl Tool for CronCreateTool {
                 prompt: p.prompt,
                 timezone,
                 origin_session_id: Some(origin_session(ctx)),
+                // Inherited from the calling session, never a parameter —
+                // exactly like `origin_session` above, and for the same
+                // reason: a model may no more choose which board a job
+                // files work on than it may choose which board a tool call
+                // touches. A job scheduled from inside a board belongs to
+                // that board; one scheduled from a chat belongs to none.
+                project_id: ctx.session_trigger.project().cloned(),
             })
             .await
             .map_err(cron_tool_error)?;
@@ -380,7 +387,7 @@ impl Tool for CronUpdateTool {
                 },
                 "prompt": {
                     "type": "string",
-                    "description": r#"New instruction to execute when the job fires. Omit to keep the current one. As with CronCreate, each fire runs in a fresh session with NO memory of this conversation and the text is handed to the agent as a task to perform — NOT as a message from the user — so write it as a self-contained, imperative instruction with every detail inlined."#
+                    "description": "New instruction to execute when the job fires. Omit to keep the current one. Same rules as CronCreate's `prompt`."
                 },
                 "schedule": {
                     "type": "string",
@@ -721,7 +728,7 @@ mod tests {
     fn report_nothing_is_visible_only_to_recurring_fires() {
         assert_eq!(
             CronReportNothingTool.trigger_scope(),
-            ToolTriggerScope::CronFire
+            ToolTriggerScope::CronConversation
         );
     }
 
@@ -777,6 +784,7 @@ mod tests {
                 prompt: "news".to_string(),
                 timezone: "UTC".to_string(),
                 origin_session_id: None,
+                project_id: None,
             })
             .await
             .expect("job creates")
@@ -835,6 +843,7 @@ mod tests {
                 prompt: "news".to_string(),
                 timezone: timezone.to_string(),
                 origin_session_id: None,
+                project_id: None,
             })
             .await
             .expect("job creates")
@@ -1094,6 +1103,7 @@ mod tests {
                 origin_session_id: Some("sess-user".into()),
                 conversation: false,
                 job_title: None,
+                project_id: None,
             },
         );
         assert_eq!(origin_session(&ctx).as_str(), "sess-user");
@@ -1114,6 +1124,7 @@ mod tests {
                 origin_session_id: Some("sess-somewhere-else".into()),
                 conversation: true,
                 job_title: Some("Daily news".into()),
+                project_id: None,
             },
         );
         assert_eq!(origin_session(&ctx).as_str(), "cron-daily-news");
@@ -1131,6 +1142,7 @@ mod tests {
                 origin_session_id: None,
                 conversation: false,
                 job_title: None,
+                project_id: None,
             },
         );
         assert_eq!(origin_session(&ctx).as_str(), "cron-fire-2");

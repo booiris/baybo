@@ -6,7 +6,7 @@ The `context` crate owns the per-actor conversation state: the
 transcript (`messages`), the token budget, and the hardcoded
 compression flow. Persistence is wired in directly — every
 `ContextManager` takes a bound `SessionId` + `Arc<SessionManager>` at
-construction; `append` and the compression apply mirror to
+construction; `append` and the compression apply persist to
 `session_messages` through the `SessionManager` wrapper in
 [`baybo-session`](session.md). Tests construct an in-memory store via
 `baybo_session::test_support::MemorySessionStore` and pass it through
@@ -14,10 +14,10 @@ the same constructor — no separate "in-memory mode" exists.
 
 Core responsibilities:
 
-- **Sole owner of the transcript**: `ContextManager` holds `Vec<ChatMessage>` directly. `Session` (in `baybo-model`) carries only metadata (id, user, channel, lineage, soul binding, …). Ordinary `append` calls `persist_appended` (→ `SessionManager::append_session_message`); `append_idempotent` asks the store to atomically claim a `source_event_id` and mirrors the message into the live window only for `Inserted`, never `Existing`. Every successful compression calls `persist_compaction` (→ `SessionManager::apply_session_compaction`). Cold-start hydration via `restore_from_store` seeds the manager so an actor restart preserves the conversation; on load it runs `transcript_repair::repair_tool_pairing`, which persists a synthetic "interrupted" `ToolResult` for any `ToolUse` a crash left unanswered (append-only) and repositions displaced result rows next to their issuing assistant row, so a crash-torn transcript can't wedge the next request on provider tool-pairing validation.
-- **Caller-driven compression**: `append()` is pure (push + budget update); the agent loop calls `maybe_compress()` at well-defined points so compression LLM cost can be recorded against the cost ledger
+- **Sole owner of the transcript**: `ContextManager` holds `Vec<ChatMessage>` directly. `Session` (in `baybo-model`) carries only metadata (id, user, channel, lineage, soul binding, …). Ordinary `append` calls `persist_appended` (→ `SessionManager::append_session_message`) **before** pushing into the live window or charging the budget; a store error returns `ContextError::Transcript` and leaves both untouched. `append_idempotent` asks the store to atomically claim a `source_event_id` and mirrors the message into the live window only for `Inserted`, never `Existing`. Every successful compression calls `persist_compaction` (→ `SessionManager::apply_session_compaction`). Cold-start hydration via `restore_from_store` seeds the manager so an actor restart preserves the conversation; on load it runs `transcript_repair::repair_tool_pairing`, which persists a synthetic "interrupted" `ToolResult` for any `ToolUse` a crash left unanswered (append-only), repositions displaced result rows next to their issuing assistant row, and quarantines orphan/duplicate results from the provider-facing window without deleting their durable rows.
+- **Caller-driven compression**: `append()` durably appends, then pushes and updates the budget; it never triggers compression. The agent loop calls `maybe_compress()` at well-defined points so compression LLM cost can be recorded against the cost ledger.
 - **Token budget tracking**: track current token usage and remaining capacity via `TokenBudget`, anchored to the provider's authoritative `usage.input_tokens` between calls
-- **Hardcoded compaction flow**: a single impl block on `ContextManager` — one blocking summariser call, assembled with the verbatim tail. No trait, no dispatch — every production session takes the same path. **A summary is the only thing that shortens a transcript**: when the call fails, nothing is applied and the user is told.
+- **Hardcoded compaction flow**: a single impl block on `ContextManager` — one blocking summariser call, assembled with the verbatim tail. No trait, no dispatch — every production session takes the same path. **A summary is the only thing that supersedes durable active transcript rows**: hydration quarantine only filters invalid protocol blocks from the provider-facing in-memory view and never rewrites storage. When the summariser call fails, nothing is applied and the user is told.
 
 **Goal**: ensure the context sent to the LLM never exceeds the model's context window while preserving the most valuable information.
 
@@ -93,13 +93,20 @@ here is the byte-budget cap and the content-addressed spill.
 
 ### Compression is caller-driven
 
-`append()` only pushes the message and updates the token budget — it does **not** auto-compress. The agent loop calls `maybe_compress()` at the top of every iteration; that's the single point where compression LLM calls happen and where their cost is recorded against the cost ledger.
+`append()` persists the message, then pushes it into the live window and updates
+the token budget; it does **not** auto-compress. If persistence fails, it returns
+`ContextError::Transcript` without changing memory. Agent ingress, assistant,
+tool-result, interjection, recall, cron, notification, and subagent paths
+propagate that error and stop the current turn before another LLM call. The
+agent loop calls `maybe_compress()` at the top of every iteration; that is the
+single point where compression LLM calls happen and where their cost is recorded
+against the cost ledger.
 
 This trade-off — losing the "impossible to forget" property of auto-compression — is deliberate: every compression that reaches Stage 2 spawns a billable LLM call, and the cost-recording context (`SpanRecorder`, `TurnId`, `CostManager`) only exists at the agent-loop layer. Auto-compressing inside `append()` would silently bypass that recording.
 
 ```rust
 // Append in any number of places without cost-recording overhead.
-self.context_manager.append(&user_msg).await;
+self.context_manager.append(&user_msg).await?;
 
 // Single explicit compression site at the top of each iteration.
 self.compress_if_needed(session, span_recorder, turn_id, &cancel_token, delta_tx.as_ref(), &mut compaction_failure_reported).await?;
@@ -153,6 +160,9 @@ honest, in ascending order of cost:
    fallback for everything a diff cannot beat: a hint (no tag, so no prior copy to
    address), a section `messages[0]` never carried, and a wholesale rewrite, whose
    diff quotes both copies and is measured against the body before it is chosen.
+   A section the fresh assembly no longer carries is not retracted mid-session:
+   the leading row stays immutable, and the next compaction reseeds the current
+   prompt without that section.
    Each explanatory paragraph is likewise carried only by an update that needs it,
    so the common single-section delta explains neither diffs nor self-edits.
 
@@ -334,7 +344,9 @@ two appears in neither the diff nor the live set.
 `ContextManager::run_compression_flow` (in `compressor.rs`) is `async` and receives a one-shot `ChatCallback`.
 
 1. **Pre-flight gate**: return `NoOp` without firing the LLM when `non_system.len() ≤ keep_recent` **and** the non-system total is under `MIN_COMPACTABLE_TOKENS` — both, not either. The count alone says nothing about the summariser, which collapses any number of messages into one: gating on it refused to compact a transcript of a few pasted files — ten messages, 26k tokens, well past the budget — for as many turns as it stayed under the count. The token half is what the gate is really for: a `/compact` on a genuinely tiny conversation declines rather than burning a call to produce something longer than what it replaced.
-2. **Summarise**: send the full conversation + `SUMMARIZE_INSTRUCTION` through the `ChatCallback`. The whole transcript goes even though its tail is about to be kept verbatim, because `LlmCallInputs::Persisted` can only name the *entire* active set — trimming the request to a strict prefix would force an `Inline` marker and re-embed the transcript into every compaction span.
+2. **Summarise**: send the conversation's own prefix + `SUMMARIZE_INSTRUCTION` through the `ChatCallback`. The whole transcript goes even though its tail is about to be kept verbatim, because `LlmCallInputs::Persisted` can only name the *entire* active set — trimming the request to a strict prefix would force an `Inline` marker and re-embed the transcript into every compaction span.
+
+   **The request has to be the turn's own request as far as the two overlap.** Providers route a prompt-cache lookup on the head of the request, so a compaction that rebuilt the transcript its own way diverged at the first differing byte and re-prefilled the whole thing cold — 41% of all uncached input tokens on an 11-day sample, and on the subscription leg the cold ~240k-token compaction request was the only one the usage limit rejected while the cached main calls beside it passed. Three things make it match: `ContextManager::llm_prefix()` (the same framing + `merge_for_llm` pass `messages_for_llm` does, minus the per-turn tail — task reminder, progress observation, notification cue — which is momentary guidance a summariser is not owed); the session's own tool list, passed in by the agent loop from the one place that builds it (`AgentLoop::session_tool_defs`); and `ToolChoice::None`, which keeps the offer from being taken up without spending prompt text on a prohibition. The instruction is pushed **after** the merge — it rides as `Role::User`, and merging it in would fold it into the last transcript row and make the span's `suffix` marker a lie. The summariser also runs at a fixed low reasoning rung: this workload does not need the session's potentially high setting, which spent about half the summariser's output tokens on hidden reasoning.
 3. **Assemble** (`assemble_summary`): `[system…, summary, verbatim recent slice]`. The slice is a backward walk in atomic units (a message, or a `tool_use`/`tool_result` pair) bounded by `recent_slice_bounds(max_tokens)`, and it is what keeps a compaction from turning the last tool results and the user's own words into a paraphrase of themselves.
 4. **No fallback**: if the summariser errored or returned nothing usable, return `Failed { reason }` and leave the transcript exactly as it was. There is deliberately no "drop the middle" path. It existed once, and a two-second provider blip (`Our servers are currently overloaded`, both attempts) is all it took to cut a 1000-message conversation down to its last handful — silently, since a truncate reported as a successful compaction. A transcript that is still over threshold is a far smaller problem than one that lost its history: the next turn retries, and the user is told meanwhile.
 
@@ -345,7 +357,7 @@ Two things can make the flow decline instead:
 
 **Slice bounds.** `RECENT_SLICE_MAX_TOKENS_RATIO` (0.15) is window-relative, and **must stay below `compression_threshold`**: the tail rides along into the compacted transcript, so a ratio at or above the trigger would land every compaction back above its own threshold and re-fire it forever. `RECENT_SLICE_MAX_TOKENS_ABS` (40K) caps it on very large windows; the walk's token floor is expressed as a fraction of the derived cap so `min ≤ max` holds structurally rather than by coincidence at large sizes. On a window small enough that no tail fits, the compaction is summary-only.
 
-The summary message follows Claude Code's continuation-prompt shape: an intro paragraph framing the conversation as resumed from compaction, the body prefixed with `Summary:`, a `read the full transcript at: <path>` pointer (resolved through `WorkspacePaths::session_log_file`) — a **virtual** path with no file behind it: a `Read` of it is served by a virtual-read resolver (`ReadTool` consults `ctx.virtual_reads` before the filesystem) from the durable `session_messages` transcript (full, including rows compaction has since superseded), and a closing paragraph instructing the model to resume work without acknowledging the summary. The footer has two variants because its claim has to be true — one says the recent messages are preserved verbatim below, one doesn't. `parse_summary_response` strips both `<analysis>` and `<summary>` tags.
+The summary message follows Claude Code's continuation-prompt shape: an intro paragraph framing the conversation as resumed from compaction, the body prefixed with `Summary:`, a `read the full transcript at: <path>` pointer (resolved through `WorkspacePaths::session_log_file`) — a **virtual** path with no file behind it: a `Read` of it is served by a virtual-read resolver (`ReadTool` consults `ctx.virtual_reads` before the filesystem) from the durable `session_messages` transcript (full, including rows compaction has since superseded), and a closing paragraph instructing the model to resume work without acknowledging the summary. The footer has two variants because its claim has to be true — one says the recent messages are preserved verbatim below, one doesn't. The current instruction requests one `<summary>` block; `parse_summary_response` strips its tags and remains tolerant of the older `<analysis>` shape.
 
 Every `Replaced` return triggers `ContextManager` to insert the skill trailer right after the system block (`insert_skill_trailer`). The historical `<system-reminder>` carrying the skill list lives in a `User` message, which the summary discards by construction. Re-inserting is cheaper than tracking whether the kept slice still carries one. The reminder block re-advertises the session's *filtered* set (`invocable_skill_summaries` — agent-invocable, non-untrusted, channel-admitted; skipped when empty), never the raw registry, so a hidden skill can't leak back in after compaction; the per-called-skill `<skill>` detail blocks stay keyed on `called_skills` unfiltered. Putting it adjacent to the system prompt also keeps the "what tools are available" context lined up for prompt caching.
 
@@ -367,8 +379,11 @@ The context sent to the LLM is organized in descending priority:
 
 ## Constraints
 
-- `TokenBudget::max_tokens` is sourced from the active LLM client's `ModelInfo::context_window` — installed by `AgentLoop::from_config` via `ContextManager::set_active_model_context_window`. There is no separate configured cap; resize the model's `context_window` if you need headroom for output tokens.
+- `TokenBudget::max_tokens` is sourced from the active LLM client's `ModelInfo::context_window` — installed by `AgentLoop::from_config` via `ContextManager::set_active_model_context_window`. Resize the model's `context_window` if you need headroom for output tokens.
 - `agent.context.compression_threshold` ships at `0.65` (`crates/config/src/agent.rs`). Raising it leaves less headroom for the compaction's own output; lowering it compacts more often.
+- `agent.context.max_active_tokens` ships at `120_000` and is the **absolute** half of the same decision: `TokenBudget::compression_ceiling` is the *lesser* of the window share and this cap, and `0` turns the cap off. A share alone stopped bounding anything once providers began advertising million-token windows — 0.65 of 1,048,576 trips at 681K, and a measured board ran two sessions to 226K and 295K input tokens over ~200 calls each without ever compacting. What that costs is paid per call, not at the window: the long prefix is re-sent every iteration, so it is cache reads where the provider caches and full-price prefill plus tail latency where it does not. Both rules live in `compression_ceiling` and nowhere else, so the gate and the post-compaction savings check cannot disagree about what "too much context" means.
+
+  It is deliberately **not** an issue-run-only rule. Nothing about cache economics or prefill latency is particular to a board's runs; that is only where the runaway was measured. The visible consequence is that long chat conversations on a large-window model now compact where they previously did not.
 - `agent.context.keep_recent` is the message-count half of the pre-flight gate — how many non-system messages still count as a *short* conversation. It no longer sizes a kept tail: the verbatim slice after a summary is sized in tokens by `recent_slice_bounds`.
 
 ## Cost recording
@@ -387,7 +402,7 @@ Lifecycle:
 2. After a main call lands `usage.input_tokens = N` for the current transcript of length `K` → `record_call_actual(N)` anchors the baseline (`actual_tokens=N`, `message_count_at_call=K`) and feeds a `(raw_text_estimate, N)` sample to `TokenCalibration` keyed by `current_model`. The slice argument from the previous API is gone — the manager owns the transcript outright now, so the call site has nothing useful to pass in.
 3. Within the turn, each new assistant/tool message is appended; budget grows as `N + tokenize(suffix)`.
 4. Compression mutates the prefix → `maybe_compress` calls `invalidate_baseline()`; next call resets the cycle.
-5. Compression LLM calls are *not* fed into calibration — their input shape (old non-system messages, no tools schema) differs from main-call shape and would set a misleading baseline.
+5. Compression LLM calls are *not* fed into calibration — they carry the instruction suffix and answer at a fixed low reasoning rung, so their shape differs from a main call's and would set a misleading baseline. (Their *prefix* is deliberately identical, tool list included; see step 2.)
 
 `TokenCalibration` (per-model EMA ratio of `actual / estimate`, α=0.3, samples clamped to [0.5, 2.0], estimates < 100 tokens skipped) is still applied to the **delta** part — single-message BPE error is small but non-zero. The full-sweep fallback path also goes through calibration so cold-start estimates are scaled too.
 

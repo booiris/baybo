@@ -18,10 +18,14 @@
 //! - **Size cap**: identity files are system-prompt-bound (~kB). A
 //!   multi-MiB file is corruption or symlink shenanigans — fail before
 //!   we slurp it.
-//! - **The name survives**: an edit to `IDENTITY.md` may change the `Name:`
-//!   line but not remove it — that line is what every surface calls the
-//!   agent, and losing it fails nothing loudly, it just renders the agent as
-//!   a raw id.
+//! - **The name survives**: an edit to `IDENTITY.md` may not remove the
+//!   `Name:` line — that line is what every surface calls the agent, and
+//!   losing it fails nothing loudly, it just renders the agent as a raw id.
+//!   For a project agent it may not *change* it either: its `@handle` was
+//!   derived from that name when it was hired. Both rules live in
+//!   `baybo_workspace::name` and are applied by `write_managed_file`, this
+//!   tier's single writer — so this tool has no naming check of its own to
+//!   remember, and neither will the next tool to reach `personas/`.
 //! - **Audit commit**: after a successful write, the change is staged and
 //!   committed into the `personas/` repo with a fixed `Baybo <baybo@local>`
 //!   author, so the user can later see what the agent rewrote and revert
@@ -50,7 +54,7 @@
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
-use baybo_workspace::{IdentityKind, WorkspacePaths};
+use baybo_workspace::WorkspacePaths;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -72,7 +76,8 @@ const PERSONA_EDIT_PICKUP_NOTE: &str =
     "\nnote: your system prompt picks this change up on the next request";
 
 use super::managed_repo::{
-    ChangeKind, ManagedRoots, ManagedTarget, append_audit_line, commit_change, reject_if_oversized,
+    ChangeKind, ManagedRoots, append_audit_line, commit_change, reject_if_oversized,
+    write_managed_file,
 };
 use super::paths::require_absolute;
 use crate::{ResourceAccess, Tool, ToolContext, ToolError, ToolOutput};
@@ -105,17 +110,14 @@ impl Tool for EditTool {
     }
 
     fn description(&self) -> String {
-        "Perform targeted string replacement inside a file. Always use \
-         this instead of Bash commands like sed or awk for editing files. \
+        "Perform targeted string replacement inside a file. \
          Replace `old_string` with `new_string`; when `replace_all` is \
          false (default), `old_string` must appear exactly once — otherwise \
          the tool fails without touching the file. Provide enough surrounding \
          context in `old_string` to ensure a unique match.\n\n\
          READ FIRST: you must Read the file before editing it. If it changed \
          on disk since your last Read, Read it again — the edit is rejected \
-         until your view is current.\n\n\
-         PATHS: `file_path` MUST be an absolute filesystem path. Relative \
-         paths are rejected."
+         until your view is current."
             .to_string()
     }
 
@@ -123,7 +125,7 @@ impl Tool for EditTool {
         json!({
             "type": "object",
             "properties": {
-                "file_path":   { "type": "string" },
+                "file_path":   { "type": "string", "description": "Absolute path; relative is rejected" },
                 "old_string":  { "type": "string" },
                 "new_string":  { "type": "string" },
                 "replace_all": { "type": "boolean", "default": false }
@@ -212,13 +214,19 @@ impl Tool for EditTool {
             contents.replacen(&p.old_string, &p.new_string, 1)
         };
 
-        if let Some(target) = &audit_target {
-            reject_if_it_would_orphan_the_name(target, &contents, &updated)?;
+        match &audit_target {
+            // Inside `personas/`: the write applies whatever governs that
+            // file's contents, so this tool has no naming rule of its own to
+            // remember — see `write_managed_file`.
+            Some(target) => {
+                write_managed_file(target, &ctx.agent_id, &p.file_path, &updated).await?
+            }
+            None => tokio::fs::write(&p.file_path, &updated)
+                .await
+                .map_err(|e| {
+                    ToolError::Execution(format!("write {}: {e}", p.file_path.display()))
+                })?,
         }
-
-        tokio::fs::write(&p.file_path, &updated)
-            .await
-            .map_err(|e| ToolError::Execution(format!("write {}: {e}", p.file_path.display())))?;
 
         // Re-anchor the read baseline to the file we just wrote so a chained
         // Edit on the same file does not demand an intervening re-read.
@@ -247,39 +255,6 @@ impl Tool for EditTool {
 
         Ok(ToolOutput::Text(text))
     }
-}
-
-/// Refuse an edit to `IDENTITY.md` that would leave it without a readable
-/// `Name:` line.
-///
-/// That line is not prose: it is what every surface calls this agent — the
-/// roster, the picker, the delete confirmation. Losing it does not fail
-/// anything loudly, it just makes the agent render as its raw id, so an
-/// incidental reformat while updating some other field could quietly cost
-/// the agent its name. Only *removal* is refused: an edit is free to change
-/// the name, and a file that had no name to begin with (the shipped
-/// template, which invites the agent to choose one) is left alone.
-fn reject_if_it_would_orphan_the_name(
-    target: &ManagedTarget,
-    before: &str,
-    after: &str,
-) -> crate::Result<()> {
-    if !target
-        .rel_path
-        .ends_with(IdentityKind::Identity.file_name())
-    {
-        return Ok(());
-    }
-    if baybo_workspace::display_name(before).is_some()
-        && baybo_workspace::display_name(after).is_none()
-    {
-        return Err(ToolError::InvalidParams(
-            "this edit would remove the `Name:` line from IDENTITY.md, which is what every \
-             surface calls you — keep a `Name: <something>` line (renaming yourself is fine)"
-                .into(),
-        ));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -313,7 +288,7 @@ mod tests {
     }
 
     use baybo_model::{ChannelType, User};
-    use baybo_workspace::WorkspacePaths;
+    use baybo_workspace::{IdentityKind, WorkspacePaths};
     use std::time::Duration;
     use tokio::process::Command;
 
@@ -723,6 +698,62 @@ mod tests {
         tool_with(paths.clone())
             .execute(
                 json!({ "file_path": unnamed, "old_string": "alpha", "new_string": "bravo" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+    }
+
+    /// A project agent is hired *under* its name: the `@handle` its board
+    /// addresses it by was derived from that name, so letting the agent
+    /// rename itself would leave the roster and every mention disagreeing.
+    #[tokio::test]
+    async fn a_project_agent_cannot_rename_itself() {
+        let agent_id = "project-01JDEV";
+        let (_tmp, paths) = make_persona_workspace(agent_id).await;
+        let target = paths.persona_identity_file(agent_id, IdentityKind::Identity);
+        let named = "# Who Am I?\n\n* **Name:** Dev\n* **Vibe:** dry\n";
+        tokio::fs::write(&target, named).await.unwrap();
+        let ctx = ToolContext {
+            agent_id: AgentProfileId::parse(agent_id).unwrap(),
+            ..ctx_with_paths(paths.clone())
+        };
+
+        let err = tool_with(paths.clone())
+            .execute(
+                json!({ "file_path": target, "old_string": "Dev", "new_string": "Aster" }),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidParams(ref m) if m.contains("@handle")),
+            "got: {err:?}"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&target).await.unwrap(),
+            named,
+            "a refused edit writes nothing"
+        );
+
+        // The rest of its self-image is still its own.
+        tool_with(paths.clone())
+            .execute(
+                json!({ "file_path": target, "old_string": "dry", "new_string": "warm" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        // A memory file that happens to be called `IDENTITY.md` is a memory,
+        // not a self-image: the naming rule has no business inside it.
+        let memory_dir = paths.persona_memory_dir(agent_id);
+        tokio::fs::create_dir_all(&memory_dir).await.unwrap();
+        let decoy = memory_dir.join(IdentityKind::Identity.file_name());
+        tokio::fs::write(&decoy, "* **Name:** Dev\n").await.unwrap();
+        tool_with(paths.clone())
+            .execute(
+                json!({ "file_path": decoy, "old_string": "Dev", "new_string": "Aster" }),
                 &ctx,
             )
             .await

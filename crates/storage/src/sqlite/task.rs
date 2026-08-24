@@ -88,7 +88,7 @@ impl TaskStore for SqliteTaskStore {
         let created_at = super::time::to_us(task.created_at);
         let updated_at = super::time::to_us(task.updated_at);
         self.pool
-            .interact("tasks.create", move |conn| {
+            .interact_write("tasks.create", move |conn| {
                 // Idempotent on (session_id, task_id): the caller mints the id, so a
                 // storage-level retry re-sends identical values and lands as a no-op
                 // overwrite rather than a duplicate-key failure.
@@ -202,8 +202,8 @@ impl TaskStore for SqliteTaskStore {
         );
         let affected = self
             .pool
-            .interact("tasks.update", move |conn| {
-                Ok(conn.execute(&sql, rusqlite::params_from_iter(params))?)
+            .interact_write("tasks.update", move |conn| {
+                Ok(conn.execute(&sql, rusqlite::params_from_iter(params.iter()))?)
             })
             .await?;
         Ok(affected > 0)
@@ -214,7 +214,7 @@ impl TaskStore for SqliteTaskStore {
         let task_id = task_id.to_string();
         let affected = self
             .pool
-            .interact("tasks.delete", move |conn| {
+            .interact_write("tasks.delete", move |conn| {
                 Ok(conn.execute(
                     "DELETE FROM session_tasks WHERE session_id = ?1 AND task_id = ?2",
                     rusqlite::params![session_id, task_id],
@@ -355,7 +355,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tasks_cascade_delete_with_session() {
+    async fn hiding_a_session_preserves_its_tasks() {
         let tmpdir = tempfile::tempdir().unwrap();
         let pool = SqlitePool::open(tmpdir.path().join("test.db"))
             .await
@@ -364,14 +364,14 @@ mod tests {
         let s = make_session("s-cascade");
         sessions.save(&s).await.unwrap();
         let store = SqliteTaskStore::new(pool);
-        let t = make_task("doomed", TaskStatus::Pending);
+        let t = make_task("recoverable", TaskStatus::Pending);
         store.create(&s.id, &t).await.unwrap();
         assert!(store.get(&s.id, &t.id).await.unwrap().is_some());
 
-        sessions.delete(&s.id).await.unwrap();
+        assert!(sessions.set_hidden(&s.id, true).await.unwrap());
         assert!(
-            store.list(&s.id).await.unwrap().is_empty(),
-            "tasks must cascade-delete with the parent session"
+            store.get(&s.id, &t.id).await.unwrap().is_some(),
+            "hiding a session must preserve its related user data"
         );
     }
 }

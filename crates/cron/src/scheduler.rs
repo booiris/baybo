@@ -41,6 +41,9 @@ pub struct CronTriggerEvent {
     /// and emits nothing under its own session; a recurring fire *is* the
     /// conversation and dispatches normally.
     pub one_shot: bool,
+    /// The board this fire files work on, from the execution's snapshot.
+    /// `None` is an ordinary fire.
+    pub project_id: Option<baybo_model::ProjectId>,
     /// The session that originally registered the cron job (if any).
     /// Symmetric to `create_spawned_session` lineage: lets the
     /// downstream actor stamp `TriggerSource::Cron { origin_session_id }`
@@ -70,6 +73,7 @@ impl CronTriggerEvent {
             prompt: execution.prompt.clone(),
             one_shot: execution.is_one_shot(),
             origin_session_id: execution.origin_session_id.clone(),
+            project_id: execution.project_id.clone(),
             previous_fire_at: execution.previous_fire_at,
         }
     }
@@ -91,6 +95,8 @@ pub struct NewCronJob {
     /// The conversation this job was created from. For a one-shot, it is also
     /// where the fire's result will be delivered.
     pub origin_session_id: Option<SessionId>,
+    /// The board this job files work on. `None` is an ordinary job.
+    pub project_id: Option<baybo_model::ProjectId>,
 }
 
 /// What boot needs to supply to seed or reconcile one runtime-owned job.
@@ -196,6 +202,7 @@ impl CronScheduler {
             prompt,
             timezone,
             origin_session_id,
+            project_id,
         } = spec;
 
         validate_prompt(&prompt)?;
@@ -216,6 +223,7 @@ impl CronScheduler {
             next_trigger_at: Some(next_trigger_at),
             created_at: now,
             updated_at: now,
+            project_id,
             origin_session_id,
             deleted_at: None,
             pinned: false,
@@ -298,6 +306,10 @@ impl CronScheduler {
             channel: spec.channel,
             title: title.to_string(),
             schedule,
+            // A runtime-owned job belongs to the deployment, not to a
+            // board: there is no conversation that created it and no
+            // project that would own its cards.
+            project_id: None,
             prompt: prompt.to_string(),
             timezone: spec.timezone,
             status: CronStatus::Enabled,
@@ -705,7 +717,7 @@ impl CronScheduler {
         self.recover_pending().await;
 
         let mut interval = tokio::time::interval(TICK_INTERVAL);
-        info!(
+        debug!(
             tick_secs = TICK_INTERVAL.as_secs(),
             "cron scheduler started"
         );
@@ -716,7 +728,7 @@ impl CronScheduler {
                     self.tick().await;
                 }
                 _ = self.shutdown.wait() => {
-                    info!("cron scheduler shutting down");
+                    debug!("cron scheduler shutting down");
                     break;
                 }
             }
@@ -1274,6 +1286,7 @@ mod tests {
             prompt: prompt.to_string(),
             timezone: "UTC".to_string(),
             origin_session_id: None,
+            project_id: None,
         }
     }
 
@@ -2898,6 +2911,7 @@ mod tests {
             next_trigger_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            project_id: None,
             origin_session_id: None,
             deleted_at: None,
             pinned: false,

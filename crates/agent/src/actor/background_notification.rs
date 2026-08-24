@@ -328,22 +328,26 @@ impl AgentActor {
 
         // The prompt row and its batch idempotency key land atomically. Raw
         // results own analysed-report delivery until this prompt is durable.
-        let Some(append_outcome) = self
+        let append_outcome = match self
             .volatile
             .agent_loop
             .append_background_notification_prompt_once(content.clone(), &source_event_id)
             .await
-        else {
-            warn!(
-                session_id = %self.durable.session.id,
-                "background notification prompt failed to persist; restoring buffered batch"
-            );
-            self.durable
-                .session
-                .state
-                .background_notifications
-                .buffered_results = pending;
-            return;
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                warn!(
+                    session_id = %self.durable.session.id,
+                    error = %error,
+                    "background notification prompt failed to persist; restoring buffered batch"
+                );
+                self.durable
+                    .session
+                    .state
+                    .background_notifications
+                    .buffered_results = pending;
+                return;
+            }
         };
         let mut prompt_ordinal = append_outcome.ordinal();
         if !append_outcome.was_inserted() {
@@ -371,7 +375,7 @@ impl AgentActor {
             if !prompt_active {
                 let reanchor_source_event_id =
                     background_reanchor_source_event_id_for(&handle_ids, prompt_ordinal);
-                let Some(reanchored) = self
+                let reanchored = match self
                     .volatile
                     .agent_loop
                     .append_background_notification_prompt_once(
@@ -379,13 +383,21 @@ impl AgentActor {
                         &reanchor_source_event_id,
                     )
                     .await
-                else {
-                    self.durable
-                        .session
-                        .state
-                        .background_notifications
-                        .buffered_results = pending;
-                    return;
+                {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        warn!(
+                            session_id = %self.durable.session.id,
+                            error = %error,
+                            "background notification prompt re-anchor failed"
+                        );
+                        self.durable
+                            .session
+                            .state
+                            .background_notifications
+                            .buffered_results = pending;
+                        return;
+                    }
                 };
                 prompt_ordinal = reanchored.ordinal();
             }
@@ -527,12 +539,20 @@ impl AgentActor {
                 .append_background_notification_prompt_once(reanchor_content, &source_event_id)
                 .await
                 .map(|outcome| outcome.ordinal());
-            let Some(new_ordinal) = new_ordinal else {
-                self.record_background_notification_failure(
-                    "re-anchored prompt row failed to persist",
-                )
-                .await;
-                return;
+            let new_ordinal = match new_ordinal {
+                Ok(ordinal) => ordinal,
+                Err(error) => {
+                    warn!(
+                        session_id = %self.durable.session.id,
+                        error = %error,
+                        "active background notification prompt re-anchor failed"
+                    );
+                    self.record_background_notification_failure(
+                        "re-anchored prompt row failed to persist",
+                    )
+                    .await;
+                    return;
+                }
             };
             if let Some(active) = self
                 .durable

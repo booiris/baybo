@@ -20,7 +20,7 @@ impl SecretStore for SqliteSecretStore {
         let name = name.to_string();
         let value = encrypted_value.to_vec();
         self.pool
-            .interact("secrets.store", move |conn| {
+            .interact_write("secrets.store", move |conn| {
                 conn.execute(
                     "INSERT OR REPLACE INTO secrets (name, encrypted_value) VALUES (?1, ?2)",
                     rusqlite::params![name, value],
@@ -60,7 +60,7 @@ impl SecretStore for SqliteSecretStore {
     async fn delete(&self, name: &str) -> Result<()> {
         let name = name.to_string();
         self.pool
-            .interact("secrets.delete", move |conn| {
+            .interact_write("secrets.delete", move |conn| {
                 conn.execute(
                     "DELETE FROM secrets WHERE name = ?1",
                     rusqlite::params![name],
@@ -73,7 +73,7 @@ impl SecretStore for SqliteSecretStore {
     async fn rewrite_all(&self, entries: &[(String, Vec<u8>)]) -> Result<()> {
         let entries = entries.to_vec();
         self.pool
-            .interact("secrets.rewrite_all", move |conn| {
+            .interact_write("secrets.rewrite_all", move |conn| {
                 let tx = conn.transaction()?;
                 {
                     let mut stmt = tx.prepare(

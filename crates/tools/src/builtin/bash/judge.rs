@@ -283,6 +283,7 @@ async fn run_judge(
             temperature: Some(0.0),
             tools: vec![],
             reasoning_effort: None,
+            ..Default::default()
         };
         let reply = match llm.chat(&request).await {
             Ok(resp) => resp.response.content,

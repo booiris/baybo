@@ -9,10 +9,12 @@ mod folder;
 mod governance;
 mod ids;
 mod llm_entry_name;
+mod llm_pin;
 mod message;
 mod model_tier;
 mod money;
 mod pricing;
+mod project;
 mod security_types;
 mod session;
 pub mod spawn_protocol;
@@ -20,10 +22,13 @@ mod task;
 mod tool_output;
 
 pub use agent_profile::{
-    AgentBinding, AgentFramework, AgentProfileId, BUILTIN_AGENT_PROFILE_ID, InvalidAgentProfileId,
-    MAX_AGENT_PROFILE_ID_CHARS, MAX_AGENT_PROFILE_NAME_CHARS,
+    AgentBinding, AgentFramework, AgentHandle, AgentProfileId, BUILTIN_AGENT_PROFILE_ID,
+    InvalidAgentHandle, InvalidAgentProfileId, MAX_AGENT_HANDLE_CHARS, MAX_AGENT_PROFILE_ID_CHARS,
+    MAX_AGENT_PROFILE_NAME_CHARS, TeamMembership,
 };
-pub use approval::{ApprovalDecision, ApprovedResource, HostPattern, ResourceAccess};
+pub use approval::{
+    ApprovalDecision, ApprovalResolution, ApprovedResource, HostPattern, ResourceAccess,
+};
 pub use control_event::{ControlEvent, ControlEventKind, control_event_row_id};
 pub use cost::{CallReason, CostRecord, CostSummary, TimeRange};
 pub use cron::{
@@ -41,14 +46,20 @@ pub use ids::{
     ToolSetHashParseError, TurnId,
 };
 pub use llm_entry_name::LlmEntryName;
+pub use llm_pin::LlmPin;
 pub use message::{
-    BlobRef, ChatMessage, ContentBlock, MessageMetadata, MessageSource, Role, SHA256_PREFIX,
-    TOOL_OUTPUT_CLOSE_PREFIX, TOOL_OUTPUT_OPEN_PREFIX, TOOL_RESULT_ERROR_PREFIX, ThinkingContent,
-    ToolResultMeta, blob_content_digest,
+    BlobRef, ChatMessage, ContentBlock, MediaBlock, MediaKind, MessageMetadata, MessageSource,
+    Role, SHA256_PREFIX, TOOL_OUTPUT_CLOSE_PREFIX, TOOL_OUTPUT_OPEN_PREFIX,
+    TOOL_RESULT_ERROR_PREFIX, ThinkingContent, ToolResultMeta, blob_content_digest,
+    prose_with_media,
 };
 pub use model_tier::ModelTier;
 pub use money::{MicroUsd, usd_decimal_option};
 pub use pricing::LlmPricingOverride;
+pub use project::{
+    InvalidProjectValue, IssueEventId, IssueId, IssueRunId, MAX_PROJECT_ID_CHARS,
+    MAX_PROJECT_NAME_CHARS, ProjectId,
+};
 pub use security_types::{PlaceholderId, SecretKind};
 pub use session::{
     BackgroundNotificationDelivery, BackgroundNotificationGroup, BackgroundNotificationState,
@@ -65,4 +76,4 @@ pub use task::{
     TASK_CREATE_TOOL_NAME, TASK_GET_TOOL_NAME, TASK_LIST_TOOL_NAME, TASK_MUTATING_TOOL_NAMES,
     TASK_UPDATE_TOOL_NAME, Task, TaskStatus,
 };
-pub use tool_output::wrap_tool_output;
+pub use tool_output::{MAX_TOOL_OUTPUT_BYTES, wrap_tool_output};

@@ -193,24 +193,49 @@ impl ToolRegistry {
     /// `channel` started by `trigger`: the manifest's `channels` axis (e.g.
     /// owner-only deck tools) and the tool's [`Tool::trigger_scope`] axis (e.g.
     /// `report_nothing`, visible only in a recurring cron fire). This is what
-    /// the agent loop sends the LLM: a session's channel *and* trigger are both
-    /// fixed for its whole life, so the filtered list stays byte-stable within a
-    /// session and the prompt-cache constraint above still holds. A tool with no
-    /// manifest is treated as channel-unrestricted (defensive — `register`
-    /// always stores one).
+    /// the agent loop sends the LLM. A tool with no manifest is treated as
+    /// channel-unrestricted (defensive — `register` always stores one).
+    ///
+    /// All three axes below are fixed for a session, and it is tempting to
+    /// conclude the answer is too. It is not: the axes are fixed, the set they
+    /// filter is not. The MCP reconciler adds and drops dynamic tools
+    /// underneath live sessions (`register_dynamic` / `unregister_for_source`),
+    /// and the agent loop calls this afresh for every request, so a server
+    /// connecting or dropping changes the tool block **mid-session, mid-turn**
+    /// — including between one request and its own compaction, which F2 went
+    /// out of its way to give a shared prefix.
+    ///
+    /// So the prompt-cache constraint above is a best effort here, not an
+    /// invariant. Measured over 16 days of board runs: 17 mid-session changes,
+    /// of which 5 were real shrinkages with a live turn inside the window. The
+    /// upside is that a server the user adds mid-conversation reaches that
+    /// conversation immediately. Snapshotting per turn would buy the invariant
+    /// and keep that upside; it is deliberately not done, because after the
+    /// `SharedWorkspace` scope took `browser/*` out of issue runs, the churn
+    /// that was actually measured is gone and the rest is unquantified.
+    ///
+    /// `allowlist` is the third axis and the only one that is not a boundary:
+    /// a subagent profile naming the tools its child needs (`Some`) keeps the
+    /// rest out of the child's prefix, which is a budget, not a gate — the
+    /// executor still runs a name that arrives anyway, exactly as it would
+    /// today. `None` leaves the other two axes to decide. Unlike them it never
+    /// changes under a session at all: it is written once, at spawn, before
+    /// the child's actor exists.
     pub fn tool_definitions_for_session(
         &self,
         channel: &baybo_model::ChannelType,
         trigger: &baybo_model::TriggerSource,
+        allowlist: Option<&[String]>,
     ) -> Vec<ToolDefinition> {
+        let allowed = |name: &String| allowlist.is_none_or(|list| list.contains(name));
         let mut defs: HashMap<String, ToolDefinition> = HashMap::new();
         for (name, tool) in &self.builtin {
             let channel_ok = self
                 .builtin_manifests
                 .get(name)
                 .is_none_or(|m| m.allows_channel(channel));
-            if channel_ok && tool.trigger_scope().allows_trigger(trigger) {
-                let def = tool_definition_for(tool.as_ref());
+            if channel_ok && tool.trigger_scope().allows_trigger(trigger) && allowed(name) {
+                let def = tool_definition_offered(tool.as_ref(), trigger);
                 defs.insert(def.name.clone(), def);
             }
         }
@@ -220,8 +245,8 @@ impl ToolRegistry {
                 .manifests
                 .get(name)
                 .is_none_or(|m| m.allows_channel(channel));
-            if channel_ok && tool.trigger_scope().allows_trigger(trigger) {
-                let def = tool_definition_for(tool.as_ref());
+            if channel_ok && tool.trigger_scope().allows_trigger(trigger) && allowed(name) {
+                let def = tool_definition_offered(tool.as_ref(), trigger);
                 defs.insert(def.name.clone(), def);
             } else {
                 // A restricted dynamic tool must not fall back to a
@@ -284,11 +309,27 @@ impl ToolRegistry {
     }
 }
 
+/// A tool's whole declared surface, for inventory views (`baybo status`, the
+/// admin tools listing). Not what a session is offered — see
+/// [`tool_definition_offered`].
 fn tool_definition_for(tool: &dyn Tool) -> ToolDefinition {
     ToolDefinition {
         name: tool.name().to_string(),
         description: tool.description(),
         parameters_schema: tool.parameters_schema(),
+    }
+}
+
+/// What a session started by `trigger` is actually handed: the surface minus
+/// any parameter [`Tool::parameters_schema_for`] withholds from it.
+fn tool_definition_offered(
+    tool: &dyn Tool,
+    trigger: &baybo_model::TriggerSource,
+) -> ToolDefinition {
+    ToolDefinition {
+        name: tool.name().to_string(),
+        description: tool.description(),
+        parameters_schema: tool.parameters_schema_for(trigger),
     }
 }
 
@@ -409,6 +450,7 @@ mod tests {
         let owner = names(registry.tool_definitions_for_session(
             &baybo_model::ChannelType::owner(),
             &baybo_model::TriggerSource::User,
+            None,
         ));
         assert!(owner.contains(&"OwnerOnly".to_string()));
         assert!(owner.contains(&"PutBlob".to_string()));
@@ -416,6 +458,7 @@ mod tests {
         let telegram = names(registry.tool_definitions_for_session(
             &baybo_model::ChannelType::telegram(),
             &baybo_model::TriggerSource::User,
+            None,
         ));
         assert!(!telegram.contains(&"OwnerOnly".to_string()));
         assert!(!telegram.contains(&"PutBlob".to_string()));
@@ -428,7 +471,7 @@ mod tests {
     }
 
     #[test]
-    fn trigger_scope_shows_cron_fire_tools_only_to_a_recurring_fire() {
+    fn trigger_scope_shows_cron_tools_only_to_a_recurring_conversation() {
         use crate::{Tool, ToolContext, ToolOutput, ToolTriggerScope};
         use baybo_model::TriggerSource;
 
@@ -445,7 +488,7 @@ mod tests {
                 serde_json::json!({"type": "object"})
             }
             fn trigger_scope(&self) -> ToolTriggerScope {
-                ToolTriggerScope::CronFire
+                ToolTriggerScope::CronConversation
             }
             async fn execute(
                 &self,
@@ -469,7 +512,7 @@ mod tests {
 
         let has = |trigger: &TriggerSource| {
             registry
-                .tool_definitions_for_session(&baybo_model::ChannelType::owner(), trigger)
+                .tool_definitions_for_session(&baybo_model::ChannelType::owner(), trigger, None)
                 .into_iter()
                 .any(|d| d.name == "report_nothing")
         };
@@ -478,6 +521,7 @@ mod tests {
             origin_session_id: None,
             conversation,
             job_title: None,
+            project_id: None,
         };
 
         // A recurring fire (its own conversation) sees it; an ordinary session
@@ -485,6 +529,267 @@ mod tests {
         assert!(has(&cron(true)));
         assert!(!has(&TriggerSource::User));
         assert!(!has(&cron(false)));
+    }
+
+    #[test]
+    fn trigger_scope_shows_board_tools_only_to_project_linked_sessions() {
+        use crate::{Tool, ToolContext, ToolOutput, ToolTriggerScope};
+        use baybo_model::TriggerSource;
+
+        struct BoardOnly;
+        #[async_trait::async_trait]
+        impl Tool for BoardOnly {
+            fn name(&self) -> &str {
+                "IssueList"
+            }
+            fn description(&self) -> String {
+                "x".into()
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            fn trigger_scope(&self) -> ToolTriggerScope {
+                ToolTriggerScope::ProjectBoard
+            }
+            async fn execute(
+                &self,
+                _p: serde_json::Value,
+                _c: &ToolContext,
+            ) -> crate::Result<ToolOutput> {
+                Ok(ToolOutput::Text(String::new()))
+            }
+        }
+
+        let mut registry = default_registry();
+        registry.register(
+            Arc::new(BoardOnly),
+            crate::ToolManifest {
+                name: "IssueList".into(),
+                description: "x".into(),
+                trust_level: baybo_model::TrustLevel::Trusted,
+                parameters_schema: serde_json::json!({"type": "object"}),
+                capabilities: vec![],
+                channels: Vec::new(),
+            },
+        );
+
+        let has = |trigger: &TriggerSource| {
+            registry
+                .tool_definitions_for_session(&baybo_model::ChannelType::owner(), trigger, None)
+                .into_iter()
+                .any(|d| d.name == "IssueList")
+        };
+        assert!(has(&TriggerSource::Issue {
+            project_id: baybo_model::ProjectId::generate(),
+            issue_id: baybo_model::IssueId::generate(),
+            number: 1,
+        }));
+        assert!(has(&TriggerSource::Cron {
+            cron_job_id: "cj".into(),
+            origin_session_id: None,
+            conversation: true,
+            job_title: None,
+            project_id: Some(baybo_model::ProjectId::generate()),
+        }));
+        assert!(!has(&TriggerSource::User));
+        assert!(!has(&TriggerSource::Cron {
+            cron_job_id: "cj".into(),
+            origin_session_id: None,
+            conversation: true,
+            job_title: None,
+            project_id: None,
+        }));
+    }
+
+    /// The allowlist is a third axis over the other two, not a replacement:
+    /// a name on the list that the trigger already refuses stays refused.
+    #[test]
+    fn a_profile_s_tool_list_narrows_what_the_other_axes_already_allow() {
+        use crate::{Tool, ToolContext, ToolOutput, ToolTriggerScope};
+        use baybo_model::TriggerSource;
+
+        struct Named(&'static str, ToolTriggerScope);
+        #[async_trait::async_trait]
+        impl Tool for Named {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn description(&self) -> String {
+                "x".into()
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            fn trigger_scope(&self) -> ToolTriggerScope {
+                self.1
+            }
+            async fn execute(
+                &self,
+                _p: serde_json::Value,
+                _c: &ToolContext,
+            ) -> crate::Result<ToolOutput> {
+                Ok(ToolOutput::Text(String::new()))
+            }
+        }
+
+        let mut registry = default_registry();
+        for (name, scope) in [
+            ("Keeper", ToolTriggerScope::Any),
+            ("Dropped", ToolTriggerScope::Any),
+            ("OffTrigger", ToolTriggerScope::SharedWorkspace),
+        ] {
+            registry.register(
+                Arc::new(Named(name, scope)),
+                crate::ToolManifest {
+                    name: name.into(),
+                    description: "x".into(),
+                    trust_level: baybo_model::TrustLevel::Trusted,
+                    parameters_schema: serde_json::json!({"type": "object"}),
+                    capabilities: vec![],
+                    channels: Vec::new(),
+                },
+            );
+        }
+
+        let run = TriggerSource::Issue {
+            project_id: baybo_model::ProjectId::generate(),
+            issue_id: baybo_model::IssueId::generate(),
+            number: 1,
+        };
+        let names = |allow: Option<&[String]>| {
+            registry
+                .tool_definitions_for_session(&baybo_model::ChannelType::owner(), &run, allow)
+                .into_iter()
+                .map(|d| d.name)
+                .collect::<Vec<_>>()
+        };
+
+        let unrestricted = names(None);
+        assert!(unrestricted.contains(&"Keeper".to_string()));
+        assert!(unrestricted.contains(&"Dropped".to_string()));
+
+        let allow = ["Keeper".to_string(), "OffTrigger".to_string()];
+        let restricted = names(Some(&allow));
+        assert!(restricted.contains(&"Keeper".to_string()));
+        assert!(
+            !restricted.contains(&"Dropped".to_string()),
+            "a tool the list does not name is not offered"
+        );
+        assert!(
+            !restricted.contains(&"OffTrigger".to_string()),
+            "naming a tool cannot hand a run one its trigger refuses"
+        );
+    }
+
+    /// The tools whose target is state the workspace shares, or a chat there
+    /// is nobody at, stay out of a card's run. Free-to-construct ones are
+    /// pinned here; the deck, skill and attachment tools carry the same scope
+    /// but need a manager to build, so their own crates hold that assertion.
+    #[test]
+    fn a_run_is_not_offered_the_tools_that_act_outside_it() {
+        use crate::{Tool, ToolTriggerScope};
+        use baybo_model::TriggerSource;
+
+        let run = TriggerSource::Issue {
+            project_id: baybo_model::ProjectId::generate(),
+            issue_id: baybo_model::IssueId::generate(),
+            number: 1,
+        };
+        for tool in [
+            Arc::new(crate::builtin::secret::SecretAddTool) as Arc<dyn Tool>,
+            Arc::new(crate::builtin::echo::EchoTool) as Arc<dyn Tool>,
+        ] {
+            assert_eq!(
+                tool.trigger_scope(),
+                ToolTriggerScope::SharedWorkspace,
+                "{} writes state every session shares",
+                tool.name()
+            );
+            assert!(!tool.trigger_scope().allows_trigger(&run));
+        }
+    }
+
+    /// A **dynamic** tool — the shape every MCP server registers under — is
+    /// filtered on the same axis as a builtin. This is what keeps the browser
+    /// server's 24 tools out of a card's run, and only out of a card's run.
+    #[test]
+    fn a_shared_workspace_tool_reaches_every_session_but_a_card_s_run() {
+        use crate::{Tool, ToolContext, ToolOutput, ToolTriggerScope};
+        use baybo_model::TriggerSource;
+
+        struct WatchedOnly;
+        #[async_trait::async_trait]
+        impl Tool for WatchedOnly {
+            fn name(&self) -> &str {
+                "browser/navigate_page"
+            }
+            fn description(&self) -> String {
+                "x".into()
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            fn trigger_scope(&self) -> ToolTriggerScope {
+                ToolTriggerScope::SharedWorkspace
+            }
+            async fn execute(
+                &self,
+                _p: serde_json::Value,
+                _c: &ToolContext,
+            ) -> crate::Result<ToolOutput> {
+                Ok(ToolOutput::Text(String::new()))
+            }
+        }
+
+        let registry = default_registry();
+        registry.register_dynamic(
+            "browser",
+            Arc::new(WatchedOnly),
+            crate::ToolManifest {
+                name: "browser/navigate_page".into(),
+                description: "x".into(),
+                trust_level: baybo_model::TrustLevel::Trusted,
+                parameters_schema: serde_json::json!({"type": "object"}),
+                capabilities: vec![],
+                channels: Vec::new(),
+            },
+        );
+
+        let has = |trigger: &TriggerSource| {
+            registry
+                .tool_definitions_for_session(&baybo_model::ChannelType::owner(), trigger, None)
+                .into_iter()
+                .any(|d| d.name == "browser/navigate_page")
+        };
+        assert!(has(&TriggerSource::User));
+        assert!(
+            has(&TriggerSource::Cron {
+                cron_job_id: "cj".into(),
+                origin_session_id: None,
+                conversation: true,
+                job_title: None,
+                project_id: None,
+            }),
+            "a cron fire may browse"
+        );
+        assert!(
+            has(&TriggerSource::Cron {
+                cron_job_id: "cj".into(),
+                origin_session_id: None,
+                conversation: false,
+                job_title: None,
+                project_id: Some(baybo_model::ProjectId::generate()),
+            }),
+            "a board-patrol fire carries a project id and is still not a card's run"
+        );
+        assert!(
+            !has(&TriggerSource::Issue {
+                project_id: baybo_model::ProjectId::generate(),
+                issue_id: baybo_model::IssueId::generate(),
+                number: 1,
+            }),
+            "a card's run has its own checkout; the shared browser is not its to hold"
+        );
     }
 
     fn recording(name: &str) -> (Arc<dyn crate::Tool>, crate::ToolManifest) {
@@ -542,5 +847,96 @@ mod tests {
         registry.replace_source("other", vec![recording("z")]);
         registry.replace_source("s", Vec::new());
         assert!(registry.get("z").is_some());
+    }
+}
+
+#[cfg(test)]
+mod offered_schema_tests {
+    use super::*;
+    use baybo_model::TriggerSource;
+    use baybo_storage::test_support::MemoryBlobStore;
+    use std::sync::Arc;
+
+    fn registry() -> ToolRegistry {
+        ToolRegistry::with_defaults(crate::builtin::DefaultToolsConfig {
+            blob_store: Arc::new(MemoryBlobStore::new()) as Arc<dyn baybo_store::BlobStore>,
+            process_manager: baybo_process::ProcessManager::transient(),
+            workspace_paths: baybo_workspace::WorkspacePaths::new("/tmp"),
+            proxy: None,
+            permission: Arc::new(crate::builtin::LivePermissionMode::new(
+                crate::builtin::BashPermissionMode::Manual,
+            )),
+            builtin_memory: true,
+        })
+    }
+
+    fn issue_run() -> TriggerSource {
+        TriggerSource::Issue {
+            project_id: baybo_model::ProjectId::generate(),
+            issue_id: baybo_model::IssueId::generate(),
+            number: 1,
+        }
+    }
+
+    fn props(def: &ToolDefinition) -> Vec<String> {
+        def.parameters_schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// A knob the runtime will refuse is not offered. `bash`'s `on_timeout`
+    /// only chooses between detaching and killing, and without a background
+    /// host there is nothing to detach into — the command is killed whatever
+    /// the model picks.
+    #[test]
+    fn a_card_s_run_is_not_offered_a_knob_its_runtime_refuses() {
+        let registry = registry();
+        let owner = baybo_model::ChannelType::owner();
+
+        let in_chat = registry.tool_definitions_for_session(&owner, &TriggerSource::User, None);
+        let bash = in_chat
+            .iter()
+            .find(|d| d.name == "Bash")
+            .expect("Bash is registered");
+        assert!(
+            props(bash).iter().any(|p| p == "on_timeout"),
+            "a session that can host background work keeps the choice: {:?}",
+            props(bash)
+        );
+
+        let in_run = registry.tool_definitions_for_session(&owner, &issue_run(), None);
+        let bash = in_run
+            .iter()
+            .find(|d| d.name == "Bash")
+            .expect("Bash is registered");
+        assert!(
+            !props(bash).iter().any(|p| p == "on_timeout"),
+            "a card's run must not be offered it: {:?}",
+            props(bash)
+        );
+        assert!(
+            props(bash).iter().any(|p| p == "command"),
+            "the rest of the schema survives: {:?}",
+            props(bash)
+        );
+    }
+
+    /// The full surface still exists — the manifest and the inventory views
+    /// carry it, because the executor accepts a parameter this withholds.
+    #[test]
+    fn withholding_a_parameter_does_not_narrow_the_declared_surface() {
+        let registry = registry();
+        let all = registry.tool_definitions();
+        let bash = all
+            .iter()
+            .find(|d| d.name == "Bash")
+            .expect("Bash is registered");
+        assert!(
+            props(bash).iter().any(|p| p == "on_timeout"),
+            "{:?}",
+            props(bash)
+        );
     }
 }

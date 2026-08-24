@@ -108,9 +108,10 @@ Because `tool_use_id` is known when the span opens, the tool span closes during
 execution — no deferred close, no waiting for the transcript ordinal. The write
 chooses `Persisted` only when its serialized pointer is smaller than the capped
 inline value. The pointer is written before `AgentLoop` appends the transcript
-row, so a rare append failure leaves it unresolvable rather than dangling
-silently: replay surfaces a visible `trace_reconstruction_error` for a
-`tool_use_id` with no matching `ToolResult`.
+row. If that append fails, the agent aborts the turn and leaves the failed row
+out of its live context; replay still surfaces a visible
+`trace_reconstruction_error` for the already-closed pointer rather than
+inventing a result.
 
 The model-facing payload is still capped at
 `baybo_context::prompts::tool_output::MAX_TOOL_OUTPUT_BYTES` and any full value
@@ -124,11 +125,17 @@ server-side, while the per-turn web endpoint leaves them compact and
 `LlmCallBegin.tools` records **what the model was allowed to call**, the other
 half of "what did the LLM see" beside `input_messages`. It is an
 `Option<LlmToolSetRef> { hash: ToolSetHash, count: usize }` — a reference, for
-the same reason `LlmCallInputs::Persisted` is one. A session's tool list is
-session-stable by construction (`tool_definitions_for_session` filters on the
-channel and the trigger, both fixed for the session, which is also what keeps
-prompt caching alive) and runs to tens of KB of JSON schema. Inlining it per
-call would make the schemas the largest thing in the `spans` table.
+the same reason `LlmCallInputs::Persisted` is one — the list runs to tens of KB
+of JSON schema, and inlining it per call would make the schemas the largest
+thing in the `spans` table.
+
+A session's list is *mostly* stable, which is what keeps prompt caching alive,
+but it is not stable **by construction** and the hash is the place that shows
+it: `tool_definitions_for_session` is called afresh per request, and the MCP
+reconciler connects and drops servers underneath live sessions. So one session
+can legitimately record more than one hash, and a hash changing mid-session is
+a real event worth reading — the model was handed a different set — not a bug
+in the recorder.
 
 The definitions live in `llm_tool_sets(hash TEXT PRIMARY KEY, data TEXT)`,
 keyed by the SHA-256 of their own serialized body — so writes are
@@ -195,8 +202,12 @@ wrong input. A `Persisted` marker is only emitted when the count is known, so
 every reference is validated — there is no skip path. A hydration *code* bug is
 recoverable (the truth lives in durable `session_messages`; `replay` is pure and
 re-runnable after the fix) — the tripwire only makes drift loud, not silent. The
-write-side / read-side filter equivalence is pinned by a differential test, the
-marker path by a negative test.
+marker path is pinned by a negative test
+(`replay_flags_prefix_len_tripwire_mismatch`). There is no second, write-side
+copy of the active-message filter to keep in lockstep with it: the
+`superseded_by > N` form is applied only by the read-side reconstruction, while
+the write side anchors on `latest_session_ordinal` + `count_active_messages` and
+emits an inline copy whenever those disagree with the in-memory window.
 
 ### Synchronous lifecycle writes
 
@@ -207,7 +218,13 @@ an LLM or tool request goes out. There is no deferred/background write path.
 
 ### Recovery
 
-`baybo_agent::recovery` closes half-open trace rows left by dropped execution.
+`baybo_agent::recovery` closes half-open trace rows left behind by a process or
+actor that died. It is not the only closer of a dropped future: a span whose
+guard future is dropped while the process lives (a `/stop` abandoning an
+in-flight tool call) is closed immediately by `runtime::scope::with_span`'s Drop
+guard, and has to be — recovery reaches pending spans only under a step that is
+itself unfinished, and that step closes normally on the same unwind.
+
 At boot, `recover_orphaned_traces_and_turns` walks non-terminal turns from the
 prior process, closes pending spans/steps at the last observed child activity,
 and cancels the turn as `SystemCrash`. It also asks `TraceStore` for unfinished

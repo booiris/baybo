@@ -74,6 +74,35 @@ impl RunningChild for LongRunningChild {
 }
 
 #[tokio::test(start_paused = true)]
+async fn transcript_append_failure_stops_before_the_llm_call() {
+    let mut harness = AgentTestHarness::builder().build();
+    let session_id = harness.session.id.clone();
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("must not run".into())]);
+    harness.memory_session_store.fail_appends(true);
+
+    harness.send_text("keep this durable").await.unwrap();
+    let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    assert!(
+        harness.stub_llm.captured_requests().is_empty(),
+        "the model must not run when its transcript input was not persisted"
+    );
+    assert!(
+        harness
+            .session_manager
+            .load_active_session_messages(&session_id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the failed row must not appear in the durable transcript"
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn clean_conversation_streams_text_then_final_message() {
     let mut harness = AgentTestHarness::builder().build();
     harness
@@ -2704,6 +2733,7 @@ async fn cron_fire_is_framed_as_a_task_not_a_user_message() {
         // dispatches out through the channel (what this test asserts on).
         conversation: true,
         job_title: Some("Demo".into()),
+        project_id: None,
     };
     let mut harness = AgentTestHarness::builder().session(session).build();
 
@@ -2805,7 +2835,7 @@ async fn recurring_fire_that_reports_nothing_notifies_no_one() {
             json!({"type": "object"})
         }
         fn trigger_scope(&self) -> baybo_tools::ToolTriggerScope {
-            baybo_tools::ToolTriggerScope::CronFire
+            baybo_tools::ToolTriggerScope::CronConversation
         }
         async fn execute(
             &self,
@@ -2825,6 +2855,7 @@ async fn recurring_fire_that_reports_nothing_notifies_no_one() {
         origin_session_id: None,
         conversation: true,
         job_title: Some("Watcher".into()),
+        project_id: None,
     };
     let fire_session_id = session.id.clone();
 
@@ -2950,6 +2981,7 @@ async fn one_shot_cron_result_lands_in_the_scheduling_conversation() {
                 origin_session_id: Some(origin_id.clone()),
                 conversation: false,
                 job_title: None,
+                project_id: None,
             },
         )
         .await
@@ -2977,6 +3009,7 @@ async fn one_shot_cron_result_lands_in_the_scheduling_conversation() {
         next_trigger_at: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        project_id: None,
         origin_session_id: Some(origin_id.clone()),
         deleted_at: None,
         pinned: false,
@@ -3107,6 +3140,7 @@ async fn replayed_cron_result_does_not_duplicate_the_notification() {
                 origin_session_id: Some(origin_id.clone()),
                 conversation: false,
                 job_title: None,
+                project_id: None,
             },
         )
         .await
@@ -3133,6 +3167,7 @@ async fn replayed_cron_result_does_not_duplicate_the_notification() {
         next_trigger_at: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        project_id: None,
         origin_session_id: Some(origin_id.clone()),
         deleted_at: None,
         pinned: false,
@@ -3256,6 +3291,7 @@ async fn a_failed_recurring_fire_reports_a_real_notification_in_its_conversation
         origin_session_id: None,
         conversation: true,
         job_title: Some("News".into()),
+        project_id: None,
     };
     let session_id = session.id.clone();
     let mut harness = AgentTestHarness::builder().session(session).build();
@@ -3325,9 +3361,8 @@ async fn a_failed_recurring_fire_reports_a_real_notification_in_its_conversation
 /// preview. So nothing may be recorded as delivered — the ledger must stay
 /// unresolved so the boot re-drive retries it.
 ///
-/// The append returns `Option<i64>` and logs-and-swallows a store error, so
-/// treating `None` as success would silently mark the reminder delivered and
-/// then lose it. This pins that it doesn't.
+/// The append returns an error to the notification loop, which keeps its
+/// buffered retry and must not settle the ledger as delivered.
 #[tokio::test(start_paused = true)]
 async fn a_cron_notification_that_cannot_be_persisted_is_not_marked_delivered() {
     use baybo_model::{CronExecution, ExecutionOutcome, PendingCronResult};
@@ -3349,6 +3384,7 @@ async fn a_cron_notification_that_cannot_be_persisted_is_not_marked_delivered() 
         next_trigger_at: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        project_id: None,
         origin_session_id: Some(origin_id.clone()),
         deleted_at: None,
         pinned: false,
@@ -4779,6 +4815,170 @@ async fn stop_persists_partial_work_so_it_survives_reload() {
     );
 }
 
+#[tokio::test]
+async fn an_issue_run_is_refused_a_tool_scoped_to_another_trigger() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static RAN: AtomicBool = AtomicBool::new(false);
+
+    struct CronOnlyTool;
+    #[async_trait::async_trait]
+    impl Tool for CronOnlyTool {
+        fn name(&self) -> &str {
+            "report_nothing"
+        }
+        fn description(&self) -> String {
+            "test stand-in for a cron-only tool".to_string()
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type": "object"})
+        }
+        fn trigger_scope(&self) -> baybo_tools::ToolTriggerScope {
+            baybo_tools::ToolTriggerScope::CronConversation
+        }
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _ctx: &baybo_tools::ToolContext,
+        ) -> baybo_tools::Result<ToolOutput> {
+            RAN.store(true, Ordering::SeqCst);
+            Ok(ToolOutput::Text("opened".into()))
+        }
+    }
+
+    let mut session = SessionBuilder::new().build();
+    session.trigger = TriggerSource::Issue {
+        project_id: baybo_model::ProjectId::parse("proj-a").expect("project id"),
+        issue_id: baybo_model::IssueId::from("issue-1"),
+        number: 7,
+    };
+    let manifest = baybo_tools::ToolManifest {
+        name: "report_nothing".into(),
+        description: "test stand-in for a cron-only tool".into(),
+        trust_level: baybo_model::TrustLevel::Trusted,
+        parameters_schema: json!({"type": "object"}),
+        capabilities: vec![],
+        channels: Vec::new(),
+    };
+    let mut harness = AgentTestHarness::builder()
+        .session(session)
+        .with_tool(Arc::new(CronOnlyTool) as Arc<dyn Tool>, manifest)
+        .build();
+
+    harness.stub_llm.push_response(LlmResponse {
+        content: String::new(),
+        content_blocks: vec![],
+        tool_calls: vec![ToolCallInfo {
+            id: "c1".into(),
+            name: "report_nothing".into(),
+            arguments: json!({}),
+            signature: None,
+        }],
+        usage: Default::default(),
+        thinking: None,
+    });
+    harness.stub_llm.push_response(LlmResponse {
+        content: "could not reach a browser".into(),
+        content_blocks: vec![],
+        tool_calls: vec![],
+        usage: Default::default(),
+        thinking: None,
+    });
+
+    harness
+        .mailbox
+        .send(AgentMessage::IssueRun {
+            run_id: baybo_model::IssueRunId::generate(),
+            number: 7,
+            brief: "Check the dev server renders".into(),
+            files: Vec::new(),
+            checkout: "/ws/work/projects/p/7".into(),
+        })
+        .await
+        .expect("mailbox accepts the run");
+    harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    assert!(
+        !RAN.load(Ordering::SeqCst),
+        "the tool body must never run for a session its scope excludes"
+    );
+}
+
+#[tokio::test]
+async fn an_issue_run_executes_as_its_own_kind_of_turn() {
+    let mut session = SessionBuilder::new().build();
+    session.trigger = TriggerSource::Issue {
+        project_id: baybo_model::ProjectId::parse("proj-a").expect("project id"),
+        issue_id: baybo_model::IssueId::from("issue-1"),
+        number: 7,
+    };
+    let mut harness = AgentTestHarness::builder().session(session).build();
+
+    harness.stub_llm.push_response(LlmResponse {
+        content: "Cleared the reconnect storm and added a regression test.".into(),
+        content_blocks: vec![],
+        tool_calls: vec![],
+        usage: Default::default(),
+        thinking: None,
+    });
+
+    let run_id = baybo_model::IssueRunId::generate();
+    harness
+        .mailbox
+        .send(AgentMessage::IssueRun {
+            run_id: run_id.clone(),
+            number: 7,
+            brief: "Fix the WS reconnect storm\n\nThe timer never clears.".into(),
+            files: Vec::new(),
+            checkout: "/ws/work/projects/p/7".into(),
+        })
+        .await
+        .expect("mailbox accepts the run");
+    harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    let requests = harness.stub_llm.captured_requests();
+    let framed = requests
+        .iter()
+        .flat_map(|r| &r.messages)
+        .filter(|m| matches!(m.role, Role::User))
+        .flat_map(|m| &m.content)
+        .filter_map(|b| match b {
+            ContentBlock::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .find(|t| t.contains("[issue #7]"))
+        .expect("a user turn carrying the issue framing");
+    assert!(
+        framed.contains("project-board task") && framed.contains("nobody is waiting at a keyboard"),
+        "the run must not read as a chat turn: {framed}"
+    );
+    assert!(
+        framed.contains("Fix the WS reconnect storm"),
+        "carries the brief: {framed}"
+    );
+    assert!(
+        framed.contains("/ws/work/projects/p/7"),
+        "the run must be told its checkout: {framed}"
+    );
+
+    let turns = harness
+        .turn_lifecycle
+        .list_by_session(&harness.session.id, None)
+        .await
+        .expect("turns");
+    let run_turn = turns
+        .iter()
+        .find(|t| t.input_kind() == baybo_turn::TurnInputKind::IssueRun)
+        .expect("the run opened a turn of its own kind");
+    assert!(
+        run_turn.is_terminal(),
+        "and it finished, so the waiter has an edge to settle on: {:?}",
+        run_turn.status
+    );
+
+    harness.shutdown().await;
+}
+
 /// A turn whose edits cancel out must be told so, on the very next request.
 ///
 /// This is the incident from session cddcfcdb-c5f8-43fc-bb83-01385d0a7b31
@@ -4966,4 +5166,244 @@ async fn an_llm_span_records_its_tool_set_by_reference() {
     );
 
     harness.shutdown().await;
+}
+
+/// Concurrent probes where one finishes and one ignores cancellation.
+mod batch_cancel_tools {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use baybo_model::TrustLevel;
+    use baybo_tools::{Tool, ToolConcurrency, ToolContext, ToolManifest, ToolOutput};
+    use serde_json::{Value, json};
+    use tokio::sync::Notify;
+
+    fn manifest(name: &str) -> ToolManifest {
+        ToolManifest {
+            name: name.to_string(),
+            description: "batch-cancel probe".into(),
+            trust_level: TrustLevel::Trusted,
+            parameters_schema: json!({"type": "object", "additionalProperties": true}),
+            capabilities: vec![],
+            channels: Vec::new(),
+        }
+    }
+
+    pub struct ParkingTool {
+        entered: Arc<Notify>,
+    }
+
+    impl ParkingTool {
+        pub const NAME: &'static str = "parks_forever";
+
+        pub fn new(entered: Arc<Notify>) -> Self {
+            Self { entered }
+        }
+
+        pub fn manifest() -> ToolManifest {
+            manifest(Self::NAME)
+        }
+    }
+
+    #[async_trait]
+    impl Tool for ParkingTool {
+        fn name(&self) -> &str {
+            Self::NAME
+        }
+        fn description(&self) -> String {
+            "Parks forever.".to_string()
+        }
+        fn parameters_schema(&self) -> Value {
+            json!({"type": "object", "additionalProperties": true})
+        }
+        fn concurrency(&self) -> ToolConcurrency {
+            ToolConcurrency::Concurrent
+        }
+        async fn execute(
+            &self,
+            _params: Value,
+            _ctx: &ToolContext,
+        ) -> baybo_tools::Result<ToolOutput> {
+            self.entered.notify_one();
+            std::future::pending::<()>().await;
+            unreachable!("the parking tool ends only by drop-on-cancel")
+        }
+    }
+
+    pub struct QuickTool {
+        done: Arc<Notify>,
+    }
+
+    impl QuickTool {
+        pub const NAME: &'static str = "answers_at_once";
+        pub const ANSWER: &'static str = "the quick tool really finished";
+
+        pub fn new(done: Arc<Notify>) -> Self {
+            Self { done }
+        }
+
+        pub fn manifest() -> ToolManifest {
+            manifest(Self::NAME)
+        }
+    }
+
+    #[async_trait]
+    impl Tool for QuickTool {
+        fn name(&self) -> &str {
+            Self::NAME
+        }
+        fn description(&self) -> String {
+            "Answers immediately.".to_string()
+        }
+        fn parameters_schema(&self) -> Value {
+            json!({"type": "object", "additionalProperties": true})
+        }
+        fn concurrency(&self) -> ToolConcurrency {
+            ToolConcurrency::Concurrent
+        }
+        async fn execute(
+            &self,
+            _params: Value,
+            _ctx: &ToolContext,
+        ) -> baybo_tools::Result<ToolOutput> {
+            self.done.notify_one();
+            Ok(ToolOutput::Text(Self::ANSWER.to_string()))
+        }
+    }
+}
+
+/// Cancellation preserves completed results, call pairing, and terminal spans.
+#[tokio::test(start_paused = true)]
+async fn stop_aborts_an_in_flight_tool_batch_without_dangling_tool_use() {
+    use batch_cancel_tools::{ParkingTool, QuickTool};
+    use baybo_store::SessionStore;
+    use baybo_trace::TraceStore;
+    use baybo_turn::CancelReason;
+
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let finished = Arc::new(tokio::sync::Notify::new());
+    let parking = Arc::new(ParkingTool::new(Arc::clone(&entered)));
+    let quick = Arc::new(QuickTool::new(Arc::clone(&finished)));
+
+    let mut harness = AgentTestHarness::builder()
+        .with_tool(quick as Arc<dyn Tool>, QuickTool::manifest())
+        .with_tool(parking as Arc<dyn Tool>, ParkingTool::manifest())
+        .build();
+
+    harness.stub_llm.push_stream(vec![
+        StreamEvent::ToolCall(ToolCallInfo {
+            id: "quick-1".into(),
+            name: QuickTool::NAME.into(),
+            arguments: json!({}),
+            signature: None,
+        }),
+        StreamEvent::ToolCall(ToolCallInfo {
+            id: "parked-1".into(),
+            name: ParkingTool::NAME.into(),
+            arguments: json!({}),
+            signature: None,
+        }),
+    ]);
+
+    harness.send_text("run both").await.unwrap();
+
+    // Wait until one call finishes while the other remains in flight.
+    tokio::time::timeout(Duration::from_secs(2), finished.notified())
+        .await
+        .expect("the quick tool should have completed");
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .expect("the parking tool should be in flight");
+
+    let turns = harness
+        .turn_lifecycle
+        .list_active_chat_turns_by_session(&harness.session.id)
+        .await
+        .expect("list active turns");
+    assert!(!turns.is_empty(), "a turn must be in flight to cancel");
+    for turn in &turns {
+        harness
+            .turn_lifecycle
+            .cancel(&turn.id, CancelReason::UserStopped, vec![])
+            .await
+            .expect("cancel the in-flight turn");
+    }
+
+    harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    let transcript = harness
+        .memory_session_store
+        .load_session_messages_with_supersede(&harness.session.id)
+        .await
+        .expect("load transcript");
+
+    let mut declared: Vec<String> = Vec::new();
+    let mut answered: Vec<String> = Vec::new();
+    let mut quick_result_text = String::new();
+    for row in &transcript {
+        for block in &row.message.content {
+            match block {
+                ContentBlock::ToolUse { id, .. } => declared.push(id.clone()),
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } => {
+                    answered.push(tool_use_id.clone());
+                    if tool_use_id == "quick-1" {
+                        quick_result_text = content.to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    declared.sort();
+    answered.sort();
+    assert_eq!(
+        declared,
+        vec!["parked-1".to_string(), "quick-1".to_string()],
+        "the dispatched assistant row must declare both calls"
+    );
+    assert_eq!(
+        answered, declared,
+        "every declared tool_use needs exactly one tool_result, or the next \
+         provider request is rejected: {transcript:?}"
+    );
+    assert!(
+        quick_result_text.contains(QuickTool::ANSWER),
+        "a call that finished before the cancel keeps its real result, got \
+         {quick_result_text:?}"
+    );
+
+    let trace_store: Arc<dyn TraceStore> = harness.trace_store.clone();
+    // Let `with_span`'s asynchronous drop guard finish.
+    let mut pending_spans = Vec::new();
+    for _ in 0..64 {
+        pending_spans.clear();
+        for turn in &turns {
+            for step in trace_store.list_steps_by_turn(&turn.id).await.unwrap() {
+                for row in trace_store.list_spans_by_step(&step.id).await.unwrap() {
+                    let span = baybo_trace::Span::from_row(row).unwrap();
+                    if !span.outcome.is_terminal() {
+                        pending_spans.push((span.id, span.kind.tag()));
+                    }
+                }
+            }
+        }
+        if pending_spans.is_empty() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        pending_spans.is_empty(),
+        "a cancelled tool call must not leave a forever-in-flight span behind: \
+         {pending_spans:?}"
+    );
+
+    // This times out if cancellation leaves the loop parked in the tool call.
+    tokio::time::timeout(Duration::from_secs(5), harness.shutdown())
+        .await
+        .expect("actor must terminate after its in-flight tool batch is cancelled");
 }

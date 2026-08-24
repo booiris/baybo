@@ -7,27 +7,33 @@ The `storage` crate is the **sqlite adapter**: it implements every `*Store` trai
 Its job is:
 
 - Implement every `*Store` trait from `baybo-store` (`SessionStore`,
-  `SessionSummaryStore`, `SessionFolderStore`, `TaskStore`, `TurnStore`,
+  `SessionFolderStore`, `MessageSearchStore`, `TaskStore`, `TurnStore`,
   `TraceStore`, `CostStore`, `SecretStore`, `CronStore`, `BlobStore`,
   `ChannelSessionStore`, `ChannelBotStore`, `ChannelPairingStore`,
-  `DeviceStore`, `SkillRiskStore`, `AgentProfileStore`,
+  `DeviceStore`, `SkillRiskStore`, `AgentProfileStore`, `ProjectStore`,
   `DeckCardStore`) via sqlite
 - Provide `Store` for dependency injection
 - Manage database schema initialization
 
-Because the trait contracts and their row/DTO types live in `baybo-store` (a leaf over `baybo-model`), `baybo-storage` no longer depends on any of the domain crates whose stores it implements — its only normal dependencies are `baybo-store` + `baybo-model`. `baybo-turn` and `baybo-trace` stay on as `dev-dependencies` alone, so the sqlite round-trip tests can build the rich `Turn` / `Step` / `Span` types and call their `to_row` / `from_row` helpers. Domain crates depend on `baybo-store` to *call* a store; the assembly layer wires in `baybo-storage`.
+Because the trait contracts and their row/DTO types live in `baybo-store` (a leaf over `baybo-model`), `baybo-storage` no longer depends on any of the domain crates whose stores it implements — its normal dependencies are `baybo-store`, `baybo-model`, and `baybo-workspace`, whose path constants name the blob subdirectory on the `Store::open` path. `baybo-workspace` is itself a leaf with no `baybo-*` dependencies, so it opens no edge into a domain. `baybo-turn` and `baybo-trace` stay on as `dev-dependencies` alone, so the sqlite round-trip tests can build the rich `Turn` / `Step` / `Span` types and call their `to_row` / `from_row` helpers. Domain crates depend on `baybo-store` to *call* a store; the assembly layer wires in `baybo-storage`.
 
 ## Design Decisions
 
-### One connection per in-flight operation — a memory-safety rule, not a tuning knob
+### One connection per in-flight operation, one writer per pool
 
 `SqlitePool` (`sqlite/mod.rs`) is a real pool of `rusqlite::Connection`s (`POOL_SIZE = 8`). Stores never hold a connection; they reach the database only through:
 
 ```rust
-pool.interact("sessions.load_last_user_message", move |conn| { … }).await
+pool.interact("sessions.last_user_messages", move |conn| { … }).await
+pool.interact_write("sessions.append_session_message", move |conn| { … }).await
 ```
 
 which checks a connection out **exclusively for the whole closure** — prepare, step, *and every `row.get()`*.
+`interact` is read-only and installs SQLite's `query_only` guard for the
+checkout, so a misclassified mutation fails. `interact_write` first joins a
+single-permit writer queue shared by every store built from the pool, then
+checks out an ordinary connection. Reads retain all eight-way pool parallelism;
+writes wait in Tokio instead of racing inside SQLite until `busy_timeout`.
 
 The exclusivity is load-bearing, and the reason is not throughput. A sqlite connection owns an unsynchronised private heap — its lookaside allocator — and the C API's own accessors mutate it: `sqlite3_value_text()` allocates in order to NUL-terminate a TEXT column. **The decode is as much a critical section as the query is**, so a lock around only the statement is a non-fix. Two threads inside one connection corrupt the lookaside free list, and the process dies later in `sqlite3DbMallocRawNN` when something pops the dangling head — far from the code that broke it.
 
@@ -37,10 +43,23 @@ Consequences worth knowing:
 
 - **The closure is `'static`.** Bind every parameter as an owned value (`session_id.as_str().to_string()`), and do fallible decoding (serde, chrono) in the outer `anyhow` closure rather than inside a `query_map` row closure, which may only yield `rusqlite::Result`.
 - **No `.await` inside a closure.** A method that must await something non-SQL between statements (`sqlite/blob.rs` does, for path locks and filesystem writes) splits into several `interact` calls. That is behaviour-preserving only where the statements were not already one transaction — check before splitting.
-- **`busy_timeout` is 5s, not 0.** With a single shared connection, intra-process write contention was impossible: everything queued behind one handle. A pool makes concurrent writers real, so without a timeout the agent loop and the trace sink would trade spurious `SQLITE_BUSY`. [`retry`](../../crates/storage/src/retry.rs) is now the *second* line of defence, for cross-process contention (the CLI writing the same file as a running gateway) that outlives the timeout.
+- **`busy_timeout` is 5s, not 0.** The writer queue removes contention between
+  stores sharing this process. The timeout remains necessary for a different
+  process (for example the CLI against a running gateway) or a separately
+  opened pool holding the same file. [`retry`](../../crates/storage/src/retry.rs)
+  is the second line of defence for CLI operations when that contention
+  outlives the timeout.
 - **Transactions get exclusivity for free.** A `BEGIN IMMEDIATE` block runs inside one closure on one connection, so another task's statements can no longer land inside it — which they could when every task shared the one handle.
 
-The pool itself is ~60 lines in `sqlite/mod.rs`: all eight connections opened in `build`, parked in a `Vec` behind a `parking_lot::Mutex`, and handed out one per `tokio::sync::Semaphore` permit, with the closure and the checkout both living on a `spawn_blocking` thread. Two details are load-bearing. The permit is released *after* the connection is back in the pool, or a woken waiter would find nothing to take. And a closure that panics takes its connection with it rather than returning one that may sit mid-statement — `PoolInner::take` then opens a replacement, which is the only path that opens a connection after `build` and the reason `open_leaves_no_connection_to_be_created_later` asserts it stays unreached in ordinary service.
+The pool lives in `sqlite/mod.rs`: all eight connections are opened in `build`,
+parked in a `Vec` behind a `parking_lot::Mutex`, and handed out one per
+connection-semaphore permit, while a second semaphore admits one write closure
+at a time. The closure and checkout live on a `spawn_blocking` thread. Three
+details are load-bearing. The writer permit is acquired before a connection, so
+a queued writer consumes no read capacity. The connection permit is released
+only after the handle is back in the pool. And a closure that panics takes its
+connection with it rather than returning one that may sit mid-statement —
+`PoolInner::take` then opens a replacement.
 
 Owning those lines is also what keeps the `rusqlite` version free to move: a pool crate pinning an older `rusqlite` is what stranded this workspace on SQLite 3.51.1, whose `unixLock` → `unixIsSharingShmNode` → `unixEnterMutex` path takes the process-global `unixBigLock` while holding a file's inode mutex — the exact order sqlite's own comment marks ERROR. One thread closing a database while another opened one deadlocked the pair, across *unrelated* files, and the suite hung roughly one run in fifty. Upstream fixed it in 3.51.3; the workspace `rusqlite = "0.40"` floor (SQLite 3.53.2) is what keeps it fixed.
 
@@ -50,7 +69,7 @@ Every `*Store` trait contract lives in `baybo-store`; `baybo-storage` only *impl
 
 ```
 sqlite/session.rs         → impl SessionStore                         (trait + StoredMessage from baybo-store)
-sqlite/session_summary.rs → impl SessionSummaryStore                  (trait + SessionSummaryRow from baybo-store)
+sqlite/search.rs          → impl MessageSearchStore                   (trait + SearchHit / SearchScope from baybo-store; also owns the message_fts DDL)
 sqlite/trace.rs           → impl TraceStore                           (trait from baybo-store; rows ↔ Step/Span/SpanEvent via baybo-trace)
 sqlite/secret.rs          → impl SecretStore                          (trait from baybo-store; one secrets table shared by minted placeholders, mcp.* creds, and user_env.* user secrets)
 sqlite/turn.rs            → impl TurnStore                            (trait from baybo-store; rows ↔ Turn via baybo-turn)
@@ -65,12 +84,13 @@ sqlite/session_folder.rs  → impl SessionFolderStore                   (trait +
 sqlite/task.rs            → impl TaskStore                            (trait + TaskPatch from baybo-store)
 sqlite/device.rs          → impl DeviceStore                          (trait + DeviceRow / DeviceStatus from baybo-store)
 sqlite/agent_profile.rs   → impl AgentProfileStore                    (trait + AgentProfileRow / AgentProfileUpdate from baybo-store)
+sqlite/project.rs         → impl ProjectStore                         (trait + ProjectRow / IssueRow / IssueRunRow / IssueEventRow and their update/new types from baybo-store)
 sqlite/deck.rs            → impl DeckCardStore                        (trait + DeckCardRow / DeckSnapshotRow / DeckLayoutEntry / DeckSize from baybo-store; deck_cards + latest-N-pruned deck_snapshots)
 ```
 
-Each file above holds its store's queries, but the table DDL is not colocated: every `CREATE TABLE` lives in `sqlite/mod.rs`'s schema initialization — the single place to read the full set of persisted tables or add a new one.
+Each file above holds its store's queries, but the table DDL is not colocated: every `CREATE TABLE` lives in `sqlite/mod.rs`'s schema initialization — the single place to read the full set of persisted tables or add a new one. One table is deliberately outside it: the FTS5 index `message_fts` is owned by `sqlite/search.rs`, which drops and recreates it from `search::rebuild_if_stale` whenever the segmenter fingerprint changes, because `CREATE ... IF NOT EXISTS` cannot migrate a column onto a table that already exists. It is therefore the one table whose DDL is not `IF NOT EXISTS` and not in `mod.rs`; only its fingerprint row's table, `search_meta`, is (see [`search.md`](../search.md)).
 
-`Session`, `User`, `ChannelType`, and `SessionState` live in `baybo-model` so that both `baybo-session` (the `SessionManager` facade) and `baybo-storage` (sqlite impl) can type against them without either crate dragging the other along. The `SessionStore` / `SessionSummaryStore` traits and their `StoredMessage` / `SessionSummaryRow` row types live in `baybo-store`; `baybo-storage` implements them and `baybo-session` calls them.
+`Session`, `User`, `ChannelType`, and `SessionState` live in `baybo-model` so that both `baybo-session` (the `SessionManager` facade) and `baybo-storage` (sqlite impl) can type against them without either crate dragging the other along. The `SessionStore` trait and its `StoredMessage` row type live in `baybo-store`; `baybo-storage` implements it and `baybo-session` calls it.
 
 The conversation transcript itself is **not** stored on `Session` — it's owned by `baybo_context::ContextManager` while the actor is alive and persisted via the per-message `SessionStore` log: `append_session_message` for ordinary turns, `append_session_message_idempotent` for replayable source events, `apply_session_compaction` for `/compact`, and `load_active_session_messages` for cold-start hydration. Rows live in the `session_messages` table (append-only, with a `superseded_by` marker for compactions).
 
@@ -93,9 +113,13 @@ The conversation transcript lives in `session_messages` as a per-session
 sequence assigned at append time (`MAX(ordinal) + 1`). Rows are never deleted
 or rewritten — this is user-facing core data (see the never-delete rule in the
 repo `CLAUDE.md`). Columns: `role`, `content` (serialized `ContentBlock`s),
-`created_at`, `source` (`MessageSource`: `user` / `cron` / `agent` — tells a
-genuine prompt and a cron fire apart from the agent's own injected `user`-role
-rows), `platform_msg_id` (client send idempotency key — sync-redelivery dedup, optimistic-row reconciliation, and the outbox durability point lookup), `source_event_id` (nullable durable idempotency key for internal replayable events), and `superseded_by`.
+`created_at`, `source` (`MessageSource` — the provenance axis every framing and
+rendering decision keys on: `user`, `user_interjection`, `issue_brief`, `cron`,
+`cron_notification`, `recalled_memory`, `system_prompt_update`, `skill_listing`,
+`skills_update`, `subagent_seed`, `agent`. Role does not follow from it:
+`cron_notification` is the one assistant-role source besides `agent`, and
+`user_interjection` renders as a genuine user turn — `ChatMessage::from_user`
+matches it alongside `user`), `platform_msg_id` (client send idempotency key — sync-redelivery dedup, optimistic-row reconciliation, and the outbox durability point lookup), `source_event_id` (nullable durable idempotency key for internal replayable events), and `superseded_by`.
 
 `source_event_id` is unique per session across the **full** transcript, including
 superseded rows. `append_session_message_idempotent` performs the row insert and
@@ -128,7 +152,7 @@ ordinal.
 
 - **Active set** — rows where `superseded_by IS NULL`, ordered by `ordinal`:
   the live LLM context (machinery included). Served by
-  `load_active_session_messages` / `_up_to`; a partial index
+  `load_active_session_messages`; a partial index
   `idx_session_messages_active` on `(session_id, ordinal) WHERE superseded_by IS
   NULL` makes it a back-of-index walk, never a full scan. **The context reads
   never filter `compaction_inserted`** — the re-injected turns ARE what the model
@@ -159,16 +183,14 @@ A row superseded by a *later* compaction (`superseded_by > N`) was still part of
 the snapshot at `N`; a row superseded at or before `N` was not. This filter is
 what makes the ordinal references above replay-stable across compaction.
 
-**Two implementations of that filter, kept in lockstep.** The write-side
-snapshot — `load_active_session_messages_up_to(session, N)`, plain SQL
-`superseded_by IS NULL AND ordinal <= N` — is *time-sensitive*: it returns what
-is active *right now*. The read-side reconstruction (trace hydration over
-`load_session_messages_with_supersede`, which loads every row plus its marker)
-applies the `superseded_by > N` form above. They agree only at the instant
-before the referenced rows are superseded — which holds because a reference is
-captured at call time (rows still active) and the at-most-one-compaction-in-
-flight invariant rules out a concurrent supersede. A differential test pins the
-equivalence so the two filters can't drift apart silently. Three anchoring
+**One implementation of that filter.** The write side takes no ordinal-bounded
+snapshot at all: `ContextManager::input_marker_with_suffix` anchors a reference
+on `latest_session_ordinal` + `count_active_messages` and emits `Persisted` only
+while the persisted active count still mirrors the in-memory window, falling
+back to a self-contained inline copy when it does not. So only the read-side
+reconstruction — trace hydration over `load_session_messages_with_supersede`,
+which loads every row plus its marker — applies the `superseded_by > N` form
+above, and there is no second filter to keep in lockstep. Three anchoring
 helpers — `latest_session_ordinal`, `count_active_messages`,
 `active_index_of_ordinal` — exist to anchor and validate those references; the
 sync/backfill read surface (`load_active_session_messages_tail` / `_since`,
@@ -193,8 +215,8 @@ loading `end = offset + limit` rows always covers an `end`-line window, so
 offsets) and sequential full pagination stays O(N²) without a per-session render
 cache — disproportionate for a rare path until real sessions grow large. A true
 sqlite row-cursor (`rows.next()` is lazy, stop early) is avoided because the
-`dyn SessionStore` boundary would force `Pin<Box<dyn Stream>>` and the single
-shared `Arc<sqlite::Connection>` would be held open across the render.
+`dyn SessionStore` boundary would force `Pin<Box<dyn Stream>>` and a pooled
+connection would be checked out for the whole render.
 
 ### Session planning checklist: the `session_tasks` table
 
@@ -218,7 +240,7 @@ rows themselves carry no unread/acknowledged state.
 
 ### Single backend: sqlite
 
-All store implementations use sqlite (async-native, SQLite-compatible). There is no rusqlite or separate in-memory backend. `Store::open(path)` opens (or creates) a file-backed sqlite database (creating parent directories if missing). There is **one** way to open a pool and tests use it too — a temp-dir path — rather than a test-only in-memory mode: a store with no on-disk home reports `StoreIdentity::Ephemeral`, which tells cross-process coordination there is no peer to synchronise with, and that is a silent footgun to leave reachable from production code. `SqlitePool` wraps a shared `sqlite::Connection` behind `Arc` for cheap cloning across async tasks.
+All store implementations are rusqlite over a file-backed SQLite database, and there is no separate in-memory backend. `Store::open(path)` opens (or creates) that file (creating parent directories if missing). There is **one** way to open a pool and tests use it too — a temp-dir path — rather than a test-only in-memory mode: a store with no on-disk home reports `StoreIdentity::Ephemeral`, which tells cross-process coordination there is no peer to synchronise with, and that is a silent footgun to leave reachable from production code. rusqlite is synchronous, so a `SqlitePool` handle is how async callers reach it at all; the mechanics of that — eight connections, one checked out exclusively per closure on a `spawn_blocking` thread, and what that makes load-bearing — are above under *One connection per in-flight operation*.
 
 The database file path is not a user-facing config knob. Bootstrap composes it from the project root via `boot::storage_db_path()` — storage always lives at `<workspace.path>/state/storage.db`. Operators pick the project root; the storage layout underneath it is fixed by convention.
 
@@ -291,15 +313,27 @@ of each.
 
 ### Transaction boundaries
 
-Use transactions wherever a multi-statement write must be atomic — most importantly `SessionStore::delete`, which cascades the session's `session_messages` rows and removes the parent row in one `BEGIN IMMEDIATE` transaction (a non-transactional implementation could strand a transcript under a concurrent write).
+Use transactions wherever a multi-statement write must be atomic. Session rows
+and transcripts are user-facing core data and are outside the deletable-table
+model entirely: there is no `SessionStore::delete` method and no production
+`DELETE FROM sessions`. The chat delete affordance writes `hidden = true`;
+idle cleanup only reaps the in-memory actor.
 
-Session rows and transcripts are user-facing core data: runtime/background
-cleanup must not call the delete path. It exists for explicit destructive flows
-initiated by the user.
+### Deletable tables hard-delete except `cron_jobs`, `deck_cards`, `projects`, `issues` and a project's agents
 
-### Hard delete everywhere but `cron_jobs` and `deck_cards`
-
-Deletion is a plain `DELETE FROM` in every table but two: no tombstone column, no revival semantics, once a row is gone it is gone. The one cadence-driven retention sweep in `baybo-janitor` is `channel_pairings` (expired/abandoned auth-flow rows), which issues the same `DELETE FROM` against rows past their retention horizon. Blobs are **not** swept on a TTL; there is no `BlobStore::purge_older_than` API, so a blob row lives until an explicit `BlobStore::delete` removes it (which unlinks the content-addressed payload once no live row still references it). The one blob-side reap is filesystem scratch, not rows: `SqliteBlobStore` construction removes `<blob_root>/.tmp` entries whose mtime is older than 24h — upload temp files stranded by a crash mid-`put_stream`; younger entries are left alone because another process may still be writing them.
+For tables that are deletable, deletion is a plain `DELETE FROM` except for
+the cases below: no generic tombstone convention, no implicit revival
+semantics. Sessions are not in this category. The one cadence-driven retention
+sweep in `baybo-janitor` is `channel_pairings` (expired/abandoned auth-flow
+rows), which issues the same `DELETE FROM` against rows past their retention
+horizon. Blobs are **not** swept on a TTL; there is no
+`BlobStore::purge_older_than` API, so a blob row lives until an explicit
+`BlobStore::delete` removes it (which unlinks the content-addressed payload
+once no live row still references it). The one blob-side reap is filesystem
+scratch, not rows: `SqliteBlobStore` construction removes
+`<blob_root>/.tmp` entries whose mtime is older than 24h — upload temp files
+stranded by a crash mid-`put_stream`; younger entries are left alone because
+another process may still be writing them.
 
 **`cron_jobs` is the first exception: it soft-deletes.** The table carries a `deleted_at INTEGER` tombstone (Unix µs; NULL = live), `CronStore::delete` stamps it, `CronStore::restore` clears it, and no code path anywhere issues a `DELETE FROM cron_jobs`.
 
@@ -309,9 +343,27 @@ What makes the tombstone safe is that the filter lives in SQL, not in Rust: `lis
 
 **`deck_cards` is the second, with one difference: its recycle bin can be emptied.** The mechanics mirror `cron_jobs` — a `deleted_at INTEGER` tombstone (Unix µs; NULL = live) that `DeckCardStore::set_deleted` stamps and clears, the filter in SQL (`list_live`, `count_live`, `set_layout` and the `record_snapshot` seq bump all carry `WHERE … deleted_at IS NULL`, backed by the partial index `idx_deck_cards_live` on `(position) WHERE deleted_at IS NULL`), `get` still resolving a deleted row by id, and `list_deleted` inverting the filter for the recycle-bin view. What differs is what the tombstone protects: nothing outlives a card — its `deck_snapshots` are ephemeral render state, pruned to a small latest-N by a plain `DELETE` on every insert (the push counter survives pruning because `last_seq` lives on the card row) — so a hard delete strands nothing. Hence `DeckCardStore::purge`: user-triggered from the bin (`DeckManager` refuses to purge a card that is not already deleted), never a background sweep, it removes the row and its snapshots in one transaction and the manager deletes the bundle directory plus the card's runtime residue (its private tmux-socket dir — servers best-effort killed first — and its exec scratch dir; see `deck.md`).
 
+**A project's agents are the fifth, and the split runs down the middle of one table.** `agent_profiles` holds both global chat personas and project teammates, distinguished by `project_id`/`handle` being set (`TeamMembership`). A global persona is deleted outright — nothing references it by id. A teammate is not: `issues.assignee`, `issue_runs.agent_id` and every `issue_events.actor` name it, and a board that cannot say who did the work is worse than one listing an agent nobody can assign. So `AgentProfileStore::delete` carries `AND project_id IS NULL` and `remove_from_team` stamps `deleted_at` instead — two verbs on one table because the table holds two kinds of row, with the guard in SQL rather than in a caller's memory. `get` still resolves a removed teammate, which is what makes an old timeline entry readable; `list_team` filters `deleted_at IS NULL`, and the domain layer refuses to assign new work to a removed agent (a resolving `get` is not a member). Unlike the other tombstones there is **no restore and no bin**: the handle stays permanently reserved by `idx_agent_profiles_handle` (which deliberately omits `deleted_at IS NULL`), because reissuing `@dev-1` would silently repoint every timeline entry that already said it.
+
+That reservation is one half of a wider rule about those two columns: **`agent_profiles.project_id`/`handle` are insert-only**, and that is the schema's job, not the store impl's. Today no statement in `SqliteAgentProfileStore` names either column after the `INSERT` — but "no statement happens to name it" is a coincidence, and one added field on `AgentProfileUpdate` ends it silently. So a trigger says it instead:
+
+```sql
+CREATE TRIGGER IF NOT EXISTS agent_profiles_team_is_insert_only
+    BEFORE UPDATE OF project_id, handle ON agent_profiles
+    WHEN NEW.project_id IS NOT OLD.project_id OR NEW.handle IS NOT OLD.handle
+    BEGIN SELECT RAISE(ABORT, '…'); END;
+```
+
+The only trigger in the schema, and it earns that by guarding the one column a *human* typed into prose that is already stored: `@dev-1` in a comment resolves through this row and nothing else. It fires on the value, not on the column being mentioned, so a write-back of the same membership passes and `remove_from_team`'s `deleted_at` stamp never touches it. It lives with the post-migration indexes rather than the `CREATE TABLE` batch, for the same reason they do — on a pre-team DB the columns do not exist until the `ALTER` loop runs.
+
+It is also half of an invariant that SQL alone cannot hold. The display name the handle was derived from is frozen in the same way and for the same reason, but it is a line in the agent's own `IDENTITY.md` — there is no name column here to constrain, deliberately (see [`agent-profiles.md`](agent-profiles.md)). That half is enforced inside the one writer of that file in each crate that has one; this is the half a trigger can keep.
+
+**`projects` and `issues` are the third and fourth, and neither has a delete path at all.** A project carries `archived_at INTEGER` and an issue carries `cancelled_at INTEGER`; `ProjectStore` exposes no `delete_project` and no `delete_issue`, so there is nothing to call from a sweeper. The reason is the same one that protects sessions: an issue is a unit of work with conversation history hanging off it (its runs, its timeline), and the project row is what ties a working directory and a team to the board they belong to. Archiving is the whole affordance — `list_projects(include_archived = false)` filters `WHERE archived_at IS NULL` in SQL, `get_project` still resolves an archived row by id, and the domain layer refuses writes to an archived project while leaving reads open. Cancelling an issue is the same shape one level down: the row keeps its number, its position and its history, and only stops counting as live work.
+
+
 ## Constraints
 
-- Normal dependencies are just `baybo-store` (trait contracts + row/DTO types) and `baybo-model` (domain types) — no domain crate; reverse edges from any domain crate back to `baybo-storage` do not exist. `baybo-turn` / `baybo-trace` are `dev-dependencies` only (round-trip tests)
+- Normal dependencies are `baybo-store` (trait contracts + row/DTO types), `baybo-model` (domain types), and `baybo-workspace` (path constants — a leaf with no `baybo-*` deps of its own, so it introduces no domain edge) — no domain crate; reverse edges from any domain crate back to `baybo-storage` do not exist. `baybo-turn` / `baybo-trace` are `dev-dependencies` only (round-trip tests)
 - Exposes trait objects externally, not concrete backend types
 - Assumes upper layers have already sanitized data before persistence
 
@@ -320,8 +372,8 @@ What makes the tombstone safe is that the filter lives in SQL, not in Rust: `lis
 | Module                                   | Role                                                                                      |
 | ---------------------------------------- | ----------------------------------------------------------------------------------------- |
 | `storage` (self)                         | Provides sqlite implementations for every Store trait from `baybo-store`; owns queries and schema initialization |
-| `store`                                  | Owns every `*Store` trait contract + its row/DTO types; `storage` implements them and depends only on this crate (+ `model`) |
+| `store`                                  | Owns every `*Store` trait contract + its row/DTO types; `storage` implements them and takes no domain dependency beyond this crate (+ `model`, + the `workspace` path leaf) |
 | `model` / `trace` / `turn`               | Provide domain types the sqlite impls round-trip (`trace` / `turn` are `dev-dependencies` only, for the round-trip tests) |
 | `context`                                | Owns `ContextManager`; pure in-memory                                                     |
-| `session`                                | Owns the `SessionManager` facade and calls `SessionStore` / `SessionSummaryStore` (whose traits live in `baybo-store`); `storage` does **not** depend on `session` |
+| `session`                                | Owns the `SessionManager` facade and calls `SessionStore` (whose trait lives in `baybo-store`); `storage` does **not** depend on `session` |
 | `agent`                                  | Injects stores into managers (TurnLifecycle, etc.); re-exports SessionManager |

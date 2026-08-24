@@ -217,11 +217,6 @@ impl SessionStore for MemorySessionStore {
         }
     }
 
-    async fn delete(&self, session_id: &SessionId) -> Result<bool> {
-        self.transcripts.lock().remove(session_id);
-        Ok(self.data.lock().remove(session_id).is_some())
-    }
-
     async fn list_expired(&self, before: DateTime<Utc>) -> Result<Vec<SessionId>> {
         Ok(self
             .data

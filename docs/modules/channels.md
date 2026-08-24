@@ -8,7 +8,7 @@ types and MessagePack codec live in the separate `wire` crate; `channels`
 re-exports it as `baybo_channels::wire` for existing server-side consumers.
 
 There is **no adapter trait**. A [`Channel`] is a concrete struct — a
-*protocol surface* (telegram, weixin, tui, http, …), 1:1 with
+*protocol surface* (telegram, weixin, discord, tui, owner, …), 1:1 with
 `ChannelType`. Each `Channel` owns its live [`Connection`]s (N per
 channel, transport-provided) and, when its [`ChannelKind`] is
 `Subscribed`, the reverse index from `session_id` to the connections
@@ -68,7 +68,7 @@ pub struct Channel {
     // Per-session replay buffer of the in-flight turn's progress events
     // (Subscribed channels only; reset at turn start, dropped at turn end,
     // capped at MAX_INFLIGHT_ENTRIES = 2048).
-    in_flight: DashMap<SessionId, Vec<SessionEvent>>,
+    in_flight: DashMap<SessionId, Vec<StampedEvent>>,
 }
 
 impl Channel {
@@ -90,7 +90,7 @@ impl Channel {
     pub fn has_subscribers(&self, session_id: &SessionId) -> bool;
     pub fn connection_count(&self) -> usize;
     pub fn pending_approvals(&self, session_id: &SessionId) -> Vec<ApprovalRequest>;
-    pub fn in_flight_events(&self, session_id: &SessionId) -> Vec<SessionEvent>;
+    pub fn in_flight_events(&self, session_id: &SessionId) -> Vec<StampedEvent>;
     pub fn resolve_approval(&self, call_id: &str, decision: ApprovalDecision) -> Option<SessionId>;
 
     // Kind narrowing — see `SubscribedView` below.
@@ -100,11 +100,18 @@ impl Channel {
 
 The live stream is ephemeral until the turn's assistant message
 persists, so a client that joins **mid-turn** recovers the
-already-streamed progress from `in_flight` two ways:
-`SubscribedView::subscribe` replays the buffer to the fresh subscriber,
-and the gateway folds the same snapshot into both the
-`Frame::SubscribeState` bundle's `work_steps` and the REST chat-history
-transcript (one shared `channel::work_steps` helper).
+already-streamed progress from `in_flight` two ways, both of them pulls:
+the gateway folds the snapshot into the `Frame::SubscribeState` bundle's
+`work_steps`, and the REST chat-history transcript folds the same one in
+(one shared `channel::work_steps` helper reading
+`Channel::in_flight_events`, its only two callers in the tree).
+`SubscribedView::subscribe` itself pushes nothing — it only records the
+connection in `subscriptions`, so a subscribe with no bundle behind it
+recovers nothing.
+
+`StampedEvent { at, event }` — the buffer stamps each event because an
+un-persisted mid-turn step has no other record of when it happened;
+`work_steps` uses the stamp to time the gaps in a replayed work block.
 
 `Connection` is the per-WS handle the gateway hands to `Channel::attach`
 after the `Register` handshake:
@@ -137,7 +144,7 @@ fans output to connections:
 | Kind          | Meaning                                                                                          | Used by                  |
 | ------------- | ------------------------------------------------------------------------------------------------ | ------------------------ |
 | `Multiplexed` | One connection carries every session of this `ChannelType`. Subscribe / Unsubscribe are protocol errors. | telegram, weixin, discord sidecars |
-| `Subscribed`  | Connections receive only the sessions they explicitly subscribe to via `Subscribe` / `Unsubscribe` frames. | TUI (one subscription per process), http (the web chat page, switched on navigation), device (the paired iOS companion) |
+| `Subscribed`  | Connections receive only the sessions they explicitly subscribe to via `Subscribe` / `Unsubscribe` frames. | TUI (one subscription per process) and `owner` — the single reserved channel the web chat page and the paired iOS companion both attach to, each connection subscribing to the sessions it is showing |
 
 ### Kind-typed `SubscribedView`
 
@@ -146,7 +153,7 @@ Operations that only make sense on a `Subscribed` channel —
 `broadcast_session_patch` / `broadcast_session_activity` /
 `broadcast_folders_changed` / `broadcast_list_stale` /
 `broadcast_deck_card_data` / `broadcast_deck_changed` /
-`set_dispatch_observer` — live on
+`broadcast_project_changed` / `set_dispatch_observer` — live on
 [`SubscribedView<'_>`], a cheap borrow obtained from
 `Channel::as_subscribed()`. Multiplexed channels
 return `None` from that call, so a caller holding only a `&Channel`
@@ -182,10 +189,11 @@ Plus one Subscribed-exclusive method on the view:
 `broadcast_session_activity` / `broadcast_folders_changed` /
 `broadcast_list_stale` for sidebar-level frames, plus
 `broadcast_deck_card_data` / `broadcast_deck_changed` for deck pushes
-([`deck.md`](./deck.md)); all of them target every attached connection
-regardless of subscription (sidebar freshness doesn't need per-session
-keying — every tab maintains its full list — and the deck tab has no
-session to subscribe to).
+([`deck.md`](./deck.md)) and `broadcast_project_changed` for board
+invalidations ([`project.md`](./project.md)); all of them target every
+attached connection regardless of subscription (sidebar freshness doesn't
+need per-session keying — every tab maintains its full list — and neither
+the deck tab nor a board has a session to subscribe to).
 
 All of these funnel into the same internal `dispatch_event` /
 `broadcast_frame` machinery: non-blocking, drops the frame for any
@@ -234,8 +242,35 @@ the gateway crate.
 
 `ChannelRegistry` is a thin map from `ChannelType` to `Arc<Channel>`
 plus a shared `ApprovalGateMap` populated at install time. Channels
-are eagerly created at gateway boot from `ChannelsConfig` and installed
-once; nothing here drops them at runtime.
+are created at gateway boot from `ChannelsConfig`, and nothing here drops
+them at runtime — but boot is not the only door in. A `/v1/channel-ws`
+upgrade naming a type the registry does not hold installs it on the spot
+(`adapter::resolve_or_install_channel`, reached from the WS route and the
+device content leg), so a `get` miss is a first-connect condition rather
+than a config error.
+
+That lazy path is the **ordinary** one for the bot channels, not an
+out-of-tree exception. `install_channels` installs `telegram` /
+`discord` / `weixin` only under `config.<ch>.enabled`, and nothing in the
+product writes those entries — `baybo channel add` writes the bot store
+and the vault, and `SidecarSupervisor::run` spawns a sidecar purely off
+`ChannelBotStore::list_live` with no config gate. On a default config a
+registered Telegram bot's sidecar therefore connects, misses, and installs
+`telegram` itself. (The adapter's own comment says the opposite; it is
+wrong.) A custom type declared by a sidecar takes the same path, and has
+to: `ChannelsConfig` is a closed struct of `cli` / `telegram` / `discord`
+/ `weixin` / `message_buffer_size` with no custom map, so an out-of-tree
+type cannot be named in `baybo.json` at all — it exists only as the
+`channel_type` on the wire.
+
+`install`'s `contains_key` → `insert` is not atomic, so two simultaneous
+first-connects of the same type race, with two outcomes depending on the
+interleaving: if B's `contains_key` runs before A's `insert`, both build a
+channel and B's connection attaches to one the registry no longer holds;
+if it runs after, B gets `DuplicateChannel` back out of
+`resolve_or_install_channel` and the route answers
+`RegisterAck { ok: false, reason: "channel resolve failed: duplicate
+channel …" }`.
 
 ```rust
 pub struct ChannelRegistry { /* DashMap<ChannelType, Arc<Channel>>, Arc<ApprovalGateMap> */ }
@@ -243,7 +278,7 @@ pub struct ChannelRegistry { /* DashMap<ChannelType, Arc<Channel>>, Arc<Approval
 impl ChannelRegistry {
     pub fn new() -> Self;
     pub fn approval_gates(&self) -> Arc<ApprovalGateMap>;
-    pub fn install(&self, channel: Arc<Channel>) -> Result<()>;       // boot-time only
+    pub fn install(&self, channel: Arc<Channel>) -> Result<()>;       // boot + lazy first-connect
     pub fn get(&self, channel_type: &ChannelType) -> Option<Arc<Channel>>;
     pub fn list(&self) -> Vec<ChannelType>;
     pub fn len(&self) -> usize;
@@ -252,8 +287,10 @@ impl ChannelRegistry {
 ```
 
 `install` errors with `ChannelError::DuplicateChannel` if the type is
-already installed — that's a config bug (operator declared the same
-channel twice). There is no `unregister`: channels are pinned for the
+already installed. At boot that means a config bug (the operator declared
+the same channel twice); after boot it is the losing side of the
+first-connect race above, and reaches the peer as a failed
+`RegisterAck` rather than a startup error. There is no `unregister`: channels are pinned for the
 lifetime of the gateway process. The previous `Session-scoped clients`
 split (one `Arc<Channel>` per `session_id` for the TUI) and the
 `DuplicateSessionClient` error are gone — the TUI is now a `Subscribed`
@@ -512,10 +549,13 @@ examples.
 All platforms map to the same [`IncomingMessage`] structure. The message
 id is minted server-side as a fresh UUIDv4
 (`route.rs::build_inbound_message`) — there is no platform prefixing.
-User ids follow per-surface conventions: `$USER` (falling back to
-`tui-user`) for the TUI, `web-operator` for `http`, the paired
-`device_id` for `device`, and
-`<channelType>_<botId>_<chatKey>_<platformUserId>` for bot sidecars.
+User ids follow per-surface conventions on every channel but `owner`:
+`$USER` (falling back to `tui-user`) for the TUI, and
+`<channelType>_<botId>_<chatKey>_<platformUserId>` for bot sidecars. The
+`owner` channel — the web dashboard and the paired iOS companion alike —
+stamps the single `OWNER_USER_ID` server-side in `build_inbound_message`
+and discards whatever `user_id` the client sent; a `device_id` is pairing
+/ push state, not an identity.
 Session ids come from the client only on the TUI (which mints its own
 UUID into `Register`); web / device sessions are allocated by the REST
 `create_session` path, and `Multiplexed` sidecar sessions by the
@@ -559,5 +599,5 @@ deliberately.
 | `model`    | Provides `ContentBlock`, `ChannelType`, `SessionId`, `ResourceAccess`, `User`                      |
 | `agent`    | Router owns the registry and calls `Channel::dispatch_agent` (and the approval-dispatch helpers) by `ChannelType` |
 | `tools`    | Provides `ApprovalGate` + `ApprovalGateMap` reused by the registry; `ApprovalQueue` backs `ApprovalSurface`       |
-| `gateway`  | Hosts the in-tree transports (`/v1/channel-ws` and the paired-device Noise relay leg); installs channels at boot, builds per-WS `Connection`s, owns the `ConnectionSink` impl, and translates `SessionEvent` → `wire::Frame` |
+| `gateway`  | Hosts the in-tree transports (`/v1/channel-ws` and the paired-device Noise relay leg); installs channels at boot from config and lazily on any uninstalled type's first connect, builds per-WS `Connection`s, owns the `ConnectionSink` impl, and translates `SessionEvent` → `wire::Frame` |
 | `security` | Inbound user messages go to `SecurityGateway` first after entering the system                                     |

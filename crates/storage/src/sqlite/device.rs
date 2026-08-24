@@ -131,8 +131,8 @@ impl DeviceStore for SqliteDeviceStore {
         let params = insert_params(row);
         let failed = self
             .pool
-            .interact("devices.create", move |conn| {
-                match conn.execute(INSERT_DEVICE, rusqlite::params_from_iter(params)) {
+            .interact_write("devices.create", move |conn| {
+                match conn.execute(INSERT_DEVICE, rusqlite::params_from_iter(params.iter())) {
                     Ok(_) => Ok(None),
                     Err(e) => Ok(Some(e.to_string())),
                 }
@@ -149,9 +149,9 @@ impl DeviceStore for SqliteDeviceStore {
         let params = insert_params(row);
         let failed = self
             .pool
-            .interact("devices.create_provisioning", move |conn| {
+            .interact_write("devices.create_provisioning", move |conn| {
                 let sql = format!("{INSERT_DEVICE}{REPAIR_UPSERT_TAIL}");
-                match conn.execute(&sql, rusqlite::params_from_iter(params)) {
+                match conn.execute(&sql, rusqlite::params_from_iter(params.iter())) {
                     Ok(_) => Ok(None),
                     Err(e) => Ok(Some(e.to_string())),
                 }
@@ -171,7 +171,7 @@ impl DeviceStore for SqliteDeviceStore {
         let id = device_id.to_string();
         let replaced = self
             .pool
-            .interact("devices.approve_replacing", move |conn| {
+            .interact_write("devices.approve_replacing", move |conn| {
                 let tx =
                     conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
@@ -222,7 +222,7 @@ impl DeviceStore for SqliteDeviceStore {
         let inserted_id = device_id.clone();
         let outcome = self
             .pool
-            .interact("devices.create_replacing_approved", move |conn| {
+            .interact_write("devices.create_replacing_approved", move |conn| {
                 // BEGIN IMMEDIATE takes the write lock up front so the revoke + upsert
                 // commit as a unit — no window where there are zero or two approved
                 // devices, and the partial unique index can never trip.
@@ -253,7 +253,7 @@ impl DeviceStore for SqliteDeviceStore {
                 )?;
 
                 let sql = format!("{INSERT_DEVICE}{REPAIR_UPSERT_TAIL}");
-                if let Err(e) = tx.execute(&sql, rusqlite::params_from_iter(params)) {
+                if let Err(e) = tx.execute(&sql, rusqlite::params_from_iter(params.iter())) {
                     // Drop the tx without committing: the revoke rolls back with it.
                     return Ok(Err(e.to_string()));
                 }
@@ -359,7 +359,7 @@ impl DeviceStore for SqliteDeviceStore {
     async fn revoke(&self, device_id: &str) -> Result<bool> {
         let id = device_id.to_string();
         self.pool
-            .interact("devices.revoke", move |conn| {
+            .interact_write("devices.revoke", move |conn| {
                 let affected = conn.execute(
                     "UPDATE devices SET status = 'revoked'
                  WHERE device_id = ?1 AND status != 'revoked'",
@@ -373,7 +373,7 @@ impl DeviceStore for SqliteDeviceStore {
     async fn touch_last_seen(&self, device_id: &str, now: i64) -> Result<()> {
         let id = device_id.to_string();
         self.pool
-            .interact("devices.touch_last_seen", move |conn| {
+            .interact_write("devices.touch_last_seen", move |conn| {
                 conn.execute(
                     "UPDATE devices SET last_seen_at = ?2 WHERE device_id = ?1",
                     rusqlite::params![id, now],

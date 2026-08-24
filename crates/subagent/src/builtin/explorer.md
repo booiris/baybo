@@ -1,17 +1,12 @@
 ---
 name: explorer
 description: |
-  Read-only investigation. Spawn when the parent needs to locate
-  something in the workspace — "where is type X defined", "which
-  files reference Y", "summarise the public surface of crate Z" —
-  and synthesis can wait until the report comes back.
-  Pick this over general-purpose when the work is purely discovery
-  and the parent can stay focused on the conversation while the
-  subagent grovels through files. Avoid for tasks that need to
-  produce a plan (use planner) or mutate the workspace (use
-  general-purpose, with the change spelled out in the brief).
+  Read-only discovery: where something is, what references it, what a
+  crate exposes. Pick over general-purpose when nothing needs changing,
+  over planner when no plan is wanted.
 version: 0.1.0
 default_tier: lite
+tools: Read, Grep, Glob, Bash, WebFetch, IssueGet, IssueList, GetBlob, Skill, Now
 ---
 # Identity
 

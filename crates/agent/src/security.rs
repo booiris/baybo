@@ -61,9 +61,13 @@ impl SecurityGateway {
     /// Scan incoming content, mint placeholders for any matches, store real
     /// secrets in the vault, and rewrite `msg.content` in place.
     pub async fn sanitize_input(&self, msg: &mut Message, session: &mut Session) -> Result<()> {
+        let origin = ScanOrigin {
+            session_id: Some(session.id.as_str()),
+            ..Default::default()
+        };
         for block in &msg.content {
             if let ContentBlock::Text(text) = block {
-                self.log_injection_warnings("inbound", text);
+                self.log_injection_warnings("inbound", origin, text);
             }
         }
 
@@ -252,20 +256,24 @@ impl SecurityGateway {
     /// `ToolOutput::Error` (string leaves) and `ToolOutput::Json` (full
     /// recursive walk). Mints + vaults any new secrets and logs any
     /// prompt-injection markers observed.
-    pub async fn sanitize_tool_output(&self, output: &mut baybo_tools::ToolOutput) -> Result<()> {
+    pub async fn sanitize_tool_output(
+        &self,
+        output: &mut baybo_tools::ToolOutput,
+        origin: ScanOrigin<'_>,
+    ) -> Result<()> {
         let mut mints: Vec<Mint> = Vec::new();
         match output {
             baybo_tools::ToolOutput::Text(s) | baybo_tools::ToolOutput::Error(s) => {
-                self.log_injection_warnings("tool_output", s);
+                self.log_injection_warnings("tool_output", origin, s);
                 sanitize_string(s, &self.leak_detector, &self.minter, &mut mints);
             }
             baybo_tools::ToolOutput::Json(v) => {
-                self.log_injection_warnings_in_value("tool_output", v);
+                self.log_injection_warnings_in_value("tool_output", origin, v);
                 sanitize_value(v, &self.leak_detector, &self.minter, &mut mints);
             }
             baybo_tools::ToolOutput::WithAttachments { text, .. }
             | baybo_tools::ToolOutput::MultiModalText { text, .. } => {
-                self.log_injection_warnings("tool_output", text);
+                self.log_injection_warnings("tool_output", origin, text);
                 sanitize_string(text, &self.leak_detector, &self.minter, &mut mints);
             }
         }
@@ -277,16 +285,21 @@ impl SecurityGateway {
         Ok(())
     }
 
-    fn log_injection_warnings(&self, source: &'static str, text: &str) {
+    fn log_injection_warnings(&self, source: &'static str, origin: ScanOrigin<'_>, text: &str) {
         let mut summary = InjectionSummary::default();
         summary.add(&self.injection_detector.scan(text));
-        summary.emit(source);
+        summary.emit(source, origin);
     }
 
-    fn log_injection_warnings_in_value(&self, source: &'static str, value: &serde_json::Value) {
+    fn log_injection_warnings_in_value(
+        &self,
+        source: &'static str,
+        origin: ScanOrigin<'_>,
+        value: &serde_json::Value,
+    ) {
         let mut summary = InjectionSummary::default();
         self.accumulate_injection_warnings(value, &mut summary);
-        summary.emit(source);
+        summary.emit(source, origin);
     }
 
     fn accumulate_injection_warnings(
@@ -548,36 +561,127 @@ impl InjectionSummary {
             .join(",")
     }
 
-    fn emit(&self, source: &'static str) {
+    fn emit(&self, source: &'static str, origin: ScanOrigin<'_>) {
         let Some(max_severity) = self.max_severity else {
             return;
         };
         let rules = self.rules_summary();
-        match max_severity {
-            InjectionSeverity::Critical | InjectionSeverity::High => {
+        let session_id = origin.session_id.unwrap_or("-");
+        let tool = origin.tool.unwrap_or("-");
+        let span_id = origin.span_id.unwrap_or("-");
+        let provenance = origin.provenance;
+        // Tracing levels are static, so each arm repeats the fields.
+        match emitted_level(max_severity, provenance) {
+            tracing::Level::WARN => {
                 tracing::warn!(
                     source,
+                    session_id,
+                    tool,
+                    span_id,
                     rules = %rules,
                     severity = ?max_severity,
+                    provenance = ?provenance,
                     "prompt-injection markers detected"
                 );
             }
-            InjectionSeverity::Medium => {
+            tracing::Level::INFO => {
                 tracing::info!(
                     source,
+                    session_id,
+                    tool,
+                    span_id,
                     rules = %rules,
                     severity = ?max_severity,
+                    provenance = ?provenance,
                     "prompt-injection markers detected"
                 );
             }
-            InjectionSeverity::Low => {
+            _ => {
                 tracing::debug!(
                     source,
+                    session_id,
+                    tool,
+                    span_id,
                     rules = %rules,
                     severity = ?max_severity,
+                    provenance = ?provenance,
                     "prompt-injection markers detected"
                 );
             }
+        }
+    }
+}
+
+/// Whose text is being scanned. Rides the injection log lines so a
+/// `Critical` detection can be tied to the session, tool call and span that
+/// produced it — the one line where attribution matters most is otherwise
+/// the one line without any.
+#[derive(Clone, Copy, Default)]
+pub struct ScanOrigin<'a> {
+    pub session_id: Option<&'a str>,
+    pub tool: Option<&'a str>,
+    pub span_id: Option<&'a str>,
+    pub provenance: OutputProvenance,
+}
+
+/// Whether output is fully sourced from declared reads inside the checkout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputProvenance {
+    /// All output came from declared reads inside the checkout.
+    WorkspaceLocal,
+    /// Anything unclassified or outside the checkout.
+    #[default]
+    Foreign,
+}
+
+impl OutputProvenance {
+    /// Classify only declared file reads within `checkout_root` as local.
+    pub fn classify(
+        source: baybo_tools::OutputSource,
+        accesses: &[baybo_model::ResourceAccess],
+        checkout_root: Option<&std::path::Path>,
+    ) -> Self {
+        if source != baybo_tools::OutputSource::DeclaredFiles {
+            return Self::Foreign;
+        }
+        let Some(root) = checkout_root else {
+            return Self::Foreign;
+        };
+        if accesses.is_empty() {
+            return Self::Foreign;
+        }
+        let all_inside = accesses.iter().all(|access| match access {
+            baybo_model::ResourceAccess::ReadFile { path } => {
+                // Reject traversal before applying the textual prefix check.
+                !path
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+                    && path.starts_with(root)
+            }
+            _ => false,
+        });
+        if all_inside {
+            Self::WorkspaceLocal
+        } else {
+            Self::Foreign
+        }
+    }
+}
+
+/// Demote checkout-local detections one tier without suppressing them.
+fn emitted_level(severity: InjectionSeverity, provenance: OutputProvenance) -> tracing::Level {
+    match (provenance, severity) {
+        (OutputProvenance::Foreign, InjectionSeverity::Critical | InjectionSeverity::High) => {
+            tracing::Level::WARN
+        }
+        (OutputProvenance::Foreign, InjectionSeverity::Medium) => tracing::Level::INFO,
+        (OutputProvenance::Foreign, InjectionSeverity::Low) => tracing::Level::DEBUG,
+        (
+            OutputProvenance::WorkspaceLocal,
+            InjectionSeverity::Critical | InjectionSeverity::High,
+        ) => tracing::Level::INFO,
+        (OutputProvenance::WorkspaceLocal, InjectionSeverity::Medium | InjectionSeverity::Low) => {
+            tracing::Level::DEBUG
         }
     }
 }
@@ -1178,5 +1282,159 @@ mod tests {
         summary.add(&gw.detect_injection("Please list the files."));
         assert!(summary.max_severity.is_none());
         assert!(summary.rules_summary().is_empty());
+    }
+
+    mod provenance {
+        use super::*;
+        use baybo_model::ResourceAccess;
+        use baybo_tools::OutputSource;
+        use std::path::{Path, PathBuf};
+
+        const ROOT: &str = "/data/kanban";
+
+        fn read(path: &str) -> ResourceAccess {
+            ResourceAccess::ReadFile {
+                path: PathBuf::from(path),
+            }
+        }
+
+        fn classify(source: OutputSource, accesses: &[ResourceAccess]) -> OutputProvenance {
+            OutputProvenance::classify(source, accesses, Some(Path::new(ROOT)))
+        }
+
+        #[test]
+        fn declared_read_inside_the_checkout_is_workspace_local() {
+            assert_eq!(
+                classify(
+                    OutputSource::DeclaredFiles,
+                    &[read("/data/kanban/crates/agent/src/security.rs")]
+                ),
+                OutputProvenance::WorkspaceLocal
+            );
+        }
+
+        #[test]
+        fn a_read_outside_the_checkout_is_foreign() {
+            assert_eq!(
+                classify(OutputSource::DeclaredFiles, &[read("/etc/passwd")]),
+                OutputProvenance::Foreign
+            );
+        }
+
+        #[test]
+        fn a_sibling_directory_sharing_the_prefix_is_foreign() {
+            assert_eq!(
+                classify(OutputSource::DeclaredFiles, &[read("/data/kanban-evil/x")]),
+                OutputProvenance::Foreign
+            );
+        }
+
+        #[test]
+        fn a_traversal_component_is_foreign_even_under_the_root() {
+            assert_eq!(
+                classify(
+                    OutputSource::DeclaredFiles,
+                    &[read("/data/kanban/../secrets/key")]
+                ),
+                OutputProvenance::Foreign
+            );
+        }
+
+        #[test]
+        fn a_sessionless_checkout_is_foreign() {
+            assert_eq!(
+                OutputProvenance::classify(
+                    OutputSource::DeclaredFiles,
+                    &[read("/data/kanban/README.md")],
+                    None
+                ),
+                OutputProvenance::Foreign
+            );
+        }
+
+        #[test]
+        fn an_opaque_tool_stays_foreign_wherever_it_read() {
+            assert_eq!(
+                classify(OutputSource::Opaque, &[read("/data/kanban/README.md")]),
+                OutputProvenance::Foreign
+            );
+        }
+
+        #[test]
+        fn no_declared_access_is_foreign() {
+            assert_eq!(
+                classify(OutputSource::DeclaredFiles, &[]),
+                OutputProvenance::Foreign
+            );
+        }
+
+        #[test]
+        fn one_non_read_access_taints_the_whole_call() {
+            assert_eq!(
+                classify(
+                    OutputSource::DeclaredFiles,
+                    &[
+                        read("/data/kanban/README.md"),
+                        ResourceAccess::WriteFile {
+                            path: PathBuf::from("/data/kanban/README.md"),
+                        },
+                    ]
+                ),
+                OutputProvenance::Foreign
+            );
+        }
+
+        #[test]
+        fn foreign_severity_mapping_is_unchanged() {
+            let f = OutputProvenance::Foreign;
+            assert_eq!(
+                emitted_level(InjectionSeverity::Critical, f),
+                tracing::Level::WARN
+            );
+            assert_eq!(
+                emitted_level(InjectionSeverity::High, f),
+                tracing::Level::WARN
+            );
+            assert_eq!(
+                emitted_level(InjectionSeverity::Medium, f),
+                tracing::Level::INFO
+            );
+            assert_eq!(
+                emitted_level(InjectionSeverity::Low, f),
+                tracing::Level::DEBUG
+            );
+        }
+
+        #[test]
+        fn workspace_local_drops_exactly_one_tier() {
+            let w = OutputProvenance::WorkspaceLocal;
+            assert_eq!(
+                emitted_level(InjectionSeverity::Critical, w),
+                tracing::Level::INFO
+            );
+            assert_eq!(
+                emitted_level(InjectionSeverity::High, w),
+                tracing::Level::INFO
+            );
+            assert_eq!(
+                emitted_level(InjectionSeverity::Medium, w),
+                tracing::Level::DEBUG
+            );
+            assert_eq!(
+                emitted_level(InjectionSeverity::Low, w),
+                tracing::Level::DEBUG
+            );
+        }
+
+        #[test]
+        fn an_unclassified_origin_keeps_full_severity() {
+            assert_eq!(
+                emitted_level(
+                    InjectionSeverity::Critical,
+                    ScanOrigin::default().provenance
+                ),
+                tracing::Level::WARN
+            );
+        }
     }
 }

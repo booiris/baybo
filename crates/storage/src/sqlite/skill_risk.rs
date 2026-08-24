@@ -66,7 +66,7 @@ impl SkillRiskStore for SqliteSkillRiskStore {
         let model = verdict.model.clone();
         let assessed_at = verdict.assessed_at;
         self.pool
-            .interact("skill_risk.put", move |conn| {
+            .interact_write("skill_risk.put", move |conn| {
                 conn.execute(
                     "INSERT OR REPLACE INTO skill_risk_assessments \
                      (skill_name, content_hash, level, rationale, model, assessed_at) \
@@ -88,15 +88,23 @@ impl SkillRiskStore for SqliteSkillRiskStore {
     async fn forget(&self, skill_name: &str) -> Result<()> {
         let skill_name = skill_name.to_string();
         self.pool
-            .interact("skill_risk.forget", move |conn| {
-                conn.execute(
+            .interact_write("skill_risk.forget", move |conn| {
+                // One transaction because forgetting a skill is one decision:
+                // an assessment left without its job (or the reverse) is a
+                // state no reader expects. It is also what makes the write
+                // retry-safe — a bare second `DELETE` that failed BUSY would
+                // otherwise re-run the first on the next attempt.
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                tx.execute(
                     "DELETE FROM skill_risk_assessments WHERE skill_name = ?1",
                     rusqlite::params![skill_name],
                 )?;
-                conn.execute(
+                tx.execute(
                     "DELETE FROM skill_risk_assessment_jobs WHERE skill_name = ?1",
                     rusqlite::params![skill_name],
                 )?;
+                tx.commit()?;
                 Ok(())
             })
             .await
@@ -112,7 +120,7 @@ impl SkillRiskStore for SqliteSkillRiskStore {
         let created_at = job.created_at;
         let updated_at = job.updated_at;
         self.pool
-            .interact("skill_risk.upsert_job", move |conn| {
+            .interact_write("skill_risk.upsert_job", move |conn| {
                 conn.execute(
                     "INSERT INTO skill_risk_assessment_jobs \
                      (skill_name, content_hash, source_path, status, attempts, last_error, \
@@ -155,7 +163,7 @@ impl SkillRiskStore for SqliteSkillRiskStore {
         let last_error = last_error.map(|s| s.to_string());
         let now = super::time::now_us();
         self.pool
-            .interact("skill_risk.set_job_status", move |conn| {
+            .interact_write("skill_risk.set_job_status", move |conn| {
                 conn.execute(
                     "UPDATE skill_risk_assessment_jobs \
                      SET status = ?1, attempts = ?2, last_error = ?3, updated_at = ?4 \
@@ -171,7 +179,7 @@ impl SkillRiskStore for SqliteSkillRiskStore {
         let skill_name = skill_name.to_string();
         let content_hash = content_hash.to_string();
         self.pool
-            .interact("skill_risk.delete_job", move |conn| {
+            .interact_write("skill_risk.delete_job", move |conn| {
                 conn.execute(
                     "DELETE FROM skill_risk_assessment_jobs \
                      WHERE skill_name = ?1 AND content_hash = ?2",

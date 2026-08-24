@@ -177,7 +177,7 @@ impl Router {
                         let actor_token = parent_token.child_token();
                         actor_spawner(
                             session,
-                            pins.llm,
+                            pins.entry,
                             pins.model,
                             pins.effort,
                             response_tx,
@@ -387,7 +387,7 @@ impl Router {
                 let actor_token = parent_token.child_token();
                 actor_spawner(
                     session,
-                    pins.llm,
+                    pins.entry,
                     pins.model,
                     pins.effort,
                     response_tx,
@@ -758,6 +758,8 @@ mod tests {
             cron_store: Arc::new(InMemoryCronStore::new()) as Arc<dyn CronStore>,
             agent_profiles: Arc::new(baybo_store::test_support::MemoryAgentProfileStore::new()),
             cron_trigger_rx,
+            issue_run_rx: None,
+            board: None,
             actor_parent_token: CancellationToken::new(),
             rate_limit: LiveRateLimit::new(rate_limit_max, Duration::from_secs(60)),
             workspace: Arc::new(baybo_workspace::WorkspacePaths::new(

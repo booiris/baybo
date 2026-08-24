@@ -1,7 +1,7 @@
-// jsdom stops short of two DOM APIs the image viewer depends on. Neither is
-// exotic in a browser — they are simply unimplemented — so suites that render
-// the viewer install the missing halves rather than let the component branch
-// around a test environment.
+// jsdom stops short of a few DOM APIs the dashboard depends on. None is exotic
+// in a browser — they are simply unimplemented — so the suites that need them
+// install the missing halves rather than let a component branch around a test
+// environment.
 
 /** jsdom ships Pointer Events but not the capture API, so any handler calling
  * `setPointerCapture` throws mid-dispatch and surfaces as an unhandled error
@@ -24,4 +24,36 @@ export function installObjectUrls(url: string): void {
     createObjectURL: () => url,
     revokeObjectURL: () => {},
   });
+}
+
+/** jsdom runs no layout, so every element reports `scrollHeight` and
+ * `clientHeight` as a hard 0 and swallows writes to `scrollTop`. A pane that
+ * sticks to its own bottom is then untestable in both directions at once: it
+ * can neither be scrolled off the edge nor be caught putting itself back.
+ *
+ * Installs one box for every element — the two numbers a test needs, and a
+ * `scrollTop` that remembers what was written to it. Not restored, for the
+ * reason `installObjectUrls` is not. `scrollTo` comes with it, since a smooth
+ * jump goes through that rather than the property. */
+export function installScrollBox(box: { scrollHeight: number; clientHeight: number }): void {
+  const tops = new WeakMap<Element, number>();
+  const proto = Element.prototype;
+  Object.defineProperty(proto, 'scrollTop', {
+    configurable: true,
+    get(this: Element) {
+      return tops.get(this) ?? 0;
+    },
+    set(this: Element, value: number) {
+      tops.set(this, value);
+    },
+  });
+  for (const [name, value] of [
+    ['scrollHeight', box.scrollHeight],
+    ['clientHeight', box.clientHeight],
+  ] as const) {
+    Object.defineProperty(proto, name, { configurable: true, get: () => value });
+  }
+  proto.scrollTo = function scrollTo(this: Element, options?: ScrollToOptions | number) {
+    tops.set(this, typeof options === 'number' ? options : (options?.top ?? 0));
+  } as Element['scrollTo'];
 }

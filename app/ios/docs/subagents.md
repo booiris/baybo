@@ -48,7 +48,7 @@ for _ in 0..MAX_LINEAGE_WALK_HOPS {
     let Some(l) = s.lineage.as_ref() else { break };
     s = load(&l.parent_session_id)?;
 }
-s.channel == ChannelType::owner() && !is_hidden_cron_session(&s)
+s.channel == ChannelType::owner() && !is_private_cron_session(&s)
 ```
 
 Two things this deliberately does **not** do:
@@ -63,7 +63,7 @@ Two things this deliberately does **not** do:
 - **It does not stop at `channel == owner`.** A cron fire session is minted on
   the cron job's own channel, so a job scheduled from an owner conversation
   produces an owner-channel fire session — and a **one-shot** fire is a private
-  workspace the chat list drops (`is_hidden_cron_session`) and the attach path
+  workspace the chat list drops (`is_private_cron_session`) and the attach path
   404s unconditionally. Without the second clause, a subagent spawned inside one
   becomes a side door into a conversation no client is supposed to reach. The
   rule is "the root must be a session you could already open", not "the root must

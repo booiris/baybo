@@ -31,15 +31,12 @@ const MAX_FILE_MIB: u64 = MAX_FILE_BYTES / 1024 / 1024;
 static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
     format!(
         "Search file contents with a regular expression by spawning the \
-         `rg` (ripgrep) binary. Always use this instead of Bash commands \
-         like grep or rg. `output_mode` may be `content` (matching lines), \
+         `rg` (ripgrep) binary. `output_mode` may be `content` (matching lines), \
          `files_with_matches` (default, paths only), or `count` (match \
          counts per file). Supports file-type filtering via the `glob` \
          parameter. Sensitive paths (SSH/AWS/GPG configs, .env, \
          /etc/shadow, …) are filtered out of the output so their contents \
          never enter the result.\n\n\
-         PATHS: `path` is REQUIRED and MUST be an absolute filesystem path. \
-         Relative paths and omission are rejected.\n\n\
          BEFORE SEARCHING: For an unfamiliar directory, first probe its \
          scale with `Glob` (e.g. count entries) and narrow the search root \
          or `glob` filter accordingly. Files larger than {MAX_FILE_MIB} MiB \

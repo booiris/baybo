@@ -9,16 +9,12 @@
 
 use std::path::{Path, PathBuf};
 
-/// Maximum bytes of tool output carried into LLM context before the cap
-/// truncates with a notice. Covers the post-sanitization text.
-pub const MAX_TOOL_OUTPUT_BYTES: usize = 32 * 1024;
-
-/// Truncate `content` to at most [`MAX_TOOL_OUTPUT_BYTES`] at a UTF-8 char
+/// Truncate `content` to at most [`baybo_model::MAX_TOOL_OUTPUT_BYTES`] at a UTF-8 char
 /// boundary, appending a notice when truncation happened. When `spill_path`
 /// is set the notice points the model at the full payload (readable back via
 /// the `Read` tool).
 pub fn cap_tool_output(content: String, spill_path: Option<&Path>) -> String {
-    let limit = MAX_TOOL_OUTPUT_BYTES;
+    let limit = baybo_model::MAX_TOOL_OUTPUT_BYTES;
     if content.len() <= limit {
         return content;
     }
@@ -98,7 +94,7 @@ mod tests {
 
     #[test]
     fn cap_truncates_long_content() {
-        let big = "x".repeat(MAX_TOOL_OUTPUT_BYTES + 1024);
+        let big = "x".repeat(baybo_model::MAX_TOOL_OUTPUT_BYTES + 1024);
         let out = cap_tool_output(big.clone(), None);
         assert!(out.len() < big.len());
         assert!(out.contains("[... truncated"));
@@ -106,26 +102,28 @@ mod tests {
 
     #[test]
     fn cap_notice_references_spill_path() {
-        let big = "x".repeat(MAX_TOOL_OUTPUT_BYTES + 1024);
+        let big = "x".repeat(baybo_model::MAX_TOOL_OUTPUT_BYTES + 1024);
         let out = cap_tool_output(big, Some(Path::new("/tmp/spill/abc.txt")));
         assert!(out.contains("Full output written to /tmp/spill/abc.txt"));
         assert!(out.contains("`Read` tool"));
-        assert!(out.contains(&format!("{MAX_TOOL_OUTPUT_BYTES} bytes")));
+        assert!(out.contains(&format!("{} bytes", baybo_model::MAX_TOOL_OUTPUT_BYTES)));
     }
 
     #[test]
     fn cap_respects_char_boundary() {
         // 4-byte chars so most byte indices are non-boundaries.
-        let big = "🐙".repeat(MAX_TOOL_OUTPUT_BYTES);
+        let big = "🐙".repeat(baybo_model::MAX_TOOL_OUTPUT_BYTES);
         let out = cap_tool_output(big, None);
-        assert!(out.len() >= MAX_TOOL_OUTPUT_BYTES - 4);
+        assert!(out.len() >= baybo_model::MAX_TOOL_OUTPUT_BYTES - 4);
         assert!(out.contains("[... truncated"));
     }
 
     #[tokio::test]
     async fn spill_writes_full_payload_and_dedups() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let bytes = "x".repeat(MAX_TOOL_OUTPUT_BYTES + 1024).into_bytes();
+        let bytes = "x"
+            .repeat(baybo_model::MAX_TOOL_OUTPUT_BYTES + 1024)
+            .into_bytes();
 
         let p1 = spill_tool_output(dir.path(), &bytes)
             .await

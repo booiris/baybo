@@ -2,6 +2,9 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum ContextError {
+    #[error("transcript persistence error: {0}")]
+    Transcript(String),
+
     #[error("context compression error: {0}")]
     Compression(String),
 

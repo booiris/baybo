@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::approval::ResourceAccess;
 use crate::mcp::content_adapter::adapt_call_result;
-use crate::{Tool, ToolContext, ToolError, ToolOutput};
+use crate::{Tool, ToolContext, ToolError, ToolOutput, ToolTriggerScope};
 
 /// Wrapper that exposes one rmcp-discovered tool to Baybo's agent loop.
 ///
@@ -32,6 +32,7 @@ pub struct McpTool {
     description: String,
     parameters_schema: Value,
     default_resource_access: Vec<ResourceAccess>,
+    trigger_scope: ToolTriggerScope,
     peer: Peer<RoleClient>,
     blob_store: Option<Arc<dyn BlobStore>>,
 }
@@ -41,6 +42,7 @@ impl McpTool {
         server_name: String,
         descriptor: RmcpTool,
         default_resource_access: Vec<ResourceAccess>,
+        trigger_scope: ToolTriggerScope,
         peer: Peer<RoleClient>,
         blob_store: Option<Arc<dyn BlobStore>>,
     ) -> Self {
@@ -58,6 +60,7 @@ impl McpTool {
             description,
             parameters_schema,
             default_resource_access,
+            trigger_scope,
             peer,
             blob_store,
         }
@@ -88,6 +91,10 @@ impl Tool for McpTool {
 
     fn accessed_resources(&self, _params: &Value) -> Vec<ResourceAccess> {
         self.default_resource_access.clone()
+    }
+
+    fn trigger_scope(&self) -> ToolTriggerScope {
+        self.trigger_scope
     }
 
     fn max_timeout(&self) -> Duration {

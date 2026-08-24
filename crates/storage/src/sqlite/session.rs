@@ -91,6 +91,7 @@ pub(super) fn rehydrate_message(
         MessageSource::User => ChatMessage::user(content),
         MessageSource::UserInterjection => ChatMessage::user_interjection(content),
         MessageSource::Cron => ChatMessage::cron_fire(content),
+        MessageSource::IssueBrief => ChatMessage::issue_brief(content),
         MessageSource::CronNotification => ChatMessage::cron_notification(content),
         MessageSource::RecalledMemory => ChatMessage::recalled_memory(content),
         MessageSource::SystemPromptUpdate => ChatMessage::system_prompt_update(content),
@@ -298,6 +299,7 @@ impl SessionStore for SqliteSessionStore {
             baybo_model::TriggerKind::User => "user",
             baybo_model::TriggerKind::Cron => "cron",
             baybo_model::TriggerKind::Spawned => "spawned",
+            baybo_model::TriggerKind::Issue => "issue",
         };
         let parent_session = session
             .lineage
@@ -345,7 +347,7 @@ impl SessionStore for SqliteSessionStore {
         // binding structurally write-once rather than write-once by
         // convention.
         self.pool
-            .interact("sessions.save", move |conn| {
+            .interact_write("sessions.save", move |conn| {
                 conn.execute(
                     "INSERT INTO sessions \
                      (id, root_session_id, trigger_kind, parent_session_id, parent_turn_id, \
@@ -396,7 +398,7 @@ impl SessionStore for SqliteSessionStore {
         // the up-to-date value regardless of blob staleness.
         let affected = self
             .pool
-            .interact("sessions.set_hidden", move |conn| {
+            .interact_write("sessions.set_hidden", move |conn| {
                 Ok(conn.execute(
                     "UPDATE sessions SET hidden = ?2 WHERE id = ?1",
                     rusqlite::params![sid, flag],
@@ -420,7 +422,7 @@ impl SessionStore for SqliteSessionStore {
         let value: Option<String> = llm.map(|n| n.as_str().to_string());
         let affected = self
             .pool
-            .interact("sessions.set_last_llm", move |conn| {
+            .interact_write("sessions.set_last_llm", move |conn| {
                 Ok(conn.execute(
                     "UPDATE sessions SET last_llm = ?2 WHERE id = ?1",
                     rusqlite::params![sid, value],
@@ -439,7 +441,7 @@ impl SessionStore for SqliteSessionStore {
         let value: Option<String> = model.map(str::to_string);
         let affected = self
             .pool
-            .interact("sessions.set_last_model", move |conn| {
+            .interact_write("sessions.set_last_model", move |conn| {
                 Ok(conn.execute(
                     "UPDATE sessions SET last_model = ?2 WHERE id = ?1",
                     rusqlite::params![sid, value],
@@ -457,7 +459,7 @@ impl SessionStore for SqliteSessionStore {
         let value: Option<String> = effort.map(str::to_string);
         let affected = self
             .pool
-            .interact("sessions.set_last_effort", move |conn| {
+            .interact_write("sessions.set_last_effort", move |conn| {
                 Ok(conn.execute(
                     "UPDATE sessions SET last_effort = ?2 WHERE id = ?1",
                     rusqlite::params![sid, value],
@@ -476,7 +478,7 @@ impl SessionStore for SqliteSessionStore {
         // `Session.pinned` from the column on read.
         let affected = self
             .pool
-            .interact("sessions.set_pinned", move |conn| {
+            .interact_write("sessions.set_pinned", move |conn| {
                 Ok(conn.execute(
                     "UPDATE sessions SET pinned = ?2 WHERE id = ?1",
                     rusqlite::params![sid, flag],
@@ -495,7 +497,7 @@ impl SessionStore for SqliteSessionStore {
         // `Session.archived` from the column on read.
         let affected = self
             .pool
-            .interact("sessions.set_archived", move |conn| {
+            .interact_write("sessions.set_archived", move |conn| {
                 Ok(conn.execute(
                     "UPDATE sessions SET archived = ?2 WHERE id = ?1",
                     rusqlite::params![sid, flag],
@@ -519,7 +521,7 @@ impl SessionStore for SqliteSessionStore {
         let value: Option<String> = folder_id.map(|f| f.as_str().to_string());
         let affected = self
             .pool
-            .interact("sessions.set_folder", move |conn| {
+            .interact_write("sessions.set_folder", move |conn| {
                 Ok(conn.execute(
                     "UPDATE sessions SET folder_id = ?2 WHERE id = ?1",
                     rusqlite::params![sid, value],
@@ -537,7 +539,7 @@ impl SessionStore for SqliteSessionStore {
         // one). The JSON `data` blob is untouched, like `set_pinned`.
         let affected = self
             .pool
-            .interact("sessions.set_read_cursor", move |conn| {
+            .interact_write("sessions.set_read_cursor", move |conn| {
                 Ok(conn.execute(
                     "UPDATE sessions \
                      SET read_cursor = CASE \
@@ -556,7 +558,7 @@ impl SessionStore for SqliteSessionStore {
         let value: Option<String> = title.map(|t| t.to_string());
         let affected = self
             .pool
-            .interact("sessions.set_title", move |conn| {
+            .interact_write("sessions.set_title", move |conn| {
                 Ok(conn.execute(
                     "UPDATE sessions SET title = ?2 WHERE id = ?1",
                     rusqlite::params![sid, value],
@@ -571,7 +573,7 @@ impl SessionStore for SqliteSessionStore {
         let value = title.to_string();
         let affected = self
             .pool
-            .interact("sessions.set_title_if_absent", move |conn| {
+            .interact_write("sessions.set_title_if_absent", move |conn| {
                 Ok(conn.execute(
                     "UPDATE sessions SET title = ?2 WHERE id = ?1 AND title IS NULL",
                     rusqlite::params![sid, value],
@@ -579,37 +581,6 @@ impl SessionStore for SqliteSessionStore {
             })
             .await?;
         Ok(affected > 0)
-    }
-
-    async fn delete(&self, session_id: &SessionId) -> Result<bool> {
-        let sid = session_id.as_str().to_string();
-        self.pool
-            .interact("sessions.delete", move |conn| {
-                // The message-log cascade and the session-row delete must commit
-                // as a unit (see below); BEGIN IMMEDIATE takes the write lock up
-                // front so the pair runs without an interleaved writer.
-                let tx =
-                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-
-                // Cascade the message log first — there's no FK in sqlite, so
-                // a stranded `session_messages` row would otherwise outlive
-                // its parent.
-                tx.execute(
-                    "DELETE FROM session_messages WHERE session_id = ?1",
-                    rusqlite::params![sid],
-                )?;
-
-                let affected =
-                    tx.execute("DELETE FROM sessions WHERE id = ?1", rusqlite::params![sid])?;
-                if affected == 0 {
-                    // Dropping the transaction rolls it back.
-                    drop(tx);
-                    return Ok(false);
-                }
-                tx.commit()?;
-                Ok(true)
-            })
-            .await
     }
 
     async fn list_expired(&self, before: DateTime<Utc>) -> Result<Vec<SessionId>> {
@@ -763,7 +734,7 @@ impl SessionStore for SqliteSessionStore {
         // serialises writes per session, so there's no concurrent-
         // append race to defend against here.
         self.pool
-            .interact("sessions.append_session_message", move |conn| {
+            .interact_write("sessions.append_session_message", move |conn| {
                 // The FTS mirror must be atomic with the row: a crash between
                 // the two leaves the message permanently unsearchable, and
                 // nothing downstream can detect the gap.
@@ -811,7 +782,7 @@ impl SessionStore for SqliteSessionStore {
         let platform_msg_id = message.platform_msg_id().to_string();
         let indexed = message.clone();
         self.pool
-            .interact("sessions.append_session_message_idempotent", move |conn| {
+            .interact_write("sessions.append_session_message_idempotent", move |conn| {
                 let tx = conn.transaction()?;
                 let inserted: Option<i64> = tx
                     .query_row(
@@ -902,7 +873,7 @@ impl SessionStore for SqliteSessionStore {
         let platform_msg_id = platform_msg_id.to_string();
         let created_us = super::time::to_us(created_at);
         self.pool
-            .interact("sessions.append_control_event", move |conn| {
+            .interact_write("sessions.append_control_event", move |conn| {
                 let seq: i64 = conn
                     .query_row(
                         "INSERT INTO session_control_events \
@@ -980,7 +951,7 @@ impl SessionStore for SqliteSessionStore {
         }
 
         self.pool
-            .interact("sessions.apply_session_compaction", move |conn| {
+            .interact_write("sessions.apply_session_compaction", move |conn| {
                 let tx =
                     conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
@@ -1457,6 +1428,7 @@ impl SessionStore for SqliteSessionStore {
                        FROM session_messages m \
                        JOIN sessions s ON s.id = m.session_id \
                        WHERE s.dreamed_through_ordinal IS NULL \
+                         AND s.trigger_kind != 'issue' \
                          AND m.created_at >= ?1 AND m.created_at < ?2 \
                          AND m.compaction_inserted = 0 \
                          AND m.source IN ({HUMAN_SOURCES_SQL}) \
@@ -1470,6 +1442,7 @@ impl SessionStore for SqliteSessionStore {
                        FROM session_messages m \
                        JOIN sessions s ON s.id = m.session_id \
                        WHERE s.dreamed_through_ordinal IS NOT NULL \
+                         AND s.trigger_kind != 'issue' \
                          AND m.ordinal > s.dreamed_through_ordinal \
                          AND m.compaction_inserted = 0 \
                        GROUP BY m.session_id \
@@ -1539,7 +1512,7 @@ impl SessionStore for SqliteSessionStore {
     ) -> Result<bool> {
         let sid = session_id.as_str().to_string();
         self.pool
-            .interact("sessions.set_dreamed_through_ordinal", move |conn| {
+            .interact_write("sessions.set_dreamed_through_ordinal", move |conn| {
                 // MAX-wins so a slow writer cannot rewind the cursor and
                 // hand the same conversation to a later pass a second time.
                 Ok(conn.execute(
@@ -1786,7 +1759,7 @@ impl SessionStore for SqliteSessionStore {
         let now_json = now.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
         let affected = self
             .pool
-            .interact("sessions.touch_last_active", move |conn| {
+            .interact_write("sessions.touch_last_active", move |conn| {
                 Ok(conn.execute(
                     "UPDATE sessions \
                      SET last_active = ?2, data = json_set(data, '$.last_active', ?3) \
@@ -1960,8 +1933,8 @@ mod tests {
     /// Run one raw statement against the pool (test-only schema surgery /
     /// hand-written rows the store's own API can't produce).
     async fn exec(pool: &SqlitePool, sql: &'static str, params: Vec<rusqlite::types::Value>) {
-        pool.interact("test.exec", move |conn| {
-            conn.execute(sql, rusqlite::params_from_iter(params))?;
+        pool.interact_write("test.exec", move |conn| {
+            conn.execute(sql, rusqlite::params_from_iter(params.iter()))?;
             Ok(())
         })
         .await
@@ -1971,7 +1944,7 @@ mod tests {
     /// Re-run the schema/migration boot path (what a new binary does against
     /// an older DB).
     async fn init_db(pool: &SqlitePool) {
-        pool.interact("test.init_db", super::super::init_db)
+        pool.interact_write("test.init_db", super::super::init_db)
             .await
             .unwrap();
     }
@@ -1993,9 +1966,66 @@ mod tests {
         let loaded = store.get(&s.id).await.unwrap().unwrap();
         assert_eq!(loaded.id, s.id);
         assert_eq!(loaded.root_session_id, s.id);
+    }
 
-        store.delete(&s.id).await.unwrap();
-        assert!(store.get(&s.id).await.unwrap().is_none());
+    /// `sessions.project_id` is `json_extract(data, '$.trigger.project_id')`
+    /// — a SQL literal standing on `baybo_model::TriggerSource`'s serde
+    /// output, which lives in another crate and answers to no schema gate.
+    /// Rename that field, flatten the enum, or add a `rename` attribute and
+    /// the column silently reads NULL: every board's burn and both of its
+    /// ceilings quietly go to zero with nothing red anywhere. Hence the real
+    /// writer rather than a hand-written blob — hand-written JSON in a test
+    /// is the one thing that cannot catch this.
+    #[tokio::test]
+    async fn the_board_column_reads_the_trigger_the_model_actually_serialises() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
+        let store = SqliteSessionStore::new(pool.clone());
+
+        let project_id = baybo_model::ProjectId::parse("01JCONTRACT").unwrap();
+        let mut on_a_card = make_root_session("issue-1");
+        on_a_card.trigger = TriggerSource::Issue {
+            project_id: project_id.clone(),
+            issue_id: baybo_model::IssueId::generate(),
+            number: 7,
+        };
+        store.save(&on_a_card).await.unwrap();
+
+        let mut swept = make_root_session("cron-1");
+        swept.trigger = TriggerSource::Cron {
+            cron_job_id: "j1".to_owned(),
+            origin_session_id: None,
+            conversation: false,
+            job_title: None,
+            project_id: Some(project_id.clone()),
+        };
+        store.save(&swept).await.unwrap();
+
+        store.save(&make_root_session("chat-1")).await.unwrap();
+
+        let expected = project_id.as_str().to_owned();
+        pool.interact("test.assert_board_column", move |conn| {
+            let mut stmt = conn.prepare("SELECT id, project_id FROM sessions ORDER BY id")?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            assert_eq!(
+                rows,
+                vec![
+                    ("chat-1".to_owned(), None),
+                    ("cron-1".to_owned(), Some(expected.clone())),
+                    ("issue-1".to_owned(), Some(expected)),
+                ],
+                "both board-bearing triggers must land at the same JSON path"
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -2390,7 +2420,7 @@ mod tests {
         let s = make_root_session("corrupt-binding");
         store.save(&s).await.unwrap();
         let sid = s.id.as_str().to_string();
-        pool.interact("test.corrupt", move |conn| {
+        pool.interact_write("test.corrupt", move |conn| {
             conn.execute(
                 "UPDATE sessions SET agent_id = ?2, agent_framework = ?3 WHERE id = ?1",
                 rusqlite::params![sid, "../escape", "borked"],

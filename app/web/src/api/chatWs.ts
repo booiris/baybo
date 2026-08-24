@@ -156,6 +156,9 @@ export interface WireApprovalCard {
   description?: string | null;
 }
 
+/** Mirror of Rust `ProjectChangeScope` — which plane of a project changed. */
+export type ProjectChangeScope = 'project' | 'board' | 'run' | 'timeline';
+
 export type Frame =
   | { kind: 'register'; token: string; channel_type: string }
   | { kind: 'register_ack'; ok: boolean; reason: string | null }
@@ -276,6 +279,15 @@ export type Frame =
    *  consumes them. The page ignores them (routeInboundFrame's default arm). */
   | { kind: 'deck_card_data'; card_id: string; seq: number; payload: string }
   | { kind: 'deck_changed' }
+  /** Server → client: a project changed. Session-less broadcast (the
+   *  `deck_changed` pattern) — carries only what to refetch, never state.
+   *  `issue_number` is present when the change is about one issue. */
+  | {
+      kind: 'project_changed';
+      project_id: string;
+      scope: ProjectChangeScope;
+      issue_number?: number;
+    }
   | { kind: 'ping' }
   | { kind: 'pong' };
 

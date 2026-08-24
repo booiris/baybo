@@ -48,7 +48,7 @@ Memory is partitioned **per agent**, and an agent's partition is wherever its
 persona already lives:
 
 ```text
-<root>/personas/<agent_id>/
+<persona>/                         # personas/<agent_id>/, or personas/project/<agent_id>/
   SOUL.md  IDENTITY.md  USER.md      # the agent's identity files
   skills/                            # the skills only it sees
   memory/
@@ -56,10 +56,11 @@ persona already lives:
     cat-name.md                      #   one fact per file
 ```
 
-One rule, no special cases: the built-in is just another persona directory
-(`personas/baybo/`), so its memory lives beside its soul like everyone
-else's. There is no shared tree — nowhere for one agent's writes to land in
-another's reach.
+The built-in is just another persona directory (`personas/baybo/`), so its
+memory lives beside its soul like everyone else's. Newly created project
+agents use `project-<ULID>` ids and are grouped under `personas/project/`;
+legacy unprefixed project personas remain flat and valid. There is no shared
+memory tree — nowhere for one agent's writes to land in another's reach.
 
 A custom agent's tree is materialised by `ensure_persona_layout` at creation;
 the built-in is skipped there (it has no create step), so its index is seeded
@@ -79,6 +80,32 @@ contract the identity files have.
 `<identity>`, `<shared_user_profile>`, `<user_notes>`, **`<memory path="…">`**
 carrying `MEMORY.md` verbatim, **`MEMORY_HINT`**, then the background-work
 and tag-handling hints. Declarative content first, operating rules last.
+
+`PromptShape` separates card runs from ordinary conversations:
+
+- `Chat` — every session that is not a card run, including every cron fire. It
+  gets the Edit affordance, both user sections, and the general conversation
+  memory rule.
+- `Issue` — a card run. It uses the board memory rule and drops both the Edit
+  affordance and `<shared_user_profile>` / `<user_notes>`: nobody is at a
+  keyboard, and on the live board all seven agents' `USER.md` were byte-identical
+  unmodified seed templates with the shared file blank — 806 bytes of empty form
+  on every request, which an agent then reads as one more thing to fill in.
+  Existing sessions retire old copies of those sections at their next
+  compaction.
+
+The generic memory rule names "the state of ongoing work" and defines `project`
+as "ongoing work and where it stands". On a board that invites a stale copy of
+the card: of 32 memories the live board's agents had written, **18 were
+card-state snapshots** ("#12 approved, lead merge pending") with no writer to
+keep them current. The `Issue` shape instead prohibits card-local state first,
+then allows only reusable knowledge — environment behaviour, a board-wide rule,
+a codebase trap, or an expensive-to-rediscover reference. The frontmatter
+contract does not vary: both shapes still document all four types.
+
+`PromptShape::for_trigger` is the only constructor. It reads the trigger's
+canonical issue accessor: an issue run gets `Issue`; every other trigger gets
+`Chat`, including a cron fire carrying a `project_id`.
 
 Only the **index** is injected. A memory's body costs nothing until the model
 decides an index line is worth a `Read` — which is what lets the tree grow
@@ -120,8 +147,8 @@ writes are audited instead of approved, in three tiers:
 | Tier | Roots | Approval | Allowlist | Size cap | Audit commit |
 |---|---|---|---|---|---|
 | Shared profile | `personas/USER.md` | bypassed for `Edit` | yes | 1 MiB | yes |
-| Identity | `personas/<agent_id>/{SOUL,IDENTITY,USER}.md` | bypassed for `Edit` | yes | 1 MiB | yes |
-| Memory | `personas/<agent_id>/memory/**` | bypassed | **no** | 1 MiB | yes |
+| Identity | `<persona>/{SOUL,IDENTITY,USER}.md` | bypassed for `Edit` | yes | 1 MiB | yes |
+| Memory | `<persona>/memory/**` | bypassed | **no** | 1 MiB | yes |
 | Scratch | `work/` | bypassed | no | no | no |
 
 The per-agent tiers are **owned**: `<agent_id>` is the calling agent, and a
@@ -209,7 +236,7 @@ makes location the entire guard:
 The first two live in `baybo-workspace` beside `absolutise`, whose own
 doc-comment warns that it leaves `..` intact for exactly this reason — and so
 does the **shape recogniser**, `classify_persona_path`. Recognising
-`personas/<id>/memory/x.md` is the same knowledge as constructing it, and the
+Recognising a persona memory path is the same knowledge as constructing it, and the
 constructors (`persona_identity_file`, `persona_memory_dir`,
 `shared_user_file`) are right there: a recogniser kept in another crate would
 go on matching a layout that had moved, and it is the recogniser that grants

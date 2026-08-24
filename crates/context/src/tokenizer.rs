@@ -279,7 +279,7 @@ mod tests {
             tok.count_text(&delivered)
         );
 
-        let mut budget = crate::budget::TokenBudget::new(128_000, 0.75);
+        let mut budget = crate::budget::TokenBudget::new(128_000, 0.75, 0);
         budget.update(BATCH_ATTACHMENTS * one);
         assert!(
             !budget.needs_compression(),
@@ -546,7 +546,7 @@ mod tests {
     fn one_attachment_stays_under_a_small_models_compaction_trigger() {
         // Any provider can be handed inlined text; 32k is the smallest
         // window worth designing against.
-        let mut budget = crate::budget::TokenBudget::new(32_000, 0.75);
+        let mut budget = crate::budget::TokenBudget::new(32_000, 0.75, 0);
         budget.update(INLINED_FILE_TOKEN_BOUND + MESSAGE_OVERHEAD);
         assert!(!budget.needs_compression());
         budget.update(2 * (INLINED_FILE_TOKEN_BOUND + MESSAGE_OVERHEAD));
@@ -559,7 +559,7 @@ mod tests {
             baybo_llm::pdf_document_tokens(Some(baybo_llm::MAX_PDF_PAGES)),
             baybo_llm::audio_tokens(Some(baybo_llm::MAX_AUDIO_SECONDS * 1_000)),
         ] {
-            let mut budget = crate::budget::TokenBudget::new(128_000, 0.75);
+            let mut budget = crate::budget::TokenBudget::new(128_000, 0.75, 0);
             budget.update(at_cap + MESSAGE_OVERHEAD);
             assert!(!budget.needs_compression(), "{at_cap}");
             budget.update(2 * (at_cap + MESSAGE_OVERHEAD));

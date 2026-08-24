@@ -73,7 +73,7 @@ const CLOSE_TAG: &str = "</system_prompt_update>";
 /// sequence of them reads as contradictory.
 const FRAMING_BODY: &str = r#"The system prompt above was assembled when this conversation started; some of its sources have changed since. Each block below updates the part carrying the same tag — anything not named is still current, and the last such update wins.
 
-A block's `path` is where that file lives now. Any other path the prompt above gives for that tag is dead: it may still exist on disk, so writing there appears to succeed and is never read."#;
+Any `path` a block carries is where that file lives now. Any other path the prompt above gives for that tag is dead: it may still exist on disk, so writing there appears to succeed and is never read."#;
 
 /// Appended to [`FRAMING_BODY`] only when a [`UpdateBlock::Diff`] is actually
 /// present, so an update made only of full bodies is unchanged by this
@@ -238,6 +238,8 @@ fn self_closing(tag: SectionTag, path: &Path, attr: &str) -> String {
 /// already did — and as a diff from them once somebody else has written over
 /// part of it. Sections only: a hint has no file behind it, and a body absent
 /// from `seeded` for any *other* reason is still described in full or by diff.
+/// A section absent from `current` is intentionally left alone: the immutable
+/// leading row keeps it until compaction reseeds the current prompt.
 pub fn build_blocks<'a>(
     current: &'a [PromptPart],
     rendered: &'a [String],
@@ -580,6 +582,20 @@ mod tests {
         ));
         assert!(out.contains("hook 0"), "{out}");
         assert!(!has_diff_block(&out), "{out}");
+    }
+
+    #[test]
+    fn a_section_absent_from_the_current_prompt_waits_for_compaction() {
+        let parts = vec![soul("/w/SOUL.md", "s")];
+        let rendered = render_all(&parts);
+        let seeded = format!(
+            "{}\n\n<shared_user_profile path=\"/w/USER.md\">\nold profile\n</shared_user_profile>",
+            rendered[0]
+        );
+        assert!(
+            blocks(&parts, &rendered, &seeded, &no_writes()).is_empty(),
+            "an absent section is retired only when compaction reseeds the prompt"
+        );
     }
 
     /// The delta is measured against the leading row ONLY. A part an earlier

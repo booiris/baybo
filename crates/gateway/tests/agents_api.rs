@@ -5,8 +5,6 @@
 //! delete, avatar allowed), creates validate name/llm/avatar-blob, `PUT`
 //! is a full content replace, and deletes are plain row removals.
 
-use std::sync::Arc;
-
 use axum::body::{self, Body};
 use axum::http::{Request, StatusCode};
 use baybo_gateway::test_support::build_test_deps;
@@ -196,16 +194,35 @@ async fn agents_api_round_trip() {
     // and description — not which model it runs on or what it calls itself.
     // …its model is not one of them: the builtin *is* `default-llm`, so
     // pinning it would put one decision in two places.
-    let err = put_expect(
+    for pin in [
+        json!({ "llm": llm_entry }),
+        // A rung alone is a pin too: thinking level is spend, and letting it
+        // through would put that decision in the second place the entry pin
+        // is refused for.
+        json!({ "reasoning_effort": "high" }),
+    ] {
+        let err = put_expect(
+            &router,
+            "/v1/agents/baybo/model",
+            pin,
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        assert!(err["error"].as_str().unwrap_or("").contains("default-llm"));
+    }
+    let builtin = get(&router, "/v1/agents/baybo", StatusCode::OK).await;
+    for level in ["llm", "model", "reasoning_effort"] {
+        assert!(builtin.get(level).is_none(), "got {builtin:?}");
+    }
+    // Clearing is a no-op it accepts — that is what makes the refusal about
+    // the pin rather than about the endpoint.
+    put_expect(
         &router,
         "/v1/agents/baybo/model",
-        json!({ "llm": llm_entry }),
-        StatusCode::BAD_REQUEST,
+        json!({}),
+        StatusCode::NO_CONTENT,
     )
     .await;
-    assert!(err["error"].as_str().unwrap_or("").contains("default-llm"));
-    let builtin = get(&router, "/v1/agents/baybo", StatusCode::OK).await;
-    assert!(builtin.get("llm").is_none(), "got {builtin:?}");
 
     put_expect(
         &router,
@@ -592,45 +609,98 @@ async fn agents_api_round_trip() {
     assert_eq!(list["items"].as_array().expect("items").len(), 1);
 }
 
+/// The LLM pin is one choice at three levels, and `PUT …/model` replaces all
+/// of it. A board agent's run has no chat header to pick a model or a
+/// thinking rung from, so this endpoint is the only door those two have.
+#[tokio::test]
+async fn agent_model_pin_is_replaced_whole_and_validated_at_every_level() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let state = build_admin_state(&tg);
+    let router = build_router(state);
+
+    let entry = tg
+        .deps
+        .llm_pool
+        .read()
+        .entry_names()
+        .first()
+        .expect("test pool has one entry")
+        .to_string();
+    // The stub pool serves exactly one model per entry, named after it.
+    let model = entry.clone();
+
+    let created = post_expect(
+        &router,
+        "/v1/agents",
+        json!({ "name": "Pinned" }),
+        StatusCode::OK,
+    )
+    .await;
+    let id = created["id"].as_str().expect("id").to_owned();
+    let pin_url = format!("/v1/agents/{id}/model");
+
+    // ── all three levels round-trip, and the rung is canonicalised ──
+    put_expect(
+        &router,
+        &pin_url,
+        // `NONE` is Codex's spelling of `off`; it must not persist as a
+        // second spelling of one rung.
+        json!({ "llm": entry, "model": model, "reasoning_effort": "NONE" }),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    let pinned = get(&router, &format!("/v1/agents/{id}"), StatusCode::OK).await;
+    assert_eq!(pinned["llm"].as_str(), Some(entry.as_str()));
+    assert_eq!(pinned["model"].as_str(), Some(model.as_str()));
+    assert_eq!(pinned["reasoning_effort"].as_str(), Some("off"));
+
+    // ── each level is refused rather than degraded ──────────────────
+    for (body, expected) in [
+        (json!({ "llm": "nope" }), "unknown LLM entry"),
+        (
+            json!({ "llm": entry, "model": "not-a-model" }),
+            "not a configured model",
+        ),
+        // A model names nothing without the entry it is a model of, so this
+        // is refused rather than silently dropped.
+        (json!({ "model": model }), "requires an llm entry"),
+        (
+            json!({ "llm": entry, "reasoning_effort": "ultraplus" }),
+            "unknown reasoning_effort",
+        ),
+    ] {
+        let err = put_expect(&router, &pin_url, body, StatusCode::BAD_REQUEST).await;
+        assert!(
+            err["error"].as_str().unwrap_or("").contains(expected),
+            "expected {expected:?}, got {err:?}",
+        );
+    }
+    let unchanged = get(&router, &format!("/v1/agents/{id}"), StatusCode::OK).await;
+    assert_eq!(
+        unchanged["model"].as_str(),
+        Some(model.as_str()),
+        "a refused pin must leave the stored one alone",
+    );
+
+    // ── clearing clears every level ─────────────────────────────────
+    // Not just the entry: a model left behind belongs to an entry the agent
+    // no longer names, and a rung left behind is spend nobody asked for.
+    put_expect(&router, &pin_url, json!({}), StatusCode::NO_CONTENT).await;
+    let cleared = get(&router, &format!("/v1/agents/{id}"), StatusCode::OK).await;
+    for level in ["llm", "model", "reasoning_effort"] {
+        assert!(
+            cleared.get(level).is_none(),
+            "{level} survived a cleared pin: {cleared:?}",
+        );
+    }
+}
+
 // ── helpers ─────────────────────────────────────────────────────────
 
 fn build_admin_state(
     tg: &baybo_gateway::test_support::TestGateway,
 ) -> baybo_gateway::server::AdminState {
-    baybo_gateway::server::AdminState {
-        // Per-test workspace, from the same tempdir the deps were built
-        // with: the agents surface writes identity files under it, so a
-        // shared path would leak one test's persona into the next.
-        workspace_paths: std::sync::Arc::clone(&tg.deps.workspace_paths),
-        config: Arc::clone(&tg.deps.config),
-        config_path: tg.deps.config_path.clone(),
-        session_manager: Arc::clone(&tg.deps.session_manager),
-        turn_lifecycle: Arc::clone(&tg.deps.turn_lifecycle),
-        cron_scheduler: Arc::clone(&tg.deps.cron_scheduler),
-        trace_store: tg.deps.stores.trace.clone(),
-        cost_store: tg.deps.stores.cost.clone(),
-        message_search: tg.deps.stores.message_search.clone(),
-        query_api: Arc::new(baybo_query::QueryApi::new(
-            tg.deps.session_manager.store(),
-            Arc::clone(&tg.deps.turn_lifecycle),
-            tg.deps.stores.trace.clone(),
-            tg.deps.stores.cost.clone(),
-        )),
-        skill_registry: Arc::clone(&tg.deps.skill_registry),
-        tool_registry: Arc::clone(&tg.deps.tool_registry),
-        channel_registry: Arc::clone(&tg.deps.channel_registry),
-        llm_pool: tg.deps.llm_pool.clone(),
-        supervisor: tg.deps.supervisor.clone(),
-        config_reloader: tg.deps.config_reloader.clone(),
-        log_buffer: Arc::clone(&tg.deps.log_buffer),
-        channel_bot_store: tg.deps.stores.channel_bot.clone(),
-        agent_profile_store: tg.deps.stores.agent_profile.clone(),
-        blob_store: tg.deps.stores.blob.clone(),
-        channel_control: Arc::clone(&tg.deps.channel_control),
-        secret_vault: Arc::clone(&tg.deps.secret_vault),
-        deck_manager: Arc::clone(&tg.deps.deck_manager),
-        bind_display: tg.deps.runtime_config.admin_bind.to_string(),
-    }
+    baybo_gateway::server::AdminState::from_deps(&tg.deps)
 }
 
 fn build_router(state: baybo_gateway::server::AdminState) -> axum::Router {
