@@ -147,6 +147,6 @@ was tried and failed, and several name a bug that shipped once already.
 - Voice input has no composer affordance — the mic placeholder button was
   removed with the Liquid Glass restyle. Wiring real capture later means
   re-adding the button, not just filling in a handler.
-- The Projects tab renders its cards root and the new-board form; the board,
+- The Projects tab renders its cards root, the new-board form and the board;
   the card detail, the run transcript and the team screens are still to come
-  (see [`docs/projects-plan.md`](docs/projects-plan.md) P4–P7).
+  (see [`docs/projects-plan.md`](docs/projects-plan.md) P5–P7).

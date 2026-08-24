@@ -48,7 +48,7 @@ struct RootView: View {
                                 case .deckRecycle:
                                     DeckRecycleScreen()
                                 case .projectBoard(let projectId):
-                                    ProjectBoardScreen(projectId: projectId)
+                                    ProjectBoardScreen(projectId: projectId, store: store.projectsStore)
                                 case .projectIssue(let projectId, let number):
                                     ProjectIssueScreen(projectId: projectId, number: number)
                                 case .newProject:

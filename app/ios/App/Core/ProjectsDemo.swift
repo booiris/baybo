@@ -15,10 +15,17 @@
     /// archived one so the archived toggle exists to press.
     extension ProjectsStore {
         static let demoArg = "-baybo-demo-projects"
+        /// The board `-baybo-demo-board` opens: the one with something in
+        /// every stage and all four Waiting kinds.
+        static let demoBoardId = "p-rglide"
 
         static var demoRequested: Bool {
             ProcessInfo.processInfo.arguments.contains(demoArg)
         }
+
+        /// A fixed "now" the fixture hangs its ages off. Timestamps of `0`
+        /// render as `20689d`, which is not a card anybody has ever seen.
+        private static var nowMs: Int64 { Int64(Date().timeIntervalSince1970 * 1000) }
 
         func seedDemo() {
             let projects: [ProjectInfo] = [
@@ -99,7 +106,26 @@
 
             installDemo(
                 projects: projects, attention: attention, activity: activity,
-                boards: boards)
+                boards: boards,
+                approvalPrompts: [
+                    Self.demoBoardId: [
+                        41: [
+                            IssueApprovalPrompt(
+                                callId: "call-1", tool: "exec_command",
+                                summary: "cargo test -p baybo-relay",
+                                askedBy: "dev-1", askedAtMs: Self.nowMs - 120_000)
+                        ]
+                    ]
+                ],
+                blockedQuestions: [
+                    Self.demoBoardId: [
+                        38: IssueTimeline.PendingQuestion(
+                            askedBy: "lead",
+                            question:
+                                "The relay token format is not in the docs — is it the pairing token or a fresh one?",
+                            askedAtMs: Self.nowMs - 600_000)
+                    ]
+                ])
         }
 
         private static func demoProject(
@@ -127,7 +153,11 @@
                 parent: nil, filedFrom: nil, stage: 0,
                 subIssues: number == 41 ? SubIssueProgress(done: 2, total: 5) : nil,
                 unread: unread, lastRunFailed: lastRunFailed, approvalPending: approvalPending,
-                openedByAgent: number == 38, cancelledAtMs: nil, createdAtMs: 0, updatedAtMs: 0)
+                openedByAgent: number == 38, cancelledAtMs: nil,
+                createdAtMs: nowMs - 86_400_000,
+                // Spread the ages so the row's age column shows a range rather
+                // than one number repeated down the list.
+                updatedAtMs: nowMs - Int64(number % 7 + 1) * 900_000)
         }
 
         private static func demoRun(
@@ -135,7 +165,9 @@
         ) -> IssueRunInfo {
             IssueRunInfo(
                 number: number, attempt: 1, agentId: agent, status: status, trigger: trigger,
-                sessionId: "s-\(number)", error: nil, createdAtMs: 0,
+                sessionId: "s-\(number)",
+                error: status == .failed ? "the sandbox exited 137" : nil,
+                createdAtMs: nowMs - 900_000,
                 // Roughly 12 minutes of elapsed, so the run word carries a
                 // duration rather than a suspicious `0s`.
                 startedAtMs: Int64(Date().timeIntervalSince1970 * 1000) - 720_000,

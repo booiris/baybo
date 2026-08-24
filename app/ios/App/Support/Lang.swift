@@ -63,8 +63,12 @@ final class Lang: ObservableObject {
         bundle.localizedString(forKey: key, value: key, table: nil)
     }
 
-    func t(_ key: String, _ arg: String) -> String {
-        String(format: t(key), arg)
+    /// Variadic rather than one-argument: the board's sentences interleave a
+    /// handle, a card number and a title, and a template that cannot take
+    /// three of them gets worked around by concatenation — which is exactly
+    /// how a translation loses the right to put them in another order.
+    func t(_ key: String, _ args: String...) -> String {
+        String(format: t(key), arguments: args)
     }
 
     /// The catalog for an EXPLICIT language, rather than the app's current one.

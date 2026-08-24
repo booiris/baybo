@@ -173,3 +173,48 @@ enum Haptics {
         UINotificationFeedbackGenerator().notificationOccurred(.success)
     }
 }
+
+/// An answer pill: shorter than the standard pills above, which size for a
+/// full-page CTA and read bulky stacked inside a card. Both surfaces that ask
+/// the operator to approve something use it — the transcript's approval card
+/// and the board's Waiting strip — so the two answers are the same size and
+/// shape wherever they are asked.
+///
+/// `fill: nil` draws the stroke-only variant. The 44pt floor is the HIG minimum
+/// hit target and is the real lower bound here: the padding may shrink, the
+/// tappable area may not — this is the one control in the app where a mis-tap
+/// runs a command the user meant to refuse.
+struct CompactPillButtonStyle: ButtonStyle {
+    let fill: Color?
+    let color: Color
+    /// Full-width by default, which is what a dock card's pair wants. The
+    /// board's Waiting strip sets it false: those two answers sit at the end
+    /// of a row that already carries the question.
+    var expands: Bool = true
+
+    func makeBody(configuration: Configuration) -> some View {
+        // The PAINTED capsule and the TAPPABLE area are deliberately different
+        // sizes in the inline variant. Sizing the capsule itself to the 44pt
+        // floor makes a pill that outweighs the row it sits in — "Deny" came
+        // out a disc — so the capsule takes its natural height and the 44pt
+        // frame goes around it. The target never shrinks; only the paint does.
+        configuration.label
+            .font(Theme.mono(expands ? 14 : 12))
+            .foregroundStyle(color)
+            .padding(.vertical, expands ? 8 : 6)
+            .padding(.horizontal, expands ? 0 : 12)
+            .frame(maxWidth: expands ? .infinity : nil, minHeight: expands ? 44 : 0)
+            .background {
+                if let fill {
+                    Capsule().fill(fill)
+                }
+            }
+            .overlay(fill == nil ? Capsule().strokeBorder(color, lineWidth: 1) : nil)
+            .frame(minHeight: 44)
+            // Stroke-only pills don't hit-test their interior without a shape,
+            // and the inline variant's target extends past its capsule.
+            .contentShape(Rectangle())
+            .opacity(configuration.isPressed ? 0.7 : 1)
+            .scaleEffect(configuration.isPressed ? 0.98 : 1)
+    }
+}

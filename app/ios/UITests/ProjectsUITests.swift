@@ -86,6 +86,146 @@ final class ProjectsUITests: BayboUITestCase {
             "backing out did not return to the cards root")
     }
 
+    private func openBoard() -> XCUIApplication {
+        launch(["-baybo-open-home", "-baybo-demo-projects", "-baybo-demo-board"])
+    }
+
+    /// The stage wall: one stage at a time, and the segment carries its live
+    /// count.
+    func testTheBoardShowsOneStageAtATimeAndSwitchesOnASegment() {
+        let app = openBoard()
+        let inProgress = app.buttons["stage-in-progress"]
+        XCTAssertTrue(inProgress.waitForExistence(timeout: 5), "the board never painted")
+        XCTAssertTrue(app.buttons["issue-row-41"].waitForExistence(timeout: 3))
+        // Todo's cards are not on screen while In Progress is the stage.
+        XCTAssertFalse(app.buttons["issue-row-43"].exists)
+
+        app.buttons["stage-todo"].tap()
+        XCTAssertTrue(
+            app.buttons["issue-row-43"].waitForExistence(timeout: 3),
+            "switching stage did not swap the cards")
+        XCTAssertFalse(app.buttons["issue-row-41"].exists)
+    }
+
+    /// **The consequence is the sheet.** These two sentences are the reason it
+    /// exists, and both are things a desktop board never has to say: a move out
+    /// of In Progress does not stop the run, and a move in starts one.
+    func testTheMoveSheetSaysWhatEachMoveWillDo() {
+        let app = openBoard()
+        XCTAssertTrue(app.buttons["issue-row-41"].waitForExistence(timeout: 5))
+        app.buttons["issue-row-41"].press(forDuration: 1.0)
+
+        let move = app.buttons["Move"].firstMatch
+        XCTAssertTrue(move.waitForExistence(timeout: 3), "no Move in the long-press menu")
+        move.tap()
+
+        let todo = app.buttons["move-todo"]
+        XCTAssertTrue(todo.waitForExistence(timeout: 3), "the Move sheet never presented")
+        XCTAssertTrue(
+            todo.label.contains("only Stop ends it"),
+            "moving out of In Progress must say the run keeps going; got \(todo.label)")
+
+        let done = app.buttons["move-done"]
+        XCTAssertTrue(
+            done.label.contains("worktree"),
+            "Done must say what it reclaims; got \(done.label)")
+        // The card is already In Progress, so that row is the current one.
+        XCTAssertFalse(app.buttons["move-in-progress"].isEnabled)
+    }
+
+    /// A card with nobody on it cannot be started, and the row says so rather
+    /// than sitting disabled — tapping it opens the picker and finishes the
+    /// move afterwards.
+    func testAnUnassignedCardOffersThePickerInsteadOfADeadRow() {
+        let app = openBoard()
+        app.buttons["stage-todo"].tap()
+        let row = app.buttons["issue-row-44"]
+        XCTAssertTrue(row.waitForExistence(timeout: 5))
+        row.press(forDuration: 1.0)
+        app.buttons["Move"].firstMatch.tap()
+
+        let inProgress = app.buttons["move-in-progress"]
+        XCTAssertTrue(inProgress.waitForExistence(timeout: 3))
+        XCTAssertTrue(
+            inProgress.label.contains("Needs an assignee"),
+            "an unassigned card must say what is missing; got \(inProgress.label)")
+        XCTAssertTrue(inProgress.isEnabled, "the row must not be dead")
+        inProgress.tap()
+        XCTAssertTrue(
+            app.buttons["assign-dev-1"].waitForExistence(timeout: 3),
+            "tapping it should open the assignee picker")
+    }
+
+    /// A move that started nothing can be taken back; a move that STARTED a
+    /// run cannot, and must not offer to.
+    ///
+    /// Undoing a move into In Progress would put the card back while the run it
+    /// triggered kept going — so the toast would be offering to unwind
+    /// something it cannot reach, and the operator only finds that out after
+    /// pressing. Both halves are asserted: the first build shipped one toast
+    /// view that always drew Undo.
+    func testOnlyAMoveThatStartedNothingOffersUndo() {
+        let app = openBoard()
+        XCTAssertTrue(app.buttons["issue-row-41"].waitForExistence(timeout: 5))
+
+        // Out of In Progress: starts nothing, so it is reversible.
+        app.buttons["issue-row-41"].press(forDuration: 1.0)
+        app.buttons["Move"].firstMatch.tap()
+        XCTAssertTrue(app.buttons["move-review"].waitForExistence(timeout: 3))
+        app.buttons["move-review"].tap()
+        XCTAssertTrue(
+            app.buttons["board-undo"].waitForExistence(timeout: 4),
+            "a move that started nothing should be undoable")
+
+        // Back into In Progress: this one queues a run.
+        app.buttons["stage-review"].tap()
+        XCTAssertTrue(app.buttons["issue-row-41"].waitForExistence(timeout: 4))
+        app.buttons["issue-row-41"].press(forDuration: 1.0)
+        app.buttons["Move"].firstMatch.tap()
+        let inProgress = app.buttons["move-in-progress"]
+        XCTAssertTrue(inProgress.waitForExistence(timeout: 3))
+        XCTAssertTrue(
+            inProgress.label.contains("Starts a run"),
+            "the row should say it starts one; got \(inProgress.label)")
+        inProgress.tap()
+        // Give the toast the same window the undoable one got.
+        XCTAssertFalse(
+            app.buttons["board-undo"].waitForExistence(timeout: 3),
+            "a move that queued a run must not offer to undo it")
+    }
+
+    /// The Waiting strip's answer buttons must not fall through to the row.
+    ///
+    /// The text column opens the card; the buttons answer. A default-styled
+    /// button inside a tappable row hands its press to the row, which would
+    /// make Approve navigate instead of approving — silently, and only on the
+    /// one control in this app where a mis-tap runs a command.
+    func testTheWaitingStripsAnswerButtonsDoNotOpenTheCard() {
+        let app = openBoard()
+        let deny = app.buttons["waiting-deny-41"]
+        XCTAssertTrue(deny.waitForExistence(timeout: 5), "no approval row in the strip")
+        deny.tap()
+        // Still on the board: the board's own segments are the proof, since a
+        // pushed card screen covers them.
+        XCTAssertTrue(
+            app.buttons["stage-in-progress"].waitForExistence(timeout: 3),
+            "answering must not navigate away from the board")
+    }
+
+    /// All four kinds, and each card at most once — a card already waiting for
+    /// something answerable does not also queue as news.
+    func testTheWaitingStripCarriesEveryKindAndNoCardTwice() {
+        let app = openBoard()
+        XCTAssertTrue(app.otherElements["waiting-strip"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["waiting-approve-41"].exists, "no approval row")
+        XCTAssertTrue(app.buttons["waiting-retry-42"].exists, "no failed row")
+        XCTAssertTrue(app.buttons["waiting-answer-38"].exists, "no question row")
+        // #41 carries unread AND an approval; only the approval may be listed.
+        XCTAssertEqual(
+            app.descendants(matching: .any).matching(identifier: "waiting-row-41").count, 1,
+            "a card must not appear in the strip twice")
+    }
+
     /// The new-board form is a pushed route, not a sheet — deliberately, so the
     /// name field can rise with the keyboard (the home shell opts out of
     /// keyboard avoidance wholesale). Create stays disabled until it is named.
@@ -102,7 +242,7 @@ final class ProjectsUITests: BayboUITestCase {
         XCTAssertFalse(create.isEnabled, "an unnamed board must not be creatable")
 
         name.tap()
-        name.typeText("rglide-2")
+        name.typeText("a-new-board")
         XCTAssertTrue(create.isEnabled, "a named board should be creatable")
     }
 }

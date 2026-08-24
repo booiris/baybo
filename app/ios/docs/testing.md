@@ -373,7 +373,11 @@ without touching `app/ios` at all.
   paint), one merely busy, one idle, and one archived (so the archived toggle
   exists to press). Nothing is persisted — a later plain launch on the same
   simulator inherits none of it, which is why this flag needs no uninstall
-  between runs.
+  between runs. Add **`-baybo-demo-board`** to land straight on the seeded
+  board rather than driving two taps through the cards root; that board is the
+  one with something in every stage and all four Waiting-strip kinds (the
+  parked approval and the agent's question are seeded directly, because
+  `refreshWaitingDetails` reads them off the network and the demo has none).
 
 - **`-baybo-demo-switch`** (DEBUG) opens session `demo-a` with a session-tagged
   turn, then switches `chatPath` to `demo-b` at 5s — exercising the single

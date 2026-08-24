@@ -87,13 +87,34 @@ contact:
   are made unique across the row (`dev-1` and `docs-1` both reduce to `D1`).
 
 
-## P4 · The board screen
+## P4 · The board screen — **done**
 
 - The segmented control (live counts excluding cancelled, news dots) plus the horizontal swipe on the bar strip only (segmented / board row / Waiting strip, never the card rows); the board row (face ring, budget chip, filter chip, ⋯ menu); bands and reading order (render-only, scroll anchored by row id); the card row (`ChatRowBody` grammar: hand glyph, run word with elapsed, the two faces when a runner differs, spine, ring).
 - The Waiting-on-you strip's four kinds (approval with inline two answers, failed with Run again, agent question with Answer, unread that only opens); `call_id` lookups only for cards flagged `approval_pending`.
 - The Move sheet (its sentences come from `MoveConsequence`), the long-press menu, leading Pin / trailing Move (full-swipe disabled), the Undo toast for moves that start no run (the `ChatListScreen` undo machinery at :16-18 and :312-361), and the assignee-picker path.
 - The Filter sheet (with Running only); the ⋯ menu (Activity / Team / Mark all read / Settings); pull-to-refresh (the hand-rolled mechanics at :150-170 plus `RefreshRing`); skeletons; offline write-disabling; archived read-only.
 - UI tests: the Move sheet's consequence copy, `.buttonStyle(.plain)` isolation on the Waiting strip's buttons, pixel sampling for floating panels.
+
+**What the simulator changed.**
+
+- **The Waiting strip's answer buttons were not in the accessibility tree at
+  all.** The row carries a tap gesture and an identifier, and SwiftUI folds
+  such a container into one element — so Deny and Approve drew, and worked
+  under a finger, and existed for nothing that reads the tree, VoiceOver
+  included. Both the strip and each row now say `.accessibilityElement(children:
+  .contain)`. The UI test found this; no amount of looking at the screen would
+  have.
+- **The monogram rule had to leave the view.** It lived inside `TeamFaces`, so
+  the assignee picker and the filter sheet went on printing `D1` for both
+  `@dev-1` and `@docs-1`. It is now `AgentMonogram`, which is a property of a
+  SET of handles, and all three lists ask it.
+- **Its cap was on the wrong quantity** — the first segment's width rather than
+  the glyph count — so a dashed handle could reach four glyphs (`REV1`) in a
+  circle that holds three. Caught by the test that asserted the ceiling.
+- **The answer pills were sized to the 44pt hit floor**, which made "Deny" a
+  disc inside a compact row. The painted capsule and the tappable area are now
+  different sizes: the target never shrinks, only the paint does.
+
 
 ## P5 · Issue detail (the largest phase — split into a web PR and a native PR)
 

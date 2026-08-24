@@ -351,7 +351,10 @@ private struct StageStrip: View {
 }
 
 /// Overlapping faces, the lead heavier and whoever is running ringed.
-private struct TeamFaces: View {
+/// The row of faces a board shows for its team: who is on it, and who is
+/// working right now. Shared by the cards root and the board's own bar strip —
+/// the two say the same thing about the same team and must not drift.
+struct TeamFaces: View {
     let team: [TeamMemberInfo]
     let runs: [IssueRunInfo]
 
@@ -359,43 +362,8 @@ private struct TeamFaces: View {
         Set(runs.filter { $0.status == .running && $0.settledAtMs == nil }.map(\.agentId))
     }
 
-    /// Monograms, made unique ACROSS the faces actually drawn.
-    ///
-    /// The obvious rule — first letter of each dash-segment — collides on real
-    /// handles (`dev-1` and `docs-1` both give `D1`), and two identical faces
-    /// standing for different agents is worse than a longer one: the whole
-    /// point of the row is "who".
-    ///
-    /// When one pair collides the WHOLE row widens, not just the pair. A row
-    /// reading `DE1 D2 DO1` makes the odd one out look like a different kind of
-    /// thing, when all it means is that its neighbours happened to clash.
-    private var monograms: [String: String] {
-        let shown = Array(team.prefix(5))
-        var out: [String: String] = [:]
-        // Three glyphs is the ceiling a 22pt circle can carry; past that,
-        // duplicates are simply what the row shows.
-        for width in 1...3 {
-            out = Dictionary(
-                uniqueKeysWithValues: shown.map {
-                    ($0.id, Self.monogram($0.handle, leading: width))
-                })
-            if Set(out.values).count == shown.count { break }
-        }
-        return out
-    }
-
-    private static func monogram(_ handle: String, leading: Int) -> String {
-        let parts = handle.split(separator: "-")
-        guard let first = parts.first else { return handle.prefix(2).uppercased() }
-        let head = first.prefix(leading).uppercased()
-        guard parts.count >= 2, let tail = parts[1].first else {
-            return String(first.prefix(max(2, leading))).uppercased()
-        }
-        return head + String(tail).uppercased()
-    }
-
     var body: some View {
-        let monograms = self.monograms
+        let monograms = AgentMonogram.map(for: Array(team.prefix(5)))
         // Set apart rather than stacked. The overlapping-avatars idiom saves
         // room this card does not need, and it costs the thing the row is FOR:
         // a working member's ring lands on its neighbour's edge, and four
@@ -421,8 +389,9 @@ private struct TeamFaces: View {
 /// hire).
 struct AgentFace: View {
     let handle: String
-    /// Precomputed by `TeamFaces` so the monogram can be made unique across the
-    /// row; a face drawn on its own falls back to the plain rule.
+    /// Precomputed by whoever draws the whole team, so the monogram can be
+    /// made unique across it (`AgentMonogram.map`). A face drawn on its own
+    /// falls back to the plain rule.
     var monogram: String? = nil
     var lead: Bool = false
     var working: Bool = false
@@ -430,14 +399,7 @@ struct AgentFace: View {
 
     static let defaultSize: CGFloat = 22
 
-    private var initials: String {
-        if let monogram { return monogram }
-        let parts = handle.split(separator: "-")
-        if parts.count >= 2, let a = parts[0].first, let b = parts[1].first {
-            return "\(a)\(b)".uppercased()
-        }
-        return String(handle.prefix(2)).uppercased()
-    }
+    private var initials: String { monogram ?? AgentMonogram.of(handle) }
 
     var body: some View {
         Text(verbatim: initials)

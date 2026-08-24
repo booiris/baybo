@@ -472,6 +472,13 @@ final class AppStore: ObservableObject {
             if args.contains("-baybo-demo-logout-confirm") {
                 confirmLogout = true
             }
+            // `-baybo-demo-board` (with `-baybo-demo-projects`): land straight
+            // on the seeded board, so the stage wall and the Waiting strip are
+            // reachable without driving two taps through the cards root.
+            if args.contains("-baybo-demo-board") {
+                homeTab = .projects
+                chatPath = [.projectBoard(ProjectsStore.demoBoardId)]
+            }
             route = .home
             return
         }

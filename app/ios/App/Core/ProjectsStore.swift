@@ -45,6 +45,16 @@ final class ProjectsStore: ObservableObject {
     @Published private(set) var attention: [String: ProjectAttention] = [:]
     @Published private(set) var activity: [String: ProjectActivity] = [:]
     @Published private(set) var boards: [String: Board] = [:]
+    /// Parked approval prompts per board, keyed by card number. Never
+    /// mirrored: a prompt is a live queue entry with a timeout, and a mirror
+    /// that painted one on a cold start would be offering an answer to
+    /// something that stopped listening hours ago.
+    @Published private(set) var approvalPrompts: [String: [Int64: [IssueApprovalPrompt]]] = [:]
+    /// Blocks an AGENT wrote, per board, keyed by card number — the ones that
+    /// are a question rather than the operator's own stop order. Read off the
+    /// same events pass as the prompts, and unmirrored for the same reason.
+    @Published private(set) var blockedQuestions: [String: [Int64: IssueTimeline.PendingQuestion]] =
+        [:]
     /// The last refresh could not reach the gateway, so what is on screen is
     /// the mirror. Drives the offline line and disables every write.
     @Published private(set) var isOffline = false
@@ -92,12 +102,20 @@ final class ProjectsStore: ObservableObject {
         /// properties keep their `private(set)` for every other caller.
         func installDemo(
             projects: [ProjectInfo], attention: [String: ProjectAttention],
-            activity: [String: ProjectActivity], boards: [String: Board]
+            activity: [String: ProjectActivity], boards: [String: Board],
+            approvalPrompts: [String: [Int64: [IssueApprovalPrompt]]] = [:],
+            blockedQuestions: [String: [Int64: IssueTimeline.PendingQuestion]] = [:]
         ) {
             self.projects = projects
             self.attention = attention
             self.activity = activity
             self.boards = boards
+            // Seeded rather than fetched: `refreshWaitingDetails` reads each
+            // flagged card's events over the network, which the demo has none
+            // of — and without these two the strip can only ever show the
+            // failed and unread kinds, i.e. half of what it exists to show.
+            self.approvalPrompts = approvalPrompts
+            self.blockedQuestions = blockedQuestions
         }
     #endif
 
@@ -298,6 +316,20 @@ final class ProjectsStore: ObservableObject {
             writeError = "Offline — this board takes writes again when the connection is back."
             return false
         }
+        #if DEBUG
+            // The demo board keeps its own writes. Without this every press
+            // here reaches a gateway that is not there, fails, and rolls back —
+            // which would leave the move, undo, assign and approve flows with
+            // no way to be driven headlessly at all.
+            if isDemo {
+                if var board = boards[projectId] {
+                    apply(&board)
+                    boards[projectId] = board
+                }
+                writeError = nil
+                return true
+            }
+        #endif
         let snapshot = boards[projectId]
         if var board = snapshot {
             apply(&board)
@@ -320,6 +352,187 @@ final class ProjectsStore: ObservableObject {
     }
 
     func clearWriteError() { writeError = nil }
+
+    // MARK: - The board's verbs
+    //
+    // Each of these is one press on the board, and each is here rather than at
+    // its call site for the same reason: every one of them composes something
+    // the board owns — the destination column's whole order, which counts a
+    // cancelled card, what a local edit does to the mirror — and a second
+    // caller composing it again would compose it differently.
+
+    /// Move a card, sending the destination column's FULL order.
+    ///
+    /// The card goes at the END of the destination, which is what a phone move
+    /// can honestly promise: there is no drag, so there is no position the
+    /// operator chose. Cancelled cards stay in the order — they are still rows
+    /// in that column, and dropping them here would renumber them away.
+    @discardableResult
+    func move(board projectId: String, issue number: Int64, to status: IssueStatus) async -> Bool {
+        let destination = (boards[projectId]?.issues ?? [])
+            .filter { $0.status == status && $0.number != number }
+            .sorted { $0.position < $1.position }
+            .map(\.number)
+        return await write(
+            board: projectId,
+            apply: { board in
+                guard let index = board.issues.firstIndex(where: { $0.number == number }) else {
+                    return
+                }
+                board.issues[index] = board.issues[index].with(status: status)
+            },
+            call: { client in
+                _ = try await client.projectIssueMove(
+                    projectId: projectId, number: number, status: status,
+                    orderedNumbers: destination + [number])
+            })
+    }
+
+    @discardableResult
+    func setPinned(board projectId: String, issue number: Int64, _ pinned: Bool) async -> Bool {
+        await write(
+            board: projectId,
+            apply: { board in
+                guard let index = board.issues.firstIndex(where: { $0.number == number }) else {
+                    return
+                }
+                board.issues[index] = board.issues[index].with(pinned: pinned)
+            },
+            call: { client in
+                _ = try await client.projectIssuePatch(
+                    projectId: projectId, number: number,
+                    patch: Self.patch(pinned: pinned))
+            })
+    }
+
+    @discardableResult
+    func assign(board projectId: String, issue number: Int64, to agentId: String?) async -> Bool {
+        await write(
+            board: projectId,
+            apply: { board in
+                guard let index = board.issues.firstIndex(where: { $0.number == number }) else {
+                    return
+                }
+                board.issues[index] = board.issues[index].with(
+                    assignee: agentId.map { StringPatch.set(value: $0) } ?? .clear)
+            },
+            call: { client in
+                _ = try await client.projectIssuePatch(
+                    projectId: projectId, number: number,
+                    patch: Self.patch(
+                        assignee: agentId.map { StringPatch.set(value: $0) } ?? .clear))
+            })
+    }
+
+    /// Start another attempt on a card whose last run failed.
+    @discardableResult
+    func retryRun(board projectId: String, issue number: Int64) async -> Bool {
+        await write(board: projectId) { client in
+            _ = try await client.projectRunRetry(projectId: projectId, number: number)
+        }
+    }
+
+    /// Answer one parked approval prompt.
+    ///
+    /// A 404 is treated as success: the live queue is the truth, and a prompt
+    /// that timed out or was answered from another surface is gone rather than
+    /// broken. The refetch that follows is what corrects the screen.
+    @discardableResult
+    func resolveApproval(
+        board projectId: String, issue number: Int64, callId: String,
+        decision: IssueApprovalDecision
+    ) async -> Bool {
+        let answered = await write(board: projectId) { client in
+            try await client.projectIssueApprovalResolve(
+                projectId: projectId, number: number, callId: callId, decision: decision)
+        }
+        if !answered, Self.readsAsGone(writeError) {
+            writeError = "Closed — it timed out, or it was already answered."
+            scheduleBoardRefresh(projectId)
+        }
+        return answered
+    }
+
+    /// Stamp the whole board read. Optimistic, because the number it clears is
+    /// the one on the screen the press is on.
+    @discardableResult
+    func markAllRead(board projectId: String) async -> Bool {
+        await write(
+            board: projectId,
+            apply: { board in
+                for index in board.issues.indices {
+                    board.issues[index] = board.issues[index].with(unread: 0)
+                }
+            },
+            call: { client in try await client.projectRead(projectId: projectId) })
+    }
+
+    /// What the Waiting strip needs that the board's own rows cannot say: the
+    /// parked prompts, and which blocks are an agent ASKING something.
+    ///
+    /// Both are read from a card's `events`, which is why one pass fetches
+    /// them together — asking twice would double a cost that is already the
+    /// strip's whole expense. Bounded by the two flags: only cards marked
+    /// `approval_pending` or carrying a `blocked_reason` are fetched, so a
+    /// board with nothing waiting costs nothing at all. The fetches are
+    /// concurrent, because a board that parked four prompts should not take
+    /// four round trips to say so.
+    func refreshWaitingDetails(board projectId: String) async {
+        guard !isDemo else { return }
+        let flagged = (boards[projectId]?.issues ?? [])
+            .filter { $0.cancelledAtMs == nil }
+            .filter { $0.approvalPending || $0.blockedReason != nil }
+        guard !flagged.isEmpty else {
+            approvalPrompts[projectId] = [:]
+            blockedQuestions[projectId] = [:]
+            return
+        }
+        let client = self.client
+        var prompts: [Int64: [IssueApprovalPrompt]] = [:]
+        var questions: [Int64: IssueTimeline.PendingQuestion] = [:]
+        await withTaskGroup(
+            of: (Int64, [IssueApprovalPrompt], IssueTimeline.PendingQuestion?).self
+        ) { group in
+            for issue in flagged {
+                let number = issue.number
+                let blockedReason = issue.blockedReason
+                group.addTask {
+                    guard
+                        let json = try? await client.projectIssueEvents(
+                            projectId: projectId, number: number),
+                        let events = try? IssueEvent.decodeList(json)
+                    else { return (number, [], nil) }
+                    return (
+                        number,
+                        IssueTimeline.pendingApprovals(in: events),
+                        IssueTimeline.agentQuestion(blockedReason: blockedReason, events: events)
+                    )
+                }
+            }
+            for await (number, found, question) in group {
+                if !found.isEmpty { prompts[number] = found }
+                if let question { questions[number] = question }
+            }
+        }
+        approvalPrompts[projectId] = prompts
+        blockedQuestions[projectId] = questions
+    }
+
+    private static func patch(
+        pinned: Bool? = nil, assignee: StringPatch = .keep, blockedReason: StringPatch = .keep
+    ) -> IssuePatch {
+        IssuePatch(
+            title: nil, description: nil, attachments: nil, priority: nil, assignee: assignee,
+            blockedReason: blockedReason, cancelled: nil, parent: nil, stage: nil, pinned: pinned)
+    }
+
+    /// Whether the server's refusal was "that prompt no longer exists". The
+    /// gateway answers a stale `call_id` with a 404 whose body says so, and
+    /// `BayboError.Other` carries that sentence verbatim.
+    private static func readsAsGone(_ message: String?) -> Bool {
+        guard let message = message?.lowercased() else { return false }
+        return message.contains("404") || message.contains("not found")
+    }
 
     /// The gateway's own words. `BayboError.Other` carries the server's
     /// sentence verbatim; the two typed variants are the transport's.
