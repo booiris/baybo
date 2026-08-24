@@ -366,6 +366,15 @@ without touching `app/ios` at all.
   and `app/ios/UITests/ModelPickerUITests.swift` drives the picks through the
   pill's accessibility VALUE (the label is the constant "Model").
 
+- **`-baybo-demo-projects`** (DEBUG) seeds a canned set of boards into
+  `ProjectsStore` and short-circuits every refresh, so the Projects tab renders
+  with no gateway to fetch from. Four boards on purpose: one wanting all three
+  attention kinds at once (so the tab badge and a card's waiting count both
+  paint), one merely busy, one idle, and one archived (so the archived toggle
+  exists to press). Nothing is persisted — a later plain launch on the same
+  simulator inherits none of it, which is why this flag needs no uninstall
+  between runs.
+
 - **`-baybo-demo-switch`** (DEBUG) opens session `demo-a` with a session-tagged
   turn, then switches `chatPath` to `demo-b` at 5s — exercising the single
   reused webview's cross-session remount so a content leak is

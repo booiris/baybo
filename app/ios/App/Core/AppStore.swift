@@ -56,6 +56,18 @@ final class AppStore: ObservableObject {
         /// The Deck's recycle bin: soft-deleted cards, each restorable. Pushed
         /// from the Deck header's ☰ menu, mirroring `archived` for Chats.
         case deckRecycle
+        /// One board, by project id. A pushed screen rather than the tab root:
+        /// the root is the cards, and changing project means backing out to
+        /// them — there is no switcher in the top-left, deliberately.
+        case projectBoard(String)
+        /// One card on a board. Pushed over its board, so the edge swipe goes
+        /// back to the column it came from.
+        case projectIssue(project: String, number: Int64)
+        /// The new-board form. A pushed route rather than a sheet because it
+        /// types: this shell opts out of keyboard avoidance wholesale
+        /// (`HomeTabView.ignoresSafeArea(.keyboard)`), and a pushed screen sits
+        /// outside that.
+        case newProject
     }
 
     /// A scheduled job's delete, waiting on the confirm dialog. Carries the name
@@ -737,6 +749,30 @@ final class AppStore: ObservableObject {
     func openArchived() {
         guard !chatPath.contains(.archived) else { return }
         chatPath.append(.archived)
+    }
+
+    /// Open a board over the cards root.
+    ///
+    /// Deliberately NOT `activateSession`'s shape: that one forces
+    /// `homeTab = .chats` and RESETS the path, which is right for a
+    /// conversation and wrong for everything here — the Projects tab must
+    /// stay selected underneath, and the push must stack rather than replace.
+    func openProjectBoard(_ projectId: String) {
+        let route = AppStore.ChatRoute.projectBoard(projectId)
+        guard chatPath.last != route else { return }
+        chatPath.append(route)
+        Task { await projectsStore.refreshBoard(projectId) }
+    }
+
+    func openProjectIssue(project: String, number: Int64) {
+        let route = AppStore.ChatRoute.projectIssue(project: project, number: number)
+        guard chatPath.last != route else { return }
+        chatPath.append(route)
+    }
+
+    func openNewProject() {
+        guard !chatPath.contains(.newProject) else { return }
+        chatPath.append(.newProject)
     }
 
     /// Open a conversation from a search result, parking it on the matched

@@ -175,6 +175,41 @@ struct ScreenshotPixels {
         return CGFloat(luma.filter { $0 > threshold }.count) / scale
     }
 
+    /// The fraction of `rect` (in POINTS) painted a saturated red.
+    ///
+    /// Luma cannot answer this one: a badge's red and the black glyph beside it
+    /// are both dark against paper. Written for the tab badges, which SwiftUI
+    /// draws but exposes to accessibility NOWHERE — the tab item's label stays
+    /// the bare section name, and the badge has no child element — so a
+    /// screenshot is the only place the count exists to be read at all.
+    func redCoverage(in rect: CGRect) -> CGFloat {
+        let x = Int(rect.minX * scale)
+        let y = Int(rect.minY * scale)
+        let w = Int(rect.width * scale)
+        let h = Int(rect.height * scale)
+        guard w > 0, h > 0, x >= 0, y >= 0, x + w <= image.width, y + h <= image.height,
+            let crop = image.cropping(to: CGRect(x: x, y: y, width: w, height: h))
+        else { return 0 }
+        var pixels = [UInt8](repeating: 0, count: w * h * 4)
+        guard
+            let context = pixels.withUnsafeMutableBytes({ buffer in
+                CGContext(
+                    data: buffer.baseAddress, width: w, height: h, bitsPerComponent: 8,
+                    bytesPerRow: w * 4, space: CGColorSpaceCreateDeviceRGB(),
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+            })
+        else { return 0 }
+        context.draw(crop, in: CGRect(x: 0, y: 0, width: w, height: h))
+        var red = 0
+        for i in stride(from: 0, to: pixels.count, by: 4) {
+            let r = CGFloat(pixels[i]) / 255
+            let g = CGFloat(pixels[i + 1]) / 255
+            let b = CGFloat(pixels[i + 2]) / 255
+            if r > 0.5, r - max(g, b) > 0.25 { red += 1 }
+        }
+        return CGFloat(red) / CGFloat(w * h)
+    }
+
     /// `height` pixels of one column, as luma.
     private func rows(column: Int, from top: Int, height: Int) -> [CGFloat]? {
         guard height > 0, top >= 0, top + height <= image.height,

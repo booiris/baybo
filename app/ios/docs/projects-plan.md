@@ -56,7 +56,7 @@ Six pure models (`BoardOrder`, `RunLabels`, `MoveConsequence`, `CommentHint`, `I
 5. **Demo fixture**: `-baybo-demo-projects` inside the `-baybo-open-home` block (AppStore:348-459; `demoHomeMode` short-circuits the network, as `demoCronJobs` :914-961 does).
 - Gates: Swift unit tests (`xcodegen` → `build-for-testing` + `test-without-building`; **never** a bare `xcodebuild test`) and app/web `pnpm lint` / `pnpm test`.
 
-## P3 · Cards root, navigation, badges
+## P3 · Cards root, navigation, badges — **done**
 
 1. Replace the `PlaceholderScreen` at `HomeScreen.swift:89-90` with the Projects cards root (the `section{}` wrapper supplies the wordmark header); empty state and New project.
 2. Routes: add `.projectBoard(String)` and `.projectIssue(String, Int64)` to `AppStore.ChatRoute` (Hashable with payloads, as `.cronGroup` is; **keep transient state off the route** — the comment at AppStore:124-134); add two arms to the `RootView.swift:33-50` switch (the surrounding Group hides nav chrome for free); push with the guard-then-append shape of `openArchived` (AppStore:731-734) rather than `activateSession`, which switches tabs and resets the path; attach `PopGestureEnabler().frame(width: 0, height: 0)` to every pushed screen. The board→issue two-deep stack exercises PopGesture's peer-inheritance path (`PopGesture.swift:158-193`), which already exists.
@@ -64,6 +64,28 @@ Six pure models (`BoardOrder`, `RunLabels`, `MoveConsequence`, `CommentHint`, `I
 4. The New project form (the `DirectLoginView` shape); on success, push the new board.
 5. Strings: hand-edit `Localizable.xcstrings` with both `en` and `zh-Hans` units (`home.tab.projects` already exists).
 - UI tests: a smoke test for the cards root (on a **fresh simulator** — the local iPhone 17 Pro is paired, which merges demo rows away).
+
+**What the simulator changed.** Three things the plan assumed did not survive
+contact:
+
+- `.badge` renders, but SwiftUI exposes it to accessibility **nowhere** — the
+  tab item's label stays the bare section name and the badge has no child
+  element (dumped from the live tree). A test reading `label` would have passed
+  a build that drew no badge at all, so `ProjectsUITests` asserts the disc in
+  pixels via a new `ScreenshotPixels.redCoverage(in:)`, with Deck as the
+  no-badge control.
+- `AppStore.projectsStore` is a nested `ObservableObject`, so its changes do not
+  republish `AppStore`; the badge read through `store` would have frozen at
+  whatever it saw on first paint. `HomeTabView` now subscribes to
+  `$attention` directly. The demo fixture cannot catch this — it seeds before
+  the first render.
+- The team faces on a card were an overlapping avatar stack with the working
+  mark drawn as a ring around each face. On a four-agent board the rings crossed
+  their neighbours, and the LEAD's ring vanished under its own heavier border —
+  so the agent most likely to be working was the one face that could never say
+  so. Faces are now set apart, the working mark is a corner dot, and monograms
+  are made unique across the row (`dev-1` and `docs-1` both reduce to `D1`).
+
 
 ## P4 · The board screen
 

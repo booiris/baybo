@@ -47,6 +47,12 @@ struct RootView: View {
                                     CronJobsScreen()
                                 case .deckRecycle:
                                     DeckRecycleScreen()
+                                case .projectBoard(let projectId):
+                                    ProjectBoardScreen(projectId: projectId)
+                                case .projectIssue(let projectId, let number):
+                                    ProjectIssueScreen(projectId: projectId, number: number)
+                                case .newProject:
+                                    NewProjectScreen()
                                 }
                             }
                             .toolbar(.hidden, for: .navigationBar)

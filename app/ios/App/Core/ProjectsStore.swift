@@ -78,7 +78,37 @@ final class ProjectsStore: ObservableObject {
     ) {
         self.supportDirectory = supportDirectory
         self.clientProvider = clientProvider
+        #if DEBUG
+            if Self.demoRequested {
+                seedDemo()
+                return
+            }
+        #endif
         loadMirror()
+    }
+
+    #if DEBUG
+        /// The one door `-baybo-demo-projects` writes through, so the published
+        /// properties keep their `private(set)` for every other caller.
+        func installDemo(
+            projects: [ProjectInfo], attention: [String: ProjectAttention],
+            activity: [String: ProjectActivity], boards: [String: Board]
+        ) {
+            self.projects = projects
+            self.attention = attention
+            self.activity = activity
+            self.boards = boards
+        }
+    #endif
+
+    /// True when the store is serving canned data and must not touch the
+    /// network or the disk. Always false in a release build.
+    private var isDemo: Bool {
+        #if DEBUG
+            return Self.demoRequested
+        #else
+            return false
+        #endif
     }
 
     // MARK: - Mirror
@@ -152,6 +182,7 @@ final class ProjectsStore: ObservableObject {
     /// The cards root: every board, what each is burning today, and what is
     /// waiting on the operator.
     func refreshRoot() async {
+        guard !isDemo else { return }
         do {
             let projects = try await client.projectList(includeArchived: true)
             let attention = try await client.projectsAttention()
@@ -174,6 +205,7 @@ final class ProjectsStore: ObservableObject {
 
     /// One board, wholesale.
     func refreshBoard(_ projectId: String) async {
+        guard !isDemo else { return }
         do {
             let issues = try await client.projectIssues(projectId: projectId)
             let runs = try await client.projectActiveRuns(projectId: projectId)
