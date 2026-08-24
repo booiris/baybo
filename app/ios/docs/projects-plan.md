@@ -20,7 +20,15 @@ The only server work standing in front of the iOS client. What landed, against t
    - Optional, non-blocking: let the web board consume `approval_pending`.
 - Gates: root `cargo fmt` / `clippy --all --benches --tests --examples --all-features` / `nextest run --workspace` (**without** `--all-features`), the openapi sync test, and the ts-bindings script.
 
-## P1 · The FFI surface (app/ios is its own cargo workspace)
+## P1 · The FFI surface — **done**
+
+25 exported calls, the `ProjectSink` lane and the `StringPatch` tri-state, against the sketch below. Three things landed differently, each for a reason worth keeping:
+
+- **`project_update` returns nothing.** The route answers with the row, but a full replace is a body the caller authored field by field — there is nothing in the response it does not already hold — so it rides `put_empty` rather than growing the trait a `put_json` for one call site.
+- **The timeline, the feed and a run's transcript answer raw gateway JSON**, not records. Their consumer is the issue webview, which renders the gateway's own shape; mirroring a 20-arm tagged union through UniFFI would buy a second shape to keep in step and nothing else. The pieces the native side needs off a timeline (a parked prompt's `call_id`, who blocked the card) are one small model's job in P2.
+- **`agent_set_model` deferred to P7.** It is an `/v1/agents` route, not a board one, and its only caller is the agent profile that phase builds.
+
+Every enum decodes through an `Unknown` arm and refuses to *encode* one — a card whose gateway grew a status costs that card its word rather than blanking the board, while asking the server to move a card into a column this build cannot name fails before the request. `Frame::ProjectChanged` now has a consuming pump lane placed before the catch-all; a session-less `Gap` nudges the project sink too, since a board has no other way to learn it missed an invalidation.
 
 1. **A PATCH verb**: add `patch_json` to the `GatewayJsonClient` trait (GA:29-77) and to all four implementations — `DirectHttp` (`direct/mod.rs:171`, reqwest `.patch()`), relay (`relay/api.rs:53`, where the method is a `&str`: `request("PATCH", …)`; `ReplayPolicy::Converges` holds for absolute-value PATCHes), the `ActiveGatewayClient` `forward!` dispatcher (`gateway_client.rs:30-65`), and the `RecordingClient` test double (GA ~1360).
 2. **Reads** (the tolerant wire-struct → record pattern of `SessionSummary`, GA:128-163): a `PATH_PROJECTS` const, then `project_list(include_archived)`, `project_get`, `project_issues` (mind the Done paging parameters), `project_active_runs`, `project_team`, `projects_attention`, `projects_activity(since_ms)`, `project_issue_get`, `project_issue_events`, `project_issue_runs`, `project_feed(before_ms)`.

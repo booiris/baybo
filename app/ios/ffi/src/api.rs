@@ -699,6 +699,390 @@ pub trait PairAbortListener: Send + Sync {
     fn on_abort(&self, reason: String);
 }
 
+/// Where the connection-global board invalidations land — the [`DeckSink`]
+/// pattern. `Frame::ProjectChanged` is a session-less broadcast (a board has
+/// no session to subscribe), so the transport routes it here and NEVER to a
+/// per-session [`FrameSink`]. One sink per client, registered via
+/// [`crate::BayboClient::set_project_sink`]; both legs share it. Calls arrive
+/// on the core's tokio workers, so the Swift impl must be thread-safe (hop to
+/// the main actor before touching UI).
+///
+/// The Swift implementor must NOT be named `ProjectSinkImpl` — UniFFI
+/// generates a class of exactly that name for every `with_foreign` trait, and
+/// a same-named class collides.
+#[uniffi::export(with_foreign)]
+pub trait ProjectSink: Send + Sync {
+    /// Something on `project_id` changed; refetch it.
+    ///
+    /// `scope` is the gateway's own word for which plane moved — `project`,
+    /// `board`, `run`, `timeline`, or anything a later gateway invents.
+    /// **Treat every scope as "this board is dirty"**: a move emits no
+    /// board-scope frame at all (it records a timeline entry and, entering In
+    /// Progress, a run), so a client that refetched the board only on
+    /// `board` would miss exactly the change it most needs to draw.
+    ///
+    /// `issue_number` is present when the change is about one card, which a
+    /// card page uses to ignore everything for another number.
+    fn on_project_changed(&self, project_id: String, scope: String, issue_number: Option<u32>);
+    /// The gateway dropped a session-less broadcast on this connection, so a
+    /// `ProjectChanged` may have gone with it: whatever board is on screen is
+    /// suspect. Fires on the same `Frame::Gap { session_id: None }` that
+    /// staleness-nudges the chat list — without it, an invalidation lost to a
+    /// full broadcast queue is lost for good, and the board sits wrong until
+    /// something else happens to move it.
+    fn on_project_stale(&self);
+}
+
+// ─────────────────────────── projects (kanban boards) ───────────────────────
+//
+// Mirrors of the gateway's `/v1/projects/*` DTOs. Every enum carries an
+// `Unknown` arm for the reason [`ChatSubagentStatus::Unknown`] does: a board
+// whose gateway grew a status must cost one card its word, not blank the whole
+// board with a decode error. The rules behind these fields live in
+// `docs/modules/project.md`; what the phone does with them is
+// `app/ios/docs/projects.md`.
+
+/// Which column a card sits in. Entering [`Self::InProgress`] is the board's
+/// single execution trigger, and it is the one status that requires an
+/// assignee.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum IssueStatus {
+    Backlog,
+    Todo,
+    InProgress,
+    Review,
+    Done,
+    Unknown,
+}
+
+/// Informs the lead's triage and the order the board takes work out of Todo.
+/// It never reorders a column on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum IssuePriority {
+    Urgent,
+    High,
+    Medium,
+    Low,
+    None,
+    Unknown,
+}
+
+/// Where a run is. `Held`, `Queued` and `Running` are the unsettled states —
+/// a card showing any of them is a card being worked, and a card has at most
+/// one such run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum RunStatus {
+    /// Recorded but not started: the board is over one of its daily
+    /// ceilings. It starts by itself once there is headroom — or when the
+    /// operator presses Run again, which releases what the ceiling allows.
+    Held,
+    Queued,
+    Running,
+    Done,
+    Failed,
+    Cancelled,
+    Unknown,
+}
+
+/// Why a run was started. The execution log prints it verbatim, and the four
+/// coordination triggers (`Triage`/`Review`/`Stalled`/`Blocked`) are the ones
+/// that run as the board's `@lead` rather than as the card's assignee — which
+/// is why a card's face draws the ring on whoever is running, not the
+/// assignee.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum RunTrigger {
+    Started,
+    Assigned,
+    Retry,
+    Comment,
+    Promoted,
+    Triage,
+    StageBarrier,
+    Review,
+    Stalled,
+    Blocked,
+    Grooming,
+    BoardIdle,
+    Unknown,
+}
+
+/// A board: a git repository, a team of agents, a budget and one board of
+/// cards.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ProjectInfo {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    /// Absolute path to the git repository this board's agents work in. Set
+    /// once, at creation.
+    pub workdir: String,
+    /// Daily spend ceiling in micro-USD; `None` means no limit. Note this
+    /// ceiling measures nothing on a subscription plan — the token one is
+    /// what bites there.
+    pub daily_budget_micros: Option<i64>,
+    pub daily_budget_tokens: Option<i64>,
+    /// How many runs the board starts on its own by taking cards off the top
+    /// of Todo. `0` means it starts only what somebody moves into In
+    /// Progress.
+    pub max_parallel_issue_runs: i64,
+    pub agents_may_merge: bool,
+    /// Present only while the board sits in the archive, which makes it
+    /// read-only: no moves, no comments, no approvals answered.
+    pub archived_at_ms: Option<i64>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+/// A file hung on a card or one of its comments.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct IssueAttachmentInfo {
+    pub blob_id: String,
+    pub mime_type: String,
+    pub size: u32,
+    pub filename: Option<String>,
+}
+
+/// A parent card's progress ring. Cancelled steps leave both counts, so a
+/// card whose last steps were called off reads finished rather than stuck.
+#[derive(Debug, Clone, Copy, uniffi::Record)]
+pub struct SubIssueProgress {
+    pub done: i64,
+    pub total: i64,
+}
+
+/// One card on a board.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct IssueInfo {
+    /// The human address, unique within its board: `#3`.
+    pub number: i64,
+    pub project_id: String,
+    pub title: String,
+    pub description: String,
+    pub attachments: Vec<IssueAttachmentInfo>,
+    pub status: IssueStatus,
+    pub priority: IssuePriority,
+    /// The agent on it, by profile id. In Progress always has one.
+    pub assignee: Option<String>,
+    /// Dense ascending rank within the column. The phone renders
+    /// pinned-then-unread-then-this, and never writes the order back.
+    pub position: i64,
+    pub pinned: bool,
+    /// Absent until the card's branch has a commit, so a research card never
+    /// shows one.
+    pub branch: Option<String>,
+    /// Why work stopped. A badge — a blocked card stays in its column, and
+    /// its queued run is parked rather than cancelled.
+    pub blocked_reason: Option<String>,
+    pub parent: Option<i64>,
+    /// The card whose run filed this one. Provenance only: it gates no work
+    /// and orders no column.
+    pub filed_from: Option<i64>,
+    pub stage: i64,
+    pub sub_issues: Option<SubIssueProgress>,
+    /// Agents' comments and agents moving the card into Review since the
+    /// operator last opened it. The operator's own acts never count.
+    pub unread: i64,
+    pub last_run_failed: bool,
+    /// A run on this card is parked on an approval prompt. Resolved
+    /// server-side off the live queue — never re-derived here from the
+    /// timeline, which cannot tell an answered prompt from a timed-out one.
+    pub approval_pending: bool,
+    pub opened_by_agent: bool,
+    /// Present once cancelled. The row is never deleted, and a cancelled
+    /// card can be reopened.
+    pub cancelled_at_ms: Option<i64>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+/// One execution of a card by an agent.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct IssueRunInfo {
+    /// The card this ran, by its number on the board.
+    pub number: i64,
+    /// `1` for a card's first run, incrementing thereafter — how the
+    /// execution log addresses it.
+    pub attempt: i64,
+    pub agent_id: String,
+    pub status: RunStatus,
+    pub trigger: RunTrigger,
+    /// The session it executed in, present once claimed. One agent's runs on
+    /// a card share a session, which is why a transcript page holds the
+    /// attempts before it.
+    pub session_id: Option<String>,
+    pub error: Option<String>,
+    pub created_at_ms: i64,
+    pub started_at_ms: Option<i64>,
+    pub settled_at_ms: Option<i64>,
+    /// Micro-USD over this run's own window. **`None` is not zero** — the
+    /// active-run poll does not price runs at all, and a run that has not
+    /// billed yet is a real zero, so a caller that renders the two the same
+    /// reports free work as fact.
+    pub cost_micros: Option<i64>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+}
+
+/// A card's whole execution log, newest run first, with what the card has
+/// cost across all of them.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct IssueRunLog {
+    pub runs: Vec<IssueRunInfo>,
+    pub total_cost_micros: i64,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
+}
+
+/// Who hired a teammate. Absent on one the operator created.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct HiredBy {
+    pub id: String,
+    pub handle: String,
+}
+
+/// One agent on a board's team.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct TeamMemberInfo {
+    pub id: String,
+    /// The immutable `@handle` a comment mentions. Fixed at hire; nothing
+    /// renames it.
+    pub handle: String,
+    pub name: String,
+    pub description: String,
+    pub avatar_blob_id: Option<String>,
+    /// `baybo` / `claude` / `codex`. Only a `baybo` teammate can host a
+    /// card's session, so only one can be assigned.
+    pub framework: String,
+    pub llm: Option<String>,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    /// The coordinator every board has and none may remove.
+    pub lead: bool,
+    pub hired_by: Option<HiredBy>,
+    pub created_at_ms: i64,
+}
+
+/// One board with something waiting on the operator. Every count here is an
+/// event that a press can discharge — runs the daily ceiling is holding are a
+/// standing condition and are deliberately absent, and archived boards are
+/// excluded wholesale.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ProjectAttention {
+    pub project_id: String,
+    pub name: String,
+    pub approvals: u32,
+    pub failed: u32,
+    pub unread: u32,
+}
+
+/// What a board has been doing today. `working` counts runs, not the In
+/// Progress column — a run outlives its column by design.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ProjectActivity {
+    pub project_id: String,
+    pub working: u32,
+    /// Spend since the caller's `since_ms`, which must be the **budget's**
+    /// day — UTC midnight — or the figure accuses the board of crossing a
+    /// ceiling it did not.
+    pub burn_micros: i64,
+    pub burn_tokens: i64,
+}
+
+/// How an approval prompt was answered from a card. Two answers, not the
+/// web's three: `approve_always` widens a policy from a surface with no room
+/// to show what was widened, so it is deliberately absent — the same rule
+/// [`ApprovalDecision`] follows for chat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum IssueApprovalDecision {
+    Approve,
+    Deny,
+}
+
+/// One field of a sparse card edit.
+///
+/// The gateway reads `assignee` and `blocked_reason` as double options —
+/// absent means "leave it", an explicit `null` means "clear it" — and UniFFI
+/// cannot express `Option<Option<T>>`, so the three states are spelled out.
+/// Without the distinction there is no way to unassign a card or lift a block
+/// at all, since both are "write null" and neither is "omit".
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum StringPatch {
+    /// Leave whatever is there: the key is omitted from the body.
+    Keep,
+    /// Clear it: the key is sent as an explicit `null`.
+    Clear,
+    Set {
+        value: String,
+    },
+}
+
+/// A sparse edit to one card. Every `None` field is omitted from the request,
+/// so a caller changes one property without restating the rest.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct IssuePatch {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    /// Replaces the whole attachment set when present; an empty vec clears
+    /// it. Blob ids only — the gateway reads mime and size off the store.
+    pub attachments: Option<Vec<String>>,
+    pub priority: Option<IssuePriority>,
+    /// Assigning on a card already in In Progress starts a run, or hands the
+    /// running one over to the new agent.
+    pub assignee: StringPatch,
+    /// Setting it parks the card's run wherever the board acts on its own;
+    /// clearing it hands that run back out.
+    pub blocked_reason: StringPatch,
+    /// `true` cancels the card, `false` reopens it. Cancelling is terminal
+    /// but reversible, and never deletes the row.
+    pub cancelled: Option<bool>,
+    /// `0` detaches the card from its parent.
+    pub parent: Option<i64>,
+    pub stage: Option<i64>,
+    /// A reading order and nothing else: it never touches `position`, and
+    /// the board does not take work out of Todo by it.
+    pub pinned: Option<bool>,
+}
+
+/// A new card. `status` defaults to Backlog and `assignee` is required when
+/// it is In Progress — creating one there starts a run.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct NewIssue {
+    pub title: String,
+    pub description: String,
+    /// Blob ids, uploaded through `blob_upload_*` first.
+    pub attachments: Vec<String>,
+    pub status: Option<IssueStatus>,
+    pub priority: Option<IssuePriority>,
+    pub assignee: Option<String>,
+    pub parent: Option<i64>,
+    pub stage: Option<i64>,
+}
+
+/// A new board. Leaving `workdir` empty has the server create and
+/// git-initialise `<workspace>/work/<name>`; giving one requires an absolute
+/// path to an existing repository.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct NewProject {
+    pub name: String,
+    pub description: String,
+    pub workdir: Option<String>,
+    pub daily_budget_micros: Option<i64>,
+    pub daily_budget_tokens: Option<i64>,
+    pub max_parallel_issue_runs: Option<i64>,
+}
+
+/// The board's own knobs. **A full replace**: every field is written as
+/// given, so a caller that omits a ceiling clears it rather than leaving it
+/// alone. Read the current values, change one, send them all.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ProjectSettings {
+    pub name: String,
+    pub description: String,
+    pub daily_budget_micros: Option<i64>,
+    pub daily_budget_tokens: Option<i64>,
+    pub max_parallel_issue_runs: Option<i64>,
+}
+
 /// The `invalid_token` signal travels from the leg to Swift as an UNTYPED STRING
 /// through three hops — `TransportError::Other(code)` → `.to_string()` →
 /// [`BayboError::from_msg`]'s exact match. Every hop is an equality on the same

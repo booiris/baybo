@@ -84,6 +84,29 @@ impl GatewayJsonClient for GatewayApi {
         }
     }
 
+    fn patch_json<'a, T>(
+        &'a self,
+        path: &'a str,
+        body: Vec<u8>,
+    ) -> impl std::future::Future<Output = Result<T, String>> + Send + 'a
+    where
+        T: DeserializeOwned + Send + 'static,
+    {
+        async move {
+            // Default `Converges` like every other verb here: a card PATCH
+            // carries absolute values, so a replayed one lands the same
+            // edit twice with the same result.
+            let body = request(
+                "PATCH",
+                path,
+                vec![TunnelHeader::new(HEADER_CONTENT_TYPE, MEDIA_TYPE_JSON)],
+                Some(body),
+            )
+            .await?;
+            serde_json::from_slice(&body).map_err(|e| format!("decode response: {e}"))
+        }
+    }
+
     fn post_empty<'a>(
         &'a self,
         path: &'a str,

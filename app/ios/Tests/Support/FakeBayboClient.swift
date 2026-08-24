@@ -547,6 +547,74 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
 
     func setDeckSink(sink: DeckSink) {}
 
+    // MARK: - Projects
+    //
+    // Every one of these throws: the Projects tab drives a store that takes an
+    // injected client of its own, so a test that means to exercise a board
+    // seeds that store rather than reaching through here. These exist to keep
+    // `BayboClientProtocol` conformance — which is the only thing in the repo
+    // that catches UniFFI seam drift — and a live call landing in one is a
+    // test relying on a call it never declared.
+
+    func projectList(includeArchived: Bool) async throws -> [ProjectInfo] { throw Self.unsupported }
+    func projectGet(projectId: String) async throws -> ProjectInfo { throw Self.unsupported }
+    func projectCreate(new: NewProject) async throws -> ProjectInfo { throw Self.unsupported }
+    func projectUpdate(projectId: String, settings: ProjectSettings) async throws {
+        throw Self.unsupported
+    }
+    func projectSetArchived(projectId: String, archived: Bool) async throws -> ProjectInfo {
+        throw Self.unsupported
+    }
+    func projectIssues(projectId: String) async throws -> [IssueInfo] { throw Self.unsupported }
+    func projectIssueGet(projectId: String, number: Int64) async throws -> IssueInfo {
+        throw Self.unsupported
+    }
+    func projectIssueCreate(projectId: String, new: NewIssue) async throws -> IssueInfo {
+        throw Self.unsupported
+    }
+    func projectIssuePatch(projectId: String, number: Int64, patch: IssuePatch) async throws
+        -> IssueInfo
+    { throw Self.unsupported }
+    func projectIssueMove(
+        projectId: String, number: Int64, status: IssueStatus, orderedNumbers: [Int64]
+    ) async throws -> IssueInfo { throw Self.unsupported }
+    func projectActiveRuns(projectId: String) async throws -> [IssueRunInfo] {
+        throw Self.unsupported
+    }
+    func projectIssueRuns(projectId: String, number: Int64) async throws -> IssueRunLog {
+        throw Self.unsupported
+    }
+    func projectRunCancel(projectId: String, number: Int64) async throws { throw Self.unsupported }
+    func projectRunRetry(projectId: String, number: Int64) async throws -> IssueRunInfo {
+        throw Self.unsupported
+    }
+    func projectRunTranscript(
+        projectId: String, number: Int64, attempt: Int64, beforeOrdinal: Int64?, limit: UInt32?
+    ) async throws -> String { throw Self.unsupported }
+    func projectIssueEvents(projectId: String, number: Int64) async throws -> String {
+        throw Self.unsupported
+    }
+    func projectIssueComment(
+        projectId: String, number: Int64, text: String, attachments: [String]
+    ) async throws -> String { throw Self.unsupported }
+    func projectIssueApprovalResolve(
+        projectId: String, number: Int64, callId: String, decision: IssueApprovalDecision
+    ) async throws { throw Self.unsupported }
+    func projectIssueRead(projectId: String, number: Int64) async throws { throw Self.unsupported }
+    func projectRead(projectId: String) async throws { throw Self.unsupported }
+    func projectFeed(projectId: String, beforeMs: Int64?, limit: UInt32?) async throws -> String {
+        throw Self.unsupported
+    }
+    func projectTeam(projectId: String) async throws -> [TeamMemberInfo] { throw Self.unsupported }
+    func projectRemoveAgent(projectId: String, agentId: String) async throws {
+        throw Self.unsupported
+    }
+    func projectsAttention() async throws -> [ProjectAttention] { throw Self.unsupported }
+    func projectsActivity(sinceMs: Int64?) async throws -> [ProjectActivity] {
+        throw Self.unsupported
+    }
+    func setProjectSink(sink: ProjectSink) {}
+
     /// Answers from the same seeded cache the cached-read paths use, so a test
     /// that wants a tapped attachment to have bytes seeds one map, not two.
     func blobDownloadBytes(blobId: String, progress: BlobProgress?) async throws -> Data {

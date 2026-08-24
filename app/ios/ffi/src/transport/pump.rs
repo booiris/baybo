@@ -15,10 +15,10 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::api::FrameSink;
-use crate::core::{Frame, resolve_approval_frame, subscribe_frame};
+use crate::core::{Frame, ProjectChangeScope, resolve_approval_frame, subscribe_frame};
 
 use super::supervisor::{Msg, OutboundCmd};
-use super::{Connection, RoutingMap, SharedDeckSink, SharedListSink};
+use super::{Connection, RoutingMap, SharedDeckSink, SharedListSink, SharedProjectSink};
 
 /// If the socket yields nothing for this long the leg is treated as dead — e.g.
 /// frozen across an iOS background round-trip, whose read side never resumes — and
@@ -35,6 +35,7 @@ pub(super) struct PumpCtx {
     pub(super) sinks: RoutingMap,
     pub(super) list_sink: SharedListSink,
     pub(super) deck_sink: SharedDeckSink,
+    pub(super) project_sink: SharedProjectSink,
     pub(super) last_inbound: Arc<parking_lot::Mutex<Instant>>,
     pub(super) leg_id: u64,
     pub(super) events: mpsc::UnboundedSender<Msg>,
@@ -220,11 +221,27 @@ fn with_global_sink<S: ?Sized>(
     }
 }
 
+/// The gateway's own word for a [`ProjectChangeScope`], passed through rather
+/// than mirrored as an enum: a client that refetches the whole board on every
+/// scope needs the string only to log it, and a mirrored enum would need a new
+/// arm — and a new UniFFI binding — every time the gateway grows a plane.
+/// `Unknown` is the wire's fallback arm and reaches Swift as `"unknown"`.
+fn scope_word(scope: ProjectChangeScope) -> &'static str {
+    match scope {
+        ProjectChangeScope::Project => "project",
+        ProjectChangeScope::Board => "board",
+        ProjectChangeScope::Run => "run",
+        ProjectChangeScope::Timeline => "timeline",
+        ProjectChangeScope::Unknown => "unknown",
+    }
+}
+
 pub(super) async fn dispatch_inbound_frame(ctx: &PumpCtx, frame: Frame) {
     let PumpCtx {
         sinks,
         list_sink,
         deck_sink,
+        project_sink,
         ..
     } = ctx;
     // Connection-global lanes first. These frames have no per-session routing
@@ -265,6 +282,9 @@ pub(super) async fn dispatch_inbound_frame(ctx: &PumpCtx, frame: Frame) {
         // the per-session path below.
         Frame::Gap { session_id: None } => {
             with_global_sink(list_sink, |sink| sink.on_list_stale());
+            // The same drop can take a `ProjectChanged` with it, and a board
+            // has no other way to learn it missed one.
+            with_global_sink(project_sink, |sink| sink.on_project_stale());
             false
         }
         // Deck pushes for the connection-global Deck tab.
@@ -282,6 +302,22 @@ pub(super) async fn dispatch_inbound_frame(ctx: &PumpCtx, frame: Frame) {
         // sink answers by refetching `GET /v1/deck`.
         Frame::DeckChanged => {
             with_global_sink(deck_sink, |sink| sink.on_deck_changed());
+            false
+        }
+        // A board moved. Session-less like the deck frames, and it MUST be
+        // consumed here: falling through to the per-session path broadcasts
+        // it to every subscribed transcript sink — which cannot use it — and
+        // reaches nobody at all when no chat is open, which is precisely
+        // when a board is on screen.
+        Frame::ProjectChanged {
+            project_id,
+            scope,
+            issue_number,
+        } => {
+            let scope = scope_word(*scope);
+            with_global_sink(project_sink, |sink| {
+                sink.on_project_changed(project_id.clone(), scope.to_owned(), *issue_number)
+            });
             false
         }
         // TEE, not a lane: a `SessionUpdated` patch carrying a freshly-

@@ -75,7 +75,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-use crate::api::{DeckSink, FrameSink, SessionListSink};
+use crate::api::{DeckSink, FrameSink, ProjectSink, SessionListSink};
 use crate::core::{Frame, MobileError, WireApprovalDecision, WireAttachment};
 
 mod pump;
@@ -200,6 +200,11 @@ pub(crate) type SharedListSink = Arc<parking_lot::Mutex<Option<Arc<dyn SessionLi
 /// [`FrameSink`].
 pub(crate) type SharedDeckSink = Arc<parking_lot::Mutex<Option<Arc<dyn DeckSink>>>>;
 
+/// The connection-global project sink — the [`SharedDeckSink`] pattern.
+/// `ProjectChanged` is a session-less broadcast (a board has no session to
+/// subscribe), so it lands here and never on a per-session [`FrameSink`].
+pub(crate) type SharedProjectSink = Arc<parking_lot::Mutex<Option<Arc<dyn ProjectSink>>>>;
+
 /// The shared per-session frame-routing map: pump reads on every inbound
 /// frame, supervisor writes on open/unsubscribe/disconnect. One of the two
 /// deliberate shared surfaces (see the module doc).
@@ -216,6 +221,8 @@ pub(crate) struct SessionRegistry {
     list_sink: SharedListSink,
     /// Connection-global deck pushes (`DeckCardData` / `DeckChanged`) land here.
     deck_sink: SharedDeckSink,
+    /// Connection-global board invalidations (`ProjectChanged`) land here.
+    project_sink: SharedProjectSink,
     /// [`SUBSCRIBE_ACK_TIMEOUT`], injectable so the tests that must sit out an
     /// unanswered subscribe cost milliseconds instead of seconds. Read at
     /// supervisor spawn, so a test override must precede the first operation.
@@ -230,6 +237,7 @@ impl SessionRegistry {
             sinks: Arc::new(Mutex::new(HashMap::new())),
             list_sink: Arc::new(parking_lot::Mutex::new(None)),
             deck_sink: Arc::new(parking_lot::Mutex::new(None)),
+            project_sink: Arc::new(parking_lot::Mutex::new(None)),
             subscribe_ack_timeout: SUBSCRIBE_ACK_TIMEOUT,
         }
     }
@@ -255,6 +263,7 @@ impl SessionRegistry {
                 self.sinks.clone(),
                 self.list_sink.clone(),
                 self.deck_sink.clone(),
+                self.project_sink.clone(),
                 self.subscribe_ack_timeout,
             )
         })
@@ -383,6 +392,10 @@ impl SessionRegistry {
     pub(crate) fn set_deck_sink(&self, sink: Option<Arc<dyn DeckSink>>) {
         *self.deck_sink.lock() = sink;
     }
+
+    pub(crate) fn set_project_sink(&self, sink: Option<Arc<dyn ProjectSink>>) {
+        *self.project_sink.lock() = sink;
+    }
 }
 
 /// The user message payload `connect_and_send` enqueues right after the
@@ -484,6 +497,10 @@ pub(crate) fn set_list_sink<L: SessionLeg>(leg: &L, sink: Option<Arc<dyn Session
 /// Point `leg`'s registry at the connection-global deck sink.
 pub(crate) fn set_deck_sink<L: SessionLeg>(leg: &L, sink: Option<Arc<dyn DeckSink>>) {
     leg.registry().set_deck_sink(sink);
+}
+
+pub(crate) fn set_project_sink<L: SessionLeg>(leg: &L, sink: Option<Arc<dyn ProjectSink>>) {
+    leg.registry().set_project_sink(sink);
 }
 
 /// Read the next binary WS message (skipping ping/pong).
