@@ -68,7 +68,67 @@ async fn on_board(state: &AdminState, project: &ProjectId, row: IssueRow) -> Res
         .board_cards(project)
         .await
         .map_err(project_err)?;
-    Ok(IssueDto::on_board(row, &board))
+    let awaiting = cards_awaiting_approval(state, project).await;
+    Ok(IssueDto::on_board(row, &board, &awaiting))
+}
+
+/// Which of this board's cards have a run parked on an approval prompt.
+///
+/// The live queue is the only thing that knows one is still answerable: a
+/// prompt the gateway timed out leaves `approval_requested` behind with no
+/// resolution, so a card reading its own timeline would go on asking for
+/// an answer nothing is waiting for. Empty on an archived board, because
+/// those prompts cannot be answered — the same exclusion
+/// [`projects_attention`] makes, kept in one place rather than two that
+/// can come to disagree about what is waiting.
+///
+/// A parked session is placed on its board through `trigger.issue()`, the
+/// same reading [`resolve_approval`] answers by, so a card asks for an
+/// answer exactly when the door that takes one would accept it. The rail's
+/// count reaches the same fact the other way, through `issue_runs`
+/// (`ProjectManager::attention`) — two spellings of one question, agreeing
+/// today because a run's session is minted from the card it runs.
+async fn cards_awaiting_approval(
+    state: &AdminState,
+    project: &ProjectId,
+) -> std::collections::HashSet<baybo_model::IssueId> {
+    // One snapshot of the queue, then reads against it. Unlike
+    // `projects_attention`, resolving a session to its card has to await,
+    // so a prompt answered inside that window is reported pending for this
+    // one response — self-healing, since every answer refetches the board.
+    // The direction is deliberate: a badge that lingers a beat costs a
+    // wasted tap, where the other way round hides a prompt from the only
+    // person who can answer it.
+    let parked: Vec<baybo_model::SessionId> = state
+        .channel_registry
+        .get(&baybo_model::ChannelType::owner())
+        .map(|channel| channel.pending_approval_sessions().into_iter().collect())
+        .unwrap_or_default();
+    // Nothing is parked anywhere on the gateway, which is the ordinary
+    // case: no session reads, and no archived read either.
+    if parked.is_empty() {
+        return Default::default();
+    }
+    let archived = state
+        .project_manager
+        .get_project(project)
+        .await
+        .is_ok_and(|row| row.archived_at.is_some());
+    if archived {
+        return Default::default();
+    }
+    let mut cards = std::collections::HashSet::new();
+    for session in parked {
+        let Ok(Some(session)) = state.session_manager.get(&session).await else {
+            continue;
+        };
+        if let Some((project_id, issue_id, _)) = session.trigger.issue()
+            && project_id == project
+        {
+            cards.insert(issue_id.clone());
+        }
+    }
+    cards
 }
 
 type ActorHandles = std::collections::HashMap<AgentProfileId, baybo_model::AgentHandle>;
@@ -366,6 +426,15 @@ pub struct IssueDto {
     /// shows it, because a failure that leaves the card looking untouched
     /// is a badge pointing at something the operator cannot find.
     pub last_run_failed: bool,
+    /// A run on this card is parked on an approval prompt, waiting to be
+    /// answered. Read off the live queue rather than the timeline, for the
+    /// same reason [`ProjectAttentionDto::approvals`] is: a prompt that
+    /// timed out leaves `approval_requested` behind with no resolution, so
+    /// a card deriving this from its own entries would keep asking for an
+    /// answer nothing is waiting for. `false` on an archived board — its
+    /// prompts are not answerable, and pointing at one would be a badge
+    /// with no press behind it.
+    pub approval_pending: bool,
     /// An agent filed this card, rather than the operator. The board's own
     /// work breakdown, and the same fact `RunTrigger::Grooming` turns on —
     /// a card the operator parked in Backlog is left alone, so the card
@@ -396,7 +465,16 @@ impl IssueDto {
     /// runs would answer "did this card's newest run fail" a second time,
     /// and the board's badge and the card's face would then be two
     /// answers to one question.
-    pub fn on_board(row: IssueRow, board: &BoardCards) -> Self {
+    ///
+    /// `awaiting_approval` comes from the live queue via
+    /// [`cards_awaiting_approval`] for the same reason — the queue is the
+    /// only thing that knows a prompt is still answerable.
+    pub fn on_board(
+        row: IssueRow,
+        board: &BoardCards,
+        awaiting_approval: &std::collections::HashSet<baybo_model::IssueId>,
+    ) -> Self {
+        let approval_pending = awaiting_approval.contains(&row.id);
         let signals = board.signals(&row.id);
         let number_of = |id: &baybo_model::IssueId| {
             board
@@ -427,6 +505,7 @@ impl IssueDto {
             unread: signals.unread as i64,
             last_run_failed: signals.last_run_failed,
             opened_by_agent: board.opened_by_agent(row.number),
+            approval_pending,
             ..Self::from(row)
         }
     }
@@ -462,6 +541,7 @@ impl From<IssueRow> for IssueDto {
             unread: 0,
             last_run_failed: false,
             opened_by_agent: false,
+            approval_pending: false,
             cancelled_at_ms: row.cancelled_at.map(|t| t.timestamp_millis()),
             created_at_ms: row.created_at.timestamp_millis(),
             updated_at_ms: row.updated_at.timestamp_millis(),
@@ -1321,11 +1401,12 @@ async fn list_issues(
         .board_cards(&id)
         .await
         .map_err(project_err)?;
+    let awaiting = cards_awaiting_approval(&state, &id).await;
     let items = board
         .rows
         .iter()
         .cloned()
-        .map(|row| IssueDto::on_board(row, &board))
+        .map(|row| IssueDto::on_board(row, &board, &awaiting))
         .collect();
     Ok(Json(ListResponse::new(items)))
 }
@@ -1652,6 +1733,7 @@ fn parked_approval_session(
         (status = 204, description = "The prompt was answered"),
         (status = 401, description = "Unauthorized", body = ErrorBody),
         (status = 404, description = "Unknown project or issue, or this card has no prompt waiting on that call", body = ErrorBody),
+        (status = 409, description = "The project is archived", body = ErrorBody),
     )
 )]
 async fn resolve_approval(
@@ -1660,12 +1742,13 @@ async fn resolve_approval(
     Json(req): Json<ResolveApprovalRequest>,
 ) -> Result<StatusCode> {
     let id = parse_project_id(&project_id)?;
-    // A point read, and its result is used: it 404s an unknown board or
-    // card before the queue is touched, and the card's own id is what the
-    // parked prompt is checked against below.
+    // A point read, and its result is used three ways: it 404s an unknown
+    // board or card before the queue is touched, it 409s an archived one
+    // rather than letting a read-only board release an agent, and the
+    // card's own id is what the parked prompt is checked against below.
     let issue = state
         .project_manager
-        .get_issue(&id, number)
+        .approvable_issue(&id, number)
         .await
         .map_err(project_err)?;
     let channel = state

@@ -1316,6 +1316,132 @@ async fn answering_an_approval_has_to_name_a_card_on_this_board() {
     );
 }
 
+#[tokio::test]
+async fn an_archived_board_does_not_answer_the_prompts_it_left_parked() {
+    let (router, tg) = router().await;
+    install_owner_channel(&tg);
+    let p = open_project(&router, "archived mid-prompt").await;
+    open_issue(&router, &p, "asked before the lights went out").await;
+    let session = issue_session(&tg, &p, 1).await;
+    let blocked = park_approval(&tg, &session, "c-archived").await;
+    let channel = tg
+        .deps
+        .channel_registry
+        .get(&baybo_model::ChannelType::owner())
+        .expect("owner channel");
+    assert_eq!(channel.pending_approvals(&session).len(), 1);
+
+    post(
+        &router,
+        &format!("/v1/projects/{p}/archive"),
+        json!({ "archived": true }),
+        StatusCode::OK,
+    )
+    .await;
+
+    // Answering releases an agent to act, so it is a write, and an
+    // archived board takes none. The prompt is left to time out.
+    post(
+        &router,
+        &format!("/v1/projects/{p}/issues/1/approvals/c-archived"),
+        json!({ "decision": "approve" }),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    assert_eq!(
+        channel.pending_approvals(&session).len(),
+        1,
+        "the prompt is still parked"
+    );
+
+    // And the card stops asking, so nothing points at a prompt the board
+    // will not take an answer for.
+    let card = get(
+        &router,
+        &format!("/v1/projects/{p}/issues/1"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(card["approval_pending"], json!(false));
+
+    post(
+        &router,
+        &format!("/v1/projects/{p}/archive"),
+        json!({ "archived": false }),
+        StatusCode::OK,
+    )
+    .await;
+    post(
+        &router,
+        &format!("/v1/projects/{p}/issues/1/approvals/c-archived"),
+        json!({ "decision": "approve" }),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    assert_eq!(
+        blocked.await.expect("the blocked call returns"),
+        baybo_tools::ApprovalOutcome::answered(baybo_model::ApprovalDecision::Approve),
+        "unarchiving hands the waiting agent its answer"
+    );
+}
+
+#[tokio::test]
+async fn a_card_says_when_a_run_on_it_is_waiting_for_an_answer() {
+    let (router, tg) = router().await;
+    install_owner_channel(&tg);
+    let p = open_project(&router, "asking").await;
+    open_issue(&router, &p, "the one that asked").await;
+    open_issue(&router, &p, "the one that did not").await;
+
+    let listed = get(&router, &format!("/v1/projects/{p}/issues"), StatusCode::OK).await;
+    for card in listed["items"].as_array().expect("items") {
+        assert_eq!(card["approval_pending"], json!(false));
+    }
+
+    let session = issue_session(&tg, &p, 1).await;
+    let blocked = park_approval(&tg, &session, "c-face").await;
+
+    let listed = get(&router, &format!("/v1/projects/{p}/issues"), StatusCode::OK).await;
+    let flagged: Vec<i64> = listed["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .filter(|card| card["approval_pending"] == json!(true))
+        .map(|card| card["number"].as_i64().expect("number"))
+        .collect();
+    assert_eq!(
+        flagged,
+        vec![1],
+        "only the card whose run raised the prompt"
+    );
+    let card = get(
+        &router,
+        &format!("/v1/projects/{p}/issues/1"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(card["approval_pending"], json!(true));
+
+    post(
+        &router,
+        &format!("/v1/projects/{p}/issues/1/approvals/c-face"),
+        json!({ "decision": "deny" }),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    blocked.await.expect("the blocked call returns");
+
+    // Answered is answered: the badge follows the queue, not the timeline
+    // entry, which still records that it was asked.
+    let card = get(
+        &router,
+        &format!("/v1/projects/{p}/issues/1"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(card["approval_pending"], json!(false));
+}
+
 fn install_owner_channel(tg: &baybo_gateway::test_support::TestGateway) {
     baybo_gateway::channel::boot::install_channels(
         &tg.deps.channel_registry,

@@ -5292,11 +5292,16 @@
                           "stage",
                           "unread",
                           "last_run_failed",
+                          "approval_pending",
                           "opened_by_agent",
                           "created_at_ms",
                           "updated_at_ms"
                         ],
                         "properties": {
+                          "approval_pending": {
+                            "type": "boolean",
+                            "description": "A run on this card is parked on an approval prompt, waiting to be\nanswered. Read off the live queue rather than the timeline, for the\nsame reason [`ProjectAttentionDto::approvals`] is: a prompt that\ntimed out leaves `approval_requested` behind with no resolution, so\na card deriving this from its own entries would keep asking for an\nanswer nothing is waiting for. `false` on an archived board — its\nprompts are not answerable, and pointing at one would be a badge\nwith no press behind it."
+                          },
                           "assignee": {
                             "type": [
                               "string",
@@ -5743,6 +5748,16 @@
           },
           "404": {
             "description": "Unknown project or issue, or this card has no prompt waiting on that call",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The project is archived",
             "content": {
               "application/json": {
                 "schema": {
@@ -9525,11 +9540,16 @@
           "stage",
           "unread",
           "last_run_failed",
+          "approval_pending",
           "opened_by_agent",
           "created_at_ms",
           "updated_at_ms"
         ],
         "properties": {
+          "approval_pending": {
+            "type": "boolean",
+            "description": "A run on this card is parked on an approval prompt, waiting to be\nanswered. Read off the live queue rather than the timeline, for the\nsame reason [`ProjectAttentionDto::approvals`] is: a prompt that\ntimed out leaves `approval_requested` behind with no resolution, so\na card deriving this from its own entries would keep asking for an\nanswer nothing is waiting for. `false` on an archived board — its\nprompts are not answerable, and pointing at one would be a badge\nwith no press behind it."
+          },
           "assignee": {
             "type": [
               "string",

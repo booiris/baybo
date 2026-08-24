@@ -2675,6 +2675,17 @@ export interface components {
             filename?: string | null;
         };
         IssueDto: {
+            /**
+             * @description A run on this card is parked on an approval prompt, waiting to be
+             *     answered. Read off the live queue rather than the timeline, for the
+             *     same reason [`ProjectAttentionDto::approvals`] is: a prompt that
+             *     timed out leaves `approval_requested` behind with no resolution, so
+             *     a card deriving this from its own entries would keep asking for an
+             *     answer nothing is waiting for. `false` on an archived board — its
+             *     prompts are not answerable, and pointing at one would be a badge
+             *     with no press behind it.
+             */
+            approval_pending: boolean;
             /** @description The agent on it, if any. In Progress always has one. */
             assignee?: string | null;
             /** @description Files hung on the description. */
@@ -7888,6 +7899,17 @@ export interface operations {
                 content: {
                     "application/json": {
                         items: {
+                            /**
+                             * @description A run on this card is parked on an approval prompt, waiting to be
+                             *     answered. Read off the live queue rather than the timeline, for the
+                             *     same reason [`ProjectAttentionDto::approvals`] is: a prompt that
+                             *     timed out leaves `approval_requested` behind with no resolution, so
+                             *     a card deriving this from its own entries would keep asking for an
+                             *     answer nothing is waiting for. `false` on an archived board — its
+                             *     prompts are not answerable, and pointing at one would be a badge
+                             *     with no press behind it.
+                             */
+                            approval_pending: boolean;
                             /** @description The agent on it, if any. In Progress always has one. */
                             assignee?: string | null;
                             /** @description Files hung on the description. */
@@ -8209,6 +8231,15 @@ export interface operations {
             };
             /** @description Unknown project or issue, or this card has no prompt waiting on that call */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The project is archived */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -2353,6 +2353,31 @@ impl ProjectManager {
             })
     }
 
+    /// The card an approval may be answered on.
+    ///
+    /// Answering releases an agent to act, which makes it a write in the
+    /// only sense this gate measures, so it goes through the same archived
+    /// check every other write does. An archived board's parked prompt is
+    /// left to time out — the alternative is a board that takes no comments
+    /// and no moves yet can still be talked into running a command.
+    ///
+    /// Two consequences worth stating, because neither is visible from the
+    /// call site. Archiving does not stop a run that is already executing
+    /// (only `promotions` reads the flag), so a run that reaches a gate
+    /// just after the operator archives its board now waits out
+    /// `APPROVAL_TIMEOUT` and self-denies rather than being answered
+    /// either way — the same end state a denial reaches, later. And this
+    /// gate covers the REST door only: `Frame::ResolveApproval` resolves a
+    /// bare `call_id` against the same queue with no card and no board in
+    /// hand (`gateway/src/channel/route.rs`), so a client subscribed to an
+    /// issue's session could still answer one there. No shipped client
+    /// does — issue sessions are excluded from every chat surface — but
+    /// this is a gate with two doors and only one of them checks.
+    pub async fn approvable_issue(&self, project: &ProjectId, number: i64) -> Result<IssueRow> {
+        self.writable_project(project).await?;
+        self.get_issue(project, number).await
+    }
+
     pub async fn create_issue(
         &self,
         project: &ProjectId,
