@@ -179,3 +179,30 @@ millisecond ack budgets via `with_subscribe_ack_timeout` rather than sleeping
 production seconds. The Swift fence/fallthrough behaviors are pinned by
 `Tests/ChatStoreStaleLegTests.swift` with the fake client's `failPlainSend` /
 `stallConnect` / `stallSendAfterConnect` / `dropLeg` knobs.
+
+## The project sink
+
+`Frame::ProjectChanged` is **session-less**, and that is what shapes its route
+through the pump. Session-bearing frames fan out to whichever transcript sink
+is subscribed to that session; a session-less one has nobody to fan out to, so
+it fell through the catch-all into `route_per_session`, which broadcasts to
+every subscribed transcript — none of which can use it — and reached nobody at
+all when no chat was open, i.e. exactly when a board is on screen.
+
+So it gets a **consuming lane** ahead of the catch-all: the pump hands it to
+`SharedProjectSink` and returns, and the frame never enters the per-session
+fan-out. A session-less `Gap` nudges the same sink, because a board has no
+other way to learn an invalidation was dropped.
+
+On the Swift side `ProjectEventsRelay` hops to the main actor and publishes to
+`ProjectInvalidations` — a small broadcaster, not a call into `ProjectsStore`.
+Three surfaces can be watching one board at once (the cards root, the board,
+and an open card with a run sheet over it), and a store that reached into the
+others to nudge them would make every new surface an edit to every existing
+one. The relay publishes; whoever is on screen listens.
+
+**Every scope means dirty.** A move emits no `board`-scope frame at all — it
+records a timeline entry, and entering In Progress a run — so a client that
+refetched only on `board` would miss precisely the change it most needs to
+draw. The scope is carried only so a card page can ignore what belongs to
+another number.

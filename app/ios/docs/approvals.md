@@ -65,8 +65,42 @@ result, so a reload re-labels the same step (`ChatWorkStep.approval` on REST
 rows, `WireWorkStep.approval` in the `subscribe_state` snapshot). A `deny` also
 still reads red via the existing `denied` tool status.
 
+## Board approvals are a different plane
+
+A project card's run can park on the same gate, and answering it is **not**
+this code. The two differ in every layer:
+
+| | Chat | Board |
+|---|---|---|
+| transport | live frames on the device channel | REST (`POST …/issues/{n}/approval`) |
+| where the pending set comes from | `ChatStore.approvalObserveFrame` on the frame stream | replaying the card's `events` by `call_id` |
+| answers offered | approve / **approve-always** / deny | approve / deny only |
+| where it is shown | the composer dock's `ApprovalCardView` | the board's Waiting strip, and the card's own dock |
+
+**Approve-always is deliberately absent from the board.** It widens a policy,
+and neither the Waiting strip's compact row nor a card's dock has room to show
+*what* was widened — the same rule this file already states for why the chat
+card offers three and not four.
+
+The types are separate on purpose: `PendingApproval` is the chat's (it carries
+a `toolCallId`, a params preview and the resource lines the frame supplies),
+`IssueApprovalPrompt` is the board's (a `call_id`, a tool, a summary and who
+asked — everything a timeline entry has). They are genuinely different planes,
+not two spellings of one, and `ApprovalCardView` is shared by taking the chat's
+shape as its input.
+
+The live queue is the truth on both sides. On the board that matters more,
+because the pending set is *replayed from history*: a gateway restart drops
+every parked prompt without writing a resolution, and a timed-out prompt
+self-denies the same way — so an entry can name a prompt nothing is waiting
+for, which is why answering one tolerates a 404 and reads it as "already
+closed". The card's `approval_pending` flag comes off the live queue rather
+than the timeline for exactly that reason.
+
 ## Related
 
 - The chat-list row's parked-gate glyph is the
   [Chat-list approval mark](chat-list.md).
+- The board's side is [projects.md](projects.md) §3.1 (the Waiting strip) and
+  §3.3 (the card's dock).
 - The `-baybo-demo-approval` harness flag is documented in [testing.md](testing.md).

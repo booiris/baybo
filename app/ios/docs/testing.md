@@ -70,6 +70,29 @@ Library) for its active/closed/toggle wiring, with no layout stubs at all.
 no-unnecessary-condition / react-hooks, with a suppression baseline for the
 existing backlog) gates the wiring-bug class over `src`.
 
+**Three compile-time drift sentinels live here**, all type-only, none producing
+a byte of runtime output — which is why `pnpm build` (not `pnpm test`) is the
+only thing that evaluates them:
+
+| file | pins | against |
+|---|---|---|
+| `src/wireSentinel.ts` | the live frame mirrors | the ts-rs contract under `sidecars/` |
+| `src/restSentinel.ts` | `TranscriptRowItem` | `app/web`'s generated `ChatTranscriptItem` |
+| `src/issue/issueSentinel.ts` | the card page's DTO mirrors | `app/web`'s generated `IssueDto` / `IssueEventDto` / `IssueRunDto` / `ActorDto` |
+
+Each reads `app/web`'s generated schema rather than generating a second copy:
+both would come from the one committed `docs/openapi.json` through the same
+generator and be byte-identical, and a second copy is a second thing to
+regenerate — a new drift surface inside the gate built to close one. The import
+is type-only under `noEmit`, so `tsc` follows the path and no bundler or pnpm
+resolution is involved.
+
+`issueSentinel.ts` is worth reading as a case for the pattern: the mirrors were
+written by hand from the Rust source, and it caught three wrong guesses at once
+(`assignee` as an object rather than a bare id, `IssueRun.agent` rather than
+`agent_id`, and an externally-tagged `Actor`). Every one of them fails silently
+at runtime as a missing `@handle`.
+
 ### `app/ios/Tests/` (`BayboTests`)
 
 Swift Testing (`@Test`/`#expect`), a **host-application** bundle (hostless would
@@ -78,6 +101,22 @@ an injected `any BayboClientProtocol` — the protocol UniFFI already generates 
 so the frame paths, the approval queue, and the outbox's two-stage confirmation
 are testable with no gateway. XCTest stays for `BayboUITests` (Swift Testing has
 no UI API); both bundles coexist.
+
+**`LocalizedKeyTests` is a gate, not a nicety.** `Lang.t` echoes the key on a
+miss, so a screen ships with a button labelled `chat.cancel` and every existing
+assertion stays green — an assertion on a label matches the key as happily as
+the word. The suite walks every `lang.t("…")` literal under `App/` and fails on
+one the catalog does not carry, and on a key one language has and the other does
+not. It has caught two already: `chat.cancel` (never existed) and `issue.system`
+(exists in the WEB locales and not in the Swift catalog).
+
+**Golden fixtures shared across ends** live in `app/ios/web/src/pages/…` and are
+read by BOTH a vitest suite and a Swift test. `commentHintVectors.json` is the
+one that matters: what sending a comment will do is a rule that lives in Rust
+(`crates/project/src/comments.rs::comment_delivery`), is not exposed over REST —
+a composer must say it while the text is still being typed — and is therefore
+re-derived by every client. `app/web` has one copy, `app/ios` has another, and
+nothing but those vectors makes the two agree.
 
 `ComposerStaging` takes the same injected client, which is what makes the
 composer's *lifetimes* testable below the UI: `FakeBayboClient.holdBlobUploads()`

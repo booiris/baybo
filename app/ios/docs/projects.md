@@ -1,8 +1,15 @@
 # iOS Projects tab — design (the kanban / project feature on the phone)
 
-*Design settled 2026-08-23 (12 owner decisions + 8 improvements from a survey of shipped products); revised 2026-08-24 against merged master. Canvas: artifact "Projects Tab 设计稿" <https://claude.ai/code/artifact/80f6b10a-071f-4288-b518-d354c8c1c9d2> (three pages — Flows / States & panels / Improvements — 32 artboards). Implementation plan: [projects-plan.md](projects-plan.md).*
+*Design settled 2026-08-23 (12 owner decisions + 8 improvements from a survey of shipped products); revised 2026-08-24 against merged master; **built 2026-08-24/25, P0–P8**. Canvas: artifact "Projects Tab 设计稿" <https://claude.ai/code/artifact/80f6b10a-071f-4288-b518-d354c8c1c9d2> (three pages — Flows / States & panels / Improvements — 32 artboards).*
+
+*This document is the DESIGN — what the phone does and why. [projects-plan.md](projects-plan.md) is the build log: what each phase changed, and, more usefully, what the simulator and the type checker corrected. Where the two disagree the plan is the newer.*
 
 ## 0. What the code actually says (2026-08-24, HEAD = 306b22d7, kanban merged into master)
+
+> **Read as of that date.** Everything under "Still missing" below has since
+> been built — the pump lane, the PATCH verb, all of it. The section is kept
+> because the three facts that SHAPE the phone are still true and still the
+> reason this design looks as it does.
 
 - The feature: `crates/project` (every rule), gateway `/v1/projects/*` (`crates/gateway/src/api/admin/projects.rs` + `project_team.rs`), `Frame::ProjectChanged` (`crates/wire/src/lib.rs:966`, scope = `project|board|run|timeline`), `app/web/src/pages/projects/*`. Nothing on iOS.
 - Three facts that shape the phone, read out of the code rather than the docs:
@@ -11,7 +18,7 @@
   3. **Approvals are answered per card over REST**: `POST …/issues/{n}/approvals/{call_id}`, resolved by looking `call_id` up in the owner channel's live queue; the gateway self-denies after 300s. The existing iOS `ApprovalQueue` (derived from a subscribed session's frames) cannot see them.
 - Already in place: the device token authenticates the whole `/v1` surface (`auth/admin.rs:134-139`); `Frame::ProjectChanged` **is on this branch** (the iOS ffi takes `crates/wire` as a path dependency, so it already decodes); the run-transcript endpoint returns a plain `ChatSessionDetail` (`projects.rs:1573-1610`), which the existing transcript webview renders unchanged.
 - Landed with this document (plan P0): `IssueDto.approval_pending`, resolved off the live approval queue and empty on an archived board; a 409 when an archived board is asked to answer a prompt; a `ProjectChangeScope::Unknown` arm so a future scope costs a client the narrowing rather than the frame.
-- Still missing (plan P1): the ffi pump has no `ProjectChanged` arm (a session-less frame currently fans out to every transcript sink, which ignores it); `GatewayJsonClient` has no PATCH verb, which `PATCH …/issues/{n}` needs.
+- ~~Still missing (plan P1)~~ — **built**: the ffi pump's consuming `ProjectChanged` lane (see [connection.md](connection.md#the-project-sink)) and `GatewayJsonClient::patch_json`.
 - Changed on master since the design snapshot: `7fcec51d` gave `list_issues` **paging and search over the Done column** (the board fetch is no longer "the whole board in one go"); `2722f2cf` added `opened_by_agent` to IssueDto; `aed877c7` per-board model pin; `4e6417e0`/`da70b732` money ceiling → held runs.
 
 ## 0.1 Owner decisions (2026-08-23)
@@ -202,3 +209,28 @@ Rejected: putting the web board in a WKWebView (a Tailwind/brutalist re-skin, `t
 ## 9. Rejected approaches (do not re-tread)
 
 `TabView(.page)` with five pages (three horizontal gestures fighting); an inbox as the tab root; an approval countdown; fail-fast offline writes; a "Needs you" band that duplicates whole cards; a cross-board N+1 fan-out over `events`; a small webview for the description; a tab dot instead of a count (the owner's third round replaced it with a number).
+
+## 10. What shipped, and what did not
+
+Built across P0–P8: the gateway's `approval_pending` and archived-board guard,
+the whole ffi surface, the Swift data layer and its pure models, the cards
+root, the board, the card page (a third webview), run transcripts, and the
+team / profile / activity / settings screens.
+
+**Deferred deliberately, and worth naming so nobody looks for them:**
+
+- **`@` mention chips and staged attachments on a comment.** The card's dock
+  takes text. Mentioning is typing `@handle`, which the hint line already
+  describes the effect of; attaching would want the composer's whole staging
+  strip, which is bound to `ChatStore` from its initialiser down.
+- **The description editor is a `<textarea>` over the raw markdown**, which is
+  what §3.3 asks for — but it has had no device pass, and a Chinese keyboard is
+  specifically what it needs (this app has one marked-text scar already).
+- **The card page's pickers.** `pick(field)` crosses the bridge and the screen
+  holds it; the sheets themselves are the board's, reached from the board.
+- **Everything is simulator-only.** No tier here has run on hardware.
+
+**The two questions §0.2 raised are still open**, and neither was P8's to
+close: a run that reaches an approval gate just after its board is archived
+still waits out the 300s timeout and self-denies, and `Frame::ResolveApproval`
+is still a second door that checks no board.

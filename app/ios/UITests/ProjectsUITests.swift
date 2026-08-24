@@ -226,6 +226,62 @@ final class ProjectsUITests: BayboUITestCase {
             "a card must not appear in the strip twice")
     }
 
+    /// The board's ⋯ opens the four screens P7 added.
+    ///
+    /// A menu is exactly the kind of wiring that compiles, looks right in
+    /// review, and opens nothing: a sheet bound to the wrong flag, or one whose
+    /// `if let` never resolves, fails silently.
+    func testTheBoardMenuOpensTheScreensBehindIt() {
+        let app = openBoard()
+        XCTAssertTrue(app.buttons["board-menu"].waitForExistence(timeout: 5))
+
+        app.buttons["board-menu"].tap()
+        XCTAssertTrue(app.buttons["Team"].waitForExistence(timeout: 3), "no Team entry")
+        app.buttons["Team"].tap()
+        // The demo has no gateway, so the sheet shows its read-failed line
+        // rather than rows — which is still the sheet, presented.
+        XCTAssertTrue(
+            app.staticTexts["Team"].waitForExistence(timeout: 5), "the team sheet never presented")
+        app.buttons["Done"].firstMatch.tap()
+
+        XCTAssertTrue(app.buttons["board-menu"].waitForExistence(timeout: 3))
+        app.buttons["board-menu"].tap()
+        XCTAssertTrue(app.buttons["Activity"].waitForExistence(timeout: 3), "no Activity entry")
+        app.buttons["Activity"].tap()
+        XCTAssertTrue(
+            app.staticTexts["Activity"].waitForExistence(timeout: 5),
+            "the activity sheet never presented")
+    }
+
+    /// A cancelled card is hidden by default and still reachable — dropping it
+    /// from the client entirely is how a card somebody wants to reopen becomes
+    /// unreachable from the phone.
+    func testTheFilterWidensToCancelledAndNarrowsToRunning() {
+        let app = openBoard()
+        XCTAssertTrue(app.buttons["board-filter-chip"].waitForExistence(timeout: 5))
+        app.buttons["board-filter-chip"].tap()
+
+        let running = app.buttons["filter-running"]
+        XCTAssertTrue(running.waitForExistence(timeout: 3), "the filter sheet never presented")
+        XCTAssertEqual(running.value as? String, "0")
+        running.tap()
+        XCTAssertEqual(running.value as? String, "1")
+
+        // Showing cancelled WIDENS the board, so it must not count as a filter —
+        // otherwise an un-narrowed list wears a filter mark.
+        let cancelled = app.buttons["filter-cancelled"]
+        XCTAssertTrue(cancelled.exists)
+        cancelled.tap()
+        XCTAssertEqual(cancelled.value as? String, "1")
+
+        XCTAssertTrue(app.buttons["filter-clear"].exists, "Clear should appear once narrowed")
+        app.buttons["filter-clear"].tap()
+        XCTAssertEqual(running.value as? String, "0", "Clear drops the narrowings")
+        XCTAssertEqual(
+            cancelled.value as? String, "1",
+            "Clear must leave the widening alone — it is not a narrowing")
+    }
+
     /// The new-board form is a pushed route, not a sheet — deliberately, so the
     /// name field can rise with the keyboard (the home shell opts out of
     /// keyboard avoidance wholesale). Create stays disabled until it is named.

@@ -1,4 +1,26 @@
 # iOS Projects tab — implementation plan
+*__Archived 2026-08-25.__ Every phase is done. This is now a build log rather
+than a plan: what each phase changed, and — the part worth keeping — what the
+simulator, the type checker and the tests corrected about it. The design is
+[projects.md](projects.md).*
+
+**The five corrections most worth remembering:**
+
+1. **SwiftUI exposes `.badge` to accessibility nowhere.** A test reading the tab
+   item's `label` passes a build that draws no badge at all. Assert the disc in
+   pixels.
+2. **A nested `ObservableObject` republishes nothing through its owner.** The
+   Projects badge read through `AppStore` froze at its first paint; the run
+   sheet's `contentVisible` would have left a loaded transcript behind a
+   transparent view.
+3. **A missing string key is invisible** — `Lang.t` echoes it, and an assertion
+   on a label matches the key as happily as the word. `LocalizedKeyTests` caught
+   two.
+4. **Hand-written DTO mirrors are wrong until something checks them.**
+   `issueSentinel.ts` caught three at once, each of which fails at runtime as a
+   missing `@handle` rather than an error.
+5. **`App/Resources/transcript/` is a committed copy of `web/dist`.** `pnpm
+   build` alone does not reach the app.
 
 *Written 2026-08-24 against HEAD 306b22d7 (kanban merged into master; feat/ios-swiftui fast-forwarded onto it). Design: [projects.md](projects.md). One PR per phase through `scripts/dev-merge-sync.sh` (opens as a draft; the owner runs `gh pr ready`; the script then verifies each of the five REQUIRED_CHECKS reports `pass` rather than `skipping`). **All three iOS CI jobs are `if: false`** (ios-web only because the Actions quota ran out, and it is the cheapest to restore) — every iOS-side phase runs its suites on a laptop and says so in the PR body.*
 
@@ -209,10 +231,27 @@ writes and stops answering approvals.
 a row that would have printed the raw key.
 
 
-## P8 · Wrap-up
+## P8 · Wrap-up — **done**
 
 - Fill out the four test tiers. Docs: fix `navigation.md:21` ("projects is `PlaceholderScreen`") and add Projects to the real-screens list plus the badge description; add a cross-reference paragraph to `approvals.md` distinguishing board approvals (REST, two answers) from chat approvals; note in `chat-list.md` that Projects deliberately stays out of the app-icon badge; register the `-baybo-demo-projects` fixture and the golden-fixture home in `testing.md`; document the ProjectSink lane in `connection.md` and the ffi docs; archive this plan.
 - Odds and ends: add a `Haptics` warning variant if the touch vocabulary needs one (only `tap` and `success` exist); consider restoring the `ios-web` CI job — it was switched off for quota alone and is the only CI evaluator of the two sentinels.
+
+**Done in P8.** `navigation.md` no longer calls Projects a placeholder and now
+documents the tab badges and their two traps; `chat-list.md` says why Projects
+stays out of the APP-ICON badge (nothing about a board is pushed, so an icon
+count would be right only while the app was foreground); `approvals.md` gains a
+table separating board approvals from chat ones across all four layers, and says
+why approve-always is absent from the board; `connection.md` documents the
+consuming `ProjectChanged` lane and why a session-less frame needed one;
+`testing.md` registers the three drift sentinels, `LocalizedKeyTests` and the
+cross-end golden vectors.
+
+**Not done, and left to the owner:** `Haptics` gained no warning variant — the
+touch vocabulary never wanted one, since every refusal on this feature is a
+sentence the server wrote and a banner reads it. And `ios-web` is still
+`if: false`: its comment now says THREE sentinels rather than two, and makes
+the case, but turning a CI job on is a quota decision and not a code change.
+
 
 ## Risks and mitigations
 

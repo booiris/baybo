@@ -322,20 +322,28 @@ jobs:
   # 1x runner. It was originally disabled as collateral damage — it shared a job
   # with the cargo half below, which is what actually ate the budget.
   #
-  # It also carries the two compile-time drift sentinels, which is why running
+  # It also carries the THREE compile-time drift sentinels, which is why running
   # it matters beyond this bundle: `src/wireSentinel.ts` pins the hand-written
-  # frame mirrors to the ts-rs contract in crates/wire, and `src/restSentinel.ts`
-  # pins `TranscriptRowItem` to the gateway's `ChatTranscriptItem` via
-  # docs/openapi.json. Both are `tsc --noEmit` assertions with no runtime
+  # frame mirrors to the ts-rs contract in crates/wire, `src/restSentinel.ts`
+  # pins `TranscriptRowItem` to the gateway's `ChatTranscriptItem`, and
+  # `src/issue/issueSentinel.ts` pins the project card page's DTO mirrors to
+  # `IssueDto` / `IssueEventDto` / `IssueRunDto` / `ActorDto` — the last two via
+  # docs/openapi.json. All three are `tsc --noEmit` assertions with no runtime
   # component, so this job is the only thing anywhere that evaluates them.
+  #
+  # The third one is the strongest argument yet for turning this back on: it
+  # caught three wrong hand-written mirrors on the day it was added, every one
+  # of which fails silently at runtime as a missing `@handle` rather than as an
+  # error anybody would see.
   # OFF ONLY BECAUSE THE ACTIONS QUOTA IS EXHAUSTED — not because it is slow, not
   # because it is flaky, and not for the reason the two jobs below are off. This
   # is the cheap one. To turn it back on, replace the `if: false` with the gate
   # kept below it; nothing else needs changing.
   #
-  # What stays unenforced meanwhile: both `tsc --noEmit` sentinels. Neither has a
-  # runtime component, so no other job anywhere evaluates them — a PR that adds a
-  # field to `ChatTranscriptItem` and forgets the iOS mirror goes green.
+  # What stays unenforced meanwhile: all three `tsc --noEmit` sentinels. None has
+  # a runtime component, so no other job anywhere evaluates them — a PR that adds
+  # a field to `ChatTranscriptItem` or `IssueDto` and forgets the iOS mirror goes
+  # green.
   ios-web:
     name: iOS transcript bundle (lint + test + build)
     needs: changes
