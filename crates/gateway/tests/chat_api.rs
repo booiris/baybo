@@ -2922,16 +2922,18 @@ async fn a_subagent_under_a_recurring_cron_conversation_is_readable() {
     .await;
 }
 
-/// A child whose parent row is gone has no provable root, so it is refused —
+/// A child whose parent row is absent has no provable root, so it is refused —
 /// the walk must not fall through to "no lineage left ⇒ this is the root".
 #[tokio::test]
 async fn a_subagent_with_a_missing_parent_row_is_not_readable() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let router = build_router(build_admin_state(&tg));
 
-    let root = seed_root(&tg, ChannelType::owner(), baybo_model::TriggerSource::User).await;
-    let child = seed_child(&tg, &root, "orphan").await;
-    tg.deps.session_manager.store().delete(&root.id).await.ok();
+    let mut missing_parent =
+        seed_root(&tg, ChannelType::owner(), baybo_model::TriggerSource::User).await;
+    missing_parent.id = SessionId::from("missing-parent");
+    missing_parent.root_session_id = missing_parent.id.clone();
+    let child = seed_child(&tg, &missing_parent, "orphan").await;
 
     get(
         &router,

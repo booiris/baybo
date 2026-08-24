@@ -134,7 +134,7 @@ impl DeckCardStore for SqliteDeckCardStore {
         let created = super::time::to_us(r.created_at);
         let sizes = DeckSize::join(&r.sizes);
         self.pool
-            .interact("deck_cards.create", move |conn| {
+            .interact_write("deck_cards.create", move |conn| {
                 conn.execute(
                     "INSERT INTO deck_cards (id, title, position, size, sizes, maximize, \
                      enabled, quarantined_at, deleted_at, spec_hash, last_seq, created_at) \
@@ -230,7 +230,7 @@ impl DeckCardStore for SqliteDeckCardStore {
             .map(|e| (e.id.clone(), e.position, e.size.as_str()))
             .collect();
         self.pool
-            .interact("deck_cards.set_layout", move |conn| {
+            .interact_write("deck_cards.set_layout", move |conn| {
                 let tx =
                     conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 for (id, position, size) in &entries {
@@ -250,7 +250,7 @@ impl DeckCardStore for SqliteDeckCardStore {
         let id = id.to_string();
         let affected = self
             .pool
-            .interact("deck_cards.set_enabled", move |conn| {
+            .interact_write("deck_cards.set_enabled", move |conn| {
                 Ok(conn.execute(
                     "UPDATE deck_cards SET enabled = ?2 WHERE id = ?1",
                     rusqlite::params![id, enabled],
@@ -265,7 +265,7 @@ impl DeckCardStore for SqliteDeckCardStore {
         let at = at.map(super::time::to_us);
         let affected = self
             .pool
-            .interact("deck_cards.set_quarantined", move |conn| {
+            .interact_write("deck_cards.set_quarantined", move |conn| {
                 Ok(conn.execute(
                     "UPDATE deck_cards SET quarantined_at = ?2 WHERE id = ?1",
                     rusqlite::params![id, at],
@@ -292,7 +292,7 @@ impl DeckCardStore for SqliteDeckCardStore {
         let sizes = DeckSize::join(sizes);
         let affected = self
             .pool
-            .interact("deck_cards.set_installed", move |conn| {
+            .interact_write("deck_cards.set_installed", move |conn| {
                 Ok(conn.execute(
                     "UPDATE deck_cards SET title = ?2, spec_hash = ?3, \
                      size = COALESCE(?4, size), sizes = ?5, maximize = ?6 WHERE id = ?1",
@@ -308,7 +308,7 @@ impl DeckCardStore for SqliteDeckCardStore {
         let at = at.map(super::time::to_us);
         let affected = self
             .pool
-            .interact("deck_cards.set_deleted", move |conn| {
+            .interact_write("deck_cards.set_deleted", move |conn| {
                 Ok(conn.execute(
                     "UPDATE deck_cards SET deleted_at = ?2 WHERE id = ?1",
                     rusqlite::params![id, at],
@@ -321,7 +321,7 @@ impl DeckCardStore for SqliteDeckCardStore {
     async fn purge(&self, id: &str) -> Result<bool> {
         let id = id.to_string();
         self.pool
-            .interact("deck_cards.purge", move |conn| {
+            .interact_write("deck_cards.purge", move |conn| {
                 let tx =
                     conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 tx.execute(
@@ -350,7 +350,7 @@ impl DeckCardStore for SqliteDeckCardStore {
         let error = error.map(|e| e.to_string());
         let fetched = super::time::to_us(fetched_at);
         self.pool
-            .interact("deck_cards.record_snapshot", move |conn| {
+            .interact_write("deck_cards.record_snapshot", move |conn| {
                 let tx =
                     conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 let bumped = tx.execute(
@@ -498,7 +498,7 @@ mod tests {
         let store = SqliteDeckCardStore::new(pool.clone());
         // Insert bypassing `create` to leave `sizes` at the column default.
         let now_us = super::super::time::to_us(chrono::Utc::now());
-        pool.interact("test.legacy_insert", move |conn| {
+        pool.interact_write("test.legacy_insert", move |conn| {
             conn.execute(
                 "INSERT INTO deck_cards (id, title, position, size, spec_hash, created_at) \
                  VALUES ('legacy', 't', 0, 'large', 'h', ?1)",

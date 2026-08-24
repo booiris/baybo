@@ -49,13 +49,14 @@ A spawned session's `trigger` is **inherited from the root** session (so a subag
 
 One `AgentActor` per session. All messages targeting the same session (user input, cron triggers, subagent spawns, background-job completions, model re-pins, stop) are queued through the actor handle and consumed sequentially. Therefore `SessionStore` implementations do not need to defend against concurrent writes on the same `session_id` — that guarantee comes from the actor model and is what lets `append_session_message` use a single `INSERT … SELECT MAX(ordinal)+1` without locking. Re-introducing concurrent paths into the session would invalidate the storage contract.
 
-### Source deletion cascades the transcript
+### Sessions have no row-deletion surface
 
-`SessionStore::delete(session_id)` runs the `session_messages` cascade and the session-row delete inside one `BEGIN IMMEDIATE` write transaction so a stranded transcript can never outlive its parent.
-
-### Subagent parent deletion drains the subtree first — design intent, not yet wired
-
-`CancelReason::ParentDeleted` exists in `baybo-turn` for this, but today `SessionManager::delete` performs no subagent cancellation and has no production caller: the chat `DELETE /v1/chat/sessions/:id` endpoint hides the session via `set_hidden` instead of deleting it. If row-level deletion ever gets a production path, it must trip the subagent's cancellation token (`Cancelled { ParentDeleted }`) **before** the parent row is removed, so a parent never disappears while a child is still running tools or holding LLM state.
+Session rows and transcripts are user-facing core data. `SessionStore` and
+`SessionManager` expose no hard-delete method; the chat
+`DELETE /v1/chat/sessions/:id` endpoint sets `hidden = true` and keeps the
+row, transcript, summary cursor, and channel binding recoverable. Idle cleanup
+only reaps the in-memory actor. A future user-requested wipe must introduce a
+dedicated, explicitly gated policy surface rather than a general store verb.
 
 ### Session ID conventions
 
@@ -90,6 +91,6 @@ Session rows and their transcripts are core user data and are **never** dropped 
 | --------- | --------------------------------------------------------------------------------------------------- |
 | `model`   | Defines `Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `Lineage`               |
 | `storage` | Implements `SessionStore` / `SessionFolderStore` against sqlite; pulls the traits from `baybo-store` (no `baybo-session` dependency) |
-| `context` | Owns the in-memory transcript via `ContextManager`; agent loop brokers persistence via this crate  |
+| `context` | Owns the live transcript and persists each append before advancing its in-memory window |
 | `agent`   | Re-exports `SessionManager`; Router calls it; `AgentActor` holds the `Session` instance            |
 | `cli` / `gateway` | Operator-facing surfaces consume `baybo_agent::SessionManager`                              |

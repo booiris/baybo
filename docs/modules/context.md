@@ -6,7 +6,7 @@ The `context` crate owns the per-actor conversation state: the
 transcript (`messages`), the token budget, and the hardcoded
 compression flow. Persistence is wired in directly — every
 `ContextManager` takes a bound `SessionId` + `Arc<SessionManager>` at
-construction; `append` and the compression apply mirror to
+construction; `append` and the compression apply persist to
 `session_messages` through the `SessionManager` wrapper in
 [`baybo-session`](session.md). Tests construct an in-memory store via
 `baybo_session::test_support::MemorySessionStore` and pass it through
@@ -14,8 +14,8 @@ the same constructor — no separate "in-memory mode" exists.
 
 Core responsibilities:
 
-- **Sole owner of the transcript**: `ContextManager` holds `Vec<ChatMessage>` directly. `Session` (in `baybo-model`) carries only metadata (id, user, channel, lineage, soul binding, …). Ordinary `append` calls `persist_appended` (→ `SessionManager::append_session_message`); `append_idempotent` asks the store to atomically claim a `source_event_id` and mirrors the message into the live window only for `Inserted`, never `Existing`. Every successful compression calls `persist_compaction` (→ `SessionManager::apply_session_compaction`). Cold-start hydration via `restore_from_store` seeds the manager so an actor restart preserves the conversation; on load it runs `transcript_repair::repair_tool_pairing`, which persists a synthetic "interrupted" `ToolResult` for any `ToolUse` a crash left unanswered (append-only), repositions displaced result rows next to their issuing assistant row, and quarantines orphan/duplicate results from the provider-facing window without deleting their durable rows.
-- **Caller-driven compression**: `append()` is pure (push + budget update); the agent loop calls `maybe_compress()` at well-defined points so compression LLM cost can be recorded against the cost ledger
+- **Sole owner of the transcript**: `ContextManager` holds `Vec<ChatMessage>` directly. `Session` (in `baybo-model`) carries only metadata (id, user, channel, lineage, soul binding, …). Ordinary `append` calls `persist_appended` (→ `SessionManager::append_session_message`) **before** pushing into the live window or charging the budget; a store error returns `ContextError::Transcript` and leaves both untouched. `append_idempotent` asks the store to atomically claim a `source_event_id` and mirrors the message into the live window only for `Inserted`, never `Existing`. Every successful compression calls `persist_compaction` (→ `SessionManager::apply_session_compaction`). Cold-start hydration via `restore_from_store` seeds the manager so an actor restart preserves the conversation; on load it runs `transcript_repair::repair_tool_pairing`, which persists a synthetic "interrupted" `ToolResult` for any `ToolUse` a crash left unanswered (append-only), repositions displaced result rows next to their issuing assistant row, and quarantines orphan/duplicate results from the provider-facing window without deleting their durable rows.
+- **Caller-driven compression**: `append()` durably appends, then pushes and updates the budget; it never triggers compression. The agent loop calls `maybe_compress()` at well-defined points so compression LLM cost can be recorded against the cost ledger.
 - **Token budget tracking**: track current token usage and remaining capacity via `TokenBudget`, anchored to the provider's authoritative `usage.input_tokens` between calls
 - **Hardcoded compaction flow**: a single impl block on `ContextManager` — one blocking summariser call, assembled with the verbatim tail. No trait, no dispatch — every production session takes the same path. **A summary is the only thing that supersedes durable active transcript rows**: hydration quarantine only filters invalid protocol blocks from the provider-facing in-memory view and never rewrites storage. When the summariser call fails, nothing is applied and the user is told.
 
@@ -93,13 +93,20 @@ here is the byte-budget cap and the content-addressed spill.
 
 ### Compression is caller-driven
 
-`append()` only pushes the message and updates the token budget — it does **not** auto-compress. The agent loop calls `maybe_compress()` at the top of every iteration; that's the single point where compression LLM calls happen and where their cost is recorded against the cost ledger.
+`append()` persists the message, then pushes it into the live window and updates
+the token budget; it does **not** auto-compress. If persistence fails, it returns
+`ContextError::Transcript` without changing memory. Agent ingress, assistant,
+tool-result, interjection, recall, cron, notification, and subagent paths
+propagate that error and stop the current turn before another LLM call. The
+agent loop calls `maybe_compress()` at the top of every iteration; that is the
+single point where compression LLM calls happen and where their cost is recorded
+against the cost ledger.
 
 This trade-off — losing the "impossible to forget" property of auto-compression — is deliberate: every compression that reaches Stage 2 spawns a billable LLM call, and the cost-recording context (`SpanRecorder`, `TurnId`, `CostManager`) only exists at the agent-loop layer. Auto-compressing inside `append()` would silently bypass that recording.
 
 ```rust
 // Append in any number of places without cost-recording overhead.
-self.context_manager.append(&user_msg).await;
+self.context_manager.append(&user_msg).await?;
 
 // Single explicit compression site at the top of each iteration.
 self.compress_if_needed(session, span_recorder, turn_id, &cancel_token, delta_tx.as_ref(), &mut compaction_failure_reported).await?;

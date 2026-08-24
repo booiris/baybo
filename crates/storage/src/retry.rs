@@ -1,27 +1,29 @@
 //! Bounded retry wrapper for cross-process sqlite contention.
 //!
 //! Second line of defence, behind the connection's `busy_timeout` (see
-//! `sqlite::BUSY_TIMEOUT`). The timeout absorbs *intra-process* write
-//! contention, which a connection pool makes routine: two pooled
-//! connections writing at once is normal, and failing the second one
-//! would be a bug, not a signal.
+//! `sqlite::BUSY_TIMEOUT`).
 //!
-//! What the timeout cannot cover is a *cross-process* writer holding the
-//! lock for longer than the timeout — today just the CLI's `baybo
-//! channels bot add/remove`, which writes the same database file a
-//! running gateway may read/write. This helper exists for those
-//! call-sites: contention that survives `busy_timeout` is genuinely
-//! anomalous and worth a bounded retry plus a loud log.
+//! *Intra-process* write contention never reaches sqlite: writers queue
+//! on `PoolInner::writer` inside `SqlitePool::interact_write`, so a
+//! second pooled writer waits its turn in the process instead of
+//! colliding on the file lock and burning the busy handler's sleeps.
+//!
+//! What neither the queue nor the timeout covers is a *cross-process*
+//! writer holding the lock for longer than the timeout — the CLI's
+//! `baybo channels bot add/remove`, say, writing the same database file
+//! a gateway is live on. A `BUSY` that survives both is therefore, by
+//! construction, that case: genuinely anomalous, and worth a bounded
+//! retry plus a loud log. That is why `interact_write` wraps *every*
+//! write in this helper rather than a hand-picked few — there is no
+//! longer a class of in-process contention for it to paper over.
 //!
 //! Every retry logs at `warn!` so operators and telemetry can see
 //! contention when it matters; after the last attempt the original
 //! error propagates for loud failure.
 //!
-//! Gateway hot paths (`ChannelBotReconciler`, `ChannelSessionResolver`,
-//! agent-loop DB writes) deliberately do NOT use this helper — having
-//! already waited out `busy_timeout`, a `BUSY` there is a real problem
-//! and should surface as a debuggable error rather than a silently
-//! tolerated latency bump.
+//! Reads are not wrapped. Under WAL a reader takes no write lock, so it
+//! has nothing to lose the race for, and retrying one would hide a real
+//! fault rather than a contended moment.
 
 use std::fmt::Display;
 use std::future::Future;

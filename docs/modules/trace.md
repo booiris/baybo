@@ -108,9 +108,10 @@ Because `tool_use_id` is known when the span opens, the tool span closes during
 execution — no deferred close, no waiting for the transcript ordinal. The write
 chooses `Persisted` only when its serialized pointer is smaller than the capped
 inline value. The pointer is written before `AgentLoop` appends the transcript
-row, so a rare append failure leaves it unresolvable rather than dangling
-silently: replay surfaces a visible `trace_reconstruction_error` for a
-`tool_use_id` with no matching `ToolResult`.
+row. If that append fails, the agent aborts the turn and leaves the failed row
+out of its live context; replay still surfaces a visible
+`trace_reconstruction_error` for the already-closed pointer rather than
+inventing a result.
 
 The model-facing payload is still capped at
 `baybo_context::prompts::tool_output::MAX_TOOL_OUTPUT_BYTES` and any full value

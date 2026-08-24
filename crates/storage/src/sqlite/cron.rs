@@ -184,7 +184,7 @@ impl CronStore for SqliteCronStore {
         let pinned_flag: i64 = if job.pinned { 1 } else { 0 };
         let builtin_flag: i64 = if job.builtin { 1 } else { 0 };
         self.pool
-            .interact("cron.create", move |conn| {
+            .interact_write("cron.create", move |conn| {
                 conn.execute(
                     "INSERT INTO cron_jobs (id, user_id, status, next_trigger_at, deleted_at, pinned, builtin, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     rusqlite::params![id, user_id, status, next_trigger_us, deleted_us, pinned_flag, builtin_flag, data],
@@ -230,7 +230,7 @@ impl CronStore for SqliteCronStore {
         let status = job.status.as_str().to_string();
         let affected = self
             .pool
-            .interact("cron.save", move |conn| {
+            .interact_write("cron.save", move |conn| {
                 // `pinned` is deliberately NOT in this SET list — it is owned by
                 // the targeted `set_pinned`, exactly like `sessions.pinned`. This
                 // is a whole-blob last-writer-wins UPDATE from whatever snapshot
@@ -260,7 +260,7 @@ impl CronStore for SqliteCronStore {
         // cannot lose it. Reads patch `CronJob.pinned` from the column.
         let affected = self
             .pool
-            .interact("cron.set_pinned", move |conn| {
+            .interact_write("cron.set_pinned", move |conn| {
                 Ok(conn.execute(
                     "UPDATE cron_jobs SET pinned = ?2 WHERE id = ?1",
                     rusqlite::params![id, flag],
@@ -280,7 +280,7 @@ impl CronStore for SqliteCronStore {
         let expected = Unmoved::from(expected);
 
         self.pool
-            .interact("cron.save_if_unchanged", move |conn| {
+            .interact_write("cron.save_if_unchanged", move |conn| {
                 // The read and the write are one transaction: this write replaces
                 // the whole blob, so it may only land on the row the caller read
                 // — every field of it, not just the two the columns project.
@@ -326,7 +326,7 @@ impl CronStore for SqliteCronStore {
         let expected = Unmoved::from(expected);
 
         self.pool
-            .interact("cron.record_fire", move |conn| {
+            .interact_write("cron.record_fire", move |conn| {
                 // The read and the write are one transaction, so the blob this
                 // rewrites is the one the row carries *now*. An edit that landed
                 // while the slot was firing lives in that blob, and a write-back
@@ -350,7 +350,7 @@ impl CronStore for SqliteCronStore {
                 };
 
                 let mut job = job_from_row(None, 0, 0, &data)?;
-                job.status = fire.status;
+                job.status = fire.status.clone();
                 job.next_trigger_at = fire.next_trigger_at;
                 job.last_triggered_at = Some(fire.last_triggered_at);
                 job.updated_at = fire.updated_at;
@@ -493,7 +493,7 @@ impl CronStore for SqliteCronStore {
         // the caller treats that as benign and skips the dispatch.
         let affected = self
             .pool
-            .interact("cron.record_execution", move |conn| {
+            .interact_write("cron.record_execution", move |conn| {
                 Ok(conn.execute(
                     "INSERT OR IGNORE INTO cron_executions (id, job_id, user_id, scheduled_fire_time, triggered_at, status, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     rusqlite::params![
@@ -584,7 +584,7 @@ impl CronStore for SqliteCronStore {
         let id = execution_id.to_string();
         let affected = self
             .pool
-            .interact("cron.update_execution_status", move |conn| {
+            .interact_write("cron.update_execution_status", move |conn| {
                 Ok(conn.execute(
                     "UPDATE cron_executions SET status = ?1 WHERE id = ?2",
                     rusqlite::params![status, id],
@@ -643,7 +643,7 @@ impl CronStore for SqliteCronStore {
         let id = execution_id.to_string();
 
         self.pool
-            .interact("cron.record_execution_completion", move |conn| {
+            .interact_write("cron.record_execution_completion", move |conn| {
                 conn.execute(
                     "UPDATE cron_executions SET completed_at = ?1, data = ?2 WHERE id = ?3",
                     rusqlite::params![completed_us, data, id],
@@ -661,7 +661,7 @@ impl CronStore for SqliteCronStore {
         let id = execution_id.to_string();
 
         self.pool
-            .interact("cron.mark_execution_notified", move |conn| {
+            .interact_write("cron.mark_execution_notified", move |conn| {
                 conn.execute(
                     "UPDATE cron_executions SET notified_at = ?1, data = ?2 WHERE id = ?3",
                     rusqlite::params![at_us, data, id],
@@ -712,7 +712,7 @@ impl SqliteCronStore {
         let id = job_id.to_string();
         let affected = self
             .pool
-            .interact("cron.write_deleted_at", move |conn| {
+            .interact_write("cron.write_deleted_at", move |conn| {
                 Ok(conn.execute(
                     "UPDATE cron_jobs SET deleted_at = ?1 WHERE id = ?2",
                     rusqlite::params![deleted_us, id],

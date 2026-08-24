@@ -621,7 +621,7 @@ impl ProjectStore for SqliteProjectStore {
         let created_at = super::time::to_us(row.created_at);
         let updated_at = super::time::to_us(row.updated_at);
         self.pool
-            .interact("projects.create", move |conn| {
+            .interact_write("projects.create", move |conn| {
                 conn.execute(
                     "INSERT INTO projects \
                      (id, name, description, workdir, daily_budget_micros, \
@@ -662,7 +662,7 @@ impl ProjectStore for SqliteProjectStore {
         let now = super::time::now_us();
         let affected = self
             .pool
-            .interact("projects.update", move |conn| {
+            .interact_write("projects.update", move |conn| {
                 // One statement, so the stamp cannot be written against a
                 // row other than the one it compared. SQLite evaluates every
                 // expression in an UPDATE against the pre-update row, which
@@ -725,7 +725,7 @@ impl ProjectStore for SqliteProjectStore {
         let at = super::time::to_us(at);
         let affected = self
             .pool
-            .interact("issues.mark_read", move |conn| {
+            .interact_write("issues.mark_read", move |conn| {
                 Ok(conn.execute(
                     "UPDATE issues SET read_at = MAX(COALESCE(read_at, 0), ?2) WHERE id = ?1",
                     rusqlite::params![issue, at],
@@ -744,7 +744,7 @@ impl ProjectStore for SqliteProjectStore {
         let at = super::time::to_us(at);
         let affected = self
             .pool
-            .interact("issues.mark_project_read", move |conn| {
+            .interact_write("issues.mark_project_read", move |conn| {
                 Ok(conn.execute(
                     // The guard is where `mark_issue_read`'s `MAX(...)` is:
                     // both keep the cursor monotonic, and here it also makes
@@ -841,7 +841,7 @@ impl ProjectStore for SqliteProjectStore {
         let stamp = archived.then_some(now);
         let affected = self
             .pool
-            .interact("projects.set_archived", move |conn| {
+            .interact_write("projects.set_archived", move |conn| {
                 // Restoring is an operator turning a board back on, which is
                 // the same class of change as raising a ceiling; shelving one
                 // starts nothing, so it stamps nothing.
@@ -913,7 +913,7 @@ impl ProjectStore for SqliteProjectStore {
         let created_at = super::time::to_us(new.created_at);
         let raw = self
             .pool
-            .interact("issues.create", move |conn| {
+            .interact_write("issues.create", move |conn| {
                 let tx =
                     conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 let number: i64 = tx.query_row(
@@ -977,7 +977,7 @@ impl ProjectStore for SqliteProjectStore {
         let now = super::time::now_us();
         let affected = self
             .pool
-            .interact("issues.update", move |conn| {
+            .interact_write("issues.update", move |conn| {
                 let title = update.title.clone();
                 let description = update.description.clone();
                 // Encoded here rather than beside `description` because a
@@ -1252,7 +1252,7 @@ impl ProjectStore for SqliteProjectStore {
         let ordered: Vec<i64> = ordered_numbers.to_vec();
         let now = super::time::now_us();
         self.pool
-            .interact("issues.move", move |conn| {
+            .interact_write("issues.move", move |conn| {
                 let tx =
                     conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 // Read the column it is leaving before the update overwrites
@@ -1315,7 +1315,7 @@ impl ProjectStore for SqliteProjectStore {
         let now = super::time::now_us();
         let outcome = self
             .pool
-            .interact("issue_runs.enqueue", move |conn| {
+            .interact_write("issue_runs.enqueue", move |conn| {
                 let tx =
                     conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 let attempt: i64 = tx.query_row(
@@ -1386,7 +1386,7 @@ impl ProjectStore for SqliteProjectStore {
             .map_err(|e| StorageError::Storage(format!("serialize issue event: {e}")))?;
         let created = super::time::to_us(row.created_at);
         self.pool
-            .interact("issue_events.append", move |conn| {
+            .interact_write("issue_events.append", move |conn| {
                 conn.execute(
                     "INSERT INTO issue_events (id, issue_id, project_id, number, actor, kind, \
                      body, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -1417,7 +1417,7 @@ impl ProjectStore for SqliteProjectStore {
         let now = super::time::now_us();
         let changed = self
             .pool
-            .interact("issues.set_branch", move |conn| {
+            .interact_write("issues.set_branch", move |conn| {
                 Ok(conn.execute(
                     "UPDATE issues SET branch = ?2, updated_at = ?3 WHERE id = ?1",
                     rusqlite::params![id, branch, now],
@@ -1687,7 +1687,7 @@ impl ProjectStore for SqliteProjectStore {
         let now = super::time::now_us();
         let affected = self
             .pool
-            .interact("issue_runs.claim", move |conn| {
+            .interact_write("issue_runs.claim", move |conn| {
                 // Scoped to `queued`, so two dispatches of the same row
                 // resolve into one execution rather than two — the
                 // execution, not the work each dispatcher did to get here.
@@ -1719,7 +1719,7 @@ impl ProjectStore for SqliteProjectStore {
         let now = super::time::now_us();
         let affected = self
             .pool
-            .interact("issue_runs.settle", move |conn| {
+            .interact_write("issue_runs.settle", move |conn| {
                 Ok(conn.execute(
                     "UPDATE issue_runs SET status = ?2, error = ?3, settled_at = ?4 \
                      WHERE id = ?1 AND settled_at IS NULL",
@@ -1734,7 +1734,7 @@ impl ProjectStore for SqliteProjectStore {
         let id = id.as_str().to_string();
         let raw = self
             .pool
-            .interact("issue_runs.hold", move |conn| {
+            .interact_write("issue_runs.hold", move |conn| {
                 // Write and read back in one statement, as `requeue_unsettled`
                 // does: the caller is handed the row this wrote rather than
                 // its own pre-write copy plus a guess at what changed.
@@ -1774,7 +1774,7 @@ impl ProjectStore for SqliteProjectStore {
         let id = id.as_str().to_string();
         let raw = self
             .pool
-            .interact("issue_runs.release", move |conn| {
+            .interact_write("issue_runs.release", move |conn| {
                 let mut stmt = conn.prepare(&format!(
                     "UPDATE issue_runs SET status = 'queued' \
                      WHERE id = ?1 AND status = 'held' \
@@ -1792,7 +1792,7 @@ impl ProjectStore for SqliteProjectStore {
     async fn requeue_unsettled(&self) -> Result<Vec<IssueRunRow>> {
         let raw = self
             .pool
-            .interact("issue_runs.requeue", move |conn| {
+            .interact_write("issue_runs.requeue", move |conn| {
                 // Preserve first claim so pre-restart spend stays in the run window.
                 // Update and return atomically so narrated resume counts match.
                 let mut stmt = conn.prepare(&format!(
@@ -1893,7 +1893,7 @@ mod tests {
 
         store
             .pool
-            .interact("test.blank_the_column", |conn| {
+            .interact_write("test.blank_the_column", |conn| {
                 conn.execute("UPDATE projects SET daily_budget_tokens = NULL", [])?;
                 Ok(())
             })
@@ -2014,7 +2014,7 @@ mod tests {
 
         store
             .pool
-            .interact("test.blank_the_column", |conn| {
+            .interact_write("test.blank_the_column", |conn| {
                 conn.execute("UPDATE projects SET rules_changed_at = NULL", [])?;
                 Ok(())
             })
@@ -2538,7 +2538,7 @@ mod tests {
         // missing column is `SQLITE_ERROR`, not a constraint of any kind.
         store
             .pool
-            .interact("test.break_insert", |conn| {
+            .interact_write("test.break_insert", |conn| {
                 Ok(conn.execute_batch("ALTER TABLE issue_runs DROP COLUMN error;")?)
             })
             .await
@@ -2750,7 +2750,7 @@ mod tests {
 
         store
             .pool
-            .interact("test.rewind_the_resume_migration", move |conn| {
+            .interact_write("test.rewind_the_resume_migration", move |conn| {
                 conn.execute("ALTER TABLE issue_runs DROP COLUMN resumes", [])?;
                 let migration = super::super::ADD_COLUMNS
                     .iter()
@@ -3002,7 +3002,7 @@ mod tests {
 
         store
             .pool
-            .interact("test.rewind_the_pin_migration", move |conn| {
+            .interact_write("test.rewind_the_pin_migration", move |conn| {
                 conn.execute("ALTER TABLE issues DROP COLUMN pinned", [])?;
                 let migration = super::super::ADD_COLUMNS
                     .iter()
@@ -3058,7 +3058,7 @@ mod tests {
 
         store
             .pool
-            .interact("test.rewind_the_origin_migration", move |conn| {
+            .interact_write("test.rewind_the_origin_migration", move |conn| {
                 conn.execute("ALTER TABLE issues DROP COLUMN filed_from_issue_id", [])?;
                 let migration = super::super::ADD_COLUMNS
                     .iter()
@@ -3504,7 +3504,7 @@ mod tests {
     /// `project_id` column is generated from.
     async fn session_row(pool: &SqlitePool, id: &str, root: &str, trigger: &str) {
         let (id, root, trigger) = (id.to_owned(), root.to_owned(), trigger.to_owned());
-        pool.interact("test.session_row", move |conn| {
+        pool.interact_write("test.session_row", move |conn| {
             conn.execute(
                 "INSERT INTO sessions \
                      (id, root_session_id, trigger_kind, created_at, last_active, data) \

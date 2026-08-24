@@ -858,10 +858,7 @@ impl AgentActor {
                     .volatile
                     .agent_loop
                     .append_cron_notification(content.clone(), source_event_id.as_deref())
-                    .await
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("cron notification was not persisted to the transcript")
-                    })?;
+                    .await?;
                 let SessionMessageAppendOutcome::Inserted { ordinal } = append_outcome else {
                     return Err(anyhow::anyhow!(
                         "cron notification source event was inserted concurrently"

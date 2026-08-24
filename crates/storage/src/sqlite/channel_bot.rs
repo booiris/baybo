@@ -82,7 +82,7 @@ impl ChannelBotStore for SqliteChannelBotStore {
         let channel_type = channel_type.as_str().to_string();
         let bot_id = bot_id.to_string();
         self.pool
-            .interact("channel_bots.put", move |conn| {
+            .interact_write("channel_bots.put", move |conn| {
                 // Live row wins: `INSERT OR IGNORE` preserves the existing
                 // `created_at` on a re-add, no-op on conflict.
                 conn.execute(
@@ -99,7 +99,7 @@ impl ChannelBotStore for SqliteChannelBotStore {
         let channel_type = channel_type.as_str().to_string();
         let bot_id = bot_id.to_string();
         self.pool
-            .interact("channel_bots.delete", move |conn| {
+            .interact_write("channel_bots.delete", move |conn| {
                 conn.execute(
                     "DELETE FROM channel_bots
              WHERE channel_type = ?1 AND bot_id = ?2",

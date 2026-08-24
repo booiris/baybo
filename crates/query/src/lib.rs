@@ -1891,12 +1891,6 @@ mod tests {
                 _ => Ok(false),
             }
         }
-        async fn delete(
-            &self,
-            _id: &SessionId,
-        ) -> std::result::Result<bool, baybo_store::StorageError> {
-            Ok(true)
-        }
         async fn list_expired(
             &self,
             _before: DateTime<Utc>,

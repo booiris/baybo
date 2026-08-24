@@ -36,7 +36,7 @@ impl SqliteAgentProfileStore {
         let now = super::time::now_us();
         store
             .pool
-            .interact("agent_profiles.seed_builtin", move |conn| {
+            .interact_write("agent_profiles.seed_builtin", move |conn| {
                 conn.execute(
                     "INSERT OR IGNORE INTO agent_profiles \
                      (id, description, framework, builtin, created_at, updated_at) \
@@ -285,7 +285,7 @@ impl AgentProfileStore for SqliteAgentProfileStore {
         // non-`Internal` variant and can't be built inside it.
         let outcome = self
             .pool
-            .interact("agent_profiles.create", move |conn| {
+            .interact_write("agent_profiles.create", move |conn| {
                 // Neither `builtin` nor `deleted_at` is in the column list:
                 // the schema default fills the first (so the seed stays the
                 // only writer of 1) and an agent is never born removed.
@@ -328,7 +328,7 @@ impl AgentProfileStore for SqliteAgentProfileStore {
         let now = super::time::now_us();
         let outcome = self
             .pool
-            .interact("agent_profiles.update", move |conn| {
+            .interact_write("agent_profiles.update", move |conn| {
                 match conn.execute(
                     // The self-reference on the builtin's `framework` is the
                     // guard: no caller can move it off baybo, while every
@@ -357,7 +357,7 @@ impl AgentProfileStore for SqliteAgentProfileStore {
         let now = super::time::now_us();
         let affected = self
             .pool
-            .interact("agent_profiles.set_avatar", move |conn| {
+            .interact_write("agent_profiles.set_avatar", move |conn| {
                 Ok(conn.execute(
                     "UPDATE agent_profiles SET avatar_blob_id = ?2, updated_at = ?3 WHERE id = ?1",
                     rusqlite::params![id, blob_id, now],
@@ -375,7 +375,7 @@ impl AgentProfileStore for SqliteAgentProfileStore {
         let now = super::time::now_us();
         let affected = self
             .pool
-            .interact("agent_profiles.set_llm", move |conn| {
+            .interact_write("agent_profiles.set_llm", move |conn| {
                 Ok(conn.execute(
                     // One statement for all three levels, so the row can
                     // never hold a model belonging to an entry it no longer
@@ -400,7 +400,7 @@ impl AgentProfileStore for SqliteAgentProfileStore {
         let id = id.as_str().to_string();
         let affected = self
             .pool
-            .interact("agent_profiles.delete", move |conn| {
+            .interact_write("agent_profiles.delete", move |conn| {
                 Ok(conn.execute(
                     // The team guard is structural for the same reason the
                     // builtin one is: a row an issue's `assignee` points at
@@ -419,7 +419,7 @@ impl AgentProfileStore for SqliteAgentProfileStore {
         let now = super::time::now_us();
         let affected = self
             .pool
-            .interact("agent_profiles.remove_from_team", move |conn| {
+            .interact_write("agent_profiles.remove_from_team", move |conn| {
                 Ok(conn.execute(
                     // `deleted_at IS NULL` keeps the stamp honest: a second
                     // removal must not rewrite when the agent actually left.
@@ -787,7 +787,7 @@ mod tests {
             let id = id.as_str().to_string();
             store
                 .pool
-                .interact("test.move_membership", move |conn| {
+                .interact_write("test.move_membership", move |conn| {
                     Ok(conn
                         .execute(sql, rusqlite::params![id])
                         .err()

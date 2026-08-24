@@ -40,7 +40,7 @@ pub use turn::SqliteTurnStore;
 use baybo_store::{StorageError, StoreIdentity};
 use parking_lot::Mutex;
 use std::sync::Arc;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Connections kept open by the pool. Readers never block each other under
 /// WAL; writers serialise on the write lock regardless of how many handles
@@ -63,12 +63,11 @@ const POOL_SIZE: usize = 8;
 /// truncate-and-regrow churn.
 const WAL_SIZE_LIMIT: i64 = 64 * 1024 * 1024;
 
-/// A second writer waits for the current one rather than failing. Concurrent
-/// writers are routine here — the agent loop and the trace sink write while the
-/// gateway serves reads — and sqlite's default of 0 would turn that normal
-/// overlap into spurious `SQLITE_BUSY`. Contention that outlives this timeout is
-/// a different animal (a *cross-process* writer, i.e. the CLI holding the file
-/// against a running gateway) and is handled by [`crate::retry`].
+/// A writer outside this pool waits for the current one rather than failing.
+/// Writers sharing the pool queue on `PoolInner::writer`, while a CLI process
+/// or a separately opened pool can still contend inside SQLite. Its default of
+/// 0 would turn that overlap into a spurious `SQLITE_BUSY`; CLI operations
+/// retry contention that outlives this timeout via [`crate::retry`].
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Owner-only. Sqlite would otherwise create the file at whatever the umask
@@ -540,8 +539,9 @@ const ADD_COLUMNS: &[AddColumn] = &[
 /// Pool of sqlite connections.
 ///
 /// Cheap to clone (the state is one `Arc`) and shared by every store. Callers
-/// reach the database only through [`SqlitePool::interact`], which checks a
-/// connection out *exclusively* for the whole closure.
+/// reach the database only through [`SqlitePool::interact`] for reads or
+/// [`SqlitePool::interact_write`] for mutations. Both check a connection out
+/// *exclusively* for the whole closure; writes also queue before checkout.
 ///
 /// That exclusivity is a memory-safety contract, not a throughput knob. A
 /// sqlite connection owns an unsynchronised private heap — its lookaside
@@ -560,7 +560,7 @@ pub struct SqlitePool {
     identity: StoreIdentity,
 }
 
-/// The connections, and the gate that hands them out one at a time.
+/// The connections, and the gates that hand them out safely.
 struct PoolInner {
     /// Where a replacement connection comes from. Kept as the path the caller
     /// opened rather than the canonicalized one so a replacement resolves
@@ -574,6 +574,9 @@ struct PoolInner {
     /// permit outlives this borrow: it rides into the blocking task and is
     /// released only once the connection is back.
     permits: Arc<Semaphore>,
+    /// SQLite permits one writer at a time. Queue writers here instead of
+    /// making unrelated connections contend inside SQLite until busy_timeout.
+    writer: Arc<Semaphore>,
 }
 
 impl PoolInner {
@@ -687,21 +690,82 @@ impl SqlitePool {
                 path,
                 idle: Mutex::new(connections),
                 permits: Arc::new(Semaphore::new(POOL_SIZE)),
+                writer: Arc::new(Semaphore::new(1)),
             }),
             identity,
         };
-        pool.interact("sqlite.init_db", init_db)
+        pool.interact_write("sqlite.init_db", init_db)
             .await
             .map_err(|e| anyhow::anyhow!("failed to initialize schema for {what}: {e}"))?;
         Ok(pool)
     }
 
-    /// Run `f` against a connection held exclusively for the whole closure.
+    /// Run a read-only `f` against a connection held exclusively for the whole
+    /// closure.
     ///
     /// `f` runs on a blocking thread (rusqlite is synchronous), so it must own
-    /// its inputs — bind every parameter as an owned value. `op` names the
-    /// call-site and prefixes any error.
+    /// its inputs -- bind every parameter as an owned value. The query-only
+    /// guard makes an accidentally misclassified write fail rather than bypass
+    /// the process-wide writer queue. `op` names the call-site and prefixes
+    /// any error.
     pub(crate) async fn interact<F, T>(&self, op: &'static str, f: F) -> Result<T, StorageError>
+    where
+        F: FnOnce(&mut rusqlite::Connection) -> anyhow::Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.interact_inner(op, true, None, f).await
+    }
+
+    /// Run a mutating `f` after joining this pool's single-writer queue.
+    ///
+    /// The queue makes an in-process `SQLITE_BUSY` unreachable, so a `BUSY` that
+    /// still arrives here is by construction the *cross-process* case — a CLI
+    /// invocation writing the file a gateway is live on — which is exactly what
+    /// [`crate::retry`] exists for. Hence the retry wrapper on every write
+    /// rather than on a hand-picked few.
+    ///
+    /// `f` is `Fn`, not `FnOnce`, because a retry re-runs it. That is only sound
+    /// because a write closure is either a single statement or wraps its
+    /// statements in one transaction, so a retried attempt cannot double-apply
+    /// a half-finished one — `write_closures_are_retry_safe` guards the rule.
+    /// The writer permit is taken *inside* each attempt so the backoff does not
+    /// hold the queue shut against writers that would succeed.
+    pub(crate) async fn interact_write<F, T>(
+        &self,
+        op: &'static str,
+        f: F,
+    ) -> Result<T, StorageError>
+    where
+        F: Fn(&mut rusqlite::Connection) -> anyhow::Result<T> + Send + Sync + 'static,
+        T: Send + 'static,
+    {
+        let f = Arc::new(f);
+        crate::retry::retry_on_busy(op, || {
+            let f = Arc::clone(&f);
+            async move {
+                let writer = self
+                    .inner
+                    .writer
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|e| {
+                        StorageError::Internal(anyhow::anyhow!("{op}: writer queue: {e}"))
+                    })?;
+                self.interact_inner(op, false, Some(writer), move |conn| f(conn))
+                    .await
+            }
+        })
+        .await
+    }
+
+    async fn interact_inner<F, T>(
+        &self,
+        op: &'static str,
+        read_only: bool,
+        writer: Option<OwnedSemaphorePermit>,
+        f: F,
+    ) -> Result<T, StorageError>
     where
         F: FnOnce(&mut rusqlite::Connection) -> anyhow::Result<T> + Send + 'static,
         T: Send + 'static,
@@ -715,6 +779,7 @@ impl SqlitePool {
             .map_err(|e| StorageError::Internal(anyhow::anyhow!("{op}: pool checkout: {e}")))?;
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || {
+            let _writer = writer;
             // Moved in so it is released on the blocking thread, after the
             // connection is back in `idle` — a permit handed on while the
             // connection is still out would admit a caller with nothing to
@@ -723,8 +788,12 @@ impl SqlitePool {
             let mut conn = inner
                 .take()
                 .map_err(|e| StorageError::Internal(anyhow::anyhow!("{op}: {e}")))?;
-            let out =
-                f(&mut conn).map_err(|e| StorageError::Internal(anyhow::anyhow!("{op}: {e}")));
+            let result = if read_only {
+                interact_read_only(&mut conn, f)
+            } else {
+                f(&mut conn)
+            };
+            let out = result.map_err(|e| StorageError::Internal(anyhow::anyhow!("{op}: {e}")));
             inner.give_back(conn);
             out
         })
@@ -732,6 +801,25 @@ impl SqlitePool {
         // The closure panicked, so it never produced a result. Its connection
         // went with it rather than returning to the pool possibly mid-statement.
         .map_err(|e| StorageError::Internal(anyhow::anyhow!("{op}: {e}")))?
+    }
+}
+
+fn interact_read_only<F, T>(conn: &mut rusqlite::Connection, f: F) -> anyhow::Result<T>
+where
+    F: FnOnce(&mut rusqlite::Connection) -> anyhow::Result<T>,
+{
+    conn.pragma_update(None, "query_only", true)?;
+    let result = f(conn);
+    let reset = conn.pragma_update(None, "query_only", false);
+    match (result, reset) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(anyhow::anyhow!(
+            "failed to leave sqlite read-only checkout: {error}"
+        )),
+        (Err(error), Err(reset_error)) => Err(error.context(format!(
+            "also failed to leave sqlite read-only checkout: {reset_error}"
+        ))),
     }
 }
 
@@ -1823,7 +1911,7 @@ mod tests {
         let pool = SqlitePool::open(tmpdir.path().join("test.db"))
             .await
             .expect("open");
-        pool.interact("test.write", |conn| {
+        pool.interact_write("test.write", |conn| {
             conn.execute(
                 "INSERT INTO secrets (name, encrypted_value) VALUES ('k', x'01')",
                 [],
@@ -1859,7 +1947,7 @@ mod tests {
             tasks.push(tokio::spawn(async move {
                 for i in 0..25 {
                     let name = format!("k{w}-{i}");
-                    pool.interact("test.concurrent_write", move |conn| {
+                    pool.interact_write("test.concurrent_write", move |conn| {
                         conn.execute(
                             "INSERT INTO secrets (name, encrypted_value) VALUES (?1, x'01')",
                             rusqlite::params![name],
@@ -1884,6 +1972,149 @@ mod tests {
         assert_eq!(n, 200, "no writer was silently dropped");
     }
 
+    /// `interact_write` re-runs its closure on a `SQLITE_BUSY`, and in
+    /// autocommit mode each statement commits on its own — so a closure with
+    /// two bare writes can land the first, fail BUSY on the second, and
+    /// double-apply the first on the retry. Every write closure must therefore
+    /// issue at most one mutating statement or wrap them in one transaction.
+    ///
+    /// Checked against the source because the rule is about a shape the type
+    /// system cannot express, and the failure is silent: it needs cross-process
+    /// contention to show up at all, and then it corrupts rather than errors.
+    #[test]
+    fn write_closures_are_retry_safe() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sqlite");
+        let mut offenders = Vec::new();
+
+        for entry in std::fs::read_dir(&dir).expect("sqlite module dir") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("read source");
+            // Inline `mod tests` hand-writes throwaway schema surgery that no
+            // retry ever sees; the rule is about the production write surface.
+            let production = source.split("#[cfg(test)]").next().unwrap_or(&source);
+            let lines: Vec<&str> = production.lines().collect();
+
+            for (i, line) in lines.iter().enumerate() {
+                let Some(col) = line.find(".interact_write(") else {
+                    continue;
+                };
+                // Closure body: down to the first line no deeper than the call
+                // that closes it.
+                let mut body = String::new();
+                for next in &lines[i + 1..] {
+                    let indent = next.len() - next.trim_start().len();
+                    if !next.trim().is_empty() && indent <= col && next.contains("})") {
+                        break;
+                    }
+                    body.push_str(next);
+                    body.push('\n');
+                }
+                if body.contains(".transaction") || body.contains("tx.") {
+                    continue;
+                }
+                let writes = body.matches(".execute").count();
+                if writes > 1 {
+                    offenders.push(format!(
+                        "{}:{} — {writes} bare mutating statements, no transaction",
+                        path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+                        i + 1
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "retry-unsafe write closures (wrap them in one transaction): {offenders:#?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn write_checkouts_are_serialized_before_entering_sqlite() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .expect("open");
+        let start = Arc::new(tokio::sync::Barrier::new(9));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+
+        for writer_id in 0..8 {
+            let pool = pool.clone();
+            let start = start.clone();
+            let active = active.clone();
+            let peak = peak.clone();
+            tasks.push(tokio::spawn(async move {
+                start.wait().await;
+                pool.interact_write("test.writer_queue", move |conn| {
+                    let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now_active, Ordering::SeqCst);
+                    for _ in 0..1_000 {
+                        std::thread::yield_now();
+                    }
+                    conn.execute(
+                        "INSERT INTO secrets (name, encrypted_value) VALUES (?1, x'01')",
+                        rusqlite::params![format!("writer-{writer_id}")],
+                    )?;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await
+                .expect("queued write");
+            }));
+        }
+
+        start.wait().await;
+        for task in tasks {
+            task.await.expect("writer task");
+        }
+
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "only one write closure may enter SQLite at a time"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_checkout_rejects_writes_and_resets_the_connection() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .expect("open");
+
+        let error = pool
+            .interact("test.misclassified_write", |conn| {
+                conn.execute(
+                    "INSERT INTO secrets (name, encrypted_value) VALUES ('wrong-gate', x'01')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect_err("read checkout must reject a write");
+        assert!(
+            error.to_string().contains("readonly"),
+            "sqlite should identify the query-only refusal: {error}"
+        );
+
+        pool.interact_write("test.write_after_read_refusal", |conn| {
+            conn.execute(
+                "INSERT INTO secrets (name, encrypted_value) VALUES ('right-gate', x'01')",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("query_only must be reset before the connection is returned");
+    }
+
     /// An open pool must already hold every connection, leaving none to open
     /// lazily later.
     ///
@@ -1899,7 +2130,7 @@ mod tests {
             .expect("open");
 
         let verdicts = pool
-            .interact("test.classify", |conn| {
+            .interact_write("test.classify", |conn| {
                 conn.execute_batch(
                     "CREATE TABLE t (id TEXT PRIMARY KEY, uniq TEXT UNIQUE, needed TEXT NOT NULL,                      checked INTEGER CHECK (checked > 0));
                      INSERT INTO t VALUES ('a', 'a', 'x', 1);",
@@ -1978,7 +2209,7 @@ mod tests {
         let pool = SqlitePool::open(dir.path().join("t.db"))
             .await
             .expect("open");
-        pool.interact("test.init_db", init_db)
+        pool.interact_write("test.init_db", init_db)
             .await
             .expect("schema");
 
@@ -1988,7 +2219,7 @@ mod tests {
             agent: &'static str,
             settled: Option<i64>,
         ) -> Result<usize, StorageError> {
-            pool.interact("test.insert_run", move |conn| {
+            pool.interact_write("test.insert_run", move |conn| {
                 Ok(conn.execute(
                     "INSERT INTO issue_runs (id, issue_id, project_id, number, agent_id, \
                      trigger, status, attempt, created_at, settled_at) \
@@ -2007,7 +2238,7 @@ mod tests {
 
         // Now widen the card's slot, which is the change this index exists
         // to survive, and the per-agent guard must still hold.
-        pool.interact("test.widen", |conn| {
+        pool.interact_write("test.widen", |conn| {
             Ok(conn.execute_batch("DROP INDEX idx_issue_runs_live;")?)
         })
         .await
@@ -2082,7 +2313,7 @@ mod tests {
             let pool = pool.clone();
             tasks.push(tokio::spawn(async move {
                 let name = format!("k{w}");
-                pool.interact("test.after_panic", move |conn| {
+                pool.interact_write("test.after_panic", move |conn| {
                     conn.execute(
                         "INSERT INTO secrets (name, encrypted_value) VALUES (?1, x'01')",
                         rusqlite::params![name],
@@ -2114,7 +2345,7 @@ mod tests {
         let path = dir.path().join("t.db");
         let pool = SqlitePool::open(&path).await.expect("open");
         // Force a WAL write so the sidecars exist for the assertion below.
-        pool.interact("test.write", |conn| {
+        pool.interact_write("test.write", |conn| {
             Ok(conn.execute(
                 "INSERT INTO secrets (name, encrypted_value) VALUES ('k', x'00')",
                 [],
@@ -2173,7 +2404,7 @@ mod tests {
             definition: "TEXT NOT NULL DEFAULT 'seed'",
         };
 
-        pool.interact("test.migrate", move |conn| {
+        pool.interact_write("test.migrate", move |conn| {
             conn.execute("CREATE TABLE legacy (id INTEGER PRIMARY KEY)", [])?;
             conn.execute("INSERT INTO legacy (id) VALUES (1)", [])?;
 
@@ -2365,7 +2596,7 @@ mod tests {
         };
 
         let err = pool
-            .interact("test.migrate", move |conn| {
+            .interact_write("test.migrate", move |conn| {
                 migration
                     .apply(conn)
                     .map_err(|e| StorageError::Storage(e.to_string()))?;
@@ -2393,7 +2624,7 @@ mod tests {
 
         let plaintext = "b7f3c1d9e2a48605f1c3d7b9e0a2f4c68d1b3e5a7c9f0b2d4e6a8c0f2b4d6e81";
         let seed = plaintext.to_string();
-        pool.interact("test.seed", move |conn| {
+        pool.interact_write("test.seed", move |conn| {
             conn.execute(
                 "INSERT INTO devices
                    (device_id, device_pubkey, auth_token, status, created_at, approved_at)
@@ -2428,7 +2659,7 @@ mod tests {
         let b = SqlitePool::open(dir_b.path().join("test.db"))
             .await
             .expect("open b");
-        a.interact("test.write", |conn| {
+        a.interact_write("test.write", |conn| {
             conn.execute(
                 "INSERT INTO secrets (name, encrypted_value) VALUES ('k', x'01')",
                 [],

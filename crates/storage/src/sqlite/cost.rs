@@ -35,7 +35,7 @@ impl CostStore for SqliteCostStore {
         let cost_usd = record.cost_usd.into_micros();
         let timestamp = time::to_us(record.timestamp);
         self.pool
-            .interact("cost.record", move |conn| {
+            .interact_write("cost.record", move |conn| {
                 conn.execute(
                     "INSERT INTO cost_records \
                      (user_id, session_id, turn_id, span_id, reason, model, reasoning_effort, \

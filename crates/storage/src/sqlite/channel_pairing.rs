@@ -125,7 +125,7 @@ impl ChannelPairingStore for SqliteChannelPairingStore {
         // inbounds from the same user agree. Expired pending rows
         // get overwritten with the new code and a fresh expires_at.
         self.pool
-            .interact("channel_pairings.upsert_pending", move |conn| {
+            .interact_write("channel_pairings.upsert_pending", move |conn| {
                 conn.execute(
                     "INSERT INTO channel_pairings
                          (channel_type, bot_id, user_id, code, status,
@@ -187,7 +187,7 @@ impl ChannelPairingStore for SqliteChannelPairingStore {
         let code_owned = code.to_string();
         let affected = self
             .pool
-            .interact("channel_pairings.approve_by_code", move |conn| {
+            .interact_write("channel_pairings.approve_by_code", move |conn| {
                 Ok(conn.execute(
                     "UPDATE channel_pairings
                      SET status = 'approved',
@@ -251,7 +251,7 @@ impl ChannelPairingStore for SqliteChannelPairingStore {
         let bot_id = bot_id.to_string();
         let user_id = user_id.to_string();
         self.pool
-            .interact("channel_pairings.delete", move |conn| {
+            .interact_write("channel_pairings.delete", move |conn| {
                 conn.execute(
                     "DELETE FROM channel_pairings
                      WHERE channel_type = ?1 AND bot_id = ?2 AND user_id = ?3",
@@ -265,7 +265,7 @@ impl ChannelPairingStore for SqliteChannelPairingStore {
 
     async fn purge_expired(&self, now_secs: i64, approved_cutoff_secs: i64) -> Result<u64, String> {
         self.pool
-            .interact("channel_pairings.purge_expired", move |conn| {
+            .interact_write("channel_pairings.purge_expired", move |conn| {
                 let affected = conn.execute(
                     "DELETE FROM channel_pairings \
                      WHERE (status = 'pending' AND expires_at IS NOT NULL AND expires_at <= ?1) \

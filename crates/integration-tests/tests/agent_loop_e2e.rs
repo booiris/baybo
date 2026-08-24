@@ -74,6 +74,35 @@ impl RunningChild for LongRunningChild {
 }
 
 #[tokio::test(start_paused = true)]
+async fn transcript_append_failure_stops_before_the_llm_call() {
+    let mut harness = AgentTestHarness::builder().build();
+    let session_id = harness.session.id.clone();
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("must not run".into())]);
+    harness.memory_session_store.fail_appends(true);
+
+    harness.send_text("keep this durable").await.unwrap();
+    let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    assert!(
+        harness.stub_llm.captured_requests().is_empty(),
+        "the model must not run when its transcript input was not persisted"
+    );
+    assert!(
+        harness
+            .session_manager
+            .load_active_session_messages(&session_id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the failed row must not appear in the durable transcript"
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn clean_conversation_streams_text_then_final_message() {
     let mut harness = AgentTestHarness::builder().build();
     harness
@@ -3332,9 +3361,8 @@ async fn a_failed_recurring_fire_reports_a_real_notification_in_its_conversation
 /// preview. So nothing may be recorded as delivered — the ledger must stay
 /// unresolved so the boot re-drive retries it.
 ///
-/// The append returns `Option<i64>` and logs-and-swallows a store error, so
-/// treating `None` as success would silently mark the reminder delivered and
-/// then lose it. This pins that it doesn't.
+/// The append returns an error to the notification loop, which keeps its
+/// buffered retry and must not settle the ledger as delivered.
 #[tokio::test(start_paused = true)]
 async fn a_cron_notification_that_cannot_be_persisted_is_not_marked_delivered() {
     use baybo_model::{CronExecution, ExecutionOutcome, PendingCronResult};

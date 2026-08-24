@@ -1187,7 +1187,7 @@ async fn run_external_agent(
     // Persist the operator-supplied task up-front so the transcript
     // shows something even if the external agent crashes before
     // emitting its first event.
-    append_subagent_message(
+    if let Err(error) = append_subagent_message(
         &session_manager,
         &child_session_id,
         // The task is the parent agent's instruction to the subagent, not a
@@ -1196,7 +1196,19 @@ async fn run_external_agent(
         // same as the baybo-backend path's `append_spawned_prompt`).
         ChatMessage::subagent_seed(vec![ContentBlock::Text(request.task.clone())]),
     )
-    .await;
+    .await
+    {
+        return (
+            SubagentResult {
+                child_session_id,
+                final_content: None,
+                status: SubagentExitStatus::Failed {
+                    reason: format!("persist external agent task: {error}"),
+                },
+            },
+            None,
+        );
+    }
 
     let cancel = request.cancel.clone();
     let mut stream = match agent.run(request).await {
@@ -1260,7 +1272,14 @@ async fn run_external_agent(
                 }
             }
             Some(Ok(ExternalAgentEvent::Intermediate(msg))) => {
-                append_subagent_message(&session_manager, &child_session_id, msg).await;
+                if let Err(error) =
+                    append_subagent_message(&session_manager, &child_session_id, msg).await
+                {
+                    final_status = Some(SubagentExitStatus::Failed {
+                        reason: format!("persist external agent turn: {error}"),
+                    });
+                    break;
+                }
             }
             Some(Ok(ExternalAgentEvent::FinalContent(blocks))) => {
                 final_content = Some(blocks);
@@ -1309,19 +1328,13 @@ async fn append_subagent_message(
     session_manager: &Arc<baybo_session::SessionManager>,
     session_id: &SessionId,
     mut msg: ChatMessage,
-) {
+) -> anyhow::Result<()> {
     cap_external_agent_blocks(&mut msg);
-    if let Err(e) = session_manager
+    session_manager
         .append_session_message(session_id, &msg)
         .await
-    {
-        warn!(
-            session_id = %session_id,
-            role = ?msg.role,
-            error = %e,
-            "failed to persist external-agent turn to session_messages",
-        );
-    }
+        .map(|_| ())
+        .map_err(anyhow::Error::new)
 }
 
 /// Bound the text an external agent's turn writes into `session_messages`.
