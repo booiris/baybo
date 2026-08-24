@@ -129,6 +129,9 @@ type BayboGlobal = {
 declare global {
   interface Window {
     baybo: BayboGlobal;
+    /// The card page's inbound handler (src/issue/bridge.ts). Declared here
+    /// because a global interface may only be declared once per shape.
+    issuePage?: import("./issue/bridge").IssueGlobal;
     webkit?: {
       messageHandlers?: {
         baybo?: { postMessage(message: unknown): void };
@@ -147,6 +150,17 @@ export const hasNativeBridge = native !== undefined;
 function post(message: Record<string, unknown>): void {
   if (native) native.postMessage(message);
   else console.log("[baybo bridge]", message);
+}
+
+/// The raw channel, for a second page that rides the same `baybo` handler.
+///
+/// `src/issue/bridge.ts` uses it for the card page's own messages. It is
+/// exported rather than duplicated so both pages agree on the dev-console
+/// fallback and on which handler is the channel — an issue bridge that reached
+/// for `window.webkit` itself would silently post nowhere the day that name
+/// changes here.
+export function postToNative(message: Record<string, unknown>): void {
+  post(message);
 }
 
 // For fire-and-forget posts whose failure must never surface as a page error

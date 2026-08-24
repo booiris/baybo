@@ -1,0 +1,272 @@
+/* The card page. Reuses the transcript's tokens from styles.css — the two
+   surfaces sit under the same native chrome, and a second palette here would
+   show as a seam the moment a card is pushed off a board. */
+
+.issue-page {
+  height: 100dvh;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: 12px 20px 0;
+  box-sizing: border-box;
+  color: var(--ink);
+  background: var(--paper);
+}
+
+.issue-loading {
+  padding: 40px 20px;
+  text-align: center;
+  color: var(--ink-soft);
+  font-family: var(--mono);
+  font-size: 13px;
+}
+
+.issue-head h1 {
+  margin: 0 0 10px;
+  font-size: 20px;
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.issue-head h1.cancelled,
+.issue-subs .cancelled {
+  text-decoration: line-through;
+  color: var(--ink-soft);
+}
+
+.issue-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+
+.issue-chip {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-soft);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0 10px;
+  /* 32px, not the 44 a standalone control gets: these sit in a wrapping row
+     under a title, and a 44pt chip row would push the description off the
+     first screen. The row is scrollable and nothing here is destructive. */
+  min-height: 32px;
+  cursor: pointer;
+}
+
+.issue-chip.static {
+  cursor: default;
+}
+
+.issue-blocked {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  padding: 10px 12px;
+  margin-bottom: 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  font-size: 13px;
+}
+
+.issue-blocked-label {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+  white-space: nowrap;
+}
+
+.issue-run {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  margin-bottom: 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  font-size: 13px;
+}
+
+.issue-run-word,
+.issue-run-status {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+/* Red is the failure token and nothing else — a queued or held run is not a
+   broken one, and colouring them the same makes the board unreadable at a
+   glance, which is the one thing this row is for. */
+.issue-run-status.failed,
+.issue-run-error {
+  color: var(--err);
+}
+
+.issue-run-who {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-soft);
+}
+
+.issue-run-open,
+.issue-runs button,
+.issue-subs button,
+.issue-fold button {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink);
+  background: transparent;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  text-align: left;
+}
+
+.issue-run-open {
+  margin-left: auto;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0 10px;
+  min-height: 32px;
+}
+
+.issue-section {
+  margin: 0 0 22px;
+}
+
+.issue-section h2 {
+  margin: 0 0 8px;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  font-weight: 400;
+  color: var(--ink-soft);
+}
+
+.issue-count {
+  letter-spacing: 0;
+}
+
+.issue-empty {
+  margin: 0;
+  color: var(--ink-soft);
+  font-size: 13px;
+}
+
+.issue-editor {
+  width: 100%;
+  min-height: 200px;
+  box-sizing: border-box;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--paper);
+  color: var(--ink);
+  /* The editor shows the SOURCE, so it is monospaced — a proportional face
+     over raw markdown hides exactly the alignment the syntax depends on. */
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.55;
+  resize: none;
+}
+
+.issue-attachments {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.issue-subs,
+.issue-runs,
+.issue-activity {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.issue-subs li,
+.issue-runs li {
+  padding: 7px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.issue-subs button,
+.issue-runs button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 30px;
+  font-size: 13px;
+  font-family: inherit;
+}
+
+.issue-sub-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  border: 1px solid var(--ink-soft);
+  flex: none;
+}
+
+.issue-sub-dot.done {
+  background: var(--ink);
+  border-color: var(--ink);
+}
+
+.issue-run-attempt {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-soft);
+}
+
+.issue-run-error {
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.issue-entry {
+  padding: 8px 0;
+}
+
+.issue-entry.system {
+  color: var(--ink-soft);
+  font-size: 12px;
+}
+
+.issue-entry-head {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  margin-bottom: 2px;
+}
+
+.issue-entry-who {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-soft);
+}
+
+.issue-entry-time {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--ink-soft);
+  margin-left: auto;
+}
+
+.issue-fold {
+  padding: 6px 0;
+}
+
+.issue-fold button {
+  color: var(--ink-soft);
+  min-height: 32px;
+}
