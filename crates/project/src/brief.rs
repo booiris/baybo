@@ -28,6 +28,11 @@ pub(crate) enum BriefWindow {
     SinceItsLastRun(chrono::DateTime<chrono::Utc>),
 }
 
+/// What a run is told besides the card itself: which comments it has not
+/// read, and the standing facts about the checkout and the board it is
+/// working on. Not only comments, despite the name — a fact a run needs
+/// every time it starts belongs here rather than as another positional
+/// argument to [`issue_brief`].
 pub(crate) struct Said {
     window: BriefWindow,
     /// The checkout this run is handed was last worked in by another agent,
@@ -36,6 +41,14 @@ pub(crate) struct Said {
     /// by that agent's own last run and still arrives holding whatever the
     /// agent in between left behind.
     inherited_worktree: bool,
+    /// Whether this board's agents may land a card's branch themselves.
+    ///
+    /// Told to the run because the tool cannot tell it: the registry filters
+    /// tools by trigger, not by project, so `IssueMerge` is offered on every
+    /// board and only refuses once called. Without this sentence an agent on
+    /// a board that *does* merge has no way to learn that it may, and the
+    /// setting would change nothing at all.
+    board_merges: bool,
     comments: Vec<Comment>,
 }
 
@@ -80,6 +93,13 @@ fn properties_line(issue: &IssueRow, assignee: Option<&str>) -> String {
 const SAID_SINCE_LAST_RUN: &str = "\n\nSaid since your last run:\n";
 
 const SAID_ON_THE_CARD: &str = "\n\nSaid on the card so far:\n";
+
+const BOARD_MERGES: &str = r#"
+
+This board lands its own work. Once the card has been reviewed, merge its
+branch into the repository's own checkout with `IssueMerge` — nobody is
+waiting to do it for you, and a branch that is never merged is work that
+never shipped. Commit everything on the branch first."#;
 
 const INHERITED_WORKTREE: &str = r#"
 
@@ -232,6 +252,9 @@ pub(crate) fn issue_brief(
     if said.inherited_worktree {
         brief.push_str(INHERITED_WORKTREE);
     }
+    if said.board_merges {
+        brief.push_str(BOARD_MERGES);
+    }
     if !said.comments.is_empty() {
         brief.push_str(match said.window {
             BriefWindow::SinceItsLastRun(_) => SAID_SINCE_LAST_RUN,
@@ -375,6 +398,15 @@ pub(crate) async fn comments_for_brief(
     agents: &Arc<dyn AgentProfileStore>,
     run: &IssueRunRow,
 ) -> Said {
+    // A board that cannot be read is a board that does not merge: the
+    // permissive reading of a failed lookup would invite a run to write the
+    // repository's own trunk on the strength of an error.
+    let board_merges = store
+        .get_project(&run.project_id)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|project| project.agents_may_merge);
     let (window, inherited_worktree) = match store.list_runs(&run.issue_id).await {
         Ok(runs) => (brief_window(run, &runs), inherits_a_worktree(run, &runs)),
         Err(e) => {
@@ -382,6 +414,7 @@ pub(crate) async fn comments_for_brief(
             return Said {
                 window: BriefWindow::WholeCard,
                 inherited_worktree: false,
+                board_merges,
                 comments: Vec::new(),
             };
         }
@@ -400,6 +433,7 @@ pub(crate) async fn comments_for_brief(
     Said {
         window,
         inherited_worktree,
+        board_merges,
         comments,
     }
 }
@@ -550,6 +584,7 @@ mod tests {
                 window: BriefWindow::WholeCard,
                 inherited_worktree: false,
                 comments: Vec::new(),
+                board_merges: false,
             },
             RunTrigger::Started,
             Some("@parser-engineer"),
@@ -570,6 +605,7 @@ mod tests {
                 window: BriefWindow::WholeCard,
                 inherited_worktree: false,
                 comments: Vec::new(),
+                board_merges: false,
             },
             RunTrigger::Started,
             None,
@@ -577,6 +613,38 @@ mod tests {
         assert!(brief.contains(UNASSIGNED), "{brief}");
         assert!(!brief.contains(PRIORITY_LABEL), "{brief}");
         assert!(!brief.contains(BRANCH_LABEL), "{brief}");
+    }
+
+    /// The setting is invisible to the agent without this sentence: the tool
+    /// registry filters by trigger, not by project, so `IssueMerge` is
+    /// offered on every board and a run has no other way to learn that its
+    /// own board is one that lands its work.
+    #[test]
+    fn only_a_board_that_merges_is_told_to_merge_and_it_is_told_which_tool() {
+        let issue = card();
+        let says = |board_merges| {
+            issue_brief(
+                &issue,
+                &Said {
+                    window: BriefWindow::WholeCard,
+                    inherited_worktree: false,
+                    comments: Vec::new(),
+                    board_merges,
+                },
+                RunTrigger::Started,
+                None,
+            )
+        };
+        let merging = says(true);
+        assert!(merging.contains(BOARD_MERGES), "{merging}");
+        assert!(
+            merging.contains("IssueMerge"),
+            "an invitation that does not name the door is one the run cannot take: {merging}"
+        );
+        assert!(
+            !says(false).contains("IssueMerge"),
+            "a board that does not merge must not invite it"
+        );
     }
 
     #[test]
@@ -594,6 +662,7 @@ mod tests {
                 window: BriefWindow::WholeCard,
                 inherited_worktree: false,
                 comments: vec![said(actors::OPERATOR, "start with the CSV path")],
+                board_merges: false,
             },
             RunTrigger::Started,
             None,
@@ -627,6 +696,7 @@ mod tests {
                 window: BriefWindow::SinceItsLastRun(first.created_at),
                 inherited_worktree: false,
                 comments: vec![said(actors::OPERATOR, "also handle the empty case")],
+                board_merges: false,
             },
             RunTrigger::Started,
             None,
@@ -743,6 +813,7 @@ mod tests {
                     said(actors::OPERATOR, "start with the CSV path"),
                     said("@dev-1", "also handle the empty case"),
                 ],
+                board_merges: false,
             },
             RunTrigger::Started,
             None,
@@ -786,6 +857,7 @@ mod tests {
                 window: BriefWindow::SinceItsLastRun(first.created_at),
                 inherited_worktree: true,
                 comments: Vec::new(),
+                board_merges: false,
             },
             RunTrigger::Started,
             None,
@@ -831,6 +903,7 @@ mod tests {
                 window: BriefWindow::WholeCard,
                 inherited_worktree: false,
                 comments,
+                board_merges: false,
             },
             RunTrigger::Started,
             None,
@@ -867,6 +940,7 @@ mod tests {
                     said(actors::OPERATOR, "start with the CSV path"),
                     said("@qa", "also handle the empty case"),
                 ],
+                board_merges: false,
             },
             RunTrigger::Started,
             None,
@@ -890,6 +964,7 @@ mod tests {
                     said("@dev-1", "not yet — doing that now"),
                     said(actors::BOARD, "held the run: the project is out of budget"),
                 ],
+                board_merges: false,
             },
             RunTrigger::Started,
             None,
@@ -923,6 +998,7 @@ mod tests {
                     ),
                     said("@qa", "agreed"),
                 ],
+                board_merges: false,
             },
             RunTrigger::Started,
             None,
@@ -940,6 +1016,7 @@ mod tests {
             window: BriefWindow::WholeCard,
             inherited_worktree: false,
             comments,
+            board_merges: false,
         }
     }
 
@@ -1080,6 +1157,7 @@ mod tests {
             window: BriefWindow::SinceItsLastRun(issue.updated_at + Duration::seconds(1)),
             inherited_worktree: false,
             comments: Vec::new(),
+            board_merges: false,
         };
         assert!(
             delivered(&issue, &follow_up).is_empty(),
@@ -1102,6 +1180,7 @@ mod tests {
             window: BriefWindow::SinceItsLastRun(issue.updated_at - Duration::seconds(1)),
             inherited_worktree: false,
             comments: Vec::new(),
+            board_merges: false,
         };
         assert_eq!(delivered(&issue, &after_an_edit).len(), 1);
     }

@@ -4323,10 +4323,15 @@
                           "description",
                           "workdir",
                           "max_parallel_issue_runs",
+                          "agents_may_merge",
                           "created_at_ms",
                           "updated_at_ms"
                         ],
                         "properties": {
+                          "agents_may_merge": {
+                            "type": "boolean",
+                            "description": "Whether this board's agents may land a card's branch in the\nrepository's own checkout, through `IssueMerge`. Always serialised:\na board that merges its own work is a thing an operator must be able\nto see without inferring it from a missing field."
+                          },
                           "archived_at_ms": {
                             "type": [
                               "integer",
@@ -9892,6 +9897,38 @@
           {
             "type": "object",
             "required": [
+              "branch",
+              "into",
+              "commit",
+              "commits",
+              "kind"
+            ],
+            "properties": {
+              "branch": {
+                "type": "string"
+              },
+              "commit": {
+                "type": "string"
+              },
+              "commits": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "into": {
+                "type": "string",
+                "description": "The branch it landed on — the repository's own checkout may be\nparked somewhere other than its trunk, so the card names where."
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "branch_merged"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
               "branch_deleted",
               "kind"
             ],
@@ -10894,10 +10931,15 @@
           "description",
           "workdir",
           "max_parallel_issue_runs",
+          "agents_may_merge",
           "created_at_ms",
           "updated_at_ms"
         ],
         "properties": {
+          "agents_may_merge": {
+            "type": "boolean",
+            "description": "Whether this board's agents may land a card's branch in the\nrepository's own checkout, through `IssueMerge`. Always serialised:\na board that merges its own work is a thing an operator must be able\nto see without inferring it from a missing field."
+          },
           "archived_at_ms": {
             "type": [
               "integer",
@@ -11971,6 +12013,10 @@
           "name"
         ],
         "properties": {
+          "agents_may_merge": {
+            "type": "boolean",
+            "description": "Whether this board's agents may merge a card's branch into the\nrepository's own checkout. Full-replace like every other field here,\nand worth saying plainly because this one is a `bool`: a client that\nomits it turns merging **off**."
+          },
           "daily_budget_micros": {
             "type": [
               "integer",

@@ -1401,6 +1401,7 @@ mod tests {
                 archived_at: None,
                 created_at: now,
                 updated_at: now,
+                agents_may_merge: false,
             })
             .await
             .expect("project");

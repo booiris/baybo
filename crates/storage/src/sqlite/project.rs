@@ -75,8 +75,12 @@ fn event_from_raw(raw: RawEvent) -> Result<IssueEventRow> {
     })
 }
 
+/// The projection order **is** [`RawProject`]'s tuple order, and nothing
+/// links the two at compile time. A new column goes on the end, always —
+/// see [`ISSUE_COLUMNS`] for what inserting one mid-list does.
 const PROJECT_COLUMNS: &str = "id, name, description, workdir, daily_budget_micros, \
-     daily_budget_tokens, max_parallel_issue_runs, archived_at, created_at, updated_at";
+     daily_budget_tokens, max_parallel_issue_runs, archived_at, created_at, updated_at, \
+     agents_may_merge";
 
 /// The projection order **is** [`RawIssue`]'s tuple order, and nothing links
 /// the two at compile time. A new column goes on the end, always: inserting
@@ -299,6 +303,7 @@ type RawProject = (
     Option<i64>,
     i64,
     i64,
+    Option<i64>,
 );
 
 type RawIssue = (
@@ -336,6 +341,7 @@ fn read_raw_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawProject> {
         row.get(7)?,
         row.get(8)?,
         row.get(9)?,
+        row.get(10)?,
     ))
 }
 
@@ -393,6 +399,7 @@ fn project_from_raw(raw: RawProject) -> Result<ProjectRow> {
         archived_at,
         created_at,
         updated_at,
+        agents_may_merge,
     ) = raw;
     Ok(ProjectRow {
         // A stored id runs the grammar again on the way out: the row is the
@@ -409,6 +416,11 @@ fn project_from_raw(raw: RawProject) -> Result<ProjectRow> {
         max_parallel_issue_runs: max_parallel_issue_runs
             .and_then(|n| usize::try_from(n).ok())
             .unwrap_or(baybo_store::project::DEFAULT_MAX_PARALLEL_ISSUE_RUNS),
+        // NULL is the same "written before the column existed" as above, and
+        // the same answer a board opened today starts with.
+        agents_may_merge: agents_may_merge
+            .map(|n| n != 0)
+            .unwrap_or(baybo_store::project::DEFAULT_AGENTS_MAY_MERGE),
         archived_at: ts_opt("projects.archived_at", archived_at)?,
         created_at: ts("projects.created_at", created_at)?,
         updated_at: ts("projects.updated_at", updated_at)?,
@@ -525,6 +537,7 @@ impl ProjectStore for SqliteProjectStore {
         let daily_budget_tokens = row.daily_budget_tokens;
         let max_parallel_issue_runs =
             i64::try_from(row.max_parallel_issue_runs).unwrap_or(i64::MAX);
+        let agents_may_merge = i64::from(row.agents_may_merge);
         let created_at = super::time::to_us(row.created_at);
         let updated_at = super::time::to_us(row.updated_at);
         self.pool
@@ -532,9 +545,9 @@ impl ProjectStore for SqliteProjectStore {
                 conn.execute(
                     "INSERT INTO projects \
                      (id, name, description, workdir, daily_budget_micros, \
-                      daily_budget_tokens, max_parallel_issue_runs, archived_at, \
-                      created_at, updated_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9)",
+                      daily_budget_tokens, max_parallel_issue_runs, agents_may_merge, \
+                      archived_at, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10)",
                     rusqlite::params![
                         id,
                         name,
@@ -543,6 +556,7 @@ impl ProjectStore for SqliteProjectStore {
                         daily_budget,
                         daily_budget_tokens,
                         max_parallel_issue_runs,
+                        agents_may_merge,
                         created_at,
                         updated_at
                     ],
@@ -560,6 +574,7 @@ impl ProjectStore for SqliteProjectStore {
         let daily_budget_tokens = update.daily_budget_tokens;
         let max_parallel_issue_runs =
             i64::try_from(update.max_parallel_issue_runs).unwrap_or(i64::MAX);
+        let agents_may_merge = i64::from(update.agents_may_merge);
         let now = super::time::now_us();
         let affected = self
             .pool
@@ -567,7 +582,8 @@ impl ProjectStore for SqliteProjectStore {
                 Ok(conn.execute(
                     "UPDATE projects SET name = ?2, description = ?3, \
                      daily_budget_micros = ?4, daily_budget_tokens = ?5, \
-                     max_parallel_issue_runs = ?6, updated_at = ?7 \
+                     max_parallel_issue_runs = ?6, agents_may_merge = ?7, \
+                     updated_at = ?8 \
                      WHERE id = ?1",
                     rusqlite::params![
                         id,
@@ -576,6 +592,7 @@ impl ProjectStore for SqliteProjectStore {
                         daily_budget,
                         daily_budget_tokens,
                         max_parallel_issue_runs,
+                        agents_may_merge,
                         now
                     ],
                 )?)
@@ -1714,6 +1731,7 @@ mod tests {
             archived_at: None,
             created_at: now,
             updated_at: now,
+            agents_may_merge: false,
         }
     }
 
@@ -1991,6 +2009,7 @@ mod tests {
                         daily_budget: None,
                         daily_budget_tokens: None,
                         max_parallel_issue_runs: DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
+                        agents_may_merge: false,
                     }
                 )
                 .await

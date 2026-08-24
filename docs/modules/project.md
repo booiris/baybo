@@ -51,11 +51,11 @@ every door leads through it.
 | `driver.rs` | Which Todo cards the board starts by itself, in what order, and which cards the lead is asked about (staffing, review, stalled work, blocks, the Backlog the board filed) |
 | `budget.rs` | `Headroom` and the UTC-day window a daily ceiling measures |
 | `timeline.rs` | `diff_events` — an edit reduced to the entries worth writing |
-| `worktree.rs` | The per-issue git worktree: create, branch, resolve the commit identity, reclaim |
+| `worktree.rs` | The per-issue git worktree: create, branch, resolve the commit identity, merge, reclaim |
 | `approvals.rs` | `TimelineApprovalGate` — a run's approval prompts, on the card |
 | `events.rs` | The `ProjectEvents` push port (the gateway implements it) |
 | `stopper.rs` | The `IssueRunStopper` port — interrupt the turn under a live run — and the `TurnLifecycle` adapter a real assembly hands it |
-| `tools/` | The six board tools an agent working a project can call |
+| `tools/` | The seven board tools an agent working a project can call |
 
 Everything under `runs`/`comments`/`mentions`/`stages`/`budget`/`timeline`/`driver`
 is a **pure rule module**: no store, no clock beyond an argument, unit-tested in
@@ -1057,7 +1057,9 @@ Three details that are easy to get wrong and are pinned by tests:
   --delete` agrees — two independent readings, because it is the one step that
   cannot be undone. `commits_ahead` returning `None` means git could not answer,
   which is never read as zero. A branch that still carries work is the
-  deliverable: baybo does not merge, the operator decides.
+  deliverable on a board whose `agents_may_merge` is off; on one where it is
+  on, an agent may have landed it already through `IssueMerge`, in which
+  case the branch counts zero ahead and reclamation drops it here.
 
 **A run's commits stay the operator's.** An issue run is credited in the
 message, not in the authorship: `BashTool` appends a
@@ -1315,9 +1317,9 @@ arriving as a bare "cancelled" — which is exactly the blank a lead fills in wi
 a guess. A person's own stop still carries no note: they know why they pressed
 it.
 
-**The branch is the one artefact a board hands over**, since it never merges, so
-`record_branch` is written to survive the awkward order rather than assume a
-tidy one. It reads the checkout's *own* branch, so a retitle mid-run cannot
+**The branch is the artefact a board hands over** when it does not land its
+own work, so `record_branch` is written to survive the awkward order rather
+than assume a tidy one. It reads the checkout's *own* branch, so a retitle mid-run cannot
 rename a ref git already knows; and when the checkout is gone it falls back to
 the name the tree was cut with, so a card finished *before* its run settled —
 which reclaims the tree — still surfaces one. `commits_ahead` is then asked of
@@ -1697,10 +1699,18 @@ already cancelled.
 
 ### Tools
 
-Six tools an agent working a board can call: `IssueList`, `IssueGet`,
-`IssueCreate`, `IssueUpdate`, `IssueComment`, `ProjectAgentCreate`. Hosted here
-rather than in `baybo-tools`, like `cron`/`skills`/`subagent`/`task` — a crate
-that owns a domain hosts its own `Tool` impls.
+Seven tools an agent working a board can call: `IssueList`, `IssueGet`,
+`IssueCreate`, `IssueUpdate`, `IssueComment`, `IssueMerge`,
+`ProjectAgentCreate`. Hosted here rather than in `baybo-tools`, like
+`cron`/`skills`/`subagent`/`task` — a crate that owns a domain hosts its own
+`Tool` impls.
+
+`IssueMerge` is the one whose availability does not match its usefulness.
+The registry filters tools by trigger, not by project, so it is offered on
+every board and refuses at `execute` where `agents_may_merge` is off — which
+is why its description says so outright, and why the run brief tells a board
+that *does* merge that it may. Without that sentence the setting would change
+nothing an agent could act on.
 
 **None of them takes a `project_id`.** The board comes from the calling
 session's `TriggerSource`, which is the entire security model: a tool that
@@ -1801,6 +1811,15 @@ signal would refetch every column to learn that somebody said something.
 - **A project's workdir may not overlap baybo's workspace**, in either
   direction, checked after canonicalisation because the sandbox resolves
   symlinks when it mounts. `work/` is the single exemption.
-- **The board never merges.** A branch with commits outlives its card; what
-  happens to it is the operator's decision, and asking an assignee to merge is
-  an ordinary comment on a live card.
+- **The board merges only where it was told to, and only through one door.**
+  `agents_may_merge` is off by default, and then a branch with commits
+  outlives its card: what happens to it is the operator's decision, and
+  asking an assignee to merge is an ordinary comment on a live card. Where it
+  is on, `merge_issue_branch` is the whole write surface —
+  no other caller runs `git merge`, and the tool is its only agent-facing
+  door. **It is not a lock.** A run carries `Bash` and a writable checkout,
+  and `git merge` is not a destructive command, so the flag decides whether
+  the board *invites* a merge and whether the door opens; it cannot stop an
+  agent that shells out. Making it a lock would mean gating `git merge`
+  behind approval in every session, which on an unattended board is a run
+  that parks forever.

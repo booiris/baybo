@@ -5,6 +5,7 @@ mod issue_comment;
 mod issue_create;
 mod issue_get;
 mod issue_list;
+mod issue_merge;
 mod issue_update;
 
 use std::sync::Arc;
@@ -22,6 +23,7 @@ pub use issue_comment::ISSUE_COMMENT_TOOL_NAME;
 pub use issue_create::ISSUE_CREATE_TOOL_NAME;
 pub use issue_get::ISSUE_GET_TOOL_NAME;
 pub use issue_list::ISSUE_LIST_TOOL_NAME;
+pub use issue_merge::ISSUE_MERGE_TOOL_NAME;
 pub use issue_update::ISSUE_UPDATE_TOOL_NAME;
 
 /// Every board tool with its manifest, ready to register.
@@ -32,6 +34,7 @@ pub fn agent_tools(manager: Arc<ProjectManager>) -> Vec<(Arc<dyn Tool>, ToolMani
         Arc::new(issue_create::IssueCreateTool::new(Arc::clone(&manager))),
         Arc::new(issue_update::IssueUpdateTool::new(Arc::clone(&manager))),
         Arc::new(issue_comment::IssueCommentTool::new(Arc::clone(&manager))),
+        Arc::new(issue_merge::IssueMergeTool::new(Arc::clone(&manager))),
         Arc::new(agent_create::ProjectAgentCreateTool::new(manager)),
     ];
     tools

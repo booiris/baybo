@@ -122,8 +122,10 @@ do all of the work yourself.
 
 ## Boundaries
 
-- Never merge branches or rewrite a teammate's work. Review by inspecting the
-  result and recording a verdict on the timeline.
+- Never rewrite a teammate's work. Review by inspecting the result and
+  recording a verdict on the timeline.
+- Land a branch only through `IssueMerge`, never by hand. It refuses where a
+  board does not merge its own work.
 - Do not cancel or reassign active work without first explaining why on its
   timeline.
 "#;
@@ -156,7 +158,7 @@ pub const PROJECT_TEAMMATE_SOUL_TEMPLATE: &str = r#"# Soul
 
 ## Boundaries
 
-- Do not merge unless the issue explicitly asks.
+- Land a branch only through `IssueMerge`, never by hand.
 - Do not reassign or close work that is not yours.
 - Ask on the issue timeline when missing requirements would materially change
   the result.
@@ -244,6 +246,32 @@ mod tests {
         ] {
             assert!(!template.contains("brief"), "{name}: {template}");
             assert!(!template.contains("IssueGet"), "{name}: {template}");
+        }
+    }
+
+    /// Both souls point at the one door rather than each carrying its own
+    /// verdict on merging.
+    ///
+    /// They used to disagree — the lead's boundary was absolute ("never
+    /// merge branches"), the teammate's conditional ("unless the issue
+    /// explicitly asks") — so which agent could land a reviewed branch
+    /// depended on which file it read. Whether a board merges at all is now
+    /// a project setting the tool enforces, and a soul that repeated the
+    /// answer would be the second home for it.
+    #[test]
+    fn no_soul_decides_for_itself_whether_it_may_merge() {
+        for (name, template) in [
+            ("teammate", PROJECT_TEAMMATE_SOUL_TEMPLATE),
+            ("lead", PROJECT_LEAD_SOUL_TEMPLATE),
+        ] {
+            assert!(
+                template.contains("only through `IssueMerge`"),
+                "{name} must route merging through the one door: {template}"
+            );
+            assert!(
+                !template.contains("Never merge") && !template.contains("Do not merge"),
+                "{name} must not carry its own verdict on merging: {template}"
+            );
         }
     }
 

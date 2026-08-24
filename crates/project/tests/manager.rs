@@ -121,6 +121,7 @@ fn driven_project(name: &str) -> NewProject {
         daily_budget: None,
         daily_budget_tokens: None,
         max_parallel_issue_runs: None,
+        agents_may_merge: false,
     }
 }
 
@@ -250,6 +251,284 @@ async fn the_lead_can_be_assigned_work() {
         .into_issue();
     assert_eq!(issue.assignee, Some(lead));
     assert_eq!(f.dispatched.lock().len(), 1, "and starting it runs");
+}
+
+/// A board with a real repository behind it, one card in Review, and a
+/// branch with a commit on it waiting to land.
+async fn board_with_a_branch_to_land(
+    f: &Fixture,
+    agents_may_merge: bool,
+) -> (ProjectRow, IssueRow) {
+    let project = f
+        .manager
+        .create_project(NewProject {
+            agents_may_merge,
+            ..new_project("Landing")
+        })
+        .await
+        .expect("project");
+    let repo = std::path::PathBuf::from(&project.workdir);
+    // The materialised workdir is `git init`-fresh, and git refuses to merge
+    // into an empty head, so the trunk needs its first commit.
+    write_and_commit(&repo, "base.txt", "base").await;
+
+    let issue = f
+        .manager
+        .create_issue(
+            &project.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::Review,
+                ..new_issue("land me")
+            },
+        )
+        .await
+        .expect("issue")
+        .into_issue();
+
+    let root = baybo_project::worktree::worktree_root(&f.paths, &project.id, issue.number);
+    let branch = baybo_project::worktree::branch_name(issue.number, &issue.title);
+    baybo_project::worktree::ensure(&repo, &root, &branch)
+        .await
+        .expect("worktree");
+    write_and_commit(&root, "done.txt", "the work").await;
+    (project, issue)
+}
+
+async fn write_and_commit(dir: &std::path::Path, name: &str, body: &str) {
+    tokio::fs::write(dir.join(name), body).await.expect("write");
+    for args in [
+        vec!["add", "--all"],
+        vec![
+            "-c",
+            "user.email=t@example.invalid",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--quiet",
+            "-m",
+            "work",
+        ],
+    ] {
+        let out = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(&args)
+            .output()
+            .await
+            .expect("git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_board_that_does_not_merge_refuses_and_says_the_branch_is_the_handover() {
+    let f = fixture().await;
+    let (project, issue) = board_with_a_branch_to_land(&f, false).await;
+
+    let merged = f
+        .manager
+        .merge_issue_branch(&project.id, issue.number, IssueActor::User)
+        .await
+        .expect("a refusal is an answer, not an error");
+    let baybo_project::worktree::Merged::Refused { reason, .. } = merged else {
+        panic!("a board with the setting off must refuse: {merged:?}");
+    };
+    assert!(
+        reason.contains("do not merge"),
+        "the refusal has to read as policy, not breakage: {reason}"
+    );
+    assert!(
+        f.store
+            .list_events(&issue.id)
+            .await
+            .expect("timeline")
+            .iter()
+            .all(|e| !matches!(e.body, IssueEventBody::BranchMerged { .. })),
+        "a refusal writes nothing to the card"
+    );
+}
+
+/// The flag removes the person who used to run the merge; it does not
+/// remove the review the board already does.
+#[tokio::test]
+async fn a_card_nobody_has_looked_at_is_not_merged_even_on_a_merging_board() {
+    let f = fixture().await;
+    let (project, issue) = board_with_a_branch_to_land(&f, true).await;
+    f.manager
+        .move_issue(
+            &project.id,
+            issue.number,
+            IssueActor::User,
+            IssueStatus::Todo,
+            &[issue.number],
+        )
+        .await
+        .expect("back to todo");
+
+    let merged = f
+        .manager
+        .merge_issue_branch(&project.id, issue.number, IssueActor::User)
+        .await
+        .expect("refusal");
+    assert!(
+        matches!(&merged, baybo_project::worktree::Merged::Refused { reason, .. }
+            if reason.contains("review")),
+        "an unreviewed card must be told to go through review: {merged:?}"
+    );
+}
+
+#[tokio::test]
+async fn landing_a_branch_records_it_on_the_card_and_says_where_it_went() {
+    let f = fixture().await;
+    let (project, issue) = board_with_a_branch_to_land(&f, true).await;
+    assert_eq!(issue.branch, None, "nothing has recorded a branch yet");
+
+    let merged = f
+        .manager
+        .merge_issue_branch(&project.id, issue.number, IssueActor::User)
+        .await
+        .expect("merge");
+    let baybo_project::worktree::Merged::Landed { into, commits, .. } = merged else {
+        panic!("expected a landing: {merged:?}");
+    };
+    assert_eq!(commits, 1);
+
+    // Recorded *before* the merge on purpose: a merged branch is zero
+    // commits ahead, and `record_branch`'s guard would then never record it,
+    // leaving the card naming no branch at all right after landing one.
+    let after = f
+        .manager
+        .get_issue(&project.id, issue.number)
+        .await
+        .expect("issue");
+    assert_eq!(
+        after.branch.as_deref(),
+        Some(baybo_project::worktree::branch_name(issue.number, &issue.title).as_str()),
+        "the card must still name the branch it landed"
+    );
+
+    let landed = f
+        .store
+        .list_events(&issue.id)
+        .await
+        .expect("timeline")
+        .into_iter()
+        .find_map(|e| match e.body {
+            IssueEventBody::BranchMerged { into, commits, .. } => Some((into, commits)),
+            _ => None,
+        })
+        .expect("the timeline records the landing");
+    assert_eq!(landed, (into, commits));
+}
+
+/// Done is the one column the board cannot start a run in — a comment there
+/// wakes nobody, no status change triggers one, and the retry button refuses
+/// outright — so the only merge a Done card can get is one made in the same
+/// turn that closed it. That turn runs *after* reclamation has taken the
+/// worktree, which is why this path is worth pinning: everything the merge
+/// needs has to survive the checkout being gone.
+#[tokio::test]
+async fn a_card_closed_in_the_same_turn_can_still_land_its_branch() {
+    let f = fixture().await;
+    let (project, issue) = board_with_a_branch_to_land(&f, true).await;
+    let root = baybo_project::worktree::worktree_root(&f.paths, &project.id, issue.number);
+
+    f.manager
+        .move_issue(
+            &project.id,
+            issue.number,
+            IssueActor::User,
+            IssueStatus::Done,
+            &[issue.number],
+        )
+        .await
+        .expect("close it");
+    assert!(
+        !root.exists(),
+        "reclamation runs on the way into Done, so the checkout is gone by now"
+    );
+
+    let merged = f
+        .manager
+        .merge_issue_branch(&project.id, issue.number, IssueActor::User)
+        .await
+        .expect("merge");
+    assert!(
+        matches!(merged, baybo_project::worktree::Merged::Landed { .. }),
+        "a reclaimed checkout must not stop the branch it left behind from landing: {merged:?}"
+    );
+}
+
+/// Both halves are needed for this to bite, which is why they are in one
+/// test: `branch_worked_on` reads the live checkout's own branch and only
+/// falls back to re-deriving the name from the card's *current* title once
+/// that checkout is gone. Close the card (reclamation takes the tree),
+/// retitle it, and the fallback names a ref that never existed — while the
+/// branch the card recorded is the one git actually knows.
+#[tokio::test]
+async fn a_retitled_card_lands_the_branch_it_recorded_not_one_named_after_the_new_title() {
+    let f = fixture().await;
+    let (project, issue) = board_with_a_branch_to_land(&f, true).await;
+    let cut_as = baybo_project::worktree::branch_name(issue.number, &issue.title);
+
+    // What a run's settle would have recorded, before anyone retitles.
+    f.store
+        .set_issue_branch(&issue.id, &cut_as)
+        .await
+        .expect("record the branch");
+    f.manager
+        .move_issue(
+            &project.id,
+            issue.number,
+            IssueActor::User,
+            IssueStatus::Done,
+            &[issue.number],
+        )
+        .await
+        .expect("close it, which reclaims the checkout");
+    f.manager
+        .update_issue(
+            &project.id,
+            issue.number,
+            IssueActor::User,
+            IssueUpdate {
+                title: Some("something else entirely".to_owned()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("retitle");
+
+    let merged = f
+        .manager
+        .merge_issue_branch(&project.id, issue.number, IssueActor::User)
+        .await
+        .expect("merge");
+    assert!(
+        matches!(merged, baybo_project::worktree::Merged::Landed { .. }),
+        "the recorded branch is the one git knows: {merged:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_archived_board_does_not_merge() {
+    let f = fixture().await;
+    let (project, issue) = board_with_a_branch_to_land(&f, true).await;
+    f.manager
+        .set_project_archived(&project.id, true)
+        .await
+        .expect("archive");
+    assert!(
+        matches!(
+            f.manager
+                .merge_issue_branch(&project.id, issue.number, IssueActor::User)
+                .await,
+            Err(ProjectError::Archived(_))
+        ),
+        "an archived board is read-only, merging included"
+    );
 }
 
 fn new_member(name: &str) -> baybo_project::NewTeamMember {
@@ -688,6 +967,7 @@ async fn an_archived_project_is_read_only() {
                 daily_budget: None,
                 daily_budget_tokens: None,
                 max_parallel_issue_runs: DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
+                agents_may_merge: false,
             },
         )
         .await
@@ -2657,6 +2937,7 @@ async fn a_hold_on_a_cancelled_card_is_called_off_even_on_a_stopped_board() {
                 daily_budget: Some(baybo_model::MicroUsd::ZERO),
                 daily_budget_tokens: None,
                 max_parallel_issue_runs: 0,
+                agents_may_merge: false,
             },
         )
         .await
@@ -2713,6 +2994,7 @@ async fn a_raised_budget_releases_what_it_was_holding() {
                 daily_budget: Some(baybo_model::MicroUsd::from_micros(5_000_000)),
                 daily_budget_tokens: None,
                 max_parallel_issue_runs: DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
+                agents_may_merge: false,
             },
         )
         .await
@@ -2786,6 +3068,7 @@ async fn the_next_enqueue_releases_a_hold_the_budget_no_longer_justifies() {
                 daily_budget: Some(baybo_model::MicroUsd::from_micros(5_000_000)),
                 daily_budget_tokens: None,
                 max_parallel_issue_runs: DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
+                agents_may_merge: false,
             },
         )
         .await
@@ -2867,6 +3150,7 @@ async fn touching_the_held_card_itself_releases_it() {
                 daily_budget: Some(baybo_model::MicroUsd::from_micros(5_000_000)),
                 daily_budget_tokens: None,
                 max_parallel_issue_runs: DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
+                agents_may_merge: false,
             },
         )
         .await
@@ -2903,6 +3187,7 @@ async fn a_negative_budget_is_refused() {
                 daily_budget: Some(baybo_model::MicroUsd::from_micros(-1)),
                 daily_budget_tokens: None,
                 max_parallel_issue_runs: DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
+                agents_may_merge: false,
             },
         )
         .await
@@ -2976,6 +3261,7 @@ async fn a_released_hold_never_lands_on_a_card_the_board_has_finished_with() {
                     daily_budget: Some(baybo_model::MicroUsd::from_micros(5_000_000)),
                     daily_budget_tokens: None,
                     max_parallel_issue_runs: DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
+                    agents_may_merge: false,
                 },
             )
             .await
@@ -3189,6 +3475,7 @@ async fn raising_the_ceiling_that_was_not_the_reason_releases_nothing() {
                 daily_budget: Some(baybo_model::MicroUsd::from_micros(500_000_000)),
                 daily_budget_tokens: Some(0),
                 max_parallel_issue_runs: DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
+                agents_may_merge: false,
             },
         )
         .await
@@ -3211,6 +3498,7 @@ async fn raising_the_ceiling_that_was_not_the_reason_releases_nothing() {
                 daily_budget: Some(baybo_model::MicroUsd::from_micros(500_000_000)),
                 daily_budget_tokens: Some(1_000_000),
                 max_parallel_issue_runs: DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
+                agents_may_merge: false,
             },
         )
         .await
@@ -3323,6 +3611,7 @@ async fn a_negative_token_ceiling_is_refused_on_the_way_in_and_on_the_way_back()
                 daily_budget: None,
                 daily_budget_tokens: Some(-1),
                 max_parallel_issue_runs: DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
+                agents_may_merge: false,
             },
         )
         .await
@@ -3966,6 +4255,7 @@ async fn the_attention_count_is_what_only_the_operator_can_clear() {
                 daily_budget: Some(baybo_model::MicroUsd::from_micros(5_000_000)),
                 daily_budget_tokens: None,
                 max_parallel_issue_runs: DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
+                agents_may_merge: false,
             },
         )
         .await
@@ -5073,6 +5363,7 @@ async fn a_board_over_its_money_ceiling_stops_the_run_that_is_spending_it() {
                 daily_budget: Some(baybo_model::MicroUsd::ZERO),
                 daily_budget_tokens: None,
                 max_parallel_issue_runs: 3,
+                agents_may_merge: false,
             },
         )
         .await
@@ -5122,6 +5413,7 @@ async fn a_spent_token_ceiling_lets_the_run_it_is_measuring_finish() {
                 daily_budget: None,
                 daily_budget_tokens: Some(0),
                 max_parallel_issue_runs: 3,
+                agents_may_merge: false,
             },
         )
         .await
@@ -5705,6 +5997,7 @@ async fn set_ceiling(f: &Fixture, project: &ProjectRow, slots: usize) {
                 daily_budget: project.daily_budget,
                 daily_budget_tokens: None,
                 max_parallel_issue_runs: slots,
+                agents_may_merge: project.agents_may_merge,
             },
         )
         .await
@@ -5721,6 +6014,7 @@ async fn set_budget(f: &Fixture, project: &ProjectRow, budget: Option<baybo_mode
                 daily_budget: budget,
                 daily_budget_tokens: None,
                 max_parallel_issue_runs: project.max_parallel_issue_runs,
+                agents_may_merge: project.agents_may_merge,
             },
         )
         .await
@@ -5984,6 +6278,7 @@ async fn an_exhausted_budget_parks_the_driver_rather_than_filling_in_progress() 
                 daily_budget: Some(baybo_model::MicroUsd::ZERO),
                 daily_budget_tokens: None,
                 max_parallel_issue_runs: 3,
+                agents_may_merge: false,
             },
         )
         .await
@@ -6506,6 +6801,7 @@ async fn work_the_board_already_owes_takes_the_slots_a_rolled_over_budget_frees(
                 daily_budget: None,
                 daily_budget_tokens: None,
                 max_parallel_issue_runs: 2,
+                agents_may_merge: false,
             },
         )
         .await
@@ -7432,6 +7728,7 @@ async fn a_budget_held_row_stands_down_for_the_block_question_too() {
                 daily_budget: None,
                 daily_budget_tokens: None,
                 max_parallel_issue_runs: p.max_parallel_issue_runs,
+                agents_may_merge: false,
             },
         )
         .await
@@ -7926,6 +8223,7 @@ async fn leadless_board(f: &Fixture, name: &str) -> (ProjectRow, AgentProfileId)
         archived_at: None,
         created_at: now,
         updated_at: now,
+        agents_may_merge: false,
     };
     f.store.create_project(&row).await.expect("legacy board");
     let dev = seed_agent(f, &row.id, "leader", AgentFramework::Baybo).await;

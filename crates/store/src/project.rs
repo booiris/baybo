@@ -106,6 +106,21 @@ impl IssuePriority {
 /// here instead of at a second literal the DDL would have to keep in step.
 pub const DEFAULT_MAX_PARALLEL_ISSUE_RUNS: usize = 3;
 
+/// Whether a board's agents may land their own branches in the repository's
+/// own checkout.
+///
+/// Off unless a board says otherwise, for the same reason the ceiling above
+/// resolves here: the `projects.agents_may_merge` column is nullable with no
+/// SQL default, so a row written before it existed answers here rather than
+/// at a second literal in the DDL.
+///
+/// **Advisory in the `false` direction.** A run carries `Bash` and a
+/// writable checkout, and `git merge` is not a destructive command, so a
+/// board with this off can still be talked into merging by hand. What the
+/// flag decides is whether the board *invites* it and whether `IssueMerge`
+/// will do it — not whether git is reachable.
+pub const DEFAULT_AGENTS_MAY_MERGE: bool = false;
+
 /// One row of `projects`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectRow {
@@ -131,6 +146,13 @@ pub struct ProjectRow {
     /// the column existed resolves to [`DEFAULT_MAX_PARALLEL_ISSUE_RUNS`] at the
     /// storage edge rather than making every reader decide again.
     pub max_parallel_issue_runs: usize,
+    /// Whether this board's agents may merge a card's branch into the
+    /// repository's own checkout, through `IssueMerge`.
+    ///
+    /// Not `Option`, for [`ProjectRow::max_parallel_issue_runs`]'s reason: a
+    /// row written before the column existed resolves to
+    /// [`DEFAULT_AGENTS_MAY_MERGE`] at the storage edge.
+    pub agents_may_merge: bool,
     /// Soft archive. There is no hard delete in any production path.
     pub archived_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
@@ -151,6 +173,9 @@ pub struct ProjectUpdate {
     /// See [`ProjectRow::max_parallel_issue_runs`]. `0` stops the board driving
     /// itself.
     pub max_parallel_issue_runs: usize,
+    /// See [`ProjectRow::agents_may_merge`]. Full-replace like the rest of
+    /// this struct, so a caller that omits it turns merging **off**.
+    pub agents_may_merge: bool,
 }
 
 /// A file hung on a card — on its description, or on one comment.
@@ -440,6 +465,23 @@ pub enum IssueEventBody {
     WorktreeReclaimed {
         branch_deleted: bool,
     },
+    /// A card's branch was merged into the repository's own checkout, by an
+    /// agent that called `IssueMerge` on a board whose
+    /// [`ProjectRow::agents_may_merge`] is on.
+    ///
+    /// `into` is stored rather than assumed: `git merge` lands on whatever
+    /// branch the repository's checkout is on, so a board whose repo is
+    /// parked somewhere other than its trunk merges *there*, and a card that
+    /// did not say where is one nobody can audit afterwards.
+    BranchMerged {
+        branch: String,
+        into: String,
+        /// The merge commit. Empty only when git would not say, which is
+        /// not worth failing the whole merge over.
+        commit: String,
+        /// How many commits the card contributed.
+        commits: usize,
+    },
     /// The worktree was left in place, and why. Almost always uncommitted
     /// work: the checkout holds the only copy, so the operator gets told
     /// rather than the board deciding for them.
@@ -532,6 +574,7 @@ impl IssueEventBody {
             IssueEventBody::Blocked { .. } => "blocked",
             IssueEventBody::Unblocked => "unblocked",
             IssueEventBody::Cancelled => "cancelled",
+            IssueEventBody::BranchMerged { .. } => "branch_merged",
             IssueEventBody::WorktreeReclaimed { .. } => "worktree_reclaimed",
             IssueEventBody::WorktreeKept { .. } => "worktree_kept",
             IssueEventBody::Filed { .. } => "filed",

@@ -361,6 +361,197 @@ pub async fn reclaim(repo: &Path, root: &Path, branch: &str) -> Result<Reclaimed
     Ok(Reclaimed::Removed { branch_deleted })
 }
 
+/// What happened when a card's branch was offered to the repository's own
+/// checkout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Merged {
+    /// The branch is in. `into` names the branch the repository's own
+    /// checkout is on — reported rather than assumed, because a repository
+    /// parked on something other than its trunk merges *there*, and a card
+    /// that does not say so is a card nobody can audit.
+    Landed {
+        into: String,
+        commit: String,
+        commits: usize,
+    },
+    /// The checkout already had every commit on the branch. Not an error:
+    /// a card merged twice, or one whose work reached the trunk some other
+    /// way, is in the state the caller wanted.
+    AlreadyThere { into: String },
+    /// Nothing was merged, and why — a sentence written for the agent that
+    /// asked, because it is the one that has to decide what to do next.
+    /// `retryable` is true only for a lock another writer holds; a conflict
+    /// and a dirty tree both need somebody to act first.
+    Refused { reason: String, retryable: bool },
+}
+
+/// Offer an issue's branch to the repository's own checkout.
+///
+/// Runs `git -C <repo> merge`, never `checkout`: the trunk is checked out in
+/// the primary worktree, so a sibling checkout cannot take it — `git` refuses
+/// `checkout`, `push . HEAD:<trunk>` and `branch -f` alike. Merging from
+/// outside is the one shape that works, and it leaves the primary tree clean.
+///
+/// Every refusal is checked **before** the merge runs, because the failure
+/// this exists to prevent is a half-merged trunk in the operator's own
+/// working tree.
+pub async fn merge(repo: &Path, root: &Path, branch: &str, message: &str) -> Result<Merged> {
+    if !branch_exists(repo, branch).await? {
+        return Ok(Merged::Refused {
+            reason: format!("there is no branch `{branch}` in this repository"),
+            retryable: false,
+        });
+    }
+    // `branch_of` says nothing for a detached HEAD and nothing for a branch
+    // that has never been committed to, and neither can be merged into:
+    // measured on git 2.54, `merge --no-ff` into an empty head is refused by
+    // git itself ("does not make sense into an empty head").
+    let Some(into) = branch_of(repo).await else {
+        return Ok(Merged::Refused {
+            reason: "the repository's own checkout has no branch with commits on it to merge \
+                     into — it is on a detached HEAD, or nothing has ever been committed to it. \
+                     Either one needs a person."
+                .to_owned(),
+            retryable: false,
+        });
+    };
+    if into == branch {
+        return Ok(Merged::Refused {
+            reason: format!(
+                "the repository's own checkout is on `{branch}` itself, so there is nothing to \
+                 merge it into"
+            ),
+            retryable: false,
+        });
+    }
+    let commits = match commits_ahead(repo, branch).await {
+        None => {
+            return Ok(Merged::Refused {
+                reason: format!("git could not count what `{branch}` carries"),
+                retryable: false,
+            });
+        }
+        Some(0) => return Ok(Merged::AlreadyThere { into }),
+        Some(n) => n,
+    };
+    if let Some(dirty) = dirty_tracked(repo).await {
+        return Ok(Merged::Refused {
+            reason: format!(
+                "the repository's own checkout has uncommitted changes, and merging into it \
+                 would mix them with this branch: {dirty}"
+            ),
+            retryable: false,
+        });
+    }
+    // The card's own checkout is checked too, and this is the refusal worth
+    // having: `git -C <repo> merge` never looks at it, so work still sitting
+    // uncommitted in the worktree is silently *absent* from what lands, and
+    // the agent would read a success it did not get.
+    if root.exists()
+        && let Some(dirty) = dirty_tracked(root).await
+    {
+        return Ok(Merged::Refused {
+            reason: format!(
+                "this issue's checkout has uncommitted changes, which a merge would leave \
+                 behind: {dirty}. Commit them to `{branch}` first."
+            ),
+            retryable: false,
+        });
+    }
+
+    // A merge commit needs a committer, and this one is made on the host,
+    // outside the sandbox — so it reaches neither the per-checkout config
+    // `ensure_identity_config` writes nor `BashTool`'s `git()` shim. Without
+    // this a host that has never had `user.email` set answers "Committer
+    // identity unknown", which reaches the agent as a refusal it cannot act
+    // on and which reads like a conflict. Resolved the same way, and through
+    // the same fallback, as the config handed to a sandboxed run.
+    let (name, email) = resolve_identity(repo)
+        .await
+        .unwrap_or_else(|| identity_or_fallback(""));
+    let user_name = format!("user.name={name}");
+    let user_email = format!("user.email={email}");
+    let out = run(
+        repo,
+        &[
+            "-c",
+            &user_name,
+            "-c",
+            &user_email,
+            "merge",
+            "--no-ff",
+            "-m",
+            message,
+            branch,
+        ],
+    )
+    .await?;
+    if !out.status.success() {
+        // Conflict text goes to **stdout**, not stderr, so a reader that
+        // takes only one of the two reports a failure with no reason in it.
+        let mut said = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if !stderr.trim().is_empty() {
+            if !said.is_empty() {
+                said.push('\n');
+            }
+            said.push_str(stderr.trim());
+        }
+        // A lock is another writer, not a disagreement about the code: the
+        // same call a moment later is the right answer, and telling an agent
+        // to resolve a conflict that does not exist sends it to rewrite code
+        // nobody objected to.
+        let retryable = said.contains(LOCK_MARKER);
+        if !retryable {
+            let _ = run(repo, &["merge", "--abort"]).await;
+        }
+        return Ok(Merged::Refused {
+            reason: said,
+            retryable,
+        });
+    }
+    let commit = run(repo, &["rev-parse", "HEAD"])
+        .await
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        .unwrap_or_default();
+    Ok(Merged::Landed {
+        into,
+        commit,
+        commits,
+    })
+}
+
+/// `.git/index.lock` is git's own word for "another writer is in here".
+const LOCK_MARKER: &str = "index.lock";
+
+/// The tracked files this checkout has changed, as one line, or `None` when
+/// it is clean.
+///
+/// `--untracked-files=no` is not an optimisation: a real repository is full
+/// of build output, and a plain `--porcelain` would report `?? target/` and
+/// refuse every merge there has ever been.
+async fn dirty_tracked(root: &Path) -> Option<String> {
+    let out = run(root, &["status", "--porcelain", "--untracked-files=no"])
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let said = String::from_utf8_lossy(&out.stdout);
+    let paths: Vec<&str> = said
+        .lines()
+        .filter_map(|line| line.get(3..))
+        .take(MAX_DIRTY_PATHS)
+        .collect();
+    (!paths.is_empty()).then(|| paths.join(", "))
+}
+
+/// Enough to recognise what is in the way without pasting a whole tree into
+/// a tool answer.
+const MAX_DIRTY_PATHS: usize = 5;
+
 /// How many commits `branch` has that the repository's own checkout does
 /// not — what the issue actually produced.
 pub async fn commits_ahead(repo: &Path, branch: &str) -> Option<usize> {
@@ -452,6 +643,229 @@ mod tests {
         assert_eq!(branch_name(7, "!!!"), "issue/7");
         assert_eq!(branch_name(7, "???"), branch_name(7, "!!!"));
         assert!(branch_name(9, &"x".repeat(200)).len() < 60);
+    }
+
+    /// A repository with a commit on its own checkout, plus an issue
+    /// worktree carrying one commit of its own.
+    async fn repo_with_a_branch_to_land() -> (tempfile::TempDir, PathBuf) {
+        let repo = fresh_repo().await;
+        tokio::fs::write(repo.path().join("base.txt"), b"base")
+            .await
+            .expect("seed");
+        commit(repo.path(), "base").await;
+        let root = repo.path().join("wt").join("5");
+        ensure(repo.path(), &root, "issue/5-work")
+            .await
+            .expect("worktree");
+        tokio::fs::write(root.join("done.txt"), b"work")
+            .await
+            .expect("work");
+        commit(&root, "the work").await;
+        (repo, root)
+    }
+
+    #[tokio::test]
+    async fn a_branch_lands_on_whatever_the_repository_is_parked_on_and_says_which() {
+        let (repo, root) = repo_with_a_branch_to_land().await;
+        let merged = merge(repo.path(), &root, "issue/5-work", "Merge #5: the work")
+            .await
+            .expect("merge");
+        let Merged::Landed {
+            into,
+            commit,
+            commits,
+        } = merged
+        else {
+            panic!("expected a landing, got {merged:?}");
+        };
+        assert_eq!(
+            into, "master",
+            "the trunk it landed on is reported, not assumed"
+        );
+        assert_eq!(commits, 1);
+        assert!(!commit.is_empty(), "the merge commit has to be nameable");
+
+        // The repository's own tree is left usable, which is the whole
+        // reason this merges from outside rather than checking the trunk out.
+        // Tracked files only: this fixture keeps its worktree *inside* the
+        // repo, which production does not, and `?? wt/` is not dirt.
+        let status = run(
+            repo.path(),
+            &["status", "--porcelain", "--untracked-files=no"],
+        )
+        .await
+        .expect("status");
+        assert!(
+            String::from_utf8_lossy(&status.stdout).trim().is_empty(),
+            "the primary checkout must be clean after a merge"
+        );
+        assert_eq!(commits_ahead(repo.path(), "issue/5-work").await, Some(0));
+    }
+
+    /// The merge is made on the host, outside the sandbox, so it reaches
+    /// neither shim that gives a sandboxed commit its identity. Git refuses
+    /// to make a merge commit without one, so the identity has to be
+    /// resolved and passed here or the whole verb breaks on a bare host.
+    #[tokio::test]
+    async fn the_merge_commit_carries_an_identity_git_will_accept() {
+        let (repo, root) = repo_with_a_branch_to_land().await;
+        git(
+            repo.path(),
+            &["config", "user.email", "board@example.invalid"],
+        )
+        .await
+        .expect("local identity");
+        git(repo.path(), &["config", "user.name", "The Board"])
+            .await
+            .expect("local identity");
+
+        let merged = merge(repo.path(), &root, "issue/5-work", "Merge #5: the work")
+            .await
+            .expect("merge");
+        assert!(matches!(merged, Merged::Landed { .. }), "{merged:?}");
+
+        let who = run(repo.path(), &["log", "-1", "--format=%cn <%ce>"])
+            .await
+            .expect("log");
+        assert_eq!(
+            String::from_utf8_lossy(&who.stdout).trim(),
+            "The Board <board@example.invalid>",
+            "the identity the repository resolves is the one the merge commits as"
+        );
+    }
+
+    #[tokio::test]
+    async fn merging_the_same_branch_twice_is_not_an_error() {
+        let (repo, root) = repo_with_a_branch_to_land().await;
+        merge(repo.path(), &root, "issue/5-work", "Merge #5: the work")
+            .await
+            .expect("first");
+        let again = merge(repo.path(), &root, "issue/5-work", "Merge #5: the work")
+            .await
+            .expect("second");
+        assert!(
+            matches!(again, Merged::AlreadyThere { .. }),
+            "a card whose branch is already in is in the state the caller wanted: {again:?}"
+        );
+    }
+
+    /// The refusal that only this layer can make: `git -C <repo> merge` never
+    /// looks at the card's own checkout, so uncommitted work there would be
+    /// absent from what lands while the agent read a success.
+    #[tokio::test]
+    async fn uncommitted_work_in_the_card_s_own_checkout_refuses_the_merge() {
+        let (repo, root) = repo_with_a_branch_to_land().await;
+        tokio::fs::write(root.join("done.txt"), b"work, and more since")
+            .await
+            .expect("dirty the worktree");
+
+        let merged = merge(repo.path(), &root, "issue/5-work", "Merge #5: the work")
+            .await
+            .expect("merge");
+        let Merged::Refused { reason, retryable } = merged else {
+            panic!("a dirty card checkout must refuse, got {merged:?}");
+        };
+        assert!(reason.contains("done.txt"), "{reason}");
+        assert!(!retryable, "committing is somebody's job, not a retry");
+        assert_eq!(
+            commits_ahead(repo.path(), "issue/5-work").await,
+            Some(1),
+            "nothing may have landed"
+        );
+    }
+
+    #[tokio::test]
+    async fn uncommitted_work_in_the_repository_s_own_checkout_refuses_the_merge() {
+        let (repo, root) = repo_with_a_branch_to_land().await;
+        tokio::fs::write(repo.path().join("base.txt"), b"the operator was mid-edit")
+            .await
+            .expect("dirty the primary tree");
+
+        let merged = merge(repo.path(), &root, "issue/5-work", "Merge #5: the work")
+            .await
+            .expect("merge");
+        assert!(
+            matches!(&merged, Merged::Refused { reason, .. } if reason.contains("base.txt")),
+            "the operator's own uncommitted work must stop the merge: {merged:?}"
+        );
+    }
+
+    /// Build output is what an untracked file is in a real repository, and a
+    /// merge that refused on those would never run anywhere.
+    #[tokio::test]
+    async fn an_untracked_file_does_not_stop_a_merge() {
+        let (repo, root) = repo_with_a_branch_to_land().await;
+        tokio::fs::write(repo.path().join("target-ish.log"), b"build output")
+            .await
+            .expect("untracked");
+        let merged = merge(repo.path(), &root, "issue/5-work", "Merge #5: the work")
+            .await
+            .expect("merge");
+        assert!(matches!(merged, Merged::Landed { .. }), "{merged:?}");
+    }
+
+    #[tokio::test]
+    async fn a_conflict_is_reported_and_leaves_no_merge_half_done() {
+        let repo = fresh_repo().await;
+        tokio::fs::write(repo.path().join("both.txt"), b"base")
+            .await
+            .expect("seed");
+        commit(repo.path(), "base").await;
+        let root = repo.path().join("wt").join("6");
+        ensure(repo.path(), &root, "issue/6-theirs")
+            .await
+            .expect("worktree");
+        tokio::fs::write(root.join("both.txt"), b"theirs")
+            .await
+            .expect("their edit");
+        commit(&root, "theirs").await;
+        // And the trunk moves under it, on the same line.
+        tokio::fs::write(repo.path().join("both.txt"), b"ours")
+            .await
+            .expect("our edit");
+        commit(repo.path(), "ours").await;
+
+        let merged = merge(repo.path(), &root, "issue/6-theirs", "Merge #6: theirs")
+            .await
+            .expect("merge");
+        let Merged::Refused { reason, retryable } = merged else {
+            panic!("a conflict must refuse, got {merged:?}");
+        };
+        // Conflict text is on stdout, and a refusal with no reason in it is
+        // one the agent cannot act on.
+        assert!(reason.to_lowercase().contains("conflict"), "{reason}");
+        assert!(!retryable, "a conflict needs somebody to resolve it");
+        let status = run(
+            repo.path(),
+            &["status", "--porcelain", "--untracked-files=no"],
+        )
+        .await
+        .expect("status");
+        assert!(
+            String::from_utf8_lossy(&status.stdout).trim().is_empty(),
+            "an aborted merge must leave the operator's checkout as it was"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_branch_that_is_not_there_refuses_rather_than_failing() {
+        let repo = fresh_repo().await;
+        tokio::fs::write(repo.path().join("base.txt"), b"base")
+            .await
+            .expect("seed");
+        commit(repo.path(), "base").await;
+        let merged = merge(
+            repo.path(),
+            &repo.path().join("nowhere"),
+            "issue/99-ghost",
+            "Merge #99",
+        )
+        .await
+        .expect("merge");
+        assert!(
+            matches!(&merged, Merged::Refused { reason, .. } if reason.contains("issue/99-ghost")),
+            "{merged:?}"
+        );
     }
 
     #[tokio::test]

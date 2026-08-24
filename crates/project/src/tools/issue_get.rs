@@ -128,6 +128,10 @@ fn named_agents(entry: &IssueEventRow) -> Vec<AgentProfileId> {
     ids
 }
 
+/// How much of a sha a person reads before their eyes glaze over, and
+/// enough for `git show` to resolve.
+const SHORT_SHA: usize = 8;
+
 fn narrate(body: &IssueEventBody, known: &[baybo_store::AgentProfileRow]) -> String {
     match body {
         // The files are named, not dropped: a comment whose whole point was
@@ -198,6 +202,18 @@ fn narrate(body: &IssueEventBody, known: &[baybo_store::AgentProfileRow]) -> Str
         IssueEventBody::Blocked { reason } => format!("blocked it: {reason}"),
         IssueEventBody::Unblocked => "unblocked it".to_owned(),
         IssueEventBody::Cancelled => "cancelled it".to_owned(),
+        IssueEventBody::BranchMerged {
+            branch,
+            into,
+            commit,
+            commits,
+        } => {
+            let landed = match commit.get(..SHORT_SHA) {
+                Some(short) => format!(" as {short}"),
+                None => String::new(),
+            };
+            format!("merged {branch} into {into}{landed} ({commits} commits)")
+        }
         IssueEventBody::WorktreeReclaimed { branch_deleted } => {
             if *branch_deleted {
                 // Not "nothing was committed": a branch merged before the

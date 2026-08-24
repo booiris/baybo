@@ -49,6 +49,10 @@ pub(crate) fn left_a_mark(body: &IssueEventBody) -> bool {
             // leave the card untouched, and telling the operator it left
             // nothing is how they stop looking for work that is there.
             | IssueEventBody::Filed { .. }
+            // Same reasoning as `Filed`, and the stronger case: a run whose
+            // whole product was landing the branch changed the repository,
+            // not just the ledger.
+            | IssueEventBody::BranchMerged { .. }
     )
 }
 

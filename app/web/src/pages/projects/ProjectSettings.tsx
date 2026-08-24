@@ -13,7 +13,12 @@ import {
   parseTokenBudget,
   tokenBudgetHint,
 } from './budgetModel';
-import { formatParallelIssueRuns, parallelIssueRunsHint, parseParallelIssueRuns } from './driverModel';
+import {
+  agentsMayMergeHint,
+  formatParallelIssueRuns,
+  parallelIssueRunsHint,
+  parseParallelIssueRuns,
+} from './driverModel';
 import { fieldLabel, textInput } from './CreateProjectForm';
 import { MarkdownEditor } from './MarkdownEditor';
 import { activityFor, useBoardActivity } from './useBoardActivity';
@@ -34,6 +39,7 @@ export function ProjectSettings({
   const [budget, setBudget] = useState(formatBudget(project.daily_budget_micros));
   const [tokenBudget, setTokenBudget] = useState(formatTokenBudget(project.daily_budget_tokens));
   const [parallelIssueRuns, setParallelIssueRuns] = useState(formatParallelIssueRuns(project.max_parallel_issue_runs));
+  const [agentsMayMerge, setAgentsMayMerge] = useState(project.agents_may_merge);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   // Archiving is asked about before it happens; un-archiving is not. Only one
@@ -73,6 +79,7 @@ export function ProjectSettings({
       daily_budget_micros: micros,
       daily_budget_tokens: tokens,
       max_parallel_issue_runs: slots,
+      agents_may_merge: agentsMayMerge,
     });
     setBusy(false);
     if (outcome.kind === 'unauthorized') {
@@ -200,6 +207,23 @@ export function ProjectSettings({
           />
           <p className="mt-1 text-[0.7rem] text-ink-soft leading-snug">
             {parallelIssueRunsHint(parseParallelIssueRuns(parallelIssueRuns))}
+          </p>
+        </div>
+
+        <div>
+          <label className="flex items-center gap-1.5 font-mono text-[0.78rem] cursor-pointer">
+            <input
+              type="checkbox"
+              checked={agentsMayMerge}
+              disabled={archived}
+              onChange={(event) => {
+                setAgentsMayMerge(event.target.checked);
+              }}
+            />
+            Agents may merge
+          </label>
+          <p className="mt-1 text-[0.7rem] text-ink-soft leading-snug">
+            {agentsMayMergeHint(agentsMayMerge)}
           </p>
         </div>
 

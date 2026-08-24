@@ -112,6 +112,7 @@ impl Fixture {
                 daily_budget: None,
                 daily_budget_tokens: None,
                 max_parallel_issue_runs: Some(0),
+                agents_may_merge: false,
             })
             .await
             .expect("create project");
@@ -749,6 +750,7 @@ mod approvals {
                 daily_budget: None,
                 daily_budget_tokens: None,
                 max_parallel_issue_runs: None,
+                agents_may_merge: false,
             })
             .await
             .expect("project");
@@ -867,6 +869,7 @@ mod approvals {
                 daily_budget: None,
                 daily_budget_tokens: None,
                 max_parallel_issue_runs: None,
+                agents_may_merge: false,
             })
             .await
             .expect("project");
@@ -1053,6 +1056,7 @@ async fn an_exhausted_board_reads_as_idle_and_says_why() {
             daily_budget: Some(baybo_model::MicroUsd::ZERO),
             daily_budget_tokens: None,
             max_parallel_issue_runs: None,
+            agents_may_merge: false,
         })
         .await
         .expect("project");
@@ -1098,6 +1102,7 @@ async fn a_board_held_on_tokens_reports_tokens_not_dollars() {
             daily_budget: None,
             daily_budget_tokens: Some(0),
             max_parallel_issue_runs: None,
+            agents_may_merge: false,
         })
         .await
         .expect("project");

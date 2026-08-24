@@ -155,6 +155,11 @@ pub struct ProjectDto {
     /// top of Todo as room appears. `0` means it starts only what somebody
     /// drags into In Progress.
     pub max_parallel_issue_runs: i64,
+    /// Whether this board's agents may land a card's branch in the
+    /// repository's own checkout, through `IssueMerge`. Always serialised:
+    /// a board that merges its own work is a thing an operator must be able
+    /// to see without inferring it from a missing field.
+    pub agents_may_merge: bool,
     /// Present only while the project sits in the archive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at_ms: Option<i64>,
@@ -172,6 +177,7 @@ impl From<ProjectRow> for ProjectDto {
             daily_budget_micros: row.daily_budget.map(baybo_model::MicroUsd::into_micros),
             daily_budget_tokens: row.daily_budget_tokens,
             max_parallel_issue_runs: i64::try_from(row.max_parallel_issue_runs).unwrap_or(i64::MAX),
+            agents_may_merge: row.agents_may_merge,
             archived_at_ms: row.archived_at.map(|t| t.timestamp_millis()),
             created_at_ms: row.created_at.timestamp_millis(),
             updated_at_ms: row.updated_at.timestamp_millis(),
@@ -672,6 +678,14 @@ pub enum IssueEventBodyDto {
     },
     Unblocked,
     Cancelled,
+    BranchMerged {
+        branch: String,
+        /// The branch it landed on — the repository's own checkout may be
+        /// parked somewhere other than its trunk, so the card names where.
+        into: String,
+        commit: String,
+        commits: i64,
+    },
     WorktreeReclaimed {
         branch_deleted: bool,
     },
@@ -811,6 +825,17 @@ impl IssueEventBodyDto {
             IssueEventBody::Blocked { reason } => Self::Blocked { reason },
             IssueEventBody::Unblocked => Self::Unblocked,
             IssueEventBody::Cancelled => Self::Cancelled,
+            IssueEventBody::BranchMerged {
+                branch,
+                into,
+                commit,
+                commits,
+            } => Self::BranchMerged {
+                branch,
+                into,
+                commit,
+                commits: i64::try_from(commits).unwrap_or(i64::MAX),
+            },
             IssueEventBody::WorktreeReclaimed { branch_deleted } => {
                 Self::WorktreeReclaimed { branch_deleted }
             }
@@ -1029,6 +1054,12 @@ pub struct UpdateProjectRequest {
     /// it restores the default rather than keeping what the board had.
     #[serde(default)]
     pub max_parallel_issue_runs: Option<i64>,
+    /// Whether this board's agents may merge a card's branch into the
+    /// repository's own checkout. Full-replace like every other field here,
+    /// and worth saying plainly because this one is a `bool`: a client that
+    /// omits it turns merging **off**.
+    #[serde(default)]
+    pub agents_may_merge: bool,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1166,6 +1197,7 @@ async fn create_project(
                 .max_parallel_issue_runs
                 .map(parallel_issue_runs)
                 .transpose()?,
+            agents_may_merge: false,
         })
         .await
         .map_err(project_err)?;
@@ -1232,6 +1264,7 @@ async fn update_project(
                     .map(parallel_issue_runs)
                     .transpose()?
                     .unwrap_or(DEFAULT_MAX_PARALLEL_ISSUE_RUNS),
+                agents_may_merge: req.agents_may_merge,
             },
         )
         .await

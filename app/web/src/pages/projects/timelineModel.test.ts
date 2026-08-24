@@ -371,3 +371,38 @@ describe('feedLine', () => {
     expect(said(feed({ kind: 'comment', text: report }))).toBe('@dev-1 commented on #7');
   });
 });
+
+describe('a branch that landed', () => {
+  const merged: IssueEventBody = {
+    kind: 'branch_merged',
+    branch: 'issue/20-integration',
+    into: 'master',
+    commit: '7e1674e648b5252ef276216b30eab085d487c890',
+    commits: 35,
+  };
+
+  // The board's whole point is work reaching the repository, so the entry
+  // reads as an outcome rather than as the muted routine note the switch's
+  // `default` arm would otherwise give a new kind.
+  it('reads as an outcome, not as routine bookkeeping', () => {
+    expect(eventTone(merged)).toBe('ok');
+  });
+
+  it('names where it went, because the repo may not be on its trunk', () => {
+    const line = describeEvent(merged);
+    expect(line).toContain('issue/20-integration');
+    expect(line).toContain('master');
+    expect(line).toContain('7e1674e6');
+    expect(line).toContain('35 commits');
+  });
+
+  it('counts one commit as one', () => {
+    const one = describeEvent({ ...merged, commits: 1 });
+    expect(one).toContain('1 commit');
+    expect(one).not.toContain('1 commits');
+  });
+
+  it('survives a merge git would not name a commit for', () => {
+    expect(describeEvent({ ...merged, commit: '' })).not.toContain('as ');
+  });
+});

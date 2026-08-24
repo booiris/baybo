@@ -517,6 +517,7 @@ mod tests {
                 daily_budget: None,
                 daily_budget_tokens: None,
                 max_parallel_issue_runs: None,
+                agents_may_merge: false,
             })
             .await
             .expect("project");
@@ -715,6 +716,7 @@ mod tests {
                     daily_budget: Some(MicroUsd::ZERO),
                     daily_budget_tokens: None,
                     max_parallel_issue_runs: DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
+                    agents_may_merge: false,
                 },
             )
             .await

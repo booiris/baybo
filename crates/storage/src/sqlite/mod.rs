@@ -513,6 +513,11 @@ const ADD_COLUMNS: &[AddColumn] = &[
         definition: "INTEGER",
     },
     AddColumn {
+        table: "projects",
+        column: "agents_may_merge",
+        definition: "INTEGER",
+    },
+    AddColumn {
         table: "issue_runs",
         column: "resumes",
         definition: "INTEGER NOT NULL DEFAULT 0",
@@ -1438,6 +1443,11 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     -- `DEFAULT_MAX_PARALLEL_ISSUE_RUNS` rather than to a SQL
                     -- default that would be the number's second home.
                     max_parallel_issue_runs INTEGER,
+                    -- Whether this board's agents may land a card's branch
+                    -- in the repository's own checkout, through
+                    -- `IssueMerge`. NULL resolves to
+                    -- `DEFAULT_AGENTS_MAY_MERGE`, for the reason above.
+                    agents_may_merge INTEGER,
                     archived_at INTEGER,
                     created_at  INTEGER NOT NULL,
                     updated_at  INTEGER NOT NULL

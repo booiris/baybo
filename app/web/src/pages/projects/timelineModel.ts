@@ -68,6 +68,10 @@ export function eventTone(body: IssueEventBody): Tone {
     case 'stage_completed':
     case 'budget_restored':
     case 'token_budget_restored':
+    // The card's work reaching the repository is the outcome the whole
+    // board exists for, so it reads as one — not as the muted routine note
+    // the `default` arm below would give it.
+    case 'branch_merged':
       return 'ok';
     case 'approval_resolved':
       // How it resolved outranks what was decided: a window that expired or
@@ -96,6 +100,10 @@ export function actorLabel(event: IssueEvent): string {
 function unnamedActor(_kind: never): string {
   return 'somebody';
 }
+
+/// How much of a sha a person reads before their eyes glaze over, and
+/// enough for `git show` to resolve. Mirrors `SHORT_SHA` in `issue_get.rs`.
+const SHORT_SHA = 8;
 
 const DECISION_LABEL: Record<'approve' | 'approve_always' | 'deny', string> = {
   approve: 'approval',
@@ -177,6 +185,13 @@ export function describeEvent(body: IssueEventBody): string | null {
       return 'unblocked it';
     case 'cancelled':
       return 'cancelled it';
+    case 'branch_merged': {
+      // The branch it landed on is named rather than assumed: a repository
+      // parked somewhere other than its trunk merges there.
+      const at = body.commit ? ` as ${body.commit.slice(0, SHORT_SHA)}` : '';
+      const many = body.commits === 1 ? '1 commit' : `${body.commits} commits`;
+      return `merged ${body.branch} into ${body.into}${at} — ${many}`;
+    }
     case 'worktree_reclaimed':
       return body.branch_deleted
         ? 'reclaimed the worktree and deleted its branch — it held nothing this repo did not already have'

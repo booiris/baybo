@@ -71,6 +71,7 @@ async fn fixture() -> Fixture {
             daily_budget: None,
             daily_budget_tokens: None,
             max_parallel_issue_runs: Some(0),
+            agents_may_merge: false,
         })
         .await
         .expect("create project")

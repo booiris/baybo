@@ -13,6 +13,7 @@ function project(overrides: Partial<Project> = {}): Project {
     description: '',
     workdir: '/tmp/rglide',
     max_parallel_issue_runs: 3,
+    agents_may_merge: false,
     created_at_ms: 0,
     updated_at_ms: 0,
     ...overrides,

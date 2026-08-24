@@ -2823,6 +2823,18 @@ export interface components {
             /** @enum {string} */
             kind: "cancelled";
         } | {
+            branch: string;
+            commit: string;
+            /** Format: int64 */
+            commits: number;
+            /**
+             * @description The branch it landed on — the repository's own checkout may be
+             *     parked somewhere other than its trunk, so the card names where.
+             */
+            into: string;
+            /** @enum {string} */
+            kind: "branch_merged";
+        } | {
             branch_deleted: boolean;
             /** @enum {string} */
             kind: "worktree_reclaimed";
@@ -3252,6 +3264,13 @@ export interface components {
             text: string;
         };
         ProjectDto: {
+            /**
+             * @description Whether this board's agents may land a card's branch in the
+             *     repository's own checkout, through `IssueMerge`. Always serialised:
+             *     a board that merges its own work is a thing an operator must be able
+             *     to see without inferring it from a missing field.
+             */
+            agents_may_merge: boolean;
             /**
              * Format: int64
              * @description Present only while the project sits in the archive.
@@ -3786,6 +3805,13 @@ export interface components {
             supports_vision?: boolean | null;
         };
         UpdateProjectRequest: {
+            /**
+             * @description Whether this board's agents may merge a card's branch into the
+             *     repository's own checkout. Full-replace like every other field here,
+             *     and worth saying plainly because this one is a `bool`: a client that
+             *     omits it turns merging **off**.
+             */
+            agents_may_merge?: boolean;
             /**
              * Format: int64
              * @description Daily spend ceiling in micro-USD (USD × 10^6). Omit for no limit;
@@ -7227,6 +7253,13 @@ export interface operations {
                 content: {
                     "application/json": {
                         items: {
+                            /**
+                             * @description Whether this board's agents may land a card's branch in the
+                             *     repository's own checkout, through `IssueMerge`. Always serialised:
+                             *     a board that merges its own work is a thing an operator must be able
+                             *     to see without inferring it from a missing field.
+                             */
+                            agents_may_merge: boolean;
                             /**
                              * Format: int64
                              * @description Present only while the project sits in the archive.

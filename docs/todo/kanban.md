@@ -58,7 +58,12 @@ the behaviour was verified against its source (clone inspected 2026-08-05).
    only the **branch name with a copy action**. Review rides the run
    transcript plus the branch checked out locally; merging is done by
    the assignee on request (an ordinary comment) or by the user in a
-   terminal. Dragging to Done marks completion **without** touching git;
+   terminal. **Revised 2026-08-24:** a board may now opt into landing its
+   own work with the `agents_may_merge` project setting, which is off by
+   default. It adds no button and no platform-driven merge: the assignee
+   calls the `IssueMerge` tool, the run brief tells it the board is one
+   that merges, and everything below about Done still holds — Done never
+   merges anything. Dragging to Done marks completion **without** touching git;
    entering Done/Cancelled reclaims the worktree — skipped with a
    timeline note if it holds uncommitted changes; a branch is deleted
    only when **both** readings agree it holds nothing — ours, that it is
@@ -488,6 +493,9 @@ announces which of these will happen before sending.
 - `projects` — id (ULID), name, description, workdir, budget knobs,
   `max_parallel_issue_runs` (how many runs the board starts by itself; `0` is the
   manual board),
+  `agents_may_merge` (whether its agents land their own branches; off by
+  default, and nullable with no SQL default so an older row resolves at the
+  storage edge rather than at a second literal),
   `archived_at`, timestamps. No hard delete.
 - `issues` — id, project_id, `number` (per-project sequence), title,
   description, `status` (`backlog|todo|in_progress|review|done`),
@@ -667,9 +675,14 @@ announces which of these will happen before sending.
     when the commit count is `Some(0)` and `branch --delete` agrees, so
     neither "git could not answer" nor "git thinks it is unmerged" is
     read as "nothing was produced".
-- **No merge machinery**: the platform never merges. The assignee merges
-  when asked (an ordinary comment-triggered run in its worktree) or the
-  user merges in a terminal. Worktree reclamation runs when an issue
+- **Merge machinery is one verb, and nothing calls it but an agent**:
+  `worktree::merge` behind `ProjectManager::merge_issue_branch` behind the
+  `IssueMerge` tool, refused unless the project's `agents_may_merge` is on
+  and the card has reached Review. No transition merges — least of all Done,
+  which is the one point on the board with no run listening and no way to
+  report a conflict. Where the setting is off, the assignee merges when
+  asked (an ordinary comment-triggered run in its worktree) or the user
+  merges in a terminal. Worktree reclamation runs when an issue
   enters Done or Cancelled — skipped with a timeline note if the
   worktree holds uncommitted changes; branches are kept until a later
   GC.
@@ -681,7 +694,9 @@ announces which of these will happen before sending.
   (status/assign/stage — status moves flow through the trigger
   predicate), `IssueComment`, `IssueList`, `IssueGet`, plus
   `ProjectAgentCreate` (cap default 16, `INSERT … SELECT` guard, audited)
-  — lifted conceptually intact from the multi-project design.
+  — lifted conceptually intact from the multi-project design. `IssueMerge`
+  (2026-08-24) is the one addition, and it is gated on the board's
+  `agents_may_merge`.
 - **Budget**: per-project daily spend gate checked at enqueue; exhausted
   → runs stay queued with a budget event in the feed.
 
@@ -713,7 +728,13 @@ announces which of these will happen before sending.
    cannot vouch for, is the deliverable and is kept.
 
    The merge-by-assignee flow needs no code: it is an ordinary comment on
-   a live card, which now wakes the assignee in its own worktree.
+   a live card, which now wakes the assignee in its own worktree. What the
+   assignee then *runs* does need code, on a board that lands its own work:
+   `IssueMerge`, whose refusals are the checks a prompt cannot make — a dirty
+   card checkout (which `git -C <repo> merge` never looks at, so its work
+   would be silently absent), a dirty primary checkout, an unreviewed card,
+   and a conflict, which is aborted so the operator's own tree is left as it
+   was.
 4. **Team autonomy.** ✅ **Shipped.**
 
    - **Teams.** `agent_profiles` gains a `TeamMembership` (`project_id` +
@@ -915,8 +936,27 @@ announces which of these will happen before sending.
 
 ## What is still not built
 
-Everything in "Pages and interactions" above now exists. Four things
+Everything in "Pages and interactions" above now exists. Five things
 remain, all recorded with their reasons rather than left to be re-derived:
+
+- **A merge gate that means "reviewed" rather than "in Review".** On a board
+  with `agents_may_merge` on, `IssueMerge` admits a card in Review or Done —
+  and the card's own author is what puts it in Review ("Close the loop. Move
+  ready work to Review", `PROJECT_TEAMMATE_SOUL_TEMPLATE`). Nothing compares
+  actors, so one agent can move its own card to Review and land it in the
+  same turn, with no second pair of eyes. Verified reachable, not inferred.
+  The column is doing the wrong job here: it records that the author says the
+  work is ready, not that anybody accepted it, and **no approval is stored
+  anywhere** — `IssueStatus` is five columns and none of them is a verdict.
+  What a gate could actually check is that the card carries a `Comment` by
+  some actor other than the caller since it entered Review. That is a
+  second-pair-of-eyes test, not an approval test: it cannot tell agreement
+  from objection, and it has to exclude system-written entries or the lead
+  assigning a reviewer would satisfy it before the reviewer had looked.
+  **Deliberately deferred** (2026-08-24) rather than forgotten — the flag is
+  off by default, the boards that turn it on are the operator's own, and a
+  weak gate that reads like a strong one is worse than a named gap. Revisit
+  when a real case turns up.
 
 - **Mid-turn injection.** A comment on a card whose run is *executing* is
   picked up by a follow-up run when that one settles, never lost and never

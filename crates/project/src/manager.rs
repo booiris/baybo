@@ -25,6 +25,29 @@ use crate::error::{ProjectError, Result};
 use crate::events::ProjectEvents;
 use crate::runs::{RunOutcome, Transition, ledger_entry, triggers_run};
 
+/// The columns a card's branch may be merged from.
+///
+/// Review is the point of it: the board keeps its reviewer, and the flag
+/// only removes the person who used to run the merge afterwards. Done is
+/// here too because a card can reach it before anybody asks for the merge,
+/// and refusing then would strand exactly the work this exists to land.
+///
+/// Done cannot be the *only* one, and that is mechanical rather than a
+/// preference: a Done card can host no run at all. A comment on one is
+/// `RecordOnly`, no status change into Done triggers a run, `accepts_runs`
+/// refuses the retry button, and the driver only looks at Todo. So a merge
+/// that required Done could only ever happen inside the turn that closed the
+/// card, and a turn that missed it would leave the branch unlandable by any
+/// agent — which is the failure this whole verb exists to stop.
+///
+/// **This is a weak gate, knowingly.** Review says the author called the
+/// work ready, not that anybody accepted it — the author moves its own card
+/// there — and nothing here compares actors, so one agent can move its card
+/// to Review and land it in the same turn. Nothing stores an approval to
+/// check instead. See "What is still not built" in `docs/todo/kanban.md`
+/// for what a real gate would test and why it is deferred.
+const MERGEABLE_FROM: &[IssueStatus] = &[IssueStatus::Review, IssueStatus::Done];
+
 /// Upper bound on an issue title (chars, after trim). Long enough for a
 /// sentence, short enough that a card face can show it.
 pub(crate) const MAX_ISSUE_TITLE_CHARS: usize = 200;
@@ -208,6 +231,10 @@ pub struct NewProject {
     /// [`DEFAULT_MAX_PARALLEL_ISSUE_RUNS`]; `Some(0)` opens a board that only
     /// ever runs what somebody drags.
     pub max_parallel_issue_runs: Option<usize>,
+    /// Whether the board's agents may merge a card's branch into the
+    /// repository's own checkout. Off by default — a board that lands code
+    /// on its trunk unattended is a decision, not a default.
+    pub agents_may_merge: bool,
 }
 
 /// What a caller supplies to open an issue. Status is where the card
@@ -287,6 +314,11 @@ pub struct ProjectManager {
     driving: tokio::sync::Mutex<()>,
     /// Boards where lead seeding failed.
     leadless: parking_lot::Mutex<std::collections::HashSet<ProjectId>>,
+    /// Serialises [`merge_issue_branch`](Self::merge_issue_branch). Nothing
+    /// else locks the repository, and a board runs several cards at once, so
+    /// two merges would otherwise race `.git/index.lock` and one would come
+    /// back reading like a conflict it never had.
+    merging: tokio::sync::Mutex<()>,
     /// Optional closer for prompts abandoned by settled runs.
     prompts: parking_lot::Mutex<Option<Arc<dyn crate::CardPromptCloser>>>,
     /// What interrupts a live run. See [`crate::IssueRunStopper`].
@@ -361,6 +393,7 @@ impl ProjectManager {
             dispatch,
             driving: tokio::sync::Mutex::new(()),
             leadless: parking_lot::Mutex::default(),
+            merging: tokio::sync::Mutex::new(()),
             prompts: parking_lot::Mutex::default(),
             stopper,
             stopping: parking_lot::Mutex::default(),
@@ -1252,8 +1285,12 @@ impl ProjectManager {
 
     /// Record the branch a run's work is on, once there is work on it.
     ///
-    /// The board never merges, so this ref is the artefact it hands the
-    /// operator. It is read from the checkout rather than derived from the
+    /// On a board that does not merge its own work, this ref is the artefact
+    /// it hands the operator; on one that does,
+    /// [`merge_issue_branch`](Self::merge_issue_branch) records it *before*
+    /// merging, because a merged branch is zero commits ahead and the guard
+    /// below would then never record it at all. It is read from the checkout
+    /// rather than derived from the
     /// title so that a retitle mid-run cannot rename it, and it falls back
     /// to the name the tree was cut with so that a card finished *before*
     /// its run settled — which reclaims the tree — still surfaces one.
@@ -1926,6 +1963,7 @@ impl ProjectManager {
             max_parallel_issue_runs: new
                 .max_parallel_issue_runs
                 .unwrap_or(DEFAULT_MAX_PARALLEL_ISSUE_RUNS),
+            agents_may_merge: new.agents_may_merge,
             // Never read, so a board's first agent comment is unread even
             // if it lands before anybody opens it.
             archived_at: None,
@@ -2176,6 +2214,7 @@ impl ProjectManager {
             daily_budget: update.daily_budget,
             daily_budget_tokens: update.daily_budget_tokens,
             max_parallel_issue_runs: update.max_parallel_issue_runs,
+            agents_may_merge: update.agents_may_merge,
         };
         // A ceiling is the one field here that can stop a board, and it left
         // no trace anywhere: no event, no timeline row, and `updated_at` is
@@ -2194,6 +2233,16 @@ impl ProjectManager {
                 tokens_from = ?before.daily_budget_tokens,
                 tokens_to = ?update.daily_budget_tokens,
                 "a daily ceiling changed"
+            );
+        }
+        // Same reasoning, and a stronger case for it: this one decides
+        // whether the board may write its own trunk.
+        if before.agents_may_merge != update.agents_may_merge {
+            tracing::info!(
+                project = %id,
+                from = before.agents_may_merge,
+                to = update.agents_may_merge,
+                "whether this board's agents may merge changed"
             );
         }
         self.store.update_project(id, &update).await?;
@@ -2847,6 +2896,109 @@ impl ProjectManager {
             ));
         }
         Ok(())
+    }
+
+    /// Land an issue's branch in the repository's own checkout.
+    ///
+    /// The one door. Every question a merge has to answer — may this board
+    /// merge at all, has the card been looked at, which branch is the card's,
+    /// is either tree dirty — is answered here rather than at the tool, so
+    /// that a second caller cannot answer any of them differently. The git
+    /// itself lives in [`crate::worktree::merge`], beside every other verb
+    /// that touches a card's checkout.
+    ///
+    /// A refusal is a value, not an error: the caller is an agent, and
+    /// "your board does not do this" is an answer it can act on, while an
+    /// `Err` reads as a fault it should retry.
+    pub async fn merge_issue_branch(
+        &self,
+        project: &ProjectId,
+        number: i64,
+        actor: IssueActor,
+    ) -> Result<crate::worktree::Merged> {
+        let row = self.writable_project(project).await?;
+        if !row.agents_may_merge {
+            return Ok(crate::worktree::Merged::Refused {
+                reason: "this board's agents do not merge. Its branch is the artefact it hands \
+                         over; say on the card that the work is ready and let the operator land \
+                         it."
+                .to_owned(),
+                retryable: false,
+            });
+        }
+        let issue = self.get_issue(project, number).await?;
+        if !MERGEABLE_FROM.contains(&issue.status) {
+            return Ok(crate::worktree::Merged::Refused {
+                reason: format!(
+                    "#{number} is in {}, and a branch is merged once its work has been looked \
+                     at — move it to review first.",
+                    issue.status.as_str()
+                ),
+                retryable: false,
+            });
+        }
+        if issue.cancelled_at.is_some() {
+            return Ok(crate::worktree::Merged::Refused {
+                reason: format!("#{number} is cancelled, so its branch is not work to land"),
+                retryable: false,
+            });
+        }
+        let root = crate::worktree::worktree_root(&self.paths, project, number);
+        // The card's own record wins where it has one. `branch_worked_on`
+        // falls back to re-deriving the name from the *current* title once
+        // the checkout is gone — and a Done card's checkout is always gone,
+        // because reclamation runs on the way in. A retitle between the
+        // branch being recorded and the merge being asked for would
+        // otherwise send this at a ref that never existed.
+        let branch = match issue.branch.as_deref() {
+            Some(recorded) => recorded.to_owned(),
+            None => self.branch_worked_on(&root, &issue).await,
+        };
+        // Recorded *before* the merge, not after: a merged branch is zero
+        // commits ahead, and `record_branch`'s guard would then refuse to
+        // record it for the rest of the card's life. The card would end up
+        // naming no branch at all, right after landing one.
+        if issue.branch.is_none()
+            && let Ok(true) = self.store.set_issue_branch(&issue.id, &branch).await
+        {
+            self.events.board_changed(project, Some(number));
+        }
+
+        let merged = {
+            let _one_at_a_time = self.merging.lock().await;
+            crate::worktree::merge(
+                Path::new(&row.workdir),
+                &root,
+                &branch,
+                &format!("Merge #{number}: {}", issue.title),
+            )
+            .await?
+        };
+
+        if let crate::worktree::Merged::Landed {
+            into,
+            commit,
+            commits,
+        } = &merged
+        {
+            self.store
+                .append_event(&NewIssueEvent {
+                    issue_id: issue.id.clone(),
+                    project_id: project.clone(),
+                    number,
+                    actor,
+                    body: IssueEventBody::BranchMerged {
+                        branch: branch.clone(),
+                        into: into.clone(),
+                        commit: commit.clone(),
+                        commits: *commits,
+                    },
+                })
+                .await?;
+            self.events.timeline_changed(project, number);
+            self.events.board_changed(project, Some(number));
+        }
+        Ok(merged)
     }
 
     async fn writable_project(&self, id: &ProjectId) -> Result<ProjectRow> {

@@ -439,6 +439,7 @@ export async function updateProject(
     daily_budget_micros?: number | null;
     daily_budget_tokens?: number | null;
     max_parallel_issue_runs: number;
+    agents_may_merge: boolean;
   },
 ): Promise<Outcome<Project>> {
   try {
