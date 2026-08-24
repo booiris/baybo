@@ -11,7 +11,7 @@ import WebKit
 /// eval before the page commits would vanish). Web→native messages arrive on
 /// the `baybo` script message handler as `{ type: ... }` objects.
 @MainActor
-final class TranscriptBridge: NSObject, ObservableObject {
+final class TranscriptBridge: NSObject, ObservableObject, WebMediaSink {
     static let messageHandlerName = "baybo"
 
     private weak var store: (any TranscriptTarget)?
@@ -279,8 +279,7 @@ final class TranscriptBridge: NSObject, ObservableObject {
     /// One file card's lifecycle step. `loaded`/`total` only ride a `loading`
     /// tick; `error` only a `failed` one.
     func fileState(
-        blobId: String, state: String, loaded: UInt64? = nil, total: UInt64? = nil,
-        error: String? = nil
+        blobId: String, state: String, loaded: UInt64?, total: UInt64?, error: String?
     ) {
         var payload: [String: Any] = ["blobId": blobId, "state": state]
         if let loaded { payload["loaded"] = loaded }
@@ -304,8 +303,7 @@ final class TranscriptBridge: NSObject, ObservableObject {
     /// Answer to `requestVideoPoster`: the poster frame's JPEG bytes plus the
     /// natural size and duration, or `dataBase64: nil` + error.
     func videoPoster(
-        id: Int, dataBase64: String?, width: Int, height: Int, durationMs: Int,
-        error: String? = nil
+        id: Int, dataBase64: String?, width: Int, height: Int, durationMs: Int, error: String?
     ) {
         let payload: [String: Any] = [
             "id": id,

@@ -377,7 +377,11 @@ without touching `app/ios` at all.
   board rather than driving two taps through the cards root; that board is the
   one with something in every stage and all four Waiting-strip kinds (the
   parked approval and the agent's question are seeded directly, because
-  `refreshWaitingDetails` reads them off the network and the demo has none).
+  `refreshWaitingDetails` reads them off the network and the demo has none). Add
+  **`-baybo-demo-card`** to land one level deeper again, on a card: that page
+  talks to a gateway of its own, so what it shows headlessly is the shell, the
+  dock and the streamed inset over the page's own loading line — which is
+  itself the proof that the bridge, the entry and the i18n handoff all work.
 
 - **`-baybo-demo-switch`** (DEBUG) opens session `demo-a` with a session-tagged
   turn, then switches `chatPath` to `demo-b` at 5s — exercising the single

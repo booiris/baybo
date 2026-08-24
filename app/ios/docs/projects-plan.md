@@ -116,12 +116,45 @@ contact:
   different sizes: the target never shrinks, only the paint does.
 
 
-## P5 · Issue detail (the largest phase — split into a web PR and a native PR)
+## P5 · Issue detail — **done** (split into a web PR and a native PR)
 
 - **Web half**: add the `issue` entry to `vite.config.ts:17-22` and an `issue.html` (viewport meta copied from deck.html); a new `src/issue/` (new files start with zero eslint suppressions); **extract the attachment components out of `Transcript.tsx` into `src/attachments.tsx`** (AttachmentImage/Bubble/Video/Audio/File, `useNearViewport`, …) — this shifts the suppression baseline, so do it as its own commit; reuse `Markdown.tsx` directly (which pulls in `bridge.ts`: the cheapest resolution is to register the `baybo` handler on the issue webview too so `openUrl` works, otherwise parameterize it); repeat the KaTeX css and fontsource imports in the entry; an `issueSentinel.ts` pinning the hand-written DTO mirrors through `restSentinel`'s type-only import; `issue.*` strings in both locales with the parity test; collapsed activity (consecutive system events → "N events ›").
 - **Native half**: `IssueBridge` (the DeckBridge pattern, main-frame guard, crash budget; `requestBlob`/`blobResult` as the transcript does) and `IssueHost` (if it adopts the transcript's `permitsNavigation`, that gate must admit `/issue.html`; deck's ungated delegate is the alternative); the bottom-inset stream (`setComposerTop` → `pushBottomInset`, replayed on `ready`); the dock (composer pill, hint chip from `CommentHint`, @ chips, `ApprovalCardView` with `CompactPillButtonStyle` lifted out first, the Unblock-after-send toggle, the Editing mode bar); the Stop `ConfirmDialog` (a snapshot struct like `PendingCronJobDelete`, hosted on RootView); native pickers; the ⋯ menu; `RenameDialog` for the title.
 - `POST read` fires after the card renders, then attention refetches.
 - Gates: `app/ios/web` `pnpm lint && pnpm test && pnpm build` (the build is the only evaluator of both drift sentinels), the two-step Swift test run, and a device pass — put the description editor through a Chinese keyboard.
+
+**What the build and the simulator changed.**
+
+- **`issueSentinel.ts` caught three wrong mirrors before any Swift existed.**
+  Written by hand from the Rust source, `IssueDetail.assignee` was an
+  `AgentRef` (it is a bare id), `IssueRun` carried an `agent` object (it
+  carries `agent_id`), and `Actor` was externally tagged (it is internally
+  tagged by `kind`). All three fail silently at runtime as a missing
+  `@handle`; the build caught every one.
+- **`TranscriptMedia` needed a seam, not a fork.** It was tied to the concrete
+  `TranscriptBridge` by exactly one thing — the four replies it makes — so
+  `WebMediaSink` narrows that to a protocol and `WebMediaDispatch` handles the
+  inbound half once for both pages. A file card on a card behaves as it does in
+  a conversation because it IS the same code on both ends.
+- **The timeline is spliced, not re-encoded.** Its only consumer is the page, so
+  it crosses as the gateway's own bytes; a Swift mirror of it would be a third
+  place every new event kind has to be taught about. The card and its runs DO go
+  through `IssueWire`, which is a mirror and says so.
+- **A missing string key is invisible.** `lang.t` echoes the key on a miss, so
+  the Stop dialog shipped a button labelled `chat.cancel` and every assertion
+  stayed green. `LocalizedKeyTests` now walks every `lang.t("…")` in `App/` and
+  fails on a key the catalog does not carry — and on one language carrying a key
+  the other does not.
+- **`App/Resources/transcript/` is a COMMITTED copy of `web/dist`.** `pnpm build`
+  alone does not reach the app; the card page rendered blank until the copy step
+  ran. `build-app.sh` does it, and a Swift/web loop that skips it is testing the
+  last bundle.
+
+**Deferred from P5, deliberately:** the `@` mention chips, staged attachments on
+a comment, and the run-transcript sheet the card's run rows point at (P6). The
+`onOpenRun` hook is wired and inert rather than absent, so the card's shape is
+the one it keeps.
+
 
 ## P6 · Run transcript sheet
 

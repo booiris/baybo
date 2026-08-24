@@ -479,6 +479,18 @@ final class AppStore: ObservableObject {
                 homeTab = .projects
                 chatPath = [.projectBoard(ProjectsStore.demoBoardId)]
             }
+            // `-baybo-demo-card`: one level deeper again, onto a card. The card
+            // page talks to a gateway (its own store is not the board's demo
+            // one), so this shows the shell and the loading state rather than
+            // a populated card — enough to check the header, the dock and the
+            // streamed inset headlessly.
+            if args.contains("-baybo-demo-card") {
+                homeTab = .projects
+                chatPath = [
+                    .projectBoard(ProjectsStore.demoBoardId),
+                    .projectIssue(project: ProjectsStore.demoBoardId, number: 41),
+                ]
+            }
             route = .home
             return
         }
