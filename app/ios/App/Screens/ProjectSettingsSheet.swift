@@ -115,21 +115,25 @@ struct ProjectSettingsSheet: View {
         .frame(height: 52)
     }
 
+    /// The app has ONE way to draw a destructive action — the red outline pill
+    /// Settings logs out with — and this sheet had invented a second: bare sans
+    /// text, left-aligned, dangling under the working-directory path with
+    /// nothing around it. It read as an unstyled link rather than as the peer
+    /// of the Save pill directly above it.
+    ///
+    /// Red only for the archiving direction. Restoring a board takes nothing
+    /// away, and red in this app means destructive or error, never "this row is
+    /// the important one".
     private var archiveRow: some View {
         Button {
             Haptics.tap()
             confirmingArchive = true
         } label: {
             Text(verbatim: lang.t(isArchived ? "settings.unarchive" : "settings.archive"))
-                .font(Theme.sys(14))
-                .foregroundStyle(isArchived ? Theme.ink : Theme.err)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 20)
-                .frame(minHeight: 52)
-                .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
-        .padding(.top, 22)
+        .buttonStyle(OutlinePillButtonStyle(color: isArchived ? Theme.ink : Theme.err))
+        .padding(.horizontal, 20)
+        .padding(.top, 24)
         .accessibilityIdentifier("settings-archive")
     }
 

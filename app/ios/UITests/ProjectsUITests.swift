@@ -364,6 +364,48 @@ final class ProjectsUITests: BayboUITestCase {
             "the activity sheet never presented")
     }
 
+    /// Archiving a board: the pill, its confirm, and the way back out.
+    ///
+    /// The confirm this raises offers **no visible Cancel** — the system draws
+    /// it as a floating card with the one action on it — so the scrim is the
+    /// only way out. And a scrim dismiss is precisely what left
+    /// `.confirmationDialog`'s `isPresented` latched true in the TabView shell,
+    /// deadening the trigger: the bug the hand-rolled `ConfirmDialog` was
+    /// written to escape. Presented from inside a SHEET it does not reproduce,
+    /// and this is what says so — for a control whose only escape hatch is the
+    /// dismissal that used to break it.
+    ///
+    /// The second press deliberately lands **off the label**, near the pill's
+    /// leading edge. `OutlinePillButtonStyle` paints a 1px capsule and nothing
+    /// else, so without its `contentShape` only the glyphs hit-test and the
+    /// interior is dead — and a centre `.tap()`, which is all `.tap()` ever
+    /// does, lands on the glyphs and passes either way. That is exactly how the
+    /// logout pill shipped broken.
+    ///
+    /// The budget chip rather than the ⋯ entry, because the menu's "Settings"
+    /// label collides with the tab bar's.
+    func testArchivingAsksFirstAndTheTriggerSurvivesADismissal() {
+        let app = openBoard()
+        XCTAssertTrue(app.buttons["board-budget-chip"].waitForExistence(timeout: 5))
+        app.buttons["board-budget-chip"].tap()
+
+        let archive = app.buttons["settings-archive"]
+        XCTAssertTrue(archive.waitForExistence(timeout: 5), "settings never presented")
+        archive.tap()
+        let confirm = app.staticTexts["Archive this project?"]
+        XCTAssertTrue(confirm.waitForExistence(timeout: 3), "the pill did not raise the confirm")
+
+        // Beside the dialog card but inside the sheet: the scrim.
+        app.coordinate(withNormalizedOffset: CGVector(dx: 0.06, dy: 0.5)).tap()
+        sleep(1)
+        XCTAssertFalse(confirm.exists, "the scrim did not dismiss it")
+
+        archive.coordinate(withNormalizedOffset: CGVector(dx: 0.06, dy: 0.5)).tap()
+        XCTAssertTrue(
+            confirm.waitForExistence(timeout: 3),
+            "the pill's interior is dead, or the trigger did not survive a scrim dismiss")
+    }
+
     /// A cancelled card is hidden by default and still reachable — dropping it
     /// from the client entirely is how a card somebody wants to reopen becomes
     /// unreachable from the phone.
