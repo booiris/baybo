@@ -421,6 +421,11 @@ struct ProjectBoardScreen: View {
                     .padding(.horizontal, 8)
                     .frame(height: 26)
                     .overlay(Capsule().strokeBorder(Theme.line, lineWidth: 1))
+                    // Stroke-only: the capsule paints a 1px outline and
+                    // nothing else, so without a shape only the glyphs
+                    // hit-test and the pill's interior is dead. This app has
+                    // shipped that bug before, on the logout pill.
+                    .contentShape(Capsule())
                 }
                 .buttonStyle(.plain)
                 .accessibilityIdentifier("board-budget-chip")
@@ -580,6 +585,12 @@ struct ProjectBoardScreen: View {
                             .font(Theme.sys(13, weight: .bold))
                             .foregroundStyle(Theme.paper)
                             .frame(minHeight: 44)
+                            // `minHeight` is LAYOUT; a `Text` still hit-tests
+                            // its own box, so the 44pt target it was reaching
+                            // for was never tappable. This is the one control
+                            // here with a three-second life — a missed tap on
+                            // it cannot be tried again.
+                            .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                     .accessibilityIdentifier("board-undo")

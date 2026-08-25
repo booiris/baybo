@@ -62,6 +62,19 @@ struct IssueCardRow: View {
         .frame(minHeight: 52)
         .padding(.vertical, 13)
         .opacity(isCancelled ? 0.5 : 1)
+        // THE WHOLE ROW is the tap target, and saying so is required rather
+        // than tidy. Under `.buttonStyle(.plain)` a label's hit region is
+        // whatever it actually PAINTS — a `Text` hit-tests its glyphs and
+        // nothing else — so without this the row opened only where letters
+        // happened to be and was dead everywhere else: the gap after a short
+        // title, the space between the handle and the run word, the right
+        // margin. It reads as a list that ignores half its taps.
+        //
+        // Invisible to every assertion the suite already had, too: `exists`,
+        // `isHittable` and the a11y frame are all satisfied by a row whose
+        // paint does not fill it, and `.tap()` lands dead centre — which on a
+        // card row is usually over the title.
+        .contentShape(Rectangle())
         .accessibilityElement(children: .combine)
         .accessibilityIdentifier("issue-row-\(issue.number)")
     }

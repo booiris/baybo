@@ -148,6 +148,35 @@ final class ProjectsUITests: BayboUITestCase {
         XCTAssertFalse(app.buttons["issue-row-41"].exists)
     }
 
+    /// The WHOLE row opens the card, not just the letters in it.
+    ///
+    /// Under `.buttonStyle(.plain)` a label's hit region is whatever it
+    /// PAINTS — a `Text` hit-tests its own box and nothing else — so a row
+    /// without a `contentShape` is dead wherever there is no ink.
+    ///
+    /// **These three points are measured, not guessed.** A probe over the row
+    /// found exactly which offsets died before the fix: the far right edge and
+    /// both vertical paddings. A centre tap — what `.tap()` does — landed on
+    /// the title and passed either way, which is why this walks coordinates
+    /// instead.
+    func testEveryPartOfTheRowOpensTheCardNotJustItsText() {
+        let dead: [(String, CGVector)] = [
+            ("the right margin", CGVector(dx: 0.98, dy: 0.5)),
+            ("the padding above the text", CGVector(dx: 0.5, dy: 0.03)),
+            ("the padding below it", CGVector(dx: 0.5, dy: 0.97)),
+        ]
+        for (where_, offset) in dead {
+            let app = openBoard()
+            let row = app.buttons["issue-row-41"]
+            XCTAssertTrue(row.waitForExistence(timeout: 8))
+            row.coordinate(withNormalizedOffset: offset).tap()
+            XCTAssertTrue(
+                app.buttons["issue-menu"].waitForExistence(timeout: 8),
+                "tapping \(where_) should open the card")
+            app.terminate()
+        }
+    }
+
     /// **The consequence is the sheet.** These two sentences are the reason it
     /// exists, and both are things a desktop board never has to say: a move out
     /// of In Progress does not stop the run, and a move in starts one.

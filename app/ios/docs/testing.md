@@ -148,6 +148,27 @@ Send `XCUIKeyboardKey.delete` once per existing character instead
 the caret into the middle of the text, where backspaces eat the wrong half. The
 dialog focuses the field itself and parks the caret at the end.
 
+### A `.plain` button is only tappable where it PAINTS
+
+Under `.buttonStyle(.plain)` the hit region is whatever the label actually
+draws. A `Text` hit-tests its own box; a `.frame(minHeight:)` is layout and
+adds nothing tappable; a stroke-only `Capsule` hit-tests a 1px outline. So a
+row without a `contentShape` is dead wherever there is no ink — and it looks
+completely healthy: `exists`, `isHittable` and the accessibility frame are all
+satisfied by a control whose paint does not fill it.
+
+`.tap()` will not find it either, because it lands dead centre — which on a
+card row is usually right on the title. **Walk coordinates to test this**, and
+measure the dead points rather than guessing them: a throwaway probe test that
+taps a grid of `coordinate(withNormalizedOffset:)` points and logs which ones
+open is ten minutes and tells you exactly which offsets a regression test has
+to use. `testEveryPartOfTheRowOpensTheCardNotJustItsText` uses three offsets
+found that way, and it fails without the fix — which the first version of it,
+written from reasoning, did not.
+
+The app has now shipped this bug three times: the logout pill
+(`OutlinePillButtonStyle`), a board card row, and the board's budget chip.
+
 ### A tap lands on the element's CENTRE, so an a11y frame is a test surface
 
 `element.tap()` synthesises a touch at the middle of the element's

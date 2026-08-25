@@ -364,6 +364,24 @@ board already writes, and two copies would be two file formats kept identical
 by hand. `IssueMirror` gained an `attachments` field there: the board never
 drew a card's files, so it never wrote them.
 
+### 9.4 Hit targets
+
+Three controls here needed an explicit `contentShape`, all the same bug: under
+`.buttonStyle(.plain)` a label is tappable only where it PAINTS.
+
+- **The card row** opened only where letters were. The gap after a short
+  title, the space between the handle and the run word, the right margin and
+  both vertical paddings were dead — a list that ignores half its taps.
+- **The budget chip** is a stroke-only capsule: a 1px outline hit-tests a 1px
+  outline, and the interior was dead. The logout pill shipped this exact bug
+  once already.
+- **Undo** reached for a 44pt target with `.frame(minHeight: 44)`, which is
+  layout and nothing else. It is the one control here with a three-second
+  life, so a missed tap on it cannot be tried again.
+
+The cards root was already fine and was checked rather than assumed: a
+`ProjectCardView` has a filled background, and a filled shape hit-tests.
+
 ## 10. What shipped, and what did not
 
 Built across P0–P8: the gateway's `approval_pending` and archived-board guard,
