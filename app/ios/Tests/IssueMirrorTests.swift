@@ -83,6 +83,37 @@ struct IssueMirrorTests {
         #expect(second.pendingApprovals.isEmpty, "but nothing may be answered from disk")
     }
 
+    /// The faces the card page draws come with the team's OWN monograms.
+    ///
+    /// The distinction the test is on: `AgentMonogram.map` widens the whole set
+    /// when any pair collides, and `AgentMonogram.of` (one handle, no set)
+    /// cannot — `dev-1` and `docs-1` both reduce to `D1` under it. The page is
+    /// handed the resolved letters for exactly this reason, and a store that
+    /// resolved them per member would hand it two identical faces.
+    @Test func theCardPageIsHandedTheTeamsOwnMonograms() async {
+        let dir = TempSupportDir()
+        let fake = FakeBayboClient()
+        fake.stubIssueDetail = issue(41)
+        fake.stubTeam = [
+            TeamMemberInfo(
+                id: "a-dev", handle: "dev-1", name: "dev-1", description: "",
+                avatarBlobId: "blob-7", framework: "baybo", llm: nil, model: nil,
+                reasoningEffort: nil, lead: false, hiredBy: nil, createdAtMs: 0),
+            TeamMemberInfo(
+                id: "a-docs", handle: "docs-1", name: "docs-1", description: "",
+                avatarBlobId: nil, framework: "baybo", llm: nil, model: nil,
+                reasoningEffort: nil, lead: false, hiredBy: nil, createdAtMs: 0),
+        ]
+        let store = IssueStore(
+            projectId: "p1", number: 41, client: fake, supportDirectory: dir.url)
+        await store.refresh()
+
+        #expect(
+            store.people["a-dev"] == IssuePerson(handle: "dev-1", avatar: "blob-7", monogram: "DE1"))
+        #expect(
+            store.people["a-docs"] == IssuePerson(handle: "docs-1", avatar: nil, monogram: "DO1"))
+    }
+
     /// And the same rule for where the card opens. The envelope on disk still
     /// carries the boundary it was fetched with, and replaying it would open
     /// the card halfway up a thread under a rule promising news that is not

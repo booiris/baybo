@@ -175,12 +175,12 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
 
     func deliver(
         issue: IssueInfo, eventsJson: String, runs: [IssueRunInfo],
-        handles: [String: String], children: [IssueInfo], firstUnread: String?
+        people: [String: IssuePerson], children: [IssueInfo], firstUnread: String?
     ) {
         page(
             "deliver",
             Self.payload(
-                issue: issue, eventsJson: eventsJson, runs: runs, handles: handles,
+                issue: issue, eventsJson: eventsJson, runs: runs, people: people,
                 children: children, firstUnread: firstUnread))
     }
 
@@ -191,12 +191,12 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
     /// JSON with a field quietly missing rather than anything that fails.
     static func payload(
         issue: IssueInfo, eventsJson: String, runs: [IssueRunInfo],
-        handles: [String: String], children: [IssueInfo], firstUnread: String?
+        people: [String: IssuePerson], children: [IssueInfo], firstUnread: String?
     ) -> String {
         var payload: [String: Any] = [
             "issue": IssueWire.card(issue),
             "runs": runs.map(IssueWire.run(_:)),
-            "handles": handles,
+            "people": people.mapValues(IssueWire.person(_:)),
             "children": children.map(IssueWire.child(_:)),
         ]
         // Omitted rather than sent as null when there is nothing new: the page

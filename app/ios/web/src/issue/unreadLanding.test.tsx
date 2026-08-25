@@ -62,12 +62,14 @@ function moved(id: string): IssueEvent {
 }
 
 function withEvents(events: IssueEvent[], firstUnread?: string): IssuePayload {
-  return { issue: card, events, runs: [], handles: {}, firstUnread };
+  return { issue: card, events, runs: [], people: PEOPLE, firstUnread };
 }
 
 function fold(): HTMLButtonElement | null {
   return document.querySelector(".issue-fold button");
 }
+
+const PEOPLE = { "a-dev": { handle: "dev-1", monogram: "D1" } };
 
 const EVENTS: IssueEvent[] = [
   comment("e1", "read this one"),
@@ -76,7 +78,7 @@ const EVENTS: IssueEvent[] = [
 ];
 
 function payload(firstUnread?: string): IssuePayload {
-  return { issue: card, events: EVENTS, runs: [], handles: {}, firstUnread };
+  return { issue: card, events: EVENTS, runs: [], people: PEOPLE, firstUnread };
 }
 
 function deliver(p: IssuePayload): void {

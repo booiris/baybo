@@ -12,6 +12,14 @@
    is silent by design — the only thing that catches one is spelling it the way
    styles.css does. */
 
+:root {
+  /* The face column, shared by the posts and by the rail the machinery lines
+     hang their dot on — two rules that must agree or the card grows a second
+     left margin halfway down. */
+  --face: 26px;
+  --face-gap: 8px;
+}
+
 .issue-page {
   height: 100dvh;
   overflow-y: auto;
@@ -31,14 +39,16 @@
   text-align: center;
   color: var(--color-ink-soft);
   font-family: var(--font-mono);
-  font-size: 13px;
+  font-size: 12px;
 }
 
 .issue-head h1 {
   margin: 0 0 10px;
-  font-size: 20px;
+  font-family: var(--font-sans);
+  font-size: 17px;
   font-weight: 600;
   line-height: 1.3;
+  letter-spacing: -0.01em;
 }
 
 .issue-head h1.cancelled,
@@ -56,7 +66,7 @@
 
 .issue-chip {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 10.5px;
   color: var(--color-ink-soft);
   background: transparent;
   border: 1px solid var(--color-line);
@@ -65,7 +75,7 @@
   /* 32px, not the 44 a standalone control gets: these sit in a wrapping row
      under a title, and a 44pt chip row would push the description off the
      first screen. The row is scrollable and nothing here is destructive. */
-  min-height: 32px;
+  min-height: 28px;
   cursor: pointer;
 }
 
@@ -82,7 +92,7 @@
   border: 1px solid var(--color-line);
   border-radius: var(--radius);
   background: var(--color-surface);
-  font-size: 13px;
+  font-size: 12.5px;
 }
 
 .issue-blocked-label {
@@ -102,7 +112,7 @@
   margin-bottom: 14px;
   border: 1px solid var(--color-line);
   border-radius: var(--radius);
-  font-size: 13px;
+  font-size: 12.5px;
 }
 
 .issue-run-word,
@@ -156,7 +166,7 @@
 .issue-section h2 {
   margin: 0 0 8px;
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 9.5px;
   letter-spacing: 0.12em;
   text-transform: uppercase;
   font-weight: 400;
@@ -170,7 +180,7 @@
 .issue-empty {
   margin: 0;
   color: var(--color-ink-soft);
-  font-size: 13px;
+  font-size: 12.5px;
 }
 
 .issue-editor {
@@ -185,7 +195,7 @@
   /* The editor shows the SOURCE, so it is monospaced — a proportional face
      over raw markdown hides exactly the alignment the syntax depends on. */
   font-family: var(--font-mono);
-  font-size: 13px;
+  font-size: 12.5px;
   line-height: 1.55;
   resize: none;
 }
@@ -217,7 +227,7 @@
   gap: 8px;
   width: 100%;
   min-height: 30px;
-  font-size: 13px;
+  font-size: 12.5px;
   font-family: inherit;
 }
 
@@ -247,37 +257,173 @@
   white-space: nowrap;
 }
 
+/* ---- posts and lines -------------------------------------------------------
+
+   What somebody said is a boxed post with a face beside it; what the board did
+   is one line on the same left rail. The split is what keeps a long card
+   readable: the eye finds the next thing a person wrote by running down the
+   face column, and machinery that wore the same frame would make the card a
+   wall of identical rectangles. */
+
 .issue-entry {
-  padding: 8px 0;
+  padding: 7px 0;
 }
 
-.issue-entry.system {
-  color: var(--color-ink-soft);
-  font-size: 12px;
-}
-
-.issue-entry-head {
+.issue-post {
   display: flex;
-  gap: 8px;
+  align-items: flex-start;
+  gap: var(--face-gap);
+}
+
+.issue-face {
+  width: var(--face);
+  height: var(--face);
+  flex: none;
+  box-sizing: border-box;
+  border: 1px solid var(--color-line);
+  border-radius: 50%;
+  background: var(--color-surface);
+  object-fit: cover;
+  overflow: hidden;
+  /* The monogram, when there is no picture. Centred by grid rather than
+     line-height so a two- and a three-glyph monogram sit identically. */
+  display: inline-grid;
+  place-items: center;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  color: var(--color-ink-soft);
+}
+
+/* The operator is the one filled disc — the same ink their chat bubble wears.
+   The board's own entries are hairline and dashed: a thing, but not a person. */
+.issue-face.user {
+  background: var(--color-ink);
+  border-color: var(--color-ink);
+}
+
+.issue-face.system {
+  border-style: dashed;
+}
+
+.issue-box {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius);
+  background: var(--color-paper);
+}
+
+/* The tail, drawn twice: the border's triangle and the fill's, one pixel
+   apart. A single triangle cannot have a 1px outline. */
+.issue-box::before,
+.issue-box::after {
+  content: "";
+  position: absolute;
+  top: 10px;
+  width: 0;
+  height: 0;
+  border-style: solid;
+  border-width: 6px 7px 6px 0;
+  border-color: transparent var(--color-line) transparent transparent;
+}
+
+.issue-box::before {
+  left: -7px;
+}
+
+.issue-box::after {
+  left: -6px;
+  border-right-color: var(--color-surface);
+}
+
+.issue-box-head {
+  display: flex;
   align-items: baseline;
-  margin-bottom: 2px;
+  gap: 6px;
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--color-line);
+  background: var(--color-surface);
+  border-radius: calc(var(--radius) - 1px) calc(var(--radius) - 1px) 0 0;
 }
 
-.issue-entry-who {
+.issue-box-who {
   font-family: var(--font-mono);
-  font-size: 11px;
-  color: var(--color-ink-soft);
+  font-size: 10.5px;
+  color: var(--color-ink);
 }
 
-.issue-entry-time {
-  font-family: var(--font-mono);
-  font-size: 10px;
+.issue-box-said {
+  font-family: var(--font-sans);
+  font-size: 10.5px;
   color: var(--color-ink-soft);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.issue-box-when {
   margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  color: var(--color-ink-soft);
+  white-space: nowrap;
+}
+
+/* The one long read on this page, so it is the one place that leaves the
+   monospace chrome behind — Inter at the transcript's proportions, a notch
+   down: a card is scanned, a conversation is read. */
+.issue-box-body {
+  padding: 7px 10px;
+  font-family: var(--font-sans);
+  font-size: 0.875rem;
+  line-height: 1.55;
+}
+
+.issue-line {
+  display: flex;
+  align-items: baseline;
+  gap: var(--face-gap);
+  padding: 4px 0;
+  font-size: 11.5px;
+  color: var(--color-ink-soft);
+}
+
+/* A dot centred in the FACE column, so machinery hangs off the same rail the
+   posts do rather than starting a second margin. */
+.issue-line-dot {
+  width: var(--face);
+  height: 1em;
+  flex: none;
+  background: radial-gradient(
+    circle at 50% 50%,
+    var(--color-line-strong) 0 2.5px,
+    transparent 2.5px
+  );
+}
+
+.issue-line-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.issue-line-who {
+  font-family: var(--font-mono);
+}
+
+.issue-line-when {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  white-space: nowrap;
 }
 
 .issue-fold {
   padding: 6px 0;
+  /* On the box column, not the page margin: the faces set the card's left
+     rail, and a collapsed run starting further left reads as a different
+     list. */
+  padding-left: calc(var(--face) + var(--face-gap));
 }
 
 .issue-fold button {

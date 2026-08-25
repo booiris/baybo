@@ -121,7 +121,7 @@ Moving out of In Progress **never kills the run**; Stop is the only kill switch.
 | Layer | Owner | Contents |
 |---|---|---|
 | header | native (`ChatHeaderView` grammar) | back · `#N · status` glass pill (tap → Move sheet) · ⋯ |
-| body | **`issue.html` WKWebView** | title · chips · live-run row · blocked banner · ↳ / ⑂ · description (full markdown / KaTeX / images) · attachments · sub-issues · runs · activity (comments as markdown; **every run of system events collapses into a closed "N events ›" line — a run of one included** — and presses open and close it again, while comments, approvals and blocks never collapse) · a "New activity" jump pill |
+| body | **`issue.html` WKWebView** | title · chips · live-run row · blocked banner · ↳ / ⑂ · **the description as the opening post** · attachments · sub-issues · runs · activity (**posts and lines**, below) · a "New activity" jump pill |
 | dock | native (`ComposerDock` grammar) | hint chip · @ chips · `ApprovalCardView` (two answers, REST-backed) · composer pill (+ attachment bloom) |
 | overlays | native | pickers (`ModelMenuPanel` style) · sheets · `RenameDialog` · `ConfirmDialog` |
 
@@ -132,7 +132,32 @@ Moving out of In Progress **never kills the run**; Stop is the only kill switch.
 - **The approval card**: `ApprovalCardView` unchanged in the dock (`CompactPillButtonStyle` lifted out of its file first), two answers; the pending set is the card's `events` replayed by `call_id` (requested without resolved). The live queue is the truth, so tolerate a 404 on answer.
 - **The Answer flow** (an agent's question): Answer from the Waiting strip or the blocked banner opens the card with the composer focused and `@lead ` prefilled, the hint reading "Answers @lead · unblocking hands the run back to @dev-2", and "Unblock #N after sending" checked by default → `POST comment` first, then `PATCH {blocked_reason: null}` (the unblock door hands the parked run back out, and its brief carries your answer). A block the operator wrote themselves does not get this treatment.
 - **Editing the description (decision 11)**: a ✎ in the Description section header swaps the rendered block for a plain `<textarea>` holding the raw markdown (deliberately not contenteditable), and the native dock becomes "Editing description · Cancel | Done". Done sends the text over the bridge → `PATCH {description}` → re-render. Renaming the title still goes through `RenameDialog` (⋯ → Rename).
+- **Posts and lines** (2026-08-25): the card reads as a thread. What somebody
+  said — the description included, hoisted into the first box under its
+  author's name — is a bordered box with a face beside it and a head reading
+  `@who · time`; what the board did is one line on the same left rail, a dot
+  in the face column and a sentence. The split is what keeps a long card
+  readable: the eye finds the next thing a person wrote by running down the
+  face column, and machinery in the same frame makes a wall of rectangles.
+  - **Faces come from native**: `IssuePerson { handle, avatar, monogram }` per
+    agent id on the payload. The monogram is `AgentMonogram.map`'s, i.e. the
+    TEAM's — `dev-1` and `docs-1` both reduce to `D1` until the set widens, so
+    a page deriving one from the handle it was handed would draw the collision
+    the board already avoids. The picture rides `requestBlob` (this page's
+    scheme handler is static-only) and is cached per blob id, since one avatar
+    appears on every row its author wrote.
+  - The operator reads as **You** and wears the one filled disc; the board is
+    hairline and dashed. It printed "board" for the operator's own comments
+    until this change — `actorHandle` answers `null` for a user and the system
+    alike, and the row printed the system's word for either.
+  - Bodies are **Inter at 0.875rem**, the one place on the page that leaves the
+    monospace chrome behind: a card is scanned, a comment is read. Everything
+    else came down a notch with it (title 20→17 and into Inter, matching the
+    native card row; chips 11→10.5).
 - `POST …/read` fires only after the timeline renders successfully, then attention is refetched.
+- **Every run of system events collapses** into a closed `N events ›` line — a
+  run of one included — and presses open and close it again. Comments,
+  approvals and blocks never collapse.
 - **The card opens where the reading stopped.** `GET …/events` answers
   `IssueTimelineDto { items, first_unread }`; the page draws a red `NEW` rule
   above that entry and `scrollIntoView`s it (clearing the floating header via

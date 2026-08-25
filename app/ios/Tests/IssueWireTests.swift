@@ -121,7 +121,8 @@ import Testing
             "body":{"kind":"swimlane_changed","lane":"fast"}}],"first_unread":"e1"}
             """
         let json = IssueBridge.payload(
-            issue: issue(), eventsJson: envelope, runs: [], handles: ["a-dev": "dev-1"],
+            issue: issue(), eventsJson: envelope, runs: [],
+            people: ["a-dev": IssuePerson(handle: "dev-1", avatar: nil, monogram: "D1")],
             children: [], firstUnread: "e1")
         let decoded =
             try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any] ?? [:]
@@ -134,7 +135,7 @@ import Testing
         #expect((events.first?["body"] as? [String: Any])?["lane"] as? String == "fast")
 
         let quiet = IssueBridge.payload(
-            issue: issue(), eventsJson: envelope, runs: [], handles: [:], children: [],
+            issue: issue(), eventsJson: envelope, runs: [], people: [:], children: [],
             firstUnread: nil)
         let quietly =
             try JSONSerialization.jsonObject(with: Data(quiet.utf8)) as? [String: Any] ?? [:]

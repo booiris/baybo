@@ -61,6 +61,7 @@ export const en = {
       unassigned: "Unassigned",
       blocked: "Blocked",
       system: "board",
+      you: "You",
       nEvents_one: "{{count}} event",
       nEvents_other: "{{count}} events",
       eventOpened: "opened this card",

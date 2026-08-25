@@ -1,4 +1,12 @@
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { AttachmentBubble } from "../attachments";
 import { currentConnEpoch } from "../bridge";
@@ -12,12 +20,14 @@ import {
   postIssueRendered,
   subscribeIssue,
   type IssuePayload,
+  type Person,
 } from "./bridge";
+import { avatarUrl } from "./avatars";
 import { fold, foldHead, type Fold } from "./timeline";
 import {
-  actorHandle,
   isLiveRun,
   toWireAttachment,
+  type Actor,
   type ChildIssue,
   type IssueDetail,
   type IssueEvent,
@@ -125,13 +135,22 @@ export function IssuePage() {
     return <div className="issue-loading">{t("issue.loading")}</div>;
   }
 
-  const { issue, events, runs, handles } = payload;
-  // Ids in, handles out. The DTOs carry profile ids and only the board
-  // knows the team, so the map arrives on the payload and every name on
+  const { issue, events, runs, people } = payload;
+  // Ids in, people out. The DTOs carry profile ids and only the board knows
+  // the team, so the map arrives on the payload and every name and face on
   // this page goes through it — an id that resolves to nothing prints as
-  // itself, which is what the gateway does too.
-  const handle = (id: string): string => handles[id] ?? id;
+  // itself, which is what the gateway does too, and wears a blank disc.
+  const who = (id: string): Person => people[id] ?? { handle: id, monogram: "" };
+  const handle = (id: string): string => who(id).handle;
   const liveRun = runs.find(isLiveRun) ?? null;
+  // Who opened the card: the description reads as their post, the way the
+  // first box on a GitHub issue does. Off the timeline's `opened` entry —
+  // the card DTO records only whether an AGENT opened it, not which one.
+  const opened = events.find((e) => e.body.kind === "opened") ?? null;
+  // And the entry is then HOISTED rather than repeated: the description's own
+  // head already says "@who opened this card", so leaving the line in the
+  // Activity would print the same fact twice, a screen apart.
+  const timeline = opened === null ? events : events.filter((e) => e.id !== opened.id);
 
   return (
     <div
@@ -154,6 +173,8 @@ export function IssuePage() {
       {liveRun !== null && <RunRow run={liveRun} who={handle(liveRun.agent_id)} />}
       <Description
         issue={issue}
+        author={opened?.actor ?? null}
+        who={who}
         editing={editing}
         draft={draft}
         onDraft={setDraft}
@@ -175,7 +196,7 @@ export function IssuePage() {
       )}
       <SubIssues issue={issue} children={payload.children ?? []} />
       <Runs runs={runs} handle={handle} />
-      <Activity events={events} landing={landing} />
+      <Activity events={timeline} landing={landing} who={who} />
     </div>
   );
 }
@@ -237,12 +258,16 @@ function RunRow({ run, who }: { run: IssueRun; who: string }) {
 /// list that silently loses its nesting comes from.
 function Description({
   issue,
+  author,
+  who,
   editing,
   draft,
   onDraft,
   onDone,
 }: {
   issue: IssueDetail;
+  author: Actor | null;
+  who: (id: string) => Person;
   editing: boolean;
   draft: string;
   onDraft: (text: string) => void;
@@ -262,30 +287,30 @@ function Description({
     sent.current = true;
   }, [editing]);
 
-  if (editing) {
-    return (
-      <section className="issue-section">
-        <h2>{t("issue.description")}</h2>
-        <textarea
-          className="issue-editor"
-          value={draft}
-          onChange={(e) => onDraft(e.target.value)}
-          onBlur={() => onDone(draft)}
-          autoFocus
-          spellCheck={false}
-        />
-      </section>
-    );
-  }
-
   return (
     <section className="issue-section">
-      <h2>{t("issue.description")}</h2>
-      {issue.description === "" ? (
-        <p className="issue-empty">{t("issue.noDescription")}</p>
-      ) : (
-        <MarkdownBody text={issue.description} />
-      )}
+      <Post
+        actor={author}
+        who={who}
+        title={author !== null ? speaker(author, who, t) : t("issue.description")}
+        at={issue.created_at_ms}
+        said={author !== null ? t("issue.eventOpened") : undefined}
+      >
+        {editing ? (
+          <textarea
+            className="issue-editor"
+            value={draft}
+            onChange={(e) => onDraft(e.target.value)}
+            onBlur={() => onDone(draft)}
+            autoFocus
+            spellCheck={false}
+          />
+        ) : issue.description === "" ? (
+          <p className="issue-empty">{t("issue.noDescription")}</p>
+        ) : (
+          <MarkdownBody text={issue.description} />
+        )}
+      </Post>
     </section>
   );
 }
@@ -356,7 +381,15 @@ function Runs({ runs, handle }: { runs: IssueRun[]; handle: (id: string) => stri
 /// that row is the only thing on this page that says so. It is not a filter:
 /// everything above it is still there, because a card is a record and the
 /// point of arriving mid-thread is to be able to scroll back up out of it.
-function Activity({ events, landing }: { events: IssueEvent[]; landing: string | null }) {
+function Activity({
+  events,
+  landing,
+  who,
+}: {
+  events: IssueEvent[];
+  landing: string | null;
+  who: (id: string) => Person;
+}) {
   const { t } = useTranslation();
   const folded = useMemo(() => fold(events, landing ?? undefined), [events, landing]);
   if (folded.length === 0) return null;
@@ -371,7 +404,7 @@ function Activity({ events, landing }: { events: IssueEvent[]; landing: string |
                 {t("issue.unreadFrom")}
               </li>
             )}
-            <FoldRow item={item} landed={foldHead(item)?.id === landing} />
+            <FoldRow item={item} landed={foldHead(item)?.id === landing} who={who} />
           </Fragment>
         ))}
       </ol>
@@ -396,7 +429,15 @@ function rowKey(item: Fold, index: number): string {
 /// `landed` is the exception, and it has to be: the run carrying the unread
 /// boundary is what the page just scrolled to, and landing a reader on a
 /// closed line is landing them on nothing.
-function FoldRow({ item, landed }: { item: Fold; landed: boolean }) {
+function FoldRow({
+  item,
+  landed,
+  who,
+}: {
+  item: Fold;
+  landed: boolean;
+  who: (id: string) => Person;
+}) {
   const { t } = useTranslation();
   /// The reader's own choice, once they make one — `null` means "follow the
   /// landing". Not seeded with `useState(landed)`: the boundary arrives with
@@ -404,7 +445,7 @@ function FoldRow({ item, landed }: { item: Fold; landed: boolean }) {
   /// and an initial value would be read before it exists.
   const [toggled, setToggled] = useState<boolean | null>(null);
 
-  if (item.kind === "entry") return <EntryRow event={item.event} />;
+  if (item.kind === "entry") return <EntryRow event={item.event} who={who} />;
 
   const open = toggled ?? landed;
   return (
@@ -414,51 +455,155 @@ function FoldRow({ item, landed }: { item: Fold; landed: boolean }) {
           {t("issue.nEvents", { count: item.events.length })} {open ? "⌄" : "›"}
         </button>
       </li>
-      {open &&
-        item.events.map((event) => <EntryRow key={event.id} event={event} />)}
+      {open && item.events.map((event) => <EntryRow key={event.id} event={event} who={who} />)}
     </>
   );
 }
 
-function EntryRow({ event }: { event: IssueEvent }) {
+/// One timeline entry: a POST if somebody wrote it, a LINE if the board did.
+///
+/// The split is the whole shape of the page. What a person (or an agent, which
+/// on a board is the same kind of thing) said is a boxed post with a face
+/// beside it — it has an author, a body, and it is what the card is about.
+/// Machinery has no body worth a box: a `moved` is one sentence, and giving it
+/// the same frame as a paragraph of reasoning makes a card read as a wall of
+/// identical rectangles.
+function EntryRow({ event, who }: { event: IssueEvent; who: (id: string) => Person }) {
   const { t } = useTranslation();
-  const who = actorHandle(event.actor);
-  const isComment = event.body.kind === "comment";
   const text = typeof event.body.text === "string" ? event.body.text : "";
   const attachments = Array.isArray(event.body.attachments) ? event.body.attachments : [];
 
+  if (event.body.kind !== "comment") {
+    return (
+      <li className="issue-line">
+        <span className="issue-line-dot" aria-hidden="true" />
+        <span className="issue-line-text">
+          <span className="issue-line-who">{speaker(event.actor, who, t)}</span>{" "}
+          {/* An unrecognised kind renders as its own name rather than throwing:
+              the gateway adds kinds on its own schedule, and a card whose
+              Activity died because of one would take the comments with it. */}
+          {describe(event, t)}
+        </span>
+        <span className="issue-line-when">{shortTime(event.created_at_ms)}</span>
+      </li>
+    );
+  }
+
   return (
-    <li className={`issue-entry ${isComment ? "comment" : "system"}`}>
-      <div className="issue-entry-head">
-        <span className="issue-entry-who">{who !== null ? `@${who}` : t("issue.system")}</span>
-        <span className="issue-entry-time">{shortTime(event.created_at_ms)}</span>
-      </div>
-      {isComment ? (
-        <>
-          <MarkdownBody text={text} />
-          {attachments.length > 0 && (
-            <div className="issue-attachments">
-              {attachments.map((raw, i) => {
-                const a = raw as { blob_id?: unknown };
-                if (typeof a.blob_id !== "string") return null;
-                return (
-                  <AttachmentBubble
-                    key={`${a.blob_id}-${String(i)}`}
-                    attachment={toWireAttachment(raw as Parameters<typeof toWireAttachment>[0])}
-                    connEpoch={currentConnEpoch()}
-                  />
-                );
-              })}
-            </div>
-          )}
-        </>
-      ) : (
-        // An unrecognised kind renders as its own name rather than throwing:
-        // the gateway adds kinds on its own schedule, and a card whose Activity
-        // died because of one would take the comments with it.
-        <span className="issue-entry-line">{describe(event, t)}</span>
-      )}
+    <li className="issue-entry comment">
+      <Post
+        actor={event.actor}
+        who={who}
+        title={speaker(event.actor, who, t)}
+        at={event.created_at_ms}
+      >
+        <MarkdownBody text={text} />
+        {attachments.length > 0 && (
+          <div className="issue-attachments">
+            {attachments.map((raw, i) => {
+              const a = raw as { blob_id?: unknown };
+              if (typeof a.blob_id !== "string") return null;
+              return (
+                <AttachmentBubble
+                  key={`${a.blob_id}-${String(i)}`}
+                  attachment={toWireAttachment(raw as Parameters<typeof toWireAttachment>[0])}
+                  connEpoch={currentConnEpoch()}
+                />
+              );
+            })}
+          </div>
+        )}
+      </Post>
     </li>
+  );
+}
+
+/// A face beside a bordered box: the shape a threaded issue has had since
+/// before GitHub, and the reason a long card stays readable — the eye finds
+/// the next thing somebody said by looking down one column, not by reading.
+function Post({
+  actor,
+  who,
+  title,
+  at,
+  said,
+  children,
+}: {
+  /// Whose face goes beside the box. `null` draws the board's blank disc —
+  /// the description of a card whose opening nothing recorded.
+  actor: Actor | null;
+  who: (id: string) => Person;
+  /// The head's first word. Passed in rather than derived from `actor`
+  /// because the description's box is titled by what it IS on a card nobody
+  /// can be named the author of.
+  title: string;
+  at: number;
+  /// What this box is, when that is not simply "they wrote this" — the
+  /// description's box says "opened this card".
+  said?: string;
+  children: ReactNode;
+}) {
+  return (
+    <div className="issue-post">
+      <Avatar actor={actor} who={who} />
+      <div className="issue-box">
+        <div className="issue-box-head">
+          <span className="issue-box-who">{title}</span>
+          {said !== undefined && <span className="issue-box-said">{said}</span>}
+          <span className="issue-box-when">{shortTime(at)}</span>
+        </div>
+        <div className="issue-box-body">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+/// Whoever an actor is, in words.
+function speaker(actor: Actor, who: (id: string) => Person, t: Translate): string {
+  // The operator reads as themselves. This printed "board" until 2026-08-25,
+  // because `actorHandle` answers `null` for both a user and the system and
+  // the row printed the system's word for either.
+  if (actor.kind === "user") return t("issue.you");
+  if (actor.kind === "system") return t("issue.system");
+  return `@${who(actor.id).handle}`;
+}
+
+/// An agent's picture, or the letters that stand in for it.
+///
+/// The bytes come over the bridge (`avatars.ts`) because this page's scheme
+/// handler is static-only. A face that has not loaded — or an agent with no
+/// avatar, which is most of them — is the monogram native computed for the
+/// whole team; an actor who is not an agent gets a plain disc, filled for the
+/// operator and hairline for the board.
+function Avatar({ actor, who }: { actor: Actor | null; who: (id: string) => Person }) {
+  const person = actor !== null && actor.kind === "agent" ? who(actor.id) : null;
+  const blob = person?.avatar;
+  const [url, setUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (blob === undefined) {
+      setUrl(null);
+      return;
+    }
+    let live = true;
+    avatarUrl(blob)
+      .then((next) => {
+        if (live) setUrl(next);
+      })
+      .catch(() => {
+        // A face that will not load is a monogram, not an error: the card is
+        // about what was said, and nothing here is worth a broken-image icon.
+      });
+    return () => {
+      live = false;
+    };
+  }, [blob]);
+
+  if (url !== null) return <img className="issue-face" src={url} alt="" />;
+  return (
+    <span className={`issue-face ${actor?.kind ?? "system"}`} aria-hidden="true">
+      {person?.monogram ?? ""}
+    </span>
   );
 }
 

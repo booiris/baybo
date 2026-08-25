@@ -84,6 +84,18 @@ enum IssueWire {
         return out
     }
 
+    /// One agent, as the page's `Person`: what to call them, and what to draw
+    /// for them. camelCase because this half is NATIVE's own — unlike the
+    /// card, the runs and the children above, no gateway DTO has this shape.
+    static func person(_ person: IssuePerson) -> [String: Any] {
+        var out: [String: Any] = [
+            "handle": person.handle,
+            "monogram": person.monogram,
+        ]
+        if let avatar = person.avatar { out["avatar"] = avatar }
+        return out
+    }
+
     static func attachment(_ a: IssueAttachmentInfo) -> [String: Any] {
         var out: [String: Any] = [
             "blob_id": a.blobId,

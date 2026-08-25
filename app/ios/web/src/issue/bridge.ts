@@ -22,14 +22,24 @@ export type IssueInit = {
   bottomInset: number;
 };
 
+/// Who an agent id is: what to call them, and what to draw for them.
+///
+/// The DTOs carry profile ids, and only the board knows the team — so this is
+/// resolved once natively rather than in every place the page prints a name.
+/// `monogram` comes with it because it is a property of the whole TEAM, not of
+/// one handle (`dev-1` and `docs-1` both give `D1` until the set widens): a
+/// page deriving its own would print the collision `AgentMonogram` exists to
+/// avoid. `avatar` is a blob id, fetched over the same `requestBlob` bridge
+/// the attachment cards use.
+export type Person = { handle: string; avatar?: string; monogram: string };
+
 export type IssuePayload = {
   issue: IssueDetail;
   events: IssueEvent[];
   runs: IssueRun[];
-  /// Agent profile id → `@handle`. The DTOs carry ids, not handles, and only
-  /// the board knows the team — so resolution happens once on the native side
-  /// rather than in every place this page prints a name.
-  handles: Record<string, string>;
+  /// Agent profile id → who they are. An id that resolves to nothing prints as
+  /// itself, which is what the gateway does too.
+  people: Record<string, Person>;
   /// This card's children, from the board. The issue DTO carries only a
   /// done/total COUNT, so listing them needs a source the card itself is not.
   children?: ChildIssue[];

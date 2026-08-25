@@ -94,6 +94,20 @@ struct IssueEvent: Equatable {
     }
 }
 
+/// Who an agent id is, once the board has resolved it.
+///
+/// A type rather than a `[String: Any]` because it crosses a boundary and the
+/// far side reads it by name: the page's `Person` in `issue/bridge.ts`.
+/// `monogram` travels WITH the handle because it is a property of the whole
+/// team — see `AgentMonogram` — and a page handed only the handle would
+/// re-derive it wrongly for exactly the pairs the rule exists for.
+struct IssuePerson: Equatable {
+    let handle: String
+    /// The blob the page fetches over the bridge. Most agents have none.
+    let avatar: String?
+    let monogram: String
+}
+
 /// A tool call parked on this card, waiting to be answered.
 ///
 /// Distinct from the chat surface's `PendingApproval` on purpose, and not

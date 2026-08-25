@@ -421,9 +421,30 @@ final class IssueStore: ObservableObject, WebMediaTarget {
     private func deliver() {
         guard let issue else { return }
         bridge?.deliver(
-            issue: issue, eventsJson: eventsJson, runs: runs,
-            handles: Dictionary(team.map { ($0.id, $0.handle) }, uniquingKeysWith: { a, _ in a }),
+            issue: issue, eventsJson: eventsJson, runs: runs, people: people,
             children: children, firstUnread: firstUnread)
+    }
+
+    /// Who the ids on this card's DTOs are: what to call them, and what to
+    /// draw for them.
+    ///
+    /// The monogram is resolved HERE rather than on the page, because it is a
+    /// property of the whole team and not of one handle — `dev-1` and `docs-1`
+    /// both give `D1` until the set widens (see `AgentMonogram`). A page
+    /// deriving its own from the handle it was handed would print exactly the
+    /// collision the board already knows how to avoid.
+    var people: [String: IssuePerson] {
+        let monograms = AgentMonogram.map(for: team)
+        return Dictionary(
+            team.map { member in
+                (
+                    member.id,
+                    IssuePerson(
+                        handle: member.handle,
+                        avatar: member.avatarBlobId,
+                        monogram: monograms[member.id] ?? AgentMonogram.of(member.handle))
+                )
+            }, uniquingKeysWith: { a, _ in a })
     }
 
     /// Re-send whatever is loaded. Called when the page reports `ready` after

@@ -61,6 +61,7 @@ export const zh: typeof en = {
       unassigned: "未指派",
       blocked: "已阻塞",
       system: "看板",
+      you: "你",
       // Chinese has one plural form, so i18next only ever selects `_other`
       // here. `_one` is carried anyway because the parity test compares key
       // SETS — and a per-key exemption would be a hole in the check that
