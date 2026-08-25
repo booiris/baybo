@@ -205,6 +205,227 @@
         }
       }
     },
+    "attach.addImage": {
+      "extractionState": "stale",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Add attachment"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "添加附件"
+          }
+        }
+      }
+    },
+    "attach.attachFailed": {
+      "extractionState": "stale",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Couldn't read that file"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "无法读取该文件"
+          }
+        }
+      }
+    },
+    "attach.attachFiles": {
+      "extractionState": "stale",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Files"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "文件"
+          }
+        }
+      }
+    },
+    "attach.attachPaste": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Paste"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "粘贴"
+          }
+        }
+      }
+    },
+    "attach.attachPhotos": {
+      "extractionState": "stale",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Photos"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "照片"
+          }
+        }
+      }
+    },
+    "attach.draftAttachmentsLost": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Some attachments could not be restored"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "部分附件无法恢复"
+          }
+        }
+      }
+    },
+    "attach.remove": {
+      "extractionState": "stale",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Remove"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "移除"
+          }
+        }
+      }
+    },
+    "attach.removeFailedAttachment": {
+      "extractionState": "stale",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Retry or remove the attachment that failed to upload"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "请重试或移除上传失败的附件"
+          }
+        }
+      }
+    },
+    "attach.retryUpload": {
+      "extractionState": "stale",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Retry"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "重试"
+          }
+        }
+      }
+    },
+    "attach.stagedImage": {
+      "extractionState": "stale",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Image"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "图片"
+          }
+        }
+      }
+    },
+    "attach.tooLarge": {
+      "extractionState": "stale",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Too large (max 100 MB)"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "文件过大（最大 100 MB）"
+          }
+        }
+      }
+    },
+    "attach.tooManyAttachments": {
+      "extractionState": "stale",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Up to %d attachments"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "最多 %d 个附件"
+          }
+        }
+      }
+    },
+    "attach.waitingUpload": {
+      "extractionState": "stale",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Waiting for the attachment to finish uploading…"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "正在等待附件上传完成…"
+          }
+        }
+      }
+    },
     "board.anAgent": {
       "extractionState": "manual",
       "localizations": {
@@ -936,23 +1157,6 @@
         }
       }
     },
-    "chat.addImage": {
-      "extractionState": "stale",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Add attachment"
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "添加附件"
-          }
-        }
-      }
-    },
     "chat.approvalApprove": {
       "extractionState": "stale",
       "localizations": {
@@ -1038,74 +1242,6 @@
         }
       }
     },
-    "chat.attachFailed": {
-      "extractionState": "stale",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Couldn't read that file"
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "无法读取该文件"
-          }
-        }
-      }
-    },
-    "chat.attachFiles": {
-      "extractionState": "stale",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Files"
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "文件"
-          }
-        }
-      }
-    },
-    "chat.attachPaste": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Paste"
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "粘贴"
-          }
-        }
-      }
-    },
-    "chat.attachPhotos": {
-      "extractionState": "stale",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Photos"
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "照片"
-          }
-        }
-      }
-    },
     "chat.back": {
       "extractionState": "stale",
       "localizations": {
@@ -1119,23 +1255,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "返回对话列表"
-          }
-        }
-      }
-    },
-    "chat.draftAttachmentsLost": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Some attachments could not be restored"
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "部分附件无法恢复"
           }
         }
       }
@@ -1565,40 +1684,6 @@
         }
       }
     },
-    "chat.remove": {
-      "extractionState": "stale",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Remove"
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "移除"
-          }
-        }
-      }
-    },
-    "chat.removeFailedAttachment": {
-      "extractionState": "stale",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Retry or remove the attachment that failed to upload"
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "请重试或移除上传失败的附件"
-          }
-        }
-      }
-    },
     "chat.resyncing": {
       "extractionState": "manual",
       "localizations": {
@@ -1612,23 +1697,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "正在从服务器重建对话…"
-          }
-        }
-      }
-    },
-    "chat.retryUpload": {
-      "extractionState": "stale",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Retry"
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "重试"
           }
         }
       }
@@ -1663,23 +1731,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "发送失败：%@"
-          }
-        }
-      }
-    },
-    "chat.stagedImage": {
-      "extractionState": "stale",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Image"
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "图片"
           }
         }
       }
@@ -1735,40 +1786,6 @@
         }
       }
     },
-    "chat.tooLarge": {
-      "extractionState": "stale",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Too large (max 100 MB)"
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "文件过大（最大 100 MB）"
-          }
-        }
-      }
-    },
-    "chat.tooManyAttachments": {
-      "extractionState": "stale",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Up to %d attachments"
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "最多 %d 个附件"
-          }
-        }
-      }
-    },
     "chat.voice": {
       "extractionState": "stale",
       "localizations": {
@@ -1782,23 +1799,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "语音输入"
-          }
-        }
-      }
-    },
-    "chat.waitingUpload": {
-      "extractionState": "stale",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Waiting for the attachment to finish uploading…"
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "正在等待附件上传完成…"
           }
         }
       }

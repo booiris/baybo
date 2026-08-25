@@ -534,7 +534,7 @@ final class DeckStore: ObservableObject {
         name: String,
         upload: @escaping (any BayboClientProtocol) async throws -> String
     ) {
-        guard byteCount <= Int64(ChatStore.maxAttachmentBytes) else {
+        guard byteCount <= Int64(ComposerStaging.maxAttachmentBytes) else {
             settlePick(id: id, ok: false, refJSON: nil, error: "too large")
             return
         }

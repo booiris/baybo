@@ -82,21 +82,6 @@ final class ChatStore: ObservableObject, TranscriptTarget {
 
     static let reconnectBackoff: Duration = .milliseconds(2000)
     static let foregroundDebounce: Duration = .milliseconds(400)
-    /// Matches the gateway's 100 MiB blob cap (`MAX_BLOB_BYTES`) so an
-    /// over-size pick is rejected up front instead of failing after upload.
-    nonisolated static let maxAttachmentBytes = 100 * 1024 * 1024
-    /// How many picks the composer will stage on ONE message. A UI limit, not
-    /// a second copy of a wire cap: multi-select makes an accidental 200-file
-    /// pick one gesture away, and every staged item holds an upload, a
-    /// thumbnail and a strip tile. The gateway enforces its own per-message
-    /// attachment cap independently.
-    static let maxStagedAttachments = 10
-    /// How many staged picks upload at once; the rest queue. A ten-pick batch
-    /// fired off in parallel is ten sockets on one uplink AND ten 100ms
-    /// progress tickers hopping to the main actor — about a hundred composer
-    /// re-evaluations a second, which defeats the coalescing the tick interval
-    /// exists to provide.
-    static let maxConcurrentUploads = 2
     /// Ceiling on the offscreen frame buffer. A long agent turn on a
     /// backgrounded session streams every delta as a JSON string into
     /// `bufferedFrames`; past this the buffer is dropped and the transcript
@@ -192,7 +177,7 @@ final class ChatStore: ObservableObject, TranscriptTarget {
     var staging: ComposerStaging {
         if let composerDraft { return composerDraft }
         let made = ComposerStaging(
-            store: self, sessionId: sessionId, client: client, pasteboard: pasteboard,
+            host: self, client: client, pasteboard: pasteboard,
             supportDirectory: supportDirectory)
         composerDraft = made
         return made
@@ -624,7 +609,7 @@ final class ChatStore: ObservableObject, TranscriptTarget {
     /// one, having no row, would then read as an unsent new-chat draft).
     func discardDraft() {
         composerDraft?.discardDraft()
-        DraftStore.delete(sessionId: sessionId, in: supportDirectory)
+        DraftStore.delete(key: .chat(sessionId), in: supportDirectory)
     }
 
     /// The dock's line dies with the VISIT, whoever raised it. The strip retracts
@@ -1709,4 +1694,11 @@ final class ChatStore: ObservableObject, TranscriptTarget {
             }
         }
     }
+}
+
+/// A conversation is a composer host: it holds the notice line and names the
+/// draft. Nothing else of the staging machine's reaches in here — see
+/// `ComposerHost`.
+extension ChatStore: ComposerHost {
+    var draftKey: DraftKey { .chat(sessionId) }
 }

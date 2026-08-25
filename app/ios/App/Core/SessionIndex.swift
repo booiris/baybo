@@ -600,7 +600,7 @@ final class SessionIndex: ObservableObject {
         pendingMutations[sessionId] = .hidden
         mutationEpoch += 1
         TranscriptStore.delete(sessionId: sessionId, in: supportDirectory)
-        DraftStore.delete(sessionId: sessionId, in: supportDirectory)
+        DraftStore.delete(key: .chat(sessionId), in: supportDirectory)
         onSessionsRemoved?([sessionId])
         guard let idx = rows.firstIndex(where: { $0.id == sessionId }) else { return }
         hiddenBackups[sessionId] = rows[idx]
@@ -623,7 +623,7 @@ final class SessionIndex: ObservableObject {
         for sessionId in targets {
             pendingMutations[sessionId] = .hidden
             TranscriptStore.delete(sessionId: sessionId, in: supportDirectory)
-            DraftStore.delete(sessionId: sessionId, in: supportDirectory)
+            DraftStore.delete(key: .chat(sessionId), in: supportDirectory)
         }
         onSessionsRemoved?(targets)
         mutationEpoch += 1
@@ -857,7 +857,7 @@ final class SessionIndex: ObservableObject {
         for row in rows
         where !survivors.contains(row.id) && pendingMutations[row.id] == nil {
             TranscriptStore.delete(sessionId: row.id, in: supportDirectory)
-            DraftStore.delete(sessionId: row.id, in: supportDirectory)
+            DraftStore.delete(key: .chat(row.id), in: supportDirectory)
             dropped.insert(row.id)
         }
         if !dropped.isEmpty { onSessionsRemoved?(dropped) }

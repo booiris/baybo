@@ -167,9 +167,9 @@ enum AttachSource: CaseIterable {
 
     @MainActor var title: String {
         switch self {
-        case .photos: return Lang.shared.t("chat.attachPhotos")
-        case .files: return Lang.shared.t("chat.attachFiles")
-        case .paste: return Lang.shared.t("chat.attachPaste")
+        case .photos: return Lang.shared.t("attach.attachPhotos")
+        case .files: return Lang.shared.t("attach.attachFiles")
+        case .paste: return Lang.shared.t("attach.attachPaste")
         }
     }
 

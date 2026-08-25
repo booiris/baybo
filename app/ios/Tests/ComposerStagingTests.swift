@@ -236,13 +236,13 @@ struct ComposerStagingTests {
     @Test func aPasteOverTheCapAdmitsWhatFitsAndSaysSo() async throws {
         let items = Array(
             repeating: FakePasteboard.Item.image(Self.smallPNG()),
-            count: ChatStore.maxStagedAttachments + 3)
+            count: ComposerStaging.maxStagedAttachments + 3)
         let fixture = ComposerFixture(pasteboard: FakePasteboard(items))
         fixture.client.holdBlobUploads()
 
         fixture.staging.stagePasteboard()
 
-        #expect(fixture.staging.staged.count == ChatStore.maxStagedAttachments)
+        #expect(fixture.staging.staged.count == ComposerStaging.maxStagedAttachments)
         #expect(fixture.store.notice != nil)
         let notice = fixture.store.notice
         fixture.staging.remove(try #require(fixture.staging.staged.first?.id))
@@ -276,7 +276,7 @@ struct ComposerStagingTests {
         #expect(fixture.staging.staged.count == 1)
 
         #expect(await waitUntil { fixture.staging.staged.isEmpty })
-        #expect(fixture.store.notice == Lang.shared.t("chat.attachFailed"))
+        #expect(fixture.store.notice == Lang.shared.t("attach.attachFailed"))
         #expect(fixture.client.blobUploadCalls.isEmpty)
     }
 
@@ -711,7 +711,7 @@ struct ComposerStagingTests {
         let id = try await stageAFailedUpload(fixture)
         let blocker = try #require(StagedAttachment.blocker(fixture.staging.staged))
         fixture.staging.noteBlocked(blocker)
-        #expect(fixture.store.notice == Lang.shared.t("chat.removeFailedAttachment"))
+        #expect(fixture.store.notice == Lang.shared.t("attach.removeFailedAttachment"))
 
         fixture.staging.remove(id)
 
@@ -752,19 +752,19 @@ struct ComposerStagingTests {
     /// an EMPTY strip, naming a tile that never existed.
     @Test func leavingTakesTheLineAnOverCapPickLeftBehind() throws {
         let fixture = ComposerFixture()
-        for _ in 0..<ChatStore.maxStagedAttachments {
+        for _ in 0..<ComposerStaging.maxStagedAttachments {
             _ = try #require(fixture.staging.admitPhoto())
         }
         #expect(fixture.staging.admitPhoto() == nil, "the eleventh pick has no slot")
         #expect(
             fixture.store.notice
                 == String(
-                    format: Lang.shared.t("chat.tooManyAttachments"),
-                    ChatStore.maxStagedAttachments))
+                    format: Lang.shared.t("attach.tooManyAttachments"),
+                    ComposerStaging.maxStagedAttachments))
 
         fixture.store.leaveChat()
 
-        #expect(fixture.staging.staged.count == ChatStore.maxStagedAttachments, "the draft stays")
+        #expect(fixture.staging.staged.count == ComposerStaging.maxStagedAttachments, "the draft stays")
         #expect(fixture.store.notice == nil, "no tile to name, so nothing to come back to")
     }
 
@@ -774,7 +774,7 @@ struct ComposerStagingTests {
         let fixture = ComposerFixture()
         fixture.staging.stage(files: [Self.missingFile])
         #expect(fixture.staging.staged.isEmpty)
-        #expect(fixture.store.notice == Lang.shared.t("chat.attachFailed"))
+        #expect(fixture.store.notice == Lang.shared.t("attach.attachFailed"))
 
         fixture.store.leaveChat()
 
@@ -786,7 +786,7 @@ struct ComposerStagingTests {
     @Test func leavingTakesThePickersOwnFailureWithIt() {
         let fixture = ComposerFixture()
         fixture.staging.notePickerFailed()
-        #expect(fixture.store.notice == Lang.shared.t("chat.attachFailed"))
+        #expect(fixture.store.notice == Lang.shared.t("attach.attachFailed"))
 
         fixture.store.leaveChat()
 
@@ -814,9 +814,9 @@ struct ComposerStagingTests {
         }
         #expect(
             await waitUntil {
-                fixture.client.parkedBlobUploads == ChatStore.maxConcurrentUploads
+                fixture.client.parkedBlobUploads == ComposerStaging.maxConcurrentUploads
             }, "the cap holds the last two back")
-        #expect(fixture.client.blobUploadCalls.count == ChatStore.maxConcurrentUploads)
+        #expect(fixture.client.blobUploadCalls.count == ComposerStaging.maxConcurrentUploads)
 
         // The user takes back both picks that are mid-flight, then the first of
         // the two abandoned uploads lands.
@@ -924,8 +924,8 @@ struct ComposerStagingTests {
     @Test func overCapPicksAreRejectedNotClamped() {
         #expect(StagedAttachment.wireSize(0) == 0)
         #expect(StagedAttachment.wireSize(1_048_576) == 1_048_576)
-        #expect(StagedAttachment.wireSize(ChatStore.maxAttachmentBytes) != nil)
-        #expect(StagedAttachment.wireSize(ChatStore.maxAttachmentBytes + 1) == nil)
+        #expect(StagedAttachment.wireSize(ComposerStaging.maxAttachmentBytes) != nil)
+        #expect(StagedAttachment.wireSize(ComposerStaging.maxAttachmentBytes + 1) == nil)
         #expect(StagedAttachment.wireSize(Int(UInt32.max) + 1) == nil)
         #expect(StagedAttachment.wireSize(-1) == nil)
     }
@@ -935,10 +935,10 @@ struct ComposerStagingTests {
     /// upload all at once — ten parallel uploads is ten progress tickers
     /// hopping to the main actor.
     @Test func theStagedCapIsACountAndTheByteCapIsTheGateways() {
-        #expect(ChatStore.maxStagedAttachments == 10)
-        #expect(ChatStore.maxAttachmentBytes == 100 * 1024 * 1024)
-        #expect(ChatStore.maxConcurrentUploads > 0)
-        #expect(ChatStore.maxConcurrentUploads < ChatStore.maxStagedAttachments)
+        #expect(ComposerStaging.maxStagedAttachments == 10)
+        #expect(ComposerStaging.maxAttachmentBytes == 100 * 1024 * 1024)
+        #expect(ComposerStaging.maxConcurrentUploads > 0)
+        #expect(ComposerStaging.maxConcurrentUploads < ComposerStaging.maxStagedAttachments)
     }
 
     // MARK: - chat-list preview

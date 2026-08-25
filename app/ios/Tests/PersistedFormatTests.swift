@@ -161,7 +161,7 @@ struct PersistedFormatTests {
                              "bookmark":"Ym9va21hcms="}]}
             """, to: "\(Self.draftsDirectory)/\(Self.sessionId)/draft.json")
 
-        let draft = try #require(DraftStore.read(sessionId: Self.sessionId, in: temp.url))
+        let draft = try #require(DraftStore.read(key: .chat(Self.sessionId), in: temp.url))
         #expect(draft.text == "look at this")
         let attachment = try #require(draft.attachments.first)
         #expect(attachment.id == "11111111-2222-3333-4444-555555555555")
@@ -193,7 +193,7 @@ struct PersistedFormatTests {
                         mime: "application/pdf", filename: "review.pdf", byteCount: 34,
                         blobId: nil, bookmark: Data("bookmark".utf8)),
                 ]),
-            sessionId: Self.sessionId, in: temp.url)
+            key: .chat(Self.sessionId), in: temp.url)
 
         let json = try read("\(Self.draftsDirectory)/\(Self.sessionId)/draft.json")
         for key in ["\"text\"", "\"attachments\"", "\"id\"", "\"isImage\"", "\"mime\"",
