@@ -81,6 +81,9 @@ final class ProjectsStore: ObservableObject {
     /// under the thumb. Held refreshes are applied on release.
     private var heldForGesture = false
     private var missedWhileHeld: Set<String> = []
+    /// When each board was last opened on THIS phone. Drives the cards root's
+    /// order; see `ProjectRecency` for why it is local and why logout takes it.
+    private let recency: ProjectRecency
 
     init(
         supportDirectory: URL = SessionIndex.supportDirectory(),
@@ -88,6 +91,7 @@ final class ProjectsStore: ObservableObject {
     ) {
         self.supportDirectory = supportDirectory
         self.clientProvider = clientProvider
+        recency = ProjectRecency(directory: supportDirectory)
         #if DEBUG
             if Self.demoRequested {
                 seedDemo()
@@ -189,6 +193,9 @@ final class ProjectsStore: ObservableObject {
     static func removeMirror(in directory: URL = SessionIndex.supportDirectory()) {
         let fm = FileManager.default
         try? fm.removeItem(at: directory.appendingPathComponent("projects.json"))
+        // The open-order stamps go with the boards: a project id that meant
+        // one board under this gateway means nothing under the next.
+        ProjectRecency.remove(in: directory)
         guard let names = try? fm.contentsOfDirectory(atPath: directory.path) else { return }
         for name in names where name.hasPrefix("board-") && name.hasSuffix(".json") {
             try? fm.removeItem(at: directory.appendingPathComponent(name))
@@ -352,6 +359,23 @@ final class ProjectsStore: ObservableObject {
     }
 
     func clearWriteError() { writeError = nil }
+
+    // MARK: - Order
+
+    /// The cards root's order: most recently opened on this phone first, then
+    /// everything never opened here (in the server's own order).
+    func inRecencyOrder(_ projects: [ProjectInfo]) -> [ProjectInfo] {
+        recency.ordered(projects)
+    }
+
+    /// Stamp a board as opened. Called from the one place a board is entered,
+    /// so a second entry point cannot quietly skip it.
+    func recordOpened(_ projectId: String) {
+        recency.record(projectId)
+        // The list is @Published-driven; nothing about `projects` changed, so
+        // the reorder has to be announced.
+        objectWillChange.send()
+    }
 
     // MARK: - The board's verbs
     //

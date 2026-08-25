@@ -779,6 +779,11 @@ final class AppStore: ObservableObject {
     func openProjectBoard(_ projectId: String) {
         let route = AppStore.ChatRoute.projectBoard(projectId)
         guard chatPath.last != route else { return }
+        // Stamped here rather than in the card row's press, because this is
+        // the ONE door into a board — the cards root, the create flow, and a
+        // push tap all come through it, and a stamp on the row would miss the
+        // other two.
+        projectsStore.recordOpened(projectId)
         chatPath.append(route)
         Task { await projectsStore.refreshBoard(projectId) }
     }

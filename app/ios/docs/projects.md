@@ -210,6 +210,37 @@ Rejected: putting the web board in a WKWebView (a Tailwind/brutalist re-skin, `t
 
 `TabView(.page)` with five pages (three horizontal gestures fighting); an inbox as the tab root; an approval countdown; fail-fast offline writes; a "Needs you" band that duplicates whole cards; a cross-board N+1 fan-out over `events`; a small webview for the description; a tab dot instead of a count (the owner's third round replaced it with a number).
 
+## 9. The cards root's order, and its one action
+
+*Both settled during the build, 2026-08-25, at the owner's request.*
+
+**New project is the header's trailing icon**, not a row in the list. It began
+as a dashed card at the FOOT of the cards, which put the one thing you cannot
+reach any other way behind however many boards you happen to have — and the
+trailing glass circle is already this shell's "one action per section" slot
+(Chats mints a conversation there). The empty state keeps its own full-width
+CTA: on a screen with nothing else on it, a 45pt circle in the corner is not
+where somebody looks.
+
+**The list is ordered by what THIS PHONE opened last.** Purely local
+(`ProjectRecency`, an `[id: ms]` map beside the board mirror), and deliberately
+so: which board you reached for last is a fact about this device, not about the
+account — the desk has its own order, the gateway stores nothing about a
+client's attention, and a board opened on a laptop should not reorder the
+phone's list. Logout deletes it with the mirror, because a project id that
+meant `rglide` under one gateway means nothing under the next.
+
+Two rules inside that:
+
+- **A board never opened here keeps the server's order among its peers and
+  follows the opened ones**, rather than sorting as if it were opened at the
+  epoch. A `?? 0` sort would interleave unseen boards by an answer nobody gave.
+- **The stamp is written in `openProjectBoard`**, the one door into a board —
+  not in the card row's press. The cards root, the create flow and a push tap
+  all come through that function, and a stamp on the row would miss the other
+  two. It is also why a just-created board leads the list rather than sinking
+  to the bottom a second after it was made: creating opens it.
+
 ## 10. What shipped, and what did not
 
 Built across P0–P8: the gateway's `approval_pending` and archived-board guard,

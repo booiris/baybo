@@ -64,6 +64,47 @@ final class ProjectsUITests: BayboUITestCase {
             "Deck has nothing waiting and must carry no badge; red coverage was \(onDeck)")
     }
 
+    /// The list is ordered by what this phone opened last, and the order
+    /// survives a relaunch — which is the only part of it a user can see go
+    /// wrong.
+    func testTheListReordersByWhatWasOpenedLastAndRemembersIt() {
+        let app = openProjects()
+        let cards = app.buttons.matching(identifier: "project-card")
+        XCTAssertTrue(cards.element(boundBy: 0).waitForExistence(timeout: 5))
+        // The fixture's server order: rglide, atlas, scratch.
+        XCTAssertTrue(cards.element(boundBy: 0).label.contains("rglide"), "unexpected seed order")
+
+        // Open the THIRD board, then come back.
+        cards.element(boundBy: 2).tap()
+        let back = app.buttons["Back to projects"]
+        XCTAssertTrue(back.waitForExistence(timeout: 5))
+        back.tap()
+
+        XCTAssertTrue(
+            app.buttons.matching(identifier: "project-card").element(boundBy: 0)
+                .waitForExistence(timeout: 5))
+        XCTAssertTrue(
+            app.buttons.matching(identifier: "project-card").element(boundBy: 0).label
+                .contains("scratch"),
+            "the board just opened should lead the list")
+
+        // Relaunch WITHOUT resetting the store: the stamps are on disk, and
+        // outliving the process is the whole point of writing them there.
+        app.terminate()
+        let relaunched = XCUIApplication()
+        relaunched.launchArguments = [
+            "-baybo-open-home", "-baybo-home-tab", "projects", "-baybo-demo-projects",
+            "-baybo.lang", "en", "-AppleLanguages", "(en)", "-AppleLocale", "en_US",
+        ]
+        relaunched.launch()
+        let first = relaunched.buttons.matching(identifier: "project-card").element(boundBy: 0)
+        XCTAssertTrue(first.waitForExistence(timeout: 8))
+        XCTAssertTrue(
+            first.label.contains("scratch"),
+            "the order must survive a relaunch; got \(first.label)")
+        relaunched.terminate()
+    }
+
     /// A press opens the board as a PUSH — the shell's whole point is that the
     /// board covers the tab bar, so a tab bar still on screen means the card
     /// merely switched sections.
@@ -287,8 +328,11 @@ final class ProjectsUITests: BayboUITestCase {
     /// keyboard avoidance wholesale). Create stays disabled until it is named.
     func testTheNewBoardFormRefusesToCreateUntilItIsNamed() {
         let app = openProjects()
-        let new = app.buttons["project-new"]
-        XCTAssertTrue(new.waitForExistence(timeout: 5), "no new-board affordance")
+        // The header's + — the dashed card at the foot of the list is gone,
+        // because it put the one thing you cannot reach any other way behind
+        // however many boards you happen to have.
+        let new = app.buttons["header-action"]
+        XCTAssertTrue(new.waitForExistence(timeout: 5), "no new-board affordance in the header")
         new.tap()
 
         let name = app.textFields["new-project-name"]

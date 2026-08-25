@@ -14,7 +14,7 @@ import WebKit
 final class TranscriptBridge: NSObject, ObservableObject, WebMediaSink {
     static let messageHandlerName = "baybo"
 
-    private weak var store: (any TranscriptTarget)?
+    private weak var store: (any TranscriptTarget)?			
     weak var webView: WKWebView?
     private(set) var ready = false
     private var pending: [String] = []

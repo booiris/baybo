@@ -83,7 +83,7 @@ struct ChatListScreen: View {
 
             HomeHeaderView(
                 notice: notice ?? appStore.sessionNotice,
-                onCompose: compose,
+                onAction: compose,
                 onArchived: appStore.openArchived,
                 onCronJobs: appStore.openCronJobs,
                 isRefreshing: isRefreshing

@@ -114,7 +114,18 @@ struct HomeTabView: View {
         case .deck:
             section { DeckScreen() }
         case .projects:
-            section { ProjectsScreen(store: store.projectsStore) }
+            // New project lives in the header, beside the wordmark — the same
+            // slot Chats puts compose in. It was a dashed card at the FOOT of
+            // the list, which put the one thing you cannot reach any other way
+            // behind however many boards you happen to have.
+            section(
+                action: {
+                    Haptics.tap()
+                    store.openNewProject()
+                }, icon: "plus", labelKey: "projects.new"
+            ) {
+                ProjectsScreen(store: store.projectsStore)
+            }
         case .search:
             // No `section` wrapper: this screen's field IS its header, and the
             // shared wordmark stacked above a search field is one header too many.
@@ -168,10 +179,13 @@ struct HomeTabView: View {
     }
 
     /// Non-chat sections: content under the shared wordmark header.
-    private func section<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
+    private func section<Content: View>(
+        action: (() -> Void)? = nil, icon: String = "plus", labelKey: String = "",
+        @ViewBuilder _ content: () -> Content
+    ) -> some View {
         ZStack(alignment: .top) {
             content()
-            HomeHeaderView()
+            HomeHeaderView(onAction: action, actionIcon: icon, actionLabelKey: labelKey)
         }
         .background(Theme.paper)
     }
@@ -232,7 +246,13 @@ extension AppStore.HomeTab {
 /// under it.
 struct HomeHeaderView: View {
     var notice: String? = nil
-    var onCompose: (() -> Void)? = nil
+    /// The trailing glass circle: this section's ONE action. Chats mints a
+    /// conversation, Projects a board. The glyph and label ride along rather
+    /// than being hardcoded here — the button is the header's, what it does is
+    /// the section's.
+    var onAction: (() -> Void)? = nil
+    var actionIcon: String = "square.and.pencil"
+    var actionLabelKey: String = "list.newChat"
     /// Chats only: the ☰ menu's entries — push the archived list, and the live
     /// scheduled jobs. The menu renders iff `onArchived` is set; both entries
     /// belong to the same Chats-only surface.
@@ -286,17 +306,18 @@ struct HomeHeaderView: View {
                     }
                 }
 
-                if let onCompose {
+                if let onAction {
                     HStack {
                         Spacer()
-                        Button(action: onCompose) {
-                            Image(systemName: "square.and.pencil")
+                        Button(action: onAction) {
+                            Image(systemName: actionIcon)
                                 .font(.system(size: 16, weight: .medium))
                                 .foregroundStyle(Theme.ink)
                                 .frame(width: 45, height: 45)
                         }
                         .glassSurface(interactive: true, in: .circle)
-                        .accessibilityLabel(Text(verbatim: Lang.shared.t("list.newChat")))
+                        .accessibilityIdentifier("header-action")
+                        .accessibilityLabel(Text(verbatim: Lang.shared.t(actionLabelKey)))
                     }
                 }
             }

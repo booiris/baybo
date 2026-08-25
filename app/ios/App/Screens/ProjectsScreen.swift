@@ -19,8 +19,16 @@ struct ProjectsScreen: View {
         _projects = ObservedObject(wrappedValue: store)
     }
 
-    private var live: [ProjectInfo] { projects.projects.filter { $0.archivedAtMs == nil } }
-    private var archived: [ProjectInfo] { projects.projects.filter { $0.archivedAtMs != nil } }
+    /// **Most recently opened on this phone first**, then everything never
+    /// opened here. The order is the store's answer, not this view's — the same
+    /// list is sorted for the live and the archived block, and two call sites
+    /// deciding it separately is how they drift.
+    private var live: [ProjectInfo] {
+        projects.inRecencyOrder(projects.projects.filter { $0.archivedAtMs == nil })
+    }
+    private var archived: [ProjectInfo] {
+        projects.inRecencyOrder(projects.projects.filter { $0.archivedAtMs != nil })
+    }
     private var visible: [ProjectInfo] { showsArchived ? live + archived : live }
 
     var body: some View {
@@ -68,7 +76,6 @@ struct ProjectsScreen: View {
                     .buttonStyle(.plain)
                     .accessibilityIdentifier("project-card")
                 }
-                newProjectCard
                 archivedToggle
             }
             .padding(.horizontal, ProjectsLayout.gutter)
@@ -91,32 +98,6 @@ struct ProjectsScreen: View {
             }
         }
         .padding(.bottom, 2)
-    }
-
-    private var newProjectCard: some View {
-        Button {
-            Haptics.tap()
-            appStore.openNewProject()
-        } label: {
-            HStack(spacing: 8) {
-                Image(systemName: "plus")
-                    .font(.system(size: 14, weight: .medium))
-                Text(verbatim: lang.t("projects.new"))
-                    .font(Theme.mono(13))
-            }
-            .foregroundStyle(Theme.ink)
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 18)
-            .overlay(
-                RoundedRectangle(cornerRadius: Theme.radius, style: .continuous)
-                    .strokeBorder(
-                        Theme.inkSoft.opacity(0.3),
-                        style: StrokeStyle(lineWidth: 1, dash: [4, 4]))
-            )
-            .contentShape(RoundedRectangle(cornerRadius: Theme.radius, style: .continuous))
-        }
-        .buttonStyle(.plain)
-        .accessibilityIdentifier("project-new")
     }
 
     @ViewBuilder private var archivedToggle: some View {
