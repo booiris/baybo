@@ -103,6 +103,57 @@
         }
       }
     },
+    "agent.defaultEntry": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Default · %@"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "默认 · %@"
+          }
+        }
+      }
+    },
+    "agent.entryDefault": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "entry default"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "条目默认"
+          }
+        }
+      }
+    },
+    "agent.entryDefaultModel": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ (entry default)"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@（条目默认）"
+          }
+        }
+      }
+    },
     "agent.faceUnreadable": {
       "extractionState": "manual",
       "localizations": {
@@ -154,19 +205,36 @@
         }
       }
     },
-    "agent.inheritNote": {
+    "agent.llm": {
       "extractionState": "manual",
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Whatever baybo.json's default-llm points at"
+            "value": "llm"
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "由 baybo.json 的 default-llm 决定"
+            "value": "llm"
+          }
+        }
+      }
+    },
+    "agent.model": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "model"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "模型"
           }
         }
       }
@@ -201,6 +269,40 @@
           "stringUnit": {
             "state": "translated",
             "value": "运行于"
+          }
+        }
+      }
+    },
+    "agent.thinking": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "thinking"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "思考"
+          }
+        }
+      }
+    },
+    "agent.unavailable": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ (unavailable)"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@（已不可用）"
           }
         }
       }

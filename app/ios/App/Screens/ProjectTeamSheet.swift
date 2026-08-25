@@ -34,7 +34,14 @@ struct ProjectTeamSheet: View {
         .background(Theme.paper)
         .task { await load() }
         .sheet(item: $profile) { member in
-            AgentProfileSheet(member: member, projectId: projectId, client: client) {
+            // Presented by identity, READ from the roster: the profile writes
+            // a pin and then refetches, and a sheet holding the snapshot it was
+            // handed would go on showing the value the operator just replaced.
+            // The roster row is the source of truth on both clients.
+            AgentProfileSheet(
+                member: team.first { $0.id == member.id } ?? member,
+                projectId: projectId, client: client
+            ) {
                 Task { await load() }
             }
             .presentationDetents([.medium, .large])

@@ -3,11 +3,17 @@ import SwiftUI
 
 /// One teammate: who it is, and what it runs on.
 ///
-/// The model pin is the only thing here that writes, and it is a **whole
-/// pin** — entry, model and thinking level replaced together, because absent
-/// means "inherit" at each level on the server. Setting a model without an
-/// entry is a 400 there; this screen therefore never offers one without the
-/// other, and Clear sends all three as null rather than one.
+/// The pin is edited **whole** — entry, model and thinking level go over the
+/// wire together on every pick, because absent means "inherit" at each level
+/// on the server and a per-field save could leave the row naming a model that
+/// belongs to an entry it no longer names. Setting a model without an entry is
+/// a 400 there, so picking an entry drops the model that belonged to the old
+/// one; the thinking level survives, being the one level the server accepts on
+/// its own.
+///
+/// The three rows and their contents mirror `app/web`'s `LlmPinFields`, down
+/// to which rows exist at all — see `LlmPinOptions`, where the rules both
+/// clients obey are written once.
 struct AgentProfileSheet: View {
     let member: TeamMemberInfo
     let projectId: String
@@ -22,10 +28,24 @@ struct AgentProfileSheet: View {
     @State private var saving = false
     @State private var error: String?
     @State private var facePick: PhotosPickerItem?
+    @State private var level: Level = .profile
+
+    /// Which list the sheet is showing. A drill-down INSIDE the sheet rather
+    /// than a sheet on a sheet — a third layer over a board is a place to get
+    /// lost, and the back row says where you are.
+    private enum Level: Equatable {
+        case profile
+        case llm
+        case model
+        case effort
+    }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
+                // The face stays put at every level: it says whose pin is
+                // being changed, which is the one thing a list of model names
+                // cannot.
                 head
                 if let error {
                     Text(verbatim: error)
@@ -34,22 +54,10 @@ struct AgentProfileSheet: View {
                         .padding(.horizontal, 20)
                         .padding(.top, 12)
                 }
-                section(lang.t("agent.runsOn"))
-                modelRows
-                if !member.description.isEmpty {
-                    section(lang.t("agent.brief"))
-                    Text(verbatim: member.description)
-                        .font(Theme.sys(13.5))
-                        .foregroundStyle(Theme.ink)
-                        .lineSpacing(3)
-                        .padding(.horizontal, 20)
-                }
-                if let hiredBy = member.hiredBy {
-                    section(lang.t("agent.hiredBy"))
-                    Text(verbatim: "@\(hiredBy.handle)")
-                        .font(Theme.mono(12))
-                        .foregroundStyle(Theme.inkSoft)
-                        .padding(.horizontal, 20)
+                if level == .profile {
+                    profileBody
+                } else {
+                    pickerBody
                 }
                 Spacer(minLength: 40)
             }
@@ -100,14 +108,34 @@ struct AgentProfileSheet: View {
         .padding(.horizontal, 20)
     }
 
-    /// One row per LLM entry, plus Clear.
+    @ViewBuilder private var profileBody: some View {
+        section(lang.t("agent.runsOn"))
+        pinRows
+        if !member.description.isEmpty {
+            section(lang.t("agent.brief"))
+            Text(verbatim: member.description)
+                .font(Theme.sys(13.5))
+                .foregroundStyle(Theme.ink)
+                .lineSpacing(3)
+                .padding(.horizontal, 20)
+        }
+        if let hiredBy = member.hiredBy {
+            section(lang.t("agent.hiredBy"))
+            Text(verbatim: "@\(hiredBy.handle)")
+                .font(Theme.mono(12))
+                .foregroundStyle(Theme.inkSoft)
+                .padding(.horizontal, 20)
+        }
+    }
+
+    /// The pin, as three fields — the `baybo.json` entry, the model within it,
+    /// and how hard it thinks. `app/web`'s `LlmPinFields`, in this app's
+    /// grammar.
     ///
-    /// Entries only — not the entry→model→effort ladder the chat header's
-    /// picker walks. An agent's pin is a board-level decision made rarely, and
-    /// three levels of menu on a sheet inside a sheet is a place to get lost;
-    /// the entry's own default model and level are what the server uses, which
-    /// is the honest thing for a screen this size to promise.
-    @ViewBuilder private var modelRows: some View {
+    /// The thinking field is ABSENT, not disabled, when the entry the pin
+    /// resolves to expresses no rungs: baybo sends that provider no effort at
+    /// all, and a greyed row would advertise a knob that does not exist.
+    @ViewBuilder private var pinRows: some View {
         if catalog.models.isEmpty {
             Text(verbatim: lang.t("agent.noModels"))
                 .font(Theme.sys(13))
@@ -115,49 +143,152 @@ struct AgentProfileSheet: View {
                 .padding(.horizontal, 20)
         } else {
             VStack(spacing: 0) {
-                ForEach(catalog.models, id: \.name) { entry in
-                    pinRow(
-                        title: entry.name,
-                        subtitle: entry.model,
-                        selected: member.llm == entry.name,
-                        identifier: "agent-llm-\(entry.name)"
-                    ) {
-                        setPin(llm: entry.name, model: nil)
-                    }
-                }
-                pinRow(
-                    title: lang.t("agent.inherit"),
-                    subtitle: lang.t("agent.inheritNote"),
-                    selected: member.llm == nil,
-                    identifier: "agent-llm-inherit"
-                ) {
-                    setPin(llm: nil, model: nil)
+                fieldRow(
+                    label: lang.t("agent.llm"), value: label(in: entryRows, for: member.llm),
+                    identifier: "agent-field-llm"
+                ) { level = .llm }
+                fieldRow(
+                    label: lang.t("agent.model"), value: label(in: modelRows, for: member.model),
+                    identifier: "agent-field-model"
+                ) { level = .model }
+                if !effortRows.isEmpty {
+                    fieldRow(
+                        label: lang.t("agent.thinking"),
+                        value: label(in: effortRows, for: member.reasoningEffort),
+                        identifier: "agent-field-effort"
+                    ) { level = .effort }
                 }
             }
         }
     }
 
-    private func pinRow(
-        title: String, subtitle: String?, selected: Bool, identifier: String,
-        action: @escaping () -> Void
+    /// The open field's rows, under a back row that names it.
+    @ViewBuilder private var pickerBody: some View {
+        backRow(title: levelTitle)
+        VStack(spacing: 0) {
+            ForEach(openRows, id: \.label) { row in
+                optionRow(row)
+            }
+        }
+    }
+
+    private var entryRows: [LlmPinOptions.Row] {
+        LlmPinOptions.entryRows(
+            entries: catalog.models, defaultName: catalog.defaultName, pinned: member.llm)
+    }
+
+    private var modelRows: [LlmPinOptions.Row] {
+        LlmPinOptions.modelRows(
+            entries: catalog.models, defaultName: catalog.defaultName, entry: member.llm,
+            pinned: member.model)
+    }
+
+    private var effortRows: [LlmPinOptions.Row] {
+        LlmPinOptions.effortRows(
+            entries: catalog.models, defaultName: catalog.defaultName, entry: member.llm,
+            pinned: member.reasoningEffort)
+    }
+
+    private var openRows: [LlmPinOptions.Row] {
+        switch level {
+        case .profile: []
+        case .llm: entryRows
+        case .model: modelRows
+        case .effort: effortRows
+        }
+    }
+
+    private var levelTitle: String {
+        switch level {
+        case .profile: ""
+        case .llm: lang.t("agent.llm")
+        case .model: lang.t("agent.model")
+        case .effort: lang.t("agent.thinking")
+        }
+    }
+
+    private var pickedAtOpenLevel: String? {
+        switch level {
+        case .profile: nil
+        case .llm: member.llm
+        case .model: member.model
+        case .effort: member.reasoningEffort
+        }
+    }
+
+    private func label(in rows: [LlmPinOptions.Row], for value: String?) -> String {
+        rows.first { $0.value == value }?.label ?? value ?? ""
+    }
+
+    /// Picking writes the whole triple and returns to the profile.
+    private func pick(_ row: LlmPinOptions.Row) {
+        switch level {
+        case .profile:
+            return
+        case .llm:
+            // The model goes with the entry it belonged to. Carrying it across
+            // would pin a model the new entry cannot serve, which the gateway
+            // refuses — so the picker refuses it first. The thinking level
+            // stays: the server takes it with no entry at all.
+            setPin(llm: row.value, model: nil, effort: member.reasoningEffort)
+        case .model:
+            setPin(llm: member.llm, model: row.value, effort: member.reasoningEffort)
+        case .effort:
+            setPin(llm: member.llm, model: member.model, effort: row.value)
+        }
+    }
+
+    private func fieldRow(
+        label: String, value: String, identifier: String, action: @escaping () -> Void
     ) -> some View {
         Button {
-            guard !saving, !selected else { return }
+            guard !saving else { return }
             Haptics.tap()
             action()
         } label: {
             HStack(spacing: 10) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(verbatim: title)
-                        .font(Theme.sys(14))
-                        .foregroundStyle(Theme.ink)
-                    if let subtitle, !subtitle.isEmpty {
-                        Text(verbatim: subtitle)
-                            .font(Theme.mono(10.5))
-                            .foregroundStyle(Theme.inkSoft)
-                            .lineLimit(1)
-                    }
-                }
+                Text(verbatim: label)
+                    .font(Theme.mono(12))
+                    .foregroundStyle(Theme.inkSoft)
+                Spacer(minLength: 12)
+                Text(verbatim: value)
+                    .font(Theme.sys(14))
+                    .foregroundStyle(Theme.ink)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Theme.inkSoft)
+            }
+            .padding(.horizontal, 20)
+            .frame(minHeight: 52)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(saving)
+        .opacity(saving ? 0.5 : 1)
+        .accessibilityIdentifier(identifier)
+        // The label alone is not the row: two rows reading `llm` and `model`
+        // say nothing about what they are set to, which is the whole reason to
+        // press one.
+        .accessibilityLabel(Text(verbatim: "\(label) \(value)"))
+    }
+
+    private func optionRow(_ row: LlmPinOptions.Row) -> some View {
+        let selected = row.value == pickedAtOpenLevel
+        return Button {
+            guard !saving else { return }
+            Haptics.tap()
+            if selected {
+                level = .profile
+            } else {
+                pick(row)
+            }
+        } label: {
+            HStack(spacing: 10) {
+                Text(verbatim: row.label)
+                    .font(Theme.sys(14))
+                    .foregroundStyle(Theme.ink)
                 Spacer(minLength: 6)
                 if selected {
                     Image(systemName: "checkmark")
@@ -172,7 +303,31 @@ struct AgentProfileSheet: View {
         .buttonStyle(.plain)
         .disabled(saving)
         .opacity(saving ? 0.5 : 1)
-        .accessibilityIdentifier(identifier)
+        .accessibilityIdentifier("agent-option-\(row.value ?? "inherit")")
+    }
+
+    private func backRow(title: String) -> some View {
+        Button {
+            Haptics.tap()
+            level = .profile
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "chevron.left")
+                    .font(.system(size: 12, weight: .semibold))
+                Text(verbatim: title)
+                    .font(Theme.mono(12))
+                    .textCase(.uppercase)
+                    .kerning(1.2)
+                Spacer(minLength: 0)
+            }
+            .foregroundStyle(Theme.inkSoft)
+            .padding(.horizontal, 20)
+            .frame(minHeight: 44)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .padding(.top, 14)
+        .accessibilityIdentifier("agent-picker-back")
     }
 
     private func section(_ title: String) -> some View {
@@ -186,18 +341,23 @@ struct AgentProfileSheet: View {
             .padding(.bottom, 8)
     }
 
-    /// The pin is replaced WHOLE. Clearing means all three levels at once —
-    /// anything less leaves two thirds of a pin pointing at an entry the agent
-    /// no longer uses.
-    private func setPin(llm: String?, model: String?) {
+    /// The pin is replaced WHOLE, every time. Anything less leaves two thirds
+    /// of a pin pointing at an entry the agent no longer uses.
+    ///
+    /// The sheet stays open and drops back to the profile: three fields means
+    /// an operator usually sets two of them, and dismissing after the first
+    /// would make the second a re-open. `onChanged` refetches the roster, and
+    /// `member` is read from it — so what these rows show after a write is the
+    /// server's answer, never a local echo of the pick.
+    private func setPin(llm: String?, model: String?, effort: String?) {
         saving = true
         error = nil
         Task {
             do {
                 try await client.agentSetModel(
-                    agentId: member.id, llm: llm, model: model, reasoningEffort: nil)
+                    agentId: member.id, llm: llm, model: model, reasoningEffort: effort)
                 onChanged()
-                dismiss()
+                level = .profile
             } catch {
                 self.error = ProjectsStore.message(from: error)
             }
