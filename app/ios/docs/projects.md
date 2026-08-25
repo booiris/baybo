@@ -62,10 +62,10 @@ Projects tab root = Projects cards (wordmark header, tab bar visible)
  ├─ one card per project (most recent first) · dashed "New project" card · Show archived
  ├─ zero projects → empty state
  └─ tap a card → Board (push, covers the tab bar)
-      ├─ header: [←] project name … [+ new issue]
+      ├─ header: [←] project name … [+ new issue] [⋯]
       ├─ stage segmented control (5 segments, tap to switch; a segment with news wears a red dot;
       │   the bar strip itself takes a horizontal swipe to change stage)
-      ├─ board row: team faces (working = ring) · budget chip (only over ceiling) · filter · ⋯
+      ├─ board row: team faces (working = ring) · budget chip (only over ceiling) · filter
       ├─ "Waiting on you" strip (current board only, only when non-empty, collapsible):
       │    approval (inline Deny/Approve) · failed run (Run again) · agent question (Answer) · unread card (open it)
       └─ the open stage's wall of cards: bands Pinned / New / Queue
@@ -102,7 +102,7 @@ Pushed screens use the `ChatRoute` + `ArchivedScreen` header grammar plus `PopGe
 - **Reading order = pinned → unread → `position`**, rendered only, never written back; a cancelled card is never lifted by unread (a pin does lift it); a refresh anchors scroll by row id.
 - **A card is a row** (`ChatRowBody` grammar, `Theme.sys`): a 3px spine on the leading edge (urgent/high ink, medium light grey); first line `#N · ▲▲/▲/◆/▽ priority (all ink — red is only for failure) · (pin) · age · hand glyph (approval_pending) · red unread count`; two lines of title; a badge row of Blocked / ✕ Run failed (the one red thing) / ⑂ branch (only once it has a commit) / ↳ #N; a footer of assignee face + handle, **the runner's face** (a second, ringed face when the run is not the assignee's — a coordination run is @lead's), the run word `WORKING · 4m` / `QUEUED` / `HELD · 41m` (running measures from `started_at_ms`, queued/held from `created_at_ms`, nothing after it settles), and the `done/total` progress ring. A cancelled card is struck through and dimmed but still opens (Reopen).
 - **The "Waiting on you" strip**: the current board only, and **parked approvals ONLY** (Deny / Approve inline; found by taking the `approval_pending` cards and reading their `events` for the `call_id`, which is bounded). *Something is waiting on you when it has stopped and cannot go on until a person answers* — and on a board that is a parked prompt and nothing else. It shipped with four kinds and was narrowed 2026-08-25: a **failed run** is over, not waiting (the card wears `✕ Run failed`); an **unread card** is news, and nobody is stopped (the card wears a red count, its segment a dot); an agent's **question** does park a run, but it is answered by writing a sentence and no sentence fits in a strip row (the card wears `⊘ Blocked`, and the answering happens on the card where the writing happens). Each of the three already said itself on the card row, so the strip was a third place for the same fact, filling with rows whose only affordance was "go and look" — which is the list underneath it. No countdown (the 300s timeout is a gateway-private constant); answering a prompt that is gone returns 404 → the row stays retired and the board refetches.
-- **The board row**: team faces → budget chip (`⏸ $6.10 / $5.00`, only when `burnState == over`, opens Settings; **a standing condition, not news, so it never feeds a red dot**) → filter chip (ink-filled with a count when narrowed) → ⋯ (Activity · Team · **Mark all read N** · Settings).
+- **The board row**: team faces → budget chip (`⏸ $6.10 / $5.00`, only when `burnState == over`, opens Settings; **a standing condition, not news, so it never feeds a red dot**) → filter chip (ink-filled with a count when narrowed). **The ⋯ is in the header**, beside `+` (Activity · Team · **Mark all read N** · Settings): every entry behind it acts on the whole board, and standing next to the filter it read as one more way to narrow the list.
 - Pull to refresh (the `RefreshRing` beside the title); on a first open with no mirror, skeleton rows in the real rows' geometry.
 
 ### 3.2 Moving a card (Move sheet / long press / swipe)

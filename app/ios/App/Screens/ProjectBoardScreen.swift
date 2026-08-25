@@ -203,7 +203,7 @@ struct ProjectBoardScreen: View {
         .environment(\.defaultMinListRowHeight, 0)
         .scrollContentBackground(.hidden)
         .contentMargins(.top, StageBar.inset, for: .scrollContent)
-        .contentMargins(.bottom, 90, for: .scrollContent)
+        .contentMargins(.bottom, 24, for: .scrollContent)
         .scrollBounceBehavior(.always)
         .onScrollGeometryChange(for: CGFloat.self) { geo in
             max(0, -(geo.contentOffset.y + geo.contentInsets.top))
@@ -484,7 +484,6 @@ struct ProjectBoardScreen: View {
                 .accessibilityIdentifier("board-budget-chip")
             }
             filterChip
-            boardMenu
         }
     }
 
@@ -544,11 +543,11 @@ struct ProjectBoardScreen: View {
             .disabled(project == nil)
         } label: {
             Image(systemName: "ellipsis")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(Theme.inkSoft)
-                .frame(width: 30, height: 26)
-                .contentShape(Rectangle())
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(Theme.ink)
+                .frame(width: 42, height: 42)
         }
+        .glassSurface(interactive: true, in: .circle)
         .accessibilityIdentifier("board-menu")
         .accessibilityLabel(Text(verbatim: lang.t("list.menu")))
     }
@@ -561,12 +560,15 @@ struct ProjectBoardScreen: View {
                 .font(Theme.mono(16))
                 .foregroundStyle(Theme.ink)
                 .lineLimit(1)
-                .padding(.horizontal, 66)
+                // Both circles on the right, plus their gap — kept symmetric so
+                // the name stays centred on the screen rather than on whatever
+                // is left of it.
+                .padding(.horizontal, 114)
                 .overlay(alignment: .trailing) {
                     BoardRefreshRing(isRefreshing: isRefreshing).offset(x: 16)
                 }
 
-            HStack {
+            HStack(spacing: 6) {
                 Button { dismiss() } label: {
                     Image(systemName: "chevron.left")
                         .font(.system(size: 18, weight: .semibold))
@@ -607,6 +609,7 @@ struct ProjectBoardScreen: View {
                     .accessibilityIdentifier("board-new-issue")
                     .accessibilityLabel(Text(verbatim: lang.t("newIssue.title")))
                 }
+                boardMenu
             }
         }
         .padding(.horizontal, 24)
