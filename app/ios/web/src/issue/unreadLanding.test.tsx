@@ -7,6 +7,8 @@ import type { IssuePayload } from "./bridge";
 import { IssuePage } from "./IssuePage";
 import type { IssueDetail, IssueEvent } from "./types";
 
+/// The card's Activity list: where it opens, and what it keeps folded away.
+///
 /// Opening a card where the reading stopped.
 ///
 /// The boundary is the gateway's (`IssueTimelineDto.first_unread`) and this
@@ -47,6 +49,24 @@ function comment(id: string, text: string): IssueEvent {
     body: { kind: "comment", text },
     created_at_ms: Number(id.slice(1)),
   };
+}
+
+function moved(id: string): IssueEvent {
+  return {
+    id,
+    number: 7,
+    actor: { kind: "system" },
+    body: { kind: "moved", from: "in_progress", to: "review" },
+    created_at_ms: Number(id.slice(1)),
+  };
+}
+
+function withEvents(events: IssueEvent[], firstUnread?: string): IssuePayload {
+  return { issue: card, events, runs: [], handles: {}, firstUnread };
+}
+
+function fold(): HTMLButtonElement | null {
+  return document.querySelector(".issue-fold button");
 }
 
 const EVENTS: IssueEvent[] = [
@@ -133,5 +153,51 @@ describe("opening a card at the unread boundary", () => {
 
     expect(rule()).not.toBeNull();
     expect(scrolled).not.toHaveBeenCalled();
+  });
+});
+
+describe("machinery folds away", () => {
+  /// A lone `moved` used to render in full — "1 event ›" saves no space. But
+  /// space was never the point: what buries the two things a person said is a
+  /// wall of rows that all look alike, and one uniform closed line per run is
+  /// what makes the comments findable.
+  it("folds a run of one, like any other run", () => {
+    page();
+    deliver(withEvents([comment("e1", "before"), moved("e5"), comment("e9", "after")]));
+
+    expect(fold()?.textContent).toContain("1 event");
+    expect(document.body.textContent).not.toContain("moved it");
+    expect(document.body.textContent).toContain("before");
+  });
+
+  it("opens on a press and closes again on the next one", () => {
+    page();
+    deliver(withEvents([moved("e5"), moved("e6")]));
+    const button = fold();
+
+    expect(button?.getAttribute("aria-expanded")).toBe("false");
+    act(() => button?.click());
+    expect(fold()?.getAttribute("aria-expanded")).toBe("true");
+    expect(document.body.textContent).toContain("moved it");
+    act(() => fold()?.click());
+    expect(fold()?.getAttribute("aria-expanded")).toBe("false");
+    expect(document.body.textContent).not.toContain("moved it");
+  });
+
+  /// The exception, and it has to be one: the run carrying the boundary is
+  /// what the page just scrolled to, and landing a reader on a closed line is
+  /// landing them on nothing.
+  it("opens the run the card lands on", () => {
+    page();
+    // The boundary arrives on the SECOND delivery, as it does in the app —
+    // the mirror paints first and carries none. A row seeded at mount would
+    // read the landing before it exists.
+    deliver(withEvents([comment("e1", "before"), moved("e5"), moved("e6")]));
+    expect(fold()?.getAttribute("aria-expanded")).toBe("false");
+
+    deliver(withEvents([comment("e1", "before"), moved("e5"), moved("e6")], "e5"));
+    expect(fold()?.getAttribute("aria-expanded")).toBe("true");
+    expect(document.body.textContent).toContain("moved it");
+    expect(rule()?.nextElementSibling?.textContent).toContain("2 events");
   });
 });

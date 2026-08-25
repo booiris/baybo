@@ -121,7 +121,7 @@ Moving out of In Progress **never kills the run**; Stop is the only kill switch.
 | Layer | Owner | Contents |
 |---|---|---|
 | header | native (`ChatHeaderView` grammar) | back · `#N · status` glass pill (tap → Move sheet) · ⋯ |
-| body | **`issue.html` WKWebView** | title · chips · live-run row · blocked banner · ↳ / ⑂ · description (full markdown / KaTeX / images) · attachments · sub-issues · runs · activity (comments as markdown; **consecutive system events collapse into "N events ›"**, while comments, approvals and blocks never collapse) · a "New activity" jump pill |
+| body | **`issue.html` WKWebView** | title · chips · live-run row · blocked banner · ↳ / ⑂ · description (full markdown / KaTeX / images) · attachments · sub-issues · runs · activity (comments as markdown; **every run of system events collapses into a closed "N events ›" line — a run of one included** — and presses open and close it again, while comments, approvals and blocks never collapse) · a "New activity" jump pill |
 | dock | native (`ComposerDock` grammar) | hint chip · @ chips · `ApprovalCardView` (two answers, REST-backed) · composer pill (+ attachment bloom) |
 | overlays | native | pickers (`ModelMenuPanel` style) · sheets · `RenameDialog` · `ConfirmDialog` |
 
@@ -156,7 +156,10 @@ Moving out of In Progress **never kills the run**; Stop is the only kill switch.
     the rule.
   - The fold splits at the boundary (`fold(events, breakBefore)`): a group is
     drawn at its first member, so a swallowed boundary would put `NEW` above
-    entries read yesterday.
+    entries read yesterday. The run carrying the boundary is the one fold that
+    opens by default — landing a reader on a closed line is landing them on
+    nothing. It follows the payload rather than being seeded at mount: the
+    mirror mounts the row a beat before the boundary exists.
 
 ### 3.4 Run transcript (sheet)
 

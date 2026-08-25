@@ -371,7 +371,7 @@ function Activity({ events, landing }: { events: IssueEvent[]; landing: string |
                 {t("issue.unreadFrom")}
               </li>
             )}
-            <FoldRow item={item} />
+            <FoldRow item={item} landed={foldHead(item)?.id === landing} />
           </Fragment>
         ))}
       </ol>
@@ -383,27 +383,40 @@ function rowKey(item: Fold, index: number): string {
   return item.kind === "entry" ? item.event.id : `sys-${item.events[0]?.id ?? String(index)}`;
 }
 
-function FoldRow({ item }: { item: Fold }) {
+/// One folded run of machinery, closed until asked.
+///
+/// **Every run, including one entry long.** A lone `moved` used to render in
+/// full on the argument that "1 event ›" saves no space — but space was never
+/// the point: a card's Activity is mostly machinery, and what buries the two
+/// things a person said is a wall of rows that all look like rows. One
+/// uniform closed line per run is what makes the comments findable, and it is
+/// also what keeps the shape stable — splitting a run at the unread boundary
+/// would otherwise turn a tidy `3 events ›` into a raw row plus `2 events ›`.
+///
+/// `landed` is the exception, and it has to be: the run carrying the unread
+/// boundary is what the page just scrolled to, and landing a reader on a
+/// closed line is landing them on nothing.
+function FoldRow({ item, landed }: { item: Fold; landed: boolean }) {
   const { t } = useTranslation();
-  const [open, setOpen] = useState(false);
+  /// The reader's own choice, once they make one — `null` means "follow the
+  /// landing". Not seeded with `useState(landed)`: the boundary arrives with
+  /// the live payload, a beat after the mirror has already mounted this row,
+  /// and an initial value would be read before it exists.
+  const [toggled, setToggled] = useState<boolean | null>(null);
 
   if (item.kind === "entry") return <EntryRow event={item.event} />;
 
-  if (item.events.length === 1 || open) {
-    return (
-      <>
-        {item.events.map((event) => (
-          <EntryRow key={event.id} event={event} />
-        ))}
-      </>
-    );
-  }
+  const open = toggled ?? landed;
   return (
-    <li className="issue-fold">
-      <button type="button" onClick={() => setOpen(true)}>
-        {t("issue.nEvents", { count: item.events.length })} ›
-      </button>
-    </li>
+    <>
+      <li className="issue-fold">
+        <button type="button" onClick={() => setToggled(!open)} aria-expanded={open}>
+          {t("issue.nEvents", { count: item.events.length })} {open ? "⌄" : "›"}
+        </button>
+      </li>
+      {open &&
+        item.events.map((event) => <EntryRow key={event.id} event={event} />)}
+    </>
   );
 }
 
