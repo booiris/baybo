@@ -17,12 +17,14 @@ import {
   pickField,
   postActivityAtBottom,
   postDescription,
+  postGeneratedFace,
   postIssueRendered,
   subscribeIssue,
   type IssuePayload,
   type Person,
 } from "./bridge";
 import { avatarUrl } from "./avatars";
+import { botttsPng } from "./generatedFace";
 import { fold, foldHead, type Fold } from "./timeline";
 import {
   isLiveRun,
@@ -124,6 +126,34 @@ export function IssuePage() {
     if (grabbed.current) return;
     rule.scrollIntoView({ block: "start" });
   }, [landing, payload]);
+
+  /// Give a faceless teammate the generated face, once.
+  ///
+  /// An agent is created with no avatar — every path that makes one sets it
+  /// to null — so without this the phone draws letters for a roster the web
+  /// draws robots for. The generator is the library `app/web` already uses,
+  /// which is the whole reason it runs HERE rather than in Rust: the gateway
+  /// has no JS engine, and porting DiceBear would be a second implementation
+  /// of somebody else's artwork, drifting on their next release.
+  ///
+  /// Once per agent per page, and only for agents this card actually names.
+  /// Native answers by uploading and PUTting; the face arrives on the next
+  /// delivery like any other change to the team.
+  const drawnFor = useRef(new Set<string>());
+  useEffect(() => {
+    const people = payload?.people;
+    if (people === undefined) return;
+    for (const [id, person] of Object.entries(people)) {
+      if (person.avatar !== undefined || drawnFor.current.has(id)) continue;
+      drawnFor.current.add(id);
+      void botttsPng(id)
+        .then((png) => postGeneratedFace(id, png))
+        .catch(() => {
+          // A face that could not be drawn leaves the agent as it already
+          // was — with a monogram — and does not retry this page's life.
+        });
+    }
+  }, [payload?.people]);
 
   const onScroll = useCallback(() => {
     const el = scrollRef.current;

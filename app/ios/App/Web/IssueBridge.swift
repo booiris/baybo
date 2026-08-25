@@ -75,6 +75,12 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
             if let field = body["field"] as? String {
                 onPick?(field)
             }
+        case "generatedFace":
+            if let agentId = body["agentId"] as? String,
+                let png = body["pngBase64"] as? String
+            {
+                store?.storeGeneratedFace(agentId: agentId, pngBase64: png)
+            }
         case "activityAtBottom":
             onActivityAtBottom?(body["atBottom"] as? Bool ?? true)
         case "openUrl":

@@ -161,6 +161,16 @@ export function pickField(field: "status" | "priority" | "assignee" | "stage"): 
   postToNative({ type: "pick", field });
 }
 
+/// A face this page drew for an agent that has none, as PNG base64.
+///
+/// Native does the storing: uploading needs the blob API and the agent PUT,
+/// and this page speaks no REST — exactly as it never sends a comment itself.
+/// Fire-and-forget: the answer arrives as the next delivery, with the agent's
+/// `avatar` filled in.
+export function postGeneratedFace(agentId: string, pngBase64: string): void {
+  postToNative({ type: "generatedFace", agentId, pngBase64 });
+}
+
 /// How tall the rendered card is, so native can decide whether its "new
 /// activity" pill is worth showing.
 export function postActivityAtBottom(atBottom: boolean): void {

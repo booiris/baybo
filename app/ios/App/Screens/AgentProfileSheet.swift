@@ -1,3 +1,4 @@
+import PhotosUI
 import SwiftUI
 
 /// One teammate: who it is, and what it runs on.
@@ -20,6 +21,7 @@ struct AgentProfileSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var saving = false
     @State private var error: String?
+    @State private var facePick: PhotosPickerItem?
 
     var body: some View {
         ScrollView {
@@ -55,13 +57,36 @@ struct AgentProfileSheet: View {
         }
         .background(Theme.paper)
         .onAppear { catalog.refreshIfNeeded() }
+        .onChange(of: facePick) { _, pick in
+            guard let pick else { return }
+            facePick = nil
+            setFace(pick)
+        }
     }
 
     private var head: some View {
         HStack(spacing: 12) {
-            AgentFace(
-                handle: member.handle, avatarBlobId: member.avatarBlobId,
-                lead: member.lead, size: 40)
+            // The face is the picker. A row of its own would be a fourth thing
+            // on a sheet that is mostly a list of models, and the thing you
+            // press to change a picture should be the picture.
+            PhotosPicker(selection: $facePick, matching: .images) {
+                AgentFace(
+                    handle: member.handle, avatarBlobId: member.avatarBlobId,
+                    lead: member.lead, size: 40)
+                    .overlay(alignment: .bottomTrailing) {
+                        Image(systemName: "pencil")
+                            .font(.system(size: 8, weight: .semibold))
+                            .foregroundStyle(Theme.paper)
+                            .frame(width: 15, height: 15)
+                            .background(Theme.ink, in: Circle())
+                            .overlay(Circle().strokeBorder(Theme.paper, lineWidth: 1.5))
+                            .offset(x: 3, y: 3)
+                    }
+            }
+            .buttonStyle(.plain)
+            .disabled(saving)
+            .accessibilityIdentifier("agent-avatar-pick")
+            .accessibilityLabel(Text(verbatim: lang.t("agent.changeFace")))
             VStack(alignment: .leading, spacing: 3) {
                 Text(verbatim: "@\(member.handle)")
                     .font(Theme.sys(17, weight: .semibold))
@@ -177,6 +202,33 @@ struct AgentProfileSheet: View {
                 self.error = ProjectsStore.message(from: error)
             }
             saving = false
+        }
+    }
+
+    /// Give this agent the picture the operator picked.
+    ///
+    /// Two calls, in this order and no other: the bytes become a blob, and
+    /// only then does the agent point at it. The gateway stats the blob on
+    /// the way in and refuses a dangling or non-image reference — an id set
+    /// first and uploaded after would be refused, and an upload whose PUT
+    /// then failed leaves an unreferenced blob rather than a broken face.
+    private func setFace(_ pick: PhotosPickerItem) {
+        saving = true
+        error = nil
+        Task {
+            defer { saving = false }
+            do {
+                guard let data = try await pick.loadTransferable(type: Data.self) else {
+                    error = lang.t("agent.faceUnreadable")
+                    return
+                }
+                let blobId = try await AgentFaceUpload.put(data, client: client)
+                try await client.agentSetAvatar(agentId: member.id, blobId: blobId)
+                onChanged()
+                dismiss()
+            } catch {
+                self.error = ProjectsStore.message(from: error)
+            }
         }
     }
 }

@@ -390,6 +390,36 @@ final class IssueStore: ObservableObject, WebMediaTarget {
         }
     }
 
+    /// Store the face the page drew for an agent that had none.
+    ///
+    /// **Fire and forget, and silent on failure.** Nobody asked for this: it
+    /// is the page noticing a teammate has no picture and offering one, so a
+    /// refusal (offline, a gateway that 400s the blob, an agent removed since
+    /// the card was fetched) must cost the operator nothing — the agent keeps
+    /// its monogram, which is what it had a moment ago. `writeError` is for
+    /// what the operator asked for, and putting this in it would raise a
+    /// banner over a card nobody touched.
+    ///
+    /// Two calls in this order: the bytes become a blob, then the agent
+    /// points at it. The gateway stats the blob on the way in, so the reverse
+    /// order is a refusal.
+    func storeGeneratedFace(agentId: String, pngBase64: String) {
+        guard let data = Data(base64Encoded: pngBase64) else { return }
+        Task { [client, projectId] in
+            do {
+                let blobId = try await AgentFaceUpload.put(data, client: client)
+                try await client.agentSetAvatar(agentId: agentId, blobId: blobId)
+            } catch {
+                NSLog("baybo: generated face for %@: %@", agentId, bayboErrorText(error))
+                return
+            }
+            // The roster is what every face on both surfaces is drawn from,
+            // so the board refetches too — not just this card.
+            await refresh()
+            AppStore.shared?.projectsStore.scheduleBoardRefresh(projectId)
+        }
+    }
+
     func clearWriteError() { writeError = nil }
 
     /// Stamp the card read. Called from the page's own "I rendered" message —

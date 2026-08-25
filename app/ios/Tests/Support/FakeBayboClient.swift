@@ -714,6 +714,13 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     func projectRemoveAgent(projectId: String, agentId: String) async throws {
         throw Self.unsupported
     }
+    /// Faces set through this fake, newest last. `nil` is a clear.
+    var avatarsSet: [(agentId: String, blobId: String?)] = []
+    func agentSetAvatar(agentId: String, blobId: String?) async throws {
+        try refuseIfOffline()
+        avatarsSet.append((agentId, blobId))
+    }
+
     func agentSetModel(
         agentId: String, llm: String?, model: String?, reasoningEffort: String?
     ) async throws {

@@ -2223,6 +2223,36 @@ pub(crate) async fn set_agent_model<C: GatewayJsonClient + Sync>(
     client.put_empty(&path, body).await
 }
 
+/// Give an agent a face, or take it away (`blob_id: None`).
+///
+/// The blob must already exist and be an image — the gateway stats it and
+/// refuses a dangling or non-image reference, because after this the id is a
+/// soft reference (no foreign keys).
+///
+/// **PNG, not SVG.** The generated faces are drawn as SVG by DiceBear, but a
+/// native iOS view has no SVG decoder at all: an `image/svg+xml` avatar
+/// passes the gateway's `image/*` check and then renders as nothing on every
+/// board row. Whoever uploads one rasterises it first.
+pub(crate) async fn set_agent_avatar<C: GatewayJsonClient + Sync>(
+    client: &C,
+    agent_id: String,
+    blob_id: Option<String>,
+) -> Result<(), String> {
+    validate_path_segment(&agent_id, "agent_id")?;
+    let path = format!("{PATH_AGENTS}/{}/avatar", percent_encode(&agent_id));
+    let body = serde_json::to_vec(&SetAgentAvatarRequest {
+        blob_id: blob_id.as_deref(),
+    })
+    .map_err(|e| format!("encode agent avatar: {e}"))?;
+    client.put_empty(&path, body).await
+}
+
+#[derive(Serialize)]
+struct SetAgentAvatarRequest<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    blob_id: Option<&'a str>,
+}
+
 pub(crate) async fn remove_team_member<C: GatewayJsonClient + Sync>(
     client: &C,
     project: String,
@@ -3850,6 +3880,51 @@ mod tests {
             frame,
             r#"{"kind":"history_page","rows":[{"id":"r1"}],"oldest_ordinal":4,"newest_ordinal":9,"has_more":true}"#
         );
+    }
+
+    /// Setting a face and clearing one are the same door, and the difference
+    /// is whether `blob_id` is THERE: the gateway reads an absent field as
+    /// "clear", so a clear that sent `null` and a clear that sent nothing must
+    /// not be two behaviours here.
+    #[tokio::test]
+    async fn an_avatar_is_set_by_blob_and_cleared_by_absence() {
+        let client = RecordingClient::empty();
+        set_agent_avatar(&client, "a-dev".into(), Some("sha256:aa.tok".into()))
+            .await
+            .expect("set avatar");
+        let call = client.only_call();
+        assert_eq!(call.method, "PUT");
+        assert_eq!(call.path, "/v1/agents/a-dev/avatar");
+        assert!(
+            call.body.contains("\"blob_id\":\"sha256:aa.tok\""),
+            "{}",
+            call.body
+        );
+
+        let client = RecordingClient::empty();
+        set_agent_avatar(&client, "a-dev".into(), None)
+            .await
+            .expect("clear avatar");
+        assert_eq!(client.only_call().body, "{}");
+    }
+
+    /// An id reaches a URL, so it goes through the same gate every other path
+    /// segment on this client does: a separator is REFUSED rather than
+    /// encoded (an id that could carry one could address another route), and
+    /// what is merely awkward is encoded.
+    #[tokio::test]
+    async fn an_avatar_id_is_gated_like_any_path_segment() {
+        let client = RecordingClient::empty();
+        assert!(
+            set_agent_avatar(&client, "a-dev/../sessions".into(), None)
+                .await
+                .is_err()
+        );
+
+        set_agent_avatar(&client, "a dev".into(), None)
+            .await
+            .expect("set avatar");
+        assert_eq!(client.only_call().path, "/v1/agents/a%20dev/avatar");
     }
 
     /// The pin is replaced WHOLE, so every level is sent — including the ones

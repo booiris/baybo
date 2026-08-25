@@ -158,7 +158,35 @@ Moving out of In Progress **never kills the run**; Stop is the only kill switch.
   in the face column and a sentence. The split is what keeps a long card
   readable: the eye finds the next thing a person wrote by running down the
   face column, and machinery in the same frame makes a wall of rectangles.
-  - **Faces come from native**: `IssuePerson { handle, avatar, monogram }` per
+  - **Every agent ends up with a real picture, and one generator draws it.**
+  Nothing ever set `avatar_blob_id`: every path that creates an agent passes
+  `None`, and the only door that writes one is `PUT /v1/agents/{id}/avatar`.
+  The web dashboard hid that by drawing a DiceBear Bottts face locally as a
+  fallback — so the same teammate was a robot on the web and two letters on
+  the phone.
+  - **The card page draws it and native stores it.** On delivery, any
+    teammate with no `avatar` gets `botttsPng(profileId)` — the same library,
+    the same seed rule and the same four backgrounds `app/web` uses —
+    rasterised on a canvas and handed over the bridge; native uploads the
+    bytes and PUTs the id. After that both clients draw the same blob.
+  - **Why not in Rust, at creation.** The gateway has no JS engine (`bun` is
+    for sidecars and deck cards; a core path must not grow an optional
+    binary), so generating there would mean porting somebody else's artwork —
+    a second implementation that drifts on their next release. The cost of
+    doing it client-side is accepted and bounded: an agent has letters until
+    a card naming it is opened once.
+  - **PNG, never the SVG.** A native `UIImage` has no SVG decoder, so an
+    `image/svg+xml` avatar passes the gateway's `image/*` check and then
+    renders as nothing on every board row.
+  - Once per agent per page (the card refetches on every frame its board
+    sends, and each delivery carries the whole roster), and **silent on
+    failure**: nobody asked for it, so a refusal leaves the monogram that was
+    already there rather than raising a banner over an untouched card.
+  - A picture can also be chosen by hand: the face in `AgentProfileSheet` is
+    a `PhotosPicker`. Same two calls in the same order — blob first, then the
+    agent points at it, because the gateway stats the blob when the avatar is
+    set and refuses a dangling reference.
+- **Faces come from native**: `IssuePerson { handle, avatar, monogram }` per
     agent id on the payload. The monogram is `AgentMonogram.map`'s, i.e. the
     TEAM's — `dev-1` and `docs-1` both reduce to `D1` until the set widens, so
     a page deriving one from the handle it was handed would draw the collision

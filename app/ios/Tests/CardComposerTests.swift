@@ -131,6 +131,45 @@ struct CardComposerTests {
         #expect(card.notice != nil, "the tile holding it up says why")
     }
 
+    /// A face the page drew becomes a blob FIRST, and only then the agent's.
+    ///
+    /// The gateway stats the blob when the avatar is set and refuses a
+    /// dangling reference, so the reverse order is not a slower way to do
+    /// this — it is a 400.
+    @Test func aGeneratedFaceIsStoredAsABlobBeforeTheAgentPointsAtIt() async {
+        let dir = TempSupportDir()
+        let fake = FakeBayboClient()
+        let card = store(dir, client: fake)
+        let png = Data([0x89, 0x50, 0x4E, 0x47]).base64EncodedString()
+
+        card.storeGeneratedFace(agentId: "a-dev", pngBase64: png)
+        #expect(await waitUntil { !fake.avatarsSet.isEmpty })
+
+        let upload = fake.blobUploadCalls.first
+        #expect(upload?.mimeType == "image/png", "a native row cannot draw an SVG")
+        #expect(fake.avatarsSet.first?.agentId == "a-dev")
+        #expect(fake.avatarsSet.first?.blobId != nil)
+    }
+
+    /// Nobody asked for it, so a refusal costs nothing: the agent keeps the
+    /// monogram it already had, and no banner appears over a card the
+    /// operator did not touch.
+    @Test func aRefusedFaceIsSilent() async {
+        let dir = TempSupportDir()
+        let fake = FakeBayboClient()
+        fake.failProjects = true
+        let card = store(dir, client: fake)
+
+        card.storeGeneratedFace(
+            agentId: "a-dev", pngBase64: Data([0x89]).base64EncodedString())
+        #expect(await waitUntil { !fake.blobUploadCalls.isEmpty })
+        // The PUT is what refuses; give its task a turn to land in.
+        _ = await waitUntil { fake.avatarsSet.count == 1 }
+
+        #expect(fake.avatarsSet.isEmpty, "a refused face sets nothing")
+        #expect(card.writeError == nil, "and raises no banner over an untouched card")
+    }
+
     /// The machine outlives the frame — an upload holds it — so leaving must
     /// retire it, or a re-push builds a second one over the same draft key and
     /// the zombie's terminal write puts a sent draft back on disk.

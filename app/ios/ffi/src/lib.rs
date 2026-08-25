@@ -905,6 +905,22 @@ impl BayboClient {
         .await
     }
 
+    /// Give an agent a face, or clear it (`blob_id: None`).
+    ///
+    /// The blob is uploaded first (`blob_upload_file`) and must be an image;
+    /// see `gateway_api::set_agent_avatar` for why it has to be a raster one.
+    pub async fn agent_set_avatar(
+        self: Arc<Self>,
+        agent_id: String,
+        blob_id: Option<String>,
+    ) -> Result<(), BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::set_agent_avatar(&client, agent_id, blob_id).await
+        })
+        .await
+    }
+
     /// Take an agent off a board. Refused for the lead, and for an agent
     /// with a run in flight.
     pub async fn project_remove_agent(
