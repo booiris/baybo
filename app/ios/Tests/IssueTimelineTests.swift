@@ -124,41 +124,6 @@ import Testing
         #expect(IssueTimeline.pendingApprovals(in: timeline).isEmpty)
     }
 
-    /// Consecutive machinery folds; what a person said never does.
-    @Test func consecutiveSystemEntriesFoldButCommentsNeverDo() {
-        let timeline = events(
-            [
-                """
-                {"id":"e1","number":1,"actor":{"kind":"system"},"created_at_ms":1,
-                 "body":{"kind":"moved","from":"todo","to":"in_progress"}}
-                """,
-                """
-                {"id":"e2","number":1,"actor":{"kind":"system"},"created_at_ms":2,
-                 "body":{"kind":"run_started","attempt":1,"trigger":"promoted"}}
-                """,
-                """
-                {"id":"e3","number":1,"actor":{"kind":"agent","id":"a-dev","handle":"dev-1"},
-                 "created_at_ms":3,"body":{"kind":"comment","text":"looking"}}
-                """,
-                """
-                {"id":"e4","number":1,"actor":{"kind":"system"},"created_at_ms":4,
-                 "body":{"kind":"run_settled","attempt":1,"status":"done"}}
-                """,
-            ].joined(separator: ","))
-        let folded = IssueTimeline.fold(timeline)
-        #expect(folded.count == 3)
-        if case let .system(first) = folded[0] {
-            #expect(first.map(\.id) == ["e1", "e2"])
-        } else {
-            Issue.record("the first two system entries should fold")
-        }
-        if case let .entry(comment) = folded[1] {
-            #expect(comment.id == "e3")
-        } else {
-            Issue.record("a comment is never folded")
-        }
-    }
-
     /// Malformed input costs the entry, not the card.
     @Test func aMalformedEnvelopeYieldsNoEntriesRatherThanThrowing() throws {
         #expect(try IssueEvent.decodeList("{\"items\":[]}").isEmpty)

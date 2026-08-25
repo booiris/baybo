@@ -8,9 +8,11 @@ import type { IssueEvent } from "./types";
 /// collapse into one expandable row; **comments, approvals and blocks never
 /// do**, because they are the reason anybody opened the card.
 ///
-/// Mirrors `app/ios`'s `IssueTimeline.fold`, which the Waiting strip reads for
-/// the same timeline. The two agree on which kinds are always shown; nothing
-/// enforces that but this comment and the tests on either side.
+/// The one home for this rule. There WAS a Swift mirror
+/// (`IssueTimeline.fold`), described here as what the Waiting strip read —
+/// which it never did: the strip reads `pendingApprovals`, and the fold had no
+/// caller on that side at all. It was deleted 2026-08-25 rather than kept in
+/// step with this file, since only the webview draws the Activity.
 
 /// Kinds that stand alone. A person said it, a person must answer it, or it
 /// stopped the card — none of those is machinery.

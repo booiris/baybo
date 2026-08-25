@@ -182,35 +182,4 @@ enum IssueTimeline {
         let askedAtMs: Int64
     }
 
-    /// Consecutive system entries fold into one row.
-    ///
-    /// A card's Activity is mostly machinery — moved, assigned, run started,
-    /// run settled — and on a phone that buries the two things a person
-    /// actually said. Comments, approvals and blocks are never folded: they
-    /// are the reason anybody opened the card.
-    static func fold(_ events: [IssueEvent]) -> [Fold] {
-        var folded: [Fold] = []
-        for event in events {
-            if isAlwaysShown(event) {
-                folded.append(.entry(event))
-            } else if case let .system(runs)? = folded.last {
-                folded[folded.count - 1] = .system(runs + [event])
-            } else {
-                folded.append(.system([event]))
-            }
-        }
-        return folded
-    }
-
-    enum Fold: Equatable {
-        case entry(IssueEvent)
-        case system([IssueEvent])
-    }
-
-    private static func isAlwaysShown(_ event: IssueEvent) -> Bool {
-        switch event.kind {
-        case "comment", "approval_requested", "approval_resolved", "blocked": true
-        default: false
-        }
-    }
 }
