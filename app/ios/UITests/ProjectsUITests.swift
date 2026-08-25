@@ -385,6 +385,27 @@ final class ProjectsUITests: BayboUITestCase {
             "an archived board must not offer to file a card")
     }
 
+    /// The card's escape hatch is in its ⋯, and the page comes back rather
+    /// than staying blank — a rebuild that reloaded the document and never
+    /// re-delivered would look exactly like a hang.
+    func testACardCanBeRebuiltFromItsMenu() {
+        let app = launch(["-baybo-open-home", "-baybo-demo-projects", "-baybo-demo-card"])
+        XCTAssertTrue(app.buttons["issue-menu"].waitForExistence(timeout: 10))
+        app.buttons["issue-menu"].tap()
+
+        let resync = app.buttons["Rebuild this card"]
+        XCTAssertTrue(resync.waitForExistence(timeout: 3), "no rebuild entry")
+        resync.tap()
+
+        // The demo has no gateway, so what comes back is the page's own
+        // loading line — which is still the page, reloaded and talking.
+        XCTAssertTrue(
+            app.staticTexts["Loading card…"].waitForExistence(timeout: 15),
+            "the page never came back after the rebuild")
+        // And the native chrome around it survived.
+        XCTAssertTrue(app.buttons["issue-menu"].exists)
+    }
+
     /// The new-board form is a pushed route, not a sheet — deliberately, so the
     /// name field can rise with the keyboard (the home shell opts out of
     /// keyboard avoidance wholesale). Create stays disabled until it is named.

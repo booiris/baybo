@@ -181,6 +181,52 @@ final class IssueStore: ObservableObject, WebMediaTarget {
         try? data.write(to: url, options: .atomic)
     }
 
+    /// Throw this card's local state away and let the COLD-OPEN path rebuild
+    /// it — the chat's escape hatch, applied to a card.
+    ///
+    /// Deliberately not a new reconciliation routine: a freshly installed
+    /// device renders this card correctly off the same server data, so the
+    /// reconstruction known to be right is the one a first open runs — no
+    /// mirror on disk, a page with no memory, one fetch.
+    ///
+    /// Three steps and nothing else:
+    ///
+    /// 1. delete the mirror, so nothing restores;
+    /// 2. drop what is in memory, because on THIS page native holds the
+    ///    content and pushes it — clearing it is what "a page with no memory"
+    ///    means here, where the chat's equivalent state lives in the webview;
+    ///    and
+    /// 3. reload the document, so every in-memory web latch dies with it
+    ///    rather than being enumerated and cleared. A "reset yourself" bridge
+    ///    message is deliberately NOT what this is: it could only clear the
+    ///    state somebody thought to list, and state that was not cleared when
+    ///    it should have been is exactly what the hatch exists to escape.
+    ///
+    /// One scar the chat carries that this does not: there is no
+    /// `discardPersist` here, because the card page never writes the mirror —
+    /// native does, after a fetch. The dying document has no persist to
+    /// resurrect what step 1 just deleted.
+    ///
+    /// What it does NOT touch: the board's own mirror (a card is not its
+    /// board), and the live approval queue — answering is REST, so a prompt
+    /// survives this untouched and is re-derived from the refetched timeline.
+    func resync() {
+        if let url = mirrorURL {
+            try? FileManager.default.removeItem(at: url)
+        }
+        issue = nil
+        events = []
+        eventsJson = "{\"items\":[]}"
+        runs = []
+        children = []
+        writeError = nil
+        // Nothing is from a mirror any more, because nothing is here at all.
+        isFromMirror = false
+        stampedRead = false
+        bridge?.rebuild()
+        Task { await refresh() }
+    }
+
     /// Drop every cached card. Called with the board mirrors on logout — a
     /// card belongs to the gateway that served it.
     static func removeMirrors(in directory: URL = SessionIndex.supportDirectory()) {

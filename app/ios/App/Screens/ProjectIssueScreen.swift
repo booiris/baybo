@@ -169,6 +169,17 @@ struct ProjectIssueScreen: View {
                     Label(lang.t("board.runAgain"), systemImage: "arrow.clockwise")
                 }
             }
+            // The chat's escape hatch, on a card. No confirm: it throws away
+            // only a local copy, and the page's own loading line is the
+            // feedback — the chat's banner exists because its rows live in the
+            // webview and there is nothing else to look at meanwhile.
+            Button {
+                Haptics.tap()
+                store.resync()
+            } label: {
+                Label(lang.t("issue.resync"), systemImage: "arrow.triangle.2.circlepath")
+            }
+            .accessibilityIdentifier("issue-resync")
         } label: {
             Image(systemName: "ellipsis")
                 .font(.system(size: 15, weight: .semibold))

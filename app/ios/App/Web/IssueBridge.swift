@@ -117,6 +117,20 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
     private var consecutiveDeaths = 0
     private var lastDeathAt = Date.distantPast
 
+    /// Reload the page from scratch — the third step of `IssueStore.resync`.
+    ///
+    /// The same load `IssueHost.init` performs, so every piece of in-memory
+    /// web state dies with the document: the rendered card, the scroll
+    /// position, an open description editor. The fresh `issueReady` replays
+    /// whatever the refetch has landed by then, and buffers what it has not.
+    func rebuild() {
+        guard let webView, let url = IssueHost.issueURL else { return }
+        ready = false
+        pending.removeAll()
+        lastBottomInset = Int.min
+        webView.load(URLRequest(url: url))
+    }
+
     func contentProcessDied() {
         let now = Date()
         if now.timeIntervalSince(lastDeathAt) > Self.deathWindowSeconds { consecutiveDeaths = 0 }

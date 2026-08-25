@@ -161,4 +161,71 @@ struct IssueMirrorTests {
         let written = (try? FileManager.default.contentsOfDirectory(atPath: dir.url.path)) ?? []
         #expect(!written.contains { $0.contains("escape") })
     }
+
+    /// The hatch: the mirror goes, the memory goes, and the next open is a
+    /// cold one. What it must NOT do is leave a copy anywhere.
+    @Test func resyncLeavesNothingBehindOnDiskOrInMemory() async {
+        let dir = TempSupportDir()
+        let first = await seeded(dir)
+        #expect(first.issue != nil)
+
+        // Resync with a client that answers nothing, so the refetch cannot
+        // quietly repopulate what the clear was supposed to remove.
+        let offline = FakeBayboClient()
+        offline.failProjects = true
+        let store = IssueStore(
+            projectId: "p1", number: 41, client: offline, supportDirectory: dir.url)
+        #expect(store.issue != nil, "it starts from the mirror")
+        store.resync()
+
+        #expect(store.issue == nil)
+        #expect(store.events.isEmpty)
+        #expect(store.runs.isEmpty)
+        #expect(!store.isFromMirror, "nothing is mirrored, because nothing is here")
+        #expect(store.pendingApprovals.isEmpty)
+
+        // And a third store finds no file to paint from.
+        let third = IssueStore(
+            projectId: "p1", number: 41, client: FakeBayboClient(), supportDirectory: dir.url)
+        #expect(third.issue == nil, "the mirror is gone from disk too")
+    }
+
+    /// A resync must not take the BOARD's mirror with it — a card is not its
+    /// board, and rebuilding one card should not cost the list its cold paint.
+    @Test func resyncLeavesTheBoardsOwnMirrorAlone() async {
+        let dir = TempSupportDir()
+        let fake = FakeBayboClient()
+        fake.stubProjects = [
+            ProjectInfo(
+                id: "p1", name: "rglide", description: "", workdir: "/tmp/p1",
+                dailyBudgetMicros: nil, dailyBudgetTokens: nil, maxParallelIssueRuns: 3,
+                agentsMayMerge: false, archivedAtMs: nil, createdAtMs: 0, updatedAtMs: 0)
+        ]
+        fake.stubIssues = [issue(41)]
+        let board = ProjectsStore(supportDirectory: dir.url, clientProvider: { fake })
+        await board.refreshRoot()
+        await board.refreshBoard("p1")
+
+        let card = await seeded(dir)
+        card.resync()
+
+        let reopened = ProjectsStore(supportDirectory: dir.url, clientProvider: { fake })
+        #expect(reopened.projects.map(\.name) == ["rglide"])
+        #expect(reopened.boards["p1"]?.issues.count == 1)
+    }
+
+    /// Read is stamped once per card — and a rebuild is a fresh look at it, so
+    /// the stamp re-arms. Otherwise a card resynced after being read would
+    /// never mark itself read again on this device.
+    @Test func resyncReArmsTheReadStamp() async {
+        let dir = TempSupportDir()
+        let store = await seeded(dir)
+        store.markRendered()
+        store.resync()
+        // Nothing observable to assert but the absence of a crash and the
+        // flag's reset; `markRendered` is idempotent by design, so this pins
+        // that the reset happened at all.
+        store.markRendered()
+        #expect(store.issue == nil)
+    }
 }

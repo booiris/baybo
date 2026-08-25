@@ -332,6 +332,32 @@ arm the live controls off a card the network never confirmed.
 Logout deletes every cached card with the board mirrors: one belongs to the
 gateway that served it.
 
+**The escape hatch.** The card's ⋯ carries *Rebuild this card* — the chat's
+per-session resync, applied here. Deliberately not a new reconciliation
+routine: a freshly installed device renders this card correctly off the same
+server data, so the reconstruction known to be right is the one a first open
+runs. Three steps — delete the mirror, drop what is in memory, reload the
+document — and nothing else.
+
+Step 2 is the one that differs from chat. There, the rows live in the webview
+and the store holds almost nothing; here native holds the content and pushes
+it, so clearing native state IS "a page with no memory".
+
+A "reset yourself" bridge message is deliberately not what this is: it could
+only clear the state somebody thought to list, and state that was not cleared
+when it should have been is exactly what the hatch exists to escape.
+
+**One chat scar that does not apply**: there is no `discardPersist` here,
+because the card page never writes the mirror — native does, after a fetch.
+The dying document has no persist to resurrect what step 1 just deleted.
+
+It does not touch the board's own mirror (a card is not its board) or the live
+approval queue (answering is REST, so a parked prompt survives untouched and
+is re-derived from the refetched timeline). No confirm dialog: it throws away
+a local copy only, and the page's own loading line is the feedback — chat
+needs a banner because its rows live in the webview and there is nothing else
+to look at meanwhile.
+
 The on-disk shapes moved to `ProjectMirrors.swift` when this became the second
 mirror needing them — a card, its runs and its team are the same records the
 board already writes, and two copies would be two file formats kept identical

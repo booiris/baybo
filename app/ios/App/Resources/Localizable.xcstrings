@@ -2857,6 +2857,23 @@
         }
       }
     },
+    "issue.resync": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Rebuild this card"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "重建这张卡片"
+          }
+        }
+      }
+    },
     "issue.send": {
       "extractionState": "manual",
       "localizations": {
