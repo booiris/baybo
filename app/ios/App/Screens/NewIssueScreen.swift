@@ -192,7 +192,7 @@ struct NewIssueScreen: View {
                 Spacer(minLength: 6)
                 Image(systemName: "chevron.right")
                     .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(Theme.line)
+                    .foregroundStyle(Theme.lineStrong)
             }
             .padding(.horizontal, ProjectsLayout.gutter)
             .frame(minHeight: 48)
@@ -221,7 +221,7 @@ struct NewIssueScreen: View {
                 )
                 .overlay(
                     RoundedRectangle(cornerRadius: 9, style: .continuous)
-                        .strokeBorder(selected ? Color.clear : Theme.line, lineWidth: 1)
+                        .strokeBorder(selected ? Color.clear : Theme.lineStrong, lineWidth: 1)
                 )
                 .contentShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
         }

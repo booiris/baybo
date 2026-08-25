@@ -28,7 +28,7 @@ struct ProjectTeamSheet: View {
     var body: some View {
         VStack(spacing: 0) {
             titleRow
-            Rectangle().fill(Theme.line).frame(height: 1)
+            Rectangle().fill(Theme.lineStrong).frame(height: 1)
             content
         }
         .background(Theme.paper)
@@ -133,7 +133,7 @@ struct ProjectTeamSheet: View {
                             .foregroundStyle(Theme.inkSoft)
                             .padding(.horizontal, 5)
                             .frame(height: 15)
-                            .overlay(Capsule().strokeBorder(Theme.line, lineWidth: 1))
+                            .overlay(Capsule().strokeBorder(Theme.lineStrong, lineWidth: 1))
                     }
                 }
                 Text(verbatim: Self.subtitle(member))
@@ -144,7 +144,7 @@ struct ProjectTeamSheet: View {
             Spacer(minLength: 6)
             Image(systemName: "chevron.right")
                 .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(Theme.line)
+                .foregroundStyle(Theme.lineStrong)
         }
         .frame(minHeight: 56)
         .contentShape(Rectangle())

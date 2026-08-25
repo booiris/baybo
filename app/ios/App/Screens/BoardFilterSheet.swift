@@ -133,7 +133,7 @@ struct BoardFilterSheet: View {
                 Spacer()
                 Image(systemName: isOn ? "checkmark.circle.fill" : "circle")
                     .font(.system(size: 17))
-                    .foregroundStyle(isOn ? Theme.ink : Theme.line)
+                    .foregroundStyle(isOn ? Theme.ink : Theme.lineStrong)
             }
             .padding(.horizontal, 20)
             .frame(minHeight: 50)
@@ -159,7 +159,7 @@ struct BoardFilterSheet: View {
                 .frame(maxWidth: .infinity)
                 .background(selected ? Theme.ink : Color.clear, in: Capsule())
                 .overlay(
-                    Capsule().strokeBorder(selected ? Color.clear : Theme.line, lineWidth: 1))
+                    Capsule().strokeBorder(selected ? Color.clear : Theme.lineStrong, lineWidth: 1))
                 .contentShape(Capsule())
         }
         .buttonStyle(.plain)

@@ -13,6 +13,14 @@
    styles.css does. */
 
 :root {
+  /* This page is a Projects surface, and Projects draws its boxes a step
+     heavier than the rest of the app (see `Theme.lineStrong`) — it sits under
+     the same native chrome as the board that pushed it, and a card whose boxes
+     are lighter than the row it came from reads as a different app. Redefined
+     for the whole document rather than at each border, so this page cannot end
+     up carrying two weights. */
+  --color-line: var(--color-line-strong);
+
   /* The face column, shared by the posts and by the rail the machinery lines
      hang their dot on — two rules that must agree or the card grows a second
      left margin halfway down. */

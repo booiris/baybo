@@ -86,7 +86,7 @@ struct IssueCardRow: View {
         let color: Color? =
             switch issue.priority {
             case .urgent, .high: Theme.ink
-            case .medium: Theme.line
+            case .medium: Theme.lineStrong
             case .low, .none, .unknown: nil
             }
         RoundedRectangle(cornerRadius: 1.5, style: .continuous)
@@ -198,7 +198,7 @@ struct IssueCardRow: View {
                 .frame(height: 18)
                 .overlay(
                     Capsule().strokeBorder(
-                        badge.isFailure ? Theme.err.opacity(0.4) : Theme.line, lineWidth: 1))
+                        badge.isFailure ? Theme.err.opacity(0.4) : Theme.lineStrong, lineWidth: 1))
             }
             Spacer(minLength: 0)
         }
@@ -295,7 +295,7 @@ struct SubIssueRing: View {
     var body: some View {
         ZStack {
             Circle()
-                .stroke(Theme.line, lineWidth: 2)
+                .stroke(Theme.lineStrong, lineWidth: 2)
             Circle()
                 .trim(from: 0, to: total > 0 ? min(1, Double(done) / Double(total)) : 0)
                 .stroke(Theme.ink, style: StrokeStyle(lineWidth: 2, lineCap: .round))

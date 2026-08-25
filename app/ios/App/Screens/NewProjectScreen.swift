@@ -146,7 +146,7 @@ struct NewProjectScreen: View {
                 .frame(minHeight: 48)
                 .overlay(
                     RoundedRectangle(cornerRadius: Theme.radius, style: .continuous)
-                        .strokeBorder(Theme.line, lineWidth: 1)
+                        .strokeBorder(Theme.lineStrong, lineWidth: 1)
                 )
                 .accessibilityIdentifier(identifier)
             if let hint {

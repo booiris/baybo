@@ -88,6 +88,16 @@ From the live `:root` block in `app/ios/web/src/styles.css`:
 reserved for text and deliberate line elements. `--color-line-strong` is the heavier
 neutral rule (blockquote edges, dividers) — still neutral, still 1–2px.
 
+**Projects draws its boxes at `--color-line-strong`; every other surface uses
+`--color-line`** (2026-08-25). A board puts a five-segment control, two chips, a row of
+face circles and a wall of card outlines on one screen — a far denser field of borders
+than a chat list — and at the light hairline the whole tab washed out into the paper.
+Raising the base for the whole app was tried first and rejected: where a hairline
+separates two lines of text and nothing else (the chat list, Settings) the heavier weight
+reads as ruled paper. The card page carries the rule by redefining `--color-line` for its
+own document; the composer is the one exception, because the card dock shares it with the
+chat.
+
 The same `:root` block also carries the transcript's **layout knobs**, each with one
 source of truth:
 
@@ -113,7 +123,8 @@ source of truth:
 ### Swift-side mirror (`Theme.swift`)
 
 `Theme` holds the same palette as `Color` values — `paper` white, `surface` 0.98 grey,
-`ink` `#111111`, `inkSoft` `#6B6B6B`, `line` `#E4E4E4`, `err` `#D40000` — plus:
+`ink` `#111111`, `inkSoft` `#6B6B6B`, `line` `#E4E4E4`, `lineStrong` `#BCBCBC` (Projects
+only — see above), `err` `#D40000` — plus:
 
 - `Theme.radius = 14` — the CSS `--radius`, for in-plane inset boxes.
 - `Theme.radiusModal = 20` — **floating layers only** (the confirm dialog). In-plane inset
@@ -143,8 +154,9 @@ coloured one, and why the failed-send glyph is the one red thing in the thread.
 ### Borders
 
 **1px hairlines.** Light `--color-line` for incidental containers (inputs, bubbles,
-chips); ink for deliberate line elements (the wordmark rule, focus). `--color-line-strong`
-where a neutral rule needs more weight than a hairline (quote edges, dividers). **Never
+chips) — `--color-line-strong` for those same containers inside Projects; ink for
+deliberate line elements (the wordmark rule, focus). `--color-line-strong` also carries a
+neutral rule that needs more weight than a hairline (quote edges, dividers). **Never
 heavier than 1px** for the incidental case.
 
 ### Corners

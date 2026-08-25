@@ -303,10 +303,10 @@ struct ProjectBoardScreen: View {
         VStack(spacing: 0) {
             ForEach(0..<5, id: \.self) { _ in
                 VStack(alignment: .leading, spacing: 6) {
-                    RoundedRectangle(cornerRadius: 3).fill(Theme.line).frame(width: 60, height: 9)
-                    RoundedRectangle(cornerRadius: 3).fill(Theme.line)
+                    RoundedRectangle(cornerRadius: 3).fill(Theme.lineStrong).frame(width: 60, height: 9)
+                    RoundedRectangle(cornerRadius: 3).fill(Theme.lineStrong)
                         .frame(maxWidth: .infinity).frame(height: 13)
-                    RoundedRectangle(cornerRadius: 3).fill(Theme.line).frame(width: 120, height: 9)
+                    RoundedRectangle(cornerRadius: 3).fill(Theme.lineStrong).frame(width: 120, height: 9)
                 }
                 .padding(.horizontal, 20)
                 .padding(.vertical, 15)
@@ -433,7 +433,7 @@ struct ProjectBoardScreen: View {
                     )
                     .overlay(
                         RoundedRectangle(cornerRadius: 9, style: .continuous)
-                            .strokeBorder(candidate == stage ? Color.clear : Theme.line, lineWidth: 1)
+                            .strokeBorder(candidate == stage ? Color.clear : Theme.lineStrong, lineWidth: 1)
                     )
                     // A dot rather than a number: pressing the segment cannot
                     // discharge it — opening the cards can.
@@ -473,7 +473,7 @@ struct ProjectBoardScreen: View {
                     .foregroundStyle(Theme.ink)
                     .padding(.horizontal, 8)
                     .frame(height: 26)
-                    .overlay(Capsule().strokeBorder(Theme.line, lineWidth: 1))
+                    .overlay(Capsule().strokeBorder(Theme.lineStrong, lineWidth: 1))
                     // Stroke-only: the capsule paints a 1px outline and
                     // nothing else, so without a shape only the glyphs
                     // hit-test and the pill's interior is dead. This app has
@@ -505,7 +505,7 @@ struct ProjectBoardScreen: View {
             .frame(height: 26)
             .background(filter.isActive ? Theme.ink : Color.clear, in: Capsule())
             .overlay(
-                Capsule().strokeBorder(filter.isActive ? Color.clear : Theme.line, lineWidth: 1))
+                Capsule().strokeBorder(filter.isActive ? Color.clear : Theme.lineStrong, lineWidth: 1))
             .contentShape(Capsule())
         }
         .buttonStyle(.plain)
@@ -589,7 +589,7 @@ struct ProjectBoardScreen: View {
                         .padding(.horizontal, 8)
                         .frame(height: 22)
                         .background(Theme.paper, in: Capsule())
-                        .overlay(Capsule().strokeBorder(Theme.line, lineWidth: 1))
+                        .overlay(Capsule().strokeBorder(Theme.lineStrong, lineWidth: 1))
                 } else {
                     Button {
                         Haptics.tap()

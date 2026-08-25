@@ -187,7 +187,7 @@ struct ProjectCardView: View {
         .background(Theme.paper, in: RoundedRectangle(cornerRadius: Theme.radius, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: Theme.radius, style: .continuous)
-                .strokeBorder(Theme.line, lineWidth: 1)
+                .strokeBorder(Theme.lineStrong, lineWidth: 1)
         )
         .opacity(isArchived ? 0.6 : 1)
         .accessibilityElement(children: .contain)
@@ -207,7 +207,7 @@ struct ProjectCardView: View {
                     .foregroundStyle(Theme.inkSoft)
                     .padding(.horizontal, 7)
                     .frame(height: 20)
-                    .overlay(Capsule().strokeBorder(Theme.line, lineWidth: 1))
+                    .overlay(Capsule().strokeBorder(Theme.lineStrong, lineWidth: 1))
             }
             Spacer(minLength: 8)
             if waiting > 0 {
@@ -221,7 +221,7 @@ struct ProjectCardView: View {
             }
             Image(systemName: "chevron.right")
                 .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(Theme.line)
+                .foregroundStyle(Theme.lineStrong)
         }
     }
 
@@ -320,7 +320,7 @@ private struct StageStrip: View {
                         .frame(maxWidth: .infinity, minHeight: 22)
                         .overlay(
                             RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                .strokeBorder(Theme.line, lineWidth: 1)
+                                .strokeBorder(Theme.lineStrong, lineWidth: 1)
                         )
                     if BoardOrder.hasNews(inStage: issues) {
                         Circle()
@@ -390,7 +390,7 @@ struct TeamFaces: View {
                     .font(Theme.mono(10))
                     .foregroundStyle(Theme.inkSoft)
                     .frame(width: AgentFace.defaultSize, height: AgentFace.defaultSize)
-                    .overlay(Circle().strokeBorder(Theme.line, lineWidth: 1))
+                    .overlay(Circle().strokeBorder(Theme.lineStrong, lineWidth: 1))
             }
         }
         .accessibilityHidden(true)
@@ -435,7 +435,7 @@ struct AgentFace: View {
     var body: some View {
         picture
             .overlay(
-                Circle().strokeBorder(lead ? Theme.ink : Theme.line, lineWidth: lead ? 1.5 : 1)
+                Circle().strokeBorder(lead ? Theme.ink : Theme.lineStrong, lineWidth: lead ? 1.5 : 1)
             )
             .overlay(
                 // The working mark is a dot at the corner, matching the one the

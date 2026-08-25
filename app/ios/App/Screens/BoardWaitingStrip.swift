@@ -62,7 +62,7 @@ struct BoardWaitingStrip: View {
                 ForEach(items) { item in
                     row(item)
                     if item.id != items.last?.id {
-                        Rectangle().fill(Theme.line).frame(height: 1)
+                        Rectangle().fill(Theme.lineStrong).frame(height: 1)
                     }
                 }
             }
@@ -71,7 +71,7 @@ struct BoardWaitingStrip: View {
             )
             .overlay(
                 RoundedRectangle(cornerRadius: Theme.radius, style: .continuous)
-                    .strokeBorder(Theme.line, lineWidth: 1)
+                    .strokeBorder(Theme.lineStrong, lineWidth: 1)
             )
         }
         .accessibilityElement(children: .contain)

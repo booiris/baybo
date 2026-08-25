@@ -20,7 +20,7 @@ struct ProjectActivityScreen: View {
     var body: some View {
         VStack(spacing: 0) {
             titleRow
-            Rectangle().fill(Theme.line).frame(height: 1)
+            Rectangle().fill(Theme.lineStrong).frame(height: 1)
             content
         }
         .background(Theme.paper)

@@ -14,6 +14,27 @@ enum Theme {
     static let ink = Color(red: 0x11 / 255.0, green: 0x11 / 255.0, blue: 0x11 / 255.0)
     static let inkSoft = Color(red: 0x6B / 255.0, green: 0x6B / 255.0, blue: 0x6B / 255.0)
     static let line = Color(red: 0xE4 / 255.0, green: 0xE4 / 255.0, blue: 0xE4 / 255.0)
+    /// The heavier hairline, **for the Projects tab and nothing else**.
+    ///
+    /// Not a new colour: the web tokens have carried this exact value as
+    /// `--color-line-strong` since they were written, and only the light half
+    /// had ever been mirrored here.
+    ///
+    /// Projects is a denser field of boxes than anywhere else in the app — a
+    /// board puts a five-segment control, two chips, a row of face circles and
+    /// a wall of card outlines on one screen — and at `line` the whole thing
+    /// washes out into the paper. Raising the base instead was tried first and
+    /// rejected: it made the chat list and Settings, where a hairline separates
+    /// two lines of text and nothing else, read as ruled paper.
+    ///
+    /// **The rule, so this stays a rule and not a habit: every border inside
+    /// the Projects tab uses `lineStrong`; every border outside it uses
+    /// `line`.** The card page mirrors it by redefining `--color-line` for its
+    /// own document (`issue/issue.css`). The one exception is the composer,
+    /// which the card dock SHARES with the chat — threading a colour through
+    /// the `ComposerHost` seam to repaint one thumbnail outline would couple
+    /// the two surfaces the seam exists to keep apart.
+    static let lineStrong = Color(red: 0xBC / 255.0, green: 0xBC / 255.0, blue: 0xBC / 255.0)
     static let err = Color(red: 0xD4 / 255.0, green: 0, blue: 0)
 
     static let radius: CGFloat = 14
