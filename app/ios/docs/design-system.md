@@ -249,8 +249,9 @@ whole mechanism rather than fight it per-block.
 
 ## Recorded deviations
 
-The custom **Liquid Glass** surfaces — the chat composer dock, the jump-to-latest button,
-and the Chats header's compose circle — are a deliberate, recorded departure from the flat
+The custom **Liquid Glass** surfaces — the chat composer dock, the project card's dock
+(the same `ComposerPill`, since 2026-08-25), the jump-to-latest button, and the Chats
+header's compose circle — are a deliberate, recorded departure from the flat
 monochrome system (glass is neither flat nor strictly ink-on-paper). They are documented in
 [navigation.md](navigation.md), which also holds the constraints they carry (white tint
 only, borderless composer pill, bare glass on the discs) and the `glassSurface` shim every

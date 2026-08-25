@@ -38,8 +38,17 @@ final class IssueStore: ObservableObject, WebMediaTarget {
     @Published private(set) var runs: [IssueRunInfo] = []
     @Published private(set) var team: [TeamMemberInfo] = []
     @Published private(set) var children: [IssueInfo] = []
-    /// The last write's failure, in the server's own words.
+    /// The last write's failure, in the server's own words. Drawn as a banner
+    /// at the top of the screen, and cleared on entry by every write.
     @Published private(set) var writeError: String?
+    /// The dock's own line — what the attachment strip has to say (too large,
+    /// still uploading, that file could not be read).
+    ///
+    /// Deliberately NOT `writeError`: every `write` clears that on entry, so
+    /// resolving an approval would wipe "attachment too large", and it renders
+    /// at the top of the page rather than under the strip that raised it. The
+    /// strip's retraction discipline assumes a slot only it writes.
+    @Published var notice: String?
     /// The description editor is open. Native owns the bar; the web owns the
     /// textarea.
     @Published var editing = false
@@ -52,6 +61,11 @@ final class IssueStore: ObservableObject, WebMediaTarget {
 
     private let client: any BayboClientProtocol
     private let supportDirectory: URL
+    /// The system clipboard, behind the paste row. Injected for the reason
+    /// `ChatStore`'s is: `UIPasteboard.general` is process-global and
+    /// swift-testing runs suites in PARALLEL, so one suite's paste written to
+    /// the real board surfaces as another's logic bug.
+    private let pasteboard: any PasteboardReading
     private weak var bridge: IssueBridge?
     /// Everything on screen came off DISK and no live fetch has landed yet.
     ///
@@ -65,6 +79,23 @@ final class IssueStore: ObservableObject, WebMediaTarget {
     private var stampedRead = false
     private var invalidations: ProjectInvalidations.Token?
 
+    /// The card's composer draft: what has been typed and what is staged.
+    ///
+    /// An explicit optional built on first use rather than a `lazy var`, which
+    /// is `ChatStore`'s rule and for its reason: constructing one reads the
+    /// draft off disk and RESUMES the uploads it still owes, so a store built
+    /// to prefetch a card — or an SwiftUI preview — would start uploads nobody
+    /// asked for.
+    private var composerDraft: ComposerStaging?
+    var staging: ComposerStaging {
+        if let composerDraft { return composerDraft }
+        let made = ComposerStaging(
+            host: self, client: client, pasteboard: pasteboard,
+            supportDirectory: supportDirectory)
+        composerDraft = made
+        return made
+    }
+
     private lazy var media: TranscriptMedia = {
         let media = TranscriptMedia(client: client)
         media.onPreview = { [weak self] in self?.filePreview = $0 }
@@ -77,12 +108,14 @@ final class IssueStore: ObservableObject, WebMediaTarget {
     init(
         projectId: String, number: Int64,
         client: any BayboClientProtocol = Baybo.client,
-        supportDirectory: URL = SessionIndex.supportDirectory()
+        supportDirectory: URL = SessionIndex.supportDirectory(),
+        pasteboard: any PasteboardReading = Pasteboards.launch()
     ) {
         self.projectId = projectId
         self.number = number
         self.client = client
         self.supportDirectory = supportDirectory
+        self.pasteboard = pasteboard
         loadMirror()
     }
 
@@ -243,6 +276,15 @@ final class IssueStore: ObservableObject, WebMediaTarget {
         Task { await refresh() }
     }
 
+    /// This screen is going away for good. The staging machine outlives the
+    /// frame — an upload holds it — so a re-push would build a SECOND one over
+    /// the same draft key, and the zombie's terminal write would put a sent
+    /// draft straight back on disk.
+    func leaveCard() {
+        composerDraft?.retire()
+        composerDraft = nil
+    }
+
     /// Drop every cached card. Called with the board mirrors on logout — a
     /// card belongs to the gateway that served it.
     static func removeMirrors(in directory: URL = SessionIndex.supportDirectory()) {
@@ -288,12 +330,20 @@ final class IssueStore: ObservableObject, WebMediaTarget {
         }
     }
 
-    func comment(_ text: String) {
-        Task {
-            await write { [projectId, number] client in
-                _ = try await client.projectIssueComment(
-                    projectId: projectId, number: number, text: text, attachments: [])
-            }
+    /// Post a comment, and say whether it landed.
+    ///
+    /// The answer is the point, and it is why this is `async` where every
+    /// other verb here is fire-and-forget. There is no outbox on this surface:
+    /// a comment that failed is gone. That was survivable while the dock only
+    /// carried text — it cleared the field before the write and the operator
+    /// could retype a sentence — but a comment carries UPLOADED BLOBS now, and
+    /// discarding the strip on a failure throws away files they can never get
+    /// back, leaving them referenced by nothing on the gateway.
+    @discardableResult
+    func comment(_ text: String, attachments: [IssueAttachmentInput] = []) async -> Bool {
+        await write { [projectId, number] client in
+            _ = try await client.projectIssueComment(
+                projectId: projectId, number: number, text: text, attachments: attachments)
         }
     }
 
@@ -489,4 +539,11 @@ final class IssueStore: ObservableObject, WebMediaTarget {
             assignee: .keep, blockedReason: .keep, cancelled: nil, parent: nil, stage: nil,
             pinned: nil)
     }
+}
+
+/// A card is a composer host: it holds the dock's notice line and names the
+/// draft. Its key lives under `card-drafts/`, never beside the conversations —
+/// see `DraftScope`.
+extension IssueStore: ComposerHost {
+    var draftKey: DraftKey { .card(project: projectId, number: number) }
 }

@@ -1043,6 +1043,20 @@ pub struct IssuePatch {
     pub pinned: Option<bool>,
 }
 
+/// One file a card comment carries.
+///
+/// A record rather than a bare blob id because the gateway resolves a blob's
+/// mime and size itself but has no idea what the user picked the file AS — and
+/// the card page prints file cards by name. `AttachmentRef`'s other fields
+/// (kind, mime, size) are deliberately absent: they are the chat frame's, and
+/// sending them here would be a second, disagreeing copy of what the blob
+/// already knows.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct IssueAttachmentInput {
+    pub blob_id: String,
+    pub filename: Option<String>,
+}
+
 /// A new card. `status` defaults to Backlog and `assignee` is required when
 /// it is In Progress — creating one there starts a run.
 #[derive(Debug, Clone, uniffi::Record)]

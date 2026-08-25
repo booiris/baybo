@@ -1,17 +1,26 @@
+import PhotosUI
 import SwiftUI
 
-/// The card's bottom dock: what you can say, and what saying it will do.
+/// The card's bottom dock: what you can say, what saying it will do, and the
+/// files it will carry.
 ///
-/// Its own type rather than `ComposerView` reused, because that one is bound to
-/// `ChatStore` from its initialiser down — a draft store, an attach menu, a
-/// staging strip, an outbox. What a card needs is a text field, a sentence
-/// above it, and the approval prompt when one is parked. Sharing the seam
-/// (`CompactPillButtonStyle`, `ApprovalCardView`) rather than the surface.
+/// **Its own type, on shared parts.** It was its own type AND its own surface
+/// until 2026-08-25, because `ComposerView` was bound to `ChatStore` from its
+/// initialiser down — so a card got a plain rounded field while the chat got
+/// the glass pill, and attachments were written up as deferred. What actually
+/// bound them was two fields, now a `ComposerHost`; the pill, the `+`, the
+/// strip and the pickers are shared views, and this file keeps only what a
+/// card genuinely does differently: the description editor's bar, the hint
+/// line, the unblock toggle, the REST approval card, and a send that posts a
+/// comment and then — in that order — lifts a block.
 struct IssueDock: View {
     @ObservedObject var store: IssueStore
+    @ObservedObject var staging: ComposerStaging
+    @ObservedObject var attach: AttachMenu
     @ObservedObject private var lang = Lang.shared
 
-    @State private var text = ""
+    @State private var photoPicks: [PhotosPickerItem] = []
+    @State private var sending = false
     @FocusState private var focused: Bool
     /// Send the comment AND lift the block. Checked by default when an agent
     /// is the one asking: answering a question and leaving the card parked is
@@ -32,16 +41,43 @@ struct IssueDock: View {
             if store.editing {
                 editingBar
             } else {
+                if let notice = store.notice {
+                    noticeRow(notice)
+                }
                 if let prompt = store.pendingApprovals.first {
                     approvalCard(prompt)
+                        // Re-key on the prompt so answering the head SWAPS in
+                        // the next card (a fresh one-shot latch) instead of
+                        // reusing this one, whose buttons have already fired.
+                        .id(prompt.callId)
                 }
                 hint
+                if !staging.staged.isEmpty {
+                    StagedStrip(
+                        items: staging.staged,
+                        onRemove: { staging.remove($0) },
+                        onRetry: { staging.retry($0) })
+                }
                 composer
             }
         }
         .padding(.horizontal, 14)
         .padding(.top, 8)
         .background(alignment: .bottom) { veil }
+        .attachmentPickers(attach: attach, staging: staging, photoPicks: $photoPicks)
+    }
+
+    /// The strip's own line — too large, still uploading, could not be read.
+    /// Distinct from `writeError`'s banner at the top of the page: this one
+    /// belongs to the row that raised it and is taken back by the same tile.
+    private func noticeRow(_ notice: String) -> some View {
+        HStack {
+            Text(verbatim: notice)
+                .font(Theme.mono(10.5))
+                .foregroundStyle(Theme.err)
+                .lineLimit(2)
+            Spacer(minLength: 0)
+        }
     }
 
     // MARK: - Editing
@@ -137,57 +173,83 @@ struct IssueDock: View {
         }
     }
 
+    /// The chat's pill exactly — the glass, the 48pt floor, the 17pt field —
+    /// with a `+` on the left and a plain send on the right. No focus-driven
+    /// gutter animation: this dock streams its own top edge to the card page
+    /// as a bottom inset on every layout settle, so an animating dock is a
+    /// moving inset per tick.
     private var composer: some View {
-        HStack(alignment: .bottom, spacing: 8) {
-            TextField(lang.t("issue.commentPlaceholder"), text: $text, axis: .vertical)
-                .font(Theme.sys(15))
-                .foregroundStyle(Theme.ink)
-                .lineLimit(1...5)
-                .focused($focused)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 11)
-                .accessibilityIdentifier(Self.fieldIdentifier)
+        ComposerPill(
+            text: $staging.text,
+            placeholder: lang.t("issue.commentPlaceholder"),
+            fieldIdentifier: Self.fieldIdentifier,
+            lineLimit: 1...5,
+            focused: $focused
+        ) {
+            AttachButton(attach: attach, pasteReady: staging.pasteReady)
+        } trailing: {
             Button {
                 send()
             } label: {
-                Image(systemName: "arrow.up")
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(canSend ? Theme.paper : Theme.inkSoft)
-                    .frame(width: 34, height: 34)
-                    .background(canSend ? Theme.ink : Theme.surface, in: Circle())
+                ComposerSendCircle(systemName: "arrow.up", filled: canSend)
             }
             .buttonStyle(.plain)
-            .disabled(!canSend)
+            .disabled(!canSend || sending)
             .padding(.trailing, 6)
             .padding(.bottom, 6)
             .accessibilityIdentifier("issue-send")
             .accessibilityLabel(Text(verbatim: lang.t("issue.send")))
         }
-        .background(
-            RoundedRectangle(cornerRadius: 24, style: .continuous)
-                .fill(Theme.paper)
-                .shadow(color: Theme.ink.opacity(0.08), radius: 14, y: 4)
-        )
         .padding(.bottom, 8)
     }
 
     private var canSend: Bool {
-        !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        !staging.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || !staging.staged.isEmpty
     }
 
     private func send() {
-        guard canSend else { return }
+        // The gate is the staging machine's — a pick still uploading or failed
+        // holds the send, and says so on its own tile.
+        guard !sending, let payload = staging.claimSend() else { return }
         Haptics.tap()
-        let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        text = ""
-        store.comment(body)
-        // The comment first, THEN the unblock: the unblock door hands the
-        // parked run back out, and its brief is built from what the card says
-        // at that moment — lifting first would restart the agent without the
-        // answer it stopped for.
-        if question != nil, unblockAfterSend {
-            store.unblock()
+        let lifting = question != nil && unblockAfterSend
+        sending = true
+        Task {
+            defer { sending = false }
+            let landed = await store.comment(
+                payload.text,
+                attachments: payload.picks.compactMap { pick in
+                    pick.blobId.map {
+                        IssueAttachmentInput(blobId: $0, filename: pick.filename)
+                    }
+                })
+            // **Only a landed comment discards.** There is no outbox here, and
+            // the picks are uploaded blobs: clearing the strip on a failure
+            // throws away files the operator cannot get back, with a banner as
+            // the only trace. A failure leaves the text and the tiles exactly
+            // where they are, to be sent again.
+            guard landed else { return }
+            clearField()
+            staging.discardDraft()
+            // The comment first, THEN the unblock: the unblock door hands the
+            // parked run back out, and its brief is built from what the card
+            // says at that moment — lifting first would restart the agent
+            // without the answer it stopped for.
+            if lifting {
+                store.unblock()
+            }
         }
+    }
+
+    /// Clear the field deterministically, INCLUDING a live CJK IME
+    /// composition — the same reach the chat composer makes, and for the scar
+    /// it was written for: the composing syllables live in the focused text
+    /// view's marked range, not in the binding, so a plain `text = ""` leaves
+    /// them to re-commit on the next input turn.
+    private func clearField() {
+        FocusedTextInput.clearDocument()
+        staging.text = ""
     }
 
     /// The paper tail under the pill, so the page's content fades out behind

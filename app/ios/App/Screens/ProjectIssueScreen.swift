@@ -19,6 +19,11 @@ struct ProjectIssueScreen: View {
     /// Created with the store, torn down with the screen. One card, one
     /// webview — see `IssueHost`.
     @State private var host: IssueHost?
+    /// The `+`'s panel, owned HERE rather than by the dock: it floats over the
+    /// dock's own rows — the hint line, the approval card, the strip — and a
+    /// panel presented from inside them draws behind them and loses its taps.
+    /// `ChatScreen` holds its own for the same reason.
+    @StateObject private var attach = AttachMenu()
     @State private var confirmingStop = false
     @State private var picking: String?
     /// The run whose transcript is open. Addressed by attempt, never by
@@ -36,6 +41,11 @@ struct ProjectIssueScreen: View {
         ZStack(alignment: .top) {
             page
             header
+            // Only the attach panel's SCRIM lands here — the panel itself rides
+            // inside the dock's layer, above the dock's own rows.
+            if attach.isOpen {
+                AttachMenuScrim(isPresented: $attach.isOpen)
+            }
             if let error = store.writeError { errorBanner(error) }
         }
         .background(Theme.paper)
@@ -64,8 +74,21 @@ struct ProjectIssueScreen: View {
         }
         .onChange(of: lang.current.lproj) { _, code in host?.bridge.setLanguage(code) }
         .onChange(of: store.editing) { _, active in host?.bridge.setEditing(active) }
+        .onAppear {
+            // The paste row's source. A process-global slot with one occupant:
+            // the chat screen and this one are never both on screen, and the
+            // registrant is the only thing that can clear it, so the handover
+            // survives an appear that lands before the other's disappear.
+            ComposerPasteTarget.shared.attach(store.staging)
+        }
         .onDisappear {
+            ComposerPasteTarget.shared.detach(store.staging)
             if let host { host.teardown(store: store) }
+            // The staging machine outlives this frame — an upload holds it —
+            // so a re-push would build a second one over the same draft key,
+            // and the zombie's terminal write would put a sent draft back on
+            // disk.
+            store.leaveCard()
         }
         .sheet(item: $openRun) { route in
             ProjectRunSheet(route: route) { confirmingStop = true }
@@ -94,7 +117,18 @@ struct ProjectIssueScreen: View {
     }
 
     private var dock: some View {
-        IssueDock(store: store)
+        ComposerDock(collapsed: false, jumpVisible: false) {
+            IssueDock(store: store, staging: store.staging, attach: attach)
+        } panel: {
+            if attach.isOpen {
+                AttachMenuPanel(
+                    anchor: attach.anchor, sources: attach.sources,
+                    isPresented: $attach.isOpen
+                ) { source in
+                    attach.pick = source
+                }
+            }
+        }
             // The dock's own top edge IS the page's bottom obstruction. Read
             // in window coordinates and streamed on every settle, so a
             // keyboard sliding up moves the page's padding rather than its

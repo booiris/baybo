@@ -237,32 +237,11 @@ struct ComposerView: View {
     }
 
     /// Clear the field deterministically, INCLUDING a live CJK IME composition.
-    /// The composing syllables (underlined marked text / inline candidates) live
-    /// in the focused text view's marked range — the UIKit input session — NOT
-    /// in the `text` binding, so a plain `text = ""` (sync or deferred) leaves
-    /// them to re-commit on the next input turn and re-materialize after send
-    /// (the intermittent "字没消失", worst under pinyin). Reach the focused input
-    /// over the responder chain, `unmarkText()` to finalize+drop the composition
-    /// FIRST (it commits, so ordering matters), then empty the document
-    /// imperatively so the reset can't lose a race with the field's own edit
-    /// up-sync; mirror `staging.text` so `hasDraft`/send-gating stay in
-    /// lockstep. No responder is resigned — the keyboard stays up.
+    /// The UIKit half is `FocusedTextInput.clearDocument()` — see it for the
+    /// marked-text scar. This mirrors `staging.text` after, so `hasDraft` and
+    /// the send gate stay in lockstep.
     private func clearField() {
-        if let input = Self.focusedTextInput() {
-            input.unmarkText()
-            if let range = input.textRange(
-                from: input.beginningOfDocument, to: input.endOfDocument)
-            {
-                input.replace(range, withText: "")
-            }
-        }
+        FocusedTextInput.clearDocument()
         staging.text = ""
-    }
-
-    /// The current first responder if it is a text input. Lives in
-    /// `FocusedTextInput` because `SearchScreen` needs the same probe (to skip a
-    /// request while a composition is open).
-    private static func focusedTextInput() -> UITextInput? {
-        FocusedTextInput.current
     }
 }

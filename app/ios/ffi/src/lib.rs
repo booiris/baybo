@@ -33,12 +33,12 @@ pub use api::{
     BlobServeOutcome, ChatSearchGroup, ChatSearchHit, ChatSearchResults, ChatSessionSummary,
     ChatSubagentList, ChatSubagentStatus, ChatSubagentSummary, ClientConfig, CronJobStatus,
     CronJobSummary, DeckCardInfo, DeckLayoutEntryInput, DeckSink, DeckSnapshotInfo, DeckView,
-    FrameSink, HiredBy, IssueApprovalDecision, IssueAttachmentInfo, IssueInfo, IssuePatch,
-    IssuePriority, IssueRunInfo, IssueRunLog, IssueStatus, LlmModelCatalog, LlmModelInfo,
-    MessageLookup, NewIssue, NewProject, PairAbortListener, PairChallenge, PairTarget,
-    PairedSummary, ProjectActivity, ProjectAttention, ProjectInfo, ProjectSettings, ProjectSink,
-    RunStatus, RunTrigger, SessionListSink, SessionModelPin, StringPatch, SubIssueProgress,
-    SubagentCursor, TeamMemberInfo,
+    FrameSink, HiredBy, IssueApprovalDecision, IssueAttachmentInfo, IssueAttachmentInput,
+    IssueInfo, IssuePatch, IssuePriority, IssueRunInfo, IssueRunLog, IssueStatus, LlmModelCatalog,
+    LlmModelInfo, MessageLookup, NewIssue, NewProject, PairAbortListener, PairChallenge,
+    PairTarget, PairedSummary, ProjectActivity, ProjectAttention, ProjectInfo, ProjectSettings,
+    ProjectSink, RunStatus, RunTrigger, SessionListSink, SessionModelPin, StringPatch,
+    SubIssueProgress, SubagentCursor, TeamMemberInfo,
 };
 use apns::ApnsState;
 use binding::{ActiveLeg, active_leg};
@@ -806,7 +806,7 @@ impl BayboClient {
         project_id: String,
         number: i64,
         text: String,
-        attachments: Vec<String>,
+        attachments: Vec<IssueAttachmentInput>,
     ) -> Result<String, BayboError> {
         runtime::run(async move {
             let client = self.gateway_client()?;

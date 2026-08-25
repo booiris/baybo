@@ -30,6 +30,29 @@ enum FocusedTextInput {
     static var isComposing: Bool {
         current?.markedTextRange != nil
     }
+
+    /// Empty the focused input's document, finalising any live IME composition
+    /// FIRST.
+    ///
+    /// The composing syllables (underlined marked text / inline candidates)
+    /// live in the input session's marked range — NOT in the SwiftUI binding —
+    /// so a plain `text = ""` (sync or deferred) leaves them to re-commit on
+    /// the next input turn and re-materialise after send: the intermittent
+    /// "字没消失", worst under pinyin. `unmarkText()` commits, so the ordering
+    /// matters; the document is then emptied imperatively so the reset cannot
+    /// lose a race with the field's own edit up-sync. No responder is
+    /// resigned — the keyboard stays up.
+    ///
+    /// Both docks call it, and the CALLER still empties its own binding after:
+    /// this reaches the UIKit half only.
+    static func clearDocument() {
+        guard let input = current else { return }
+        input.unmarkText()
+        guard
+            let range = input.textRange(from: input.beginningOfDocument, to: input.endOfDocument)
+        else { return }
+        input.replace(range, withText: "")
+    }
 }
 
 /// One-shot sink for the responder-chain probe above.

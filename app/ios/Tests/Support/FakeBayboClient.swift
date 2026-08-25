@@ -680,9 +680,20 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
         guard let stubIssueEventsJson else { throw Self.unsupported }
         return stubIssueEventsJson
     }
+    /// What the card dock posted, in order. The attachments matter as much as
+    /// the text: a comment that dropped its picks is the failure the strip's
+    /// send gate exists for.
+    var comments: [(number: Int64, text: String, attachments: [IssueAttachmentInput])] = []
+    /// Refuse the next comment, to exercise the dock keeping its strip.
+    var failComments = false
     func projectIssueComment(
-        projectId: String, number: Int64, text: String, attachments: [String]
-    ) async throws -> String { throw Self.unsupported }
+        projectId: String, number: Int64, text: String, attachments: [IssueAttachmentInput]
+    ) async throws -> String {
+        try refuseIfOffline()
+        if failComments { throw Self.unsupported }
+        comments.append((number, text, attachments))
+        return "{}"
+    }
     func projectIssueApprovalResolve(
         projectId: String, number: Int64, callId: String, decision: IssueApprovalDecision
     ) async throws {

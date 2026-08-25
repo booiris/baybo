@@ -123,7 +123,7 @@ Moving out of In Progress **never kills the run**; Stop is the only kill switch.
 |---|---|---|
 | header | native (`ChatHeaderView` grammar) | back · `#N · status` glass pill (tap → Move sheet) · ⋯ |
 | body | **`issue.html` WKWebView** | title · chips · live-run row · blocked banner · ↳ / ⑂ · **the description as the opening post** · attachments · sub-issues · runs · activity (**posts and lines**, below) · a "New activity" jump pill |
-| dock | native (`ComposerDock` grammar) | hint chip · @ chips · `ApprovalCardView` (two answers, REST-backed) · composer pill (+ attachment bloom) |
+| dock | native, inside the real `ComposerDock` | notice line · `ApprovalCardView` (two answers, REST-backed) · hint chip · staged strip · the chat's composer pill (`+` → attach panel, in-field send) |
 | overlays | native | pickers (`ModelMenuPanel` style) · sheets · `RenameDialog` · `ConfirmDialog` |
 
 - Why the whole body rather than a small webview for the description alone: a webview inside a native ScrollView is two scrollers plus height round-trips, while a full-page webview is exactly `ChatScreen`'s existing layering (header / webview / dock / bottom-inset stream) — and comment markdown, attachments, `#N` links and KaTeX all come free.
@@ -155,6 +155,33 @@ Moving out of In Progress **never kills the run**; Stop is the only kill switch.
     monospace chrome behind: a card is scanned, a comment is read. Everything
     else came down a notch with it (title 20→17 and into Inter, matching the
     native card row; chips 11→10.5).
+- **The dock is the chat's pill on shared parts** (2026-08-25). `ComposerPill`,
+  `ComposerSendCircle`, `StagedStrip`, `AttachButton` and the pickers are
+  store-free views both docks use; `ComposerStaging` — text, spool, uploads,
+  draft — plugs into whichever surface owns it through `ComposerHost`
+  (`draftKey` + `notice`), which is the one thing that made this a deferral.
+  What stays per-surface is what genuinely differs: this file keeps the
+  editing bar, the hint, the unblock toggle, its own flat veil, and a send
+  that posts a comment and THEN lifts a block.
+  - **No `send` on the seam**, deliberately: a chat mints an id, paints an
+    optimistic bubble, writes an outbox row and sends through a connection
+    gate. The machine's door out is `claimSend()`, which also moves the send
+    GATE off the view — a surface reading `staged.compactMap(\.blobId)` for
+    itself would ship a comment minus every pick still uploading, silently.
+  - **Only a landed comment discards.** There is no outbox here, and the picks
+    are uploaded blobs: clearing the strip on a failure strands files the
+    operator cannot get back. `IssueStore.comment` answers `Bool` for exactly
+    this, and it is why that one verb is `async` where the rest are not.
+  - The card's draft lives under `card-drafts/`, never beside the
+    conversations: `AppStore.unsentDraftSessionId` treats an unlisted,
+    outbox-free directory in the chat root as the abandoned new chat the
+    compose button resumes.
+  - A comment's files carry `filename` on the wire (`IssueAttachmentInput`) —
+    the gateway resolves mime and size off the blob, but nothing there knows
+    what the user picked the file AS, and the page prints file cards by name.
+  - No focus-driven gutter animation, unlike the chat's: this dock streams its
+    own top edge to the page as a bottom inset on every layout settle, so an
+    animating dock is a moving inset per tick.
 - `POST …/read` fires only after the timeline renders successfully, then attention is refetched.
 - **Every run of system events collapses** into a closed `N events ›` line — a
   run of one included — and presses open and close it again. Comments,
@@ -318,9 +345,9 @@ offering a press that can only 400.
 carries the `archived` chip explaining why instead of a button that can only
 fail. The two are mutually exclusive by construction.
 
-Not offered on this screen: attachments (they want the composer's staging
-strip, which is bound to `ChatStore`; a card takes files from its own page)
-and `parent`/`stage` (filing a sub-card is a thing you do FROM the parent, and
+Not offered on this NEW-CARD screen: attachments (a card's files arrive on a
+comment, from the dock — see §3.3 — or on its description from the web) and
+`parent`/`stage` (filing a sub-card is a thing you do FROM the parent, and
 there is no parent in view here).
 
 ### 9.2 Agents' faces
@@ -513,10 +540,11 @@ team / profile / activity / settings screens.
 
 **Deferred deliberately, and worth naming so nobody looks for them:**
 
-- **`@` mention chips and staged attachments on a comment.** The card's dock
-  takes text. Mentioning is typing `@handle`, which the hint line already
-  describes the effect of; attaching would want the composer's whole staging
-  strip, which is bound to `ChatStore` from its initialiser down.
+- **`@` mention chips on a comment.** Mentioning is typing `@handle`, which
+  the hint line already describes the effect of.
+  ~~Staged attachments~~ — **shipped 2026-08-25**, see §3.3. What made them a
+  deferral was one `weak var store: ChatStore?` on the staging machine; that
+  is a `ComposerHost` now, and the card has the same strip.
 - **The description editor is a `<textarea>` over the raw markdown**, which is
   what §3.3 asks for — but it has had no device pass, and a Chinese keyboard is
   specifically what it needs (this app has one marked-text scar already).

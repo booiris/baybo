@@ -8,10 +8,10 @@ use serde::{Deserialize, Serialize};
 use crate::api::{
     ChatSearchGroup, ChatSearchHit, ChatSearchResults, ChatSessionSummary, ChatSubagentList,
     ChatSubagentStatus, ChatSubagentSummary, CronJobStatus, CronJobSummary, DeckCardInfo,
-    DeckLayoutEntryInput, DeckSnapshotInfo, DeckView, HiredBy, IssueAttachmentInfo, IssueInfo,
-    IssuePriority, IssueRunInfo, IssueStatus, LlmModelCatalog, LlmModelInfo, ProjectActivity,
-    ProjectAttention, ProjectInfo, RunStatus, RunTrigger, SessionModelPin, SubIssueProgress,
-    SubagentCursor, TeamMemberInfo,
+    DeckLayoutEntryInput, DeckSnapshotInfo, DeckView, HiredBy, IssueAttachmentInfo,
+    IssueAttachmentInput, IssueInfo, IssuePriority, IssueRunInfo, IssueStatus, LlmModelCatalog,
+    LlmModelInfo, ProjectActivity, ProjectAttention, ProjectInfo, RunStatus, RunTrigger,
+    SessionModelPin, SubIssueProgress, SubagentCursor, TeamMemberInfo,
 };
 
 const PATH_CHAT_SESSIONS: &str = "/v1/chat/sessions";
@@ -1755,6 +1755,11 @@ struct SetProjectArchivedRequest {
 #[derive(Serialize)]
 struct AttachmentRequest<'a> {
     blob_id: &'a str,
+    /// What to call the file. The gateway reads mime and size off the blob
+    /// itself, but nothing there knows what the user picked it as — omit this
+    /// and every file card on a card page prints an inferred name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    filename: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -1936,7 +1941,10 @@ pub(crate) async fn create_issue<C: GatewayJsonClient + Sync>(
         attachments: new
             .attachments
             .iter()
-            .map(|blob_id| AttachmentRequest { blob_id })
+            .map(|blob_id| AttachmentRequest {
+                blob_id,
+                filename: None,
+            })
             .collect(),
         status,
         priority,
@@ -1962,7 +1970,10 @@ pub(crate) async fn patch_issue<C: GatewayJsonClient + Sync>(
         description: patch.description.as_deref(),
         attachments: patch.attachments.as_ref().map(|ids| {
             ids.iter()
-                .map(|blob_id| AttachmentRequest { blob_id })
+                .map(|blob_id| AttachmentRequest {
+                    blob_id,
+                    filename: None,
+                })
                 .collect()
         }),
         priority,
@@ -2085,14 +2096,17 @@ pub(crate) async fn comment_on_issue<C: GatewayJsonClient + Sync>(
     project: String,
     number: i64,
     text: String,
-    attachments: Vec<String>,
+    attachments: Vec<IssueAttachmentInput>,
 ) -> Result<String, String> {
     let path = format!("{}/comments", issue_path(&project, number)?);
     let body = serde_json::to_vec(&NewCommentRequest {
         text: &text,
         attachments: attachments
             .iter()
-            .map(|blob_id| AttachmentRequest { blob_id })
+            .map(|a| AttachmentRequest {
+                blob_id: &a.blob_id,
+                filename: a.filename.as_deref(),
+            })
             .collect(),
     })
     .map_err(|e| format!("encode comment: {e}"))?;
