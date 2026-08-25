@@ -40,6 +40,10 @@ final class ProjectsUITests: BayboUITestCase {
     /// Deck is the control. Without it "there is red near the tab bar" would be
     /// satisfied by any red anywhere in the strip, including the neighbouring
     /// Chats badge.
+    ///
+    /// What it counts is PARKED APPROVALS, not the server's wider `/attention`
+    /// — the same set a board's Waiting strip shows, so the number you press
+    /// and the rows you land on agree.
     func testTheProjectsTabCarriesABadgeAndAQuietTabDoesNot() {
         let app = openProjects()
         XCTAssertTrue(
@@ -282,18 +286,27 @@ final class ProjectsUITests: BayboUITestCase {
             "answering must not navigate away from the board")
     }
 
-    /// All four kinds, and each card at most once — a card already waiting for
-    /// something answerable does not also queue as news.
-    func testTheWaitingStripCarriesEveryKindAndNoCardTwice() {
+    /// **Only parked approvals reach the strip.** The fixture's board also has
+    /// a failed run (#42), an agent's question (#38) and two unread cards —
+    /// none of which is waiting on an answer, and each of which says itself on
+    /// its own card row instead.
+    func testOnlyParkedApprovalsReachTheStrip() {
         let app = openBoard()
         XCTAssertTrue(app.otherElements["waiting-strip"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.buttons["waiting-approve-41"].exists, "no approval row")
-        XCTAssertTrue(app.buttons["waiting-retry-42"].exists, "no failed row")
-        XCTAssertTrue(app.buttons["waiting-answer-38"].exists, "no question row")
-        // #41 carries unread AND an approval; only the approval may be listed.
+
         XCTAssertEqual(
-            app.descendants(matching: .any).matching(identifier: "waiting-row-41").count, 1,
-            "a card must not appear in the strip twice")
+            app.descendants(matching: .any).matching(
+                NSPredicate(format: "identifier BEGINSWITH 'waiting-row-'")
+            ).count, 1,
+            "the strip should hold the one parked prompt and nothing else")
+
+        // The failed card still says so, on its own row.
+        app.buttons["stage-todo"].tap()
+        app.buttons["stage-in-progress"].tap()
+        XCTAssertTrue(
+            app.buttons["issue-row-42"].label.contains("Run failed"),
+            "a failed run must still be visible on the card")
     }
 
     /// The board's ⋯ opens the four screens P7 added.
@@ -448,38 +461,18 @@ final class ProjectsUITests: BayboUITestCase {
             app.buttons["waiting-approve-41"].waitForExistence(timeout: 4),
             "an answered approval must leave the strip on the press")
 
-        let retry = app.buttons["waiting-retry-42"]
-        XCTAssertTrue(retry.waitForExistence(timeout: 4), "no failed row")
-        retry.tap()
-        XCTAssertFalse(
-            app.buttons["waiting-retry-42"].waitForExistence(timeout: 4),
-            "Run again must retire the row: the newest run is no longer the failed one")
     }
 
-    /// The strip goes away entirely once nothing is waiting — a header reading
-    /// "WAITING ON YOU 0" over an empty box would be the same bug wearing a
-    /// different number.
-    func testTheStripDisappearsOnceEverythingIsAnswered() {
+    /// The strip goes away entirely once the last prompt is answered — a header
+    /// reading "WAITING ON YOU 0" over an empty box would be the same bug
+    /// wearing a different number.
+    func testTheStripDisappearsOnceTheLastPromptIsAnswered() {
         let app = openBoard()
         XCTAssertTrue(app.buttons["waiting-approve-41"].waitForExistence(timeout: 5))
         app.buttons["waiting-approve-41"].tap()
-        XCTAssertTrue(app.buttons["waiting-retry-42"].waitForExistence(timeout: 4))
-        app.buttons["waiting-retry-42"].tap()
-
-        // What is left is the agent's question and one unread — both are
-        // discharged by opening a card, not from here. Mark all read takes the
-        // unread one.
-        XCTAssertTrue(app.buttons["board-menu"].waitForExistence(timeout: 4))
-        app.buttons["board-menu"].tap()
-        let markRead = app.buttons.matching(
-            NSPredicate(format: "label BEGINSWITH 'Mark all read'")).firstMatch
-        XCTAssertTrue(markRead.waitForExistence(timeout: 3))
-        markRead.tap()
-
         XCTAssertFalse(
-            app.descendants(matching: .any).matching(identifier: "waiting-row-43").firstMatch
-                .waitForExistence(timeout: 4),
-            "a card with nothing left waiting must leave the strip")
+            app.otherElements["waiting-strip"].waitForExistence(timeout: 4),
+            "an empty strip must not linger as a header over nothing")
     }
 
     /// The new-board form is a pushed route, not a sheet — deliberately, so the

@@ -57,11 +57,6 @@ final class ProjectsStore: ObservableObject {
     /// that painted one on a cold start would be offering an answer to
     /// something that stopped listening hours ago.
     @Published private(set) var approvalPrompts: [String: [Int64: [IssueApprovalPrompt]]] = [:]
-    /// Blocks an AGENT wrote, per board, keyed by card number — the ones that
-    /// are a question rather than the operator's own stop order. Read off the
-    /// same events pass as the prompts, and unmirrored for the same reason.
-    @Published private(set) var blockedQuestions: [String: [Int64: IssueTimeline.PendingQuestion]] =
-        [:]
     /// The last refresh could not reach the gateway, so what is on screen is
     /// the mirror. Drives the offline line and disables every write.
     @Published private(set) var isOffline = false
@@ -114,19 +109,16 @@ final class ProjectsStore: ObservableObject {
         func installDemo(
             projects: [ProjectInfo], attention: [String: ProjectAttention],
             activity: [String: ProjectActivity], boards: [String: Board],
-            approvalPrompts: [String: [Int64: [IssueApprovalPrompt]]] = [:],
-            blockedQuestions: [String: [Int64: IssueTimeline.PendingQuestion]] = [:]
+            approvalPrompts: [String: [Int64: [IssueApprovalPrompt]]] = [:]
         ) {
             self.projects = projects
             self.attention = attention
             self.activity = activity
             self.boards = boards
-            // Seeded rather than fetched: `refreshWaitingDetails` reads each
+            // Seeded rather than fetched: `refreshApprovalPrompts` reads each
             // flagged card's events over the network, which the demo has none
-            // of — and without these two the strip can only ever show the
-            // failed and unread kinds, i.e. half of what it exists to show.
+            // of — and without this the strip would always be empty.
             self.approvalPrompts = approvalPrompts
-            self.blockedQuestions = blockedQuestions
         }
     #endif
 
@@ -547,55 +539,45 @@ final class ProjectsStore: ObservableObject {
             call: { client in try await client.projectRead(projectId: projectId) })
     }
 
-    /// What the Waiting strip needs that the board's own rows cannot say: the
-    /// parked prompts, and which blocks are an agent ASKING something.
+    /// The prompts parked on this board, which is the one thing the Waiting
+    /// strip needs and the board's own rows cannot say.
     ///
-    /// Both are read from a card's `events`, which is why one pass fetches
-    /// them together — asking twice would double a cost that is already the
-    /// strip's whole expense. Bounded by the two flags: only cards marked
-    /// `approval_pending` or carrying a `blocked_reason` are fetched, so a
-    /// board with nothing waiting costs nothing at all. The fetches are
-    /// concurrent, because a board that parked four prompts should not take
-    /// four round trips to say so.
-    func refreshWaitingDetails(board projectId: String) async {
+    /// Read off each flagged card's `events` because there is no list route —
+    /// and bounded by `approval_pending`, so a board with nothing parked costs
+    /// nothing at all. The fetches are concurrent: a board holding four
+    /// prompts should not take four round trips to say so.
+    ///
+    /// It used to fetch for blocked cards too, to tell an agent's question
+    /// from the operator's own stop order. The strip no longer shows
+    /// questions, and the card's dock derives its own from the card's events —
+    /// so those fetches bought nothing and are gone.
+    func refreshApprovalPrompts(board projectId: String) async {
         guard !isDemo else { return }
         let flagged = (boards[projectId]?.issues ?? [])
-            .filter { $0.cancelledAtMs == nil }
-            .filter { $0.approvalPending || $0.blockedReason != nil }
+            .filter { $0.cancelledAtMs == nil && $0.approvalPending }
         guard !flagged.isEmpty else {
             approvalPrompts[projectId] = [:]
-            blockedQuestions[projectId] = [:]
             return
         }
         let client = self.client
         var prompts: [Int64: [IssueApprovalPrompt]] = [:]
-        var questions: [Int64: IssueTimeline.PendingQuestion] = [:]
-        await withTaskGroup(
-            of: (Int64, [IssueApprovalPrompt], IssueTimeline.PendingQuestion?).self
-        ) { group in
+        await withTaskGroup(of: (Int64, [IssueApprovalPrompt]).self) { group in
             for issue in flagged {
                 let number = issue.number
-                let blockedReason = issue.blockedReason
                 group.addTask {
                     guard
                         let json = try? await client.projectIssueEvents(
                             projectId: projectId, number: number),
                         let events = try? IssueEvent.decodeList(json)
-                    else { return (number, [], nil) }
-                    return (
-                        number,
-                        IssueTimeline.pendingApprovals(in: events),
-                        IssueTimeline.agentQuestion(blockedReason: blockedReason, events: events)
-                    )
+                    else { return (number, []) }
+                    return (number, IssueTimeline.pendingApprovals(in: events))
                 }
             }
-            for await (number, found, question) in group {
-                if !found.isEmpty { prompts[number] = found }
-                if let question { questions[number] = question }
+            for await (number, found) in group where !found.isEmpty {
+                prompts[number] = found
             }
         }
         approvalPrompts[projectId] = prompts
-        blockedQuestions[projectId] = questions
     }
 
     private static func patch(

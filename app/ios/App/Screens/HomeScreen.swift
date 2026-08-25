@@ -47,8 +47,9 @@ struct HomeTabView: View {
                 // that carry one. It reads as a promise the press can keep:
                 // Chats opens a list whose rows each discharge part of it, and
                 // Projects opens the cards, whose rows carry the same per-board
-                // numbers. Nothing pushes a board, so this only moves while the
-                // app is foreground — which is the honest state of the feature.
+                // number, which is the board's parked approvals. Nothing pushes
+                // a board, so this only moves while the app is foreground —
+                // which is the honest state of the feature.
                 .badge(badge(for: tab))
             }
         }
@@ -65,9 +66,12 @@ struct HomeTabView: View {
         // A `Published` publisher replays its current value on subscribe, so
         // this also seeds the badge rather than only tracking it from here on.
         .onReceive(store.projectsStore.$attention) { attention in
-            projectsWaiting = attention.values.reduce(0) {
-                $0 + Int($1.approvals + $1.failed + $1.unread)
-            }
+            // Parked approvals only — the same set a board's Waiting strip
+            // shows and a card's own badge counts. The server's `/attention`
+            // also counts failed runs and unread cards; neither is waiting on
+            // an answer, and a tab badge that cannot be discharged by
+            // answering anything is a mark you learn to ignore.
+            projectsWaiting = attention.values.reduce(0) { $0 + Int($1.approvals) }
         }
         #if DEBUG
             .task { await demoTabCycleIfRequested() }

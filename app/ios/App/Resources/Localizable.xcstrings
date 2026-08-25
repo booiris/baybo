@@ -222,23 +222,6 @@
         }
       }
     },
-    "board.answer": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Answer"
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "回答"
-          }
-        }
-      }
-    },
     "board.approve": {
       "extractionState": "manual",
       "localizations": {
@@ -817,23 +800,6 @@
         }
       }
     },
-    "board.waitingFailed": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@ %@ — the run failed"
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@ %@ — 运行失败了"
-          }
-        }
-      }
-    },
     "board.waitingOnYou": {
       "extractionState": "manual",
       "localizations": {
@@ -847,40 +813,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "等你处理"
-          }
-        }
-      }
-    },
-    "board.waitingQuestion": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@ asks on %@ %@"
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@ 在 %@ %@ 上问了个问题"
-          }
-        }
-      }
-    },
-    "board.waitingUnread": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@ %@ — something was said"
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@ %@ — 有新消息"
           }
         }
       }

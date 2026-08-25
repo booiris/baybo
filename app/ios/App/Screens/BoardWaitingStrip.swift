@@ -1,59 +1,47 @@
 import SwiftUI
 
-/// The board's "Waiting on you" strip: everything on THIS board that has
-/// stopped and is holding for a person.
+/// The board's "Waiting on you" strip: the tool calls parked on an approval
+/// gate, and nothing else.
 ///
-/// Compact rows rather than whole cards, because the point is the count and
-/// the answer, not the card — a strip that reprinted four full cards would
-/// push the board itself off the screen. Each row's press is the answer,
-/// except the unread one, which can only be discharged by opening the card.
+/// **Only approvals**, and the phrase is the reason. Something is *waiting on
+/// you* when it has stopped and cannot go on until a person answers. On a
+/// board that is true of a parked prompt and of nothing else:
+///
+/// - a **failed run** is over, not waiting — nothing is blocked on an answer,
+///   and the card wears `✕ Run failed`;
+/// - an **unread card** is news — nobody is stopped, and the card wears a red
+///   count while its segment wears a dot;
+/// - an agent's **question** does park a run, but it is answered by writing a
+///   sentence, and no sentence fits in a strip row — so the card wears
+///   `⊘ Blocked` and the answering happens where the writing happens.
+///
+/// Each of those already says itself on the card row. A strip that repeated
+/// them was a third place for the same fact, and it filled up with rows whose
+/// only affordance was "go and look" — which is what the list underneath it
+/// already is.
 ///
 /// The strip carries the current board only. A cross-board inbox was the other
 /// candidate and was rejected: it would be a second place a card can be acted
 /// on, with its own idea of what is urgent, and the cards root already carries
-/// the per-board counts that say which board to enter.
+/// the per-board count.
 struct BoardWaitingStrip: View {
     let items: [Item]
     let onApprove: (Int64, String, IssueApprovalDecision) -> Void
-    let onRetry: (Int64) -> Void
     let onOpen: (Int64) -> Void
 
     @ObservedObject private var lang = Lang.shared
 
-    /// One thing waiting, in the order the board wants them answered.
+    /// One parked prompt.
     ///
-    /// The four kinds are deliberately not one "needs attention" row: they are
-    /// answered by four different presses, and a strip that made them look
-    /// alike would make three of them lie about what tapping does.
-    enum Item: Identifiable, Equatable {
-        /// A tool call parked on the gate. Answerable in place.
-        case approval(number: Int64, title: String, prompt: IssueApprovalPrompt)
-        /// The last attempt failed. One press starts another.
-        case failed(number: Int64, title: String, error: String?)
-        /// An AGENT wrote the block, so it is a question. An operator's own
-        /// block is not — nothing should invite somebody to answer themselves.
-        case question(number: Int64, title: String, askedBy: String, question: String)
-        /// Something was said on the card while you were elsewhere. Opening it
-        /// is the only thing that clears it.
-        case unread(number: Int64, title: String, count: Int64)
+    /// A struct rather than an enum now that there is one kind: an enum with a
+    /// single case is a switch nobody will ever add a branch to, and the four
+    /// it used to have made three dead shapes look like live ones.
+    struct Item: Identifiable, Equatable {
+        let number: Int64
+        let title: String
+        let prompt: IssueApprovalPrompt
 
-        var id: String {
-            switch self {
-            case let .approval(number, _, prompt): "approval-\(number)-\(prompt.callId)"
-            case let .failed(number, _, _): "failed-\(number)"
-            case let .question(number, _, _, _): "question-\(number)"
-            case let .unread(number, _, _): "unread-\(number)"
-            }
-        }
-
-        var number: Int64 {
-            switch self {
-            case let .approval(number, _, _): number
-            case let .failed(number, _, _): number
-            case let .question(number, _, _, _): number
-            case let .unread(number, _, _): number
-            }
-        }
+        var id: String { "approval-\(number)-\(prompt.callId)" }
     }
 
     var body: some View {
@@ -78,7 +66,9 @@ struct BoardWaitingStrip: View {
                     }
                 }
             }
-            .background(Theme.surface, in: RoundedRectangle(cornerRadius: Theme.radius, style: .continuous))
+            .background(
+                Theme.surface, in: RoundedRectangle(cornerRadius: Theme.radius, style: .continuous)
+            )
             .overlay(
                 RoundedRectangle(cornerRadius: Theme.radius, style: .continuous)
                     .strokeBorder(Theme.line, lineWidth: 1)
@@ -88,29 +78,46 @@ struct BoardWaitingStrip: View {
         .accessibilityIdentifier("waiting-strip")
     }
 
-    @ViewBuilder private func row(_ item: Item) -> some View {
+    private func row(_ item: Item) -> some View {
         HStack(alignment: .center, spacing: 10) {
             VStack(alignment: .leading, spacing: 2) {
-                Text(verbatim: headline(item))
-                    .font(Theme.sys(12.5, weight: .medium))
-                    .foregroundStyle(Theme.ink)
-                    .lineLimit(1)
-                if let detail = detail(item) {
-                    Text(verbatim: detail)
-                        .font(Theme.sys(11.5))
-                        .foregroundStyle(Theme.inkSoft)
-                        .lineLimit(2)
-                        .multilineTextAlignment(.leading)
-                }
+                Text(
+                    verbatim: lang.t(
+                        "board.waitingApproval",
+                        item.prompt.askedBy.map { "@\($0)" } ?? lang.t("board.anAgent"),
+                        "#\(item.number)", item.title)
+                )
+                .font(Theme.sys(12.5, weight: .medium))
+                .foregroundStyle(Theme.ink)
+                .lineLimit(1)
+                Text(verbatim: item.prompt.summary ?? item.prompt.tool)
+                    .font(Theme.sys(11.5))
+                    .foregroundStyle(Theme.inkSoft)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            // The whole text column opens the card. Tapping it must NOT
-            // discharge whatever the row is asking — the answer buttons are
-            // the only thing that answers.
+            // The text column opens the card. It must NOT answer — the two
+            // buttons are the only thing that answers.
             .contentShape(Rectangle())
             .onTapGesture { onOpen(item.number) }
 
-            answers(item)
+            // Both buttons are `.plain`-isolated on purpose: inside a row that
+            // is itself tappable, a default-styled button hands its press to
+            // the row, and Approve would open the card instead of approving.
+            HStack(spacing: 6) {
+                Button(lang.t("board.deny")) {
+                    onApprove(item.number, item.prompt.callId, .deny)
+                }
+                .buttonStyle(CompactPillButtonStyle(fill: nil, color: Theme.err, expands: false))
+                .accessibilityIdentifier("waiting-deny-\(item.number)")
+                Button(lang.t("board.approve")) {
+                    onApprove(item.number, item.prompt.callId, .approve)
+                }
+                .buttonStyle(
+                    CompactPillButtonStyle(fill: Theme.ink, color: Theme.paper, expands: false))
+                .accessibilityIdentifier("waiting-approve-\(item.number)")
+            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
@@ -123,111 +130,27 @@ struct BoardWaitingStrip: View {
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("waiting-row-\(item.number)")
     }
-
-    /// Every button here is `.buttonStyle(.plain)`-isolated on purpose: inside
-    /// a row that is itself tappable, a default-styled button hands its press
-    /// to the row, and Approve would open the card instead of approving.
-    @ViewBuilder private func answers(_ item: Item) -> some View {
-        switch item {
-        case let .approval(number, _, prompt):
-            HStack(spacing: 6) {
-                Button(lang.t("board.deny")) { onApprove(number, prompt.callId, .deny) }
-                    .buttonStyle(
-                        CompactPillButtonStyle(fill: nil, color: Theme.err, expands: false))
-                    .accessibilityIdentifier("waiting-deny-\(number)")
-                Button(lang.t("board.approve")) { onApprove(number, prompt.callId, .approve) }
-                    .buttonStyle(
-                        CompactPillButtonStyle(
-                            fill: Theme.ink, color: Theme.paper, expands: false))
-                    .accessibilityIdentifier("waiting-approve-\(number)")
-            }
-        case let .failed(number, _, _):
-            Button(lang.t("board.runAgain")) { onRetry(number) }
-                .buttonStyle(CompactPillButtonStyle(fill: nil, color: Theme.ink, expands: false))
-                .accessibilityIdentifier("waiting-retry-\(number)")
-        case let .question(number, _, _, _):
-            Button(lang.t("board.answer")) { onOpen(number) }
-                .buttonStyle(
-                    CompactPillButtonStyle(fill: Theme.ink, color: Theme.paper, expands: false))
-                .accessibilityIdentifier("waiting-answer-\(number)")
-        case let .unread(_, _, count):
-            // No button: opening the card is what clears an unread, and a
-            // "Mark read" here would let the count go without the thing that
-            // caused it ever being looked at.
-            Text(verbatim: count > 99 ? "99+" : "\(count)")
-                .font(Theme.sys(10, weight: .medium))
-                .foregroundStyle(Theme.paper)
-                .padding(.horizontal, 5)
-                .frame(minWidth: 16, minHeight: 16)
-                .background(Theme.err, in: Capsule())
-        }
-    }
-
-    private func headline(_ item: Item) -> String {
-        switch item {
-        case let .approval(number, title, prompt):
-            let who = prompt.askedBy.map { "@\($0)" } ?? lang.t("board.anAgent")
-            return lang.t("board.waitingApproval", who, "#\(number)", title)
-        case let .failed(number, title, _):
-            return lang.t("board.waitingFailed", "#\(number)", title)
-        case let .question(number, title, askedBy, _):
-            return lang.t("board.waitingQuestion", "@\(askedBy)", "#\(number)", title)
-        case let .unread(number, title, _):
-            return lang.t("board.waitingUnread", "#\(number)", title)
-        }
-    }
-
-    private func detail(_ item: Item) -> String? {
-        switch item {
-        case let .approval(_, _, prompt): prompt.summary ?? prompt.tool
-        case let .failed(_, _, error): error
-        case let .question(_, _, _, question): question
-        case .unread: nil
-        }
-    }
 }
 
 /// Building the strip from a board.
 ///
-/// Kept apart from the view so the ordering is testable without a screen: the
-/// order IS the design — an approval blocks a running agent right now, a
-/// failed run has already stopped, a question is waiting on a sentence, and an
-/// unread is only news.
+/// Kept apart from the view so what it contains is testable without a screen.
 enum BoardWaiting {
     static func items(
         issues: [IssueInfo],
-        runs: [IssueRunInfo],
-        prompts: [Int64: [IssueApprovalPrompt]],
-        blockedQuestions: [Int64: IssueTimeline.PendingQuestion]
+        prompts: [Int64: [IssueApprovalPrompt]]
     ) -> [BoardWaitingStrip.Item] {
         // A cancelled card waits for nothing: it is terminal, and the run that
         // was on it does not come back on its own.
-        let live = issues.filter { $0.cancelledAtMs == nil }
-        var out: [BoardWaitingStrip.Item] = []
-
-        for issue in live {
-            for prompt in prompts[issue.number] ?? [] {
-                out.append(.approval(number: issue.number, title: issue.title, prompt: prompt))
+        issues
+            .filter { $0.cancelledAtMs == nil }
+            .flatMap { issue in
+                // Several prompts on one card are several rows: each is
+                // answered by its own `call_id`, and collapsing them would
+                // leave one unanswerable.
+                (prompts[issue.number] ?? []).map {
+                    BoardWaitingStrip.Item(number: issue.number, title: issue.title, prompt: $0)
+                }
             }
-        }
-        for issue in live where issue.lastRunFailed {
-            let error = runs.first { $0.number == issue.number && $0.status == .failed }?.error
-            out.append(.failed(number: issue.number, title: issue.title, error: error))
-        }
-        for issue in live {
-            guard let question = blockedQuestions[issue.number] else { continue }
-            out.append(
-                .question(
-                    number: issue.number, title: issue.title, askedBy: question.askedBy,
-                    question: question.question))
-        }
-        for issue in live where issue.unread > 0 {
-            // A card already in the strip for a reason that can be ANSWERED
-            // does not also queue as news: the answer discharges the visit, and
-            // the same card twice makes the count say two things are waiting.
-            guard !out.contains(where: { $0.number == issue.number }) else { continue }
-            out.append(.unread(number: issue.number, title: issue.title, count: issue.unread))
-        }
-        return out
     }
 }

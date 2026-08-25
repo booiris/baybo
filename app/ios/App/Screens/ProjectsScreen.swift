@@ -161,13 +161,16 @@ struct ProjectCardView: View {
 
     private var isArchived: Bool { project.archivedAtMs != nil }
 
-    /// Approvals, failures and unread together — every one of them an event a
-    /// press can discharge. Runs the ceiling is holding are deliberately not
-    /// here: a hold is a standing condition, and painting it in the same red
-    /// makes a mark that cannot be cleared by acting.
+    /// **Parked approvals, and nothing else** — the same set the board's
+    /// Waiting strip shows, so the number you press and the rows you land on
+    /// are the same number.
+    ///
+    /// The server's `/attention` also counts failed runs and unread cards, and
+    /// this deliberately does not: neither is waiting on an answer. A failed
+    /// run is over and an unread card is news, and a red count that cannot be
+    /// discharged by answering anything is a mark you learn to ignore.
     private var waiting: Int {
-        guard let attention else { return 0 }
-        return Int(attention.approvals + attention.failed + attention.unread)
+        Int(attention?.approvals ?? 0)
     }
 
     var body: some View {

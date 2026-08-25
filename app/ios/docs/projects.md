@@ -32,7 +32,7 @@
 | 5 | Mirror boards to disk | **Yes**, with REPLACE semantics | §5 |
 | 6 | Create a project from the phone | **Yes** | §3.5 |
 | 7 | A project-picker card screen | **Projects cards IS the tab root**; the board is a pushed screen; **there is no switcher in the top-left — changing project means swiping back to the cards** (a deliberate divergence from web decision 12) | §2, §3.0 |
-| 8 | Tab badge | **Native `.badge(n)`** on **both** Projects and Chats (a deliberate divergence from web's "a tab gets a dot, never a count") | §3.0 |
+| 8 | Tab badge | **Native `.badge(n)`** on **both** Projects and Chats (a deliberate divergence from web's "a tab gets a dot, never a count"). Since 2026-08-25 it counts **parked approvals only**, matching the strip — see §9.6 | §3.0 |
 | 9 | Mark-read by swiping a Waiting-on-you row | **No** | §3.1 |
 | 10 | Confirm before Stop | **Yes, a ConfirmDialog** | §3.3 |
 | 11 | Editing the description | **A ✎ button; raw text while editing, rendered again on exit** — in v1 | §3.3 |
@@ -100,7 +100,7 @@ Pushed screens use the `ChatRoute` + `ArchivedScreen` header grammar plus `PopGe
 - **One stage at a time** — the web `ColumnPage` on a phone. The segmented control carries live counts (**cancelled excluded**); a segment with unread wears a red dot; the `Pinned / New / Queue` bands only print a header when more than one is non-empty. **No `TabView(.page)`**: a row's swipe actions, page paging, and the edge-back gesture are three horizontal gestures fighting. The bar strip (segmented + board row + Waiting strip) takes the horizontal swipe instead.
 - **Reading order = pinned → unread → `position`**, rendered only, never written back; a cancelled card is never lifted by unread (a pin does lift it); a refresh anchors scroll by row id.
 - **A card is a row** (`ChatRowBody` grammar, `Theme.sys`): a 3px spine on the leading edge (urgent/high ink, medium light grey); first line `#N · ▲▲/▲/◆/▽ priority (all ink — red is only for failure) · (pin) · age · hand glyph (approval_pending) · red unread count`; two lines of title; a badge row of Blocked / ✕ Run failed (the one red thing) / ⑂ branch (only once it has a commit) / ↳ #N; a footer of assignee face + handle, **the runner's face** (a second, ringed face when the run is not the assignee's — a coordination run is @lead's), the run word `WORKING · 4m` / `QUEUED` / `HELD · 41m` (running measures from `started_at_ms`, queued/held from `created_at_ms`, nothing after it settles), and the `done/total` progress ring. A cancelled card is struck through and dimmed but still opens (Reopen).
-- **The "Waiting on you" strip**: the current board only, compact rows rather than whole cards, four kinds — an approval (Deny / Approve inline; found by taking the `approval_pending` cards and reading their `events` for the `call_id`, which is bounded), a failed run (Run again), **an agent's question** (`blocked_reason` set and the newest `blocked` event's actor is an agent → "@lead asks on #7: …" + Answer), and an unread card (opening is the only way to clear it — decision 9). No countdown (the 300s timeout is a gateway-private constant); answering a prompt that is gone returns 404 → the row becomes "Closed — timed out or already answered" and refreshes.
+- **The "Waiting on you" strip**: the current board only, and **parked approvals ONLY** (Deny / Approve inline; found by taking the `approval_pending` cards and reading their `events` for the `call_id`, which is bounded). *Something is waiting on you when it has stopped and cannot go on until a person answers* — and on a board that is a parked prompt and nothing else. It shipped with four kinds and was narrowed 2026-08-25: a **failed run** is over, not waiting (the card wears `✕ Run failed`); an **unread card** is news, and nobody is stopped (the card wears a red count, its segment a dot); an agent's **question** does park a run, but it is answered by writing a sentence and no sentence fits in a strip row (the card wears `⊘ Blocked`, and the answering happens on the card where the writing happens). Each of the three already said itself on the card row, so the strip was a third place for the same fact, filling with rows whose only affordance was "go and look" — which is the list underneath it. No countdown (the 300s timeout is a gateway-private constant); answering a prompt that is gone returns 404 → the row stays retired and the board refetches.
 - **The board row**: team faces → budget chip (`⏸ $6.10 / $5.00`, only when `burnState == over`, opens Settings; **a standing condition, not news, so it never feeds a red dot**) → filter chip (ink-filled with a count when narrowed) → ⋯ (Activity · Team · **Mark all read N** · Settings).
 - Pull to refresh (the `RefreshRing` beside the title); on a first open with no mirror, skeleton rows in the real rows' geometry.
 
@@ -363,6 +363,25 @@ mirror needing them — a card, its runs and its team are the same records the
 board already writes, and two copies would be two file formats kept identical
 by hand. `IssueMirror` gained an `attachments` field there: the board never
 drew a card's files, so it never wrote them.
+
+### 9.6 One meaning for the red count
+
+The tab badge, a card's badge and the board's strip all count the same thing:
+**tool calls parked on an approval gate**.
+
+The server's `/projects/attention` is wider — approvals + failed + unread — and
+the badges deliberately no longer follow it. Two reasons:
+
+- **A count you cannot discharge is a mark you learn to ignore.** A failed run
+  and an unread card are not answerable; folding them into the same red number
+  as a parked prompt makes the number mean "some things happened", which is not
+  worth a badge.
+- **The number you press and the rows you land on must agree.** A card reading
+  `6` that opens onto a strip of one row is worse than either number alone.
+
+The cost is that the phone's badge and the web's rail no longer show the same
+figure. That is accepted: they are answering different questions, and the
+phone's is the narrower, more useful one.
 
 ### 9.5 A Waiting row leaves on the press
 

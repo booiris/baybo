@@ -78,9 +78,7 @@ struct ProjectBoardScreen: View {
     private var waiting: [BoardWaitingStrip.Item] {
         guard let board else { return [] }
         return BoardWaiting.items(
-            issues: board.issues, runs: board.runs,
-            prompts: projects.approvalPrompts[projectId] ?? [:],
-            blockedQuestions: projects.blockedQuestions[projectId] ?? [:])
+            issues: board.issues, prompts: projects.approvalPrompts[projectId] ?? [:])
     }
 
     var body: some View {
@@ -95,7 +93,7 @@ struct ProjectBoardScreen: View {
         .background(PopGestureEnabler().frame(width: 0, height: 0))
         .task {
             await projects.refreshBoard(projectId)
-            await projects.refreshWaitingDetails(board: projectId)
+            await projects.refreshApprovalPrompts(board: projectId)
         }
         // One pass over the roster rather than one fetch per drawing: the same
         // teammate appears on every card it owns, in the face strip and in
@@ -113,7 +111,7 @@ struct ProjectBoardScreen: View {
             }
         }
         .onChange(of: board?.fetchedAtMs) { _, _ in
-            Task { await projects.refreshWaitingDetails(board: projectId) }
+            Task { await projects.refreshApprovalPrompts(board: projectId) }
         }
         .sheet(item: $moving) { issue in
             MoveSheet(
@@ -335,7 +333,6 @@ struct ProjectBoardScreen: View {
                     onApprove: { number, callId, decision in
                         answer(number: number, callId: callId, decision: decision)
                     },
-                    onRetry: { number in retry(number) },
                     onOpen: { number in
                         appStore.openProjectIssue(project: projectId, number: number)
                     })
@@ -773,13 +770,8 @@ struct ProjectBoardScreen: View {
         Task {
             await projects.resolveApproval(
                 board: projectId, issue: number, callId: callId, decision: decision)
-            await projects.refreshWaitingDetails(board: projectId)
+            await projects.refreshApprovalPrompts(board: projectId)
         }
-    }
-
-    private func retry(_ number: Int64) {
-        Haptics.tap()
-        Task { await projects.retryRun(board: projectId, issue: number) }
     }
 
     private func markAllRead() {
@@ -791,7 +783,7 @@ struct ProjectBoardScreen: View {
         isRefreshing = true
         Task {
             await projects.refreshBoard(projectId)
-            await projects.refreshWaitingDetails(board: projectId)
+            await projects.refreshApprovalPrompts(board: projectId)
             withAnimation(.easeOut(duration: 0.2)) { isRefreshing = false }
         }
     }

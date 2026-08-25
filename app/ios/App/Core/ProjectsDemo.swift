@@ -116,15 +116,6 @@
                                 askedBy: "dev-1", askedAtMs: Self.nowMs - 120_000)
                         ]
                     ]
-                ],
-                blockedQuestions: [
-                    Self.demoBoardId: [
-                        38: IssueTimeline.PendingQuestion(
-                            askedBy: "lead",
-                            question:
-                                "The relay token format is not in the docs — is it the pairing token or a fresh one?",
-                            askedAtMs: Self.nowMs - 600_000)
-                    ]
                 ])
         }
 

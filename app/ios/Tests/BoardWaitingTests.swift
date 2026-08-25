@@ -30,12 +30,11 @@ import Testing
             askedAtMs: 1)
     }
 
-    private func question(_ text: String) -> IssueTimeline.PendingQuestion {
-        IssueTimeline.PendingQuestion(askedBy: "lead", question: text, askedAtMs: 1)
-    }
-
-    /// Approvals first, then failures, then questions, then news.
-    @Test func theStripIsOrderedByHowMuchIsStoppedWaitingForYou() {
+    /// **Only a parked prompt is waiting on you.** A failed run is over, an
+    /// unread card is news, and a block is answered by writing a sentence —
+    /// none of the three is stopped on an answer that fits in a strip row, and
+    /// each already says itself on the card row.
+    @Test func nothingButAParkedPromptReachesTheStrip() {
         let items = BoardWaiting.items(
             issues: [
                 issue(1, unread: 3),
@@ -43,21 +42,8 @@ import Testing
                 issue(3, blockedReason: "which token?"),
                 issue(4, approvalPending: true),
             ],
-            runs: [],
-            prompts: [4: [prompt("c1")]],
-            blockedQuestions: [3: question("which token?")])
-        #expect(items.map(\.number) == [4, 2, 3, 1])
-    }
-
-    /// A card that is already in the strip for something ANSWERABLE does not
-    /// queue a second time as news: the answer discharges the visit, and one
-    /// card counted twice makes the header claim two things are waiting.
-    @Test func aCardWithAnAnswerableRowDoesNotAlsoQueueAsUnread() {
-        let items = BoardWaiting.items(
-            issues: [issue(7, unread: 4, approvalPending: true)],
-            runs: [], prompts: [7: [prompt("c1")]], blockedQuestions: [:])
-        #expect(items.count == 1)
-        if case .approval = items[0] {} else { Issue.record("the approval should win") }
+            prompts: [4: [prompt("c1")]])
+        #expect(items.map(\.number) == [4])
     }
 
     /// Several prompts on one card are several rows: each is answered by its
@@ -65,7 +51,7 @@ import Testing
     @Test func eachParkedPromptIsItsOwnRow() {
         let items = BoardWaiting.items(
             issues: [issue(7, approvalPending: true)],
-            runs: [], prompts: [7: [prompt("c1"), prompt("c2")]], blockedQuestions: [:])
+            prompts: [7: [prompt("c1"), prompt("c2")]])
         #expect(items.count == 2)
         #expect(Set(items.map(\.id)).count == 2)
     }
@@ -74,36 +60,28 @@ import Testing
     /// on it does not come back on its own.
     @Test func aCancelledCardNeverWaits() {
         let items = BoardWaiting.items(
-            issues: [issue(9, unread: 2, lastRunFailed: true, cancelled: true)],
-            runs: [], prompts: [:], blockedQuestions: [:])
+            issues: [issue(9, approvalPending: true, cancelled: true)],
+            prompts: [9: [prompt("c1")]])
         #expect(items.isEmpty)
     }
 
-    /// A block the OPERATOR wrote is not a question, so it is not in the map
-    /// the strip reads — and nothing here should invite them to answer
-    /// themselves.
-    @Test func onlyAnAgentAuthoredBlockReachesTheStrip() {
+    /// A prompt whose card is not on this board belongs to no row — the map is
+    /// keyed by number, and a number the board does not hold is not a card.
+    @Test func aPromptWithNoCardOnThisBoardIsDropped() {
         let items = BoardWaiting.items(
-            issues: [issue(3, blockedReason: "stop for now")],
-            runs: [], prompts: [:], blockedQuestions: [:])
+            issues: [issue(1)], prompts: [99: [prompt("c1")]])
         #expect(items.isEmpty)
     }
 
-    /// The failed row carries the server's own error, which is the part an
-    /// operator can act on.
-    @Test func aFailedRowCarriesTheRunsError() {
-        let run = IssueRunInfo(
-            number: 2, attempt: 1, agentId: "a-dev", status: .failed, trigger: .promoted,
-            sessionId: "s", error: "the sandbox exited 137", createdAtMs: 0, startedAtMs: 0,
-            settledAtMs: 9, costMicros: nil, inputTokens: nil, outputTokens: nil)
+    /// The row names WHO is asking and WHAT for — the two things an answer
+    /// turns on.
+    @Test func aRowCarriesWhoAsksAndWhatFor() {
         let items = BoardWaiting.items(
-            issues: [issue(2, lastRunFailed: true)], runs: [run], prompts: [:],
-            blockedQuestions: [:])
-        if case let .failed(_, _, error) = items.first {
-            #expect(error == "the sandbox exited 137")
-        } else {
-            Issue.record("expected a failed row")
-        }
+            issues: [issue(4, title: "the dial loop", approvalPending: true)],
+            prompts: [4: [prompt("c1")]])
+        #expect(items.first?.title == "the dial loop")
+        #expect(items.first?.prompt.askedBy == "dev-1")
+        #expect(items.first?.prompt.summary == "cargo test")
     }
 }
 
