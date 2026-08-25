@@ -64,7 +64,7 @@
                     Self.demoIssue(
                         42, "p-rglide", title: "keepalive should feed liveness, not the timer",
                         status: .inProgress, priority: .high, assignee: "a-dev2",
-                        lastRunFailed: true),
+                        lastRunFailed: true, pinned: true),
                     Self.demoIssue(
                         43, "p-rglide", title: "write the connection doc", status: .todo,
                         priority: .medium, assignee: nil, unread: 1),
@@ -87,11 +87,20 @@
                     Self.demoRun(42, agent: "a-dev2", status: .queued, trigger: .retry),
                     Self.demoRun(43, agent: "a-lead", status: .running, trigger: .started),
                 ],
+                // Eight, which is two past what the face row draws: the row
+                // caps at `TeamFaces.maxFaces` and counts the rest, and a
+                // fixture that fits leaves both the counter and the truncation
+                // it replaced unpaintable. `dev-*` against `docs-*` also forces
+                // `AgentMonogram` to widen the whole set.
                 team: [
                     Self.demoMember("a-lead", "lead", lead: true),
                     Self.demoMember("a-dev", "dev-1"),
                     Self.demoMember("a-dev2", "dev-2"),
                     Self.demoMember("a-doc", "docs-1"),
+                    Self.demoMember("a-dev3", "dev-3"),
+                    Self.demoMember("a-doc2", "docs-2"),
+                    Self.demoMember("a-qa", "qa-1"),
+                    Self.demoMember("a-rev", "reviewer-1"),
                 ],
                 fetchedAtMs: 1)
             boards["p-atlas"] = Board(
@@ -155,12 +164,12 @@
             _ number: Int64, _ projectId: String, title: String, status: IssueStatus,
             priority: IssuePriority, assignee: String?, unread: Int64 = 0,
             lastRunFailed: Bool = false, approvalPending: Bool = false,
-            blockedReason: String? = nil
+            blockedReason: String? = nil, pinned: Bool = false
         ) -> IssueInfo {
             IssueInfo(
                 number: number, projectId: projectId, title: title, description: "",
                 attachments: [], status: status, priority: priority, assignee: assignee,
-                position: number, pinned: false, branch: nil, blockedReason: blockedReason,
+                position: number, pinned: pinned, branch: nil, blockedReason: blockedReason,
                 parent: nil, filedFrom: nil, stage: 0,
                 subIssues: number == 41 ? SubIssueProgress(done: 2, total: 5) : nil,
                 unread: unread, lastRunFailed: lastRunFailed, approvalPending: approvalPending,
@@ -188,9 +197,9 @@
         private static func demoMember(_ id: String, _ handle: String, lead: Bool = false)
             -> TeamMemberInfo
         {
-            // Two of the four carry a picture, so one screenshot shows both
-            // paths: an uploaded avatar and the monogram an agent without one
-            // falls back to.
+            // Two carry a picture, so one screenshot shows both paths: an
+            // uploaded avatar and the monogram an agent without one falls back
+            // to.
             let avatar: String? =
                 switch handle {
                 case "lead": "\(AgentAvatars.demoPrefix)1f6f5b"

@@ -109,6 +109,7 @@ struct IssueCardRow: View {
                 Image(systemName: "pin.fill")
                     .font(.system(size: 9))
                     .foregroundStyle(Theme.inkSoft)
+                    .padding(.horizontal, -Self.symbolBearing(9))
                     .accessibilityLabel(Text(verbatim: lang.t("board.pinned")))
             }
             Text(verbatim: RunLabels.compact(seconds: age))
@@ -120,6 +121,7 @@ struct IssueCardRow: View {
                 Image(systemName: "hand.raised")
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(Theme.ink)
+                    .padding(.horizontal, -Self.symbolBearing(10))
                     .accessibilityLabel(Text(verbatim: lang.t("board.awaitingApproval")))
             }
             Spacer(minLength: 6)
@@ -134,6 +136,20 @@ struct IssueCardRow: View {
                         Text(verbatim: lang.t("board.unread", "\(issue.unread)")))
             }
         }
+    }
+
+    /// The side padding an SF Symbol carries INSIDE its image box, as a share
+    /// of its point size (measured: `pin.fill` 17/90, `hand.raised` 21/90 and
+    /// 14/90).
+    ///
+    /// The rest of this line is monospace text whose glyphs sit flush in their
+    /// cells — the Menlo triangle the priority marks come from has a bearing of
+    /// 0.03pt at 10pt — so a symbol's own padding lands on top of the stack's
+    /// 6pt and nothing else's does. That is what put the pin in a wider trough
+    /// than every gap around it, and pushed it off-centre between its two
+    /// neighbours. Cancelling it puts the symbols on the text's rhythm.
+    private static func symbolBearing(_ pointSize: CGFloat) -> CGFloat {
+        pointSize * 0.19
     }
 
     private var title: some View {

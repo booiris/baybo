@@ -346,20 +346,51 @@ struct TeamFaces: View {
         Set(runs.filter { $0.status == .running && $0.settledAtMs == nil }.map(\.agentId))
     }
 
+    /// How many faces the row draws before it starts COUNTING instead.
+    ///
+    /// Six is what fits beside the board row's budget and filter chips on the
+    /// narrowest phone this app supports; the cards root's row is wider. The
+    /// cap used to be five and the remainder was simply dropped — a team of
+    /// six drew as a team of five, with nothing on screen admitting it.
+    static let maxFaces = 6
+
+    /// How many of a team's faces get drawn.
+    ///
+    /// A `+1` would cost exactly the width of the face it replaced, so the
+    /// counter only ever stands for two or more.
+    static func facesDrawn(of count: Int) -> Int {
+        count <= maxFaces + 1 ? count : maxFaces
+    }
+
+    private var shown: [TeamMemberInfo] {
+        Array(team.prefix(Self.facesDrawn(of: team.count)))
+    }
+
     var body: some View {
-        let monograms = AgentMonogram.map(for: Array(team.prefix(5)))
+        // Over the WHOLE team, never the part that fits: one colliding pair
+        // widens the entire set, so a monogram computed over a prefix is how
+        // this row comes to print `D1` where the assignee picker prints `DE1`
+        // for the same agent — the exact drift `AgentMonogram` exists to stop.
+        let monograms = AgentMonogram.map(for: team)
         // Set apart rather than stacked. The overlapping-avatars idiom saves
         // room this card does not need, and it costs the thing the row is FOR:
         // a working member's ring lands on its neighbour's edge, and four
         // agents read as a tangle of arcs instead of as who is busy.
         return HStack(spacing: 4) {
-            ForEach(team.prefix(5), id: \.id) { member in
+            ForEach(shown, id: \.id) { member in
                 AgentFace(
                     handle: member.handle,
                     monogram: monograms[member.id],
                     avatarBlobId: member.avatarBlobId,
                     lead: member.lead,
                     working: working.contains(member.id))
+            }
+            if shown.count < team.count {
+                Text(verbatim: "+\(team.count - shown.count)")
+                    .font(Theme.mono(10))
+                    .foregroundStyle(Theme.inkSoft)
+                    .frame(width: AgentFace.defaultSize, height: AgentFace.defaultSize)
+                    .overlay(Circle().strokeBorder(Theme.line, lineWidth: 1))
             }
         }
         .accessibilityHidden(true)

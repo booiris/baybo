@@ -454,10 +454,14 @@ without touching `app/ios` at all.
   **`-baybo-demo-card`** to land one level deeper again, on a card: that page
   talks to a gateway of its own, so what it shows headlessly is the shell, the
   dock and the streamed inset over the page's own loading line — which is
-  itself the proof that the bridge, the entry and the i18n handoff all work. Two of the demo board's four teammates carry a
+  itself the proof that the bridge, the entry and the i18n handoff all work. Two of the demo board's eight teammates carry a
   `demo-avatar-<hex>` blob, which `AgentAvatars` draws as a flat disc without a
   gateway — so one screenshot shows both face paths side by side (an uploaded
-  picture and the monogram an agent without one falls back to).
+  picture and the monogram an agent without one falls back to). Eight is two
+  past what the face row draws, so the `+N` counter and the `dev-*`/`docs-*`
+  monogram widening both paint; card #42 arrives pinned, which is the only way
+  the Pinned band header and the row's pin glyph appear without driving a
+  swipe.
 
 - **`-baybo-demo-switch`** (DEBUG) opens session `demo-a` with a session-tagged
   turn, then switches `chatPath` to `demo-b` at 5s — exercising the single
