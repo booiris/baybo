@@ -7,17 +7,13 @@ pub(crate) fn is_finished(issue: &IssueRow) -> bool {
     issue.status == IssueStatus::Done || issue.cancelled_at.is_some()
 }
 
-fn is_pending(child: &IssueRow) -> bool {
-    child.cancelled_at.is_none() && child.status != IssueStatus::Done
-}
-
 /// Whether `stage` has just emptied, given the parent's children and the
 /// child that reached a terminal state.
 pub(crate) fn stage_complete(children: &[IssueRow], stage: i64) -> bool {
     let mut seen = false;
     for child in children.iter().filter(|c| c.stage == stage) {
         seen = true;
-        if is_pending(child) {
+        if !is_finished(child) {
             return false;
         }
     }
@@ -27,7 +23,7 @@ pub(crate) fn stage_complete(children: &[IssueRow], stage: i64) -> bool {
 /// Whether finishing a child in `stage` opens a barrier: that stage has
 /// emptied **and** nothing earlier is still open.
 pub(crate) fn barrier_opens(children: &[IssueRow], stage: i64) -> bool {
-    stage_complete(children, stage) && !children.iter().any(|c| is_pending(c) && c.stage < stage)
+    stage_complete(children, stage) && !children.iter().any(|c| !is_finished(c) && c.stage < stage)
 }
 
 /// `(done, total)` for a parent's card, counting only work that is still
@@ -49,7 +45,7 @@ pub fn progress(children: &[IssueRow]) -> (usize, usize) {
 pub(crate) fn open_stages(children: &[IssueRow]) -> Vec<i64> {
     let mut stages: Vec<i64> = children
         .iter()
-        .filter(|c| is_pending(c))
+        .filter(|c| !is_finished(c))
         .map(|c| c.stage)
         .collect();
     stages.sort_unstable();

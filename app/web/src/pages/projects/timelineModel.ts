@@ -65,6 +65,7 @@ export function eventTone(body: IssueEventBody): Tone {
     case 'run_refused':
       return 'warn';
     case 'unblocked':
+    case 'uncancelled':
     case 'stage_completed':
     case 'budget_restored':
     case 'token_budget_restored':
@@ -185,6 +186,8 @@ export function describeEvent(body: IssueEventBody): string | null {
       return 'unblocked it';
     case 'cancelled':
       return 'cancelled it';
+    case 'uncancelled':
+      return 'reopened it';
     case 'branch_merged': {
       // The branch it landed on is named rather than assumed: a repository
       // parked somewhere other than its trunk merges there.
@@ -260,11 +263,14 @@ export function commentHint(
   team: Agent[],
 ): string {
   const assignee = issue.assignee == null ? null : handleOf(team, issue.assignee);
+  // Ahead of every other case, including the unstaffed one: on a cancelled
+  // card the operator's comment is what takes the cancel back, and the
+  // ordinary rules only apply again to the card it leaves behind.
+  if (issue.cancelled_at_ms != null) {
+    return 'This issue is cancelled — commenting reopens it.';
+  }
   if (assignee == null) {
     return 'Records only — nobody is assigned to this issue yet.';
-  }
-  if (issue.cancelled_at_ms != null) {
-    return 'Records only — this issue is cancelled.';
   }
   if (issue.status === 'backlog' || issue.status === 'done') {
     return `Records only — @${assignee} is not working on this right now.`;
@@ -428,6 +434,8 @@ export function feedLine(entry: FeedEntry): Span[] {
       return join(who(entry), ' unblocked ', at);
     case 'cancelled':
       return join(who(entry), ' cancelled ', at);
+    case 'uncancelled':
+      return join(who(entry), ' reopened ', at);
     case 'approval_requested':
       return join('approval waiting on ', at, `: ${body.tool} — ${body.summary}`);
     case 'approval_resolved':

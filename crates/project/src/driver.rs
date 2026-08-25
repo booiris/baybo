@@ -34,6 +34,14 @@
 //! ever leaves Backlog because somebody decided it should, and
 //! [`awaiting_grooming`] asks the lead to be that somebody — but only for
 //! the cards the board itself filed there.
+//!
+//! Who filed it is therefore a term in every rule that could move a Backlog
+//! card, not only in the question named after it: [`board_may_take_up`] is
+//! the one home for it, and [`ran_dry`] and [`drain_anchor`] read it too.
+//! [`ran_dry`] asking without it was the hole — a person's parked card is
+//! live enough to keep the board from ever going quiet, and the drain
+//! question then hands the lead a whole board and asks it to find something
+//! to start.
 
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
@@ -64,11 +72,11 @@ pub(crate) fn busy(runs: impl IntoIterator<Item = i64>) -> BTreeSet<i64> {
 /// The two things the driver can do about a waiting card — start it, or ask
 /// who should — split on staffing and on nothing else, so every other gate
 /// belongs here rather than once per branch.
-fn is_waiting(issue: &IssueRow, busy: &BTreeSet<i64>) -> bool {
+fn is_waiting(issue: &IssueRow, spoken_for: &BTreeSet<i64>) -> bool {
     issue.status == IssueStatus::Todo
-        && issue.cancelled_at.is_none()
+        && crate::runs::accepts_runs(issue)
         && board_may_start(issue)
-        && !busy.contains(&issue.number)
+        && !spoken_for.contains(&issue.number)
 }
 
 /// Whether automatic board actions may start this card; operators may override blocks.
@@ -76,9 +84,37 @@ pub(crate) fn board_may_start(issue: &IssueRow) -> bool {
     issue.blocked_reason.is_none()
 }
 
+/// The columns work is under way in. Backlog is parked and Done is over, so
+/// neither is a column a card is woken in.
+pub(crate) fn is_live_work(status: IssueStatus) -> bool {
+    matches!(
+        status,
+        IssueStatus::Todo | IssueStatus::InProgress | IssueStatus::Review
+    )
+}
+
+/// Whether this card is work the **board** may take up on its own authority.
+///
+/// [`crate::runs::accepts_runs`] plus the one thing a row cannot say about
+/// itself: who put it in Backlog. A person parking a card there has exactly
+/// the standing of a person setting a block — the answer is "not now", given
+/// by somebody entitled to give it — so every rule that would not adjudicate
+/// the block must not reopen the column either. `agent_opened` is the
+/// board-wide authorship read [`awaiting_grooming`] is built on, and this is
+/// the one place the rule is spelled.
+///
+/// Deliberately *not* [`board_may_start`], which answers the other half —
+/// whether a card the board may take up is paused right now. The two are
+/// asked together everywhere except [`ran_dry`], whose blocked cards are
+/// filtered by [`drain_anchor`] instead.
+fn board_may_take_up(issue: &IssueRow, agent_opened: &BTreeSet<i64>) -> bool {
+    crate::runs::accepts_runs(issue)
+        && (is_live_work(issue.status) || agent_opened.contains(&issue.number))
+}
+
 /// A waiting card somebody is on: the board can start it.
-fn is_promotable(issue: &IssueRow, busy: &BTreeSet<i64>) -> bool {
-    is_waiting(issue, busy) && issue.assignee.is_some()
+fn is_promotable(issue: &IssueRow, spoken_for: &BTreeSet<i64>) -> bool {
+    is_waiting(issue, spoken_for) && issue.assignee.is_some()
 }
 
 /// A waiting card nobody is on: the board can only ask who should be.
@@ -86,8 +122,8 @@ fn is_promotable(issue: &IssueRow, busy: &BTreeSet<i64>) -> bool {
 /// Deliberately not `!is_promotable`, which would be true of every card on
 /// the board — cancelled, blocked, in another column, already running — and
 /// would send all of them to the lead as "unstaffed work".
-fn needs_staffing(issue: &IssueRow, busy: &BTreeSet<i64>) -> bool {
-    is_waiting(issue, busy) && issue.assignee.is_none()
+fn needs_staffing(issue: &IssueRow, spoken_for: &BTreeSet<i64>) -> bool {
+    is_waiting(issue, spoken_for) && issue.assignee.is_none()
 }
 
 /// Which of two ready cards goes first: the more urgent, then the one the
@@ -114,31 +150,35 @@ fn promotion_order(a: &IssueRow, b: &IssueRow) -> Ordering {
         .then(a.number.cmp(&b.number))
 }
 
+/// The cards a rule keeps, in the order every column is read in.
+///
+/// The rules below differ in exactly one thing — which cards they keep —
+/// and each used to spell the other three lines itself. Only the boilerplate
+/// is shared: every question keeps its own predicate, because they are six
+/// different questions with six different answers, and the point of hoisting
+/// this is that each one is now the one line that says what it asks.
+fn in_promotion_order(issues: &[IssueRow], keep: impl Fn(&IssueRow) -> bool) -> Vec<IssueRow> {
+    let mut hits: Vec<IssueRow> = issues.iter().filter(|i| keep(i)).cloned().collect();
+    hits.sort_by(promotion_order);
+    hits
+}
+
 /// The cards to move into In Progress, best first, at most `slots` of them.
 pub(crate) fn slate(issues: &[IssueRow], busy: &BTreeSet<i64>, slots: usize) -> Vec<IssueRow> {
+    // Ahead of the filter, not after it: a full board answers zero every
+    // pass, and a `truncate(0)` would pay for the clone and the sort first.
     if slots == 0 {
         return Vec::new();
     }
-    let mut ready: Vec<IssueRow> = issues
-        .iter()
-        .filter(|i| is_promotable(i, busy))
-        .cloned()
-        .collect();
-    ready.sort_by(promotion_order);
+    let mut ready = in_promotion_order(issues, |i| is_promotable(i, busy));
     ready.truncate(slots);
     ready
 }
 
 /// The cards sitting in Todo with nobody on them, in the order the lead
 /// should be asked about them.
-pub(crate) fn awaiting_triage(issues: &[IssueRow], busy: &BTreeSet<i64>) -> Vec<IssueRow> {
-    let mut unstaffed: Vec<IssueRow> = issues
-        .iter()
-        .filter(|i| needs_staffing(i, busy))
-        .cloned()
-        .collect();
-    unstaffed.sort_by(promotion_order);
-    unstaffed
+pub(crate) fn awaiting_triage(issues: &[IssueRow], in_flight: &BTreeSet<i64>) -> Vec<IssueRow> {
+    in_promotion_order(issues, |i| needs_staffing(i, in_flight))
 }
 
 /// Whether the lead may be asked about a live card it does not own.
@@ -147,7 +187,7 @@ fn takes_a_lead_question(
     in_flight: &BTreeSet<i64>,
     lead: &baybo_model::AgentProfileId,
 ) -> bool {
-    issue.cancelled_at.is_none()
+    crate::runs::accepts_runs(issue)
         && !in_flight.contains(&issue.number)
         && issue.assignee.as_ref() != Some(lead)
 }
@@ -158,37 +198,23 @@ pub(crate) fn blocked(
     in_flight: &BTreeSet<i64>,
     lead: &baybo_model::AgentProfileId,
 ) -> Vec<IssueRow> {
-    let mut paused: Vec<IssueRow> = issues
-        .iter()
-        .filter(|i| {
-            !board_may_start(i)
-                && crate::runs::accepts_runs(i)
-                && takes_a_lead_question(i, in_flight, lead)
-        })
-        .cloned()
-        .collect();
-    paused.sort_by(promotion_order);
-    paused
+    in_promotion_order(issues, |i| {
+        !board_may_start(i) && takes_a_lead_question(i, in_flight, lead)
+    })
 }
 
 /// The cards sitting in Review with nothing running on them, in the order
 /// the lead should be asked about them.
 pub(crate) fn awaiting_review(
     issues: &[IssueRow],
-    busy: &BTreeSet<i64>,
+    in_flight: &BTreeSet<i64>,
     lead: &baybo_model::AgentProfileId,
 ) -> Vec<IssueRow> {
-    let mut waiting: Vec<IssueRow> = issues
-        .iter()
-        .filter(|i| {
-            i.status == IssueStatus::Review
-                && board_may_start(i)
-                && takes_a_lead_question(i, busy, lead)
-        })
-        .cloned()
-        .collect();
-    waiting.sort_by(promotion_order);
-    waiting
+    in_promotion_order(issues, |i| {
+        i.status == IssueStatus::Review
+            && board_may_start(i)
+            && takes_a_lead_question(i, in_flight, lead)
+    })
 }
 
 /// The cards sitting in In Progress with no run working them and nothing
@@ -200,26 +226,46 @@ pub(crate) fn awaiting_review(
 /// card's runs in hand.
 pub(crate) fn stalled(
     issues: &[IssueRow],
-    busy: &BTreeSet<i64>,
+    in_flight: &BTreeSet<i64>,
     lead: &baybo_model::AgentProfileId,
 ) -> Vec<IssueRow> {
-    let mut stuck: Vec<IssueRow> = issues
-        .iter()
-        .filter(|i| {
-            i.status == IssueStatus::InProgress
-                && board_may_start(i)
-                && takes_a_lead_question(i, busy, lead)
-        })
-        .cloned()
-        .collect();
-    stuck.sort_by(promotion_order);
-    stuck
+    in_promotion_order(issues, |i| {
+        i.status == IssueStatus::InProgress
+            && board_may_start(i)
+            && takes_a_lead_question(i, in_flight, lead)
+    })
 }
 
 /// Whether the latest block was agent-authored.
 pub(crate) fn block_is_an_agents_question(events: &[baybo_store::project::IssueEventRow]) -> bool {
     newest_block(events)
         .is_some_and(|e| matches!(e.actor, baybo_store::project::IssueActor::Agent(_)))
+}
+
+/// Whether the stop standing on this card is a **person's**.
+///
+/// The same shape as [`block_is_an_agents_question`], and for the same
+/// reason: the row says only that a card is cancelled, and who decided it
+/// lives on the timeline. A stop the board did not set is not the board's to
+/// take back.
+///
+/// Reads the newest entry of *either* direction, because a card called off
+/// and reopened carries both and only the last of them is still standing.
+pub(crate) fn cancel_is_a_persons_stop(events: &[baybo_store::project::IssueEventRow]) -> bool {
+    events
+        .iter()
+        .rev()
+        .find(|e| {
+            matches!(
+                e.body,
+                baybo_store::project::IssueEventBody::Cancelled
+                    | baybo_store::project::IssueEventBody::Uncancelled
+            )
+        })
+        .is_some_and(|e| {
+            matches!(e.body, baybo_store::project::IssueEventBody::Cancelled)
+                && !matches!(e.actor, baybo_store::project::IssueActor::Agent(_))
+        })
 }
 
 pub(crate) fn blocked_at(
@@ -284,22 +330,17 @@ pub(crate) fn awaiting_grooming(
     agent_opened: &BTreeSet<i64>,
     lead: &baybo_model::AgentProfileId,
 ) -> Vec<IssueRow> {
-    let mut parked: Vec<IssueRow> = issues
-        .iter()
-        .filter(|i| {
-            i.status == IssueStatus::Backlog
-                && agent_opened.contains(&i.number)
-                && board_may_start(i)
-                && takes_a_lead_question(i, in_flight, lead)
-        })
-        .cloned()
-        .collect();
-    parked.sort_by(promotion_order);
-    parked
+    in_promotion_order(issues, |i| {
+        i.status == IssueStatus::Backlog
+            && board_may_take_up(i, agent_opened)
+            && board_may_start(i)
+            && takes_a_lead_question(i, in_flight, lead)
+    })
 }
 
 /// Whether the board has run dry: nothing executing, nothing this pass
-/// promoted, and live work still sitting on it.
+/// promoted, and work the board may take up still sitting on it
+/// ([`board_may_take_up`] — an operator's parked Backlog is not it).
 ///
 /// The one board-scale question in this module, and it has to be one: it is
 /// asked last, after every per-card question declined, so what it reports is
@@ -313,8 +354,15 @@ pub(crate) fn awaiting_grooming(
 /// Capacity is the caller's gate, as it is for every other question here:
 /// `ask_the_lead` runs only with a slot to spare, and a board an operator
 /// stopped by setting its parallelism to zero is stopped, not drained.
-pub(crate) fn ran_dry(issues: &[IssueRow], in_flight: &BTreeSet<i64>, promoted: usize) -> bool {
-    promoted == 0 && in_flight.is_empty() && issues.iter().any(crate::runs::accepts_runs)
+pub(crate) fn ran_dry(
+    issues: &[IssueRow],
+    in_flight: &BTreeSet<i64>,
+    agent_opened: &BTreeSet<i64>,
+    promoted: usize,
+) -> bool {
+    promoted == 0
+        && in_flight.is_empty()
+        && issues.iter().any(|i| board_may_take_up(i, agent_opened))
 }
 
 /// Whether the board has done anything since the lead last had it in front
@@ -329,6 +377,12 @@ pub(crate) fn ran_dry(issues: &[IssueRow], in_flight: &BTreeSet<i64>, promoted: 
 /// deferral rots in: "not yet, wait for the other card" is a complete
 /// answer when it is given and a dead end the moment the other card lands,
 /// and the landing touches nothing the deferred card carries.
+///
+/// A **cancelled** run is on the look side of that asymmetry and not the
+/// work side, which is what [`newest_run_was_cancelled`] does per card and
+/// this does for the board: somebody stopping a run read the board to do it,
+/// and asking the lead what to do next would countermand them one tick after
+/// they decided.
 ///
 /// It also closes the obvious spin for free: the drain question is itself a
 /// wake, so being asked is being looked at, and answering it is not work.
@@ -348,28 +402,40 @@ pub(crate) fn nothing_has_happened_since_the_lead_looked(marks: &DrainMarks) -> 
 /// needs one to live on. The pick is the order every column is already read
 /// in, over the cards the board could act on — filing it against a blocked
 /// card would put a run on work an operator paused, and `parked_by_a_block`
-/// would hold that run rather than deliver it.
+/// would hold that run rather than deliver it. A card the operator parked in
+/// Backlog is the same paused work under a different name, which is what
+/// [`board_may_take_up`] keeps out: this question reads the whole board, so
+/// anchoring it on such a card hands the lead the one card it may not move.
 ///
 /// Deliberately **not** [`takes_a_lead_question`]: a card whose assignee is
 /// the lead is excluded from every question *about a card*, because the
 /// lead's own card has no other party. This question is not about the card,
 /// and a board whose only live card is the lead's is precisely a board with
 /// nothing else to anchor to.
-pub(crate) fn drain_anchor(issues: &[IssueRow], in_flight: &BTreeSet<i64>) -> Option<IssueRow> {
+pub(crate) fn drain_anchor(
+    issues: &[IssueRow],
+    in_flight: &BTreeSet<i64>,
+    agent_opened: &BTreeSet<i64>,
+) -> Option<IssueRow> {
     issues
         .iter()
         .filter(|i| {
-            crate::runs::accepts_runs(i) && board_may_start(i) && !in_flight.contains(&i.number)
+            board_may_take_up(i, agent_opened)
+                && board_may_start(i)
+                && !in_flight.contains(&i.number)
         })
         .min_by(|a, b| promotion_order(a, b))
         .cloned()
 }
 
-/// A card whose newest run was **cancelled** is not stalled: a cancel is a
-/// decision — a human's stop, or the board calling a row off — and waking
-/// the lead to get the work going again would countermand it within one
-/// tick. The stop stands until somebody acts on the card, which makes it a
-/// new question.
+/// Whether the newest run on this card was **cancelled**: a decision — a
+/// human's stop, or the board calling a row off — and waking the lead to get
+/// the work going again would countermand it within one tick. The stop
+/// stands until somebody acts on the card, which makes it a new question.
+///
+/// Read by every lead question but `Blocked`, whose own preparation settles
+/// a run `Cancelled` before asking; and by the drain question through
+/// `DrainMarks`, where a cancelled run does not count as the board working.
 pub(crate) fn newest_run_was_cancelled(runs: &[IssueRunRow]) -> bool {
     runs.iter()
         .max_by_key(|run| run.created_at)
@@ -505,6 +571,17 @@ mod tests {
 
     /// A board with nothing recorded against any card.
     fn idle() -> BTreeSet<i64> {
+        BTreeSet::new()
+    }
+
+    /// The cards the board filed itself, by number — what
+    /// `ProjectStore::agent_opened_issues` answers.
+    fn the_boards_own(numbers: impl IntoIterator<Item = i64>) -> BTreeSet<i64> {
+        numbers.into_iter().collect()
+    }
+
+    /// A board where every parked card is the operator's.
+    fn all_the_operators() -> BTreeSet<i64> {
         BTreeSet::new()
     }
 
@@ -712,25 +789,37 @@ mod tests {
     #[test]
     fn a_board_has_run_dry_only_with_work_left_on_it_and_nothing_moving() {
         let live = issue(1, IssueStatus::Backlog);
+        let boards_own = the_boards_own([1]);
         assert!(
-            ran_dry(std::slice::from_ref(&live), &idle(), 0),
+            ran_dry(std::slice::from_ref(&live), &idle(), &boards_own, 0),
             "a card nothing will ever start, and nothing running to start it"
         );
         assert!(
-            !ran_dry(std::slice::from_ref(&live), &busy([2]), 0),
+            !ran_dry(std::slice::from_ref(&live), &busy([2]), &boards_own, 0),
             "a board with a run on it is working, whatever that run is on"
         );
         assert!(
-            !ran_dry(std::slice::from_ref(&live), &idle(), 1),
+            !ran_dry(std::slice::from_ref(&live), &idle(), &boards_own, 1),
             "and a pass that just promoted something has not run dry — the \
              slate it filled is not in flight yet"
+        );
+        assert!(
+            !ran_dry(
+                std::slice::from_ref(&live),
+                &idle(),
+                &all_the_operators(),
+                0
+            ),
+            "but the same card parked by a person is not work the board is \
+             stuck on — it is work somebody said not yet to, and a board with \
+             nothing else on it is quiet"
         );
 
         let finished = issue(1, IssueStatus::Done);
         let mut cancelled = issue(2, IssueStatus::Todo);
         cancelled.cancelled_at = Some(Utc::now());
         assert!(
-            !ran_dry(&[finished, cancelled], &idle(), 0),
+            !ran_dry(&[finished, cancelled], &idle(), &the_boards_own([1, 2]), 0),
             "a board the work is over on is quiet, not stuck"
         );
     }
@@ -774,18 +863,39 @@ mod tests {
         urgent.priority = IssuePriority::Urgent;
         let ordinary = issue(1, IssueStatus::Backlog);
         assert_eq!(
-            drain_anchor(&[ordinary.clone(), urgent.clone()], &idle()).map(|i| i.number),
+            drain_anchor(
+                &[ordinary.clone(), urgent.clone()],
+                &idle(),
+                &the_boards_own([1, 2])
+            )
+            .map(|i| i.number),
             Some(2),
             "the same order every column is read in"
+        );
+        assert!(
+            drain_anchor(
+                &[ordinary.clone(), urgent.clone()],
+                &idle(),
+                &all_the_operators()
+            )
+            .is_none(),
+            "the same two cards parked by a person are the operator's answer, \
+             not the board's to anchor a run on"
         );
 
         let mut the_leads_own = issue(3, IssueStatus::Review);
         the_leads_own.assignee = Some(lead);
         assert_eq!(
-            drain_anchor(std::slice::from_ref(&the_leads_own), &idle()).map(|i| i.number),
+            drain_anchor(
+                std::slice::from_ref(&the_leads_own),
+                &idle(),
+                &all_the_operators()
+            )
+            .map(|i| i.number),
             Some(3),
             "a board whose only live card is the lead's still has a board to \
-             ask about — the question is not about the card"
+             ask about — the question is not about the card, and authorship \
+             only ever speaks for Backlog"
         );
 
         let mut paused = ordinary;
@@ -793,7 +903,7 @@ mod tests {
         let mut also_paused = urgent;
         also_paused.blocked_reason = Some("waiting on the operator".into());
         assert!(
-            drain_anchor(&[paused, also_paused], &idle()).is_none(),
+            drain_anchor(&[paused, also_paused], &idle(), &the_boards_own([1, 2])).is_none(),
             "every live card paused is nothing the board may act on, and each \
              block has already been put to the lead once"
         );
@@ -999,7 +1109,7 @@ mod tests {
         let mut parked = ready(1);
         parked.status = IssueStatus::Backlog;
         let board = [parked.clone()];
-        let opened = busy([1]);
+        let opened = the_boards_own([1]);
 
         assert_eq!(
             numbers(&awaiting_grooming(&board, &busy([]), &opened, &lead)),
@@ -1019,6 +1129,20 @@ mod tests {
         assert!(
             awaiting_triage(&[unstaffed], &idle()).is_empty(),
             "…and an unstaffed one is a grooming question, not a triage one"
+        );
+
+        // The two board-scale rules, which this test used not to name — and
+        // that omission is the whole of how the board came to start the
+        // operator's parked cards through the door underneath grooming.
+        assert!(
+            ran_dry(&board, &idle(), &opened, 0)
+                && drain_anchor(&board, &idle(), &opened).is_some(),
+            "the board's own parked card is still work it is stuck on"
+        );
+        assert!(
+            !ran_dry(&board, &idle(), &all_the_operators(), 0)
+                && drain_anchor(&board, &idle(), &all_the_operators()).is_none(),
+            "and the operator's is not — grooming's rule is the same rule here"
         );
     }
 

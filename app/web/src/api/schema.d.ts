@@ -2823,6 +2823,9 @@ export interface components {
             /** @enum {string} */
             kind: "cancelled";
         } | {
+            /** @enum {string} */
+            kind: "uncancelled";
+        } | {
             branch: string;
             commit: string;
             /** Format: int64 */

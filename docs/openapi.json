@@ -9897,6 +9897,20 @@
           {
             "type": "object",
             "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "uncancelled"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
               "branch",
               "into",
               "commit",

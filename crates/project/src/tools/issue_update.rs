@@ -86,7 +86,7 @@ Two of these do more than edit a row:
 - Moving an issue to `in_progress` with an assignee **starts that agent**. Move work there when it is being done now, not when it is next.
 - Setting `blocked` to a reason marks the card blocked and says why on its timeline; an empty string unblocks it.
 
-`assignee` takes an `@handle`, or `{NOBODY_WORD}` to take whoever is on it off. `cancelled: true` is the terminal negative — the row and its history stay, it just stops counting as live work. Say why in a comment before you cancel somebody else's card."#
+`assignee` takes an `@handle`, or `{NOBODY_WORD}` to take whoever is on it off. `cancelled: true` is the terminal negative — the row and its history stay, it just stops counting as live work. Say why in a comment before you cancel somebody else's card, and when the operator cancelled one, say on the card why it should come back rather than reopening it yourself."#
         )
     }
 
@@ -101,7 +101,7 @@ Two of these do more than edit a row:
                 "priority": priority_schema("Informs triage."),
                 "assignee": super::assignee_schema(true),
                 "blocked": { "type": "string", "description": "Why it is blocked; an empty string unblocks it." },
-                "cancelled": { "type": "boolean", "description": "Cancel (or un-cancel) the issue." },
+                "cancelled": { "type": "boolean", "description": "`true` cancels the issue. `false` takes back a cancel the board itself set; one the operator set is theirs to lift." },
                 "parent": { "type": "integer", "description": "Make this a sub-issue of that issue's number; `0` detaches it. One level only." },
                 "stage": { "type": "integer", "description": "Which barrier under the parent. Stage N starts when every step of stage N-1 is done." },
             },

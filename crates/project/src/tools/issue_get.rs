@@ -202,6 +202,7 @@ fn narrate(body: &IssueEventBody, known: &[baybo_store::AgentProfileRow]) -> Str
         IssueEventBody::Blocked { reason } => format!("blocked it: {reason}"),
         IssueEventBody::Unblocked => "unblocked it".to_owned(),
         IssueEventBody::Cancelled => "cancelled it".to_owned(),
+        IssueEventBody::Uncancelled => "reopened it".to_owned(),
         IssueEventBody::BranchMerged {
             branch,
             into,

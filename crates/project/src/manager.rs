@@ -157,6 +157,9 @@ const RUN_STOOD_DOWN_FOR_A_BLOCK: &str = r#"the card was blocked with a question
 const RETRY_ON_A_BLOCKED_CARD: &str =
     "this issue is blocked — lift the block before running it again";
 
+const AGENT_REOPENING_A_PERSONS_STOP: &str = "the operator cancelled this issue, so reopening it is theirs to do — say on the card why \
+     you think it should come back, and leave it cancelled";
+
 fn held_run_refusal(figures: Option<crate::budget::Figures>) -> String {
     let ceiling = match figures {
         Some(crate::budget::Figures::Tokens { .. }) => "daily token budget",
@@ -989,9 +992,9 @@ impl ProjectManager {
         let Some(lead) = self.coordinator(project).await else {
             return;
         };
-        // Only the timeline records who opened a card, and only the
-        // grooming question asks. One board-level read, skipped entirely
-        // when nothing is parked.
+        // Only the timeline records who opened a card, and every rule that
+        // could move one out of Backlog asks. One board-level read, skipped
+        // entirely when nothing is parked.
         let agent_opened = self.agent_opened_cards(project, issues).await;
         let questions = [
             (
@@ -1031,7 +1034,15 @@ impl ProjectManager {
                         continue;
                     }
                 };
-                if question == RunTrigger::Stalled && crate::driver::newest_run_was_cancelled(&runs)
+                // A cancel is a stop that stands, and it stands against every
+                // question — waking the lead about the card somebody just
+                // stopped countermands them one tick later, whichever way the
+                // wake is worded. `Blocked` is the one exception, and not a
+                // loophole: the board settles the block-parked row
+                // `Cancelled` itself in `stand_down_for_the_question` below,
+                // so reading that as somebody's stop would make the question
+                // refuse itself on the strength of its own preparation.
+                if question != RunTrigger::Blocked && crate::driver::newest_run_was_cancelled(&runs)
                 {
                     continue;
                 }
@@ -1064,8 +1075,15 @@ impl ProjectManager {
                 }
             }
         }
-        self.tell_the_lead_the_board_ran_dry(project, issues, in_flight, promoted, lead)
-            .await;
+        self.tell_the_lead_the_board_ran_dry(
+            project,
+            issues,
+            in_flight,
+            &agent_opened,
+            promoted,
+            lead,
+        )
+        .await;
     }
 
     /// Wake the lead about the **board** once it has run dry, having asked
@@ -1088,17 +1106,18 @@ impl ProjectManager {
         project: &ProjectId,
         issues: &[IssueRow],
         in_flight: &std::collections::BTreeSet<i64>,
+        agent_opened: &std::collections::BTreeSet<i64>,
         promoted: usize,
         lead: AgentProfileId,
     ) {
-        if !crate::driver::ran_dry(issues, in_flight, promoted) {
+        if !crate::driver::ran_dry(issues, in_flight, agent_opened, promoted) {
             return;
         }
         // No anchor is a board whose every live card is blocked, and each of
         // those blocks is a standing decision somebody made. There is
         // nothing here the board may act on, and `blocked` has already put
         // each of them to the lead once.
-        let Some(anchor) = crate::driver::drain_anchor(issues, in_flight) else {
+        let Some(anchor) = crate::driver::drain_anchor(issues, in_flight, agent_opened) else {
             return;
         };
         let marks = match self.store.drain_marks(project).await {
@@ -1126,9 +1145,12 @@ impl ProjectManager {
 
     /// The cards on this board an agent opened.
     ///
-    /// Empty when nothing sits in Backlog — the only question that asks —
-    /// and empty on a read failure, which leaves the operator's own parked
-    /// cards alone rather than waking the lead about them on a guess.
+    /// Empty when nothing sits in Backlog — the only column the answer is
+    /// consulted for — and empty on a read failure, which leaves the
+    /// operator's own parked cards alone rather than acting on them on a
+    /// guess. On a board of nothing but parked cards that also means the
+    /// drain question declines, which is the right way for this to fail:
+    /// quiet, not busy.
     async fn agent_opened_cards(
         &self,
         project: &ProjectId,
@@ -1161,6 +1183,19 @@ impl ProjectManager {
         );
         self.settle_off(parked, RunStatus::Cancelled, RUN_STOOD_DOWN_FOR_A_BLOCK)
             .await;
+    }
+
+    /// Whether the standing cancel is the operator's. Read failures answer
+    /// yes, which leaves their stop where it is — the same direction
+    /// [`block_is_a_question`] fails in, reached from its other side.
+    async fn stopped_by_a_person(&self, issue: &IssueRow) -> bool {
+        match self.store.list_events(&issue.id).await {
+            Ok(events) => crate::driver::cancel_is_a_persons_stop(&events),
+            Err(e) => {
+                tracing::warn!(issue = issue.number, error = %e, "could not read who cancelled a card");
+                true
+            }
+        }
     }
 
     /// Whether the block is an agent's question; read failures preserve operator stops.
@@ -1692,6 +1727,13 @@ impl ProjectManager {
             })
             .await?;
         self.events.timeline_changed(project, number);
+        // After the entry, not before: the comment is the reason the card is
+        // coming back, and a timeline that reopened it first would read as
+        // the operator explaining a decision they had already taken.
+        let issue = self
+            .take_the_cancel_back(&issue, &actor)
+            .await
+            .unwrap_or(issue);
 
         let issue = match self.mention_assignment(project, &issue, text).await {
             Some(assignee) => {
@@ -1722,6 +1764,49 @@ impl ProjectManager {
 
         self.wake_if_listening(&issue).await;
         Ok(entry)
+    }
+
+    /// A person commenting on a cancelled card is asking for it back.
+    ///
+    /// Without this the comment is a dead end:
+    /// [`comments::comment_delivery`](crate::comments) answers `RecordOnly`
+    /// for a cancelled card, so the operator types into a card nothing will
+    /// ever read, and the only way back is a second, different gesture.
+    ///
+    /// **A person's comment only.** An agent's would reach around
+    /// [`driver::cancel_is_a_persons_stop`](crate::driver) rather than
+    /// through it — saying a word on the card would take back a stop the
+    /// same agent is refused when it asks directly — and the board reviving
+    /// its own cancel is the board acting on nobody's authority.
+    ///
+    /// Written through `update_issue` like every other reversal, so the
+    /// `Uncancelled` entry, the board event and the enqueue gate all happen
+    /// once and in one place. A failure leaves the comment standing: the
+    /// operator said something, and losing that to a write they did not ask
+    /// for would be the worse half.
+    async fn take_the_cancel_back(&self, issue: &IssueRow, actor: &IssueActor) -> Option<IssueRow> {
+        if issue.cancelled_at.is_none() || !matches!(actor, IssueActor::User) {
+            return None;
+        }
+        match self
+            .update_issue(
+                &issue.project_id,
+                issue.number,
+                actor.clone(),
+                IssueUpdate {
+                    cancelled: Some(false),
+                    ..IssueUpdate::default()
+                },
+                None,
+            )
+            .await
+        {
+            Ok(after) => Some(after),
+            Err(e) => {
+                tracing::error!(issue = issue.number, error = %e, "could not take back the cancel a comment asked for");
+                None
+            }
+        }
     }
 
     /// Start the run a comment asked for, on an issue whose answer had to
@@ -2473,6 +2558,19 @@ impl ProjectManager {
             let current = self.get_issue(project, number).await?;
             self.validate_staffing(current.status, next.as_ref())?;
         }
+        // Refused here and not in the tool: the REST door writes through this
+        // function too, and a rule spelled at one of two doors is the rule
+        // drifting. The operator's own reopen is `IssueActor::User` and is
+        // untouched.
+        if update.cancelled == Some(false) && matches!(actor, IssueActor::Agent(_)) {
+            let standing = self.get_issue(project, number).await?;
+            if standing.cancelled_at.is_some() && self.stopped_by_a_person(&standing).await {
+                return Err(ProjectError::invalid(
+                    "cancelled",
+                    AGENT_REOPENING_A_PERSONS_STOP,
+                ));
+            }
+        }
         let update = IssueUpdate {
             title: update
                 .title
@@ -2548,13 +2646,17 @@ impl ProjectManager {
             IssueEventBody::StageCompleted { stage: after.stage },
         )
         .await;
-        // Nobody on the parent means nobody to wake. The event above still
-        // lands, so the operator sees the stage opened and can staff it —
-        // and a blocked parent is not woken either: the barrier opening is
-        // the board acting on its own, and the block is not its to
-        // override. The `StageCompleted` entry above is what survives for
-        // whoever lifts the block.
+        // Three gates and one reason for all of them: the barrier opening is
+        // the board acting on its own, and none of the three is its to
+        // override. Nobody on the parent means nobody to wake; a block is a
+        // decision somebody recorded; a parent in Backlog is that same
+        // decision spelled as a column, and the column is the gate that was
+        // missing — `enqueue` never reads the parallelism ceiling either, so
+        // neither of the operator's two ways to stop a board held this door.
+        // The `StageCompleted` entry above lands either way, so whoever
+        // staffs, unblocks or un-parks it sees the stage opened.
         if parent.assignee.is_some()
+            && crate::driver::is_live_work(parent.status)
             && crate::driver::board_may_start(&parent)
             && crate::stages::barrier_opens(&children, after.stage)
         {

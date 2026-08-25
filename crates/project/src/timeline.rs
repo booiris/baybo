@@ -29,8 +29,14 @@ pub(crate) fn diff_events(before: &IssueRow, after: &IssueRow) -> Vec<IssueEvent
         (Some(_), None) => out.push(IssueEventBody::Unblocked),
         _ => {}
     }
-    if before.cancelled_at.is_none() && after.cancelled_at.is_some() {
-        out.push(IssueEventBody::Cancelled);
+    // Both directions, for the same reason the block pair above reads both:
+    // `driver::cancel_is_a_persons_stop` asks whose stop is standing, and a
+    // reversal that wrote nothing left the card claiming a cancel that had
+    // already been taken back.
+    match (before.cancelled_at, after.cancelled_at) {
+        (None, Some(_)) => out.push(IssueEventBody::Cancelled),
+        (Some(_), None) => out.push(IssueEventBody::Uncancelled),
+        _ => {}
     }
     out
 }
@@ -45,6 +51,7 @@ pub(crate) fn left_a_mark(body: &IssueEventBody) -> bool {
             | IssueEventBody::Blocked { .. }
             | IssueEventBody::Unblocked
             | IssueEventBody::Cancelled
+            | IssueEventBody::Uncancelled
             // A run whose whole output was three follow-up cards did not
             // leave the card untouched, and telling the operator it left
             // nothing is how they stop looking for work that is there.
@@ -168,7 +175,7 @@ mod tests {
     }
 
     #[test]
-    fn unblocking_and_cancelling_each_read_once() {
+    fn unblocking_and_cancelling_each_read_once_in_both_directions() {
         let mut before = issue();
         before.blocked_reason = Some("waiting".into());
         let mut after = before.clone();
@@ -186,5 +193,12 @@ mod tests {
             vec![IssueEventBody::Cancelled]
         );
         assert!(diff_events(&after, &after).is_empty());
+        assert_eq!(
+            diff_events(&after, &before),
+            vec![IssueEventBody::Uncancelled],
+            "taking a cancel back is an entry too — whose stop is standing is \
+             read off these two, and a silent reversal answered with the \
+             cancel it had already undone"
+        );
     }
 }

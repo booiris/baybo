@@ -1635,25 +1635,42 @@ impl ProjectStore for SqliteProjectStore {
     async fn drain_marks(&self, project: &ProjectId) -> Result<DrainMarks> {
         let project = project.as_str().to_string();
         let failed = RunStatus::Failed.as_str();
+        let cancelled = RunStatus::Cancelled.as_str();
         let (looked_at, worked_at) = self
             .pool
             .interact("issue_runs.drain_marks", move |conn| {
                 // The one list, expanded twice with opposite senses: what
                 // wakes the lead, and what counts as the board working.
+                //
+                // A run somebody called off lands on the *look* side and
+                // never on the work side: it is not the board working, and
+                // whoever called it off had the board in front of them to do
+                // it. On the work side, as it was, a person pressing stop
+                // re-armed the very question that countermands them.
+                //
+                // `MAX` over a `UNION ALL` rather than the scalar `max()`,
+                // which is NULL if either arm is: each arm is a board that
+                // has not happened yet, and the aggregate skips those.
                 Ok(conn.query_row(
                     concat!(
                         "SELECT \
-                         (SELECT MAX(created_at) FROM issue_runs \
-                            WHERE project_id = ?1 AND trigger IN (",
+                         (SELECT MAX(mark) FROM ( \
+                            SELECT MAX(created_at) AS mark FROM issue_runs \
+                              WHERE project_id = ?1 AND trigger IN (",
                         coordination_triggers!(),
-                        ") AND NOT (status = ?2 AND session_id IS NULL)), \
+                        ") AND NOT (status = ?2 AND session_id IS NULL) \
+                            UNION ALL \
+                            SELECT MAX(settled_at) FROM issue_runs \
+                              WHERE project_id = ?1 AND status = ?3 \
+                                AND settled_at IS NOT NULL)), \
                          (SELECT MAX(settled_at) FROM issue_runs \
                             WHERE project_id = ?1 AND settled_at IS NOT NULL \
+                              AND status <> ?3 \
                               AND trigger NOT IN (",
                         coordination_triggers!(),
                         "))"
                     ),
-                    rusqlite::params![project, failed],
+                    rusqlite::params![project, failed, cancelled],
                     |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
                 )?)
             })
@@ -2606,6 +2623,57 @@ mod tests {
 
         let second = store.enqueue_run(&new_run(&issue)).await.unwrap();
         assert_eq!(second.attempt, 2);
+    }
+
+    #[tokio::test]
+    async fn a_run_somebody_called_off_is_a_look_at_the_board_and_not_work_on_it() {
+        let (_dir, store) = store().await;
+        let p = project("proj-marks", "Marks");
+        store.create_project(&p).await.unwrap();
+        let issue = store
+            .create_issue(&new_issue(&p.id, "work", IssueStatus::InProgress))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.drain_marks(&p.id).await.unwrap(),
+            DrainMarks::default(),
+            "a board nothing has ever run on carries neither mark"
+        );
+
+        let run = store.enqueue_run(&new_run(&issue)).await.unwrap();
+        store
+            .claim_run(&run.id, &SessionId::from("issue-1"))
+            .await
+            .unwrap();
+        store
+            .settle_run(&run.id, RunStatus::Cancelled, None)
+            .await
+            .unwrap();
+
+        let marks = store.drain_marks(&p.id).await.unwrap();
+        assert!(
+            marks.worked_at.is_none(),
+            "a run somebody stopped is not the board working"
+        );
+        assert!(
+            marks.looked_at.is_some(),
+            "it is somebody having read the board and decided, which is the \
+             one thing that keeps the drain question from countermanding them"
+        );
+
+        let second = store.enqueue_run(&new_run(&issue)).await.unwrap();
+        store
+            .settle_run(&second.id, RunStatus::Done, None)
+            .await
+            .unwrap();
+        let marks = store.drain_marks(&p.id).await.unwrap();
+        assert!(
+            marks
+                .worked_at
+                .is_some_and(|worked| marks.looked_at.is_some_and(|looked| worked > looked)),
+            "and work that finished after the stop is the board working again"
+        );
     }
 
     #[tokio::test]

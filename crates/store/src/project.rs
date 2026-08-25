@@ -476,6 +476,12 @@ pub enum IssueEventBody {
     },
     Unblocked,
     Cancelled,
+    /// A cancel was taken back and the card is live work again.
+    ///
+    /// Recorded because [`crate::project::IssueActor`] on the two entries is
+    /// what tells a person's stop from an agent's, and a reversal that
+    /// wrote nothing left the card saying only that it had been called off.
+    Uncancelled,
     /// The issue's worktree was given back. `branch_deleted` says whether
     /// the branch went with it, which only happens when it never produced
     /// a commit.
@@ -591,6 +597,7 @@ impl IssueEventBody {
             IssueEventBody::Blocked { .. } => "blocked",
             IssueEventBody::Unblocked => "unblocked",
             IssueEventBody::Cancelled => "cancelled",
+            IssueEventBody::Uncancelled => "uncancelled",
             IssueEventBody::BranchMerged { .. } => "branch_merged",
             IssueEventBody::WorktreeReclaimed { .. } => "worktree_reclaimed",
             IssueEventBody::WorktreeKept { .. } => "worktree_kept",
@@ -637,8 +644,10 @@ pub struct NewIssueEvent {
 /// disagree with the rows it came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DrainMarks {
-    /// When the lead was last woken about **anything** on this board — any
-    /// coordination run, not only a previous drain.
+    /// When somebody last read this board and acted on it: any coordination
+    /// run, not only a previous drain — and any run that was **cancelled**,
+    /// because calling one off is a decision, and whoever took it had the
+    /// board in front of them.
     ///
     /// Deliberately wider than the question it guards. A coordination brief
     /// tells the lead to read the whole board, so a lead woken since the
@@ -650,7 +659,8 @@ pub struct DrainMarks {
     pub looked_at: Option<DateTime<Utc>>,
     /// When a **work** run on this board last settled. Coordination is
     /// excluded on both sides: the lead being asked a question, and
-    /// answering it, is not the board doing work.
+    /// answering it, is not the board doing work. So is a run that was
+    /// cancelled — see `looked_at`, which is the side it lands on.
     pub worked_at: Option<DateTime<Utc>>,
 }
 
@@ -887,8 +897,8 @@ pub enum RunTrigger {
     /// waking anybody.
     Grooming,
     /// The lead was woken because the **board** has run dry: nothing
-    /// executing, nothing queued, room to start something, and live cards
-    /// still on it.
+    /// executing, nothing queued, room to start something, and cards the
+    /// board may take up still on it.
     ///
     /// The only question here that is about the board rather than about the
     /// card its run is filed against — that card is an anchor, because a run
@@ -896,6 +906,12 @@ pub enum RunTrigger {
     /// asked last and only when every per-card question declined, so it is
     /// by construction the board saying "I have looked at all of it and I
     /// have no move left".
+    ///
+    /// Carries [`RunTrigger::Grooming`]'s rule and not only its own, because
+    /// this question hands the lead the whole board rather than one card: a
+    /// Backlog card the **operator** parked is neither live work this counts
+    /// nor a card it may anchor on. Asking it here would put the operator's
+    /// own decision back in front of a lead told to find something to start.
     BoardIdle,
 }
 

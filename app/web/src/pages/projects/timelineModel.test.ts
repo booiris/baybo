@@ -164,16 +164,27 @@ describe('commentHint', () => {
     expect(hint).toContain('nobody is assigned');
   });
 
-  it('says record-only for parked or cancelled work even with an assignee', () => {
+  it('says record-only for parked work even with an assignee', () => {
     expect(commentHint({ status: 'backlog', assignee: DEV_1 }, [], team)).toContain(
       'not working on this',
     );
     expect(commentHint({ status: 'done', assignee: DEV_1 }, [], team)).toContain(
       'not working on this',
     );
-    expect(
-      commentHint({ status: 'in_progress', assignee: DEV_1, cancelled_at_ms: 1 }, [], team),
-    ).toContain('cancelled');
+  });
+
+  it('says a comment reopens a cancelled issue, whatever else is true of it', () => {
+    // Ahead of every other case, the unstaffed one included: the operator's
+    // comment is what takes the cancel back, so promising them 'records
+    // only' is the composer describing the card they are about to leave
+    // behind.
+    for (const issue of [
+      { status: 'in_progress' as const, assignee: DEV_1, cancelled_at_ms: 1 },
+      { status: 'in_progress' as const, assignee: null, cancelled_at_ms: 1 },
+      { status: 'backlog' as const, assignee: DEV_1, cancelled_at_ms: 1 },
+    ]) {
+      expect(commentHint(issue, [], team)).toBe('This issue is cancelled — commenting reopens it.');
+    }
   });
 
   it('promises a run when the assignee is on live work and nothing is reading', () => {

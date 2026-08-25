@@ -680,6 +680,7 @@ pub enum IssueEventBodyDto {
     },
     Unblocked,
     Cancelled,
+    Uncancelled,
     BranchMerged {
         branch: String,
         /// The branch it landed on — the repository's own checkout may be
@@ -827,6 +828,7 @@ impl IssueEventBodyDto {
             IssueEventBody::Blocked { reason } => Self::Blocked { reason },
             IssueEventBody::Unblocked => Self::Unblocked,
             IssueEventBody::Cancelled => Self::Cancelled,
+            IssueEventBody::Uncancelled => Self::Uncancelled,
             IssueEventBody::BranchMerged {
                 branch,
                 into,
