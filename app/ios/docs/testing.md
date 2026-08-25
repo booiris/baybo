@@ -169,6 +169,19 @@ written from reasoning, did not.
 The app has now shipped this bug three times: the logout pill
 (`OutlinePillButtonStyle`), a board card row, and the board's budget chip.
 
+### Assert that a thing GOES, not only that it appears
+
+`ProjectsUITests` asserted all four Waiting-strip kinds appear and nothing
+asserted any of them clears — which is how two of the four shipped answering
+nothing on screen. A strip that only ever grows looks identical to a healthy
+one at the moment the screenshot is taken.
+
+The same rule found the demo's blind spot: under `-baybo-demo-projects` a
+write's whole effect IS its `apply` closure (the network half is
+short-circuited), so a verb with no `apply` is a verb that visibly does
+nothing there. That makes the demo a decent detector for exactly this class —
+but only if a test presses the button and then asserts the row is gone.
+
 ### A tap lands on the element's CENTRE, so an a11y frame is a test surface
 
 `element.tap()` synthesises a touch at the middle of the element's

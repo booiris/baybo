@@ -17,7 +17,8 @@ extension IssueInfo {
         status: IssueStatus? = nil,
         pinned: Bool? = nil,
         assignee: StringPatch = .keep,
-        unread: Int64? = nil
+        unread: Int64? = nil,
+        lastRunFailed: Bool? = nil
     ) -> IssueInfo {
         let nextAssignee: String? =
             switch assignee {
@@ -43,7 +44,7 @@ extension IssueInfo {
             stage: stage,
             subIssues: subIssues,
             unread: unread ?? self.unread,
-            lastRunFailed: lastRunFailed,
+            lastRunFailed: lastRunFailed ?? self.lastRunFailed,
             approvalPending: approvalPending,
             openedByAgent: openedByAgent,
             cancelledAtMs: cancelledAtMs,

@@ -435,6 +435,53 @@ final class ProjectsUITests: BayboUITestCase {
         XCTAssertTrue(app.buttons["issue-menu"].exists)
     }
 
+    /// **A Waiting row leaves on the PRESS.** The suite asserted only that the
+    /// four kinds appear; nothing asserted any of them goes, which is how the
+    /// strip shipped with two answers that changed nothing on screen for a
+    /// whole round trip — and, under the demo, for ever.
+    func testAnsweringAWaitingRowRetiresItImmediately() {
+        let app = openBoard()
+        let approve = app.buttons["waiting-approve-41"]
+        XCTAssertTrue(approve.waitForExistence(timeout: 5), "no approval row")
+        approve.tap()
+        XCTAssertFalse(
+            app.buttons["waiting-approve-41"].waitForExistence(timeout: 4),
+            "an answered approval must leave the strip on the press")
+
+        let retry = app.buttons["waiting-retry-42"]
+        XCTAssertTrue(retry.waitForExistence(timeout: 4), "no failed row")
+        retry.tap()
+        XCTAssertFalse(
+            app.buttons["waiting-retry-42"].waitForExistence(timeout: 4),
+            "Run again must retire the row: the newest run is no longer the failed one")
+    }
+
+    /// The strip goes away entirely once nothing is waiting — a header reading
+    /// "WAITING ON YOU 0" over an empty box would be the same bug wearing a
+    /// different number.
+    func testTheStripDisappearsOnceEverythingIsAnswered() {
+        let app = openBoard()
+        XCTAssertTrue(app.buttons["waiting-approve-41"].waitForExistence(timeout: 5))
+        app.buttons["waiting-approve-41"].tap()
+        XCTAssertTrue(app.buttons["waiting-retry-42"].waitForExistence(timeout: 4))
+        app.buttons["waiting-retry-42"].tap()
+
+        // What is left is the agent's question and one unread — both are
+        // discharged by opening a card, not from here. Mark all read takes the
+        // unread one.
+        XCTAssertTrue(app.buttons["board-menu"].waitForExistence(timeout: 4))
+        app.buttons["board-menu"].tap()
+        let markRead = app.buttons.matching(
+            NSPredicate(format: "label BEGINSWITH 'Mark all read'")).firstMatch
+        XCTAssertTrue(markRead.waitForExistence(timeout: 3))
+        markRead.tap()
+
+        XCTAssertFalse(
+            app.descendants(matching: .any).matching(identifier: "waiting-row-43").firstMatch
+                .waitForExistence(timeout: 4),
+            "a card with nothing left waiting must leave the strip")
+    }
+
     /// The new-board form is a pushed route, not a sheet — deliberately, so the
     /// name field can rise with the keyboard (the home shell opts out of
     /// keyboard avoidance wholesale). Create stays disabled until it is named.

@@ -189,4 +189,87 @@ struct ProjectsStoreTests {
         let written = (try? FileManager.default.contentsOfDirectory(atPath: dir.url.path)) ?? []
         #expect(!written.contains { $0.contains("escape") })
     }
+
+    /// **An answered prompt leaves on the press.** It used to sit there for a
+    /// whole round trip — and the live queue being the truth is a reason to
+    /// let the refetch CORRECT this, not a reason to make the operator wait
+    /// for it.
+    @Test func answeringAPromptRetiresItAtOnce() async {
+        let dir = TempSupportDir()
+        let fake = FakeBayboClient()
+        fake.stubProjects = [project("p1", name: "rglide")]
+        fake.stubIssues = [issue(12, title: "the parser")]
+        let store = ProjectsStore(supportDirectory: dir.url, clientProvider: { fake })
+        await store.refreshRoot()
+        await store.refreshBoard("p1")
+        store.seedPrompts(
+            board: "p1",
+            [
+                12: [
+                    IssueApprovalPrompt(
+                        callId: "c1", tool: "exec", summary: nil, askedBy: "dev-1", askedAtMs: 1),
+                    IssueApprovalPrompt(
+                        callId: "c2", tool: "exec", summary: nil, askedBy: "dev-1", askedAtMs: 2),
+                ]
+            ])
+
+        _ = await store.resolveApproval(
+            board: "p1", issue: 12, callId: "c1", decision: .approve)
+        // Only ITS OWN prompt goes: a card can hold several, and a resolution
+        // retires exactly one.
+        #expect(store.approvalPrompts["p1"]?[12]?.map(\.callId) == ["c2"])
+
+        _ = await store.resolveApproval(
+            board: "p1", issue: 12, callId: "c2", decision: .deny)
+        // An empty list and an absent key must not both mean "none waiting" —
+        // the strip reads absence.
+        #expect(store.approvalPrompts["p1"]?[12] == nil)
+        // And the decisions reached the wire, not just the screen.
+        #expect(fake.approvalsResolved.map(\.1) == ["c1", "c2"])
+        #expect(fake.approvalsResolved.map(\.2) == [.approve, .deny])
+    }
+
+    /// A refusal that is NOT "already closed" puts the row back — otherwise
+    /// the operator is left with a prompt that is still waiting and can no
+    /// longer be seen.
+    @Test func aRefusedAnswerPutsTheRowBack() async {
+        let dir = TempSupportDir()
+        let fake = FakeBayboClient()
+        fake.stubProjects = [project("p1", name: "rglide")]
+        fake.stubIssues = [issue(12, title: "the parser")]
+        let store = ProjectsStore(supportDirectory: dir.url, clientProvider: { fake })
+        await store.refreshBoard("p1")
+        store.seedPrompts(
+            board: "p1",
+            [
+                12: [
+                    IssueApprovalPrompt(
+                        callId: "c1", tool: "exec", summary: nil, askedBy: "dev-1", askedAtMs: 1)
+                ]
+            ])
+
+        fake.failProjects = true
+        let answered = await store.resolveApproval(
+            board: "p1", issue: 12, callId: "c1", decision: .approve)
+        #expect(!answered)
+        #expect(
+            store.approvalPrompts["p1"]?[12]?.map(\.callId) == ["c1"],
+            "a prompt still waiting must come back")
+    }
+
+    /// A retry clears the failed flag at once, because that is what the server
+    /// will say: `last_run_failed` asks whether the NEWEST run failed, and a
+    /// retry makes the newest one queued.
+    @Test func aRetryClearsTheFailedFlagWithoutWaitingForTheRoundTrip() async {
+        let dir = TempSupportDir()
+        let fake = FakeBayboClient()
+        fake.stubProjects = [project("p1", name: "rglide")]
+        fake.stubIssues = [issue(12, title: "the parser").with(lastRunFailed: true)]
+        let store = ProjectsStore(supportDirectory: dir.url, clientProvider: { fake })
+        await store.refreshBoard("p1")
+        #expect(store.boards["p1"]?.issues.first?.lastRunFailed == true)
+
+        _ = await store.retryRun(board: "p1", issue: 12)
+        #expect(store.boards["p1"]?.issues.first?.lastRunFailed == false)
+    }
 }

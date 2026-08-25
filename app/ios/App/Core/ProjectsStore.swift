@@ -458,11 +458,25 @@ final class ProjectsStore: ObservableObject {
     }
 
     /// Start another attempt on a card whose last run failed.
+    ///
+    /// The flag clears optimistically because that is what the server will
+    /// say: `last_run_failed` asks whether the NEWEST run failed, and a retry
+    /// makes the newest one queued. Without this the row sat in the Waiting
+    /// strip unchanged for the whole round trip, which reads as a button that
+    /// did nothing.
     @discardableResult
     func retryRun(board projectId: String, issue number: Int64) async -> Bool {
-        await write(board: projectId) { client in
-            _ = try await client.projectRunRetry(projectId: projectId, number: number)
-        }
+        await write(
+            board: projectId,
+            apply: { board in
+                guard let index = board.issues.firstIndex(where: { $0.number == number }) else {
+                    return
+                }
+                board.issues[index] = board.issues[index].with(lastRunFailed: false)
+            },
+            call: { client in
+                _ = try await client.projectRunRetry(projectId: projectId, number: number)
+            })
     }
 
     /// Answer one parked approval prompt.
@@ -475,15 +489,48 @@ final class ProjectsStore: ObservableObject {
         board projectId: String, issue number: Int64, callId: String,
         decision: IssueApprovalDecision
     ) async -> Bool {
+        // The row leaves on the PRESS, not a round trip later. Prompts do not
+        // live on `Board`, so `write`'s snapshot cannot roll this back — the
+        // restore below is this one's own.
+        let snapshot = approvalPrompts[projectId]
+        retirePrompt(board: projectId, issue: number, callId: callId)
+
         let answered = await write(board: projectId) { client in
             try await client.projectIssueApprovalResolve(
                 projectId: projectId, number: number, callId: callId, decision: decision)
         }
-        if !answered, Self.readsAsGone(writeError) {
+        guard !answered else { return true }
+        if Self.readsAsGone(writeError) {
+            // Gone is gone: a prompt that timed out or was answered elsewhere
+            // should stay off the strip, so the optimistic removal STANDS.
             writeError = "Closed — it timed out, or it was already answered."
             scheduleBoardRefresh(projectId)
+        } else {
+            // Any other refusal means the gate is still waiting. Put it back,
+            // or the operator is left with an unanswerable prompt they can no
+            // longer see.
+            approvalPrompts[projectId] = snapshot
         }
-        return answered
+        return false
+    }
+
+    #if DEBUG
+        /// Seed the parked prompts directly. Tests only: the real path reads
+        /// them off each flagged card's events, which needs a gateway.
+        func seedPrompts(board projectId: String, _ prompts: [Int64: [IssueApprovalPrompt]]) {
+            approvalPrompts[projectId] = prompts
+        }
+    #endif
+
+    private func retirePrompt(board projectId: String, issue number: Int64, callId: String) {
+        guard var forBoard = approvalPrompts[projectId], var forCard = forBoard[number] else {
+            return
+        }
+        forCard.removeAll { $0.callId == callId }
+        // An empty list and an absent key must not both mean "none waiting" —
+        // the strip reads absence, so collapse to it.
+        forBoard[number] = forCard.isEmpty ? nil : forCard
+        approvalPrompts[projectId] = forBoard
     }
 
     /// Stamp the whole board read. Optimistic, because the number it clears is

@@ -331,9 +331,26 @@ final class IssueStore: ObservableObject, WebMediaTarget {
     /// read by anybody.
     func markRendered() {
         guard !stampedRead else { return }
+        // Latched BEFORE the await so a second `issueRendered` in the same
+        // breath cannot send twice, and cleared again if the send failed —
+        // otherwise one lost POST leaves the card unread for this screen's
+        // whole life, with the unread row sitting on the board behind it and
+        // no way to discharge it but Mark all read.
         stampedRead = true
         Task { [projectId, number] in
-            try? await client.projectIssueRead(projectId: projectId, number: number)
+            do {
+                try await client.projectIssueRead(projectId: projectId, number: number)
+            } catch {
+                stampedRead = false
+                NSLog("baybo: mark read #%lld: %@", number, bayboErrorText(error))
+                return
+            }
+            // The board plane too, not just the root's counts: the Waiting
+            // strip reads `board.issues[].unread`, which `refreshRoot` never
+            // writes. A frame normally does this — `mark_issue_read` emits a
+            // timeline invalidation — but a leg that is down or redialing
+            // carries no frame while the REST call still lands.
+            AppStore.shared?.projectsStore.scheduleBoardRefresh(projectId)
             AppStore.shared?.projectsStore.scheduleRootRefresh()
         }
     }

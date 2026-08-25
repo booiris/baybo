@@ -564,6 +564,7 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     private var _stubIssueDetail: IssueInfo?
     private var _stubIssueEventsJson: String?
     private var _stubRunLog: IssueRunLog?
+    private var _approvalsResolved: [(Int64, String, IssueApprovalDecision)] = []
     private var _stubRuns: [IssueRunInfo] = []
     private var _stubTeam: [TeamMemberInfo] = []
     private var _stubAttention: [ProjectAttention] = []
@@ -592,6 +593,12 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     var stubRunLog: IssueRunLog? {
         get { lock.withLock { _stubRunLog } }
         set { lock.withLock { _stubRunLog = newValue } }
+    }
+    /// What was answered, so a test can assert the DECISION reached the wire
+    /// and not only that the row went away.
+    var approvalsResolved: [(Int64, String, IssueApprovalDecision)] {
+        get { lock.withLock { _approvalsResolved } }
+        set { lock.withLock { _approvalsResolved = newValue } }
     }
     var stubRuns: [IssueRunInfo] {
         get { lock.withLock { _stubRuns } }
@@ -659,7 +666,11 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     }
     func projectRunCancel(projectId: String, number: Int64) async throws { throw Self.unsupported }
     func projectRunRetry(projectId: String, number: Int64) async throws -> IssueRunInfo {
-        throw Self.unsupported
+        try refuseIfOffline()
+        return IssueRunInfo(
+            number: number, attempt: 1, agentId: "a-dev", status: .queued, trigger: .retry,
+            sessionId: nil, error: nil, createdAtMs: 0, startedAtMs: nil, settledAtMs: nil,
+            costMicros: nil, inputTokens: nil, outputTokens: nil)
     }
     func projectRunTranscript(
         projectId: String, number: Int64, attempt: Int64, beforeOrdinal: Int64?, limit: UInt32?
@@ -674,9 +685,14 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     ) async throws -> String { throw Self.unsupported }
     func projectIssueApprovalResolve(
         projectId: String, number: Int64, callId: String, decision: IssueApprovalDecision
-    ) async throws { throw Self.unsupported }
-    func projectIssueRead(projectId: String, number: Int64) async throws { throw Self.unsupported }
-    func projectRead(projectId: String) async throws { throw Self.unsupported }
+    ) async throws {
+        try refuseIfOffline()
+        approvalsResolved.append((number, callId, decision))
+    }
+    func projectIssueRead(projectId: String, number: Int64) async throws {
+        try refuseIfOffline()
+    }
+    func projectRead(projectId: String) async throws { try refuseIfOffline() }
     func projectFeed(projectId: String, beforeMs: Int64?, limit: UInt32?) async throws -> String {
         throw Self.unsupported
     }

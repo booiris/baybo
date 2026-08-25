@@ -364,6 +364,27 @@ board already writes, and two copies would be two file formats kept identical
 by hand. `IssueMirror` gained an `attachments` field there: the board never
 drew a card's files, so it never wrote them.
 
+### 9.5 A Waiting row leaves on the press
+
+Every board verb applies its effect locally before the write lands, and rolls
+back on refusal — `write`'s snapshot. Two did not: `resolveApproval` and
+`retryRun` passed no `apply` closure, so the row they answered sat unchanged
+for a full round trip. It reads as a button that did nothing.
+
+Both now predict what the server will say:
+
+- **A retry clears `last_run_failed`.** The flag asks whether the NEWEST run
+  failed (`FAILED_CARD_PREDICATE` in `crates/storage/src/sqlite/project.rs`),
+  and a retry makes the newest one queued — so the prediction is exact.
+- **An answer retires its prompt.** Prompts do not live on `Board`, so
+  `write`'s snapshot cannot restore them; `resolveApproval` keeps its own. A
+  404 ("already closed") deliberately does NOT restore — gone is gone — while
+  any other refusal puts the row back, because the gate is still waiting and
+  an operator left with an invisible prompt cannot answer it.
+
+The live queue is still the truth. Being the truth is a reason to let the
+refetch CORRECT this, not a reason to make somebody wait for it.
+
 ### 9.4 Hit targets
 
 Three controls here needed an explicit `contentShape`, all the same bug: under
