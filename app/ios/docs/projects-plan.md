@@ -172,6 +172,12 @@ contact:
   ran. `build-app.sh` does it, and a Swift/web loop that skips it is testing the
   last bundle.
 
+**Found after P8 by the owner: there was no way to file a card at all.**
+`project_issue_create` shipped in P1 and no UI ever called it — an audit of
+every `project_*` FFI call against its Swift callers now says the only other
+unused one is `project_get`, which is genuinely redundant (the cards root goes
+through `projectList`). The board's `+` closes it; see projects.md §9.1.
+
 **Deferred from P5, deliberately:** the `@` mention chips, staged attachments on
 a comment, and the run-transcript sheet the card's run rows point at (P6). The
 `onOpenRun` hook is wired and inert rather than absent, so the card's shape is

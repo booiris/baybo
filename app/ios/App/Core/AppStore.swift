@@ -68,6 +68,12 @@ final class AppStore: ObservableObject {
         /// (`HomeTabView.ignoresSafeArea(.keyboard)`), and a pushed screen sits
         /// outside that.
         case newProject
+        /// Filing a card. The column rides ON the route rather than in a
+        /// `@State` beside it: which column you are filing into is part of
+        /// WHERE this screen is, not something that happens to it — and a
+        /// route that forgot it would open every card in the backlog after a
+        /// state restoration.
+        case newIssue(project: String, status: IssueStatus)
     }
 
     /// A scheduled job's delete, waiting on the confirm dialog. Carries the name
@@ -790,6 +796,13 @@ final class AppStore: ObservableObject {
 
     func openProjectIssue(project: String, number: Int64) {
         let route = AppStore.ChatRoute.projectIssue(project: project, number: number)
+        guard chatPath.last != route else { return }
+        chatPath.append(route)
+    }
+
+    /// File a card on a board, opening in the column the board was showing.
+    func openNewIssue(project: String, status: IssueStatus) {
+        let route = AppStore.ChatRoute.newIssue(project: project, status: status)
         guard chatPath.last != route else { return }
         chatPath.append(route)
     }

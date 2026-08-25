@@ -83,14 +83,9 @@ enum MoveConsequence {
         if target == current { return "current" }
         switch target {
         case .inProgress:
-            guard let assignee = assigneeHandle else {
-                return "Needs an assignee first — pick who is on it, then it moves"
-            }
-            if overCeiling {
-                return
-                    "Starts a run for @\(assignee) — may be held, the board is over \(heldCeiling.phrase)"
-            }
-            return "Starts a run: @\(assignee) reads the card now"
+            return startingNote(
+                assigneeHandle: assigneeHandle, overCeiling: overCeiling,
+                heldCeiling: heldCeiling, arriving: "then it moves")
         case .done:
             // Entering Done reclaims the checkout — but only once whatever is
             // running has settled, and a dirty worktree is kept with a note
@@ -107,6 +102,54 @@ enum MoveConsequence {
         case .unknown:
             return nil
         }
+    }
+
+    /// What entering In Progress does — the board's ONE execution trigger, and
+    /// the only sentence two surfaces both have to say.
+    ///
+    /// A MOVE into it starts a run; opening a NEW card straight into it does
+    /// the same thing (`Transition::created` dispatches), and refusing it
+    /// without an assignee is the same server rule. `arriving` is the only
+    /// difference — a move "moves", a create "opens" — so the rule lives here
+    /// once and the two callers supply their own verb.
+    static func startingNote(
+        assigneeHandle: String?,
+        overCeiling: Bool,
+        heldCeiling: HeldCeiling,
+        arriving: String
+    ) -> String {
+        guard let assignee = assigneeHandle else {
+            return "Needs an assignee first — pick who is on it, \(arriving)"
+        }
+        if overCeiling {
+            return
+                "Starts a run for @\(assignee) — may be held, the board is over \(heldCeiling.phrase)"
+        }
+        return "Starts a run: @\(assignee) reads the card now"
+    }
+
+    /// What opening a NEW card in a column will do.
+    ///
+    /// Only In Progress says anything. The other four are the quiet answer —
+    /// a card that opens in Backlog does nothing at all, and a sentence
+    /// claiming otherwise (a moved card's "the run keeps going", a Done card's
+    /// worktree) would be about a run that never existed.
+    static func openingNote(
+        in status: IssueStatus,
+        assigneeHandle: String?,
+        overCeiling: Bool = false,
+        heldCeiling: HeldCeiling = .unknown
+    ) -> String? {
+        guard status == .inProgress else { return nil }
+        return startingNote(
+            assigneeHandle: assigneeHandle, overCeiling: overCeiling,
+            heldCeiling: heldCeiling, arriving: "then it opens")
+    }
+
+    /// Whether the board will REFUSE a card opened this way. The server's own
+    /// rule (`validate_staffing`): In Progress needs somebody on it.
+    static func refusesOpening(in status: IssueStatus, assignee: String?) -> Bool {
+        status == .inProgress && assignee == nil
     }
 
     /// What the toast says after a move landed.

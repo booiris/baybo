@@ -279,3 +279,64 @@ import Testing
         #expect(AgentMonogram.of("") == "")
     }
 }
+
+/// Opening a NEW card, and the one rule it shares with moving one.
+@Suite struct OpeningACardTests {
+    /// **Only In Progress says anything.** A card opening in Backlog does
+    /// nothing at all, and a moved card's "the run keeps going" or a Done
+    /// card's worktree line would be about a run that never existed.
+    @Test func onlyInProgressHasAConsequenceWorthPrinting() {
+        for status in [IssueStatus.backlog, .todo, .review, .done] {
+            #expect(MoveConsequence.openingNote(in: status, assigneeHandle: "dev-1") == nil)
+        }
+        #expect(MoveConsequence.openingNote(in: .inProgress, assigneeHandle: "dev-1") != nil)
+    }
+
+    /// The sentence names WHO, because that is the part somebody acts on.
+    @Test func openingIntoInProgressSaysWhoStarts() {
+        let note = MoveConsequence.openingNote(in: .inProgress, assigneeHandle: "dev-1")
+        #expect(note == "Starts a run: @dev-1 reads the card now")
+    }
+
+    /// Over the ceiling it says "may be held" rather than claiming to know —
+    /// the server decides at enqueue.
+    @Test func overTheCeilingItSaysMayRatherThanWill() {
+        let note = MoveConsequence.openingNote(
+            in: .inProgress, assigneeHandle: "dev-1", overCeiling: true, heldCeiling: .tokens)
+        #expect(note?.contains("may be held") == true)
+        // And names the ceiling that actually stopped it: an operator told
+        // "budget" on a token-limited board raises the wrong number.
+        #expect(note?.contains("daily token budget") == true)
+    }
+
+    /// With nobody on it, the note says what is missing rather than what will
+    /// happen — and the CREATE verb, not the move one.
+    @Test func withNobodyOnItTheNoteNamesWhatIsMissing() {
+        let note = MoveConsequence.openingNote(in: .inProgress, assigneeHandle: nil)
+        #expect(note == "Needs an assignee first — pick who is on it, then it opens")
+    }
+
+    /// The server's own rule (`validate_staffing`): In Progress needs somebody.
+    /// The form must not offer to try, because the answer is a 400.
+    @Test func theBoardRefusesInProgressWithNobodyOnIt() {
+        #expect(MoveConsequence.refusesOpening(in: .inProgress, assignee: nil))
+        #expect(!MoveConsequence.refusesOpening(in: .inProgress, assignee: "a-dev"))
+        for status in [IssueStatus.backlog, .todo, .review, .done] {
+            #expect(!MoveConsequence.refusesOpening(in: status, assignee: nil))
+        }
+    }
+
+    /// The two callers share the rule and differ only in the verb — which is
+    /// the whole reason `startingNote` takes one.
+    @Test func movingAndOpeningShareTheRuleAndDifferOnlyInTheVerb() {
+        let moving = MoveConsequence.startingNote(
+            assigneeHandle: nil, overCeiling: false, heldCeiling: .unknown,
+            arriving: "then it moves")
+        let opening = MoveConsequence.openingNote(in: .inProgress, assigneeHandle: nil)
+        #expect(moving.hasSuffix("then it moves"))
+        #expect(opening?.hasSuffix("then it opens") == true)
+        #expect(
+            moving.dropLast("then it moves".count) == opening?.dropLast("then it opens".count))
+    }
+}
+

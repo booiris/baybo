@@ -241,6 +241,35 @@ Two rules inside that:
   two. It is also why a just-created board leads the list rather than sinking
   to the bottom a second after it was made: creating opens it.
 
+### 9.1 Filing a card
+
+The board's header trailing slot carries a `+` — the same "one action per
+screen" idiom as the cards root's. It opens `NewIssueScreen` **in the column
+the board was showing**, which is the web's rule (`CreateIssueModal`'s
+`initialStatus`): filing from the Todo tab and finding the card in Backlog is
+a small betrayal every time.
+
+**Opening a card straight into In Progress starts a run.** `Transition::created`
+dispatches exactly as a move into that column does, and `validate_staffing`
+refuses it without an assignee — the same two facts the Move sheet already
+states. So the rule lives in ONE place (`MoveConsequence.startingNote`) and
+the two callers supply their own verb: a move "moves", a create "opens". The
+other four columns say nothing at all, because a card that opens in Backlog
+does nothing, and a sentence about a run that never existed is worse than
+silence.
+
+The form's Create button is off for a card the board would refuse, rather than
+offering a press that can only 400.
+
+**An archived board offers no `+` at all** — it takes no writes, so the slot
+carries the `archived` chip explaining why instead of a button that can only
+fail. The two are mutually exclusive by construction.
+
+Not offered on this screen: attachments (they want the composer's staging
+strip, which is bound to `ChatStore`; a card takes files from its own page)
+and `parent`/`stage` (filing a sub-card is a thing you do FROM the parent, and
+there is no parent in view here).
+
 ## 10. What shipped, and what did not
 
 Built across P0–P8: the gateway's `approval_pending` and archived-board guard,

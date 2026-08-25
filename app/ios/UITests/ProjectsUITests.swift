@@ -323,6 +323,68 @@ final class ProjectsUITests: BayboUITestCase {
             "Clear must leave the widening alone — it is not a narrowing")
     }
 
+    /// Filing a card: the board's + opens the form in the column you were on,
+    /// and In Progress without somebody on it is refused before it is sent.
+    ///
+    /// That refusal is the server's (`validate_staffing`), and offering a
+    /// button that can only 400 is worse than not offering it.
+    func testFilingACardOpensInTheStageYouWereOnAndRefusesAnUnstaffedRun() {
+        let app = openBoard()
+        // Land on Todo first, so "the column you were on" is testable at all.
+        XCTAssertTrue(app.buttons["stage-todo"].waitForExistence(timeout: 5))
+        app.buttons["stage-todo"].tap()
+
+        let plus = app.buttons["board-new-issue"]
+        XCTAssertTrue(plus.waitForExistence(timeout: 3), "no way to file a card")
+        plus.tap()
+
+        let todoChip = app.buttons["new-issue-stage-todo"]
+        XCTAssertTrue(todoChip.waitForExistence(timeout: 5), "the form never pushed")
+        XCTAssertEqual(
+            todoChip.value as? String, "1", "the form should open in the column you were on")
+
+        let create = app.buttons["new-issue-create"]
+        XCTAssertFalse(create.isEnabled, "an untitled card must not be filable")
+
+        let title = app.textFields["new-issue-title"]
+        XCTAssertTrue(title.exists)
+        title.tap()
+        title.typeText("the relay token format")
+        XCTAssertTrue(create.isEnabled, "a titled card in Todo is filable")
+
+        // In Progress with nobody on it: the board refuses it, so the form does.
+        app.buttons["new-issue-stage-in-progress"].tap()
+        XCTAssertFalse(
+            create.isEnabled, "In Progress with nobody on it must not be filable")
+        let note = app.staticTexts["new-issue-consequence"]
+        XCTAssertTrue(note.waitForExistence(timeout: 3), "no consequence line")
+        XCTAssertTrue(
+            note.label.contains("Needs an assignee"),
+            "the line should say what is missing; got \(note.label)")
+
+        // Back to Todo and it is filable again — the refusal is about the
+        // column, not about the card.
+        app.buttons["new-issue-stage-todo"].tap()
+        XCTAssertTrue(create.isEnabled)
+    }
+
+    /// An archived board takes no writes, so the slot that would file a card
+    /// carries the chip explaining why instead of a button that can only fail.
+    func testAnArchivedBoardOffersNoWayToFileACard() {
+        let app = openProjects()
+        XCTAssertTrue(app.buttons["Show archived (1)"].waitForExistence(timeout: 5))
+        app.buttons["Show archived (1)"].tap()
+
+        let cards = app.buttons.matching(identifier: "project-card")
+        XCTAssertTrue(cards.element(boundBy: 3).waitForExistence(timeout: 3))
+        cards.element(boundBy: 3).tap()
+
+        XCTAssertTrue(app.buttons["Back to projects"].waitForExistence(timeout: 5))
+        XCTAssertFalse(
+            app.buttons["board-new-issue"].exists,
+            "an archived board must not offer to file a card")
+    }
+
     /// The new-board form is a pushed route, not a sheet — deliberately, so the
     /// name field can rise with the keyboard (the home shell opts out of
     /// keyboard avoidance wholesale). Create stays disabled until it is named.

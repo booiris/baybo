@@ -507,6 +507,10 @@ struct ProjectBoardScreen: View {
                 .glassSurface(interactive: true, in: .circle)
                 .accessibilityLabel(Text(verbatim: lang.t("board.back")))
                 Spacer()
+                // The two are mutually exclusive by construction: an archived
+                // board takes no writes, so the thing that would file a card is
+                // exactly the thing it cannot do — and the chip explains why the
+                // slot is not a button.
                 if isArchived {
                     Text(verbatim: lang.t("projects.archivedChip"))
                         .font(Theme.mono(10))
@@ -515,6 +519,24 @@ struct ProjectBoardScreen: View {
                         .frame(height: 22)
                         .background(Theme.paper, in: Capsule())
                         .overlay(Capsule().strokeBorder(Theme.line, lineWidth: 1))
+                } else {
+                    Button {
+                        Haptics.tap()
+                        // The column you are looking at, which is the web's rule
+                        // too — filing from Todo and finding the card in Backlog
+                        // is a small betrayal every time.
+                        appStore.openNewIssue(project: projectId, status: stage)
+                    } label: {
+                        Image(systemName: "plus")
+                            .font(.system(size: 17, weight: .medium))
+                            .foregroundStyle(Theme.ink)
+                            .frame(width: 42, height: 42)
+                    }
+                    .glassSurface(interactive: true, in: .circle)
+                    .disabled(projects.isOffline)
+                    .opacity(projects.isOffline ? 0.4 : 1)
+                    .accessibilityIdentifier("board-new-issue")
+                    .accessibilityLabel(Text(verbatim: lang.t("newIssue.title")))
                 }
             }
         }

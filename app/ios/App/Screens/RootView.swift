@@ -53,6 +53,9 @@ struct RootView: View {
                                     ProjectIssueScreen(projectId: projectId, number: number)
                                 case .newProject:
                                     NewProjectScreen()
+                                case .newIssue(let projectId, let status):
+                                    NewIssueScreen(
+                                        projectId: projectId, initialStatus: status)
                                 }
                             }
                             .toolbar(.hidden, for: .navigationBar)
