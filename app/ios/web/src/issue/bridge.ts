@@ -54,15 +54,18 @@ export type IssuePayload = {
   firstUnread?: string;
 };
 
+/// What the RENDERED CARD listens to — and only it.
+///
+/// `init` and `setLanguage` are deliberately NOT here: they have their own
+/// listeners below because this is a one-holder slot, and a second consumer
+/// parked in it swallows the card. See `subscribeIssue`.
 export type IssueEvents = {
-  init(payload: IssueInit): void;
   /// A full replacement. The card is small and its parts move together — a
   /// comment writes a timeline entry AND bumps the card — so there is nothing
   /// a field-by-field merge would protect and one more way for the two to
   /// disagree if it tried.
   deliver(payload: IssuePayload): void;
   bottomInset(px: number): void;
-  language(lang: string): void;
   /// The dock's ✎ / Done. Web owns the textarea; native owns the bar.
   setEditing(active: boolean): void;
   /// Scroll the newest activity into view (the "new activity" pill, and the
@@ -80,15 +83,46 @@ export type IssueGlobal = {
 };
 
 type Buffered =
-  | { kind: "init"; payload: IssueInit }
   | { kind: "deliver"; payload: IssuePayload }
   | { kind: "bottomInset"; px: number }
-  | { kind: "language"; lang: string }
   | { kind: "setEditing"; active: boolean }
   | { kind: "jumpToLatest" };
 
 let events: IssueEvents | null = null;
+/// Everything native pushed before the card subscribed, replayed in arrival
+/// order the moment it does. Load-bearing on EVERY open, not a cold-start
+/// nicety: native answers `issueReady` in that same turn with whatever it
+/// already holds — a mirror that was on disk before the webview existed, or a
+/// fetch a directly-connected gateway answered while the page was still
+/// parsing — and React has not committed the tree yet.
 const buffer: Buffered[] = [];
+
+/// The init native sent, LATCHED.
+///
+/// It arrives with `ready`, before the React tree mounts, and it carries the
+/// language and the dock's height — so a listener that registers afterwards
+/// must still be told, exactly as the transcript's `onInit` does.
+let initPayload: IssueInit | null = null;
+const initListeners = new Set<(payload: IssueInit) => void>();
+const languageListeners = new Set<(lang: string) => void>();
+
+/// Hear the init — now if it has already landed, otherwise when it does.
+export function onIssueInit(cb: (payload: IssueInit) => void): () => void {
+  initListeners.add(cb);
+  if (initPayload !== null) cb(initPayload);
+  return () => {
+    initListeners.delete(cb);
+  };
+}
+
+/// Hear native switch the language. Not latched: `init` already carries the
+/// language this page opened in, and this is only the changes after it.
+export function onIssueLanguage(cb: (lang: string) => void): () => void {
+  languageListeners.add(cb);
+  return () => {
+    languageListeners.delete(cb);
+  };
+}
 
 function dispatch(item: Buffered): void {
   if (!events) {
@@ -99,10 +133,8 @@ function dispatch(item: Buffered): void {
 }
 
 function deliver(e: IssueEvents, item: Buffered): void {
-  if (item.kind === "init") e.init(item.payload);
-  else if (item.kind === "deliver") e.deliver(item.payload);
+  if (item.kind === "deliver") e.deliver(item.payload);
   else if (item.kind === "bottomInset") e.bottomInset(item.px);
-  else if (item.kind === "language") e.language(item.lang);
   else if (item.kind === "setEditing") e.setEditing(item.active);
   // Every kind needs its own branch ABOVE this terminal else — it is a bare
   // fall-through to `jumpToLatest`, so a missing branch silently turns a new
@@ -111,6 +143,14 @@ function deliver(e: IssueEvents, item: Buffered): void {
   else e.jumpToLatest();
 }
 
+/// Take the card's ONE subscription, and drain what arrived before it.
+///
+/// One holder, and it is the React tree. Nothing else may subscribe: whoever
+/// holds this slot CONSUMES native's stream, so a second listener parked here
+/// — a language shim, a logger — is handed the card's first `deliver` and
+/// drops it on the floor, and no second one is ever sent. The card then sits
+/// on its loading line with the data already in the app, which is what
+/// `deliverBeforeMount.test.tsx` pins.
 export function subscribeIssue(e: IssueEvents): () => void {
   events = e;
   for (const item of buffer.splice(0, buffer.length)) deliver(e, item);
@@ -120,10 +160,15 @@ export function subscribeIssue(e: IssueEvents): () => void {
 }
 
 window.issuePage = {
-  init: (payload) => dispatch({ kind: "init", payload }),
+  init: (payload) => {
+    initPayload = payload;
+    for (const cb of [...initListeners]) cb(payload);
+  },
   deliver: (payload) => dispatch({ kind: "deliver", payload }),
   setBottomInset: (px) => dispatch({ kind: "bottomInset", px }),
-  setLanguage: (lang) => dispatch({ kind: "language", lang }),
+  setLanguage: (lang) => {
+    for (const cb of [...languageListeners]) cb(lang);
+  },
   setEditing: (active) => dispatch({ kind: "setEditing", active }),
   jumpToLatest: () => dispatch({ kind: "jumpToLatest" }),
 };

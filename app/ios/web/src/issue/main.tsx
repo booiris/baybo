@@ -13,18 +13,15 @@ import "katex/dist/katex.min.css";
 import i18n from "../i18n";
 import "../styles.css";
 import "./issue.css";
-import { postIssueReady, subscribeIssue } from "./bridge";
+import { onIssueInit, onIssueLanguage, postIssueReady } from "./bridge";
 import { IssuePage } from "./IssuePage";
 
-// Language is native's to set, exactly as it is for the transcript.
-subscribeIssue({
-  init: (payload) => void i18n.changeLanguage(payload.language),
-  deliver: () => undefined,
-  bottomInset: () => undefined,
-  language: (lang) => void i18n.changeLanguage(lang),
-  setEditing: () => undefined,
-  jumpToLatest: () => undefined,
-});
+// Language is native's to set, exactly as it is for the transcript — and on
+// its OWN listener, never through `subscribeIssue`. That slot has one holder
+// and it is the card: a stub parked there to catch `init` is handed the first
+// `deliver` too, and a `deliver: () => undefined` swallows the card whole.
+onIssueLanguage((lang) => void i18n.changeLanguage(lang));
+onIssueInit((payload) => void i18n.changeLanguage(payload.language));
 
 const root = document.getElementById("issue-root");
 if (!root) throw new Error("issue-root missing");

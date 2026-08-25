@@ -128,6 +128,25 @@ Moving out of In Progress **never kills the run**; Stop is the only kill switch.
 
 - Why the whole body rather than a small webview for the description alone: a webview inside a native ScrollView is two scrollers plus height round-trips, while a full-page webview is exactly `ChatScreen`'s existing layering (header / webview / dock / bottom-inset stream) — and comment markdown, attachments, `#N` links and KaTeX all come free.
 - Shape: a third Vite entry `issue.html`; an `IssueBridge` (the size of `DeckBridge`, with its main-frame-only guard and 3-reloads-per-30s crash budget): native→web `init / deliverIssue / deliverEvents / deliverRuns / setBottomInset / jumpToLatest / blobResult / editDescription`, web→native `ready / pick(field) / openRun / openIssue(n) / requestBlob / viewImage / previewFile / copy / log / descriptionDone`. **Inline images ride the bridge's `requestBlob`/`blobResult` (as the transcript does), so no scheme route is needed**; putting HtmlPreview in the issue body would need `DynamicRoute` widened, which v1 skips. The keyboard: the webview never resizes; native streams the bottom inset (the transcript's mechanism). One host per card, torn down on exit.
+- **`subscribeIssue` has ONE holder, and it is the React tree** (2026-08-25 —
+  shipped broken, fixed same day). `main.tsx` posts `issueReady` on the line
+  after `createRoot().render(…)`, which has only SCHEDULED the tree; native
+  answers in that same main-actor turn with everything it holds (the flushed
+  `pending` evals plus `redeliver()`), and `IssuePage`'s subscribe effect runs
+  ~18 ms later. The `buffer` in `issue/bridge.ts` is what carries the card
+  across that gap — and it only holds while the slot is EMPTY. `main.tsx` had
+  parked a language stub in it whose `deliver` was `() => undefined`, so the
+  card was handed to the stub, dropped, and never re-sent: **"Loading card…"
+  forever, with the card already in the app** (the dock, which reads the same
+  `IssueStore`, drew the blocked banner and the hint the whole time). It looked
+  like a *direct-connection* bug only because the relay leg is slow enough that
+  the fetch usually lands after the tree has subscribed; a mirror on disk
+  reproduces it on any leg. `init` and `setLanguage` now have their own latched
+  listeners (`onIssueInit` / `onIssueLanguage`) — the transcript's shape, which
+  this page had copied everywhere except here. `deliverBeforeMount.test.tsx`
+  imports the real entry module and pins it; a test that mounts `<IssuePage/>`
+  first passes on the broken wiring, which is why the three existing render
+  suites never saw it.
 - The live-run row: running → Stop → **`ConfirmDialog`** (decision 10) "Stop run #k? The card stays where it is. Stopping is the only way to end a run."; held → `@h is held — over the daily token ceiling` + **Run it again** (on a held card the press is what releases it, so it is never greyed out); failed → `✕ Run #k failed — <error>` + Run again. Stop lives only here and in the transcript header, never in a long-press menu.
 - **The hint chip** (native): the **third mirror** of `comments::comment_delivery` (`crates/project/src/comments.rs:37`) and `mentions::assigns_to`; the web's two live in `timelineModel.ts:252` and `mentionModel.ts`. Wording is taken from the web verbatim. The rule is not exposed over REST, so every client re-derives it — which is why it **must** be pinned by golden fixtures shared with app/web (§7).
 - **The approval card**: `ApprovalCardView` unchanged in the dock (`CompactPillButtonStyle` lifted out of its file first), two answers; the pending set is the card's `events` replayed by `call_id` (requested without resolved). The live queue is the truth, so tolerate a 404 on answer.

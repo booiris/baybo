@@ -12,6 +12,7 @@ import { AttachmentBubble } from "../attachments";
 import { currentConnEpoch } from "../bridge";
 import { MarkdownBody } from "../Markdown";
 import {
+  onIssueInit,
   openIssue,
   openRun,
   pickField,
@@ -67,15 +68,18 @@ export function IssuePage() {
   /// theirs: a live payload arriving mid-read must not yank them anywhere.
   const grabbed = useRef(false);
 
+  /// The dock's height at first paint. On its own listener rather than in the
+  /// subscription below, and BEFORE it: the init landed with `ready`, long
+  /// before this tree committed, so it is replayed out of the latch — and it
+  /// has to be applied before the buffered `bottomInset` updates that followed
+  /// it drain, or the oldest number would win.
+  useEffect(() => onIssueInit((p) => setBottomInset(p.bottomInset)), []);
+
   useEffect(
     () =>
       subscribeIssue({
-        init: (p) => setBottomInset(p.bottomInset),
         deliver: (p) => setPayload(p),
         bottomInset: (px) => setBottomInset(px),
-        language: () => {
-          /* i18n is switched by main.tsx, which owns the instance */
-        },
         setEditing: (active) => setEditing(active),
         jumpToLatest: () => {
           const el = scrollRef.current;
