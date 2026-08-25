@@ -300,6 +300,44 @@ The board loads the whole roster's faces once when it arrives, rather than each
 face loading its own — a face knows its blob and nothing about the others, so a
 face-driven fetch is one fetch per drawing by construction.
 
+### 9.3 A card's local cache
+
+A card mirrors its own content (`issue-<project>-<number>.json`) so it paints
+before the network answers — the board's rule, REPLACE and never merge, for
+the board's reason: there is no local state here worth protecting, and a merge
+would only invent ways for the two to disagree.
+
+The timeline rides as its **raw envelope**, the bytes the gateway sent. Its
+only consumer is the webview, and a Swift mirror of it would be a third place
+every new event kind has to be taught about. The team rides along rather than
+being read out of the board's mirror, because a card can be opened without its
+board ever having been — a `#N` link inside another card's prose is a door
+straight to it.
+
+**What a mirrored card may NOT arm.** This is the part worth reading twice:
+
+- **Parked approvals.** A prompt is a live queue entry with a 300s timeout, and
+  one replayed off disk would ask for an answer to something that stopped
+  listening hours ago. `ProjectsStore` refuses to cache prompts at all for
+  exactly this reason; a card caches its timeline (the Activity has to paint)
+  but withholds `pendingApprovals` until a live answer lands.
+- **The live run, and therefore Stop.** A run unsettled when the mirror was
+  written may have finished long ago, and the header's Stop would be offering
+  to end something already over.
+
+Both hang off one flag, `isFromMirror`, cleared by **this fetch's own answer**
+— not by `self.issue != nil`, which is true the moment a mirror loads and would
+arm the live controls off a card the network never confirmed.
+
+Logout deletes every cached card with the board mirrors: one belongs to the
+gateway that served it.
+
+The on-disk shapes moved to `ProjectMirrors.swift` when this became the second
+mirror needing them — a card, its runs and its team are the same records the
+board already writes, and two copies would be two file formats kept identical
+by hand. `IssueMirror` gained an `attachments` field there: the board never
+drew a card's files, so it never wrote them.
+
 ## 10. What shipped, and what did not
 
 Built across P0–P8: the gateway's `approval_pending` and archived-board guard,

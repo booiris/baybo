@@ -561,6 +561,9 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     /// below stay unsupported until a phase has a caller for one.
     private var _stubProjects: [ProjectInfo] = []
     private var _stubIssues: [IssueInfo] = []
+    private var _stubIssueDetail: IssueInfo?
+    private var _stubIssueEventsJson: String?
+    private var _stubRunLog: IssueRunLog?
     private var _stubRuns: [IssueRunInfo] = []
     private var _stubTeam: [TeamMemberInfo] = []
     private var _stubAttention: [ProjectAttention] = []
@@ -575,6 +578,20 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     var stubIssues: [IssueInfo] {
         get { lock.withLock { _stubIssues } }
         set { lock.withLock { _stubIssues = newValue } }
+    }
+    /// One card, for `projectIssueGet` — separate from `stubIssues` (the
+    /// board's list), because a card page reads both for different things.
+    var stubIssueDetail: IssueInfo? {
+        get { lock.withLock { _stubIssueDetail } }
+        set { lock.withLock { _stubIssueDetail = newValue } }
+    }
+    var stubIssueEventsJson: String? {
+        get { lock.withLock { _stubIssueEventsJson } }
+        set { lock.withLock { _stubIssueEventsJson = newValue } }
+    }
+    var stubRunLog: IssueRunLog? {
+        get { lock.withLock { _stubRunLog } }
+        set { lock.withLock { _stubRunLog = newValue } }
     }
     var stubRuns: [IssueRunInfo] {
         get { lock.withLock { _stubRuns } }
@@ -618,7 +635,9 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
         return stubIssues
     }
     func projectIssueGet(projectId: String, number: Int64) async throws -> IssueInfo {
-        throw Self.unsupported
+        try refuseIfOffline()
+        guard let stubIssueDetail else { throw Self.unsupported }
+        return stubIssueDetail
     }
     func projectIssueCreate(projectId: String, new: NewIssue) async throws -> IssueInfo {
         throw Self.unsupported
@@ -634,7 +653,9 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
         return stubRuns
     }
     func projectIssueRuns(projectId: String, number: Int64) async throws -> IssueRunLog {
-        throw Self.unsupported
+        try refuseIfOffline()
+        guard let stubRunLog else { throw Self.unsupported }
+        return stubRunLog
     }
     func projectRunCancel(projectId: String, number: Int64) async throws { throw Self.unsupported }
     func projectRunRetry(projectId: String, number: Int64) async throws -> IssueRunInfo {
@@ -644,7 +665,9 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
         projectId: String, number: Int64, attempt: Int64, beforeOrdinal: Int64?, limit: UInt32?
     ) async throws -> String { throw Self.unsupported }
     func projectIssueEvents(projectId: String, number: Int64) async throws -> String {
-        throw Self.unsupported
+        try refuseIfOffline()
+        guard let stubIssueEventsJson else { throw Self.unsupported }
+        return stubIssueEventsJson
     }
     func projectIssueComment(
         projectId: String, number: Int64, text: String, attachments: [String]

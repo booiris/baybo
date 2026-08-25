@@ -41,7 +41,15 @@ final class IssueStore: ObservableObject, WebMediaTarget {
     @Published var videoPlayback: VideoPlayback?
 
     private let client: any BayboClientProtocol
+    private let supportDirectory: URL
     private weak var bridge: IssueBridge?
+    /// Everything on screen came off DISK and no live fetch has landed yet.
+    ///
+    /// Load-bearing, not cosmetic: a mirrored card may name a prompt that
+    /// timed out hours ago and a run that has long since settled, and both of
+    /// those drive controls that ACT. Content paints from the mirror; anything
+    /// that presses a live queue waits for the network.
+    @Published private(set) var isFromMirror = false
     /// The card is stamped read once its timeline has rendered, and once —
     /// re-stamping per delivery would spend a round trip per comment.
     private var stampedRead = false
@@ -58,11 +66,14 @@ final class IssueStore: ObservableObject, WebMediaTarget {
 
     init(
         projectId: String, number: Int64,
-        client: any BayboClientProtocol = Baybo.client
+        client: any BayboClientProtocol = Baybo.client,
+        supportDirectory: URL = SessionIndex.supportDirectory()
     ) {
         self.projectId = projectId
         self.number = number
         self.client = client
+        self.supportDirectory = supportDirectory
+        loadMirror()
     }
 
     func attach(_ bridge: IssueBridge) {
@@ -105,7 +116,8 @@ final class IssueStore: ObservableObject, WebMediaTarget {
         async let team = try? client.projectTeam(projectId: projectId)
         async let siblings = try? client.projectIssues(projectId: projectId)
 
-        if let fetched = await issue { self.issue = fetched }
+        let fetchedIssue = await issue
+        if let fetchedIssue { self.issue = fetchedIssue }
         if let json = await eventsJson {
             self.eventsJson = json
             events = (try? IssueEvent.decodeList(json)) ?? []
@@ -119,7 +131,64 @@ final class IssueStore: ObservableObject, WebMediaTarget {
         if let fetched = await siblings {
             children = fetched.filter { $0.parent == number }
         }
+        // THIS fetch's own answer, not `self.issue` — that is non-nil the
+        // moment a mirror loads, so reading it would arm the live controls off
+        // a cached card the network never confirmed.
+        if fetchedIssue != nil { isFromMirror = false }
+        persistMirror()
         deliver()
+    }
+
+    // MARK: - Mirror
+    //
+    // REPLACE, never merge — the board's rule, for the board's reason: there
+    // is no local state here worth protecting, and a merge would only invent
+    // ways for the two to disagree.
+
+    private var mirrorURL: URL? {
+        // The project id reaches the filesystem, so it may not name a path;
+        // the number is an Int64 and cannot.
+        guard !projectId.isEmpty, !projectId.contains("/"), !projectId.contains(".") else {
+            return nil
+        }
+        return supportDirectory.appendingPathComponent("issue-\(projectId)-\(number).json")
+    }
+
+    private func loadMirror() {
+        guard let url = mirrorURL, let data = try? Data(contentsOf: url),
+            let mirror = try? JSONDecoder().decode(
+                ProjectsStore.IssueContentMirror.self, from: data)
+        else { return }
+        issue = mirror.issue.info
+        eventsJson = mirror.eventsJson
+        events = (try? IssueEvent.decodeList(mirror.eventsJson)) ?? []
+        runs = mirror.runs.map(\.info)
+        team = mirror.team.map(\.info)
+        children = mirror.children.map(\.info)
+        isFromMirror = true
+    }
+
+    private func persistMirror() {
+        guard let url = mirrorURL, let issue else { return }
+        let mirror = ProjectsStore.IssueContentMirror(
+            issue: ProjectsStore.IssueMirror(info: issue),
+            eventsJson: eventsJson,
+            runs: runs.map(ProjectsStore.RunMirror.init(info:)),
+            team: team.map(ProjectsStore.TeamMirror.init(info:)),
+            children: children.map(ProjectsStore.IssueMirror.init(info:)),
+            fetchedAtMs: Int64(Date().timeIntervalSince1970 * 1000))
+        guard let data = try? JSONEncoder().encode(mirror) else { return }
+        try? data.write(to: url, options: .atomic)
+    }
+
+    /// Drop every cached card. Called with the board mirrors on logout — a
+    /// card belongs to the gateway that served it.
+    static func removeMirrors(in directory: URL = SessionIndex.supportDirectory()) {
+        let fm = FileManager.default
+        guard let names = try? fm.contentsOfDirectory(atPath: directory.path) else { return }
+        for name in names where name.hasPrefix("issue-") && name.hasSuffix(".json") {
+            try? fm.removeItem(at: directory.appendingPathComponent(name))
+        }
     }
 
     /// A frame said this card changed. Scoped refetches would be four separate
@@ -225,12 +294,26 @@ final class IssueStore: ObservableObject, WebMediaTarget {
 
     // MARK: - Derived
 
+    /// The run holding this card, **once a live answer has landed**.
+    ///
+    /// Withheld while the page is showing the mirror: a run that was unsettled
+    /// when this was written may have finished hours ago, and this drives the
+    /// header's Stop — a button that would then be offering to stop something
+    /// already over.
     var liveRun: IssueRunInfo? {
-        runs.first { $0.settledAtMs == nil }
+        guard !isFromMirror else { return nil }
+        return runs.first { $0.settledAtMs == nil }
     }
 
+    /// Prompts parked on this card, **once a live answer has landed**.
+    ///
+    /// Never from the mirror, for the reason the board refuses to cache them
+    /// at all: a prompt is a live queue entry with a 300s timeout, and one
+    /// replayed off disk would offer an answer to something that stopped
+    /// listening hours ago.
     var pendingApprovals: [IssueApprovalPrompt] {
-        IssueTimeline.pendingApprovals(in: events)
+        guard !isFromMirror else { return [] }
+        return IssueTimeline.pendingApprovals(in: events)
     }
 
     /// What sending a comment will do, said before it is sent — the third
