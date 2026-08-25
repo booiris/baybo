@@ -358,16 +358,22 @@ deferred rather than shipped as a profile flag.
 
 `session pin ?? profile pin ?? deployment default`, resolved at actor
 spawn/hydration (not per turn) by `resolve_spawn_pins`, with the existing
-stale-pin tolerance (`warn!` + default). An explicit per-session switch always
-wins; a profile edit reaches sessions that never switched at their next
+stale-pin tolerance (`warn!` + default). An explicit switch on a conversation
+always wins; a profile edit reaches sessions that never switched at their next
 hydration — a cold start or an idle reap.
+
+**A card's run session is outside that precedence**: it is minted per (issue,
+agent) and reused by every later run of that agent on the card, so a pin on it
+would outrank the profile forever. `TriggerSource::can_pin_its_own_llm` is
+false for `Issue`, `resolve_spawn_pins` returns the profile whole for such a
+session, and `PUT /v1/chat/sessions/{id}/model` refuses to write one — so a
+run always starts on whatever the profile says at that moment.
 
 The profile carries the **whole** pin — entry, model-within-entry and
 reasoning rung (`baybo_model::LlmPin`) — not just the entry. It had to grow
-the other two once boards shipped: a card's run is spawned by the board with
-nothing on its session, so a chat header it does not have was the only place
-those two could be set, and every board agent ran its entry's default model at
-its entry's default rung.
+the other two once boards shipped: a card's run carries no session pin, so a
+chat header it does not have was the only place those two could be set, and
+every board agent ran its entry's default model at its entry's default rung.
 
 The fallback granularity differs by level, and the asymmetry is deliberate.
 Entry and model fall back **together**, because a model id is a model *of an
@@ -389,9 +395,9 @@ spawn closure in `crates/baybo/src/runtime.rs` gains two lines of resolution fro
 - `AgentLoopConfig` — the id, from which every `MemoryContext` and
   `ToolContext` the loop mints is stamped.
 
-`initial_llm` resolution reads `session.state.last_llm` at three sites
-(`router/user_input.rs` twice, `router/cron.rs` once); all three now call one
-`resolve_spawn_pins(session, store)` rather than carrying three copies of the
+`initial_llm` resolution happens at six sites (`router/user_input.rs` twice,
+`router/cron.rs` three times, `router/issue.rs` once); all of them call one
+`resolve_spawn_pins(session, store)` rather than carrying six copies of the
 precedence rule. It resolves before the closure, because `route_or_spawn`
 takes a synchronous one and the fallback reads the store — and unbound or
 built-in sessions short-circuit without touching it at all. Nothing else in

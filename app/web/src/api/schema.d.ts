@@ -5340,7 +5340,7 @@ export interface operations {
                     "application/json": components["schemas"]["SetSessionModelResponse"];
                 };
             };
-            /** @description Unknown LLM entry name */
+            /** @description Unknown LLM entry name, or a card's run session, which follows its agent's pin */
             400: {
                 headers: {
                     [name: string]: unknown;
