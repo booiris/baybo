@@ -177,7 +177,9 @@ struct AssigneePicker: View {
 
     private func memberRow(_ member: TeamMemberInfo) -> some View {
         HStack(spacing: 10) {
-            AgentFace(handle: member.handle, monogram: monograms[member.id], lead: member.lead)
+            AgentFace(
+                handle: member.handle, monogram: monograms[member.id],
+                avatarBlobId: member.avatarBlobId, lead: member.lead)
             VStack(alignment: .leading, spacing: 2) {
                 Text(verbatim: "@\(member.handle)")
                     .font(Theme.sys(14, weight: .medium))

@@ -17,10 +17,14 @@ struct IssueCardRow: View {
     let run: IssueRunInfo?
     /// The assignee's handle, resolved by the board (the card carries an id).
     let assigneeHandle: String?
+    /// And its picture, resolved the same way. A row knows a handle and
+    /// nothing about the roster; the board holds both.
+    var assigneeAvatar: String? = nil
     /// The running agent's handle, when a run is on this card and it is NOT
     /// the assignee's — about a third of a working board's runs are
     /// coordination runs, which execute as the lead.
     let runnerHandle: String?
+    var runnerAvatar: String? = nil
     let langCode: String
 
     @ObservedObject private var lang = Lang.shared
@@ -28,13 +32,16 @@ struct IssueCardRow: View {
     let now: Date
 
     init(
-        issue: IssueInfo, run: IssueRunInfo?, assigneeHandle: String?, runnerHandle: String?,
+        issue: IssueInfo, run: IssueRunInfo?, assigneeHandle: String?,
+        assigneeAvatar: String? = nil, runnerHandle: String?, runnerAvatar: String? = nil,
         langCode: String, now: Date = Date()
     ) {
         self.issue = issue
         self.run = run
         self.assigneeHandle = assigneeHandle
+        self.assigneeAvatar = assigneeAvatar
         self.runnerHandle = runnerHandle
+        self.runnerAvatar = runnerAvatar
         self.langCode = langCode
         self.now = now
     }
@@ -171,7 +178,7 @@ struct IssueCardRow: View {
     private var footer: some View {
         HStack(spacing: 6) {
             if let assigneeHandle {
-                AgentFace(handle: assigneeHandle, size: 18)
+                AgentFace(handle: assigneeHandle, avatarBlobId: assigneeAvatar, size: 18)
                 Text(verbatim: "@\(assigneeHandle)")
                     .font(Theme.mono(10.5))
                     .foregroundStyle(Theme.inkSoft)
@@ -186,7 +193,8 @@ struct IssueCardRow: View {
             // is on the work — so whoever is burning the tokens arrives as a
             // face and nothing else.
             if let runnerHandle {
-                AgentFace(handle: runnerHandle, working: true, size: 18)
+                AgentFace(
+                    handle: runnerHandle, avatarBlobId: runnerAvatar, working: true, size: 18)
                     .accessibilityLabel(
                         Text(verbatim: lang.t("board.runningAs", runnerHandle)))
             }

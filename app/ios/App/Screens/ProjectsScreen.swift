@@ -354,6 +354,7 @@ struct TeamFaces: View {
                 AgentFace(
                     handle: member.handle,
                     monogram: monograms[member.id],
+                    avatarBlobId: member.avatarBlobId,
                     lead: member.lead,
                     working: working.contains(member.id))
             }
@@ -374,22 +375,31 @@ struct AgentFace: View {
     /// made unique across it (`AgentMonogram.map`). A face drawn on its own
     /// falls back to the plain rule.
     var monogram: String? = nil
+    /// The agent's uploaded picture, if it has one. Resolved through
+    /// `AgentAvatars` rather than fetched here: a face knows its own blob and
+    /// nothing about the others, so a face-driven fetch is one fetch per
+    /// DRAWING — and a busy board draws the same teammate a dozen times.
+    var avatarBlobId: String? = nil
     var lead: Bool = false
     var working: Bool = false
     var size: CGFloat = AgentFace.defaultSize
 
     static let defaultSize: CGFloat = 22
 
+    @ObservedObject private var avatars = AgentAvatars.shared
+
     private var initials: String { monogram ?? AgentMonogram.of(handle) }
 
+    /// **An uploaded avatar or a monogram, and nothing in between.**
+    ///
+    /// `app/web` fills that gap with a Bottts robot generated from the agent
+    /// id, and this deliberately does not match it: DiceBear is not portable
+    /// to Swift, and a *different* generated face on each device would be
+    /// worse than none — two surfaces claiming to depict the same teammate
+    /// with different pictures. The monogram is honestly "there is no
+    /// picture", and it is derived from the handle printed beside it.
     var body: some View {
-        Text(verbatim: initials)
-            // Three glyphs only happen on a collision, and they have to fit the
-            // same circle — the row's rhythm is the point, not the type size.
-            .font(Theme.mono(size * (initials.count > 2 ? 0.30 : 0.36)))
-            .foregroundStyle(Theme.ink)
-            .frame(width: size, height: size)
-            .background(Theme.paper, in: Circle())
+        picture
             .overlay(
                 Circle().strokeBorder(lead ? Theme.ink : Theme.line, lineWidth: lead ? 1.5 : 1)
             )
@@ -415,5 +425,28 @@ struct AgentFace: View {
                 },
                 alignment: .topTrailing
             )
+            .onAppear { avatars.load(blobId: avatarBlobId) }
+    }
+
+    @ViewBuilder private var picture: some View {
+        if let uploaded = avatars.image(for: avatarBlobId) {
+            uploaded
+                .resizable()
+                // `.fill`, not `.fit`: an avatar that is not square would
+                // otherwise letterbox inside the circle and read as a broken
+                // image rather than a cropped one.
+                .aspectRatio(contentMode: .fill)
+                .frame(width: size, height: size)
+                .clipShape(Circle())
+        } else {
+            Text(verbatim: initials)
+                // Three glyphs only happen on a collision, and they have to fit
+                // the same circle — the row's rhythm is the point, not the type
+                // size.
+                .font(Theme.mono(size * (initials.count > 2 ? 0.30 : 0.36)))
+                .foregroundStyle(Theme.ink)
+                .frame(width: size, height: size)
+                .background(Theme.paper, in: Circle())
+        }
     }
 }

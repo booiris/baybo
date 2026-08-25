@@ -270,6 +270,36 @@ strip, which is bound to `ChatStore`; a card takes files from its own page)
 and `parent`/`stage` (filing a sub-card is a thing you do FROM the parent, and
 there is no parent in view here).
 
+### 9.2 Agents' faces
+
+An agent draws its **uploaded avatar** (`TeamMemberInfo.avatar_blob_id`) when
+it has one, and a monogram when it does not.
+
+**iOS deliberately does not draw the generated face `app/web` shows.** The web
+fills that gap with a Bottts robot seeded on the agent's profile id
+(`components/botttsFace.ts`); DiceBear is not portable to Swift, and a
+*different* generated face on each device would be worse than none — two
+surfaces claiming to depict the same teammate with different pictures. The
+monogram is honestly "there is no picture", and it is derived from the handle
+printed beside it, so the two agree.
+
+`AgentAvatars` is one store for the whole app, keyed by BLOB id:
+
+- **Not a fetch per drawing.** The same teammate appears on every card it owns,
+  in the board's face strip, in the assignee picker, in the filter sheet and on
+  its own profile. `app/web`'s `useTeamPortraits` carries the same comment.
+- **Keyed by blob, not agent.** Replacing an avatar mints a new blob, so a
+  stale picture cannot survive under the agent's key — and two agents sharing
+  one image cost one fetch.
+- **A failure is remembered.** A blob that answered with nothing usable is not
+  retried on every repaint; that agent falls back to the monogram like one that
+  never had a picture.
+- **Logout clears it**, because a blob id means nothing under the next gateway.
+
+The board loads the whole roster's faces once when it arrives, rather than each
+face loading its own — a face knows its blob and nothing about the others, so a
+face-driven fetch is one fetch per drawing by construction.
+
 ## 10. What shipped, and what did not
 
 Built across P0–P8: the gateway's `approval_pending` and archived-board guard,

@@ -177,8 +177,17 @@
         private static func demoMember(_ id: String, _ handle: String, lead: Bool = false)
             -> TeamMemberInfo
         {
-            TeamMemberInfo(
-                id: id, handle: handle, name: handle, description: "", avatarBlobId: nil,
+            // Two of the four carry a picture, so one screenshot shows both
+            // paths: an uploaded avatar and the monogram an agent without one
+            // falls back to.
+            let avatar: String? =
+                switch handle {
+                case "lead": "\(AgentAvatars.demoPrefix)1f6f5b"
+                case "dev-1": "\(AgentAvatars.demoPrefix)c2703a"
+                default: nil
+                }
+            return TeamMemberInfo(
+                id: id, handle: handle, name: handle, description: "", avatarBlobId: avatar,
                 framework: "baybo", llm: "claude", model: "claude-sonnet-5",
                 reasoningEffort: nil, lead: lead, hiredBy: nil, createdAtMs: 0)
         }

@@ -177,7 +177,10 @@ struct NewIssueScreen: View {
         } label: {
             HStack(spacing: 10) {
                 if let handle = assigneeHandle {
-                    AgentFace(handle: handle, size: 22)
+                    AgentFace(
+                        handle: handle,
+                        avatarBlobId: assignee.flatMap { board?.avatarBlobId(forAgent: $0) },
+                        size: 22)
                     Text(verbatim: "@\(handle)")
                         .font(Theme.sys(14))
                         .foregroundStyle(Theme.ink)

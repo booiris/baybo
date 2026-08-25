@@ -1513,6 +1513,10 @@ final class AppStore: ObservableObject {
         // So do the boards: a mirror that outlived a binding is somebody
         // else's account on screen.
         ProjectsStore.removeMirror()
+        // And the agents' faces: a blob id means nothing under the next
+        // gateway, and a cached picture would be a departed account's agent
+        // looking back from the new one's board.
+        AgentAvatars.shared.reset()
         // As does the model catalog — a rebind must not offer the departed
         // gateway's LLM entries.
         ModelCatalog.shared.reset()

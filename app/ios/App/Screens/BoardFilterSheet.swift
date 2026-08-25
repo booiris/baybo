@@ -77,6 +77,7 @@ struct BoardFilterSheet: View {
                                         AgentFace(
                                             handle: member.handle,
                                             monogram: monograms[member.id],
+                                            avatarBlobId: member.avatarBlobId,
                                             lead: member.lead)
                                         Text(verbatim: "@\(member.handle)")
                                             .font(Theme.sys(14))

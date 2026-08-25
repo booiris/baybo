@@ -420,7 +420,10 @@ without touching `app/ios` at all.
   **`-baybo-demo-card`** to land one level deeper again, on a card: that page
   talks to a gateway of its own, so what it shows headlessly is the shell, the
   dock and the streamed inset over the page's own loading line — which is
-  itself the proof that the bridge, the entry and the i18n handoff all work.
+  itself the proof that the bridge, the entry and the i18n handoff all work. Two of the demo board's four teammates carry a
+  `demo-avatar-<hex>` blob, which `AgentAvatars` draws as a flat disc without a
+  gateway — so one screenshot shows both face paths side by side (an uploaded
+  picture and the monogram an agent without one falls back to).
 
 - **`-baybo-demo-switch`** (DEBUG) opens session `demo-a` with a session-tagged
   turn, then switches `chatPath` to `demo-b` at 5s — exercising the single

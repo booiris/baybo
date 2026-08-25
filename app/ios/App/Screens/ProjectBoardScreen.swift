@@ -97,6 +97,13 @@ struct ProjectBoardScreen: View {
             await projects.refreshBoard(projectId)
             await projects.refreshWaitingDetails(board: projectId)
         }
+        // One pass over the roster rather than one fetch per drawing: the same
+        // teammate appears on every card it owns, in the face strip and in
+        // every picker.
+        .onChange(of: board?.team.count) { _, _ in
+            AgentAvatars.shared.load(team: board?.team ?? [])
+        }
+        .onAppear { AgentAvatars.shared.load(team: board?.team ?? []) }
         // A card's run word carries an elapsed, and a board left open with
         // nothing arriving would freeze it at whatever the last fetch said.
         .task {
@@ -228,7 +235,11 @@ struct ProjectBoardScreen: View {
                 issue: issue,
                 run: board?.liveRun(for: issue.number),
                 assigneeHandle: issue.assignee.map { board?.handle(forAgent: $0) ?? $0 },
+                assigneeAvatar: issue.assignee.flatMap { board?.avatarBlobId(forAgent: $0) },
                 runnerHandle: runnerHandle(for: issue),
+                runnerAvatar: board?.liveRun(for: issue.number).flatMap {
+                    board?.avatarBlobId(forAgent: $0.agentId)
+                },
                 langCode: lang.current.lproj,
                 now: now)
         }

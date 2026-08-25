@@ -59,7 +59,9 @@ struct AgentProfileSheet: View {
 
     private var head: some View {
         HStack(spacing: 12) {
-            AgentFace(handle: member.handle, lead: member.lead, size: 40)
+            AgentFace(
+                handle: member.handle, avatarBlobId: member.avatarBlobId,
+                lead: member.lead, size: 40)
             VStack(alignment: .leading, spacing: 3) {
                 Text(verbatim: "@\(member.handle)")
                     .font(Theme.sys(17, weight: .semibold))

@@ -39,6 +39,13 @@ final class ProjectsStore: ObservableObject {
         func handle(forAgent agentId: String) -> String {
             CommentHint.handle(forAgent: agentId, in: team)
         }
+
+        /// The uploaded picture for an agent, if it has one. Looked up here
+        /// rather than in each row: a row knows a handle and nothing about the
+        /// roster, and the board is the one place holding both.
+        func avatarBlobId(forAgent agentId: String) -> String? {
+            team.first { $0.id == agentId }?.avatarBlobId
+        }
     }
 
     @Published private(set) var projects: [ProjectInfo] = []

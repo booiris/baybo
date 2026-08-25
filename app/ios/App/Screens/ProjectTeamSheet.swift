@@ -117,7 +117,9 @@ struct ProjectTeamSheet: View {
 
     private func row(_ member: TeamMemberInfo) -> some View {
         HStack(spacing: 10) {
-            AgentFace(handle: member.handle, monogram: monograms[member.id], lead: member.lead)
+            AgentFace(
+                handle: member.handle, monogram: monograms[member.id],
+                avatarBlobId: member.avatarBlobId, lead: member.lead)
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
                     Text(verbatim: "@\(member.handle)")
