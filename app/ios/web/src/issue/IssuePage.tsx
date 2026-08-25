@@ -163,7 +163,12 @@ export function IssuePage() {
       onPointerDown={() => (grabbed.current = true)}
       style={{ paddingBottom: `${String(bottomInset + 24)}px` }}
     >
-      <IssueHead issue={issue} assigneeHandle={issue.assignee !== undefined ? handle(issue.assignee) : null} />
+      <IssueHead
+        issue={issue}
+        opened={opened}
+        who={who}
+        assigneeHandle={issue.assignee !== undefined ? handle(issue.assignee) : null}
+      />
       {issue.blocked_reason !== undefined && issue.blocked_reason !== "" && (
         <div className="issue-blocked" role="note">
           <span className="issue-blocked-label">{t("issue.blocked")}</span>
@@ -173,8 +178,6 @@ export function IssuePage() {
       {liveRun !== null && <RunRow run={liveRun} who={handle(liveRun.agent_id)} />}
       <Description
         issue={issue}
-        author={opened?.actor ?? null}
-        who={who}
         editing={editing}
         draft={draft}
         onDraft={setDraft}
@@ -201,15 +204,51 @@ export function IssuePage() {
   );
 }
 
+/// Title, the three things you can change, and one thin line of the rest.
+///
+/// **Chips are for controls only.** The row was five identical pills — three
+/// pickers, a branch that opens nothing, a parent link — and four objects of
+/// equal weight saying unrelated things is what made the top of this page
+/// unreadable. What cannot be pressed to change something is not a chip: it
+/// goes on the meta line, at the weight of provenance, which is what it is.
+///
+/// The meta line also absorbed the description's old header (`@who opened
+/// this card · time`): that was a bordered bar with an avatar beside it,
+/// carrying two facts, directly under a title that had just said what the
+/// card is.
 function IssueHead({
   issue,
+  opened,
+  who,
   assigneeHandle,
 }: {
   issue: IssueDetail;
+  opened: IssueEvent | null;
+  who: (id: string) => Person;
   assigneeHandle: string | null;
 }) {
   const { t } = useTranslation();
   const cancelled = issue.cancelled_at_ms !== undefined;
+  const meta: ReactNode[] = [];
+  meta.push(
+    <span key="opened">
+      {t("issue.openedBy", {
+        who: opened === null ? t("issue.system") : speaker(opened.actor, who, t),
+      })}{" "}
+      {shortTime(opened?.created_at_ms ?? issue.created_at_ms)}
+    </span>,
+  );
+  if (issue.branch !== undefined && issue.branch !== "") {
+    meta.push(<span key="branch">⑂ {issue.branch}</span>);
+  }
+  if (issue.parent !== undefined) {
+    meta.push(
+      <button type="button" key="parent" onClick={() => openIssue(issue.parent ?? 0)}>
+        ↳ #{issue.parent}
+      </button>,
+    );
+  }
+
   return (
     <header className="issue-head">
       <h1 className={cancelled ? "cancelled" : undefined}>{issue.title}</h1>
@@ -223,20 +262,25 @@ function IssueHead({
         <button type="button" className="issue-chip" onClick={() => pickField("assignee")}>
           {assigneeHandle !== null ? `@${assigneeHandle}` : t("issue.unassigned")}
         </button>
-        {issue.branch !== undefined && issue.branch !== "" && (
-          <span className="issue-chip static">⑂ {issue.branch}</span>
-        )}
-        {issue.parent !== undefined && (
-          <button type="button" className="issue-chip" onClick={() => openIssue(issue.parent ?? 0)}>
-            ↳ #{issue.parent}
-          </button>
-        )}
+      </div>
+      <div className="issue-meta">
+        {meta.map((item, i) => (
+          <Fragment key={i}>
+            {i > 0 && <span className="issue-meta-dot">·</span>}
+            {item}
+          </Fragment>
+        ))}
       </div>
     </header>
   );
 }
 
-/// The live run's own row: what is happening and how long it has been.
+/// The live run, as ONE LINE — what is happening, who is doing it, and the way
+/// into its transcript.
+///
+/// It was a bordered box, which put a second rectangle between the title and
+/// the card's first sentence. A run is a state, not an object: the line reads
+/// as one.
 function RunRow({ run, who }: { run: IssueRun; who: string }) {
   const { t } = useTranslation();
   return (
@@ -244,7 +288,7 @@ function RunRow({ run, who }: { run: IssueRun; who: string }) {
       <span className="issue-run-word">{t(`issue.run.${run.status}`)}</span>
       <span className="issue-run-who">@{who}</span>
       <button type="button" className="issue-run-open" onClick={() => openRun(run.attempt)}>
-        {t("issue.openRun")}
+        {t("issue.openRun")} ›
       </button>
     </div>
   );
@@ -258,16 +302,12 @@ function RunRow({ run, who }: { run: IssueRun; who: string }) {
 /// list that silently loses its nesting comes from.
 function Description({
   issue,
-  author,
-  who,
   editing,
   draft,
   onDraft,
   onDone,
 }: {
   issue: IssueDetail;
-  author: Actor | null;
-  who: (id: string) => Person;
   editing: boolean;
   draft: string;
   onDraft: (text: string) => void;
@@ -287,30 +327,28 @@ function Description({
     sent.current = true;
   }, [editing]);
 
+  if (editing) {
+    return (
+      <section className="issue-section">
+        <textarea
+          className="issue-editor"
+          value={draft}
+          onChange={(e) => onDraft(e.target.value)}
+          onBlur={() => onDone(draft)}
+          autoFocus
+          spellCheck={false}
+        />
+      </section>
+    );
+  }
+
   return (
-    <section className="issue-section">
-      <Post
-        actor={author}
-        who={who}
-        title={author !== null ? speaker(author, who, t) : t("issue.description")}
-        at={issue.created_at_ms}
-        said={author !== null ? t("issue.eventOpened") : undefined}
-      >
-        {editing ? (
-          <textarea
-            className="issue-editor"
-            value={draft}
-            onChange={(e) => onDraft(e.target.value)}
-            onBlur={() => onDone(draft)}
-            autoFocus
-            spellCheck={false}
-          />
-        ) : issue.description === "" ? (
-          <p className="issue-empty">{t("issue.noDescription")}</p>
-        ) : (
-          <MarkdownBody text={issue.description} />
-        )}
-      </Post>
+    <section className="issue-section issue-body">
+      {issue.description === "" ? (
+        <p className="issue-empty">{t("issue.noDescription")}</p>
+      ) : (
+        <MarkdownBody text={issue.description} />
+      )}
     </section>
   );
 }

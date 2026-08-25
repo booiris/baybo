@@ -42,6 +42,7 @@ const card: IssueDetail = {
   last_run_failed: false,
   approval_pending: false,
   opened_by_agent: false,
+  branch: "issue-7",
   created_at_ms: 1,
   updated_at_ms: 9,
 };
@@ -156,26 +157,38 @@ describe("a comment is a post", () => {
     expect(line?.querySelector(".issue-box")).toBeNull();
   });
 
-  /// The description's head already says who opened the card. Leaving the
-  /// `opened` entry in the Activity as well prints the same fact twice, a
-  /// screen apart — so it is hoisted, not repeated.
-  it("hoists the opening into the description and drops it from the timeline", () => {
+  /// Who opened the card is one line of provenance under the head, not a
+  /// bordered bar with a face beside it — and it is said ONCE: leaving the
+  /// `opened` entry in the Activity too printed the same fact twice, a screen
+  /// apart.
+  it("puts the opening on the meta line and drops it from the timeline", () => {
     mount();
     deliver([opened("e1"), comment("e2", "said")]);
 
-    const head = document.querySelector(".issue-box-head");
-    expect(head?.textContent).toContain("You");
-    expect(head?.textContent).toContain("opened this card");
+    expect(document.querySelector(".issue-meta")?.textContent).toContain("opened by You");
     expect(document.querySelector(".issue-activity")?.textContent).not.toContain("opened this");
   });
 
-  /// A card nobody's timeline records the opening of still has a box, titled
-  /// by what it IS — the alternative was a head reading "board", which is
-  /// what the page did before it had heads at all.
-  it("titles the description by its name when there is no opener", () => {
+  /// **The description is not a post.** It is what the title is about, one
+  /// line above it — so it carries no box, no author bar and no face, and
+  /// every framed thing on the page belongs to somebody who wrote it.
+  it("leaves the card's own text unboxed", () => {
+    mount();
+    deliver([opened("e1"), comment("e2", "said")]);
+
+    expect(document.querySelectorAll(".issue-box")).toHaveLength(1);
+    expect(document.querySelectorAll(".issue-activity .issue-box")).toHaveLength(1);
+    expect(document.querySelector(".issue-body")).not.toBeNull();
+  });
+
+  /// Chips are for CONTROLS. The branch opens nothing and the row was five
+  /// identical pills — four objects of equal weight saying unrelated things.
+  it("keeps the chip row to the three things you can change", () => {
     mount();
     deliver([comment("e2", "said")]);
 
-    expect(document.querySelector(".issue-box-head")?.textContent).toContain("Description");
+    const chips = [...document.querySelectorAll(".issue-chip")].map((c) => c.textContent);
+    expect(chips).toHaveLength(3);
+    expect(chips.join(" ")).not.toContain("⑂");
   });
 });

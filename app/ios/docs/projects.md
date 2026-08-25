@@ -122,7 +122,7 @@ Moving out of In Progress **never kills the run**; Stop is the only kill switch.
 | Layer | Owner | Contents |
 |---|---|---|
 | header | native (`ChatHeaderView` grammar) | back · `#N · status` glass pill (tap → Move sheet) · ⋯ |
-| body | **`issue.html` WKWebView** | title · chips · live-run row · blocked banner · ↳ / ⑂ · **the description as the opening post** · attachments · sub-issues · runs · activity (**posts and lines**, below) · a "New activity" jump pill |
+| body | **`issue.html` WKWebView** | title · three chips · one meta line · live-run line · blocked banner · the description as plain body · attachments · sub-issues · runs · activity (**posts and lines**, below) · a "New activity" jump pill |
 | dock | native, inside the real `ComposerDock` | notice line · `ApprovalCardView` (two answers, REST-backed) · hint chip · staged strip · the chat's composer pill (`+` → attach panel, in-field send) |
 | overlays | native | pickers (`ModelMenuPanel` style) · sheets · `RenameDialog` · `ConfirmDialog` |
 
@@ -133,6 +133,24 @@ Moving out of In Progress **never kills the run**; Stop is the only kill switch.
 - **The approval card**: `ApprovalCardView` unchanged in the dock (`CompactPillButtonStyle` lifted out of its file first), two answers; the pending set is the card's `events` replayed by `call_id` (requested without resolved). The live queue is the truth, so tolerate a 404 on answer.
 - **The Answer flow** (an agent's question): Answer from the Waiting strip or the blocked banner opens the card with the composer focused and `@lead ` prefilled, the hint reading "Answers @lead · unblocking hands the run back to @dev-2", and "Unblock #N after sending" checked by default → `POST comment` first, then `PATCH {blocked_reason: null}` (the unblock door hands the parked run back out, and its brief carries your answer). A block the operator wrote themselves does not get this treatment.
 - **Editing the description (decision 11)**: a ✎ in the Description section header swaps the rendered block for a plain `<textarea>` holding the raw markdown (deliberately not contenteditable), and the native dock becomes "Editing description · Cancel | Done". Done sends the text over the bridge → `PATCH {description}` → re-render. Renaming the title still goes through `RenameDialog` (⋯ → Rename).
+- **Nothing is framed above the Activity** (2026-08-25). The head had grown
+  three stacked rectangles between the title and the card's first sentence —
+  a row of five identical chips, a bordered live-run box, and the description
+  wearing a post's box, avatar and author bar. Each is now the lightest thing
+  that carries its fact:
+  - **Chips are for controls**: status, priority, assignee, and nothing else.
+    A branch opens nothing and a parent is a link, so they moved to the meta
+    line — four objects of equal weight saying unrelated things is what made
+    the top of the page unreadable.
+  - **One meta line** in mono ink-soft: `opened by @who · time · ⑂ branch ·
+    ↳ #parent`. It absorbed the description's old author bar, which sat under
+    a title that had just said what the card is.
+  - **The live run is a line**, not a box, and `Open run ›` is a text link
+    rather than the page's third capsule.
+  - **The description is not a post.** It is what the title is about, one line
+    above it — no box, no face, no head. Every framed thing on the page now
+    belongs to somebody who wrote it, which is what makes the frames mean
+    something.
 - **Posts and lines** (2026-08-25): the card reads as a thread. What somebody
   said — the description included, hoisted into the first box under its
   author's name — is a bordered box with a face beside it and a head reading

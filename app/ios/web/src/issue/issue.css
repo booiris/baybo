@@ -61,7 +61,43 @@
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
-  margin-bottom: 14px;
+  margin-bottom: 6px;
+}
+
+/* Provenance, at the weight provenance deserves: who opened the card and when,
+   the branch, the parent. None of it is a control — the one link here is the
+   parent — so none of it is a chip. */
+.issue-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 5px;
+  margin-bottom: 16px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--color-ink-soft);
+}
+
+.issue-meta button {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--color-ink);
+  background: transparent;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+}
+
+.issue-meta-dot {
+  opacity: 0.5;
+}
+
+/* The card's own text sits directly under the head — no box, no author bar.
+   It is what the title is about, and the title is one line above it. */
+.issue-body {
+  font-family: var(--font-sans);
+  font-size: 0.875rem;
+  line-height: 1.55;
 }
 
 .issue-chip {
@@ -104,14 +140,14 @@
   white-space: nowrap;
 }
 
+/* One LINE, not a box: a run is a state of the card, and a bordered rectangle
+   for it put a second frame between the title and the first sentence. */
 .issue-run {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 10px 12px;
-  margin-bottom: 14px;
-  border: 1px solid var(--color-line);
-  border-radius: var(--radius);
+  padding: 0 0 12px;
+  margin-bottom: 2px;
   font-size: 12.5px;
 }
 
@@ -151,12 +187,13 @@
   text-align: left;
 }
 
+/* The only control on the run LINE, so it reads as one: a bordered pill here
+   put the page's third capsule in the first 120px of it. */
 .issue-run-open {
   margin-left: auto;
-  border: 1px solid var(--color-line);
-  border-radius: 999px;
-  padding: 0 10px;
+  color: var(--color-ink);
   min-height: 32px;
+  padding-left: 10px;
 }
 
 .issue-section {
