@@ -25,6 +25,16 @@ final class IssueStore: ObservableObject, WebMediaTarget {
     /// bytes verbatim — re-encoding through a Swift mirror would be a third
     /// place every new event kind has to be taught about.
     private var eventsJson = "{\"items\":[]}"
+    /// Where the operator stopped reading: the oldest entry they have not
+    /// seen, resolved by the gateway (`IssueTimelineDto.first_unread`).
+    ///
+    /// **Live only**, and never restored from the mirror even though the
+    /// envelope on disk still carries it — the same rule `liveRun` and
+    /// `pendingApprovals` are under, for the same reason. This card was read
+    /// the moment it was last opened, so a boundary replayed off disk points
+    /// at a line the operator has already crossed, and the page would open
+    /// halfway up a thread with a rule promising news that is not there.
+    private(set) var firstUnread: String?
     @Published private(set) var runs: [IssueRunInfo] = []
     @Published private(set) var team: [TeamMemberInfo] = []
     @Published private(set) var children: [IssueInfo] = []
@@ -120,7 +130,10 @@ final class IssueStore: ObservableObject, WebMediaTarget {
         if let fetchedIssue { self.issue = fetchedIssue }
         if let json = await eventsJson {
             self.eventsJson = json
-            events = (try? IssueEvent.decodeList(json)) ?? []
+            let timeline =
+                (try? IssueEvent.decodeTimeline(json)) ?? (events: [], firstUnread: nil)
+            events = timeline.events
+            firstUnread = timeline.firstUnread
         }
         // The log carries totals beside the rows; the page prints the rows and
         // the totals belong to a screen that does not exist yet (P7).
@@ -161,6 +174,8 @@ final class IssueStore: ObservableObject, WebMediaTarget {
         else { return }
         issue = mirror.issue.info
         eventsJson = mirror.eventsJson
+        // The entries, and deliberately not the boundary they were written
+        // with — see `firstUnread`.
         events = (try? IssueEvent.decodeList(mirror.eventsJson)) ?? []
         runs = mirror.runs.map(\.info)
         team = mirror.team.map(\.info)
@@ -217,6 +232,7 @@ final class IssueStore: ObservableObject, WebMediaTarget {
         issue = nil
         events = []
         eventsJson = "{\"items\":[]}"
+        firstUnread = nil
         runs = []
         children = []
         writeError = nil
@@ -407,7 +423,7 @@ final class IssueStore: ObservableObject, WebMediaTarget {
         bridge?.deliver(
             issue: issue, eventsJson: eventsJson, runs: runs,
             handles: Dictionary(team.map { ($0.id, $0.handle) }, uniquingKeysWith: { a, _ in a }),
-            children: children)
+            children: children, firstUnread: firstUnread)
     }
 
     /// Re-send whatever is loaded. Called when the page reports `ready` after

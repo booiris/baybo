@@ -175,23 +175,44 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
 
     func deliver(
         issue: IssueInfo, eventsJson: String, runs: [IssueRunInfo],
-        handles: [String: String], children: [IssueInfo]
+        handles: [String: String], children: [IssueInfo], firstUnread: String?
     ) {
-        let payload: [String: Any] = [
+        page(
+            "deliver",
+            Self.payload(
+                issue: issue, eventsJson: eventsJson, runs: runs, handles: handles,
+                children: children, firstUnread: firstUnread))
+    }
+
+    /// Everything the page draws, as the JSON it is handed.
+    ///
+    /// Split out from `deliver` so the SPLICE below has a test: it is string
+    /// surgery on an encoder's output, and getting it wrong produces valid
+    /// JSON with a field quietly missing rather than anything that fails.
+    static func payload(
+        issue: IssueInfo, eventsJson: String, runs: [IssueRunInfo],
+        handles: [String: String], children: [IssueInfo], firstUnread: String?
+    ) -> String {
+        var payload: [String: Any] = [
             "issue": IssueWire.card(issue),
             "runs": runs.map(IssueWire.run(_:)),
             "handles": handles,
             "children": children.map(IssueWire.child(_:)),
         ]
+        // Omitted rather than sent as null when there is nothing new: the page
+        // latches the first boundary it is given and never clears it, so a
+        // `null` arriving after the card is stamped read must be indistinguish-
+        // able from silence.
+        if let firstUnread { payload["firstUnread"] = firstUnread }
         // The timeline is SPLICED in as the gateway's own bytes rather than
         // re-encoded: its only consumer is the page, and a Swift mirror of it
         // would be a third place every new event kind has to be taught about.
-        var json = Self.jsonObject(payload)
-        if json.hasSuffix("}"), let items = Self.itemsArray(eventsJson) {
+        var json = jsonObject(payload)
+        if json.hasSuffix("}"), let items = itemsArray(eventsJson) {
             json.removeLast()
             json += ",\"events\":\(items)}"
         }
-        page("deliver", json)
+        return json
     }
 
     /// The `items` array out of the timeline envelope, verbatim. Nil when the

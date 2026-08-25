@@ -33,6 +33,15 @@ export type IssuePayload = {
   /// This card's children, from the board. The issue DTO carries only a
   /// done/total COUNT, so listing them needs a source the card itself is not.
   children?: ChildIssue[];
+  /// The entry the operator has not seen yet — `IssueTimelineDto.first_unread`,
+  /// straight off the timeline response. **Resolved server-side** by the same
+  /// predicate the unread badge is counted with, so this page never decides
+  /// what "unread" means; it only decides where to put the rule.
+  ///
+  /// Absent when nothing is new, and absent while the card is painting from
+  /// native's mirror — a cursor read off disk points at a boundary the server
+  /// may have moved hours ago. See `IssueStore.firstUnread`.
+  firstUnread?: string;
 };
 
 export type IssueEvents = {

@@ -43,12 +43,29 @@ struct IssueEvent: Equatable {
     /// the timeline is rendered by the webview, and a native decoder that
     /// threw on a new kind would take the whole card's Activity with it.
     static func decodeList(_ json: String) throws -> [IssueEvent] {
-        guard let data = json.data(using: .utf8) else { return [] }
+        try decodeTimeline(json).events
+    }
+
+    /// The same envelope, read whole: the entries AND `first_unread`, the
+    /// entry the operator has not seen yet.
+    ///
+    /// One pass rather than two calls over the same bytes — a card's timeline
+    /// is the largest thing this app decodes on the main actor, and it is
+    /// re-read on every frame its board sends.
+    ///
+    /// The id is the gateway's answer, never re-derived here: which entries
+    /// count as unread is one rule with one home (`UNREAD_EVENT_PREDICATE`),
+    /// and a second copy of it in this file would put the card page's rule
+    /// somewhere the board's unread badge disagrees with.
+    static func decodeTimeline(_ json: String) throws -> (
+        events: [IssueEvent], firstUnread: String?
+    ) {
+        guard let data = json.data(using: .utf8) else { return ([], nil) }
         let root = try JSONSerialization.jsonObject(with: data)
         guard let object = root as? [String: Any],
             let items = object["items"] as? [[String: Any]]
-        else { return [] }
-        return items.compactMap(IssueEvent.init(item:))
+        else { return ([], nil) }
+        return (items.compactMap(IssueEvent.init(item:)), object["first_unread"] as? String)
     }
 
     init?(item: [String: Any]) {

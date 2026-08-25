@@ -166,4 +166,24 @@ import Testing
         // An entry without an id or a body kind is not one.
         #expect(try IssueEvent.decodeList("{\"items\":[{\"number\":1}]}").isEmpty)
     }
+
+    /// The envelope carries the entries AND where the reader should land in
+    /// them. The id is the gateway's answer — nothing here decides what counts
+    /// as unread, which is why there is no rule to test, only a field to read.
+    @Test func theEnvelopeCarriesWhereTheReaderStopped() throws {
+        let envelope = """
+            {"items":[
+              {"id":"e1","number":1,"created_at_ms":1,"body":{"kind":"comment","text":"old"}},
+              {"id":"e2","number":1,"created_at_ms":2,"body":{"kind":"comment","text":"new"}}
+            ],"first_unread":"e2"}
+            """
+        let timeline = try IssueEvent.decodeTimeline(envelope)
+        #expect(timeline.events.map(\.id) == ["e1", "e2"])
+        #expect(timeline.firstUnread == "e2")
+
+        // Omitted, never null, on a card with nothing new — a gateway that
+        // started sending `null` would read the same here.
+        #expect(try IssueEvent.decodeTimeline("{\"items\":[]}").firstUnread == nil)
+        #expect(try IssueEvent.decodeTimeline("{\"items\":[],\"first_unread\":null}").firstUnread == nil)
+    }
 }

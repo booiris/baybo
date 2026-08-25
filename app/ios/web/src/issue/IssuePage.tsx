@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { AttachmentBubble } from "../attachments";
 import { currentConnEpoch } from "../bridge";
@@ -13,7 +13,7 @@ import {
   subscribeIssue,
   type IssuePayload,
 } from "./bridge";
-import { fold, type Fold } from "./timeline";
+import { fold, foldHead, type Fold } from "./timeline";
 import {
   actorHandle,
   isLiveRun,
@@ -40,6 +40,20 @@ export function IssuePage() {
   const [draft, setDraft] = useState("");
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const renderedFor = useRef<string | null>(null);
+  /// Where the operator stopped reading, FROZEN for the life of this page.
+  ///
+  /// It has to be: painting the card stamps it read (`postIssueRendered`), the
+  /// stamp invalidates the timeline, and the refetch that follows a second
+  /// later answers `first_unread: null` — so a rule that tracked the payload
+  /// would appear and then vanish under the reader, taking the one landmark
+  /// telling them where the new part starts.
+  const [landing, setLanding] = useState<string | null>(null);
+  /// The landing already scrolled to. One scroll per boundary, not per
+  /// delivery — a card refetches on every frame its board sends.
+  const landedOn = useRef<string | null>(null);
+  /// The reader has put a finger on the page. From then on the scroll is
+  /// theirs: a live payload arriving mid-read must not yank them anywhere.
+  const grabbed = useRef(false);
 
   useEffect(
     () =>
@@ -77,6 +91,30 @@ export function IssuePage() {
     postIssueRendered();
   }, [payload]);
 
+  // Latched on the first payload that names one and never cleared — see
+  // `landing`. A second boundary never arrives while this page lives: the only
+  // thing that moves the cursor is opening the card, which already happened.
+  useEffect(() => {
+    const anchor = payload?.firstUnread;
+    if (anchor === undefined) return;
+    setLanding((current) => current ?? anchor);
+  }, [payload?.firstUnread]);
+
+  /// Open the card where the reading stopped, once.
+  ///
+  /// Deliberately after the rule has rendered rather than on the payload: the
+  /// row is found in the DOM, so a boundary naming an entry this page did not
+  /// draw simply leaves the card at the top instead of scrolling into nothing.
+  useEffect(() => {
+    if (landing === null || landedOn.current === landing) return;
+    const el = scrollRef.current;
+    const rule = el?.querySelector<HTMLElement>("[data-unread-rule]");
+    if (!el || !rule) return;
+    landedOn.current = landing;
+    if (grabbed.current) return;
+    rule.scrollIntoView({ block: "start" });
+  }, [landing, payload]);
+
   const onScroll = useCallback(() => {
     const el = scrollRef.current;
     if (!el) return;
@@ -100,6 +138,10 @@ export function IssuePage() {
       className="issue-page"
       ref={scrollRef}
       onScroll={onScroll}
+      // `pointerdown`, not `scroll`: the auto-scroll below fires a scroll of
+      // its own, and a guard that could not tell the two apart would disarm
+      // itself on the very first thing it does.
+      onPointerDown={() => (grabbed.current = true)}
       style={{ paddingBottom: `${String(bottomInset + 24)}px` }}
     >
       <IssueHead issue={issue} assigneeHandle={issue.assignee !== undefined ? handle(issue.assignee) : null} />
@@ -133,7 +175,7 @@ export function IssuePage() {
       )}
       <SubIssues issue={issue} children={payload.children ?? []} />
       <Runs runs={runs} handle={handle} />
-      <Activity events={events} />
+      <Activity events={events} landing={landing} />
     </div>
   );
 }
@@ -309,16 +351,28 @@ function Runs({ runs, handle }: { runs: IssueRun[]; handle: (id: string) => stri
 }
 
 /// The card's Activity: what people said, with the machinery folded away.
-function Activity({ events }: { events: IssueEvent[] }) {
+///
+/// `landing` is where the operator stopped reading, and the rule drawn above
+/// that row is the only thing on this page that says so. It is not a filter:
+/// everything above it is still there, because a card is a record and the
+/// point of arriving mid-thread is to be able to scroll back up out of it.
+function Activity({ events, landing }: { events: IssueEvent[]; landing: string | null }) {
   const { t } = useTranslation();
-  const folded = useMemo(() => fold(events), [events]);
+  const folded = useMemo(() => fold(events, landing ?? undefined), [events, landing]);
   if (folded.length === 0) return null;
   return (
     <section className="issue-section">
       <h2>{t("issue.activity")}</h2>
       <ol className="issue-activity">
         {folded.map((item, i) => (
-          <FoldRow key={rowKey(item, i)} item={item} />
+          <Fragment key={rowKey(item, i)}>
+            {foldHead(item)?.id === landing && (
+              <li className="issue-unread-rule" data-unread-rule>
+                {t("issue.unreadFrom")}
+              </li>
+            )}
+            <FoldRow item={item} />
+          </Fragment>
         ))}
       </ol>
     </section>

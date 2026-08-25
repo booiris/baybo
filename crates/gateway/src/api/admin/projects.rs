@@ -936,6 +936,26 @@ pub struct IssueEventDto {
     pub created_at_ms: i64,
 }
 
+/// A card's timeline, and where the operator's eye should land in it.
+///
+/// Its own envelope rather than [`ListResponse`] because the second field
+/// is the whole point: a client that got only the rows would have to work
+/// out which of them are new from a read cursor and a rule, and that rule
+/// already has a home — see
+/// [`ProjectStore::first_unread_event`](baybo_store::project::ProjectStore::first_unread_event).
+/// Shipping the resolved id is what keeps the divider and the unread badge
+/// two views of one answer instead of two answers.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct IssueTimelineDto {
+    /// Oldest first.
+    pub items: Vec<IssueEventDto>,
+    /// The oldest entry the operator has not seen, by `id`. **Absent** on a
+    /// card with nothing new — which is every card a moment after it is
+    /// opened, because opening one stamps it read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_unread: Option<String>,
+}
+
 /// One line of a board's activity feed. Shaped like a timeline entry
 /// because most lines are one, but `number` is optional: joining the team
 /// is a fact about the board, not about any card, so there is nothing for
@@ -2067,7 +2087,7 @@ async fn project_feed(
         ("number" = i64, Path, description = "Issue number within the project"),
     ),
     responses(
-        (status = 200, description = "This issue's timeline, oldest first", body = inline(ListResponse<IssueEventDto>)),
+        (status = 200, description = "This issue's timeline, oldest first, and where a reader should land in it", body = IssueTimelineDto),
         (status = 401, description = "Unauthorized", body = ErrorBody),
         (status = 404, description = "Unknown project or issue", body = ErrorBody),
     )
@@ -2075,11 +2095,16 @@ async fn project_feed(
 async fn list_issue_events(
     State(state): State<AdminState>,
     Path((project_id, number)): Path<(String, i64)>,
-) -> Result<Json<ListResponse<IssueEventDto>>> {
+) -> Result<Json<IssueTimelineDto>> {
     let id = parse_project_id(&project_id)?;
     let rows = state
         .project_manager
         .timeline(&id, number)
+        .await
+        .map_err(project_err)?;
+    let first_unread = state
+        .project_manager
+        .first_unread_event(&id, number)
         .await
         .map_err(project_err)?;
     let handles = actor_handles(&state, &id, &rows).await;
@@ -2087,7 +2112,10 @@ async fn list_issue_events(
         .into_iter()
         .map(|row| IssueEventDto::with_handles(row, &handles))
         .collect();
-    Ok(Json(ListResponse::new(items)))
+    Ok(Json(IssueTimelineDto {
+        items,
+        first_unread: first_unread.map(|id| id.as_str().to_owned()),
+    }))
 }
 
 #[utoipa::path(

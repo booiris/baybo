@@ -83,6 +83,29 @@ struct IssueMirrorTests {
         #expect(second.pendingApprovals.isEmpty, "but nothing may be answered from disk")
     }
 
+    /// And the same rule for where the card opens. The envelope on disk still
+    /// carries the boundary it was fetched with, and replaying it would open
+    /// the card halfway up a thread under a rule promising news that is not
+    /// there — this card was read the moment it was last opened.
+    @Test func aMirroredCardOpensAtTheTopRatherThanAtAStaleBoundary() async {
+        let dir = TempSupportDir()
+        let fake = FakeBayboClient()
+        fake.stubIssueDetail = issue(41)
+        fake.stubIssueEventsJson = """
+            {"items":[{"id":"e1","number":41,"created_at_ms":1,"body":{"kind":"comment","text":"hi"}}],
+             "first_unread":"e1"}
+            """
+        let first = IssueStore(
+            projectId: "p1", number: 41, client: fake, supportDirectory: dir.url)
+        await first.refresh()
+        #expect(first.firstUnread == "e1", "live, the card lands where the reading stopped")
+
+        let second = IssueStore(
+            projectId: "p1", number: 41, client: FakeBayboClient(), supportDirectory: dir.url)
+        #expect(second.events.count == 1, "the timeline still paints")
+        #expect(second.firstUnread == nil, "but the boundary waits for the network")
+    }
+
     /// Same rule for Stop: a run unsettled when this was written may have
     /// finished hours ago, and the header's Stop would be offering to end
     /// something already over.

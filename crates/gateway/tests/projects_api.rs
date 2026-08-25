@@ -865,6 +865,90 @@ async fn a_run_can_be_stopped_and_started_again() {
     .await;
 }
 
+/// A card's timeline says where the reader should land, and the id it
+/// names is one of the rows it just shipped.
+///
+/// The client is handed the resolved entry rather than the read cursor on
+/// purpose: deciding which rows are new is one rule, it already lives in
+/// the store, and a second copy of it in a client would draw its divider
+/// somewhere the unread badge disagrees with. The agent comments are
+/// planted through the store for the reason `one_press_reads_every_card`
+/// explains — the endpoint speaks as the operator, and the operator's own
+/// words are never unread.
+#[tokio::test]
+async fn a_timeline_says_where_to_land_in_it() {
+    let (router, tg) = router().await;
+    let p = open_project(&router, "landing").await;
+    seed_teammate(&tg, &p, "dev-1").await;
+    let project_id = baybo_model::ProjectId::parse(p.clone()).expect("project id");
+    let number = open_issue(&router, &p, "long thread").await;
+    let issue = tg
+        .deps
+        .stores
+        .project
+        .get_issue(&project_id, number)
+        .await
+        .expect("issue")
+        .expect("issue row");
+
+    let timeline = |router: axum::Router| {
+        let path = format!("/v1/projects/{p}/issues/{number}/events");
+        async move { get(&router, &path, StatusCode::OK).await }
+    };
+
+    let opened = timeline(router.clone()).await;
+    assert!(
+        opened["first_unread"].is_null(),
+        "a card whose only entry is the operator opening it has nothing new"
+    );
+
+    for text in ["the first new one", "and a later one"] {
+        tg.deps
+            .stores
+            .project
+            .append_event(&baybo_store::project::NewIssueEvent {
+                issue_id: issue.id.clone(),
+                project_id: project_id.clone(),
+                number,
+                actor: baybo_store::project::IssueActor::Agent(
+                    baybo_model::AgentProfileId::parse("dev-1").expect("agent id"),
+                ),
+                body: baybo_store::project::IssueEventBody::Comment {
+                    text: text.into(),
+                    attachments: Vec::new(),
+                },
+            })
+            .await
+            .expect("agent comment");
+    }
+
+    let body = timeline(router.clone()).await;
+    let landing = body["first_unread"].as_str().expect("first_unread");
+    let items = body["items"].as_array().expect("items");
+    let landed = items
+        .iter()
+        .find(|item| item["id"].as_str() == Some(landing))
+        .expect("the id names a row the same response shipped");
+    assert_eq!(
+        landed["body"]["text"].as_str(),
+        Some("the first new one"),
+        "the oldest unread one, so the new run reads downward"
+    );
+
+    post(
+        &router,
+        &format!("/v1/projects/{p}/issues/{number}/read"),
+        json!({}),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    let read = timeline(router.clone()).await;
+    assert!(
+        read["first_unread"].is_null(),
+        "opening the card leaves nothing to land on"
+    );
+}
+
 /// One press, and every card on the board comes back at zero.
 ///
 /// The agent comments are planted through the store because the comment

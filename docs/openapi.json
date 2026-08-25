@@ -5879,56 +5879,11 @@
         ],
         "responses": {
           "200": {
-            "description": "This issue's timeline, oldest first",
+            "description": "This issue's timeline, oldest first, and where a reader should land in it",
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "description": "Envelope for list endpoints. `next_cursor` is opaque — clients\npass it back as `?cursor=` to fetch the next page, and treat\n`None` as \"no more pages.\" The cursor's internal scheme may change\nacross releases; clients must not parse it.",
-                  "required": [
-                    "items"
-                  ],
-                  "properties": {
-                    "items": {
-                      "type": "array",
-                      "items": {
-                        "type": "object",
-                        "description": "One entry on an issue's timeline.",
-                        "required": [
-                          "id",
-                          "number",
-                          "actor",
-                          "body",
-                          "created_at_ms"
-                        ],
-                        "properties": {
-                          "actor": {
-                            "$ref": "#/components/schemas/ActorDto"
-                          },
-                          "body": {
-                            "$ref": "#/components/schemas/IssueEventBodyDto"
-                          },
-                          "created_at_ms": {
-                            "type": "integer",
-                            "format": "int64"
-                          },
-                          "id": {
-                            "type": "string"
-                          },
-                          "number": {
-                            "type": "integer",
-                            "format": "int64"
-                          }
-                        }
-                      }
-                    },
-                    "next_cursor": {
-                      "type": [
-                        "string",
-                        "null"
-                      ]
-                    }
-                  }
+                  "$ref": "#/components/schemas/IssueTimelineDto"
                 }
               }
             }
@@ -10346,6 +10301,29 @@
           "review",
           "done"
         ]
+      },
+      "IssueTimelineDto": {
+        "type": "object",
+        "description": "A card's timeline, and where the operator's eye should land in it.\n\nIts own envelope rather than [`ListResponse`] because the second field\nis the whole point: a client that got only the rows would have to work\nout which of them are new from a read cursor and a rule, and that rule\nalready has a home — see\n[`ProjectStore::first_unread_event`](baybo_store::project::ProjectStore::first_unread_event).\nShipping the resolved id is what keeps the divider and the unread badge\ntwo views of one answer instead of two answers.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "first_unread": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The oldest entry the operator has not seen, by `id`. **Absent** on a\ncard with nothing new — which is every card a moment after it is\nopened, because opening one stamps it read."
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/IssueEventDto"
+            },
+            "description": "Oldest first."
+          }
+        }
       },
       "ListResponse_SlashCommandEntry": {
         "type": "object",

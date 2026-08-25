@@ -2420,6 +2420,7 @@ forwards_everything_else! {
     enqueue_run(new: &NewIssueRun) -> StoreResult<IssueRunRow>;
     append_event(new: &NewIssueEvent) -> StoreResult<IssueEventRow>;
     list_events(issue: &IssueId) -> StoreResult<Vec<IssueEventRow>>;
+    first_unread_event(issue: &IssueId) -> StoreResult<Option<baybo_model::IssueEventId>>;
     agent_opened_issues(project: &ProjectId) -> StoreResult<Vec<i64>>;
     events_since(issue: &IssueId, since: DateTime<Utc>) -> StoreResult<Vec<IssueEventRow>>;
     set_issue_branch(id: &IssueId, branch: &str) -> StoreResult<bool>;

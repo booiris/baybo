@@ -106,6 +106,43 @@ import Testing
         #expect(Set(wire.keys) == ["number", "title", "status", "cancelled_at_ms"])
     }
 
+    /// The timeline rides through as the gateway's own bytes, spliced beside
+    /// the encoded half — and `first_unread`, which arrives on that envelope,
+    /// has to survive the splice as `firstUnread` or the card page loses the
+    /// one thing telling it where the reading stopped.
+    ///
+    /// String surgery on an encoder's output: getting it wrong yields valid
+    /// JSON with a field quietly missing, which is exactly the failure nothing
+    /// downstream reports.
+    @MainActor
+    @Test func theTimelineIsSplicedInWholeWithItsUnreadBoundary() throws {
+        let envelope = """
+            {"items":[{"id":"e1","number":41,"created_at_ms":1,\
+            "body":{"kind":"swimlane_changed","lane":"fast"}}],"first_unread":"e1"}
+            """
+        let json = IssueBridge.payload(
+            issue: issue(), eventsJson: envelope, runs: [], handles: ["a-dev": "dev-1"],
+            children: [], firstUnread: "e1")
+        let decoded =
+            try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any] ?? [:]
+
+        #expect(decoded["firstUnread"] as? String == "e1")
+        let events = decoded["events"] as? [[String: Any]] ?? []
+        #expect(events.count == 1)
+        // A kind this build has never heard of arrives intact, which is the
+        // whole point of splicing rather than re-encoding through a mirror.
+        #expect((events.first?["body"] as? [String: Any])?["lane"] as? String == "fast")
+
+        let quiet = IssueBridge.payload(
+            issue: issue(), eventsJson: envelope, runs: [], handles: [:], children: [],
+            firstUnread: nil)
+        let quietly =
+            try JSONSerialization.jsonObject(with: Data(quiet.utf8)) as? [String: Any] ?? [:]
+        #expect(
+            quietly["firstUnread"] == nil,
+            "absent, never null — the page latches the first boundary it is given")
+    }
+
     /// The whole payload must survive `JSONSerialization` — it is spliced into
     /// an `evaluateJavaScript` string, and a value that cannot encode would
     /// silently produce `{}` and a page that never paints.

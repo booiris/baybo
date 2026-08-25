@@ -53,6 +53,10 @@ export const en = {
       subIssues: "Sub-issues",
       runs: "Runs",
       activity: "Activity",
+      /// The rule the card opens at. Deliberately not a count: the badge that
+      /// sent the operator here already said how many, and a second tally that
+      /// could disagree with it is worse than no tally.
+      unreadFrom: "New",
       openRun: "Open run",
       unassigned: "Unassigned",
       blocked: "Blocked",

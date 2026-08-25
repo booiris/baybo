@@ -2994,6 +2994,27 @@ export interface components {
          */
         IssueStatusDto: "backlog" | "todo" | "in_progress" | "review" | "done";
         /**
+         * @description A card's timeline, and where the operator's eye should land in it.
+         *
+         *     Its own envelope rather than [`ListResponse`] because the second field
+         *     is the whole point: a client that got only the rows would have to work
+         *     out which of them are new from a read cursor and a rule, and that rule
+         *     already has a home — see
+         *     [`ProjectStore::first_unread_event`](baybo_store::project::ProjectStore::first_unread_event).
+         *     Shipping the resolved id is what keeps the divider and the unread badge
+         *     two views of one answer instead of two answers.
+         */
+        IssueTimelineDto: {
+            /**
+             * @description The oldest entry the operator has not seen, by `id`. **Absent** on a
+             *     card with nothing new — which is every card a moment after it is
+             *     opened, because opening one stamps it read.
+             */
+            first_unread?: string | null;
+            /** @description Oldest first. */
+            items: components["schemas"]["IssueEventDto"][];
+        };
+        /**
          * @description Envelope for list endpoints. `next_cursor` is opaque — clients
          *     pass it back as `?cursor=` to fetch the next page, and treat
          *     `None` as "no more pages." The cursor's internal scheme may change
@@ -8319,24 +8340,13 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description This issue's timeline, oldest first */
+            /** @description This issue's timeline, oldest first, and where a reader should land in it */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        items: {
-                            actor: components["schemas"]["ActorDto"];
-                            body: components["schemas"]["IssueEventBodyDto"];
-                            /** Format: int64 */
-                            created_at_ms: number;
-                            id: string;
-                            /** Format: int64 */
-                            number: number;
-                        }[];
-                        next_cursor?: string | null;
-                    };
+                    "application/json": components["schemas"]["IssueTimelineDto"];
                 };
             };
             /** @description Unauthorized */

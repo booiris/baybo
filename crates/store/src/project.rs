@@ -773,6 +773,19 @@ pub trait ProjectStore: Send + Sync {
 
     async fn list_events(&self, issue: &IssueId) -> Result<Vec<IssueEventRow>>;
 
+    /// The oldest entry on this card the operator has not seen — where a
+    /// reader opening it should land. `None` on a card with nothing new,
+    /// which is every card a moment after it is opened.
+    ///
+    /// Answered **here**, off the same predicate
+    /// [`CardSignals::unread`] is counted with, rather than by handing a
+    /// client the read cursor and the timeline and letting it work out
+    /// which rows are new. That is one rule — "what counts as unread" —
+    /// and a second copy of it in a client would put the divider
+    /// somewhere the badge disagrees with. The client gets the resolved
+    /// id and nothing to derive.
+    async fn first_unread_event(&self, issue: &IssueId) -> Result<Option<IssueEventId>>;
+
     async fn events_since(
         &self,
         issue: &IssueId,

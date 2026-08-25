@@ -56,6 +56,7 @@ export const zh: typeof en = {
       subIssues: "子任务",
       runs: "运行记录",
       activity: "动态",
+      unreadFrom: "新动态",
       openRun: "查看运行",
       unassigned: "未指派",
       blocked: "已阻塞",

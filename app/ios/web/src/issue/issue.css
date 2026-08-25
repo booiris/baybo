@@ -284,3 +284,29 @@
   color: var(--color-ink-soft);
   min-height: 32px;
 }
+
+/* Where the operator stopped reading. The one red thing on this page besides a
+   failed run — the same hue the card row's unread count wears, because it marks
+   the same fact and a second colour for it would read as a second fact. */
+.issue-unread-rule {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 14px 0 2px;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--color-err);
+  /* Scrolled to the TOP of the viewport, so the rule needs the page's own top
+     padding under the floating native header cleared or it lands beneath it. */
+  scroll-margin-top: calc(env(safe-area-inset-top, 0px) + 70px);
+}
+
+.issue-unread-rule::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--color-err);
+  opacity: 0.35;
+}

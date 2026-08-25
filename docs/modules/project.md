@@ -1742,7 +1742,13 @@ home of these rules:
   filter covers all three arms: the operator's own words, their own block and
   their own tidying are not news to them. An agent's block joins the other two
   because it is a decision the operator did not make, and on a blocked card it
-  is usually a question that gates the work.
+  is usually a question that gates the work. Two readers, one predicate:
+  `card_signals()` counts the matching rows, and `first_unread_event()` takes
+  the oldest of them — the entry a client should open the card at. That second
+  one exists so no client has to be told what "unread" means: handed the
+  cursor and the rows instead, it would answer the question a second time, and
+  its divider and this badge would be free to disagree. `GET
+  …/issues/{n}/events` ships it as `IssueTimelineDto.first_unread`.
 - `FAILED_CARD_PREDICATE` — a live card whose newest run failed. Both
   `card_signals()` (the badge) and `attention()` read it.
 - `UNSEEN_FAILURE_PREDICATE` — and that run settled after `read_at`.

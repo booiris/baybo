@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use baybo_model::{
-    AgentFramework, AgentHandle, AgentProfileId, IssueId, IssueRunId, MAX_PROJECT_NAME_CHARS,
-    ProjectId, SessionId, TeamMembership,
+    AgentFramework, AgentHandle, AgentProfileId, IssueEventId, IssueId, IssueRunId,
+    MAX_PROJECT_NAME_CHARS, ProjectId, SessionId, TeamMembership,
 };
 use baybo_store::project::{
     BoardCards, DEFAULT_MAX_PARALLEL_ISSUE_RUNS, IssueActor, IssueEventBody, IssueEventRow,
@@ -1803,6 +1803,23 @@ impl ProjectManager {
     pub async fn timeline(&self, project: &ProjectId, number: i64) -> Result<Vec<IssueEventRow>> {
         let issue = self.get_issue(project, number).await?;
         Ok(self.store.list_events(&issue.id).await?)
+    }
+
+    /// Where a reader opening this card should land: its oldest entry the
+    /// operator has not seen, or `None` on a card with nothing new.
+    ///
+    /// The resolved id, never the read cursor — see
+    /// [`ProjectStore::first_unread_event`](baybo_store::project::ProjectStore::first_unread_event).
+    /// A client handed the cursor would decide for itself which rows are
+    /// new, and the divider it drew would be free to disagree with the
+    /// unread badge that sent the operator here.
+    pub async fn first_unread_event(
+        &self,
+        project: &ProjectId,
+        number: i64,
+    ) -> Result<Option<IssueEventId>> {
+        let issue = self.get_issue(project, number).await?;
+        Ok(self.store.first_unread_event(&issue.id).await?)
     }
 
     /// Every run of one issue, newest first. The unpriced read, for callers

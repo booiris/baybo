@@ -133,6 +133,30 @@ Moving out of In Progress **never kills the run**; Stop is the only kill switch.
 - **The Answer flow** (an agent's question): Answer from the Waiting strip or the blocked banner opens the card with the composer focused and `@lead ` prefilled, the hint reading "Answers @lead · unblocking hands the run back to @dev-2", and "Unblock #N after sending" checked by default → `POST comment` first, then `PATCH {blocked_reason: null}` (the unblock door hands the parked run back out, and its brief carries your answer). A block the operator wrote themselves does not get this treatment.
 - **Editing the description (decision 11)**: a ✎ in the Description section header swaps the rendered block for a plain `<textarea>` holding the raw markdown (deliberately not contenteditable), and the native dock becomes "Editing description · Cancel | Done". Done sends the text over the bridge → `PATCH {description}` → re-render. Renaming the title still goes through `RenameDialog` (⋯ → Rename).
 - `POST …/read` fires only after the timeline renders successfully, then attention is refetched.
+- **The card opens where the reading stopped.** `GET …/events` answers
+  `IssueTimelineDto { items, first_unread }`; the page draws a red `NEW` rule
+  above that entry and `scrollIntoView`s it (clearing the floating header via
+  `scroll-margin-top`, not a magic offset). Everything above it is still there —
+  a card is a record, and arriving mid-thread has to be scrollable out of.
+  Three things make it behave:
+  - **The boundary is the server's.** `first_unread` is resolved by
+    `ProjectStore::first_unread_event`, off the same `UNREAD_EVENT_PREDICATE`
+    the unread badge is counted with, so the rule and the badge cannot
+    disagree. Neither client re-derives it — §4's last row, applied to a
+    position instead of a count.
+  - **The page freezes it.** Painting the card stamps it read, which
+    invalidates the timeline, whose refetch answers with no boundary at all —
+    a rule that tracked the payload would vanish a second after the reader
+    arrived. Native mirrors that: `firstUnread` is **live-only**, never
+    restored from the mirror (the same rule as `liveRun` and
+    `pendingApprovals`), because a boundary replayed off disk points at a line
+    already crossed.
+  - **A finger wins.** The mirror paints first and the live answer lands a
+    moment later; a `pointerdown` before it does disarms the scroll and leaves
+    the rule.
+  - The fold splits at the boundary (`fold(events, breakBefore)`): a group is
+    drawn at its first member, so a swallowed boundary would put `NEW` above
+    entries read yesterday.
 
 ### 3.4 Run transcript (sheet)
 

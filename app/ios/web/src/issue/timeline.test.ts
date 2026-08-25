@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { agentQuestion, fold, isAlwaysShown, pendingApprovals } from "./timeline";
+import { agentQuestion, fold, foldHead, isAlwaysShown, pendingApprovals, type Fold } from "./timeline";
 import type { Actor, IssueEvent } from "./types";
 
 function event(id: string, kind: string, extra: Record<string, unknown> = {}, actor: Actor = { kind: "system" }): IssueEvent {
@@ -41,6 +41,37 @@ describe("activity fold", () => {
 
   it("an empty timeline folds to nothing", () => {
     expect(fold([])).toEqual([]);
+  });
+
+  /// The unread rule is drawn above a fold, and a fold is drawn at its first
+  /// member — so a boundary swallowed mid-group would put "New" above entries
+  /// the operator read yesterday.
+  it("splits a run of machinery at the unread boundary", () => {
+    const events = [
+      event("e1", "moved", { from: "todo", to: "in_progress" }),
+      event("e2", "run_started", { attempt: 1 }),
+      event("e3", "run_settled", { attempt: 1, status: "done" }),
+    ];
+    expect(fold(events).map((f) => f.kind)).toEqual(["system"]);
+
+    const split = fold(events, "e2");
+    expect(split).toHaveLength(2);
+    expect(split[0]?.kind === "system" && split[0].events.map((e) => e.id)).toEqual(["e1"]);
+    expect(split[1]?.kind === "system" && split[1].events.map((e) => e.id)).toEqual(["e2", "e3"]);
+  });
+
+  it("names the row a fold is drawn at, which is what the rule anchors to", () => {
+    const machinery = fold([event("e1", "moved"), event("e2", "run_started")]);
+    expect(foldHead(machinery[0] as Fold)?.id).toBe("e1");
+    const comment = fold([event("e9", "comment", { text: "hi" }, agent("dev-1"))]);
+    expect(foldHead(comment[0] as Fold)?.id).toBe("e9");
+  });
+
+  /// A boundary naming an entry that is not here — a response the page never
+  /// drew, a card resynced mid-read — folds exactly as if none was given.
+  it("an unknown boundary changes nothing", () => {
+    const events = [event("e1", "moved"), event("e2", "run_started")];
+    expect(fold(events, "e404")).toEqual(fold(events));
   });
 });
 

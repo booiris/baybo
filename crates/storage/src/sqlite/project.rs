@@ -1402,6 +1402,39 @@ impl ProjectStore for SqliteProjectStore {
         self.events_query(issue.as_str().to_string(), None).await
     }
 
+    async fn first_unread_event(
+        &self,
+        issue: &IssueId,
+    ) -> Result<Option<baybo_model::IssueEventId>> {
+        let issue = issue.as_str().to_string();
+        let review_status = IssueStatus::Review.as_str();
+        let id = self
+            .pool
+            .interact("issue_events.first_unread", move |conn| {
+                Ok(conn
+                    .query_row(
+                        // `UNREAD_EVENT_PREDICATE` verbatim, and the ordering
+                        // `events_query` lists with — "the first unread one"
+                        // has to mean the first one the page will draw, not
+                        // the first one some other sort would have put there.
+                        &format!(
+                            "SELECT e.id FROM issue_events e \
+                             JOIN issues i ON i.id = e.issue_id \
+                             WHERE e.issue_id = :issue AND {UNREAD_EVENT_PREDICATE} \
+                             ORDER BY e.created_at, e.id LIMIT 1"
+                        ),
+                        rusqlite::named_params! {
+                            ":issue": issue,
+                            ":review": review_status,
+                        },
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?)
+            })
+            .await?;
+        Ok(id.map(baybo_model::IssueEventId::from))
+    }
+
     async fn events_since(
         &self,
         issue: &IssueId,
@@ -3808,6 +3841,111 @@ mod tests {
             store.spend_since(&p.id, since).await.unwrap(),
             spent,
             "a restart does not refund the board"
+        );
+    }
+
+    /// Where a reader opening a card should land: the OLDEST entry it has
+    /// not seen, chosen by the same predicate the unread badge counts with.
+    ///
+    /// The two must not be able to disagree — a badge saying 2 over a
+    /// divider drawn above the operator's own comment is a card that
+    /// contradicts itself — which is why the id is resolved here rather
+    /// than by a client handed the cursor and the rows.
+    #[tokio::test]
+    async fn a_card_opens_at_the_oldest_thing_the_operator_has_not_seen() {
+        let (_dir, store) = store().await;
+        let dev = IssueActor::Agent(AgentProfileId::parse("dev-1").unwrap());
+        let p = project("01JFIRSTUNREAD", "Landing");
+        store.create_project(&p).await.unwrap();
+        let issue = store
+            .create_issue(&new_issue(&p.id, "long thread", IssueStatus::Todo))
+            .await
+            .unwrap();
+
+        let comment = |text: &str| IssueEventBody::Comment {
+            text: text.to_owned(),
+            attachments: Vec::new(),
+        };
+
+        store
+            .append_event(&event(&issue, dev.clone(), comment("read this one")))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.first_unread_event(&issue.id).await.unwrap(),
+            Some(
+                store
+                    .list_events(&issue.id)
+                    .await
+                    .unwrap()
+                    .first()
+                    .unwrap()
+                    .id
+                    .clone()
+            ),
+            "a card nobody has opened has read nothing"
+        );
+
+        store
+            .mark_issue_read(&issue.id, chrono::Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            store.first_unread_event(&issue.id).await.unwrap(),
+            None,
+            "and opening it leaves nothing to land on"
+        );
+
+        // The operator's own comment is not news to the operator, and a
+        // system entry is machinery — neither is what the badge counts, so
+        // neither may be what the divider sits above.
+        store
+            .append_event(&event(&issue, IssueActor::User, comment("mine")))
+            .await
+            .unwrap();
+        store
+            .append_event(&event(
+                &issue,
+                IssueActor::System,
+                IssueEventBody::Moved {
+                    from: IssueStatus::Todo,
+                    to: IssueStatus::InProgress,
+                },
+            ))
+            .await
+            .unwrap();
+        assert_eq!(store.first_unread_event(&issue.id).await.unwrap(), None);
+
+        store
+            .append_event(&event(&issue, dev.clone(), comment("the first new one")))
+            .await
+            .unwrap();
+        store
+            .append_event(&event(&issue, dev.clone(), comment("and a later one")))
+            .await
+            .unwrap();
+        let landed = store.first_unread_event(&issue.id).await.unwrap();
+        let rows = store.list_events(&issue.id).await.unwrap();
+        let expected = rows
+            .iter()
+            .find(|row| {
+                matches!(&row.body, IssueEventBody::Comment { text, .. } if text == "the first new one")
+            })
+            .unwrap();
+        assert_eq!(
+            landed.as_ref(),
+            Some(&expected.id),
+            "the oldest unread one, so the new run reads downward"
+        );
+        assert_eq!(
+            store
+                .card_signals(&p.id)
+                .await
+                .unwrap()
+                .get(&issue.id)
+                .map(|signals| signals.unread),
+            Some(2),
+            "and the badge counts the same set the divider was placed by"
         );
     }
 

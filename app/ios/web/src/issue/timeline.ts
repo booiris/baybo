@@ -34,7 +34,12 @@ export function isAlwaysShown(event: IssueEvent): boolean {
   return ALWAYS_SHOWN.has(event.body.kind);
 }
 
-export function fold(events: IssueEvent[]): Fold[] {
+/// `breakBefore` is the entry the unread rule sits above: a fold that swallowed
+/// it would put the rule above entries the operator has already read, since a
+/// group is drawn at the position of its first member. Splitting there costs
+/// one extra collapsed row in the rare case the boundary falls inside a run of
+/// machinery, and buys a rule that means exactly what it says.
+export function fold(events: IssueEvent[], breakBefore?: string): Fold[] {
   const out: Fold[] = [];
   for (const event of events) {
     if (isAlwaysShown(event)) {
@@ -46,13 +51,18 @@ export function fold(events: IssueEvent[]): Fold[] {
     // present even on an empty array, so the `?.` the empty case actually
     // needs reads to the linter as dead code.
     const last = out.length > 0 ? out[out.length - 1] : undefined;
-    if (last?.kind === "system") {
+    if (last?.kind === "system" && event.id !== breakBefore) {
       last.events = [...last.events, event];
     } else {
       out.push({ kind: "system", events: [event] });
     }
   }
   return out;
+}
+
+/// The row a `Fold` is drawn at, which is what the unread rule anchors to.
+export function foldHead(item: Fold): IssueEvent | undefined {
+  return item.kind === "entry" ? item.event : item.events[0];
 }
 
 /// Prompts requested and not yet resolved, oldest first.
