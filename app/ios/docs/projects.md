@@ -62,7 +62,7 @@ Projects tab root = Projects cards (wordmark header, tab bar visible)
  ├─ one card per project (most recent first) · dashed "New project" card · Show archived
  ├─ zero projects → empty state
  └─ tap a card → Board (push, covers the tab bar)
-      ├─ header: [←] project name … [+ new issue] [⋯]
+      ├─ header: [←] project name … [✎ new issue] [⋯]
       ├─ stage segmented control (5 segments, tap to switch; a segment with news wears a red dot;
       │   the bar strip itself takes a horizontal swipe to change stage)
       ├─ board row: team faces (working = ring) · budget chip (only over ceiling) · filter
@@ -80,7 +80,7 @@ Projects tab root = Projects cards (wordmark header, tab bar visible)
            ├─ long press → Move to… · Assign… · Pin · Block… · Cancel issue
            ├─ leading swipe → Pin · trailing swipe → Move… (full-swipe disabled)
            ├─ ⋯ → Activity (push) · Team (sheet → Agent profile) · Mark all read N · Settings (push)
-           └─ + → New issue sheet (document-first)
+           └─ ✎ → New issue sheet (document-first; the compose glyph, not a `+` — the cards root's `+` makes a BOARD one push back)
 ```
 
 Pushed screens use the `ChatRoute` + `ArchivedScreen` header grammar plus `PopGestureEnabler`; sheets use the `SubagentSheet` grammar (`.sheet` + `.large`, **never** `fullScreenCover`); confirmations are hosted on `RootView` (`ConfirmDialog` / `RenameDialog`).

@@ -598,8 +598,15 @@ struct ProjectBoardScreen: View {
                         // is a small betrayal every time.
                         appStore.openNewIssue(project: projectId, status: stage)
                     } label: {
-                        Image(systemName: "plus")
-                            .font(.system(size: 17, weight: .medium))
+                        // The compose glyph, not a `+`. The cards root one push
+                        // back already wears `+` for a new BOARD, and two
+                        // different creates in the same corner of the same tab
+                        // looked like the same button. `square.and.pencil` is
+                        // this app's "make a thing you write" — the chat list's
+                        // own — and a card is document-first, which is exactly
+                        // what the sheet behind this button opens with.
+                        Image(systemName: "square.and.pencil")
+                            .font(.system(size: 16, weight: .medium))
                             .foregroundStyle(Theme.ink)
                             .frame(width: 42, height: 42)
                     }
