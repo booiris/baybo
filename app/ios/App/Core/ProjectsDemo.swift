@@ -81,7 +81,7 @@
                         38, "p-rglide", title: "blocked on the relay token format",
                         status: .todo, priority: .medium, assignee: "a-lead",
                         blockedReason: "needs the relay token format"),
-                ],
+                ] + Self.demoQueue(),
                 runs: [
                     Self.demoRun(41, agent: "a-dev", status: .running, trigger: .promoted),
                     Self.demoRun(42, agent: "a-dev2", status: .queued, trigger: .retry),
@@ -129,6 +129,26 @@
                 dailyBudgetTokens: name == "rglide" ? 1_000_000 : nil,
                 maxParallelIssueRuns: 3, agentsMayMerge: false, archivedAtMs: archivedAtMs,
                 createdAtMs: 0, updatedAtMs: 0)
+        }
+
+        /// Todo's tail: enough cards that the stage does not fit on a phone.
+        ///
+        /// A fixture where every stage fits leaves the whole SCROLLING half of
+        /// this screen unpaintable — the pinned stage bar, the band headers
+        /// passing under it, pull-to-refresh. Deliberately plain: these are
+        /// here to have height, and anything interesting on them would compete
+        /// with the cards above that are here to show a state.
+        private static func demoQueue() -> [IssueInfo] {
+            [
+                "drop the retired pump tee", "name the fence generations",
+                "one door for the send gate", "fold the ack judgement in",
+                "stop logging the token", "measure the first-frame gap",
+                "delete the old relay shim",
+            ].enumerated().map { index, title in
+                demoIssue(
+                    Int64(45 + index), "p-rglide", title: title, status: .todo,
+                    priority: index.isMultiple(of: 3) ? .medium : .low, assignee: nil)
+            }
         }
 
         private static func demoIssue(

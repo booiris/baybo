@@ -84,6 +84,7 @@ struct ProjectBoardScreen: View {
     var body: some View {
         ZStack(alignment: .top) {
             content
+            if board != nil { pinnedStages }
             header
             if let toast { toastBar(toast) }
             if let error = projects.writeError { errorBanner(error) }
@@ -201,7 +202,7 @@ struct ProjectBoardScreen: View {
         .listSectionSpacing(14)
         .environment(\.defaultMinListRowHeight, 0)
         .scrollContentBackground(.hidden)
-        .contentMargins(.top, ChatListScreen.topContentMargin, for: .scrollContent)
+        .contentMargins(.top, StageBar.inset, for: .scrollContent)
         .contentMargins(.bottom, 90, for: .scrollContent)
         .scrollBounceBehavior(.always)
         .onScrollGeometryChange(for: CGFloat.self) { geo in
@@ -317,15 +318,68 @@ struct ProjectBoardScreen: View {
         .accessibilityHidden(true)
     }
 
+    // MARK: - The stage bar
+    //
+    // The five stages are PINNED under the header rather than scrolled with
+    // the board, and that is what they are for: they are navigation, not
+    // content. The list beneath them is one column out of five, and a control
+    // that scrolls away leaves you dragging back to the top every time you
+    // want to read a different one — on the screen whose whole shape is "one
+    // stage at a time".
+    //
+    // Only the segments. The board row and the Waiting strip stay in the
+    // scroll: the strip is a row per parked prompt and pinning it would take
+    // half the screen with it, and the board row is chrome you reach for
+    // occasionally rather than a thing you steer by.
+
+    private enum StageBar {
+        /// The control itself. Read by `stageSegments` AND by the inset the
+        /// list keeps clear of it — two numbers that must agree or the first
+        /// card sits under the bar.
+        static let control: CGFloat = 40
+        /// Between the header and the control.
+        static let breath: CGFloat = 12
+        /// Below it: rows disappear into paper rather than clipping at a hard
+        /// edge, the same way they do under the header.
+        static let fade: CGFloat = 12
+
+        /// What the list must keep clear at the top.
+        static var inset: CGFloat { ChatHeaderView.barHeight + breath + control + fade }
+    }
+
+    private var pinnedStages: some View {
+        VStack(spacing: 0) {
+            VStack(spacing: 0) {
+                // The header's own band, held open and painted here. The
+                // header floats on a VEIL — a gradient that is clear by its
+                // bottom edge, so content shows through the last few points
+                // of it, which is right on a transcript and wrong here: it
+                // put a sliver of a card row between the title and the
+                // segments, in a strip of screen nothing scrolls through.
+                Spacer().frame(height: ChatHeaderView.barHeight)
+                stageSegments
+                    .padding(.horizontal, 20)
+                    .padding(.top, StageBar.breath)
+            }
+            .background(Theme.paper.ignoresSafeArea(edges: .top))
+            LinearGradient(
+                colors: [Theme.paper, Theme.paper.opacity(0)], startPoint: .top,
+                endPoint: .bottom
+            )
+            .frame(height: StageBar.fade)
+        }
+        .contentShape(Rectangle())
+        .gesture(stageSwipe)
+    }
+
     // MARK: - The bar strip
     //
-    // Segmented control, board row and Waiting strip together — and the ONLY
-    // thing that takes a horizontal swipe on this screen. The card rows keep
-    // theirs for the swipe actions.
+    // The board row and the Waiting strip. Both take the horizontal swipe,
+    // as the pinned segments above do — the card rows keep theirs for the
+    // swipe actions.
 
     private var barStrip: some View {
         VStack(spacing: 10) {
-            stageSegments
             boardRow
             if !waiting.isEmpty {
                 BoardWaitingStrip(
@@ -341,15 +395,17 @@ struct ProjectBoardScreen: View {
         .padding(.horizontal, 20)
         .padding(.bottom, 12)
         .contentShape(Rectangle())
-        .gesture(
-            DragGesture(minimumDistance: 24)
-                .onEnded { value in
-                    guard abs(value.translation.width) > abs(value.translation.height) else {
-                        return
-                    }
-                    step(by: value.translation.width < 0 ? 1 : -1)
-                }
-        )
+        .gesture(stageSwipe)
+    }
+
+    /// Sideways on the bar changes stage. Written once because two views take
+    /// it now — the pinned segments and the strip under them.
+    private var stageSwipe: some Gesture {
+        DragGesture(minimumDistance: 24)
+            .onEnded { value in
+                guard abs(value.translation.width) > abs(value.translation.height) else { return }
+                step(by: value.translation.width < 0 ? 1 : -1)
+            }
     }
 
     private var stageSegments: some View {
@@ -370,7 +426,7 @@ struct ProjectBoardScreen: View {
                     }
                     .foregroundStyle(candidate == stage ? Theme.paper : Theme.inkSoft)
                     .frame(maxWidth: .infinity)
-                    .frame(height: 40)
+                    .frame(height: StageBar.control)
                     .background(
                         RoundedRectangle(cornerRadius: 9, style: .continuous)
                             .fill(candidate == stage ? Theme.ink : Color.clear)

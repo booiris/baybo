@@ -152,6 +152,34 @@ final class ProjectsUITests: BayboUITestCase {
         XCTAssertFalse(app.buttons["issue-row-41"].exists)
     }
 
+    /// The five stages are navigation, not content: they stay put while the
+    /// board scrolls under them.
+    ///
+    /// The trap this test is written around is that it passes trivially if
+    /// the list never moves — a stage that fits on screen swipes to nothing,
+    /// and "the bar did not move" would then be true of a bar that scrolls.
+    /// So the scroll is PROVEN first, by a card that is below the fold before
+    /// the swipe and reachable after it.
+    func testTheStageBarStaysPutWhileTheBoardScrolls() {
+        let app = openBoard()
+        XCTAssertTrue(app.buttons["stage-todo"].waitForExistence(timeout: 5))
+        app.buttons["stage-todo"].tap()
+
+        let bar = app.buttons["stage-todo"]
+        XCTAssertTrue(app.buttons["issue-row-43"].waitForExistence(timeout: 3))
+        let below = app.buttons["issue-row-51"]
+        XCTAssertFalse(below.exists, "the fixture's Todo fits on screen — nothing here scrolls")
+        let before = bar.frame
+
+        app.swipeUp()
+
+        XCTAssertTrue(below.waitForExistence(timeout: 3), "the board did not scroll")
+        XCTAssertEqual(
+            bar.frame.minY, before.minY, accuracy: 0.5,
+            "the stage bar scrolled away with the board")
+        XCTAssertTrue(bar.isHittable, "and it is still pressable where it sits")
+    }
+
     /// The WHOLE row opens the card, not just the letters in it.
     ///
     /// Under `.buttonStyle(.plain)` a label's hit region is whatever it
