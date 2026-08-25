@@ -1745,6 +1745,10 @@ struct UpdateProjectRequest<'a> {
     daily_budget_micros: Option<i64>,
     daily_budget_tokens: Option<i64>,
     max_parallel_issue_runs: Option<i64>,
+    /// Never omitted. `#[serde(default)]` on the gateway's side reads a
+    /// missing `agents_may_merge` as `false`, so leaving it out of a
+    /// full-replace body is not "leave it alone" — it is "turn it off".
+    agents_may_merge: bool,
 }
 
 #[derive(Serialize)]
@@ -1892,6 +1896,7 @@ pub(crate) async fn update_project<C: GatewayJsonClient + Sync>(
         daily_budget_micros: settings.daily_budget_micros,
         daily_budget_tokens: settings.daily_budget_tokens,
         max_parallel_issue_runs: settings.max_parallel_issue_runs,
+        agents_may_merge: settings.agents_may_merge,
     })
     .map_err(|e| format!("encode project settings: {e}"))?;
     client.put_empty(&path, body).await
@@ -3906,6 +3911,43 @@ mod tests {
             .await
             .expect("clear avatar");
         assert_eq!(client.only_call().body, "{}");
+    }
+
+    /// The board's settings are a FULL REPLACE, and `agents_may_merge` is the
+    /// field where that is dangerous: it is a plain `bool` with no "unset", and
+    /// the gateway defaults a missing one to `false`. So an omission is not
+    /// "leave it alone" — it silently turns a board's merging off, which is
+    /// what every Save from this app did until this field existed. Both
+    /// directions are pinned, because a body that always said `true` would
+    /// pass a test that only checked the interesting one.
+    #[tokio::test]
+    async fn the_settings_body_always_states_whether_the_board_merges() {
+        for merges in [true, false] {
+            let client = RecordingClient::empty();
+            update_project(
+                &client,
+                "p-1".into(),
+                crate::api::ProjectSettings {
+                    name: "rglide".into(),
+                    description: String::new(),
+                    daily_budget_micros: None,
+                    daily_budget_tokens: None,
+                    max_parallel_issue_runs: None,
+                    agents_may_merge: merges,
+                },
+            )
+            .await
+            .expect("update project");
+            let call = client.only_call();
+            assert_eq!(call.method, "PUT");
+            assert_eq!(call.path, "/v1/projects/p-1");
+            assert!(
+                call.body
+                    .contains(&format!("\"agents_may_merge\":{merges}")),
+                "{}",
+                call.body
+            );
+        }
     }
 
     /// An id reaches a URL, so it goes through the same gate every other path

@@ -136,7 +136,10 @@
                 id: id, name: name, description: description, workdir: "/work/\(name)",
                 dailyBudgetMicros: budgetUsd.map { Int64($0 * 1_000_000) },
                 dailyBudgetTokens: name == "rglide" ? 1_000_000 : nil,
-                maxParallelIssueRuns: 3, agentsMayMerge: false, archivedAtMs: archivedAtMs,
+                maxParallelIssueRuns: 3,
+                // The board the demo opens merges; the others do not, so one
+                // launch paints both halves of the auto-merge hint.
+                agentsMayMerge: id == Self.demoBoardId, archivedAtMs: archivedAtMs,
                 createdAtMs: 0, updatedAtMs: 0)
         }
 

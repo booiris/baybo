@@ -364,6 +364,40 @@ final class ProjectsUITests: BayboUITestCase {
             "the activity sheet never presented")
     }
 
+    /// Auto-merge reads the BOARD, and says which of the two things happens.
+    ///
+    /// The fixture's open board merges and its neighbours do not, deliberately:
+    /// a switch wired to a constant `false` — or to a settings body that never
+    /// carried the field, which is what this app shipped until now — looks
+    /// exactly like a correct one on a board that does not merge. Starting ON
+    /// is the only observation that separates them.
+    ///
+    /// The hint is asserted in both directions because the label alone does not
+    /// say what "off" costs: whether the branch waits for you or is thrown away
+    /// is the whole decision, and it lives in that sentence.
+    func testAutoMergeReadsTheBoardAndSaysWhatEachStateMeans() {
+        let app = openBoard()
+        XCTAssertTrue(app.buttons["board-budget-chip"].waitForExistence(timeout: 5))
+        app.buttons["board-budget-chip"].tap()
+
+        let toggle = app.switches["settings-auto-merge"]
+        XCTAssertTrue(toggle.waitForExistence(timeout: 5), "settings never presented")
+        XCTAssertEqual(
+            toggle.value as? String, "1",
+            "this board merges — a switch that starts off is not reading the board")
+        let merges = app.staticTexts.containing(
+            NSPredicate(format: "label CONTAINS 'assignee merges the branch'"))
+        XCTAssertTrue(merges.element.exists, "the on state must say who merges, and into what")
+
+        toggle.tap()
+        let handsOver = app.staticTexts.containing(
+            NSPredicate(format: "label CONTAINS 'hands its branch over'"))
+        XCTAssertTrue(
+            handsOver.element.waitForExistence(timeout: 3),
+            "the off state must say the branch is handed over, not lost")
+        XCTAssertFalse(merges.element.exists, "both sentences must never be on screen at once")
+    }
+
     /// Archiving a board: the pill, its confirm, and the way back out.
     ///
     /// The confirm this raises offers **no visible Cancel** — the system draws

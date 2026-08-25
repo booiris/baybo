@@ -1095,6 +1095,15 @@ pub struct ProjectSettings {
     pub daily_budget_micros: Option<i64>,
     pub daily_budget_tokens: Option<i64>,
     pub max_parallel_issue_runs: Option<i64>,
+    /// Whether a finished card's branch merges itself.
+    ///
+    /// The full-replace rule bites hardest here, because this one is a plain
+    /// `bool` with no "unset": the gateway's request struct defaults it to
+    /// `false`, so a client that leaves it out of the body does not keep the
+    /// board's setting — it turns merging **off**. This field is absent from
+    /// this record until 2026-08-26, which is exactly how long every Save from
+    /// this app was silently doing that.
+    pub agents_may_merge: bool,
 }
 
 /// The `invalid_token` signal travels from the leg to Swift as an UNTYPED STRING

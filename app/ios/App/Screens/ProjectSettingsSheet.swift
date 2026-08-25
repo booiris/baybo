@@ -19,6 +19,7 @@ struct ProjectSettingsSheet: View {
     @State private var budgetUsd: String
     @State private var budgetTokens: String
     @State private var parallelRuns: String
+    @State private var autoMerge: Bool
     @State private var saving = false
     @State private var error: String?
     @State private var confirmingArchive = false
@@ -35,6 +36,7 @@ struct ProjectSettingsSheet: View {
             } ?? "")
         _budgetTokens = State(initialValue: project.dailyBudgetTokens.map(String.init) ?? "")
         _parallelRuns = State(initialValue: String(project.maxParallelIssueRuns))
+        _autoMerge = State(initialValue: project.agentsMayMerge)
     }
 
     private var isArchived: Bool { project.archivedAtMs != nil }
@@ -62,6 +64,9 @@ struct ProjectSettingsSheet: View {
                 field(
                     lang.t("newProject.parallelRuns"), $parallelRuns, "settings-parallel",
                     keyboard: .numberPad, hint: lang.t("newProject.parallelRunsNote"))
+
+                section(lang.t("settings.finishing"))
+                autoMergeRow
 
                 Button(lang.t("common.save")) { save() }
                     .buttonStyle(InkPillButtonStyle())
@@ -148,6 +153,37 @@ struct ProjectSettingsSheet: View {
             .padding(.bottom, 4)
     }
 
+    /// Whether a finished card's branch merges itself.
+    ///
+    /// It is a `Toggle` rather than a checkmark row because it is the only
+    /// thing on this sheet that is a STATE rather than a value being typed —
+    /// and unlike the ceilings it takes effect on the board's own behaviour,
+    /// not on a number.
+    ///
+    /// The hint says which of the two things happens, in both directions: an
+    /// operator reading `Auto-merge` alone cannot tell whether "off" means the
+    /// branch waits for them or is thrown away. The two sentences are
+    /// `app/web`'s `agentsMayMergeHint`, so the boards do not describe
+    /// themselves differently on the two clients.
+    private var autoMergeRow: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Toggle(isOn: $autoMerge) {
+                Text(verbatim: lang.t("settings.autoMerge"))
+                    .font(Theme.sys(15))
+                    .foregroundStyle(Theme.ink)
+            }
+            .tint(Theme.ink)
+            .disabled(saving)
+            .accessibilityIdentifier("settings-auto-merge")
+            Text(verbatim: lang.t(autoMerge ? "settings.autoMergeOn" : "settings.autoMergeOff"))
+                .font(Theme.mono(10.5))
+                .foregroundStyle(Theme.inkSoft)
+                .lineSpacing(2)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.horizontal, 20)
+    }
+
     private func field(
         _ label: String, _ text: Binding<String>, _ identifier: String,
         keyboard: UIKeyboardType = .default, hint: String? = nil
@@ -196,7 +232,8 @@ struct ProjectSettingsSheet: View {
                         dailyBudgetMicros: NewProjectScreen.micros(fromUsd: budgetUsd),
                         dailyBudgetTokens: Int64(budgetTokens.trimmingCharacters(in: .whitespaces)),
                         maxParallelIssueRuns: Int64(
-                            parallelRuns.trimmingCharacters(in: .whitespaces))))
+                            parallelRuns.trimmingCharacters(in: .whitespaces)),
+                        agentsMayMerge: autoMerge))
                 onSaved()
                 dismiss()
             } catch {
