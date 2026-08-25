@@ -1,6 +1,16 @@
 /* The card page. Reuses the transcript's tokens from styles.css — the two
    surfaces sit under the same native chrome, and a second palette here would
-   show as a seam the moment a card is pushed off a board. */
+   show as a seam the moment a card is pushed off a board.
+
+   Those tokens are spelled `--color-ink` / `--font-mono`, and this file spelled
+   them `--ink` / `--mono` until 2026-08-25 — 36 references to seven variables
+   that do not exist. Nothing failed: an unresolvable `var()` is invalid at
+   computed-value time, so each declaration quietly fell back. The page lost
+   every hairline (`border: 1px solid var(--line)` unsets the whole shorthand,
+   taking `border-style` to `none`), every mono run, and both surface fills, and
+   went on rendering as a plausible page in the wrong clothes. A missing token
+   is silent by design — the only thing that catches one is spelling it the way
+   styles.css does. */
 
 .issue-page {
   height: 100dvh;
@@ -12,15 +22,15 @@
      which is the bar height plus a breath. */
   padding: calc(env(safe-area-inset-top, 0px) + 58px) 20px 0;
   box-sizing: border-box;
-  color: var(--ink);
-  background: var(--paper);
+  color: var(--color-ink);
+  background: var(--color-paper);
 }
 
 .issue-loading {
   padding: calc(env(safe-area-inset-top, 0px) + 90px) 20px 40px;
   text-align: center;
-  color: var(--ink-soft);
-  font-family: var(--mono);
+  color: var(--color-ink-soft);
+  font-family: var(--font-mono);
   font-size: 13px;
 }
 
@@ -34,7 +44,7 @@
 .issue-head h1.cancelled,
 .issue-subs .cancelled {
   text-decoration: line-through;
-  color: var(--ink-soft);
+  color: var(--color-ink-soft);
 }
 
 .issue-chips {
@@ -45,11 +55,11 @@
 }
 
 .issue-chip {
-  font-family: var(--mono);
+  font-family: var(--font-mono);
   font-size: 11px;
-  color: var(--ink-soft);
+  color: var(--color-ink-soft);
   background: transparent;
-  border: 1px solid var(--line);
+  border: 1px solid var(--color-line);
   border-radius: 999px;
   padding: 0 10px;
   /* 32px, not the 44 a standalone control gets: these sit in a wrapping row
@@ -69,18 +79,18 @@
   align-items: baseline;
   padding: 10px 12px;
   margin-bottom: 14px;
-  border: 1px solid var(--line);
+  border: 1px solid var(--color-line);
   border-radius: var(--radius);
-  background: var(--surface);
+  background: var(--color-surface);
   font-size: 13px;
 }
 
 .issue-blocked-label {
-  font-family: var(--mono);
+  font-family: var(--font-mono);
   font-size: 10px;
   letter-spacing: 0.1em;
   text-transform: uppercase;
-  color: var(--ink-soft);
+  color: var(--color-ink-soft);
   white-space: nowrap;
 }
 
@@ -90,14 +100,14 @@
   gap: 8px;
   padding: 10px 12px;
   margin-bottom: 14px;
-  border: 1px solid var(--line);
+  border: 1px solid var(--color-line);
   border-radius: var(--radius);
   font-size: 13px;
 }
 
 .issue-run-word,
 .issue-run-status {
-  font-family: var(--mono);
+  font-family: var(--font-mono);
   font-size: 10px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -108,22 +118,22 @@
    glance, which is the one thing this row is for. */
 .issue-run-status.failed,
 .issue-run-error {
-  color: var(--err);
+  color: var(--color-err);
 }
 
 .issue-run-who {
-  font-family: var(--mono);
+  font-family: var(--font-mono);
   font-size: 11px;
-  color: var(--ink-soft);
+  color: var(--color-ink-soft);
 }
 
 .issue-run-open,
 .issue-runs button,
 .issue-subs button,
 .issue-fold button {
-  font-family: var(--mono);
+  font-family: var(--font-mono);
   font-size: 11px;
-  color: var(--ink);
+  color: var(--color-ink);
   background: transparent;
   border: none;
   padding: 0;
@@ -133,7 +143,7 @@
 
 .issue-run-open {
   margin-left: auto;
-  border: 1px solid var(--line);
+  border: 1px solid var(--color-line);
   border-radius: 999px;
   padding: 0 10px;
   min-height: 32px;
@@ -145,12 +155,12 @@
 
 .issue-section h2 {
   margin: 0 0 8px;
-  font-family: var(--mono);
+  font-family: var(--font-mono);
   font-size: 10px;
   letter-spacing: 0.12em;
   text-transform: uppercase;
   font-weight: 400;
-  color: var(--ink-soft);
+  color: var(--color-ink-soft);
 }
 
 .issue-count {
@@ -159,7 +169,7 @@
 
 .issue-empty {
   margin: 0;
-  color: var(--ink-soft);
+  color: var(--color-ink-soft);
   font-size: 13px;
 }
 
@@ -168,13 +178,13 @@
   min-height: 200px;
   box-sizing: border-box;
   padding: 12px;
-  border: 1px solid var(--line);
+  border: 1px solid var(--color-line);
   border-radius: var(--radius);
-  background: var(--paper);
-  color: var(--ink);
+  background: var(--color-paper);
+  color: var(--color-ink);
   /* The editor shows the SOURCE, so it is monospaced — a proportional face
      over raw markdown hides exactly the alignment the syntax depends on. */
-  font-family: var(--mono);
+  font-family: var(--font-mono);
   font-size: 13px;
   line-height: 1.55;
   resize: none;
@@ -197,7 +207,7 @@
 .issue-subs li,
 .issue-runs li {
   padding: 7px 0;
-  border-bottom: 1px solid var(--line);
+  border-bottom: 1px solid var(--color-line);
 }
 
 .issue-subs button,
@@ -215,19 +225,19 @@
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  border: 1px solid var(--ink-soft);
+  border: 1px solid var(--color-ink-soft);
   flex: none;
 }
 
 .issue-sub-dot.done {
-  background: var(--ink);
-  border-color: var(--ink);
+  background: var(--color-ink);
+  border-color: var(--color-ink);
 }
 
 .issue-run-attempt {
-  font-family: var(--mono);
+  font-family: var(--font-mono);
   font-size: 11px;
-  color: var(--ink-soft);
+  color: var(--color-ink-soft);
 }
 
 .issue-run-error {
@@ -242,7 +252,7 @@
 }
 
 .issue-entry.system {
-  color: var(--ink-soft);
+  color: var(--color-ink-soft);
   font-size: 12px;
 }
 
@@ -254,15 +264,15 @@
 }
 
 .issue-entry-who {
-  font-family: var(--mono);
+  font-family: var(--font-mono);
   font-size: 11px;
-  color: var(--ink-soft);
+  color: var(--color-ink-soft);
 }
 
 .issue-entry-time {
-  font-family: var(--mono);
+  font-family: var(--font-mono);
   font-size: 10px;
-  color: var(--ink-soft);
+  color: var(--color-ink-soft);
   margin-left: auto;
 }
 
@@ -271,6 +281,6 @@
 }
 
 .issue-fold button {
-  color: var(--ink-soft);
+  color: var(--color-ink-soft);
   min-height: 32px;
 }

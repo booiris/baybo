@@ -364,6 +364,35 @@ board already writes, and two copies would be two file formats kept identical
 by hand. `IssueMirror` gained an `attachments` field there: the board never
 drew a card's files, so it never wrote them.
 
+### 9.7 The card page was wearing the wrong clothes
+
+Found while adding the unread rule, and worth writing down because nothing in
+four tiers of tests could see it: `issue.css` referenced `--ink`, `--ink-soft`,
+`--paper`, `--surface`, `--line`, `--err` and `--mono` — **seven variables that
+do not exist**. The bundle's tokens are `--color-ink` and `--font-mono`
+(`styles.css:6`), and the page had been written against the shorter names.
+
+Nothing failed. An unresolvable `var()` is *invalid at computed-value time*, so
+each declaration quietly fell back:
+
+- `border: 1px solid var(--line)` unsets the whole shorthand — `border-style`
+  goes to `none`, so the chips, the section rules and the run list had **no
+  border at all**, not a dark one;
+- every `color: var(--ink-soft)` inherited full ink, so the greys the layout
+  reads by — `@handle`, timestamps, the fold's "N events ›" — were as loud as
+  the text;
+- the one `var(--err)` inherited ink too, so a run's error printed black;
+- the mono runs were the only harmless ones, and only by luck: `:root` sets
+  `font-family: var(--font-mono)`, so falling back to inherit landed on the
+  font they were asking for.
+
+The result was a plausible page in the wrong clothes, which is why it survived
+a whole build phase and several screenshots. Verified both directions in a
+browser rather than by reading: `.issue-chip` computes `1px solid #e4e4e4`
+now, and re-injecting the old declaration puts it back to `none / #111`. A
+missing token is silent by construction — the only thing that catches one is
+spelling it the way `styles.css` does.
+
 ### 9.6 One meaning for the red count
 
 The tab badge, a card's badge and the board's strip all count the same thing:
