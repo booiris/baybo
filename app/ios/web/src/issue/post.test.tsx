@@ -93,7 +93,7 @@ function mount() {
 /// titled by what it IS ("Description") on a card whose opening nothing
 /// recorded.
 function heads(): string[] {
-  return [...document.querySelectorAll(".issue-activity .issue-box-who")].map(
+  return [...document.querySelectorAll(".issue-activity .issue-said-who")].map(
     (el) => el.textContent,
   );
 }
@@ -104,13 +104,17 @@ beforeEach(() => {
 });
 
 describe("a comment is a post", () => {
-  it("boxes it under a head naming its author, with their monogram for a face", () => {
+  /// The head names the author and stands OUTSIDE the box: the box holds the
+  /// words and nothing else, which is what stops a comment being three nested
+  /// rectangles deep.
+  it("boxes the words under a bare head naming its author", () => {
     mount();
     deliver([comment("e1", "pulled the flag")]);
 
     const box = document.querySelector(".issue-entry.comment .issue-box");
     expect(box).not.toBeNull();
-    expect(box?.querySelector(".issue-box-body")?.textContent).toContain("pulled the flag");
+    expect(box?.textContent).toContain("pulled the flag");
+    expect(box?.querySelector(".issue-said-who")).toBeNull();
     expect(heads()).toContain("@dev-1");
     // The monogram is NATIVE's — it is unique across the team, which one
     // handle on its own cannot tell you.
@@ -145,16 +149,36 @@ describe("a comment is a post", () => {
   it("leaves the board's own entries as a line", () => {
     mount();
     deliver([moved("e1"), comment("e2", "said")]);
-    // Machinery is folded shut, so open the run to see the line it holds.
-    act(() => {
-      document.querySelector<HTMLButtonElement>(".issue-fold button")?.click();
-    });
 
     expect(document.querySelectorAll(".issue-entry.comment")).toHaveLength(1);
     const line = document.querySelector(".issue-line");
     expect(line?.textContent).toContain("moved it");
     expect(line?.querySelector(".issue-line-dot")).not.toBeNull();
     expect(line?.querySelector(".issue-box")).toBeNull();
+  });
+
+  /// **A run of one is not a run.** A `1 event ›` is a control that hides
+  /// exactly one line and spends one saying so; two or more still collapse.
+  it("draws a lone machinery entry rather than folding it", () => {
+    mount();
+    deliver([moved("e1"), comment("e2", "said")]);
+
+    expect(document.querySelector(".issue-fold")).toBeNull();
+    expect(document.querySelector(".issue-line")?.textContent).toContain("moved it");
+  });
+
+  it("still folds two in a row, and opens them on a press", () => {
+    mount();
+    deliver([moved("e1"), moved("e2"), comment("e3", "said")]);
+
+    const fold = document.querySelector<HTMLButtonElement>(".issue-fold button");
+    expect(fold?.textContent).toContain("2");
+    expect(document.querySelectorAll(".issue-line")).toHaveLength(0);
+
+    act(() => {
+      fold?.click();
+    });
+    expect(document.querySelectorAll(".issue-line")).toHaveLength(2);
   });
 
   /// Who opened the card is one line of provenance under the head, not a

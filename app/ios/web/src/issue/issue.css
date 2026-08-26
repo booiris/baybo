@@ -106,6 +106,27 @@
   background: var(--color-paper);
 }
 
+/* The card's own WORDS opt back in to selection and the iOS long-press Copy
+   callout, which `:root` turns off for the whole document (see `styles.css` —
+   the transcript's `.bubble` / `.msg` list is the same opt-in, and this page
+   was simply never added to it). A branch name is the clearest case: it exists
+   to be pasted into a terminal.
+
+   Controls stay inert on purpose. A chip, the fold, `Open run ›` and the
+   sub-issue rows are things you press, and a long press that starts selecting
+   the label instead of firing the button is the web-in-an-app tell this whole
+   rule exists to avoid. */
+.issue-head h1,
+.issue-meta,
+.issue-body,
+.issue-box,
+.issue-blocked,
+.issue-line-text {
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-touch-callout: default;
+}
+
 .issue-loading {
   padding: calc(env(safe-area-inset-top, 0px) + 90px) 20px 40px;
   text-align: center;
@@ -183,7 +204,7 @@
    over 14px is 23px a line, and the description is the one paragraph on this
    page somebody reads straight through. */
 .issue-body,
-.issue-box-body {
+.issue-box {
   font-family: var(--font-sans);
   font-size: 0.875rem;
   line-height: 1.65;
@@ -394,10 +415,12 @@
   padding: 7px 0;
 }
 
+/* The post is a BLOCK, not a face beside a column: the head carries the face
+   and the box below it runs the page's whole width. A comment is the longest
+   thing on a card, and a 34px column of nothing down its left was the price of
+   putting the face beside the words instead of above them. */
 .issue-post {
-  display: flex;
-  align-items: flex-start;
-  gap: var(--face-gap);
+  display: block;
 }
 
 .issue-face {
@@ -430,75 +453,81 @@
   border-style: dashed;
 }
 
-.issue-box {
-  position: relative;
-  flex: 1;
-  min-width: 0;
-  border: 1px solid var(--color-line);
-  border-radius: var(--radius);
-  background: var(--color-paper);
-}
-
-/* The tail, drawn twice: the border's triangle and the fill's, one pixel
-   apart. A single triangle cannot have a 1px outline. */
-.issue-box::before,
-.issue-box::after {
-  content: "";
-  position: absolute;
-  top: 10px;
-  width: 0;
-  height: 0;
-  border-style: solid;
-  border-width: 6px 7px 6px 0;
-  border-color: transparent var(--color-line) transparent transparent;
-}
-
-.issue-box::before {
-  left: -7px;
-}
-
-.issue-box::after {
-  left: -6px;
-  border-right-color: var(--color-surface);
-}
-
-.issue-box-head {
+/* **Outside the box** as of 2026-08-26. It used to be a bar INSIDE it — a
+   filled strip with its own bottom hairline and its own corner radius, under a
+   tail pointing back at the face — which made every comment three nested
+   rectangles deep to say two things a caption says. What is left is one line
+   of provenance at the weight the meta line under the title already uses. */
+.issue-said-head {
   display: flex;
-  align-items: baseline;
-  gap: 6px;
-  padding: 5px 10px;
-  border-bottom: 1px solid var(--color-line);
-  background: var(--color-surface);
-  border-radius: calc(var(--radius) - 1px) calc(var(--radius) - 1px) 0 0;
+  align-items: center;
+  gap: var(--face-gap);
+  margin-bottom: 6px;
+  font-family: var(--font-mono);
 }
 
-.issue-box-who {
-  font-family: var(--font-mono);
+.issue-said-who {
   font-size: 10.5px;
   color: var(--color-ink);
 }
 
-.issue-box-said {
-  font-family: var(--font-sans);
-  font-size: 10.5px;
-  color: var(--color-ink-soft);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.issue-box-when {
-  margin-left: auto;
-  font-family: var(--font-mono);
+/* Straight after the handle, not flung to the right edge: the head is a
+   CAPTION for the box under it, and the box is now as wide as what was said —
+   a time parked at the band's edge belonged to a full-width row that no longer
+   exists, and over a two-word answer it read as a column of its own. */
+.issue-said-when {
   font-size: 9.5px;
   color: var(--color-ink-soft);
   white-space: nowrap;
 }
 
-/* Type comes from the card-prose rule above, which this shares with the
-   description; only the box's own padding lives here. */
-.issue-box-body {
+/* The words, and nothing else: no head, and no tail either — the tail pointed
+   at a name that is no longer in here, and a bubble's horn on a card that is a
+   record rather than a chat was always borrowing somebody else's shape.
+   Held off the page's rail by half a face — derived from the face column
+   rather than eyeballed, so widening the face keeps the box under the handle
+   it belongs to instead of drifting off it.
+
+   `fit-content`: a box is as wide as what was said. Every comment stretched to
+   the full band before, which made a three-word answer a full-width rectangle
+   with one line of text in the corner of it — and made two comments of very
+   different lengths look like the same amount of speech. */
+.issue-box {
+  width: fit-content;
+  max-width: 100%;
+  margin-left: calc(var(--face) / 2);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius);
+  background: var(--color-paper);
   padding: 7px 10px;
+}
+
+/* The operator's own words are INKED — the same fill their message wears in
+   the chat. A card is scanned for "what did I already answer", and on a page
+   where every other box is a hairline on paper, one filled box is the only
+   mark that survives being read past at speed. */
+.issue-entry[data-actor="user"] .issue-box {
+  background: var(--color-ink);
+  border-color: var(--color-ink);
+  color: var(--color-paper);
+}
+
+/* Markdown inside an inked box: a comment is rendered prose, so the chips and
+   rules `.md` draws on paper have to be told about the dark ground or they
+   arrive as light-grey holes in it. */
+.issue-entry[data-actor="user"] .issue-box :is(code, pre) {
+  background: color-mix(in srgb, var(--color-paper) 16%, transparent);
+  border-color: transparent;
+  color: inherit;
+}
+
+.issue-entry[data-actor="user"] .issue-box a {
+  color: inherit;
+}
+
+.issue-entry[data-actor="user"] .issue-box blockquote {
+  border-left-color: color-mix(in srgb, var(--color-paper) 40%, transparent);
+  color: color-mix(in srgb, var(--color-paper) 75%, transparent);
 }
 
 .issue-line {
@@ -560,8 +589,24 @@
 }
 
 .issue-fold button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   color: var(--color-ink-soft);
   min-height: 32px;
+}
+
+/* `.work-chevron`'s rule, for its reason: one mark that turns, so opening a
+   fold cannot move it. `line-height: 1` is what keeps the glyph's own box from
+   deciding where the rotation happens. */
+.issue-chevron {
+  display: inline-block;
+  line-height: 1;
+  transition: transform 120ms ease;
+}
+
+.issue-chevron.open {
+  transform: translateY(1px) rotate(90deg);
 }
 
 /* Where the operator stopped reading. The one red thing on this page besides a

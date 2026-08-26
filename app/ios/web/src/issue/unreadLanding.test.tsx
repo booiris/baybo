@@ -159,16 +159,17 @@ describe("opening a card at the unread boundary", () => {
 });
 
 describe("machinery folds away", () => {
-  /// A lone `moved` used to render in full — "1 event ›" saves no space. But
-  /// space was never the point: what buries the two things a person said is a
-  /// wall of rows that all look alike, and one uniform closed line per run is
-  /// what makes the comments findable.
-  it("folds a run of one, like any other run", () => {
+  /// **A run of one is drawn, not folded** (2026-08-26). It was uniform for a
+  /// while — every run collapsed, a lone `moved` included, so the comments
+  /// would be findable down a column of identical closed lines. What that
+  /// bought in practice was a control hiding exactly one line and spending one
+  /// to say so, on most of the runs a card has.
+  it("draws a run of one rather than folding it", () => {
     page();
     deliver(withEvents([comment("e1", "before"), moved("e5"), comment("e9", "after")]));
 
-    expect(fold()?.textContent).toContain("1 event");
-    expect(document.body.textContent).not.toContain("moved it");
+    expect(fold()).toBeNull();
+    expect(document.body.textContent).toContain("moved it");
     expect(document.body.textContent).toContain("before");
   });
 

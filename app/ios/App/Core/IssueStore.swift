@@ -769,13 +769,21 @@ extension IssueStore: ComposerHost {
                     "body": ["kind": "run_settled", "attempt": 2, "status": "failed"],
                     "created_at_ms": now - 6_900_000,
                 ],
+                // Consecutive machinery on purpose: one lone entry draws as a
+                // line and two in a row collapse, so the fixture has to carry
+                // both shapes or one of them is never looked at.
                 [
-                    "id": "ev-5", "number": number, "actor": ["kind": "user"],
+                    "id": "ev-5", "number": number, "actor": ["kind": "system"],
+                    "body": ["kind": "run_started", "attempt": 3],
+                    "created_at_ms": now - 6_800_000,
+                ],
+                [
+                    "id": "ev-6", "number": number, "actor": ["kind": "user"],
                     "body": ["kind": "comment", "text": "Try it again once the fence lands."],
                     "created_at_ms": now - 1_800_000,
                 ],
             ]
-            let envelope: [String: Any] = ["items": items, "first_unread": "ev-5"]
+            let envelope: [String: Any] = ["items": items, "first_unread": "ev-6"]
             guard let data = try? JSONSerialization.data(withJSONObject: envelope),
                 let json = String(data: data, encoding: .utf8)
             else { return "{\"items\":[]}" }

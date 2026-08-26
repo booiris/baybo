@@ -456,13 +456,17 @@ function rowKey(item: Fold, index: number): string {
 
 /// One folded run of machinery, closed until asked.
 ///
-/// **Every run, including one entry long.** A lone `moved` used to render in
-/// full on the argument that "1 event ›" saves no space — but space was never
-/// the point: a card's Activity is mostly machinery, and what buries the two
-/// things a person said is a wall of rows that all look like rows. One
-/// uniform closed line per run is what makes the comments findable, and it is
-/// also what keeps the shape stable — splitting a run at the unread boundary
-/// would otherwise turn a tidy `3 events ›` into a raw row plus `2 events ›`.
+/// **A run of ONE is not a run** (2026-08-26). It was uniform for a while —
+/// every run collapsed, a lone `moved` included — on the argument that what
+/// buries the two things a person said is a wall of rows that all look like
+/// rows, so one closed line per run is what makes the comments findable. In
+/// practice `1 event ›` is a control that hides exactly one line and spends
+/// one saying so, and a card's Activity was full of them. Two or more still
+/// collapse.
+///
+/// The grouping itself stays in `fold`: a split at the unread boundary really
+/// can leave a group of one, and to the model that is still a group. This is
+/// only about what a group of one is DRAWN as.
 ///
 /// `landed` is the exception, and it has to be: the run carrying the unread
 /// boundary is what the page just scrolled to, and landing a reader on a
@@ -484,13 +488,20 @@ function FoldRow({
   const [toggled, setToggled] = useState<boolean | null>(null);
 
   if (item.kind === "entry") return <EntryRow event={item.event} who={who} />;
+  if (item.events.length === 1) return <EntryRow event={item.events[0]} who={who} />;
 
   const open = toggled ?? landed;
   return (
     <>
       <li className="issue-fold">
         <button type="button" onClick={() => setToggled(!open)} aria-expanded={open}>
-          {t("issue.nEvents", { count: item.events.length })} {open ? "⌄" : "›"}
+          {t("issue.nEvents", { count: item.events.length })}
+          {/* ONE glyph, rotated — the transcript's `.work-chevron`. Two
+              characters (`›` and `⌄`) have two sets of metrics, so the mark
+              moved every time the fold opened. */}
+          <span className={`issue-chevron${open ? " open" : ""}`} aria-hidden="true">
+            ›
+          </span>
         </button>
       </li>
       {open && item.events.map((event) => <EntryRow key={event.id} event={event} who={who} />)}
@@ -528,71 +539,33 @@ function EntryRow({ event, who }: { event: IssueEvent; who: (id: string) => Pers
   }
 
   return (
-    <li className="issue-entry comment">
-      <Post
-        actor={event.actor}
-        who={who}
-        title={speaker(event.actor, who, t)}
-        at={event.created_at_ms}
-      >
-        <MarkdownBody text={text} />
-        {attachments.length > 0 && (
-          <div className="issue-attachments">
-            {attachments.map((raw, i) => {
-              const a = raw as { blob_id?: unknown };
-              if (typeof a.blob_id !== "string") return null;
-              return (
-                <AttachmentBubble
-                  key={`${a.blob_id}-${String(i)}`}
-                  attachment={toWireAttachment(raw as Parameters<typeof toWireAttachment>[0])}
-                  connEpoch={currentConnEpoch()}
-                />
-              );
-            })}
-          </div>
-        )}
-      </Post>
-    </li>
-  );
-}
-
-/// A face beside a bordered box: the shape a threaded issue has had since
-/// before GitHub, and the reason a long card stays readable — the eye finds
-/// the next thing somebody said by looking down one column, not by reading.
-function Post({
-  actor,
-  who,
-  title,
-  at,
-  said,
-  children,
-}: {
-  /// Whose face goes beside the box. `null` draws the board's blank disc —
-  /// the description of a card whose opening nothing recorded.
-  actor: Actor | null;
-  who: (id: string) => Person;
-  /// The head's first word. Passed in rather than derived from `actor`
-  /// because the description's box is titled by what it IS on a card nobody
-  /// can be named the author of.
-  title: string;
-  at: number;
-  /// What this box is, when that is not simply "they wrote this" — the
-  /// description's box says "opened this card".
-  said?: string;
-  children: ReactNode;
-}) {
-  return (
-    <div className="issue-post">
-      <Avatar actor={actor} who={who} />
-      <div className="issue-box">
-        <div className="issue-box-head">
-          <span className="issue-box-who">{title}</span>
-          {said !== undefined && <span className="issue-box-said">{said}</span>}
-          <span className="issue-box-when">{shortTime(at)}</span>
+    <li className="issue-entry comment" data-actor={event.actor.kind}>
+      <div className="issue-post">
+        <div className="issue-said-head">
+          <Avatar actor={event.actor} who={who} />
+          <span className="issue-said-who">{speaker(event.actor, who, t)}</span>
+          <span className="issue-said-when">{shortTime(event.created_at_ms)}</span>
         </div>
-        <div className="issue-box-body">{children}</div>
+        <div className="issue-box">
+          <MarkdownBody text={text} />
+          {attachments.length > 0 && (
+            <div className="issue-attachments">
+              {attachments.map((raw, i) => {
+                const a = raw as { blob_id?: unknown };
+                if (typeof a.blob_id !== "string") return null;
+                return (
+                  <AttachmentBubble
+                    key={`${a.blob_id}-${String(i)}`}
+                    attachment={toWireAttachment(raw as Parameters<typeof toWireAttachment>[0])}
+                    connEpoch={currentConnEpoch()}
+                  />
+                );
+              })}
+            </div>
+          )}
+        </div>
       </div>
-    </div>
+    </li>
   );
 }
 

@@ -302,6 +302,29 @@ final class ProjectCardUITests: BayboUITestCase {
             "the disc stayed up after taking the card to the bottom")
     }
 
+    /// **The card's words can be copied.** `:root` turns selection and the iOS
+    /// long-press callout off for the whole document — the transcript opts its
+    /// own prose back in, and this page was never added to that list, so a
+    /// press on a title, a branch or a comment did nothing at all.
+    ///
+    /// Asserted through the system menu the press raises, because that is the
+    /// only observable end of it: `user-select` is a computed style no XCUITest
+    /// can read, and the selection itself exposes no element.
+    func testTheCardsWordsCanBeCopied() {
+        let app = openCard()
+        let body = app.staticTexts.containing(
+            NSPredicate(format: "label CONTAINS 'stops resubscribing'")
+        ).firstMatch
+        XCTAssertTrue(body.waitForExistence(timeout: Self.webviewTimeout))
+
+        body.press(forDuration: 1.0)
+
+        XCTAssertTrue(
+            app.menuItems["Copy"].waitForExistence(timeout: 5)
+                || app.buttons["Copy"].waitForExistence(timeout: 1),
+            "a long press on the description raised no Copy — the page is still inert")
+    }
+
     /// The page can be scrolled clear of the dock.
     ///
     /// The webview is full-bleed UNDER a floating dock and pads itself by the
