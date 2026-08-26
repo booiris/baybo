@@ -36,32 +36,42 @@ struct IssueDock: View {
             blockedReason: store.issue?.blockedReason, events: store.events)
     }
 
+    /// The gutter every row above the pill sits in. The PILL's own gutters are
+    /// `ComposerPill`'s — wider at rest, and animated — so this cannot be one
+    /// padding around the whole stack the way it was until 2026-08-26.
+    private static let rowGutter: CGFloat = 14
+
     var body: some View {
         VStack(spacing: 8) {
             if store.editing {
                 editingBar
+                    .padding(.horizontal, Self.rowGutter)
             } else {
                 if let notice = store.notice {
                     noticeRow(notice)
+                        .padding(.horizontal, Self.rowGutter)
                 }
                 if let prompt = store.pendingApprovals.first {
                     approvalCard(prompt)
+                        .padding(.horizontal, Self.rowGutter)
                         // Re-key on the prompt so answering the head SWAPS in
                         // the next card (a fresh one-shot latch) instead of
                         // reusing this one, whose buttons have already fired.
                         .id(prompt.callId)
                 }
                 hint
+                    .padding(.horizontal, Self.rowGutter)
                 if !staging.staged.isEmpty {
                     StagedStrip(
                         items: staging.staged,
                         onRemove: { staging.remove($0) },
-                        onRetry: { staging.retry($0) })
+                        onRetry: { staging.retry($0) }
+                    )
+                    .padding(.horizontal, Self.rowGutter)
                 }
                 composer
             }
         }
-        .padding(.horizontal, 14)
         .padding(.top, 8)
         .background(alignment: .bottom) { veil }
         .attachmentPickers(attach: attach, staging: staging, photoPicks: $photoPicks)
@@ -173,15 +183,21 @@ struct IssueDock: View {
         }
     }
 
-    /// The chat's pill exactly — the glass, the 48pt floor, the 17pt field —
-    /// with a `+` on the left and a plain send on the right. No focus-driven
-    /// gutter animation: this dock streams its own top edge to the card page
-    /// as a bottom inset on every layout settle, so an animating dock is a
-    /// moving inset per tick.
+    /// The chat's pill exactly — the glass, the 48pt floor, the 17pt field, and
+    /// since 2026-08-26 its WIDTH and the beat it changes it on. The two docks
+    /// drawing the same control at two widths, one push apart, was the whole
+    /// reason to move the gutters into `ComposerPill`.
+    ///
+    /// **No prompt text.** A card's field is the only thing on the dock that
+    /// takes typing, and what a comment does is already said above it by the
+    /// hint line — so the grey sentence inside the pill was a third voice
+    /// saying the obvious. The words stay as the field's accessibility name,
+    /// which is what a `TextField` would otherwise have taken from them.
     private var composer: some View {
         ComposerPill(
             text: $staging.text,
-            placeholder: lang.t("issue.commentPlaceholder"),
+            placeholder: "",
+            accessibilityLabel: lang.t("issue.commentField"),
             fieldIdentifier: Self.fieldIdentifier,
             lineLimit: 1...5,
             focused: $focused

@@ -129,7 +129,7 @@ Moving out of In Progress **never kills the run**; Stop is the only kill switch.
 | header | native (`ChatHeaderView` grammar) | back · `#N · status` glass pill (tap → Move sheet) · ⋯ (✎ · Run again · **Runs** · Rebuild) |
 | body | **`issue.html` WKWebView** | title · one meta line · the description as plain body · the state band (three chips · live-run line · blocked banner) · attachments · sub-issues · activity (**posts and lines**, below) · a "New activity" jump pill |
 | pickers | native sheets over the page | status → `MoveSheet` · priority → `PriorityPicker` · assignee → `AssigneePicker`, all writing through `ProjectsStore` |
-| dock | native, inside the real `ComposerDock` | notice line · `ApprovalCardView` (two answers, REST-backed) · hint chip · staged strip · the chat's composer pill (`+` → attach panel, in-field send) |
+| dock | native, inside the real `ComposerDock` | jump-to-newest disc · notice line · `ApprovalCardView` (two answers, REST-backed) · hint chip · staged strip · the chat's composer pill, at the chat's width and beat (`+` → attach panel, in-field send, no prompt text) |
 | overlays | native | pickers (`ModelMenuPanel` style) · sheets · `RenameDialog` · `ConfirmDialog` |
 
 - Why the whole body rather than a small webview for the description alone: a webview inside a native ScrollView is two scrollers plus height round-trips, while a full-page webview is exactly `ChatScreen`'s existing layering (header / webview / dock / bottom-inset stream) — and comment markdown, attachments, `#N` links and KaTeX all come free.
@@ -321,9 +321,29 @@ Moving out of In Progress **never kills the run**; Stop is the only kill switch.
   - A comment's files carry `filename` on the wire (`IssueAttachmentInput`) —
     the gateway resolves mime and size off the blob, but nothing there knows
     what the user picked the file AS, and the page prints file cards by name.
-  - No focus-driven gutter animation, unlike the chat's: this dock streams its
-    own top edge to the page as a bottom inset on every layout settle, so an
-    animating dock is a moving inset per tick.
+  - **The pill is the chat's, width and beat included** (2026-08-26). It used
+    to sit at a gutter of its own and never move, on the argument that this
+    dock streams its top edge to the page as a bottom inset and an animating
+    dock is a moving inset per tick — but the gutters are HORIZONTAL and move
+    no edge the page reads, and the cost of the exception was the same control
+    being two different widths one push apart. The gutters now live in
+    `ComposerPill` (40pt at rest, 14 focused, `.easeOut(0.25)`) rather than in
+    either dock; the rows a dock stacks above the pill keep their own.
+  - **The field draws no prompt.** What a comment will do is already said by
+    the hint line directly above it, so the grey sentence inside the pill was a
+    third voice saying the obvious. `issue.commentPlaceholder` became
+    `issue.commentField` and is now the field's accessibility NAME: a
+    `TextField` takes its name from its prompt, so removing one without this
+    leaves something VoiceOver can land on and not say what it is.
+  - **The way back down** is the chat's disc, on the chat's rule: `arrow.down`
+    in glass above the dock, only while the newest activity is off screen. The
+    page reports that (`activityAtBottom`) on every scroll AND on every
+    delivery — a card that arrives taller than its screen fires no scroll event
+    at all, so a signal taken only from `onScroll` says "at the bottom" about
+    the one card that needs the disc most. The dock's geometry is read on
+    `IssueDock` rather than around the whole stack, so the disc popping in does
+    not inflate the inset and reflow the card under a button that only
+    appeared — `ChatScreen` measures its composer for the same reason.
 - `POST …/read` fires only after the timeline renders successfully, then attention is refetched.
 - **Every run of system events collapses** into a closed `N events ›` line — a
   run of one included — and presses open and close it again. Comments,

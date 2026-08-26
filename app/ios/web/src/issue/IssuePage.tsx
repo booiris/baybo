@@ -159,11 +159,19 @@ export function IssuePage() {
     }
   }, [payload?.people]);
 
-  const onScroll = useCallback(() => {
+  /// Tell native whether the newest activity is on screen — it draws the way
+  /// back down, and only when there is one.
+  const reportAtBottom = useCallback(() => {
     const el = scrollRef.current;
     if (!el) return;
     postActivityAtBottom(el.scrollHeight - el.scrollTop - el.clientHeight < 48);
   }, []);
+
+  /// On every delivery as well as on every scroll. A card that arrives taller
+  /// than its screen fires no scroll event at all, so a page reported only
+  /// from `onScroll` opens at the top saying it is at the bottom — which is
+  /// exactly the card that needs the disc most.
+  useEffect(reportAtBottom, [reportAtBottom, payload, landing]);
 
   if (!payload) {
     return <div className="issue-loading">{t("issue.loading")}</div>;
@@ -190,7 +198,7 @@ export function IssuePage() {
     <div
       className="issue-page"
       ref={scrollRef}
-      onScroll={onScroll}
+      onScroll={reportAtBottom}
       // `pointerdown`, not `scroll`: the auto-scroll below fires a scroll of
       // its own, and a guard that could not tell the two apart would disarm
       // itself on the very first thing it does.

@@ -2874,7 +2874,7 @@
         }
       }
     },
-    "issue.commentPlaceholder": {
+    "issue.commentField": {
       "extractionState": "manual",
       "localizations": {
         "en": {
@@ -2887,6 +2887,23 @@
           "stringUnit": {
             "state": "translated",
             "value": "在这张卡片上说点什么"
+          }
+        }
+      }
+    },
+    "issue.jumpToLatest": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Jump to the newest activity"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "跳到最新动态"
           }
         }
       }

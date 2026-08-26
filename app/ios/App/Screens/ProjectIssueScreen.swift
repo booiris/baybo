@@ -38,6 +38,13 @@ struct ProjectIssueScreen: View {
     /// Set when the assignee picker was opened BY a move, so the move can
     /// finish once somebody is on the card.
     @State private var assignThenMoveTo: IssueStatus?
+    /// Whether the page is parked at its newest activity. The web side reports
+    /// it — on every scroll and once per delivery — and it drives the one
+    /// affordance a long card needs and had none of: the way back down.
+    ///
+    /// Starts true so a card that fits its screen never flashes a disc on the
+    /// way in.
+    @State private var atBottom = true
     /// The run whose transcript is open. Addressed by attempt, never by
     /// session id — an attempt that never started has no session and is
     /// still a row somebody wants to read.
@@ -76,6 +83,7 @@ struct ProjectIssueScreen: View {
                     show(run)
                 }
                 created.bridge.onPick = { field in raise(field) }
+                created.bridge.onActivityAtBottom = { atBottom = $0 }
                 host = created
                 created.bridge.deliverInit(language: lang.current.lproj, bottomInset: 0)
             }
@@ -142,8 +150,37 @@ struct ProjectIssueScreen: View {
     }
 
     private var dock: some View {
-        ComposerDock(collapsed: false, jumpVisible: false) {
-            IssueDock(store: store, staging: store.staging, attach: attach)
+        ComposerDock(collapsed: false, jumpVisible: !atBottom) {
+            VStack(spacing: 12) {
+                if !atBottom {
+                    Button {
+                        Haptics.tap()
+                        host?.bridge.jumpToLatest()
+                    } label: {
+                        Image(systemName: "arrow.down")
+                            .font(.system(size: 17, weight: .medium))
+                            .foregroundStyle(Theme.ink)
+                            .frame(width: 44, height: 44)
+                    }
+                    .glassSurface(interactive: true, in: .circle)
+                    .accessibilityIdentifier("issue-jump")
+                    .accessibilityLabel(Text(verbatim: lang.t("issue.jumpToLatest")))
+                    .transition(.scale(scale: 0.7).combined(with: .opacity))
+                }
+                IssueDock(store: store, staging: store.staging, attach: attach)
+                    // The DOCK's own top edge is the page's bottom
+                    // obstruction — measured here rather than around the whole
+                    // stack, so the disc popping in above it does not inflate
+                    // the inset and reflow the card under a button that only
+                    // appeared. `ChatScreen` measures its composer for the same
+                    // reason.
+                    .onGeometryChange(for: CGFloat.self) { proxy in
+                        proxy.frame(in: .global).minY
+                    } action: { _, minY in
+                        let screenHeight = UIScreen.main.bounds.height
+                        host?.bridge.setBottomInset(max(0, Int(screenHeight - minY)))
+                    }
+            }
         } panel: {
             if attach.isOpen {
                 AttachMenuPanel(
@@ -154,16 +191,6 @@ struct ProjectIssueScreen: View {
                 }
             }
         }
-            // The dock's own top edge IS the page's bottom obstruction. Read
-            // in window coordinates and streamed on every settle, so a
-            // keyboard sliding up moves the page's padding rather than its
-            // frame.
-            .onGeometryChange(for: CGFloat.self) { proxy in
-                proxy.frame(in: .global).minY
-            } action: { _, minY in
-                let screenHeight = UIScreen.main.bounds.height
-                host?.bridge.setBottomInset(max(0, Int(screenHeight - minY)))
-            }
     }
 
     // MARK: - Header

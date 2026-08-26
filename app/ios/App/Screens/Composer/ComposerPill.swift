@@ -13,13 +13,21 @@ import SwiftUI
 /// whole capsule focus the field, the glass, and the shadow that carries the
 /// boundary over blank paper.
 ///
-/// **No horizontal padding.** The chat's pill animates its gutters with focus
-/// and the card's does not (the card streams its dock's top edge to the web
-/// side on every layout settle, so an animating dock is a moving inset per
-/// tick). That belongs to each dock, outside this.
+/// **The gutters are here** (2026-08-26). They used to belong to each dock,
+/// because only the chat's animated with focus — the card's sat still at a
+/// gutter of its own, which made the same control two different widths one
+/// push apart. Both surfaces now want the same shape, so the shape has one
+/// home; the rows a dock stacks ABOVE the pill keep their own gutters, since
+/// those genuinely differ.
 struct ComposerPill<Leading: View, Trailing: View>: View {
     @Binding var text: String
+    /// The prompt drawn in an empty field. May be empty — the card's is — and
+    /// then `accessibilityLabel` is what names the field.
     let placeholder: String
+    /// What a screen reader calls the field. A `TextField` takes its name from
+    /// its prompt, so a field with no prompt has no name at all: something
+    /// VoiceOver can land on and not say what it is.
+    let accessibilityLabel: String
     /// The field's accessibility id. Each dock has its own — the UI smokes
     /// address them by it, and a shared one would make "the field" ambiguous
     /// on a screen that has both a card dock and a chat behind it.
@@ -44,6 +52,7 @@ struct ComposerPill<Leading: View, Trailing: View>: View {
                 .lineLimit(lineLimit)
                 .font(.system(size: 17))
                 .accessibilityIdentifier(fieldIdentifier)
+                .accessibilityLabel(Text(verbatim: accessibilityLabel))
                 .focused(focused)
                 .padding(.vertical, 13)
                 .background {
@@ -61,7 +70,18 @@ struct ComposerPill<Leading: View, Trailing: View>: View {
         // instead of a hairline.
         .glassSurface(tint: Theme.paper.opacity(0.25), in: .rect(cornerRadius: 24))
         .shadow(color: Theme.ink.opacity(0.08), radius: 14, y: 4)
+        // At rest the pill holds a moderate width; focus stretches it out
+        // toward the screen edges — a small gutter stays — on the keyboard's
+        // beat.
+        .padding(.horizontal, focused.wrappedValue ? Self.focusedGutter : Self.restGutter)
+        .animation(.easeOut(duration: 0.25), value: focused.wrappedValue)
     }
+
+    /// How far the pill sits from the screen edges, unfocused and focused.
+    /// Computed rather than stored: this type is generic on its two accessory
+    /// slots, and a generic type may hold no static storage.
+    private static var restGutter: CGFloat { 40 }
+    private static var focusedGutter: CGFloat { 14 }
 }
 
 /// The pill's round trailing control, as a LOOK: each dock wraps it in its own

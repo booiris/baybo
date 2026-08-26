@@ -103,6 +103,7 @@ struct ComposerView: View {
             ComposerPill(
                 text: $staging.text,
                 placeholder: lang.t("chat.placeholder"),
+                accessibilityLabel: lang.t("chat.placeholder"),
                 fieldIdentifier: Self.fieldIdentifier,
                 lineLimit: 1...6,
                 focused: $focused
@@ -136,11 +137,6 @@ struct ComposerView: View {
                 .padding(.trailing, 6)
                 .padding(.bottom, 6)
             }
-            // At rest the pill holds a moderate width; focus stretches it out
-            // toward the screen edges — a small gutter stays — on the
-            // keyboard's beat. The notice/staged rows keep their own gutters.
-            .padding(.horizontal, focused ? 14 : 40)
-            .animation(.easeOut(duration: 0.25), value: focused)
         }
         .padding(.top, 0)
         .padding(.bottom, dockBottomPadding)

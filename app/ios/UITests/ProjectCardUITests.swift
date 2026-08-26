@@ -182,6 +182,93 @@ final class ProjectCardUITests: BayboUITestCase {
             "the card still reads @dev-1 after handing it to @dev-2")
     }
 
+    // MARK: - The dock
+
+    /// **The same control is the same width on both surfaces.** The card's
+    /// pill sat at a gutter of its own while the chat's held a narrower
+    /// resting width and stretched on focus, so pushing a card off a
+    /// conversation changed the shape of the thing you type into. Measured
+    /// across two launches rather than asserted against a number, because the
+    /// requirement is that they AGREE — a number here would go stale the day
+    /// the chat's changes and would not notice.
+    func testTheFieldMatchesTheChatsRestingWidth() {
+        let chat = launch(["-baybo-open-chat"])
+        let chatField = chat.descendants(matching: .any)["composer.field"].firstMatch
+        XCTAssertTrue(
+            chatField.waitForExistence(timeout: Self.webviewTimeout), "no chat composer")
+        let chatFrame = chatField.frame
+        chat.terminate()
+
+        let card = openCard()
+        let cardField = card.descendants(matching: .any)[IssueDockFields.field].firstMatch
+        XCTAssertTrue(cardField.waitForExistence(timeout: 10), "no card composer")
+
+        XCTAssertEqual(
+            cardField.frame.minX, chatFrame.minX, accuracy: 0.5,
+            "the card's field starts at a different gutter than the chat's")
+        XCTAssertEqual(
+            cardField.frame.width, chatFrame.width, accuracy: 0.5,
+            "the card's field is a different width than the chat's")
+    }
+
+    /// And it stretches on the same beat. At rest the pill holds a moderate
+    /// width; focus takes it out toward the edges with the keyboard.
+    func testFocusingTheFieldWidensThePill() {
+        let app = openCard()
+        let field = app.descendants(matching: .any)[IssueDockFields.field].firstMatch
+        XCTAssertTrue(field.waitForExistence(timeout: 10), "no card composer")
+        let resting = field.frame.width
+
+        field.tap()
+        XCTAssertTrue(
+            app.keyboards.firstMatch.waitForExistence(timeout: 5), "the field never focused")
+        // 40pt gutters at rest, 14 focused — the pill gains 52 in all.
+        XCTAssertEqual(
+            field.frame.width, resting + 52, accuracy: 1,
+            "focusing the card's field did not stretch the pill the way the chat's does")
+    }
+
+    /// **No prompt inside the pill.** What a comment will do is already said on
+    /// the hint line above it; the grey sentence in the field was a third voice
+    /// saying the obvious. The words stay as the field's accessibility name,
+    /// which is the one thing a placeholder was still buying.
+    func testTheFieldCarriesNoPlaceholder() {
+        let app = openCard()
+        let field = app.descendants(matching: .any)[IssueDockFields.field].firstMatch
+        XCTAssertTrue(field.waitForExistence(timeout: 10), "no card composer")
+
+        XCTAssertTrue(
+            (field.placeholderValue ?? "").isEmpty,
+            "the card's field still draws a placeholder: \(field.placeholderValue ?? "")")
+        XCTAssertEqual(
+            field.label, "Say something on this card",
+            "a field with no placeholder needs a name of its own")
+    }
+
+    /// **The way back down.** A card is opened at the top and its Activity is
+    /// at the bottom; until 2026-08-26 the only way back was to drag. The disc
+    /// is the chat's, and it appears on the same rule: only when the newest
+    /// thing is off screen.
+    func testTheJumpDiscTakesTheCardToItsNewestActivity() {
+        let app = openCard()
+        let jump = app.buttons["issue-jump"]
+        XCTAssertTrue(
+            jump.waitForExistence(timeout: Self.webviewTimeout),
+            "a card taller than its screen offers no way to the bottom")
+        attachScreenshot(app, name: "card-jump-disc")
+
+        let last = app.staticTexts.containing(
+            NSPredicate(format: "label CONTAINS 'once the fence lands'")
+        ).firstMatch
+        jump.tap()
+
+        XCTAssertTrue(
+            last.waitForExistence(timeout: 10), "the jump landed nowhere near the newest comment")
+        XCTAssertTrue(
+            jump.waitForNonExistence(timeout: 5),
+            "the disc stayed up after taking the card to the bottom")
+    }
+
     /// The page can be scrolled clear of the dock.
     ///
     /// The webview is full-bleed UNDER a floating dock and pads itself by the
