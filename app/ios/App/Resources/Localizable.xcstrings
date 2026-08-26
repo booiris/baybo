@@ -970,6 +970,23 @@
         }
       }
     },
+    "board.priorityTitle": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "How urgent is this card?"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "这张卡有多急？"
+          }
+        }
+      }
+    },
     "board.runAgain": {
       "extractionState": "manual",
       "localizations": {
@@ -2938,6 +2955,23 @@
           "stringUnit": {
             "state": "translated",
             "value": "重建这张卡片"
+          }
+        }
+      }
+    },
+    "issue.runs": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Runs"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "运行记录"
           }
         }
       }

@@ -451,10 +451,16 @@ without touching `app/ios` at all.
   one with something in every stage and all four Waiting-strip kinds (the
   parked approval and the agent's question are seeded directly, because
   `refreshWaitingDetails` reads them off the network and the demo has none). Add
-  **`-baybo-demo-card`** to land one level deeper again, on a card: that page
-  talks to a gateway of its own, so what it shows headlessly is the shell, the
-  dock and the streamed inset over the page's own loading line — which is
-  itself the proof that the bridge, the entry and the i18n handoff all work. Two of the demo board's eight teammates carry a
+  **`-baybo-demo-card`** to land one level deeper again, on card #41 — filled
+  in from that same board fixture (`IssueStore.seedDemoCard`), plus what the
+  board's own rows leave empty: a description, a branch, a run LOG (the board
+  holds only unsettled runs) and a timeline. It used to open on the page's own
+  loading line for ever, since the card store talks to a gateway of its own and
+  the demo has none — so everything the card itself draws had no tier at all,
+  which is what `ProjectCardUITests` now covers: where the head, the text and
+  the state chips LAND, that the chips are really painted a hue (`redCoverage`,
+  since jsdom is blind to colour), the run log in the ⋯, and that the last
+  comment can be scrolled out from under the dock. Two of the demo board's eight teammates carry a
   `demo-avatar-<hex>` blob, which `AgentAvatars` draws as a flat disc without a
   gateway — so one screenshot shows both face paths side by side (an uploaded
   picture and the monogram an agent without one falls back to). Eight is two

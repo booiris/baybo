@@ -123,7 +123,12 @@ struct ProjectBoardScreen: View {
                 heldCeiling: heldCeiling,
                 onPick: { row in pick(row, for: issue) })
         }
-        .sheet(item: $assigning) { issue in
+        .sheet(item: $assigning) { assignThenMoveTo = nil } content: { issue in
+            // Swiped away without an answer, the pending move has to go with
+            // it — otherwise the NEXT assignment, made from the ⋯ minutes
+            // later, silently carries the card to the column this one was
+            // opened for. The picked path has already taken the target by the
+            // time this fires.
             AssigneePicker(
                 team: board?.team ?? [], current: issue.assignee,
                 onPick: { agentId in assign(issue, to: agentId) })
@@ -723,13 +728,7 @@ struct ProjectBoardScreen: View {
         Int((board?.issues ?? []).filter { $0.cancelledAtMs == nil }.reduce(0) { $0 + $1.unread })
     }
 
-    private var budgetMeter: BudgetMeter.Meter? {
-        guard let project else { return nil }
-        let activity = projects.activity[projectId]
-        return BudgetMeter.meter(
-            burnMicros: activity?.burnMicros ?? 0, burnTokens: activity?.burnTokens ?? 0,
-            limitMicros: project.dailyBudgetMicros, limitTokens: project.dailyBudgetTokens)
-    }
+    private var budgetMeter: BudgetMeter.Meter? { projects.budgetMeter(board: projectId) }
     private var isOverCeiling: Bool { budgetMeter?.burn == .over }
     /// Which ceiling the board is over. Taken from the meter rather than
     /// guessed: an operator told "over its daily budget" on a token-limited

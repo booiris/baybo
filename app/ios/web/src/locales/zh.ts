@@ -54,7 +54,6 @@ export const zh: typeof en = {
       noDescription: "暂无描述。",
       attachments: "附件",
       subIssues: "子任务",
-      runs: "运行记录",
       activity: "动态",
       openedBy: "由 {{who}} 创建于",
       unreadFrom: "新动态",

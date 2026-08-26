@@ -15,8 +15,12 @@ extension IssueInfo {
     /// "clear it", and one optional cannot say both.
     func with(
         status: IssueStatus? = nil,
+        priority: IssuePriority? = nil,
         pinned: Bool? = nil,
         assignee: StringPatch = .keep,
+        description: String? = nil,
+        branch: StringPatch = .keep,
+        blockedReason: StringPatch = .keep,
         unread: Int64? = nil,
         lastRunFailed: Bool? = nil
     ) -> IssueInfo {
@@ -26,19 +30,31 @@ extension IssueInfo {
             case .clear: nil
             case let .set(value): value
             }
+        let nextBranch: String? =
+            switch branch {
+            case .keep: self.branch
+            case .clear: nil
+            case let .set(value): value
+            }
+        let nextBlocked: String? =
+            switch blockedReason {
+            case .keep: self.blockedReason
+            case .clear: nil
+            case let .set(value): value
+            }
         return IssueInfo(
             number: number,
             projectId: projectId,
             title: title,
-            description: description,
+            description: description ?? self.description,
             attachments: attachments,
             status: status ?? self.status,
-            priority: priority,
+            priority: priority ?? self.priority,
             assignee: nextAssignee,
             position: position,
             pinned: pinned ?? self.pinned,
-            branch: branch,
-            blockedReason: blockedReason,
+            branch: nextBranch,
+            blockedReason: nextBlocked,
             parent: parent,
             filedFrom: filedFrom,
             stage: stage,

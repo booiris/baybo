@@ -197,19 +197,7 @@ export function IssuePage() {
       onPointerDown={() => (grabbed.current = true)}
       style={{ paddingBottom: `${String(bottomInset + 24)}px` }}
     >
-      <IssueHead
-        issue={issue}
-        opened={opened}
-        who={who}
-        assigneeHandle={issue.assignee !== undefined ? handle(issue.assignee) : null}
-      />
-      {issue.blocked_reason !== undefined && issue.blocked_reason !== "" && (
-        <div className="issue-blocked" role="note">
-          <span className="issue-blocked-label">{t("issue.blocked")}</span>
-          <span>{issue.blocked_reason}</span>
-        </div>
-      )}
-      {liveRun !== null && <RunRow run={liveRun} who={handle(liveRun.agent_id)} />}
+      <IssueHead issue={issue} opened={opened} who={who} />
       <Description
         issue={issue}
         editing={editing}
@@ -217,6 +205,7 @@ export function IssuePage() {
         onDraft={setDraft}
         onDone={(text) => postDescription(text)}
       />
+      <StateBand issue={issue} handle={handle} liveRun={liveRun} />
       {issue.attachments !== undefined && issue.attachments.length > 0 && (
         <section className="issue-section">
           <h2>{t("issue.attachments")}</h2>
@@ -232,19 +221,19 @@ export function IssuePage() {
         </section>
       )}
       <SubIssues issue={issue} children={payload.children ?? []} />
-      <Runs runs={runs} handle={handle} />
       <Activity events={timeline} landing={landing} who={who} />
     </div>
   );
 }
 
-/// Title, the three things you can change, and one thin line of the rest.
+/// The title, and one thin line of provenance under it.
 ///
-/// **Chips are for controls only.** The row was five identical pills — three
-/// pickers, a branch that opens nothing, a parent link — and four objects of
-/// equal weight saying unrelated things is what made the top of this page
-/// unreadable. What cannot be pressed to change something is not a chip: it
-/// goes on the meta line, at the weight of provenance, which is what it is.
+/// **Nothing here is a control.** The three pickers used to sit between the
+/// title and the card's first sentence, which put a row of pills in front of
+/// the two things a reader opens a card to find out: what it is called and
+/// what it says. They are state, they are read second, and they now sit under
+/// the description in the `StateBand` — the head is the title, then who opened
+/// it, then the text.
 ///
 /// The meta line also absorbed the description's old header (`@who opened
 /// this card · time`): that was a bordered bar with an avatar beside it,
@@ -254,12 +243,10 @@ function IssueHead({
   issue,
   opened,
   who,
-  assigneeHandle,
 }: {
   issue: IssueDetail;
   opened: IssueEvent | null;
   who: (id: string) => Person;
-  assigneeHandle: string | null;
 }) {
   const { t } = useTranslation();
   const cancelled = issue.cancelled_at_ms !== undefined;
@@ -286,17 +273,6 @@ function IssueHead({
   return (
     <header className="issue-head">
       <h1 className={cancelled ? "cancelled" : undefined}>{issue.title}</h1>
-      <div className="issue-chips">
-        <button type="button" className="issue-chip" onClick={() => pickField("status")}>
-          {t(`issue.status.${issue.status}`)}
-        </button>
-        <button type="button" className="issue-chip" onClick={() => pickField("priority")}>
-          {t(`issue.priority.${issue.priority}`)}
-        </button>
-        <button type="button" className="issue-chip" onClick={() => pickField("assignee")}>
-          {assigneeHandle !== null ? `@${assigneeHandle}` : t("issue.unassigned")}
-        </button>
-      </div>
       <div className="issue-meta">
         {meta.map((item, i) => (
           <Fragment key={i}>
@@ -309,16 +285,81 @@ function IssueHead({
   );
 }
 
+/// What state the card is in, under the text it is about.
+///
+/// The three pickers, the run that holds the card, and the block that stops
+/// it — one band, read after the description rather than in front of it.
+///
+/// The chips post `pick`; native owns the pickers and the writes, because a
+/// move sends the destination column's whole order and a move into In Progress
+/// starts a run — rules that live in `ProjectsStore` and may not have a second
+/// implementation on this page.
+///
+/// **The chips carry a hue**, which is this app's one departure from
+/// ink-on-paper (see `docs/design-system.md`): a status and a priority are
+/// the two facts a board is scanned for, they are read in a glance rather
+/// than a sentence, and the word alone in ink-soft made a card in Review
+/// indistinguishable from one in Backlog until you read it. The hue is a
+/// property of the VALUE — the same table tints the sub-issue dots — so the
+/// page cannot end up saying `done` in two colours.
+function StateBand({
+  issue,
+  handle,
+  liveRun,
+}: {
+  issue: IssueDetail;
+  handle: (id: string) => string;
+  liveRun: IssueRun | null;
+}) {
+  const { t } = useTranslation();
+  const assignee = issue.assignee;
+  return (
+    <div className="issue-state">
+      <div className="issue-chips">
+        <button
+          type="button"
+          className="issue-chip"
+          data-status={issue.status}
+          onClick={() => pickField("status")}
+        >
+          {t(`issue.status.${issue.status}`)}
+        </button>
+        <button
+          type="button"
+          className="issue-chip"
+          data-priority={issue.priority}
+          onClick={() => pickField("priority")}
+        >
+          {t(`issue.priority.${issue.priority}`)}
+        </button>
+        <button type="button" className="issue-chip" onClick={() => pickField("assignee")}>
+          {assignee !== undefined ? `@${handle(assignee)}` : t("issue.unassigned")}
+        </button>
+      </div>
+      {liveRun !== null && <RunRow run={liveRun} who={handle(liveRun.agent_id)} />}
+      {issue.blocked_reason !== undefined && issue.blocked_reason !== "" && (
+        <div className="issue-blocked" role="note">
+          <span className="issue-blocked-label">{t("issue.blocked")}</span>
+          <span>{issue.blocked_reason}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /// The live run, as ONE LINE — what is happening, who is doing it, and the way
 /// into its transcript.
 ///
 /// It was a bordered box, which put a second rectangle between the title and
 /// the card's first sentence. A run is a state, not an object: the line reads
-/// as one.
+/// as one — and it is the only run left on this page. The card's whole run
+/// LIST moved into the native ⋯, where the rest of the things you can do to a
+/// card already are; a settled attempt is history, and history does not belong
+/// between a card's state and its comments.
 function RunRow({ run, who }: { run: IssueRun; who: string }) {
   const { t } = useTranslation();
   return (
-    <div className={`issue-run ${run.status}`}>
+    <div className="issue-run" data-run={run.status}>
       <span className="issue-run-word">{t(`issue.run.${run.status}`)}</span>
       <span className="issue-run-who">@{who}</span>
       <button type="button" className="issue-run-open" onClick={() => openRun(run.attempt)}>
@@ -409,36 +450,10 @@ function SubIssues({ issue, children }: { issue: IssueDetail; children: ChildIss
         {children.map((sub) => (
           <li key={sub.number}>
             <button type="button" onClick={() => openIssue(sub.number)}>
-              <span className={`issue-sub-dot ${sub.status}`} aria-hidden="true" />
+              <span className="issue-sub-dot" data-status={sub.status} aria-hidden="true" />
               <span className={sub.cancelled_at_ms !== undefined ? "cancelled" : undefined}>
                 #{sub.number} {sub.title}
               </span>
-            </button>
-          </li>
-        ))}
-      </ul>
-    </section>
-  );
-}
-
-function Runs({ runs, handle }: { runs: IssueRun[]; handle: (id: string) => string }) {
-  const { t } = useTranslation();
-  if (runs.length === 0) return null;
-  return (
-    <section className="issue-section">
-      <h2>{t("issue.runs")}</h2>
-      <ul className="issue-runs">
-        {runs.map((run) => (
-          <li key={`${String(run.attempt)}-${String(run.created_at_ms)}`}>
-            <button type="button" onClick={() => openRun(run.attempt)}>
-              <span className="issue-run-attempt">#{run.attempt}</span>
-              <span className={`issue-run-status ${run.status}`}>
-                {t(`issue.run.${run.status}`)}
-              </span>
-              <span className="issue-run-who">@{handle(run.agent_id)}</span>
-              {run.error !== undefined && run.error !== "" && (
-                <span className="issue-run-error">{run.error}</span>
-              )}
             </button>
           </li>
         ))}

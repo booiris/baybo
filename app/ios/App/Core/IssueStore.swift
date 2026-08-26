@@ -116,6 +116,9 @@ final class IssueStore: ObservableObject, WebMediaTarget {
         self.client = client
         self.supportDirectory = supportDirectory
         self.pasteboard = pasteboard
+        #if DEBUG
+            if seedDemoCard() { return }
+        #endif
         loadMirror()
     }
 
@@ -150,6 +153,19 @@ final class IssueStore: ObservableObject, WebMediaTarget {
     /// are independent and a card that took four serial round trips to open
     /// would feel like it.
     func refresh() async {
+        #if DEBUG
+            // The demo card's fixture is the answer; asking the gateway would
+            // be five 404s on a board that only exists in memory. Re-seeded
+            // rather than skipped, because the board fixture is where a demo
+            // write lands: picking a status or an assignee edits the in-memory
+            // board (`ProjectsStore.write`), and this is what carries that
+            // back onto the card. See `seedDemoCard`.
+            if isDemoCard {
+                _ = seedDemoCard()
+                deliver()
+                return
+            }
+        #endif
         isRefreshing = true
         defer { isRefreshing = false }
         async let issue = try? client.projectIssueGet(projectId: projectId, number: number)
@@ -217,6 +233,11 @@ final class IssueStore: ObservableObject, WebMediaTarget {
     }
 
     private func persistMirror() {
+        #if DEBUG
+            // The demo is memory-only, `ProjectsStore`'s rule: a fixture left
+            // on disk is a card a later plain launch would find and believe.
+            if isDemoCard { return }
+        #endif
         guard let url = mirrorURL, let issue else { return }
         let mirror = ProjectsStore.IssueContentMirror(
             issue: ProjectsStore.IssueMirror(info: issue),
@@ -404,6 +425,16 @@ final class IssueStore: ObservableObject, WebMediaTarget {
     /// points at it. The gateway stats the blob on the way in, so the reverse
     /// order is a refusal.
     func storeGeneratedFace(agentId: String, pngBase64: String) {
+        #if DEBUG
+            // A blob upload followed by an avatar PATCH — for six agents that
+            // do not exist, on the operator's real gateway, once per open. The
+            // demo seeds a team where the board's fixture leaves most faces
+            // empty, and the page draws one for each; nothing before this
+            // change ever delivered a payload here, so the generator had
+            // nothing to fire on. `ProjectsStore`'s rule, applied: the demo
+            // touches neither the network nor the disk.
+            if isDemoCard { return }
+        #endif
         guard let data = Data(base64Encoded: pngBase64) else { return }
         Task { [client, projectId] in
             do {
@@ -422,10 +453,24 @@ final class IssueStore: ObservableObject, WebMediaTarget {
 
     func clearWriteError() { writeError = nil }
 
+    /// Carry a refusal raised somewhere else onto this screen's banner.
+    ///
+    /// The chips write through `ProjectsStore` — a move sends the destination
+    /// column's whole order, and that rule has one home — so their refusals
+    /// land on THAT store's `writeError` while the banner over this page reads
+    /// this one. Verbatim, like every other refusal here: the gateway's
+    /// sentences name which ceiling, which block, which card holds the slot.
+    func showWriteError(_ message: String?) {
+        writeError = message
+    }
+
     /// Stamp the card read. Called from the page's own "I rendered" message —
     /// never on the way in, because a card whose timeline threw has not been
     /// read by anybody.
     func markRendered() {
+        #if DEBUG
+            if isDemoCard { return }
+        #endif
         guard !stampedRead else { return }
         // Latched BEFORE the await so a second `issueRendered` in the same
         // breath cannot send twice, and cleared again if the send failed —
@@ -577,3 +622,163 @@ final class IssueStore: ObservableObject, WebMediaTarget {
 extension IssueStore: ComposerHost {
     var draftKey: DraftKey { .card(project: projectId, number: number) }
 }
+
+#if DEBUG
+
+    /// `-baybo-demo-card`: the card page with something in every part of it.
+    ///
+    /// It used to open on its own loading line for ever — the store talks to a
+    /// gateway and the demo has none — so the ONLY thing reachable headlessly
+    /// was the shell around an empty page. Everything the card itself draws
+    /// (the head, the description, the state band, the sub-issues, the
+    /// Activity) and everything the ⋯ offers about a run had no test tier at
+    /// all.
+    ///
+    /// The card, the team and the number come from the BOARD fixture rather
+    /// than from a second copy here: `-baybo-demo-card` lands on card #41 of
+    /// the demo board, and two fixtures for one card is two things to keep in
+    /// step. What this adds is what the board's own rows leave empty — the
+    /// description, the branch, the run LOG (a board holds only unsettled
+    /// runs) and a timeline.
+    extension IssueStore {
+        static let demoCardArg = "-baybo-demo-card"
+
+        private var isDemoCard: Bool {
+            ProcessInfo.processInfo.arguments.contains(Self.demoCardArg)
+                && ProjectsStore.demoRequested
+        }
+
+        /// Fill this store from the demo board. Answers whether it did, so the
+        /// caller can fall through to the real cold-open path when the flag is
+        /// absent — or when the board fixture has no such card.
+        ///
+        /// Seeding is only half of it: a store with a card in it DELIVERS, and
+        /// delivering is what arms the page's own side effects. `refresh`,
+        /// `markRendered` and `storeGeneratedFace` are all gated on
+        /// `isDemoCard` for that reason — the last one would otherwise upload a
+        /// generated face and PATCH an avatar for every faceless agent in the
+        /// fixture, against whatever gateway the simulator happens to be
+        /// paired with, once per open.
+        private func seedDemoCard() -> Bool {
+            guard isDemoCard,
+                let board = AppStore.shared?.projectsStore.boards[projectId],
+                let card = board.issues.first(where: { $0.number == number })
+            else { return false }
+            // The board's own row, plus the three fields a board row leaves
+            // empty. Through `with` rather than the full initialiser, which is
+            // what that helper exists for: a field added to the record
+            // upstream must fail ONE file to compile, not be silently dropped
+            // by whichever call site nobody updated.
+            issue = card.with(
+                description: Self.demoDescription,
+                branch: .set(
+                    value: "project-\(projectId)/feat/issue-\(number)-dial-loop-subscription"),
+                blockedReason: .set(value: Self.demoBlockedReason))
+            team = board.team
+            runs = Self.demoRuns(number: number)
+            eventsJson = Self.demoEventsJson(number: number, assignee: card.assignee ?? "a-dev")
+            events = (try? IssueEvent.decodeList(eventsJson)) ?? []
+            // The board fixture parents nothing, so take two rows as this
+            // card's children: the section prints a header off the DTO's
+            // done/total and its LIST off the board, and a header with no rows
+            // under it is not a state worth shipping a fixture of.
+            children = Array(board.issues.filter { $0.number != number }.prefix(2))
+            // NOT from a mirror: the fixture is what a live answer would have
+            // said, so the controls a mirror withholds — Stop, the run rows —
+            // are armed and therefore paintable.
+            isFromMirror = false
+            return true
+        }
+
+        /// Why the card is stopped — and the page's one PAN VECTOR, which is
+        /// what makes it worth putting in a fixture.
+        ///
+        /// The description cannot pan the page (`.md` clips its own overflow),
+        /// so the only text that can is the text outside it, and the blocked
+        /// note is where that arrives in real life: an agent naming the symbol
+        /// it is stuck on. Long enough to beat the note's text column, which is
+        /// narrower than the page by the label beside it.
+        private static let demoBlockedReason =
+            "needs a decision on transport::supervisor::redial_until_connected_after_the_second_leg"
+
+        /// Markdown, and deliberately awkward markdown: a long unbroken
+        /// identifier is what used to run past `.md`'s clip and pan the whole
+        /// page sideways, so the fixture that a screenshot test looks at is
+        /// the one that would show it coming back.
+        private static let demoDescription = """
+            The dial loop stops resubscribing after the second redial: the leg \
+            comes back, the session never re-attaches, and the card sits \
+            **WORKING** with nothing arriving.
+
+            `transport::supervisor::redial_until_connected` drops the \
+            subscription set on the way out.
+            """
+
+        private static func demoRuns(number: Int64) -> [IssueRunInfo] {
+            let now = Int64(Date().timeIntervalSince1970 * 1000)
+            return [
+                IssueRunInfo(
+                    number: number, attempt: 3, agentId: "a-dev", status: .running,
+                    trigger: .promoted, sessionId: "s-\(number)", error: nil,
+                    createdAtMs: now - 780_000, startedAtMs: now - 720_000, settledAtMs: nil,
+                    costMicros: nil, inputTokens: nil, outputTokens: nil),
+                IssueRunInfo(
+                    number: number, attempt: 2, agentId: "a-dev2", status: .failed,
+                    trigger: .retry, sessionId: "s-\(number)-2",
+                    error: "the sandbox exited 137", createdAtMs: now - 7_200_000,
+                    startedAtMs: now - 7_100_000, settledAtMs: now - 6_900_000,
+                    costMicros: 41_000, inputTokens: 12_000, outputTokens: 900),
+                // An attempt that never got a slot: a row somebody still wants
+                // to SEE, with no session and therefore no transcript to open.
+                IssueRunInfo(
+                    number: number, attempt: 1, agentId: "a-lead", status: .cancelled,
+                    trigger: .triage, sessionId: nil, error: nil,
+                    createdAtMs: now - 86_400_000, startedAtMs: nil,
+                    settledAtMs: now - 86_300_000, costMicros: nil, inputTokens: nil,
+                    outputTokens: nil),
+            ]
+        }
+
+        private static func demoEventsJson(number: Int64, assignee: String) -> String {
+            let now = Int64(Date().timeIntervalSince1970 * 1000)
+            let items: [[String: Any]] = [
+                [
+                    "id": "ev-1", "number": number, "actor": ["kind": "user"],
+                    "body": ["kind": "opened"], "created_at_ms": now - 86_400_000,
+                ],
+                [
+                    "id": "ev-2", "number": number, "actor": ["kind": "system"],
+                    "body": ["kind": "moved", "from": "todo", "to": "in_progress"],
+                    "created_at_ms": now - 80_000_000,
+                ],
+                [
+                    "id": "ev-3", "number": number,
+                    "actor": ["kind": "agent", "id": assignee, "handle": "dev-1"],
+                    "body": [
+                        "kind": "comment",
+                        "text": "Reproduced on the second redial. The subscription set is "
+                            + "rebuilt from `pending`, which the dial path has already "
+                            + "drained.",
+                    ],
+                    "created_at_ms": now - 7_200_000,
+                ],
+                [
+                    "id": "ev-4", "number": number, "actor": ["kind": "system"],
+                    "body": ["kind": "run_settled", "attempt": 2, "status": "failed"],
+                    "created_at_ms": now - 6_900_000,
+                ],
+                [
+                    "id": "ev-5", "number": number, "actor": ["kind": "user"],
+                    "body": ["kind": "comment", "text": "Try it again once the fence lands."],
+                    "created_at_ms": now - 1_800_000,
+                ],
+            ]
+            let envelope: [String: Any] = ["items": items, "first_unread": "ev-5"]
+            guard let data = try? JSONSerialization.data(withJSONObject: envelope),
+                let json = String(data: data, encoding: .utf8)
+            else { return "{\"items\":[]}" }
+            return json
+        }
+    }
+
+#endif

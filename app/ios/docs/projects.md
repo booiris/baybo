@@ -70,11 +70,16 @@ Projects tab root = Projects cards (wordmark header, tab bar visible)
       │    approval (inline Deny/Approve) · failed run (Run again) · agent question (Answer) · unread card (open it)
       └─ the open stage's wall of cards: bands Pinned / New / Queue
            ├─ tap a card → Issue detail (push)
-           │    ├─ body = issue.html webview (title · chips · live-run · description · attachments ·
-           │    │   sub-issues · runs · activity)
-           │    ├─ a run row → Run transcript sheet (transcript webview, read-only)
-           │    ├─ a chip → native pickers (status / priority / assignee / parent+stage)
-           │    ├─ ⋯ → Rename · Pin · Block…/Unblock · Cancel/Reopen · Copy branch
+           │    ├─ body = issue.html webview (title · meta · description · state band
+           │    │   [chips · live-run · blocked] · attachments · sub-issues · activity)
+           │    ├─ the live-run line's `Open run ›`, or ⋯ → Runs → an attempt
+           │    │   → Run transcript sheet (transcript webview, read-only)
+           │    ├─ a chip → native pickers: status → the board's own Move sheet
+           │    │   (consequences and all), priority → `PriorityPicker`,
+           │    │   assignee → `AssigneePicker` (parent+stage is still v2)
+           │    ├─ ⋯ → ✎ Edit description · Run again · Runs (every attempt,
+           │    │   newest first) · Rebuild this card — designed also to carry
+           │    │   Rename · Pin · Block…/Unblock · Cancel/Reopen · Copy branch
            │    ├─ sub-issue / #N → child card (push; back returns to the card you came from)
            │    └─ dock (native): hint chip · @ chips · ApprovalCardView (two answers) · composer pill
            ├─ long press → Move to… · Assign… · Pin · Block… · Cancel issue
@@ -121,8 +126,9 @@ Moving out of In Progress **never kills the run**; Stop is the only kill switch.
 
 | Layer | Owner | Contents |
 |---|---|---|
-| header | native (`ChatHeaderView` grammar) | back · `#N · status` glass pill (tap → Move sheet) · ⋯ |
-| body | **`issue.html` WKWebView** | title · three chips · one meta line · live-run line · blocked banner · the description as plain body · attachments · sub-issues · runs · activity (**posts and lines**, below) · a "New activity" jump pill |
+| header | native (`ChatHeaderView` grammar) | back · `#N · status` glass pill (tap → Move sheet) · ⋯ (✎ · Run again · **Runs** · Rebuild) |
+| body | **`issue.html` WKWebView** | title · one meta line · the description as plain body · the state band (three chips · live-run line · blocked banner) · attachments · sub-issues · activity (**posts and lines**, below) · a "New activity" jump pill |
+| pickers | native sheets over the page | status → `MoveSheet` · priority → `PriorityPicker` · assignee → `AssigneePicker`, all writing through `ProjectsStore` |
 | dock | native, inside the real `ComposerDock` | notice line · `ApprovalCardView` (two answers, REST-backed) · hint chip · staged strip · the chat's composer pill (`+` → attach panel, in-field send) |
 | overlays | native | pickers (`ModelMenuPanel` style) · sheets · `RenameDialog` · `ConfirmDialog` |
 
@@ -152,6 +158,76 @@ Moving out of In Progress **never kills the run**; Stop is the only kill switch.
 - **The approval card**: `ApprovalCardView` unchanged in the dock (`CompactPillButtonStyle` lifted out of its file first), two answers; the pending set is the card's `events` replayed by `call_id` (requested without resolved). The live queue is the truth, so tolerate a 404 on answer.
 - **The Answer flow** (an agent's question): Answer from the Waiting strip or the blocked banner opens the card with the composer focused and `@lead ` prefilled, the hint reading "Answers @lead · unblocking hands the run back to @dev-2", and "Unblock #N after sending" checked by default → `POST comment` first, then `PATCH {blocked_reason: null}` (the unblock door hands the parked run back out, and its brief carries your answer). A block the operator wrote themselves does not get this treatment.
 - **Editing the description (decision 11)**: a ✎ in the Description section header swaps the rendered block for a plain `<textarea>` holding the raw markdown (deliberately not contenteditable), and the native dock becomes "Editing description · Cancel | Done". Done sends the text over the bridge → `PATCH {description}` → re-render. Renaming the title still goes through `RenameDialog` (⋯ → Rename).
+- **The head is the title and the text; state is read second** (2026-08-26).
+  The three pickers sat between the title and the card's first sentence, so
+  the first screen was a title, a row of pills, a line of provenance and then,
+  if there was room, the description. A card is opened to find out what it is
+  called and what it says: those two are now adjacent, and the chips, the
+  live-run line and the blocked note follow as one `.issue-state` band under
+  the text.
+  - **The chips carry a hue**, and it is the app's one departure from
+    ink-on-paper (`docs/design-system.md` § Colour is for STATE). A status and
+    a priority are what a board is scanned for and are read in a glance rather
+    than a sentence, and in ink-soft a card in Review looked exactly like one
+    in Backlog until you read the word. Muted, keyed by the VALUE
+    (`[data-status]` / `[data-priority]`) so the chips and the sub-issue dots
+    read ONE table, and tinted rather than filled — each chip is a button that
+    opens a picker, and a solid coloured pill reads as a thing to press for
+    consequence. A value that is not in the table keeps the neutral ink-soft:
+    `backlog`, and priority below High.
+  - **The chips became controls** in the same change. All three posted `pick`
+    and native dropped it — `picking` was written and never read — so status,
+    priority and assignee were inert from the day they were drawn, which
+    colouring them only made louder. They now raise the board's own
+    `MoveSheet` (consequence rows and all), a new `PriorityPicker`, and
+    `AssigneePicker`, including the chain the board has: In Progress with
+    nobody on it opens the assignee picker first and finishes the move on its
+    answer. A picker swiped away without an answer clears that pending move —
+    the board latched it, so the NEXT assignment carried the card to a column
+    nobody asked for (fixed on both screens).
+    - **The writes go through `ProjectsStore`, not the card's own store.** A
+      move sends the destination column's WHOLE order and a move into In
+      Progress starts a run; those rules have one home, and the card page is
+      not it. What the card does after the board answers is refetch — it holds
+      a SECOND copy of the same row, so without that the chip the operator
+      just changed keeps saying what it said. A refusal is carried over
+      verbatim onto the card's banner (`IssueStore.showWriteError`), because
+      the board's sentence names which ceiling and which block. `overCeiling`
+      / `heldCeiling` come from `ProjectsStore.budgetMeter(board:)`, lifted off
+      the board screen so the two surfaces cannot disagree about which ceiling
+      is biting.
+    - **Priority is the one card verb with no consequence**: it orders no
+      column and starts no run, so `PriorityPicker` wears `AssigneePicker`'s
+      grammar (a mark, a word, a tick) rather than `MoveSheet`'s. Its
+      `ProjectsStore.setPriority` PATCHes ONLY `priority` — the patch is a
+      full replace of every field it names, so `ProjectsStoreTests` pins the
+      shape of the body rather than the board that comes back.
+    - **No undo toast here**, unlike the board: the Move sheet's row already
+      said what the press would do, a move from the card is reversed by moving
+      it back, and the toast machinery belongs to the list screen.
+  - **The run LIST moved into the native ⋯** as a `Runs` submenu, newest
+    first. A settled attempt is history — read once, when something went wrong
+    — and it sat between the card's state and its comments on every open. An
+    attempt with no session is listed and DISABLED rather than hidden: the
+    difference between "there was no third attempt" and "the third attempt
+    never got a slot" is the whole reason to open the log. A failed attempt
+    carries the server's sentence as the row's SUBTITLE — the one thing the
+    deleted list said that nothing else does — and that subtitle is DRAWN and
+    nothing more: a menu row exposes only its title to accessibility, so the
+    sentence rides the row's `accessibilityLabel` too (`runReading`). The live
+    run stays on the page, because that is not history but the card's state.
+  - **The page scrolls in ONE axis** (`overflow-x: hidden` on `.issue-page`).
+    `overflow-y: auto` alone computes the other axis to `auto` as well, so one
+    thing wider than the reading band — a title carrying a path or an
+    identifier, a `project-<ULID>/feat/<slug>` branch on the meta line, an
+    agent naming a symbol in a blocked reason — panned the whole card sideways
+    under the finger, native header and all. The clamp is the invariant; the
+    page-wide `word-break: break-word; overflow-wrap: anywhere` beside it (the
+    transcript's own `.msg.assistant` rule, which this page never got) is what
+    keeps that from turning into text silently CLIPPED at the edge by `.md`'s
+    `overflow-x: clip`. `ProjectCardUITests` pins the outcome rather than
+    either rule: it drags sideways and asserts the title's left edge does not
+    move.
 - **Nothing is framed above the Activity** (2026-08-25). The head had grown
   three stacked rectangles between the title and the card's first sentence —
   a row of five identical chips, a bordered live-run box, and the description
@@ -160,7 +236,8 @@ Moving out of In Progress **never kills the run**; Stop is the only kill switch.
   - **Chips are for controls**: status, priority, assignee, and nothing else.
     A branch opens nothing and a parent is a link, so they moved to the meta
     line — four objects of equal weight saying unrelated things is what made
-    the top of the page unreadable.
+    the top of the page unreadable. (The chip row itself has since moved BELOW
+    the description; see the 2026-08-26 entry above.)
   - **One meta line** in mono ink-soft: `opened by @who · time · ⑂ branch ·
     ↳ #parent`. It absorbed the description's old author bar, which sat under
     a title that had just said what the card is.

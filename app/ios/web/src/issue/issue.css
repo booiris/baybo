@@ -26,11 +26,75 @@
      left margin halfway down. */
   --face: 26px;
   --face-gap: 8px;
+
+  /* ---- state hues --------------------------------------------------------
+     The app's ONE departure from ink-on-paper, and it is scoped to this page
+     (see `docs/design-system.md` § Colour is for STATE): a card's status and
+     its priority are what a board is scanned for, they are read in a glance
+     rather than in a sentence, and in ink-soft a card in Review looked exactly
+     like a card in Backlog until you read the word.
+
+     Muted on purpose — these tint 10.5px mono text and a 7% wash behind it, so
+     each one clears 4.5:1 on paper; a saturated palette would turn the band
+     under the description into the loudest thing on a page whose subject is
+     the text above it. The VALUE is the key (`[data-status]` /
+     `[data-priority]`), so the chips and the sub-issue dots read one table and
+     the page cannot say `done` in two colours.
+
+     A value that is not in the table has no hue and keeps the neutral
+     ink-soft: `backlog` (nothing scheduled is not a state to point at) and
+     priority below High (medium, low and none are the resting cases). A hue on
+     every value would put a second rainbow beside the first; what is left
+     coloured is what an operator is meant to act on. */
+  --state-todo: #3d5a99;
+  --state-progress: #a35a00;
+  --state-review: #6b3fa0;
+  --state-done: #157a4d;
+  --prio-urgent: var(--color-err);
+  --prio-high: #b3261e;
 }
+
+/* The table itself. Scoped to the page rather than written bare, so a `[data-
+   status]` that ever appears outside it — the loading line, whatever is added
+   beside this page next — does not silently inherit a card's vocabulary. What
+   keeps it out of the card's own PROSE is upstream, and worth knowing: the
+   markdown pipeline carries no `rehype-raw`, so agent-authored text cannot emit
+   an attribute at all. Adding raw HTML there would put this table in reach of
+   whatever an agent writes. */
+.issue-page [data-status="todo"] { --state-hue: var(--state-todo); }
+.issue-page [data-status="in_progress"] { --state-hue: var(--state-progress); }
+.issue-page [data-status="review"] { --state-hue: var(--state-review); }
+.issue-page [data-status="done"] { --state-hue: var(--state-done); }
+.issue-page [data-priority="urgent"] { --state-hue: var(--prio-urgent); }
+.issue-page [data-priority="high"] { --state-hue: var(--prio-high); }
+/* A live run is the card's status in motion, so it borrows the status it means
+   rather than inventing a third vocabulary for the same three states. Only
+   `running`: the row draws the one UNSETTLED run, so `done` and `failed`
+   cannot reach it, and a queued or held run is not a run in motion. */
+.issue-page [data-run="running"] { --state-hue: var(--state-progress); }
 
 .issue-page {
   height: 100dvh;
   overflow-y: auto;
+  /* ONE axis. Not defensive tidiness: `overflow-y: auto` alone computes the
+     other axis to `auto` too, so any single thing wider than the band — a
+     title with an unbroken token in it, a branch name on the meta line — made
+     the whole card pan sideways under the finger, native header and all. The
+     wrap rules below are what keep that from turning into content clipped at
+     the edge instead; this line is what makes the page unable to pan whatever
+     they miss. */
+  overflow-x: hidden;
+  /* ...and nothing gets CLIPPED at that edge instead, which is the failure the
+     clamp on its own would have traded up for. The transcript's own prose rule
+     (`.msg.assistant`), applied to the whole page for the same reason it is
+     applied to a whole message: everything here is somebody's text — a title
+     that is a file path, a `project-<ULID>/feat/<slug>` branch on the meta
+     line, a URL in a comment, an agent's sentence about what it merged — and a
+     rule listing the rows that happened to overflow last would be a list that
+     the next kind of card falls off. `.md-table-wrap` already resets `word-
+     break` for cells, which is the one place breaking anywhere is wrong. */
+  word-break: break-word;
+  overflow-wrap: anywhere;
   -webkit-overflow-scrolling: touch;
   /* The native header FLOATS over this page — it is a veil, not a bar — so the
      content clears it here. `env()` works because the entry sets
@@ -51,7 +115,7 @@
 }
 
 .issue-head h1 {
-  margin: 0 0 10px;
+  margin: 0 0 8px;
   font-family: var(--font-sans);
   font-size: 17px;
   font-weight: 600;
@@ -65,11 +129,20 @@
   color: var(--color-ink-soft);
 }
 
+/* State, under the text it is about. The chips used to sit between the title
+   and the first sentence, which put a row of pills in front of the two things
+   a card is opened to find out. */
+.issue-state {
+  /* No top margin: the description's section already carries 22px below it and
+     the two collapse, so one written here would be inert and read as a spacing
+     knob that does nothing. */
+  margin: 0 0 22px;
+}
+
 .issue-chips {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
-  margin-bottom: 6px;
 }
 
 /* Provenance, at the weight provenance deserves: who opened the card and when,
@@ -80,7 +153,7 @@
   flex-wrap: wrap;
   align-items: baseline;
   gap: 5px;
-  margin-bottom: 16px;
+  margin-bottom: 14px;
   font-family: var(--font-mono);
   font-size: 10px;
   color: var(--color-ink-soft);
@@ -109,22 +182,40 @@
 }
 
 .issue-chip {
+  /* No hue is the resting case — an assignee is a person, not a state, and a
+     priority of `none` is the absence of one. Declared here rather than left
+     unset so the tinted rules below stay valid: an undefined custom property
+     makes `color: var(--state-hue)` invalid at computed-value time, which
+     lands on inherited ink rather than on this. */
+  --state-hue: var(--color-ink-soft);
   font-family: var(--font-mono);
   font-size: 10.5px;
-  color: var(--color-ink-soft);
+  color: var(--state-hue);
   background: transparent;
   border: 1px solid var(--color-line);
   border-radius: 999px;
   padding: 0 10px;
-  /* 32px, not the 44 a standalone control gets: these sit in a wrapping row
-     under a title, and a 44pt chip row would push the description off the
-     first screen. The row is scrollable and nothing here is destructive. */
+  /* 28px, not the 44 a standalone control gets: these sit in a wrapping row
+     under the description, and a 44pt chip row would push the first comment
+     off the screen. Nothing here is destructive. */
   min-height: 28px;
   cursor: pointer;
 }
 
-.issue-chip.static {
-  cursor: default;
+/* Tinted, never filled: these are BUTTONS — each raises a picker — and a solid
+   coloured pill on a card reads as a thing to press for consequence rather
+   than a thing that says what is true. The wash is what makes the hue survive
+   next to a neutral chip; the border carries the rest. */
+.issue-chip:is(
+    [data-status="todo"],
+    [data-status="in_progress"],
+    [data-status="review"],
+    [data-status="done"],
+    [data-priority="urgent"],
+    [data-priority="high"]
+  ) {
+  border-color: color-mix(in srgb, var(--state-hue) 45%, var(--color-line));
+  background: color-mix(in srgb, var(--state-hue) 7%, var(--color-paper));
 }
 
 .issue-blocked {
@@ -132,7 +223,7 @@
   gap: 8px;
   align-items: baseline;
   padding: 10px 12px;
-  margin-bottom: 14px;
+  margin-top: 10px;
   border: 1px solid var(--color-line);
   border-radius: var(--radius);
   background: var(--color-surface);
@@ -149,30 +240,25 @@
 }
 
 /* One LINE, not a box: a run is a state of the card, and a bordered rectangle
-   for it put a second frame between the title and the first sentence. */
+   for it put a second frame between the card's state and its first comment. */
 .issue-run {
+  --state-hue: var(--color-ink-soft);
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 0 0 12px;
-  margin-bottom: 2px;
+  padding: 10px 0 0;
   font-size: 12.5px;
 }
 
-.issue-run-word,
-.issue-run-status {
+/* Queued and held are NOT tinted: a run waiting for a slot is not a run in
+   motion, and colouring them the same makes the one word this line exists for
+   stop meaning anything. */
+.issue-run-word {
   font-family: var(--font-mono);
   font-size: 10px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-}
-
-/* Red is the failure token and nothing else — a queued or held run is not a
-   broken one, and colouring them the same makes the board unreadable at a
-   glance, which is the one thing this row is for. */
-.issue-run-status.failed,
-.issue-run-error {
-  color: var(--color-err);
+  color: var(--state-hue);
 }
 
 .issue-run-who {
@@ -182,7 +268,6 @@
 }
 
 .issue-run-open,
-.issue-runs button,
 .issue-subs button,
 .issue-fold button {
   font-family: var(--font-mono);
@@ -252,21 +337,18 @@
 }
 
 .issue-subs,
-.issue-runs,
 .issue-activity {
   list-style: none;
   margin: 0;
   padding: 0;
 }
 
-.issue-subs li,
-.issue-runs li {
+.issue-subs li {
   padding: 7px 0;
   border-bottom: 1px solid var(--color-line);
 }
 
-.issue-subs button,
-.issue-runs button {
+.issue-subs button {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -276,30 +358,20 @@
   font-family: inherit;
 }
 
+/* The same hue table the chips read, so a child row and the chip a tap away
+   from it agree about what `done` looks like. Filled once it IS done — the
+   one state a child list is scanned for. */
 .issue-sub-dot {
+  --state-hue: var(--color-ink-soft);
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  border: 1px solid var(--color-ink-soft);
+  border: 1px solid var(--state-hue);
   flex: none;
 }
 
-.issue-sub-dot.done {
-  background: var(--color-ink);
-  border-color: var(--color-ink);
-}
-
-.issue-run-attempt {
-  font-family: var(--font-mono);
-  font-size: 11px;
-  color: var(--color-ink-soft);
-}
-
-.issue-run-error {
-  font-size: 11px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.issue-sub-dot[data-status="done"] {
+  background: var(--state-hue);
 }
 
 /* ---- posts and lines -------------------------------------------------------

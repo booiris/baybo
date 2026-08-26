@@ -51,7 +51,6 @@ export const en = {
       noDescription: "No description.",
       attachments: "Attachments",
       subIssues: "Sub-issues",
-      runs: "Runs",
       activity: "Activity",
       openedBy: "opened by {{who}}",
       /// The rule the card opens at. Deliberately not a count: the badge that

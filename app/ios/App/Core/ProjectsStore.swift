@@ -361,6 +361,22 @@ final class ProjectsStore: ObservableObject {
 
     func clearWriteError() { writeError = nil }
 
+    /// How a board stands against its two ceilings.
+    ///
+    /// Here rather than on the board screen because it is a QUESTION about a
+    /// board — "is it over, and over which one" — and it now has two askers:
+    /// the board's own budget chip and the card page, whose Move sheet says
+    /// what a move will do about a held run. Two derivations of it would be
+    /// two answers, and the one the operator acts on is whichever screen they
+    /// happen to be looking at.
+    func budgetMeter(board projectId: String) -> BudgetMeter.Meter? {
+        guard let project = projects.first(where: { $0.id == projectId }) else { return nil }
+        let activity = activity[projectId]
+        return BudgetMeter.meter(
+            burnMicros: activity?.burnMicros ?? 0, burnTokens: activity?.burnTokens ?? 0,
+            limitMicros: project.dailyBudgetMicros, limitTokens: project.dailyBudgetTokens)
+    }
+
     // MARK: - Order
 
     /// The cards root's order: most recently opened on this phone first, then
@@ -446,6 +462,28 @@ final class ProjectsStore: ObservableObject {
                     projectId: projectId, number: number,
                     patch: Self.patch(
                         assignee: agentId.map { StringPatch.set(value: $0) } ?? .clear))
+            })
+    }
+
+    /// How urgent this card is. A label and nothing else — priority orders no
+    /// column and starts no run, which is why this is the one card verb with
+    /// no consequence sentence attached to it.
+    @discardableResult
+    func setPriority(board projectId: String, issue number: Int64, to priority: IssuePriority)
+        async -> Bool
+    {
+        await write(
+            board: projectId,
+            apply: { board in
+                guard let index = board.issues.firstIndex(where: { $0.number == number }) else {
+                    return
+                }
+                board.issues[index] = board.issues[index].with(priority: priority)
+            },
+            call: { client in
+                _ = try await client.projectIssuePatch(
+                    projectId: projectId, number: number,
+                    patch: Self.patch(priority: priority))
             })
     }
 
@@ -581,11 +619,13 @@ final class ProjectsStore: ObservableObject {
     }
 
     private static func patch(
-        pinned: Bool? = nil, assignee: StringPatch = .keep, blockedReason: StringPatch = .keep
+        pinned: Bool? = nil, priority: IssuePriority? = nil, assignee: StringPatch = .keep,
+        blockedReason: StringPatch = .keep
     ) -> IssuePatch {
         IssuePatch(
-            title: nil, description: nil, attachments: nil, priority: nil, assignee: assignee,
-            blockedReason: blockedReason, cancelled: nil, parent: nil, stage: nil, pinned: pinned)
+            title: nil, description: nil, attachments: nil, priority: priority,
+            assignee: assignee, blockedReason: blockedReason, cancelled: nil, parent: nil,
+            stage: nil, pinned: pinned)
     }
 
     /// Whether the server's refusal was "that prompt no longer exists". The

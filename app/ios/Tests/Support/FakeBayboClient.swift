@@ -569,8 +569,12 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     private var _stubTeam: [TeamMemberInfo] = []
     private var _stubAttention: [ProjectAttention] = []
     private var _stubActivity: [ProjectActivity] = []
+    private var _patches: [(Int64, IssuePatch)] = []
     /// Make the board unreachable, which is how the store learns it is offline.
     private var _failProjects = false
+
+    /// Every `PATCH /issues/{n}` this fake was sent, in order.
+    var patches: [(Int64, IssuePatch)] { lock.withLock { _patches } }
 
     var stubProjects: [ProjectInfo] {
         get { lock.withLock { _stubProjects } }
@@ -649,9 +653,20 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     func projectIssueCreate(projectId: String, new: NewIssue) async throws -> IssueInfo {
         throw Self.unsupported
     }
+    /// Records the patch and answers with the stubbed card.
+    ///
+    /// The recording is the point: `IssuePatch` is a FULL REPLACE of every
+    /// field it names, so a verb that means to change one thing and quietly
+    /// carries a second clears that second — which is a class of bug no
+    /// assertion about the resulting board can see, because the optimistic
+    /// edit is applied locally and looks right either way.
     func projectIssuePatch(projectId: String, number: Int64, patch: IssuePatch) async throws
         -> IssueInfo
-    { throw Self.unsupported }
+    {
+        lock.withLock { _patches.append((number, patch)) }
+        guard let card = stubIssueDetail else { throw Self.unsupported }
+        return card
+    }
     func projectIssueMove(
         projectId: String, number: Int64, status: IssueStatus, orderedNumbers: [Int64]
     ) async throws -> IssueInfo { throw Self.unsupported }

@@ -111,6 +111,86 @@ struct MoveSheet: View {
     }
 }
 
+/// How urgent this card is.
+///
+/// The board has never had one: priority is set when a card is filed and then
+/// only ever read, so the one place that can change it is the card itself.
+/// `AssigneePicker`'s grammar rather than `MoveSheet`'s — a priority has no
+/// consequence to spell out, it orders no column and starts no run, so a row
+/// is a mark, a word and a tick.
+struct PriorityPicker: View {
+    let current: IssuePriority
+    let onPick: (IssuePriority) -> Void
+
+    @ObservedObject private var lang = Lang.shared
+    @Environment(\.dismiss) private var dismiss
+
+    /// Loudest first, the way the board's own filter and the New issue sheet
+    /// order them — `none` last, because it is the absence of an answer rather
+    /// than the quietest one.
+    private static let levels: [IssuePriority] = [.urgent, .high, .medium, .low, .none]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(verbatim: lang.t("board.priorityTitle"))
+                .font(Theme.mono(13))
+                .foregroundStyle(Theme.inkSoft)
+                .padding(.horizontal, 20)
+                .padding(.top, 22)
+                .padding(.bottom, 12)
+
+            ForEach(Self.levels, id: \.self) { level in
+                Button {
+                    guard level != current else { return }
+                    Haptics.tap()
+                    dismiss()
+                    onPick(level)
+                } label: {
+                    row(level)
+                }
+                .buttonStyle(.plain)
+                .disabled(level == current)
+                .accessibilityIdentifier(
+                    "priority-\(IssueCardRow.priorityWord(level).lowercased().replacingOccurrences(of: " ", with: "-"))"
+                )
+            }
+
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Theme.paper)
+        // Header + five 52pt rows. Its own number rather than the Move sheet's
+        // 430: those rows are taller and each carries a sentence, and a detent
+        // copied from them leaves this one standing in a hand's width of paper.
+        .presentationDetents([.height(330)])
+        .presentationDragIndicator(.visible)
+    }
+
+    private func row(_ level: IssuePriority) -> some View {
+        HStack(spacing: 10) {
+            // The board's own mark, so a level is the same shape wherever it
+            // is read — a card row, the New issue sheet, here.
+            Text(verbatim: IssueCardRow.priorityMark(level))
+                .font(Theme.mono(12))
+                .foregroundStyle(level == current ? Theme.inkSoft : Theme.ink)
+                .frame(width: 26, alignment: .leading)
+            Text(verbatim: IssueCardRow.priorityWord(level))
+                .font(Theme.sys(15, weight: level == current ? .regular : .medium))
+                .foregroundStyle(level == current ? Theme.inkSoft : Theme.ink)
+            Spacer(minLength: 6)
+            if level == current {
+                Image(systemName: "checkmark")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Theme.inkSoft)
+            }
+        }
+        .padding(.horizontal, 20)
+        .frame(minHeight: 52)
+        .contentShape(Rectangle())
+        .opacity(level == current ? 0.6 : 1)
+    }
+}
+
 /// Who is on this card.
 ///
 /// Reached two ways, and the second is why it exists: from the ⋯ menu, and

@@ -141,6 +141,42 @@ struct ProjectsStoreTests {
             store.writeError == "this issue is blocked — lift the block before running it again")
     }
 
+    /// **A patch says one thing.** `IssuePatch` is a full replace of every
+    /// field it names, so a verb that carries a field it did not mean to
+    /// change CLEARS it — and nothing about the resulting board would show it,
+    /// since the optimistic edit is applied locally and looks right either
+    /// way. The wire is the only place this is visible, which is why the fake
+    /// records it.
+    @Test func settingThePriorityChangesThePriorityAndNothingElse() async {
+        let dir = TempSupportDir()
+        let fake = FakeBayboClient()
+        fake.stubProjects = [project("p1", name: "rglide")]
+        fake.stubIssues = [issue(12, title: "the parser")]
+        fake.stubIssueDetail = issue(12, title: "the parser")
+        let store = ProjectsStore(supportDirectory: dir.url, clientProvider: { fake })
+        await store.refreshRoot()
+        await store.refreshBoard("p1")
+
+        let sent = await store.setPriority(board: "p1", issue: 12, to: .low)
+
+        #expect(sent)
+        #expect(store.boards["p1"]?.issues.first?.priority == .low)
+        let patch = fake.patches.last
+        #expect(patch?.0 == 12)
+        #expect(patch?.1.priority == .low)
+        // The card keeps its agent and its block: `.keep` on both, never a
+        // `nil` that reads as "clear it".
+        #expect(patch?.1.assignee == .keep)
+        #expect(patch?.1.blockedReason == .keep)
+        #expect(patch?.1.pinned == nil)
+        #expect(patch?.1.title == nil)
+        #expect(patch?.1.description == nil)
+        #expect(patch?.1.attachments == nil)
+        #expect(patch?.1.stage == nil)
+        #expect(patch?.1.parent == nil)
+        #expect(patch?.1.cancelled == nil)
+    }
+
     /// Offline disables writes rather than queueing them: a board moves while
     /// the phone is away, so replaying a write authored against a board that
     /// has since changed is worse than not having sent it.

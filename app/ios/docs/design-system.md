@@ -151,6 +151,30 @@ destructive/error only. Everything else is monochrome ink. No decorative hues.
 This is why, for example, the message-index landing ring is an ink ring rather than a
 coloured one, and why the failed-send glyph is the one red thing in the thread.
 
+**One exception, and it is a STATE one** (2026-08-26): the project card page tints its
+status and priority chips, and the sub-issue dots that say the same thing
+(`web/src/issue/issue.css`, the `--state-*` / `--prio-*` table). A card's status and its
+priority are what a board is scanned for — read in a glance rather than in a sentence —
+and in ink-soft a card in Review was indistinguishable from one in Backlog until you read
+the word. The rules that keep it from becoming decoration:
+
+- **Muted, and tinted rather than filled.** Each hue clears 4.5:1 on paper at 10.5px, and
+  a chip wears the hue as its text, a 45%-blended border and a 7% wash — never a solid
+  fill. Every one of these chips is a BUTTON that raises a picker, and a solid coloured
+  pill reads as a thing to press for consequence rather than a thing saying what is true.
+- **Keyed by the value, not by the element.** `[data-status]` / `[data-priority]`, so the
+  chips and the sub-issue dots read one table and the page cannot say `done` in two
+  colours.
+- **It stops where it stops meaning something.** Priority is coloured at Urgent and High
+  only — medium, low and none are the resting cases — and a queued or held run is not
+  tinted, because a run waiting for a slot is not a run in motion. `backlog` is absent
+  from the table for the same reason and keeps the neutral ink-soft: nothing scheduled is
+  not a state to point at. The wash and the tinted border are keyed to the same six
+  values, not to the attribute's presence, so a neutral chip is neutral all the way down.
+
+Nothing else in the app takes a hue. A second surface wanting one is a conversation, not a
+precedent.
+
 ### Borders
 
 **1px hairlines.** Light `--color-line` for incidental containers (inputs, bubbles,

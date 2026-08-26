@@ -543,11 +543,19 @@ final class ProjectsUITests: BayboUITestCase {
         XCTAssertTrue(resync.waitForExistence(timeout: 3), "no rebuild entry")
         resync.tap()
 
-        // The demo has no gateway, so what comes back is the page's own
-        // loading line — which is still the page, reloaded and talking.
+        // The CARD comes back, not merely the page: the hatch throws away the
+        // mirror and everything in memory and lets the cold-open path rebuild
+        // it, so what proves it worked is the card's own text being drawn a
+        // second time by a document that has no memory of the first.
+        //
+        // It used to assert the page's loading line instead, which was all the
+        // demo could ever show — the card store talks to a gateway and there
+        // is none — until `-baybo-demo-card` started seeding one (2026-08-26).
+        // A hang and a rebuild look identical from the loading line.
         XCTAssertTrue(
-            app.staticTexts["Loading card…"].waitForExistence(timeout: 15),
-            "the page never came back after the rebuild")
+            app.staticTexts["the dial loop drops its subscription"].waitForExistence(
+                timeout: BayboUITestCase.webviewTimeout),
+            "the card never came back after the rebuild")
         // And the native chrome around it survived.
         XCTAssertTrue(app.buttons["issue-menu"].exists)
     }
