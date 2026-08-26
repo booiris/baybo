@@ -583,6 +583,83 @@ async fn a_timeline_never_renders_another_boards_handle() {
     );
 }
 
+/// A model answering a strict tool schema fills in every field it is
+/// offered, and `0` is what it fills an integer with. `parent: 0` used to
+/// mean "detach", so a run reporting that it could not start — one
+/// `IssueUpdate` carrying a block reason and a full set of filler — quietly
+/// took itself out of its parent's plan and zeroed the stage it was planned
+/// into. Two cards on the live board lost their parent that way, and the
+/// lead spent a run putting the plan back together. The card render carries
+/// neither field, so the agent could not have seen it happen either.
+#[tokio::test]
+async fn a_filler_parent_does_not_take_a_card_out_of_its_plan() {
+    let f = fixture().await;
+    let (project, lead) = f.open("Planned").await;
+    let ctx = f.ctx(&project, &lead);
+    // Distinct `key`s: this fixture's context is a cron fire, so a card
+    // opened without one dedupes onto the last.
+    f.call(
+        "IssueCreate",
+        &ctx,
+        json!({ "title": "the plan", "key": "plan" }),
+    )
+    .await;
+    f.call(
+        "IssueCreate",
+        &ctx,
+        json!({ "title": "step one", "parent": 1, "stage": 2, "key": "step" }),
+    )
+    .await;
+    let plan = f.manager.get_issue(&project, 1).await.expect("plan");
+    let placed = f.manager.get_issue(&project, 2).await.expect("step");
+    assert_eq!(placed.parent_issue_id.as_ref(), Some(&plan.id));
+    assert_eq!(placed.stage, 2);
+
+    f.call(
+        "IssueUpdate",
+        &ctx,
+        json!({
+            "number": 2,
+            "blocked": "waiting for the plan's first stage",
+            "parent": 0,
+            "stage": 0,
+        }),
+    )
+    .await;
+    let reported = f.manager.get_issue(&project, 2).await.expect("step");
+    assert_eq!(
+        reported.parent_issue_id.as_ref(),
+        Some(&plan.id),
+        "the card said it was blocked, not that it had left the plan"
+    );
+    assert_eq!(
+        reported.stage, 2,
+        "and half a placement is not a placement: a stage with no parent \
+         beside it is filler too"
+    );
+    assert_eq!(
+        reported.blocked_reason.as_deref(),
+        Some("waiting for the plan's first stage"),
+        "while the field the call was actually about landed"
+    );
+
+    f.call(
+        "IssueUpdate",
+        &ctx,
+        json!({ "number": 2, "detach_parent": true }),
+    )
+    .await;
+    let detached = f.manager.get_issue(&project, 2).await.expect("step");
+    assert_eq!(
+        detached.parent_issue_id, None,
+        "the explicit intent still detaches"
+    );
+    assert_eq!(
+        detached.stage, 0,
+        "and a stage under a parent that is gone is a barrier nobody set"
+    );
+}
+
 #[tokio::test]
 async fn an_update_that_changes_nothing_is_a_mistake_worth_saying() {
     let f = fixture().await;

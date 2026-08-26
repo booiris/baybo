@@ -3758,9 +3758,12 @@ export interface components {
             blocked_reason?: string | null;
             cancelled?: boolean | null;
             description?: string | null;
+            /** @description Take the card out of its parent's plan, clearing its stage. */
+            detach_parent?: boolean;
             /**
              * Format: int64
-             * @description Re-parent by number; `0` detaches. Absent leaves the parent alone.
+             * @description Re-parent by number. Absent leaves the parent alone, and no number
+             *     detaches — that is `detach_parent`.
              */
             parent?: number | null;
             /**
@@ -3769,7 +3772,11 @@ export interface components {
              */
             pinned?: boolean | null;
             priority?: null | components["schemas"]["IssuePriorityDto"];
-            /** Format: int64 */
+            /**
+             * Format: int64
+             * @description Which barrier under the parent. Landed only alongside `parent` or
+             *     `detach_parent`: half a placement is not a placement.
+             */
             stage?: number | null;
             title?: string | null;
         };

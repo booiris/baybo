@@ -6487,6 +6487,223 @@ async fn column_of(f: &Fixture, project: &ProjectId, number: i64) -> IssueStatus
         .status
 }
 
+/// Open a staffed Todo card as a step of `parent`, at `stage`.
+async fn queue_step(
+    f: &Fixture,
+    project: &ProjectId,
+    title: &str,
+    assignee: &AgentProfileId,
+    priority: IssuePriority,
+    parent: i64,
+    stage: i64,
+) -> IssueRow {
+    f.manager
+        .create_issue(
+            project,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::Todo,
+                assignee: Some(assignee.clone()),
+                priority,
+                parent: Some(parent),
+                stage,
+                ..new_issue(title)
+            },
+        )
+        .await
+        .expect("step")
+        .into_issue()
+}
+
+/// The incident, in the shape it actually had: a lead filed a plan under
+/// one card — three steps at stage 1, a final acceptance step at stage 3 —
+/// and the board started the stage-3 step before any stage-1 step had run,
+/// because nothing on the starting path read `stage`. Its assignee
+/// spent a run discovering there was nothing to accept yet and blocked the
+/// card, and that prose block is what went on to wake the lead nine times.
+///
+/// `urgent` on the last step is not decoration: `promotion_order` sorts by
+/// priority, so the step furthest from being startable was the first card
+/// the board reached for.
+#[tokio::test]
+async fn a_later_stage_is_not_promoted_while_an_earlier_one_is_open() {
+    let f = fixture().await;
+    let (p, dev) = driven_board(&f, 5).await;
+    let plan = queue_card(
+        &f,
+        &p.id,
+        "the plan",
+        Some(dev.clone()),
+        IssuePriority::None,
+    )
+    .await;
+
+    for step in 1..=3 {
+        queue_step(
+            &f,
+            &p.id,
+            &format!("stage one, step {step}"),
+            &dev,
+            IssuePriority::High,
+            plan.number,
+            1,
+        )
+        .await;
+    }
+    let acceptance = queue_step(
+        &f,
+        &p.id,
+        "final acceptance",
+        &dev,
+        IssuePriority::Urgent,
+        plan.number,
+        3,
+    )
+    .await;
+
+    tick(&f, &p.id).await;
+
+    assert_eq!(
+        column_of(&f, &p.id, acceptance.number).await,
+        IssueStatus::Todo,
+        "a step whose stage the board has not reached stays where it is"
+    );
+    let started: Vec<i64> = f.dispatched.lock().iter().map(|run| run.number).collect();
+    assert!(
+        !started.contains(&acceptance.number),
+        "and nothing was started on it: {started:?}"
+    );
+    assert!(
+        started.len() >= 2,
+        "while the stage the board *has* reached runs, urgent or not: {started:?}"
+    );
+}
+
+/// The override the board must never take back: a person dragging a held
+/// step into In Progress is overruling the plan on purpose, exactly as they
+/// may overrule a block. The gate lives in `driver::is_waiting`, which only
+/// the board's own two doors ask.
+#[tokio::test]
+async fn an_operator_starting_a_held_step_still_starts_it() {
+    let f = fixture().await;
+    let (p, dev) = driven_board(&f, 5).await;
+    let plan = queue_card(
+        &f,
+        &p.id,
+        "the plan",
+        Some(dev.clone()),
+        IssuePriority::None,
+    )
+    .await;
+    let first = queue_step(
+        &f,
+        &p.id,
+        "stage one",
+        &dev,
+        IssuePriority::High,
+        plan.number,
+        1,
+    )
+    .await;
+    let later = queue_step(
+        &f,
+        &p.id,
+        "stage two",
+        &dev,
+        IssuePriority::High,
+        plan.number,
+        2,
+    )
+    .await;
+
+    f.manager
+        .move_issue(
+            &p.id,
+            later.number,
+            IssueActor::User,
+            IssueStatus::InProgress,
+            &[later.number],
+        )
+        .await
+        .expect("drag");
+
+    let started: Vec<i64> = f.dispatched.lock().iter().map(|run| run.number).collect();
+    assert!(
+        started.contains(&later.number),
+        "the operator's own move starts the card it names: {started:?}"
+    );
+    assert_eq!(
+        column_of(&f, &p.id, first.number).await,
+        IssueStatus::Todo,
+        "and the stage it jumped is still open, which is the point of the override"
+    );
+}
+
+/// "Cancel the step you are not doing" is how an operator opens a barrier,
+/// and it has to work on the way *in* as well as on the way out —
+/// `stages::is_finished` is the one definition both sides read.
+#[tokio::test]
+async fn a_cancelled_step_does_not_hold_the_next_stage_shut() {
+    let f = fixture().await;
+    let (p, dev) = driven_board(&f, 5).await;
+    let plan = queue_card(
+        &f,
+        &p.id,
+        "the plan",
+        Some(dev.clone()),
+        IssuePriority::None,
+    )
+    .await;
+    let dropped = queue_step(
+        &f,
+        &p.id,
+        "stage one",
+        &dev,
+        IssuePriority::High,
+        plan.number,
+        1,
+    )
+    .await;
+    let later = queue_step(
+        &f,
+        &p.id,
+        "stage two",
+        &dev,
+        IssuePriority::High,
+        plan.number,
+        2,
+    )
+    .await;
+
+    tick(&f, &p.id).await;
+    assert_eq!(
+        column_of(&f, &p.id, later.number).await,
+        IssueStatus::Todo,
+        "the control: stage two waits while stage one is open"
+    );
+
+    f.manager
+        .update_issue(
+            &p.id,
+            dropped.number,
+            IssueActor::User,
+            IssueUpdate {
+                cancelled: Some(true),
+                ..IssueUpdate::default()
+            },
+            None,
+        )
+        .await
+        .expect("cancel");
+    tick(&f, &p.id).await;
+
+    assert_eq!(
+        column_of(&f, &p.id, later.number).await,
+        IssueStatus::InProgress,
+        "a step nobody is doing any more is not a step the next stage waits for"
+    );
+}
+
 #[tokio::test]
 async fn a_staffed_card_in_todo_starts_itself() {
     let f = fixture().await;
@@ -6992,8 +7209,18 @@ async fn a_deferral_the_board_outlived_is_put_back_to_the_lead() {
     );
 }
 
+/// A rule the board schedules by is news no card carries, and the board is
+/// what gets told.
+///
+/// It used to re-open every **card's** question instead. That reads the
+/// right way round — the answer was given under the old rules, so ask it
+/// again — and it is wrong twice over. It asks the lead to decide one thing
+/// about the whole board once per card, and, because the same stamp is what
+/// the ask cap counted from, each save minted the quota to do it again: a
+/// short burst of saves bought nine runs across five cards, all of which
+/// changed nothing.
 #[tokio::test]
-async fn a_rule_the_board_changed_re_opens_what_the_lead_answered_under_the_old_one() {
+async fn a_rule_the_board_changed_is_one_question_about_the_board() {
     let f = fixture().await;
     let (p, _dev) = driven_board(&f, 3).await;
 
@@ -7031,14 +7258,30 @@ async fn a_rule_the_board_changed_re_opens_what_the_lead_answered_under_the_old_
     tick(&f, &p.id).await;
     assert_eq!(
         asks(&f),
-        vec![RunTrigger::Review, RunTrigger::Review],
-        "the answer was given under rules the board no longer has, so the \
-         question is a question again"
+        vec![RunTrigger::Review, RunTrigger::BoardIdle],
+        "the premise of every standing answer moved, and the lead is handed \
+         the board — not one card at a time"
     );
+
+    // Told once. Answering is a look, so the rule the answer was given
+    // under is a rule the lead has now read.
+    let told = f.dispatched.lock()[1].clone();
+    settle_clean(&f, &told).await;
+    tick(&f, &p.id).await;
+    tick(&f, &p.id).await;
     assert_eq!(
-        f.dispatched.lock()[1].number,
-        review.number,
-        "and it is the same card, asked again rather than a new one"
+        asks(&f).len(),
+        2,
+        "and saving the settings again buys nothing until something happens"
+    );
+    set_merge(&f, &p, false).await;
+    set_merge(&f, &p, true).await;
+    tick(&f, &p.id).await;
+    assert_eq!(
+        asks(&f).len(),
+        3,
+        "a rule that changes after that look is news again — once, not once \
+         per save and not once per card"
     );
 }
 

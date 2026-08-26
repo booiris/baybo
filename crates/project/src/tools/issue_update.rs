@@ -10,7 +10,7 @@ use super::{
     NOBODY_WORD, actor, exec_err, parse_priority, parse_status, priority_schema, project_err,
     render_issue, scope, status_schema,
 };
-use crate::ProjectManager;
+use crate::{Placement, ProjectManager};
 
 pub const ISSUE_UPDATE_TOOL_NAME: &str = "IssueUpdate";
 
@@ -43,11 +43,16 @@ struct Params {
     blocked: Option<String>,
     #[serde(default)]
     cancelled: Option<bool>,
-    /// The issue this one is a step of, by number; `0` detaches it.
+    /// The issue this one is a step of, by number. Never a detach — see
+    /// [`Placement`].
     #[serde(default)]
     parent: Option<i64>,
+    /// Lands only alongside `parent` or `detach_parent`.
     #[serde(default)]
     stage: Option<i64>,
+    /// Take this card out of its parent's plan. The only way to do that.
+    #[serde(default)]
+    detach_parent: bool,
 }
 
 impl IssueUpdateTool {
@@ -102,8 +107,9 @@ Two of these do more than edit a row:
                 "assignee": super::assignee_schema(true),
                 "blocked": { "type": "string", "description": "Why it is blocked; an empty string unblocks it." },
                 "cancelled": { "type": "boolean", "description": "`true` cancels the issue. `false` takes back a cancel the board itself set; one the operator set is theirs to lift." },
-                "parent": { "type": "integer", "description": "Make this a sub-issue of that issue's number; `0` detaches it. One level only." },
-                "stage": { "type": "integer", "description": "Which barrier under the parent. Stage N starts when every step of stage N-1 is done." },
+                "parent": { "type": "integer", "description": "Make this a sub-issue of that issue's number. One level only. Never detaches — use `detach_parent`." },
+                "stage": { "type": "integer", "description": "Which barrier under the parent. Stage N starts when every step of stage N-1 is done, and the board holds a step in Todo until then; move it to `in_progress` yourself to start it sooner. Send it together with `parent` — alone it is ignored, so pass the card's current stage when you are not moving it." },
+                "detach_parent": { "type": "boolean", "description": "`true` takes this card out of its parent's plan and clears its stage." },
             },
             "required": ["number"],
         })
@@ -128,19 +134,22 @@ Two of these do more than edit a row:
             super::parse_assignee_value(&self.manager, &project, p.assignee.as_deref()).await?;
         let status = p.status.as_deref().map(parse_status).transpose()?;
         // The model addresses the parent by number, like everything else on
-        // the board; the store wants an id. Resolving here rather than
-        // widening the tool's vocabulary keeps ULIDs out of the schema.
-        let parent = match p.parent {
-            None => None,
-            Some(0) => Some(None),
-            Some(number) => Some(Some(
-                self.manager
-                    .get_issue(&project, number)
-                    .await
-                    .map_err(project_err)?
-                    .id,
-            )),
-        };
+        // the board; the store wants an id. Resolved through the manager
+        // rather than here: it keeps ULIDs out of the schema, and it keeps
+        // one home for what a number below `1` means — this tool is where a
+        // filler value proved it needed one.
+        let (parent, stage) = self
+            .manager
+            .resolve_placement(
+                &project,
+                Placement {
+                    parent: p.parent,
+                    detach: p.detach_parent,
+                    stage: p.stage,
+                },
+            )
+            .await
+            .map_err(project_err)?;
         let update = IssueUpdate {
             title: p.title,
             description: p.description,
@@ -149,7 +158,7 @@ Two of these do more than edit a row:
             // records who put them there and why.
             attachments: None,
             parent,
-            stage: p.stage,
+            stage,
             priority: p.priority.as_deref().map(parse_priority).transpose()?,
             assignee,
             // An all-whitespace reason is an unblock, which the manager

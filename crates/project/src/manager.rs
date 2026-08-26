@@ -240,6 +240,40 @@ pub struct NewProject {
     pub agents_may_merge: bool,
 }
 
+/// Where a card sits under a parent, as a wire caller expresses it: a
+/// parent by **number**, the detach as its own intent, and the stage that
+/// only means anything alongside one of them.
+///
+/// Resolved by [`ProjectManager::resolve_placement`], which is the one home
+/// for reading it — the tool and the admin API both address a parent by
+/// number, and two spellings of "what does `0` mean here" is one of them
+/// being wrong.
+#[derive(Debug, Clone, Default)]
+pub struct Placement {
+    /// The parent's number. Values below `1` are not issue numbers and are
+    /// read as "leave the placement alone", never as a detach.
+    pub parent: Option<i64>,
+    /// Take the card out of its parent's plan, resetting its stage.
+    pub detach: bool,
+    /// Which barrier under the parent. Landed only with a `parent` or a
+    /// `detach`, because half a placement is not a placement.
+    pub stage: Option<i64>,
+}
+
+/// What one drive pass knows about the board it is looking at, past the
+/// rows themselves.
+struct BoardPass {
+    /// Cards with a run recorded against them that is actually executing —
+    /// block-parked rows hold a card's slot without spending capacity, so
+    /// they are not in here.
+    in_flight: std::collections::BTreeSet<i64>,
+    /// When the operator last changed a rule this board schedules by. Read
+    /// only by the board question — see
+    /// `driver::nothing_has_happened_since_the_lead_looked`.
+    rules_changed_at: chrono::DateTime<chrono::Utc>,
+    promoted: usize,
+}
+
 /// What a caller supplies to open an issue. Status is where the card
 /// lands; there is no separate "column" concept.
 #[derive(Debug, Clone)]
@@ -873,8 +907,16 @@ impl ProjectManager {
         // is on. A board with no capacity left says nothing rather than
         // queueing a question it cannot act on the answer to.
         if slots > moved {
-            self.ask_the_lead(project, &issues, &in_flight, row.rules_changed_at, moved)
-                .await;
+            self.ask_the_lead(
+                project,
+                &issues,
+                &BoardPass {
+                    in_flight,
+                    rules_changed_at: row.rules_changed_at,
+                    promoted: moved,
+                },
+            )
+            .await;
         }
         Ok(moved)
     }
@@ -981,14 +1023,8 @@ impl ProjectManager {
     /// Wake the lead for the first card that needs its attention, if there
     /// is one it has not already been asked about as the card stands.
     ///
-    async fn ask_the_lead(
-        &self,
-        project: &ProjectId,
-        issues: &[IssueRow],
-        in_flight: &std::collections::BTreeSet<i64>,
-        rules_changed_at: chrono::DateTime<chrono::Utc>,
-        promoted: usize,
-    ) {
+    async fn ask_the_lead(&self, project: &ProjectId, issues: &[IssueRow], pass: &BoardPass) {
+        let in_flight = &pass.in_flight;
         let Some(lead) = self.coordinator(project).await else {
             return;
         };
@@ -1046,7 +1082,7 @@ impl ProjectManager {
                 {
                     continue;
                 }
-                if crate::driver::already_asked(&issue, &runs, question, rules_changed_at) {
+                if crate::driver::already_asked(&issue, &runs, question) {
                     continue;
                 }
                 if question == RunTrigger::Blocked {
@@ -1075,15 +1111,8 @@ impl ProjectManager {
                 }
             }
         }
-        self.tell_the_lead_the_board_ran_dry(
-            project,
-            issues,
-            in_flight,
-            &agent_opened,
-            promoted,
-            lead,
-        )
-        .await;
+        self.tell_the_lead_the_board_ran_dry(project, issues, pass, &agent_opened, lead)
+            .await;
     }
 
     /// Wake the lead about the **board** once it has run dry, having asked
@@ -1105,19 +1134,19 @@ impl ProjectManager {
         &self,
         project: &ProjectId,
         issues: &[IssueRow],
-        in_flight: &std::collections::BTreeSet<i64>,
+        pass: &BoardPass,
         agent_opened: &std::collections::BTreeSet<i64>,
-        promoted: usize,
         lead: AgentProfileId,
     ) {
-        if !crate::driver::ran_dry(issues, in_flight, agent_opened, promoted) {
+        if !crate::driver::ran_dry(issues, &pass.in_flight, agent_opened, pass.promoted) {
             return;
         }
         // No anchor is a board whose every live card is blocked, and each of
         // those blocks is a standing decision somebody made. There is
         // nothing here the board may act on, and `blocked` has already put
         // each of them to the lead once.
-        let Some(anchor) = crate::driver::drain_anchor(issues, in_flight, agent_opened) else {
+        let Some(anchor) = crate::driver::drain_anchor(issues, &pass.in_flight, agent_opened)
+        else {
             return;
         };
         let marks = match self.store.drain_marks(project).await {
@@ -1127,7 +1156,8 @@ impl ProjectManager {
                 return;
             }
         };
-        if crate::driver::nothing_has_happened_since_the_lead_looked(&marks) {
+        if crate::driver::nothing_has_happened_since_the_lead_looked(&marks, pass.rules_changed_at)
+        {
             return;
         }
         if self
@@ -2517,6 +2547,38 @@ impl ProjectManager {
             .dispatch_if_triggered(Transition::created(&issue), &issue, &actor)
             .await;
         Ok(Opened::Created(issue))
+    }
+
+    /// The `parent`/`stage` half of a patch, as a wire caller expresses it.
+    ///
+    /// `parent` is an issue number and `0` is not one, so `0` used to be
+    /// spare capacity the detach was hung on. That put the detach behind a
+    /// **filler value**: a model answering a strict tool schema fills every
+    /// field it is offered, so a run reporting that it could not start named
+    /// `parent` and `stage` alongside its block reason — filling both with
+    /// `0` — and took the card out of its parent's plan on the way to saying
+    /// something else entirely. Detaching is [`Placement::detach`] now,
+    /// which no filler produces.
+    ///
+    /// `stage` rides with `parent` for the same reason and one more: the two
+    /// are **one fact** — where this card sits under that parent — and half
+    /// of it is not a placement. A patch naming a stage and no parent is not
+    /// asking for anything this can answer.
+    pub async fn resolve_placement(
+        &self,
+        project: &ProjectId,
+        placement: Placement,
+    ) -> Result<(Option<Option<IssueId>>, Option<i64>)> {
+        if placement.detach {
+            // A stage number under a parent that is no longer there is a
+            // barrier the next reader would honour.
+            return Ok((Some(None), Some(0)));
+        }
+        let Some(number) = placement.parent.filter(|number| *number > 0) else {
+            return Ok((None, None));
+        };
+        let parent = self.get_issue(project, number).await?;
+        Ok((Some(Some(parent.id)), placement.stage))
     }
 
     /// Edit a card. `attachments` replaces the description's file list

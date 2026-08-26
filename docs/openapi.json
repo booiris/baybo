@@ -11908,13 +11908,17 @@
               "null"
             ]
           },
+          "detach_parent": {
+            "type": "boolean",
+            "description": "Take the card out of its parent's plan, clearing its stage."
+          },
           "parent": {
             "type": [
               "integer",
               "null"
             ],
             "format": "int64",
-            "description": "Re-parent by number; `0` detaches. Absent leaves the parent alone."
+            "description": "Re-parent by number. Absent leaves the parent alone, and no number\ndetaches — that is `detach_parent`."
           },
           "pinned": {
             "type": [
@@ -11938,7 +11942,8 @@
               "integer",
               "null"
             ],
-            "format": "int64"
+            "format": "int64",
+            "description": "Which barrier under the parent. Landed only alongside `parent` or\n`detach_parent`: half a placement is not a placement."
           },
           "title": {
             "type": [
