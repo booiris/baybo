@@ -34,6 +34,13 @@ describe('describeEvent', () => {
     );
   });
 
+  it('records title and description edits as readable activity', () => {
+    expect(describeEvent({ kind: 'title_changed', from: 'Before', to: 'After' })).toBe(
+      'changed the title from “Before” to “After”',
+    );
+    expect(describeEvent({ kind: 'description_changed' })).toBe('edited the description');
+  });
+
   it('reads all four assignment cases as sentences, not as templates', () => {
     expect(describeEvent({ kind: 'assigned', to: ref('dev-1') })).toBe('assigned it to @dev-1');
     expect(describeEvent({ kind: 'assigned', from: ref('dev-1'), to: ref('dev-2') })).toBe(
@@ -97,6 +104,8 @@ describe('describeEvent', () => {
   it('covers every kind — an unhandled one would return undefined', () => {
     const kinds: IssueEventBody[] = [
       { kind: 'opened' },
+      { kind: 'title_changed', from: 'Before', to: 'After' },
+      { kind: 'description_changed' },
       { kind: 'moved', from: 'todo', to: 'done' },
       { kind: 'assigned', to: ref('dev-1') },
       { kind: 'run_started', attempt: 1, trigger: 'started' },
@@ -309,6 +318,12 @@ describe('feedLine', () => {
     expect(said(feed({ kind: 'opened' }))).toBe('@dev-1 opened #7');
     expect(said(feed({ kind: 'blocked', reason: 'sandbox has no tmux' }))).toBe(
       '@dev-1 blocked #7: sandbox has no tmux',
+    );
+    expect(said(feed({ kind: 'title_changed', from: 'Before', to: 'After' }))).toBe(
+      '@dev-1 changed the title of #7',
+    );
+    expect(said(feed({ kind: 'description_changed' }))).toBe(
+      '@dev-1 edited the description of #7',
     );
   });
 

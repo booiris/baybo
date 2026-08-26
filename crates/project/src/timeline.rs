@@ -5,6 +5,15 @@ use baybo_store::project::{IssueEventBody, IssueRow};
 /// The entries one edit deserves, in the order they should read.
 pub(crate) fn diff_events(before: &IssueRow, after: &IssueRow) -> Vec<IssueEventBody> {
     let mut out = Vec::new();
+    if before.title != after.title {
+        out.push(IssueEventBody::TitleChanged {
+            from: before.title.clone(),
+            to: after.title.clone(),
+        });
+    }
+    if before.description != after.description {
+        out.push(IssueEventBody::DescriptionChanged);
+    }
     if before.status != after.status {
         out.push(IssueEventBody::Moved {
             from: before.status,
@@ -46,6 +55,8 @@ pub(crate) fn left_a_mark(body: &IssueEventBody) -> bool {
     matches!(
         body,
         IssueEventBody::Comment { .. }
+            | IssueEventBody::TitleChanged { .. }
+            | IssueEventBody::DescriptionChanged
             | IssueEventBody::Moved { .. }
             | IssueEventBody::Assigned { .. }
             | IssueEventBody::Blocked { .. }
@@ -100,16 +111,30 @@ mod tests {
     }
 
     #[test]
-    fn an_edit_that_changes_nothing_visible_says_nothing() {
+    fn title_and_description_edits_are_recorded() {
         let before = issue();
         let mut after = before.clone();
         after.title = "Wire it properly".into();
         after.description = "with tests".into();
         after.priority = IssuePriority::Urgent;
-        assert!(
-            diff_events(&before, &after).is_empty(),
-            "prose edits are not events; the current text is on the page"
+        assert_eq!(
+            diff_events(&before, &after),
+            vec![
+                IssueEventBody::TitleChanged {
+                    from: "Wire it".into(),
+                    to: "Wire it properly".into(),
+                },
+                IssueEventBody::DescriptionChanged,
+            ],
+            "priority stays quiet, but prose edits need an actor and a time"
         );
+    }
+
+    #[test]
+    fn unchanged_prose_does_not_create_duplicate_events() {
+        let before = issue();
+        let after = before.clone();
+        assert!(diff_events(&before, &after).is_empty());
     }
 
     #[test]

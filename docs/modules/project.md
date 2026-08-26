@@ -50,7 +50,7 @@ every door leads through it.
 | `stages.rs` | Sub-issues, `is_finished`, the stage barrier's two questions, the progress ring |
 | `driver.rs` | Which Todo cards the board starts by itself, in what order, which cards the lead is asked about (staffing, review, stalled work, blocks, the Backlog the board filed), and when the board itself has run dry |
 | `budget.rs` | `Headroom` and the UTC-day window a daily ceiling measures |
-| `timeline.rs` | `diff_events` — an edit reduced to the entries worth writing |
+| `timeline.rs` | `diff_events` — an edit reduced to the entries worth writing, including title and description edits |
 | `worktree.rs` | The per-issue git worktree: create, branch, resolve the commit identity, merge, reclaim |
 | `approvals.rs` | `TimelineApprovalGate` — a run's approval prompts, on the card |
 | `events.rs` | The `ProjectEvents` push port (the gateway implements it) |
@@ -1125,6 +1125,15 @@ re-opened every question the lead had answered — invisibly, which is what made
 it expensive. The shape is not exotic: a model answering a strict tool schema
 fills in every field it is offered, so "report that I am blocked" arrives as a
 patch naming all ten.
+
+Title and description edits are timeline events once their values actually
+change. A title event keeps both names: titles are bounded, and the old name is
+what makes references written before the rename intelligible. A description
+event records who edited it and when, but does not copy either markdown body
+into the event — descriptions are unbounded, and making every revision a second
+full description would turn one edit into an unbounded storage multiplier.
+Priority, pinning, attachments and hierarchy remain quiet unless another rule
+gives them their own event.
 
 Two refinements on that guard, both mechanical bounds the comparison alone
 does not give:

@@ -644,6 +644,11 @@ pub enum IssueEventBodyDto {
         attachments: Vec<IssueAttachmentDto>,
     },
     Opened,
+    TitleChanged {
+        from: String,
+        to: String,
+    },
+    DescriptionChanged,
     Moved {
         from: IssueStatusDto,
         to: IssueStatusDto,
@@ -798,6 +803,8 @@ impl IssueEventBodyDto {
                     .collect(),
             },
             IssueEventBody::Opened => Self::Opened,
+            IssueEventBody::TitleChanged { from, to } => Self::TitleChanged { from, to },
+            IssueEventBody::DescriptionChanged => Self::DescriptionChanged,
             IssueEventBody::Moved { from, to } => Self::Moved {
                 from: from.into(),
                 to: to.into(),

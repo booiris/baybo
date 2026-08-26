@@ -384,6 +384,45 @@ async fn a_patch_leaves_unnamed_fields_alone_and_null_clears_the_block() {
 }
 
 #[tokio::test]
+async fn title_and_description_edits_are_recorded_on_the_timeline() {
+    let (router, _tg) = router().await;
+    let p = open_project(&router, "edit history").await;
+    open_issue(&router, &p, "Before").await;
+    let uri = format!("/v1/projects/{p}/issues/1");
+
+    patch(
+        &router,
+        &uri,
+        json!({ "title": "After", "description": "New details" }),
+        StatusCode::OK,
+    )
+    .await;
+
+    let events = issue_events(&router, &p, 1).await;
+    assert_eq!(
+        events[events.len() - 2]["body"],
+        json!({ "kind": "title_changed", "from": "Before", "to": "After" })
+    );
+    assert_eq!(
+        events[events.len() - 1]["body"],
+        json!({ "kind": "description_changed" })
+    );
+
+    patch(
+        &router,
+        &uri,
+        json!({ "title": "After", "description": "New details" }),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        issue_events(&router, &p, 1).await.len(),
+        events.len(),
+        "rewriting the same prose is not another edit"
+    );
+}
+
+#[tokio::test]
 async fn a_pin_is_a_field_a_patch_can_set_on_its_own() {
     let (router, _tg) = router().await;
     let p = open_project(&router, "pins").await;

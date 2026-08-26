@@ -154,6 +154,10 @@ fn narrate(body: &IssueEventBody, known: &[baybo_store::AgentProfileRow]) -> Str
             }
         },
         IssueEventBody::Opened => "opened the issue".to_owned(),
+        IssueEventBody::TitleChanged { from, to } => {
+            format!("changed the title from {from:?} to {to:?}")
+        }
+        IssueEventBody::DescriptionChanged => "edited the description".to_owned(),
         IssueEventBody::Moved { from, to } => {
             format!("moved it from {} to {}", from.as_str(), to.as_str())
         }

@@ -2773,6 +2773,14 @@ export interface components {
             /** @enum {string} */
             kind: "opened";
         } | {
+            from: string;
+            /** @enum {string} */
+            kind: "title_changed";
+            to: string;
+        } | {
+            /** @enum {string} */
+            kind: "description_changed";
+        } | {
             from: components["schemas"]["IssueStatusDto"];
             /** @enum {string} */
             kind: "moved";

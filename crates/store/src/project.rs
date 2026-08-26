@@ -434,6 +434,17 @@ pub enum IssueEventBody {
         attachments: Vec<IssueAttachment>,
     },
     Opened,
+    /// The card's title changed. Both values are kept because titles are
+    /// short, and a rename without its old name cannot explain references
+    /// made before it happened.
+    TitleChanged {
+        from: String,
+        to: String,
+    },
+    /// The card's description changed. The prose itself stays on the card:
+    /// descriptions are unbounded markdown, so copying every revision into
+    /// the timeline would make an edit an unbounded storage multiplier.
+    DescriptionChanged,
     Moved {
         from: IssueStatus,
         to: IssueStatus,
@@ -596,6 +607,8 @@ impl IssueEventBody {
         match self {
             IssueEventBody::Comment { .. } => "comment",
             IssueEventBody::Opened => "opened",
+            IssueEventBody::TitleChanged { .. } => "title_changed",
+            IssueEventBody::DescriptionChanged => "description_changed",
             IssueEventBody::Moved { .. } => "moved",
             IssueEventBody::Assigned { .. } => "assigned",
             IssueEventBody::RunStarted { .. } => "run_started",
