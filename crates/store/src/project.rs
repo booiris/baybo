@@ -157,18 +157,26 @@ pub struct ProjectRow {
     /// either ceiling, [`Self::max_parallel_issue_runs`],
     /// [`Self::agents_may_merge`], or a restore from the archive.
     ///
-    /// Scheduling state rather than content, and nothing draws it. The
-    /// driver's `already_asked` reads it so that a standing question the
-    /// lead has already answered becomes a question again when the premise
-    /// of that answer changed: "escalate this to somebody who may merge" is
-    /// the answer to a board that could not, and the board turning that on
-    /// is the only thing that ever happens next.
+    /// Scheduling state rather than content, and nothing draws it. Its one
+    /// reader is `driver::nothing_has_happened_since_the_lead_looked`, the
+    /// guard on the question about the **board**: a standing answer the lead
+    /// gave becomes a question again when the premise of that answer moved,
+    /// and "escalate this to somebody who may merge" is the answer to a
+    /// board that could not, whose only sequel is the board being told it
+    /// now may.
+    ///
+    /// Read there rather than per card, deliberately. A rule is one fact
+    /// about the whole board, and the per-card guard that used to read this
+    /// answered it once per card — the lead reading one card at a time to
+    /// decide something about all of them, and, because that guard's ask cap
+    /// counted from the same mark, each save minting the quota to do it
+    /// again.
     ///
     /// Not `Option`, for [`Self::max_parallel_issue_runs`]'s reason: a row
-    /// written before the column existed resolves to its `created_at` at
-    /// the storage edge. Every card is younger than its board, so a board
-    /// whose rules never changed is exactly a board this re-opens nothing
-    /// on.
+    /// written before the column existed resolves to its `created_at` at the
+    /// storage edge. A board is older than anything that ever ran on it, so
+    /// a board whose rules never changed is exactly a board this re-opens
+    /// nothing on.
     pub rules_changed_at: DateTime<Utc>,
     /// Soft archive. There is no hard delete in any production path.
     pub archived_at: Option<DateTime<Utc>>,
