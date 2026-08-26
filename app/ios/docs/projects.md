@@ -366,6 +366,13 @@ Moving out of In Progress **never kills the run**; Stop is the only kill switch.
     being two different widths one push apart. The gutters now live in
     `ComposerPill` (40pt at rest, 14 focused, `.easeOut(0.25)`) rather than in
     either dock; the rows a dock stacks above the pill keep their own.
+    The **vertical** gap followed the same day and could not move in with them:
+    the card's pill sat a flat 8pt off the floor where the chat's sits flush
+    and lifts 12 on focus, and that number is tied to each dock's own veil,
+    which turns solid across exactly that strip. `IssueDock` carries
+    `dockBottomPadding` as its own copy of `ComposerView`'s. Unlike the gutters
+    it IS a height, so the 12 reaches the page as a re-pad — which is what the
+    keyboard riding up does a beat later anyway.
   - **The field draws no prompt.** What a comment will do is already said by
     the card's own state band, so the grey sentence inside the pill was a
     third voice saying the obvious. `issue.commentPlaceholder` became

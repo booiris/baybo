@@ -68,6 +68,7 @@ struct IssueDock: View {
             composer
         }
         .padding(.top, 8)
+        .padding(.bottom, dockBottomPadding)
         .background(alignment: .bottom) { veil }
         .attachmentPickers(attach: attach, staging: staging, photoPicks: $photoPicks)
     }
@@ -179,7 +180,6 @@ struct IssueDock: View {
             .accessibilityIdentifier("issue-send")
             .accessibilityLabel(Text(verbatim: lang.t("issue.send")))
         }
-        .padding(.bottom, 8)
     }
 
     private var canSend: Bool {
@@ -230,6 +230,15 @@ struct IssueDock: View {
         FocusedTextInput.clearDocument()
         staging.text = ""
     }
+
+    /// The gap under the pill — `ComposerView.dockBottomPadding`, to the pixel.
+    /// The card's pill used to sit a flat 8pt off the bottom while the chat's
+    /// sat flush and lifted 12 on focus, so pushing a card off a conversation
+    /// moved the thing you type into. Unlike the gutters this one is VERTICAL,
+    /// and this dock's height is what native reports to the page as its bottom
+    /// obstruction — so the 12pt arrives as a re-pad, which is the same thing
+    /// the keyboard riding up already does a beat later.
+    private var dockBottomPadding: CGFloat { focused ? 12 : 0 }
 
     /// The paper tail under the pill, so the page's content fades out behind
     /// the dock rather than sliding under a hard edge.

@@ -214,14 +214,14 @@ final class ProjectCardUITests: BayboUITestCase {
 
     // MARK: - The dock
 
-    /// **The same control is the same width on both surfaces.** The card's
-    /// pill sat at a gutter of its own while the chat's held a narrower
-    /// resting width and stretched on focus, so pushing a card off a
-    /// conversation changed the shape of the thing you type into. Measured
-    /// across two launches rather than asserted against a number, because the
-    /// requirement is that they AGREE — a number here would go stale the day
+    /// **The same control sits in the same place on both surfaces.** The
+    /// card's pill had a gutter of its own and a bottom gap of its own — 8pt
+    /// off the floor where the chat's sits flush — so pushing a card off a
+    /// conversation moved and reshaped the thing you type into. Measured
+    /// across two launches rather than against numbers, because the
+    /// requirement is that they AGREE: a number here would go stale the day
     /// the chat's changes and would not notice.
-    func testTheFieldMatchesTheChatsRestingWidth() {
+    func testTheFieldMatchesTheChatsRestingGeometry() {
         let chat = launch(["-baybo-open-chat"])
         let chatField = chat.descendants(matching: .any)["composer.field"].firstMatch
         XCTAssertTrue(
@@ -239,6 +239,9 @@ final class ProjectCardUITests: BayboUITestCase {
         XCTAssertEqual(
             cardField.frame.width, chatFrame.width, accuracy: 0.5,
             "the card's field is a different width than the chat's")
+        XCTAssertEqual(
+            cardField.frame.maxY, chatFrame.maxY, accuracy: 0.5,
+            "the card's field sits at a different height off the floor than the chat's")
     }
 
     /// And it stretches on the same beat. At rest the pill holds a moderate
