@@ -77,6 +77,66 @@ final class IssueDockUITests: BayboUITestCase {
             app.textFields[IssueDockFields.field].value as? String == "this will not land",
             "a failed comment threw away what was typed")
     }
+
+    /// **A half-typed `@` offers the board's roster**, and completing writes
+    /// the handle the gateway will read. The strip is the only part of the
+    /// card dock that reaches into UIKit for the caret, so this case is what
+    /// says the reach still works — a `TextField` reports no selection, and
+    /// the fallback (the end of the draft) would pass a weaker assertion.
+    func testAHalfTypedHandleOffersTheBoardsRoster() {
+        let app = openCard()
+        let field = app.textFields[IssueDockFields.field]
+        field.tap()
+        field.typeText("@de")
+
+        let offered = app.buttons[Self.mention("dev-1")]
+        XCTAssertTrue(offered.waitForExistence(timeout: 3), "no mention strip appeared")
+        XCTAssertTrue(app.buttons[Self.mention("dev-2")].exists)
+        XCTAssertFalse(
+            app.buttons[Self.mention("qa-1")].exists, "the strip offered a handle that cannot match")
+
+        offered.tap()
+        XCTAssertEqual(
+            app.textFields[IssueDockFields.field].value as? String, "@dev-1 ",
+            "completing left something other than the handle and one space")
+        XCTAssertFalse(
+            app.buttons[Self.mention("dev-2")].exists, "the strip stayed up after completing")
+    }
+
+    /// The negative control, and the reason the grammar is mirrored from
+    /// `crates/project/src/mentions.rs` rather than approximated: an `@` after
+    /// a letter is an address, the gateway reads no mention out of it, and a
+    /// strip that offered one would promise a delivery nobody makes.
+    func testAnAddressIsNotOfferedAsAMention() {
+        let app = openCard()
+        let field = app.textFields[IssueDockFields.field]
+        field.tap()
+        field.typeText("mail me@de")
+
+        XCTAssertFalse(
+            app.buttons[Self.mention("dev-1")].waitForExistence(timeout: 1),
+            "an address was offered a completion")
+    }
+
+    /// The card's own assignee leads the strip — the plumbing a model test
+    /// cannot see, since `IssueMention` is handed the id and this is what
+    /// hands it over. `lead` is first on the demo board's roster; `dev-1` is
+    /// #41's agent.
+    func testTheCardsAssigneeLeadsTheStrip() {
+        let app = openCard()
+        let field = app.textFields[IssueDockFields.field]
+        field.tap()
+        field.typeText("@")
+
+        let assignee = app.buttons[Self.mention("dev-1")]
+        XCTAssertTrue(assignee.waitForExistence(timeout: 3), "a bare @ offered nobody")
+        XCTAssertLessThan(
+            assignee.frame.minX, app.buttons[Self.mention("lead")].frame.minX,
+            "the card's agent is not the first chip")
+    }
+
+    /// Mirrors `IssueDock`'s per-handle identifier.
+    private static func mention(_ handle: String) -> String { "issue-mention.\(handle)" }
 }
 
 /// Mirrors `IssueDock.fieldIdentifier` — the app module is not importable from

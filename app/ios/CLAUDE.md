@@ -152,6 +152,7 @@ was tried and failed, and several name a bug that shipped once already.
 - Voice input has no composer affordance — the mic placeholder button was
   removed with the Liquid Glass restyle. Wiring real capture later means
   re-adding the button, not just filling in a handler.
-- The Projects tab has no device pass yet — every tier is simulator-only, and
-  the description editor in particular wants a Chinese keyboard on hardware.
-  Deferred inside it: `@` mention chips and staged attachments on a comment.
+- The Projects tab has no device pass yet — every tier is simulator-only. The
+  comment field's `@` mention strip is the piece that most wants hardware: it
+  reads the caret off the focused UIKit document and holds itself back while an
+  IME composition is open, so a Chinese keyboard is what would find its edges.

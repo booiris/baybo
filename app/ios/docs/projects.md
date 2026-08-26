@@ -135,7 +135,7 @@ Moving out of In Progress **never kills the run**; Stop is the only kill switch.
 | overlays | native | pickers (`ModelMenuPanel` style) · sheets · `RenameDialog` · `ConfirmDialog` |
 
 - Why the whole body rather than a small webview for the description alone: a webview inside a native ScrollView is two scrollers plus height round-trips, while a full-page webview is exactly `ChatScreen`'s existing layering (header / webview / dock / bottom-inset stream) — and comment markdown, attachments, `#N` links and KaTeX all come free.
-- Shape: a third Vite entry `issue.html`; an `IssueBridge` (the size of `DeckBridge`, with its main-frame-only guard and 3-reloads-per-30s crash budget): native→web `init / deliverIssue / deliverEvents / deliverRuns / setBottomInset / jumpToLatest / blobResult`, web→native `ready / pick(field) / openRun / openIssue(n) / activityAtBottom / requestBlob / viewImage / previewFile / copy / log`. **Inline images ride the bridge's `requestBlob`/`blobResult` (as the transcript does), so no scheme route is needed**; putting HtmlPreview in the issue body would need `DynamicRoute` widened, which v1 skips. The keyboard: the webview never resizes; native streams the bottom inset (the transcript's mechanism). One host per card, torn down on exit.
+- Shape: a third Vite entry `issue.html`; an `IssueBridge` (the size of `DeckBridge`, with its main-frame-only guard and 3-reloads-per-30s crash budget): native→web `init / deliverIssue / deliverEvents / deliverRuns / setBottomInset / jumpToLatest / blobResult`, web→native `ready / pick(field) / openRun / openIssue(n) / activityAtBottom / requestBlob / viewImage / previewFile / copy / log`. **Inline images ride the bridge's `requestBlob`/`blobResult` (as the transcript does), so no scheme route is needed**; putting HtmlPreview in the issue body would need `DynamicRoute` widened, which v1 skips. The keyboard: the webview never resizes; native streams the bottom inset (the transcript's mechanism). **One host per card, owned by the screen's `@StateObject` and torn down in that object's `deinit` — `.onDisappear` is NOT exit, a push fires it too.** The card page is the one screen that can push another of itself (a sub-issue row, the `↳ #N` parent chip), and the destructor hung off `.onDisappear` until 2026-08-26: tapping a sub-issue destroyed the card underneath it — webview unparented, message handler removed, invalidation token dropped — and coming back found a white page under a live header and dock, permanently, because the rebuild was gated on `host == nil` and `host` was never nil'd. Ownership is the only signal that tells "covered" from "gone". `SubagentHost` and `ProjectRunHost` carry the same shape and the same comment.
 - **`subscribeIssue` has ONE holder, and it is the React tree** (2026-08-25 —
   shipped broken, fixed same day). `main.tsx` posts `issueReady` on the line
   after `createRoot().render(…)`, which has only SCHEDULED the tree; native
@@ -175,6 +175,38 @@ Moving out of In Progress **never kills the run**; Stop is the only kill switch.
   needs a mirror and a fixture in the same commit. What stays on the dock is the
   ANSWER row, which is a control rather than a caption: it carries "Unblock #N
   after sending".
+- **The mention strip** (2026-08-26): a half-typed `@` puts the board's roster
+  on one scrolling row directly above the field, and a chip writes `@handle `
+  over what was typed. The card's own assignee leads it — a phone shows about
+  three chips and scrolls for the rest, so the order is what most operators
+  will ever see, where the web's popup shows the whole list and keeps roster
+  order.
+  - **The grammar is the gateway's** (`crates/project/src/mentions.rs`),
+    mirrored in `IssueMention` for the same reason `app/web` mirrors it a
+    second time in `projects/mentionModel.ts`: a completion offered where the
+    server will read no mention promises a delivery nobody makes. `me@dev-1`
+    is an address, `@Dev` is not a handle, and the strip says so by not
+    appearing. What it does NOT say is what the mention will DO — that rule
+    (`comments::comment_delivery`) has one client-side implementation and it is
+    not this one; see the composer-hint bullet above.
+  - **A strip, not a popup at the caret.** The web opens its list where the
+    caret is, which it can do because a `<textarea>`'s caret can be measured —
+    `projects/caret.ts` lays the draft out a second time in a hidden mirror to
+    find it. A SwiftUI `TextField` exposes neither the caret's position nor its
+    offset, so the dock reads the offset off the focused UIKit document
+    (`FocusedTextInput.caretOffset`) on each edit, and the strip takes the
+    QuickType bar's place instead of the popup's.
+  - **The completion is written through the document**, not the binding
+    (`FocusedTextInput.replace`): a `TextField` handed a new string puts the
+    caret at the end of it, which would move the cursor every time a
+    completion landed mid-draft. Both reaches are UTF-16-indexed, which is why
+    `IssueMention` scans code units rather than Characters — an emoji earlier
+    in the draft would otherwise shift the insert.
+  - **What it cannot see is the caret MOVING with no edit behind it** — a tap
+    into the middle of a draft. The strip is stale until the next keystroke,
+    harmlessly: the offset it holds still points at the `@` it was measured
+    from. Nothing is offered against an open IME composition either, or
+    `@ceshi` on the way to `@测试` would be read as a handle prefix.
 - **The approval card**: `ApprovalCardView` unchanged in the dock (`CompactPillButtonStyle` lifted out of its file first), two answers; the pending set is the card's `events` replayed by `call_id` (requested without resolved). The live queue is the truth, so tolerate a 404 on answer.
 - **The Answer flow** (an agent's question): Answer from the Waiting strip or the blocked banner opens the card with the composer focused and `@lead ` prefilled, the answer row reading "Answers @lead" beside "Unblock #N after sending", checked by default → `POST comment` first, then `PATCH {blocked_reason: null}` (the unblock door hands the parked run back out, and its brief carries your answer). A block the operator wrote themselves does not get this treatment.
 - **Rebuild is on the LIST, and the description editor has no door**
@@ -465,6 +497,7 @@ Moving out of In Progress **never kills the run**; Stop is the only kill switch.
 - **Fetches**: opening a board = project / issues / agents / active runs (a card adds events / runs); the cards root = projects / activity / attention / feed head.
 - **Pushes**: `project_changed` on the owner WS → **any scope means the board is dirty** (`move_issue` emits no board-scope frame), debounced 300ms for the open board; a card page reacts only to its own number; a run sheet re-reads on `run|timeline`. `Gap{session_id: null}` triggers the same refresh. While a row's swipe panel is open, refreshes are held and applied on release.
 - **Attention**: foreground poll every 60s, plus after every write, plus on entering the tab (keyed on `homeTab` — `onAppear` re-fires and is unreliable), plus `scenePhase == .active`, plus when `chatPath` empties.
+- **Neither appearance hook is a route hook.** `onAppear` re-fires (above); `.onDisappear` fires when a screen is merely COVERED — by a push or a `fullScreenCover` — which is why nothing irreversible may hang off it. On the card page only the paste-target handover does, because `ComposerPasteTarget.detach` is identity-guarded and `onAppear` puts it back. The two destructors are `IssueHost.deinit` (the webview, the handler, the store's bridge) and `IssueStore.deinit` (`leaveCard`, which retires the composer's staging machine). Retiring that machine on a cover cancelled the reader's in-flight uploads and lazily built the second machine over the same draft key that `retire()` exists to prevent.
 - **Badges**: the app-icon badge still counts chat unread only; the tab badges are §3.0.
 
 ## 6. Native vs webview
@@ -748,16 +781,20 @@ team / profile / activity / settings screens.
 
 **Deferred deliberately, and worth naming so nobody looks for them:**
 
-- **`@` mention chips on a comment.** Mentioning is typing `@handle`, and since
-  2026-08-26 nothing on either client says what that will do in advance — an
-  unassigned card is the only one where a mention does anything a plain comment
-  does not.
+- **What a mention will DO, said in advance.** Nothing on either client warns
+  that an `@` on an unassigned card staffs it — the one thing a mention does
+  that a plain comment does not; the rule lives at the gateway and stayed
+  there when the composer hint came out (§3.3).
+  ~~`@` mention chips~~ — **shipped 2026-08-26**, see §3.3: a half-typed `@`
+  offers the board's roster on a strip above the field, and a chip writes the
+  handle.
   ~~Staged attachments~~ — **shipped 2026-08-25**, see §3.3. What made them a
   deferral was one `weak var store: ChatStore?` on the staging machine; that
   is a `ComposerHost` now, and the card has the same strip.
-- **The description editor is a `<textarea>` over the raw markdown**, which is
-  what §3.3 asks for — but it has had no device pass, and a Chinese keyboard is
-  specifically what it needs (this app has one marked-text scar already).
+  ~~The description editor~~ — **deleted 2026-08-26**, see §3.3. It was
+  deferred here as "shipped but no device pass"; a card's text is written by
+  whoever files it and by the agent working it, so the phone stopped offering
+  to rewrite it rather than growing a Chinese-keyboard pass for it.
 - **The card page's pickers.** `pick(field)` crosses the bridge and the screen
   holds it; the sheets themselves are the board's, reached from the board.
 - **Everything is simulator-only.** No tier here has run on hardware.

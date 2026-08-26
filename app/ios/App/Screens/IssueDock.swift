@@ -22,6 +22,17 @@ struct IssueDock: View {
     @State private var photoPicks: [PhotosPickerItem] = []
     @State private var sending = false
     @FocusState private var focused: Bool
+    /// Where the caret was after the last edit, as a UTF-16 offset — `nil`
+    /// while an IME composition is open, and until the field has been typed
+    /// into at all.
+    ///
+    /// A `TextField` reports no selection, so this is read off the focused
+    /// UIKit document on each edit. What that cannot see is the caret MOVING
+    /// with no edit behind it (a tap into the middle of a draft), and the
+    /// strip is stale for exactly that long — harmlessly: the offset it holds
+    /// still points at the `@` it was measured from, so completing from a
+    /// stale strip still lands in the right place.
+    @State private var caret: Int?
     /// Send the comment AND lift the block. Checked by default when an agent
     /// is the one asking: answering a question and leaving the card parked is
     /// almost never what somebody meant, and the unblock is what hands the run
@@ -65,6 +76,7 @@ struct IssueDock: View {
                 )
                 .padding(.horizontal, Self.rowGutter)
             }
+            mentionRow
             composer
         }
         .padding(.top, 8)
@@ -147,6 +159,87 @@ struct IssueDock: View {
         }
     }
 
+    // MARK: - Mentions
+
+    /// The mention being typed, if the field has one open.
+    private var mention: IssueMentionQuery? {
+        guard focused, let caret else { return nil }
+        return IssueMention.query(in: staging.text, caret: caret)
+    }
+
+    /// Who a half-typed `@` could mean, on the board's own roster.
+    private var mentionCandidates: [TeamMemberInfo] {
+        guard let mention else { return [] }
+        return IssueMention.candidates(
+            in: store.team, prefix: mention.prefix, assignee: store.issue?.assignee)
+    }
+
+    /// The handles an open `@` could become, directly above the field.
+    ///
+    /// **A strip, not a popup at the caret.** The web dashboard opens its list
+    /// where the caret is, which it can do because a `<textarea>`'s caret can
+    /// be measured (`projects/caret.ts` lays the draft out a second time in a
+    /// hidden mirror to find it). A SwiftUI `TextField` exposes neither its
+    /// caret's position nor its offset, and a phone has the QuickType bar's
+    /// answer anyway: one row between the words and the keyboard, close enough
+    /// to what is being typed that choosing does not mean looking away.
+    ///
+    /// It scrolls rather than wrapping, so a board with a large team costs the
+    /// page the same height as a board with three agents — this row's height
+    /// is reported to the card as its bottom obstruction, and a row that grows
+    /// to two lines reflows the whole page mid-word.
+    @ViewBuilder private var mentionRow: some View {
+        let candidates = mentionCandidates
+        if !candidates.isEmpty {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    ForEach(candidates, id: \.id) { member in
+                        Button {
+                            complete(member.handle)
+                        } label: {
+                            Text(verbatim: "@\(member.handle)")
+                                .font(Theme.mono(12))
+                                .foregroundStyle(Theme.ink)
+                                .padding(.horizontal, 10)
+                                .frame(minHeight: Self.chipHeight)
+                                .background(Capsule().fill(Theme.paper))
+                                .overlay(Capsule().strokeBorder(Theme.lineStrong, lineWidth: 1))
+                                .contentShape(Capsule())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityIdentifier("issue-mention.\(member.handle)")
+                    }
+                }
+                .padding(.horizontal, Self.rowGutter)
+            }
+            // The scroller is pinned to the chips it holds: left to size
+            // itself it takes the height it is offered, and the dock's height
+            // is what the card is told to keep clear.
+            .frame(height: Self.chipHeight)
+        }
+    }
+
+    /// One chip, and therefore the strip. Under the 44pt hit floor
+    /// deliberately — this is the QuickType bar's row rather than a control
+    /// with consequence, and every point of it is charged to the card as
+    /// obstruction.
+    private static let chipHeight: CGFloat = 32
+
+    /// Write `@handle ` over what has been typed of it.
+    private func complete(_ handle: String) {
+        guard let mention else { return }
+        Haptics.tap()
+        let edit = IssueMention.edit(for: mention, handle: handle, in: staging.text)
+        // The DOCUMENT first, so a completion landing mid-draft leaves the
+        // caret behind the handle instead of at the end of the comment. The
+        // binding write after it is the fallback for a probe that found no
+        // responder, and an equal write — discarded by `text`'s own guard —
+        // when the document took it.
+        FocusedTextInput.replace(edit.range, with: edit.text)
+        staging.text = IssueMention.applying(edit, to: staging.text)
+        caret = edit.range.lowerBound + edit.text.utf16.count
+    }
+
     /// The chat's pill exactly — the glass, the 48pt floor, the 17pt field, and
     /// since 2026-08-26 its WIDTH and the beat it changes it on. The two docks
     /// drawing the same control at two widths, one push apart, was the whole
@@ -179,6 +272,20 @@ struct IssueDock: View {
             .padding(.bottom, 6)
             .accessibilityIdentifier("issue-send")
             .accessibilityLabel(Text(verbatim: lang.t("issue.send")))
+        }
+        // The caret is read HERE rather than tracked by the field, which
+        // reports no selection at all. By the time the binding has changed the
+        // UIKit document behind it already holds the edit, so this is the
+        // caret as it stands after the keystroke.
+        //
+        // Nothing is offered against an OPEN composition: a pinyin keyboard
+        // mirrors its uncommitted syllables into the binding, so `@ceshi` on
+        // the way to `@测试` would otherwise be read as a handle prefix and
+        // answered with a list.
+        .onChange(of: staging.text) { _, text in
+            caret =
+                FocusedTextInput.isComposing
+                ? nil : (FocusedTextInput.caretOffset ?? text.utf16.count)
         }
     }
 
@@ -240,17 +347,29 @@ struct IssueDock: View {
     /// the keyboard riding up already does a beat later.
     private var dockBottomPadding: CGFloat { focused ? 12 : 0 }
 
+    /// How far the paper takes to arrive at the dock's top edge. A card's
+    /// entries slide under the dock as it scrolls, and a flat opaque band
+    /// would cut the last one off mid-line.
+    ///
+    /// A FIXED band, not a fraction of the dock's height, which is what it was
+    /// until the mention strip: at 40% of the height every row the dock grows
+    /// pushed the fade further down, so the newest row — the one the operator
+    /// is looking at — landed in the transparent part of it, with the card's
+    /// own text running between the chips. At rest the two are within a few
+    /// points of each other.
+    private static let veilFade: CGFloat = 28
+
     /// The paper tail under the pill, so the page's content fades out behind
     /// the dock rather than sliding under a hard edge.
     private var veil: some View {
-        LinearGradient(
-            stops: [
-                .init(color: Theme.paper.opacity(0), location: 0),
-                .init(color: Theme.paper, location: 0.4),
-                .init(color: Theme.paper, location: 1),
-            ],
-            startPoint: .top, endPoint: .bottom
-        )
+        VStack(spacing: 0) {
+            LinearGradient(
+                colors: [Theme.paper.opacity(0), Theme.paper],
+                startPoint: .top, endPoint: .bottom
+            )
+            .frame(height: Self.veilFade)
+            Theme.paper
+        }
         .ignoresSafeArea(edges: .bottom)
         .allowsHitTesting(false)
     }

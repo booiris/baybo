@@ -53,6 +53,38 @@ enum FocusedTextInput {
         else { return }
         input.replace(range, withText: "")
     }
+
+    /// Where the caret is, as an offset from the start of the document.
+    ///
+    /// In UTF-16 code units: `UITextPosition` is backed by the field's text
+    /// storage, which is an `NSString`. That is the same unit `IssueMention`
+    /// scans in, and the reason it does.
+    ///
+    /// The END of the selection, so a caret is a caret and a selection reads
+    /// as its right edge — which is where the next keystroke lands.
+    static var caretOffset: Int? {
+        guard let input = current, let selection = input.selectedTextRange else { return nil }
+        return input.offset(from: input.beginningOfDocument, to: selection.end)
+    }
+
+    /// Replace a UTF-16 range of the focused input's document, leaving the
+    /// caret behind what was written.
+    ///
+    /// Through the document rather than through SwiftUI's binding: a binding
+    /// write replaces the whole string, and a `TextField` handed a new string
+    /// puts the caret at the END of it — which moves the operator's cursor
+    /// every time a completion lands mid-draft. Answers whether it reached a
+    /// responder, so the caller can fall back to the binding.
+    @discardableResult
+    static func replace(_ range: Range<Int>, with text: String) -> Bool {
+        guard let input = current,
+            let from = input.position(from: input.beginningOfDocument, offset: range.lowerBound),
+            let to = input.position(from: input.beginningOfDocument, offset: range.upperBound),
+            let target = input.textRange(from: from, to: to)
+        else { return false }
+        input.replace(target, withText: text)
+        return true
+    }
 }
 
 /// One-shot sink for the responder-chain probe above.
