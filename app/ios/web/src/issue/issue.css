@@ -175,10 +175,18 @@
 
 /* The card's own text sits directly under the head — no box, no author bar.
    It is what the title is about, and the title is one line above it. */
-.issue-body {
+
+/* CARD PROSE, and the only type spec on this page that leaves the monospace
+   chrome behind: the description and every comment body, in one rule so the
+   two cannot drift. Inter a notch under the transcript's (which is 1rem/1.6)
+   — a card is scanned where a conversation is read — but not as tight: 1.65
+   over 14px is 23px a line, and the description is the one paragraph on this
+   page somebody reads straight through. */
+.issue-body,
+.issue-box-body {
   font-family: var(--font-sans);
   font-size: 0.875rem;
-  line-height: 1.55;
+  line-height: 1.65;
 }
 
 .issue-chip {
@@ -487,14 +495,10 @@
   white-space: nowrap;
 }
 
-/* The one long read on this page, so it is the one place that leaves the
-   monospace chrome behind — Inter at the transcript's proportions, a notch
-   down: a card is scanned, a conversation is read. */
+/* Type comes from the card-prose rule above, which this shares with the
+   description; only the box's own padding lives here. */
 .issue-box-body {
   padding: 7px 10px;
-  font-family: var(--font-sans);
-  font-size: 0.875rem;
-  line-height: 1.55;
 }
 
 .issue-line {
