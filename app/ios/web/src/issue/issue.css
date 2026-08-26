@@ -303,6 +303,23 @@
   color: var(--color-ink-soft);
 }
 
+/* A hairline running out of the heading to the page edge — the `NEW` rule's
+   shape in the neutral tone. Activity is where the card stops being a record
+   of what it IS and starts being what was said about it, and that is the one
+   seam on the page worth drawing. */
+.issue-section h2.issue-ruled {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.issue-section h2.issue-ruled::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--color-line);
+}
+
 .issue-count {
   letter-spacing: 0;
 }
@@ -489,17 +506,28 @@
   color: var(--color-ink-soft);
 }
 
-/* A dot centred in the FACE column, so machinery hangs off the same rail the
-   posts do rather than starting a second margin. */
+/* A dot on the page's own left rail, at the head of the face column — the
+   posts' faces start there too, so the Activity has ONE left edge rather than
+   a machinery margin inset half a face from it.
+   `1lh` and not `1em`: the box is the first LINE, so the dot centres on the
+   line it belongs to and a sentence that wraps does not drag it halfway down
+   the entry. The old box was `1em` tall with the dot at its middle, which
+   under `align-items: baseline` put it ~3px above the text it labels. */
 .issue-line-dot {
   width: var(--face);
-  height: 1em;
+  height: 1lh;
   flex: none;
-  background: radial-gradient(
-    circle at 50% 50%,
-    var(--color-line-strong) 0 2.5px,
-    transparent 2.5px
-  );
+  align-self: flex-start;
+  display: flex;
+  align-items: center;
+}
+
+.issue-line-dot::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--color-line-strong);
 }
 
 .issue-line-text {
@@ -519,11 +547,12 @@
 }
 
 .issue-fold {
+  /* On the page's own left rail, where the faces and the machinery dots start
+     — not indented onto the box column with the things somebody said. A
+     closed run is a fold in the record, not an entry in it, and starting it
+     under the boxes made the Activity read as a list with a ragged left
+     edge. */
   padding: 6px 0;
-  /* On the box column, not the page margin: the faces set the card's left
-     rail, and a collapsed run starting further left reads as a different
-     list. */
-  padding-left: calc(var(--face) + var(--face-gap));
 }
 
 .issue-fold button {

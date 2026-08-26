@@ -433,7 +433,7 @@ function Activity({
   if (folded.length === 0) return null;
   return (
     <section className="issue-section">
-      <h2>{t("issue.activity")}</h2>
+      <h2 className="issue-ruled">{t("issue.activity")}</h2>
       <ol className="issue-activity">
         {folded.map((item, i) => (
           <Fragment key={rowKey(item, i)}>
