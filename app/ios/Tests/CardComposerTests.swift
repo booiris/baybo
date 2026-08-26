@@ -170,17 +170,27 @@ struct CardComposerTests {
         #expect(card.writeError == nil, "and raises no banner over an untouched card")
     }
 
-    /// The machine outlives the frame — an upload holds it — so leaving must
-    /// retire it, or a re-push builds a second one over the same draft key and
-    /// the zombie's terminal write puts a sent draft back on disk.
-    @Test func leavingTheCardRetiresItsStagingMachine() async {
+    /// The machine outlives the frame — an upload holds it — so the STORE'S
+    /// DEATH must retire it, or a re-push builds a second one over the same
+    /// draft key and the zombie's terminal write puts a sent draft back on
+    /// disk.
+    ///
+    /// Driven by dropping the store rather than by calling the rule, because
+    /// which moment fires it is the whole of what went wrong: it used to hang
+    /// off `ProjectIssueScreen`'s `.onDisappear`, which SwiftUI fires when a
+    /// push merely COVERS the card — so tapping a sub-issue retired a machine
+    /// the reader was coming straight back to. A test that calls `leaveCard()`
+    /// itself passes either way.
+    @Test func theCardsDeathRetiresItsStagingMachine() async {
         let dir = TempSupportDir()
-        let card = store(dir, client: FakeBayboClient())
-        let machine = card.staging
-        card.staging.text = "half a comment"
-        card.staging.flushDraft()
+        var card: IssueStore? = store(dir, client: FakeBayboClient())
+        // Deliberately the ONLY strong reference to the store, so `card = nil`
+        // below really is the pop.
+        let machine = card!.staging
+        machine.text = "half a comment"
+        machine.flushDraft()
 
-        card.leaveCard()
+        card = nil
         machine.text = "written by a ghost"
         machine.flushDraft()
 
@@ -188,6 +198,40 @@ struct CardComposerTests {
             DraftStore.read(key: .card(project: "p1", number: 41), in: dir.url)?.text
                 == "half a comment",
             "a retired machine may not touch the draft again")
-        #expect(card.staging !== machine, "and the next visit gets a fresh one")
+    }
+
+    /// **And the death has to be reachable.** Everything the card page cleans
+    /// up now hangs off `deinit` — the composer above, and `IssueHost`'s
+    /// stopping the page, unhooking the native surface and letting the
+    /// WebContent process go — so one retain cycle anywhere in
+    /// store → host → bridge is not a tidy little leak. It is a card whose
+    /// webview never stops, whose `ProjectInvalidations` observer refetches
+    /// five REST routes on every board broadcast for the life of the process,
+    /// and whose staging machine is never retired, once per card ever opened.
+    ///
+    /// It has happened: the screen installed `onPick` / `onOpenRun` /
+    /// `onActivityAtBottom` on the bridge from inside its own `body`, and a
+    /// closure written there captures the whole view struct — `@StateObject`
+    /// storage included — closing `host → bridge → closure → view → host`.
+    /// Those callbacks are gone (`IssueBridge` says why); this is what notices
+    /// if anything like them comes back.
+    @Test func droppingTheCardReleasesItsWebviewHost() async {
+        let dir = TempSupportDir()
+        weak var weakStore: IssueStore?
+        weak var weakHost: IssueHost?
+        autoreleasepool {
+            let card = store(dir, client: FakeBayboClient())
+            weakStore = card
+            // Everything the screen touches, touched: the page's host and the
+            // composer's machine both wire themselves into the store on first
+            // read, and either could be the end that will not let go.
+            weakHost = card.host
+            _ = card.staging
+        }
+
+        #expect(weakStore == nil, "the card's store outlived the card")
+        #expect(
+            weakHost == nil,
+            "the card's webview host outlived the card — its page is still running")
     }
 }

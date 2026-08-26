@@ -16,9 +16,16 @@ struct ProjectIssueScreen: View {
     let projectId: String
     let number: Int64
 
-    /// Created with the store, torn down with the screen. One card, one
-    /// webview — see `IssueHost`.
-    @State private var host: IssueHost?
+    /// The card's webview. One card, one webview — see `IssueHost`.
+    ///
+    /// The SCREEN owns no part of it. It used to hold the host in a `@State`
+    /// optional built inside `.task` behind an `if host == nil` gate, and tore
+    /// it down from `.onDisappear` — a destructor on a hook that also fires
+    /// when a push merely covers the card, and a gate that made the wreckage
+    /// permanent. It belongs to the store, and the store belongs to the screen,
+    /// so the pop takes all three and nothing has to decide what "leaving"
+    /// means.
+    private var host: IssueHost { store.host }
     /// The `+`'s panel, owned HERE rather than by the dock: it floats over the
     /// dock's own rows — the hint line, the approval card, the strip — and a
     /// panel presented from inside them draws behind them and loses its taps.
@@ -38,13 +45,6 @@ struct ProjectIssueScreen: View {
     /// Set when the assignee picker was opened BY a move, so the move can
     /// finish once somebody is on the card.
     @State private var assignThenMoveTo: IssueStatus?
-    /// Whether the page is parked at its newest activity. The web side reports
-    /// it — on every scroll and once per delivery — and it drives the one
-    /// affordance a long card needs and had none of: the way back down.
-    ///
-    /// Starts true so a card that fits its screen never flashes a disc on the
-    /// way in.
-    @State private var atBottom = true
     /// The run whose transcript is open. Addressed by attempt, never by
     /// session id — an attempt that never started has no session and is
     /// still a row somebody wants to read.
@@ -53,6 +53,10 @@ struct ProjectIssueScreen: View {
     init(projectId: String, number: Int64) {
         self.projectId = projectId
         self.number = number
+        // Inside the `@autoclosure`, deliberately: `RootView` re-evaluates its
+        // navigation destination on every update, so a store built here as a
+        // plain statement would run a mirror read and two JSON decodes on the
+        // main thread each time, only to be thrown away.
         _store = StateObject(wrappedValue: IssueStore(projectId: projectId, number: number))
     }
 
@@ -74,22 +78,28 @@ struct ProjectIssueScreen: View {
         .ignoresSafeArea(.keyboard)
         .background(PopGestureEnabler().frame(width: 0, height: 0))
         .safeAreaInset(edge: .bottom, spacing: 0) { dock }
-        .task {
-            if host == nil {
-                let created = IssueHost(store: store)
-                created.bridge.onOpenRun = { attempt in
-                    guard let run = store.runs.first(where: { $0.attempt == attempt })
-                    else { return }
-                    show(run)
-                }
-                created.bridge.onPick = { field in raise(field) }
-                created.bridge.onActivityAtBottom = { atBottom = $0 }
-                host = created
-                created.bridge.deliverInit(language: lang.current.lproj, bottomInset: 0)
-            }
-            await store.refresh()
+        // Re-runs on every re-appear, which is what the refetch wants: a card
+        // that was covered while its board moved on comes back current. The
+        // webview is not rebuilt here — it belongs to `host`, and rebuilding it
+        // per appearance would cold-start a WebContent process and throw the
+        // reader's scroll away every time they peek at a sub-issue.
+        .task { await store.refresh() }
+        // The page's two requests, ANSWERED HERE and cleared. They arrive as
+        // store state rather than as closures installed on the bridge, because
+        // a closure written here captures this whole struct — `_host` and all —
+        // and the bridge outlives the body. See `IssueBridge`.
+        .onChange(of: store.pickRequest) { _, field in
+            guard let field else { return }
+            store.pickRequest = nil
+            raise(field)
         }
-        .onChange(of: lang.current.lproj) { _, code in host?.bridge.setLanguage(code) }
+        .onChange(of: store.openRunRequest) { _, attempt in
+            guard let attempt else { return }
+            store.openRunRequest = nil
+            guard let run = store.runs.first(where: { $0.attempt == attempt }) else { return }
+            show(run)
+        }
+        .onChange(of: lang.current.lproj) { _, code in host.bridge.setLanguage(code) }
         .onAppear {
             // The paste row's source. A process-global slot with one occupant:
             // the chat screen and this one are never both on screen, and the
@@ -97,14 +107,14 @@ struct ProjectIssueScreen: View {
             // survives an appear that lands before the other's disappear.
             ComposerPasteTarget.shared.attach(store.staging)
         }
+        // ONLY reversible work belongs here: a push fires this too — tapping a
+        // sub-issue covers this card without ending the visit — so anything
+        // irreversible would destroy the page the reader is coming back to.
+        // The paste target survives it because `detach` is identity-guarded and
+        // `onAppear` puts it back; the destructors are `IssueHost.deinit` and
+        // `IssueStore.deinit`, which fire when the screen actually goes.
         .onDisappear {
             ComposerPasteTarget.shared.detach(store.staging)
-            if let host { host.teardown(store: store) }
-            // The staging machine outlives this frame — an upload holds it —
-            // so a re-push would build a second one over the same draft key,
-            // and the zombie's terminal write would put a sent draft back on
-            // disk.
-            store.leaveCard()
         }
         .sheet(item: $picking) { field in
             picker(field)
@@ -139,13 +149,9 @@ struct ProjectIssueScreen: View {
         }
     }
 
-    @ViewBuilder private var page: some View {
-        if let host {
-            IssueWebView(host: host)
-                .ignoresSafeArea(.container, edges: .bottom)
-        } else {
-            Color.clear
-        }
+    private var page: some View {
+        IssueWebView(host: host)
+            .ignoresSafeArea(.container, edges: .bottom)
     }
 
     private var dock: some View {
@@ -160,16 +166,16 @@ struct ProjectIssueScreen: View {
                     proxy.frame(in: .global).minY
                 } action: { _, minY in
                     let screenHeight = UIScreen.main.bounds.height
-                    host?.bridge.setBottomInset(max(0, Int(screenHeight - minY)))
+                    host.bridge.setBottomInset(max(0, Int(screenHeight - minY)))
                 }
                 // An overlay rather than a row above the dock: the attach
                 // panel hangs off this content's top edge, and a disc in the
                 // stack raised the panel by the disc's own height.
                 .jumpToLatestDisc(
-                    visible: !atBottom, label: lang.t("issue.jumpToLatest"),
+                    visible: !store.atBottom, label: lang.t("issue.jumpToLatest"),
                     identifier: "issue-jump"
                 ) {
-                    host?.bridge.jumpToLatest()
+                    host.bridge.jumpToLatest()
                 }
         } panel: {
             if attach.isOpen {

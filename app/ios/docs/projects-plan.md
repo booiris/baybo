@@ -259,6 +259,93 @@ sentence the server wrote and a banner reads it. And `ios-web` is still
 the case, but turning a CI job on is a quota decision and not a code change.
 
 
+## After P8 · fixes
+
+### `.onDisappear` destroyed the card you were coming back to (2026-08-26)
+
+**Symptom.** Open a card, tap a sub-issue row or the `↳ #N` parent chip, then
+back out: the card you came FROM is a white page. Header and dock still live and
+still working; the body gone. Permanent for that screen — pop to the board and
+re-open and it is fine, which is what made it read as "only when you come back".
+
+**Cause, in one line.** `ProjectIssueScreen` ran a *destructor* from
+`.onDisappear`, a hook SwiftUI also fires when the screen is merely covered by a
+push. `IssueHost.teardown` unparents the `WKWebView`, removes the message
+handler and detaches the store; nothing re-parents on the way back, because
+`makeUIView` runs once, `updateUIView` is empty and `.task`'s rebuild was gated
+on `if host == nil` — and `host` was never nil'd. What is left is the ZStack's
+`Theme.paper`, which is `Color.white`.
+
+The card page is the only screen in the app that can push another of ITSELF, so
+it is the only one where the difference between "covered" and "gone" ever
+showed. Everything else it raises is a `.sheet`, and a sheet does not fire the
+presenter's `onDisappear`.
+
+**Fix.** Hang the teardown off OWNERSHIP, which is push-proof by construction:
+a covered screen's state storage is retained by the NavigationStack, so no
+"is this a real exit" predicate has to be written, or kept in sync. The card's
+`IssueStore` owns the host (`IssueStore.host`, built on first read), the screen
+owns the store as its one `@StateObject`, and `IssueHost.deinit` stops the page,
+removes the message handler and unparents the webview. The optional `host` and
+its rebuild gate are gone with it, `deliverInit` moved into `IssueHost.init`
+(the one-shot frame belongs to the one-shot object), and `IssueStore.detach`
+went entirely: everything it undid — the invalidation token, the media sink, the
+bridge reference — dies with the store, and an inverse reachable from a screen
+is an inverse some `.onDisappear` eventually calls on a card that was only
+covered.
+
+**Two things adversarial review caught in the first cut of this fix**, both of
+which would have made it worse than the bug:
+
+1. **The teardown would never have run at all.** `ProjectIssueScreen` installed
+   `onOpenRun` / `onPick` / `onActivityAtBottom` on `IssueBridge` from inside
+   its own body, and a closure written there captures the whole view struct —
+   `@StateObject` storage included — so `host → bridge → closure → view → host`
+   was a cycle. Moving the destructor onto `deinit` moved it onto something that
+   could not fire: a live WebContent process and a `ProjectInvalidations`
+   observer refetching five REST routes, per card ever opened, forever. The
+   three callbacks are gone; the page's requests land as store state
+   (`pickRequest` / `openRunRequest` / `atBottom`) and the screen answers them
+   with `onChange`. `IssueBridge.store` is weak, so that route cannot cycle —
+   and with no closure properties left there is nowhere to install one.
+   `CardComposerTests.droppingTheCardReleasesItsWebviewHost` is what notices if
+   anything like them comes back.
+2. **The first cut held the store and the host as two `@StateObject`s** (the
+   `SubagentHost` / `ProjectRunHost` shape), which needs the shared instance in
+   `init` — outside `StateObject`'s `@autoclosure`. `RootView` re-evaluates its
+   navigation destination on every update, so that rebuilt a whole `IssueStore`
+   — a synchronous mirror read plus two JSON decodes, on the main thread — and
+   threw it away, every time. Those two screens pay it because they OBSERVE
+   published state on their hosts and a nested `ObservableObject` republishes
+   nothing through its owner. This one only calls through `bridge`, so the store
+   can own the host outright and stay lazy.
+
+Two more things rode the same wrong hook and moved with it:
+
+- **`store.leaveCard()`** — documented "*going away for good*" and retiring the
+  composer's staging machine — cancelled every in-flight upload and dropped the
+  staged strip each time a sub-issue was opened, and the next read of `staging`
+  lazily built exactly the second machine over the same draft key that
+  `retire()` exists to prevent. Now `IssueStore.deinit`.
+- **`IssueWebView.dismantleUIView`** unparented the webview, the inverse of
+  `TranscriptWebView`, whose comment says why: dropping is where a reparenting
+  race lives; claiming is where the unparent belongs. Swapped to match.
+
+`ComposerPasteTarget` stayed on the appearance pair, deliberately: it is the
+reversible, identity-guarded handover that hook is FOR.
+
+**Test.** `ProjectCardUITests.testComingBackFromASubIssueLeavesTheCardPainted`,
+with two assertions on purpose. Existence catches an unparented page; it does
+not catch one parked on an empty document — a white body is a claim about
+PIXELS, and this suite is otherwise blind to those (`ScreenshotPixels` gained
+`inkCoverage(in:)` for it). The unit tier gets the two halves the pixels
+cannot reach: `CardComposerTests.theCardsDeathRetiresItsStagingMachine` now
+drives the rule by DROPPING the store rather than by calling it — a test that
+calls `leaveCard()` itself passes on the broken wiring, which is why the
+existing one never saw this — and `droppingTheCardReleasesItsWebviewHost`
+asserts the drop is actually reachable, which is the assertion the first cut of
+this fix would have failed.
+
 ## Risks and mitigations
 
 | Risk | Mitigation |

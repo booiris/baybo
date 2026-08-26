@@ -396,4 +396,81 @@ final class ProjectCardUITests: BayboUITestCase {
         app.swipeRight()
         XCTAssertEqual(title.frame.minX, before.minX, accuracy: 0.5, "the card panned back")
     }
+
+    /// **The page's own `Open run ›` opens the run.** The ⋯'s log is one door
+    /// into the run sheet and this is the other, and it is the only one that
+    /// starts inside the webview — the page posts `openRun`, and the SCREEN is
+    /// what can present a sheet.
+    ///
+    /// Worth its own case because that hop has moved: the page's request used
+    /// to arrive on a closure the screen installed on `IssueBridge`, and a
+    /// closure written in a `View`'s body captures the view — which is what
+    /// made the card page immortal. It now lands as store state
+    /// (`IssueStore.openRunRequest`) and the screen answers it, so this is the
+    /// test that says the answer still arrives.
+    func testThePagesOwnOpenRunLinkOpensTheRun() {
+        let app = openCard()
+        let link = app.buttons.containing(
+            NSPredicate(format: "label CONTAINS 'Open run'")
+        ).firstMatch
+        XCTAssertTrue(
+            link.waitForExistence(timeout: Self.webviewTimeout),
+            "the live-run line offers no way into the run")
+        link.tap()
+
+        XCTAssertTrue(
+            app.staticTexts["#41 · attempt 3"].waitForExistence(timeout: 8),
+            "the page's Open run opened no run sheet")
+        attachScreenshot(app, name: "card-open-run")
+    }
+
+    // MARK: - Leaving and coming back
+
+    /// **A card survives being covered.** Tapping a sub-issue pushes a second
+    /// card over this one, and coming back must return the card you left, not
+    /// an empty page.
+    ///
+    /// Two assertions, because either alone is fooled. The webview's own
+    /// elements vanish with it, so `exists` catches an unparented page — but
+    /// not a parked one that is merely blank; and a body that paints nothing is
+    /// a claim about PIXELS, which every other assertion in this suite is blind
+    /// to (see `screenPixels`). A card that came back holds ink: dark text on
+    /// paper, across the band between the header and the dock.
+    func testComingBackFromASubIssueLeavesTheCardPainted() throws {
+        let app = openCard()
+        let child = app.buttons.containing(
+            NSPredicate(format: "label CONTAINS '#42'")
+        ).firstMatch
+        XCTAssertTrue(child.waitForExistence(timeout: Self.webviewTimeout), "no sub-issue row")
+        child.tap()
+
+        XCTAssertTrue(
+            app.staticTexts["keepalive should feed liveness, not the timer"].waitForExistence(
+                timeout: Self.webviewTimeout),
+            "the sub-issue never opened")
+
+        app.buttons["Back to projects"].firstMatch.tap()
+
+        let title = app.staticTexts[Self.title]
+        XCTAssertTrue(
+            title.waitForExistence(timeout: Self.webviewTimeout),
+            "the card we came back to is gone — its webview never came back")
+
+        let shot = try XCTUnwrap(screenPixels(), "could not read the screen")
+        XCTAssertGreaterThan(
+            shot.inkCoverage(in: bodyBand(app)), 0.005,
+            "the card came back blank — laid out, but painting nothing")
+        attachScreenshot(app, name: "card-after-sub-issue")
+    }
+
+    /// The reading band: everything between the header's bottom edge and the
+    /// dock's top one, which is exactly what the webview owns.
+    private func bodyBand(_ app: XCUIApplication) -> CGRect {
+        let field = app.descendants(matching: .any)[IssueDockFields.field].firstMatch
+        let top = app.buttons["issue-menu"].exists ? app.buttons["issue-menu"].frame.maxY : 120
+        let bottom = field.exists ? field.frame.minY : app.frame.height - 100
+        return CGRect(
+            x: app.frame.minX + 20, y: top + 8,
+            width: app.frame.width - 40, height: max(0, bottom - top - 16))
+    }
 }

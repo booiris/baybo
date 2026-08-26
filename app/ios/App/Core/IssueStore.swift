@@ -51,6 +51,36 @@ final class IssueStore: ObservableObject, WebMediaTarget {
     @Published var notice: String?
     @Published private(set) var isRefreshing = false
 
+    // MARK: - What the page asks the screen for
+    //
+    // Three signals the card page raises and only a screen can answer: open a
+    // run's transcript, raise a picker, and whether the reader is parked at the
+    // newest activity. They land HERE, as state, rather than on closures the
+    // screen installs on `IssueBridge` — which is what they were, and what
+    // quietly made the screen immortal.
+    //
+    // A closure written inside a `View`'s body captures that whole struct,
+    // property wrappers included, so one stored on a bridge closed the cycle
+    // `IssueHost → bridge → closure → view → _host → IssueHost`. Neither
+    // destructor could ever run: a WebContent process per card opened, a
+    // `ProjectInvalidations` observer per card refetching forever, and a
+    // composer staging machine that was never retired. `IssueBridge.store` is
+    // WEAK, so routing through the store cannot cycle no matter what the screen
+    // does — and with the closures gone there is nowhere to install one.
+
+    /// A chip was pressed: `status` / `priority` / `assignee` / `stage`, as the
+    /// page spells them. The screen consumes it and clears it.
+    @Published var pickRequest: String?
+    /// `Open run ›` was pressed, by ATTEMPT. Consumed and cleared like the
+    /// pick.
+    @Published var openRunRequest: Int64?
+    /// Whether the page is parked at its newest activity — the page reports it
+    /// on every scroll and once per delivery, and it drives the way back down.
+    ///
+    /// Starts true so a card that fits its screen never flashes a disc on the
+    /// way in.
+    @Published private(set) var atBottom = true
+
     @Published var filePreview: FilePreview?
     @Published var fileShare: FilePreview?
     @Published var viewedImage: ViewedImage?
@@ -93,6 +123,24 @@ final class IssueStore: ObservableObject, WebMediaTarget {
         return made
     }
 
+    /// The card's webview, built on first use and owned for this store's whole
+    /// life — the screen keeps no second reference and never observes it.
+    ///
+    /// **Built here rather than beside the store in the screen**, and an
+    /// explicit optional rather than a `lazy var`, for `staging`'s reason plus
+    /// one of its own: two `@StateObject`s over one instance would need that
+    /// instance in `ProjectIssueScreen.init`, out of `StateObject`'s
+    /// `@autoclosure` — which means constructing a whole `IssueStore` (a
+    /// synchronous mirror read and two JSON decodes) on EVERY re-evaluation of
+    /// the navigation destination, and throwing it away.
+    private var webHost: IssueHost?
+    var host: IssueHost {
+        if let webHost { return webHost }
+        let made = IssueHost(store: self)
+        webHost = made
+        return made
+    }
+
     private lazy var media: TranscriptMedia = {
         let media = TranscriptMedia(client: client)
         media.onPreview = { [weak self] in self?.filePreview = $0 }
@@ -119,6 +167,16 @@ final class IssueStore: ObservableObject, WebMediaTarget {
         loadMirror()
     }
 
+    deinit {
+        MainActor.assumeIsolated { leaveCard() }
+    }
+
+    /// Wire the page's bridge in. Called once, from `IssueHost.init`, which
+    /// this store owns — so there is no inverse: everything `detach` used to
+    /// undo (the invalidation token, the media sink, the bridge reference) dies
+    /// with the store itself, and an inverse reachable from a screen is an
+    /// inverse a `.onDisappear` eventually calls on a card that was only
+    /// covered.
     func attach(_ bridge: IssueBridge) {
         self.bridge = bridge
         media.attach(bridge)
@@ -131,13 +189,6 @@ final class IssueStore: ObservableObject, WebMediaTarget {
             guard change.issueNumber == nil || change.issueNumber == self.number else { return }
             self.invalidated()
         }
-    }
-
-    func detach(_ bridge: IssueBridge) {
-        guard self.bridge === bridge else { return }
-        invalidations = nil
-        media.detach(bridge)
-        self.bridge = nil
     }
 
     // MARK: - Reads
@@ -322,7 +373,14 @@ final class IssueStore: ObservableObject, WebMediaTarget {
     /// frame — an upload holds it — so a re-push would build a SECOND one over
     /// the same draft key, and the zombie's terminal write would put a sent
     /// draft straight back on disk.
-    func leaveCard() {
+    ///
+    /// **"For good" is what `deinit` means and what `.onDisappear` does not.**
+    /// It hung off the latter, where a push covering the card — a sub-issue,
+    /// the `↳ #N` parent chip — retired the staging mid-visit: every in-flight
+    /// upload cancelled, the staged strip dropped, and the next read of
+    /// `staging` lazily building exactly the second machine this exists to
+    /// prevent.
+    private func leaveCard() {
         composerDraft?.retire()
         composerDraft = nil
     }
@@ -473,6 +531,10 @@ final class IssueStore: ObservableObject, WebMediaTarget {
     /// sentences name which ceiling, which block, which card holds the slot.
     func showWriteError(_ message: String?) {
         writeError = message
+    }
+
+    func setAtBottom(_ value: Bool) {
+        atBottom = value
     }
 
     /// Stamp the card read. Called from the page's own "I rendered" message —

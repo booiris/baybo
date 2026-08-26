@@ -210,6 +210,43 @@ struct ScreenshotPixels {
         return CGFloat(red) / CGFloat(w * h)
     }
 
+    /// The fraction of `rect` (in POINTS) painted INK — anything materially
+    /// darker than the page under it.
+    ///
+    /// The question this answers is "did anything render here at all", which
+    /// neither `exists` nor a frame can: a webview that was unparented, or one
+    /// parked on an empty document, lays out and measures exactly like a card
+    /// full of text. Paper is ~0.98 luma and the type is near-black, so a
+    /// threshold well below the paper catches type, rules and chips alike
+    /// without being fooled by the page's own faint washes.
+    func inkCoverage(in rect: CGRect, threshold: CGFloat = 0.6) -> CGFloat {
+        let x = Int(rect.minX * scale)
+        let y = Int(rect.minY * scale)
+        let w = Int(rect.width * scale)
+        let h = Int(rect.height * scale)
+        guard w > 0, h > 0, x >= 0, y >= 0, x + w <= image.width, y + h <= image.height,
+            let crop = image.cropping(to: CGRect(x: x, y: y, width: w, height: h))
+        else { return 0 }
+        var pixels = [UInt8](repeating: 0, count: w * h * 4)
+        guard
+            let context = pixels.withUnsafeMutableBytes({ buffer in
+                CGContext(
+                    data: buffer.baseAddress, width: w, height: h, bitsPerComponent: 8,
+                    bytesPerRow: w * 4, space: CGColorSpaceCreateDeviceRGB(),
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+            })
+        else { return 0 }
+        context.draw(crop, in: CGRect(x: 0, y: 0, width: w, height: h))
+        var dark = 0
+        for i in stride(from: 0, to: pixels.count, by: 4) {
+            let luma =
+                (0.299 * CGFloat(pixels[i]) + 0.587 * CGFloat(pixels[i + 1])
+                    + 0.114 * CGFloat(pixels[i + 2])) / 255
+            if luma < threshold { dark += 1 }
+        }
+        return CGFloat(dark) / CGFloat(w * h)
+    }
+
     /// `height` pixels of one column, as luma.
     private func rows(column: Int, from top: Int, height: Int) -> [CGFloat]? {
         guard height > 0, top >= 0, top + height <= image.height,

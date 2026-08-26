@@ -64,11 +64,11 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
             }
         case "openRun":
             if let attempt = (body["attempt"] as? NSNumber)?.int64Value {
-                onOpenRun?(attempt)
+                store?.openRunRequest = attempt
             }
         case "pick":
             if let field = body["field"] as? String {
-                onPick?(field)
+                store?.pickRequest = field
             }
         case "generatedFace":
             if let agentId = body["agentId"] as? String,
@@ -77,7 +77,7 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
                 store?.storeGeneratedFace(agentId: agentId, pngBase64: png)
             }
         case "activityAtBottom":
-            onActivityAtBottom?(body["atBottom"] as? Bool ?? true)
+            store?.setAtBottom(body["atBottom"] as? Bool ?? true)
         case "openUrl":
             if let url = body["url"] as? String, let parsed = URL(string: url) {
                 UIApplication.shared.open(parsed)
@@ -99,12 +99,20 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
         }
     }
 
-    /// Raised to the screen rather than handled here: opening a run sheet and
-    /// presenting a picker are presentation, and a bridge that reached for the
-    /// view hierarchy would be a second place navigation happens.
-    var onOpenRun: ((Int64) -> Void)?
-    var onPick: ((String) -> Void)?
-    var onActivityAtBottom: ((Bool) -> Void)?
+    // Opening a run sheet and presenting a picker are PRESENTATION, and a
+    // bridge that reached for the view hierarchy would be a second place
+    // navigation happens — so those two, and the page's at-bottom report, are
+    // raised to the screen rather than handled here.
+    //
+    // Raised as STATE ON THE STORE (`pickRequest` / `openRunRequest` /
+    // `setAtBottom`), never as `onPick` / `onOpenRun` / `onActivityAtBottom`
+    // closures the screen installs — which is what they were until 2026-08-26.
+    // A closure written inside a `View`'s body captures the whole view struct,
+    // `@StateObject` storage included, so storing one here closed the cycle
+    // `IssueHost → bridge → closure → view → host` and made the card page
+    // immortal: its `deinit` teardown never ran, so every card ever opened kept
+    // a live WebContent process and an invalidation observer refetching behind
+    // it. `store` is weak, so this route cannot cycle whatever the screen does.
 
     // MARK: - native → web
 
