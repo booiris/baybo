@@ -14,6 +14,7 @@ final class IssueDockUITests: BayboUITestCase {
     private static let plusLabel = "Add attachment"
     private static let photosRow = "Photos"
     private static let filesRow = "Files"
+    private static let pasteRow = "Paste"
 
     private func openCard() -> XCUIApplication {
         let app = launch(Self.cardArguments)
@@ -133,6 +134,41 @@ final class IssueDockUITests: BayboUITestCase {
         XCTAssertLessThan(
             assignee.frame.minX, app.buttons[Self.mention("lead")].frame.minX,
             "the card's agent is not the first chip")
+    }
+
+    /// **The panel covers the jump disc**, which on a card is up the moment it
+    /// opens: a card is opened at the top and its Activity is at the bottom.
+    /// The disc used to be a row in this dock's stack, so the panel — which
+    /// hangs off the stack's top edge — opened a disc's height clear of the
+    /// `+`. `ComposerAttachUITests` holds the chat's half of this.
+    func testThePlusPanelFloatsOverTheJumpDisc() {
+        let app = openCard()
+        let jump = app.buttons["issue-jump"]
+        XCTAssertTrue(
+            jump.waitForExistence(timeout: Self.webviewTimeout),
+            "a card taller than its screen offers no way to the bottom")
+        let jumpFrame = jump.frame
+
+        app.buttons[Self.plusLabel].tap()
+        XCTAssertTrue(
+            app.buttons[Self.filesRow].waitForExistence(timeout: 3), "the + panel never opened")
+
+        // The panel's LOWEST row is the one in the disc's band, and which row
+        // that is depends on the clipboard: `Paste` is offered only when there
+        // is an image on it, and the simulator's board is not this suite's to
+        // decide.
+        let bottom = try? XCTUnwrap(
+            [Self.photosRow, Self.filesRow, Self.pasteRow]
+                .map { app.buttons[$0] }
+                .filter(\.exists)
+                .max { $0.frame.maxY < $1.frame.maxY },
+            "the panel drew no rows at all")
+        XCTAssertTrue(
+            bottom?.frame.intersects(jumpFrame) == true,
+            "the panel was pushed clear of the disc instead of covering it")
+        XCTAssertTrue(
+            bottom?.isHittable == true, "the disc is on top of the panel — it takes its taps")
+        attachScreenshot(app, name: "card-plus-panel-over-jump")
     }
 
     /// Mirrors `IssueDock`'s per-handle identifier.

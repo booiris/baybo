@@ -131,7 +131,7 @@ Moving out of In Progress **never kills the run**; Stop is the only kill switch.
 | header | native (`ChatHeaderView` grammar) | back · `#N · status` glass pill (tap → Move sheet) · ⋯ (Run again · **Runs**), drawn only when it has an entry |
 | body | **`issue.html` WKWebView** | title · one meta line · the description as plain body · the state band (three chips · live-run line · blocked banner) · attachments · sub-issues · activity (**posts and lines**, below) · a "New activity" jump pill |
 | pickers | native sheets over the page | status → `MoveSheet` · priority → `PriorityPicker` · assignee → `AssigneePicker`, all writing through `ProjectsStore` |
-| dock | native, inside the real `ComposerDock` | jump-to-newest disc · notice line · `ApprovalCardView` (two answers, REST-backed) · answer row (only when an agent is asking) · staged strip · the chat's composer pill, at the chat's width and beat (`+` → attach panel, in-field send, no prompt text) |
+| dock | native, inside the real `ComposerDock` | jump-to-newest disc (floating over it, not in it) · notice line · `ApprovalCardView` (two answers, REST-backed) · answer row (only when an agent is asking) · staged strip · the `@` mention strip · the chat's composer pill, at the chat's width and beat (`+` → attach panel, in-field send, no prompt text) |
 | overlays | native | pickers (`ModelMenuPanel` style) · sheets · `RenameDialog` · `ConfirmDialog` |
 
 - Why the whole body rather than a small webview for the description alone: a webview inside a native ScrollView is two scrollers plus height round-trips, while a full-page webview is exactly `ChatScreen`'s existing layering (header / webview / dock / bottom-inset stream) — and comment markdown, attachments, `#N` links and KaTeX all come free.
@@ -416,14 +416,18 @@ Moving out of In Progress **never kills the run**; Stop is the only kill switch.
     page reports that (`activityAtBottom`) on every scroll AND on every
     delivery — a card that arrives taller than its screen fires no scroll event
     at all, so a signal taken only from `onScroll` says "at the bottom" about
-    the one card that needs the disc most. The dock's geometry is read on
-    `IssueDock` rather than around the whole stack, so the disc popping in does
-    not inflate the inset and reflow the card under a button that only
-    appeared — `ChatScreen` measures its composer for the same reason.
+    the one card that needs the disc most. It is literally the chat's view
+    (`JumpToLatestDisc`) and, since 2026-08-27, an OVERLAY on the dock rather
+    than a row above it: it costs the dock no height, so it can neither inflate
+    the inset the card is told to keep clear nor push the attach panel up by
+    its own height. The dock's geometry is still read on `IssueDock` itself.
 - `POST …/read` fires only after the timeline renders successfully, then attention is refetched.
-- **Every run of system events collapses** into a closed `N events ›` line — a
-  run of one included — and presses open and close it again. Comments,
-  approvals and blocks never collapse.
+- **A run of two or more system events collapses** into a closed `N events ›`
+  line, and presses open and close it again; a run of ONE is drawn (2026-08-26
+  — `1 event ›` was a control that hid exactly one line and spent one saying
+  so, on most of the runs a card has). The grouping itself still makes groups
+  of one — a split at the unread boundary really does leave one — so only the
+  drawing changed. Comments, approvals and blocks never collapse.
 - **The card opens where the reading stopped.** `GET …/events` answers
   `IssueTimelineDto { items, first_unread }`; the page draws a red `NEW` rule
   above that entry and `scrollIntoView`s it (clearing the floating header via

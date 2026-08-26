@@ -149,37 +149,28 @@ struct ProjectIssueScreen: View {
     }
 
     private var dock: some View {
-        ComposerDock(collapsed: false, jumpVisible: !atBottom) {
-            VStack(spacing: 12) {
-                if !atBottom {
-                    Button {
-                        Haptics.tap()
-                        host?.bridge.jumpToLatest()
-                    } label: {
-                        Image(systemName: "arrow.down")
-                            .font(.system(size: 17, weight: .medium))
-                            .foregroundStyle(Theme.ink)
-                            .frame(width: 44, height: 44)
-                    }
-                    .glassSurface(interactive: true, in: .circle)
-                    .accessibilityIdentifier("issue-jump")
-                    .accessibilityLabel(Text(verbatim: lang.t("issue.jumpToLatest")))
-                    .transition(.scale(scale: 0.7).combined(with: .opacity))
+        ComposerDock(collapsed: false) {
+            IssueDock(store: store, staging: store.staging, attach: attach)
+                // The DOCK's own top edge is the page's bottom obstruction —
+                // measured on the dock itself, so the disc floating above it
+                // does not inflate the inset and reflow the card under a
+                // button that only appeared. `ChatScreen` measures its
+                // composer for the same reason.
+                .onGeometryChange(for: CGFloat.self) { proxy in
+                    proxy.frame(in: .global).minY
+                } action: { _, minY in
+                    let screenHeight = UIScreen.main.bounds.height
+                    host?.bridge.setBottomInset(max(0, Int(screenHeight - minY)))
                 }
-                IssueDock(store: store, staging: store.staging, attach: attach)
-                    // The DOCK's own top edge is the page's bottom
-                    // obstruction — measured here rather than around the whole
-                    // stack, so the disc popping in above it does not inflate
-                    // the inset and reflow the card under a button that only
-                    // appeared. `ChatScreen` measures its composer for the same
-                    // reason.
-                    .onGeometryChange(for: CGFloat.self) { proxy in
-                        proxy.frame(in: .global).minY
-                    } action: { _, minY in
-                        let screenHeight = UIScreen.main.bounds.height
-                        host?.bridge.setBottomInset(max(0, Int(screenHeight - minY)))
-                    }
-            }
+                // An overlay rather than a row above the dock: the attach
+                // panel hangs off this content's top edge, and a disc in the
+                // stack raised the panel by the disc's own height.
+                .jumpToLatestDisc(
+                    visible: !atBottom, label: lang.t("issue.jumpToLatest"),
+                    identifier: "issue-jump"
+                ) {
+                    host?.bridge.jumpToLatest()
+                }
         } panel: {
             if attach.isOpen {
                 AttachMenuPanel(

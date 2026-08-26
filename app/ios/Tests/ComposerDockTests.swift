@@ -38,7 +38,7 @@ struct ComposerDockTests {
     ) -> some View {
         VStack(spacing: 0) {
             Color.clear.frame(width: dockWidth, height: headroom)
-            ComposerDock(collapsed: collapsed, jumpVisible: false) {
+            ComposerDock(collapsed: collapsed) {
                 Theme.surface.frame(width: dockWidth, height: dockHeight)
             } panel: {
                 if panelOpen {

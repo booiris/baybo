@@ -113,37 +113,27 @@ struct ChatScreen: View {
         // lives in `ComposerDock`, which is store-free so `ComposerDockTests`
         // can render it. Only the CONTENT is assembled here.
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            ComposerDock(
-                collapsed: bridge.htmlPreviewMaximized, jumpVisible: bridge.jumpVisible
-            ) {
-                VStack(spacing: 12) {
-                    if bridge.jumpVisible {
-                        Button {
-                            bridge.jumpToLatest()
-                        } label: {
-                            Image(systemName: "arrow.down")
-                                .font(.system(size: 17, weight: .medium))
-                                .foregroundStyle(Theme.ink)
-                                .frame(width: 44, height: 44)
-                        }
-                        .glassSurface(interactive: true, in: .circle)
-                        .accessibilityLabel(Text(verbatim: Lang.shared.t("chat.jumpToLatest")))
-                        .transition(.scale(scale: 0.7).combined(with: .opacity))
+            ComposerDock(collapsed: bridge.htmlPreviewMaximized) {
+                ComposerView(store: store, attach: attach)
+                    .onGeometryChange(for: CGFloat.self) { proxy in
+                        proxy.frame(in: .global).minY
+                    } action: { minY in
+                        // The composer's own geometry is the one signal that
+                        // tracks BOTH the keyboard it rides and its own growth
+                        // (notice line, staged strip, multiline field). The
+                        // bridge converts to the covered strip against the
+                        // WINDOW bottom.
+                        bridge.setComposerTop(minY)
                     }
-                    ComposerView(store: store, attach: attach)
-                        .onGeometryChange(for: CGFloat.self) { proxy in
-                            proxy.frame(in: .global).minY
-                        } action: { minY in
-                            // The composer's own geometry is the one signal that
-                            // tracks BOTH the keyboard it rides and its own
-                            // growth (notice line, staged strip, multiline
-                            // field). The bridge converts to the covered strip
-                            // against the WINDOW bottom. Measured on the
-                            // COMPOSER, not the wrapping stack: the jump button
-                            // popping in must never inflate the web-side inset.
-                            bridge.setComposerTop(minY)
-                        }
-                }
+                    // An overlay, so the disc costs the dock no height: the
+                    // attach panel hangs off this content's top edge, and a
+                    // disc in the stack pushed the panel up by 56pt.
+                    .jumpToLatestDisc(
+                        visible: bridge.jumpVisible,
+                        label: Lang.shared.t("chat.jumpToLatest"), identifier: "chat-jump"
+                    ) {
+                        bridge.jumpToLatest()
+                    }
             } panel: {
                 if attach.isOpen {
                     AttachMenuPanel(
