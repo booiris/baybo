@@ -19,7 +19,8 @@ import Testing
         cancelled: Bool = false,
         status: IssueStatus = .todo,
         assignee: String? = nil,
-        blocked: String? = nil
+        blocked: String? = nil,
+        updatedAt: Int64 = 0
     ) -> IssueInfo {
         IssueInfo(
             number: number, projectId: "p1", title: "#\(number)", description: "",
@@ -27,7 +28,7 @@ import Testing
             position: position, pinned: pinned, branch: nil, blockedReason: blocked,
             parent: nil, filedFrom: nil, stage: 0, subIssues: nil, unread: unread,
             lastRunFailed: false, approvalPending: false, openedByAgent: false,
-            cancelledAtMs: cancelled ? 5 : nil, createdAtMs: 0, updatedAtMs: 0)
+            cancelledAtMs: cancelled ? 5 : nil, createdAtMs: 0, updatedAtMs: updatedAt)
     }
 
     private func run(
@@ -45,10 +46,9 @@ import Testing
 
     // MARK: - BoardOrder
 
-    /// Pinned outranks unread, and unread outranks the board's own order: a pin
-    /// is what somebody chose, an unread count is what happened while they were
-    /// elsewhere.
-    @Test func pinnedLeadsThenUnreadThenTheBoardsOwnOrder() {
+    /// Pinned outranks unread: a pin is what somebody chose, while an unread
+    /// count is what happened while they were elsewhere.
+    @Test func pinnedLeadsThenUnread() {
         let bands = BoardOrder.bands([
             issue(1, position: 0),
             issue(2, position: 1, unread: 3),
@@ -68,6 +68,34 @@ import Testing
             issue(2, position: 1, pinned: true, unread: 1),
         ])
         #expect(bands.pinned.map(\.number) == [2, 1])
+    }
+
+    /// Recency is subordinate to the existing ranks: an older unread card
+    /// still leads a newer Queue card, while cards inside either rank descend
+    /// by their last update time.
+    @Test func newestUpdateLeadsInsideEachExistingRank() {
+        let bands = BoardOrder.bands([
+            issue(1, position: 0, updatedAt: 10),
+            issue(2, position: 1, unread: 1, updatedAt: 20),
+            issue(3, position: 2, updatedAt: 50),
+            issue(4, position: 3, unread: 1, updatedAt: 40),
+            issue(5, position: 4, pinned: true, updatedAt: 10),
+            issue(6, position: 5, pinned: true, updatedAt: 30),
+        ])
+        #expect(bands.pinned.map(\.number) == [6, 5])
+        #expect(bands.new.map(\.number) == [4, 2])
+        #expect(bands.queue.map(\.number) == [3, 1])
+    }
+
+    /// Equal update times retain the stored position, with the issue number
+    /// making a duplicated position deterministic during a refetch.
+    @Test func equalUpdateTimesFallBackToStoredOrder() {
+        let ordered = BoardOrder.reading([
+            issue(3, position: 2, updatedAt: 10),
+            issue(2, position: 0, updatedAt: 10),
+            issue(1, position: 0, updatedAt: 10),
+        ])
+        #expect(ordered.map(\.number) == [1, 2, 3])
     }
 
     /// A cancelled card is never lifted by unread — floating a struck-through

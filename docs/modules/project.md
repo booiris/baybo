@@ -812,11 +812,12 @@ Five things it will not do, each of which is a rule and not a coincidence:
 
 Ordering is `(priority, position, number)` — the same order `IssueList` already
 reads a column in, deliberately, so "what is next in Todo" has one answer
-whether an agent asks or the board acts. Note that the **web board renders in
-`position` order with pinned cards lifted first and unread cards lifted within
-each partition** (`readingOrder`, a reading order that writes nothing), so on a
-column with mixed priorities the card the board takes next is not necessarily
-the one rendered at the top.
+whether an agent asks or the board acts. Note that both clients render pinned
+cards first and unread cards within each partition, then sort each resulting
+rank by `updated_at` descending (`readingOrder` / `BoardOrder`, a reading order
+that writes nothing); `position` and `number` only break equal timestamps. So
+on a column with mixed priorities the card the board takes next is not
+necessarily the one rendered at the top.
 
 **Asking the lead.** Some cards are not work the board can start — they are
 questions only the lead can answer, and the same pass that promotes asks them

@@ -2,13 +2,12 @@ import Foundation
 
 /// The order a stage's cards are READ in, and the bands they are drawn under.
 ///
-/// Two lifts sit above the board's own `position`, and both are rendered
-/// orders only — nothing here ever writes a position back. A drag on the desk
-/// still sends the stored order, and a card settles back across a band
-/// boundary on the next refetch, which is the cost both lifts already charge
-/// on the web.
+/// Two lifts and recency sit above the board's own `position`, and all are
+/// rendered orders only — nothing here ever writes a position back. Inside
+/// each rank, `updatedAtMs` descends; position and number make equal timestamps
+/// deterministic and preserve the stored order as the fallback.
 ///
-/// The ranking is **pinned, then unread, then the board's own**, and the
+/// The ranking is **pinned, then unread, then newest updated**, and the
 /// reason that order and not the reverse: a pin is what somebody chose, an
 /// unread count is what happened to a card while they were elsewhere, and
 /// what was chosen outranks what arrived. The unread lift applies again
@@ -47,7 +46,7 @@ enum BoardOrder {
 
     static func bands(_ issues: [IssueInfo]) -> Bands {
         var bands = Bands()
-        for issue in stableByPosition(issues) {
+        for issue in newestFirst(issues) {
             if issue.pinned {
                 bands.pinned.append(issue)
             } else if hasNews(issue) {
@@ -65,14 +64,14 @@ enum BoardOrder {
         bands(issues).all
     }
 
-    /// The board's own order, made total so the two lifts are the only thing
-    /// that moves a card. `position` is a dense rank the server renumbers per
-    /// move, but two cards can still share one across a refetch mid-move —
-    /// `number` breaks that tie the same way the server's own pick order
-    /// does, rather than leaving it to sort stability nobody can see.
-    private static func stableByPosition(_ issues: [IssueInfo]) -> [IssueInfo] {
+    /// Recency made total by the board's stored order. `position` is a dense
+    /// rank the server renumbers per move, but two cards can still share one
+    /// across a refetch mid-move, so `number` is the final visible tie-breaker.
+    private static func newestFirst(_ issues: [IssueInfo]) -> [IssueInfo] {
         issues.sorted {
-            $0.position == $1.position ? $0.number < $1.number : $0.position < $1.position
+            if $0.updatedAtMs != $1.updatedAtMs { return $0.updatedAtMs > $1.updatedAtMs }
+            if $0.position != $1.position { return $0.position < $1.position }
+            return $0.number < $1.number
         }
     }
 

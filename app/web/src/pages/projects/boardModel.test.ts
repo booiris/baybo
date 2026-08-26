@@ -496,22 +496,21 @@ describe('readingOrder', () => {
     expect(view.todo.map((i) => i.number)).toEqual([4]);
   });
 
-  it('keeps the order the operator gave the cards inside each half', () => {
-    // The hoist is a reading order laid over `position`, never a rewrite of
-    // it: two cards that are both new stay in the order they were dragged
-    // into, and so do two that are not.
+  it('sorts newest first inside each existing rank', () => {
+    // New still outranks Queue even when Queue holds the newest card; recency
+    // only decides the order among cards with the same reading rank.
     const view = readingOrder(
       board({
         backlog: [
-          issue(1),
-          issue(2, { unread: 1 }),
-          issue(3),
-          issue(4, { unread: 5 }),
-          issue(5),
+          issue(1, { updated_at_ms: 10 }),
+          issue(2, { unread: 1, updated_at_ms: 20 }),
+          issue(3, { updated_at_ms: 50 }),
+          issue(4, { unread: 5, updated_at_ms: 40 }),
+          issue(5, { updated_at_ms: 30 }),
         ],
       }),
     );
-    expect(view.backlog.map((i) => i.number)).toEqual([2, 4, 1, 3, 5]);
+    expect(view.backlog.map((i) => i.number)).toEqual([4, 2, 3, 5, 1]);
   });
 
   it('never lifts a cancelled card over live work', () => {
@@ -555,13 +554,18 @@ describe('readingOrder', () => {
     expect(view.backlog.map((i) => i.number)).toEqual([2, 1, 4, 3]);
   });
 
-  it('keeps the operator order inside the pinned block', () => {
+  it('falls back to stored position and number when update times tie', () => {
     const view = readingOrder(
       board({
-        backlog: [issue(1, { pinned: true }), issue(2), issue(3, { pinned: true })],
+        backlog: [
+          issue(3, { pinned: true, position: 2, updated_at_ms: 10 }),
+          issue(2, { position: 1, updated_at_ms: 10 }),
+          issue(1, { pinned: true, position: 0, updated_at_ms: 10 }),
+          issue(4, { pinned: true, position: 0, updated_at_ms: 10 }),
+        ],
       }),
     );
-    expect(view.backlog.map((i) => i.number)).toEqual([1, 3, 2]);
+    expect(view.backlog.map((i) => i.number)).toEqual([1, 4, 3, 2]);
   });
 
   it('lifts a cancelled card that was pinned, unlike one that is only unread', () => {

@@ -113,7 +113,8 @@ export function unreadTotal(board: Board): number {
 }
 
 /// The order a column is **read** in: pinned cards first, then cards with
-/// something new, then everything else in the board's own order.
+/// something new, then everything else. Inside each rank, the most recently
+/// updated card leads; the board's stored position and number break ties.
 ///
 /// Two lifts, ranked, and the rank is the point. A pin is the operator
 /// saying "keep this in front of me"; an unread count is something that
@@ -131,13 +132,11 @@ export function unreadTotal(board: Board): number {
 /// inside its column before the first `over` resolved, so a 4px twitch
 /// posted a reorder of a column nobody had touched.
 ///
-/// It writes no `position`, not even through a drag: each partition is
-/// stable, so the order the operator dragged their cards into survives
-/// inside every band and a card falls back into it as soon as it is read or
-/// unpinned, and a move sends [`persistedOrder`] — the stored order with one
-/// card moved — rather than the order on screen. A pin therefore costs one
-/// more boundary a dragged card settles back across on the next refetch,
-/// which is the same trade the unread lift already makes.
+/// It writes no `position`, not even through a drag: recency is a rendered
+/// order only, while a move sends [`persistedOrder`] — the stored order with
+/// one card moved — rather than the order on screen. The stored order remains
+/// the deterministic fallback when two cards have the same update time and
+/// remains available to the board's own scheduling rules.
 ///
 /// A cancelled card is never lifted **by its unread count**. Cancel is
 /// terminal, and floating a struck-through card over live work because
@@ -203,27 +202,24 @@ export function readingBands(column: readonly Issue[], status: IssueStatus): Rea
     {
       key: 'pinned',
       label: 'Pinned',
-      note: 'Held at the top because you pinned them — press the pin again to release one',
+      note:
+        'Held at the top because you pinned them — newest touched first within this band',
       issues: of('pinned'),
     },
     {
       key: 'news',
       label: 'New',
-      note: 'Something has happened on these since you last opened them. Opening one clears it',
+      note:
+        'Something has happened on these since you last opened them — newest touched first',
       issues: of('news'),
     },
     {
       key: 'queue',
       label: 'Queue',
-      // Two things this must not claim. It cannot say "what a drag writes"
-      // — the stage page has no drag, and a tooltip naming a gesture that
-      // is not there sends the operator hunting for it. And only Todo is
-      // drawn from: on the other four stages `position` is a reading order
-      // and nothing takes work out of them by it.
       note:
         status === 'todo'
-          ? 'The order the stage stores — with priority, what the board starts next. Drag on the board to change it'
-          : 'The order the stage stores. Drag on the board to change it',
+          ? 'Newest touched first. Priority and stored position still decide what the board starts next'
+          : 'Newest touched first',
       issues: of('queue'),
     },
   ];
@@ -316,7 +312,15 @@ function partition(column: Issue[], lift: (issue: Issue) => boolean): [Issue[], 
 
 function hoist(column: Issue[], lift: (issue: Issue) => boolean): Issue[] {
   const [lifted, rest] = partition(column, lift);
-  return [...lifted, ...rest];
+  return [...newestFirst(lifted), ...newestFirst(rest)];
+}
+
+function newestFirst(column: Issue[]): Issue[] {
+  return [...column].sort((a, b) => {
+    if (a.updated_at_ms !== b.updated_at_ms) return b.updated_at_ms - a.updated_at_ms;
+    if (a.position !== b.position) return a.position - b.position;
+    return a.number - b.number;
+  });
 }
 
 // Cards and columns share one DndContext, so their ids need namespaces.
