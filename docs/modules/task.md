@@ -64,6 +64,21 @@ stored status. The three stored statuses are `pending` / `in_progress` /
 `completed`. Rows are otherwise reaped only by the `sessions` cascade — never a
 session or transcript row.
 
+`TaskCreate` resolves dependencies inside one batch through caller-chosen
+`key` / `depends_on_keys` names. Real `depends_on` values are only task ULIDs
+returned by an earlier tool result. The implementation mints every new ULID,
+builds the batch-key map, then resolves dependencies before writing any row;
+the previous claim that `depends_on` could name another new task was impossible
+because the caller could not know a random id that had not been returned yet.
+The response includes `created_by_key` so subsequent calls can cross the batch
+boundary using real ids.
+
+Optional update fields carry explicit strict-schema no-op values. `unchanged`
+means no status write, blank subject/description strings are ignored, and an
+empty `depends_on` array is filler rather than a destructive clear.
+`clear_depends_on: true` is the sole explicit clear operation. `TaskList`
+similarly accepts `status: "all"` as its unfiltered spelling.
+
 ### Re-injection (throttled) + the live web surface
 
 The agent loop owns the model-facing and user-facing surfacing (see

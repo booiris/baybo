@@ -107,7 +107,7 @@ To hand over a file you produced — a screenshot, a report, a diff — store it
             .into_iter()
             .map(|a| AttachmentRequest {
                 blob_id: a.blob_id,
-                filename: a.filename,
+                filename: a.filename.filter(|name| !name.trim().is_empty()),
             })
             .collect();
         self.manager

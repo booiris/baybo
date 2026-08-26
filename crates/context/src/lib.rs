@@ -381,7 +381,8 @@ pub struct ContextManager {
     /// subtracts it so the provider-anchored baseline stays messages-only.
     task_reminder_raw: usize,
     /// Transient "you are going in circles" observation, set by the agent loop
-    /// when a turn's file edits cancelled out (see
+    /// when a turn's file edits cancelled out or one tool keeps returning the
+    /// same error (see
     /// [`crate::prompts::no_progress`]). Same contract as
     /// [`Self::task_reminder`]: never persisted, never in `self.messages`,
     /// appended at the tail by [`Self::messages_for_llm`]. Cleared once the

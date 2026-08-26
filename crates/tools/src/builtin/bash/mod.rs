@@ -700,8 +700,8 @@ impl Tool for BashTool {
             "type": "object",
             "properties": {
                 "command":    { "type": "string", "description": "The shell command to run" },
-                "timeout_ms": { "type": "integer", "minimum": 1, "description": "Per-command timeout in ms (falls back to the tool context timeout)" },
-                "cwd":        { "type": "string", "description": "Working directory for the command" },
+                "timeout_ms": { "type": "integer", "minimum": 0, "description": "Per-command timeout in ms. Use `0` to fall back to the tool context timeout." },
+                "cwd":        { "type": "string", "description": "Working directory for the command. An empty string uses the session work directory." },
                 "secret_env": { "type": "array", "items": { "type": "string" }, "description": "Names of stored user secrets to inject as environment variables for THIS command only. Values are pulled from the vault, never shown to you, and scrubbed from the output. Discover names with SecretList / SecretCheck." },
                 "on_timeout": { "type": "string", "enum": ["background", "kill"], "description": "What to do if the command exceeds its timeout. 'background' (default) detaches it — you get a handle now and a notification when it finishes, with full output streamed to a file you can Read — so a long build/test never blocks you or loses its work. 'kill' terminates it and returns a timeout error." }
             },
@@ -766,8 +766,10 @@ impl Tool for BashTool {
     }
 
     async fn execute(&self, params: Value, ctx: &ToolContext) -> crate::Result<ToolOutput> {
-        let p: Params =
+        let mut p: Params =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
+        p.timeout_ms = p.timeout_ms.filter(|timeout| *timeout > 0);
+        p.cwd = p.cwd.filter(|cwd| !cwd.as_os_str().is_empty());
 
         if let Some(dir) = &p.cwd {
             require_absolute(dir, "Bash", "cwd")?;

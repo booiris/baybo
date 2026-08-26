@@ -1281,6 +1281,15 @@ only alongside a `parent` or a detach — half a placement is not a placement.
 The rule generalises: **every optional property on a board tool's schema needs
 an inert filler value**, because a strict schema will be filled.
 
+That rule applies beyond placement. `IssueCreate(parent=0)` opens a top-level
+card instead of looking up the impossible card `#0`; `IssueList(status="all",
+before=0)` is unfiltered. On `IssueUpdate`, blank text and assignee values plus
+`status` / `priority` set to `unchanged` are no-ops. Operations whose old
+spelling collided with filler have their own booleans: `clear_description`,
+`unblock`, `reopen`, and `detach_parent`. False is inert; true states the
+destructive or reversing intent. Empty attachment filenames likewise fall
+back to the blob's ordinary display name.
+
 `stages::is_finished` — Done **or** cancelled — is the single definition of
 "the board is done with this card", read by the barrier, the worktree
 reclamation and the enqueue gate alike. A cancelled step counts out of its

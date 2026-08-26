@@ -25,13 +25,12 @@ use tracing::{debug, info, warn};
 
 use crate::runtime::compression::CompressionRunner;
 use crate::runtime::error_recovery::ErrorHandler;
-use crate::runtime::progress_ledger::{ProgressVerdict, TurnProgressLedger};
+use crate::runtime::progress_ledger::{ProgressVerdict, TurnProgressMonitor, tool_call_succeeded};
 use crate::runtime::progress_observer::{
     ObserverState, ProgressObserverRunner, build_observer_prompt, channel_wants_progress,
     should_fire_observer,
 };
 use crate::runtime::scope::TurnSpec;
-
 use crate::runtime::tool_executor::{ExecutedTool, ToolExecutor};
 use crate::security::SecurityGateway;
 use tokio_util::sync::CancellationToken;
@@ -103,16 +102,6 @@ fn media_digest(block: &ContentBlock) -> Option<&str> {
         | ContentBlock::File { blob, .. } => blob.content_digest(),
         _ => None,
     }
-}
-
-/// Whether a file-writing tool's outcome means the file really changed.
-///
-/// `ToolOutput::Error` is the in-band failure a tool returns for a rejected
-/// call — a `Read`-before-write violation, a missing `old_string`, an oversize
-/// body — and rides back as `Ok`, so `is_ok()` alone would count an edit that
-/// wrote nothing. `Err` covers the denied and panicked paths.
-fn tool_wrote_successfully(output: &anyhow::Result<ToolOutput>) -> bool {
-    matches!(output, Ok(o) if !matches!(o, ToolOutput::Error(_)))
 }
 
 /// Fold a tool's attachments into the turn's accumulator, skipping content the
@@ -547,12 +536,11 @@ pub struct AgentLoop {
     /// row persists the fingerprint it observed — so a read survives actor
     /// eviction / process restart. Any gap fails closed (forces a re-read).
     read_tracker: ReadTracker,
-    /// Per-turn record of file mutations, used to tell the model when its
-    /// edits have cancelled out (see
-    /// [`crate::runtime::progress_ledger`]). Reset at the top of every turn:
-    /// "change this file back" is ordinary work when the user asked for it
-    /// between turns, and only becomes churn inside a single turn.
-    progress_ledger: TurnProgressLedger,
+    /// Per-turn progress monitor for file churn and repeated non-file tool
+    /// failures. Reset at the top of every turn: "change this file back" is
+    /// ordinary work when the user asked for it between turns, and only
+    /// becomes churn inside a single turn.
+    progress_monitor: TurnProgressMonitor,
 }
 
 /// Construction bundle for [`AgentLoop`]. Every field maps 1:1 to a
@@ -690,7 +678,7 @@ impl AgentLoop {
             title_generation: None,
             title_sink,
             read_tracker: ReadTracker::default(),
-            progress_ledger: TurnProgressLedger::default(),
+            progress_monitor: TurnProgressMonitor::default(),
         }
     }
 
@@ -939,9 +927,10 @@ impl AgentLoop {
         let background_eligible =
             crate::runtime::background_jobs::background_eligible(session, turn_kind);
         self.context_manager.ensure_seeded().await?;
-        // Churn is a within-turn property. Editing a file back to how it was
-        // is exactly what "undo that" means when the user asks between turns.
-        self.progress_ledger.clear();
+        // Churn and repeated failure are within-turn properties. Editing a
+        // file back to how it was is exactly what "undo that" means when the
+        // user asks between turns.
+        self.progress_monitor.clear();
         self.context_manager.set_progress_observation(None);
 
         // Fire-and-forget at turn start so the title derives concurrently with
@@ -1637,7 +1626,7 @@ impl AgentLoop {
             // post-write value and not a read staged earlier in this response.
             let write_fingerprint = (baybo_tools::FILE_WRITING_TOOLS
                 .contains(&tool_call.name.as_str())
-                && tool_wrote_successfully(&executed.output))
+                && tool_call_succeeded(&executed.output))
             .then(|| {
                 tool_call
                     .arguments
@@ -1646,15 +1635,13 @@ impl AgentLoop {
                     .and_then(|p| self.read_tracker.get(std::path::Path::new(p)))
             })
             .flatten();
-            // Same three inputs the fingerprint above uses, read for a
-            // different question: not "what does the file look like now" but
-            // "has this turn's editing gone anywhere". A denial and a failure
-            // both count as "the file did not move" — a mid-turn `/stop`
-            // surfaces as `Denied`, so they are not reliably distinguishable.
-            if let Some(verdict) = self.progress_ledger.record(
+            // File calls retain their transitions; every other tool retains
+            // only its current consecutive error signature. Both detectors
+            // report through the same per-turn monitor.
+            if let Some(verdict) = self.progress_monitor.record(
                 &tool_call.name,
                 &tool_call.arguments,
-                tool_wrote_successfully(&executed.output),
+                &executed.output,
             ) {
                 self.note_no_progress(&verdict);
             }
@@ -1715,24 +1702,39 @@ impl AgentLoop {
     /// have told it nothing. `max_iterations` remains the hard backstop.
     fn note_no_progress(&mut self, verdict: &ProgressVerdict) {
         use baybo_context::prompts::no_progress;
-        let (kind, count) = match verdict {
-            ProgressVerdict::StateRevisited { edits, .. } => {
-                (no_progress::Kind::StateRevisited, *edits)
-            }
-            ProgressVerdict::AttemptRepeated { attempts, .. } => {
-                (no_progress::Kind::AttemptRepeated, *attempts)
-            }
-            ProgressVerdict::Futile { streak, .. } => (no_progress::Kind::Futile, *streak),
+        let render_file = |path: &std::path::Path, kind, count| {
+            warn!(
+                path = %path.display(),
+                count,
+                kind = ?kind,
+                "turn is churning a file without net progress; telling the model"
+            );
+            no_progress::render(kind, &path.display().to_string(), count)
         };
-        let path = verdict.path().display().to_string();
-        warn!(
-            path = %path,
-            count,
-            kind = ?kind,
-            "turn is churning a file without net progress; telling the model"
-        );
+        let observation = match verdict {
+            ProgressVerdict::StateRevisited { path, edits } => {
+                render_file(path, no_progress::Kind::StateRevisited, *edits)
+            }
+            ProgressVerdict::AttemptRepeated { path, attempts } => {
+                render_file(path, no_progress::Kind::AttemptRepeated, *attempts)
+            }
+            ProgressVerdict::Futile { path, streak } => {
+                render_file(path, no_progress::Kind::Futile, *streak)
+            }
+            ProgressVerdict::RepeatedToolFailure {
+                tool_name,
+                attempts,
+            } => {
+                warn!(
+                    tool = %tool_name,
+                    attempts = *attempts,
+                    "tool returned the same error repeatedly; telling the model"
+                );
+                no_progress::render_repeated_tool_failure(tool_name, *attempts)
+            }
+        };
         self.context_manager
-            .set_progress_observation(Some(no_progress::render(kind, &path, count)));
+            .set_progress_observation(Some(observation));
     }
 
     /// Call the LLM with retry on transient errors using `ErrorHandler`.

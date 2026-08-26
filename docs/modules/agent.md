@@ -34,7 +34,7 @@ agent/src/
 │   ├── compression.rs        # compaction LLM call: step/span, cost, retry
 │   ├── billed_chat.rs        # cost-aware LLM call wrapper
 │   ├── error_recovery.rs     # retry / degrade policy
-│   ├── progress_ledger.rs    # per-turn file-mutation ledger; spots edits that cancelled out
+│   ├── progress_ledger.rs    # per-turn progress monitor; file churn + repeated tool failures
 │   ├── sandbox.rs            # SandboxAdapter glue for tool exec
 │   ├── scope.rs              # with_turn / with_step / with_span / LLM span guards
 │   ├── llm_pool.rs           # per-provider LlmClient pool
@@ -321,7 +321,18 @@ Router-level user rate limiting (`actor/router`) uses a sliding window (default 
 
 ### No-progress detection
 
-`runtime/progress_ledger.rs` keeps a per-turn record of every `Edit` / `Write`, and tells the model when a turn's edits have stopped going anywhere. It exists because nothing else in the loop could: `max_iterations` is a cost backstop at 1000, `error_recovery` only classifies LLM/IO errors, the progress observer never writes back into the turn, and a denied tool call leaves no state the loop can reason over — so a turn could edit one file five times, net zero, and no part of the runtime would notice.
+`runtime/progress_ledger.rs` owns the loop's one `TurnProgressMonitor` and its two internal detectors. `FileMutationLedger` keeps a per-turn record of every `Edit` / `Write`, and tells the model when a turn's edits have stopped going anywhere. It exists because nothing else in the loop could: `max_iterations` is a cost backstop at 1000, `error_recovery` only classifies LLM/IO errors, the progress observer never writes back into the turn, and a denied tool call leaves no state the loop can reason over — so a turn could edit one file five times, net zero, and no part of the runtime would notice.
+
+`ToolFailureDetector` covers every non-file tool. Three consecutive calls of
+the same tool returning the exact same error fingerprint mount one transient
+observation telling the model to name what cause the next call changes, choose
+another route, or report the blocker. A success, another tool, a file-tool
+call, or a different error resets the streak. Only a hash is retained, never
+the error text; the latest full tool result is already adjacent in context.
+File tools route to `FileMutationLedger`, whose state-transition verdict is
+more useful than a generic error repeat. Both detectors share the monitor's
+single record call and turn-boundary reset, but keep separate evidence and
+reset rules.
 
 **What it compares.** Not file contents — `Edit` rejects `old_string == new_string`, so every applied edit changes the bytes, and `FileFingerprint` carries an mtime, so it moves even when the content comes back. What identifies churn is the *sequence of state transitions*: an `Edit` names both endpoints of its own transition, so an edit whose `new_string` reproduces an earlier edit's `old_string` has undone that edit. A `Write` names only its result, so results are compared to results. Only the two hashes are kept, never the payloads.
 
@@ -339,7 +350,9 @@ The reported verdict names whichever signal crossed the threshold, so the observ
 
 **It injects, it does not stop.** The verdict renders (`baybo_context::prompts::no_progress`) into a transient tail row via `ContextManager::set_progress_observation`, which rides exactly one request and is then cleared — never persisted, so it cannot replay as history. Injection rather than enforcement because the runtime knows the *fact* (this file is back where it was) but not whether it is a mistake: a flag toggled on to test and off again is indistinguishable. A model reasoning correctly from a missing fact needs the fact, not a killed turn.
 
-**Per-turn, deliberately.** The ledger is cleared at the top of every `run_inner`. "Change that back" is ordinary work when the user asks for it between turns; it is only churn inside one turn.
+**Per-turn, deliberately.** The monitor clears both detectors at the top of
+every `run_inner`. "Change that back" is ordinary work when the user asks for
+it between turns; it is only churn inside one turn.
 
 Bounded at 128 files × 64 attempts, **least-recently-touched evicted first**. Both numbers are sized against the failure mode rather than against memory — the whole structure is a few hundred KB at pathological worst case, next to an LLM context measured in megabytes — and the eviction order is load-bearing: a turn that sweeps a crate and *then* churns one file is exactly the case worth catching, and insertion-order eviction drops that file's history precisely because it was seen first.
 

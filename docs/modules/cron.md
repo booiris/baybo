@@ -261,6 +261,11 @@ The three single-job tools (`CronDelete` / `CronPause` / `CronResume`) share one
 
 Its schedule arrives the way `CronCreate`'s does — a recurring `schedule` expression or a one-shot `at`, **mutually exclusive**, both omitted meaning "leave the schedule alone" — because the model composes the two tools from the same mental model, and a `CronSchedule` enum on the wire is a shape it fumbles. Two details keep that surface honest: a blank string is read as a field the caller *did not set* (the model reaches for `""` to mean "leave this alone" often enough that taking it literally would rewrite the job with an empty cron expression), and a naive `at` is read **in the zone the job lives in** — the one this call sets, or else the one the job already has — because a wall-clock reminder read as UTC would move by the offset.
 
+Both tool schemas say this at the field itself: when a strict function-calling
+layer materializes both `schedule` and `at`, the unused side is `""`. Creation
+still requires exactly one non-empty side; update treats two empty sides as no
+schedule change.
+
 The bin itself is **not** part of the model's surface. `CronList` returns live jobs only: a paused job appears with `status: disabled`, a deleted one does not appear at all, so the model can neither see nor act on a job the user has removed. Restore is a human affordance — the web cron page's Recycle Bin view and `POST /v1/cron/{id}/restore`.
 
 ### Storage decoupling

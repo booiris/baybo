@@ -68,8 +68,8 @@ ContextManager (struct)
     ├── interjection.rs    — wrap_interjections (mid-turn steering envelope)
     ├── recalled_memory.rs — wrap_recalled_memories (recall envelope)
     ├── tasks.rs           — render_task_list (transient checklist reminder)
-    ├── no_progress.rs     — render (transient "your edits cancelled out"
-    │                        observation; see agent.md → No-progress detection)
+    ├── no_progress.rs     — render transient file-churn and repeated-tool-error
+    │                        observations (see agent.md → No-progress detection)
     ├── title.rs           — build_title_prompt (conversation-title pass)
     ├── cancelled_turn.rs  — /stop salvage marker (SUFFIX + strip_marker)
     ├── tool_output.rs     — cap_tool_output / spill (+ MAX cap)
@@ -208,7 +208,7 @@ honest, in ascending order of cost:
    So each candidate path is checked against
    `ToolResultMeta::write_fingerprint` — the `{mtime, size}` the writing call
    left, stamped by the agent loop **only when the call actually wrote**
-   (`tool_wrote_successfully`; the sibling `read_fingerprint` is stamped for
+   (`tool_call_succeeded`; the sibling `read_fingerprint` is stamped for
    failed and denied writes as well, carrying the pre-call anchor, which is what
    made it the wrong input). It rides the persisted `ToolResult`, so the check
    survives rehydration with the transcript instead of living in a field. Newest

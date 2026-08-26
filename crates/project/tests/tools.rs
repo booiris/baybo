@@ -596,6 +596,12 @@ async fn a_filler_parent_does_not_take_a_card_out_of_its_plan() {
     let f = fixture().await;
     let (project, lead) = f.open("Planned").await;
     let ctx = f.ctx(&project, &lead);
+    f.call(
+        "ProjectAgentCreate",
+        &ctx,
+        json!({ "name": "dev", "role": "Codes." }),
+    )
+    .await;
     // Distinct `key`s: this fixture's context is a cron fire, so a card
     // opened without one dedupes onto the last.
     f.call(
@@ -607,7 +613,7 @@ async fn a_filler_parent_does_not_take_a_card_out_of_its_plan() {
     f.call(
         "IssueCreate",
         &ctx,
-        json!({ "title": "step one", "parent": 1, "stage": 2, "key": "step" }),
+        json!({ "title": "step one", "parent": 1, "stage": 2, "priority": "high", "assignee": "@dev", "key": "step" }),
     )
     .await;
     let plan = f.manager.get_issue(&project, 1).await.expect("plan");
@@ -623,6 +629,15 @@ async fn a_filler_parent_does_not_take_a_card_out_of_its_plan() {
             "blocked": "waiting for the plan's first stage",
             "parent": 0,
             "stage": 0,
+            "title": "",
+            "description": "",
+            "clear_description": false,
+            "status": "unchanged",
+            "priority": "unchanged",
+            "assignee": "",
+            "cancelled": false,
+            "reopen": false,
+            "unblock": false,
         }),
     )
     .await;
@@ -642,6 +657,8 @@ async fn a_filler_parent_does_not_take_a_card_out_of_its_plan() {
         Some("waiting for the plan's first stage"),
         "while the field the call was actually about landed"
     );
+    assert_eq!(reported.priority, placed.priority);
+    assert_eq!(reported.assignee, placed.assignee);
 
     f.call(
         "IssueUpdate",
@@ -658,6 +675,39 @@ async fn a_filler_parent_does_not_take_a_card_out_of_its_plan() {
         detached.stage, 0,
         "and a stage under a parent that is gone is a barrier nobody set"
     );
+}
+
+/// Strict-schema providers may materialize an omitted optional integer as
+/// zero. A create with that filler is still a top-level card; looking up card
+/// #0 made every otherwise-valid `IssueCreate` fail before this normalization.
+#[tokio::test]
+async fn a_filler_parent_opens_a_top_level_card() {
+    let f = fixture().await;
+    let (project, lead) = f.open("Root filler").await;
+    let ctx = f.ctx(&project, &lead);
+
+    let created = f
+        .call(
+            "IssueCreate",
+            &ctx,
+            json!({
+                "title": "standalone work",
+                "description": "not part of another card",
+                "parent": 0,
+                "stage": 0,
+                "key": "standalone",
+            }),
+        )
+        .await;
+
+    assert_eq!(created["number"], 1, "{created}");
+    assert!(created["parent"].is_null(), "{created}");
+    let stored = f.manager.get_issue(&project, 1).await.expect("card");
+    assert!(stored.parent_issue_id.is_none());
+
+    let schema = f.tool("IssueCreate").parameters_schema();
+    assert_eq!(schema["properties"]["parent"]["minimum"], 0);
+    assert_eq!(schema["properties"]["priority"]["enum"][0], "none");
 }
 
 #[tokio::test]
@@ -1360,6 +1410,46 @@ async fn paging_back_through_done_reaches_every_card_the_cap_held_back() {
         seen,
         (1..=20).collect::<Vec<i64>>(),
         "every card once, no gap and no repeat"
+    );
+}
+
+/// `before` has no "unset" spelling an integer parameter can carry, so a
+/// caller reaches for `0` — and card numbers being 1-based, that bound
+/// answered "no such card" for the whole board. It is read as no bound,
+/// the way an empty `query` and an empty `assignee` already are, because a
+/// filter that silently empties the board is indistinguishable from an
+/// empty board.
+#[tokio::test]
+async fn a_bound_below_the_first_card_is_no_bound() {
+    let f = fixture().await;
+    let (project, lead) = f.open("Bound").await;
+    let ctx = f.ctx(&project, &lead);
+    for n in 1..=3 {
+        f.call(
+            "IssueCreate",
+            &ctx,
+            json!({ "title": format!("card {n}"), "key": format!("c{n}") }),
+        )
+        .await;
+    }
+
+    let unbounded = f.call("IssueList", &ctx, json!({})).await;
+    assert_eq!(unbounded["count"], 3, "{unbounded}");
+
+    for bound in [0, -1] {
+        let listed = f.call("IssueList", &ctx, json!({ "before": bound })).await;
+        assert_eq!(
+            listed["count"], 3,
+            "before {bound} excluded the board: {listed}"
+        );
+    }
+
+    let bounded = f.call("IssueList", &ctx, json!({ "before": 2 })).await;
+    assert_eq!(bounded["count"], 1, "a real bound still bounds: {bounded}");
+    assert_eq!(bounded["issues"][0]["number"], 1);
+    assert_eq!(
+        f.tool("IssueList").parameters_schema()["properties"]["before"]["minimum"],
+        0
     );
 }
 
