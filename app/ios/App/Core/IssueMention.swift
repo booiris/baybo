@@ -9,14 +9,24 @@ struct IssueMentionQuery: Equatable {
     let prefix: String
 }
 
-/// The replacement that completes a query, as an edit rather than a finished
-/// string: the dock applies it to the live UIKit document so a caret in the
-/// middle of a draft stays where the operator put it.
-struct IssueMentionEdit: Equatable {
+/// Completing a query, in both of the forms the dock needs it: the EDIT (the
+/// live UIKit document takes it, so a caret in the middle of a draft stays
+/// where the operator put it) and the finished DRAFT (the binding takes that).
+///
+/// **Both come off one snapshot of the text, in one call, deliberately.** The
+/// dock used to ask for the edit, apply it to the document, and then ask for
+/// the draft — and the document write updates the binding under it, so the
+/// second question was answered about text that already carried the answer.
+/// The edit went in twice and the handle came out doubled (`@dev-1 ev-1 `).
+/// There is no second question to get wrong now.
+struct IssueMentionCompletion: Equatable {
     /// The UTF-16 range of the draft it replaces — the `@`, what was typed
     /// after it, and a space already sitting behind it.
     let range: Range<Int>
+    /// What goes in that range.
     let text: String
+    /// The whole draft, completed.
+    let draft: String
 }
 
 /// Completing a mention in a comment.
@@ -83,28 +93,23 @@ enum IssueMention {
         return matching
     }
 
-    /// The edit that turns `query` into `@handle `.
+    /// Turn `query` into `@handle `.
     ///
     /// The trailing space is part of the replacement rather than a decision
     /// about the tail: a mention runs up against the next word otherwise, and
-    /// a space already there is swallowed by the range so completing twice
-    /// cannot leave two.
-    static func edit(for query: IssueMentionQuery, handle: String, in text: String)
-        -> IssueMentionEdit
+    /// a space already there is swallowed by the range so completing cannot
+    /// leave two.
+    static func completion(for query: IssueMentionQuery, handle: String, in text: String)
+        -> IssueMentionCompletion
     {
         let units = Array(text.utf16)
         let typedEnd = min(query.start + 1 + query.prefix.utf16.count, units.count)
         let end = typedEnd < units.count && units[typedEnd] == space ? typedEnd + 1 : typedEnd
-        return IssueMentionEdit(range: query.start..<end, text: "@\(handle) ")
-    }
-
-    /// `edit` applied to the draft — the fallback when the field's document is
-    /// out of reach, and how a test says what the operator would see.
-    static func applying(_ edit: IssueMentionEdit, to text: String) -> String {
-        let units = Array(text.utf16)
-        let head = String(decoding: units[0..<min(edit.range.lowerBound, units.count)], as: UTF16.self)
-        let tail = String(decoding: units[min(edit.range.upperBound, units.count)...], as: UTF16.self)
-        return head + edit.text + tail
+        let written = "@\(handle) "
+        let head = String(decoding: units[0..<min(query.start, units.count)], as: UTF16.self)
+        let tail = String(decoding: units[end...], as: UTF16.self)
+        return IssueMentionCompletion(
+            range: query.start..<end, text: written, draft: head + written + tail)
     }
 
     private static func isHandleUnit(_ unit: UInt16) -> Bool {

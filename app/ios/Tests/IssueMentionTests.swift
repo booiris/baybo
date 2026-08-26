@@ -118,9 +118,34 @@ struct IssueMentionTests {
         #expect(complete("hi @qa, and @de", "dev-2") == "hi @qa, and @dev-2 ")
     }
 
+    /// **The doubled handle** (2026-08-27). The dock asked for the edit,
+    /// applied it to the field's document, and then asked what the draft now
+    /// read — but writing the document updates the binding under it, so the
+    /// second question was answered about text that already carried the
+    /// handle, and the edit went in twice: `@d` completed to `@dev-1 ev-1 `.
+    ///
+    /// The completion carries both halves off ONE reading now, so the shape of
+    /// the bug is unrepresentable. What this pins is the arithmetic that made
+    /// it visible — the range and the text are the same edit the draft
+    /// describes, so a caller who applies one gets the other.
+    @Test func theEditAndTheDraftAreTheSameEdit() {
+        guard let open = query("please @d") else {
+            Issue.record("no mention open")
+            return
+        }
+        let done = IssueMention.completion(for: open, handle: "dev-1", in: "please @d")
+
+        #expect(done.draft == "please @dev-1 ")
+        #expect(done.range == 7..<9, "the range covers the @ and what was typed of the handle")
+        #expect(done.text == "@dev-1 ")
+        // What the document is handed, applied to what the binding held: the
+        // two agree, which is the only reason writing both is safe.
+        let byHand = "please @d".prefix(7) + done.text + "please @d".dropFirst(9)
+        #expect(String(byHand) == done.draft)
+    }
+
     private func complete(_ text: String, _ handle: String, caret: Int? = nil) -> String? {
         guard let open = query(text, caret: caret) else { return nil }
-        return IssueMention.applying(
-            IssueMention.edit(for: open, handle: handle, in: text), to: text)
+        return IssueMention.completion(for: open, handle: handle, in: text).draft
     }
 }

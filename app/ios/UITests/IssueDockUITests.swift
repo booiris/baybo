@@ -100,8 +100,19 @@ final class IssueDockUITests: BayboUITestCase {
         XCTAssertEqual(
             app.textFields[IssueDockFields.field].value as? String, "@dev-1 ",
             "completing left something other than the handle and one space")
+
+        // **The strip closes and STAYS closed on the handle just chosen.** The
+        // field's up-sync lands a beat after the completion and re-reads the
+        // caret; parked in front of the trailing space it is back inside the
+        // finished handle, which reopens the strip on `@dev-1` — one tap from
+        // writing it twice. Held open a second, because that beat is the case.
         XCTAssertFalse(
             app.buttons[Self.mention("dev-2")].exists, "the strip stayed up after completing")
+        XCTAssertFalse(
+            offered.waitForExistence(timeout: 1), "the completed handle was offered again")
+        XCTAssertEqual(
+            app.textFields[IssueDockFields.field].value as? String, "@dev-1 ",
+            "the draft changed on its own after the completion settled")
     }
 
     /// The negative control, and the reason the grammar is mirrored from

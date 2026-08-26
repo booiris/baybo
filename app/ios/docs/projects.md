@@ -196,8 +196,18 @@ Moving out of In Progress **never kills the run**; Stop is the only kill switch.
     offset, so the dock reads the offset off the focused UIKit document
     (`FocusedTextInput.caretOffset`) on each edit, and the strip takes the
     QuickType bar's place instead of the popup's.
+  - **The whole completion is worked out before anything is written.** The
+    dock asked for the edit, applied it, then asked what the draft now read —
+    and writing the field updates its binding underneath, so the second
+    question was answered about text that already carried the handle and the
+    edit went in twice (`@d` → `@dev-1 ev-1 `). `IssueMentionCompletion`
+    carries the edit AND the finished draft off one reading, the binding write
+    is conditioned on the draft not already saying it, and the strip stays shut
+    for the draft it just wrote — a caret parked in front of the trailing space
+    is back inside the finished handle, one tap from writing it again.
   - **The completion is written through the document**, not the binding
-    (`FocusedTextInput.replace`): a `TextField` handed a new string puts the
+    (`FocusedTextInput.replace`, which commits any live IME composition first —
+    uncommitted syllables re-commit after a write that reaches around them): a `TextField` handed a new string puts the
     caret at the end of it, which would move the cursor every time a
     completion landed mid-draft. Both reaches are UTF-16-indexed, which is why
     `IssueMention` scans code units rather than Characters — an emoji earlier

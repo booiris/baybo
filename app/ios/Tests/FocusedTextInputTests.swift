@@ -81,6 +81,30 @@ struct FocusedTextInputTests {
         #expect(FocusedTextInput.caretOffset == 7)
     }
 
+    /// **No composition survives the write.** Uncommitted syllables live in
+    /// the input session's marked range, and this app has the scar already
+    /// (`clearDocument`): a document written around them leaves them to
+    /// re-commit afterwards, which on a mention completion would put the
+    /// handle in twice.
+    ///
+    /// Honest about what it proves: this passes with or without `replace`'s
+    /// explicit `unmarkText`, because a `UITextView` handed a range covering
+    /// its own marked text clears the mark itself. The explicit commit is
+    /// there for the LIVE input session — a real pinyin keyboard, which no
+    /// harness reproduces and which is where the original scar was found. What
+    /// this pins is the outcome, so a future `replace` that stops clearing it
+    /// goes red here rather than on somebody's phone.
+    @Test func aLiveCompositionIsCommittedBeforeTheWrite() {
+        let (window, field) = focused("@", caret: 1)
+        defer { close(window, field) }
+        field.setMarkedText("d", selectedRange: NSRange(location: 1, length: 0))
+        #expect(field.markedTextRange != nil, "the harness failed to open a composition")
+
+        #expect(FocusedTextInput.replace(0..<2, with: "@dev-1 "))
+        #expect(field.text == "@dev-1 ")
+        #expect(field.markedTextRange == nil, "a composition left open re-commits after the write")
+    }
+
     /// Nothing focused is an answer, not a crash: the dock falls back to its
     /// binding on a `false`.
     @Test func nothingFocusedIsSaidRatherThanGuessed() {

@@ -33,6 +33,10 @@ struct IssueDock: View {
     /// still points at the `@` it was measured from, so completing from a
     /// stale strip still lands in the right place.
     @State private var caret: Int?
+    /// The draft a completion just wrote. Compared by VALUE rather than held
+    /// as a "just completed" flag, so it retires itself: the next keystroke
+    /// makes the draft something else and the strip is live again.
+    @State private var completedDraft: String?
     /// Send the comment AND lift the block. Checked by default when an agent
     /// is the one asking: answering a question and leaving the card parked is
     /// almost never what somebody meant, and the unblock is what hands the run
@@ -162,8 +166,14 @@ struct IssueDock: View {
     // MARK: - Mentions
 
     /// The mention being typed, if the field has one open.
+    ///
+    /// A draft this dock has just completed into offers nothing, whatever the
+    /// caret says. The field's up-sync arrives a beat after the completion and
+    /// re-reads the caret, and a caret UIKit parks in front of the trailing
+    /// space is back INSIDE the finished handle — which reopens the strip on
+    /// the handle just chosen, one tap away from writing it a second time.
     private var mention: IssueMentionQuery? {
-        guard focused, let caret else { return nil }
+        guard focused, let caret, staging.text != completedDraft else { return nil }
         return IssueMention.query(in: staging.text, caret: caret)
     }
 
@@ -226,18 +236,33 @@ struct IssueDock: View {
     private static let chipHeight: CGFloat = 32
 
     /// Write `@handle ` over what has been typed of it.
+    ///
+    /// **The whole completion is worked out BEFORE anything is written**, off
+    /// one reading of the draft. Writing the document updates the binding
+    /// under this function — that is what a text field does — so a draft read
+    /// back afterwards already carries the handle, and applying the edit to it
+    /// a second time is where `@dev-1 ev-1 ` came from. `IssueMentionCompletion`
+    /// carries both halves so there is no second reading to get wrong.
     private func complete(_ handle: String) {
         guard let mention else { return }
         Haptics.tap()
-        let edit = IssueMention.edit(for: mention, handle: handle, in: staging.text)
+        let completion = IssueMention.completion(
+            for: mention, handle: handle, in: staging.text)
         // The DOCUMENT first, so a completion landing mid-draft leaves the
-        // caret behind the handle instead of at the end of the comment. The
-        // binding write after it is the fallback for a probe that found no
-        // responder, and an equal write — discarded by `text`'s own guard —
-        // when the document took it.
-        FocusedTextInput.replace(edit.range, with: edit.text)
-        staging.text = IssueMention.applying(edit, to: staging.text)
-        caret = edit.range.lowerBound + edit.text.utf16.count
+        // caret behind the handle instead of at the end of the comment.
+        let wrote = FocusedTextInput.replace(completion.range, with: completion.text)
+        // ...and the binding only if the field has not already reported the
+        // same thing. A text field's own up-sync may land before this line or
+        // after it, and the whole class of bug here is one writer acting on
+        // what the other has already done — so the write is conditioned on
+        // what the draft SAYS rather than on which order they ran in. It is
+        // still unconditional when the document could not be reached at all:
+        // an unwritten binding would send the half-typed handle.
+        if !wrote || staging.text != completion.draft {
+            staging.text = completion.draft
+        }
+        caret = completion.range.lowerBound + completion.text.utf16.count
+        completedDraft = completion.draft
     }
 
     /// The chat's pill exactly — the glass, the 48pt floor, the 17pt field, and

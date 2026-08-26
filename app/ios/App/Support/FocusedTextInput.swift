@@ -75,9 +75,19 @@ enum FocusedTextInput {
     /// puts the caret at the END of it — which moves the operator's cursor
     /// every time a completion lands mid-draft. Answers whether it reached a
     /// responder, so the caller can fall back to the binding.
+    ///
+    /// **Any live composition is committed first**, `clearDocument`'s scar
+    /// applied to a write that is not a reset: uncommitted syllables live in
+    /// the input session's marked range, and a range replaced around them
+    /// leaves them to re-commit afterwards — the replacement AND the text it
+    /// was meant to replace, both in the document. `unmarkText` commits, so
+    /// the marked text lands where it already reads in the binding, which is
+    /// what the caller measured its range against.
     @discardableResult
     static func replace(_ range: Range<Int>, with text: String) -> Bool {
-        guard let input = current,
+        guard let input = current else { return false }
+        input.unmarkText()
+        guard
             let from = input.position(from: input.beginningOfDocument, offset: range.lowerBound),
             let to = input.position(from: input.beginningOfDocument, offset: range.upperBound),
             let target = input.textRange(from: from, to: to)
