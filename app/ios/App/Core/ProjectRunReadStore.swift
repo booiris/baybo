@@ -99,34 +99,45 @@ final class ProjectRunReadStore: ObservableObject, TranscriptTarget {
     // MARK: - Reading
     //
     // A run has no SYNC route — only backward pages. So `requestSync` asks for
-    // the NEWEST page rather than a difference: the page's own merge is what
-    // folds it into what is already rendered, and a run only ever grows at the
-    // tail. Passing the cursor would ask the gateway a question it has no
+    // the NEWEST page rather than a difference: a run only ever grows at the
+    // tail, and passing the cursor would ask the gateway a question it has no
     // route to answer.
+    //
+    // **The two calls take different doors, and the difference is the frame
+    // KIND.** The web arms a guard on a sync request that only `sync_page` /
+    // `sync_failed` unwinds, and separately DROPS a `history_page` matching no
+    // in-flight backward-paging request. Answering the initial load with a
+    // history page — which is what this did until 2026-08-26 — lost the rows
+    // AND left the guard armed, so every run sat on "Loading conversation…"
+    // with its transcript already fetched. Which door was taken is what decides
+    // the failure frame too: a nil `beforeOrdinal` is an ordinary first
+    // scroll-up page, so it cannot be the thing that tells the two apart.
 
     func requestSync(sinceOrdinal: Int64?, limit: UInt32) {
-        fetchPage(before: nil, limit: limit)
+        Task { [projectId, number, attempt] in
+            do {
+                let frame = try await client.projectRunTranscriptBaseline(
+                    projectId: projectId, number: number, attempt: attempt, limit: limit)
+                bridge?.pushFrame(frame)
+            } catch {
+                NSLog("baybo: run baseline: %@", bayboErrorText(error))
+                // The webview armed an in-flight guard for this request and
+                // will not ask again until something unwinds it.
+                pushSynthesized(["kind": "sync_failed", "error": bayboErrorText(error)])
+            }
+        }
     }
 
     func fetchHistory(beforeOrdinal: Int64?, limit: UInt32) {
-        fetchPage(before: beforeOrdinal, limit: limit)
-    }
-
-    private func fetchPage(before: Int64?, limit: UInt32) {
         Task { [projectId, number, attempt] in
             do {
                 let frame = try await client.projectRunTranscript(
                     projectId: projectId, number: number, attempt: attempt,
-                    beforeOrdinal: before, limit: limit)
+                    beforeOrdinal: beforeOrdinal, limit: limit)
                 bridge?.pushFrame(frame)
             } catch {
-                NSLog("baybo: run transcript: %@", bayboErrorText(error))
-                // The webview armed an in-flight guard for this request and
-                // will not ask again until something unwinds it.
-                pushSynthesized([
-                    "kind": before == nil ? "sync_failed" : "history_failed",
-                    "error": bayboErrorText(error),
-                ])
+                NSLog("baybo: run history: %@", bayboErrorText(error))
+                pushSynthesized(["kind": "history_failed", "error": bayboErrorText(error)])
             }
         }
     }

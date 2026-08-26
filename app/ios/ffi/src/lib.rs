@@ -757,9 +757,11 @@ impl BayboClient {
     /// frame the chat transcript consumes — so the transcript webview
     /// renders it unchanged.
     ///
-    /// There is no sync twin: a card's run has no sync route, so a live page
-    /// advances by re-reading its newest page when a `ProjectChanged` frame
-    /// says the run moved.
+    /// **Scroll-up only.** The initial load takes
+    /// [`Self::project_run_transcript_baseline`], which reads the same route
+    /// and dresses it as a `sync_page`: the web drops a history page that
+    /// answers no backward-paging request, and only a `sync_page` unwinds the
+    /// guard its sync request armed.
     pub async fn project_run_transcript(
         self: Arc<Self>,
         project_id: String,
@@ -779,6 +781,28 @@ impl BayboClient {
                 limit,
             )
             .await
+        })
+        .await
+    }
+
+    /// The run's newest page as a baseline `sync_page` — what answers the
+    /// transcript's initial load, and what a live run re-reads when a
+    /// `ProjectChanged` frame says it moved.
+    ///
+    /// A card's run has no sync route, so this is the same backward-paging
+    /// endpoint read with no cursor. See `gateway_api` for why the frame KIND
+    /// is the whole point.
+    pub async fn project_run_transcript_baseline(
+        self: Arc<Self>,
+        project_id: String,
+        number: i64,
+        attempt: i64,
+        limit: Option<u32>,
+    ) -> Result<String, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::fetch_run_transcript_baseline(&client, project_id, number, attempt, limit)
+                .await
         })
         .await
     }

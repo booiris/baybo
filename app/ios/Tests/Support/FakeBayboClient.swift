@@ -672,9 +672,31 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
             sessionId: nil, error: nil, createdAtMs: 0, startedAtMs: nil, settledAtMs: nil,
             costMicros: nil, inputTokens: nil, outputTokens: nil)
     }
+    /// What a run's transcript answers with, per door. Two stubs rather than
+    /// one, because the doors differ in the only way that matters: the FRAME
+    /// KIND, and a fake that served both from one field could not tell a store
+    /// that took the wrong door from one that took the right one.
+    var stubRunBaselineJson: String?
+    var stubRunHistoryJson: String?
+    /// The `beforeOrdinal` of each scroll-up page asked for, in order.
+    var runHistoryAsks: [Int64?] = []
+    var runBaselineAsks = 0
     func projectRunTranscript(
         projectId: String, number: Int64, attempt: Int64, beforeOrdinal: Int64?, limit: UInt32?
-    ) async throws -> String { throw Self.unsupported }
+    ) async throws -> String {
+        runHistoryAsks.append(beforeOrdinal)
+        try refuseIfOffline()
+        guard let stubRunHistoryJson else { throw Self.unsupported }
+        return stubRunHistoryJson
+    }
+    func projectRunTranscriptBaseline(
+        projectId: String, number: Int64, attempt: Int64, limit: UInt32?
+    ) async throws -> String {
+        runBaselineAsks += 1
+        try refuseIfOffline()
+        guard let stubRunBaselineJson else { throw Self.unsupported }
+        return stubRunBaselineJson
+    }
     func projectIssueEvents(projectId: String, number: Int64) async throws -> String {
         try refuseIfOffline()
         guard let stubIssueEventsJson else { throw Self.unsupported }

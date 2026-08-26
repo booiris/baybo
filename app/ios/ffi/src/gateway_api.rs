@@ -2072,11 +2072,61 @@ pub(crate) async fn fetch_run_transcript_page<C: GatewayJsonClient + Sync>(
     before_ordinal: Option<i64>,
     limit: Option<u32>,
 ) -> Result<String, String> {
-    let path = format!(
+    history_page_at(
+        client,
+        run_transcript_path(&project, number, attempt)?,
+        before_ordinal,
+        limit,
+    )
+    .await
+}
+
+/// The run's newest page, as a **baseline `sync_page`**.
+///
+/// A run has no sync route, so this reads the same backward-paging endpoint
+/// with no cursor — the newest page IS the whole tail. What matters is the
+/// frame it is dressed as. The web arms an in-flight guard when it asks for a
+/// sync and unwinds it on `sync_page` / `sync_failed` and nothing else; and it
+/// DROPS a `history_page` that matches no in-flight backward-paging request, as
+/// stale. Answering the initial load with a history page — which is what this
+/// did until 2026-08-26 — therefore lost twice: the rows were discarded and the
+/// guard stayed armed, so a run sat on "Loading conversation…" forever with its
+/// transcript already fetched.
+///
+/// `since_ordinal: None` makes it a baseline, which is honest: this is the
+/// newest page and not a difference. The web's REPLACE keeps whatever history
+/// the reader had paged in above it.
+pub(crate) async fn fetch_run_transcript_baseline<C: GatewayJsonClient + Sync>(
+    client: &C,
+    project: String,
+    number: i64,
+    attempt: i64,
+    limit: Option<u32>,
+) -> Result<String, String> {
+    let mut path = run_transcript_path(&project, number, attempt)?;
+    if let Some(limit) = limit {
+        let mut first_query = true;
+        append_query(&mut path, &mut first_query, "limit", limit);
+    }
+    let detail: ChatSessionDetail = client.get_json(&path).await?;
+    let frame = SyncPageFrame {
+        kind: "sync_page",
+        rows: detail.transcript,
+        since_ordinal: None,
+        next_cursor: detail.newest_ordinal,
+        rebased: false,
+        oldest_ordinal: detail.oldest_ordinal,
+        has_more_older: detail.has_more,
+        compaction_points: Vec::new(),
+    };
+    serde_json::to_string(&frame).map_err(|e| format!("encode run sync page: {e}"))
+}
+
+fn run_transcript_path(project: &str, number: i64, attempt: i64) -> Result<String, String> {
+    Ok(format!(
         "{}/runs/{attempt}/transcript",
-        issue_path(&project, number)?
-    );
-    history_page_at(client, path, before_ordinal, limit).await
+        issue_path(project, number)?
+    ))
 }
 
 /// A card's timeline, verbatim. Raw JSON rather than a typed record: the
@@ -3911,6 +3961,44 @@ mod tests {
             .await
             .expect("clear avatar");
         assert_eq!(client.only_call().body, "{}");
+    }
+
+    /// A run's transcript answers its two callers with two DIFFERENT frames,
+    /// and that is the whole feature rather than an implementation detail.
+    ///
+    /// The web arms a guard when it asks for a sync and unwinds it on
+    /// `sync_page` / `sync_failed` and nothing else; separately it DROPS a
+    /// `history_page` that matches no in-flight backward-paging request. So the
+    /// initial load answered with a history page lost twice over — rows
+    /// discarded, guard left armed — and every run sat on "Loading
+    /// conversation…" with its transcript already in hand. Both kinds are
+    /// asserted here because either one alone passes on the broken pairing.
+    #[tokio::test]
+    async fn a_runs_first_page_is_a_sync_frame_and_its_scrollback_a_history_one() {
+        let body = r#"{"transcript":[{"id":"r1"}],"has_more":true,"oldest_ordinal":4,"newest_ordinal":9}"#;
+
+        let client = RecordingClient::new(body);
+        let frame = fetch_run_transcript_baseline(&client, "p-1".into(), 26, 2, Some(80))
+            .await
+            .expect("baseline");
+        assert_eq!(
+            client.only_call().path,
+            "/v1/projects/p-1/issues/26/runs/2/transcript?limit=80"
+        );
+        assert_eq!(
+            frame,
+            r#"{"kind":"sync_page","rows":[{"id":"r1"}],"since_ordinal":null,"next_cursor":9,"rebased":false,"oldest_ordinal":4,"has_more_older":true}"#
+        );
+
+        let client = RecordingClient::new(body);
+        let frame = fetch_run_transcript_page(&client, "p-1".into(), 26, 2, Some(4), Some(80))
+            .await
+            .expect("page");
+        assert_eq!(
+            client.only_call().path,
+            "/v1/projects/p-1/issues/26/runs/2/transcript?before_ordinal=4&limit=80"
+        );
+        assert!(frame.starts_with(r#"{"kind":"history_page""#), "{frame}");
     }
 
     /// The board's settings are a FULL REPLACE, and `agents_may_merge` is the
