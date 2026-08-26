@@ -184,11 +184,11 @@ impl Tool for CronCreateTool {
                 },
                 "schedule": {
                     "type": "string",
-                    "description": "Recurring cron expression evaluated in `timezone`. Supply exactly one of `schedule` or `at`."
+                    "description": "Recurring cron expression evaluated in `timezone`. Supply exactly one non-empty value across `schedule` and `at`; use an empty string for the unused field when the strict schema materializes both."
                 },
                 "at": {
                     "type": "string",
-                    "description": "One-shot timestamp; fires once, then the job stops and stays in the list as `executed`. Either RFC3339 with offset (e.g. \"2026-04-17T14:25:00Z\" or \"2026-04-17T22:25:00+08:00\") or a naive `YYYY-MM-DDTHH:MM:SS` interpreted in `timezone`. Supply exactly one of `schedule` or `at`."
+                    "description": "One-shot timestamp; fires once, then the job stops and stays in the list as `executed`. Either RFC3339 with offset (e.g. \"2026-04-17T14:25:00Z\" or \"2026-04-17T22:25:00+08:00\") or a naive `YYYY-MM-DDTHH:MM:SS` interpreted in `timezone`. Supply exactly one non-empty value across `schedule` and `at`; use an empty string for the unused field when the strict schema materializes both."
                 }
             },
             "required": ["title", "timezone", "prompt"]
@@ -383,23 +383,23 @@ impl Tool for CronUpdateTool {
                 },
                 "title": {
                     "type": "string",
-                    "description": "New short human name for the job. Omit to keep the current one."
+                    "description": "New short human name for the job. Omit it, or use an empty string under a strict schema, to keep the current one."
                 },
                 "prompt": {
                     "type": "string",
-                    "description": "New instruction to execute when the job fires. Omit to keep the current one. Same rules as CronCreate's `prompt`."
+                    "description": "New instruction to execute when the job fires. Omit it, or use an empty string under a strict schema, to keep the current one. Same rules as CronCreate's `prompt`."
                 },
                 "schedule": {
                     "type": "string",
-                    "description": "New recurring cron expression, evaluated in the job's timezone. Supply at most one of `schedule` or `at`; both omitted leaves the current schedule alone."
+                    "description": "New recurring cron expression, evaluated in the job's timezone. Supply at most one non-empty value across `schedule` and `at`; both omitted or empty leaves the current schedule alone."
                 },
                 "at": {
                     "type": "string",
-                    "description": "New one-shot timestamp: the job fires once at this time, then stops. Either RFC3339 with offset (e.g. \"2026-04-17T22:25:00+08:00\") or a naive `YYYY-MM-DDTHH:MM:SS`, read in the job's timezone (or in `timezone`, when this call also changes it). Must be in the future. Supply at most one of `schedule` or `at`."
+                    "description": "New one-shot timestamp: the job fires once at this time, then stops. Either RFC3339 with offset (e.g. \"2026-04-17T22:25:00+08:00\") or a naive `YYYY-MM-DDTHH:MM:SS`, read in the job's timezone (or in `timezone`, when this call also changes it). Must be in the future. Supply at most one non-empty value across `schedule` and `at`; an empty value is unchanged."
                 },
                 "timezone": {
                     "type": "string",
-                    "description": "New IANA timezone (e.g. \"Asia/Shanghai\") for the job. Omit to keep the current one. Changing it alone moves the job: the same cron expression names a different instant in a different zone."
+                    "description": "New IANA timezone (e.g. \"Asia/Shanghai\") for the job. Omit it, or use an empty string under a strict schema, to keep the current one. Changing it alone moves the job: the same cron expression names a different instant in a different zone."
                 }
             },
             "required": ["id"]
@@ -910,6 +910,24 @@ mod tests {
         let job = scheduler.get_job(&id).await.unwrap().unwrap();
         assert_eq!(job.prompt, "news");
         assert_eq!(job.status, CronStatus::Enabled);
+    }
+
+    #[test]
+    fn schedule_pair_describes_its_strict_schema_filler() {
+        let (scheduler, _rx) = test_scheduler();
+        for schema in [
+            CronCreateTool::new(Arc::clone(&scheduler)).parameters_schema(),
+            CronUpdateTool::new(scheduler).parameters_schema(),
+        ] {
+            for field in ["schedule", "at"] {
+                assert!(
+                    schema["properties"][field]["description"]
+                        .as_str()
+                        .is_some_and(|description| description.contains("empty")),
+                    "{field}: {schema}"
+                );
+            }
+        }
     }
 
     /// Editing nothing is always a caller bug, and the model must see it as one

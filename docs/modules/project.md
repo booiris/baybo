@@ -50,7 +50,7 @@ every door leads through it.
 | `stages.rs` | Sub-issues, `is_finished`, the stage barrier's two questions, the progress ring |
 | `driver.rs` | Which Todo cards the board starts by itself, in what order, which cards the lead is asked about (staffing, review, stalled work, blocks, the Backlog the board filed), and when the board itself has run dry |
 | `budget.rs` | `Headroom` and the UTC-day window a daily ceiling measures |
-| `timeline.rs` | `diff_events` — an edit reduced to the entries worth writing |
+| `timeline.rs` | `diff_events` — an edit reduced to the entries worth writing, including title and description edits |
 | `worktree.rs` | The per-issue git worktree: create, branch, resolve the commit identity, merge, reclaim |
 | `approvals.rs` | `TimelineApprovalGate` — a run's approval prompts, on the card |
 | `events.rs` | The `ProjectEvents` push port (the gateway implements it) |
@@ -766,7 +766,7 @@ the sweep is not. But racing them in two tasks leaves a re-dispatch and a
 promotion to be sorted out by `claim_run` alone, and there is no reason to
 spend that guard here.
 
-Five things it will not do, each of which is a rule and not a coincidence:
+Six things it will not do, each of which is a rule and not a coincidence:
 
 - **It will not promote a card whose assignee cannot host a run.** Asked in
   `promote` through `enqueue_refusal`, *before* the move — and that ordering
@@ -786,6 +786,24 @@ Five things it will not do, each of which is a rule and not a coincidence:
   be in. This is not an edge case — a comment on a Todo card wakes its assignee
   where it stands, and a triage run sits on an unstaffed card by construction.
   Both are in the busy set, held runs included.
+- **It will not start a step before its stage.** A card's place in a plan is
+  `parent_issue_id` + `stage`, and the starting path read neither until
+  `driver::held_by_a_stage` existed — so a plan was something the board
+  *displayed*, while `IssueCreate`'s own schema told the model "stage N starts
+  when every step of stage N-1 is done". The model has no way to check that,
+  and a lead that filed eight steps across three stages watched the board
+  start seven of them straight away; each one spent a run discovering it
+  could not work and left a prose block behind, and those blocks are what went
+  on to wake the lead fifty-two times.
+  The gate is in `driver::is_waiting` and deliberately **not** in
+  `board_may_start`: six rules read that one, and the two that read its
+  negation — `driver::blocked`, and `ran_dry` through `drain_anchor` — would
+  start reporting every step of a later stage as a card a block has stopped,
+  handing the lead a question about a card nothing is wrong with.
+  `stages::stage_is_open` is the predicate, shared with the barrier below so
+  that "may this step start" and "has this barrier opened" cannot drift into
+  two answers. It fails **open**: a step whose siblings are not in the slate
+  is not held.
 - **It will not overrule a block.** A person dragging a blocked card into In
   Progress is overriding the block deliberately; the board doing it would be
   overriding it on nobody's authority. `driver::board_may_start` is that rule,
@@ -893,11 +911,19 @@ the last is about **the board**, and is asked only once all five have declined:
 - **Stalled** — a card sitting in In Progress with no run against it and
   nothing queued: work that has silently stopped. A blocked card is not
   stalled — the block is the explanation, recorded by somebody with the
-  authority to pause the card. Neither is a card whose newest run was
-  **cancelled** (`driver::newest_run_was_cancelled`): a cancel is a decision
-  — a human's stop, or the board calling a row off — and waking the lead
-  would countermand it within one tick. The stop stands until somebody acts
-  on the card.
+  authority to pause the card.
+
+  A card whose newest run was **cancelled** takes no question at all
+  (`driver::newest_run_was_cancelled`, asked in `ask_the_lead` for every
+  trigger but one): a cancel is a decision — a human's stop, or the board
+  calling a row off — and waking the lead would countermand it within one
+  tick, whichever way the wake is worded. The stop stands until somebody acts
+  on the card. **`Blocked` is the exception**, and not a loophole: the board
+  settles the block-parked row `Cancelled` itself in
+  `stand_down_for_the_question`, immediately before asking, so reading that as
+  somebody's stop would make the question refuse itself on the strength of its
+  own preparation. The board-scale half of the same rule is in the drain
+  question's marks, below.
 - **Triage** — a card that reached Todo with nobody on it: the board cannot
   start it, so the question is *who should do this*.
 - **Grooming** — a card parked in **Backlog** that an **agent** filed there.
@@ -945,7 +971,8 @@ the last is about **the board**, and is asked only once all five have declined:
   in `CardSignals`, whose map is sparse on purpose: absent there means
   "nothing waiting", and most cards on a working board are an agent's.
 - **Board idle** — the board itself has run dry: nothing executing, nothing
-  this pass promoted, and live cards still on it (`driver::ran_dry`). The one
+  this pass promoted, and cards the board **may take up** still on it
+  (`driver::ran_dry`, over `driver::board_may_take_up`). The one
   question here that is not about a card, and it exists because the five above
   share a blind spot: each is answered **about a card**, and a card cannot see
   a premise that lives somewhere else. "Not yet — wait for #8" is a complete
@@ -964,8 +991,28 @@ the last is about **the board**, and is asked only once all five have declined:
   blocks has already been put to the lead once by the question above; there is
   nothing here the board may act on.
 
+  **Grooming's authorship rule binds this question too**, and that is the
+  whole point of `driver::board_may_take_up` being one predicate rather than a
+  clause in `awaiting_grooming`: a Backlog card the *operator* parked is
+  neither work this counts as live nor a card it may anchor on. It has to be
+  both, and asking one without the other was the hole — the parked card kept
+  `ran_dry` true forever, and this question then handed the lead the whole
+  board with "decide what should happen next" against the one card the board
+  had already agreed not to touch. `agent_opened` is read once per pass in
+  `ask_the_lead` and passed to all three rules; an unreadable timeline yields
+  an empty set, which leaves every parked card alone and lets the board go
+  quiet — the right way for this to fail.
+
   The guard is `driver::nothing_has_happened_since_the_lead_looked`, over
-  `ProjectStore::drain_marks`, and its two marks are deliberately asymmetric.
+  `ProjectStore::drain_marks` **and** `ProjectRow::rules_changed_at`. The
+  rule stamp is here rather than on each card because it is one fact about
+  the whole board, and this is the one question that hands the lead the whole
+  board: a ceiling raised or merging turned on re-opens every standing answer
+  at once, and answering it once is answering it. Per card it was one billed
+  run per card to decide one thing — and, sharing a mark with the ask cap, it
+  handed back the quota to do it again on the next save.
+
+  Its other two marks are deliberately asymmetric.
   **Any** coordination run counts as the lead having looked, because a
   coordination brief hands it the whole board — telling it again inside the
   same lull buys a billed run and no new information. Only **work** counts as
@@ -976,8 +1023,52 @@ the last is about **the board**, and is asked only once all five have declined:
   drain question is itself coordination, so being asked is being looked at and
   the spin closes for free.
 
+  A run that settled **`Cancelled`** lands on the *look* side of that pair and
+  on neither the other. It is not the board working, and whoever called it off
+  had the board in front of them to do it — so a stop neither re-arms this
+  question nor leaves it armed. Sent to the work side instead, as it was, a
+  person pressing stop woke the lead about that very card two seconds later,
+  which is `driver::newest_run_was_cancelled`'s rule losing at board scale
+  after winning per card.
+
   The store read is behind `ran_dry` rather than beside it: it is the only
   board-wide query in the pass, and a board that is working never pays for it.
+
+#### Why there is no `CardState` enum, and will not be
+
+Every rule above is a predicate over the row rather than a branch on one
+computed state, and that is forced rather than chosen. A card carries **one
+position and six independent modifiers** — the column, called-off, blocked,
+staffed, its run slot, whether its newest run was cancelled, plus the
+authorship of three of those — and the modifiers do not collapse into
+mutually exclusive variants. One counterexample settles it, and it is
+reachable today:
+
+> A card a **person** filed into Backlog, then **an agent** blocked.
+> (`update_issue` writes `blocked_reason` with no column check, so nothing
+> stops this shape.)
+
+- `driver::blocked` pins no column, so this card **is** a lead question — the
+  block is an agent's, and adjudicating it is what the lead is for. That
+  requires *paused* to outrank *parked*.
+- `driver::board_may_take_up` excludes it, so `ran_dry` must **not** count it
+  as work the board is stuck on — it is the operator's parked card and the
+  board may not reopen the column. That requires *parked* to outrank *paused*.
+
+Two live rules, the same two facts, opposite orders. A total order over
+exclusive variants has to drop one of them, and dropping either regresses a
+rule this module exists to enforce. A struct of named booleans is just the
+row again with a second home to keep in sync.
+
+What **is** worth collapsing is spelling, not structure. "Is this card still
+live" has exactly one home (`runs::accepts_runs`, over `stages::is_finished`)
+and every rule reaches it through that door; `stages::progress` asks a
+genuinely different question of the same field — Done counts *in* its
+denominator and cancelled counts *out* — and is the one place that reads
+`cancelled_at` for itself. The list-building boilerplate the six rules shared
+is hoisted into `in_promotion_order`, which shares the three identical lines
+and nothing else: each rule is now the single predicate that says what it
+asks.
 
 Cards whose assignee *is* the lead take no question at all
 (`driver::takes_a_lead_question`) — those are the lead's own, its
@@ -989,8 +1080,9 @@ assignee — and the brief they are handed opens with *why* the lead was woken
 
 The spin this could obviously become is closed by `driver::already_asked`,
 which compares each question's newest run against the card's **last
-activity**: `driver::reopened_at`, or the settle of its newest *work* run,
-whichever is later. A lead that read the card and left it alone changed
+activity**: the card's own `updated_at` — a **change** clock, not a write
+clock; see below — or the settle of its newest *work* run, whichever is
+later. A lead that read the card and left it alone changed
 nothing, so it is not asked again; editing the card, moving it, or a work run
 settling on it (a reviewer's verdict, say) makes it a new question. Coordination
 runs count on neither side — the lead looking at a card is not the card
@@ -998,25 +1090,54 @@ changing. The guard is a comparison rather than a flag precisely so that "has
 anything changed since the lead looked?" has no second copy that could
 disagree.
 
-`reopened_at` is that question's other half, and the half the card cannot
-answer: the card's own `updated_at`, **or** `ProjectRow::rules_changed_at`,
-whichever is later. An answer is given under the board's rules as much as
-under the card's state — "escalate this to somebody who may merge" is complete
-while `agents_may_merge` is off, and the operator turning it on is the only
-thing that ever happens next. It touches no card, so a guard reading the card
-alone goes on holding an answer whose premise is gone. The stamp moves for
-either ceiling, `max_parallel_issue_runs`, `agents_may_merge`, and a restore
-from the archive — the fields a board *schedules* by, spelled once in
-`A_BOARD_RULE_CHANGED` and written in the same `UPDATE` that compares them, so
-the stamp cannot be written against a row other than the one it read. A rename
-is not a rule. Deliberately the whole board at once rather than an edge per
-rule: which card a given rule could unstick is not knowable — the reason lives
-in the lead's prose — and one re-ask per operator action is the bound that
-makes guessing unnecessary. It is safe in both directions, because every rule
-change that *stops* a board is caught by a gate above the questions:
-`promotions` returns early on `max_parallel_issue_runs == 0` and
+It reads **only the card**, and that is the correction the whole loop turned
+on. A rule the board schedules by changing is also something the lead has not
+seen — "escalate this to somebody who may merge" is a complete answer while
+`agents_may_merge` is off, and the operator turning it on touches no card — so
+`ProjectRow::rules_changed_at` used to be folded in here, per card. That reads
+the right way round and is wrong twice over. It asks the lead to decide one
+thing about the whole board once per card; and because the ask cap counted
+from the same mark, each save minted the quota to do it again. A short burst
+of saves of one board's settings bought nine runs across five cards, none of
+which changed anything.
+
+The stamp belongs to the **board** question, and lives in
+`driver::nothing_has_happened_since_the_lead_looked` beside the two marks that
+were already there. Asked there it costs one run: the lead is handed the whole
+board, and answering is a *look*, which moves `DrainMarks::looked_at` past the
+stamp — so a burst of saves is one question rather than one per save per card.
+The stamp itself moves for either ceiling, `max_parallel_issue_runs`,
+`agents_may_merge`, and a restore from the archive — the fields a board
+*schedules* by, spelled once in `A_BOARD_RULE_CHANGED` and written in the same
+`UPDATE` that compares them, so it cannot be written against a row other than
+the one it read. A rename is not a rule. It is safe in both directions,
+because every rule change that *stops* a board is caught by a gate above the
+questions: `promotions` returns early on `max_parallel_issue_runs == 0` and
 `release_holds` on an exhausted ceiling, so a stamp can never be the thing
 that starts a board the operator just stopped.
+
+`issues.updated_at` can carry that question only because the writes that stamp
+it compare first. `update_issue` guards every value column it sets
+(`COALESCE`/`CASE`) and guards the stamp with `AN_ISSUE_FIELD_CHANGED`, which
+mirrors that `SET` list expression for expression; `move_issue` stamps only
+when the card actually left its column, and `set_issue_branch` only when the
+branch actually changed. `position` never stamps at all — reordering a column
+is how the operator wants it *read*. Before those guards the column was a
+**write** clock: a patch that set every field to what it already held moved it,
+recorded nothing on the timeline (`timeline::diff_events` compares values), and
+re-opened every question the lead had answered — invisibly, which is what made
+it expensive. The shape is not exotic: a model answering a strict tool schema
+fills in every field it is offered, so "report that I am blocked" arrives as a
+patch naming all ten.
+
+Title and description edits are timeline events once their values actually
+change. A title event keeps both names: titles are bounded, and the old name is
+what makes references written before the rename intelligible. A description
+event records who edited it and when, but does not copy either markdown body
+into the event — descriptions are unbounded, and making every revision a second
+full description would turn one edit into an unbounded storage multiplier.
+Priority, pinning, attachments and hierarchy remain quiet unless another rule
+gives them their own event.
 
 Two refinements on that guard, both mechanical bounds the comparison alone
 does not give:
@@ -1026,10 +1147,12 @@ does not give:
   answers, the settle re-arms the wake, two billed runs per cycle — so one
   question is asked at most `MAX_ASKS_PER_CARD_STATE` (2) times while the
   card row itself stands unchanged. Past the cap, only somebody editing,
-  moving or restaffing the card — or the board changing a rule, on the same
-  `reopened_at` mark — asks it again. Counted against that mark and not
-  against `updated_at` alone, because a card that spent its two asks under
-  the old rules has not been asked once under these.
+  moving or restaffing the card asks it again. Both halves of the guard now
+  count against the card and nothing else, which is what makes the cap a
+  bound at all: while the board-wide stamp reached in here too, the pair was
+  unbounded — the comparison is false after every save, leaving the cap as
+  the only thing counting, and counting it from a mark the save had just
+  moved counts to zero every time.
 - **A dead ask is not an ask.** A coordination run the dispatcher settled
   `Failed` before it was ever claimed never put a brief in front of the
   lead, so it does not satisfy the guard — the question stays open for the
@@ -1094,24 +1217,91 @@ and the editorial claim of cause stays in the prose, where it can name two
 origins and a reason. Provenance here is a forest of filing edges, not a
 causal tree.
 
+### A cancel, and who may take it back
+
+`cancelled_at` is one column carrying two facts — *the card is not live work*
+and *somebody decided that* — and only the first is on the row. Who decided it
+lives on the timeline, in the entry, the same place block authorship lives
+(`driver::block_is_an_agents_question`). `driver::cancel_is_a_persons_stop`
+reads it, and `ProjectManager::update_issue` refuses `cancelled: Some(false)`
+from an `IssueActor::Agent` when the standing stop is not an agent's. The
+operator's own reopen — the web's Reopen button, `IssueActor::User` — is
+untouched, and a cancel the **board** set stays the board's to take back, which
+is the half that has to keep working: nothing else clears a card the lead
+called off in a run somebody has since answered.
+
+Refused in the manager and not in `IssueUpdate`, because the REST door writes
+through the same function, and a rule spelled at one of two doors is the rule
+drifting.
+
+`timeline::diff_events` records **both directions** — `Cancelled` and
+`Uncancelled` — for the same reason the block pair does. A reversal that wrote
+nothing was not merely unattributed: it left the card's own history claiming a
+cancel that had already been undone, gave the operator no badge and no entry to
+find it by, and made the authorship read above impossible to write. `Cancelled`
+alone is why no such reversal can be found in any existing database.
+
+Reviving a card and its work restarting is **intended** — a revived card takes
+runs again, `retry_run` says so in its refusal, and the web ships the button.
+The gate is on *who*, not on *whether*.
+
 ### Stages and the barrier
 
 Sub-issues are one level deep, enforced in both directions (a child cannot gain
 children; a card with children cannot become a child). A child carries a
-`stage` number, and `check_stage_barrier` asks **two** questions on the
-transition into a finished state:
+`stage` number. Two of the three questions the board asks about a barrier are
+`check_stage_barrier`'s, on the transition into a finished state:
 
 - **Announce** — `stages::stage_complete`: are this stage's own children all
   done? That is a fact about the stage, true whenever it happens, and it is all
   `StageCompleted` claims.
 - **Wake** — `stages::barrier_opens`: that, *and* nothing earlier is still open.
 
-They are separate because stages are planned up front, so a later stage
-routinely empties while the board is still on an earlier one. Folding them
-together loses one or the other: either the operator is told a stage opened when
-nobody was woken, or a stage that emptied out of order is never mentioned at
-all. And a parent holds one run at a time, so waking it on a stage the board has
-not reached spends the slot the real barrier needs.
+The third is `driver::held_by_a_stage`, asked in the other direction and at the
+other moment: before a step **starts**, over the board the tick already holds.
+It shares **wake**'s predicate exactly — `stages::stage_is_open` — because "has
+the board reached this stage" has one answer whether it is asked of a step
+about to run or of a parent about to be told.
+
+Announce and wake are separate because a stage can still empty out of order:
+a step cancelled counts out of its stage, and an operator may start one by
+hand. Folding them together loses one or the other — either the operator is
+told a stage opened when nobody was woken, or a stage that emptied out of order
+is never mentioned at all. And a parent holds one run at a time, so waking it
+on a stage the board has not reached spends the slot the real barrier needs.
+
+The **wake** carries three gates and not two: the parent has somebody on it,
+its block is not standing (`driver::board_may_start`), and it is in a column
+work is under way in (`driver::is_live_work` — the one home for that question,
+which `comments::comment_delivery` asks as well). The column is the gate that
+was missing: a parent the operator dragged back to Backlog is paused work, and
+a barrier opening under it is the board acting on its own exactly as it would
+be over a block. `enqueue` never reads the parallelism ceiling either — only
+`promotions` does — so before this, neither of the operator's two stop signals
+held that door. The `StageCompleted` entry still lands unconditionally, so
+whoever un-parks the card sees the stage opened.
+
+Where a step sits is **one fact in two fields**, and both wire surfaces read it
+through `ProjectManager::resolve_placement`. A parent is addressed by number,
+`0` is not one, and it used to mean "detach" — which put the detach behind a
+value a model emits as *filler*. A run reporting that it could not start named
+`parent` and `stage` alongside its block reason, filling both with `0`, and
+took itself out of its parent's plan on the way to saying something else. Cards
+on the live board lost their parent that way, and the card render carries
+neither field, so the agent could not have seen it happen. Detaching is now its
+own intent (`detach_parent`), which no filler produces, and a `stage` lands
+only alongside a `parent` or a detach — half a placement is not a placement.
+The rule generalises: **every optional property on a board tool's schema needs
+an inert filler value**, because a strict schema will be filled.
+
+That rule applies beyond placement. `IssueCreate(parent=0)` opens a top-level
+card instead of looking up the impossible card `#0`; `IssueList(status="all",
+before=0)` is unfiltered. On `IssueUpdate`, blank text and assignee values plus
+`status` / `priority` set to `unchanged` are no-ops. Operations whose old
+spelling collided with filler have their own booleans: `clear_description`,
+`unblock`, `reopen`, and `detach_parent`. False is inert; true states the
+destructive or reversing intent. Empty attachment filenames likewise fall
+back to the blob's ordinary display name.
 
 `stages::is_finished` — Done **or** cancelled — is the single definition of
 "the board is done with this card", read by the barrier, the worktree
@@ -1189,11 +1379,35 @@ timeline, from the issue and its unsettled run:
 
 | Situation | Delivery |
 | --- | --- |
-| Nobody assigned, cancelled, or parked in Backlog/Done | `RecordOnly` |
+| Nobody assigned, or parked in Backlog/Done | `RecordOnly` |
+| Cancelled, and the commenter is a **person** | the cancel is taken back first, and the rules below apply to the card that leaves behind |
+| Cancelled, and the commenter is an **agent** | `RecordOnly` |
 | A block has stopped the card | `ParkedByABlock` — recorded, and nobody may be put on it |
 | Live work, nothing reading | `Wake` — start a run |
 | A `Held` or `Queued` run exists | `WaitsForQueuedRun` — it assembles its brief later, so it will read this |
 | A `Running` run exists | `AfterCurrentRun` — deferred |
+
+A **person's** comment on a cancelled card takes the cancel back
+(`ProjectManager::take_the_cancel_back`), before the delivery below is decided
+and before a mention is read. Without it the gesture is a dead end: the row
+answers `RecordOnly`, so the operator types into a card nothing will ever read
+and has to make a second, different gesture to undo the first. The comment
+lands **first** and the reversal reads after it, because the comment is the
+reason; a timeline the other way round reads as somebody explaining a decision
+they had already taken.
+
+An **agent's** comment never does this, and the gate is worth naming twice
+because the two halves fail differently. `update_issue` already refuses an
+agent reversing a *person's* cancel (`driver::cancel_is_a_persons_stop`), so
+that half would hold even if the comment door forgot — but it permits an agent
+reversing an *agent's* cancel, which is exactly the case the comment door has
+to answer on its own: a lead calls a card off, a dev says "I could still take
+this", and the board has talked itself back into abandoned work with nobody
+deciding anything. Reviving is an operator gesture.
+
+The revived card keeps the column it was called off in, so a cancelled Backlog
+card comes back **to Backlog** and starts nothing — `driver::board_may_take_up`
+still holds there, and the operator's parked column is still theirs.
 
 `ParkedByABlock` is `driver::board_may_start` asked at the comment door, and it
 is ahead of the live-run rows deliberately: a `Running` run promises a

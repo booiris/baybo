@@ -157,18 +157,26 @@ pub struct ProjectRow {
     /// either ceiling, [`Self::max_parallel_issue_runs`],
     /// [`Self::agents_may_merge`], or a restore from the archive.
     ///
-    /// Scheduling state rather than content, and nothing draws it. The
-    /// driver's `already_asked` reads it so that a standing question the
-    /// lead has already answered becomes a question again when the premise
-    /// of that answer changed: "escalate this to somebody who may merge" is
-    /// the answer to a board that could not, and the board turning that on
-    /// is the only thing that ever happens next.
+    /// Scheduling state rather than content, and nothing draws it. Its one
+    /// reader is `driver::nothing_has_happened_since_the_lead_looked`, the
+    /// guard on the question about the **board**: a standing answer the lead
+    /// gave becomes a question again when the premise of that answer moved,
+    /// and "escalate this to somebody who may merge" is the answer to a
+    /// board that could not, whose only sequel is the board being told it
+    /// now may.
+    ///
+    /// Read there rather than per card, deliberately. A rule is one fact
+    /// about the whole board, and the per-card guard that used to read this
+    /// answered it once per card — the lead reading one card at a time to
+    /// decide something about all of them, and, because that guard's ask cap
+    /// counted from the same mark, each save minting the quota to do it
+    /// again.
     ///
     /// Not `Option`, for [`Self::max_parallel_issue_runs`]'s reason: a row
-    /// written before the column existed resolves to its `created_at` at
-    /// the storage edge. Every card is younger than its board, so a board
-    /// whose rules never changed is exactly a board this re-opens nothing
-    /// on.
+    /// written before the column existed resolves to its `created_at` at the
+    /// storage edge. A board is older than anything that ever ran on it, so
+    /// a board whose rules never changed is exactly a board this re-opens
+    /// nothing on.
     pub rules_changed_at: DateTime<Utc>,
     /// Soft archive. There is no hard delete in any production path.
     pub archived_at: Option<DateTime<Utc>>,
@@ -426,6 +434,17 @@ pub enum IssueEventBody {
         attachments: Vec<IssueAttachment>,
     },
     Opened,
+    /// The card's title changed. Both values are kept because titles are
+    /// short, and a rename without its old name cannot explain references
+    /// made before it happened.
+    TitleChanged {
+        from: String,
+        to: String,
+    },
+    /// The card's description changed. The prose itself stays on the card:
+    /// descriptions are unbounded markdown, so copying every revision into
+    /// the timeline would make an edit an unbounded storage multiplier.
+    DescriptionChanged,
     Moved {
         from: IssueStatus,
         to: IssueStatus,
@@ -476,6 +495,12 @@ pub enum IssueEventBody {
     },
     Unblocked,
     Cancelled,
+    /// A cancel was taken back and the card is live work again.
+    ///
+    /// Recorded because [`crate::project::IssueActor`] on the two entries is
+    /// what tells a person's stop from an agent's, and a reversal that
+    /// wrote nothing left the card saying only that it had been called off.
+    Uncancelled,
     /// The issue's worktree was given back. `branch_deleted` says whether
     /// the branch went with it, which only happens when it never produced
     /// a commit.
@@ -582,6 +607,8 @@ impl IssueEventBody {
         match self {
             IssueEventBody::Comment { .. } => "comment",
             IssueEventBody::Opened => "opened",
+            IssueEventBody::TitleChanged { .. } => "title_changed",
+            IssueEventBody::DescriptionChanged => "description_changed",
             IssueEventBody::Moved { .. } => "moved",
             IssueEventBody::Assigned { .. } => "assigned",
             IssueEventBody::RunStarted { .. } => "run_started",
@@ -591,6 +618,7 @@ impl IssueEventBody {
             IssueEventBody::Blocked { .. } => "blocked",
             IssueEventBody::Unblocked => "unblocked",
             IssueEventBody::Cancelled => "cancelled",
+            IssueEventBody::Uncancelled => "uncancelled",
             IssueEventBody::BranchMerged { .. } => "branch_merged",
             IssueEventBody::WorktreeReclaimed { .. } => "worktree_reclaimed",
             IssueEventBody::WorktreeKept { .. } => "worktree_kept",
@@ -637,8 +665,10 @@ pub struct NewIssueEvent {
 /// disagree with the rows it came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DrainMarks {
-    /// When the lead was last woken about **anything** on this board — any
-    /// coordination run, not only a previous drain.
+    /// When somebody last read this board and acted on it: any coordination
+    /// run, not only a previous drain — and any run that was **cancelled**,
+    /// because calling one off is a decision, and whoever took it had the
+    /// board in front of them.
     ///
     /// Deliberately wider than the question it guards. A coordination brief
     /// tells the lead to read the whole board, so a lead woken since the
@@ -650,7 +680,8 @@ pub struct DrainMarks {
     pub looked_at: Option<DateTime<Utc>>,
     /// When a **work** run on this board last settled. Coordination is
     /// excluded on both sides: the lead being asked a question, and
-    /// answering it, is not the board doing work.
+    /// answering it, is not the board doing work. So is a run that was
+    /// cancelled — see `looked_at`, which is the side it lands on.
     pub worked_at: Option<DateTime<Utc>>,
 }
 
@@ -900,8 +931,8 @@ pub enum RunTrigger {
     /// waking anybody.
     Grooming,
     /// The lead was woken because the **board** has run dry: nothing
-    /// executing, nothing queued, room to start something, and live cards
-    /// still on it.
+    /// executing, nothing queued, room to start something, and cards the
+    /// board may take up still on it.
     ///
     /// The only question here that is about the board rather than about the
     /// card its run is filed against — that card is an anchor, because a run
@@ -909,6 +940,12 @@ pub enum RunTrigger {
     /// asked last and only when every per-card question declined, so it is
     /// by construction the board saying "I have looked at all of it and I
     /// have no move left".
+    ///
+    /// Carries [`RunTrigger::Grooming`]'s rule and not only its own, because
+    /// this question hands the lead the whole board rather than one card: a
+    /// Backlog card the **operator** parked is neither live work this counts
+    /// nor a card it may anchor on. Asking it here would put the operator's
+    /// own decision back in front of a lead told to find something to start.
     BoardIdle,
 }
 

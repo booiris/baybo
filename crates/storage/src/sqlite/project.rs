@@ -96,6 +96,40 @@ const A_BOARD_RULE_CHANGED: &str = "daily_budget_micros IS NOT ?4 \
      OR COALESCE(max_parallel_issue_runs, ?9) IS NOT ?6 \
      OR COALESCE(agents_may_merge, ?10) IS NOT ?7";
 
+/// Whether a patch would actually change the card, expression for
+/// expression against the `SET` list in `update_issue`.
+///
+/// `issues.updated_at` is the board's answer to "has this card changed
+/// since the lead looked" (`driver::already_asked`), and it was stamped
+/// unconditionally while every value column beside it is guarded — so a
+/// write that set each field to what it already held moved the clock,
+/// recorded nothing on the timeline (`timeline::diff_events` compares
+/// values), and re-opened every question the lead had answered. It was
+/// invisible in exactly the way that matters: a byte-identical rewrite of
+/// five cards' `blocked_reason` cost five lead runs and left not one row
+/// behind to say why.
+///
+/// Read against the pre-update row with the incoming values bound, like
+/// [`A_BOARD_RULE_CHANGED`]: SQLite evaluates every expression in an
+/// `UPDATE` against the row as it was. `IS NOT` is the null-safe
+/// inequality, which is the whole reason the comparison can be written at
+/// all — half these columns are nullable.
+///
+/// **Every arm here mirrors one line of that `SET`.** A column added to one
+/// and not the other is a card that changes without saying so, which is the
+/// defect this exists to close; `a_write_that_changes_nothing_does_not_move_the_clock`
+/// pins the pair.
+const AN_ISSUE_FIELD_CHANGED: &str = "COALESCE(?3, title) IS NOT title \
+     OR COALESCE(?4, description) IS NOT description \
+     OR COALESCE(?16, attachments) IS NOT attachments \
+     OR COALESCE(?5, priority) IS NOT priority \
+     OR (CASE WHEN ?6 THEN ?7 ELSE assignee END) IS NOT assignee \
+     OR (CASE WHEN ?8 THEN ?9 ELSE blocked_reason END) IS NOT blocked_reason \
+     OR (CASE WHEN ?10 THEN ?11 ELSE cancelled_at END) IS NOT cancelled_at \
+     OR (CASE WHEN ?13 THEN ?14 ELSE parent_issue_id END) IS NOT parent_issue_id \
+     OR COALESCE(?15, stage) IS NOT stage \
+     OR COALESCE(?17, pinned) IS NOT pinned";
+
 /// The projection order **is** [`RawIssue`]'s tuple order, and nothing links
 /// the two at compile time. A new column goes on the end, always: inserting
 /// one mid-list silently re-decodes every field after it, and only the ones
@@ -1020,7 +1054,8 @@ impl ProjectStore for SqliteProjectStore {
                     (_, stage) => stage,
                 };
                 Ok(conn.execute(
-                    "UPDATE issues SET \
+                    &format!(
+                        "UPDATE issues SET \
                        title          = COALESCE(?3, title), \
                        description    = COALESCE(?4, description), \
                        attachments    = COALESCE(?16, attachments), \
@@ -1031,8 +1066,10 @@ impl ProjectStore for SqliteProjectStore {
                        parent_issue_id = CASE WHEN ?13 THEN ?14 ELSE parent_issue_id END, \
                        stage          = COALESCE(?15, stage), \
                        pinned         = COALESCE(?17, pinned), \
-                       updated_at     = ?12 \
-                     WHERE project_id = ?1 AND number = ?2",
+                       updated_at     = CASE WHEN {AN_ISSUE_FIELD_CHANGED} \
+                           THEN ?12 ELSE updated_at END \
+                     WHERE project_id = ?1 AND number = ?2"
+                    ),
                     rusqlite::params![
                         project,
                         number,
@@ -1269,8 +1306,15 @@ impl ProjectStore for SqliteProjectStore {
                     drop(tx);
                     return Ok(false);
                 };
+                // Same-column drags land here too — the reorder below is
+                // the point of them — and the stamp is guarded for the same
+                // reason `update_issue`'s is: tidying a column is not the
+                // card changing, and the board reads that clock as "this is
+                // a question again". `position` never stamps at all, which
+                // is the rule this brings the column move into line with.
                 tx.execute(
-                    "UPDATE issues SET status = ?3, updated_at = ?4 \
+                    "UPDATE issues SET status = ?3, \
+                       updated_at = CASE WHEN status IS NOT ?3 THEN ?4 ELSE updated_at END \
                      WHERE project_id = ?1 AND number = ?2",
                     rusqlite::params![project, number, status, now],
                 )?;
@@ -1452,7 +1496,9 @@ impl ProjectStore for SqliteProjectStore {
             .pool
             .interact_write("issues.set_branch", move |conn| {
                 Ok(conn.execute(
-                    "UPDATE issues SET branch = ?2, updated_at = ?3 WHERE id = ?1",
+                    "UPDATE issues SET branch = ?2, \
+                       updated_at = CASE WHEN branch IS NOT ?2 THEN ?3 ELSE updated_at END \
+                     WHERE id = ?1",
                     rusqlite::params![id, branch, now],
                 )?)
             })
@@ -1668,25 +1714,42 @@ impl ProjectStore for SqliteProjectStore {
     async fn drain_marks(&self, project: &ProjectId) -> Result<DrainMarks> {
         let project = project.as_str().to_string();
         let failed = RunStatus::Failed.as_str();
+        let cancelled = RunStatus::Cancelled.as_str();
         let (looked_at, worked_at) = self
             .pool
             .interact("issue_runs.drain_marks", move |conn| {
                 // The one list, expanded twice with opposite senses: what
                 // wakes the lead, and what counts as the board working.
+                //
+                // A run somebody called off lands on the *look* side and
+                // never on the work side: it is not the board working, and
+                // whoever called it off had the board in front of them to do
+                // it. On the work side, as it was, a person pressing stop
+                // re-armed the very question that countermands them.
+                //
+                // `MAX` over a `UNION ALL` rather than the scalar `max()`,
+                // which is NULL if either arm is: each arm is a board that
+                // has not happened yet, and the aggregate skips those.
                 Ok(conn.query_row(
                     concat!(
                         "SELECT \
-                         (SELECT MAX(created_at) FROM issue_runs \
-                            WHERE project_id = ?1 AND trigger IN (",
+                         (SELECT MAX(mark) FROM ( \
+                            SELECT MAX(created_at) AS mark FROM issue_runs \
+                              WHERE project_id = ?1 AND trigger IN (",
                         coordination_triggers!(),
-                        ") AND NOT (status = ?2 AND session_id IS NULL)), \
+                        ") AND NOT (status = ?2 AND session_id IS NULL) \
+                            UNION ALL \
+                            SELECT MAX(settled_at) FROM issue_runs \
+                              WHERE project_id = ?1 AND status = ?3 \
+                                AND settled_at IS NOT NULL)), \
                          (SELECT MAX(settled_at) FROM issue_runs \
                             WHERE project_id = ?1 AND settled_at IS NOT NULL \
+                              AND status <> ?3 \
                               AND trigger NOT IN (",
                         coordination_triggers!(),
                         "))"
                     ),
-                    rusqlite::params![project, failed],
+                    rusqlite::params![project, failed, cancelled],
                     |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
                 )?)
             })
@@ -1941,6 +2004,207 @@ mod tests {
         assert_eq!(
             read.max_parallel_issue_runs, DEFAULT_MAX_PARALLEL_ISSUE_RUNS,
             "and the column beside it still resolves its own NULL, for its own reason"
+        );
+    }
+
+    /// A card on a fresh board, with every column carrying a value so that
+    /// "write it back over itself" has something to write.
+    async fn card(store: &SqliteProjectStore, project: &ProjectId) -> IssueRow {
+        let now = chrono::Utc::now();
+        store
+            .create_issue(&NewIssue {
+                id: IssueId::generate(),
+                project_id: project.clone(),
+                title: "a step".to_owned(),
+                description: "what it is for".to_owned(),
+                attachments: Vec::new(),
+                status: IssueStatus::Todo,
+                priority: IssuePriority::High,
+                assignee: Some(AgentProfileId::parse("dev-1".to_owned()).unwrap()),
+                parent_issue_id: None,
+                stage: 0,
+                source_key: None,
+                filed_from: None,
+                created_at: now,
+            })
+            .await
+            .unwrap()
+    }
+
+    /// The patch that sets every field to what the card already holds —
+    /// the shape a model answering a strict tool schema sends, and the one
+    /// that used to reopen every question the lead had answered.
+    fn same_card(row: &IssueRow) -> IssueUpdate {
+        IssueUpdate {
+            title: Some(row.title.clone()),
+            description: Some(row.description.clone()),
+            attachments: Some(row.attachments.clone()),
+            priority: Some(row.priority),
+            parent: Some(row.parent_issue_id.clone()),
+            stage: Some(row.stage),
+            assignee: Some(row.assignee.clone()),
+            blocked_reason: Some(row.blocked_reason.clone()),
+            cancelled: Some(row.cancelled_at.is_some()),
+            pinned: Some(row.pinned),
+        }
+    }
+
+    async fn reread(store: &SqliteProjectStore, project: &ProjectId, number: i64) -> IssueRow {
+        store
+            .list_issues(project)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|issue| issue.number == number)
+            .expect("the card")
+    }
+
+    /// Pins [`AN_ISSUE_FIELD_CHANGED`] to `update_issue`'s own `SET` list:
+    /// every guarded column, written back over itself, must leave the clock
+    /// where it was — and each of them, actually changed, must move it. A
+    /// column added to the `SET` and missed by the predicate fails the
+    /// second half.
+    #[tokio::test]
+    async fn a_write_that_changes_nothing_does_not_move_the_clock() {
+        let (_dir, store) = store().await;
+        let board = project("01JCLOCK", "board");
+        store.create_project(&board).await.unwrap();
+        let opened = card(&store, &board.id).await;
+
+        assert!(
+            store
+                .update_issue(&board.id, opened.number, &same_card(&opened))
+                .await
+                .unwrap(),
+            "the row is still there, which is all the return value claims"
+        );
+        assert_eq!(
+            reread(&store, &board.id, opened.number).await.updated_at,
+            opened.updated_at,
+            "a patch that changes nothing is not the card changing, and the \
+             board reads this clock as \"ask the lead again\""
+        );
+
+        let mut moved = opened.clone();
+        for (field, patch) in [
+            (
+                "title",
+                IssueUpdate {
+                    title: Some("renamed".to_owned()),
+                    ..IssueUpdate::default()
+                },
+            ),
+            (
+                "description",
+                IssueUpdate {
+                    description: Some("rewritten".to_owned()),
+                    ..IssueUpdate::default()
+                },
+            ),
+            (
+                "priority",
+                IssueUpdate {
+                    priority: Some(IssuePriority::Low),
+                    ..IssueUpdate::default()
+                },
+            ),
+            (
+                "assignee",
+                IssueUpdate {
+                    assignee: Some(None),
+                    ..IssueUpdate::default()
+                },
+            ),
+            (
+                "blocked_reason",
+                IssueUpdate {
+                    blocked_reason: Some(Some("waiting".to_owned())),
+                    ..IssueUpdate::default()
+                },
+            ),
+            (
+                "stage",
+                IssueUpdate {
+                    stage: Some(2),
+                    ..IssueUpdate::default()
+                },
+            ),
+            (
+                "pinned",
+                IssueUpdate {
+                    pinned: Some(true),
+                    ..IssueUpdate::default()
+                },
+            ),
+            (
+                "attachments",
+                IssueUpdate {
+                    attachments: Some(vec![IssueAttachment {
+                        blob_id: "b".to_owned(),
+                        mime_type: "text/plain".to_owned(),
+                        size: 1,
+                        filename: None,
+                    }]),
+                    ..IssueUpdate::default()
+                },
+            ),
+            (
+                "cancelled_at",
+                IssueUpdate {
+                    cancelled: Some(true),
+                    ..IssueUpdate::default()
+                },
+            ),
+        ] {
+            store
+                .update_issue(&board.id, opened.number, &patch)
+                .await
+                .unwrap();
+            let after = reread(&store, &board.id, opened.number).await;
+            assert!(
+                after.updated_at > moved.updated_at,
+                "{field} changed and the clock did not move: the predicate \
+                 has drifted from the SET list beside it"
+            );
+            moved = after;
+        }
+    }
+
+    #[tokio::test]
+    async fn tidying_a_column_is_not_the_card_changing() {
+        let (_dir, store) = store().await;
+        let board = project("01JTIDY", "board");
+        store.create_project(&board).await.unwrap();
+        let opened = card(&store, &board.id).await;
+
+        store
+            .move_issue(
+                &board.id,
+                opened.number,
+                IssueStatus::Todo,
+                &[opened.number],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            reread(&store, &board.id, opened.number).await.updated_at,
+            opened.updated_at,
+            "a drag inside the column the card is already in reorders it and \
+             changes nothing about it"
+        );
+
+        store
+            .move_issue(
+                &board.id,
+                opened.number,
+                IssueStatus::InProgress,
+                &[opened.number],
+            )
+            .await
+            .unwrap();
+        assert!(
+            reread(&store, &board.id, opened.number).await.updated_at > opened.updated_at,
+            "but a card that actually left its column did change"
         );
     }
 
@@ -2639,6 +2903,57 @@ mod tests {
 
         let second = store.enqueue_run(&new_run(&issue)).await.unwrap();
         assert_eq!(second.attempt, 2);
+    }
+
+    #[tokio::test]
+    async fn a_run_somebody_called_off_is_a_look_at_the_board_and_not_work_on_it() {
+        let (_dir, store) = store().await;
+        let p = project("proj-marks", "Marks");
+        store.create_project(&p).await.unwrap();
+        let issue = store
+            .create_issue(&new_issue(&p.id, "work", IssueStatus::InProgress))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.drain_marks(&p.id).await.unwrap(),
+            DrainMarks::default(),
+            "a board nothing has ever run on carries neither mark"
+        );
+
+        let run = store.enqueue_run(&new_run(&issue)).await.unwrap();
+        store
+            .claim_run(&run.id, &SessionId::from("issue-1"))
+            .await
+            .unwrap();
+        store
+            .settle_run(&run.id, RunStatus::Cancelled, None)
+            .await
+            .unwrap();
+
+        let marks = store.drain_marks(&p.id).await.unwrap();
+        assert!(
+            marks.worked_at.is_none(),
+            "a run somebody stopped is not the board working"
+        );
+        assert!(
+            marks.looked_at.is_some(),
+            "it is somebody having read the board and decided, which is the \
+             one thing that keeps the drain question from countermanding them"
+        );
+
+        let second = store.enqueue_run(&new_run(&issue)).await.unwrap();
+        store
+            .settle_run(&second.id, RunStatus::Done, None)
+            .await
+            .unwrap();
+        let marks = store.drain_marks(&p.id).await.unwrap();
+        assert!(
+            marks
+                .worked_at
+                .is_some_and(|worked| marks.looked_at.is_some_and(|looked| worked > looked)),
+            "and work that finished after the stop is the board working again"
+        );
     }
 
     #[tokio::test]

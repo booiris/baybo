@@ -31,8 +31,8 @@ pub use error::{ProjectError, Result};
 pub use events::{NoopProjectEvents, ProjectEvents};
 pub use manager::{
     FeedEntry, IssueRunLog, LEAD_HANDLE, MAX_FEED_PAGE, MAX_TEAM_AGENTS, NewIssueRequest,
-    NewProject, NewTeamMember, ProjectManager, RunDispatch, RunWithSpend, no_dispatch, no_stopper,
-    validate_workdir,
+    NewProject, NewTeamMember, Placement, ProjectManager, RunDispatch, RunWithSpend, no_dispatch,
+    no_stopper, validate_workdir,
 };
 /// Reachable only from a test build. The agent crate's tests assert that
 /// the session its router opens and the window this crate's brief is a

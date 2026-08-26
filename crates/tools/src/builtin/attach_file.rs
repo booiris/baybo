@@ -73,11 +73,11 @@ impl Tool for AttachFileTool {
                 },
                 "filename": {
                     "type": "string",
-                    "description": "Optional override for the filename shown to the recipient. Defaults to the path's basename."
+                    "description": "Optional override for the filename shown to the recipient. Defaults to the path's basename; an empty string also uses that default."
                 },
                 "mime_type": {
                     "type": "string",
-                    "description": "Optional MIME type override. Defaults to an extension-based guess; falls back to application/octet-stream."
+                    "description": "Optional MIME type override. Defaults to an extension-based guess; an empty string also uses that default."
                 }
             },
             "required": ["path"]
@@ -103,12 +103,15 @@ impl Tool for AttachFileTool {
         let source = LocalBlobFile::inspect(&p.path, TOOL_NAME, "attach", MAX_BYTES).await?;
         let size = source.size();
 
-        let filename = p.filename.unwrap_or_else(|| {
-            p.path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "file".to_string())
-        });
+        let filename = p
+            .filename
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| {
+                p.path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "file".to_string())
+            });
         let mime = resolve_mime_type(p.mime_type, &p.path)?;
 
         let duration_ms = probe_media_duration_ms(&p.path, &mime).await;
@@ -678,30 +681,46 @@ mod tests {
 
     /// The override outlives the call: it is persisted on the blob row and
     /// copied onto the `ContentBlock` clients bucket media by. Taken
-    /// verbatim, an empty or newline-bearing value reached
+    /// verbatim, a newline-bearing value reached
     /// `HeaderValue::from_str` in the gateway's blob download, which
     /// refuses it and serves the bytes with no `Content-Type` at all —
     /// a silent failure two crates away from the call that caused it.
-    /// `PutBlob` always rejected these; sharing `resolve_mime_type` is
+    /// Empty strings are strict-schema filler and use the inferred default.
+    /// `PutBlob` follows the same rule; sharing `resolve_mime_type` is
     /// what stops the pair from disagreeing on a check one of them skips.
     #[tokio::test]
-    async fn refuses_an_unusable_mime_type_override() {
+    async fn normalizes_empty_mime_filler_and_refuses_newlines() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("blob.bin");
         tokio::fs::write(&p, b"raw bytes").await.unwrap();
         let store = Arc::new(MemoryBlobStore::new()) as Arc<dyn BlobStore>;
         let tool = AttachFileTool::new(store);
 
-        for bad in ["", "   ", "text/plain\r\nX-Injected: 1"] {
-            let err = tool
-                .execute(json!({ "path": &p, "mime_type": bad }), &ctx())
+        for filler in ["", "   "] {
+            let output = tool
+                .execute(json!({ "path": &p, "mime_type": filler }), &ctx())
                 .await
-                .unwrap_err();
-            assert!(
-                matches!(err, ToolError::InvalidParams(ref m) if m.contains("single-line")),
-                "{bad:?}: {err:?}"
-            );
+                .unwrap();
+            let ToolOutput::WithAttachments { attachments, .. } = output else {
+                panic!("expected attachment")
+            };
+            assert!(matches!(
+                &attachments[0],
+                ContentBlock::File { mime_type, .. } if mime_type == "application/octet-stream"
+            ));
         }
+
+        let err = tool
+            .execute(
+                json!({ "path": &p, "mime_type": "text/plain\r\nX-Injected: 1" }),
+                &ctx(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ToolError::InvalidParams(ref message) if message.contains("single-line")
+        ));
     }
 
     /// The duration probe must not trust headers or extensions — both lied in

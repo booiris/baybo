@@ -1841,6 +1841,62 @@ async fn set_session_model_validates_persists_and_clears() {
     );
 }
 
+// A card's run session lives on the owner channel, so the scope check admits
+// it — but it is reused by every later run of that agent on the card, and a
+// pin written onto it would outrank the agent's profile for good. The switch
+// is refused, not stored and then ignored.
+#[tokio::test]
+async fn set_session_model_refuses_a_card_run_session() {
+    use baybo_model::{IssueId, ProjectId, TriggerSource};
+
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let state = build_admin_state(&tg);
+    let router = build_router(state.clone());
+
+    let llm = get(&router, "/v1/llm", StatusCode::OK).await;
+    let valid_name = llm["model_id"].as_str().expect("model_id").to_owned();
+
+    let run_session = tg
+        .deps
+        .session_manager
+        .create_session_with_trigger(
+            User {
+                id: baybo_gateway::auth::WEB_OPERATOR_USER_ID.into(),
+                name: None,
+                channel: ChannelType::owner(),
+            },
+            ChannelType::owner(),
+            TriggerSource::Issue {
+                project_id: ProjectId::generate(),
+                issue_id: IssueId::generate(),
+                number: 3,
+            },
+        )
+        .await
+        .expect("create issue session");
+
+    put(
+        &router,
+        &format!("/v1/chat/sessions/{}/model", run_session.id),
+        Body::from(format!(r#"{{"llm":"{valid_name}"}}"#)),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+
+    let stored = tg
+        .deps
+        .session_manager
+        .get(&run_session.id)
+        .await
+        .expect("load session")
+        .expect("the run session is still there");
+    assert!(
+        stored.state.last_llm.is_none(),
+        "a refused switch must leave the run session unpinned, got {:?}",
+        stored.state.last_llm,
+    );
+}
+
 // Sidebar preview: `list_sessions` must surface each session's most
 // recent user-authored text under `last_user_text`, with multi-line
 // content collapsed to a single line. The web client uses this as the

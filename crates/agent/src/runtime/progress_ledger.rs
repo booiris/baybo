@@ -1,5 +1,10 @@
-//! Per-turn ledger of file-mutating attempts, used to notice that the model is
-//! churning a file instead of making progress.
+//! Per-turn detection of tool activity that has stopped making progress.
+//!
+//! File mutations retain their state-transition history so revisits and
+//! cancelled-out edits can be recognized. Every other tool retains only the
+//! current consecutive error signature. The two detectors stay separate
+//! internally because their evidence and reset rules differ; this module
+//! provides the one turn lifecycle and verdict surface the agent loop needs.
 //!
 //! # Why not a content check
 //!
@@ -26,6 +31,8 @@ use std::collections::VecDeque;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+
+use baybo_tools::ToolOutput;
 
 /// Distinct files tracked in one turn, least-recently-touched evicted first.
 ///
@@ -75,6 +82,10 @@ const CLEAN_EDITS_THAT_CLEAR_SIGNALS: usize = 3;
 /// anyone says anything.
 const FUTILE_STREAK_THRESHOLD: usize = 3;
 
+/// Identical consecutive failures from one non-file tool before the model is
+/// told it is retrying the same cause.
+const REPEATED_TOOL_FAILURE_THRESHOLD: usize = 3;
+
 /// One mutation's endpoints, as hashes.
 ///
 /// `from` is `None` when the tool did not name the state it consumed — a
@@ -102,8 +113,8 @@ struct Attempt {
     outcome: AttemptOutcome,
 }
 
-/// What the ledger concluded about one file. Each carries the count that
-/// justifies it so the injected observation can be specific rather than
+/// What either progress detector concluded. Each verdict carries the count
+/// that justifies it so the injected observation can be specific rather than
 /// scolding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProgressVerdict {
@@ -115,16 +126,8 @@ pub(crate) enum ProgressVerdict {
     StateRevisited { path: PathBuf, edits: usize },
     /// A run of attempts on one file that all failed or were refused.
     Futile { path: PathBuf, streak: usize },
-}
-
-impl ProgressVerdict {
-    pub(crate) fn path(&self) -> &Path {
-        match self {
-            ProgressVerdict::AttemptRepeated { path, .. }
-            | ProgressVerdict::StateRevisited { path, .. }
-            | ProgressVerdict::Futile { path, .. } => path,
-        }
-    }
+    /// The same non-file tool returned the exact same error consecutively.
+    RepeatedToolFailure { tool_name: String, attempts: usize },
 }
 
 struct TargetHistory {
@@ -135,7 +138,7 @@ struct TargetHistory {
     /// [`CHURN_SIGNALS_BEFORE_REPORT`].
     ///
     /// Cleared by [`CLEAN_EDITS_THAT_CLEAR_SIGNALS`] consecutive advancing
-    /// edits, at the turn boundary ([`TurnProgressLedger::clear`]), and by
+    /// edits, at the turn boundary ([`TurnProgressMonitor::clear`]), and by
     /// eviction dropping the whole entry. A scattering of signals early in a
     /// long turn must not still be waiting, hundreds of iterations later, to
     /// convict an unrelated third.
@@ -158,16 +161,14 @@ enum ChurnSignal {
     Revisited,
 }
 
-/// Per-turn state. Lives on the agent loop and is cleared at the top of every
-/// turn: "the user asked me to change this file again" is ordinary work, and
-/// carrying history across turns would read it as churn.
+/// State-transition history for file mutations.
 #[derive(Default)]
-pub(crate) struct TurnProgressLedger {
+struct FileMutationLedger {
     targets: VecDeque<TargetHistory>,
 }
 
-impl TurnProgressLedger {
-    pub(crate) fn clear(&mut self) {
+impl FileMutationLedger {
+    fn clear(&mut self) {
         self.targets.clear();
     }
 
@@ -176,7 +177,7 @@ impl TurnProgressLedger {
     /// Returns `None` for every call that is not a file mutation, for a file
     /// that has already been reported this turn, and — the common case — for a
     /// call that made ordinary progress.
-    pub(crate) fn record(
+    fn record(
         &mut self,
         tool_name: &str,
         arguments: &serde_json::Value,
@@ -266,6 +267,118 @@ impl TurnProgressLedger {
         });
         self.targets.len() - 1
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FailureSignature {
+    tool_name: String,
+    error_hash: u64,
+}
+
+#[derive(Debug)]
+struct FailureStreak {
+    signature: FailureSignature,
+    attempts: usize,
+    reported: bool,
+}
+
+#[derive(Debug, Default)]
+struct ToolFailureDetector {
+    streak: Option<FailureStreak>,
+}
+
+impl ToolFailureDetector {
+    fn clear(&mut self) {
+        self.streak = None;
+    }
+
+    fn record(
+        &mut self,
+        tool_name: &str,
+        output: &anyhow::Result<ToolOutput>,
+    ) -> Option<ProgressVerdict> {
+        let Some(error_hash) = error_hash(output) else {
+            self.clear();
+            return None;
+        };
+        let signature = FailureSignature {
+            tool_name: tool_name.to_owned(),
+            error_hash,
+        };
+
+        match &mut self.streak {
+            Some(streak) if streak.signature == signature => {
+                streak.attempts += 1;
+                if streak.attempts >= REPEATED_TOOL_FAILURE_THRESHOLD && !streak.reported {
+                    streak.reported = true;
+                    return Some(ProgressVerdict::RepeatedToolFailure {
+                        tool_name: tool_name.to_owned(),
+                        attempts: streak.attempts,
+                    });
+                }
+            }
+            _ => {
+                self.streak = Some(FailureStreak {
+                    signature,
+                    attempts: 1,
+                    reported: false,
+                });
+            }
+        }
+        None
+    }
+}
+
+/// The one per-turn progress monitor owned by the agent loop.
+///
+/// File-writing tools route to the transition detector; every other tool
+/// routes to the consecutive-error detector. A file call also breaks a
+/// non-file failure streak, matching the ordinary "another tool was tried"
+/// reset rule.
+#[derive(Default)]
+pub(crate) struct TurnProgressMonitor {
+    files: FileMutationLedger,
+    failures: ToolFailureDetector,
+}
+
+impl TurnProgressMonitor {
+    pub(crate) fn clear(&mut self) {
+        self.files.clear();
+        self.failures.clear();
+    }
+
+    pub(crate) fn record(
+        &mut self,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+        output: &anyhow::Result<ToolOutput>,
+    ) -> Option<ProgressVerdict> {
+        if baybo_tools::FILE_WRITING_TOOLS.contains(&tool_name) {
+            self.failures.clear();
+            return self
+                .files
+                .record(tool_name, arguments, tool_call_succeeded(output));
+        }
+        self.failures.record(tool_name, output)
+    }
+}
+
+/// Whether a tool result represents an applied/successful call.
+///
+/// `ToolOutput::Error` is an in-band failure and therefore does not count as
+/// success even though it rides inside `Ok`.
+pub(crate) fn tool_call_succeeded(output: &anyhow::Result<ToolOutput>) -> bool {
+    matches!(output, Ok(value) if !matches!(value, ToolOutput::Error(_)))
+}
+
+fn error_hash(output: &anyhow::Result<ToolOutput>) -> Option<u64> {
+    let mut hasher = DefaultHasher::new();
+    match output {
+        Ok(ToolOutput::Error(reason)) => reason.hash(&mut hasher),
+        Err(error) => error.to_string().hash(&mut hasher),
+        Ok(_) => return None,
+    }
+    Some(hasher.finish())
 }
 
 /// Whether this attempt repeats or undoes something the file already saw.
@@ -398,7 +511,7 @@ mod tests {
     /// on. Nothing is said before that.
     #[test]
     fn the_incident_reports_on_its_third_churn_signal() {
-        let mut ledger = TurnProgressLedger::default();
+        let mut ledger = FileMutationLedger::default();
         // #143 — denied. Nothing to compare against yet.
         assert_eq!(
             ledger.record("Edit", &edit(MCP, SERVERS_FULL, SERVERS_EMPTY), false),
@@ -436,14 +549,14 @@ mod tests {
     /// flag toggled on to test and back off.
     #[test]
     fn a_single_deliberate_oscillation_says_nothing() {
-        let mut ledger = TurnProgressLedger::default();
+        let mut ledger = FileMutationLedger::default();
         assert_eq!(ledger.record("Edit", &edit(MCP, "off", "on"), true), None);
         assert_eq!(ledger.record("Edit", &edit(MCP, "on", "off"), true), None);
     }
 
     #[test]
     fn an_exact_resubmission_reports_as_a_repeat_once_over_threshold() {
-        let mut ledger = TurnProgressLedger::default();
+        let mut ledger = FileMutationLedger::default();
         // Two signals of churn to get to the threshold's edge…
         ledger.record("Edit", &edit(MCP, "a", "b"), true);
         ledger.record("Edit", &edit(MCP, "b", "a"), true); // signal 1
@@ -458,7 +571,7 @@ mod tests {
 
     #[test]
     fn only_one_observation_per_file_per_turn() {
-        let mut ledger = TurnProgressLedger::default();
+        let mut ledger = FileMutationLedger::default();
         ledger.record("Edit", &edit(MCP, "a", "b"), true);
         ledger.record("Edit", &edit(MCP, "b", "a"), true); // signal 1
         ledger.record("Edit", &edit(MCP, "a", "b"), true); // signal 2
@@ -481,7 +594,7 @@ mod tests {
     /// others were edited is not in a tight loop any more.
     #[test]
     fn eviction_restarts_a_files_signal_count() {
-        let mut ledger = TurnProgressLedger::default();
+        let mut ledger = FileMutationLedger::default();
         ledger.record("Edit", &edit(MCP, "a", "b"), true);
         ledger.record("Edit", &edit(MCP, "b", "a"), true); // signal 1
         ledger.record("Edit", &edit(MCP, "a", "b"), true); // signal 2
@@ -504,7 +617,7 @@ mod tests {
     /// to convict an unrelated third.
     #[test]
     fn a_sustained_run_of_progress_clears_the_signals() {
-        let mut ledger = TurnProgressLedger::default();
+        let mut ledger = FileMutationLedger::default();
         ledger.record("Edit", &edit(MCP, "a", "b"), true);
         ledger.record("Edit", &edit(MCP, "b", "a"), true); // signal 1
         ledger.record("Edit", &edit(MCP, "a", "b"), true); // signal 2
@@ -523,7 +636,7 @@ mod tests {
     /// edit something else" would decay its way out of ever being noticed.
     #[test]
     fn a_refusal_breaks_the_run_of_progress() {
-        let mut ledger = TurnProgressLedger::default();
+        let mut ledger = FileMutationLedger::default();
         ledger.record("Edit", &edit(MCP, "a", "b"), true);
         ledger.record("Edit", &edit(MCP, "b", "a"), true); // signal 1
         ledger.record("Edit", &edit(MCP, "a", "b"), true); // signal 2
@@ -543,7 +656,7 @@ mod tests {
     /// is still one file the turn is failing to move.
     #[test]
     fn progress_between_signals_does_not_reset_the_count() {
-        let mut ledger = TurnProgressLedger::default();
+        let mut ledger = FileMutationLedger::default();
         ledger.record("Edit", &edit(MCP, "a", "b"), true);
         ledger.record("Edit", &edit(MCP, "b", "a"), true); // signal 1
         ledger.record("Edit", &edit(MCP, "a", "z1"), true); // real progress
@@ -560,7 +673,7 @@ mod tests {
 
     #[test]
     fn a_denied_attempts_endpoints_are_not_states_the_file_held() {
-        let mut ledger = TurnProgressLedger::default();
+        let mut ledger = FileMutationLedger::default();
         // Denied: the file never became "b".
         ledger.record("Edit", &edit(MCP, "a", "b"), false);
         // A different edit landing on "b" is genuine progress, not a revisit.
@@ -571,7 +684,7 @@ mod tests {
     fn ordinary_iterative_repair_is_silent() {
         // The common shape this must not fire on: write, test, fix, fix again.
         // Every `new_string` is new, so no state ever recurs.
-        let mut ledger = TurnProgressLedger::default();
+        let mut ledger = FileMutationLedger::default();
         for (old, new) in [("v0", "v1"), ("v1", "v2"), ("v2", "v3"), ("v3", "v4")] {
             assert_eq!(
                 ledger.record("Edit", &edit(MCP, old, new), true),
@@ -586,7 +699,7 @@ mod tests {
         // `Write` does not quote what it replaced, so the comparison is
         // result-to-result. A→B→A→B→A: three of those five land on a body the
         // file already had.
-        let mut ledger = TurnProgressLedger::default();
+        let mut ledger = FileMutationLedger::default();
         for body in ["A", "B", "A", "B"] {
             assert_eq!(
                 ledger.record("Write", &write(MCP, body), true),
@@ -606,7 +719,7 @@ mod tests {
         // deliberate idempotent rewrite (a render step, a formatter), and
         // `from` is unknown for both — so they must never trip the exact-match
         // rule, however many of them there are. They still count as revisits.
-        let mut ledger = TurnProgressLedger::default();
+        let mut ledger = FileMutationLedger::default();
         ledger.record("Write", &write(MCP, "A"), true);
         ledger.record("Write", &write(MCP, "A"), true);
         ledger.record("Write", &write(MCP, "A"), true);
@@ -618,7 +731,7 @@ mod tests {
 
     #[test]
     fn three_consecutive_refusals_on_one_file_are_futile() {
-        let mut ledger = TurnProgressLedger::default();
+        let mut ledger = FileMutationLedger::default();
         assert_eq!(ledger.record("Edit", &edit(MCP, "a", "b"), false), None);
         assert_eq!(ledger.record("Edit", &edit(MCP, "c", "d"), false), None);
         assert_eq!(
@@ -632,7 +745,7 @@ mod tests {
 
     #[test]
     fn a_success_breaks_the_futile_streak() {
-        let mut ledger = TurnProgressLedger::default();
+        let mut ledger = FileMutationLedger::default();
         ledger.record("Edit", &edit(MCP, "a", "b"), false);
         ledger.record("Edit", &edit(MCP, "c", "d"), false);
         ledger.record("Edit", &edit(MCP, "e", "f"), true);
@@ -641,7 +754,7 @@ mod tests {
 
     #[test]
     fn files_are_tracked_independently() {
-        let mut ledger = TurnProgressLedger::default();
+        let mut ledger = FileMutationLedger::default();
         ledger.record("Edit", &edit(MCP, "a", "b"), true);
         // The same transition on a DIFFERENT file is unrelated work.
         assert_eq!(ledger.record("Edit", &edit("/other", "a", "b"), true), None);
@@ -649,7 +762,7 @@ mod tests {
 
     #[test]
     fn non_mutating_tools_and_malformed_arguments_are_ignored() {
-        let mut ledger = TurnProgressLedger::default();
+        let mut ledger = FileMutationLedger::default();
         assert_eq!(ledger.record("Read", &edit(MCP, "a", "b"), true), None);
         assert_eq!(
             ledger.record("Bash", &json!({ "command": "ls" }), true),
@@ -667,7 +780,7 @@ mod tests {
 
     #[test]
     fn clear_drops_every_turns_history() {
-        let mut ledger = TurnProgressLedger::default();
+        let mut ledger = FileMutationLedger::default();
         ledger.record("Edit", &edit(MCP, "a", "b"), true);
         ledger.clear();
         // The revert is now the turn's first sighting of this file: the user
@@ -677,7 +790,7 @@ mod tests {
 
     #[test]
     fn a_wide_turn_evicts_the_oldest_target_rather_than_growing() {
-        let mut ledger = TurnProgressLedger::default();
+        let mut ledger = FileMutationLedger::default();
         for i in 0..MAX_TRACKED_TARGETS + 4 {
             ledger.record("Edit", &edit(&format!("/f{i}"), "a", "b"), true);
         }
@@ -691,7 +804,7 @@ mod tests {
     /// FIFO drops it precisely because it was seen first.
     #[test]
     fn a_file_touched_throughout_a_wide_sweep_survives_eviction() {
-        let mut ledger = TurnProgressLedger::default();
+        let mut ledger = FileMutationLedger::default();
         // The state the file will eventually be dragged back to.
         assert_eq!(
             ledger.record("Edit", &edit("/churned", "s0", "s1"), true),
@@ -741,7 +854,7 @@ mod tests {
 
     #[test]
     fn the_attempt_window_is_bounded() {
-        let mut ledger = TurnProgressLedger::default();
+        let mut ledger = FileMutationLedger::default();
         for i in 0..MAX_ATTEMPTS_PER_TARGET * 2 {
             ledger.record(
                 "Edit",
@@ -750,5 +863,68 @@ mod tests {
             );
         }
         assert_eq!(ledger.targets[0].attempts.len(), MAX_ATTEMPTS_PER_TARGET);
+    }
+
+    fn failed(reason: &str) -> anyhow::Result<ToolOutput> {
+        Ok(ToolOutput::Error(reason.to_owned()))
+    }
+
+    #[test]
+    fn monitor_reports_the_third_identical_non_file_failure() {
+        let mut monitor = TurnProgressMonitor::default();
+        let arguments = json!({ "title": "broken" });
+
+        for _ in 0..2 {
+            assert_eq!(
+                monitor.record("IssueCreate", &arguments, &failed("invalid parent_id")),
+                None
+            );
+        }
+        assert_eq!(
+            monitor.record("IssueCreate", &arguments, &failed("invalid parent_id")),
+            Some(ProgressVerdict::RepeatedToolFailure {
+                tool_name: "IssueCreate".to_owned(),
+                attempts: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn monitor_resets_failure_streak_on_changed_outcome_tool_or_turn() {
+        let mut monitor = TurnProgressMonitor::default();
+        let arguments = json!({});
+
+        monitor.record("IssueCreate", &arguments, &failed("same"));
+        monitor.record("IssueCreate", &arguments, &failed("different"));
+        monitor.record("IssueUpdate", &arguments, &failed("same"));
+        assert_eq!(
+            monitor.record(
+                "IssueUpdate",
+                &arguments,
+                &Ok(ToolOutput::Text("ok".to_owned()))
+            ),
+            None
+        );
+
+        monitor.record("IssueCreate", &arguments, &failed("same"));
+        monitor.record("IssueCreate", &arguments, &failed("same"));
+        monitor.clear();
+        assert_eq!(
+            monitor.record("IssueCreate", &arguments, &failed("same")),
+            None
+        );
+    }
+
+    #[test]
+    fn monitor_routes_file_tools_to_the_transition_detector() {
+        let mut monitor = TurnProgressMonitor::default();
+        let arguments = edit(MCP, "a", "b");
+
+        assert_eq!(monitor.record("Edit", &arguments, &failed("denied")), None);
+        assert_eq!(monitor.record("Edit", &arguments, &failed("denied")), None);
+        assert!(matches!(
+            monitor.record("Edit", &arguments, &failed("denied")),
+            Some(ProgressVerdict::Futile { streak: 3, .. })
+        ));
     }
 }

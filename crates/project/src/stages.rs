@@ -7,27 +7,45 @@ pub(crate) fn is_finished(issue: &IssueRow) -> bool {
     issue.status == IssueStatus::Done || issue.cancelled_at.is_some()
 }
 
-fn is_pending(child: &IssueRow) -> bool {
-    child.cancelled_at.is_none() && child.status != IssueStatus::Done
-}
-
 /// Whether `stage` has just emptied, given the parent's children and the
 /// child that reached a terminal state.
 pub(crate) fn stage_complete(children: &[IssueRow], stage: i64) -> bool {
     let mut seen = false;
     for child in children.iter().filter(|c| c.stage == stage) {
         seen = true;
-        if is_pending(child) {
+        if !is_finished(child) {
             return false;
         }
     }
     seen
 }
 
+/// Whether `stage` has been reached: nothing earlier under the same parent
+/// is still open.
+///
+/// The board asks this twice, about two different moments, and they have to
+/// be the same question or the plan means one thing to the barrier and
+/// another to the scheduler. [`barrier_opens`] asks it *after* a step
+/// finishes, to decide whether the parent is woken;
+/// [`crate::driver::held_by_a_stage`] asks it *before* a step starts, to
+/// decide whether the board may take it up at all. Until the second reader
+/// existed the plan was advisory: `IssueCreate` told the model "stage N
+/// starts when every step of stage N-1 is done" and the promoter never read
+/// `stage`, so a stage-3 step was running before anything in its stage 1
+/// had started.
+pub(crate) fn stage_is_open<'a>(
+    siblings: impl IntoIterator<Item = &'a IssueRow>,
+    stage: i64,
+) -> bool {
+    !siblings
+        .into_iter()
+        .any(|sibling| !is_finished(sibling) && sibling.stage < stage)
+}
+
 /// Whether finishing a child in `stage` opens a barrier: that stage has
 /// emptied **and** nothing earlier is still open.
 pub(crate) fn barrier_opens(children: &[IssueRow], stage: i64) -> bool {
-    stage_complete(children, stage) && !children.iter().any(|c| is_pending(c) && c.stage < stage)
+    stage_complete(children, stage) && stage_is_open(children, stage)
 }
 
 /// `(done, total)` for a parent's card, counting only work that is still
@@ -49,7 +67,7 @@ pub fn progress(children: &[IssueRow]) -> (usize, usize) {
 pub(crate) fn open_stages(children: &[IssueRow]) -> Vec<i64> {
     let mut stages: Vec<i64> = children
         .iter()
-        .filter(|c| is_pending(c))
+        .filter(|c| !is_finished(c))
         .map(|c| c.stage)
         .collect();
     stages.sort_unstable();

@@ -1683,6 +1683,359 @@ async fn a_cancelled_card_never_starts_a_run() {
 }
 
 #[tokio::test]
+async fn an_agent_may_not_take_back_a_cancel_the_operator_set() {
+    let f = fixture().await;
+    let p = f.manager.create_project(new_project("p")).await.expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    let card = f
+        .manager
+        .create_issue(&p.id, IssueActor::User, new_issue("not doing this"))
+        .await
+        .expect("card")
+        .into_issue();
+
+    let cancelled = |cancelled: bool| IssueUpdate {
+        cancelled: Some(cancelled),
+        ..Default::default()
+    };
+
+    f.manager
+        .update_issue(&p.id, card.number, IssueActor::User, cancelled(true), None)
+        .await
+        .expect("the operator calls it off");
+
+    let refused = f
+        .manager
+        .update_issue(
+            &p.id,
+            card.number,
+            IssueActor::Agent(dev.clone()),
+            cancelled(false),
+            None,
+        )
+        .await
+        .expect_err("an agent reopened a card the operator cancelled");
+    assert!(matches!(refused, ProjectError::Invalid { .. }), "{refused}");
+    assert!(
+        f.manager
+            .get_issue(&p.id, card.number)
+            .await
+            .expect("issue")
+            .cancelled_at
+            .is_some(),
+        "and the stop is still standing"
+    );
+
+    // The operator's own reopen is untouched — the gate reads the actor, not
+    // the field.
+    f.manager
+        .update_issue(&p.id, card.number, IssueActor::User, cancelled(false), None)
+        .await
+        .expect("the operator reopens their own card");
+
+    // A stop the board set is the board's to take back, which is the half of
+    // this that has to keep working: nothing else clears a card the lead
+    // called off in a run somebody has since answered.
+    f.manager
+        .update_issue(
+            &p.id,
+            card.number,
+            IssueActor::Agent(dev.clone()),
+            cancelled(true),
+            None,
+        )
+        .await
+        .expect("an agent calls it off");
+    f.manager
+        .update_issue(
+            &p.id,
+            card.number,
+            IssueActor::Agent(dev),
+            cancelled(false),
+            None,
+        )
+        .await
+        .expect("and takes its own cancel back");
+
+    assert_eq!(
+        f.manager
+            .timeline(&p.id, card.number)
+            .await
+            .expect("timeline")
+            .iter()
+            .filter(|e| matches!(e.body, IssueEventBody::Uncancelled))
+            .count(),
+        2,
+        "every reversal is on the record — reading whose stop is standing \
+         depends on the timeline carrying both directions"
+    );
+}
+
+#[tokio::test]
+async fn a_persons_comment_takes_back_the_cancel_and_the_card_goes_again() {
+    let f = fixture().await;
+    let p = f.manager.create_project(new_project("p")).await.expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    let card = f
+        .manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev.clone()),
+                ..new_issue("the work")
+            },
+        )
+        .await
+        .expect("card")
+        .into_issue();
+    let started = f.dispatched.lock()[0].id.clone();
+    f.store_settle(&started, RunStatus::Done).await;
+    f.manager
+        .update_issue(
+            &p.id,
+            card.number,
+            IssueActor::User,
+            IssueUpdate {
+                cancelled: Some(true),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("the operator calls it off");
+    f.dispatched.lock().clear();
+
+    f.manager
+        .comment(&p.id, card.number, IssueActor::User, "actually, do it", &[])
+        .await
+        .expect("say something on it");
+
+    assert!(
+        f.manager
+            .get_issue(&p.id, card.number)
+            .await
+            .expect("issue")
+            .cancelled_at
+            .is_none(),
+        "commenting on a card you called off is asking for it back"
+    );
+    let timeline = f
+        .manager
+        .timeline(&p.id, card.number)
+        .await
+        .expect("timeline");
+    let marks: Vec<&IssueEventRow> = timeline
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.body,
+                IssueEventBody::Comment { .. } | IssueEventBody::Uncancelled
+            )
+        })
+        .collect();
+    assert!(
+        matches!(marks[marks.len() - 2].body, IssueEventBody::Comment { .. })
+            && matches!(marks[marks.len() - 1].body, IssueEventBody::Uncancelled),
+        "the comment is the reason and reads before the reversal it caused"
+    );
+    assert_eq!(
+        asks(&f),
+        vec![RunTrigger::Comment],
+        "and the card is live work again, woken by the comment that revived it"
+    );
+}
+
+#[tokio::test]
+async fn an_agents_comment_does_not_take_back_a_cancel() {
+    let f = fixture().await;
+    let p = f.manager.create_project(new_project("p")).await.expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    let card = f
+        .manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev.clone()),
+                ..new_issue("the work")
+            },
+        )
+        .await
+        .expect("card")
+        .into_issue();
+    let started = f.dispatched.lock()[0].id.clone();
+    f.store_settle(&started, RunStatus::Done).await;
+    f.manager
+        .update_issue(
+            &p.id,
+            card.number,
+            IssueActor::User,
+            IssueUpdate {
+                cancelled: Some(true),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("the operator calls it off");
+    f.dispatched.lock().clear();
+
+    // The side door `an_agent_may_not_take_back_a_cancel_the_operator_set`
+    // closes on the front: saying a word must not do what asking outright is
+    // refused for.
+    f.manager
+        .comment(
+            &p.id,
+            card.number,
+            IssueActor::Agent(dev),
+            "I still think we should",
+            &[],
+        )
+        .await
+        .expect("an agent may still say so");
+
+    assert!(
+        f.manager
+            .get_issue(&p.id, card.number)
+            .await
+            .expect("issue")
+            .cancelled_at
+            .is_some(),
+        "an agent talked a card out of the operator's cancel"
+    );
+    assert!(
+        !f.manager
+            .timeline(&p.id, card.number)
+            .await
+            .expect("timeline")
+            .iter()
+            .any(|e| matches!(e.body, IssueEventBody::Uncancelled)),
+    );
+    assert!(f.dispatched.lock().is_empty(), "and nothing runs");
+}
+
+#[tokio::test]
+async fn a_revived_card_in_backlog_comes_back_without_starting_anything() {
+    let f = fixture().await;
+    let (p, dev) = driven_board(&f, 3).await;
+    let card = park_card(
+        &f,
+        &p.id,
+        "someday, maybe",
+        IssueActor::User,
+        Some(dev.clone()),
+    )
+    .await;
+    f.manager
+        .update_issue(
+            &p.id,
+            card.number,
+            IssueActor::User,
+            IssueUpdate {
+                cancelled: Some(true),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("call it off");
+    f.dispatched.lock().clear();
+
+    f.manager
+        .comment(&p.id, card.number, IssueActor::User, "keep this", &[])
+        .await
+        .expect("say something on it");
+
+    assert!(
+        f.manager
+            .get_issue(&p.id, card.number)
+            .await
+            .expect("issue")
+            .cancelled_at
+            .is_none(),
+        "it comes back"
+    );
+    assert_eq!(
+        column_of(&f, &p.id, card.number).await,
+        IssueStatus::Backlog,
+        "into the column it was called off in"
+    );
+    tick(&f, &p.id).await;
+    assert!(
+        f.dispatched.lock().is_empty(),
+        "and Backlog the operator parked still starts nothing: {:?}",
+        asks(&f)
+    );
+}
+
+#[tokio::test]
+async fn an_agents_comment_does_not_revive_a_card_another_agent_called_off() {
+    let f = fixture().await;
+    let p = f.manager.create_project(new_project("p")).await.expect("p");
+    let lead = f.manager.team(&p.id).await.expect("team")[0].id.clone();
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    let card = f
+        .manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev.clone()),
+                ..new_issue("the work")
+            },
+        )
+        .await
+        .expect("card")
+        .into_issue();
+    let started = f.dispatched.lock()[0].id.clone();
+    f.store_settle(&started, RunStatus::Done).await;
+
+    // An agent's cancel, which `update_issue` lets another agent reverse
+    // outright — so this is the only gate standing between "say a word on the
+    // card" and the board talking itself back into abandoned work.
+    f.manager
+        .update_issue(
+            &p.id,
+            card.number,
+            IssueActor::Agent(lead),
+            IssueUpdate {
+                cancelled: Some(true),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("the lead calls it off");
+    f.dispatched.lock().clear();
+
+    f.manager
+        .comment(
+            &p.id,
+            card.number,
+            IssueActor::Agent(dev),
+            "I could still take this",
+            &[],
+        )
+        .await
+        .expect("an agent may still say so");
+
+    assert!(
+        f.manager
+            .get_issue(&p.id, card.number)
+            .await
+            .expect("issue")
+            .cancelled_at
+            .is_some(),
+        "an agent commented a cancelled card back into live work"
+    );
+    assert!(f.dispatched.lock().is_empty(), "and nothing runs");
+}
+
+#[tokio::test]
 async fn retry_is_refused_on_a_card_the_board_has_finished_with() {
     let f = fixture().await;
     let p = f.manager.create_project(new_project("p")).await.expect("p");
@@ -3798,6 +4151,64 @@ async fn a_cancelled_parent_is_not_woken_by_its_last_step() {
                 e.body,
                 baybo_store::project::IssueEventBody::StageCompleted { stage: 0 }
             ))
+    );
+}
+
+#[tokio::test]
+async fn a_parent_the_operator_parked_is_not_woken_by_its_last_step() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(new_project("Barrier"))
+        .await
+        .expect("p");
+    let lead = f.manager.team(&p.id).await.expect("team")[0].id.clone();
+    // Staffed and live, so the only thing holding the barrier shut is the
+    // column the operator dropped it into.
+    let parent = f
+        .manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                assignee: Some(lead),
+                status: IssueStatus::Backlog,
+                ..new_issue("ship the thing")
+            },
+        )
+        .await
+        .expect("parent")
+        .into_issue();
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                parent: Some(parent.number),
+                stage: 0,
+                ..new_issue("design")
+            },
+        )
+        .await
+        .expect("child");
+    f.dispatched.lock().clear();
+
+    f.manager
+        .move_issue(&p.id, 2, IssueActor::User, IssueStatus::Done, &[2])
+        .await
+        .expect("close the last step");
+    assert!(
+        f.dispatched.lock().is_empty(),
+        "a parked parent was woken by its stage emptying"
+    );
+    assert!(
+        f.manager
+            .timeline(&p.id, parent.number)
+            .await
+            .expect("timeline")
+            .iter()
+            .any(|e| matches!(e.body, IssueEventBody::StageCompleted { stage: 0 })),
+        "the stage still opened on the record, for whoever un-parks it"
     );
 }
 
@@ -6077,6 +6488,223 @@ async fn column_of(f: &Fixture, project: &ProjectId, number: i64) -> IssueStatus
         .status
 }
 
+/// Open a staffed Todo card as a step of `parent`, at `stage`.
+async fn queue_step(
+    f: &Fixture,
+    project: &ProjectId,
+    title: &str,
+    assignee: &AgentProfileId,
+    priority: IssuePriority,
+    parent: i64,
+    stage: i64,
+) -> IssueRow {
+    f.manager
+        .create_issue(
+            project,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::Todo,
+                assignee: Some(assignee.clone()),
+                priority,
+                parent: Some(parent),
+                stage,
+                ..new_issue(title)
+            },
+        )
+        .await
+        .expect("step")
+        .into_issue()
+}
+
+/// The incident, in the shape it actually had: a lead filed a plan under
+/// one card — three steps at stage 1, a final acceptance step at stage 3 —
+/// and the board started the stage-3 step before any stage-1 step had run,
+/// because nothing on the starting path read `stage`. Its assignee
+/// spent a run discovering there was nothing to accept yet and blocked the
+/// card, and that prose block is what went on to wake the lead nine times.
+///
+/// `urgent` on the last step is not decoration: `promotion_order` sorts by
+/// priority, so the step furthest from being startable was the first card
+/// the board reached for.
+#[tokio::test]
+async fn a_later_stage_is_not_promoted_while_an_earlier_one_is_open() {
+    let f = fixture().await;
+    let (p, dev) = driven_board(&f, 5).await;
+    let plan = queue_card(
+        &f,
+        &p.id,
+        "the plan",
+        Some(dev.clone()),
+        IssuePriority::None,
+    )
+    .await;
+
+    for step in 1..=3 {
+        queue_step(
+            &f,
+            &p.id,
+            &format!("stage one, step {step}"),
+            &dev,
+            IssuePriority::High,
+            plan.number,
+            1,
+        )
+        .await;
+    }
+    let acceptance = queue_step(
+        &f,
+        &p.id,
+        "final acceptance",
+        &dev,
+        IssuePriority::Urgent,
+        plan.number,
+        3,
+    )
+    .await;
+
+    tick(&f, &p.id).await;
+
+    assert_eq!(
+        column_of(&f, &p.id, acceptance.number).await,
+        IssueStatus::Todo,
+        "a step whose stage the board has not reached stays where it is"
+    );
+    let started: Vec<i64> = f.dispatched.lock().iter().map(|run| run.number).collect();
+    assert!(
+        !started.contains(&acceptance.number),
+        "and nothing was started on it: {started:?}"
+    );
+    assert!(
+        started.len() >= 2,
+        "while the stage the board *has* reached runs, urgent or not: {started:?}"
+    );
+}
+
+/// The override the board must never take back: a person dragging a held
+/// step into In Progress is overruling the plan on purpose, exactly as they
+/// may overrule a block. The gate lives in `driver::is_waiting`, which only
+/// the board's own two doors ask.
+#[tokio::test]
+async fn an_operator_starting_a_held_step_still_starts_it() {
+    let f = fixture().await;
+    let (p, dev) = driven_board(&f, 5).await;
+    let plan = queue_card(
+        &f,
+        &p.id,
+        "the plan",
+        Some(dev.clone()),
+        IssuePriority::None,
+    )
+    .await;
+    let first = queue_step(
+        &f,
+        &p.id,
+        "stage one",
+        &dev,
+        IssuePriority::High,
+        plan.number,
+        1,
+    )
+    .await;
+    let later = queue_step(
+        &f,
+        &p.id,
+        "stage two",
+        &dev,
+        IssuePriority::High,
+        plan.number,
+        2,
+    )
+    .await;
+
+    f.manager
+        .move_issue(
+            &p.id,
+            later.number,
+            IssueActor::User,
+            IssueStatus::InProgress,
+            &[later.number],
+        )
+        .await
+        .expect("drag");
+
+    let started: Vec<i64> = f.dispatched.lock().iter().map(|run| run.number).collect();
+    assert!(
+        started.contains(&later.number),
+        "the operator's own move starts the card it names: {started:?}"
+    );
+    assert_eq!(
+        column_of(&f, &p.id, first.number).await,
+        IssueStatus::Todo,
+        "and the stage it jumped is still open, which is the point of the override"
+    );
+}
+
+/// "Cancel the step you are not doing" is how an operator opens a barrier,
+/// and it has to work on the way *in* as well as on the way out —
+/// `stages::is_finished` is the one definition both sides read.
+#[tokio::test]
+async fn a_cancelled_step_does_not_hold_the_next_stage_shut() {
+    let f = fixture().await;
+    let (p, dev) = driven_board(&f, 5).await;
+    let plan = queue_card(
+        &f,
+        &p.id,
+        "the plan",
+        Some(dev.clone()),
+        IssuePriority::None,
+    )
+    .await;
+    let dropped = queue_step(
+        &f,
+        &p.id,
+        "stage one",
+        &dev,
+        IssuePriority::High,
+        plan.number,
+        1,
+    )
+    .await;
+    let later = queue_step(
+        &f,
+        &p.id,
+        "stage two",
+        &dev,
+        IssuePriority::High,
+        plan.number,
+        2,
+    )
+    .await;
+
+    tick(&f, &p.id).await;
+    assert_eq!(
+        column_of(&f, &p.id, later.number).await,
+        IssueStatus::Todo,
+        "the control: stage two waits while stage one is open"
+    );
+
+    f.manager
+        .update_issue(
+            &p.id,
+            dropped.number,
+            IssueActor::User,
+            IssueUpdate {
+                cancelled: Some(true),
+                ..IssueUpdate::default()
+            },
+            None,
+        )
+        .await
+        .expect("cancel");
+    tick(&f, &p.id).await;
+
+    assert_eq!(
+        column_of(&f, &p.id, later.number).await,
+        IssueStatus::InProgress,
+        "a step nobody is doing any more is not a step the next stage waits for"
+    );
+}
+
 #[tokio::test]
 async fn a_staffed_card_in_todo_starts_itself() {
     let f = fixture().await;
@@ -6439,6 +7067,56 @@ async fn the_lead_is_asked_about_the_backlog_the_board_filed_and_never_about_the
 }
 
 #[tokio::test]
+async fn a_board_of_nothing_but_the_operators_backlog_is_left_alone() {
+    let f = fixture().await;
+    let (p, _dev) = driven_board(&f, 3).await;
+
+    // The mirror of the test above with its agent-filed card taken away. That
+    // card is what made Grooming fire there, and Grooming returning is what
+    // kept the board from ever reaching the question below it.
+    let theirs = park_card(&f, &p.id, "someday, maybe", IssueActor::User, None).await;
+
+    tick(&f, &p.id).await;
+    tick(&f, &p.id).await;
+    assert!(
+        f.dispatched.lock().is_empty(),
+        "the operator's parked card is the whole board, and the board has \
+         nothing to ask about it: {:?}",
+        asks(&f)
+    );
+    assert_eq!(
+        column_of(&f, &p.id, theirs.number).await,
+        IssueStatus::Backlog,
+        "and it is still where they left it"
+    );
+}
+
+#[tokio::test]
+async fn a_run_the_operator_stopped_is_not_countermanded_on_the_next_pass() {
+    let f = fixture().await;
+    let (p, dev) = driven_board(&f, 3).await;
+    let card = queue_card(&f, &p.id, "the work", Some(dev), IssuePriority::None).await;
+
+    tick(&f, &p.id).await;
+    assert_eq!(asks(&f), vec![RunTrigger::Promoted], "it started");
+    f.dispatched.lock().clear();
+
+    f.manager
+        .cancel_run(&p.id, card.number)
+        .await
+        .expect("the operator stops it");
+    f.dispatched.lock().clear();
+
+    tick(&f, &p.id).await;
+    tick(&f, &p.id).await;
+    assert!(
+        f.dispatched.lock().is_empty(),
+        "a stop the operator set was countermanded on the next pass: {:?}",
+        asks(&f)
+    );
+}
+
+#[tokio::test]
 async fn a_deferral_the_board_outlived_is_put_back_to_the_lead() {
     let f = fixture().await;
     let (p, dev) = driven_board(&f, 3).await;
@@ -6532,8 +7210,18 @@ async fn a_deferral_the_board_outlived_is_put_back_to_the_lead() {
     );
 }
 
+/// A rule the board schedules by is news no card carries, and the board is
+/// what gets told.
+///
+/// It used to re-open every **card's** question instead. That reads the
+/// right way round — the answer was given under the old rules, so ask it
+/// again — and it is wrong twice over. It asks the lead to decide one thing
+/// about the whole board once per card, and, because the same stamp is what
+/// the ask cap counted from, each save minted the quota to do it again: a
+/// short burst of saves bought nine runs across five cards, all of which
+/// changed nothing.
 #[tokio::test]
-async fn a_rule_the_board_changed_re_opens_what_the_lead_answered_under_the_old_one() {
+async fn a_rule_the_board_changed_is_one_question_about_the_board() {
     let f = fixture().await;
     let (p, _dev) = driven_board(&f, 3).await;
 
@@ -6571,14 +7259,30 @@ async fn a_rule_the_board_changed_re_opens_what_the_lead_answered_under_the_old_
     tick(&f, &p.id).await;
     assert_eq!(
         asks(&f),
-        vec![RunTrigger::Review, RunTrigger::Review],
-        "the answer was given under rules the board no longer has, so the \
-         question is a question again"
+        vec![RunTrigger::Review, RunTrigger::BoardIdle],
+        "the premise of every standing answer moved, and the lead is handed \
+         the board — not one card at a time"
     );
+
+    // Told once. Answering is a look, so the rule the answer was given
+    // under is a rule the lead has now read.
+    let told = f.dispatched.lock()[1].clone();
+    settle_clean(&f, &told).await;
+    tick(&f, &p.id).await;
+    tick(&f, &p.id).await;
     assert_eq!(
-        f.dispatched.lock()[1].number,
-        review.number,
-        "and it is the same card, asked again rather than a new one"
+        asks(&f).len(),
+        2,
+        "and saving the settings again buys nothing until something happens"
+    );
+    set_merge(&f, &p, false).await;
+    set_merge(&f, &p, true).await;
+    tick(&f, &p.id).await;
+    assert_eq!(
+        asks(&f).len(),
+        3,
+        "a rule that changes after that look is news again — once, not once \
+         per save and not once per card"
     );
 }
 

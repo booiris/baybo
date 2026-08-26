@@ -1945,6 +1945,9 @@ pub struct SetSessionModelResponse {
     pub applied_to_live_actor: bool,
 }
 
+const CARD_RUN_FOLLOWS_ITS_AGENT: &str =
+    "a card's run always follows its agent's own pin; change the model on the agent instead";
+
 #[utoipa::path(
     put,
     path = "/chat/sessions/{session_id}/model",
@@ -1955,7 +1958,7 @@ pub struct SetSessionModelResponse {
     request_body = SetSessionModelRequest,
     responses(
         (status = 200, description = "Per-session model pin updated; applies from the session's next turn", body = SetSessionModelResponse),
-        (status = 400, description = "Unknown LLM entry name", body = ErrorBody),
+        (status = 400, description = "Unknown LLM entry name, or a card's run session, which follows its agent's pin", body = ErrorBody),
         (status = 401, description = "Unauthorized", body = ErrorBody),
         (status = 404, description = "Session not found", body = ErrorBody),
     )
@@ -1967,9 +1970,19 @@ async fn set_session_model(
     Json(req): Json<SetSessionModelRequest>,
 ) -> Result<Json<SetSessionModelResponse>> {
     let authed = authed.as_ref().map(|ext| &ext.0);
-    // We only need the existence/scope check, not the loaded blob:
-    // persistence goes through the targeted `set_last_llm` below.
-    let (sid, _) = load_scoped_chat_session(&state, &session_id, authed).await?;
+    // Loaded for the existence/scope check and the trigger below, not for
+    // its state: persistence goes through the targeted `set_last_llm`.
+    let (sid, session) = load_scoped_chat_session(&state, &session_id, authed).await?;
+
+    // A card's run session lives on the owner channel like any conversation,
+    // so the scope check above admits it. It is reused by every later run of
+    // that agent on the card, so a pin written here would outrank the agent's
+    // profile for good — refused rather than stored and then ignored.
+    if !session.trigger.can_pin_its_own_llm() {
+        return Err(GatewayError::BadRequest(
+            CARD_RUN_FOLLOWS_ITS_AGENT.to_owned(),
+        ));
+    }
 
     // Entry, model-within-entry and rung are one pick, and the rules that
     // govern them have one home — `validate_llm_pin`, which the agent-profile

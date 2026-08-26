@@ -148,6 +148,8 @@ struct Params {
     freshness: Option<String>,
 }
 
+const ANY_FRESHNESS: &str = "any";
+
 impl Params {
     fn parse(params: Value) -> Result<Self, ToolError> {
         let parsed: Self = serde_json::from_value(params)
@@ -178,10 +180,11 @@ impl Params {
             }
         }
         if let Some(raw) = &parsed.freshness
+            && raw != ANY_FRESHNESS
             && Freshness::parse(raw).is_none()
         {
             return Err(ToolError::InvalidParams(format!(
-                "WebSearch: `freshness` must be one of day, week, month, year — got {raw:?}"
+                "WebSearch: `freshness` must be one of any, day, week, month, year — got {raw:?}"
             )));
         }
         Ok(parsed)
@@ -337,8 +340,8 @@ impl Tool for WebSearchTool {
                 },
                 "freshness": {
                     "type": "string",
-                    "enum": ["day", "week", "month", "year"],
-                    "description": "Prefer results from this window. Provider-dependent and not guaranteed; omit unless the query is about recent events."
+                    "enum": [ANY_FRESHNESS, "day", "week", "month", "year"],
+                    "description": "Prefer results from this window. Use `any` when the strict schema requires a value but no freshness filter is wanted."
                 }
             },
             "required": ["query"],
@@ -376,7 +379,11 @@ impl Tool for WebSearchTool {
             query: params.query.trim().to_string(),
             max_results: self.max_results,
             domains: filter.clone(),
-            freshness: params.freshness.as_deref().and_then(Freshness::parse),
+            freshness: params
+                .freshness
+                .as_deref()
+                .filter(|freshness| *freshness != ANY_FRESHNESS)
+                .and_then(Freshness::parse),
             country: self.country.clone(),
             language: self.language.clone(),
         };
@@ -618,7 +625,7 @@ mod tests {
         );
         assert_eq!(
             schema["properties"]["freshness"]["enum"],
-            json!(["day", "week", "month", "year"])
+            json!(["any", "day", "week", "month", "year"])
         );
     }
 

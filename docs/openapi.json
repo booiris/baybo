@@ -1880,7 +1880,7 @@
             }
           },
           "400": {
-            "description": "Unknown LLM entry name",
+            "description": "Unknown LLM entry name, or a card's run session, which follows its agent's pin",
             "content": {
               "application/json": {
                 "schema": {
@@ -9674,6 +9674,42 @@
             ],
             "properties": {
               "from": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "title_changed"
+                ]
+              },
+              "to": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "description_changed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "from",
+              "to",
+              "kind"
+            ],
+            "properties": {
+              "from": {
                 "$ref": "#/components/schemas/IssueStatusDto"
               },
               "kind": {
@@ -9865,6 +9901,20 @@
                 "type": "string",
                 "enum": [
                   "cancelled"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "uncancelled"
                 ]
               }
             }
@@ -11892,13 +11942,17 @@
               "null"
             ]
           },
+          "detach_parent": {
+            "type": "boolean",
+            "description": "Take the card out of its parent's plan, clearing its stage."
+          },
           "parent": {
             "type": [
               "integer",
               "null"
             ],
             "format": "int64",
-            "description": "Re-parent by number; `0` detaches. Absent leaves the parent alone."
+            "description": "Re-parent by number. Absent leaves the parent alone, and no number\ndetaches — that is `detach_parent`."
           },
           "pinned": {
             "type": [
@@ -11922,7 +11976,8 @@
               "integer",
               "null"
             ],
-            "format": "int64"
+            "format": "int64",
+            "description": "Which barrier under the parent. Landed only alongside `parent` or\n`detach_parent`: half a placement is not a placement."
           },
           "title": {
             "type": [

@@ -104,16 +104,17 @@ impl LocalBlobFile {
 /// `ContentBlock` clients bucket media by. An empty or newline-bearing
 /// override reaches `HeaderValue::from_str` in the gateway's blob
 /// download, which refuses it and serves the bytes with **no**
-/// `Content-Type` at all. Failing here turns that silent, far-away
-/// degradation into an `InvalidParams` the model can act on.
+/// `Content-Type` at all. An empty override is the strict-schema spelling of
+/// "unset"; newline-bearing values still fail here rather than degrading
+/// later at download time.
 pub(super) fn resolve_mime_type(requested: Option<String>, path: &Path) -> crate::Result<String> {
-    let Some(requested) = requested else {
+    let Some(requested) = requested.filter(|value| !value.trim().is_empty()) else {
         return Ok(guess_mime(path).to_string());
     };
     let mime_type = requested.trim();
-    if mime_type.is_empty() || mime_type.contains(['\r', '\n']) {
+    if mime_type.contains(['\r', '\n']) {
         return Err(ToolError::InvalidParams(
-            "mime_type must be a non-empty single-line value".to_string(),
+            "mime_type must be a single-line value".to_string(),
         ));
     }
     Ok(mime_type.to_string())

@@ -86,6 +86,7 @@ acting on it.
 /// so this exists only because the tool executor requires a `max_timeout`.
 /// Pegged high enough never to fire in practice.
 const TOOL_WAIT_BACKSTOP: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const DEFAULT_MODEL_TIER: &str = "default";
 
 /// Raw JSON shape the LLM emits as `spawn_subagent`'s arguments.
 /// `subagent_type` and `prompt` are required; everything else is
@@ -169,7 +170,8 @@ fn parse_spawn_request(value: &Value, registry: &SubagentRegistry) -> Result<Par
         return Err("`prompt` must be a non-empty self-contained brief".into());
     }
 
-    let model_tier = match p.model_tier.as_deref() {
+    let model_tier = match p.model_tier.as_deref().map(str::trim) {
+        None | Some("") | Some(DEFAULT_MODEL_TIER) => profile.default_tier,
         Some(label) => match ModelTier::parse(label) {
             Some(t) => Some(t),
             None => {
@@ -178,10 +180,6 @@ fn parse_spawn_request(value: &Value, registry: &SubagentRegistry) -> Result<Par
                 ));
             }
         },
-        // Precedence at this boundary: explicit > profile default.
-        // The runtime's `LlmClientPool` falls back to its pool default
-        // when neither is set.
-        None => profile.default_tier,
     };
 
     let backend = match p.backend.as_deref().map(str::trim) {
@@ -489,8 +487,8 @@ fn parameters_schema() -> Value {
             },
             "model_tier": {
                 "type": "string",
-                "enum": ["lite", "balanced", "deep"],
-                "description": "Coarse model selection. Falls back to the profile's default_tier, then the pool default. Only applies to backend='baybo'."
+                "enum": [DEFAULT_MODEL_TIER, "lite", "balanced", "deep"],
+                "description": "Coarse model selection. Use `default` to fall back to the profile's default_tier, then the pool default. Only applies to backend='baybo'."
             },
             "backend": {
                 "type": "string",
@@ -1629,5 +1627,18 @@ mod tests {
             "model_tier": "ultradeep",
         });
         assert!(parse_spawn_request(&v, &registry).is_err());
+    }
+
+    #[test]
+    fn default_model_tier_uses_the_profile_default() {
+        let registry = registry_with_builtins();
+        let v = json!({
+            "subagent_type": "planner",
+            "description": "plan work",
+            "prompt": "Make a plan.",
+            "model_tier": "default",
+        });
+        let parsed = parse_spawn_request(&v, &registry).expect("valid request");
+        assert_eq!(parsed.request.model_tier, Some(ModelTier::Deep));
     }
 }

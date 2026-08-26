@@ -889,8 +889,8 @@ impl Tool for Mem0SearchTool {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "What to search for."},
-                "limit": {"type": "integer", "description": "Max results (default: configured top_k, max 50)."},
-                "scope": {"type": "string", "enum": ["session", "long-term", "all"], "description": "\"all\" (default), \"session\" (current session only), or \"long-term\"."},
+                "limit": {"type": "integer", "minimum": 0, "description": "Max results (configured top_k by default, max 50). Use `0` for the default."},
+                "scope": {"type": "string", "enum": ["all", "session", "long-term"], "default": "all", "description": "`all` (default), `session` (current session only), or `long-term`."},
                 "categories": {"type": "array", "items": {"type": "string"}, "description": "Filter by category."},
                 "filters": {"type": "object", "description": "Advanced Mem0 filter object (AND/OR/operators)."},
             },
@@ -909,6 +909,7 @@ impl Tool for Mem0SearchTool {
         let limit = params
             .get("limit")
             .and_then(|v| v.as_u64())
+            .filter(|limit| *limit > 0)
             .map(|n| n.min(50) as usize)
             .unwrap_or(self.inner.top_k);
         let user_id = ctx.user.id.as_str();
@@ -996,7 +997,7 @@ impl Tool for Mem0AddTool {
     fn description(&self) -> String {
         "Store durable fact(s) about the user in long-term memory, verbatim (no server-side \
          re-extraction). Pass `text` for one fact or `facts` for several sharing one `category`. \
-         Set longTerm=false to scope a fact to the current session."
+         Set `scope` to `session` for a session-scoped fact."
             .into()
     }
 
@@ -1007,9 +1008,9 @@ impl Tool for Mem0AddTool {
                 "text": {"type": "string", "description": "A single fact to remember."},
                 "facts": {"type": "array", "items": {"type": "string"}, "description": "Several facts to store; all share one category."},
                 "category": {"type": "string", "description": "e.g. identity, preference, decision, rule, project, configuration, technical, relationship."},
-                "importance": {"type": "number", "description": "Importance 0.0–1.0 (stored as metadata)."},
+                "importance": {"type": "number", "minimum": 0, "maximum": 1, "default": 0, "description": "Importance 0.0–1.0 (stored as metadata). Use `0` when the strict schema requires a value but no importance metadata is wanted."},
                 "metadata": {"type": "object", "description": "Additional metadata to attach."},
-                "longTerm": {"type": "boolean", "description": "Long-term (default true). false → session-scoped."},
+                "scope": {"type": "string", "enum": ["long-term", "session"], "default": "long-term", "description": "Where to keep the fact. `long-term` is the default."},
             },
             "required": []
         })
@@ -1019,20 +1020,7 @@ impl Tool for Mem0AddTool {
         if self.inner.breaker_open() {
             return Ok(breaker_unavailable());
         }
-        let facts: Vec<String> = match params.get("facts").and_then(|v| v.as_array()) {
-            Some(arr) => arr
-                .iter()
-                .filter_map(|x| x.as_str())
-                .map(str::to_string)
-                .filter(|s| !s.is_empty())
-                .collect(),
-            None => params
-                .get("text")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(|s| vec![s.to_string()])
-                .unwrap_or_default(),
-        };
+        let facts = add_facts(&params);
         if facts.is_empty() {
             return Err(ToolError::InvalidParams(
                 "provide `text` or a non-empty `facts` array".into(),
@@ -1040,10 +1028,18 @@ impl Tool for Mem0AddTool {
         }
         let user_id = ctx.user.id.as_str();
         let agent_id = ctx.agent_id.as_str();
-        let long_term = params
-            .get("longTerm")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
+        let long_term = match params.get("scope").and_then(|value| value.as_str()) {
+            None | Some("") | Some("long-term") => params
+                .get("longTerm")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true),
+            Some("session") => false,
+            Some(other) => {
+                return Err(ToolError::InvalidParams(format!(
+                    "scope must be `long-term` or `session`, got {other:?}"
+                )));
+            }
+        };
         let messages: Vec<Value> = facts
             .iter()
             .map(|f| json!({"role": "user", "content": f}))
@@ -1057,7 +1053,12 @@ impl Tool for Mem0AddTool {
         if !long_term {
             body["run_id"] = json!(ctx.session_id.as_str());
         }
-        if let Some(cat) = params.get("category").and_then(|v| v.as_str()) {
+        if let Some(cat) = params
+            .get("category")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|category| !category.is_empty())
+        {
             body["categories"] = json!([cat]);
         }
         let mut metadata = params
@@ -1065,7 +1066,11 @@ impl Tool for Mem0AddTool {
             .and_then(|v| v.as_object())
             .cloned()
             .unwrap_or_default();
-        if let Some(importance) = params.get("importance").and_then(|v| v.as_f64()) {
+        if let Some(importance) = params
+            .get("importance")
+            .and_then(|v| v.as_f64())
+            .filter(|importance| *importance > 0.0)
+        {
             metadata.insert("importance".into(), json!(importance));
         }
         if !metadata.is_empty() {
@@ -1096,6 +1101,27 @@ impl Tool for Mem0AddTool {
             }
         }
     }
+}
+
+fn add_facts(params: &Value) -> Vec<String> {
+    let facts: Vec<String> = params
+        .get("facts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|fact| !fact.trim().is_empty())
+        .map(str::to_string)
+        .collect();
+    if !facts.is_empty() {
+        return facts;
+    }
+    params
+        .get("text")
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+        .map(|text| vec![text.to_string()])
+        .unwrap_or_default()
 }
 
 struct Mem0GetTool {
@@ -1173,7 +1199,7 @@ impl Tool for Mem0ListTool {
         json!({
             "type": "object",
             "properties": {
-                "scope": {"type": "string", "enum": ["session", "long-term", "all"], "description": "\"all\" (default), \"session\", or \"long-term\"."},
+                "scope": {"type": "string", "enum": ["all", "session", "long-term"], "default": "all", "description": "`all` (default), `session`, or `long-term`."},
             },
             "required": []
         })
@@ -1416,11 +1442,21 @@ impl Tool for Mem0DeleteTool {
         let user_id = ctx.user.id.as_str();
         let agent_id = ctx.agent_id.as_str();
 
-        if let Some(memory_id) = params.get("memoryId").and_then(|v| v.as_str()) {
+        if let Some(memory_id) = params
+            .get("memoryId")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|memory_id| !memory_id.is_empty())
+        {
             return Ok(self.delete_by_id(memory_id, ctx, true).await);
         }
 
-        if let Some(query) = params.get("query").and_then(|v| v.as_str()) {
+        if let Some(query) = params
+            .get("query")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|query| !query.is_empty())
+        {
             let body = if self.inner.self_hosted {
                 json!({
                     "query": query,
@@ -1870,6 +1906,18 @@ mod tests {
         assert_eq!(scope_run_id(Some("long-term"), "s-1"), None);
         assert_eq!(scope_run_id(Some("all"), "s-1"), None);
         assert_eq!(scope_run_id(None, "s-1"), None);
+    }
+
+    #[test]
+    fn empty_facts_filler_falls_back_to_text() {
+        assert_eq!(
+            add_facts(&json!({"text": "remember this", "facts": []})),
+            vec!["remember this"]
+        );
+        assert_eq!(
+            add_facts(&json!({"text": "", "facts": ["first", " ", "second"]})),
+            vec!["first", "second"]
+        );
     }
 
     #[test]

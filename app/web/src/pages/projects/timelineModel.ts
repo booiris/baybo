@@ -56,6 +56,7 @@ export function eventTone(body: IssueEventBody): Tone {
     case 'run_refused':
       return 'warn';
     case 'unblocked':
+    case 'uncancelled':
     case 'stage_completed':
     case 'budget_restored':
     case 'token_budget_restored':
@@ -153,6 +154,10 @@ export function describeEvent(body: IssueEventBody): string | null {
       return null;
     case 'opened':
       return 'opened this issue';
+    case 'title_changed':
+      return `changed the title from “${body.from}” to “${body.to}”`;
+    case 'description_changed':
+      return 'edited the description';
     case 'moved':
       return `moved it from ${COLUMN_LABEL[body.from]} to ${COLUMN_LABEL[body.to]}`;
     case 'assigned': {
@@ -176,6 +181,8 @@ export function describeEvent(body: IssueEventBody): string | null {
       return 'unblocked it';
     case 'cancelled':
       return 'cancelled it';
+    case 'uncancelled':
+      return 'reopened it';
     case 'branch_merged': {
       // The branch it landed on is named rather than assumed: a repository
       // parked somewhere other than its trunk merges there.
@@ -329,6 +336,10 @@ export function feedLine(entry: FeedEntry): Span[] {
       return join(who(entry), ' commented on ', at);
     case 'opened':
       return join(who(entry), ' opened ', at);
+    case 'title_changed':
+      return join(who(entry), ' changed the title of ', at);
+    case 'description_changed':
+      return join(who(entry), ' edited the description of ', at);
     case 'moved':
       return join(
         who(entry),
@@ -376,6 +387,8 @@ export function feedLine(entry: FeedEntry): Span[] {
       return join(who(entry), ' unblocked ', at);
     case 'cancelled':
       return join(who(entry), ' cancelled ', at);
+    case 'uncancelled':
+      return join(who(entry), ' reopened ', at);
     case 'approval_requested':
       return join('approval waiting on ', at, `: ${body.tool} — ${body.summary}`);
     case 'approval_resolved':

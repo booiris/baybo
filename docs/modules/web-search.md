@@ -90,6 +90,10 @@ Arguments are `query` (required), `allowed_domains`, `blocked_domains`, and
 `freshness`. Domain lists are limited to 20 entries and are mutually exclusive.
 `max_results` remains operator-controlled.
 
+`freshness: "any"` is the explicit unfiltered value. It exists because a
+strict-schema caller may materialize every optional enum; choosing `day` merely
+as filler would silently turn an ordinary search into a recent-only search.
+
 The description is static so the tool array remains stable across turns and
 resumed sessions. The output is a numbered `ToolOutput::Text` block of title,
 URL, optional age, and snippet.

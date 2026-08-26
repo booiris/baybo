@@ -96,11 +96,11 @@ impl Tool for GrepTool {
             "properties": {
                 "pattern":          { "type": "string", "description": "Rust-flavor regex" },
                 "path":             { "type": "string", "description": "Absolute directory to search (required)" },
-                "glob":             { "type": "string", "description": "Filename glob to filter files (e.g. `*.rs`)" },
+                "glob":             { "type": "string", "description": "Filename glob to filter files (e.g. `*.rs`). An empty string means no filename filter." },
                 "case_insensitive": { "type": "boolean", "default": false },
                 "output_mode":      {
                     "type": "string",
-                    "enum": ["content", "files_with_matches", "count"],
+                    "enum": ["files_with_matches", "content", "count"],
                     "default": "files_with_matches"
                 }
             },
@@ -134,8 +134,9 @@ impl Tool for GrepTool {
     }
 
     async fn execute(&self, params: Value, ctx: &ToolContext) -> crate::Result<ToolOutput> {
-        let p: Params =
+        let mut p: Params =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
+        p.glob = p.glob.filter(|glob| !glob.trim().is_empty());
 
         require_absolute(&p.path, "Grep", "path")?;
 
@@ -435,6 +436,42 @@ mod tests {
         };
         assert!(s.contains("a.rs"));
         assert!(!s.contains("a.txt"));
+    }
+
+    #[tokio::test]
+    async fn an_empty_glob_filler_does_not_filter_every_file() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("a.txt"), "needle")
+            .await
+            .unwrap();
+
+        let out = GrepTool::for_test()
+            .execute(
+                json!({
+                    "pattern": "needle",
+                    "path": dir.path(),
+                    "glob": "",
+                    "output_mode": "content"
+                }),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        let ToolOutput::Text(s) = out else { panic!() };
+        assert!(s.contains("a.txt"), "{s}");
+    }
+
+    #[test]
+    fn the_optional_output_mode_leads_with_its_default() {
+        let schema = GrepTool::for_test().parameters_schema();
+        assert_eq!(
+            schema["properties"]["output_mode"]["enum"][0],
+            "files_with_matches"
+        );
+        assert_eq!(
+            schema["properties"]["output_mode"]["default"],
+            "files_with_matches"
+        );
     }
 
     /// Regression for the colon-in-path bypass that codex flagged: a

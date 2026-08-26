@@ -172,8 +172,8 @@ pub(crate) fn build_oneshot_actor(
 /// to: the session's own pick, else the bound agent's, else the deployment
 /// default.
 ///
-/// An explicit per-session switch always wins — the user pressed that button
-/// for this conversation. Otherwise a session bound to a custom agent follows
+/// An explicit switch on a conversation always wins — the user pressed that
+/// button for this thread. Otherwise a session bound to a custom agent follows
 /// that agent's pin, so editing a profile reaches its sessions at their next
 /// hydration (a cold start or an idle reap), which is the same latency a
 /// profile edit already has for the soul.
@@ -186,10 +186,12 @@ pub(crate) fn build_oneshot_actor(
 /// deliberately set to think hard must keep doing so on a session that only
 /// re-pointed which entry to use.
 ///
-/// This is also the only door a card's run has. A run's session is spawned by
-/// the board with nothing pinned on it, so *everything* it runs on comes from
-/// the profile here — which is why the profile carries the whole
-/// [`LlmPin`] and not just its entry.
+/// This is also the only door a card's run has, and a card's run session does
+/// not get that precedence: it is minted per (issue, agent) and reused by
+/// every later run of that agent on the card, so a pin on it would outrank
+/// the profile forever. Such a session takes the profile whole
+/// ([`baybo_model::TriggerSource::can_pin_its_own_llm`]) — which is why the
+/// profile carries the whole [`LlmPin`] and not just its entry.
 ///
 /// Unbound and built-in sessions short-circuit without touching the store:
 /// the built-in follows `default-llm` by definition, so there is nothing of
@@ -200,6 +202,9 @@ pub(crate) async fn resolve_spawn_pins(
     agent_profiles: &Arc<dyn AgentProfileStore>,
 ) -> LlmPin {
     let profile = agent_profile_pin(session, agent_profiles).await;
+    if !session.trigger.can_pin_its_own_llm() {
+        return profile;
+    }
     match session.state.last_llm.clone() {
         Some(entry) => LlmPin {
             entry: Some(entry),
@@ -567,6 +572,35 @@ mod tests {
                 model: Some("slow-pro".to_owned()),
                 effort: Some("low".to_owned()),
             }
+        );
+    }
+
+    /// A card's run session is reused by every later run of the same agent
+    /// on that card, so a pin left on it would outrank the profile forever.
+    /// It takes the profile whole instead — every level, the rung included.
+    #[tokio::test]
+    async fn a_card_run_session_follows_the_profile_over_its_own_pin() {
+        let profile = LlmPin {
+            entry: Some(LlmEntryName::from("fast")),
+            model: Some("fast-mini".to_owned()),
+            effort: Some("high".to_owned()),
+        };
+        let (agent, store) = store_with(profile.clone()).await;
+
+        let mut session = bound_session(&agent);
+        session.trigger = baybo_model::TriggerSource::Issue {
+            project_id: baybo_model::ProjectId::generate(),
+            issue_id: baybo_model::IssueId::generate(),
+            number: 7,
+        };
+        session.state.last_llm = Some(LlmEntryName::from("slow"));
+        session.state.last_model = Some("slow-pro".to_owned());
+        session.state.last_effort = Some("low".to_owned());
+
+        let pins = resolve_spawn_pins(&session, &store).await;
+        assert_eq!(
+            pins, profile,
+            "a run must follow the agent's current profile, not a pin left on the card's session",
         );
     }
 

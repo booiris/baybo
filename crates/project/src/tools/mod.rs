@@ -120,16 +120,46 @@ fn status_schema(description: &str) -> Value {
     json!({
         "type": "string",
         "enum": IssueStatus::ALL.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        "default": IssueStatus::Backlog.as_str(),
         "description": description,
     })
 }
 
+const UNCHANGED_ACTION: &str = "unchanged";
+const ALL_STATUSES_FILTER: &str = "all";
+
+fn status_filter_schema(description: &str) -> Value {
+    let mut values = vec![ALL_STATUSES_FILTER];
+    values.extend(IssueStatus::ALL.iter().map(|status| status.as_str()));
+    json!({ "type": "string", "enum": values, "description": description })
+}
+
+fn status_update_schema(description: &str) -> Value {
+    let mut values = vec![UNCHANGED_ACTION];
+    values.extend(IssueStatus::ALL.iter().map(|status| status.as_str()));
+    json!({ "type": "string", "enum": values, "description": description })
+}
+
 fn priority_schema(description: &str) -> Value {
+    let mut values = vec![IssuePriority::None.as_str()];
+    values.extend(
+        IssuePriority::ALL
+            .iter()
+            .filter(|priority| **priority != IssuePriority::None)
+            .map(|priority| priority.as_str()),
+    );
     json!({
         "type": "string",
-        "enum": IssuePriority::ALL.iter().map(|p| p.as_str()).collect::<Vec<_>>(),
+        "enum": values,
+        "default": IssuePriority::None.as_str(),
         "description": description,
     })
+}
+
+fn priority_update_schema(description: &str) -> Value {
+    let mut values = vec![UNCHANGED_ACTION];
+    values.extend(IssuePriority::ALL.iter().map(|priority| priority.as_str()));
+    json!({ "type": "string", "enum": values, "description": description })
 }
 
 /// The words that mean "nobody" wherever a tool takes an assignee. All three
@@ -150,7 +180,9 @@ const NOBODY_WORD: &str = NOBODY[0];
 /// others, and three spellings of one rule is how it learns a wrong one.
 fn assignee_schema(setting: bool) -> Value {
     let description = if setting {
-        format!("An `@handle` from this project's team, or `{NOBODY_WORD}` for nobody.")
+        format!(
+            "An `@handle` from this project's team, or `{NOBODY_WORD}` to explicitly set nobody. An empty string is the inert strict-schema value: it leaves an update unchanged and opens a new card unassigned."
+        )
     } else {
         format!(
             "Keep only issues assigned to this `@handle`, or `{NOBODY_WORD}` for the ones \

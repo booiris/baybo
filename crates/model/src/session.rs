@@ -197,6 +197,24 @@ impl TriggerSource {
         }
     }
 
+    /// Whether this session may hold an LLM pin of its own, outranking the
+    /// pin on the agent it is bound to.
+    ///
+    /// A conversation may: the model picker in its header is the operator
+    /// saying "this thread, this model". A card's run session may not. It is
+    /// minted per (issue, agent) and reused by every later run of that agent
+    /// on that card, so a pin left on it would outlive the run that set it
+    /// and silently outrank every later edit of the agent's own profile —
+    /// leaving the board's roster showing a model the runs are not on. A run
+    /// follows its agent's current profile, and the door that writes a
+    /// session pin refuses one here rather than storing a pin nothing reads.
+    pub fn can_pin_its_own_llm(&self) -> bool {
+        match self {
+            TriggerSource::User | TriggerSource::Cron { .. } => true,
+            TriggerSource::Issue { .. } => false,
+        }
+    }
+
     /// The issue this session works on, if it is an issue session.
     pub fn issue(&self) -> Option<(&crate::ProjectId, &crate::IssueId, i64)> {
         match self {
@@ -473,6 +491,11 @@ pub struct SessionState {
     /// `AgentMessage::SetModel`. A stranded name (entry later removed)
     /// degrades safely — `LlmClientPool::resolve` falls back to the
     /// default with a warn.
+    ///
+    /// This field and its two siblings belong to a **conversation**: a
+    /// session [`TriggerSource::can_pin_its_own_llm`] says no to (a card's
+    /// run) is refused at that endpoint and skipped at spawn, so a value
+    /// left on such a row by an older build is inert.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_llm: Option<LlmEntryName>,
 

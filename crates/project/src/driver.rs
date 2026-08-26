@@ -18,25 +18,37 @@
 //!   [`already_asked`] is what stops that from being a loop that bills for
 //!   the same question every time a run ends anywhere on the board: the
 //!   lead is asked again only when the card has *changed* since it last
-//!   looked — or when the board changed a rule the answer was given under
-//!   ([`reopened_at`]).
+//!   looked. Only the card: a rule the board schedules by changing is also
+//!   news, but it is news about the **board**, and answering it once per
+//!   card is one billed run per card to decide one thing.
 //! - [`ran_dry`] is the one question about the **board**, and it is asked
 //!   only once every rule above it has declined. Each of those reads a
 //!   single card, and a card cannot see the thing that most often strands
 //!   it: an answer given about it whose premise was somewhere else. Every
 //!   per-card question declining is exactly the state in which that has
 //!   happened, which is what makes "the board has looked at all of it and
-//!   has no move left" a fact worth spending a run on.
-//!   [`nothing_has_happened_since_the_lead_looked`] is its guard.
+//!   has no move left" a fact worth spending a run on. It is also where a
+//!   changed rule lands, for the same reason: "the operator turned merging
+//!   on" is one fact about the whole board, and the lead reads the whole
+//!   board to answer it. [`nothing_has_happened_since_the_lead_looked`] is
+//!   its guard.
 //!
 //! Backlog is the one column the board **pulls** nothing from and still
 //! **asks** about, and the two halves of that are deliberate: a card only
 //! ever leaves Backlog because somebody decided it should, and
 //! [`awaiting_grooming`] asks the lead to be that somebody — but only for
 //! the cards the board itself filed there.
+//!
+//! Who filed it is therefore a term in every rule that could move a Backlog
+//! card, not only in the question named after it: [`board_may_take_up`] is
+//! the one home for it, and [`ran_dry`] and [`drain_anchor`] read it too.
+//! [`ran_dry`] asking without it was the hole — a person's parked card is
+//! live enough to keep the board from ever going quiet, and the drain
+//! question then hands the lead a whole board and asks it to find something
+//! to start.
 
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use baybo_store::project::{
     DrainMarks, IssuePriority, IssueRow, IssueRunRow, IssueStatus, RunStatus, RunTrigger,
@@ -63,12 +75,52 @@ pub(crate) fn busy(runs: impl IntoIterator<Item = i64>) -> BTreeSet<i64> {
 ///
 /// The two things the driver can do about a waiting card — start it, or ask
 /// who should — split on staffing and on nothing else, so every other gate
-/// belongs here rather than once per branch.
-fn is_waiting(issue: &IssueRow, busy: &BTreeSet<i64>) -> bool {
+/// belongs here rather than once per branch. [`held_by_a_stage`] is the
+/// newest of them, and it is here rather than in [`board_may_start`] on
+/// purpose: six rules read that one, and the two that read its *negation*
+/// ([`blocked`], and `ran_dry` through [`drain_anchor`]) would start
+/// reporting every step of a later stage as a card a block has stopped —
+/// handing the lead a question about a card nothing is wrong with.
+fn is_waiting(issue: &IssueRow, spoken_for: &BTreeSet<i64>, held: &BTreeSet<i64>) -> bool {
     issue.status == IssueStatus::Todo
-        && issue.cancelled_at.is_none()
+        && crate::runs::accepts_runs(issue)
         && board_may_start(issue)
-        && !busy.contains(&issue.number)
+        && !held.contains(&issue.number)
+        && !spoken_for.contains(&issue.number)
+}
+
+/// The steps whose stage the board has not reached, by number.
+///
+/// A card's place in a plan is `parent_issue_id` + `stage`, and until this
+/// existed nothing on the starting path read either: `is_waiting` asked only
+/// whether a row carried a block, so a plan was a thing the board displayed
+/// rather than a thing it kept. `IssueCreate`'s own schema promised the
+/// model otherwise, which is worse than silence — the model has no way to
+/// check, and a lead that filed eight steps across three stages watched the
+/// board start all of them straight away.
+///
+/// One grouping pass over the board the tick already holds, not a store
+/// read per card. **Fails open**: a step whose siblings are not in `issues`
+/// is not held, because a gate that guesses would strand work on a partial
+/// read.
+pub(crate) fn held_by_a_stage(issues: &[IssueRow]) -> BTreeSet<i64> {
+    let mut plans: BTreeMap<&baybo_model::IssueId, Vec<&IssueRow>> = BTreeMap::new();
+    for issue in issues {
+        if let Some(parent) = issue.parent_issue_id.as_ref() {
+            plans.entry(parent).or_default().push(issue);
+        }
+    }
+    issues
+        .iter()
+        .filter(|issue| {
+            issue.parent_issue_id.as_ref().is_some_and(|parent| {
+                plans.get(parent).is_some_and(|siblings| {
+                    !crate::stages::stage_is_open(siblings.iter().copied(), issue.stage)
+                })
+            })
+        })
+        .map(|issue| issue.number)
+        .collect()
 }
 
 /// Whether automatic board actions may start this card; operators may override blocks.
@@ -76,9 +128,37 @@ pub(crate) fn board_may_start(issue: &IssueRow) -> bool {
     issue.blocked_reason.is_none()
 }
 
+/// The columns work is under way in. Backlog is parked and Done is over, so
+/// neither is a column a card is woken in.
+pub(crate) fn is_live_work(status: IssueStatus) -> bool {
+    matches!(
+        status,
+        IssueStatus::Todo | IssueStatus::InProgress | IssueStatus::Review
+    )
+}
+
+/// Whether this card is work the **board** may take up on its own authority.
+///
+/// [`crate::runs::accepts_runs`] plus the one thing a row cannot say about
+/// itself: who put it in Backlog. A person parking a card there has exactly
+/// the standing of a person setting a block — the answer is "not now", given
+/// by somebody entitled to give it — so every rule that would not adjudicate
+/// the block must not reopen the column either. `agent_opened` is the
+/// board-wide authorship read [`awaiting_grooming`] is built on, and this is
+/// the one place the rule is spelled.
+///
+/// Deliberately *not* [`board_may_start`], which answers the other half —
+/// whether a card the board may take up is paused right now. The two are
+/// asked together everywhere except [`ran_dry`], whose blocked cards are
+/// filtered by [`drain_anchor`] instead.
+fn board_may_take_up(issue: &IssueRow, agent_opened: &BTreeSet<i64>) -> bool {
+    crate::runs::accepts_runs(issue)
+        && (is_live_work(issue.status) || agent_opened.contains(&issue.number))
+}
+
 /// A waiting card somebody is on: the board can start it.
-fn is_promotable(issue: &IssueRow, busy: &BTreeSet<i64>) -> bool {
-    is_waiting(issue, busy) && issue.assignee.is_some()
+fn is_promotable(issue: &IssueRow, spoken_for: &BTreeSet<i64>, held: &BTreeSet<i64>) -> bool {
+    is_waiting(issue, spoken_for, held) && issue.assignee.is_some()
 }
 
 /// A waiting card nobody is on: the board can only ask who should be.
@@ -86,8 +166,8 @@ fn is_promotable(issue: &IssueRow, busy: &BTreeSet<i64>) -> bool {
 /// Deliberately not `!is_promotable`, which would be true of every card on
 /// the board — cancelled, blocked, in another column, already running — and
 /// would send all of them to the lead as "unstaffed work".
-fn needs_staffing(issue: &IssueRow, busy: &BTreeSet<i64>) -> bool {
-    is_waiting(issue, busy) && issue.assignee.is_none()
+fn needs_staffing(issue: &IssueRow, spoken_for: &BTreeSet<i64>, held: &BTreeSet<i64>) -> bool {
+    is_waiting(issue, spoken_for, held) && issue.assignee.is_none()
 }
 
 /// Which of two ready cards goes first: the more urgent, then the one the
@@ -114,31 +194,37 @@ fn promotion_order(a: &IssueRow, b: &IssueRow) -> Ordering {
         .then(a.number.cmp(&b.number))
 }
 
+/// The cards a rule keeps, in the order every column is read in.
+///
+/// The rules below differ in exactly one thing — which cards they keep —
+/// and each used to spell the other three lines itself. Only the boilerplate
+/// is shared: every question keeps its own predicate, because they are six
+/// different questions with six different answers, and the point of hoisting
+/// this is that each one is now the one line that says what it asks.
+fn in_promotion_order(issues: &[IssueRow], keep: impl Fn(&IssueRow) -> bool) -> Vec<IssueRow> {
+    let mut hits: Vec<IssueRow> = issues.iter().filter(|i| keep(i)).cloned().collect();
+    hits.sort_by(promotion_order);
+    hits
+}
+
 /// The cards to move into In Progress, best first, at most `slots` of them.
 pub(crate) fn slate(issues: &[IssueRow], busy: &BTreeSet<i64>, slots: usize) -> Vec<IssueRow> {
+    // Ahead of the filter, not after it: a full board answers zero every
+    // pass, and a `truncate(0)` would pay for the clone and the sort first.
     if slots == 0 {
         return Vec::new();
     }
-    let mut ready: Vec<IssueRow> = issues
-        .iter()
-        .filter(|i| is_promotable(i, busy))
-        .cloned()
-        .collect();
-    ready.sort_by(promotion_order);
+    let held = held_by_a_stage(issues);
+    let mut ready = in_promotion_order(issues, |i| is_promotable(i, busy, &held));
     ready.truncate(slots);
     ready
 }
 
 /// The cards sitting in Todo with nobody on them, in the order the lead
 /// should be asked about them.
-pub(crate) fn awaiting_triage(issues: &[IssueRow], busy: &BTreeSet<i64>) -> Vec<IssueRow> {
-    let mut unstaffed: Vec<IssueRow> = issues
-        .iter()
-        .filter(|i| needs_staffing(i, busy))
-        .cloned()
-        .collect();
-    unstaffed.sort_by(promotion_order);
-    unstaffed
+pub(crate) fn awaiting_triage(issues: &[IssueRow], in_flight: &BTreeSet<i64>) -> Vec<IssueRow> {
+    let held = held_by_a_stage(issues);
+    in_promotion_order(issues, |i| needs_staffing(i, in_flight, &held))
 }
 
 /// Whether the lead may be asked about a live card it does not own.
@@ -147,7 +233,7 @@ fn takes_a_lead_question(
     in_flight: &BTreeSet<i64>,
     lead: &baybo_model::AgentProfileId,
 ) -> bool {
-    issue.cancelled_at.is_none()
+    crate::runs::accepts_runs(issue)
         && !in_flight.contains(&issue.number)
         && issue.assignee.as_ref() != Some(lead)
 }
@@ -158,37 +244,23 @@ pub(crate) fn blocked(
     in_flight: &BTreeSet<i64>,
     lead: &baybo_model::AgentProfileId,
 ) -> Vec<IssueRow> {
-    let mut paused: Vec<IssueRow> = issues
-        .iter()
-        .filter(|i| {
-            !board_may_start(i)
-                && crate::runs::accepts_runs(i)
-                && takes_a_lead_question(i, in_flight, lead)
-        })
-        .cloned()
-        .collect();
-    paused.sort_by(promotion_order);
-    paused
+    in_promotion_order(issues, |i| {
+        !board_may_start(i) && takes_a_lead_question(i, in_flight, lead)
+    })
 }
 
 /// The cards sitting in Review with nothing running on them, in the order
 /// the lead should be asked about them.
 pub(crate) fn awaiting_review(
     issues: &[IssueRow],
-    busy: &BTreeSet<i64>,
+    in_flight: &BTreeSet<i64>,
     lead: &baybo_model::AgentProfileId,
 ) -> Vec<IssueRow> {
-    let mut waiting: Vec<IssueRow> = issues
-        .iter()
-        .filter(|i| {
-            i.status == IssueStatus::Review
-                && board_may_start(i)
-                && takes_a_lead_question(i, busy, lead)
-        })
-        .cloned()
-        .collect();
-    waiting.sort_by(promotion_order);
-    waiting
+    in_promotion_order(issues, |i| {
+        i.status == IssueStatus::Review
+            && board_may_start(i)
+            && takes_a_lead_question(i, in_flight, lead)
+    })
 }
 
 /// The cards sitting in In Progress with no run working them and nothing
@@ -200,26 +272,46 @@ pub(crate) fn awaiting_review(
 /// card's runs in hand.
 pub(crate) fn stalled(
     issues: &[IssueRow],
-    busy: &BTreeSet<i64>,
+    in_flight: &BTreeSet<i64>,
     lead: &baybo_model::AgentProfileId,
 ) -> Vec<IssueRow> {
-    let mut stuck: Vec<IssueRow> = issues
-        .iter()
-        .filter(|i| {
-            i.status == IssueStatus::InProgress
-                && board_may_start(i)
-                && takes_a_lead_question(i, busy, lead)
-        })
-        .cloned()
-        .collect();
-    stuck.sort_by(promotion_order);
-    stuck
+    in_promotion_order(issues, |i| {
+        i.status == IssueStatus::InProgress
+            && board_may_start(i)
+            && takes_a_lead_question(i, in_flight, lead)
+    })
 }
 
 /// Whether the latest block was agent-authored.
 pub(crate) fn block_is_an_agents_question(events: &[baybo_store::project::IssueEventRow]) -> bool {
     newest_block(events)
         .is_some_and(|e| matches!(e.actor, baybo_store::project::IssueActor::Agent(_)))
+}
+
+/// Whether the stop standing on this card is a **person's**.
+///
+/// The same shape as [`block_is_an_agents_question`], and for the same
+/// reason: the row says only that a card is cancelled, and who decided it
+/// lives on the timeline. A stop the board did not set is not the board's to
+/// take back.
+///
+/// Reads the newest entry of *either* direction, because a card called off
+/// and reopened carries both and only the last of them is still standing.
+pub(crate) fn cancel_is_a_persons_stop(events: &[baybo_store::project::IssueEventRow]) -> bool {
+    events
+        .iter()
+        .rev()
+        .find(|e| {
+            matches!(
+                e.body,
+                baybo_store::project::IssueEventBody::Cancelled
+                    | baybo_store::project::IssueEventBody::Uncancelled
+            )
+        })
+        .is_some_and(|e| {
+            matches!(e.body, baybo_store::project::IssueEventBody::Cancelled)
+                && !matches!(e.actor, baybo_store::project::IssueActor::Agent(_))
+        })
 }
 
 pub(crate) fn blocked_at(
@@ -284,22 +376,17 @@ pub(crate) fn awaiting_grooming(
     agent_opened: &BTreeSet<i64>,
     lead: &baybo_model::AgentProfileId,
 ) -> Vec<IssueRow> {
-    let mut parked: Vec<IssueRow> = issues
-        .iter()
-        .filter(|i| {
-            i.status == IssueStatus::Backlog
-                && agent_opened.contains(&i.number)
-                && board_may_start(i)
-                && takes_a_lead_question(i, in_flight, lead)
-        })
-        .cloned()
-        .collect();
-    parked.sort_by(promotion_order);
-    parked
+    in_promotion_order(issues, |i| {
+        i.status == IssueStatus::Backlog
+            && board_may_take_up(i, agent_opened)
+            && board_may_start(i)
+            && takes_a_lead_question(i, in_flight, lead)
+    })
 }
 
 /// Whether the board has run dry: nothing executing, nothing this pass
-/// promoted, and live work still sitting on it.
+/// promoted, and work the board may take up still sitting on it
+/// ([`board_may_take_up`] — an operator's parked Backlog is not it).
 ///
 /// The one board-scale question in this module, and it has to be one: it is
 /// asked last, after every per-card question declined, so what it reports is
@@ -313,8 +400,13 @@ pub(crate) fn awaiting_grooming(
 /// Capacity is the caller's gate, as it is for every other question here:
 /// `ask_the_lead` runs only with a slot to spare, and a board an operator
 /// stopped by setting its parallelism to zero is stopped, not drained.
-pub(crate) fn ran_dry(issues: &[IssueRow], in_flight: &BTreeSet<i64>, promoted: usize) -> bool {
-    promoted == 0 && in_flight.is_empty() && issues.iter().any(crate::runs::accepts_runs)
+pub(crate) fn ran_dry(
+    issues: &[IssueRow],
+    working: &BTreeSet<i64>,
+    agent_opened: &BTreeSet<i64>,
+    promoted: usize,
+) -> bool {
+    promoted == 0 && working.is_empty() && issues.iter().any(|i| board_may_take_up(i, agent_opened))
 }
 
 /// Whether the board has done anything since the lead last had it in front
@@ -330,15 +422,34 @@ pub(crate) fn ran_dry(issues: &[IssueRow], in_flight: &BTreeSet<i64>, promoted: 
 /// answer when it is given and a dead end the moment the other card lands,
 /// and the landing touches nothing the deferred card carries.
 ///
+/// A **cancelled** run is on the look side of that asymmetry and not the
+/// work side, which is what [`newest_run_was_cancelled`] does per card and
+/// this does for the board: somebody stopping a run read the board to do it,
+/// and asking the lead what to do next would countermand them one tick after
+/// they decided.
+///
 /// It also closes the obvious spin for free: the drain question is itself a
 /// wake, so being asked is being looked at, and answering it is not work.
 ///
 /// A board nothing has ever run on has never been looked at, and that is the
 /// truth rather than an edge case: cards were filed and nothing came.
-pub(crate) fn nothing_has_happened_since_the_lead_looked(marks: &DrainMarks) -> bool {
+/// `rules_changed_at` is the third mark, and the one no card can carry.
+/// "Escalate this to somebody who may merge" is a *complete* answer while
+/// the board's agents may not merge, and the board being told they now may
+/// is the only thing that ever happens next — it touches no card. Asked
+/// here it costs **one** run: answering is a look, which moves `looked_at`
+/// past the stamp, so a burst of saves is one question and not one per save
+/// per card. Asked per card it cost nine runs across five cards, each of
+/// them reading one card to decide something about all of them.
+pub(crate) fn nothing_has_happened_since_the_lead_looked(
+    marks: &DrainMarks,
+    rules_changed_at: chrono::DateTime<chrono::Utc>,
+) -> bool {
     match (marks.looked_at, marks.worked_at) {
         (None, _) => false,
-        (Some(looked), worked) => worked.is_none_or(|worked| worked <= looked),
+        (Some(looked), worked) => {
+            rules_changed_at <= looked && worked.is_none_or(|worked| worked <= looked)
+        }
     }
 }
 
@@ -348,67 +459,59 @@ pub(crate) fn nothing_has_happened_since_the_lead_looked(marks: &DrainMarks) -> 
 /// needs one to live on. The pick is the order every column is already read
 /// in, over the cards the board could act on — filing it against a blocked
 /// card would put a run on work an operator paused, and `parked_by_a_block`
-/// would hold that run rather than deliver it.
+/// would hold that run rather than deliver it. A card the operator parked in
+/// Backlog is the same paused work under a different name, which is what
+/// [`board_may_take_up`] keeps out: this question reads the whole board, so
+/// anchoring it on such a card hands the lead the one card it may not move.
 ///
 /// Deliberately **not** [`takes_a_lead_question`]: a card whose assignee is
 /// the lead is excluded from every question *about a card*, because the
 /// lead's own card has no other party. This question is not about the card,
 /// and a board whose only live card is the lead's is precisely a board with
 /// nothing else to anchor to.
-pub(crate) fn drain_anchor(issues: &[IssueRow], in_flight: &BTreeSet<i64>) -> Option<IssueRow> {
+pub(crate) fn drain_anchor(
+    issues: &[IssueRow],
+    in_flight: &BTreeSet<i64>,
+    agent_opened: &BTreeSet<i64>,
+) -> Option<IssueRow> {
     issues
         .iter()
         .filter(|i| {
-            crate::runs::accepts_runs(i) && board_may_start(i) && !in_flight.contains(&i.number)
+            board_may_take_up(i, agent_opened)
+                && board_may_start(i)
+                && !in_flight.contains(&i.number)
         })
         .min_by(|a, b| promotion_order(a, b))
         .cloned()
 }
 
-/// A card whose newest run was **cancelled** is not stalled: a cancel is a
-/// decision — a human's stop, or the board calling a row off — and waking
-/// the lead to get the work going again would countermand it within one
-/// tick. The stop stands until somebody acts on the card, which makes it a
-/// new question.
+/// Whether the newest run on this card was **cancelled**: a decision — a
+/// human's stop, or the board calling a row off — and waking the lead to get
+/// the work going again would countermand it within one tick. The stop
+/// stands until somebody acts on the card, which makes it a new question.
+///
+/// Read by every lead question but `Blocked`, whose own preparation settles
+/// a run `Cancelled` before asking; and by the drain question through
+/// `DrainMarks`, where a cancelled run does not count as the board working.
 pub(crate) fn newest_run_was_cancelled(runs: &[IssueRunRow]) -> bool {
     runs.iter()
         .max_by_key(|run| run.created_at)
         .is_some_and(|run| run.status == RunStatus::Cancelled)
 }
 
-/// When this card last became a fresh question, before any run is weighed:
-/// its own row changing, or the board changing a rule it schedules by.
-///
-/// The second half is the part a card cannot see about itself. "Escalate
-/// this to somebody who may merge" is a *complete* answer while the board's
-/// agents may not merge, and the board being told they now may is the only
-/// thing that ever happens next — it touches no card, so a guard reading the
-/// card alone goes on holding an answer whose premise is gone. Same shape
-/// for a ceiling raised, a parallelism raised off zero, and a board restored
-/// from the archive: the operator changed what the board may do, and every
-/// standing answer was given under the old rules.
-///
-/// Deliberately the whole board at once rather than an edge per rule. Which
-/// card a given rule could unstick is not knowable here — the reason lives
-/// in the lead's prose — and one re-ask per operator action is the bound
-/// that makes guessing unnecessary.
-fn reopened_at(
-    issue: &IssueRow,
-    rules_changed_at: chrono::DateTime<chrono::Utc>,
-) -> chrono::DateTime<chrono::Utc> {
-    issue.updated_at.max(rules_changed_at)
-}
-
-/// When this card last changed in a way the lead has not seen:
-/// [`reopened_at`], or the settle of its newest *work* run, whichever is
+/// When this card last changed in a way the lead has not seen: its own
+/// `updated_at`, or the settle of its newest *work* run, whichever is
 /// later. Coordination runs are excluded on both sides of the question —
 /// the lead looking at a card is not the card changing.
-fn last_activity(
-    issue: &IssueRow,
-    runs: &[IssueRunRow],
-    rules_changed_at: chrono::DateTime<chrono::Utc>,
-) -> chrono::DateTime<chrono::Utc> {
-    let reopened = reopened_at(issue, rules_changed_at);
+///
+/// Deliberately reads **only the card**. A board-wide rule change is also
+/// something the lead has not seen, and it used to be folded in here — but
+/// a fact about the board, answered once per card, is asked once per card,
+/// and the lead then reads one card at a time to decide something about all
+/// of them. It belongs to the board question, where
+/// [`nothing_has_happened_since_the_lead_looked`] spends one run on it.
+fn last_activity(issue: &IssueRow, runs: &[IssueRunRow]) -> chrono::DateTime<chrono::Utc> {
+    let reopened = issue.updated_at;
     runs.iter()
         .filter(|run| !run.trigger.is_coordination())
         .filter_map(|run| run.settled_at)
@@ -440,24 +543,22 @@ const MAX_ASKS_PER_CARD_STATE: usize = 2;
 /// count as the question having been asked. It still counts against the
 /// cap: a card whose checkout refuses to cut should not be retried every
 /// tick forever.
-pub(crate) fn already_asked(
-    issue: &IssueRow,
-    runs: &[IssueRunRow],
-    question: RunTrigger,
-    rules_changed_at: chrono::DateTime<chrono::Utc>,
-) -> bool {
-    let activity = last_activity(issue, runs, rules_changed_at);
+pub(crate) fn already_asked(issue: &IssueRow, runs: &[IssueRunRow], question: RunTrigger) -> bool {
+    let activity = last_activity(issue, runs);
     let asks = runs.iter().filter(|run| run.trigger == question);
     let delivered = asks.clone().any(|run| {
         run.created_at >= activity && !(run.status == RunStatus::Failed && !run.was_claimed())
     });
-    // The cap counts against the same mark, and not against `updated_at`
-    // alone: a board whose rules changed has not asked this question under
-    // them at all, so a card that spent its two asks under the old ones is
-    // not a card that has been asked.
+    // Both halves count against the card and nothing else. When the rule
+    // stamp reached in here as well, the pair was unbounded: `delivered` is
+    // false after every save — the stamp has just moved past every ask —
+    // leaving the cap as the only thing counting, and counting it from a
+    // mark the save moved counts to zero every time. A short burst of saves
+    // of one board's settings bought nine lead runs across five cards that
+    // way, none of which changed anything.
     delivered
         || asks
-            .filter(|run| run.created_at >= reopened_at(issue, rules_changed_at))
+            .filter(|run| run.created_at >= issue.updated_at)
             .count()
             >= MAX_ASKS_PER_CARD_STATE
 }
@@ -505,6 +606,22 @@ mod tests {
 
     /// A board with nothing recorded against any card.
     fn idle() -> BTreeSet<i64> {
+        BTreeSet::new()
+    }
+
+    /// A board with no plan on it, so no step is waiting for a stage.
+    fn no_stage_holds() -> BTreeSet<i64> {
+        BTreeSet::new()
+    }
+
+    /// The cards the board filed itself, by number — what
+    /// `ProjectStore::agent_opened_issues` answers.
+    fn the_boards_own(numbers: impl IntoIterator<Item = i64>) -> BTreeSet<i64> {
+        numbers.into_iter().collect()
+    }
+
+    /// A board where every parked card is the operator's.
+    fn all_the_operators() -> BTreeSet<i64> {
         BTreeSet::new()
     }
 
@@ -559,7 +676,7 @@ mod tests {
     #[test]
     fn staffing_is_the_only_thing_the_two_branches_disagree_about() {
         assert!(
-            is_promotable(&ready(1), &idle()),
+            is_promotable(&ready(1), &idle(), &no_stage_holds()),
             "the control: a staffed card in Todo with nothing against it is startable"
         );
 
@@ -569,7 +686,10 @@ mod tests {
             let mut unstaffed = staffed.clone();
             unstaffed.assignee = None;
 
-            assert!(!is_promotable(&staffed, &idle()), "promoted anyway: {why}");
+            assert!(
+                !is_promotable(&staffed, &idle(), &no_stage_holds()),
+                "promoted anyway: {why}"
+            );
             assert!(
                 awaiting_triage(&[unstaffed], &idle()).is_empty(),
                 "sent to the lead as unstaffed work anyway: {why}"
@@ -582,7 +702,7 @@ mod tests {
         let mut unstaffed = ready(1);
         unstaffed.assignee = None;
         assert!(
-            !is_promotable(&unstaffed, &idle()),
+            !is_promotable(&unstaffed, &idle(), &no_stage_holds()),
             "In Progress needs an assignee, so an unassigned card cannot be promoted into it"
         );
         assert_eq!(
@@ -668,29 +788,19 @@ mod tests {
         let mut card = ready(1);
         card.assignee = None;
         assert!(
-            !already_asked(&card, &[], RunTrigger::Triage, rules_never_changed()),
+            !already_asked(&card, &[], RunTrigger::Triage),
             "a card nobody has looked at is a fresh question"
         );
 
         let asked = triage_run(&card, card.updated_at + Duration::seconds(1));
         assert!(
-            already_asked(
-                &card,
-                std::slice::from_ref(&asked),
-                RunTrigger::Triage,
-                rules_never_changed()
-            ),
+            already_asked(&card, std::slice::from_ref(&asked), RunTrigger::Triage),
             "a lead that read the card and left it alone must not be asked again"
         );
 
         card.updated_at = asked.created_at + Duration::seconds(1);
         assert!(
-            !already_asked(
-                &card,
-                std::slice::from_ref(&asked),
-                RunTrigger::Triage,
-                rules_never_changed()
-            ),
+            !already_asked(&card, std::slice::from_ref(&asked), RunTrigger::Triage),
             "but editing the card makes it a question the lead has not answered"
         );
 
@@ -699,12 +809,7 @@ mod tests {
             ..triage_run(&card, card.updated_at + Duration::seconds(1))
         };
         assert!(
-            !already_asked(
-                &card,
-                &[asked, other],
-                RunTrigger::Triage,
-                rules_never_changed()
-            ),
+            !already_asked(&card, &[asked, other], RunTrigger::Triage),
             "and a run that was not a triage is not an answer to one"
         );
     }
@@ -712,26 +817,75 @@ mod tests {
     #[test]
     fn a_board_has_run_dry_only_with_work_left_on_it_and_nothing_moving() {
         let live = issue(1, IssueStatus::Backlog);
+        let boards_own = the_boards_own([1]);
         assert!(
-            ran_dry(std::slice::from_ref(&live), &idle(), 0),
+            ran_dry(std::slice::from_ref(&live), &idle(), &boards_own, 0),
             "a card nothing will ever start, and nothing running to start it"
         );
         assert!(
-            !ran_dry(std::slice::from_ref(&live), &busy([2]), 0),
+            !ran_dry(std::slice::from_ref(&live), &busy([2]), &boards_own, 0),
             "a board with a run on it is working, whatever that run is on"
         );
         assert!(
-            !ran_dry(std::slice::from_ref(&live), &idle(), 1),
+            !ran_dry(std::slice::from_ref(&live), &idle(), &boards_own, 1),
             "and a pass that just promoted something has not run dry — the \
              slate it filled is not in flight yet"
+        );
+        assert!(
+            !ran_dry(
+                std::slice::from_ref(&live),
+                &idle(),
+                &all_the_operators(),
+                0
+            ),
+            "but the same card parked by a person is not work the board is \
+             stuck on — it is work somebody said not yet to, and a board with \
+             nothing else on it is quiet"
         );
 
         let finished = issue(1, IssueStatus::Done);
         let mut cancelled = issue(2, IssueStatus::Todo);
         cancelled.cancelled_at = Some(Utc::now());
         assert!(
-            !ran_dry(&[finished, cancelled], &idle(), 0),
+            !ran_dry(&[finished, cancelled], &idle(), &the_boards_own([1, 2]), 0),
             "a board the work is over on is quiet, not stuck"
+        );
+    }
+
+    /// A rule the board schedules by is the one thing the lead has not seen
+    /// that no card carries: "escalate this to somebody who may merge" is a
+    /// complete answer while the board's agents may not, and the operator
+    /// turning it on touches nothing.
+    ///
+    /// It lives here rather than on each card because it is one fact about
+    /// the whole board. Asked per card it cost nine runs across five cards,
+    /// each reading one card to decide something about all of them — and, because it moved the mark the ask cap counted from, it
+    /// minted the quota to keep doing so. Asked here it costs one run, and
+    /// answering it is a look, so the save after it buys nothing.
+    #[test]
+    fn a_rule_the_board_changed_makes_the_board_a_question_once() {
+        let looked = Utc::now();
+        let quiet = DrainMarks {
+            looked_at: Some(looked),
+            worked_at: Some(looked - Duration::seconds(1)),
+        };
+        assert!(
+            nothing_has_happened_since_the_lead_looked(&quiet, looked - Duration::seconds(1)),
+            "the control: a rule changed before the lead looked is a rule it looked under"
+        );
+        assert!(
+            !nothing_has_happened_since_the_lead_looked(&quiet, looked + Duration::seconds(1)),
+            "a rule changed since is a board the lead has not read under it"
+        );
+
+        let answered = DrainMarks {
+            looked_at: Some(looked + Duration::seconds(2)),
+            ..quiet
+        };
+        assert!(
+            nothing_has_happened_since_the_lead_looked(&answered, looked + Duration::seconds(1)),
+            "and answering it is a look, so the board is quiet again — a burst \
+             of saves is one question, not one per save"
         );
     }
 
@@ -739,29 +893,41 @@ mod tests {
     fn the_board_is_told_it_ran_dry_only_when_work_outlived_the_leads_last_look() {
         let looked = Utc::now();
         assert!(
-            !nothing_has_happened_since_the_lead_looked(&DrainMarks::default()),
+            !nothing_has_happened_since_the_lead_looked(
+                &DrainMarks::default(),
+                rules_never_changed()
+            ),
             "a board nothing ever ran on has never been looked at; cards were \
              filed and nothing came for them"
         );
         assert!(
-            nothing_has_happened_since_the_lead_looked(&DrainMarks {
-                looked_at: Some(looked),
-                worked_at: None,
-            }),
+            nothing_has_happened_since_the_lead_looked(
+                &DrainMarks {
+                    looked_at: Some(looked),
+                    worked_at: None,
+                },
+                rules_never_changed(),
+            ),
             "a lead woken on a board nothing has run on has been shown all of it"
         );
         assert!(
-            nothing_has_happened_since_the_lead_looked(&DrainMarks {
-                looked_at: Some(looked),
-                worked_at: Some(looked - Duration::seconds(1)),
-            }),
+            nothing_has_happened_since_the_lead_looked(
+                &DrainMarks {
+                    looked_at: Some(looked),
+                    worked_at: Some(looked - Duration::seconds(1)),
+                },
+                rules_never_changed(),
+            ),
             "and work that settled before that look is work the look covered"
         );
         assert!(
-            !nothing_has_happened_since_the_lead_looked(&DrainMarks {
-                looked_at: Some(looked),
-                worked_at: Some(looked + Duration::seconds(1)),
-            }),
+            !nothing_has_happened_since_the_lead_looked(
+                &DrainMarks {
+                    looked_at: Some(looked),
+                    worked_at: Some(looked + Duration::seconds(1)),
+                },
+                rules_never_changed(),
+            ),
             "but work that outlived the last look is a board nobody has read \
              since it stopped — the one shape a stale deferral hides in"
         );
@@ -774,18 +940,39 @@ mod tests {
         urgent.priority = IssuePriority::Urgent;
         let ordinary = issue(1, IssueStatus::Backlog);
         assert_eq!(
-            drain_anchor(&[ordinary.clone(), urgent.clone()], &idle()).map(|i| i.number),
+            drain_anchor(
+                &[ordinary.clone(), urgent.clone()],
+                &idle(),
+                &the_boards_own([1, 2])
+            )
+            .map(|i| i.number),
             Some(2),
             "the same order every column is read in"
+        );
+        assert!(
+            drain_anchor(
+                &[ordinary.clone(), urgent.clone()],
+                &idle(),
+                &all_the_operators()
+            )
+            .is_none(),
+            "the same two cards parked by a person are the operator's answer, \
+             not the board's to anchor a run on"
         );
 
         let mut the_leads_own = issue(3, IssueStatus::Review);
         the_leads_own.assignee = Some(lead);
         assert_eq!(
-            drain_anchor(std::slice::from_ref(&the_leads_own), &idle()).map(|i| i.number),
+            drain_anchor(
+                std::slice::from_ref(&the_leads_own),
+                &idle(),
+                &all_the_operators()
+            )
+            .map(|i| i.number),
             Some(3),
             "a board whose only live card is the lead's still has a board to \
-             ask about — the question is not about the card"
+             ask about — the question is not about the card, and authorship \
+             only ever speaks for Backlog"
         );
 
         let mut paused = ordinary;
@@ -793,69 +980,9 @@ mod tests {
         let mut also_paused = urgent;
         also_paused.blocked_reason = Some("waiting on the operator".into());
         assert!(
-            drain_anchor(&[paused, also_paused], &idle()).is_none(),
+            drain_anchor(&[paused, also_paused], &idle(), &the_boards_own([1, 2])).is_none(),
             "every live card paused is nothing the board may act on, and each \
              block has already been put to the lead once"
-        );
-    }
-
-    #[test]
-    fn a_rule_the_board_changed_re_opens_a_question_the_card_cannot_see() {
-        let mut card = ready(1);
-        card.assignee = None;
-        let asked = triage_run(&card, card.updated_at + Duration::seconds(1));
-        let runs = std::slice::from_ref(&asked);
-
-        assert!(
-            already_asked(&card, runs, RunTrigger::Triage, rules_never_changed()),
-            "the control: answered, and the card has not moved since"
-        );
-        assert!(
-            already_asked(
-                &card,
-                runs,
-                RunTrigger::Triage,
-                asked.created_at - Duration::seconds(1)
-            ),
-            "a rule changed before the lead answered is a rule it answered under"
-        );
-        assert!(
-            !already_asked(
-                &card,
-                runs,
-                RunTrigger::Triage,
-                asked.created_at + Duration::seconds(1)
-            ),
-            "but an answer given under rules the board no longer has is not an              answer to the board as it stands, and nothing on the card says so"
-        );
-    }
-
-    #[test]
-    fn a_rule_change_hands_back_the_asks_a_card_spent_under_the_old_ones() {
-        let card = ready(1);
-        // Two asks that died before their brief: they never reached the
-        // lead, so only the cap is holding the question shut.
-        let spent: Vec<IssueRunRow> = (1..=2)
-            .map(|n| IssueRunRow {
-                status: RunStatus::Failed,
-                settled_at: Some(card.updated_at + Duration::seconds(n * 2)),
-                ..triage_run(&card, card.updated_at + Duration::seconds(n * 2 - 1))
-            })
-            .collect();
-        assert!(
-            already_asked(&card, &spent, RunTrigger::Triage, rules_never_changed()),
-            "the control: the cap is what stops a card that will not dispatch"
-        );
-
-        let newest_ask = spent.iter().map(|run| run.created_at).max().expect("asks");
-        assert!(
-            !already_asked(
-                &card,
-                &spent,
-                RunTrigger::Triage,
-                newest_ask + Duration::seconds(1)
-            ),
-            "a cap spent under the old rules is not a cap spent under these:              the board has not asked this question once since they changed"
         );
     }
 
@@ -870,12 +997,7 @@ mod tests {
             ..triage_run(&card, card.updated_at)
         };
         assert!(
-            !already_asked(
-                &card,
-                &[asked.clone(), worked],
-                RunTrigger::Triage,
-                rules_never_changed()
-            ),
+            !already_asked(&card, &[asked.clone(), worked], RunTrigger::Triage),
             "a work run settling after the lead looked is news the lead has not seen"
         );
 
@@ -885,12 +1007,7 @@ mod tests {
             ..triage_run(&card, card.updated_at)
         };
         assert!(
-            already_asked(
-                &card,
-                &[asked, looked_again],
-                RunTrigger::Triage,
-                rules_never_changed()
-            ),
+            already_asked(&card, &[asked, looked_again], RunTrigger::Triage),
             "but the lead's own coordination runs are not the card changing"
         );
     }
@@ -999,7 +1116,7 @@ mod tests {
         let mut parked = ready(1);
         parked.status = IssueStatus::Backlog;
         let board = [parked.clone()];
-        let opened = busy([1]);
+        let opened = the_boards_own([1]);
 
         assert_eq!(
             numbers(&awaiting_grooming(&board, &busy([]), &opened, &lead)),
@@ -1007,7 +1124,7 @@ mod tests {
             "the control: this card is the lead's to groom"
         );
         assert!(
-            !is_promotable(&parked, &idle()),
+            !is_promotable(&parked, &idle(), &no_stage_holds()),
             "and the board still starts nothing out of Backlog"
         );
         assert!(
@@ -1019,6 +1136,20 @@ mod tests {
         assert!(
             awaiting_triage(&[unstaffed], &idle()).is_empty(),
             "…and an unstaffed one is a grooming question, not a triage one"
+        );
+
+        // The two board-scale rules, which this test used not to name — and
+        // that omission is the whole of how the board came to start the
+        // operator's parked cards through the door underneath grooming.
+        assert!(
+            ran_dry(&board, &idle(), &opened, 0)
+                && drain_anchor(&board, &idle(), &opened).is_some(),
+            "the board's own parked card is still work it is stuck on"
+        );
+        assert!(
+            !ran_dry(&board, &idle(), &all_the_operators(), 0)
+                && drain_anchor(&board, &idle(), &all_the_operators()).is_none(),
+            "and the operator's is not — grooming's rule is the same rule here"
         );
     }
 
@@ -1135,12 +1266,7 @@ mod tests {
             ..triage_run(&card, card.updated_at + Duration::seconds(1))
         };
         assert!(
-            !already_asked(
-                &card,
-                std::slice::from_ref(&failed_ask),
-                RunTrigger::Triage,
-                rules_never_changed()
-            ),
+            !already_asked(&card, std::slice::from_ref(&failed_ask), RunTrigger::Triage),
             "an ask that died before its brief is not the lead having looked"
         );
         // — but a card that keeps refusing to dispatch is not retried
@@ -1151,12 +1277,7 @@ mod tests {
             ..triage_run(&card, card.updated_at + Duration::seconds(3))
         };
         assert!(
-            already_asked(
-                &card,
-                &[failed_ask, second_failed],
-                RunTrigger::Triage,
-                rules_never_changed()
-            ),
+            already_asked(&card, &[failed_ask, second_failed], RunTrigger::Triage),
             "two dead asks on an unchanged card stop the retry loop"
         );
     }
@@ -1185,14 +1306,14 @@ mod tests {
             at += Duration::seconds(2);
         }
         assert!(
-            already_asked(&card, &runs, RunTrigger::Triage, rules_never_changed()),
+            already_asked(&card, &runs, RunTrigger::Triage),
             "the machinery's own echo cannot re-raise the question a third time"
         );
 
         let mut edited = card.clone();
         edited.updated_at = at + Duration::seconds(1);
         assert!(
-            !already_asked(&edited, &runs, RunTrigger::Triage, rules_never_changed()),
+            !already_asked(&edited, &runs, RunTrigger::Triage),
             "but somebody changing the card resets the cap"
         );
     }

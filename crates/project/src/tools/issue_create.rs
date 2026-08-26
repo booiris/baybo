@@ -68,7 +68,7 @@ Putting an issue straight into `in_progress` with an assignee starts that agent 
                 "status": status_schema("Which column it opens in. Defaults to `backlog`."),
                 "priority": priority_schema("Informs triage; it never reorders the board on its own."),
                 "assignee": super::assignee_schema(true),
-                "parent": { "type": "integer", "description": "Open it as a step of that issue's number. One level only — a step cannot have steps." },
+                "parent": { "type": "integer", "minimum": 0, "description": "Open it as a step of that issue's positive card number. Use `0` when the strict schema requires a value but this is a top-level card." },
                 "stage": { "type": "integer", "description": "Which barrier under the parent (default 0). Stage N starts when every step of stage N-1 is done." },
                 "key": { "type": "string", "description": "Only inside a scheduled check: distinguishes several cards this check files. Omit it and the check keeps one open card, which is what you want for a recurring finding." },
             },
@@ -120,7 +120,7 @@ Putting an issue straight into `in_progress` with an assignee starts that agent 
                         .transpose()?
                         .unwrap_or(IssuePriority::None),
                     assignee,
-                    parent: p.parent,
+                    parent: p.parent.filter(|parent| *parent > 0),
                     stage: p.stage,
                     source_key: super::source_key(ctx, p.key.as_deref()),
                     filed_from: filed_from(ctx),

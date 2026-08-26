@@ -158,8 +158,8 @@ impl Tool for ReadTool {
             "type": "object",
             "properties": {
                 "file_path": { "type": "string", "description": "Absolute path; relative is rejected" },
-                "offset": { "type": "integer", "minimum": 1, "description": "Line number to start reading from (1-based)" },
-                "limit": { "type": "integer", "minimum": 1, "description": &*LIMIT_DESC }
+                "offset": { "type": "integer", "minimum": 0, "description": "Line number to start reading from (1-based). Use `0` when the strict schema requires a value but reading should start at line 1." },
+                "limit": { "type": "integer", "minimum": 0, "description": format!("{}. Use `0` when the strict schema requires a value but the default is wanted.", &*LIMIT_DESC) }
             },
             "required": ["file_path"]
         })
@@ -197,6 +197,8 @@ impl Tool for ReadTool {
     async fn execute(&self, params: Value, ctx: &ToolContext) -> crate::Result<ToolOutput> {
         let p: Params =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
+        let offset = p.offset.filter(|offset| *offset > 0);
+        let limit = p.limit.filter(|limit| *limit > 0);
 
         require_absolute(&p.file_path, READ_TOOL_NAME, "file_path")?;
 
@@ -209,10 +211,7 @@ impl Tool for ReadTool {
                 session_id: &ctx.session_id,
                 user: &ctx.user,
             };
-            let window = crate::VirtualReadWindow {
-                offset: p.offset,
-                limit: p.limit,
-            };
+            let window = crate::VirtualReadWindow { offset, limit };
             // The resolver returns finished `Read`-style output for the
             // window — pagination happens at the source so the whole
             // virtual file is never materialised per page.
@@ -230,8 +229,8 @@ impl Tool for ReadTool {
             )));
         }
 
-        let start = p.offset.unwrap_or(1).saturating_sub(1);
-        let limit = p.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
+        let start = offset.unwrap_or(1).saturating_sub(1);
+        let limit = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
         let end = start.saturating_add(limit);
 
         let meta = tokio::fs::metadata(&p.file_path).await.ok();
@@ -496,6 +495,20 @@ mod tests {
             !s.contains("v2"),
             "limit=1 must stop before the second line"
         );
+    }
+
+    #[tokio::test]
+    async fn zero_pagination_fillers_use_the_defaults() {
+        let out = ReadTool
+            .execute(
+                json!({ "file_path": "/no/such/file", "offset": 0, "limit": 0 }),
+                &ctx_with(Arc::new(StubResolver::Content("v1\nv2".into()))),
+            )
+            .await
+            .unwrap();
+        let ToolOutput::Text(s) = out else { panic!() };
+        assert!(s.contains("1\tv1"), "{s}");
+        assert!(s.contains("2\tv2"), "{s}");
     }
 
     #[tokio::test]

@@ -67,13 +67,13 @@ impl Tool for PutBlobTool {
                 },
                 "mime_type": {
                     "type": "string",
-                    "description": "Optional MIME type. Defaults from the file extension, then application/octet-stream."
+                    "description": "Optional MIME type. Defaults from the file extension; an empty string also uses that default."
                 },
                 "max_bytes": {
                     "type": "integer",
-                    "minimum": 1,
+                    "minimum": 0,
                     "maximum": MAX_BYTES,
-                    "description": "Optional smaller upload cap for the calling protocol."
+                    "description": "Optional smaller upload cap for the calling protocol. Use `0` when the strict schema requires a value but the default cap is wanted."
                 }
             },
             "required": ["path"]
@@ -112,9 +112,7 @@ impl Tool for PutBlobTool {
 
 fn requested_limit(requested: Option<u64>) -> crate::Result<u64> {
     match requested {
-        Some(0) => Err(ToolError::InvalidParams(
-            "max_bytes must be greater than zero".to_string(),
-        )),
+        Some(0) => Ok(MAX_BYTES),
         Some(value) if value > MAX_BYTES => Err(ToolError::InvalidParams(format!(
             "max_bytes {value} exceeds the {MAX_BYTES}-byte blob cap"
         ))),
@@ -218,12 +216,18 @@ mod tests {
         let path = dir.path().join("bounded.bin");
         tokio::fs::write(&path, b"12345").await.unwrap();
         let too_large = put_blob
-            .execute(json!({ "path": path, "max_bytes": 4 }), &ctx)
+            .execute(json!({ "path": &path, "max_bytes": 4 }), &ctx)
             .await
             .unwrap_err();
         assert!(too_large.to_string().contains("4-byte cap"));
 
-        for invalid in [0, MAX_BYTES + 1] {
+        let default_cap = put_blob
+            .execute(json!({ "path": &path, "max_bytes": 0 }), &ctx)
+            .await
+            .unwrap();
+        assert!(matches!(default_cap, ToolOutput::Json(_)));
+
+        for invalid in [MAX_BYTES + 1] {
             let error = put_blob
                 .execute(
                     json!({ "path": "/tmp/payload.bin", "max_bytes": invalid }),

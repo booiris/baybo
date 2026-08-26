@@ -230,7 +230,7 @@ verbatim (`infer: false`) — the model already decided what is worth keeping.
 | Tool | Endpoint | Purpose |
 | --- | --- | --- |
 | `mem0_search` | `POST /v2/memories/search/` | Semantic search; optional `scope` / `categories` / advanced `filters`. |
-| `mem0_add` | `POST /v1/memories/` (`infer: false`) | Store fact(s) verbatim; `category` / `importance` / `metadata`; `longTerm: false` → session-scoped. |
+| `mem0_add` | `POST /v1/memories/` (`infer: false`) | Store fact(s) verbatim; an empty strict-schema `facts` array falls back to non-empty `text`, and `importance: 0` is unset; `category` / `metadata`; `scope: "session"` → session-scoped (`longTerm` remains an accepted legacy input but is no longer offered to the model). |
 | `mem0_get` | `GET /v1/memories/{id}/` | Fetch one memory by id. |
 | `mem0_list` | `POST /v2/memories/` | List the user's memories (paginated). |
 | `mem0_update` | `PUT /v1/memories/{id}/` | Replace a memory's text in place. |

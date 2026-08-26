@@ -724,6 +724,11 @@ pub enum IssueEventBodyDto {
         attachments: Vec<IssueAttachmentDto>,
     },
     Opened,
+    TitleChanged {
+        from: String,
+        to: String,
+    },
+    DescriptionChanged,
     Moved {
         from: IssueStatusDto,
         to: IssueStatusDto,
@@ -760,6 +765,7 @@ pub enum IssueEventBodyDto {
     },
     Unblocked,
     Cancelled,
+    Uncancelled,
     BranchMerged {
         branch: String,
         /// The branch it landed on — the repository's own checkout may be
@@ -877,6 +883,8 @@ impl IssueEventBodyDto {
                     .collect(),
             },
             IssueEventBody::Opened => Self::Opened,
+            IssueEventBody::TitleChanged { from, to } => Self::TitleChanged { from, to },
+            IssueEventBody::DescriptionChanged => Self::DescriptionChanged,
             IssueEventBody::Moved { from, to } => Self::Moved {
                 from: from.into(),
                 to: to.into(),
@@ -907,6 +915,7 @@ impl IssueEventBodyDto {
             IssueEventBody::Blocked { reason } => Self::Blocked { reason },
             IssueEventBody::Unblocked => Self::Unblocked,
             IssueEventBody::Cancelled => Self::Cancelled,
+            IssueEventBody::Uncancelled => Self::Uncancelled,
             IssueEventBody::BranchMerged {
                 branch,
                 into,
@@ -1224,11 +1233,17 @@ pub struct UpdateIssueRequest {
     pub blocked_reason: Option<Option<String>>,
     #[serde(default)]
     pub cancelled: Option<bool>,
-    /// Re-parent by number; `0` detaches. Absent leaves the parent alone.
+    /// Re-parent by number. Absent leaves the parent alone, and no number
+    /// detaches — that is `detach_parent`.
     #[serde(default)]
     pub parent: Option<i64>,
+    /// Which barrier under the parent. Landed only alongside `parent` or
+    /// `detach_parent`: half a placement is not a placement.
     #[serde(default)]
     pub stage: Option<i64>,
+    /// Take the card out of its parent's plan, clearing its stage.
+    #[serde(default)]
+    pub detach_parent: bool,
     /// Keep this card at the top of its column, or stop. Singly optional:
     /// the pin is on or off, and an absent key leaves it.
     #[serde(default)]
@@ -1531,20 +1546,21 @@ async fn update_issue(
 ) -> Result<Json<IssueDto>> {
     let id = parse_project_id(&project_id)?;
     // The wire addresses a parent by number, like every other reference on
-    // this surface; the store wants an id. `0` detaches, which is the one
-    // number no issue has.
-    let parent = match req.parent {
-        None => None,
-        Some(0) => Some(None),
-        Some(number) => Some(Some(
-            state
-                .project_manager
-                .get_issue(&id, number)
-                .await
-                .map_err(project_err)?
-                .id,
-        )),
-    };
+    // this surface; the store wants an id. One home for the reading, shared
+    // with `IssueUpdate`: the two surfaces disagreeing about what a number
+    // means is the same defect twice.
+    let (parent, stage) = state
+        .project_manager
+        .resolve_placement(
+            &id,
+            baybo_project::Placement {
+                parent: req.parent,
+                detach: req.detach_parent,
+                stage: req.stage,
+            },
+        )
+        .await
+        .map_err(project_err)?;
     let attachments = req.attachments.map(requested);
     let row = state
         .project_manager
@@ -1564,7 +1580,7 @@ async fn update_issue(
                 blocked_reason: req.blocked_reason,
                 cancelled: req.cancelled,
                 parent,
-                stage: req.stage,
+                stage,
                 pinned: req.pinned,
             },
             attachments.as_deref(),

@@ -1023,9 +1023,9 @@ impl Tool for VikingRecallTool {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Search query."},
-                "limit": {"type": "integer", "description": "Max results (default: configured top_k)."},
-                "scoreThreshold": {"type": "number", "description": "Minimum score 0-1 (default: 0.15)."},
-                "targetUri": {"type": "string", "description": "Restrict search to a single viking:// root (default: user + agent memories)."}
+                "limit": {"type": "integer", "minimum": 0, "description": "Max results (configured top_k by default). Use `0` for the default."},
+                "scoreThreshold": {"type": "number", "minimum": 0, "maximum": 1, "description": "Minimum score 0-1 (default: 0.15). Use `0` for the default."},
+                "targetUri": {"type": "string", "description": "Restrict search to a single viking:// root. An empty string uses the default user + agent roots."}
             },
             "required": ["query"]
         })
@@ -1039,18 +1039,25 @@ impl Tool for VikingRecallTool {
         let limit = params
             .get("limit")
             .and_then(|v| v.as_u64())
+            .filter(|limit| *limit > 0)
             .map(|n| n.max(1) as usize)
             .unwrap_or(self.inner.top_k);
         let score_threshold = params
             .get("scoreThreshold")
             .and_then(|v| v.as_f64())
+            .filter(|threshold| *threshold > 0.0)
             .map(clamp_score)
             .unwrap_or(DEFAULT_SCORE_THRESHOLD);
         // Over-fetch then post-filter to leaves, like the official plugin.
         let request_limit = (limit * 4).max(20);
         let scope = VikingScope::new(ctx.user.id.as_str(), ctx.agent_id.as_str());
 
-        let merged = if let Some(target_uri) = params.get("targetUri").and_then(|v| v.as_str()) {
+        let merged = if let Some(target_uri) = params
+            .get("targetUri")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|target_uri| !target_uri.is_empty())
+        {
             self.find(query, target_uri, request_limit, scope, &ctx.events)
                 .await
         } else {
@@ -1101,8 +1108,8 @@ impl Tool for VikingStoreTool {
             "type": "object",
             "properties": {
                 "text": {"type": "string", "description": "Information to store as memory source text."},
-                "role": {"type": "string", "description": "Session message role (default: user)."},
-                "sessionId": {"type": "string", "description": "Existing OpenViking session ID (default: a fresh temporary session)."}
+                "role": {"type": "string", "enum": ["user", "assistant"], "default": "user", "description": "Session message role (default: user)."},
+                "sessionId": {"type": "string", "description": "Existing OpenViking session ID. An empty string creates a fresh temporary session."}
             },
             "required": ["text"]
         })
@@ -1119,11 +1126,15 @@ impl Tool for VikingStoreTool {
         let role = params
             .get("role")
             .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|role| !role.is_empty())
             .unwrap_or("user");
         let scope = VikingScope::new(ctx.user.id.as_str(), ctx.agent_id.as_str());
         let session_id = params
             .get("sessionId")
             .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|session_id| !session_id.is_empty())
             .map(String::from)
             .unwrap_or_else(|| format!("baybo-store-{}", Uuid::new_v4().simple()));
 
@@ -1233,15 +1244,20 @@ impl Tool for VikingForgetTool {
                 "uri": {"type": "string", "description": "Exact memory URI to delete."},
                 "query": {"type": "string", "description": "Search query to find a memory to delete."},
                 "targetUri": {"type": "string", "description": "Search scope URI (default: user memories)."},
-                "limit": {"type": "integer", "description": "Search candidate count (default: 5)."},
-                "scoreThreshold": {"type": "number", "description": "Minimum candidate score 0-1 (default: 0.15)."}
+                "limit": {"type": "integer", "minimum": 0, "description": "Search candidate count (default: 5). Use `0` for the default."},
+                "scoreThreshold": {"type": "number", "minimum": 0, "maximum": 1, "description": "Minimum candidate score 0-1 (default: 0.15). Use `0` for the default."}
             },
             "required": []
         })
     }
 
     async fn execute(&self, params: Value, ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
-        if let Some(uri) = params.get("uri").and_then(|v| v.as_str()) {
+        if let Some(uri) = params
+            .get("uri")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|uri| !uri.is_empty())
+        {
             if !is_memory_uri(uri) {
                 return Ok(ToolOutput::Error(format!(
                     "Refusing to delete non-memory URI: {uri}"
@@ -1250,23 +1266,32 @@ impl Tool for VikingForgetTool {
             return self.delete_uri(uri, ctx).await;
         }
 
-        let Some(query) = params.get("query").and_then(|v| v.as_str()) else {
+        let Some(query) = params
+            .get("query")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|query| !query.is_empty())
+        else {
             return Err(ToolError::InvalidParams("provide uri or query".into()));
         };
 
         let limit = params
             .get("limit")
             .and_then(|v| v.as_u64())
+            .filter(|limit| *limit > 0)
             .map(|n| n.max(1) as usize)
             .unwrap_or(FORGET_DEFAULT_LIMIT);
         let score_threshold = params
             .get("scoreThreshold")
             .and_then(|v| v.as_f64())
+            .filter(|threshold| *threshold > 0.0)
             .map(clamp_score)
             .unwrap_or(DEFAULT_SCORE_THRESHOLD);
         let target_uri = params
             .get("targetUri")
             .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|target_uri| !target_uri.is_empty())
             .unwrap_or(USER_MEMORIES_URI);
         let request_limit = (limit * 4).max(20);
 

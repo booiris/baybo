@@ -6,7 +6,9 @@ use baybo_tools::{Tool, ToolConcurrency, ToolContext, ToolError, ToolOutput, Too
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{NOBODY_WORD, exec_err, parse_status, render_issue, scope, status_schema, tokens, usd};
+use super::{
+    NOBODY_WORD, exec_err, parse_status, render_issue, scope, status_filter_schema, tokens, usd,
+};
 use crate::ProjectManager;
 
 pub const ISSUE_LIST_TOOL_NAME: &str = "IssueList";
@@ -76,7 +78,7 @@ Alongside them: `team`, where each member's `working_on` is what they have in fl
         json!({
             "type": "object",
             "properties": {
-                "status": status_schema("Only issues in this column."),
+                "status": status_filter_schema("Only issues in this column. Use `all` when the strict schema requires a value but no status filter is wanted."),
                 "assignee": super::assignee_schema(false),
                 "include_cancelled": {
                     "type": "boolean",
@@ -88,7 +90,8 @@ Alongside them: `team`, where each member's `working_on` is what they have in fl
                 },
                 "before": {
                     "type": "integer",
-                    "description": "Keep only cards numbered below this. Pass the response's `done_continue_before` to read the next page further back in Done.",
+                    "minimum": 0,
+                    "description": "Keep only cards numbered below this. Pass the response's `done_continue_before` to read the next page further back in Done. Use `0` when the strict schema requires a value but no bound is wanted.",
                 },
             },
         })
@@ -109,7 +112,13 @@ Alongside them: `team`, where each member's `working_on` is what they have in fl
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?
         };
         let project = scope(ctx)?;
-        let status = p.status.as_deref().map(parse_status).transpose()?;
+        let status = p
+            .status
+            .as_deref()
+            .map(str::trim)
+            .filter(|status| !status.is_empty() && *status != super::ALL_STATUSES_FILTER)
+            .map(parse_status)
+            .transpose()?;
         // An empty query is no question, so it excludes nothing — the same
         // reading `parse_assignee_filter` gives an empty filter.
         let query = p
@@ -118,6 +127,13 @@ Alongside them: `team`, where each member's `working_on` is what they have in fl
             .map(str::trim)
             .filter(|q| !q.is_empty())
             .map(str::to_lowercase);
+        // Card numbers are 1-based, so a bound at or below the first card
+        // would answer "no such card" for a whole board. `0` is what a
+        // model reaches for when an integer parameter has no "unset"
+        // spelling, and it read as the empty board on every call that sent
+        // it — the same reading an empty `query` or `assignee` is already
+        // given here.
+        let before = p.before.filter(|before| *before > 0);
 
         let team = self.manager.team(&project).await.map_err(exec_err)?;
         let load = self.manager.board_load(&project).await.map_err(exec_err)?;
@@ -136,7 +152,7 @@ Alongside them: `team`, where each member's `working_on` is what they have in fl
                 && wanted_assignee
                     .as_ref()
                     .is_none_or(|wanted| &issue.assignee == wanted)
-                && p.before.is_none_or(|before| issue.number < before)
+                && before.is_none_or(|before| issue.number < before)
                 && query.as_deref().is_none_or(|needle| matches(issue, needle))
         });
 

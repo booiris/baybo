@@ -45,6 +45,23 @@ registered at runtime — not just `baybo-tools::builtin`.
 | `viking_recall`, `viking_store`, `viking_forget`, `viking_archive_expand`                                                                                                                                                                                             | implemented | the memory backend's own tools (`crates/memory/src/backends/openviking.rs`); registered from `crates/baybo/src/runtime.rs` as builtins whenever memory is enabled — whatever `Memory::tools()` yields. See [`memory.md`](memory.md). |
 | `Agent`, `AskUserQuestion`, `SendMessage`, `EnterPlanMode`/`ExitPlanMode`, `EnterWorktree`/`ExitWorktree`, `LSP`, `Monitor`, `NotebookEdit`, `TaskStop`/`TaskOutput`, `ToolSearch`, `Team*`                                                               | TODO stub   | lives in `builtin::todo`; not auto-registered — each depends on a backing subsystem that has not yet landed (`TaskStop`/`TaskOutput` need the background-task runtime) |
 
+### Optional fields under strict schemas
+
+Every optional property exposed by a built-in tool has an inert value a caller
+can send when its function-calling layer materializes all schema properties.
+The convention is empty string for an unset free-form string, `0` for an unset
+optional number, `false` for an action boolean, an empty array for no supplied
+items, and a named enum value such as `all`, `any`, `default`, or `unchanged`.
+When an empty array or false value would otherwise be a real mutation, the tool
+exposes a separate positive intent (`clear_depends_on`, `unblock`, `reopen`,
+etc.). This normalization happens at each domain tool's execution seam, before
+the value reaches its manager/store.
+
+The rule covers Baybo-owned static tools. An MCP server owns its dynamic JSON
+schema and parameter semantics; Baybo cannot safely invent no-op values for an
+external tool, so repeated failures there are handled by the generic failure
+detector inside the agent's turn progress monitor instead.
+
 `ToolRegistry::with_defaults(blob_store, workspace_paths, proxy, permission)`
 registers the implemented set with `TrustLevel::Trusted` manifests declaring their
 capabilities (`ReadFile`, `WriteFile`, `Http`, `ExecCommand`). No LLM handle is
@@ -71,8 +88,8 @@ halves (probing duration/pages/dimensions and building a media `ContentBlock`
 versus returning a JSON reference) stay per-tool rather than collapsing into one
 `match` on a mode flag, and the two manifests stay separate because
 `channels: [owner]` is the only enforced gate on minting a bearer `blob_id`.
-`resolve_mime_type` is shared for a concrete reason: it rejects an empty or
-newline-bearing override, which otherwise reaches `HeaderValue::from_str` in the
+`resolve_mime_type` is shared for a concrete reason: it treats an empty override
+as unset and rejects a newline-bearing override, which otherwise reaches `HeaderValue::from_str` in the
 gateway's blob download, gets refused there, and serves the bytes with no
 `Content-Type` at all. `AttachFile` skipped that check while `PutBlob` made it
 — exactly the drift a shared seam exists to prevent. Both name the parameter

@@ -63,11 +63,11 @@ cannot serve. `set_llm` takes the whole pin; clearing clears all three.
 
 They exist because a **card's run has no header to pick from**. A chat session
 carries its own `last_llm` / `last_model` / `last_effort`, set by the
-model picker the operator presses per conversation; a board run's session is
-minted by the board with nothing on it, so what the profile says is the only
-thing that decides what that run costs and how hard it thinks. Carrying only
-the entry meant every board agent ran that entry's default model at that
-entry's default rung, with no way to say otherwise.
+model picker the operator presses per conversation; a board run's session may
+not carry one — see below — so what the profile says is the only thing that
+decides what that run costs and how hard it thinks.
+Carrying only the entry meant every board agent ran that entry's default model
+at that entry's default rung, with no way to say otherwise.
 
 **There is no prompt column, and no name column.** An agent's prompt is its
 own persona's `SOUL.md`, and its name is the `Name:` line in that persona's
@@ -114,6 +114,8 @@ It is read at actor spawn by `resolve_spawn_pins`, behind the session's own pin,
 
 - **entry and model fall back together.** A session that named its own entry keeps its own model — an empty one meaning that entry's default — and never inherits a model chosen for a different entry, which is a model that entry cannot serve.
 - **the rung falls back on its own** (`last_effort ?? profile.effort`). Effort is a provider-level knob rather than a property of one model, so an agent deliberately set to think hard keeps doing so across a session that only re-pointed which entry to use.
+
+**A card's run session is not behind its own pin.** The precedence above is a *conversation's*: the operator pressed a button meaning "this thread, this model". A run's session is minted per (issue, agent) and reused by every later run of that agent on that card, so a pin on it would outlive the run that set it and outrank every later profile edit — a roster naming one model and runs on another, with nothing on the board saying why. So `TriggerSource::can_pin_its_own_llm` is false for `Issue`, and both ends honour it: `resolve_spawn_pins` returns the profile whole without reading the session's columns, and `PUT /v1/chat/sessions/{id}/model` — which the owner-channel scope check would otherwise admit for a run session — refuses with a 400 naming the agent as the place to change it. Every run therefore starts on whatever the profile says at the moment it spawns; the one thing an edit cannot reach is a run already in flight, whose pin was resolved at its spawn. A value left on such a row by a build that predates the refusal is inert rather than cleared — nothing reads it, and per the no-legacy-migration rule nothing sweeps it either.
 
 **Neither skills nor tools are stored on the profile.** Skills are managed by the skill system, not configured per agent — the editor reads them live from the skill registry (`GET /v1/skills`) and shows them read-only; when a future per-agent-workspace model lands, that readout reads the agent's own skill folder instead. Tools are a runtime-global concern (`ToolRegistry` is process-wide by design) and Claude Code / Codex manage their own tool permissions. Storing either as a per-agent allow-list would be dead data in v1, so both are left out.
 

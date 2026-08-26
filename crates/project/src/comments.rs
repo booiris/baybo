@@ -1,8 +1,6 @@
 //! What happens when somebody says something on an issue.
 
-use baybo_store::project::{
-    IssueActor, IssueEventBody, IssueEventRow, IssueRow, IssueStatus, RunStatus,
-};
+use baybo_store::project::{IssueActor, IssueEventBody, IssueEventRow, IssueRow, RunStatus};
 
 /// Where a comment goes besides the timeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,16 +24,12 @@ pub enum CommentDelivery {
     AfterCurrentRun,
 }
 
-fn is_live_work(status: IssueStatus) -> bool {
-    matches!(
-        status,
-        IssueStatus::Todo | IssueStatus::InProgress | IssueStatus::Review
-    )
-}
-
 /// Decide a comment's delivery.
 pub(crate) fn comment_delivery(issue: &IssueRow, live_run: Option<RunStatus>) -> CommentDelivery {
-    if issue.assignee.is_none() || issue.cancelled_at.is_some() || !is_live_work(issue.status) {
+    if issue.assignee.is_none()
+        || !crate::runs::accepts_runs(issue)
+        || !crate::driver::is_live_work(issue.status)
+    {
         return CommentDelivery::RecordOnly;
     }
     if !crate::driver::board_may_start(issue) {
@@ -65,7 +59,7 @@ pub(crate) fn somebody_asked_for_more<'a>(
 mod tests {
     use super::*;
     use baybo_model::{AgentProfileId, IssueId, ProjectId};
-    use baybo_store::project::IssuePriority;
+    use baybo_store::project::{IssuePriority, IssueStatus};
 
     fn issue(status: IssueStatus, assigned: bool) -> IssueRow {
         let now = chrono::Utc::now();

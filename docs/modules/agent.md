@@ -34,7 +34,7 @@ agent/src/
 │   ├── compression.rs        # compaction LLM call: step/span, cost, retry
 │   ├── billed_chat.rs        # cost-aware LLM call wrapper
 │   ├── error_recovery.rs     # retry / degrade policy
-│   ├── progress_ledger.rs    # per-turn file-mutation ledger; spots edits that cancelled out
+│   ├── progress_ledger.rs    # per-turn progress monitor; file churn + repeated tool failures
 │   ├── sandbox.rs            # SandboxAdapter glue for tool exec
 │   ├── scope.rs              # with_turn / with_step / with_span / LLM span guards
 │   ├── llm_pool.rs           # per-provider LlmClient pool
@@ -243,9 +243,9 @@ Before a message enters an actor, Router completes: session identification/creat
 
 ### Per-session model selection
 
-Each session can pin its own `baybo.json` LLM entry via `session.state.last_llm` (`None` ⇒ follow `default-llm`, so an un-switched session keeps tracking global default changes). The pin flows into the loop's `initial_llm`: at a cold spawn / post-eviction hydration, `Router::handle_incoming` reads `session.state.last_llm` and passes it to the actor spawner; for a **live** actor, `AgentMessage::SetModel { llm }` (Trigger-tier, so it lands at a turn boundary — never mid-turn) re-pins the loop in place via `AgentLoop::set_initial_llm`. Either way the swap takes effect on the **next** turn: `AgentLoop::refresh_active_llm` re-resolves `initial_llm` against the hot-swappable `LlmClientPool` at the top of every turn — the same hook that absorbs config hot-reloads — swapping the client and context-window budget when the resolved entry changes. A stranded pin (entry later removed from config) degrades safely: `LlmClientPool::resolve` falls back to the default with a `warn!`.
+A **conversation** can pin its own `baybo.json` LLM entry via `session.state.last_llm` (`None` ⇒ follow `default-llm`, so an un-switched session keeps tracking global default changes). A card's run session cannot — `TriggerSource::can_pin_its_own_llm` is false for `Issue`, and both ends honour it: `resolve_spawn_pins` returns the bound agent's profile pin whole without reading the column, and the `PUT` below refuses to write one. A run therefore starts on whatever its agent's profile says at the moment it spawns; see [`agent-profiles.md`](agent-profiles.md). The pin flows into the loop's `initial_llm`: at a cold spawn / post-eviction hydration, `Router::handle_incoming` reads `session.state.last_llm` and passes it to the actor spawner; for a **live** actor, `AgentMessage::SetModel { llm }` (Trigger-tier, so it lands at a turn boundary — never mid-turn) re-pins the loop in place via `AgentLoop::set_initial_llm`. Either way the swap takes effect on the **next** turn: `AgentLoop::refresh_active_llm` re-resolves `initial_llm` against the hot-swappable `LlmClientPool` at the top of every turn — the same hook that absorbs config hot-reloads — swapping the client and context-window budget when the resolved entry changes. A stranded pin (entry later removed from config) degrades safely: `LlmClientPool::resolve` falls back to the default with a `warn!`.
 
-Persistence and the live re-pin are deliberately **split** to avoid a lost-update race. `last_llm` is a **flat `sessions` column**, not a JSON-blob field — exactly like `hidden` — written only by the targeted `SessionStore::set_last_llm` and omitted from `save`'s `DO UPDATE`, so a concurrent `touch` (which is a full-blob `get` + `save` fired on every inbound message) can't clobber it; `get` patches `Session.state.last_llm` from the column on read. The chat `PUT /v1/chat/sessions/{id}/model` validates the name against the pool, then (1) **persists** via `set_last_llm` synchronously — authoritative for any later spawn, and a storage failure surfaces as an error rather than a false 200 — and (2) routes `SetModel` to re-pin the live actor **in memory only** (the gateway holds an `AgentSupervisor` clone for this reach-the-live-actor hop, the same way `/stop` reaches one). `SetModel` does not itself persist. Subagent spawns are the other `initial_llm = Some(...)` path, pinning via `model_tier` instead.
+Persistence and the live re-pin are deliberately **split** to avoid a lost-update race. `last_llm` is a **flat `sessions` column**, not a JSON-blob field — exactly like `hidden` — written only by the targeted `SessionStore::set_last_llm` and omitted from `save`'s `DO UPDATE`, so a concurrent `touch` (which is a full-blob `get` + `save` fired on every inbound message) can't clobber it; `get` patches `Session.state.last_llm` from the column on read. The chat `PUT /v1/chat/sessions/{id}/model` refuses a session that may not carry a pin (400; a card's run session reaches the handler because it lives on the owner channel like any conversation, so the scope check alone does not stop it), validates the name against the pool, then (1) **persists** via `set_last_llm` synchronously — authoritative for any later spawn, and a storage failure surfaces as an error rather than a false 200 — and (2) routes `SetModel` to re-pin the live actor **in memory only** (the gateway holds an `AgentSupervisor` clone for this reach-the-live-actor hop, the same way `/stop` reaches one). `SetModel` does not itself persist. Subagent spawns are the other `initial_llm = Some(...)` path, pinning via `model_tier` instead.
 
 ### Timeouts and time limits
 
@@ -321,7 +321,18 @@ Router-level user rate limiting (`actor/router`) uses a sliding window (default 
 
 ### No-progress detection
 
-`runtime/progress_ledger.rs` keeps a per-turn record of every `Edit` / `Write`, and tells the model when a turn's edits have stopped going anywhere. It exists because nothing else in the loop could: `max_iterations` is a cost backstop at 1000, `error_recovery` only classifies LLM/IO errors, the progress observer never writes back into the turn, and a denied tool call leaves no state the loop can reason over — so a turn could edit one file five times, net zero, and no part of the runtime would notice.
+`runtime/progress_ledger.rs` owns the loop's one `TurnProgressMonitor` and its two internal detectors. `FileMutationLedger` keeps a per-turn record of every `Edit` / `Write`, and tells the model when a turn's edits have stopped going anywhere. It exists because nothing else in the loop could: `max_iterations` is a cost backstop at 1000, `error_recovery` only classifies LLM/IO errors, the progress observer never writes back into the turn, and a denied tool call leaves no state the loop can reason over — so a turn could edit one file five times, net zero, and no part of the runtime would notice.
+
+`ToolFailureDetector` covers every non-file tool. Three consecutive calls of
+the same tool returning the exact same error fingerprint mount one transient
+observation telling the model to name what cause the next call changes, choose
+another route, or report the blocker. A success, another tool, a file-tool
+call, or a different error resets the streak. Only a hash is retained, never
+the error text; the latest full tool result is already adjacent in context.
+File tools route to `FileMutationLedger`, whose state-transition verdict is
+more useful than a generic error repeat. Both detectors share the monitor's
+single record call and turn-boundary reset, but keep separate evidence and
+reset rules.
 
 **What it compares.** Not file contents — `Edit` rejects `old_string == new_string`, so every applied edit changes the bytes, and `FileFingerprint` carries an mtime, so it moves even when the content comes back. What identifies churn is the *sequence of state transitions*: an `Edit` names both endpoints of its own transition, so an edit whose `new_string` reproduces an earlier edit's `old_string` has undone that edit. A `Write` names only its result, so results are compared to results. Only the two hashes are kept, never the payloads.
 
@@ -339,7 +350,9 @@ The reported verdict names whichever signal crossed the threshold, so the observ
 
 **It injects, it does not stop.** The verdict renders (`baybo_context::prompts::no_progress`) into a transient tail row via `ContextManager::set_progress_observation`, which rides exactly one request and is then cleared — never persisted, so it cannot replay as history. Injection rather than enforcement because the runtime knows the *fact* (this file is back where it was) but not whether it is a mistake: a flag toggled on to test and off again is indistinguishable. A model reasoning correctly from a missing fact needs the fact, not a killed turn.
 
-**Per-turn, deliberately.** The ledger is cleared at the top of every `run_inner`. "Change that back" is ordinary work when the user asks for it between turns; it is only churn inside one turn.
+**Per-turn, deliberately.** The monitor clears both detectors at the top of
+every `run_inner`. "Change that back" is ordinary work when the user asks for
+it between turns; it is only churn inside one turn.
 
 Bounded at 128 files × 64 attempts, **least-recently-touched evicted first**. Both numbers are sized against the failure mode rather than against memory — the whole structure is a few hundred KB at pathological worst case, next to an LLM context measured in megabytes — and the eviction order is load-bearing: a turn that sweeps a crate and *then* churns one file is exactly the case worth catching, and insertion-order eviction drops that file's history precisely because it was seen first.
 
