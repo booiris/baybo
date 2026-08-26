@@ -37,7 +37,7 @@ final class ProjectsStore: ObservableObject {
         }
 
         func handle(forAgent agentId: String) -> String {
-            CommentHint.handle(forAgent: agentId, in: team)
+            AgentHandles.handle(forAgent: agentId, in: team)
         }
 
         /// The uploaded picture for an agent, if it has one. Looked up here

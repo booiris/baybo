@@ -1,16 +1,7 @@
 import type { components, paths } from '../../api/schema';
 
-import {
-  COLUMN_LABEL,
-  RUN_TRIGGER_LABEL,
-  formatDuration,
-  unsettledRun,
-  type Agent,
-  type IssueStatus,
-  type RunStatus,
-} from './boardModel';
-import { HELD_RUN_NOTE, formatTokens, formatUsd } from './budgetModel';
-import { handleOf } from './teamModel';
+import { COLUMN_LABEL, RUN_TRIGGER_LABEL, formatDuration } from './boardModel';
+import { formatTokens, formatUsd } from './budgetModel';
 
 export type IssueEvent = components['schemas']['IssueEventDto'];
 export type IssueEventBody = components['schemas']['IssueEventBodyDto'];
@@ -241,49 +232,6 @@ export function describeEvent(body: IssueEventBody): string | null {
 
 function unnamedEvent(_body: never): string {
   return 'did something this page is too old to describe';
-}
-
-/// What sending will do, in the assignee's own name.
-///
-/// `team` is required rather than optional: the assignee on an issue is an
-/// agent **id**, and every sentence below addresses a person. Resolving it
-/// here — where the hint is written — is what stops a raw ULID reaching the
-/// composer, which is what happened while this took only the issue.
-export function commentHint(
-  issue: {
-    status: IssueStatus;
-    assignee?: string | null;
-    cancelled_at_ms?: number | null;
-    blocked_reason?: string | null;
-  },
-  runs: { status: RunStatus }[],
-  team: Agent[],
-): string {
-  const assignee = issue.assignee == null ? null : handleOf(team, issue.assignee);
-  if (assignee == null) {
-    return 'Records only — nobody is assigned to this issue yet.';
-  }
-  if (issue.cancelled_at_ms != null) {
-    return 'Records only — this issue is cancelled.';
-  }
-  if (issue.status === 'backlog' || issue.status === 'done') {
-    return `Records only — @${assignee} is not working on this right now.`;
-  }
-  // A block takes precedence over any live run, matching the server.
-  if (issue.blocked_reason != null) {
-    return `Records only — a block has stopped this issue; @${assignee} picks this up when it is lifted.`;
-  }
-  const live = unsettledRun(runs);
-  if (live?.status === 'held') {
-    return `@${assignee} will read this when the held run starts — ${HELD_RUN_NOTE}.`;
-  }
-  if (live?.status === 'queued') {
-    return `@${assignee} will read this when the queued run starts.`;
-  }
-  if (live?.status === 'running') {
-    return `@${assignee} is mid-run — this is picked up when that run finishes.`;
-  }
-  return `Starts a run: @${assignee} will read this now.`;
 }
 
 /// When an entry happened, to the minute — always. An older entry used to

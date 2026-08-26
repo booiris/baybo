@@ -63,17 +63,20 @@ place. That is what lets every caller *in this process* — the manager, the six
 board tools, the REST routes — answer a question the same way without any of
 them carrying a copy of the rule.
 
-The web board is not one of those callers, and this is the seam to know about.
-A composer has to say what sending will do while the text is still being typed,
-so it cannot ask the server. There are two hand-written TypeScript mirrors in
-`app/web/src/pages/projects/`: `commentHint` mirrors
-`comments::comment_delivery`, the block gate inside it included, and
-`mentionHint`/`mentionQuery` mirror `mentions::assigns_to` **and the refusal
-`mention_assignment` wraps it in** — a mention on a blocked card is recorded
-and staffs nobody, so the composer says that rather than promising a handover
-that will not happen. Nothing enforces the correspondence — not a generated
-binding, not a shared schema — only the two test suites, one per language,
-asserting the same cases. So widening `is_live_work` by one column, or adding a
+The clients used to be those callers, and the seam is worth knowing about even
+now that they are not. A composer cannot ask the server what sending will do —
+it has to say it while the text is still being typed — so both clients grew a
+hand-written mirror of `comments::comment_delivery` and of `mentions::assigns_to`
+(with the refusal `mention_assignment` wraps it in: a mention on a blocked card
+is recorded and staffs nobody). **Both are gone as of 2026-08-26**: the phone's
+never earned its two lines of chrome and the web's only ever surfaced as the
+send button's `title` tooltip, which is to say almost never. `commentHint`,
+`mentionHint` and the golden vectors that held the copies together were deleted
+with them, so THIS FILE'S rule is once again the only one — a client that wants
+to warn in advance again needs a mirror and a fixture to pin it. What survives
+in `app/web/src/pages/projects/` is `mentionQuery` / `mentionCandidates` /
+`applyMention`, which are the `@` autocomplete and assert nothing about what the
+server will do. So widening `is_live_work` by one column, or adding a
 run state that reads as idle, is a change on both sides in the same commit;
 `cargo test` alone will be green with a board that wakes an agent while the
 composer still promises "Records only".
@@ -1266,9 +1269,11 @@ that cannot host a session).
 
 Both of those refusals are **log lines and nothing else** — the comment
 itself lands, so the card records the words and says nothing about the
-staffing they asked for. That is the reason `mentionHint` carries the block:
-the composer refuses in advance, in front of the person typing, which is the
-only place a refusal that writes nothing can be seen.
+staffing they asked for. That was the reason `mentionHint` carried the block:
+the composer refused in advance, in front of the person typing, which is the
+only place a refusal that writes nothing can be seen. With the hints gone
+(2026-08-26) nothing does — a mention on a blocked card is recorded, staffs
+nobody, and says so nowhere.
 
 That leaves `dispatch_if_triggered` — the last place `board_may_start` is
 not asked — exempt through exactly two doors, and both are an explicit

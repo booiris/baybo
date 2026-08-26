@@ -82,7 +82,8 @@ Projects tab root = Projects cards (wordmark header, tab bar visible)
            │    │   draws none. Designed also to carry Rename · Pin ·
            │    │   Block…/Unblock · Cancel/Reopen · Copy branch
            │    ├─ sub-issue / #N → child card (push; back returns to the card you came from)
-           │    └─ dock (native): hint chip · @ chips · ApprovalCardView (two answers) · composer pill
+           │    └─ dock (native): answer row (only when an agent is asking) ·
+           │        ApprovalCardView (two answers) · composer pill
            ├─ long press → Open · Move to… · Assign… · Pin · Rebuild this card
            ├─ leading swipe → Pin · trailing swipe → Move… (full-swipe disabled)
            ├─ ⋯ → Activity (push) · Team (sheet → Agent profile) · Mark all read N · Settings (push)
@@ -130,7 +131,7 @@ Moving out of In Progress **never kills the run**; Stop is the only kill switch.
 | header | native (`ChatHeaderView` grammar) | back · `#N · status` glass pill (tap → Move sheet) · ⋯ (Run again · **Runs**), drawn only when it has an entry |
 | body | **`issue.html` WKWebView** | title · one meta line · the description as plain body · the state band (three chips · live-run line · blocked banner) · attachments · sub-issues · activity (**posts and lines**, below) · a "New activity" jump pill |
 | pickers | native sheets over the page | status → `MoveSheet` · priority → `PriorityPicker` · assignee → `AssigneePicker`, all writing through `ProjectsStore` |
-| dock | native, inside the real `ComposerDock` | jump-to-newest disc · notice line · `ApprovalCardView` (two answers, REST-backed) · hint chip · staged strip · the chat's composer pill, at the chat's width and beat (`+` → attach panel, in-field send, no prompt text) |
+| dock | native, inside the real `ComposerDock` | jump-to-newest disc · notice line · `ApprovalCardView` (two answers, REST-backed) · answer row (only when an agent is asking) · staged strip · the chat's composer pill, at the chat's width and beat (`+` → attach panel, in-field send, no prompt text) |
 | overlays | native | pickers (`ModelMenuPanel` style) · sheets · `RenameDialog` · `ConfirmDialog` |
 
 - Why the whole body rather than a small webview for the description alone: a webview inside a native ScrollView is two scrollers plus height round-trips, while a full-page webview is exactly `ChatScreen`'s existing layering (header / webview / dock / bottom-inset stream) — and comment markdown, attachments, `#N` links and KaTeX all come free.
@@ -155,9 +156,27 @@ Moving out of In Progress **never kills the run**; Stop is the only kill switch.
   first passes on the broken wiring, which is why the three existing render
   suites never saw it.
 - The live-run row: running → Stop → **`ConfirmDialog`** (decision 10) "Stop run #k? The card stays where it is. Stopping is the only way to end a run."; held → `@h is held — over the daily token ceiling` + **Run it again** (on a held card the press is what releases it, so it is never greyed out); failed → `✕ Run #k failed — <error>` + Run again. Stop lives only here and in the transcript header, never in a long-press menu.
-- **The hint chip** (native): the **third mirror** of `comments::comment_delivery` (`crates/project/src/comments.rs:37`) and `mentions::assigns_to`; the web's two live in `timelineModel.ts:252` and `mentionModel.ts`. Wording is taken from the web verbatim. The rule is not exposed over REST, so every client re-derives it — which is why it **must** be pinned by golden fixtures shared with app/web (§7).
+- **The composer hint is gone from the phone** (2026-08-26). It was the
+  **third mirror** of `comments::comment_delivery`
+  (`crates/project/src/comments.rs:37`) — a sentence above the field saying
+  what sending would do, since that decision is not exposed over REST and a
+  composer has to say it while the text is still being typed. What it cost was
+  two lines of full-width 10.5px mono over every card, never localized, and
+  mostly repeating the state band a thumb's width above it: a card that says
+  `WORKING @dev-1` does not also need "@dev-1 is mid-run — this is picked up
+  when that run finishes". The port (`CommentHint.text` / `.mention`) and the
+  golden vectors that held it to `app/web`'s copy went with it;
+  `CommentHint.swift` is now `AgentHandles.swift`, holding only the handle
+  lookup three surfaces share. **The web's copy went too, the same day**: there
+  the sentence was never on the page at all — it was the send button's `title`,
+  a hover tooltip nobody had seen — so `commentHint`, `mentionHint`, the
+  generator and the shared vectors are all gone, and the rule is back to ONE
+  implementation, the gateway's. A client that wants to warn in advance again
+  needs a mirror and a fixture in the same commit. What stays on the dock is the
+  ANSWER row, which is a control rather than a caption: it carries "Unblock #N
+  after sending".
 - **The approval card**: `ApprovalCardView` unchanged in the dock (`CompactPillButtonStyle` lifted out of its file first), two answers; the pending set is the card's `events` replayed by `call_id` (requested without resolved). The live queue is the truth, so tolerate a 404 on answer.
-- **The Answer flow** (an agent's question): Answer from the Waiting strip or the blocked banner opens the card with the composer focused and `@lead ` prefilled, the hint reading "Answers @lead · unblocking hands the run back to @dev-2", and "Unblock #N after sending" checked by default → `POST comment` first, then `PATCH {blocked_reason: null}` (the unblock door hands the parked run back out, and its brief carries your answer). A block the operator wrote themselves does not get this treatment.
+- **The Answer flow** (an agent's question): Answer from the Waiting strip or the blocked banner opens the card with the composer focused and `@lead ` prefilled, the answer row reading "Answers @lead" beside "Unblock #N after sending", checked by default → `POST comment` first, then `PATCH {blocked_reason: null}` (the unblock door hands the parked run back out, and its brief carries your answer). A block the operator wrote themselves does not get this treatment.
 - **Rebuild is on the LIST, and the description editor has no door**
   (2026-08-26). The card's ⋯ had two unconditional entries and both went. The
   hatch belongs to the board row's long press: a card whose local copy is wrong
@@ -320,9 +339,9 @@ Moving out of In Progress **never kills the run**; Stop is the only kill switch.
   store-free views both docks use; `ComposerStaging` — text, spool, uploads,
   draft — plugs into whichever surface owns it through `ComposerHost`
   (`draftKey` + `notice`), which is the one thing that made this a deferral.
-  What stays per-surface is what genuinely differs: this file keeps the hint,
-  the unblock toggle, its own flat veil, and a send that posts a comment and
-  THEN lifts a block.
+  What stays per-surface is what genuinely differs: this file keeps the answer
+  row, its own flat veil, and a send that posts a comment and THEN lifts a
+  block.
   - **No `send` on the seam**, deliberately: a chat mints an id, paints an
     optimistic bubble, writes an outbox row and sends through a connection
     gate. The machine's door out is `claimSend()`, which also moves the send
@@ -348,7 +367,7 @@ Moving out of In Progress **never kills the run**; Stop is the only kill switch.
     `ComposerPill` (40pt at rest, 14 focused, `.easeOut(0.25)`) rather than in
     either dock; the rows a dock stacks above the pill keep their own.
   - **The field draws no prompt.** What a comment will do is already said by
-    the hint line directly above it, so the grey sentence inside the pill was a
+    the card's own state band, so the grey sentence inside the pill was a
     third voice saying the obvious. `issue.commentPlaceholder` became
     `issue.commentField` and is now the field's accessibility NAME: a
     `TextField` takes its name from its prompt, so removing one without this
@@ -425,7 +444,7 @@ Moving out of In Progress **never kills the run**; Stop is the only kill switch.
 | A manual move is never gated on the run ceiling | Move is never disabled for a full board |
 | A hold is a standing condition, not an event | budget chip, never a red dot; "Run it again" is the release |
 | At most one unsettled run per card; a refusal is only visible in the timeline | toasts say only what the server returned |
-| An @mention on a staffed card is a question, not a reassignment; on a blocked card it staffs nobody | the hint chip mirrors it |
+| An @mention on a staffed card is a question, not a reassignment; on a blocked card it staffs nobody | the gateway enforces it; no client warns in advance any more |
 | A comment on a running card is picked up by a follow-up run | "picked up when that run finishes" |
 | The lead cannot be removed; nor can an agent with a run in flight; a handle never changes | no Remove on those profiles |
 | Archived is read-only except unarchive / mark read / cancel run; approvals not answerable | §3.5 |
@@ -456,14 +475,14 @@ Rejected: putting the web board in a WKWebView (a Tailwind/brutalist re-skin, `t
 ## 7. Testing strategy
 
 - Pure logic lives in `Core/`: `BoardOrder` (pinned→unread→position), `MoveConsequence` (the Move sheet's sentences), `CommentHint`, `PendingApprovals` (replay by `call_id`), `BudgetMeter`, `RunLabels` (including elapsed).
-- **Golden fixtures shared with app/web**, copying the whole `searchSnippetVectors.json` precedent: `app/web/src/pages/projects/commentHintVectors.json` generated by an mjs script calling the web's real `commentHint`, imported directly by web vitest, and read off disk by a Swift test that walks up from `#filePath` to the repo root (as `SearchSnippetVectorTests.swift` does, coverage canary included). `approvalReplayVectors.json` the same way. Three mirrors (`comments.rs` ↔ `timelineModel.ts` ↔ Swift) pinned by one set of vectors.
+- **Golden fixtures shared with app/web**, copying the whole `searchSnippetVectors.json` precedent: `app/web/src/pages/projects/commentHintVectors.json` generated by an mjs script calling the web's real `commentHint`, imported directly by web vitest, and read off disk by a Swift test that walks up from `#filePath` to the repo root (as `SearchSnippetVectorTests.swift` does, coverage canary included). `approvalReplayVectors.json` the same way. Three mirrors (`comments.rs` ↔ `timelineModel.ts` ↔ Swift) pinned by one set of vectors. **(Retired 2026-08-26** — both client mirrors and the fixture were deleted with the hint they fed; see §3.3.)
 - A `-baybo-demo-projects` fixture with no gateway (hung off the `-baybo-open-home` block, short-circuited by `demoHomeMode`); `-baybo-home-tab projects` already exists.
 - Accessibility: rows carry label = title, value = subtitle; any bar whose children come and go gets `.accessibilityElement(children: .contain)`; the Waiting strip's buttons need `.buttonStyle(.plain)` isolation; floating panels need pixel sampling (UI tests are blind to paint).
 - New web files start with zero eslint suppressions; extracting the attachment components out of `Transcript.tsx` shifts suppression counts between files, so the baseline gets regenerated.
 
 ## 8. Scope
 
-- **v1**: cards root; board (one stage + the four-kind Waiting strip + bands + pull-to-refresh + skeleton + run elapsed + Undo toast + stage-bar swipe + haptics); Move / long press / swipe; Issue detail (webview body + native dock: two-answer approvals, Stop with confirm, Run again, Answer+unblock, comments + hint + @mention + attachments, collapsed activity); run transcript sheet; Team + profile (read / model pin / remove); Activity; Filter (with Running only); Settings (with archive); New issue; New project; empty / archived / offline states; the mirror; tab badges.
+- **v1**: cards root; board (one stage + the four-kind Waiting strip + bands + pull-to-refresh + skeleton + run elapsed + Undo toast + stage-bar swipe + haptics); Move / long press / swipe; Issue detail (webview body + native dock: two-answer approvals, Stop with confirm, Run again, Answer+unblock, comments + @mention + attachments, collapsed activity); run transcript sheet; Team + profile (read / model pin / remove); Activity; Filter (with Running only); Settings (with archive); New issue; New project; empty / archived / offline states; the mirror; tab badges.
 - **v1.5**: renaming the title, sub-issue parent/stage pickers, Copy branch.
 - **v2**: hiring, persona files, board push (plus Live Activity and a longer approval timeout), project attention in the app-icon badge, per-run headers in the transcript, HtmlPreview inside an issue, a share extension that files an issue, issue search in the global Search tab.
 - **Deliberately never**: drag reordering, five columns side by side, `approve_always`, a trace-viewer link, a workdir text field, diff stats, comment/attachment counts on the card face, inbox snooze.
@@ -722,8 +741,10 @@ team / profile / activity / settings screens.
 
 **Deferred deliberately, and worth naming so nobody looks for them:**
 
-- **`@` mention chips on a comment.** Mentioning is typing `@handle`, which
-  the hint line already describes the effect of.
+- **`@` mention chips on a comment.** Mentioning is typing `@handle`, and since
+  2026-08-26 nothing on either client says what that will do in advance — an
+  unassigned card is the only one where a mention does anything a plain comment
+  does not.
   ~~Staged attachments~~ — **shipped 2026-08-25**, see §3.3. What made them a
   deferral was one `weak var store: ChatStore?` on the staging machine; that
   is a `ComposerHost` now, and the card has the same strip.

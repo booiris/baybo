@@ -110,13 +110,16 @@ one the catalog does not carry, and on a key one language has and the other does
 not. It has caught two already: `chat.cancel` (never existed) and `issue.system`
 (exists in the WEB locales and not in the Swift catalog).
 
-**Golden fixtures shared across ends** live in `app/ios/web/src/pages/…` and are
-read by BOTH a vitest suite and a Swift test. `commentHintVectors.json` is the
-one that matters: what sending a comment will do is a rule that lives in Rust
-(`crates/project/src/comments.rs::comment_delivery`), is not exposed over REST —
-a composer must say it while the text is still being typed — and is therefore
-re-derived by every client. `app/web` has one copy, `app/ios` has another, and
-nothing but those vectors makes the two agree.
+**Golden fixtures shared across ends** are read by BOTH a vitest suite and a
+Swift test: one file, two readers, so a rule with a copy per language cannot
+drift silently. `searchSnippetVectors.json` is the live example.
+`commentHintVectors.json` was the other and is **gone (2026-08-26)** along with
+both copies of the rule it pinned — what sending a comment will do is decided
+in Rust (`crates/project/src/comments.rs::comment_delivery`) and is not exposed
+over REST, so a composer that wants to say it in advance must re-derive it; the
+phone stopped drawing that sentence and the web only ever had it as a tooltip,
+so neither client re-derives anything now. A client that wants it back needs
+the port AND the fixture, in one commit.
 
 `ComposerStaging` takes the same injected client, which is what makes the
 composer's *lifetimes* testable below the UI: `FakeBayboClient.holdBlobUploads()`

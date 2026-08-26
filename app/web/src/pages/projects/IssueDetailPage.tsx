@@ -1006,7 +1006,6 @@ export function IssueDetailPage() {
             <Timeline
               events={events}
               issue={issue}
-              runs={runs}
               busy={saving}
               contentRef={holdTimelineEdge}
               onComment={(text, attachments) => {

@@ -531,20 +531,8 @@ final class IssueStore: ObservableObject, WebMediaTarget {
         return IssueTimeline.pendingApprovals(in: events)
     }
 
-    /// What sending a comment will do, said before it is sent — the third
-    /// mirror of a rule that lives in Rust (see `CommentHint`).
-    var commentHint: String {
-        guard let issue else { return "" }
-        return CommentHint.text(
-            status: issue.status,
-            assigneeHandle: issue.assignee.map(handle(forAgent:)),
-            cancelled: issue.cancelledAtMs != nil,
-            blockedReason: issue.blockedReason,
-            liveRunStatus: liveRun?.status)
-    }
-
     func handle(forAgent agentId: String) -> String {
-        CommentHint.handle(forAgent: agentId, in: team)
+        AgentHandles.handle(forAgent: agentId, in: team)
     }
 
     // MARK: - The page

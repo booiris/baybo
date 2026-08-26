@@ -10,9 +10,9 @@ import SwiftUI
 /// the glass pill, and attachments were written up as deferred. What actually
 /// bound them was two fields, now a `ComposerHost`; the pill, the `+`, the
 /// strip and the pickers are shared views, and this file keeps only what a
-/// card genuinely does differently: the hint line, the unblock toggle, the REST
-/// approval card, and a send that posts a comment and then — in that order —
-/// lifts a block.
+/// card genuinely does differently: the unblock toggle, the REST approval
+/// card, and a send that posts a comment and then — in that order — lifts a
+/// block.
 struct IssueDock: View {
     @ObservedObject var store: IssueStore
     @ObservedObject var staging: ComposerStaging
@@ -55,7 +55,7 @@ struct IssueDock: View {
                     // this one, whose buttons have already fired.
                     .id(prompt.callId)
             }
-            hint
+            answerRow
                 .padding(.horizontal, Self.rowGutter)
             if !staging.staged.isEmpty {
                 StagedStrip(
@@ -109,10 +109,16 @@ struct IssueDock: View {
 
     // MARK: - Composer
 
-    /// The third mirror of `comments::comment_delivery` — what sending will do,
-    /// said while the text is still being typed, which is why it cannot be a
-    /// question for the server.
-    @ViewBuilder private var hint: some View {
+    /// The one row above the pill, and only when an agent is waiting on an
+    /// answer: who it goes to, and whether sending also lifts the block.
+    ///
+    /// **This is a control, not a caption.** The composer HINT that used to
+    /// live here — the sentence saying what sending would do — came out on
+    /// 2026-08-26: two lines of full-width mono over every card, mostly
+    /// repeating what the state band above it already said (`WORKING @dev-1`
+    /// and then "@dev-1 is mid-run"), and never localized. The toggle stays
+    /// because it changes what the send DOES.
+    @ViewBuilder private var answerRow: some View {
         if let question {
             HStack(spacing: 6) {
                 Text(verbatim: lang.t("issue.answering", "@\(question.askedBy)"))
@@ -136,15 +142,6 @@ struct IssueDock: View {
                 .buttonStyle(.plain)
                 .accessibilityIdentifier("issue-unblock-toggle")
                 .accessibilityValue(Text(verbatim: unblockAfterSend ? "1" : "0"))
-            }
-        } else if !store.commentHint.isEmpty {
-            HStack {
-                Text(verbatim: store.commentHint)
-                    .font(Theme.mono(10.5))
-                    .foregroundStyle(Theme.inkSoft)
-                    .lineLimit(2)
-                    .multilineTextAlignment(.leading)
-                Spacer(minLength: 0)
             }
         }
     }

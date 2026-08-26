@@ -66,7 +66,6 @@ function renderTimeline(events: IssueEvent[], onComment = vi.fn(), busy = false)
     <Timeline
       events={events}
       issue={ISSUE}
-      runs={[]}
       onComment={onComment}
       onResolveApproval={vi.fn()}
       busy={busy}
@@ -103,7 +102,6 @@ describe('Timeline', () => {
       <Timeline
         events={[]}
         issue={ISSUE}
-        runs={[]}
         onComment={onComment}
         onResolveApproval={vi.fn()}
         team={TEAM}
@@ -124,7 +122,6 @@ describe('Timeline', () => {
       <Timeline
         events={[]}
         issue={ISSUE}
-        runs={[]}
         onComment={vi.fn()}
         onResolveApproval={vi.fn()}
         team={TEAM}
@@ -157,16 +154,6 @@ describe('Timeline', () => {
     expect(screen.getByRole('button', { name: 'Comment' })).toBeDisabled();
     expect(onComment).not.toHaveBeenCalled();
   });
-
-  it('tells the operator what sending will actually do', () => {
-    renderTimeline([]);
-    // The sentence lost its chip but not its job: whether sending spends
-    // money or only records is on the button you are about to press.
-    expect(screen.getByRole('button', { name: 'Comment' })).toHaveAttribute(
-      'title',
-      expect.stringContaining('Starts a run') as unknown as string,
-    );
-  });
 });
 
 describe('pending approvals', () => {
@@ -183,7 +170,6 @@ describe('pending approvals', () => {
           }),
         ]}
         issue={ISSUE}
-        runs={[]}
         onComment={vi.fn()}
         onResolveApproval={onResolveApproval}
         busy={false}
@@ -210,7 +196,6 @@ describe('pending approvals', () => {
           entry({ kind: 'approval_requested', call_id: 'c2', tool: 'Bash', summary: 'git push' }),
         ]}
         issue={ISSUE}
-        runs={[]}
         onComment={vi.fn()}
         onResolveApproval={vi.fn()}
         busy={false}
@@ -239,7 +224,6 @@ describe('pending approvals', () => {
           }),
         ]}
         issue={ISSUE}
-        runs={[]}
         onComment={vi.fn()}
         onResolveApproval={vi.fn()}
         busy={false}
@@ -267,7 +251,6 @@ describe('pending approvals', () => {
           },
         ]}
         issue={ISSUE}
-        runs={[]}
         onComment={vi.fn()}
         onResolveApproval={vi.fn()}
         busy={false}
@@ -292,7 +275,6 @@ describe('pending approvals', () => {
           },
         ]}
         issue={ISSUE}
-        runs={[]}
         onComment={vi.fn()}
         onResolveApproval={vi.fn()}
         busy={false}
@@ -313,7 +295,6 @@ describe('pending approvals', () => {
       <Timeline
         events={[entry({ kind: 'comment', text: 'the **root cause** is a timer' })]}
         issue={ISSUE}
-        runs={[]}
         onComment={vi.fn()}
         onResolveApproval={vi.fn()}
         busy={false}
