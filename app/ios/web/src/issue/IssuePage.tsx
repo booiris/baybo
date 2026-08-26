@@ -17,7 +17,6 @@ import {
   openRun,
   pickField,
   postActivityAtBottom,
-  postDescription,
   postGeneratedFace,
   postIssueRendered,
   subscribeIssue,
@@ -49,8 +48,6 @@ export function IssuePage() {
   const { t } = useTranslation();
   const [payload, setPayload] = useState<IssuePayload | null>(null);
   const [bottomInset, setBottomInset] = useState(0);
-  const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState("");
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const renderedFor = useRef<string | null>(null);
   /// Where the operator stopped reading, FROZEN for the life of this page.
@@ -80,7 +77,6 @@ export function IssuePage() {
       subscribeIssue({
         deliver: (p) => setPayload(p),
         bottomInset: (px) => setBottomInset(px),
-        setEditing: (active) => setEditing(active),
         jumpToLatest: () => {
           const el = scrollRef.current;
           if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
@@ -88,13 +84,6 @@ export function IssuePage() {
       }),
     [],
   );
-
-  // The editor opens on whatever the card currently says, and a card that
-  // changes underneath an open editor must not yank the text out from under
-  // the typing hand — so the draft is seeded once per opening, not per render.
-  useEffect(() => {
-    if (editing) setDraft(payload?.issue.description ?? "");
-  }, [editing, payload?.issue.description]);
 
   /// Read is stamped only once the card has actually painted, and once per
   /// card: a card whose timeline threw has not been read, and re-stamping on
@@ -206,13 +195,7 @@ export function IssuePage() {
       style={{ paddingBottom: `${String(bottomInset + 24)}px` }}
     >
       <IssueHead issue={issue} opened={opened} who={who} />
-      <Description
-        issue={issue}
-        editing={editing}
-        draft={draft}
-        onDraft={setDraft}
-        onDone={(text) => postDescription(text)}
-      />
+      <Description issue={issue} />
       <StateBand issue={issue} handle={handle} liveRun={liveRun} />
       {issue.attachments !== undefined && issue.attachments.length > 0 && (
         <section className="issue-section">
@@ -377,54 +360,14 @@ function RunRow({ run, who }: { run: IssueRun; who: string }) {
   );
 }
 
-/// The description, and the editor that replaces it.
+/// What the card says, read-only.
 ///
-/// A plain `<textarea>` over the raw markdown, deliberately not a
-/// contenteditable: the source is what gets PATCHed, and a rich editor would
-/// have to round-trip markdown through a DOM and back — which is where the
-/// list that silently loses its nesting comes from.
-function Description({
-  issue,
-  editing,
-  draft,
-  onDraft,
-  onDone,
-}: {
-  issue: IssueDetail;
-  editing: boolean;
-  draft: string;
-  onDraft: (text: string) => void;
-  onDone: (text: string) => void;
-}) {
+/// It had an editor — a plain `<textarea>` over the raw markdown, opened from
+/// the card's ⋯ — and the whole of it came out on 2026-08-26. A card's text is
+/// written by whoever files it and by the agent working it; the phone reads
+/// it, comments on it, and does not rewrite it.
+function Description({ issue }: { issue: IssueDetail }) {
   const { t } = useTranslation();
-  const sent = useRef(false);
-
-  // Native's dock owns Done; it flips `editing` back off, and that edge is what
-  // sends. Guarded so a re-render during the transition cannot send twice.
-  useEffect(() => {
-    if (editing) {
-      sent.current = false;
-      return;
-    }
-    if (sent.current) return;
-    sent.current = true;
-  }, [editing]);
-
-  if (editing) {
-    return (
-      <section className="issue-section">
-        <textarea
-          className="issue-editor"
-          value={draft}
-          onChange={(e) => onDraft(e.target.value)}
-          onBlur={() => onDone(draft)}
-          autoFocus
-          spellCheck={false}
-        />
-      </section>
-    );
-  }
-
   return (
     <section className="issue-section issue-body">
       {issue.description === "" ? (

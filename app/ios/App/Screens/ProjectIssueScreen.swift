@@ -90,7 +90,6 @@ struct ProjectIssueScreen: View {
             await store.refresh()
         }
         .onChange(of: lang.current.lproj) { _, code in host?.bridge.setLanguage(code) }
-        .onChange(of: store.editing) { _, active in host?.bridge.setEditing(active) }
         .onAppear {
             // The paste row's source. A process-global slot with one occupant:
             // the chat screen and this one are never both on screen, and the
@@ -225,7 +224,7 @@ struct ProjectIssueScreen: View {
                     .accessibilityIdentifier("issue-stop")
                     .accessibilityLabel(Text(verbatim: lang.t("issue.stop")))
                 }
-                menu
+                if hasMenu { menu }
             }
         }
         .padding(.horizontal, 24)
@@ -238,15 +237,19 @@ struct ProjectIssueScreen: View {
         }
     }
 
+    /// Whether the ⋯ has anything in it.
+    ///
+    /// Both of its unconditional entries left on 2026-08-26 — the description
+    /// editor lost its door, and Rebuild moved to the board row's long press,
+    /// which is where you reach for it when the CARD is the thing that looks
+    /// wrong. What is left is about runs and is conditional, so the button has
+    /// to be too: a ⋯ that opens an empty sheet is worse than no ⋯.
+    private var hasMenu: Bool {
+        !store.runs.isEmpty || store.issue?.lastRunFailed == true
+    }
+
     private var menu: some View {
         Menu {
-            Button {
-                Haptics.tap()
-                store.editing = true
-            } label: {
-                Label(lang.t("issue.editDescription"), systemImage: "pencil")
-            }
-            .disabled(store.issue == nil)
             if store.issue?.lastRunFailed == true {
                 Button {
                     Haptics.tap()
@@ -256,17 +259,6 @@ struct ProjectIssueScreen: View {
                 }
             }
             runsMenu
-            // The chat's escape hatch, on a card. No confirm: it throws away
-            // only a local copy, and the page's own loading line is the
-            // feedback — the chat's banner exists because its rows live in the
-            // webview and there is nothing else to look at meanwhile.
-            Button {
-                Haptics.tap()
-                store.resync()
-            } label: {
-                Label(lang.t("issue.resync"), systemImage: "arrow.triangle.2.circlepath")
-            }
-            .accessibilityIdentifier("issue-resync")
         } label: {
             Image(systemName: "ellipsis")
                 .font(.system(size: 15, weight: .semibold))

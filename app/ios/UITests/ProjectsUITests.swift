@@ -7,6 +7,9 @@ import XCTest
 /// rather than switching a tab, and the new-board form being reachable from
 /// both the cards list and the empty state.
 final class ProjectsUITests: BayboUITestCase {
+    /// Card #41 of the demo board, as its page draws it.
+    private static let demoCardTitle = "the dial loop drops its subscription"
+
     private func openProjects() -> XCUIApplication {
         launch(["-baybo-open-home", "-baybo-home-tab", "projects", "-baybo-demo-projects"])
     }
@@ -202,8 +205,12 @@ final class ProjectsUITests: BayboUITestCase {
             let row = app.buttons["issue-row-41"]
             XCTAssertTrue(row.waitForExistence(timeout: 8))
             row.coordinate(withNormalizedOffset: offset).tap()
+            // The CARD, not its ⋯: that button is conditional now (it holds
+            // only run entries), so a card with no runs would read as a tap
+            // that went nowhere.
             XCTAssertTrue(
-                app.buttons["issue-menu"].waitForExistence(timeout: 8),
+                app.staticTexts[Self.demoCardTitle].waitForExistence(
+                    timeout: BayboUITestCase.webviewTimeout),
                 "tapping \(where_) should open the card")
             app.terminate()
         }
@@ -531,33 +538,37 @@ final class ProjectsUITests: BayboUITestCase {
             "an archived board must not offer to file a card")
     }
 
-    /// The card's escape hatch is in its ⋯, and the page comes back rather
-    /// than staying blank — a rebuild that reloaded the document and never
-    /// re-delivered would look exactly like a hang.
-    func testACardCanBeRebuiltFromItsMenu() {
-        let app = launch(["-baybo-open-home", "-baybo-demo-projects", "-baybo-demo-card"])
-        XCTAssertTrue(app.buttons["issue-menu"].waitForExistence(timeout: 10))
-        app.buttons["issue-menu"].tap()
+    /// **The escape hatch is on the LIST** (2026-08-26). It used to be in the
+    /// card's own ⋯, which is the chrome you have just stopped trusting when a
+    /// card is what looks wrong — and from the list it costs no round trip to
+    /// reach and none to leave.
+    ///
+    /// The press does not change the row, so the toast IS the feedback: a
+    /// press with no visible answer is a press that did nothing, as far as
+    /// anyone looking at it can tell.
+    func testACardCanBeRebuiltFromTheList() {
+        let app = openBoard()
+        let row = app.buttons["issue-row-41"]
+        XCTAssertTrue(row.waitForExistence(timeout: 5))
+        row.press(forDuration: 1.0)
 
-        let resync = app.buttons["Rebuild this card"]
-        XCTAssertTrue(resync.waitForExistence(timeout: 3), "no rebuild entry")
-        resync.tap()
+        let rebuild = app.buttons["Rebuild this card"].firstMatch
+        XCTAssertTrue(rebuild.waitForExistence(timeout: 3), "no rebuild entry on the long press")
+        attachScreenshot(app, name: "row-long-press")
+        rebuild.tap()
 
-        // The CARD comes back, not merely the page: the hatch throws away the
-        // mirror and everything in memory and lets the cold-open path rebuild
-        // it, so what proves it worked is the card's own text being drawn a
-        // second time by a document that has no memory of the first.
-        //
-        // It used to assert the page's loading line instead, which was all the
-        // demo could ever show — the card store talks to a gateway and there
-        // is none — until `-baybo-demo-card` started seeding one (2026-08-26).
-        // A hang and a rebuild look identical from the loading line.
         XCTAssertTrue(
-            app.staticTexts["the dial loop drops its subscription"].waitForExistence(
+            app.staticTexts["#41 rebuilds the next time it opens"].waitForExistence(timeout: 3),
+            "the rebuild said nothing, so nothing happened as far as the operator can see")
+        attachScreenshot(app, name: "rebuild-toast")
+
+        // And the card still opens — the hatch throws away this phone's copy,
+        // never the card.
+        row.tap()
+        XCTAssertTrue(
+            app.staticTexts[Self.demoCardTitle].waitForExistence(
                 timeout: BayboUITestCase.webviewTimeout),
-            "the card never came back after the rebuild")
-        // And the native chrome around it survived.
-        XCTAssertTrue(app.buttons["issue-menu"].exists)
+            "the card never came back after its copy was thrown away")
     }
 
     /// **A Waiting row leaves on the PRESS.** The suite asserted only that the

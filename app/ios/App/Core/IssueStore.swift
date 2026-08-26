@@ -4,8 +4,8 @@ import Foundation
 ///
 /// A separate type from `ProjectsStore` rather than a slice of it, and for the
 /// reason the board's own writes are in the store: this holds a WEBVIEW's
-/// worth of state — a bridge, an editing mode, a bottom inset — none of which
-/// a board screen has any business carrying, and all of which would need a
+/// worth of state — a bridge, a bottom inset, a live approval queue — none of
+/// which a board screen has any business carrying, and all of which would need a
 /// per-card key inside a store that is keyed by board.
 ///
 /// Attachments are not reimplemented: `TranscriptMedia` is the same engine the
@@ -49,9 +49,6 @@ final class IssueStore: ObservableObject, WebMediaTarget {
     /// at the top of the page rather than under the strip that raised it. The
     /// strip's retraction discipline assumes a slot only it writes.
     @Published var notice: String?
-    /// The description editor is open. Native owns the bar; the web owns the
-    /// textarea.
-    @Published var editing = false
     @Published private(set) var isRefreshing = false
 
     @Published var filePreview: FilePreview?
@@ -208,12 +205,36 @@ final class IssueStore: ObservableObject, WebMediaTarget {
     // ways for the two to disagree.
 
     private var mirrorURL: URL? {
+        Self.mirrorURL(projectId: projectId, number: number, in: supportDirectory)
+    }
+
+    /// Where a card's local copy lives. Static because the BOARD deletes one
+    /// for a card it has not opened — see `discardMirror` — and a second
+    /// spelling of this path is a rebuild that silently rebuilds nothing.
+    private static func mirrorURL(projectId: String, number: Int64, in directory: URL) -> URL? {
         // The project id reaches the filesystem, so it may not name a path;
         // the number is an Int64 and cannot.
         guard !projectId.isEmpty, !projectId.contains("/"), !projectId.contains(".") else {
             return nil
         }
-        return supportDirectory.appendingPathComponent("issue-\(projectId)-\(number).json")
+        return directory.appendingPathComponent("issue-\(projectId)-\(number).json")
+    }
+
+    /// Throw a card's local copy away WITHOUT opening it — the board row's
+    /// "Rebuild this card".
+    ///
+    /// The same first step as `resync`, and the only one that means anything
+    /// from a list: there is no page to reload and no memory to clear, so the
+    /// next open is the cold-open path by construction. Deliberately not a
+    /// store method: making one for a card nobody is looking at would build a
+    /// webview host and a composer draft to delete a file.
+    static func discardMirror(
+        projectId: String, number: Int64,
+        supportDirectory: URL = SessionIndex.supportDirectory()
+    ) {
+        guard let url = mirrorURL(projectId: projectId, number: number, in: supportDirectory)
+        else { return }
+        try? FileManager.default.removeItem(at: url)
     }
 
     private func loadMirror() {
@@ -338,16 +359,6 @@ final class IssueStore: ObservableObject, WebMediaTarget {
         } catch {
             writeError = ProjectsStore.message(from: error)
             return false
-        }
-    }
-
-    func setDescription(_ text: String) {
-        Task {
-            await write { [projectId, number] client in
-                _ = try await client.projectIssuePatch(
-                    projectId: projectId, number: number,
-                    patch: Self.patch(description: text))
-            }
         }
     }
 
@@ -608,12 +619,6 @@ final class IssueStore: ObservableObject, WebMediaTarget {
     }
     func queryAudioState(blobId: String) { media.queryAudioState(blobId: blobId) }
 
-    private static func patch(description: String) -> IssuePatch {
-        IssuePatch(
-            title: nil, description: description, attachments: nil, priority: nil,
-            assignee: .keep, blockedReason: .keep, cancelled: nil, parent: nil, stage: nil,
-            pinned: nil)
-    }
 }
 
 /// A card is a composer host: it holds the dock's notice line and names the
@@ -643,10 +648,14 @@ extension IssueStore: ComposerHost {
     extension IssueStore {
         static let demoCardArg = "-baybo-demo-card"
 
-        private var isDemoCard: Bool {
-            ProcessInfo.processInfo.arguments.contains(Self.demoCardArg)
-                && ProjectsStore.demoRequested
-        }
+        /// This card belongs to a demo board: the fixture is the answer, and
+        /// the network must not be touched.
+        ///
+        /// NOT keyed on `-baybo-demo-card` — that flag only says which screen
+        /// to LAND on, and a card reached by tapping a row is the same card.
+        /// Keying the seed to the landing flag gave one card two different
+        /// pages depending on how you got to it.
+        private var isDemoCard: Bool { ProjectsStore.demoRequested }
 
         /// Fill this store from the demo board. Answers whether it did, so the
         /// caller can fall through to the real cold-open path when the flag is
@@ -675,7 +684,12 @@ extension IssueStore: ComposerHost {
                     value: "project-\(projectId)/feat/issue-\(number)-dial-loop-subscription"),
                 blockedReason: .set(value: Self.demoBlockedReason))
             team = board.team
-            runs = Self.demoRuns(number: number)
+            // A LOG only for a card the board says has run. The board fixture
+            // carries the live rows (41, 42, 43) and nothing else, and a seed
+            // that invented three attempts for every card would leave the demo
+            // with no card that has never run — which is a state the card page
+            // draws differently (its ⋯ has nothing in it and is not drawn).
+            runs = board.runs.contains { $0.number == number } ? Self.demoRuns(number: number) : []
             eventsJson = Self.demoEventsJson(number: number, assignee: card.assignee ?? "a-dev")
             events = (try? IssueEvent.decodeList(eventsJson)) ?? []
             // The board fixture parents nothing, so take two rows as this

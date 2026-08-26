@@ -451,10 +451,13 @@ without touching `app/ios` at all.
   one with something in every stage and all four Waiting-strip kinds (the
   parked approval and the agent's question are seeded directly, because
   `refreshWaitingDetails` reads them off the network and the demo has none). Add
-  **`-baybo-demo-card`** to land one level deeper again, on card #41 — filled
-  in from that same board fixture (`IssueStore.seedDemoCard`), plus what the
-  board's own rows leave empty: a description, a branch, a run LOG (the board
-  holds only unsettled runs) and a timeline. It used to open on the page's own
+  **`-baybo-demo-card`** to land one level deeper again, on card #41. Every
+  card page under `-baybo-demo-projects` fills itself in from that board's own
+  fixture (`IssueStore.seedDemoCard`) — the landing flag says which SCREEN to
+  open, never which card is real, since a card reached by tapping a row is the
+  same card — plus what the board's rows leave empty: a description, a branch,
+  a timeline, and a run LOG for the cards the board says have run (41, 42, 43;
+  the rest have never run, which the page draws differently). It used to open on the page's own
   loading line for ever, since the card store talks to a gateway of its own and
   the demo has none — so everything the card itself draws had no tier at all,
   which is what `ProjectCardUITests` now covers: where the head, the text and

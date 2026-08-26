@@ -35,7 +35,7 @@
 | 8 | Tab badge | **Native `.badge(n)`** on **both** Projects and Chats (a deliberate divergence from web's "a tab gets a dot, never a count"). Since 2026-08-25 it counts **parked approvals only**, matching the strip — see §9.6 | §3.0 |
 | 9 | Mark-read by swiping a Waiting-on-you row | **No** | §3.1 |
 | 10 | Confirm before Stop | **Yes, a ConfirmDialog** | §3.3 |
-| 11 | Editing the description | **A ✎ button; raw text while editing, rendered again on exit** — in v1 | §3.3 |
+| 11 | Editing the description | **Not on the phone** (2026-08-26). Shipped in v1 behind a ✎ and taken out whole — see §3.3 | §3.3 |
 
 ## 0.2 What decision 3 leaves open (raised by review, for the owner)
 
@@ -77,12 +77,13 @@ Projects tab root = Projects cards (wordmark header, tab bar visible)
            │    ├─ a chip → native pickers: status → the board's own Move sheet
            │    │   (consequences and all), priority → `PriorityPicker`,
            │    │   assignee → `AssigneePicker` (parent+stage is still v2)
-           │    ├─ ⋯ → ✎ Edit description · Run again · Runs (every attempt,
-           │    │   newest first) · Rebuild this card — designed also to carry
-           │    │   Rename · Pin · Block…/Unblock · Cancel/Reopen · Copy branch
+           │    ├─ ⋯ → Run again · Runs (every attempt, newest first) — both
+           │    │   conditional, so the ⋯ itself is: a card that has never run
+           │    │   draws none. Designed also to carry Rename · Pin ·
+           │    │   Block…/Unblock · Cancel/Reopen · Copy branch
            │    ├─ sub-issue / #N → child card (push; back returns to the card you came from)
            │    └─ dock (native): hint chip · @ chips · ApprovalCardView (two answers) · composer pill
-           ├─ long press → Move to… · Assign… · Pin · Block… · Cancel issue
+           ├─ long press → Open · Move to… · Assign… · Pin · Rebuild this card
            ├─ leading swipe → Pin · trailing swipe → Move… (full-swipe disabled)
            ├─ ⋯ → Activity (push) · Team (sheet → Agent profile) · Mark all read N · Settings (push)
            └─ ✎ → New issue sheet (document-first; the compose glyph, not a `+` — the cards root's `+` makes a BOARD one push back)
@@ -126,14 +127,14 @@ Moving out of In Progress **never kills the run**; Stop is the only kill switch.
 
 | Layer | Owner | Contents |
 |---|---|---|
-| header | native (`ChatHeaderView` grammar) | back · `#N · status` glass pill (tap → Move sheet) · ⋯ (✎ · Run again · **Runs** · Rebuild) |
+| header | native (`ChatHeaderView` grammar) | back · `#N · status` glass pill (tap → Move sheet) · ⋯ (Run again · **Runs**), drawn only when it has an entry |
 | body | **`issue.html` WKWebView** | title · one meta line · the description as plain body · the state band (three chips · live-run line · blocked banner) · attachments · sub-issues · activity (**posts and lines**, below) · a "New activity" jump pill |
 | pickers | native sheets over the page | status → `MoveSheet` · priority → `PriorityPicker` · assignee → `AssigneePicker`, all writing through `ProjectsStore` |
 | dock | native, inside the real `ComposerDock` | jump-to-newest disc · notice line · `ApprovalCardView` (two answers, REST-backed) · hint chip · staged strip · the chat's composer pill, at the chat's width and beat (`+` → attach panel, in-field send, no prompt text) |
 | overlays | native | pickers (`ModelMenuPanel` style) · sheets · `RenameDialog` · `ConfirmDialog` |
 
 - Why the whole body rather than a small webview for the description alone: a webview inside a native ScrollView is two scrollers plus height round-trips, while a full-page webview is exactly `ChatScreen`'s existing layering (header / webview / dock / bottom-inset stream) — and comment markdown, attachments, `#N` links and KaTeX all come free.
-- Shape: a third Vite entry `issue.html`; an `IssueBridge` (the size of `DeckBridge`, with its main-frame-only guard and 3-reloads-per-30s crash budget): native→web `init / deliverIssue / deliverEvents / deliverRuns / setBottomInset / jumpToLatest / blobResult / editDescription`, web→native `ready / pick(field) / openRun / openIssue(n) / requestBlob / viewImage / previewFile / copy / log / descriptionDone`. **Inline images ride the bridge's `requestBlob`/`blobResult` (as the transcript does), so no scheme route is needed**; putting HtmlPreview in the issue body would need `DynamicRoute` widened, which v1 skips. The keyboard: the webview never resizes; native streams the bottom inset (the transcript's mechanism). One host per card, torn down on exit.
+- Shape: a third Vite entry `issue.html`; an `IssueBridge` (the size of `DeckBridge`, with its main-frame-only guard and 3-reloads-per-30s crash budget): native→web `init / deliverIssue / deliverEvents / deliverRuns / setBottomInset / jumpToLatest / blobResult`, web→native `ready / pick(field) / openRun / openIssue(n) / activityAtBottom / requestBlob / viewImage / previewFile / copy / log`. **Inline images ride the bridge's `requestBlob`/`blobResult` (as the transcript does), so no scheme route is needed**; putting HtmlPreview in the issue body would need `DynamicRoute` widened, which v1 skips. The keyboard: the webview never resizes; native streams the bottom inset (the transcript's mechanism). One host per card, torn down on exit.
 - **`subscribeIssue` has ONE holder, and it is the React tree** (2026-08-25 —
   shipped broken, fixed same day). `main.tsx` posts `issueReady` on the line
   after `createRoot().render(…)`, which has only SCHEDULED the tree; native
@@ -157,7 +158,24 @@ Moving out of In Progress **never kills the run**; Stop is the only kill switch.
 - **The hint chip** (native): the **third mirror** of `comments::comment_delivery` (`crates/project/src/comments.rs:37`) and `mentions::assigns_to`; the web's two live in `timelineModel.ts:252` and `mentionModel.ts`. Wording is taken from the web verbatim. The rule is not exposed over REST, so every client re-derives it — which is why it **must** be pinned by golden fixtures shared with app/web (§7).
 - **The approval card**: `ApprovalCardView` unchanged in the dock (`CompactPillButtonStyle` lifted out of its file first), two answers; the pending set is the card's `events` replayed by `call_id` (requested without resolved). The live queue is the truth, so tolerate a 404 on answer.
 - **The Answer flow** (an agent's question): Answer from the Waiting strip or the blocked banner opens the card with the composer focused and `@lead ` prefilled, the hint reading "Answers @lead · unblocking hands the run back to @dev-2", and "Unblock #N after sending" checked by default → `POST comment` first, then `PATCH {blocked_reason: null}` (the unblock door hands the parked run back out, and its brief carries your answer). A block the operator wrote themselves does not get this treatment.
-- **Editing the description (decision 11)**: a ✎ in the Description section header swaps the rendered block for a plain `<textarea>` holding the raw markdown (deliberately not contenteditable), and the native dock becomes "Editing description · Cancel | Done". Done sends the text over the bridge → `PATCH {description}` → re-render. Renaming the title still goes through `RenameDialog` (⋯ → Rename).
+- **Rebuild is on the LIST, and the description editor has no door**
+  (2026-08-26). The card's ⋯ had two unconditional entries and both went. The
+  hatch belongs to the board row's long press: a card whose local copy is wrong
+  is a card whose own chrome you have just stopped trusting, and from the list
+  it costs no round trip to reach and none to leave. `IssueStore.discardMirror`
+  is the whole of it from there — there is no page to reload and no memory to
+  clear, so the next open IS the cold-open path — and the toast is the
+  feedback, because the row does not change and a press with no visible answer
+  is a press that did nothing as far as anyone can tell.
+- **The description editor is GONE** (2026-08-26), not merely doorless: the
+  flag, the dock's Cancel|Done bar, the bridge's `setEditing` and
+  `descriptionDone`, the page's `<textarea>` and its CSS, `IssueStore`'s
+  `PATCH {description}` and its three strings all came out. It shipped in v1
+  as decision 11 — a ✎ in the ⋯ swapped the rendered block for the raw
+  markdown and the dock became "Editing description · Cancel | Done". A card's
+  text is written by whoever files it and by the agent working it; the phone
+  reads it, comments on it, and does not rewrite it. Renaming a card was never
+  part of this and is still `RenameDialog` (⋯ → Rename) on the list.
 - **The head is the title and the text; state is read second** (2026-08-26).
   The three pickers sat between the title and the card's first sentence, so
   the first screen was a title, a row of pills, a line of provenance and then,
@@ -302,9 +320,9 @@ Moving out of In Progress **never kills the run**; Stop is the only kill switch.
   store-free views both docks use; `ComposerStaging` — text, spool, uploads,
   draft — plugs into whichever surface owns it through `ComposerHost`
   (`draftKey` + `notice`), which is the one thing that made this a deferral.
-  What stays per-surface is what genuinely differs: this file keeps the
-  editing bar, the hint, the unblock toggle, its own flat veil, and a send
-  that posts a comment and THEN lifts a block.
+  What stays per-surface is what genuinely differs: this file keeps the hint,
+  the unblock toggle, its own flat veil, and a send that posts a comment and
+  THEN lifts a block.
   - **No `send` on the seam**, deliberately: a chat mints an id, paints an
     optimistic bubble, writes an outbox row and sends through a connection
     gate. The machine's door out is `claimSend()`, which also moves the send
@@ -393,7 +411,7 @@ Moving out of In Progress **never kills the run**; Stop is the only kill switch.
 - **New issue sheet**: document-first; chips prefilled from the open stage; `⚡ In Progress + @h — creating this starts a run`; In Progress without an assignee cannot submit.
 - **New project (pushed)**: Name (required; the server creates `work/<name>`) · Description · optional ceilings and parallel runs (the web's hints) → on success, push the new board (its lead is hired with it).
 - **Empty state**: zero projects → icon + a line that also states boards are never pushed + New project.
-- **An archived board**: an `Archived · read only` chip; + greyed; move / comment / assign / ✎ disabled and carrying the server's 409 sentence; Mark read, Stop and Unarchive still work; **approvals are not answerable** (the card renders greyed with "Archived — unarchive to answer" and the dock hosts no approval card; `/attention` already excludes archived boards, so nothing leads you to an unanswerable prompt).
+- **An archived board**: an `Archived · read only` chip; + greyed; move / comment / assign disabled and carrying the server's 409 sentence; Mark read, Stop and Unarchive still work; **approvals are not answerable** (the card renders greyed with "Archived — unarchive to answer" and the dock hosts no approval card; `/attention` already excludes archived boards, so nothing leads you to an unanswerable prompt).
 - **Offline**: a line reading "Offline — the board as of 14:02", **writes disabled** (not fail-fast), no outbox for board writes (the board moves while you are away; replaying a queued write is wrong), and the mirror is what is painted.
 
 ## 4. Domain rules the phone must not break
@@ -445,7 +463,7 @@ Rejected: putting the web board in a WKWebView (a Tailwind/brutalist re-skin, `t
 
 ## 8. Scope
 
-- **v1**: cards root; board (one stage + the four-kind Waiting strip + bands + pull-to-refresh + skeleton + run elapsed + Undo toast + stage-bar swipe + haptics); Move / long press / swipe; Issue detail (webview body + native dock: two-answer approvals, Stop with confirm, Run again, Answer+unblock, comments + hint + @mention + attachments, ✎ description editing, collapsed activity); run transcript sheet; Team + profile (read / model pin / remove); Activity; Filter (with Running only); Settings (with archive); New issue; New project; empty / archived / offline states; the mirror; tab badges.
+- **v1**: cards root; board (one stage + the four-kind Waiting strip + bands + pull-to-refresh + skeleton + run elapsed + Undo toast + stage-bar swipe + haptics); Move / long press / swipe; Issue detail (webview body + native dock: two-answer approvals, Stop with confirm, Run again, Answer+unblock, comments + hint + @mention + attachments, collapsed activity); run transcript sheet; Team + profile (read / model pin / remove); Activity; Filter (with Running only); Settings (with archive); New issue; New project; empty / archived / offline states; the mirror; tab badges.
 - **v1.5**: renaming the title, sub-issue parent/stage pickers, Copy branch.
 - **v2**: hiring, persona files, board push (plus Live Activity and a longer approval timeout), project attention in the app-icon badge, per-run headers in the transcript, HtmlPreview inside an issue, a share extension that files an issue, issue search in the global Search tab.
 - **Deliberately never**: drag reordering, five columns side by side, `approve_always`, a trace-viewer link, a workdir text field, diff stats, comment/attachment counts on the card face, inbox snooze.

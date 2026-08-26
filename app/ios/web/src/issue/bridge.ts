@@ -66,8 +66,6 @@ export type IssueEvents = {
   /// disagree if it tried.
   deliver(payload: IssuePayload): void;
   bottomInset(px: number): void;
-  /// The dock's ✎ / Done. Web owns the textarea; native owns the bar.
-  setEditing(active: boolean): void;
   /// Scroll the newest activity into view (the "new activity" pill, and the
   /// jump native runs after a comment lands).
   jumpToLatest(): void;
@@ -78,14 +76,12 @@ export type IssueGlobal = {
   deliver(payload: IssuePayload): void;
   setBottomInset(px: number): void;
   setLanguage(lang: string): void;
-  setEditing(active: boolean): void;
   jumpToLatest(): void;
 };
 
 type Buffered =
   | { kind: "deliver"; payload: IssuePayload }
   | { kind: "bottomInset"; px: number }
-  | { kind: "setEditing"; active: boolean }
   | { kind: "jumpToLatest" };
 
 let events: IssueEvents | null = null;
@@ -135,7 +131,6 @@ function dispatch(item: Buffered): void {
 function deliver(e: IssueEvents, item: Buffered): void {
   if (item.kind === "deliver") e.deliver(item.payload);
   else if (item.kind === "bottomInset") e.bottomInset(item.px);
-  else if (item.kind === "setEditing") e.setEditing(item.active);
   // Every kind needs its own branch ABOVE this terminal else — it is a bare
   // fall-through to `jumpToLatest`, so a missing branch silently turns a new
   // command into "scroll to the bottom", and the type checker cannot see it.
@@ -169,7 +164,6 @@ window.issuePage = {
   setLanguage: (lang) => {
     for (const cb of [...languageListeners]) cb(lang);
   },
-  setEditing: (active) => dispatch({ kind: "setEditing", active }),
   jumpToLatest: () => dispatch({ kind: "jumpToLatest" }),
 };
 
@@ -193,12 +187,6 @@ export function openIssue(number: number): void {
 /// Open a run's transcript.
 export function openRun(attempt: number): void {
   postToNative({ type: "openRun", attempt });
-}
-
-/// The description editor's Done. Native does the PATCH — this page never
-/// speaks REST, exactly as the transcript never does.
-export function postDescription(text: string): void {
-  postToNative({ type: "descriptionDone", text });
 }
 
 /// Ask native to open a picker for a field the header/chips own.

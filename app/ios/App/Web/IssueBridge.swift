@@ -58,11 +58,6 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
             store?.redeliver()
         case "issueRendered":
             store?.markRendered()
-        case "descriptionDone":
-            if let text = body["text"] as? String {
-                store?.setDescription(text)
-                store?.editing = false
-            }
         case "openIssue":
             if let number = (body["number"] as? NSNumber)?.int64Value, let store {
                 AppStore.shared?.openProjectIssue(project: store.projectId, number: number)
@@ -243,10 +238,6 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
     func setLanguage(_ code: String) {
         page("setLanguage", Self.jsonLiteral(code))
         shared("setLanguage", Self.jsonLiteral(code))
-    }
-
-    func setEditing(_ active: Bool) {
-        page("setEditing", active ? "true" : "false")
     }
 
     func jumpToLatest() {

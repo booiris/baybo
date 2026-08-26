@@ -293,6 +293,14 @@ struct ProjectBoardScreen: View {
                         systemImage: issue.pinned ? "pin.slash" : "pin")
                 }
             }
+            // The chat's escape hatch, on a card — reached from the LIST since
+            // 2026-08-26 rather than from the card's own ⋯, because a card
+            // whose local copy is wrong is a card whose own chrome you have
+            // just stopped trusting. Read-only boards keep it: it throws away
+            // nothing but this phone's copy.
+            Button { rebuild(issue) } label: {
+                Label(lang.t("board.rebuild"), systemImage: "arrow.triangle.2.circlepath")
+            }
         }
     }
 
@@ -816,6 +824,18 @@ struct ProjectBoardScreen: View {
             guard let row = rows.first(where: { $0.status == target }) else { return }
             await runMove(fresh, row: row)
         }
+    }
+
+    /// Throw away this phone's copy of a card, so the next open refetches it.
+    ///
+    /// No confirm — it costs a round trip and nothing else — but it does say
+    /// so: the row does not change, the card is not on screen, and a press
+    /// with no visible answer is a press that did nothing as far as anyone can
+    /// tell. `IssueStore` owns the file; this only names the card.
+    private func rebuild(_ issue: IssueInfo) {
+        Haptics.tap()
+        IssueStore.discardMirror(projectId: projectId, number: issue.number)
+        show(Toast(label: lang.t("board.rebuildDone", "#\(issue.number)"), reverse: nil))
     }
 
     private func setPinned(_ issue: IssueInfo, _ pinned: Bool) {

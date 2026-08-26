@@ -10,9 +10,9 @@ import SwiftUI
 /// the glass pill, and attachments were written up as deferred. What actually
 /// bound them was two fields, now a `ComposerHost`; the pill, the `+`, the
 /// strip and the pickers are shared views, and this file keeps only what a
-/// card genuinely does differently: the description editor's bar, the hint
-/// line, the unblock toggle, the REST approval card, and a send that posts a
-/// comment and then — in that order — lifts a block.
+/// card genuinely does differently: the hint line, the unblock toggle, the REST
+/// approval card, and a send that posts a comment and then — in that order —
+/// lifts a block.
 struct IssueDock: View {
     @ObservedObject var store: IssueStore
     @ObservedObject var staging: ComposerStaging
@@ -43,34 +43,29 @@ struct IssueDock: View {
 
     var body: some View {
         VStack(spacing: 8) {
-            if store.editing {
-                editingBar
+            if let notice = store.notice {
+                noticeRow(notice)
                     .padding(.horizontal, Self.rowGutter)
-            } else {
-                if let notice = store.notice {
-                    noticeRow(notice)
-                        .padding(.horizontal, Self.rowGutter)
-                }
-                if let prompt = store.pendingApprovals.first {
-                    approvalCard(prompt)
-                        .padding(.horizontal, Self.rowGutter)
-                        // Re-key on the prompt so answering the head SWAPS in
-                        // the next card (a fresh one-shot latch) instead of
-                        // reusing this one, whose buttons have already fired.
-                        .id(prompt.callId)
-                }
-                hint
-                    .padding(.horizontal, Self.rowGutter)
-                if !staging.staged.isEmpty {
-                    StagedStrip(
-                        items: staging.staged,
-                        onRemove: { staging.remove($0) },
-                        onRetry: { staging.retry($0) }
-                    )
-                    .padding(.horizontal, Self.rowGutter)
-                }
-                composer
             }
+            if let prompt = store.pendingApprovals.first {
+                approvalCard(prompt)
+                    .padding(.horizontal, Self.rowGutter)
+                    // Re-key on the prompt so answering the head SWAPS in the
+                    // next card (a fresh one-shot latch) instead of reusing
+                    // this one, whose buttons have already fired.
+                    .id(prompt.callId)
+            }
+            hint
+                .padding(.horizontal, Self.rowGutter)
+            if !staging.staged.isEmpty {
+                StagedStrip(
+                    items: staging.staged,
+                    onRemove: { staging.remove($0) },
+                    onRetry: { staging.retry($0) }
+                )
+                .padding(.horizontal, Self.rowGutter)
+            }
+            composer
         }
         .padding(.top, 8)
         .background(alignment: .bottom) { veil }
@@ -88,35 +83,6 @@ struct IssueDock: View {
                 .lineLimit(2)
             Spacer(minLength: 0)
         }
-    }
-
-    // MARK: - Editing
-
-    /// Native owns the bar; the web owns the textarea. Done flips `editing`
-    /// off, and the PAGE is what sends the text back — native never reads the
-    /// editor's contents, so there is no second copy of the draft to disagree.
-    private var editingBar: some View {
-        HStack {
-            Button(lang.t("common.cancel")) {
-                Haptics.tap()
-                store.editing = false
-            }
-            .buttonStyle(CompactPillButtonStyle(fill: nil, color: Theme.inkSoft, expands: false))
-            .accessibilityIdentifier("issue-edit-cancel")
-            Spacer()
-            Text(verbatim: lang.t("issue.editingDescription"))
-                .font(Theme.mono(11))
-                .foregroundStyle(Theme.inkSoft)
-            Spacer()
-            Button(lang.t("issue.doneEdit")) {
-                Haptics.tap()
-                store.editing = false
-            }
-            .buttonStyle(
-                CompactPillButtonStyle(fill: Theme.ink, color: Theme.paper, expands: false))
-            .accessibilityIdentifier("issue-edit-done")
-        }
-        .padding(.bottom, 6)
     }
 
     // MARK: - Approval

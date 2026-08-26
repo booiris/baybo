@@ -313,23 +313,6 @@
   font-size: 12.5px;
 }
 
-.issue-editor {
-  width: 100%;
-  min-height: 200px;
-  box-sizing: border-box;
-  padding: 12px;
-  border: 1px solid var(--color-line);
-  border-radius: var(--radius);
-  background: var(--color-paper);
-  color: var(--color-ink);
-  /* The editor shows the SOURCE, so it is monospaced — a proportional face
-     over raw markdown hides exactly the alignment the syntax depends on. */
-  font-family: var(--font-mono);
-  font-size: 12.5px;
-  line-height: 1.55;
-  resize: none;
-}
-
 .issue-attachments {
   display: flex;
   flex-direction: column;

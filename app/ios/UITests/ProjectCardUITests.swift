@@ -20,6 +20,11 @@ final class ProjectCardUITests: BayboUITestCase {
     private static let priorityChip = "Urgent"
     private static let assigneeChip = "@dev-1"
 
+    /// The board itself, for the two cases that start from a row.
+    private func openBoard() -> XCUIApplication {
+        launch(["-baybo-open-home", "-baybo-demo-projects", "-baybo-demo-board"])
+    }
+
     private func openCard() -> XCUIApplication {
         let app = launch(Self.cardArguments)
         XCTAssertTrue(
@@ -85,6 +90,31 @@ final class ProjectCardUITests: BayboUITestCase {
         XCTAssertLessThan(
             plain, 0.005,
             "the assignee chip is tinted; the hue is supposed to be keyed by a STATE")
+    }
+
+    /// **A ⋯ with nothing in it is not drawn.** Both of the button's
+    /// unconditional entries left on 2026-08-26 — the description editor lost
+    /// its door and Rebuild moved to the board row's long press — so what is
+    /// left is about runs, and a card that has never run has nothing to say
+    /// behind it.
+    func testACardWithNoRunsHasNoMenu() {
+        let app = openBoard()
+        // The board opens on In Progress, and every card there is running by
+        // construction — a card that has never run lives in Todo.
+        XCTAssertTrue(app.buttons["stage-todo"].waitForExistence(timeout: 8), "no stage bar")
+        app.buttons["stage-todo"].tap()
+
+        let row = app.buttons["issue-row-44"]
+        XCTAssertTrue(row.waitForExistence(timeout: 5), "no card without runs on the board")
+        row.tap()
+
+        XCTAssertTrue(
+            app.staticTexts["retire the old pump tee"].waitForExistence(
+                timeout: Self.webviewTimeout),
+            "the card never opened")
+        XCTAssertFalse(
+            app.buttons["issue-menu"].exists,
+            "a card with no runs draws a ⋯ that opens nothing")
     }
 
     /// The run log, in the ⋯ — every attempt, newest first.
