@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use baybo_model::{AgentProfileId, IssueEventId, IssueId, IssueRunId, ProjectId, SessionId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::StorageError;
 
@@ -643,7 +644,37 @@ pub struct IssueEventRow {
     pub number: i64,
     pub actor: IssueActor,
     pub body: IssueEventBody,
+    /// Client-minted idempotency key for an operator comment. Other event
+    /// kinds leave it absent.
+    pub client_msg_id: Option<IssueEventClientMsgId>,
     pub created_at: DateTime<Utc>,
+}
+
+/// Client-minted idempotency key for one operator comment.
+///
+/// UUID is the wire contract, while the wrapper prevents a timeline entry id,
+/// call id, or arbitrary string from being passed to the dedup seam by
+/// accident. The canonical lowercase spelling is what is persisted and sent
+/// back to clients.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct IssueEventClientMsgId(String);
+
+impl IssueEventClientMsgId {
+    pub fn parse(value: &str) -> std::result::Result<Self, uuid::Error> {
+        Uuid::parse_str(value).map(|id| Self(id.hyphenated().to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Result of claiming a client comment id. `Existing` is the original row:
+/// callers return it without repeating any comment side effects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IssueEventAppendOutcome {
+    Inserted(IssueEventRow),
+    Existing(IssueEventRow),
 }
 
 /// What a caller supplies to append to a timeline.
@@ -801,6 +832,18 @@ pub trait ProjectStore: Send + Sync {
     async fn enqueue_run(&self, new: &NewIssueRun) -> Result<IssueRunRow>;
 
     async fn append_event(&self, new: &NewIssueEvent) -> Result<IssueEventRow>;
+
+    async fn append_event_idempotent(
+        &self,
+        new: &NewIssueEvent,
+        client_msg_id: &IssueEventClientMsgId,
+    ) -> Result<IssueEventAppendOutcome>;
+
+    async fn event_by_client_msg_id(
+        &self,
+        issue: &IssueId,
+        client_msg_id: &IssueEventClientMsgId,
+    ) -> Result<Option<IssueEventRow>>;
 
     async fn list_events(&self, issue: &IssueId) -> Result<Vec<IssueEventRow>>;
 

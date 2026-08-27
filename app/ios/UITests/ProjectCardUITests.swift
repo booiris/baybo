@@ -302,6 +302,38 @@ final class ProjectCardUITests: BayboUITestCase {
             "the disc stayed up after taking the card to the bottom")
     }
 
+    /// The keyboard is already represented by the dock's streamed bottom
+    /// inset. If the webview also shrinks to the keyboard safe area, jumping
+    /// to its real `scrollHeight` exposes that second copy as a blank tail the
+    /// height of the keyboard between the final post and the field.
+    func testJumpingWhileTheFieldIsFocusedDoesNotLeaveAKeyboardSizedGap() {
+        let app = openCard()
+        let field = app.textFields[IssueDockFields.field]
+        field.tap()
+        XCTAssertTrue(
+            app.keyboards.firstMatch.waitForExistence(timeout: 5),
+            "the keyboard never covered the card")
+
+        let jump = app.buttons["issue-jump"]
+        XCTAssertTrue(
+            jump.waitForExistence(timeout: Self.webviewTimeout),
+            "the focused card offered no way to its newest activity")
+        jump.tap()
+
+        let last = app.staticTexts.containing(
+            NSPredicate(format: "label CONTAINS 'once the fence lands'")
+        ).firstMatch
+        XCTAssertTrue(last.waitForExistence(timeout: 10), "the jump did not reveal the last post")
+        XCTAssertTrue(jump.waitForNonExistence(timeout: 5), "the page did not reach its bottom")
+
+        let gap = field.frame.minY - last.frame.maxY
+        attachScreenshot(app, name: "card-focused-jump-bottom")
+        XCTAssertGreaterThanOrEqual(gap, 0, "the dock still covers the final post")
+        XCTAssertLessThan(
+            gap, 140,
+            "the keyboard was counted twice, leaving a \(gap)-point blank tail")
+    }
+
     /// **The card's words can be copied.** `:root` turns selection and the iOS
     /// long-press callout off for the whole document — the transcript opts its
     /// own prose back in, and this page was never added to that list, so a

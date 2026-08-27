@@ -10,9 +10,10 @@ use baybo_model::{
     MAX_PROJECT_NAME_CHARS, ProjectId, SessionId, TeamMembership,
 };
 use baybo_store::project::{
-    BoardCards, DEFAULT_MAX_PARALLEL_ISSUE_RUNS, IssueActor, IssueEventBody, IssueEventRow,
-    IssuePriority, IssueRow, IssueRunRow, IssueStatus, IssueUpdate, NewIssue, NewIssueEvent,
-    ProjectRow, ProjectStore, ProjectUpdate, RunStatus, RunTrigger, Spend,
+    BoardCards, DEFAULT_MAX_PARALLEL_ISSUE_RUNS, IssueActor, IssueEventAppendOutcome,
+    IssueEventBody, IssueEventClientMsgId, IssueEventRow, IssuePriority, IssueRow, IssueRunRow,
+    IssueStatus, IssueUpdate, NewIssue, NewIssueEvent, ProjectRow, ProjectStore, ProjectUpdate,
+    RunStatus, RunTrigger, Spend,
 };
 use baybo_store::{AgentProfileStore, BlobStore};
 use baybo_workspace::WorkspacePaths;
@@ -1736,26 +1737,81 @@ impl ProjectManager {
         text: &str,
         attachments: &[AttachmentRequest],
     ) -> Result<IssueEventRow> {
-        self.writable_project(project).await?;
+        self.comment_inner(project, number, actor, text, attachments, None)
+            .await
+    }
+
+    /// Record a client comment exactly once. A retry returns the original
+    /// timeline row and repeats none of the wake, mention, or uncancel side
+    /// effects that followed its first insertion.
+    pub async fn comment_idempotent(
+        &self,
+        project: &ProjectId,
+        number: i64,
+        actor: IssueActor,
+        text: &str,
+        attachments: &[AttachmentRequest],
+        client_msg_id: IssueEventClientMsgId,
+    ) -> Result<IssueEventRow> {
+        self.comment_inner(
+            project,
+            number,
+            actor,
+            text,
+            attachments,
+            Some(client_msg_id),
+        )
+        .await
+    }
+
+    async fn comment_inner(
+        &self,
+        project: &ProjectId,
+        number: i64,
+        actor: IssueActor,
+        text: &str,
+        attachments: &[AttachmentRequest],
+        client_msg_id: Option<IssueEventClientMsgId>,
+    ) -> Result<IssueEventRow> {
         let issue = self.get_issue(project, number).await?;
+        // Idempotency replays the original response even if the board became
+        // archived after the first request landed. Re-running current write
+        // validation would turn an already-durable comment into a failure.
+        if let Some(client_msg_id) = &client_msg_id
+            && let Some(entry) = self
+                .store
+                .event_by_client_msg_id(&issue.id, client_msg_id)
+                .await?
+        {
+            return Ok(entry);
+        }
+        self.writable_project(project).await?;
         let text = text.trim();
         let attachments = attachments::resolve(&self.blobs, attachments).await?;
         if text.is_empty() && attachments.is_empty() {
             return Err(ProjectError::invalid("text", "a comment cannot be empty"));
         }
-        let entry = self
-            .store
-            .append_event(&NewIssueEvent {
-                issue_id: issue.id.clone(),
-                project_id: project.clone(),
-                number,
-                actor: actor.clone(),
-                body: IssueEventBody::Comment {
-                    text: text.to_owned(),
-                    attachments,
-                },
-            })
-            .await?;
+        let event = NewIssueEvent {
+            issue_id: issue.id.clone(),
+            project_id: project.clone(),
+            number,
+            actor: actor.clone(),
+            body: IssueEventBody::Comment {
+                text: text.to_owned(),
+                attachments,
+            },
+        };
+        let entry = match client_msg_id {
+            Some(client_msg_id) => match self
+                .store
+                .append_event_idempotent(&event, &client_msg_id)
+                .await?
+            {
+                IssueEventAppendOutcome::Inserted(entry) => entry,
+                IssueEventAppendOutcome::Existing(entry) => return Ok(entry),
+            },
+            None => self.store.append_event(&event).await?,
+        };
         self.events.timeline_changed(project, number);
         // After the entry, not before: the comment is the reason the card is
         // coming back, and a timeline that reopened it first would read as

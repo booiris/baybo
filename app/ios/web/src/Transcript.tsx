@@ -2564,7 +2564,7 @@ export function Transcript({
           : [...freezeActiveWork(rows), rebuilt];
       });
     },
-    [setStreamingText],
+    [closeWork, setStreamingText],
   );
 
   // Fire a backward-history (scroll-up) request through native. The API result
@@ -2688,7 +2688,7 @@ export function Transcript({
       log("warn", `history page failed: ${String(e)}`);
       appendNotice(t("chat.recoverFailed", { error: String(e) }));
     }
-  }, [hasMoreOlder, requestHistory, appendNotice, drainDeferredHead]);
+  }, [hasMoreOlder, requestHistory, appendNotice, drainDeferredHead, t]);
 
   // The one forward-recovery pull (docs/sync-protocol.md "The one client
   // algorithm"): session open, reconnect, gap nudge and the safety tick all
@@ -2916,7 +2916,7 @@ export function Transcript({
       advanceCursorFromSync(frame.next_cursor, frame.rebased);
       markReadIfAdvanced();
     },
-    [advanceCursorFromSync, markReadIfAdvanced, setSyncInFlight, runSync],
+    [advanceCursorFromSync, clearStreaming, markReadIfAdvanced, setSyncInFlight, runSync],
   );
 
   const handleFrame = (frameJson: string) => {

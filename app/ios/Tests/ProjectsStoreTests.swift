@@ -15,14 +15,16 @@ struct ProjectsStoreTests {
             updatedAtMs: 0)
     }
 
-    private func issue(_ number: Int64, title: String, unread: Int64 = 0) -> IssueInfo {
+    private func issue(
+        _ number: Int64, title: String, unread: Int64 = 0, cancelled: Bool = false
+    ) -> IssueInfo {
         IssueInfo(
             number: number, projectId: "p1", title: title, description: "", attachments: [],
             status: .todo, priority: .high, assignee: "a-dev", position: number, pinned: false,
             branch: nil, blockedReason: nil, parent: nil, filedFrom: nil, stage: 0,
             subIssues: SubIssueProgress(done: 1, total: 3), unread: unread, lastRunFailed: false,
-            approvalPending: true, openedByAgent: false, cancelledAtMs: nil, createdAtMs: 0,
-            updatedAtMs: 0)
+            approvalPending: true, openedByAgent: false, cancelledAtMs: cancelled ? 1 : nil,
+            createdAtMs: 0, updatedAtMs: 0)
     }
 
     private func member(_ id: String, _ handle: String, lead: Bool = false) -> TeamMemberInfo {
@@ -175,6 +177,89 @@ struct ProjectsStoreTests {
         #expect(patch?.1.stage == nil)
         #expect(patch?.1.parent == nil)
         #expect(patch?.1.cancelled == nil)
+    }
+
+    /// Cancel is a terminal state change, not a delete. The row is marked
+    /// locally at once, its active run and parked prompt leave with it, and the
+    /// sparse PATCH says exactly that one thing. Reopen reverses only the mark.
+    @Test func cancellingAndReopeningACardUsesOneSparsePatchEachWay() async {
+        let dir = TempSupportDir()
+        let fake = FakeBayboClient()
+        let card = issue(12, title: "the parser")
+        fake.stubProjects = [project("p1", name: "rglide")]
+        fake.stubIssues = [card]
+        fake.stubIssueDetail = card
+        fake.stubRuns = [
+            IssueRunInfo(
+                number: 12, attempt: 1, agentId: "a-dev", status: .running,
+                trigger: .promoted, sessionId: "s1", error: nil, createdAtMs: 1,
+                startedAtMs: 2, settledAtMs: nil, costMicros: nil, inputTokens: nil,
+                outputTokens: nil)
+        ]
+        let store = ProjectsStore(supportDirectory: dir.url, clientProvider: { fake })
+        await store.refreshRoot()
+        await store.refreshBoard("p1")
+        store.seedPrompts(
+            board: "p1",
+            [
+                12: [
+                    IssueApprovalPrompt(
+                        callId: "c1", tool: "exec", summary: nil, askedBy: "dev-1",
+                        askedAtMs: 1)
+                ]
+            ])
+
+        #expect(await store.setCancelled(board: "p1", issue: 12, true))
+        #expect(store.boards["p1"]?.issues.first?.cancelledAtMs != nil)
+        #expect(store.boards["p1"]?.runs.isEmpty == true)
+        #expect(store.approvalPrompts["p1"]?[12] == nil)
+        let cancel = fake.patches.last?.1
+        #expect(cancel?.cancelled == true)
+        #expect(cancel?.title == nil)
+        #expect(cancel?.description == nil)
+        #expect(cancel?.attachments == nil)
+        #expect(cancel?.priority == nil)
+        #expect(cancel?.assignee == .keep)
+        #expect(cancel?.blockedReason == .keep)
+        #expect(cancel?.parent == nil)
+        #expect(cancel?.stage == nil)
+        #expect(cancel?.pinned == nil)
+
+        #expect(await store.setCancelled(board: "p1", issue: 12, false))
+        #expect(store.boards["p1"]?.issues.first?.cancelledAtMs == nil)
+        #expect(fake.patches.last?.1.cancelled == false)
+    }
+
+    /// The parked prompt is outside `Board`, so the generic write rollback
+    /// cannot restore it. The cancel verb snapshots that side state itself.
+    @Test func aRefusedCancelRestoresTheCardRunAndPrompt() async {
+        let dir = TempSupportDir()
+        let fake = FakeBayboClient()
+        fake.stubProjects = [project("p1", name: "rglide")]
+        fake.stubIssues = [issue(12, title: "the parser")]
+        fake.stubRuns = [
+            IssueRunInfo(
+                number: 12, attempt: 1, agentId: "a-dev", status: .running,
+                trigger: .promoted, sessionId: "s1", error: nil, createdAtMs: 1,
+                startedAtMs: 2, settledAtMs: nil, costMicros: nil, inputTokens: nil,
+                outputTokens: nil)
+        ]
+        let store = ProjectsStore(supportDirectory: dir.url, clientProvider: { fake })
+        await store.refreshBoard("p1")
+        store.seedPrompts(
+            board: "p1",
+            [
+                12: [
+                    IssueApprovalPrompt(
+                        callId: "c1", tool: "exec", summary: nil, askedBy: "dev-1",
+                        askedAtMs: 1)
+                ]
+            ])
+
+        #expect(!(await store.setCancelled(board: "p1", issue: 12, true)))
+        #expect(store.boards["p1"]?.issues.first?.cancelledAtMs == nil)
+        #expect(store.boards["p1"]?.runs.map(\.number) == [12])
+        #expect(store.approvalPrompts["p1"]?[12]?.map(\.callId) == ["c1"])
     }
 
     /// Offline disables writes rather than queueing them: a board moves while

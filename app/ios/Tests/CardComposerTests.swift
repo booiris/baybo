@@ -35,6 +35,10 @@ struct CardComposerTests {
 
     private func store(_ dir: TempSupportDir, client: FakeBayboClient) -> IssueStore {
         client.stubIssueDetail = issue(41)
+        client.stubIssueEventsJson = #"{"items":[]}"#
+        client.stubRunLog = IssueRunLog(
+            runs: [], totalCostMicros: 0, totalInputTokens: 0, totalOutputTokens: 0)
+        client.stubIssues = [issue(41)]
         return IssueStore(projectId: "p1", number: 41, client: client, supportDirectory: dir.url)
     }
 
@@ -80,37 +84,79 @@ struct CardComposerTests {
     @Test func aCommentCarriesItsPicksByIdAndName() async {
         let dir = TempSupportDir()
         let fake = FakeBayboClient()
+        fake.holdComments()
         let card = store(dir, client: fake)
+        await card.refresh()
 
-        let landed = await card.comment(
+        let clientMsgId = card.sendComment(
             "here you go",
             attachments: [
-                IssueAttachmentInput(blobId: "sha256:a.tok", filename: "trace.txt"),
-                IssueAttachmentInput(blobId: "sha256:b.tok", filename: nil),
+                AttachmentRef(
+                    kind: .file, blobId: "sha256:a.tok", mimeType: "text/plain", size: 12,
+                    filename: "trace.txt"),
+                AttachmentRef(
+                    kind: .file, blobId: "sha256:b.tok", mimeType: "application/json",
+                    size: 18, filename: nil),
             ])
 
-        #expect(landed)
+        #expect(await waitUntil { fake.parkedComments == 1 })
+        #expect(card.pendingComments.first?.clientMsgId == clientMsgId)
+        #expect(card.pendingComments.first?.state == .sending)
         #expect(fake.comments.count == 1)
+        #expect(fake.comments.first?.clientMsgId == clientMsgId)
         #expect(fake.comments.first?.text == "here you go")
         #expect(fake.comments.first?.attachments.map(\.blobId) == ["sha256:a.tok", "sha256:b.tok"])
         #expect(fake.comments.first?.attachments.first?.filename == "trace.txt")
+
+        fake.releaseComments()
+        #expect(await waitUntil { card.pendingComments.isEmpty })
     }
 
-    /// A comment that did not land says so. There is no outbox on this
-    /// surface, so the dock keeps its text and its tiles on a `false` — the
-    /// picks are uploaded blobs, and discarding them strands files the
-    /// operator cannot get back.
+    /// A refusal stays as the same optimistic row, and retry reuses its durable
+    /// key rather than appending a second comment.
     @Test func aRefusedCommentReportsItRatherThanVanishing() async {
         let dir = TempSupportDir()
         let fake = FakeBayboClient()
         fake.failComments = true
         let card = store(dir, client: fake)
+        await card.refresh()
 
-        let landed = await card.comment("this will not land")
+        let clientMsgId = card.sendComment("this will not land")
+        #expect(await waitUntil { card.pendingComments.first?.state == .failed })
 
-        #expect(!landed)
-        #expect(fake.comments.isEmpty)
+        #expect(card.pendingComments.first?.clientMsgId == clientMsgId)
+        #expect(fake.comments.count == 1)
         #expect(card.writeError != nil, "and the failure is reported, not swallowed")
+
+        fake.failComments = false
+        card.retryComment(clientMsgId)
+
+        #expect(await waitUntil { card.pendingComments.isEmpty })
+        #expect(fake.comments.count == 2)
+        #expect(fake.comments.allSatisfy { $0.clientMsgId == clientMsgId })
+    }
+
+    @Test func anUnconfirmedCommentSurvivesAStoreRebuild() async {
+        let dir = TempSupportDir()
+        let first = IssueCommentOutbox(
+            projectId: "p1", number: 41, supportDirectory: dir.url)
+        first.begin(
+            clientMsgId: "0c928886-cef8-4449-9e16-913c601f9988",
+            text: "still owed",
+            attachments: [
+                AttachmentRef(
+                    kind: .image, blobId: "sha256:image.tok", mimeType: "image/png", size: 7,
+                    filename: "plot.png")
+            ],
+            unblockAfterSend: true)
+
+        let rebuilt = IssueCommentOutbox(
+            projectId: "p1", number: 41, supportDirectory: dir.url)
+
+        #expect(rebuilt.entries().first?.text == "still owed")
+        #expect(rebuilt.entries().first?.attachments.first?.mimeType == "image/png")
+        #expect(rebuilt.entries().first?.unblockAfterSend == true)
+        #expect(rebuilt.entries().first?.state == .sending)
     }
 
     /// The send gate is the machine's, so the card cannot ship a comment MINUS

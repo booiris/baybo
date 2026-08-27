@@ -1329,6 +1329,7 @@ mod tests {
             number: 1,
             actor: baybo_store::project::IssueActor::User,
             body,
+            client_msg_id: None,
             created_at: at,
         }
     }

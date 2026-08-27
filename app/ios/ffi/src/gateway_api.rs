@@ -1824,6 +1824,7 @@ struct MoveIssueRequest<'a> {
 
 #[derive(Serialize)]
 struct NewCommentRequest<'a> {
+    client_msg_id: &'a str,
     text: &'a str,
     attachments: Vec<AttachmentRequest<'a>>,
 }
@@ -2154,11 +2155,13 @@ pub(crate) async fn comment_on_issue<C: GatewayJsonClient + Sync>(
     client: &C,
     project: String,
     number: i64,
+    client_msg_id: String,
     text: String,
     attachments: Vec<IssueAttachmentInput>,
 ) -> Result<String, String> {
     let path = format!("{}/comments", issue_path(&project, number)?);
     let body = serde_json::to_vec(&NewCommentRequest {
+        client_msg_id: &client_msg_id,
         text: &text,
         attachments: attachments
             .iter()
@@ -3858,6 +3861,35 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_comment_carries_its_retry_identity_and_attachments() {
+        let client = RecordingClient::new(r#"{"id":"event-1"}"#);
+        let client_msg_id = "0199318f-7df2-7a24-ae03-2ea582c857bc";
+        comment_on_issue(
+            &client,
+            "p1".to_string(),
+            12,
+            client_msg_id.to_string(),
+            "hello".to_string(),
+            vec![IssueAttachmentInput {
+                blob_id: "blob-1".to_string(),
+                filename: Some("notes.txt".to_string()),
+            }],
+        )
+        .await
+        .expect("comment");
+
+        let call = client.only_call();
+        assert_eq!(call.method, "POST");
+        assert_eq!(call.path, "/v1/projects/p1/issues/12/comments");
+        assert_eq!(
+            call.body,
+            format!(
+                r#"{{"client_msg_id":"{client_msg_id}","text":"hello","attachments":[{{"blob_id":"blob-1","filename":"notes.txt"}}]}}"#
+            )
+        );
+    }
+
     /// A status this build cannot name never reaches the wire: asking the
     /// server to move a card into a column we have no word for is a request
     /// nobody can honour, and it must fail before the request, not after.
@@ -3979,7 +4011,8 @@ mod tests {
     /// asserted here because either one alone passes on the broken pairing.
     #[tokio::test]
     async fn a_runs_first_page_is_a_sync_frame_and_its_scrollback_a_history_one() {
-        let body = r#"{"transcript":[{"id":"r1"}],"has_more":true,"oldest_ordinal":4,"newest_ordinal":9}"#;
+        let body =
+            r#"{"transcript":[{"id":"r1"}],"has_more":true,"oldest_ordinal":4,"newest_ordinal":9}"#;
 
         let client = RecordingClient::new(body);
         let frame = fetch_run_transcript_baseline(&client, "p-1".into(), 26, 2, Some(80))

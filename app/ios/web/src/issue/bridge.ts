@@ -48,6 +48,7 @@ export type Person = { handle: string; avatar?: string; monogram: string };
 export type IssuePayload = {
   issue: IssueDetail;
   events: IssueEvent[];
+  pendingComments?: IssueEvent[];
   runs: IssueRun[];
   /// Agent profile id → who they are. An id that resolves to nothing prints as
   /// itself, which is what the gateway does too.
@@ -269,6 +270,10 @@ export function postGeneratedFace(targetId: string, agentId: string, pngBase64: 
 /// activity" pill is worth showing.
 export function postActivityAtBottom(targetId: string, atBottom: boolean): void {
   postToNative({ type: "activityAtBottom", targetId, atBottom });
+}
+
+export function retryComment(clientMsgId: string): void {
+  postToNative({ type: "retryComment", targetId: activeTargetId(), clientMsgId });
 }
 
 export function postIssueState(targetId: string, state: IssueViewState): void {

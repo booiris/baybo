@@ -2925,6 +2925,12 @@ export interface components {
         IssueEventDto: {
             actor: components["schemas"]["ActorDto"];
             body: components["schemas"]["IssueEventBodyDto"];
+            /**
+             * @description Client idempotency key on an operator comment. Its presence lets a
+             *     client reconcile an optimistic row even when a timeline invalidation
+             *     wins the race against the POST response.
+             */
+            client_msg_id?: string | null;
             /** Format: int64 */
             created_at_ms: number;
             id: string;
@@ -3300,6 +3306,11 @@ export interface components {
         /** @description A comment being posted. */
         NewCommentBody: {
             attachments?: components["schemas"]["IssueAttachmentRequest"][];
+            /**
+             * @description Client-minted UUID. Reusing it on this card returns the original entry
+             *     without repeating wake/mention side effects.
+             */
+            client_msg_id?: string | null;
             /**
              * @description May be empty when `attachments` is not: "here, look at this" with a
              *     screenshot under it is a real thing to say on a card.

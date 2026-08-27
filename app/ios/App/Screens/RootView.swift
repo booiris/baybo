@@ -99,6 +99,24 @@ struct RootView: View {
                 .zIndex(1)
             }
 
+            if let pending = store.confirmCancelIssue {
+                ConfirmDialog(
+                    titleKey: "board.cancelConfirmTitle",
+                    bodyKey: "board.cancelConfirmBody",
+                    bodyArg: String(pending.number),
+                    commitKey: "board.cancelIssue",
+                    onCancel: dismissCancelIssueConfirm,
+                    onConfirm: {
+                        dismissCancelIssueConfirm()
+                        Task {
+                            await store.projectsStore.setCancelled(
+                                board: pending.projectId, issue: pending.number, true)
+                        }
+                    }
+                )
+                .zIndex(1)
+            }
+
             // The rename editor shares that hosting for the same two reasons,
             // and needs it for a third: it is the one dialog here that raises a
             // keyboard, and mounting it at the root is what lets it own the
@@ -174,6 +192,12 @@ struct RootView: View {
     private func dismissDeleteConfirm() {
         withAnimation(ConfirmDialog.exitMotion) {
             store.confirmDeleteSession = nil
+        }
+    }
+
+    private func dismissCancelIssueConfirm() {
+        withAnimation(ConfirmDialog.exitMotion) {
+            store.confirmCancelIssue = nil
         }
     }
 

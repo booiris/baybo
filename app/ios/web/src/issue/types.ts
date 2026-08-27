@@ -89,10 +89,12 @@ export type IssueEventBody = { kind: string } & Record<string, unknown>;
 
 export type IssueEvent = {
   id: string;
+  client_msg_id?: string;
   number: number;
   actor: Actor;
   body: IssueEventBody;
   created_at_ms: number;
+  send_state?: "sending" | "failed";
 };
 
 /// A child card, as the board knows it. Not from the issue DTO — see

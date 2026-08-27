@@ -497,6 +497,7 @@
    with one line of text in the corner of it — and made two comments of very
    different lengths look like the same amount of speech. */
 .issue-box {
+  position: relative;
   width: fit-content;
   max-width: 100%;
   margin-left: calc(var(--face) / 2);

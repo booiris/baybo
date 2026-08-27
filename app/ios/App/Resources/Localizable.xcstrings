@@ -732,6 +732,57 @@
         }
       }
     },
+    "board.cancelConfirmBody": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Cancel #%@? It keeps its number and its whole history — it just stops counting as live work, and nothing runs on it until you reopen it."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "取消 #%@？它会保留编号和全部历史记录，但不再计入进行中的工作；重新打开前，不会再运行任何任务。"
+          }
+        }
+      }
+    },
+    "board.cancelConfirmTitle": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Cancel this issue?"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "取消这项任务？"
+          }
+        }
+      }
+    },
+    "board.cancelIssue": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Cancel issue"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "取消任务"
+          }
+        }
+      }
+    },
     "board.cardCount": {
       "extractionState": "stale",
       "localizations": {
@@ -1017,6 +1068,23 @@
           "stringUnit": {
             "state": "translated",
             "value": "%@ 下次打开时会重建"
+          }
+        }
+      }
+    },
+    "board.reopenIssue": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Reopen issue"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "重新打开任务"
           }
         }
       }

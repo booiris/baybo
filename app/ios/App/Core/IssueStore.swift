@@ -99,6 +99,14 @@ final class IssueStore: ObservableObject, WebMediaTarget {
 
     private let client: any BayboClientProtocol
     private let supportDirectory: URL
+    private let commentOutbox: IssueCommentOutbox
+    /// A persisted `sending` row is resumed once when this card comes back.
+    /// The server-side client id makes that replay safe across process death.
+    private var resumedPersistedComments = false
+    /// Prevent a refresh and a button tap from dispatching the same local row
+    /// concurrently. The durable key protects the server; this keeps the
+    /// client from spending two requests needlessly.
+    private var activeCommentMsgIds: Set<String> = []
     /// The system clipboard, behind the paste row. Injected for the reason
     /// `ChatStore`'s is: `UIPasteboard.general` is process-global and
     /// swift-testing runs suites in PARALLEL, so one suite's paste written to
@@ -158,6 +166,8 @@ final class IssueStore: ObservableObject, WebMediaTarget {
         self.client = client
         self.supportDirectory = supportDirectory
         self.pasteboard = pasteboard
+        commentOutbox = IssueCommentOutbox(
+            projectId: projectId, number: number, supportDirectory: supportDirectory)
         #if DEBUG
             if seedDemoCard() { return }
         #endif
@@ -239,6 +249,7 @@ final class IssueStore: ObservableObject, WebMediaTarget {
                 (try? IssueEvent.decodeTimeline(json)) ?? (events: [], firstUnread: nil)
             events = timeline.events
             firstUnread = timeline.firstUnread
+            reconcileConfirmedComments()
         }
         // The log carries totals beside the rows; the page prints the rows and
         // the totals belong to a screen that does not exist yet (P7).
@@ -255,6 +266,7 @@ final class IssueStore: ObservableObject, WebMediaTarget {
         if fetchedIssue != nil { isFromMirror = false }
         persistMirror()
         deliver()
+        resumePersistedComments()
     }
 
     // MARK: - Mirror
@@ -431,21 +443,137 @@ final class IssueStore: ObservableObject, WebMediaTarget {
         }
     }
 
-    /// Post a comment, and say whether it landed.
-    ///
-    /// The answer is the point, and it is why this is `async` where every
-    /// other verb here is fire-and-forget. There is no outbox on this surface:
-    /// a comment that failed is gone. That was survivable while the dock only
-    /// carried text — it cleared the field before the write and the operator
-    /// could retype a sentence — but a comment carries UPLOADED BLOBS now, and
-    /// discarding the strip on a failure throws away files they can never get
-    /// back, leaving them referenced by nothing on the gateway.
+    /// Enrol and paint a comment before touching the network. The returned id
+    /// is both the optimistic row's identity and the server idempotency key.
     @discardableResult
-    func comment(_ text: String, attachments: [IssueAttachmentInput] = []) async -> Bool {
-        await write { [projectId, number] client in
-            _ = try await client.projectIssueComment(
-                projectId: projectId, number: number, text: text, attachments: attachments)
+    func sendComment(
+        _ text: String,
+        attachments: [AttachmentRef] = [],
+        unblockAfterSend: Bool = false
+    ) -> String {
+        writeError = nil
+        let clientMsgId = UUID().uuidString.lowercased()
+        commentOutbox.begin(
+            clientMsgId: clientMsgId,
+            text: text.trimmingCharacters(in: .whitespacesAndNewlines),
+            attachments: attachments,
+            unblockAfterSend: unblockAfterSend)
+        deliver()
+        dispatchComment(clientMsgId)
+        return clientMsgId
+    }
+
+    /// Retry the failed row in place. The webview sends only its id; the
+    /// persisted outbox remains the authority for text and attachments.
+    func retryComment(_ clientMsgId: String) {
+        guard commentOutbox.entry(clientMsgId)?.state == .failed else { return }
+        writeError = nil
+        commentOutbox.resetForRetry(clientMsgId)
+        deliver()
+        dispatchComment(clientMsgId)
+    }
+
+    var pendingComments: [PendingIssueComment] {
+        commentOutbox.entries()
+    }
+
+    private func dispatchComment(_ clientMsgId: String) {
+        guard activeCommentMsgIds.insert(clientMsgId).inserted else { return }
+        #if DEBUG
+            // Demo boards have no gateway by construction. Keep the full
+            // optimistic/failure UI testable without touching whichever real
+            // gateway the simulator may otherwise be paired with.
+            if isDemoCard {
+                commentOutbox.markFailed(clientMsgId)
+                activeCommentMsgIds.remove(clientMsgId)
+                writeError = "The demo card has no gateway."
+                deliver()
+                return
+            }
+        #endif
+        Task { [weak self] in
+            await self?.postComment(clientMsgId)
         }
+    }
+
+    private func postComment(_ clientMsgId: String) async {
+        defer { activeCommentMsgIds.remove(clientMsgId) }
+        guard let pending = commentOutbox.entry(clientMsgId) else { return }
+        do {
+            let json = try await client.projectIssueComment(
+                projectId: projectId,
+                number: number,
+                clientMsgId: clientMsgId,
+                text: pending.text,
+                attachments: pending.attachments.map(\.request))
+            mergeCommentEntry(json, clientMsgId: clientMsgId)
+            let confirmed = commentOutbox.confirm(clientMsgId)
+            writeError = nil
+            deliver()
+            // The comment is durable before this runs. The unblock rebuilds
+            // its brief from the card, so reversing the order loses the answer
+            // the agent stopped to ask for.
+            if confirmed?.unblockAfterSend == true { unblock() }
+            // The response gives us the exact row immediately; the broader
+            // refresh follows in the background for updated card/run state.
+            await refresh()
+        } catch {
+            commentOutbox.markFailed(clientMsgId)
+            writeError = ProjectsStore.message(from: error)
+            deliver()
+        }
+    }
+
+    /// A timeline fetch is also a durability receipt. This closes both races:
+    /// the invalidation can beat the POST response, and a process can die
+    /// after the server writes but before the response reaches the phone.
+    private func reconcileConfirmedComments() {
+        for clientMsgId in Set(events.compactMap(\.clientMsgId)) {
+            guard let confirmed = commentOutbox.confirm(clientMsgId) else { continue }
+            if confirmed.unblockAfterSend { unblock() }
+        }
+    }
+
+    private func resumePersistedComments() {
+        guard !resumedPersistedComments else { return }
+        resumedPersistedComments = true
+        for pending in commentOutbox.entries() where pending.state == .sending {
+            dispatchComment(pending.clientMsgId)
+        }
+    }
+
+    /// Fold the POST's exact event into the raw timeline immediately. This is
+    /// the path the FFI always documented but the app previously ignored in
+    /// favour of five unrelated refetches.
+    private func mergeCommentEntry(_ json: String, clientMsgId: String) {
+        guard let data = json.data(using: .utf8),
+            var item = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let id = item["id"] as? String
+        else { return }
+        item["client_msg_id"] = clientMsgId
+
+        var envelope: [String: Any] = [:]
+        if let current = eventsJson.data(using: .utf8),
+            let decoded = try? JSONSerialization.jsonObject(with: current) as? [String: Any]
+        {
+            envelope = decoded
+        }
+        var items = envelope["items"] as? [[String: Any]] ?? []
+        if let index = items.firstIndex(where: { candidate in
+            candidate["id"] as? String == id
+                || candidate["client_msg_id"] as? String == clientMsgId
+        }) {
+            items[index] = item
+        } else {
+            items.append(item)
+        }
+        envelope["items"] = items
+        guard let merged = try? JSONSerialization.data(withJSONObject: envelope),
+            let encoded = String(data: merged, encoding: .utf8)
+        else { return }
+        eventsJson = encoded
+        events = (try? IssueEvent.decodeList(encoded)) ?? events
+        persistMirror()
     }
 
     func resolveApproval(callId: String, decision: IssueApprovalDecision) {
@@ -641,7 +769,8 @@ final class IssueStore: ObservableObject, WebMediaTarget {
         guard let issue else { return }
         bridge?.deliver(
             issue: issue, eventsJson: eventsJson, runs: runs, people: people,
-            children: children, firstUnread: firstUnread)
+            children: children, firstUnread: firstUnread,
+            pendingComments: pendingComments)
     }
 
     /// Who the ids on this card's DTOs are: what to call them, and what to

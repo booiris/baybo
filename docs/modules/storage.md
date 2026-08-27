@@ -319,6 +319,13 @@ model entirely: there is no `SessionStore::delete` method and no production
 `DELETE FROM sessions`. The chat delete affordance writes `hidden = true`;
 idle cleanup only reaps the in-memory actor.
 
+Operator comments may carry `issue_events.client_msg_id`, a canonical UUID and
+NULL on every legacy/non-client event. A partial unique index on
+`(issue_id, client_msg_id) WHERE client_msg_id IS NOT NULL` is the durable idempotency
+claim. `append_event_idempotent` inserts and, on a conflicting claim, reads the
+original row in the same transaction; callers receive `Inserted` versus
+`Existing` so only the winner may run domain side effects.
+
 ### Deletable tables hard-delete except `cron_jobs`, `deck_cards`, `projects`, `issues` and a project's agents
 
 For tables that are deletable, deletion is a plain `DELETE FROM` except for

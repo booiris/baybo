@@ -1208,6 +1208,52 @@ async fn the_activity_feed_is_the_boards_timelines_read_across_it() {
 }
 
 #[tokio::test]
+async fn retrying_a_client_comment_returns_the_original_timeline_row() {
+    let (router, _tg) = router().await;
+    let project = open_project(&router, "idempotent comments").await;
+    open_issue(&router, &project, "say it once").await;
+    let uri = format!("/v1/projects/{project}/issues/1/comments");
+    let client_msg_id = "01944c32-cc5e-7f5c-9f1c-efaa2a5488a2";
+
+    let first = post(
+        &router,
+        &uri,
+        json!({ "client_msg_id": client_msg_id, "text": "the original" }),
+        StatusCode::OK,
+    )
+    .await;
+    let retried = post(
+        &router,
+        &uri,
+        json!({ "client_msg_id": client_msg_id, "text": "a replay with changed bytes" }),
+        StatusCode::OK,
+    )
+    .await;
+
+    assert_eq!(retried["id"], first["id"]);
+    assert_eq!(retried["client_msg_id"], client_msg_id);
+    assert_eq!(retried["body"]["text"], "the original");
+    let comments = issue_events(&router, &project, 1)
+        .await
+        .into_iter()
+        .filter(|event| event["body"]["kind"] == "comment")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        comments.len(),
+        1,
+        "the retry appended a duplicate: {comments:?}"
+    );
+
+    post(
+        &router,
+        &uri,
+        json!({ "client_msg_id": "not-a-uuid", "text": "bad key" }),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn a_timeline_names_agents_by_handle_even_after_they_leave() {
     const DEV_ID: &str = "01JC3KQ4Z8AAAAAAAAAAAAAAAA";
 

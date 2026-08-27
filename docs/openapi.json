@@ -10201,6 +10201,13 @@
           "body": {
             "$ref": "#/components/schemas/IssueEventBodyDto"
           },
+          "client_msg_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Client idempotency key on an operator comment. Its presence lets a\nclient reconcile an optimistic row even when a timeline invalidation\nwins the race against the POST response."
+          },
           "created_at_ms": {
             "type": "integer",
             "format": "int64"
@@ -10964,6 +10971,13 @@
             "items": {
               "$ref": "#/components/schemas/IssueAttachmentRequest"
             }
+          },
+          "client_msg_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Client-minted UUID. Reusing it on this card returns the original entry\nwithout repeating wake/mention side effects."
           },
           "text": {
             "type": "string",

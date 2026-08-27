@@ -1387,6 +1387,15 @@ timeline, from the issue and its unsettled run:
 | A `Held` or `Queued` run exists | `WaitsForQueuedRun` — it assembles its brief later, so it will read this |
 | A `Running` run exists | `AfterCurrentRun` — deferred |
 
+An operator comment may carry a client-minted UUID. `comment_idempotent` claims
+that key at the storage seam and returns the original timeline row on every
+replay. The duplicate path exits before `timeline_changed`, uncancelling,
+mention assignment, or wake delivery, so a retry is not merely one row on disk;
+it is one execution of every consequence of saying it. The first lookup happens
+before the archived-board write check, allowing a lost response to be replayed
+after the board was archived without turning an already-durable write into a
+failure.
+
 A **person's** comment on a cancelled card takes the cancel back
 (`ProjectManager::take_the_cancel_back`), before the delivery below is decided
 and before a mention is read. Without it the gesture is a dead end: the row

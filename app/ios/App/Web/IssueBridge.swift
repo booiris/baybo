@@ -94,6 +94,11 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
                 let folds = body["folds"] as? [String: Bool]
             else { return }
             store?.rememberPageState(scrollTop: scrollTop, folds: folds)
+        case "retryComment":
+            guard isCurrent(body) else { return }
+            if let clientMsgId = body["clientMsgId"] as? String {
+                store?.retryComment(clientMsgId)
+            }
         case "openUrl":
             guard isCurrent(body) else { return }
             if let url = body["url"] as? String, let parsed = URL(string: url) {
@@ -279,13 +284,15 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
 
     func deliver(
         issue: IssueInfo, eventsJson: String, runs: [IssueRunInfo],
-        people: [String: IssuePerson], children: [IssueInfo], firstUnread: String?
+        people: [String: IssuePerson], children: [IssueInfo], firstUnread: String?,
+        pendingComments: [PendingIssueComment]
     ) {
         page(
             "deliver",
             Self.payload(
                 issue: issue, eventsJson: eventsJson, runs: runs, people: people,
-                children: children, firstUnread: firstUnread))
+                children: children, firstUnread: firstUnread,
+                pendingComments: pendingComments))
     }
 
     /// Everything the page draws, as the JSON it is handed.
@@ -295,13 +302,15 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
     /// JSON with a field quietly missing rather than anything that fails.
     static func payload(
         issue: IssueInfo, eventsJson: String, runs: [IssueRunInfo],
-        people: [String: IssuePerson], children: [IssueInfo], firstUnread: String?
+        people: [String: IssuePerson], children: [IssueInfo], firstUnread: String?,
+        pendingComments: [PendingIssueComment] = []
     ) -> String {
         var payload: [String: Any] = [
             "issue": IssueWire.card(issue),
             "runs": runs.map(IssueWire.run(_:)),
             "people": people.mapValues(IssueWire.person(_:)),
             "children": children.map(IssueWire.child(_:)),
+            "pendingComments": pendingComments.map { pendingComment($0, number: issue.number) },
         ]
         // Omitted rather than sent as null when there is nothing new: the page
         // latches the first boundary it is given and never clears it, so a
@@ -317,6 +326,36 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
             json += ",\"events\":\(items)}"
         }
         return json
+    }
+
+    private static func pendingComment(
+        _ pending: PendingIssueComment,
+        number: Int64
+    ) -> [String: Any] {
+        var body: [String: Any] = [
+            "kind": "comment",
+            "text": pending.text,
+        ]
+        if !pending.attachments.isEmpty {
+            body["attachments"] = pending.attachments.map { attachment in
+                var wire: [String: Any] = [
+                    "blob_id": attachment.blobId,
+                    "mime_type": attachment.mimeType,
+                    "size": Int(attachment.size),
+                ]
+                if let filename = attachment.filename { wire["filename"] = filename }
+                return wire
+            }
+        }
+        return [
+            "id": "pending-\(pending.clientMsgId)",
+            "client_msg_id": pending.clientMsgId,
+            "number": number,
+            "actor": ["kind": "user"],
+            "body": body,
+            "created_at_ms": pending.createdAtMs,
+            "send_state": pending.state.rawValue,
+        ]
     }
 
     /// The `items` array out of the timeline envelope, verbatim. Nil when the

@@ -84,7 +84,7 @@ Projects tab root = Projects cards (wordmark header, tab bar visible)
            │    ├─ sub-issue / #N → child card (push; back returns to the card you came from)
            │    └─ dock (native): answer row (only when an agent is asking) ·
            │        ApprovalCardView (two answers) · composer pill
-           ├─ long press → Open · Move to… · Assign… · Pin · Rebuild this card
+           ├─ long press → Open · Move to… · Assign… · Pin · Cancel/Reopen · Rebuild this card
            ├─ leading swipe → Pin · trailing swipe → Move… (full-swipe disabled)
            ├─ ⋯ → Activity (push) · Team (sheet → Agent profile) · Mark all read N · Settings (push)
            └─ ✎ → New issue sheet (document-first; the compose glyph, not a `+` — the cards root's `+` makes a BOARD one push back)
@@ -107,7 +107,7 @@ Pushed screens use the `ChatRoute` + `ArchivedScreen` header grammar plus `PopGe
 - **One stage at a time** — the web `ColumnPage` on a phone. The segmented control carries live counts (**cancelled excluded**); a segment with unread wears a red dot; the `Pinned / New / Queue` bands only print a header when more than one is non-empty. **No `TabView(.page)`**: a row's swipe actions, page paging, and the edge-back gesture are three horizontal gestures fighting. The bar (segments + board row + Waiting strip) takes the horizontal swipe instead.
 - **The segments are PINNED under the header** (2026-08-25); the board row and the Waiting strip stay in the scroll. They are navigation, not content — the list under them is one column out of five, and a control that scrolls away means dragging back to the top to change which column you are reading, on the screen whose whole shape is "one stage at a time". Only the segments: the Waiting strip is a row per parked prompt and pinning it would take half the screen. The pinned block paints **solid paper from the status bar down**, because the header's veil is a gradient that is clear at its bottom edge — right on a transcript, wrong here, where it left a sliver of a card row visible in the strip between the title and the segments.
 - **Reading order = pinned → unread → `updated_at` descending**, rendered only, never written back; `position` then issue number break equal timestamps, a cancelled card is never lifted by unread (a pin does lift it), and a refresh anchors scroll by row id.
-- **A card is a row** (`ChatRowBody` grammar, `Theme.sys`): a 3px spine on the leading edge (urgent/high ink, medium light grey); first line `#N · ▲▲/▲/◆/▽ priority (all ink — red is only for failure) · (pin) · age · hand glyph (approval_pending) · red unread count`; two lines of title; a badge row of Blocked / ✕ Run failed (the one red thing) / ⑂ branch (only once it has a commit) / ↳ #N; a footer of assignee face + handle, **the runner's face** (a second, ringed face when the run is not the assignee's — a coordination run is @lead's), the run word `WORKING · 4m` / `QUEUED` / `HELD · 41m` (running measures from `started_at_ms`, queued/held from `created_at_ms`, nothing after it settles), and the `done/total` progress ring. A cancelled card is struck through and dimmed but still opens (Reopen).
+- **A card is a row** (`ChatRowBody` grammar, `Theme.sys`): a 3px spine on the leading edge (urgent/high ink, medium light grey); first line `#N · ▲▲/▲/◆/▽ priority (all ink — red is only for failure) · (pin) · age · hand glyph (approval_pending) · red unread count`; two lines of title; a badge row of Blocked / ✕ Run failed (the one red thing) / ⑂ branch (only once it has a commit) / ↳ #N; a footer of assignee face + handle, **the runner's face** (a second, ringed face when the run is not the assignee's — a coordination run is @lead's), the run word `WORKING · 4m` / `QUEUED` / `HELD · 41m` (running measures from `started_at_ms`, queued/held from `created_at_ms`, nothing after it settles), and the `done/total` progress ring. Its long-press menu confirms Cancel at the app root; Reopen is immediate because it is reversible. A cancelled card is struck through and dimmed but still opens.
 - **The "Waiting on you" strip**: the current board only, and **parked approvals ONLY** (Deny / Approve inline; found by taking the `approval_pending` cards and reading their `events` for the `call_id`, which is bounded). *Something is waiting on you when it has stopped and cannot go on until a person answers* — and on a board that is a parked prompt and nothing else. It shipped with four kinds and was narrowed 2026-08-25: a **failed run** is over, not waiting (the card wears `✕ Run failed`); an **unread card** is news, and nobody is stopped (the card wears a red count, its segment a dot); an agent's **question** does park a run, but it is answered by writing a sentence and no sentence fits in a strip row (the card wears `⊘ Blocked`, and the answering happens on the card where the writing happens). Each of the three already said itself on the card row, so the strip was a third place for the same fact, filling with rows whose only affordance was "go and look" — which is the list underneath it. No countdown (the 300s timeout is a gateway-private constant); answering a prompt that is gone returns 404 → the row stays retired and the board refetches.
 - **The board row**: team faces (capped at `TeamFaces.maxFaces`, with a `+N` disc for the rest — the cap used to drop the remainder silently, so a team of six drew as five; a `+1` is never drawn, since the disc costs exactly the face it would replace) → budget chip (`⏸ $6.10 / $5.00`, only when `burnState == over`, opens Settings; **a standing condition, not news, so it never feeds a red dot**) → filter chip (ink-filled with a count when narrowed). **The ⋯ is in the header**, beside `+` (Activity · Team · **Mark all read N** · Settings): every entry behind it acts on the whole board, and standing next to the filter it read as one more way to narrow the list.
 - Pull to refresh (the `RefreshRing` beside the title); on a first open with no mirror, skeleton rows in the real rows' geometry.
@@ -395,10 +395,13 @@ Moving out of In Progress **never kills the run**; Stop is the only kill switch.
     gate. The machine's door out is `claimSend()`, which also moves the send
     GATE off the view — a surface reading `staged.compactMap(\.blobId)` for
     itself would ship a comment minus every pick still uploading, silently.
-  - **Only a landed comment discards.** There is no outbox here, and the picks
-    are uploaded blobs: clearing the strip on a failure strands files the
-    operator cannot get back. `IssueStore.comment` answers `Bool` for exactly
-    this, and it is why that one verb is `async` where the rest are not.
+  - **Comments use the chat send lifecycle.** `IssueStore.sendComment` first
+    persists text plus uploaded-blob metadata under a client-minted UUID, then
+    clears the dock and paints the local post. A slow request gets the shared
+    delayed spinner; a refusal leaves the post in place with the shared red
+    retry control. Retry reuses the UUID, so it cannot append a second comment.
+    The POST's exact timeline row replaces the optimistic one immediately;
+    the broader card refresh follows rather than gating what the operator sees.
   - The card's draft lives under `card-drafts/`, never beside the
     conversations: `AppStore.unsentDraftSessionId` treats an unlisted,
     outbox-free directory in the chat root as the abandoned new chat the
@@ -491,7 +494,7 @@ Moving out of In Progress **never kills the run**; Stop is the only kill switch.
 - **New project (pushed)**: Name (required; the server creates `work/<name>`) · Description · optional ceilings and parallel runs (the web's hints) → on success, push the new board (its lead is hired with it).
 - **Empty state**: zero projects → icon + a line that also states boards are never pushed + New project.
 - **An archived board**: an `Archived · read only` chip; + greyed; move / comment / assign disabled and carrying the server's 409 sentence; Mark read, Stop and Unarchive still work; **approvals are not answerable** (the card renders greyed with "Archived — unarchive to answer" and the dock hosts no approval card; `/attention` already excludes archived boards, so nothing leads you to an unanswerable prompt).
-- **Offline**: a line reading "Offline — the board as of 14:02", **writes disabled** (not fail-fast), no outbox for board writes (the board moves while you are away; replaying a queued write is wrong), and the mirror is what is painted.
+- **Offline**: a line reading "Offline — the board as of 14:02", **mutable board writes disabled** (not fail-fast), and the mirror is what is painted. Those writes have no outbox because the board moves while you are away and replaying one is wrong. Append-only comments keep their already-visible comment outbox row and may be retried with its original `client_msg_id` once the gateway is reachable.
 
 ## 4. Domain rules the phone must not break
 
@@ -499,7 +502,7 @@ Moving out of In Progress **never kills the run**; Stop is the only kill switch.
 |---|---|
 | Entering In Progress is the only execution trigger; it needs an assignee | Move → assignee picker; New issue refuses to submit |
 | Moving out of In Progress never kills a run; cancel-run is the only kill switch | "the run keeps going"; Stop only on the card and the transcript header |
-| Column counts exclude cancelled; cancelled cards are struck through, filterable, reopenable, never deleted | segmented counts / Filter / ⋯ Reopen |
+| Column counts exclude cancelled; cancelled cards are struck through, filterable, reopenable, never deleted | segmented counts / Filter / row menu → Reopen |
 | Priority never reorders a column; pin, unread and recency are reading order only | never writes `position`; scroll anchored by row id |
 | A manual move is never gated on the run ceiling | Move is never disabled for a full board |
 | A hold is a standing condition, not an event | budget chip, never a red dot; "Run it again" is the release |

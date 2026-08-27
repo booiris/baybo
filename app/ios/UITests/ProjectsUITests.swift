@@ -571,6 +571,61 @@ final class ProjectsUITests: BayboUITestCase {
             "the card never came back after its copy was thrown away")
     }
 
+    /// Cancel lives on the list row, keeps the card recoverable through the
+    /// cancelled filter, and asks before making the terminal state change.
+    /// Reopen is the reversible half and therefore commits directly.
+    func testACardCanBeCancelledAndReopenedFromTheList() {
+        let app = openBoard()
+        let row = app.buttons["issue-row-41"]
+        XCTAssertTrue(row.waitForExistence(timeout: 5))
+        row.press(forDuration: 1.0)
+
+        let cancel = app.buttons["Cancel issue"].firstMatch
+        XCTAssertTrue(cancel.waitForExistence(timeout: 3), "no Cancel issue on the row")
+        cancel.tap()
+
+        XCTAssertTrue(
+            app.staticTexts["Cancel this issue?"].waitForExistence(timeout: 3),
+            "Cancel skipped its destructive confirmation")
+        XCTAssertTrue(
+            app.staticTexts.containing(
+                NSPredicate(format: "label CONTAINS 'keeps its number'")
+            ).firstMatch.exists,
+            "the confirmation does not explain that the row and history survive")
+        app.buttons["Cancel issue"].tap()
+
+        XCTAssertTrue(
+            row.waitForNonExistence(timeout: 3),
+            "a cancelled card should leave the live-work list immediately")
+        app.buttons["board-filter-chip"].tap()
+        let showCancelled = app.buttons["filter-cancelled"]
+        XCTAssertTrue(showCancelled.waitForExistence(timeout: 3))
+        showCancelled.tap()
+        let filterTitle = app.staticTexts["Filter"].firstMatch
+        XCTAssertTrue(filterTitle.exists)
+        filterTitle.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+            .press(
+                forDuration: 0.05,
+                thenDragTo: app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.95)))
+        XCTAssertTrue(
+            showCancelled.waitForNonExistence(timeout: 3),
+            "the filter sheet did not dismiss")
+
+        XCTAssertTrue(
+            row.waitForExistence(timeout: 3),
+            "Show cancelled did not make the recoverable row reachable")
+        row.press(forDuration: 1.0)
+        let reopen = app.buttons["Reopen issue"].firstMatch
+        XCTAssertTrue(reopen.waitForExistence(timeout: 3), "a cancelled row cannot be reopened")
+        reopen.tap()
+
+        XCTAssertTrue(row.waitForExistence(timeout: 3))
+        row.press(forDuration: 1.0)
+        XCTAssertTrue(
+            app.buttons["Cancel issue"].firstMatch.waitForExistence(timeout: 3),
+            "reopening did not restore the row's live action")
+    }
+
     /// **A Waiting row leaves on the PRESS.** The suite asserted only that the
     /// four kinds appear; nothing asserted any of them goes, which is how the
     /// strip shipped with two answers that changed nothing on screen for a

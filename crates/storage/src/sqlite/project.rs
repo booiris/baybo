@@ -8,9 +8,10 @@ use super::SqlitePool;
 use baybo_store::StorageError;
 use baybo_store::project::{
     ACTOR_AGENT_PREFIX, AttentionCounts, BoardActivity, CardSignals, DrainMarks, IssueActor,
-    IssueAttachment, IssueEventBody, IssueEventRow, IssuePriority, IssueRow, IssueRunRow,
-    IssueStatus, IssueUpdate, NewIssue, NewIssueEvent, NewIssueRun, ProjectRow, ProjectStore,
-    ProjectUpdate, Result, RunSpend, RunStatus, RunTrigger, SettledRunFacts, Spend,
+    IssueAttachment, IssueEventAppendOutcome, IssueEventBody, IssueEventClientMsgId, IssueEventRow,
+    IssuePriority, IssueRow, IssueRunRow, IssueStatus, IssueUpdate, NewIssue, NewIssueEvent,
+    NewIssueRun, ProjectRow, ProjectStore, ProjectUpdate, Result, RunSpend, RunStatus, RunTrigger,
+    SettledRunFacts, Spend,
 };
 
 pub struct SqliteProjectStore {
@@ -41,11 +42,101 @@ impl SqliteProjectStore {
             .await?;
         raws.into_iter().map(event_from_raw).collect()
     }
+
+    async fn append_event_with_client_msg_id(
+        &self,
+        new: &NewIssueEvent,
+        client_msg_id: Option<IssueEventClientMsgId>,
+    ) -> Result<IssueEventAppendOutcome> {
+        let row = IssueEventRow {
+            id: baybo_model::IssueEventId::generate(),
+            issue_id: new.issue_id.clone(),
+            project_id: new.project_id.clone(),
+            number: new.number,
+            actor: new.actor.clone(),
+            body: new.body.clone(),
+            client_msg_id,
+            created_at: chrono::Utc::now(),
+        };
+        let id = row.id.as_str().to_string();
+        let issue_id = row.issue_id.as_str().to_string();
+        let project = row.project_id.as_str().to_string();
+        let number = row.number;
+        let actor = row.actor.to_storage();
+        let kind = row.body.kind().to_owned();
+        let body = serde_json::to_string(&row.body)
+            .map_err(|e| StorageError::Storage(format!("serialize issue event: {e}")))?;
+        let created = super::time::to_us(row.created_at);
+        let client_msg_id = row.client_msg_id.as_ref().map(|id| id.as_str().to_owned());
+        let existing = self
+            .pool
+            .interact_write("issue_events.append_idempotent", move |conn| {
+                let tx = conn.transaction()?;
+                let inserted = tx.execute(
+                    "INSERT INTO issue_events (id, issue_id, project_id, number, actor, kind, \
+                     body, created_at, client_msg_id) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+                     ON CONFLICT DO NOTHING",
+                    rusqlite::params![
+                        id,
+                        issue_id,
+                        project,
+                        number,
+                        actor,
+                        kind,
+                        body,
+                        created,
+                        client_msg_id
+                    ],
+                )?;
+                if inserted == 1 {
+                    tx.commit()?;
+                    return Ok(None);
+                }
+                let key = client_msg_id.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "issue event insert conflicted without a client message id to resolve"
+                    )
+                })?;
+                let existing = tx
+                    .query_row(
+                        &format!(
+                            "SELECT {EVENT_COLUMNS} FROM issue_events \
+                             WHERE issue_id = ?1 AND client_msg_id = ?2"
+                        ),
+                        rusqlite::params![issue_id, key],
+                        read_raw_event,
+                    )
+                    .optional()?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "idempotent issue event insert returned no row and no existing key"
+                        )
+                    })?;
+                tx.commit()?;
+                Ok(Some(existing))
+            })
+            .await?;
+        match existing {
+            Some(raw) => Ok(IssueEventAppendOutcome::Existing(event_from_raw(raw)?)),
+            None => Ok(IssueEventAppendOutcome::Inserted(row)),
+        }
+    }
 }
 
-const EVENT_COLUMNS: &str = "id, issue_id, project_id, number, actor, body, created_at";
+const EVENT_COLUMNS: &str =
+    "id, issue_id, project_id, number, actor, body, created_at, client_msg_id";
 
-type RawEvent = (String, String, String, i64, String, String, i64);
+type RawEvent = (
+    String,
+    String,
+    String,
+    i64,
+    String,
+    String,
+    i64,
+    Option<String>,
+);
 
 fn read_raw_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawEvent> {
     Ok((
@@ -56,11 +147,12 @@ fn read_raw_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawEvent> {
         row.get(4)?,
         row.get(5)?,
         row.get(6)?,
+        row.get(7)?,
     ))
 }
 
 fn event_from_raw(raw: RawEvent) -> Result<IssueEventRow> {
-    let (id, issue_id, project_id, number, actor, body, created_at) = raw;
+    let (id, issue_id, project_id, number, actor, body, created_at, client_msg_id) = raw;
     Ok(IssueEventRow {
         id: baybo_model::IssueEventId::from(id),
         issue_id: IssueId::from(issue_id),
@@ -71,6 +163,13 @@ fn event_from_raw(raw: RawEvent) -> Result<IssueEventRow> {
             .ok_or_else(|| StorageError::Storage(format!("issue_events.actor unknown: {actor}")))?,
         body: serde_json::from_str(&body)
             .map_err(|e| StorageError::Storage(format!("issue_events.body unreadable: {e}")))?,
+        client_msg_id: client_msg_id
+            .map(|id| {
+                IssueEventClientMsgId::parse(&id).map_err(|e| {
+                    StorageError::Storage(format!("issue_events.client_msg_id invalid: {e}"))
+                })
+            })
+            .transpose()?,
         created_at: ts("issue_events.created_at", created_at)?,
     })
 }
@@ -1411,35 +1510,46 @@ impl ProjectStore for SqliteProjectStore {
     }
 
     async fn append_event(&self, new: &NewIssueEvent) -> Result<IssueEventRow> {
-        let row = IssueEventRow {
-            id: baybo_model::IssueEventId::generate(),
-            issue_id: new.issue_id.clone(),
-            project_id: new.project_id.clone(),
-            number: new.number,
-            actor: new.actor.clone(),
-            body: new.body.clone(),
-            created_at: chrono::Utc::now(),
-        };
-        let id = row.id.as_str().to_string();
-        let issue_id = row.issue_id.as_str().to_string();
-        let project = row.project_id.as_str().to_string();
-        let number = row.number;
-        let actor = row.actor.to_storage();
-        let kind = row.body.kind();
-        let body = serde_json::to_string(&row.body)
-            .map_err(|e| StorageError::Storage(format!("serialize issue event: {e}")))?;
-        let created = super::time::to_us(row.created_at);
-        self.pool
-            .interact_write("issue_events.append", move |conn| {
-                conn.execute(
-                    "INSERT INTO issue_events (id, issue_id, project_id, number, actor, kind, \
-                     body, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                    rusqlite::params![id, issue_id, project, number, actor, kind, body, created],
-                )?;
-                Ok(())
+        match self.append_event_with_client_msg_id(new, None).await? {
+            IssueEventAppendOutcome::Inserted(row) => Ok(row),
+            IssueEventAppendOutcome::Existing(_) => Err(StorageError::Storage(
+                "ordinary issue event append unexpectedly resolved an existing row".to_owned(),
+            )),
+        }
+    }
+
+    async fn append_event_idempotent(
+        &self,
+        new: &NewIssueEvent,
+        client_msg_id: &IssueEventClientMsgId,
+    ) -> Result<IssueEventAppendOutcome> {
+        self.append_event_with_client_msg_id(new, Some(client_msg_id.clone()))
+            .await
+    }
+
+    async fn event_by_client_msg_id(
+        &self,
+        issue: &IssueId,
+        client_msg_id: &IssueEventClientMsgId,
+    ) -> Result<Option<IssueEventRow>> {
+        let issue = issue.as_str().to_owned();
+        let client_msg_id = client_msg_id.as_str().to_owned();
+        let raw = self
+            .pool
+            .interact("issue_events.by_client_msg_id", move |conn| {
+                Ok(conn
+                    .query_row(
+                        &format!(
+                            "SELECT {EVENT_COLUMNS} FROM issue_events \
+                             WHERE issue_id = ?1 AND client_msg_id = ?2"
+                        ),
+                        rusqlite::params![issue, client_msg_id],
+                        read_raw_event,
+                    )
+                    .optional()?)
             })
             .await?;
-        Ok(row)
+        raw.map(event_from_raw).transpose()
     }
 
     async fn list_events(&self, issue: &IssueId) -> Result<Vec<IssueEventRow>> {
@@ -2399,6 +2509,56 @@ mod tests {
             "oldest first — reading order, not newest-first like the run log"
         );
         assert!(timeline.iter().all(|e| e.actor == IssueActor::User));
+    }
+
+    #[tokio::test]
+    async fn a_client_message_id_claims_one_timeline_row() {
+        let (_dir, store) = store().await;
+        let project = project("proj-comment-id", "Comment ids");
+        store.create_project(&project).await.unwrap();
+        let issue = store
+            .create_issue(&new_issue(&project.id, "Do it once", IssueStatus::Backlog))
+            .await
+            .unwrap();
+        let client_msg_id =
+            IssueEventClientMsgId::parse("01944c32-cc5e-7f5c-9f1c-efaa2a5488a2").unwrap();
+        let new = event(
+            &issue,
+            IssueActor::User,
+            IssueEventBody::Comment {
+                text: "one request, twice".to_owned(),
+                attachments: Vec::new(),
+            },
+        );
+
+        let inserted = store
+            .append_event_idempotent(&new, &client_msg_id)
+            .await
+            .unwrap();
+        let existing = store
+            .append_event_idempotent(&new, &client_msg_id)
+            .await
+            .unwrap();
+
+        let first = match inserted {
+            IssueEventAppendOutcome::Inserted(row) => row,
+            IssueEventAppendOutcome::Existing(_) => panic!("the first claim was not inserted"),
+        };
+        let second = match existing {
+            IssueEventAppendOutcome::Existing(row) => row,
+            IssueEventAppendOutcome::Inserted(_) => panic!("the retry inserted a second row"),
+        };
+        assert_eq!(first.id, second.id);
+        assert_eq!(second.client_msg_id.as_ref(), Some(&client_msg_id));
+        assert_eq!(store.list_events(&issue.id).await.unwrap().len(), 1);
+        assert_eq!(
+            store
+                .event_by_client_msg_id(&issue.id, &client_msg_id)
+                .await
+                .unwrap()
+                .map(|row| row.id),
+            Some(first.id)
+        );
     }
 
     #[tokio::test]

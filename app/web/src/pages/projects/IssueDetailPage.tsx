@@ -75,6 +75,7 @@ import { SubIssues } from './SubIssues';
 import { RunTranscriptPanel } from './RunTranscriptPanel';
 import { FloatingPanel } from './FloatingPanel';
 import { Timeline } from './Timeline';
+import { ToastStack, useToasts } from './Toasts';
 import type { IssueEvent } from './timelineModel';
 import { useBoardStream } from './useBoardStream';
 import { invalidateAttention } from './useAttention';
@@ -103,6 +104,12 @@ const railPickerChip =
 /// only thing a status says differently, because it is the one property on
 /// this rail worth reading without stopping to read it.
 const railBox = 'border-2 border-black rounded-md bg-surface px-3 py-2.5';
+
+type CancellationPreview = {
+  id: number;
+  cancelled: boolean;
+  settleAfterRefresh: number | null;
+};
 
 /// One `label ── value` line of the property table.
 ///
@@ -245,6 +252,7 @@ export function IssueDetailPage() {
   const number = Number(num ?? '');
   const client = useAdminClient();
   const { logout } = useAuth();
+  const { toasts, pushToast, dismissToast } = useToasts();
   // Router state survives a reload and is absent on a pasted URL, which is
   // exactly when the board is the honest answer. `backFrom` refuses
   // anything that is not a stage of this project.
@@ -262,6 +270,10 @@ export function IssueDetailPage() {
   const [agents, setAgents] = useState<Agent[]>([]);
   const portrait = useTeamPortraits(agents);
   const [runLog, setRunLog] = useState<RunLog | null>(null);
+  // A refresh may have started before the PATCH. Keep that older snapshot
+  // underneath the preview until a post-ack read has caught up.
+  const [cancellationPreview, setCancellationPreview] = useState<CancellationPreview | null>(null);
+  const nextCancellationId = useRef(0);
   const runs = runLog?.items ?? [];
   const [allRuns, setAllRuns] = useState(false);
   /// Which run's conversation is open over the card, by attempt. One at a
@@ -276,6 +288,7 @@ export function IssueDetailPage() {
   const runView = runLogView(runs, allRuns);
   const [events, setEvents] = useState<IssueEvent[]>([]);
   const [refreshKey, setRefreshKey] = useState(0);
+  const refreshSerial = useRef(0);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [title, setTitle] = useState('');
@@ -322,6 +335,8 @@ export function IssueDetailPage() {
     setNewBelow(false);
     setAllRuns(false);
     setOpenAttempt(null);
+    setCancellationPreview(null);
+    setSaving(false);
   }, [projectId, number]);
 
   // A card opens at the foot of its own history — the newest entries and the
@@ -388,6 +403,16 @@ export function IssueDetailPage() {
         return;
       }
       setIssue(outcome.value);
+      setCancellationPreview((current) => {
+        if (
+          current === null ||
+          current.settleAfterRefresh === null ||
+          refreshKey < current.settleAfterRefresh
+        ) {
+          return current;
+        }
+        return null;
+      });
       // Live refreshes must not overwrite an edit in progress — so the
       // editors only follow the server while they still hold what the server
       // last sent.
@@ -436,8 +461,10 @@ export function IssueDetailPage() {
   /// other way home: it emits no board frame at all, so nothing else would
   /// ever ask.
   const refetch = useCallback(() => {
-    setRefreshKey((key) => key + 1);
+    refreshSerial.current += 1;
+    setRefreshKey(refreshSerial.current);
     invalidateAttention(client);
+    return refreshSerial.current;
   }, [client]);
 
   useBoardStream(projectId, number, refetch);
@@ -449,20 +476,48 @@ export function IssueDetailPage() {
 
   const apply = useCallback(
     async (body: Parameters<typeof patchIssue>[3]) => {
+      const requestedCancellation = body.cancelled;
+      const cancellation =
+        typeof requestedCancellation === 'boolean'
+          ? {
+              id: (nextCancellationId.current += 1),
+              cancelled: requestedCancellation,
+              settleAfterRefresh: null,
+            }
+          : null;
+      if (cancellation !== null) {
+        setCancellationPreview(cancellation);
+        setError(null);
+      }
       setSaving(true);
       const wrote = `${projectId}:${String(number)}`;
       const outcome = await patchIssue(client, projectId, number, body);
-      setSaving(false);
       // The page does not unmount when the route parameter changes, so a save
       // for the card you just left can answer while the next one is on screen
       // — and the row it carries would replace it, leaving the previous card's
       // title and description sitting at the new card's URL until reload.
       if (wrote !== `${currentCard.current}`) return;
+      setSaving(false);
       if (outcome.kind === 'unauthorized') {
+        if (cancellation !== null) {
+          setCancellationPreview((current) =>
+            current?.id === cancellation.id ? null : current,
+          );
+        }
         logout();
         return;
       }
       if (outcome.kind === 'failed') {
+        if (cancellation !== null) {
+          setCancellationPreview((current) =>
+            current?.id === cancellation.id ? null : current,
+          );
+          pushToast(
+            'err',
+            `${cancellation.cancelled ? 'Cancel' : 'Reopen'} failed, rolled back — ${outcome.message}`,
+          );
+          return;
+        }
         setError(outcome.message);
         return;
       }
@@ -470,8 +525,14 @@ export function IssueDetailPage() {
       setIssue(outcome.value);
       setTitle(outcome.value.title);
       serverTitle.current = outcome.value.title;
+      if (cancellation !== null) {
+        const settleAfterRefresh = refetch();
+        setCancellationPreview((current) =>
+          current?.id === cancellation.id ? { ...current, settleAfterRefresh } : current,
+        );
+      }
     },
-    [client, logout, number, projectId],
+    [client, logout, number, projectId, pushToast, refetch],
   );
 
   const moveChild = useCallback(
@@ -780,9 +841,11 @@ export function IssueDetailPage() {
     );
   }
 
-  const cancelled = issue.cancelled_at_ms != null;
+  const cancelled = cancellationPreview?.cancelled ?? issue.cancelled_at_ms != null;
   const blocked = issue.blocked_reason != null;
-  const live = unsettledRun(runs);
+  // Cancelling the card removes it from live work; stopping an already-running
+  // turn remains the execution log's separate Cancel action.
+  const live = cancelled ? null : unsettledRun(runs);
   const children = board.filter((candidate) => candidate.parent === issue.number);
 
   const assignees = assigneeOptions(agents, portrait);
@@ -1070,13 +1133,14 @@ export function IssueDetailPage() {
                   aria-label="More actions"
                   aria-expanded={showMore}
                   title="Block, cancel…"
+                  disabled={saving}
                   onClick={() => {
                     setConfirmCancel(false);
                     setBlocking(false);
                     setBlockReason('');
                     setShowMore((value) => !value);
                   }}
-                  className="flex h-6 w-6 items-center justify-center rounded-md border-2 border-black bg-surface font-mono text-[0.8rem] font-bold leading-none text-ink cursor-pointer hover:bg-brand"
+                  className="flex h-6 w-6 items-center justify-center rounded-md border-2 border-black bg-surface font-mono text-[0.8rem] font-bold leading-none text-ink cursor-pointer hover:bg-brand disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   ⋯
                 </button>
@@ -1145,13 +1209,13 @@ export function IssueDetailPage() {
                       <div className="px-3 py-1.5">
                         <p className="font-mono text-[0.62rem] leading-snug">
                           Cancel #{issue.number}? It keeps its number and its whole history — it
-                          just stops counting as live work, and nothing runs on it until you
-                          reopen it.
+                          leaves the live queue, and no new run starts until you reopen it.
                         </p>
                         <div className="mt-2 flex gap-2">
                           <button
                             type="button"
-                            className="border-2 border-err bg-err text-white rounded-md px-2 py-0.5 font-mono text-[0.66rem] font-bold cursor-pointer"
+                            disabled={saving}
+                            className="border-2 border-err bg-err text-white rounded-md px-2 py-0.5 font-mono text-[0.66rem] font-bold cursor-pointer disabled:cursor-not-allowed disabled:opacity-50"
                             onClick={() => {
                               setConfirmCancel(false);
                               setShowMore(false);
@@ -1197,7 +1261,8 @@ export function IssueDetailPage() {
                     )}
                     <button
                       type="button"
-                      className={`w-full text-left px-3 py-1.5 font-mono text-[0.7rem] cursor-pointer hover:bg-canvas ${
+                      disabled={saving}
+                      className={`w-full text-left px-3 py-1.5 font-mono text-[0.7rem] cursor-pointer hover:bg-canvas disabled:cursor-not-allowed disabled:opacity-50 ${
                         cancelled ? '' : 'text-err'
                       }`}
                       onClick={() => {
@@ -1438,6 +1503,7 @@ export function IssueDetailPage() {
           </section>
         </aside>
       </div>
+      <ToastStack toasts={toasts} onDismiss={dismissToast} />
     </div>
   );
 }

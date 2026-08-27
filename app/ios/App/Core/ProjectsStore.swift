@@ -197,6 +197,7 @@ final class ProjectsStore: ObservableObject {
         ProjectRecency.remove(in: directory)
         // And every cached card: one belongs to the gateway that served it.
         IssueStore.removeMirrors(in: directory)
+        IssueCommentOutbox.deleteAll(in: directory)
         guard let names = try? fm.contentsOfDirectory(atPath: directory.path) else { return }
         for name in names where name.hasPrefix("board-") && name.hasSuffix(".json") {
             try? fm.removeItem(at: directory.appendingPathComponent(name))
@@ -498,6 +499,38 @@ final class ProjectsStore: ObservableObject {
             })
     }
 
+    /// Call a card off, or put it back into live work.
+    ///
+    /// Cancelling also predicts the two consequences the server owns: an
+    /// active run leaves the board and a parked approval stops being
+    /// answerable. Both are restored with the board if the write is refused.
+    @discardableResult
+    func setCancelled(board projectId: String, issue number: Int64, _ cancelled: Bool) async
+        -> Bool
+    {
+        let promptSnapshot = approvalPrompts[projectId]
+        if cancelled, var prompts = promptSnapshot {
+            prompts[number] = nil
+            approvalPrompts[projectId] = prompts
+        }
+        let sent = await write(
+            board: projectId,
+            apply: { board in
+                guard let index = board.issues.firstIndex(where: { $0.number == number }) else {
+                    return
+                }
+                board.issues[index] = board.issues[index].with(cancelled: cancelled)
+                if cancelled { board.runs.removeAll { $0.number == number } }
+            },
+            call: { client in
+                _ = try await client.projectIssuePatch(
+                    projectId: projectId, number: number,
+                    patch: Self.patch(cancelled: cancelled))
+            })
+        if !sent { approvalPrompts[projectId] = promptSnapshot }
+        return sent
+    }
+
     /// Start another attempt on a card whose last run failed.
     ///
     /// The flag clears optimistically because that is what the server will
@@ -631,11 +664,11 @@ final class ProjectsStore: ObservableObject {
 
     private static func patch(
         pinned: Bool? = nil, priority: IssuePriority? = nil, assignee: StringPatch = .keep,
-        blockedReason: StringPatch = .keep
+        blockedReason: StringPatch = .keep, cancelled: Bool? = nil
     ) -> IssuePatch {
         IssuePatch(
             title: nil, description: nil, attachments: nil, priority: priority,
-            assignee: assignee, blockedReason: blockedReason, cancelled: nil, parent: nil,
+            assignee: assignee, blockedReason: blockedReason, cancelled: cancelled, parent: nil,
             stage: nil, pinned: pinned)
     }
 

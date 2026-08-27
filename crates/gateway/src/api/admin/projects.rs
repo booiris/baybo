@@ -13,8 +13,8 @@ use baybo_model::{AgentProfileId, ProjectId};
 use baybo_project::{AttachmentRequest, NewIssueRequest, NewProject, ProjectError};
 use baybo_store::project::{
     BoardCards, DEFAULT_MAX_PARALLEL_ISSUE_RUNS, IssueActor, IssueAttachment, IssueEventBody,
-    IssueEventRow, IssuePriority, IssueRow, IssueRunRow, IssueStatus, IssueUpdate, ProjectRow,
-    ProjectUpdate, RunStatus, RunTrigger,
+    IssueEventClientMsgId, IssueEventRow, IssuePriority, IssueRow, IssueRunRow, IssueStatus,
+    IssueUpdate, ProjectRow, ProjectUpdate, RunStatus, RunTrigger,
 };
 
 use super::chat::{ChatSessionDetail, GetSessionQuery, session_detail};
@@ -939,6 +939,11 @@ impl IssueEventBodyDto {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct IssueEventDto {
     pub id: String,
+    /// Client idempotency key on an operator comment. Its presence lets a
+    /// client reconcile an optimistic row even when a timeline invalidation
+    /// wins the race against the POST response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_msg_id: Option<String>,
     pub number: i64,
     pub actor: ActorDto,
     pub body: IssueEventBodyDto,
@@ -1019,6 +1024,7 @@ impl IssueEventDto {
         };
         Self {
             id: row.id.as_str().to_owned(),
+            client_msg_id: row.client_msg_id.map(|id| id.as_str().to_owned()),
             number: row.number,
             actor,
             body: IssueEventBodyDto::with_handles(row.body, handles),
@@ -1030,6 +1036,10 @@ impl IssueEventDto {
 /// A comment being posted.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct NewCommentBody {
+    /// Client-minted UUID. Reusing it on this card returns the original entry
+    /// without repeating wake/mention side effects.
+    #[serde(default)]
+    pub client_msg_id: Option<String>,
     /// May be empty when `attachments` is not: "here, look at this" with a
     /// screenshot under it is a real thing to say on a card.
     pub text: String,
@@ -2156,17 +2166,35 @@ async fn create_comment(
     Json(req): Json<NewCommentBody>,
 ) -> Result<Json<IssueEventDto>> {
     let id = parse_project_id(&project_id)?;
-    let entry = state
-        .project_manager
-        .comment(
-            &id,
-            number,
-            IssueActor::User,
-            &req.text,
-            &requested(req.attachments),
-        )
-        .await
-        .map_err(project_err)?;
+    let client_msg_id = req
+        .client_msg_id
+        .as_deref()
+        .map(IssueEventClientMsgId::parse)
+        .transpose()
+        .map_err(|_| GatewayError::BadRequest("client_msg_id must be a UUID".to_owned()))?;
+    let attachments = requested(req.attachments);
+    let entry = match client_msg_id {
+        Some(client_msg_id) => {
+            state
+                .project_manager
+                .comment_idempotent(
+                    &id,
+                    number,
+                    IssueActor::User,
+                    &req.text,
+                    &attachments,
+                    client_msg_id,
+                )
+                .await
+        }
+        None => {
+            state
+                .project_manager
+                .comment(&id, number, IssueActor::User, &req.text, &attachments)
+                .await
+        }
+    }
+    .map_err(project_err)?;
     // No handles to resolve, and no lookup to spend on finding that out:
     // the actor is the operator by construction two lines up, and a comment
     // body names nobody. An empty map is the whole answer.

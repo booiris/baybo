@@ -2772,6 +2772,14 @@ forwards_everything_else! {
         -> StoreResult<bool>;
     enqueue_run(new: &NewIssueRun) -> StoreResult<IssueRunRow>;
     append_event(new: &NewIssueEvent) -> StoreResult<IssueEventRow>;
+    append_event_idempotent(
+        new: &NewIssueEvent,
+        client_msg_id: &baybo_store::project::IssueEventClientMsgId
+    ) -> StoreResult<baybo_store::project::IssueEventAppendOutcome>;
+    event_by_client_msg_id(
+        issue: &IssueId,
+        client_msg_id: &baybo_store::project::IssueEventClientMsgId
+    ) -> StoreResult<Option<IssueEventRow>>;
     list_events(issue: &IssueId) -> StoreResult<Vec<IssueEventRow>>;
     first_unread_event(issue: &IssueId) -> StoreResult<Option<baybo_model::IssueEventId>>;
     agent_opened_issues(project: &ProjectId) -> StoreResult<Vec<i64>>;

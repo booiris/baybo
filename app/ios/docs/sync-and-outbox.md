@@ -498,3 +498,26 @@ On the reconnect edge the sync runs first (the reconciliation gate), then
 unconfirmed entries resend. A **rebased** sync hides the floor, so each
 unconfirmed entry goes `unknown` and resolves via the per-key point lookup
 (`chatLookupMessage`) — found → released, absent → retry resumes.
+
+## Issue comment outbox
+
+Issue comments use the same visible contract through a smaller REST-specific
+outbox (`IssueCommentOutbox`): persist before clearing the dock, render an
+optimistic user post, show the shared delayed spinner while the request is in
+flight, and leave a shared red retry control on failure. One JSON file per card
+lives under `Application Support/baybo/issue-comment-outbox/` and is wiped with
+the other gateway-owned mirrors on logout.
+
+Each row is keyed by a client-minted UUID sent as `client_msg_id`. The gateway
+stores that key on `issue_events` under a unique `(issue_id, client_msg_id)` index;
+replaying it returns the original timeline row and repeats none of the comment
+side effects (wake, mention assignment, uncancel). This makes resuming a
+persisted `sending` row after process death safe. A failed row waits for a tap
+and retries with the same key.
+
+Confirmation has two equivalent doors: the comment POST returns the exact
+timeline entry, or a racing timeline refresh sees the same `client_msg_id`. Whichever
+arrives first removes the outbox row and is the sole owner of a requested
+"unblock after sending" action. The exact POST entry is merged into the local
+timeline immediately; the card's wider five-route refresh is follow-up work and
+never delays the comment appearing.

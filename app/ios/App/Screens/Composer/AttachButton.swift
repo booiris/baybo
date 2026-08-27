@@ -97,10 +97,14 @@ enum AttachPickers {
     /// clears the request as it dismisses.
     static func binding(_ attach: AttachMenu, _ source: AttachSource) -> Binding<Bool> {
         Binding(
-            get: { attach.pick == source },
+            get: {
+                MainActor.assumeIsolated { attach.pick == source }
+            },
             set: { presented in
-                guard !presented, attach.pick == source else { return }
-                attach.pick = nil
+                MainActor.assumeIsolated {
+                    guard !presented, attach.pick == source else { return }
+                    attach.pick = nil
+                }
             })
     }
 }

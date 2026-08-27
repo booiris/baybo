@@ -6,7 +6,7 @@ import XCTest
 /// The file `IssueDock.swift` has claimed exists since P8 and did not until
 /// the dock grew attachments. The demo card has NO gateway behind it, which is
 /// what makes the send case worth having: every comment fails, so what this
-/// asserts is the failure path — the one that must not throw away picks.
+/// asserts is the optimistic failure and retry path.
 final class IssueDockUITests: BayboUITestCase {
     private static let cardArguments = [
         "-baybo-open-home", "-baybo-demo-projects", "-baybo-demo-card",
@@ -57,15 +57,10 @@ final class IssueDockUITests: BayboUITestCase {
         XCTAssertFalse(photos.waitForExistence(timeout: 1))
     }
 
-    /// **A comment that did not land keeps its text.** There is no outbox on
-    /// this surface: the dock used to clear the field before the write and
-    /// never learn the answer, which was survivable while a comment was only
-    /// words. It carries uploaded blobs now, and discarding on failure strands
-    /// files the operator cannot get back.
-    ///
-    /// The demo has no gateway, so the comment always fails — which is exactly
-    /// the case under test.
-    func testAFailedCommentKeepsWhatWasTyped() {
+    /// A send clears the composer immediately and moves ownership into the
+    /// optimistic row. The demo has no gateway, so that row fails and exposes
+    /// the same retry affordance as chat; retry must reuse it, not append one.
+    func testAFailedCommentStaysAsOneRetryableOptimisticPost() {
         let app = openCard()
         let field = app.textFields[IssueDockFields.field]
         field.tap()
@@ -73,10 +68,20 @@ final class IssueDockUITests: BayboUITestCase {
 
         app.buttons["issue-send"].tap()
 
-        // The banner is the report; the text staying is the point.
-        XCTAssertTrue(
-            app.textFields[IssueDockFields.field].value as? String == "this will not land",
-            "a failed comment threw away what was typed")
+        XCTAssertEqual(
+            app.textFields[IssueDockFields.field].value as? String, "",
+            "the composer waited for the network instead of handing off to the outbox")
+        let retry = app.buttons["Send failed — tap to retry"]
+        XCTAssertTrue(retry.waitForExistence(timeout: Self.webviewTimeout))
+        XCTAssertEqual(app.staticTexts.matching(identifier: "this will not land").count, 1)
+        attachScreenshot(app, name: "card-comment-failed")
+
+        retry.tap()
+
+        XCTAssertTrue(retry.waitForExistence(timeout: 3), "retry did not return to failed")
+        XCTAssertEqual(
+            app.staticTexts.matching(identifier: "this will not land").count, 1,
+            "retry appended a second optimistic comment")
     }
 
     /// **A half-typed `@` offers the board's roster**, and completing writes

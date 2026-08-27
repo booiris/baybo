@@ -522,6 +522,11 @@ const ADD_COLUMNS: &[AddColumn] = &[
         definition: "INTEGER NOT NULL DEFAULT 0",
     },
     AddColumn {
+        table: "issue_events",
+        column: "client_msg_id",
+        definition: "TEXT",
+    },
+    AddColumn {
         table: "projects",
         column: "rules_changed_at",
         definition: "INTEGER",
@@ -1722,6 +1727,9 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     -- not have to parse every row's JSON.
                     kind       TEXT    NOT NULL,
                     body       TEXT    NOT NULL,
+                    -- UUID minted by a client for an operator comment.
+                    -- NULL for every other timeline event.
+                    client_msg_id TEXT,
                     created_at INTEGER NOT NULL
                 );
                 -- Reading order for one issue, and the range scan a
@@ -1761,6 +1769,9 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
          CREATE UNIQUE INDEX IF NOT EXISTS idx_session_messages_source_event
              ON session_messages(session_id, source_event_id)
              WHERE source_event_id IS NOT NULL;
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_issue_events_client_msg
+             ON issue_events(issue_id, client_msg_id)
+             WHERE client_msg_id IS NOT NULL;
          -- Serves the chat-list base query (channel scope + newest-first).
          CREATE INDEX IF NOT EXISTS idx_sessions_channel_active
              ON sessions(channel, last_active DESC);

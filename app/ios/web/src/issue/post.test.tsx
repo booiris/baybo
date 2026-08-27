@@ -16,11 +16,13 @@ import type { Actor, IssueDetail, IssueEvent } from "./types";
 /// the same picture once per row that draws it.
 
 const blobRequests: string[] = [];
+const nativePosts: Record<string, unknown>[] = [];
 
 vi.mock("../bridge", async (importOriginal) => {
   const real = await importOriginal<typeof import("../bridge")>();
   return {
     ...real,
+    postToNative: (message: Record<string, unknown>) => nativePosts.push(message),
     blobObjectUrl: (blobId: string) => {
       blobRequests.push(blobId);
       return Promise.resolve(`blob:${blobId}`);
@@ -67,10 +69,11 @@ function opened(id: string): IssueEvent {
   return { id, number: 7, actor: { kind: "user" }, body: { kind: "opened" }, created_at_ms: 1 };
 }
 
-function deliver(events: IssueEvent[], avatar?: string): void {
+function deliver(events: IssueEvent[], avatar?: string, pendingComments?: IssueEvent[]): void {
   const payload: IssuePayload = {
     issue: card,
     events,
+    pendingComments,
     runs: [],
     people: { "a-dev": { handle: "dev-1", monogram: "D1", avatar } },
   };
@@ -100,6 +103,7 @@ function heads(): string[] {
 
 beforeEach(() => {
   blobRequests.length = 0;
+  nativePosts.length = 0;
   forgetAvatars();
 });
 
@@ -129,6 +133,53 @@ describe("a comment is a post", () => {
 
     expect(heads()).toEqual(["You", "@dev-1"]);
     expect(document.querySelector(".issue-activity .issue-face.user")).not.toBeNull();
+  });
+
+  it("shows a delayed sending indicator and replaces the optimistic row by client id", () => {
+    mount();
+    const pending: IssueEvent = {
+      ...comment("pending-c1", "on its way", { kind: "user" }),
+      client_msg_id: "c1",
+      send_state: "sending",
+    };
+    deliver([], undefined, [pending]);
+
+    expect(document.querySelectorAll(".issue-entry.comment")).toHaveLength(1);
+    expect(document.querySelector(".send-spinner")).not.toBeNull();
+
+    deliver(
+      [
+        {
+          ...comment("e1", "on its way", { kind: "user" }),
+          client_msg_id: "c1",
+        },
+      ],
+      undefined,
+      [pending],
+    );
+
+    expect(document.querySelectorAll(".issue-entry.comment")).toHaveLength(1);
+    expect(document.querySelector(".send-spinner")).toBeNull();
+  });
+
+  it("retries a failed optimistic row with the same client id", () => {
+    mount();
+    deliver([], undefined, [
+      {
+        ...comment("pending-c2", "try me again", { kind: "user" }),
+        client_msg_id: "c2",
+        send_state: "failed",
+      },
+    ]);
+
+    const retry = document.querySelector<HTMLButtonElement>(".send-failed");
+    expect(retry).not.toBeNull();
+    act(() => retry?.click());
+    expect(nativePosts).toContainEqual({
+      type: "retryComment",
+      targetId: "test",
+      clientMsgId: "c2",
+    });
   });
 
   it("draws the picture when there is one, and asks for it once for the whole card", async () => {

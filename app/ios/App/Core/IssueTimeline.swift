@@ -20,6 +20,9 @@ struct IssueEvent: Equatable {
     }
 
     let id: String
+    /// Client idempotency key on an operator comment. Native uses it only to
+    /// retire the matching optimistic outbox row.
+    let clientMsgId: String?
     let actor: ActorKind
     /// The body's own `kind`, verbatim — `comment`, `blocked`, `run_settled`,
     /// or something this build has never heard of.
@@ -73,6 +76,7 @@ struct IssueEvent: Equatable {
         let body = item["body"] as? [String: Any] ?? [:]
         guard let kind = body["kind"] as? String else { return nil }
         self.id = id
+        clientMsgId = item["client_msg_id"] as? String
         self.kind = kind
         createdAtMs = (item["created_at_ms"] as? NSNumber)?.int64Value ?? 0
         let actor = item["actor"] as? [String: Any] ?? [:]

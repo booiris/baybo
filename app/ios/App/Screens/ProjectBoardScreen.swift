@@ -292,6 +292,26 @@ struct ProjectBoardScreen: View {
                         lang.t(issue.pinned ? "board.unpin" : "board.pin"),
                         systemImage: issue.pinned ? "pin.slash" : "pin")
                 }
+                if issue.cancelledAtMs == nil {
+                    Button(role: .destructive) {
+                        Haptics.tap()
+                        appStore.promptCancelIssue(projectId: projectId, number: issue.number)
+                    } label: {
+                        Label(lang.t("board.cancelIssue"), systemImage: "xmark.circle")
+                    }
+                } else {
+                    Button {
+                        Haptics.tap()
+                        Task {
+                            await projects.setCancelled(
+                                board: projectId, issue: issue.number, false)
+                        }
+                    } label: {
+                        Label(
+                            lang.t("board.reopenIssue"),
+                            systemImage: "arrow.uturn.backward.circle")
+                    }
+                }
             }
             // The chat's escape hatch, on a card — reached from the LIST since
             // 2026-08-26 rather than from the card's own ⋯, because a card
@@ -886,7 +906,7 @@ struct ProjectBoardScreen: View {
 
 /// `IssueInfo` is a UniFFI record, so it carries no `Identifiable`; the sheet
 /// bindings need one and a card's number is its identity within a board.
-extension IssueInfo: @retroactive Identifiable {
+extension IssueInfo: Identifiable {
     public var id: Int64 { number }
 }
 

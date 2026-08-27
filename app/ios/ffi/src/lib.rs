@@ -829,12 +829,21 @@ impl BayboClient {
         self: Arc<Self>,
         project_id: String,
         number: i64,
+        client_msg_id: String,
         text: String,
         attachments: Vec<IssueAttachmentInput>,
     ) -> Result<String, BayboError> {
         runtime::run(async move {
             let client = self.gateway_client()?;
-            gateway_api::comment_on_issue(&client, project_id, number, text, attachments).await
+            gateway_api::comment_on_issue(
+                &client,
+                project_id,
+                number,
+                client_msg_id,
+                text,
+                attachments,
+            )
+            .await
         })
         .await
     }

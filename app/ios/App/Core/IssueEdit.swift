@@ -22,7 +22,8 @@ extension IssueInfo {
         branch: StringPatch = .keep,
         blockedReason: StringPatch = .keep,
         unread: Int64? = nil,
-        lastRunFailed: Bool? = nil
+        lastRunFailed: Bool? = nil,
+        cancelled: Bool? = nil
     ) -> IssueInfo {
         let nextAssignee: String? =
             switch assignee {
@@ -41,6 +42,12 @@ extension IssueInfo {
             case .keep: self.blockedReason
             case .clear: nil
             case let .set(value): value
+            }
+        let nextCancelledAtMs: Int64? =
+            switch cancelled {
+            case nil: cancelledAtMs
+            case true: Int64(Date().timeIntervalSince1970 * 1000)
+            case false: nil
             }
         return IssueInfo(
             number: number,
@@ -63,7 +70,7 @@ extension IssueInfo {
             lastRunFailed: lastRunFailed ?? self.lastRunFailed,
             approvalPending: approvalPending,
             openedByAgent: openedByAgent,
-            cancelledAtMs: cancelledAtMs,
+            cancelledAtMs: nextCancelledAtMs,
             createdAtMs: createdAtMs,
             updatedAtMs: updatedAtMs)
     }

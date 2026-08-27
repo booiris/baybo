@@ -144,6 +144,37 @@ import Testing
             "absent, never null — the page latches the first boundary it is given")
     }
 
+    @MainActor
+    @Test func anOptimisticCommentCarriesItsRetryIdentityAndAttachmentCard() throws {
+        let attachment = AttachmentRef(
+            kind: .file, blobId: "blob-1", mimeType: "text/plain", size: 12,
+            filename: "notes.txt")
+        let pending = PendingIssueComment(
+            clientMsgId: "0199318f-7df2-7a24-ae03-2ea582c857bc",
+            text: "hello",
+            attachments: [IssueCommentAttachment(attachment)],
+            createdAtMs: 123,
+            unblockAfterSend: false,
+            state: .failed)
+        let json = IssueBridge.payload(
+            issue: issue(), eventsJson: #"{"items":[]}"#, runs: [], people: [:], children: [],
+            firstUnread: nil, pendingComments: [pending])
+        let decoded =
+            try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any] ?? [:]
+        let comments = decoded["pendingComments"] as? [[String: Any]] ?? []
+        let comment = try #require(comments.first)
+        let body = try #require(comment["body"] as? [String: Any])
+        let attachments = body["attachments"] as? [[String: Any]] ?? []
+
+        #expect(comment["client_msg_id"] as? String == pending.clientMsgId)
+        #expect(comment["send_state"] as? String == "failed")
+        #expect(comment["id"] as? String == "pending-\(pending.clientMsgId)")
+        #expect(body["kind"] as? String == "comment")
+        #expect(body["text"] as? String == "hello")
+        #expect(attachments.first?["blob_id"] as? String == "blob-1")
+        #expect(attachments.first?["filename"] as? String == "notes.txt")
+    }
+
     /// The whole payload must survive `JSONSerialization` — it is spliced into
     /// an `evaluateJavaScript` string, and a value that cannot encode would
     /// silently produce `{}` and a page that never paints.

@@ -20,7 +20,6 @@ struct IssueDock: View {
     @ObservedObject private var lang = Lang.shared
 
     @State private var photoPicks: [PhotosPickerItem] = []
-    @State private var sending = false
     @FocusState private var focused: Bool
     /// Where the caret was after the last edit, as a UTF-16 offset — `nil`
     /// while an IME composition is open, and until the field has been typed
@@ -292,7 +291,7 @@ struct IssueDock: View {
                 ComposerSendCircle(systemName: "arrow.up", filled: canSend)
             }
             .buttonStyle(.plain)
-            .disabled(!canSend || sending)
+            .disabled(!canSend)
             .padding(.trailing, 6)
             .padding(.bottom, 6)
             .accessibilityIdentifier("issue-send")
@@ -322,35 +321,15 @@ struct IssueDock: View {
     private func send() {
         // The gate is the staging machine's — a pick still uploading or failed
         // holds the send, and says so on its own tile.
-        guard !sending, let payload = staging.claimSend() else { return }
+        guard let payload = staging.claimSend() else { return }
         Haptics.tap()
         let lifting = question != nil && unblockAfterSend
-        sending = true
-        Task {
-            defer { sending = false }
-            let landed = await store.comment(
-                payload.text,
-                attachments: payload.picks.compactMap { pick in
-                    pick.blobId.map {
-                        IssueAttachmentInput(blobId: $0, filename: pick.filename)
-                    }
-                })
-            // **Only a landed comment discards.** There is no outbox here, and
-            // the picks are uploaded blobs: clearing the strip on a failure
-            // throws away files the operator cannot get back, with a banner as
-            // the only trace. A failure leaves the text and the tiles exactly
-            // where they are, to be sent again.
-            guard landed else { return }
-            clearField()
-            staging.discardDraft()
-            // The comment first, THEN the unblock: the unblock door hands the
-            // parked run back out, and its brief is built from what the card
-            // says at that moment — lifting first would restart the agent
-            // without the answer it stopped for.
-            if lifting {
-                store.unblock()
-            }
-        }
+        store.sendComment(
+            payload.text,
+            attachments: payload.picks.compactMap(\.attachmentRef),
+            unblockAfterSend: lifting)
+        clearField()
+        staging.discardDraft()
     }
 
     /// Clear the field deterministically, INCLUDING a live CJK IME

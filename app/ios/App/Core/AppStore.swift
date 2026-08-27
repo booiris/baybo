@@ -96,6 +96,13 @@ final class AppStore: ObservableObject {
         let name: String
     }
 
+    /// A board row whose terminal cancel is waiting on the root-hosted
+    /// destructive confirmation. Reopening is reversible and skips this step.
+    struct PendingIssueCancel: Equatable {
+        let projectId: String
+        let number: Int64
+    }
+
     /// A conversation's rename, waiting on the editor dialog.
     ///
     /// The **seed** is snapshotted when the editor opens, like
@@ -228,6 +235,8 @@ final class AppStore: ObservableObject {
     /// The session a swipe-delete is asking to confirm — hosted in `RootView`
     /// exactly like the logout confirm, and for the same latch/coverage reasons.
     @Published var confirmDeleteSession: String?
+    /// The issue-list cancel waiting on the same root-hosted confirmation.
+    @Published var confirmCancelIssue: PendingIssueCancel?
     /// The cron group a swipe-delete is asking to confirm, same host and reasons.
     @Published var confirmDeleteCronGroup: PendingCronGroupDelete?
     /// The conversation the list's long-press rename is editing — the one dialog
@@ -1258,6 +1267,13 @@ final class AppStore: ObservableObject {
     func promptDeleteSession(_ sessionId: String) {
         withAnimation(ConfirmDialog.enterMotion) {
             confirmDeleteSession = sessionId
+        }
+    }
+
+    /// Raise the cancel confirm for a card selected from the board list.
+    func promptCancelIssue(projectId: String, number: Int64) {
+        withAnimation(ConfirmDialog.enterMotion) {
+            confirmCancelIssue = PendingIssueCancel(projectId: projectId, number: number)
         }
     }
 

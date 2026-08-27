@@ -202,4 +202,4 @@ struct ProjectTeamSheet: View {
 /// The record already carries an `id` (the agent's profile id), so the
 /// conformance is a declaration and nothing else — a computed `id` here would
 /// be a second answer to which agent this is.
-extension TeamMemberInfo: @retroactive Identifiable {}
+extension TeamMemberInfo: Identifiable {}

@@ -22,6 +22,7 @@ import {
   postIssueState,
   provideIssueState,
   revealIssueTarget,
+  retryComment,
   subscribeIssue,
   type IssuePayload,
   type IssueViewState,
@@ -86,6 +87,7 @@ export function IssuePage({
   /// The reader has put a finger on the page. From then on the scroll is
   /// theirs: a live payload arriving mid-read must not yank them anywhere.
   const grabbed = useRef(false);
+  const followedLocalComment = useRef<string | null>(null);
 
   useLayoutEffect(() => {
     const unbind = bindNativeTarget(targetId);
@@ -237,11 +239,40 @@ export function IssuePage({
   /// exactly the card that needs the disc most.
   useEffect(reportAtBottom, [reportAtBottom, payload, landing]);
 
+  const pending = payload?.pendingComments ?? [];
+  const latestLocalComment = pending[pending.length - 1]?.client_msg_id;
+  useLayoutEffect(() => {
+    if (
+      latestLocalComment === undefined ||
+      followedLocalComment.current === latestLocalComment
+    ) {
+      return;
+    }
+    followedLocalComment.current = latestLocalComment;
+    const el = scrollRef.current;
+    if (el) {
+      el.scrollTop = el.scrollHeight;
+      schedulePageState();
+    }
+  }, [latestLocalComment, schedulePageState]);
+
   if (!payload) {
     return <div className="issue-loading">{t("issue.loading")}</div>;
   }
 
   const { issue, events, runs, people } = payload;
+  const confirmedClientMsgIds = new Set(
+    events.flatMap((event) =>
+      event.client_msg_id === undefined ? [] : [event.client_msg_id],
+    ),
+  );
+  const activityEvents = [
+    ...events,
+    ...(payload.pendingComments ?? []).filter(
+      (event) =>
+        event.client_msg_id === undefined || !confirmedClientMsgIds.has(event.client_msg_id),
+    ),
+  ];
   // Ids in, people out. The DTOs carry profile ids and only the board knows
   // the team, so the map arrives on the payload and every name and face on
   // this page goes through it — an id that resolves to nothing prints as
@@ -252,11 +283,12 @@ export function IssuePage({
   // Who opened the card: the description reads as their post, the way the
   // first box on a GitHub issue does. Off the timeline's `opened` entry —
   // the card DTO records only whether an AGENT opened it, not which one.
-  const opened = events.find((e) => e.body.kind === "opened") ?? null;
+  const opened = activityEvents.find((e) => e.body.kind === "opened") ?? null;
   // And the entry is then HOISTED rather than repeated: the description's own
   // head already says "@who opened this card", so leaving the line in the
   // Activity would print the same fact twice, a screen apart.
-  const timeline = opened === null ? events : events.filter((e) => e.id !== opened.id);
+  const timeline =
+    opened === null ? activityEvents : activityEvents.filter((e) => e.id !== opened.id);
 
   return (
     <div
@@ -642,7 +674,18 @@ function EntryRow({ event, who }: { event: IssueEvent; who: (id: string) => Pers
           <span className="issue-said-who">{speaker(event.actor, who, t)}</span>
           <span className="issue-said-when">{shortTime(event.created_at_ms)}</span>
         </div>
-        <div className="issue-box">
+        <div className={`issue-box${event.send_state ? ` ${event.send_state}` : ""}`}>
+          {event.send_state === "sending" && <span className="send-spinner" aria-hidden="true" />}
+          {event.send_state === "failed" && event.client_msg_id !== undefined && (
+            <button
+              type="button"
+              className="send-failed"
+              onClick={() => retryComment(event.client_msg_id ?? "")}
+              aria-label={t("chat.retrySend")}
+            >
+              !
+            </button>
+          )}
           <MarkdownBody text={text} />
           {attachments.length > 0 && (
             <div className="issue-attachments">

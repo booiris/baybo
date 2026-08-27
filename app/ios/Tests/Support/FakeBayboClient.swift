@@ -48,6 +48,13 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
         let mimeType: String
     }
 
+    struct CommentCall {
+        let number: Int64
+        let clientMsgId: String
+        let text: String
+        let attachments: [IssueAttachmentInput]
+    }
+
     /// Everything the app never calls under test. Distinct prose so an
     /// accidental reliance on it is obvious in the failure.
     private static let unsupported = BayboError.Other(
@@ -570,6 +577,10 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     private var _stubAttention: [ProjectAttention] = []
     private var _stubActivity: [ProjectActivity] = []
     private var _patches: [(Int64, IssuePatch)] = []
+    private var _comments: [CommentCall] = []
+    private var _failComments = false
+    private var commentsHeld = false
+    private var commentWaiters: [CheckedContinuation<Void, Never>] = []
     /// Make the board unreachable, which is how the store learns it is offline.
     private var _failProjects = false
 
@@ -623,6 +634,24 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     var failProjects: Bool {
         get { lock.withLock { _failProjects } }
         set { lock.withLock { _failProjects = newValue } }
+    }
+    var comments: [CommentCall] { lock.withLock { _comments } }
+    var failComments: Bool {
+        get { lock.withLock { _failComments } }
+        set { lock.withLock { _failComments = newValue } }
+    }
+    var parkedComments: Int { lock.withLock { commentWaiters.count } }
+
+    func holdComments() { lock.withLock { commentsHeld = true } }
+
+    func releaseComments() {
+        let parked: [CheckedContinuation<Void, Never>] = lock.withLock {
+            commentsHeld = false
+            let waiters = commentWaiters
+            commentWaiters.removeAll()
+            return waiters
+        }
+        for waiter in parked { waiter.resume() }
     }
 
     private func refuseIfOffline() throws {
@@ -717,19 +746,52 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
         guard let stubIssueEventsJson else { throw Self.unsupported }
         return stubIssueEventsJson
     }
-    /// What the card dock posted, in order. The attachments matter as much as
-    /// the text: a comment that dropped its picks is the failure the strip's
-    /// send gate exists for.
-    var comments: [(number: Int64, text: String, attachments: [IssueAttachmentInput])] = []
-    /// Refuse the next comment, to exercise the dock keeping its strip.
-    var failComments = false
     func projectIssueComment(
-        projectId: String, number: Int64, text: String, attachments: [IssueAttachmentInput]
+        projectId: String, number: Int64, clientMsgId: String, text: String,
+        attachments: [IssueAttachmentInput]
     ) async throws -> String {
         try refuseIfOffline()
+        let held: Bool = lock.withLock {
+            _comments.append(
+                CommentCall(
+                    number: number, clientMsgId: clientMsgId, text: text, attachments: attachments))
+            return commentsHeld
+        }
+        if held {
+            await withCheckedContinuation { continuation in
+                let alreadyReleased: Bool = lock.withLock {
+                    guard commentsHeld else { return true }
+                    commentWaiters.append(continuation)
+                    return false
+                }
+                if alreadyReleased { continuation.resume() }
+            }
+        }
         if failComments { throw Self.unsupported }
-        comments.append((number, text, attachments))
-        return "{}"
+        let wireAttachments: [[String: Any]] = attachments.map { attachment in
+            var wire: [String: Any] = [
+                "blob_id": attachment.blobId,
+                "mime_type": "application/octet-stream",
+                "size": 0,
+            ]
+            if let filename = attachment.filename { wire["filename"] = filename }
+            return wire
+        }
+        let row: [String: Any] = [
+            "id": "event-\(clientMsgId)",
+            "client_msg_id": clientMsgId,
+            "number": number,
+            "actor": ["kind": "user"],
+            "body": [
+                "kind": "comment",
+                "text": text,
+                "attachments": wireAttachments,
+            ],
+            "created_at_ms": 1,
+        ]
+        let data = try JSONSerialization.data(withJSONObject: row)
+        guard let json = String(data: data, encoding: .utf8) else { throw Self.unsupported }
+        return json
     }
     func projectIssueApprovalResolve(
         projectId: String, number: Int64, callId: String, decision: IssueApprovalDecision
