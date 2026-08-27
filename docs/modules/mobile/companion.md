@@ -239,7 +239,10 @@ C's blind relay, which only matches two legs by key and copies opaque frames
   splices it to the phone's `/content/join/{node}` leg. The manager self-gates on
   the approved device row (idle when none), reading the relay URL + admission key
   recorded on the row at pairing — there is **no `relay`/`push` config block**. It
-  is spawned + tracked under the shared `ShutdownSignal`
+  keeps polling that row while connected: a re-pair that changes the relay URL or
+  admission key tears down the stale control leg and immediately reconnects from
+  the new row, while a transient store read failure leaves the healthy leg alone.
+  It is spawned + tracked under the shared `ShutdownSignal`
   (`baybo_gateway::spawn_relay_content`), owns its child tasks (the control pump +
   per-signal data legs), and drains on shutdown.
 - **Device dedup is gateway-only** (`channel/state.rs` `LegDedup`): the relay is
