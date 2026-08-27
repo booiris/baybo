@@ -28,8 +28,9 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use super::api_tunnel::run_api_tunnel_over_relay;
 use super::device_content::run_content_over_relay;
 use super::state::{LegDedup, WsChannelState};
+use remote_host_protocol::REMOTE_API_KEY_HEADER;
 use remote_host_protocol::key_tag;
-use remote_host_protocol::relay::{LegClass, REMOTE_API_KEY_HEADER};
+use remote_host_protocol::relay::LegClass;
 
 use crate::relay::{
     ControlCloseFrame, ControlHello, ControlSignal, connect_control, control_error_detail,

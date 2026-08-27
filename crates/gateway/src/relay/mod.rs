@@ -174,7 +174,7 @@ pub(crate) async fn connect_control(
         .map_err(|e| ControlError::Codec(format!("bad instance key header: {e}")))?;
     request
         .headers_mut()
-        .insert(remote_host_protocol::relay::REMOTE_API_KEY_HEADER, value);
+        .insert(remote_host_protocol::REMOTE_API_KEY_HEADER, value);
     let (ws, _) = connect_async(request).await?;
     pump_control(url, ws, hello, signals, healthy_cycle).await
 }

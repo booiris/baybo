@@ -6,6 +6,14 @@
 pub mod push;
 pub mod relay;
 
+/// Header identifying the remote-host tenant on relay WebSocket upgrades and
+/// push HTTP requests.
+pub const REMOTE_API_KEY_HEADER: &str = "x-remote-api-key";
+
+/// Admission key used with the built-in public remote host when the operator
+/// does not provide one explicitly.
+pub const DEFAULT_REMOTE_API_KEY: &str = "guest";
+
 /// Join a base URL to a route path, trimming a trailing slash on the base.
 fn join(base: &str, path: &str) -> String {
     format!("{}{}", base.trim_end_matches('/'), path)

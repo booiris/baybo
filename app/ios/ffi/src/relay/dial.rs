@@ -90,7 +90,7 @@ pub(super) async fn dial_content_join(
                 .parse()
                 .map_err(|e| format!("bad instance key header: {e}"))?;
             req.headers_mut()
-                .insert(remote_host_protocol::relay::REMOTE_API_KEY_HEADER, value);
+                .insert(remote_host_protocol::REMOTE_API_KEY_HEADER, value);
         }
         if let Some(class) = leg_class {
             let value = class

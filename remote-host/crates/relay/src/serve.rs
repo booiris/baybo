@@ -36,10 +36,10 @@ use axum::routing::get;
 use remote_host_admission::{Admission, AdmissionEntry, Admit};
 use remote_host_edge::ip_limit::{self, resolve_client_ip_from};
 use remote_host_edge::ip_traffic::{ClientIp, EP_CONTENT_HOST, EP_CONTENT_JOIN};
+use remote_host_protocol::REMOTE_API_KEY_HEADER;
 use remote_host_protocol::key_tag;
 use remote_host_protocol::relay::{
     CONTENT_HOST, CONTENT_JOIN, CONTROL, LegClass, PAIR_HOST, PAIR_JOIN, RELAY_LEG_CLASS_HEADER,
-    REMOTE_API_KEY_HEADER,
 };
 // `build_router` (pub) takes an `IpLimitConfig` and a `RelayServices` carrying an
 // `IpTrafficRegistry`, so downstream callers must be able to name both without

@@ -98,7 +98,7 @@ pub(crate) struct DeviceApnsRegistration {
 /// Secret-vault name for a device's push delegation — the 64-byte Ed25519
 /// signature the device made at pairing authorizing A's gateway push key to
 /// manage its APNs binding at C. Absent → push is disabled for the device (the
-/// gateway can't prove ownership of the binding to the keyless push routes).
+/// gateway can't prove ownership of the binding to the push routes).
 pub(crate) fn device_push_delegation_secret_name(device_id: &str) -> String {
     format!("device.{device_id}.push_delegation")
 }
@@ -245,12 +245,17 @@ pub enum NotifyError {
 /// mock so the whole dispatch path is host-testable.
 #[async_trait::async_trait]
 pub trait NotifySink: Send + Sync {
-    async fn post(&self, notify_url: &str, body: &NotifyRequest) -> Result<(), NotifyError>;
+    async fn post(
+        &self,
+        notify_url: &str,
+        remote_api_key: &str,
+        body: &NotifyRequest,
+    ) -> Result<(), NotifyError>;
 }
 
-/// reqwest-backed sink POSTing to a per-device `<base>/notify`. The base is
-/// derived from the device row's relay URL at dispatch time, so the sink holds
-/// only the (proxy-aware) client.
+/// reqwest-backed sink POSTing to a per-device `<base>/notify`. The target's base
+/// and remote API key arrive per call, so the sink holds only the proxy-aware
+/// client.
 pub struct HttpNotifySink {
     client: reqwest::Client,
 }
@@ -266,11 +271,13 @@ impl HttpNotifySink {
 
 #[async_trait::async_trait]
 impl NotifySink for HttpNotifySink {
-    async fn post(&self, notify_url: &str, body: &NotifyRequest) -> Result<(), NotifyError> {
-        let resp = self
-            .client
-            .post(notify_url)
-            .json(body)
+    async fn post(
+        &self,
+        notify_url: &str,
+        remote_api_key: &str,
+        body: &NotifyRequest,
+    ) -> Result<(), NotifyError> {
+        let resp = push_post(&self.client, notify_url, remote_api_key, body)
             .send()
             .await
             .map_err(|e| NotifyError::Transient(format!("notify post: {e}")))?;
@@ -296,12 +303,17 @@ impl NotifySink for HttpNotifySink {
 /// mock.
 #[async_trait::async_trait]
 pub trait ApnsRegistrar: Send + Sync {
-    async fn register(&self, register_url: &str, body: &RegisterRequest) -> Result<(), String>;
+    async fn register(
+        &self,
+        register_url: &str,
+        remote_api_key: &str,
+        body: &RegisterRequest,
+    ) -> Result<(), String>;
 }
 
-/// reqwest-backed registrar POSTing to a per-device `<base>/register`. The base +
-/// admission key come from the device row at dispatch time, so it holds only the
-/// (proxy-aware) client.
+/// reqwest-backed registrar POSTing to a per-device `<base>/register`. The
+/// target's base and remote API key arrive per call, so it holds only the
+/// proxy-aware client.
 pub struct HttpApnsRegistrar {
     client: reqwest::Client,
 }
@@ -317,11 +329,13 @@ impl HttpApnsRegistrar {
 
 #[async_trait::async_trait]
 impl ApnsRegistrar for HttpApnsRegistrar {
-    async fn register(&self, register_url: &str, body: &RegisterRequest) -> Result<(), String> {
-        let resp = self
-            .client
-            .post(register_url)
-            .json(body)
+    async fn register(
+        &self,
+        register_url: &str,
+        remote_api_key: &str,
+        body: &RegisterRequest,
+    ) -> Result<(), String> {
+        let resp = push_post(&self.client, register_url, remote_api_key, body)
             .send()
             .await
             .map_err(|e| format!("register post: {e}"))?;
@@ -335,15 +349,29 @@ impl ApnsRegistrar for HttpApnsRegistrar {
     }
 }
 
+fn push_post<T: Serialize + ?Sized>(
+    client: &reqwest::Client,
+    url: &str,
+    remote_api_key: &str,
+    body: &T,
+) -> reqwest::RequestBuilder {
+    client
+        .post(url)
+        .header(remote_host_protocol::REMOTE_API_KEY_HEADER, remote_api_key)
+        .json(body)
+}
+
 /// A single push destination: the binding `device_id` plus the remote host (C)
 /// base URL to POST `/register` + `/notify` to. Built from a paired [`DeviceRow`]
 /// (relay path) or a [`web::WebPushBinding`] (direct path) — the builders below
 /// are identical for both, since the push material is keyed by `device_id` in the
-/// vault the same way (see [`web`]). Push is keyless, so no admission key rides
-/// here; the binding is authorized entirely by the Ed25519 delegation chain.
+/// vault the same way (see [`web`]). The remote API key marks admitted Baybo
+/// traffic at the remote-host edge; the Ed25519 delegation chain independently
+/// authorizes the device binding and each request.
 struct PushTarget {
     device_id: String,
     relay_url: String,
+    remote_api_key: String,
 }
 
 impl From<&DeviceRow> for PushTarget {
@@ -351,6 +379,7 @@ impl From<&DeviceRow> for PushTarget {
         Self {
             device_id: d.device_id.clone(),
             relay_url: d.relay_url.clone(),
+            remote_api_key: d.remote_api_key.clone(),
         }
     }
 }
@@ -360,6 +389,7 @@ impl From<web::WebPushBinding> for PushTarget {
         Self {
             device_id: b.device_id,
             relay_url: b.relay_url,
+            remote_api_key: b.remote_api_key,
         }
     }
 }
@@ -638,6 +668,10 @@ impl PushDispatcher {
             }
         };
         let mut targets: Vec<PushTarget> = device_rows.iter().map(PushTarget::from).collect();
+        // Filter legacy paired rows before deduplication so an unroutable row
+        // (notably one predating `remote_api_key`) cannot mask a valid direct
+        // binding for the same physical device.
+        retain_routable_targets(&mut targets);
         let mut seen: HashSet<String> = targets.iter().map(|t| t.device_id.clone()).collect();
         for binding in web::list_bindings(&self.secret_vault).await {
             // The same phone, paired then switched to direct, can hold both a
@@ -647,6 +681,7 @@ impl PushDispatcher {
                 targets.push(binding.into());
             }
         }
+        // Direct bindings can also contain legacy or malformed durable data.
         retain_routable_targets(&mut targets);
         if targets.is_empty() {
             tracing::debug!(
@@ -844,7 +879,9 @@ impl PushDispatcher {
             self.next_counter().await,
         )
         .map_err(NotifyError::Transient)?;
-        self.sink.post(notify_url, &body).await
+        self.sink
+            .post(notify_url, &target.remote_api_key, &body)
+            .await
     }
 
     /// Best-effort: register an approved device with C from the material A
@@ -951,7 +988,10 @@ impl PushDispatcher {
             self.next_counter().await,
         );
         let register_url = remote_host_protocol::push::register_url(base_http);
-        match registrar.register(&register_url, &body).await {
+        match registrar
+            .register(&register_url, &target.remote_api_key, &body)
+            .await
+        {
             Ok(()) => {
                 tracing::info!(
                     device = %device_id,
@@ -1082,7 +1122,8 @@ fn build_notify_body(
     let enc = b64.encode(&ciphertext);
     let n = b64.encode(&nonce);
     // Sign the notify so C can verify it against the gateway key it stored at
-    // register and reject a forged push to this device_id (the routes are keyless).
+    // register and reject a forged push to this device_id (the traffic key is
+    // not device-binding authorization).
     let sig = delegation::sign_notify(signing_key, device_id, &enc, &n, device_id, counter);
     Ok(NotifyRequest {
         device_id: device_id.to_string(),
@@ -1097,7 +1138,8 @@ fn build_notify_body(
 
 /// Pure: build + sign a `/register` body. The gateway proves ownership of the
 /// binding to C with the device's pairing-time `delegation_sig` (device→gateway)
-/// plus its own signature over the binding, so C accepts it with no caller key.
+/// plus its own signature over the binding, so C need not treat the caller's
+/// remote API key as device-binding authorization.
 fn build_register_body(
     device_id: &str,
     apns_token: &str,
@@ -1123,13 +1165,12 @@ fn build_register_body(
     }
 }
 
-/// Drop any target whose `device_id` is not self-certifying
-/// (`device-<hex(ed25519 pub)>`). C re-derives the device key from the id to
-/// verify the delegation chain, so a target of any other shape — e.g. a vault
-/// binding persisted under a retired id prefix — can never register or notify:
-/// every attempt would 403/404 and warn, on every turn, forever. The stale
-/// vault/store rows themselves stay in place (inert); pairing or registering
-/// again under the current prefix writes fresh, routable material.
+/// Drop any target whose `device_id` is not self-certifying or whose remote API
+/// key is empty. C re-derives the device key from the id to verify the delegation
+/// chain, while the remote-host edge requires the key on both push POSTs. A
+/// legacy target missing either value can never complete the current flow, so
+/// leave its durable row in place but keep it inert until the device pairs or
+/// registers again.
 fn retain_routable_targets(targets: &mut Vec<PushTarget>) {
     // Once per process, not per turn: the unroutable set is static durable
     // state, so one INFO keeps the skip observable at default RUST_LOG without
@@ -1137,21 +1178,28 @@ fn retain_routable_targets(targets: &mut Vec<PushTarget>) {
     static LEGACY_TARGETS_NOTICE: std::sync::Once = std::sync::Once::new();
     let before = targets.len();
     targets.retain(|t| {
-        if delegation::device_pubkey_from_id(&t.device_id).is_ok() {
-            return true;
+        if delegation::device_pubkey_from_id(&t.device_id).is_err() {
+            tracing::debug!(
+                device = %t.device_id,
+                "push: device id is not self-certifying; excluded from push fan-out"
+            );
+            return false;
         }
-        tracing::debug!(
-            device = %t.device_id,
-            "push: device id is not self-certifying; excluded from push fan-out"
-        );
-        false
+        if t.remote_api_key.is_empty() {
+            tracing::debug!(
+                device = %t.device_id,
+                "push: remote API key is empty; excluded from push fan-out"
+            );
+            return false;
+        }
+        true
     });
     let dropped = before - targets.len();
     if dropped > 0 {
         LEGACY_TARGETS_NOTICE.call_once(|| {
             tracing::info!(
                 count = dropped,
-                "push: unverifiable legacy push bindings excluded from push fan-out; \
+                "push: unroutable legacy push bindings excluded from push fan-out; \
                  pair or register those devices again to restore their push"
             );
         });
@@ -1469,6 +1517,26 @@ mod tests {
     }
 
     #[test]
+    fn push_post_sets_remote_api_key_header() {
+        let body = serde_json::json!({ "device_id": "device-aa" });
+        let request = push_post(
+            &reqwest::Client::new(),
+            "https://proxy.example/notify",
+            "tenant-key",
+            &body,
+        )
+        .build()
+        .unwrap();
+        assert_eq!(
+            request
+                .headers()
+                .get(remote_host_protocol::REMOTE_API_KEY_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("tenant-key")
+        );
+    }
+
+    #[test]
     fn relay_ws_base_maps_to_http_for_push() {
         // Relay legs dial wss/ws; push POSTs plain HTTP to the same host.
         assert_eq!(
@@ -1503,7 +1571,12 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl NotifySink for ScriptedSink {
-        async fn post(&self, _url: &str, _body: &NotifyRequest) -> Result<(), NotifyError> {
+        async fn post(
+            &self,
+            _url: &str,
+            _remote_api_key: &str,
+            _body: &NotifyRequest,
+        ) -> Result<(), NotifyError> {
             let n = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
             if n < self.fail_first {
                 Err(NotifyError::DeviceUnknown)
@@ -1517,11 +1590,18 @@ mod tests {
     #[derive(Default)]
     struct CountingRegistrar {
         calls: AtomicUsize,
+        remote_api_keys: Mutex<Vec<String>>,
     }
     #[async_trait::async_trait]
     impl ApnsRegistrar for CountingRegistrar {
-        async fn register(&self, _url: &str, _body: &RegisterRequest) -> Result<(), String> {
+        async fn register(
+            &self,
+            _url: &str,
+            remote_api_key: &str,
+            _body: &RegisterRequest,
+        ) -> Result<(), String> {
             self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.remote_api_keys.lock().push(remote_api_key.to_string());
             Ok(())
         }
     }
@@ -1612,6 +1692,10 @@ mod tests {
         // initial ensure + the forced re-register after cache invalidation).
         assert_eq!(sink.calls.load(AtomicOrdering::SeqCst), 2);
         assert_eq!(registrar.calls.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(
+            registrar.remote_api_keys.lock().as_slice(),
+            ["key-A", "key-A"]
+        );
     }
 
     /// An `ApnsRegistrar` that always fails and counts `/register` calls.
@@ -1621,7 +1705,12 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl ApnsRegistrar for FailingRegistrar {
-        async fn register(&self, _url: &str, _body: &RegisterRequest) -> Result<(), String> {
+        async fn register(
+            &self,
+            _url: &str,
+            _remote_api_key: &str,
+            _body: &RegisterRequest,
+        ) -> Result<(), String> {
             self.calls.fetch_add(1, AtomicOrdering::SeqCst);
             Err("register status 403 Forbidden (signature/counter rejected)".into())
         }
@@ -1687,21 +1776,32 @@ mod tests {
     }
 
     #[test]
-    fn fan_out_keeps_only_self_certifying_device_ids() {
+    fn fan_out_keeps_only_self_certifying_ids_with_remote_api_keys() {
         let valid = delegation::device_id_for(&delegation::generate_signing_key().verifying_key());
-        let mut targets: Vec<PushTarget> = [
-            valid.as_str(),
+        let mut targets = vec![
+            PushTarget {
+                device_id: valid.clone(),
+                relay_url: "wss://proxy.example".into(),
+                remote_api_key: "key-A".into(),
+            },
+            PushTarget {
+                device_id: valid.clone(),
+                relay_url: "wss://proxy.example".into(),
+                remote_api_key: String::new(),
+            },
             // The retired pre-rename prefix: C can never verify these again.
-            "ios-7b26d0fce05cd672aa87a000000000000000000000000000000000000000000",
-            "device-zz",
-            "",
-        ]
-        .into_iter()
-        .map(|id| PushTarget {
-            device_id: id.to_string(),
-            relay_url: "wss://proxy.example".into(),
-        })
-        .collect();
+            PushTarget {
+                device_id: "ios-7b26d0fce05cd672aa87a000000000000000000000000000000000000000000"
+                    .into(),
+                relay_url: "wss://proxy.example".into(),
+                remote_api_key: "key-A".into(),
+            },
+            PushTarget {
+                device_id: "device-zz".into(),
+                relay_url: "wss://proxy.example".into(),
+                remote_api_key: "key-A".into(),
+            },
+        ];
         retain_routable_targets(&mut targets);
         assert_eq!(
             targets
@@ -1736,11 +1836,16 @@ mod tests {
 
     /// A `NotifySink` that records the last body it was posted, so a test can
     /// assert the dispatched ciphertext decrypts under the binding's push key.
-    struct CapturingSink(parking_lot::Mutex<Option<NotifyRequest>>);
+    struct CapturingSink(parking_lot::Mutex<Option<(String, NotifyRequest)>>);
     #[async_trait::async_trait]
     impl NotifySink for CapturingSink {
-        async fn post(&self, _url: &str, body: &NotifyRequest) -> Result<(), NotifyError> {
-            *self.0.lock() = Some(body.clone());
+        async fn post(
+            &self,
+            _url: &str,
+            remote_api_key: &str,
+            body: &NotifyRequest,
+        ) -> Result<(), NotifyError> {
+            *self.0.lock() = Some((remote_api_key.to_string(), body.clone()));
             Ok(())
         }
     }
@@ -1767,6 +1872,7 @@ mod tests {
         let binding = web::WebPushBinding {
             device_id: device_id.clone(),
             relay_url: "ws://127.0.0.1:9".into(),
+            remote_api_key: remote_host_protocol::DEFAULT_REMOTE_API_KEY.into(),
             created_at: 0,
         };
         web::store_binding(
@@ -1790,7 +1896,8 @@ mod tests {
 
         // The captured notify is addressed to the web bid and decrypts under the
         // client's push key — exactly what the NSE does on-device.
-        let body = sink.0.lock().clone().expect("a notify was posted");
+        let (remote_api_key, body) = sink.0.lock().clone().expect("a notify was posted");
+        assert_eq!(remote_api_key, remote_host_protocol::DEFAULT_REMOTE_API_KEY);
         assert_eq!(body.device_id, device_id);
         assert_eq!(body.bid, device_id);
         let b64 = base64::engine::general_purpose::STANDARD;

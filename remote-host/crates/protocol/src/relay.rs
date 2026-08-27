@@ -3,11 +3,10 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Admission header presented on every relay WS upgrade — the gateway host legs
-/// ([`PAIR_HOST`], [`CONTENT_HOST`], [`CONTROL`]) and the phone join legs
-/// ([`PAIR_JOIN`], [`CONTENT_JOIN`]) alike. Its value must be an admitted
-/// `remote_api_key` (the relay's sole anti-abuse credential).
-pub const REMOTE_API_KEY_HEADER: &str = "x-remote-api-key";
+// Keep the original public path source-compatible after the header became a
+// relay + push contract at the protocol root.
+#[doc(hidden)]
+pub use crate::REMOTE_API_KEY_HEADER;
 
 /// Header on a phone's [`CONTENT_JOIN`] dial declaring the leg's traffic class
 /// ([`LegClass`]). The phone owns the join, so the phone authors the class; the

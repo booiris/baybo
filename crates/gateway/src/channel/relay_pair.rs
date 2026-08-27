@@ -24,7 +24,7 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-use remote_host_protocol::relay::REMOTE_API_KEY_HEADER;
+use remote_host_protocol::REMOTE_API_KEY_HEADER;
 
 use super::device_pair::{PairTransport, PairingHostDeps, drive};
 

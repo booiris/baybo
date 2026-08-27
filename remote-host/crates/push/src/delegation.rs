@@ -14,7 +14,8 @@
 //! - the **delegation** under the device key (device authorized a gateway key);
 //! - each `/register` and `/notify` **request signature** under that gateway key.
 //!
-//! The push routes are keyless — this chain is the sole authorization. No one can
+//! The remote API key carried by push requests is an edge traffic marker, not a
+//! device-binding boundary — this chain is the binding authorization. No one can
 //! overwrite, redirect, suppress, or spam another's binding even knowing its
 //! `device_id`: they cannot forge the device's delegation or the gateway's
 //! request signature.
