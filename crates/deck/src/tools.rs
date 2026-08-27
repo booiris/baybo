@@ -97,7 +97,7 @@ impl Tool for DeckCardListTool {
     }
 
     fn description(&self) -> String {
-        "List the user's live deck cards (card_id, title, size, sizes, maximize, enabled, spec_hash) — use it to resolve the user's description to a card_id before updating.".to_string()
+        "List the user's live deck cards (card_id, title, size, sizes, maximize, enabled, spec_hash) — use it to resolve the user's description to a card_id before updating. See the deck skill.".to_string()
     }
 
     fn parameters_schema(&self) -> Value {
@@ -145,7 +145,7 @@ impl Tool for DeckCardGetTool {
     }
 
     fn description(&self) -> String {
-        "Return a live card's current source verbatim (the four bundle files plus any src/ pre-build sources), so you can edit from the real source before DeckCardUpdate (rather than re-authoring blind). See the /deck skill.".to_string()
+        "Return a live card's current source verbatim (the four bundle files plus any src/ pre-build sources), so you can edit from the real source before DeckCardUpdate (rather than re-authoring blind). See the deck skill.".to_string()
     }
 
     fn parameters_schema(&self) -> Value {
@@ -214,7 +214,7 @@ impl Tool for DeckCardCreateTool {
     }
 
     fn description(&self) -> String {
-        "Install a new deck card from a staged bundle directory (absolute path). Runs the dry-run gate and returns any failure (including the service's stderr) so you can fix and retry. The /deck skill carries the bundle contract and templates.".to_string()
+        "Install a new deck card from a staged bundle directory (absolute path). Runs the dry-run gate and returns any failure (including the service's stderr) so you can fix and retry. The deck skill carries the bundle contract and templates.".to_string()
     }
 
     fn parameters_schema(&self) -> Value {
@@ -273,7 +273,7 @@ impl Tool for DeckCardUpdateTool {
     }
 
     fn description(&self) -> String {
-        "Replace an existing card's bundle (card_id + staged directory of the same four files). Runs the same dry-run gate and restarts the service; the user's title/size/layout are preserved. See the /deck skill.".to_string()
+        "Replace an existing card's bundle (card_id + staged directory of the same four files). Runs the same dry-run gate and restarts the service; the user's title/size/layout are preserved. See the deck skill.".to_string()
     }
 
     fn parameters_schema(&self) -> Value {

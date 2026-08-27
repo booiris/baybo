@@ -9,7 +9,7 @@
 - **iOS surfaces**: the FFI exposes fetch/recycle/bundle/call/layout/enable/disable/delete/restore but not purge or the per-card `openapi.json` (REST-only, desktop affordances). The recycle bin has a native screen (`DeckRecycleScreen`, pushed from the Deck header's ☰ menu — the Chats-☰ grammar; rows restore via `deck_restore` and the board refetches on the `DeckChanged` echo); purge stays REST-only. The native delete confirm is a system alert rather than the hand-rolled `ConfirmDialog`.
 - **Relay-leg op replay is governed per op by the card's own contract**: every op's mandatory `x-baybo-retryable` declaration (compiled at install, served as `retryable_ops` on the deck view) picks the phone's `ReplayPolicy` — a declared-safe op may replay a silent pooled leg, anything else fails up to the card (arbitrary agent-written service code is not safely at-least-once). The absolute-state deck writes stay on the convergent retry path unconditionally.
 
-**Post-design additions (`5ad915c5`, later than the original build).** Two capabilities beyond the 2026-07-17 design landed after the fact: (1) **automatic git version history** for card bundles — `workspace/deck/` is a git repo and install/update/purge auto-commit (see "Version history is automatic" under *The card bundle*); (2) **cross-chat update discovery tools** — `DeckCardList` + `DeckCardGet`, so the agent can update a card in a fresh conversation with no memory of its uuid and no filesystem reach into the deck root (see *Authoring pipeline*). The same commit trimmed all four `DeckCard*` tool descriptions to one-liners — the bundle contract lives in the `/deck` skill, not in the always-on tool schemas that ride every cached owner-channel prompt (~326 tokens for the four tools, down from ~621).
+**Post-design additions (`5ad915c5`, later than the original build).** Two capabilities beyond the 2026-07-17 design landed after the fact: (1) **automatic git version history** for card bundles — `workspace/deck/` is a git repo and install/update/purge auto-commit (see "Version history is automatic" under *The card bundle*); (2) **cross-chat update discovery tools** — `DeckCardList` + `DeckCardGet`, so the agent can update a card in a fresh conversation with no memory of its uuid and no filesystem reach into the deck root (see *Authoring pipeline*). The same commit trimmed all four `DeckCard*` tool descriptions to one-liners — the bundle contract lives in the `deck` skill, not in the always-on tool schemas that ride every cached owner-channel prompt (~326 tokens for the four tools, down from ~621).
 
 **Post-design additions (`2026-07-18`) — per-size adaptation + optional maximize.** The original size story was skeletal: a card declared one `size`, the ⤢ cycle spanned all three grid sizes whether or not the card handled them, and real cards wrote a single fixed layout that clipped at other sizes. Three things landed to make size real, all authoritative from the manifest and refreshed on every install/update:
 - **`sizes: [small|wide|large]`** on the manifest (non-empty, contains `size`; absent ⇒ `[size]`, the honest legacy default). The client's ⤢ cycle is confined to this set and a single-entry list hides the ⤢ control. Persisted as a `deck_cards.sizes` column (comma-joined; an empty legacy column reads back as `[size]`). Cards adapt with **`deck.onSizeChange(fn)`** (new SDK method; fires immediately + on every change) — one `card.html`, layout switched off `deck.size` / a self-set `[data-size]` attribute, never a reload.
@@ -448,19 +448,19 @@ The tab label has `Localizable.xcstrings` keys (en `Deck` + the zh-Hans kanban t
 
 ## Authoring pipeline
 
-Card authoring is **explicit-invocation-only and owner-channel-only**: the
-builtin `deck` skill is slash-only (`command: deck` +
-`disable-model-invocation: true`) and `channels: [owner]`, and all four
-`DeckCard*` tool manifests (`List`/`Get`/`Create`/`Update`) carry
-`channels: [owner]` — so the model never volunteers a card, a
-telegram/tui/subagent session neither sees the skill nor the tools (they're
-filtered from its LLM tool list and refused by the executor), and a card is
-only ever authored when the owner types `/deck <request>` in chat (web or
-iOS; it's a plain chat message, no client plumbing).
+Card authoring is **agent-or-explicit invocation and owner-channel-only**: the
+builtin `deck` skill keeps `command: deck` and leaves model invocation enabled,
+with `channels: [owner]`; all four `DeckCard*` tool manifests
+(`List`/`Get`/`Create`/`Update`) also carry `channels: [owner]`. On the owner
+surface, the skill listing advertises deck authoring so the model can pull the
+skill for an ordinary-language request to create or update a persistent card;
+`/deck <request>` remains the direct shortcut and injects the same body. A
+telegram/tui/subagent session sees neither the skill nor the tools (they are
+filtered from its LLM tool list and refused by the executor).
 
-When the user types `/deck`:
+When the user requests a Deck card, with or without `/deck`:
 
-1. **Skill.** The slash expansion injects the builtin `deck` skill: the bundle contract, the `ctx`/`deck` SDK surface, and worked examples deliberately spanning genres (an API-fetch quota card *and* a fetch-free machine-status card via `ctx.exec`) so the skill doesn't anchor generation to one shape.
+1. **Skill.** For ordinary language, the model selects the advertised builtin through the `Skill` tool; for `/deck`, slash expansion injects it directly. Either path provides the bundle contract, the `ctx`/`deck` SDK surface, and worked examples deliberately spanning genres (an API-fetch quota card *and* a fetch-free machine-status card via `ctx.exec`) so the skill doesn't anchor generation to one shape.
 2. **Staging.** The agent scaffolds and edits the four files in a scratch dir with its ordinary `Write`/`Edit` tools — the same loop it uses for all code.
 3. **`DeckCardCreate(path)` — install is a dry-run gate.** The tool: (a) static-validates (manifest + spec parse, size caps, refresh op declared with on-schema params); (b) boots the service on the host — a missing `ops` export dies here; (c) invokes the refresh op once; (d) rejects a null or oversize snapshot — all **before** the row enables or `DeckChanged` fires. Failures (stderr, bad JSON, timeout) return in the tool result so the agent iterates in the same turn; success stores the first snapshot, so the user's first sight of the card is populated, not a spinner.
 4. **Preview (best-effort).** When the browser sidecar is present, the tool renders `card.html` with the first snapshot and attaches a screenshot to the chat reply; absent a browser it degrades to the plain dry-run silently.
@@ -469,7 +469,7 @@ Updates re-run the same gate; `DeckCardUpdate(card_id, path)` replaces the bundl
 
 **Cross-chat updates need discovery, not memory.** A card persists across conversations, but a *new* chat has no memory of its uuid and the agent's file tools are sandboxed to `workspace/work/` — they can't reach `workspace/deck/<uuid>/` to read the installed source. So the authoring skill carries two read-only discovery tools alongside the authoring pair: **`DeckCardList`** (every live card's `card_id`/`title`/`size`/`sizes`/`maximize`/`enabled`/`spec_hash`, so the agent resolves "the quota card" → a uuid) and **`DeckCardGet(card_id)`** (the card's current source returned *inline* in the tool result — the four bundle files plus any `src/` pre-build files keyed by their `src/…` path — so the agent edits from the real source rather than re-authoring blind; the sandbox-reach problem is why the source comes back through the tool result, not a path). The update flow is then: `DeckCardList` → `DeckCardGet` → write the files to a fresh scratch dir → surgical edit (re-`bun build` if the card has a `src/`) → `DeckCardUpdate`. All four deck tools are `Trusted` + `channels: [owner]`; the authoring pair holds `ReadFile` (they read the agent's staged dir), the discovery pair holds no filesystem capability (they read through the manager). Without these, updating in a new chat would force a full re-write from the user's description, silently dropping whatever the card already did.
 
-The four tool **descriptions are deliberately terse** — one line each, pointing at the `/deck` skill. The full bundle contract (the four-file shapes, the `ctx`/`deck` SDK, worked examples) lives only in the skill, which is injected on `/deck` and nowhere else; the tool *schemas*, by contrast, ride every owner-channel prompt in the cached prefix whether or not the turn touches the deck. Keeping the contract out of the always-on descriptions holds the four tools to ~326 tokens (from ~621 before the trim) with no prompt-cache disruption — the model still sees the whole contract exactly when it authors, via the skill.
+The four tool **descriptions are deliberately terse** — one line each, pointing at the `deck` skill. The full bundle contract (the four-file shapes, the `ctx`/`deck` SDK, worked examples) lives only in the skill, which is loaded when the model selects it for a matching request or when `/deck` injects it directly; the tool *schemas*, by contrast, ride every owner-channel prompt in the cached prefix whether or not the turn touches the deck. Keeping the contract out of the always-on descriptions holds the four tools to ~326 tokens (from ~621 before the trim) with no prompt-cache disruption — the model still sees the whole contract exactly when it authors, via the skill.
 
 ## Security hazards & limitations
 

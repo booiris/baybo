@@ -1,10 +1,10 @@
 ---
 name: deck
-version: 0.3.1
-description: "Author and install a live card on the user's Deck (the dashboard tab of agent-written cards) — e.g. a Claude/Codex quota monitor, a machine-status board, an API watcher. Invoked explicitly by the user typing /deck <request>; never auto-selected. Covers the bundle contract, per-size adaptation and the optional maximized layout, the service and card SDK surface, worked examples, and the install flow via DeckCardCreate/DeckCardUpdate."
+version: 0.4.0
+description: "Author, install, and update live cards on the user's Deck (the persistent dashboard tab of agent-written cards). Covers the bundle contract, per-size adaptation and the optional maximized layout, the service and card SDK surface, worked examples, and the install flow via DeckCardCreate/DeckCardUpdate."
+when_to_use: "Use when the user asks to create, add, modify, fix, or redesign a persistent Deck/dashboard card — such as a Claude/Codex quota monitor, machine-status board, or API watcher — whether they use /deck or ordinary language."
 command: deck
 user-invocable: true
-disable-model-invocation: true
 channels:
   - owner
 allowed-tools:
@@ -20,9 +20,10 @@ allowed-tools:
 
 # Authoring a deck card
 
-The user invoked `/deck` — the text after the command is their request.
-Build the card they asked for. If the request is empty, ask what the
-card should show before writing anything.
+Create or update the Deck card requested by the user. The request may arrive
+in ordinary language or as `/deck <request>`; for `/deck`, treat the text after
+the command as the request. If the request does not say what the card should
+show or change, ask before writing anything.
 
 A deck card is a self-contained bundle of exactly four plain files. You
 write them in a scratch directory with your normal file tools, then

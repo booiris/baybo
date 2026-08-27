@@ -144,6 +144,21 @@ mod tests {
     }
 
     #[test]
+    fn deck_metadata_supports_model_and_slash_invocation_only_on_owner() {
+        let skill = all()
+            .into_iter()
+            .find(|skill| skill.name == DECK_SKILL_NAME)
+            .expect("deck builtin parses");
+        let summary = crate::SkillSummary::from(&skill);
+
+        assert!(skill.agent_invocable);
+        assert_eq!(skill.command.as_deref(), Some(DECK_SKILL_NAME));
+        assert!(skill.description.contains("ordinary language"));
+        assert!(summary.allows_channel(&baybo_model::ChannelType::owner()));
+        assert!(!summary.allows_channel(&baybo_model::ChannelType::telegram()));
+    }
+
+    #[test]
     fn html_gen_metadata_is_visible_only_on_owner() {
         let skill = all()
             .into_iter()
