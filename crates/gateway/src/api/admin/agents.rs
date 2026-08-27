@@ -369,6 +369,10 @@ pub struct SetAgentAvatarRequest {
     /// the avatar.
     #[serde(default)]
     pub blob_id: Option<String>,
+    /// Compare-and-set mode for generated defaults: if the profile acquired
+    /// an avatar since the caller read it, leave that newer choice untouched.
+    #[serde(default)]
+    pub only_if_empty: bool,
 }
 
 // ── validation helpers ──────────────────────────────────────────────
@@ -960,12 +964,44 @@ async fn set_agent_avatar(
     if let Some(blob_id) = req.blob_id.as_deref() {
         validate_avatar_blob(&state, blob_id).await?;
     }
-    let matched = state
-        .agent_profile_store
-        .set_avatar(&row.id, req.blob_id.as_deref())
-        .await
-        .map_err(|e| GatewayError::Internal(format!("set agent avatar: {e}")))?;
+    let conditional_blob_id = match (req.only_if_empty, req.blob_id.as_deref()) {
+        (true, Some(blob_id)) => Some(blob_id),
+        (true, None) => {
+            return Err(GatewayError::BadRequest(
+                "only_if_empty requires blob_id".to_owned(),
+            ));
+        }
+        (false, _) => None,
+    };
+    if req.only_if_empty && row.avatar_blob_id.is_some() {
+        return Ok(axum::http::StatusCode::NO_CONTENT);
+    }
+    let matched = if let Some(blob_id) = conditional_blob_id {
+        state
+            .agent_profile_store
+            .set_avatar_if_empty(&row.id, blob_id)
+            .await
+            .map_err(|e| GatewayError::Internal(format!("set agent avatar: {e}")))?
+    } else {
+        state
+            .agent_profile_store
+            .set_avatar(&row.id, req.blob_id.as_deref())
+            .await
+            .map_err(|e| GatewayError::Internal(format!("set agent avatar: {e}")))?
+    };
     if !matched {
+        if req.only_if_empty
+            && state
+                .agent_profile_store
+                .get(&row.id)
+                .await
+                .map_err(|e| {
+                    GatewayError::Internal(format!("get agent after avatar compare-and-set: {e}"))
+                })?
+                .is_some()
+        {
+            return Ok(axum::http::StatusCode::NO_CONTENT);
+        }
         return Err(GatewayError::NotFound(format!("agent profile {agent_id}")));
     }
     Ok(axum::http::StatusCode::NO_CONTENT)

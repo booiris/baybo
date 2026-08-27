@@ -36,16 +36,13 @@ struct ComposerDock<Content: View, Panel: View>: View {
     /// and weightless, but stays MOUNTED — the composer's unsent text is its own
     /// `@State` and an `if` here would drop the user's draft.
     let collapsed: Bool
-    /// The jump-to-latest disc's presence. Named rather than inferred because it
-    /// is an ANIMATION trigger: the panel has to travel with the dock the disc
-    /// pushes up, instead of stepping to the new position on its own.
-    let jumpVisible: Bool
     @ViewBuilder let content: () -> Content
     /// The attach panel, or nothing. Presented HERE rather than in the screen's
     /// own stack because this is the only layer that composites over the dock's
-    /// own rows — the notice line, the approval card, the staged strip and the
-    /// jump disc. From the screen's ZStack the panel drew behind the strip and
-    /// the disc took its taps.
+    /// own rows — the notice line, the approval card, the staged strip — and
+    /// over the jump disc that floats above them (`JumpToLatestDisc`). From the
+    /// screen's ZStack the panel drew behind the strip and the disc took its
+    /// taps.
     @ViewBuilder let panel: () -> Panel
 
     var body: some View {
@@ -56,7 +53,6 @@ struct ComposerDock<Content: View, Panel: View>: View {
             // rectangle.
             .coordinateSpace(.named(AttachMenuPanel.dockSpace))
             .overlay(alignment: .topLeading) { panel() }
-            .animation(.easeOut(duration: 0.16), value: jumpVisible)
             .opacity(collapsed ? 0 : 1)
             .allowsHitTesting(!collapsed)
             .accessibilityHidden(collapsed)

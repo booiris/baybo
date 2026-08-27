@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use baybo_model::{AgentProfileId, IssueEventId, IssueId, IssueRunId, ProjectId, SessionId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::StorageError;
 
@@ -643,7 +644,45 @@ pub struct IssueEventRow {
     pub number: i64,
     pub actor: IssueActor,
     pub body: IssueEventBody,
+    /// Client-minted idempotency key for an operator comment. Other event
+    /// kinds leave it absent.
+    pub client_msg_id: Option<IssueEventClientMsgId>,
     pub created_at: DateTime<Utc>,
+}
+
+/// Client-minted idempotency key for one operator comment.
+///
+/// UUID is the wire contract, while the wrapper prevents a timeline entry id,
+/// call id, or arbitrary string from being passed to the dedup seam by
+/// accident. The canonical lowercase spelling is what is persisted and sent
+/// back to clients.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct IssueEventClientMsgId(String);
+
+impl IssueEventClientMsgId {
+    pub fn parse(value: &str) -> std::result::Result<Self, uuid::Error> {
+        Uuid::parse_str(value).map(|id| Self(id.hyphenated().to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A client-keyed comment plus the durable completion bit for the consequences
+/// that follow its timeline insert.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdempotentIssueEvent {
+    pub event: IssueEventRow,
+    pub consequences_applied: bool,
+}
+
+/// Result of claiming a client comment id. An existing row whose consequences
+/// are unfinished must be re-driven before the original response is returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IssueEventAppendOutcome {
+    Inserted(IssueEventRow),
+    Existing(IdempotentIssueEvent),
 }
 
 /// What a caller supplies to append to a timeline.
@@ -802,7 +841,36 @@ pub trait ProjectStore: Send + Sync {
 
     async fn append_event(&self, new: &NewIssueEvent) -> Result<IssueEventRow>;
 
+    async fn append_event_idempotent(
+        &self,
+        new: &NewIssueEvent,
+        client_msg_id: &IssueEventClientMsgId,
+    ) -> Result<IssueEventAppendOutcome>;
+
+    async fn event_by_client_msg_id(
+        &self,
+        issue: &IssueId,
+        client_msg_id: &IssueEventClientMsgId,
+    ) -> Result<Option<IdempotentIssueEvent>>;
+
+    /// Complete the durable insert → consequences handoff for one
+    /// client-keyed comment. Returns false if no such event exists.
+    async fn mark_comment_consequences_applied(&self, event: &IssueEventId) -> Result<bool>;
+
     async fn list_events(&self, issue: &IssueId) -> Result<Vec<IssueEventRow>>;
+
+    /// The oldest entry on this card the operator has not seen — where a
+    /// reader opening it should land. `None` on a card with nothing new,
+    /// which is every card a moment after it is opened.
+    ///
+    /// Answered **here**, off the same predicate
+    /// [`CardSignals::unread`] is counted with, rather than by handing a
+    /// client the read cursor and the timeline and letting it work out
+    /// which rows are new. That is one rule — "what counts as unread" —
+    /// and a second copy of it in a client would put the divider
+    /// somewhere the badge disagrees with. The client gets the resolved
+    /// id and nothing to derive.
+    async fn first_unread_event(&self, issue: &IssueId) -> Result<Option<IssueEventId>>;
 
     async fn events_since(
         &self,

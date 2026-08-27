@@ -33,8 +33,12 @@ pub use api::{
     BlobServeOutcome, ChatSearchGroup, ChatSearchHit, ChatSearchResults, ChatSessionSummary,
     ChatSubagentList, ChatSubagentStatus, ChatSubagentSummary, ClientConfig, CronJobStatus,
     CronJobSummary, DeckCardInfo, DeckLayoutEntryInput, DeckSink, DeckSnapshotInfo, DeckView,
-    FrameSink, LlmModelCatalog, LlmModelInfo, MessageLookup, PairAbortListener, PairChallenge,
-    PairTarget, PairedSummary, SessionListSink, SessionModelPin, SubagentCursor,
+    FrameSink, HiredBy, IssueApprovalDecision, IssueAttachmentInfo, IssueAttachmentInput,
+    IssueInfo, IssuePatch, IssuePriority, IssueRunInfo, IssueRunLog, IssueStatus, LlmModelCatalog,
+    LlmModelInfo, MessageLookup, NewIssue, NewProject, PairAbortListener, PairChallenge,
+    PairTarget, PairedSummary, ProjectActivity, ProjectAttention, ProjectInfo, ProjectSettings,
+    ProjectSink, RunStatus, RunTrigger, SessionListSink, SessionModelPin, StringPatch,
+    SubIssueProgress, SubagentCursor, TeamMemberInfo,
 };
 use apns::ApnsState;
 use binding::{ActiveLeg, active_leg};
@@ -146,6 +150,14 @@ impl BayboClient {
     pub fn set_deck_sink(&self, sink: Arc<dyn DeckSink>) {
         transport::set_deck_sink(&self.relay, Some(sink.clone()));
         transport::set_deck_sink(&self.direct, Some(sink));
+    }
+
+    /// Register the one place board invalidations land. Both legs share it —
+    /// only one is live at a time — and the pump reads the slot live, so
+    /// registering before or after a leg establishes makes no difference.
+    pub fn set_project_sink(&self, sink: Arc<dyn ProjectSink>) {
+        transport::set_project_sink(&self.relay, Some(sink.clone()));
+        transport::set_project_sink(&self.direct, Some(sink));
     }
 
     /// The device id of a persisted relay pairing, if any — so a relaunch shows
@@ -533,6 +545,465 @@ impl BayboClient {
         runtime::run(async move {
             let client = self.gateway_client()?;
             gateway_api::restore_deck_card(&client, card_id).await
+        })
+        .await
+    }
+
+    // ───────────────────────── projects (kanban boards) ─────────────────────
+    //
+    // The whole `/v1/projects` surface, one method per route. Rules live in
+    // `docs/modules/project.md`; what the phone does with them is
+    // `app/ios/docs/projects.md`. Three of these answer raw gateway JSON
+    // rather than a record — the timeline, the feed and a run's transcript —
+    // because their consumer is the issue webview, which renders the
+    // gateway's own shape.
+
+    /// Every board, newest-touched first. `include_archived` is what the
+    /// cards root's "Show archived" toggles.
+    pub async fn project_list(
+        self: Arc<Self>,
+        include_archived: bool,
+    ) -> Result<Vec<ProjectInfo>, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::list_projects(&client, include_archived).await
+        })
+        .await
+    }
+
+    pub async fn project_get(
+        self: Arc<Self>,
+        project_id: String,
+    ) -> Result<ProjectInfo, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::fetch_project(&client, project_id).await
+        })
+        .await
+    }
+
+    /// Open a board. An empty `workdir` has the server create and
+    /// git-initialise `<workspace>/work/<name>`; a lead is hired with it.
+    pub async fn project_create(
+        self: Arc<Self>,
+        new: NewProject,
+    ) -> Result<ProjectInfo, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::create_project(&client, new).await
+        })
+        .await
+    }
+
+    /// Write the board's knobs — **a full replace**, so send every field.
+    pub async fn project_update(
+        self: Arc<Self>,
+        project_id: String,
+        settings: ProjectSettings,
+    ) -> Result<(), BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::update_project(&client, project_id, settings).await
+        })
+        .await
+    }
+
+    /// Archive or restore. Archiving settles nothing — runs already
+    /// executing finish — but the board stops taking writes, and stops
+    /// answering approvals.
+    pub async fn project_set_archived(
+        self: Arc<Self>,
+        project_id: String,
+        archived: bool,
+    ) -> Result<ProjectInfo, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::set_project_archived(&client, project_id, archived).await
+        })
+        .await
+    }
+
+    /// The whole board, column by column then by position.
+    pub async fn project_issues(
+        self: Arc<Self>,
+        project_id: String,
+    ) -> Result<Vec<IssueInfo>, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::list_project_issues(&client, project_id).await
+        })
+        .await
+    }
+
+    pub async fn project_issue_get(
+        self: Arc<Self>,
+        project_id: String,
+        number: i64,
+    ) -> Result<IssueInfo, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::fetch_issue(&client, project_id, number).await
+        })
+        .await
+    }
+
+    /// File a card. Creating one straight into In Progress starts a run, and
+    /// is refused without an assignee.
+    pub async fn project_issue_create(
+        self: Arc<Self>,
+        project_id: String,
+        new: NewIssue,
+    ) -> Result<IssueInfo, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::create_issue(&client, project_id, new).await
+        })
+        .await
+    }
+
+    /// Edit one card sparsely. Assigning on a card already in In Progress
+    /// starts a run or hands the running one over; lifting a block hands a
+    /// parked run back out.
+    pub async fn project_issue_patch(
+        self: Arc<Self>,
+        project_id: String,
+        number: i64,
+        patch: IssuePatch,
+    ) -> Result<IssueInfo, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::patch_issue(&client, project_id, number, patch).await
+        })
+        .await
+    }
+
+    /// Move a card to another column. `ordered_numbers` is the destination
+    /// column's **full** order with this card in it — the gateway renumbers
+    /// the column in one transaction.
+    ///
+    /// Moving *into* In Progress with an assignee is the board's single
+    /// execution trigger. Moving *out* of it never kills the run.
+    pub async fn project_issue_move(
+        self: Arc<Self>,
+        project_id: String,
+        number: i64,
+        status: IssueStatus,
+        ordered_numbers: Vec<i64>,
+    ) -> Result<IssueInfo, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::move_issue(&client, project_id, number, status, ordered_numbers).await
+        })
+        .await
+    }
+
+    /// Unsettled runs across the board — what a card's working / queued /
+    /// held word is read from. **No cost fields**; use
+    /// [`Self::project_issue_runs`] for those.
+    pub async fn project_active_runs(
+        self: Arc<Self>,
+        project_id: String,
+    ) -> Result<Vec<IssueRunInfo>, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::list_active_runs(&client, project_id).await
+        })
+        .await
+    }
+
+    /// One card's execution log, newest first, priced.
+    pub async fn project_issue_runs(
+        self: Arc<Self>,
+        project_id: String,
+        number: i64,
+    ) -> Result<IssueRunLog, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::list_issue_runs(&client, project_id, number).await
+        })
+        .await
+    }
+
+    /// Stop the run on this card. The only kill switch there is — no move
+    /// ends a run.
+    pub async fn project_run_cancel(
+        self: Arc<Self>,
+        project_id: String,
+        number: i64,
+    ) -> Result<(), BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::cancel_run(&client, project_id, number).await
+        })
+        .await
+    }
+
+    /// Run it again. Discharges a failed card, and on a held one the press
+    /// is what releases it — the ceiling lets through what it can before it
+    /// refuses.
+    pub async fn project_run_retry(
+        self: Arc<Self>,
+        project_id: String,
+        number: i64,
+    ) -> Result<IssueRunInfo, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::retry_run(&client, project_id, number).await
+        })
+        .await
+    }
+
+    /// A backward page of the run's session, as the same `history_page`
+    /// frame the chat transcript consumes — so the transcript webview
+    /// renders it unchanged.
+    ///
+    /// **Scroll-up only.** The initial load takes
+    /// [`Self::project_run_transcript_baseline`], which reads the same route
+    /// and dresses it as a `sync_page`: the web drops a history page that
+    /// answers no backward-paging request, and only a `sync_page` unwinds the
+    /// guard its sync request armed.
+    pub async fn project_run_transcript(
+        self: Arc<Self>,
+        project_id: String,
+        number: i64,
+        attempt: i64,
+        before_ordinal: Option<i64>,
+        limit: Option<u32>,
+    ) -> Result<String, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::fetch_run_transcript_page(
+                &client,
+                project_id,
+                number,
+                attempt,
+                before_ordinal,
+                limit,
+            )
+            .await
+        })
+        .await
+    }
+
+    /// The run's newest page as a baseline `sync_page` — what answers the
+    /// transcript's initial load, and what a live run re-reads when a
+    /// `ProjectChanged` frame says it moved.
+    ///
+    /// A card's run has no sync route, so this is the same backward-paging
+    /// endpoint read with no cursor. See `gateway_api` for why the frame KIND
+    /// is the whole point.
+    pub async fn project_run_transcript_baseline(
+        self: Arc<Self>,
+        project_id: String,
+        number: i64,
+        attempt: i64,
+        limit: Option<u32>,
+    ) -> Result<String, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::fetch_run_transcript_baseline(&client, project_id, number, attempt, limit)
+                .await
+        })
+        .await
+    }
+
+    /// A card's timeline as raw gateway JSON: comments and system events,
+    /// oldest first.
+    pub async fn project_issue_events(
+        self: Arc<Self>,
+        project_id: String,
+        number: i64,
+    ) -> Result<String, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::fetch_issue_events(&client, project_id, number).await
+        })
+        .await
+    }
+
+    /// Say something on a card, answering with the timeline entry it became.
+    /// What that does besides record depends on the card: it can wake the
+    /// assignee, merge into a queued run's brief, or land after the current
+    /// one settles. `text` may be empty when files carry it.
+    pub async fn project_issue_comment(
+        self: Arc<Self>,
+        project_id: String,
+        number: i64,
+        client_msg_id: String,
+        text: String,
+        attachments: Vec<IssueAttachmentInput>,
+    ) -> Result<String, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::comment_on_issue(
+                &client,
+                project_id,
+                number,
+                client_msg_id,
+                text,
+                attachments,
+            )
+            .await
+        })
+        .await
+    }
+
+    /// Answer a prompt a run parked on this card. Two answers only.
+    ///
+    /// The live queue is the truth: a prompt that timed out or was already
+    /// answered returns not-found, which the caller should read as "closed"
+    /// rather than as a failure to retry.
+    pub async fn project_issue_approval_resolve(
+        self: Arc<Self>,
+        project_id: String,
+        number: i64,
+        call_id: String,
+        decision: IssueApprovalDecision,
+    ) -> Result<(), BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::resolve_issue_approval(&client, project_id, number, call_id, decision)
+                .await
+        })
+        .await
+    }
+
+    /// Stamp one card read — after its timeline has rendered, never on the
+    /// way in.
+    pub async fn project_issue_read(
+        self: Arc<Self>,
+        project_id: String,
+        number: i64,
+    ) -> Result<(), BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::mark_issue_read(&client, project_id, number).await
+        })
+        .await
+    }
+
+    /// Stamp the whole board read, filtered-out cards included.
+    pub async fn project_read(self: Arc<Self>, project_id: String) -> Result<(), BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::mark_project_read(&client, project_id).await
+        })
+        .await
+    }
+
+    /// The board's activity stream as raw gateway JSON, newest first.
+    pub async fn project_feed(
+        self: Arc<Self>,
+        project_id: String,
+        before_ms: Option<i64>,
+        limit: Option<u32>,
+    ) -> Result<String, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::fetch_project_feed(&client, project_id, before_ms, limit).await
+        })
+        .await
+    }
+
+    /// The board's team. `lead` is the coordinator every board has and none
+    /// may remove.
+    pub async fn project_team(
+        self: Arc<Self>,
+        project_id: String,
+    ) -> Result<Vec<TeamMemberInfo>, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::list_team(&client, project_id).await
+        })
+        .await
+    }
+
+    /// Pin (or clear) an agent's LLM, model and thinking level.
+    ///
+    /// The pin is replaced WHOLE: absent at each level means inherit, so
+    /// clearing means passing all three as `None` rather than one. The
+    /// builtin lead follows `default-llm` and refuses a pin — clearing it is
+    /// the no-op it accepts.
+    pub async fn agent_set_model(
+        self: Arc<Self>,
+        agent_id: String,
+        llm: Option<String>,
+        model: Option<String>,
+        reasoning_effort: Option<String>,
+    ) -> Result<(), BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::set_agent_model(&client, agent_id, llm, model, reasoning_effort).await
+        })
+        .await
+    }
+
+    /// Give an agent a face, or clear it (`blob_id: None`).
+    ///
+    /// The blob is uploaded first (`blob_upload_file`) and must be an image;
+    /// see `gateway_api::set_agent_avatar` for why it has to be a raster one.
+    pub async fn agent_set_avatar(
+        self: Arc<Self>,
+        agent_id: String,
+        blob_id: Option<String>,
+    ) -> Result<(), BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::set_agent_avatar(&client, agent_id, blob_id).await
+        })
+        .await
+    }
+
+    /// Install a generated face only while the profile is still faceless.
+    /// The compare-and-set happens in the gateway, after upload, so a photo
+    /// picked while generation is in flight always wins.
+    pub async fn agent_set_avatar_if_empty(
+        self: Arc<Self>,
+        agent_id: String,
+        blob_id: String,
+    ) -> Result<(), BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::set_agent_avatar_if_empty(&client, agent_id, blob_id).await
+        })
+        .await
+    }
+
+    /// Take an agent off a board. Refused for the lead, and for an agent
+    /// with a run in flight.
+    pub async fn project_remove_agent(
+        self: Arc<Self>,
+        project_id: String,
+        agent_id: String,
+    ) -> Result<(), BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::remove_team_member(&client, project_id, agent_id).await
+        })
+        .await
+    }
+
+    /// Boards with something waiting on the operator. Boards with nothing
+    /// waiting are **absent from the list**, not zeroed, and archived boards
+    /// are excluded wholesale.
+    pub async fn projects_attention(self: Arc<Self>) -> Result<Vec<ProjectAttention>, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::projects_attention(&client).await
+        })
+        .await
+    }
+
+    /// What each board has been doing since `since_ms` — which must be the
+    /// **budget's** day (UTC midnight), or the burn is measured against a
+    /// window the ceiling does not use.
+    pub async fn projects_activity(
+        self: Arc<Self>,
+        since_ms: Option<i64>,
+    ) -> Result<Vec<ProjectActivity>, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::projects_activity(&client, since_ms).await
         })
         .await
     }

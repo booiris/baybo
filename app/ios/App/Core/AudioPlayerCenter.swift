@@ -27,7 +27,7 @@ final class AudioPlayerCenter {
     /// The single webview's bridge — refreshed on every card message, so pushes
     /// land in the live transcript. A push for a blob whose card left the tree
     /// simply finds no listener web-side.
-    private weak var bridge: TranscriptBridge?
+    private weak var bridge: (any WebMediaSink)?
     private var player: AVPlayer?
     private var blobId: String?
     private var title = ""
@@ -47,7 +47,7 @@ final class AudioPlayerCenter {
     private init() {}
 
     /// Play/pause `blobId`; a different track usurps the current one.
-    func toggle(blobId: String, url: URL, title: String, bridge: TranscriptBridge?) {
+    func toggle(blobId: String, url: URL, title: String, bridge: (any WebMediaSink)?) {
         self.bridge = bridge
         if blobId == self.blobId, let player {
             // `!= .paused` on purpose: right after play() the engine sits in
@@ -86,7 +86,7 @@ final class AudioPlayerCenter {
         updateNowPlaying()
     }
 
-    func seek(blobId: String, position: Double, bridge: TranscriptBridge?) {
+    func seek(blobId: String, position: Double, bridge: (any WebMediaSink)?) {
         self.bridge = bridge
         guard blobId == self.blobId, let player else { return }
         ended = false
@@ -110,7 +110,7 @@ final class AudioPlayerCenter {
 
     /// A card's mount-time probe: answer with this track's live state, or a
     /// bare `stopped` when the player holds some other track (or none).
-    func queryState(blobId: String, bridge: TranscriptBridge?) {
+    func queryState(blobId: String, bridge: (any WebMediaSink)?) {
         self.bridge = bridge
         if blobId == self.blobId {
             pushState()

@@ -7,10 +7,11 @@ use rusqlite::OptionalExtension;
 use super::SqlitePool;
 use baybo_store::StorageError;
 use baybo_store::project::{
-    ACTOR_AGENT_PREFIX, AttentionCounts, BoardActivity, CardSignals, DrainMarks, IssueActor,
-    IssueAttachment, IssueEventBody, IssueEventRow, IssuePriority, IssueRow, IssueRunRow,
-    IssueStatus, IssueUpdate, NewIssue, NewIssueEvent, NewIssueRun, ProjectRow, ProjectStore,
-    ProjectUpdate, Result, RunSpend, RunStatus, RunTrigger, SettledRunFacts, Spend,
+    ACTOR_AGENT_PREFIX, AttentionCounts, BoardActivity, CardSignals, DrainMarks,
+    IdempotentIssueEvent, IssueActor, IssueAttachment, IssueEventAppendOutcome, IssueEventBody,
+    IssueEventClientMsgId, IssueEventRow, IssuePriority, IssueRow, IssueRunRow, IssueStatus,
+    IssueUpdate, NewIssue, NewIssueEvent, NewIssueRun, ProjectRow, ProjectStore, ProjectUpdate,
+    Result, RunSpend, RunStatus, RunTrigger, SettledRunFacts, Spend,
 };
 
 pub struct SqliteProjectStore {
@@ -41,11 +42,106 @@ impl SqliteProjectStore {
             .await?;
         raws.into_iter().map(event_from_raw).collect()
     }
+
+    async fn append_event_with_client_msg_id(
+        &self,
+        new: &NewIssueEvent,
+        client_msg_id: Option<IssueEventClientMsgId>,
+    ) -> Result<IssueEventAppendOutcome> {
+        let row = IssueEventRow {
+            id: baybo_model::IssueEventId::generate(),
+            issue_id: new.issue_id.clone(),
+            project_id: new.project_id.clone(),
+            number: new.number,
+            actor: new.actor.clone(),
+            body: new.body.clone(),
+            client_msg_id,
+            created_at: chrono::Utc::now(),
+        };
+        let id = row.id.as_str().to_string();
+        let issue_id = row.issue_id.as_str().to_string();
+        let project = row.project_id.as_str().to_string();
+        let number = row.number;
+        let actor = row.actor.to_storage();
+        let kind = row.body.kind().to_owned();
+        let body = serde_json::to_string(&row.body)
+            .map_err(|e| StorageError::Storage(format!("serialize issue event: {e}")))?;
+        let created = super::time::to_us(row.created_at);
+        let consequences_applied = row.client_msg_id.is_none();
+        let client_msg_id = row.client_msg_id.as_ref().map(|id| id.as_str().to_owned());
+        let existing = self
+            .pool
+            .interact_write("issue_events.append_idempotent", move |conn| {
+                let tx = conn.transaction()?;
+                let inserted = tx.execute(
+                    "INSERT INTO issue_events (id, issue_id, project_id, number, actor, kind, \
+                     body, created_at, client_msg_id, comment_consequences_applied) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+                     ON CONFLICT DO NOTHING",
+                    rusqlite::params![
+                        id,
+                        issue_id,
+                        project,
+                        number,
+                        actor,
+                        kind,
+                        body,
+                        created,
+                        client_msg_id,
+                        consequences_applied,
+                    ],
+                )?;
+                if inserted == 1 {
+                    tx.commit()?;
+                    return Ok(None);
+                }
+                let key = client_msg_id.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "issue event insert conflicted without a client message id to resolve"
+                    )
+                })?;
+                let existing = tx
+                    .query_row(
+                        &format!(
+                            "SELECT {EVENT_COLUMNS} FROM issue_events \
+                             WHERE issue_id = ?1 AND client_msg_id = ?2"
+                        ),
+                        rusqlite::params![issue_id, key],
+                        read_raw_event,
+                    )
+                    .optional()?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "idempotent issue event insert returned no row and no existing key"
+                        )
+                    })?;
+                tx.commit()?;
+                Ok(Some(existing))
+            })
+            .await?;
+        match existing {
+            Some(raw) => Ok(IssueEventAppendOutcome::Existing(
+                idempotent_event_from_raw(raw)?,
+            )),
+            None => Ok(IssueEventAppendOutcome::Inserted(row)),
+        }
+    }
 }
 
-const EVENT_COLUMNS: &str = "id, issue_id, project_id, number, actor, body, created_at";
+const EVENT_COLUMNS: &str = "id, issue_id, project_id, number, actor, body, created_at, client_msg_id, \
+     comment_consequences_applied";
 
-type RawEvent = (String, String, String, i64, String, String, i64);
+type RawEvent = (
+    String,
+    String,
+    String,
+    i64,
+    String,
+    String,
+    i64,
+    Option<String>,
+    bool,
+);
 
 fn read_raw_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawEvent> {
     Ok((
@@ -56,11 +152,13 @@ fn read_raw_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawEvent> {
         row.get(4)?,
         row.get(5)?,
         row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
     ))
 }
 
 fn event_from_raw(raw: RawEvent) -> Result<IssueEventRow> {
-    let (id, issue_id, project_id, number, actor, body, created_at) = raw;
+    let (id, issue_id, project_id, number, actor, body, created_at, client_msg_id, _) = raw;
     Ok(IssueEventRow {
         id: baybo_model::IssueEventId::from(id),
         issue_id: IssueId::from(issue_id),
@@ -71,7 +169,22 @@ fn event_from_raw(raw: RawEvent) -> Result<IssueEventRow> {
             .ok_or_else(|| StorageError::Storage(format!("issue_events.actor unknown: {actor}")))?,
         body: serde_json::from_str(&body)
             .map_err(|e| StorageError::Storage(format!("issue_events.body unreadable: {e}")))?,
+        client_msg_id: client_msg_id
+            .map(|id| {
+                IssueEventClientMsgId::parse(&id).map_err(|e| {
+                    StorageError::Storage(format!("issue_events.client_msg_id invalid: {e}"))
+                })
+            })
+            .transpose()?,
         created_at: ts("issue_events.created_at", created_at)?,
+    })
+}
+
+fn idempotent_event_from_raw(raw: RawEvent) -> Result<IdempotentIssueEvent> {
+    let consequences_applied = raw.8;
+    Ok(IdempotentIssueEvent {
+        event: event_from_raw(raw)?,
+        consequences_applied,
     })
 }
 
@@ -1411,39 +1524,104 @@ impl ProjectStore for SqliteProjectStore {
     }
 
     async fn append_event(&self, new: &NewIssueEvent) -> Result<IssueEventRow> {
-        let row = IssueEventRow {
-            id: baybo_model::IssueEventId::generate(),
-            issue_id: new.issue_id.clone(),
-            project_id: new.project_id.clone(),
-            number: new.number,
-            actor: new.actor.clone(),
-            body: new.body.clone(),
-            created_at: chrono::Utc::now(),
-        };
-        let id = row.id.as_str().to_string();
-        let issue_id = row.issue_id.as_str().to_string();
-        let project = row.project_id.as_str().to_string();
-        let number = row.number;
-        let actor = row.actor.to_storage();
-        let kind = row.body.kind();
-        let body = serde_json::to_string(&row.body)
-            .map_err(|e| StorageError::Storage(format!("serialize issue event: {e}")))?;
-        let created = super::time::to_us(row.created_at);
-        self.pool
-            .interact_write("issue_events.append", move |conn| {
-                conn.execute(
-                    "INSERT INTO issue_events (id, issue_id, project_id, number, actor, kind, \
-                     body, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                    rusqlite::params![id, issue_id, project, number, actor, kind, body, created],
-                )?;
-                Ok(())
+        match self.append_event_with_client_msg_id(new, None).await? {
+            IssueEventAppendOutcome::Inserted(row) => Ok(row),
+            IssueEventAppendOutcome::Existing(_) => Err(StorageError::Storage(
+                "ordinary issue event append unexpectedly resolved an existing row".to_owned(),
+            )),
+        }
+    }
+
+    async fn append_event_idempotent(
+        &self,
+        new: &NewIssueEvent,
+        client_msg_id: &IssueEventClientMsgId,
+    ) -> Result<IssueEventAppendOutcome> {
+        self.append_event_with_client_msg_id(new, Some(client_msg_id.clone()))
+            .await
+    }
+
+    async fn event_by_client_msg_id(
+        &self,
+        issue: &IssueId,
+        client_msg_id: &IssueEventClientMsgId,
+    ) -> Result<Option<IdempotentIssueEvent>> {
+        let issue = issue.as_str().to_owned();
+        let client_msg_id = client_msg_id.as_str().to_owned();
+        let raw = self
+            .pool
+            .interact("issue_events.by_client_msg_id", move |conn| {
+                Ok(conn
+                    .query_row(
+                        &format!(
+                            "SELECT {EVENT_COLUMNS} FROM issue_events \
+                             WHERE issue_id = ?1 AND client_msg_id = ?2"
+                        ),
+                        rusqlite::params![issue, client_msg_id],
+                        read_raw_event,
+                    )
+                    .optional()?)
             })
             .await?;
-        Ok(row)
+        raw.map(idempotent_event_from_raw).transpose()
+    }
+
+    async fn mark_comment_consequences_applied(
+        &self,
+        event: &baybo_model::IssueEventId,
+    ) -> Result<bool> {
+        let event = event.as_str().to_owned();
+        let affected = self
+            .pool
+            .interact_write(
+                "issue_events.mark_comment_consequences_applied",
+                move |conn| {
+                    Ok(conn.execute(
+                        "UPDATE issue_events SET comment_consequences_applied = 1 \
+                     WHERE id = ?1 AND client_msg_id IS NOT NULL",
+                        rusqlite::params![event],
+                    )?)
+                },
+            )
+            .await?;
+        Ok(affected > 0)
     }
 
     async fn list_events(&self, issue: &IssueId) -> Result<Vec<IssueEventRow>> {
         self.events_query(issue.as_str().to_string(), None).await
+    }
+
+    async fn first_unread_event(
+        &self,
+        issue: &IssueId,
+    ) -> Result<Option<baybo_model::IssueEventId>> {
+        let issue = issue.as_str().to_string();
+        let review_status = IssueStatus::Review.as_str();
+        let id = self
+            .pool
+            .interact("issue_events.first_unread", move |conn| {
+                Ok(conn
+                    .query_row(
+                        // `UNREAD_EVENT_PREDICATE` verbatim, and the ordering
+                        // `events_query` lists with — "the first unread one"
+                        // has to mean the first one the page will draw, not
+                        // the first one some other sort would have put there.
+                        &format!(
+                            "SELECT e.id FROM issue_events e \
+                             JOIN issues i ON i.id = e.issue_id \
+                             WHERE e.issue_id = :issue AND {UNREAD_EVENT_PREDICATE} \
+                             ORDER BY e.created_at, e.id LIMIT 1"
+                        ),
+                        rusqlite::named_params! {
+                            ":issue": issue,
+                            ":review": review_status,
+                        },
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?)
+            })
+            .await?;
+        Ok(id.map(baybo_model::IssueEventId::from))
     }
 
     async fn events_since(
@@ -2366,6 +2544,62 @@ mod tests {
             "oldest first — reading order, not newest-first like the run log"
         );
         assert!(timeline.iter().all(|e| e.actor == IssueActor::User));
+    }
+
+    #[tokio::test]
+    async fn a_client_message_id_claims_one_timeline_row() {
+        let (_dir, store) = store().await;
+        let project = project("proj-comment-id", "Comment ids");
+        store.create_project(&project).await.unwrap();
+        let issue = store
+            .create_issue(&new_issue(&project.id, "Do it once", IssueStatus::Backlog))
+            .await
+            .unwrap();
+        let client_msg_id =
+            IssueEventClientMsgId::parse("01944c32-cc5e-7f5c-9f1c-efaa2a5488a2").unwrap();
+        let new = event(
+            &issue,
+            IssueActor::User,
+            IssueEventBody::Comment {
+                text: "one request, twice".to_owned(),
+                attachments: Vec::new(),
+            },
+        );
+
+        let inserted = store
+            .append_event_idempotent(&new, &client_msg_id)
+            .await
+            .unwrap();
+        let existing = store
+            .append_event_idempotent(&new, &client_msg_id)
+            .await
+            .unwrap();
+
+        let first = match inserted {
+            IssueEventAppendOutcome::Inserted(row) => row,
+            IssueEventAppendOutcome::Existing(_) => panic!("the first claim was not inserted"),
+        };
+        let second = match existing {
+            IssueEventAppendOutcome::Existing(row) => row,
+            IssueEventAppendOutcome::Inserted(_) => panic!("the retry inserted a second row"),
+        };
+        assert_eq!(first.id, second.event.id);
+        assert_eq!(second.event.client_msg_id.as_ref(), Some(&client_msg_id));
+        assert!(!second.consequences_applied);
+        assert!(
+            store
+                .mark_comment_consequences_applied(&first.id)
+                .await
+                .unwrap()
+        );
+        assert_eq!(store.list_events(&issue.id).await.unwrap().len(), 1);
+        let completed = store
+            .event_by_client_msg_id(&issue.id, &client_msg_id)
+            .await
+            .unwrap()
+            .expect("comment");
+        assert_eq!(completed.event.id, first.id);
+        assert!(completed.consequences_applied);
     }
 
     #[tokio::test]
@@ -4123,6 +4357,111 @@ mod tests {
             store.spend_since(&p.id, since).await.unwrap(),
             spent,
             "a restart does not refund the board"
+        );
+    }
+
+    /// Where a reader opening a card should land: the OLDEST entry it has
+    /// not seen, chosen by the same predicate the unread badge counts with.
+    ///
+    /// The two must not be able to disagree — a badge saying 2 over a
+    /// divider drawn above the operator's own comment is a card that
+    /// contradicts itself — which is why the id is resolved here rather
+    /// than by a client handed the cursor and the rows.
+    #[tokio::test]
+    async fn a_card_opens_at_the_oldest_thing_the_operator_has_not_seen() {
+        let (_dir, store) = store().await;
+        let dev = IssueActor::Agent(AgentProfileId::parse("dev-1").unwrap());
+        let p = project("01JFIRSTUNREAD", "Landing");
+        store.create_project(&p).await.unwrap();
+        let issue = store
+            .create_issue(&new_issue(&p.id, "long thread", IssueStatus::Todo))
+            .await
+            .unwrap();
+
+        let comment = |text: &str| IssueEventBody::Comment {
+            text: text.to_owned(),
+            attachments: Vec::new(),
+        };
+
+        store
+            .append_event(&event(&issue, dev.clone(), comment("read this one")))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.first_unread_event(&issue.id).await.unwrap(),
+            Some(
+                store
+                    .list_events(&issue.id)
+                    .await
+                    .unwrap()
+                    .first()
+                    .unwrap()
+                    .id
+                    .clone()
+            ),
+            "a card nobody has opened has read nothing"
+        );
+
+        store
+            .mark_issue_read(&issue.id, chrono::Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            store.first_unread_event(&issue.id).await.unwrap(),
+            None,
+            "and opening it leaves nothing to land on"
+        );
+
+        // The operator's own comment is not news to the operator, and a
+        // system entry is machinery — neither is what the badge counts, so
+        // neither may be what the divider sits above.
+        store
+            .append_event(&event(&issue, IssueActor::User, comment("mine")))
+            .await
+            .unwrap();
+        store
+            .append_event(&event(
+                &issue,
+                IssueActor::System,
+                IssueEventBody::Moved {
+                    from: IssueStatus::Todo,
+                    to: IssueStatus::InProgress,
+                },
+            ))
+            .await
+            .unwrap();
+        assert_eq!(store.first_unread_event(&issue.id).await.unwrap(), None);
+
+        store
+            .append_event(&event(&issue, dev.clone(), comment("the first new one")))
+            .await
+            .unwrap();
+        store
+            .append_event(&event(&issue, dev.clone(), comment("and a later one")))
+            .await
+            .unwrap();
+        let landed = store.first_unread_event(&issue.id).await.unwrap();
+        let rows = store.list_events(&issue.id).await.unwrap();
+        let expected = rows
+            .iter()
+            .find(|row| {
+                matches!(&row.body, IssueEventBody::Comment { text, .. } if text == "the first new one")
+            })
+            .unwrap();
+        assert_eq!(
+            landed.as_ref(),
+            Some(&expected.id),
+            "the oldest unread one, so the new run reads downward"
+        );
+        assert_eq!(
+            store
+                .card_signals(&p.id)
+                .await
+                .unwrap()
+                .get(&issue.id)
+                .map(|signals| signals.unread),
+            Some(2),
+            "and the badge counts the same set the divider was placed by"
         );
     }
 

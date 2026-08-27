@@ -15,23 +15,18 @@ import {
 import { Avatar } from './Avatar';
 import { caretPoint, type CaretPoint } from './caret';
 import { generatedPortrait, type Portrait } from './portrait';
-import type { Agent, Issue, IssueRun } from './boardModel';
-import {
-  applyMention,
-  mentionCandidates,
-  mentionHint,
-  mentionQuery,
-} from './mentionModel';
+import type { Agent, Issue } from './boardModel';
+import { applyMention, mentionCandidates, mentionQuery } from './mentionModel';
 import {
   actorLabel,
   approvalAsks,
-  commentHint,
   describeEvent,
   eventShape,
   eventTime,
   eventTone,
   TONE_DOT,
   pendingApprovals,
+  turnLabel,
   type IssueEvent,
   type PendingApproval as PendingApprovalRow,
   type Tone,
@@ -192,7 +187,7 @@ function PendingApproval({
       <div className="max-w-[480px] border-2 border-black border-l-[6px] border-l-warn rounded-md bg-surface px-3.5 py-2.5 shadow-brutal-sm">
         <p className="font-mono text-[0.62rem] font-bold uppercase tracking-wider text-warn">
           ⚑ Waiting on you
-          {approval.attempt == null ? '' : ` · run #${approval.attempt}`}
+          {approval.attempt == null ? '' : ` · ${turnLabel(approval.attempt)}`}
         </p>
         <ApprovalCommand tool={approval.tool} summary={approval.summary} />
         <div className="mt-2 flex flex-wrap items-center gap-2">
@@ -238,7 +233,6 @@ function PendingApproval({
 export function Timeline({
   events,
   issue,
-  runs,
   onComment,
   onResolveApproval,
   contentRef,
@@ -248,7 +242,6 @@ export function Timeline({
 }: {
   events: IssueEvent[];
   issue: Issue;
-  runs: IssueRun[];
   onComment: (text: string, attachments: IssueAttachmentRequest[]) => void;
   onResolveApproval: (callId: string, decision: 'approve' | 'approve_always' | 'deny') => void;
   /// Handed to whoever owns the scroller, so it can watch this block for the
@@ -342,9 +335,6 @@ export function Timeline({
   // history: a decision pulled out of its run loses the run it belonged to.
   const asks = approvalAsks(events);
   const open = new Set(pendingApprovals(events).map((approval) => approval.callId));
-  const mention = mentionHint(issue, draft, team);
-  const hint = mention ?? commentHint(issue, runs, team);
-
   return (
     // A column that takes whatever height is left in the pane, so the entry
     // list can absorb the slack and leave the composer at the foot even on a
@@ -500,7 +490,6 @@ export function Timeline({
             <button
               type="button"
               aria-label="Comment"
-              title={hint}
               disabled={!sendable}
               onClick={send}
               className="shrink-0 h-8 w-8 flex items-center justify-center bg-brand text-ink border-2 border-black rounded-full shadow-brutal-xs hover:bg-brand-hover active:translate-x-[1px] active:translate-y-[1px] active:shadow-none disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"

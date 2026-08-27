@@ -84,6 +84,50 @@ impl GatewayJsonClient for GatewayApi {
         }
     }
 
+    fn post_json_once<'a, T>(
+        &'a self,
+        path: &'a str,
+        body: Vec<u8>,
+    ) -> impl std::future::Future<Output = Result<T, String>> + Send + 'a
+    where
+        T: DeserializeOwned + Send + 'static,
+    {
+        async move {
+            let body = request_with_policy(
+                "POST",
+                path,
+                vec![TunnelHeader::new(HEADER_CONTENT_TYPE, MEDIA_TYPE_JSON)],
+                Some(body),
+                ReplayPolicy::Never,
+            )
+            .await?;
+            serde_json::from_slice(&body).map_err(|e| format!("decode response: {e}"))
+        }
+    }
+
+    fn patch_json<'a, T>(
+        &'a self,
+        path: &'a str,
+        body: Vec<u8>,
+    ) -> impl std::future::Future<Output = Result<T, String>> + Send + 'a
+    where
+        T: DeserializeOwned + Send + 'static,
+    {
+        async move {
+            // Default `Converges` like every other verb here: a card PATCH
+            // carries absolute values, so a replayed one lands the same
+            // edit twice with the same result.
+            let body = request(
+                "PATCH",
+                path,
+                vec![TunnelHeader::new(HEADER_CONTENT_TYPE, MEDIA_TYPE_JSON)],
+                Some(body),
+            )
+            .await?;
+            serde_json::from_slice(&body).map_err(|e| format!("decode response: {e}"))
+        }
+    }
+
     fn post_empty<'a>(
         &'a self,
         path: &'a str,
@@ -277,7 +321,7 @@ async fn run_exchange<F: TunnelFrames>(
 /// Whether a request that died in pooled-leg silence may be replayed.
 /// `Converges` is this surface's default bargain (see [`should_retry`]);
 /// `Never` is for the routes WITHOUT the client-keyed convergence property —
-/// today the deck's per-card op calls ([`GatewayJsonClient::post_raw`]).
+/// issue creation and non-retryable deck ops.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ReplayPolicy {
     Converges,

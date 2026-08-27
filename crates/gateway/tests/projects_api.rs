@@ -904,6 +904,90 @@ async fn a_run_can_be_stopped_and_started_again() {
     .await;
 }
 
+/// A card's timeline says where the reader should land, and the id it
+/// names is one of the rows it just shipped.
+///
+/// The client is handed the resolved entry rather than the read cursor on
+/// purpose: deciding which rows are new is one rule, it already lives in
+/// the store, and a second copy of it in a client would draw its divider
+/// somewhere the unread badge disagrees with. The agent comments are
+/// planted through the store for the reason `one_press_reads_every_card`
+/// explains — the endpoint speaks as the operator, and the operator's own
+/// words are never unread.
+#[tokio::test]
+async fn a_timeline_says_where_to_land_in_it() {
+    let (router, tg) = router().await;
+    let p = open_project(&router, "landing").await;
+    seed_teammate(&tg, &p, "dev-1").await;
+    let project_id = baybo_model::ProjectId::parse(p.clone()).expect("project id");
+    let number = open_issue(&router, &p, "long thread").await;
+    let issue = tg
+        .deps
+        .stores
+        .project
+        .get_issue(&project_id, number)
+        .await
+        .expect("issue")
+        .expect("issue row");
+
+    let timeline = |router: axum::Router| {
+        let path = format!("/v1/projects/{p}/issues/{number}/events");
+        async move { get(&router, &path, StatusCode::OK).await }
+    };
+
+    let opened = timeline(router.clone()).await;
+    assert!(
+        opened["first_unread"].is_null(),
+        "a card whose only entry is the operator opening it has nothing new"
+    );
+
+    for text in ["the first new one", "and a later one"] {
+        tg.deps
+            .stores
+            .project
+            .append_event(&baybo_store::project::NewIssueEvent {
+                issue_id: issue.id.clone(),
+                project_id: project_id.clone(),
+                number,
+                actor: baybo_store::project::IssueActor::Agent(
+                    baybo_model::AgentProfileId::parse("dev-1").expect("agent id"),
+                ),
+                body: baybo_store::project::IssueEventBody::Comment {
+                    text: text.into(),
+                    attachments: Vec::new(),
+                },
+            })
+            .await
+            .expect("agent comment");
+    }
+
+    let body = timeline(router.clone()).await;
+    let landing = body["first_unread"].as_str().expect("first_unread");
+    let items = body["items"].as_array().expect("items");
+    let landed = items
+        .iter()
+        .find(|item| item["id"].as_str() == Some(landing))
+        .expect("the id names a row the same response shipped");
+    assert_eq!(
+        landed["body"]["text"].as_str(),
+        Some("the first new one"),
+        "the oldest unread one, so the new run reads downward"
+    );
+
+    post(
+        &router,
+        &format!("/v1/projects/{p}/issues/{number}/read"),
+        json!({}),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    let read = timeline(router.clone()).await;
+    assert!(
+        read["first_unread"].is_null(),
+        "opening the card leaves nothing to land on"
+    );
+}
+
 /// One press, and every card on the board comes back at zero.
 ///
 /// The agent comments are planted through the store because the comment
@@ -1119,6 +1203,52 @@ async fn the_activity_feed_is_the_boards_timelines_read_across_it() {
         &router,
         "/v1/projects/01JGHOSTGHOSTGHOSTGHOSTGH/feed",
         StatusCode::NOT_FOUND,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn retrying_a_client_comment_returns_the_original_timeline_row() {
+    let (router, _tg) = router().await;
+    let project = open_project(&router, "idempotent comments").await;
+    open_issue(&router, &project, "say it once").await;
+    let uri = format!("/v1/projects/{project}/issues/1/comments");
+    let client_msg_id = "01944c32-cc5e-7f5c-9f1c-efaa2a5488a2";
+
+    let first = post(
+        &router,
+        &uri,
+        json!({ "client_msg_id": client_msg_id, "text": "the original" }),
+        StatusCode::OK,
+    )
+    .await;
+    let retried = post(
+        &router,
+        &uri,
+        json!({ "client_msg_id": client_msg_id, "text": "a replay with changed bytes" }),
+        StatusCode::OK,
+    )
+    .await;
+
+    assert_eq!(retried["id"], first["id"]);
+    assert_eq!(retried["client_msg_id"], client_msg_id);
+    assert_eq!(retried["body"]["text"], "the original");
+    let comments = issue_events(&router, &project, 1)
+        .await
+        .into_iter()
+        .filter(|event| event["body"]["kind"] == "comment")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        comments.len(),
+        1,
+        "the retry appended a duplicate: {comments:?}"
+    );
+
+    post(
+        &router,
+        &uri,
+        json!({ "client_msg_id": "not-a-uuid", "text": "bad key" }),
+        StatusCode::BAD_REQUEST,
     )
     .await;
 }
@@ -1353,6 +1483,132 @@ async fn answering_an_approval_has_to_name_a_card_on_this_board() {
         blocked.await.expect("the blocked call returns"),
         baybo_tools::ApprovalOutcome::answered(baybo_model::ApprovalDecision::Approve)
     );
+}
+
+#[tokio::test]
+async fn an_archived_board_does_not_answer_the_prompts_it_left_parked() {
+    let (router, tg) = router().await;
+    install_owner_channel(&tg);
+    let p = open_project(&router, "archived mid-prompt").await;
+    open_issue(&router, &p, "asked before the lights went out").await;
+    let session = issue_session(&tg, &p, 1).await;
+    let blocked = park_approval(&tg, &session, "c-archived").await;
+    let channel = tg
+        .deps
+        .channel_registry
+        .get(&baybo_model::ChannelType::owner())
+        .expect("owner channel");
+    assert_eq!(channel.pending_approvals(&session).len(), 1);
+
+    post(
+        &router,
+        &format!("/v1/projects/{p}/archive"),
+        json!({ "archived": true }),
+        StatusCode::OK,
+    )
+    .await;
+
+    // Answering releases an agent to act, so it is a write, and an
+    // archived board takes none. The prompt is left to time out.
+    post(
+        &router,
+        &format!("/v1/projects/{p}/issues/1/approvals/c-archived"),
+        json!({ "decision": "approve" }),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    assert_eq!(
+        channel.pending_approvals(&session).len(),
+        1,
+        "the prompt is still parked"
+    );
+
+    // And the card stops asking, so nothing points at a prompt the board
+    // will not take an answer for.
+    let card = get(
+        &router,
+        &format!("/v1/projects/{p}/issues/1"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(card["approval_pending"], json!(false));
+
+    post(
+        &router,
+        &format!("/v1/projects/{p}/archive"),
+        json!({ "archived": false }),
+        StatusCode::OK,
+    )
+    .await;
+    post(
+        &router,
+        &format!("/v1/projects/{p}/issues/1/approvals/c-archived"),
+        json!({ "decision": "approve" }),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    assert_eq!(
+        blocked.await.expect("the blocked call returns"),
+        baybo_tools::ApprovalOutcome::answered(baybo_model::ApprovalDecision::Approve),
+        "unarchiving hands the waiting agent its answer"
+    );
+}
+
+#[tokio::test]
+async fn a_card_says_when_a_run_on_it_is_waiting_for_an_answer() {
+    let (router, tg) = router().await;
+    install_owner_channel(&tg);
+    let p = open_project(&router, "asking").await;
+    open_issue(&router, &p, "the one that asked").await;
+    open_issue(&router, &p, "the one that did not").await;
+
+    let listed = get(&router, &format!("/v1/projects/{p}/issues"), StatusCode::OK).await;
+    for card in listed["items"].as_array().expect("items") {
+        assert_eq!(card["approval_pending"], json!(false));
+    }
+
+    let session = issue_session(&tg, &p, 1).await;
+    let blocked = park_approval(&tg, &session, "c-face").await;
+
+    let listed = get(&router, &format!("/v1/projects/{p}/issues"), StatusCode::OK).await;
+    let flagged: Vec<i64> = listed["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .filter(|card| card["approval_pending"] == json!(true))
+        .map(|card| card["number"].as_i64().expect("number"))
+        .collect();
+    assert_eq!(
+        flagged,
+        vec![1],
+        "only the card whose run raised the prompt"
+    );
+    let card = get(
+        &router,
+        &format!("/v1/projects/{p}/issues/1"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(card["approval_pending"], json!(true));
+
+    post(
+        &router,
+        &format!("/v1/projects/{p}/issues/1/approvals/c-face"),
+        json!({ "decision": "deny" }),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    blocked.await.expect("the blocked call returns");
+
+    // Answered is answered: the badge follows the queue, not the timeline
+    // entry, which still records that it was asked.
+    let card = get(
+        &router,
+        &format!("/v1/projects/{p}/issues/1"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(card["approval_pending"], json!(false));
 }
 
 fn install_owner_channel(tg: &baybo_gateway::test_support::TestGateway) {

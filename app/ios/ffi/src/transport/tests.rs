@@ -119,16 +119,34 @@ impl DeckSink for RecordingDeckSink {
     }
 }
 
+#[derive(Default)]
+struct RecordingProjectSink {
+    changed: parking_lot::Mutex<Vec<(String, String, Option<u32>)>>,
+    stale: parking_lot::Mutex<usize>,
+}
+
+impl ProjectSink for RecordingProjectSink {
+    fn on_project_changed(&self, project_id: String, scope: String, issue_number: Option<u32>) {
+        self.changed.lock().push((project_id, scope, issue_number));
+    }
+
+    fn on_project_stale(&self) {
+        *self.stale.lock() += 1;
+    }
+}
+
 struct Fixture {
     ctx: PumpCtx,
     list: Arc<RecordingListSink>,
     deck: Arc<RecordingDeckSink>,
+    project: Arc<RecordingProjectSink>,
 }
 
 impl Fixture {
     fn new(session_ids: &[&str]) -> (Self, Vec<Arc<RecordingSink>>) {
         let list = Arc::new(RecordingListSink::default());
         let deck = Arc::new(RecordingDeckSink::default());
+        let project = Arc::new(RecordingProjectSink::default());
         let mut map: HashMap<String, Arc<dyn FrameSink>> = HashMap::new();
         let mut sinks = Vec::new();
         for session_id in session_ids {
@@ -146,12 +164,16 @@ impl Fixture {
                     deck_sink: Arc::new(parking_lot::Mutex::new(Some(
                         deck.clone() as Arc<dyn DeckSink>
                     ))),
+                    project_sink: Arc::new(parking_lot::Mutex::new(Some(
+                        project.clone() as Arc<dyn ProjectSink>
+                    ))),
                     last_inbound: Arc::new(parking_lot::Mutex::new(Instant::now())),
                     leg_id: 1,
                     events: mpsc::unbounded_channel().0,
                 },
                 list,
                 deck,
+                project,
             },
             sinks,
         )
@@ -168,6 +190,13 @@ impl Fixture {
     /// has installed one (or the deck tab was never opened).
     fn without_deck_sink(self) -> Self {
         *self.ctx.deck_sink.lock() = None;
+        self
+    }
+
+    /// Drop the connection-global project sink: a leg can pump before Swift
+    /// has installed one (or the Projects tab was never opened).
+    fn without_project_sink(self) -> Self {
+        *self.ctx.project_sink.lock() = None;
         self
     }
 
@@ -391,6 +420,90 @@ async fn deck_changed_goes_to_the_deck_sink_and_never_to_a_session_sink() {
         sinks[0].frames().is_empty(),
         "the deck nudge must never reach a transcript sink"
     );
+}
+
+/// A board invalidation is session-less like the deck frames, and the lane
+/// exists to stop it falling through: without it the frame reaches
+/// `route_per_session`, which broadcasts a session-less frame to EVERY
+/// subscribed transcript sink — none of which can use it — and to nobody at
+/// all when no chat is open, which is exactly when a board is on screen.
+#[tokio::test]
+async fn project_changed_goes_to_the_project_sink_and_never_to_a_session_sink() {
+    let (fixture, sinks) = Fixture::new(&["s1"]);
+
+    fixture
+        .dispatch(frame(
+            r#"{"kind":"project_changed","project_id":"p1","scope":"timeline","issue_number":7}"#,
+        ))
+        .await;
+    // No `issue_number`: the whole board moved, not one card.
+    fixture
+        .dispatch(frame(
+            r#"{"kind":"project_changed","project_id":"p1","scope":"project"}"#,
+        ))
+        .await;
+
+    assert_eq!(
+        fixture.project.changed.lock().as_slice(),
+        [
+            ("p1".to_string(), "timeline".to_string(), Some(7)),
+            ("p1".to_string(), "project".to_string(), None),
+        ]
+    );
+    assert!(
+        sinks[0].frames().is_empty(),
+        "a board invalidation must never reach a transcript sink"
+    );
+}
+
+/// A scope the wire decoded into its fallback arm still names its board, and
+/// still says to refetch it — the client's answer to every scope is the same.
+#[tokio::test]
+async fn a_scope_this_build_cannot_name_still_reaches_the_project_sink() {
+    let (fixture, _sinks) = Fixture::new(&["s1"]);
+
+    fixture
+        .dispatch(frame(
+            r#"{"kind":"project_changed","project_id":"p1","scope":"swimlane"}"#,
+        ))
+        .await;
+
+    assert_eq!(
+        fixture.project.changed.lock().as_slice(),
+        [("p1".to_string(), "unknown".to_string(), None)]
+    );
+}
+
+/// A session-less `Gap` is the gateway saying it dropped a broadcast, and a
+/// `ProjectChanged` is exactly the kind of thing that goes with it. The board
+/// has no other way to learn it missed one, so the same frame nudges both the
+/// list and the project sink.
+#[tokio::test]
+async fn a_session_less_gap_makes_the_board_stale_too() {
+    let (fixture, sinks) = Fixture::new(&["s1"]);
+
+    fixture.dispatch(Frame::Gap { session_id: None }).await;
+
+    assert_eq!(*fixture.project.stale.lock(), 1);
+    assert_eq!(*fixture.list.stale.lock(), 1);
+    assert!(sinks[0].frames().is_empty());
+}
+
+/// No project sink installed (the Projects tab was never opened): the frame
+/// is DROPPED, never rerouted to the per-session sinks. The board refetches
+/// on its next open, so nothing is lost.
+#[tokio::test]
+async fn a_project_frame_without_a_project_sink_is_dropped_not_broadcast() {
+    let (fixture, sinks) = Fixture::new(&["s1"]);
+    let fixture = fixture.without_project_sink();
+
+    fixture
+        .dispatch(frame(
+            r#"{"kind":"project_changed","project_id":"p1","scope":"board"}"#,
+        ))
+        .await;
+
+    assert!(sinks[0].frames().is_empty());
 }
 
 /// No deck sink installed (the Deck tab was never opened, or the leg

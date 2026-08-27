@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { Agent } from './boardModel';
-import { applyMention, mentionCandidates, mentionHint, mentionQuery } from './mentionModel';
+import { applyMention, mentionCandidates, mentionQuery } from './mentionModel';
 
 function agent(handle: string): Agent {
   return {
@@ -81,31 +81,3 @@ describe('applyMention', () => {
   });
 });
 
-describe('mentionHint', () => {
-  it('promises a handover only on a card nobody is on', () => {
-    expect(mentionHint({ assignee: null }, '@dev-1 take this', TEAM)).toBe(
-      'Sending this puts @dev-1 on the issue.',
-    );
-    expect(mentionHint({ assignee: 'id-dev-2' }, '@dev-1 take this', TEAM)).toBeNull();
-  });
-
-  it('names the first handle, which is the one that wins', () => {
-    expect(mentionHint({ assignee: null }, '@dev-1 and @dev-2 look', TEAM)).toContain('@dev-1');
-  });
-
-  it('refuses the handover on a card a block has stopped', () => {
-    const hint = mentionHint(
-      { assignee: null, blocked_reason: 'which goal wins?' },
-      '@dev-1 take this',
-      TEAM,
-    );
-    expect(hint).toContain('a block has stopped this issue');
-    expect(hint).toContain('@dev-1');
-    expect(hint).not.toContain('puts @dev-1 on the issue');
-  });
-
-  it('says nothing for a handle nobody has', () => {
-    expect(mentionHint({ assignee: null }, '@nobody look', TEAM)).toBeNull();
-    expect(mentionHint({ assignee: null }, 'no mention', TEAM)).toBeNull();
-  });
-});

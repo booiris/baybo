@@ -6,13 +6,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use baybo_model::{
-    AgentFramework, AgentHandle, AgentProfileId, IssueId, IssueRunId, MAX_PROJECT_NAME_CHARS,
-    ProjectId, SessionId, TeamMembership,
+    AgentFramework, AgentHandle, AgentProfileId, IssueEventId, IssueId, IssueRunId,
+    MAX_PROJECT_NAME_CHARS, ProjectId, SessionId, TeamMembership,
 };
 use baybo_store::project::{
-    BoardCards, DEFAULT_MAX_PARALLEL_ISSUE_RUNS, IssueActor, IssueEventBody, IssueEventRow,
-    IssuePriority, IssueRow, IssueRunRow, IssueStatus, IssueUpdate, NewIssue, NewIssueEvent,
-    ProjectRow, ProjectStore, ProjectUpdate, RunStatus, RunTrigger, Spend,
+    BoardCards, DEFAULT_MAX_PARALLEL_ISSUE_RUNS, IssueActor, IssueEventAppendOutcome,
+    IssueEventBody, IssueEventClientMsgId, IssueEventRow, IssuePriority, IssueRow, IssueRunRow,
+    IssueStatus, IssueUpdate, NewIssue, NewIssueEvent, ProjectRow, ProjectStore, ProjectUpdate,
+    RunStatus, RunTrigger, Spend,
 };
 use baybo_store::{AgentProfileStore, BlobStore};
 use baybo_workspace::WorkspacePaths;
@@ -345,6 +346,10 @@ pub struct ProjectManager {
     /// and this only nudges — a send that fails, or a receiver that died,
     /// costs a delay until the next boot sweep, never a lost run.
     dispatch: RunDispatch,
+    /// Serialises the durable comment insert → consequences handoff. A crash
+    /// leaves the row pending for the next retry; concurrent retries in one
+    /// process must not both re-drive it before either can mark completion.
+    commenting: tokio::sync::Mutex<()>,
     /// Serialises [`drive`](Self::drive). See the comment there: deciding
     /// how much room a board has and then filling it is a read-then-write,
     /// and every run that settles asks the question again.
@@ -428,6 +433,7 @@ impl ProjectManager {
             paths,
             events,
             dispatch,
+            commenting: tokio::sync::Mutex::new(()),
             driving: tokio::sync::Mutex::new(()),
             leadless: parking_lot::Mutex::default(),
             merging: tokio::sync::Mutex::new(()),
@@ -1736,42 +1742,129 @@ impl ProjectManager {
         text: &str,
         attachments: &[AttachmentRequest],
     ) -> Result<IssueEventRow> {
-        self.writable_project(project).await?;
+        self.comment_inner(project, number, actor, text, attachments, None)
+            .await
+    }
+
+    /// Record a client comment exactly once. A retry returns the original
+    /// timeline row, re-driving consequences only when their durable
+    /// completion mark was not reached by the inserting request.
+    pub async fn comment_idempotent(
+        &self,
+        project: &ProjectId,
+        number: i64,
+        actor: IssueActor,
+        text: &str,
+        attachments: &[AttachmentRequest],
+        client_msg_id: IssueEventClientMsgId,
+    ) -> Result<IssueEventRow> {
+        self.comment_inner(
+            project,
+            number,
+            actor,
+            text,
+            attachments,
+            Some(client_msg_id),
+        )
+        .await
+    }
+
+    async fn comment_inner(
+        &self,
+        project: &ProjectId,
+        number: i64,
+        actor: IssueActor,
+        text: &str,
+        attachments: &[AttachmentRequest],
+        client_msg_id: Option<IssueEventClientMsgId>,
+    ) -> Result<IssueEventRow> {
+        let _commenting = if client_msg_id.is_some() {
+            Some(self.commenting.lock().await)
+        } else {
+            None
+        };
         let issue = self.get_issue(project, number).await?;
+        // Idempotency replays the original response even if the board became
+        // archived after the first request landed. Re-running current write
+        // validation would turn an already-durable comment into a failure.
+        if let Some(client_msg_id) = &client_msg_id
+            && let Some(claim) = self
+                .store
+                .event_by_client_msg_id(&issue.id, client_msg_id)
+                .await?
+        {
+            let needs_consequences = !claim.consequences_applied;
+            let entry = claim.event;
+            if needs_consequences {
+                self.apply_comment_consequences(&issue, &entry).await;
+                self.complete_comment_consequences(&entry).await?;
+            }
+            return Ok(entry);
+        }
+        self.writable_project(project).await?;
         let text = text.trim();
         let attachments = attachments::resolve(&self.blobs, attachments).await?;
         if text.is_empty() && attachments.is_empty() {
             return Err(ProjectError::invalid("text", "a comment cannot be empty"));
         }
-        let entry = self
-            .store
-            .append_event(&NewIssueEvent {
-                issue_id: issue.id.clone(),
-                project_id: project.clone(),
-                number,
-                actor: actor.clone(),
-                body: IssueEventBody::Comment {
-                    text: text.to_owned(),
-                    attachments,
-                },
-            })
-            .await?;
-        self.events.timeline_changed(project, number);
+        let event = NewIssueEvent {
+            issue_id: issue.id.clone(),
+            project_id: project.clone(),
+            number,
+            actor,
+            body: IssueEventBody::Comment {
+                text: text.to_owned(),
+                attachments,
+            },
+        };
+        let (entry, apply_consequences, persist_completion) = match client_msg_id {
+            Some(client_msg_id) => match self
+                .store
+                .append_event_idempotent(&event, &client_msg_id)
+                .await?
+            {
+                IssueEventAppendOutcome::Inserted(entry) => (entry, true, true),
+                IssueEventAppendOutcome::Existing(entry) => {
+                    let apply = !entry.consequences_applied;
+                    (entry.event, apply, apply)
+                }
+            },
+            None => (self.store.append_event(&event).await?, true, false),
+        };
+        if apply_consequences {
+            self.apply_comment_consequences(&issue, &entry).await;
+        }
+        if persist_completion {
+            self.complete_comment_consequences(&entry).await?;
+        }
+        Ok(entry)
+    }
+
+    async fn apply_comment_consequences(&self, issue: &IssueRow, entry: &IssueEventRow) {
+        self.events
+            .timeline_changed(&entry.project_id, entry.number);
+        let IssueEventBody::Comment { text, .. } = &entry.body else {
+            tracing::error!(event = %entry.id, "client-keyed issue event was not a comment");
+            return;
+        };
         // After the entry, not before: the comment is the reason the card is
         // coming back, and a timeline that reopened it first would read as
         // the operator explaining a decision they had already taken.
         let issue = self
-            .take_the_cancel_back(&issue, &actor)
+            .take_the_cancel_back(issue, &entry.actor)
             .await
-            .unwrap_or(issue);
+            .unwrap_or_else(|| issue.clone());
 
-        let issue = match self.mention_assignment(project, &issue, text).await {
+        let issue = match self
+            .mention_assignment(&issue.project_id, &issue, text)
+            .await
+        {
             Some(assignee) => {
                 match self
                     .update_issue(
-                        project,
-                        number,
-                        actor,
+                        &issue.project_id,
+                        issue.number,
+                        entry.actor.clone(),
                         IssueUpdate {
                             assignee: Some(Some(assignee)),
                             ..IssueUpdate::default()
@@ -1784,7 +1877,7 @@ impl ProjectManager {
                     // the delivery decision below sees that.
                     Ok(after) => after,
                     Err(e) => {
-                        tracing::debug!(issue = number, error = %e, "a mention named somebody who cannot take this card");
+                        tracing::debug!(issue = issue.number, error = %e, "a mention named somebody who cannot take this card");
                         issue
                     }
                 }
@@ -1793,7 +1886,21 @@ impl ProjectManager {
         };
 
         self.wake_if_listening(&issue).await;
-        Ok(entry)
+    }
+
+    async fn complete_comment_consequences(&self, entry: &IssueEventRow) -> Result<()> {
+        if self
+            .store
+            .mark_comment_consequences_applied(&entry.id)
+            .await?
+        {
+            return Ok(());
+        }
+        Err(baybo_store::StorageError::Storage(format!(
+            "comment event {} disappeared before its consequences were completed",
+            entry.id
+        ))
+        .into())
     }
 
     /// A person commenting on a cancelled card is asking for it back.
@@ -1918,6 +2025,23 @@ impl ProjectManager {
     pub async fn timeline(&self, project: &ProjectId, number: i64) -> Result<Vec<IssueEventRow>> {
         let issue = self.get_issue(project, number).await?;
         Ok(self.store.list_events(&issue.id).await?)
+    }
+
+    /// Where a reader opening this card should land: its oldest entry the
+    /// operator has not seen, or `None` on a card with nothing new.
+    ///
+    /// The resolved id, never the read cursor — see
+    /// [`ProjectStore::first_unread_event`](baybo_store::project::ProjectStore::first_unread_event).
+    /// A client handed the cursor would decide for itself which rows are
+    /// new, and the divider it drew would be free to disagree with the
+    /// unread badge that sent the operator here.
+    pub async fn first_unread_event(
+        &self,
+        project: &ProjectId,
+        number: i64,
+    ) -> Result<Option<IssueEventId>> {
+        let issue = self.get_issue(project, number).await?;
+        Ok(self.store.first_unread_event(&issue.id).await?)
     }
 
     /// Every run of one issue, newest first. The unpriced read, for callers
@@ -2466,6 +2590,31 @@ impl ProjectManager {
                 project: project.clone(),
                 number,
             })
+    }
+
+    /// The card an approval may be answered on.
+    ///
+    /// Answering releases an agent to act, which makes it a write in the
+    /// only sense this gate measures, so it goes through the same archived
+    /// check every other write does. An archived board's parked prompt is
+    /// left to time out — the alternative is a board that takes no comments
+    /// and no moves yet can still be talked into running a command.
+    ///
+    /// Two consequences worth stating, because neither is visible from the
+    /// call site. Archiving does not stop a run that is already executing
+    /// (only `promotions` reads the flag), so a run that reaches a gate
+    /// just after the operator archives its board now waits out
+    /// `APPROVAL_TIMEOUT` and self-denies rather than being answered
+    /// either way — the same end state a denial reaches, later. And this
+    /// gate covers the REST door only: `Frame::ResolveApproval` resolves a
+    /// bare `call_id` against the same queue with no card and no board in
+    /// hand (`gateway/src/channel/route.rs`), so a client subscribed to an
+    /// issue's session could still answer one there. No shipped client
+    /// does — issue sessions are excluded from every chat surface — but
+    /// this is a gate with two doors and only one of them checks.
+    pub async fn approvable_issue(&self, project: &ProjectId, number: i64) -> Result<IssueRow> {
+        self.writable_project(project).await?;
+        self.get_issue(project, number).await
     }
 
     pub async fn create_issue(

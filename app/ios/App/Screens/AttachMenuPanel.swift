@@ -10,10 +10,13 @@ import SwiftUI
 /// It is presented in TWO layers, and that split is the whole design:
 /// * the panel — this view — is an `.overlay` on the DOCK's content, so it
 ///   stacks above everything the dock grows upward (the notice line, the
-///   approval card, the staged strip) and above the jump-to-latest disc that
-///   shares its stack. From inside `ChatScreen`'s ZStack it could clear none of
-///   them: the dock's `.safeAreaInset` composites ABOVE that stack, so the
-///   panel drew behind the strip and the disc took its taps.
+///   approval card, the staged strip) and over the jump-to-latest disc, which
+///   floats above them in that same content. From inside `ChatScreen`'s ZStack
+///   it could clear none of them: the dock's `.safeAreaInset` composites ABOVE
+///   that stack, so the panel drew behind the strip and the disc took its
+///   taps. Being over the disc is exactly what lets the panel IGNORE it —
+///   see `JumpToLatestDisc`, which used to be a row in this stack and pushed
+///   the whole panel up by its own height.
 /// * the scrim (`AttachMenuScrim`) stays in that ZStack, where it covers the
 ///   transcript and the header but NOT the dock — which is exactly what leaves
 ///   the pill un-dimmed and still tappable under an open panel.
@@ -167,9 +170,9 @@ enum AttachSource: CaseIterable {
 
     @MainActor var title: String {
         switch self {
-        case .photos: return Lang.shared.t("chat.attachPhotos")
-        case .files: return Lang.shared.t("chat.attachFiles")
-        case .paste: return Lang.shared.t("chat.attachPaste")
+        case .photos: return Lang.shared.t("attach.attachPhotos")
+        case .files: return Lang.shared.t("attach.attachFiles")
+        case .paste: return Lang.shared.t("attach.attachPaste")
         }
     }
 

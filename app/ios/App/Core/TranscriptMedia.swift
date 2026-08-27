@@ -25,7 +25,7 @@ final class TranscriptMedia {
     /// Doubles as the ON-SCREEN token: three handlers refuse to present after
     /// it goes away, because arming a sheet for a screen the user already left
     /// hands it to whatever mounts next.
-    private weak var bridge: TranscriptBridge?
+    private weak var bridge: (any WebMediaSink)?
 
     var onPreview: ((FilePreview) -> Void)?
     var onShare: ((FilePreview) -> Void)?
@@ -38,12 +38,12 @@ final class TranscriptMedia {
 
     /// Answers that landed while nothing was attached flush here — see
     /// `pendingFileStates`.
-    func attach(_ bridge: TranscriptBridge) {
+    func attach(_ bridge: any WebMediaSink) {
         self.bridge = bridge
         flushPendingAnswers(to: bridge)
     }
 
-    func detach(_ bridge: TranscriptBridge) {
+    func detach(_ bridge: any WebMediaSink) {
         guard self.bridge === bridge else { return }
         self.bridge = nil
     }
@@ -135,7 +135,7 @@ final class TranscriptMedia {
         }
     }
 
-    private func flushPendingAnswers(to bridge: TranscriptBridge) {
+    private func flushPendingAnswers(to bridge: any WebMediaSink) {
         let states = pendingFileStates
         pendingFileStates.removeAll()
         for (blobId, s) in states {

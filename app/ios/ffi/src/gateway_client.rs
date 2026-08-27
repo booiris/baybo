@@ -42,6 +42,20 @@ impl GatewayJsonClient for ActiveGatewayClient {
         forward!(self, c => c.post_json::<T>(path, body))
     }
 
+    async fn post_json_once<'a, T>(&'a self, path: &'a str, body: Vec<u8>) -> Result<T, String>
+    where
+        T: DeserializeOwned + Send + 'static,
+    {
+        forward!(self, c => c.post_json_once::<T>(path, body))
+    }
+
+    async fn patch_json<'a, T>(&'a self, path: &'a str, body: Vec<u8>) -> Result<T, String>
+    where
+        T: DeserializeOwned + Send + 'static,
+    {
+        forward!(self, c => c.patch_json::<T>(path, body))
+    }
+
     async fn post_empty<'a>(&'a self, path: &'a str, body: Vec<u8>) -> Result<(), String> {
         forward!(self, c => c.post_empty(path, body))
     }

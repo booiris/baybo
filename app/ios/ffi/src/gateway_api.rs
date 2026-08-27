@@ -8,8 +8,10 @@ use serde::{Deserialize, Serialize};
 use crate::api::{
     ChatSearchGroup, ChatSearchHit, ChatSearchResults, ChatSessionSummary, ChatSubagentList,
     ChatSubagentStatus, ChatSubagentSummary, CronJobStatus, CronJobSummary, DeckCardInfo,
-    DeckLayoutEntryInput, DeckSnapshotInfo, DeckView, LlmModelCatalog, LlmModelInfo,
-    SessionModelPin, SubagentCursor,
+    DeckLayoutEntryInput, DeckSnapshotInfo, DeckView, HiredBy, IssueAttachmentInfo,
+    IssueAttachmentInput, IssueInfo, IssuePriority, IssueRunInfo, IssueStatus, LlmModelCatalog,
+    LlmModelInfo, ProjectActivity, ProjectAttention, ProjectInfo, RunStatus, RunTrigger,
+    SessionModelPin, SubIssueProgress, SubagentCursor, TeamMemberInfo,
 };
 
 const PATH_CHAT_SESSIONS: &str = "/v1/chat/sessions";
@@ -20,7 +22,11 @@ const PATH_CHAT_SUBAGENTS: &str = "/v1/chat/subagents";
 const PATH_CHAT_SEARCH: &str = "/v1/chat/search";
 const PATH_CRON: &str = "/v1/cron";
 const PATH_LLM_MODELS: &str = "/v1/llm/models";
+const PATH_AGENTS: &str = "/v1/agents";
 const PATH_DECK: &str = "/v1/deck";
+/// The kanban boards. Every card, run, comment and approval on the phone
+/// rides this path space — see `app/ios/docs/projects.md`.
+const PATH_PROJECTS: &str = "/v1/projects";
 const PATH_MOBILE_APNS_TOKEN: &str = "/v1/mobile/apns-token";
 pub(crate) const PATH_BLOBS: &str = "/v1/blobs";
 /// Content-type for every JSON-bodied request, shared by both legs.
@@ -35,6 +41,31 @@ pub(crate) trait GatewayJsonClient {
         T: DeserializeOwned + Send + 'static;
 
     fn post_json<'a, T>(
+        &'a self,
+        path: &'a str,
+        body: Vec<u8>,
+    ) -> impl Future<Output = Result<T, String>> + Send + 'a
+    where
+        T: DeserializeOwned + Send + 'static;
+
+    /// POST a non-idempotent create and decode what came back. Relay mode
+    /// never replays this after pooled-leg silence: the gateway may already
+    /// have committed the first request without returning its response head.
+    fn post_json_once<'a, T>(
+        &'a self,
+        path: &'a str,
+        body: Vec<u8>,
+    ) -> impl Future<Output = Result<T, String>> + Send + 'a
+    where
+        T: DeserializeOwned + Send + 'static;
+
+    /// PATCH a sparse body and decode what came back.
+    ///
+    /// Distinct from [`Self::put_empty`] in both halves: a board's card is
+    /// edited field by field (an absent key means "leave it"), and the
+    /// gateway answers with the whole updated card, which is what the
+    /// caller renders instead of refetching.
+    fn patch_json<'a, T>(
         &'a self,
         path: &'a str,
         body: Vec<u8>,
@@ -353,6 +384,10 @@ struct ChatSessionDetail {
     oldest_ordinal: Option<i64>,
     #[serde(default)]
     newest_ordinal: Option<i64>,
+    /// Present on the baseline/meta fetch. A run has no sync route of its own,
+    /// so this is the only source for the transcript's compaction dividers.
+    #[serde(default)]
+    compaction_points: Vec<CompactionPoint>,
 }
 
 /// Native-synthesized frame for the web transcript bridge: one backward
@@ -974,7 +1009,22 @@ async fn history_page<C: GatewayJsonClient + Sync>(
     limit: Option<u32>,
 ) -> Result<String, String> {
     validate_path_segment(&session_id, "session_id")?;
-    let mut path = format!("{base}/{}", percent_encode(&session_id));
+    let path = format!("{base}/{}", percent_encode(&session_id));
+    history_page_at(client, path, before_ordinal, limit).await
+}
+
+/// The page fetch itself, against a path the caller has already built.
+///
+/// Split out because a card's run transcript is not addressed by a session
+/// id at all — it hangs off the board, the card and the attempt
+/// (`…/issues/{n}/runs/{a}/transcript`) — while answering the identical DTO
+/// and feeding the identical webview frame.
+async fn history_page_at<C: GatewayJsonClient + Sync>(
+    client: &C,
+    mut path: String,
+    before_ordinal: Option<i64>,
+    limit: Option<u32>,
+) -> Result<String, String> {
     let mut first_query = true;
     if let Some(before) = before_ordinal {
         append_query(&mut path, &mut first_query, "before_ordinal", before);
@@ -1264,6 +1314,1105 @@ pub(crate) async fn update_apns_token<C: GatewayJsonClient + Sync>(
     client.post_empty(PATH_MOBILE_APNS_TOKEN, body).await
 }
 
+// ─────────────────────────── projects (kanban boards) ───────────────────────
+//
+// Every enum decodes tolerantly (`#[serde(other)] Unknown`) for the reason
+// `WireSubagentStatus` does: a gateway that grows a status must cost one card
+// its word, not fail the whole board's decode. Encoding refuses `Unknown` —
+// asking the server to move a card into a column this build cannot name is a
+// request nobody can honour.
+
+/// The gateway's `ListResponse<T>` envelope. Generic here rather than one
+/// wrapper per route, as the older surfaces have: this path space answers
+/// six different lists in the same shape, and `next_cursor` is unused by
+/// every one of them (the feed pages by `before_ms` instead).
+#[derive(Deserialize)]
+struct WireList<T> {
+    #[serde(default = "Vec::new")]
+    items: Vec<T>,
+}
+
+/// Absent means "leave it", explicit `null` means "clear it". The gateway
+/// reads both halves through its `double_option`; this is the serialize side.
+fn patch_field(patch: &crate::api::StringPatch) -> Option<Option<&str>> {
+    match patch {
+        crate::api::StringPatch::Keep => None,
+        crate::api::StringPatch::Clear => Some(None),
+        crate::api::StringPatch::Set { value } => Some(Some(value.as_str())),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WireIssueStatus {
+    Backlog,
+    Todo,
+    InProgress,
+    Review,
+    Done,
+    #[serde(other)]
+    Unknown,
+}
+
+impl From<WireIssueStatus> for IssueStatus {
+    fn from(s: WireIssueStatus) -> Self {
+        match s {
+            WireIssueStatus::Backlog => IssueStatus::Backlog,
+            WireIssueStatus::Todo => IssueStatus::Todo,
+            WireIssueStatus::InProgress => IssueStatus::InProgress,
+            WireIssueStatus::Review => IssueStatus::Review,
+            WireIssueStatus::Done => IssueStatus::Done,
+            WireIssueStatus::Unknown => IssueStatus::Unknown,
+        }
+    }
+}
+
+fn status_wire(status: IssueStatus) -> Result<&'static str, String> {
+    match status {
+        IssueStatus::Backlog => Ok("backlog"),
+        IssueStatus::Todo => Ok("todo"),
+        IssueStatus::InProgress => Ok("in_progress"),
+        IssueStatus::Review => Ok("review"),
+        IssueStatus::Done => Ok("done"),
+        IssueStatus::Unknown => Err("cannot move a card to an unknown status".to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WireIssuePriority {
+    Urgent,
+    High,
+    Medium,
+    Low,
+    None,
+    #[serde(other)]
+    Unknown,
+}
+
+impl From<WireIssuePriority> for IssuePriority {
+    fn from(p: WireIssuePriority) -> Self {
+        match p {
+            WireIssuePriority::Urgent => IssuePriority::Urgent,
+            WireIssuePriority::High => IssuePriority::High,
+            WireIssuePriority::Medium => IssuePriority::Medium,
+            WireIssuePriority::Low => IssuePriority::Low,
+            WireIssuePriority::None => IssuePriority::None,
+            WireIssuePriority::Unknown => IssuePriority::Unknown,
+        }
+    }
+}
+
+fn priority_wire(priority: IssuePriority) -> Result<&'static str, String> {
+    match priority {
+        IssuePriority::Urgent => Ok("urgent"),
+        IssuePriority::High => Ok("high"),
+        IssuePriority::Medium => Ok("medium"),
+        IssuePriority::Low => Ok("low"),
+        IssuePriority::None => Ok("none"),
+        IssuePriority::Unknown => Err("cannot set an unknown priority".to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WireRunStatus {
+    Held,
+    Queued,
+    Running,
+    Done,
+    Failed,
+    Cancelled,
+    #[serde(other)]
+    Unknown,
+}
+
+impl From<WireRunStatus> for RunStatus {
+    fn from(s: WireRunStatus) -> Self {
+        match s {
+            WireRunStatus::Held => RunStatus::Held,
+            WireRunStatus::Queued => RunStatus::Queued,
+            WireRunStatus::Running => RunStatus::Running,
+            WireRunStatus::Done => RunStatus::Done,
+            WireRunStatus::Failed => RunStatus::Failed,
+            WireRunStatus::Cancelled => RunStatus::Cancelled,
+            WireRunStatus::Unknown => RunStatus::Unknown,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WireRunTrigger {
+    Started,
+    Assigned,
+    Retry,
+    Comment,
+    Promoted,
+    Triage,
+    StageBarrier,
+    Review,
+    Stalled,
+    Blocked,
+    Grooming,
+    BoardIdle,
+    #[serde(other)]
+    Unknown,
+}
+
+impl From<WireRunTrigger> for RunTrigger {
+    fn from(t: WireRunTrigger) -> Self {
+        match t {
+            WireRunTrigger::Started => RunTrigger::Started,
+            WireRunTrigger::Assigned => RunTrigger::Assigned,
+            WireRunTrigger::Retry => RunTrigger::Retry,
+            WireRunTrigger::Comment => RunTrigger::Comment,
+            WireRunTrigger::Promoted => RunTrigger::Promoted,
+            WireRunTrigger::Triage => RunTrigger::Triage,
+            WireRunTrigger::StageBarrier => RunTrigger::StageBarrier,
+            WireRunTrigger::Review => RunTrigger::Review,
+            WireRunTrigger::Stalled => RunTrigger::Stalled,
+            WireRunTrigger::Blocked => RunTrigger::Blocked,
+            WireRunTrigger::Grooming => RunTrigger::Grooming,
+            WireRunTrigger::BoardIdle => RunTrigger::BoardIdle,
+            WireRunTrigger::Unknown => RunTrigger::Unknown,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct WireProject {
+    id: String,
+    name: String,
+    description: String,
+    workdir: String,
+    #[serde(default)]
+    daily_budget_micros: Option<i64>,
+    #[serde(default)]
+    daily_budget_tokens: Option<i64>,
+    max_parallel_issue_runs: i64,
+    #[serde(default)]
+    agents_may_merge: bool,
+    #[serde(default)]
+    archived_at_ms: Option<i64>,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+}
+
+impl From<WireProject> for ProjectInfo {
+    fn from(p: WireProject) -> Self {
+        ProjectInfo {
+            id: p.id,
+            name: p.name,
+            description: p.description,
+            workdir: p.workdir,
+            daily_budget_micros: p.daily_budget_micros,
+            daily_budget_tokens: p.daily_budget_tokens,
+            max_parallel_issue_runs: p.max_parallel_issue_runs,
+            agents_may_merge: p.agents_may_merge,
+            archived_at_ms: p.archived_at_ms,
+            created_at_ms: p.created_at_ms,
+            updated_at_ms: p.updated_at_ms,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct WireIssueAttachment {
+    blob_id: String,
+    mime_type: String,
+    size: u32,
+    #[serde(default)]
+    filename: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WireSubIssues {
+    done: i64,
+    total: i64,
+}
+
+#[derive(Deserialize)]
+struct WireIssue {
+    number: i64,
+    project_id: String,
+    title: String,
+    description: String,
+    #[serde(default)]
+    attachments: Vec<WireIssueAttachment>,
+    status: WireIssueStatus,
+    priority: WireIssuePriority,
+    #[serde(default)]
+    assignee: Option<String>,
+    position: i64,
+    pinned: bool,
+    #[serde(default)]
+    branch: Option<String>,
+    #[serde(default)]
+    blocked_reason: Option<String>,
+    #[serde(default)]
+    parent: Option<i64>,
+    #[serde(default)]
+    filed_from: Option<i64>,
+    stage: i64,
+    #[serde(default)]
+    sub_issues: Option<WireSubIssues>,
+    unread: i64,
+    last_run_failed: bool,
+    // Predates this client on a gateway that has not shipped the field yet;
+    // absent reads as "nothing waiting", the direction that shows no badge
+    // rather than a badge with nothing behind it.
+    #[serde(default)]
+    approval_pending: bool,
+    #[serde(default)]
+    opened_by_agent: bool,
+    #[serde(default)]
+    cancelled_at_ms: Option<i64>,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+}
+
+impl From<WireIssue> for IssueInfo {
+    fn from(i: WireIssue) -> Self {
+        IssueInfo {
+            number: i.number,
+            project_id: i.project_id,
+            title: i.title,
+            description: i.description,
+            attachments: i
+                .attachments
+                .into_iter()
+                .map(|a| IssueAttachmentInfo {
+                    blob_id: a.blob_id,
+                    mime_type: a.mime_type,
+                    size: a.size,
+                    filename: a.filename,
+                })
+                .collect(),
+            status: i.status.into(),
+            priority: i.priority.into(),
+            assignee: i.assignee,
+            position: i.position,
+            pinned: i.pinned,
+            branch: i.branch,
+            blocked_reason: i.blocked_reason,
+            parent: i.parent,
+            filed_from: i.filed_from,
+            stage: i.stage,
+            sub_issues: i.sub_issues.map(|s| SubIssueProgress {
+                done: s.done,
+                total: s.total,
+            }),
+            unread: i.unread,
+            last_run_failed: i.last_run_failed,
+            approval_pending: i.approval_pending,
+            opened_by_agent: i.opened_by_agent,
+            cancelled_at_ms: i.cancelled_at_ms,
+            created_at_ms: i.created_at_ms,
+            updated_at_ms: i.updated_at_ms,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct WireIssueRun {
+    number: i64,
+    attempt: i64,
+    agent_id: String,
+    status: WireRunStatus,
+    trigger: WireRunTrigger,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+    created_at_ms: i64,
+    #[serde(default)]
+    started_at_ms: Option<i64>,
+    #[serde(default)]
+    settled_at_ms: Option<i64>,
+    #[serde(default)]
+    cost_micros: Option<i64>,
+    #[serde(default)]
+    input_tokens: Option<i64>,
+    #[serde(default)]
+    output_tokens: Option<i64>,
+}
+
+impl From<WireIssueRun> for IssueRunInfo {
+    fn from(r: WireIssueRun) -> Self {
+        IssueRunInfo {
+            number: r.number,
+            attempt: r.attempt,
+            agent_id: r.agent_id,
+            status: r.status.into(),
+            trigger: r.trigger.into(),
+            session_id: r.session_id,
+            error: r.error,
+            created_at_ms: r.created_at_ms,
+            started_at_ms: r.started_at_ms,
+            settled_at_ms: r.settled_at_ms,
+            cost_micros: r.cost_micros,
+            input_tokens: r.input_tokens,
+            output_tokens: r.output_tokens,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct WireIssueRunLog {
+    #[serde(default)]
+    items: Vec<WireIssueRun>,
+    #[serde(default)]
+    total_cost_micros: i64,
+    #[serde(default)]
+    total_input_tokens: i64,
+    #[serde(default)]
+    total_output_tokens: i64,
+}
+
+#[derive(Deserialize)]
+struct WireHiredBy {
+    id: String,
+    handle: String,
+}
+
+#[derive(Deserialize)]
+struct WireTeamMember {
+    id: String,
+    handle: String,
+    name: String,
+    description: String,
+    #[serde(default)]
+    avatar_blob_id: Option<String>,
+    framework: String,
+    #[serde(default)]
+    llm: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    reasoning_effort: Option<String>,
+    lead: bool,
+    #[serde(default)]
+    hired_by: Option<WireHiredBy>,
+    created_at_ms: i64,
+}
+
+impl From<WireTeamMember> for TeamMemberInfo {
+    fn from(m: WireTeamMember) -> Self {
+        TeamMemberInfo {
+            id: m.id,
+            handle: m.handle,
+            name: m.name,
+            description: m.description,
+            avatar_blob_id: m.avatar_blob_id,
+            framework: m.framework,
+            llm: m.llm,
+            model: m.model,
+            reasoning_effort: m.reasoning_effort,
+            lead: m.lead,
+            hired_by: m.hired_by.map(|h| HiredBy {
+                id: h.id,
+                handle: h.handle,
+            }),
+            created_at_ms: m.created_at_ms,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct WireAttention {
+    project_id: String,
+    name: String,
+    approvals: u32,
+    failed: u32,
+    unread: u32,
+}
+
+#[derive(Deserialize)]
+struct WireActivity {
+    project_id: String,
+    working: u32,
+    burn_micros: i64,
+    burn_tokens: i64,
+}
+
+#[derive(Serialize)]
+struct NewProjectRequest<'a> {
+    name: &'a str,
+    description: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workdir: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    daily_budget_micros: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    daily_budget_tokens: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_parallel_issue_runs: Option<i64>,
+}
+
+/// A full replace — every knob is written as given, so nothing here is
+/// skipped when absent. `null` clears a ceiling, which is what "no limit"
+/// is on the wire.
+#[derive(Serialize)]
+struct UpdateProjectRequest<'a> {
+    name: &'a str,
+    description: &'a str,
+    daily_budget_micros: Option<i64>,
+    daily_budget_tokens: Option<i64>,
+    max_parallel_issue_runs: Option<i64>,
+    /// Never omitted. `#[serde(default)]` on the gateway's side reads a
+    /// missing `agents_may_merge` as `false`, so leaving it out of a
+    /// full-replace body is not "leave it alone" — it is "turn it off".
+    agents_may_merge: bool,
+}
+
+#[derive(Serialize)]
+struct SetProjectArchivedRequest {
+    archived: bool,
+}
+
+#[derive(Serialize)]
+struct AttachmentRequest<'a> {
+    blob_id: &'a str,
+    /// What to call the file. The gateway reads mime and size off the blob
+    /// itself, but nothing there knows what the user picked it as — omit this
+    /// and every file card on a card page prints an inferred name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    filename: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct NewIssueRequest<'a> {
+    title: &'a str,
+    description: &'a str,
+    attachments: Vec<AttachmentRequest<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    priority: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    assignee: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stage: Option<i64>,
+}
+
+/// Sparse: an omitted key leaves the field alone. `assignee` and
+/// `blocked_reason` are doubly optional — `Some(None)` serializes as an
+/// explicit `null`, which is how a card is unassigned or a block lifted.
+#[derive(Serialize)]
+struct UpdateIssueRequest<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attachments: Option<Vec<AttachmentRequest<'a>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    priority: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    assignee: Option<Option<&'a str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    blocked_reason: Option<Option<&'a str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cancelled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent: Option<i64>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    detach_parent: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stage: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pinned: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct MoveIssueRequest<'a> {
+    status: &'a str,
+    /// Every number in the destination column, in its final order, this card
+    /// among them — the gateway renumbers the column in one transaction.
+    ordered_numbers: Vec<i64>,
+}
+
+#[derive(Serialize)]
+struct NewCommentRequest<'a> {
+    client_msg_id: &'a str,
+    text: &'a str,
+    attachments: Vec<AttachmentRequest<'a>>,
+}
+
+#[derive(Serialize)]
+struct ResolveIssueApprovalRequest {
+    decision: &'static str,
+}
+
+fn project_path(project: &str) -> Result<String, String> {
+    validate_path_segment(project, "project_id")?;
+    Ok(format!("{PATH_PROJECTS}/{}", percent_encode(project)))
+}
+
+fn issue_path(project: &str, number: i64) -> Result<String, String> {
+    Ok(format!("{}/issues/{number}", project_path(project)?))
+}
+
+pub(crate) async fn list_projects<C: GatewayJsonClient + Sync>(
+    client: &C,
+    include_archived: bool,
+) -> Result<Vec<ProjectInfo>, String> {
+    let path = if include_archived {
+        format!("{PATH_PROJECTS}?include_archived=true")
+    } else {
+        PATH_PROJECTS.to_string()
+    };
+    let response: WireList<WireProject> = client.get_json(&path).await?;
+    Ok(response.items.into_iter().map(ProjectInfo::from).collect())
+}
+
+pub(crate) async fn fetch_project<C: GatewayJsonClient + Sync>(
+    client: &C,
+    project: String,
+) -> Result<ProjectInfo, String> {
+    let wire: WireProject = client.get_json(&project_path(&project)?).await?;
+    Ok(wire.into())
+}
+
+pub(crate) async fn create_project<C: GatewayJsonClient + Sync>(
+    client: &C,
+    new: crate::api::NewProject,
+) -> Result<ProjectInfo, String> {
+    let body = serde_json::to_vec(&NewProjectRequest {
+        name: &new.name,
+        description: &new.description,
+        workdir: new.workdir.as_deref(),
+        daily_budget_micros: new.daily_budget_micros,
+        daily_budget_tokens: new.daily_budget_tokens,
+        max_parallel_issue_runs: new.max_parallel_issue_runs,
+    })
+    .map_err(|e| format!("encode new project: {e}"))?;
+    let wire: WireProject = client.post_json(PATH_PROJECTS, body).await?;
+    Ok(wire.into())
+}
+
+/// Write the board's knobs. A **full replace**: an omitted ceiling is a
+/// cleared ceiling, so callers read the current settings, change one and
+/// send them all.
+///
+/// Returns nothing on purpose. The route answers with the row, but a full
+/// replace is a body the caller authored field by field — there is nothing
+/// in the response it does not already hold, and the board refetches after
+/// a write regardless (a ceiling change releases held runs).
+pub(crate) async fn update_project<C: GatewayJsonClient + Sync>(
+    client: &C,
+    project: String,
+    settings: crate::api::ProjectSettings,
+) -> Result<(), String> {
+    let path = project_path(&project)?;
+    let body = serde_json::to_vec(&UpdateProjectRequest {
+        name: &settings.name,
+        description: &settings.description,
+        daily_budget_micros: settings.daily_budget_micros,
+        daily_budget_tokens: settings.daily_budget_tokens,
+        max_parallel_issue_runs: settings.max_parallel_issue_runs,
+        agents_may_merge: settings.agents_may_merge,
+    })
+    .map_err(|e| format!("encode project settings: {e}"))?;
+    client.put_empty(&path, body).await
+}
+
+pub(crate) async fn set_project_archived<C: GatewayJsonClient + Sync>(
+    client: &C,
+    project: String,
+    archived: bool,
+) -> Result<ProjectInfo, String> {
+    let path = format!("{}/archive", project_path(&project)?);
+    let body = serde_json::to_vec(&SetProjectArchivedRequest { archived })
+        .map_err(|e| format!("encode archive request: {e}"))?;
+    let wire: WireProject = client.post_json(&path, body).await?;
+    Ok(wire.into())
+}
+
+pub(crate) async fn list_project_issues<C: GatewayJsonClient + Sync>(
+    client: &C,
+    project: String,
+) -> Result<Vec<IssueInfo>, String> {
+    let path = format!("{}/issues", project_path(&project)?);
+    let response: WireList<WireIssue> = client.get_json(&path).await?;
+    Ok(response.items.into_iter().map(IssueInfo::from).collect())
+}
+
+pub(crate) async fn fetch_issue<C: GatewayJsonClient + Sync>(
+    client: &C,
+    project: String,
+    number: i64,
+) -> Result<IssueInfo, String> {
+    let wire: WireIssue = client.get_json(&issue_path(&project, number)?).await?;
+    Ok(wire.into())
+}
+
+pub(crate) async fn create_issue<C: GatewayJsonClient + Sync>(
+    client: &C,
+    project: String,
+    new: crate::api::NewIssue,
+) -> Result<IssueInfo, String> {
+    let path = format!("{}/issues", project_path(&project)?);
+    let status = new.status.map(status_wire).transpose()?;
+    let priority = new.priority.map(priority_wire).transpose()?;
+    let body = serde_json::to_vec(&NewIssueRequest {
+        title: &new.title,
+        description: &new.description,
+        attachments: new
+            .attachments
+            .iter()
+            .map(|blob_id| AttachmentRequest {
+                blob_id,
+                filename: None,
+            })
+            .collect(),
+        status,
+        priority,
+        assignee: new.assignee.as_deref(),
+        parent: new.parent,
+        stage: new.stage,
+    })
+    .map_err(|e| format!("encode new issue: {e}"))?;
+    let wire: WireIssue = client.post_json_once(&path, body).await?;
+    Ok(wire.into())
+}
+
+pub(crate) async fn patch_issue<C: GatewayJsonClient + Sync>(
+    client: &C,
+    project: String,
+    number: i64,
+    patch: crate::api::IssuePatch,
+) -> Result<IssueInfo, String> {
+    let path = issue_path(&project, number)?;
+    let priority = patch.priority.map(priority_wire).transpose()?;
+    let detach_parent = patch.detach_parent || patch.parent.is_some_and(|parent| parent <= 0);
+    let parent = patch.parent.filter(|parent| *parent > 0);
+    let body = serde_json::to_vec(&UpdateIssueRequest {
+        title: patch.title.as_deref(),
+        description: patch.description.as_deref(),
+        attachments: patch.attachments.as_ref().map(|ids| {
+            ids.iter()
+                .map(|blob_id| AttachmentRequest {
+                    blob_id,
+                    filename: None,
+                })
+                .collect()
+        }),
+        priority,
+        assignee: patch_field(&patch.assignee),
+        blocked_reason: patch_field(&patch.blocked_reason),
+        cancelled: patch.cancelled,
+        parent,
+        detach_parent,
+        stage: patch.stage,
+        pinned: patch.pinned,
+    })
+    .map_err(|e| format!("encode issue patch: {e}"))?;
+    let wire: WireIssue = client.patch_json(&path, body).await?;
+    Ok(wire.into())
+}
+
+pub(crate) async fn move_issue<C: GatewayJsonClient + Sync>(
+    client: &C,
+    project: String,
+    number: i64,
+    status: IssueStatus,
+    ordered_numbers: Vec<i64>,
+) -> Result<IssueInfo, String> {
+    let path = format!("{}/move", issue_path(&project, number)?);
+    let body = serde_json::to_vec(&MoveIssueRequest {
+        status: status_wire(status)?,
+        ordered_numbers,
+    })
+    .map_err(|e| format!("encode issue move: {e}"))?;
+    let wire: WireIssue = client.post_json(&path, body).await?;
+    Ok(wire.into())
+}
+
+/// Unsettled runs across the whole board — what the card faces read their
+/// working / queued / held word from. These carry **no cost fields**; the
+/// per-card log does.
+pub(crate) async fn list_active_runs<C: GatewayJsonClient + Sync>(
+    client: &C,
+    project: String,
+) -> Result<Vec<IssueRunInfo>, String> {
+    let path = format!("{}/runs", project_path(&project)?);
+    let response: WireList<WireIssueRun> = client.get_json(&path).await?;
+    Ok(response.items.into_iter().map(IssueRunInfo::from).collect())
+}
+
+pub(crate) async fn list_issue_runs<C: GatewayJsonClient + Sync>(
+    client: &C,
+    project: String,
+    number: i64,
+) -> Result<crate::api::IssueRunLog, String> {
+    let path = format!("{}/runs", issue_path(&project, number)?);
+    let log: WireIssueRunLog = client.get_json(&path).await?;
+    Ok(crate::api::IssueRunLog {
+        runs: log.items.into_iter().map(IssueRunInfo::from).collect(),
+        total_cost_micros: log.total_cost_micros,
+        total_input_tokens: log.total_input_tokens,
+        total_output_tokens: log.total_output_tokens,
+    })
+}
+
+pub(crate) async fn cancel_run<C: GatewayJsonClient + Sync>(
+    client: &C,
+    project: String,
+    number: i64,
+) -> Result<(), String> {
+    let path = format!("{}/runs/cancel", issue_path(&project, number)?);
+    client.post_empty(&path, Vec::new()).await
+}
+
+/// The one press that discharges a failed card, and the press that releases a
+/// held one — the gateway lets the ceiling through what it can before it
+/// refuses, so this is never a no-op on a held run.
+pub(crate) async fn retry_run<C: GatewayJsonClient + Sync>(
+    client: &C,
+    project: String,
+    number: i64,
+) -> Result<IssueRunInfo, String> {
+    let path = format!("{}/runs/retry", issue_path(&project, number)?);
+    let wire: WireIssueRun = client.post_json(&path, Vec::new()).await?;
+    Ok(wire.into())
+}
+
+/// One agent's session on this card, as a backward transcript page. The same
+/// `ChatSessionDetail` the chat routes answer, so the transcript webview
+/// renders it unchanged; an attempt's page also holds the attempts before it,
+/// because one agent's runs on a card share a session.
+pub(crate) async fn fetch_run_transcript_page<C: GatewayJsonClient + Sync>(
+    client: &C,
+    project: String,
+    number: i64,
+    attempt: i64,
+    before_ordinal: Option<i64>,
+    limit: Option<u32>,
+) -> Result<String, String> {
+    history_page_at(
+        client,
+        run_transcript_path(&project, number, attempt)?,
+        before_ordinal,
+        limit,
+    )
+    .await
+}
+
+/// The run's newest page, as a **baseline `sync_page`**.
+///
+/// A run has no sync route, so this reads the same backward-paging endpoint
+/// with no cursor — the newest page IS the whole tail. What matters is the
+/// frame it is dressed as. The web arms an in-flight guard when it asks for a
+/// sync and unwinds it on `sync_page` / `sync_failed` and nothing else; and it
+/// DROPS a `history_page` that matches no in-flight backward-paging request, as
+/// stale. Answering the initial load with a history page — which is what this
+/// did until 2026-08-26 — therefore lost twice: the rows were discarded and the
+/// guard stayed armed, so a run sat on "Loading conversation…" forever with its
+/// transcript already fetched.
+///
+/// `since_ordinal: None` makes it a baseline, which is honest: this is the
+/// newest page and not a difference. The web's REPLACE keeps whatever history
+/// the reader had paged in above it.
+pub(crate) async fn fetch_run_transcript_baseline<C: GatewayJsonClient + Sync>(
+    client: &C,
+    project: String,
+    number: i64,
+    attempt: i64,
+    limit: Option<u32>,
+) -> Result<String, String> {
+    let mut path = run_transcript_path(&project, number, attempt)?;
+    if let Some(limit) = limit {
+        let mut first_query = true;
+        append_query(&mut path, &mut first_query, "limit", limit);
+    }
+    let detail: ChatSessionDetail = client.get_json(&path).await?;
+    let frame = SyncPageFrame {
+        kind: "sync_page",
+        rows: detail.transcript,
+        since_ordinal: None,
+        next_cursor: detail.newest_ordinal,
+        rebased: false,
+        oldest_ordinal: detail.oldest_ordinal,
+        has_more_older: detail.has_more,
+        compaction_points: detail.compaction_points,
+    };
+    serde_json::to_string(&frame).map_err(|e| format!("encode run sync page: {e}"))
+}
+
+fn run_transcript_path(project: &str, number: i64, attempt: i64) -> Result<String, String> {
+    Ok(format!(
+        "{}/runs/{attempt}/transcript",
+        issue_path(project, number)?
+    ))
+}
+
+/// A card's timeline, verbatim. Raw JSON rather than a typed record: the
+/// entries are a 20-arm tagged union the issue webview renders, and the
+/// pieces the native side needs off them (a parked prompt's `call_id`, who
+/// blocked the card) are read by one small model rather than by mirroring
+/// every arm through UniFFI.
+pub(crate) async fn fetch_issue_events<C: GatewayJsonClient + Sync>(
+    client: &C,
+    project: String,
+    number: i64,
+) -> Result<String, String> {
+    let path = format!("{}/events", issue_path(&project, number)?);
+    let events: serde_json::Value = client.get_json(&path).await?;
+    serde_json::to_string(&events).map_err(|e| format!("encode issue events: {e}"))
+}
+
+/// Post a comment; answers with the timeline entry it became, so the caller
+/// appends rather than refetching. Text may be empty when files carry it.
+pub(crate) async fn comment_on_issue<C: GatewayJsonClient + Sync>(
+    client: &C,
+    project: String,
+    number: i64,
+    client_msg_id: String,
+    text: String,
+    attachments: Vec<IssueAttachmentInput>,
+) -> Result<String, String> {
+    let path = format!("{}/comments", issue_path(&project, number)?);
+    let body = serde_json::to_vec(&NewCommentRequest {
+        client_msg_id: &client_msg_id,
+        text: &text,
+        attachments: attachments
+            .iter()
+            .map(|a| AttachmentRequest {
+                blob_id: &a.blob_id,
+                filename: a.filename.as_deref(),
+            })
+            .collect(),
+    })
+    .map_err(|e| format!("encode comment: {e}"))?;
+    let entry: serde_json::Value = client.post_json(&path, body).await?;
+    serde_json::to_string(&entry).map_err(|e| format!("encode comment entry: {e}"))
+}
+
+pub(crate) async fn resolve_issue_approval<C: GatewayJsonClient + Sync>(
+    client: &C,
+    project: String,
+    number: i64,
+    call_id: String,
+    decision: crate::api::IssueApprovalDecision,
+) -> Result<(), String> {
+    validate_path_segment(&call_id, "call_id")?;
+    let path = format!(
+        "{}/approvals/{}",
+        issue_path(&project, number)?,
+        percent_encode(&call_id)
+    );
+    let body = serde_json::to_vec(&ResolveIssueApprovalRequest {
+        decision: match decision {
+            crate::api::IssueApprovalDecision::Approve => "approve",
+            crate::api::IssueApprovalDecision::Deny => "deny",
+        },
+    })
+    .map_err(|e| format!("encode approval decision: {e}"))?;
+    client.post_empty(&path, body).await
+}
+
+/// Stamp one card read. The web only sends this once a card's timeline has
+/// actually rendered, and the phone follows: a read cursor moved by a screen
+/// nobody saw is unread work quietly discarded.
+pub(crate) async fn mark_issue_read<C: GatewayJsonClient + Sync>(
+    client: &C,
+    project: String,
+    number: i64,
+) -> Result<(), String> {
+    let path = format!("{}/read", issue_path(&project, number)?);
+    client.post_empty(&path, Vec::new()).await
+}
+
+/// Stamp every card on the board read — including the ones a filter is
+/// hiding, which is what the press clears.
+pub(crate) async fn mark_project_read<C: GatewayJsonClient + Sync>(
+    client: &C,
+    project: String,
+) -> Result<(), String> {
+    let path = format!("{}/read", project_path(&project)?);
+    client.post_empty(&path, Vec::new()).await
+}
+
+/// The board's read-only activity stream, verbatim (see
+/// [`fetch_issue_events`] for why it is raw).
+pub(crate) async fn fetch_project_feed<C: GatewayJsonClient + Sync>(
+    client: &C,
+    project: String,
+    before_ms: Option<i64>,
+    limit: Option<u32>,
+) -> Result<String, String> {
+    let mut path = format!("{}/feed", project_path(&project)?);
+    let mut first_query = true;
+    if let Some(before) = before_ms {
+        append_query(&mut path, &mut first_query, "before_ms", before);
+    }
+    if let Some(limit) = limit {
+        append_query(&mut path, &mut first_query, "limit", limit);
+    }
+    let feed: serde_json::Value = client.get_json(&path).await?;
+    serde_json::to_string(&feed).map_err(|e| format!("encode project feed: {e}"))
+}
+
+pub(crate) async fn list_team<C: GatewayJsonClient + Sync>(
+    client: &C,
+    project: String,
+) -> Result<Vec<TeamMemberInfo>, String> {
+    let path = format!("{}/agents", project_path(&project)?);
+    let response: WireList<WireTeamMember> = client.get_json(&path).await?;
+    Ok(response
+        .items
+        .into_iter()
+        .map(TeamMemberInfo::from)
+        .collect())
+}
+
+/// Pin (or clear) an agent's LLM, model and thinking level.
+///
+/// **The whole pin, replaced as one.** Absent means "inherit" at each level,
+/// so an empty body clears it entirely rather than leaving two thirds of it
+/// pointing at an entry the agent no longer uses. Sending a model without an
+/// entry is a 400 — there is no entry to pick it within — which is why the
+/// caller must send both or neither.
+pub(crate) async fn set_agent_model<C: GatewayJsonClient + Sync>(
+    client: &C,
+    agent_id: String,
+    llm: Option<String>,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+) -> Result<(), String> {
+    validate_path_segment(&agent_id, "agent_id")?;
+    #[derive(serde::Serialize)]
+    struct SetAgentModelRequest {
+        llm: Option<String>,
+        model: Option<String>,
+        reasoning_effort: Option<String>,
+    }
+    let path = format!("{PATH_AGENTS}/{}/model", percent_encode(&agent_id));
+    let body = serde_json::to_vec(&SetAgentModelRequest {
+        llm,
+        model,
+        reasoning_effort,
+    })
+    .map_err(|e| format!("encode agent model: {e}"))?;
+    client.put_empty(&path, body).await
+}
+
+/// Give an agent a face, or take it away (`blob_id: None`).
+///
+/// The blob must already exist and be an image — the gateway stats it and
+/// refuses a dangling or non-image reference, because after this the id is a
+/// soft reference (no foreign keys).
+///
+/// **PNG, not SVG.** The generated faces are drawn as SVG by DiceBear, but a
+/// native iOS view has no SVG decoder at all: an `image/svg+xml` avatar
+/// passes the gateway's `image/*` check and then renders as nothing on every
+/// board row. Whoever uploads one rasterises it first.
+pub(crate) async fn set_agent_avatar<C: GatewayJsonClient + Sync>(
+    client: &C,
+    agent_id: String,
+    blob_id: Option<String>,
+) -> Result<(), String> {
+    put_agent_avatar(client, agent_id, blob_id, false).await
+}
+
+/// Install a generated default only if the profile is still faceless when
+/// the gateway commits the write.
+pub(crate) async fn set_agent_avatar_if_empty<C: GatewayJsonClient + Sync>(
+    client: &C,
+    agent_id: String,
+    blob_id: String,
+) -> Result<(), String> {
+    put_agent_avatar(client, agent_id, Some(blob_id), true).await
+}
+
+async fn put_agent_avatar<C: GatewayJsonClient + Sync>(
+    client: &C,
+    agent_id: String,
+    blob_id: Option<String>,
+    only_if_empty: bool,
+) -> Result<(), String> {
+    validate_path_segment(&agent_id, "agent_id")?;
+    let path = format!("{PATH_AGENTS}/{}/avatar", percent_encode(&agent_id));
+    let body = serde_json::to_vec(&SetAgentAvatarRequest {
+        blob_id: blob_id.as_deref(),
+        only_if_empty,
+    })
+    .map_err(|e| format!("encode agent avatar: {e}"))?;
+    client.put_empty(&path, body).await
+}
+
+#[derive(Serialize)]
+struct SetAgentAvatarRequest<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    blob_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    only_if_empty: bool,
+}
+
+pub(crate) async fn remove_team_member<C: GatewayJsonClient + Sync>(
+    client: &C,
+    project: String,
+    agent_id: String,
+) -> Result<(), String> {
+    validate_path_segment(&agent_id, "agent_id")?;
+    let path = format!(
+        "{}/agents/{}",
+        project_path(&project)?,
+        percent_encode(&agent_id)
+    );
+    client.delete_empty(&path).await
+}
+
+/// Boards with something waiting on the operator. Boards with nothing are
+/// **absent**, not zero-valued — a caller summing this must treat a missing
+/// board as quiet.
+pub(crate) async fn projects_attention<C: GatewayJsonClient + Sync>(
+    client: &C,
+) -> Result<Vec<ProjectAttention>, String> {
+    let path = format!("{PATH_PROJECTS}/attention");
+    let response: WireList<WireAttention> = client.get_json(&path).await?;
+    Ok(response
+        .items
+        .into_iter()
+        .map(|a| ProjectAttention {
+            project_id: a.project_id,
+            name: a.name,
+            approvals: a.approvals,
+            failed: a.failed,
+            unread: a.unread,
+        })
+        .collect())
+}
+
+/// What each board has been doing since `since_ms`, which must be the
+/// **budget's** day — UTC midnight, not the device's — or the burn figure is
+/// measured against a window the ceiling does not use.
+pub(crate) async fn projects_activity<C: GatewayJsonClient + Sync>(
+    client: &C,
+    since_ms: Option<i64>,
+) -> Result<Vec<ProjectActivity>, String> {
+    let mut path = format!("{PATH_PROJECTS}/activity");
+    let mut first_query = true;
+    if let Some(since) = since_ms {
+        append_query(&mut path, &mut first_query, "since_ms", since);
+    }
+    let response: WireList<WireActivity> = client.get_json(&path).await?;
+    Ok(response
+        .items
+        .into_iter()
+        .map(|a| ProjectActivity {
+            project_id: a.project_id,
+            working: a.working,
+            burn_micros: a.burn_micros,
+            burn_tokens: a.burn_tokens,
+        })
+        .collect())
+}
+
 pub(crate) async fn upload_bytes<C: GatewayBlobClient + Sync>(
     client: &C,
     bytes: Vec<u8>,
@@ -1392,6 +2541,34 @@ mod tests {
         {
             async move {
                 self.record("POST", path, &body);
+                self.decode()
+            }
+        }
+
+        fn post_json_once<'a, T>(
+            &'a self,
+            path: &'a str,
+            body: Vec<u8>,
+        ) -> impl Future<Output = Result<T, String>> + Send + 'a
+        where
+            T: DeserializeOwned + Send + 'static,
+        {
+            async move {
+                self.record("POST_ONCE", path, &body);
+                self.decode()
+            }
+        }
+
+        fn patch_json<'a, T>(
+            &'a self,
+            path: &'a str,
+            body: Vec<u8>,
+        ) -> impl Future<Output = Result<T, String>> + Send + 'a
+        where
+            T: DeserializeOwned + Send + 'static,
+        {
+            async move {
+                self.record("PATCH", path, &body);
                 self.decode()
             }
         }
@@ -2633,5 +3810,494 @@ mod tests {
                 body: r#"{"apns_token":"abcd","apns_env":"sandbox"}"#.to_string(),
             }
         );
+    }
+
+    const ISSUE_RESPONSE: &str = r#"{"number":12,"project_id":"p1","title":"t","description":"d","status":"in_progress","priority":"high","position":3,"pinned":false,"stage":0,"unread":0,"last_run_failed":false,"approval_pending":true,"opened_by_agent":false,"created_at_ms":1,"updated_at_ms":2}"#;
+
+    #[tokio::test]
+    async fn issue_creation_uses_the_non_replayable_post_seam() {
+        let client = RecordingClient::new(ISSUE_RESPONSE);
+        create_issue(
+            &client,
+            "p1".to_string(),
+            crate::api::NewIssue {
+                title: "card".to_string(),
+                description: String::new(),
+                attachments: Vec::new(),
+                status: None,
+                priority: None,
+                assignee: None,
+                parent: None,
+                stage: None,
+            },
+        )
+        .await
+        .expect("create");
+
+        let call = client.only_call();
+        assert_eq!(call.method, "POST_ONCE");
+        assert_eq!(call.path, "/v1/projects/p1/issues");
+    }
+
+    /// THE pin for the card patch. The gateway reads `assignee` and
+    /// `blocked_reason` as double options: absent leaves the field alone, an
+    /// explicit `null` clears it. Collapse the two and there is no way to
+    /// unassign a card or lift a block at all — every "clear" silently becomes
+    /// "leave it", and a blocked card can never be unblocked from the phone.
+    #[tokio::test]
+    async fn a_card_patch_tells_leave_it_apart_from_clear_it() {
+        let client = RecordingClient::new(ISSUE_RESPONSE);
+        patch_issue(
+            &client,
+            "p1".to_string(),
+            12,
+            crate::api::IssuePatch {
+                title: None,
+                description: None,
+                attachments: None,
+                priority: None,
+                // Left alone: the key must not appear at all.
+                assignee: crate::api::StringPatch::Keep,
+                // Lifted: an explicit null, which is the unblock door.
+                blocked_reason: crate::api::StringPatch::Clear,
+                cancelled: None,
+                parent: None,
+                detach_parent: false,
+                stage: None,
+                pinned: Some(true),
+            },
+        )
+        .await
+        .expect("patch");
+
+        let call = client.only_call();
+        assert_eq!(call.method, "PATCH");
+        assert_eq!(call.path, "/v1/projects/p1/issues/12");
+        assert_eq!(call.body, r#"{"blocked_reason":null,"pinned":true}"#);
+    }
+
+    /// The other half: setting a value writes it, and the card comes back
+    /// decoded — including the badge the board reads to say a run on this card
+    /// is waiting for an answer.
+    #[tokio::test]
+    async fn a_card_patch_sets_a_value_and_decodes_the_card_it_answers_with() {
+        let client = RecordingClient::new(ISSUE_RESPONSE);
+        let issue = patch_issue(
+            &client,
+            "p1".to_string(),
+            12,
+            crate::api::IssuePatch {
+                title: None,
+                description: None,
+                attachments: None,
+                priority: Some(IssuePriority::Urgent),
+                assignee: crate::api::StringPatch::Set {
+                    value: "agent-1".to_string(),
+                },
+                blocked_reason: crate::api::StringPatch::Keep,
+                cancelled: None,
+                parent: None,
+                detach_parent: false,
+                stage: None,
+                pinned: None,
+            },
+        )
+        .await
+        .expect("patch");
+
+        assert_eq!(
+            client.only_call().body,
+            r#"{"priority":"urgent","assignee":"agent-1"}"#
+        );
+        assert_eq!(issue.number, 12);
+        assert!(matches!(issue.status, IssueStatus::InProgress));
+        assert!(matches!(issue.priority, IssuePriority::High));
+        assert!(issue.approval_pending);
+    }
+
+    #[tokio::test]
+    async fn a_card_patch_encodes_both_explicit_and_legacy_parent_detach() {
+        for patch in [
+            crate::api::IssuePatch {
+                title: None,
+                description: None,
+                attachments: None,
+                priority: None,
+                assignee: crate::api::StringPatch::Keep,
+                blocked_reason: crate::api::StringPatch::Keep,
+                cancelled: None,
+                parent: Some(0),
+                detach_parent: false,
+                stage: None,
+                pinned: None,
+            },
+            crate::api::IssuePatch {
+                title: None,
+                description: None,
+                attachments: None,
+                priority: None,
+                assignee: crate::api::StringPatch::Keep,
+                blocked_reason: crate::api::StringPatch::Keep,
+                cancelled: None,
+                parent: None,
+                detach_parent: true,
+                stage: None,
+                pinned: None,
+            },
+        ] {
+            let client = RecordingClient::new(ISSUE_RESPONSE);
+            patch_issue(&client, "p1".to_string(), 12, patch)
+                .await
+                .expect("detach");
+            assert_eq!(client.only_call().body, r#"{"detach_parent":true}"#);
+        }
+    }
+
+    /// A move carries the destination column's WHOLE order, this card in it —
+    /// the gateway renumbers the column in one transaction, so a body that
+    /// named only the moved card would renumber the column to just that card.
+    #[tokio::test]
+    async fn a_move_carries_the_destination_columns_whole_order() {
+        let client = RecordingClient::new(ISSUE_RESPONSE);
+        move_issue(
+            &client,
+            "p1".to_string(),
+            12,
+            IssueStatus::InProgress,
+            vec![9, 12, 4],
+        )
+        .await
+        .expect("move");
+
+        let call = client.only_call();
+        assert_eq!(call.method, "POST");
+        assert_eq!(call.path, "/v1/projects/p1/issues/12/move");
+        assert_eq!(
+            call.body,
+            r#"{"status":"in_progress","ordered_numbers":[9,12,4]}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn a_comment_carries_its_retry_identity_and_attachments() {
+        let client = RecordingClient::new(r#"{"id":"event-1"}"#);
+        let client_msg_id = "0199318f-7df2-7a24-ae03-2ea582c857bc";
+        comment_on_issue(
+            &client,
+            "p1".to_string(),
+            12,
+            client_msg_id.to_string(),
+            "hello".to_string(),
+            vec![IssueAttachmentInput {
+                blob_id: "blob-1".to_string(),
+                filename: Some("notes.txt".to_string()),
+            }],
+        )
+        .await
+        .expect("comment");
+
+        let call = client.only_call();
+        assert_eq!(call.method, "POST");
+        assert_eq!(call.path, "/v1/projects/p1/issues/12/comments");
+        assert_eq!(
+            call.body,
+            format!(
+                r#"{{"client_msg_id":"{client_msg_id}","text":"hello","attachments":[{{"blob_id":"blob-1","filename":"notes.txt"}}]}}"#
+            )
+        );
+    }
+
+    /// A status this build cannot name never reaches the wire: asking the
+    /// server to move a card into a column we have no word for is a request
+    /// nobody can honour, and it must fail before the request, not after.
+    #[tokio::test]
+    async fn a_move_to_a_status_this_build_cannot_name_is_refused_locally() {
+        let client = RecordingClient::new(ISSUE_RESPONSE);
+        let err = move_issue(
+            &client,
+            "p1".to_string(),
+            12,
+            IssueStatus::Unknown,
+            vec![12],
+        )
+        .await
+        .expect_err("an unknown status cannot be sent");
+
+        assert!(err.contains("unknown status"), "{err}");
+        assert!(
+            client.calls.lock().is_empty(),
+            "nothing may reach the gateway"
+        );
+    }
+
+    /// A card whose gateway grew a status still decodes: the arm costs that
+    /// one card its word, where a hard failure would blank the whole board.
+    #[tokio::test]
+    async fn a_card_with_a_status_this_build_cannot_name_still_decodes() {
+        let client = RecordingClient::new(
+            r#"{"items":[{"number":1,"project_id":"p1","title":"t","description":"","status":"swimlane","priority":"whenever","position":0,"pinned":false,"stage":0,"unread":0,"last_run_failed":false,"opened_by_agent":false,"created_at_ms":1,"updated_at_ms":2}]}"#,
+        );
+        let issues = list_project_issues(&client, "p1".to_string())
+            .await
+            .expect("list");
+
+        assert_eq!(issues.len(), 1);
+        assert!(matches!(issues[0].status, IssueStatus::Unknown));
+        assert!(matches!(issues[0].priority, IssuePriority::Unknown));
+        // The field predates this gateway: absent reads as nothing waiting.
+        assert!(!issues[0].approval_pending);
+    }
+
+    /// Two answers, and the `call_id` rides the path rather than the body —
+    /// the queue is keyed by it.
+    #[tokio::test]
+    async fn answering_a_card_prompt_names_the_call_in_the_path() {
+        let client = RecordingClient::empty();
+        resolve_issue_approval(
+            &client,
+            "p1".to_string(),
+            12,
+            "call-7".to_string(),
+            crate::api::IssueApprovalDecision::Deny,
+        )
+        .await
+        .expect("resolve");
+
+        let call = client.only_call();
+        assert_eq!(call.path, "/v1/projects/p1/issues/12/approvals/call-7");
+        assert_eq!(call.body, r#"{"decision":"deny"}"#);
+    }
+
+    /// A run's transcript hangs off the board, the card and the attempt — not
+    /// off a session id — and still answers the same page frame the chat
+    /// transcript renders.
+    #[tokio::test]
+    async fn a_run_transcript_page_is_addressed_by_card_and_attempt() {
+        let client = RecordingClient::new(
+            r#"{"transcript":[{"id":"r1"}],"has_more":true,"oldest_ordinal":4,"newest_ordinal":9}"#,
+        );
+        let frame = fetch_run_transcript_page(&client, "p1".to_string(), 12, 3, Some(9), Some(50))
+            .await
+            .expect("transcript");
+
+        assert_eq!(
+            client.only_call().path,
+            "/v1/projects/p1/issues/12/runs/3/transcript?before_ordinal=9&limit=50"
+        );
+        assert_eq!(
+            frame,
+            r#"{"kind":"history_page","rows":[{"id":"r1"}],"oldest_ordinal":4,"newest_ordinal":9,"has_more":true}"#
+        );
+    }
+
+    /// Setting a face and clearing one are the same door, and the difference
+    /// is whether `blob_id` is THERE: the gateway reads an absent field as
+    /// "clear", so a clear that sent `null` and a clear that sent nothing must
+    /// not be two behaviours here.
+    #[tokio::test]
+    async fn an_avatar_is_set_by_blob_and_cleared_by_absence() {
+        let client = RecordingClient::empty();
+        set_agent_avatar(&client, "a-dev".into(), Some("sha256:aa.tok".into()))
+            .await
+            .expect("set avatar");
+        let call = client.only_call();
+        assert_eq!(call.method, "PUT");
+        assert_eq!(call.path, "/v1/agents/a-dev/avatar");
+        assert!(
+            call.body.contains("\"blob_id\":\"sha256:aa.tok\""),
+            "{}",
+            call.body
+        );
+
+        let client = RecordingClient::empty();
+        set_agent_avatar(&client, "a-dev".into(), None)
+            .await
+            .expect("clear avatar");
+        assert_eq!(client.only_call().body, "{}");
+    }
+
+    #[tokio::test]
+    async fn a_generated_avatar_requests_gateway_compare_and_set() {
+        let client = RecordingClient::empty();
+        set_agent_avatar_if_empty(&client, "a-dev".into(), "sha256:aa.tok".into())
+            .await
+            .expect("set generated avatar");
+
+        assert_eq!(
+            client.only_call().body,
+            r#"{"blob_id":"sha256:aa.tok","only_if_empty":true}"#
+        );
+    }
+
+    /// A run's transcript answers its two callers with two DIFFERENT frames,
+    /// and that is the whole feature rather than an implementation detail.
+    ///
+    /// The web arms a guard when it asks for a sync and unwinds it on
+    /// `sync_page` / `sync_failed` and nothing else; separately it DROPS a
+    /// `history_page` that matches no in-flight backward-paging request. So the
+    /// initial load answered with a history page lost twice over — rows
+    /// discarded, guard left armed — and every run sat on "Loading
+    /// conversation…" with its transcript already in hand. Both kinds are
+    /// asserted here because either one alone passes on the broken pairing.
+    #[tokio::test]
+    async fn a_runs_first_page_is_a_sync_frame_and_its_scrollback_a_history_one() {
+        let body =
+            r#"{"transcript":[{"id":"r1"}],"has_more":true,"oldest_ordinal":4,"newest_ordinal":9}"#;
+
+        let client = RecordingClient::new(body);
+        let frame = fetch_run_transcript_baseline(&client, "p-1".into(), 26, 2, Some(80))
+            .await
+            .expect("baseline");
+        assert_eq!(
+            client.only_call().path,
+            "/v1/projects/p-1/issues/26/runs/2/transcript?limit=80"
+        );
+        assert_eq!(
+            frame,
+            r#"{"kind":"sync_page","rows":[{"id":"r1"}],"since_ordinal":null,"next_cursor":9,"rebased":false,"oldest_ordinal":4,"has_more_older":true}"#
+        );
+
+        let client = RecordingClient::new(body);
+        let frame = fetch_run_transcript_page(&client, "p-1".into(), 26, 2, Some(4), Some(80))
+            .await
+            .expect("page");
+        assert_eq!(
+            client.only_call().path,
+            "/v1/projects/p-1/issues/26/runs/2/transcript?before_ordinal=4&limit=80"
+        );
+        assert!(frame.starts_with(r#"{"kind":"history_page""#), "{frame}");
+    }
+
+    /// A run has no `/sync` endpoint, so its baseline transcript response is
+    /// the only place iOS can learn where context compaction split the rows.
+    /// Dropping this metadata leaves the split work cards visible but removes
+    /// the divider that explains why there are two of them.
+    #[tokio::test]
+    async fn a_runs_baseline_carries_compaction_points_into_its_sync_frame() {
+        let client = RecordingClient::new(
+            r#"{"transcript":[{"id":"w5"}],"has_more":false,"oldest_ordinal":2,"newest_ordinal":5,"compaction_points":[{"ordinal":4,"at":"2026-08-27T08:00:00Z"}]}"#,
+        );
+
+        let frame = fetch_run_transcript_baseline(&client, "p-1".into(), 26, 2, Some(80))
+            .await
+            .expect("baseline");
+        let json: serde_json::Value = serde_json::from_str(&frame).expect("parse");
+
+        assert_eq!(json["kind"], "sync_page");
+        assert_eq!(json["compaction_points"][0]["ordinal"], 4);
+        assert_eq!(json["compaction_points"][0]["at"], "2026-08-27T08:00:00Z");
+    }
+
+    /// The board's settings are a FULL REPLACE, and `agents_may_merge` is the
+    /// field where that is dangerous: it is a plain `bool` with no "unset", and
+    /// the gateway defaults a missing one to `false`. So an omission is not
+    /// "leave it alone" — it silently turns a board's merging off, which is
+    /// what every Save from this app did until this field existed. Both
+    /// directions are pinned, because a body that always said `true` would
+    /// pass a test that only checked the interesting one.
+    #[tokio::test]
+    async fn the_settings_body_always_states_whether_the_board_merges() {
+        for merges in [true, false] {
+            let client = RecordingClient::empty();
+            update_project(
+                &client,
+                "p-1".into(),
+                crate::api::ProjectSettings {
+                    name: "rglide".into(),
+                    description: String::new(),
+                    daily_budget_micros: None,
+                    daily_budget_tokens: None,
+                    max_parallel_issue_runs: None,
+                    agents_may_merge: merges,
+                },
+            )
+            .await
+            .expect("update project");
+            let call = client.only_call();
+            assert_eq!(call.method, "PUT");
+            assert_eq!(call.path, "/v1/projects/p-1");
+            assert!(
+                call.body
+                    .contains(&format!("\"agents_may_merge\":{merges}")),
+                "{}",
+                call.body
+            );
+        }
+    }
+
+    /// An id reaches a URL, so it goes through the same gate every other path
+    /// segment on this client does: a separator is REFUSED rather than
+    /// encoded (an id that could carry one could address another route), and
+    /// what is merely awkward is encoded.
+    #[tokio::test]
+    async fn an_avatar_id_is_gated_like_any_path_segment() {
+        let client = RecordingClient::empty();
+        assert!(
+            set_agent_avatar(&client, "a-dev/../sessions".into(), None)
+                .await
+                .is_err()
+        );
+
+        set_agent_avatar(&client, "a dev".into(), None)
+            .await
+            .expect("set avatar");
+        assert_eq!(client.only_call().path, "/v1/agents/a%20dev/avatar");
+    }
+
+    /// The pin is replaced WHOLE, so every level is sent — including the ones
+    /// that are `null`. An encoder that skipped them would leave two thirds of
+    /// a pin pointing at an entry the agent no longer uses, and clearing would
+    /// be unreachable.
+    #[tokio::test]
+    async fn an_agent_model_pin_sends_every_level_including_the_cleared_ones() {
+        let client = RecordingClient::empty();
+        set_agent_model(
+            &client,
+            "a-dev".into(),
+            Some("claude".into()),
+            Some("claude-sonnet-5".into()),
+            None,
+        )
+        .await
+        .expect("set model");
+        let call = client.only_call();
+        assert_eq!(call.method, "PUT");
+        assert_eq!(call.path, "/v1/agents/a-dev/model");
+        assert!(call.body.contains("\"llm\":\"claude\""), "{}", call.body);
+        assert!(
+            call.body.contains("\"model\":\"claude-sonnet-5\""),
+            "{}",
+            call.body
+        );
+        assert!(
+            call.body.contains("\"reasoning_effort\":null"),
+            "an absent level must be sent as null, not omitted: {}",
+            call.body
+        );
+    }
+
+    /// Clearing is all three at once. Anything less leaves a partial pin.
+    #[tokio::test]
+    async fn clearing_a_pin_sends_three_nulls() {
+        let client = RecordingClient::empty();
+        set_agent_model(&client, "a-dev".into(), None, None, None)
+            .await
+            .expect("clear model");
+        let call = client.only_call();
+        assert_eq!(
+            call.body, r#"{"llm":null,"model":null,"reasoning_effort":null}"#,
+            "clearing must name every level"
+        );
+    }
+
+    /// An agent id reaches the PATH, so a traversal attempt is refused rather
+    /// than encoded — the same gate every other path segment goes through.
+    #[tokio::test]
+    async fn an_agent_id_may_not_name_a_path() {
+        let client = RecordingClient::empty();
+        let err = set_agent_model(&client, "../admin".into(), None, None, None)
+            .await
+            .expect_err("a traversal must be refused");
+        assert!(err.contains("agent_id"), "{err}");
     }
 }

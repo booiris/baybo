@@ -35,10 +35,14 @@ vi.stubGlobal(
 
 const TURN_START = "2026-08-16T12:00:00.000Z";
 
-function mount(restored: PersistedState | null): void {
+function mount(restored: PersistedState | null, expandUnansweredTail = false): void {
   render(
     <I18nextProvider i18n={i18n}>
-      <Transcript restored={restored} initialConnEpoch={0} />
+      <Transcript
+        restored={restored}
+        initialConnEpoch={0}
+        expandUnansweredTail={expandUnansweredTail}
+      />
     </I18nextProvider>,
   );
 }
@@ -148,5 +152,87 @@ describe("the working box retires with the turn", () => {
     await pushFrame({ kind: "message", role: "assistant", ordinal: 12, content: "done" });
 
     expect(pendingBox()).toBeNull();
+  });
+});
+
+describe("a read-only transcript's unanswered tail", () => {
+  const baseline = (withOutput: boolean): Record<string, unknown> => ({
+    kind: "sync_page",
+    since_ordinal: null,
+    next_cursor: withOutput ? 6 : 5,
+    rebased: false,
+    oldest_ordinal: 1,
+    has_more_older: false,
+    compaction_points: [{ ordinal: 4, at: "2026-08-16T12:00:04.000Z" }],
+    rows: [
+      {
+        id: "m1",
+        ordinal: 1,
+        kind: "message",
+        role: "user",
+        text: "the errand",
+      },
+      {
+        id: "w2",
+        ordinal: 2,
+        kind: "work",
+        steps: [
+          {
+            kind: "tool",
+            call_id: "c-before",
+            tool: "bash",
+            tool_label: "before compact",
+            tool_status: "ok",
+          },
+        ],
+        turn_complete: false,
+      },
+      {
+        id: "w5",
+        ordinal: 5,
+        kind: "work",
+        steps: [
+          {
+            kind: "tool",
+            call_id: "c-after",
+            tool: "bash",
+            tool_label: "after compact",
+            tool_status: "ok",
+          },
+        ],
+        turn_complete: true,
+      },
+      ...(withOutput
+        ? [
+            {
+              id: "m6",
+              ordinal: 6,
+              kind: "message",
+              role: "assistant",
+              text: "done",
+            },
+          ]
+        : []),
+    ],
+  });
+
+  it("opens every compact-split work half when no final output follows", async () => {
+    mount(null, true);
+    await pushFrame(baseline(false));
+
+    expect(cards()).toHaveLength(2);
+    expect(document.querySelectorAll(".work-steps")).toHaveLength(2);
+    expect(document.body.textContent).toContain("before compact");
+    expect(document.body.textContent).toContain("after compact");
+    expect(document.querySelector(".compaction-divider")?.textContent).toContain("Compacted");
+  });
+
+  it("keeps the same work collapsed once a final output is present", async () => {
+    mount(null, true);
+    await pushFrame(baseline(true));
+
+    expect(cards()).toHaveLength(2);
+    expect(document.querySelectorAll(".work-steps")).toHaveLength(0);
+    expect(document.body.textContent).toContain("done");
   });
 });

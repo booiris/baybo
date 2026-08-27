@@ -1848,6 +1848,128 @@ async fn a_persons_comment_takes_back_the_cancel_and_the_card_goes_again() {
 }
 
 #[tokio::test]
+async fn a_retry_redrives_consequences_left_pending_after_the_comment_insert() {
+    let f = fixture().await;
+    let p = f.manager.create_project(new_project("p")).await.expect("p");
+    let card = f
+        .manager
+        .create_issue(&p.id, IssueActor::User, new_issue("interrupted comment"))
+        .await
+        .expect("card")
+        .into_issue();
+    f.manager
+        .update_issue(
+            &p.id,
+            card.number,
+            IssueActor::User,
+            IssueUpdate {
+                cancelled: Some(true),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("cancel");
+    let client_msg_id =
+        baybo_store::project::IssueEventClientMsgId::parse("01944c32-cc5e-7f5c-9f1c-efaa2a5488a2")
+            .expect("client id");
+    let inserted = f
+        .store
+        .append_event_idempotent(
+            &NewIssueEvent {
+                issue_id: card.id.clone(),
+                project_id: p.id.clone(),
+                number: card.number,
+                actor: IssueActor::User,
+                body: IssueEventBody::Comment {
+                    text: "actually, continue".to_owned(),
+                    attachments: Vec::new(),
+                },
+            },
+            &client_msg_id,
+        )
+        .await
+        .expect("durable insert");
+    let inserted = match inserted {
+        baybo_store::project::IssueEventAppendOutcome::Inserted(row) => row,
+        baybo_store::project::IssueEventAppendOutcome::Existing(_) => panic!("new client id"),
+    };
+    assert!(
+        f.manager
+            .get_issue(&p.id, card.number)
+            .await
+            .expect("issue")
+            .cancelled_at
+            .is_some(),
+        "the simulated interruption happened before uncancelling"
+    );
+
+    let replayed = f
+        .manager
+        .comment_idempotent(
+            &p.id,
+            card.number,
+            IssueActor::User,
+            "a retry's body is not authoritative",
+            &[],
+            client_msg_id.clone(),
+        )
+        .await
+        .expect("retry");
+    assert_eq!(replayed.id, inserted.id);
+    assert!(
+        f.manager
+            .get_issue(&p.id, card.number)
+            .await
+            .expect("issue")
+            .cancelled_at
+            .is_none(),
+        "the retry finishes the consequence the durable row still owed"
+    );
+    let completed = f
+        .store
+        .event_by_client_msg_id(&card.id, &client_msg_id)
+        .await
+        .expect("lookup")
+        .expect("comment");
+    assert!(completed.consequences_applied);
+
+    f.manager
+        .update_issue(
+            &p.id,
+            card.number,
+            IssueActor::User,
+            IssueUpdate {
+                cancelled: Some(true),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("cancel again");
+    f.manager
+        .comment_idempotent(
+            &p.id,
+            card.number,
+            IssueActor::User,
+            "same retry",
+            &[],
+            client_msg_id,
+        )
+        .await
+        .expect("completed replay");
+    assert!(
+        f.manager
+            .get_issue(&p.id, card.number)
+            .await
+            .expect("issue")
+            .cancelled_at
+            .is_some(),
+        "a completed replay repeats no consequence"
+    );
+}
+
+#[tokio::test]
 async fn an_agents_comment_does_not_take_back_a_cancel() {
     let f = fixture().await;
     let p = f.manager.create_project(new_project("p")).await.expect("p");
@@ -2772,7 +2894,17 @@ forwards_everything_else! {
         -> StoreResult<bool>;
     enqueue_run(new: &NewIssueRun) -> StoreResult<IssueRunRow>;
     append_event(new: &NewIssueEvent) -> StoreResult<IssueEventRow>;
+    append_event_idempotent(
+        new: &NewIssueEvent,
+        client_msg_id: &baybo_store::project::IssueEventClientMsgId
+    ) -> StoreResult<baybo_store::project::IssueEventAppendOutcome>;
+    event_by_client_msg_id(
+        issue: &IssueId,
+        client_msg_id: &baybo_store::project::IssueEventClientMsgId
+    ) -> StoreResult<Option<baybo_store::project::IdempotentIssueEvent>>;
+    mark_comment_consequences_applied(event: &baybo_model::IssueEventId) -> StoreResult<bool>;
     list_events(issue: &IssueId) -> StoreResult<Vec<IssueEventRow>>;
+    first_unread_event(issue: &IssueId) -> StoreResult<Option<baybo_model::IssueEventId>>;
     agent_opened_issues(project: &ProjectId) -> StoreResult<Vec<i64>>;
     events_since(issue: &IssueId, since: DateTime<Utc>) -> StoreResult<Vec<IssueEventRow>>;
     set_issue_branch(id: &IssueId, branch: &str) -> StoreResult<bool>;

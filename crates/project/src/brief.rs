@@ -725,6 +725,7 @@ mod tests {
                 text: text.to_owned(),
                 attachments: Vec::new(),
             },
+            client_msg_id: None,
             created_at: issue.created_at,
         }
     }

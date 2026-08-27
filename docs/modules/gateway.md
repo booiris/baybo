@@ -691,7 +691,7 @@ GET    /v1/projects/:project_id/issues/:number/runs/:attempt/transcript  the con
 POST   /v1/projects/:project_id/issues/:number/runs/cancel  ask the board to call the run off: an executing one stops the way `/stop` stops a reply, one no executor claimed is cancelled outright; 204
 POST   /v1/projects/:project_id/issues/:number/runs/retry   run the card again → 201 the new run
 GET    /v1/projects/:project_id/issues/:number/events   the card's timeline, oldest first
-POST   /v1/projects/:project_id/issues/:number/comments  record a comment → the timeline entry it became
+POST   /v1/projects/:project_id/issues/:number/comments  record a comment → the timeline entry it became; optional client_msg_id UUID makes retries return the original row without repeating side effects
 POST   /v1/projects/:project_id/issues/:number/approvals/:call_id  answer the prompt parked on that call; 204
 POST   /v1/projects/:project_id/issues/:number/read     this card's unread count resets; 204
 POST   /v1/projects/:project_id/read    every card on the board reads zero; 204

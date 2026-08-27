@@ -88,6 +88,16 @@ From the live `:root` block in `app/ios/web/src/styles.css`:
 reserved for text and deliberate line elements. `--color-line-strong` is the heavier
 neutral rule (blockquote edges, dividers) — still neutral, still 1–2px.
 
+**Projects draws its boxes at `--color-line-strong`; every other surface uses
+`--color-line`** (2026-08-25). A board puts a five-segment control, two chips, a row of
+face circles and a wall of card outlines on one screen — a far denser field of borders
+than a chat list — and at the light hairline the whole tab washed out into the paper.
+Raising the base for the whole app was tried first and rejected: where a hairline
+separates two lines of text and nothing else (the chat list, Settings) the heavier weight
+reads as ruled paper. The card page carries the rule by redefining `--color-line` for its
+own document; the composer is the one exception, because the card dock shares it with the
+chat.
+
 The same `:root` block also carries the transcript's **layout knobs**, each with one
 source of truth:
 
@@ -113,7 +123,8 @@ source of truth:
 ### Swift-side mirror (`Theme.swift`)
 
 `Theme` holds the same palette as `Color` values — `paper` white, `surface` 0.98 grey,
-`ink` `#111111`, `inkSoft` `#6B6B6B`, `line` `#E4E4E4`, `err` `#D40000` — plus:
+`ink` `#111111`, `inkSoft` `#6B6B6B`, `line` `#E4E4E4`, `lineStrong` `#BCBCBC` (Projects
+only — see above), `err` `#D40000` — plus:
 
 - `Theme.radius = 14` — the CSS `--radius`, for in-plane inset boxes.
 - `Theme.radiusModal = 20` — **floating layers only** (the confirm dialog). In-plane inset
@@ -140,11 +151,36 @@ destructive/error only. Everything else is monochrome ink. No decorative hues.
 This is why, for example, the message-index landing ring is an ink ring rather than a
 coloured one, and why the failed-send glyph is the one red thing in the thread.
 
+**One exception, and it is a STATE one** (2026-08-26): the project card page tints its
+status and priority chips, and the sub-issue dots that say the same thing
+(`web/src/issue/issue.css`, the `--state-*` / `--prio-*` table). A card's status and its
+priority are what a board is scanned for — read in a glance rather than in a sentence —
+and in ink-soft a card in Review was indistinguishable from one in Backlog until you read
+the word. The rules that keep it from becoming decoration:
+
+- **Muted, and tinted rather than filled.** Each hue clears 4.5:1 on paper at 10.5px, and
+  a chip wears the hue as its text, a 45%-blended border and a 7% wash — never a solid
+  fill. Every one of these chips is a BUTTON that raises a picker, and a solid coloured
+  pill reads as a thing to press for consequence rather than a thing saying what is true.
+- **Keyed by the value, not by the element.** `[data-status]` / `[data-priority]`, so the
+  chips and the sub-issue dots read one table and the page cannot say `done` in two
+  colours.
+- **It stops where it stops meaning something.** Priority is coloured at Urgent and High
+  only — medium, low and none are the resting cases — and a queued or held run is not
+  tinted, because a run waiting for a slot is not a run in motion. `backlog` is absent
+  from the table for the same reason and keeps the neutral ink-soft: nothing scheduled is
+  not a state to point at. The wash and the tinted border are keyed to the same six
+  values, not to the attribute's presence, so a neutral chip is neutral all the way down.
+
+Nothing else in the app takes a hue. A second surface wanting one is a conversation, not a
+precedent.
+
 ### Borders
 
 **1px hairlines.** Light `--color-line` for incidental containers (inputs, bubbles,
-chips); ink for deliberate line elements (the wordmark rule, focus). `--color-line-strong`
-where a neutral rule needs more weight than a hairline (quote edges, dividers). **Never
+chips) — `--color-line-strong` for those same containers inside Projects; ink for
+deliberate line elements (the wordmark rule, focus). `--color-line-strong` also carries a
+neutral rule that needs more weight than a hairline (quote edges, dividers). **Never
 heavier than 1px** for the incidental case.
 
 ### Corners
@@ -249,8 +285,9 @@ whole mechanism rather than fight it per-block.
 
 ## Recorded deviations
 
-The custom **Liquid Glass** surfaces — the chat composer dock, the jump-to-latest button,
-and the Chats header's compose circle — are a deliberate, recorded departure from the flat
+The custom **Liquid Glass** surfaces — the chat composer dock, the project card's dock
+(the same `ComposerPill`, since 2026-08-25), the jump-to-latest button, and the Chats
+header's compose circle — are a deliberate, recorded departure from the flat
 monochrome system (glass is neither flat nor strictly ink-on-paper). They are documented in
 [navigation.md](navigation.md), which also holds the constraints they carry (white tint
 only, borderless composer pill, bare glass on the discs) and the `glassSurface` shim every

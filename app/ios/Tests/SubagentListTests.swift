@@ -23,6 +23,7 @@ struct SubagentListTests {
             status: .running, client: FakeBayboClient())
         #expect(store.mirrored == false)
         #expect(store.listed == false)
+        #expect(store.expandsUnansweredTail)
     }
 
     /// The errand the parent authored is what names a row. A child spawned

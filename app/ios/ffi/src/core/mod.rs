@@ -21,4 +21,4 @@ pub use error::MobileError;
 pub use pairing::{PairChallenge, PairedSummary, PairingClient, PairingRequest};
 
 pub use baybo_model::ApprovalDecision as WireApprovalDecision;
-pub use wire::{AttachmentKind, Frame, WireAttachment, decode, encode};
+pub use wire::{AttachmentKind, Frame, ProjectChangeScope, WireAttachment, decode, encode};

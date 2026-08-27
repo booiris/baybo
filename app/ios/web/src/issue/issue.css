@@ -1,0 +1,641 @@
+/* The card page. Reuses the transcript's tokens from styles.css — the two
+   surfaces sit under the same native chrome, and a second palette here would
+   show as a seam the moment a card is pushed off a board.
+
+   Those tokens are spelled `--color-ink` / `--font-mono`, and this file spelled
+   them `--ink` / `--mono` until 2026-08-25 — 36 references to seven variables
+   that do not exist. Nothing failed: an unresolvable `var()` is invalid at
+   computed-value time, so each declaration quietly fell back. The page lost
+   every hairline (`border: 1px solid var(--line)` unsets the whole shorthand,
+   taking `border-style` to `none`), every mono run, and both surface fills, and
+   went on rendering as a plausible page in the wrong clothes. A missing token
+   is silent by design — the only thing that catches one is spelling it the way
+   styles.css does. */
+
+:root {
+  /* This page is a Projects surface, and Projects draws its boxes a step
+     heavier than the rest of the app (see `Theme.lineStrong`) — it sits under
+     the same native chrome as the board that pushed it, and a card whose boxes
+     are lighter than the row it came from reads as a different app. Redefined
+     for the whole document rather than at each border, so this page cannot end
+     up carrying two weights. */
+  --color-line: var(--color-line-strong);
+
+  /* The face column, shared by the posts and by the rail the machinery lines
+     hang their dot on — two rules that must agree or the card grows a second
+     left margin halfway down. */
+  --face: 26px;
+  --face-gap: 8px;
+
+  /* ---- state hues --------------------------------------------------------
+     The app's ONE departure from ink-on-paper, and it is scoped to this page
+     (see `docs/design-system.md` § Colour is for STATE): a card's status and
+     its priority are what a board is scanned for, they are read in a glance
+     rather than in a sentence, and in ink-soft a card in Review looked exactly
+     like a card in Backlog until you read the word.
+
+     Muted on purpose — these tint 10.5px mono text and a 7% wash behind it, so
+     each one clears 4.5:1 on paper; a saturated palette would turn the band
+     under the description into the loudest thing on a page whose subject is
+     the text above it. The VALUE is the key (`[data-status]` /
+     `[data-priority]`), so the chips and the sub-issue dots read one table and
+     the page cannot say `done` in two colours.
+
+     A value that is not in the table has no hue and keeps the neutral
+     ink-soft: `backlog` (nothing scheduled is not a state to point at) and
+     priority below High (medium, low and none are the resting cases). A hue on
+     every value would put a second rainbow beside the first; what is left
+     coloured is what an operator is meant to act on. */
+  --state-todo: #3d5a99;
+  --state-progress: #a35a00;
+  --state-review: #6b3fa0;
+  --state-done: #157a4d;
+  --prio-urgent: var(--color-err);
+  --prio-high: #b3261e;
+}
+
+/* The table itself. Scoped to the page rather than written bare, so a `[data-
+   status]` that ever appears outside it — the loading line, whatever is added
+   beside this page next — does not silently inherit a card's vocabulary. What
+   keeps it out of the card's own PROSE is upstream, and worth knowing: the
+   markdown pipeline carries no `rehype-raw`, so agent-authored text cannot emit
+   an attribute at all. Adding raw HTML there would put this table in reach of
+   whatever an agent writes. */
+.issue-page [data-status="todo"] { --state-hue: var(--state-todo); }
+.issue-page [data-status="in_progress"] { --state-hue: var(--state-progress); }
+.issue-page [data-status="review"] { --state-hue: var(--state-review); }
+.issue-page [data-status="done"] { --state-hue: var(--state-done); }
+.issue-page [data-priority="urgent"] { --state-hue: var(--prio-urgent); }
+.issue-page [data-priority="high"] { --state-hue: var(--prio-high); }
+/* A live run is the card's status in motion, so it borrows the status it means
+   rather than inventing a third vocabulary for the same three states. Only
+   `running`: the row draws the one UNSETTLED run, so `done` and `failed`
+   cannot reach it, and a queued or held run is not a run in motion. */
+.issue-page [data-run="running"] { --state-hue: var(--state-progress); }
+
+.issue-page {
+  height: 100dvh;
+  overflow-y: auto;
+  /* ONE axis. Not defensive tidiness: `overflow-y: auto` alone computes the
+     other axis to `auto` too, so any single thing wider than the band — a
+     title with an unbroken token in it, a branch name on the meta line — made
+     the whole card pan sideways under the finger, native header and all. The
+     wrap rules below are what keep that from turning into content clipped at
+     the edge instead; this line is what makes the page unable to pan whatever
+     they miss. */
+  overflow-x: hidden;
+  /* ...and nothing gets CLIPPED at that edge instead, which is the failure the
+     clamp on its own would have traded up for. The transcript's own prose rule
+     (`.msg.assistant`), applied to the whole page for the same reason it is
+     applied to a whole message: everything here is somebody's text — a title
+     that is a file path, a `project-<ULID>/feat/<slug>` branch on the meta
+     line, a URL in a comment, an agent's sentence about what it merged — and a
+     rule listing the rows that happened to overflow last would be a list that
+     the next kind of card falls off. `.md-table-wrap` already resets `word-
+     break` for cells, which is the one place breaking anywhere is wrong. */
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  -webkit-overflow-scrolling: touch;
+  /* The native header FLOATS over this page — it is a veil, not a bar — so the
+     content clears it here. `env()` works because the entry sets
+     `viewport-fit=cover`; the 58px matches `ChatListScreen.topContentMargin`,
+     which is the bar height plus a breath. */
+  padding: calc(env(safe-area-inset-top, 0px) + 58px) 20px 0;
+  box-sizing: border-box;
+  color: var(--color-ink);
+  background: var(--color-paper);
+}
+
+/* The card's own WORDS opt back in to selection and the iOS long-press Copy
+   callout, which `:root` turns off for the whole document (see `styles.css` —
+   the transcript's `.bubble` / `.msg` list is the same opt-in, and this page
+   was simply never added to it). A branch name is the clearest case: it exists
+   to be pasted into a terminal.
+
+   Controls stay inert on purpose. A chip, the fold, `Open run ›` and the
+   sub-issue rows are things you press, and a long press that starts selecting
+   the label instead of firing the button is the web-in-an-app tell this whole
+   rule exists to avoid. */
+.issue-head h1,
+.issue-meta,
+.issue-body,
+.issue-box,
+.issue-blocked,
+.issue-line-text {
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-touch-callout: default;
+}
+
+.issue-loading {
+  padding: calc(env(safe-area-inset-top, 0px) + 90px) 20px 40px;
+  text-align: center;
+  color: var(--color-ink-soft);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+#issue-root.issue-retargeting {
+  visibility: hidden;
+}
+
+.issue-head h1 {
+  margin: 0 0 8px;
+  font-family: var(--font-sans);
+  font-size: 17px;
+  font-weight: 600;
+  line-height: 1.3;
+  letter-spacing: -0.01em;
+}
+
+.issue-head h1.cancelled,
+.issue-subs .cancelled {
+  text-decoration: line-through;
+  color: var(--color-ink-soft);
+}
+
+/* State, under the text it is about. The chips used to sit between the title
+   and the first sentence, which put a row of pills in front of the two things
+   a card is opened to find out. */
+.issue-state {
+  /* No top margin: the description's section already carries 22px below it and
+     the two collapse, so one written here would be inert and read as a spacing
+     knob that does nothing. */
+  margin: 0 0 22px;
+}
+
+.issue-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* Provenance, at the weight provenance deserves: who opened the card and when,
+   the branch, the parent. None of it is a control — the one link here is the
+   parent — so none of it is a chip. */
+.issue-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 5px;
+  margin-bottom: 14px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--color-ink-soft);
+}
+
+.issue-meta button {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--color-ink);
+  background: transparent;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+}
+
+.issue-meta-dot {
+  opacity: 0.5;
+}
+
+/* The card's own text sits directly under the head — no box, no author bar.
+   It is what the title is about, and the title is one line above it. */
+
+/* CARD PROSE, and the only type spec on this page that leaves the monospace
+   chrome behind: the description and every comment body, in one rule so the
+   two cannot drift. Inter a notch under the transcript's (which is 1rem/1.6)
+   — a card is scanned where a conversation is read — but not as tight: 1.65
+   over 14px is 23px a line, and the description is the one paragraph on this
+   page somebody reads straight through. */
+.issue-body,
+.issue-box {
+  font-family: var(--font-sans);
+  font-size: 0.875rem;
+  line-height: 1.65;
+}
+
+.issue-chip {
+  /* No hue is the resting case — an assignee is a person, not a state, and a
+     priority of `none` is the absence of one. Declared here rather than left
+     unset so the tinted rules below stay valid: an undefined custom property
+     makes `color: var(--state-hue)` invalid at computed-value time, which
+     lands on inherited ink rather than on this. */
+  --state-hue: var(--color-ink-soft);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--state-hue);
+  background: transparent;
+  border: 1px solid var(--color-line);
+  border-radius: 999px;
+  padding: 0 10px;
+  /* 28px, not the 44 a standalone control gets: these sit in a wrapping row
+     under the description, and a 44pt chip row would push the first comment
+     off the screen. Nothing here is destructive. */
+  min-height: 28px;
+  cursor: pointer;
+}
+
+/* Tinted, never filled: these are BUTTONS — each raises a picker — and a solid
+   coloured pill on a card reads as a thing to press for consequence rather
+   than a thing that says what is true. The wash is what makes the hue survive
+   next to a neutral chip; the border carries the rest. */
+.issue-chip:is(
+    [data-status="todo"],
+    [data-status="in_progress"],
+    [data-status="review"],
+    [data-status="done"],
+    [data-priority="urgent"],
+    [data-priority="high"]
+  ) {
+  border-color: color-mix(in srgb, var(--state-hue) 45%, var(--color-line));
+  background: color-mix(in srgb, var(--state-hue) 7%, var(--color-paper));
+}
+
+.issue-blocked {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  padding: 10px 12px;
+  margin-top: 10px;
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius);
+  background: var(--color-surface);
+  font-size: 12.5px;
+}
+
+.issue-blocked-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--color-ink-soft);
+  white-space: nowrap;
+}
+
+/* One LINE, not a box: a run is a state of the card, and a bordered rectangle
+   for it put a second frame between the card's state and its first comment. */
+.issue-run {
+  --state-hue: var(--color-ink-soft);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 0 0;
+  font-size: 12.5px;
+}
+
+/* Queued and held are NOT tinted: a run waiting for a slot is not a run in
+   motion, and colouring them the same makes the one word this line exists for
+   stop meaning anything. */
+.issue-run-word {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--state-hue);
+}
+
+.issue-run-who {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--color-ink-soft);
+}
+
+.issue-run-open,
+.issue-subs button,
+.issue-fold button {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--color-ink);
+  background: transparent;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  text-align: left;
+}
+
+/* The only control on the run LINE, so it reads as one: a bordered pill here
+   put the page's third capsule in the first 120px of it. */
+.issue-run-open {
+  margin-left: auto;
+  color: var(--color-ink);
+  min-height: 32px;
+  padding-left: 10px;
+}
+
+.issue-section {
+  margin: 0 0 22px;
+}
+
+.issue-section h2 {
+  margin: 0 0 8px;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  font-weight: 400;
+  color: var(--color-ink-soft);
+}
+
+/* A hairline running out of the heading to the page edge — the `NEW` rule's
+   shape in the neutral tone. Activity is where the card stops being a record
+   of what it IS and starts being what was said about it, and that is the one
+   seam on the page worth drawing. */
+.issue-section h2.issue-ruled {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.issue-section h2.issue-ruled::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--color-line);
+}
+
+.issue-count {
+  letter-spacing: 0;
+}
+
+.issue-empty {
+  margin: 0;
+  color: var(--color-ink-soft);
+  font-size: 12.5px;
+}
+
+.issue-attachments {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.issue-subs,
+.issue-activity {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.issue-subs li {
+  padding: 7px 0;
+  border-bottom: 1px solid var(--color-line);
+}
+
+.issue-subs button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 30px;
+  font-size: 12.5px;
+  font-family: inherit;
+}
+
+/* The same hue table the chips read, so a child row and the chip a tap away
+   from it agree about what `done` looks like. Filled once it IS done — the
+   one state a child list is scanned for. */
+.issue-sub-dot {
+  --state-hue: var(--color-ink-soft);
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  border: 1px solid var(--state-hue);
+  flex: none;
+}
+
+.issue-sub-dot[data-status="done"] {
+  background: var(--state-hue);
+}
+
+/* ---- posts and lines -------------------------------------------------------
+
+   What somebody said is a boxed post with a face beside it; what the board did
+   is one line on the same left rail. The split is what keeps a long card
+   readable: the eye finds the next thing a person wrote by running down the
+   face column, and machinery that wore the same frame would make the card a
+   wall of identical rectangles. */
+
+.issue-entry {
+  padding: 7px 0;
+}
+
+/* The post is a BLOCK, not a face beside a column: the head carries the face
+   and the box below it runs the page's whole width. A comment is the longest
+   thing on a card, and a 34px column of nothing down its left was the price of
+   putting the face beside the words instead of above them. */
+.issue-post {
+  display: block;
+}
+
+.issue-face {
+  width: var(--face);
+  height: var(--face);
+  flex: none;
+  box-sizing: border-box;
+  border: 1px solid var(--color-line);
+  border-radius: 50%;
+  background: var(--color-surface);
+  object-fit: cover;
+  overflow: hidden;
+  /* The monogram, when there is no picture. Centred by grid rather than
+     line-height so a two- and a three-glyph monogram sit identically. */
+  display: inline-grid;
+  place-items: center;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  color: var(--color-ink-soft);
+}
+
+/* The operator is the one filled disc — the same ink their chat bubble wears.
+   The board's own entries are hairline and dashed: a thing, but not a person. */
+.issue-face.user {
+  background: var(--color-ink);
+  border-color: var(--color-ink);
+}
+
+.issue-face.system {
+  border-style: dashed;
+}
+
+/* **Outside the box** as of 2026-08-26. It used to be a bar INSIDE it — a
+   filled strip with its own bottom hairline and its own corner radius, under a
+   tail pointing back at the face — which made every comment three nested
+   rectangles deep to say two things a caption says. What is left is one line
+   of provenance at the weight the meta line under the title already uses. */
+.issue-said-head {
+  display: flex;
+  align-items: center;
+  gap: var(--face-gap);
+  margin-bottom: 6px;
+  font-family: var(--font-mono);
+}
+
+.issue-said-who {
+  font-size: 10.5px;
+  color: var(--color-ink);
+}
+
+/* Straight after the handle, not flung to the right edge: the head is a
+   CAPTION for the box under it, and the box is now as wide as what was said —
+   a time parked at the band's edge belonged to a full-width row that no longer
+   exists, and over a two-word answer it read as a column of its own. */
+.issue-said-when {
+  font-size: 9.5px;
+  color: var(--color-ink-soft);
+  white-space: nowrap;
+}
+
+/* The words, and nothing else: no head, and no tail either — the tail pointed
+   at a name that is no longer in here, and a bubble's horn on a card that is a
+   record rather than a chat was always borrowing somebody else's shape.
+   Held off the page's rail by half a face — derived from the face column
+   rather than eyeballed, so widening the face keeps the box under the handle
+   it belongs to instead of drifting off it.
+
+   `fit-content`: a box is as wide as what was said. Every comment stretched to
+   the full band before, which made a three-word answer a full-width rectangle
+   with one line of text in the corner of it — and made two comments of very
+   different lengths look like the same amount of speech. */
+.issue-box {
+  position: relative;
+  width: fit-content;
+  max-width: 100%;
+  margin-left: calc(var(--face) / 2);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius);
+  background: var(--color-paper);
+  padding: 7px 10px;
+}
+
+/* The operator's own words are INKED — the same fill their message wears in
+   the chat. A card is scanned for "what did I already answer", and on a page
+   where every other box is a hairline on paper, one filled box is the only
+   mark that survives being read past at speed. */
+.issue-entry[data-actor="user"] .issue-box {
+  background: var(--color-ink);
+  border-color: var(--color-ink);
+  color: var(--color-paper);
+}
+
+/* Markdown inside an inked box: a comment is rendered prose, so the chips and
+   rules `.md` draws on paper have to be told about the dark ground or they
+   arrive as light-grey holes in it. */
+.issue-entry[data-actor="user"] .issue-box :is(code, pre) {
+  background: color-mix(in srgb, var(--color-paper) 16%, transparent);
+  border-color: transparent;
+  color: inherit;
+}
+
+.issue-entry[data-actor="user"] .issue-box a {
+  color: inherit;
+}
+
+.issue-entry[data-actor="user"] .issue-box blockquote {
+  border-left-color: color-mix(in srgb, var(--color-paper) 40%, transparent);
+  color: color-mix(in srgb, var(--color-paper) 75%, transparent);
+}
+
+.issue-line {
+  display: flex;
+  align-items: baseline;
+  gap: var(--face-gap);
+  padding: 4px 0;
+  font-size: 11.5px;
+  color: var(--color-ink-soft);
+}
+
+/* A dot on the page's own left rail, at the head of the face column — the
+   posts' faces start there too, so the Activity has ONE left edge rather than
+   a machinery margin inset half a face from it.
+   `1lh` and not `1em`: the box is the first LINE, so the dot centres on the
+   line it belongs to and a sentence that wraps does not drag it halfway down
+   the entry. The old box was `1em` tall with the dot at its middle, which
+   under `align-items: baseline` put it ~3px above the text it labels. */
+.issue-line-dot {
+  width: var(--face);
+  height: 1lh;
+  flex: none;
+  align-self: flex-start;
+  display: flex;
+  align-items: center;
+}
+
+.issue-line-dot::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--color-line-strong);
+}
+
+.issue-line-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.issue-line-who {
+  font-family: var(--font-mono);
+}
+
+.issue-line-when {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  white-space: nowrap;
+}
+
+.issue-fold {
+  /* On the page's own left rail, where the faces and the machinery dots start
+     — not indented onto the box column with the things somebody said. A
+     closed run is a fold in the record, not an entry in it, and starting it
+     under the boxes made the Activity read as a list with a ragged left
+     edge. */
+  padding: 6px 0;
+}
+
+.issue-fold button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--color-ink-soft);
+  min-height: 32px;
+}
+
+/* `.work-chevron`'s rule, for its reason: one mark that turns, so opening a
+   fold cannot move it. `line-height: 1` is what keeps the glyph's own box from
+   deciding where the rotation happens. */
+.issue-chevron {
+  display: inline-block;
+  line-height: 1;
+  transition: transform 120ms ease;
+}
+
+.issue-chevron.open {
+  transform: translateY(1px) rotate(90deg);
+}
+
+/* Where the operator stopped reading. The one red thing on this page besides a
+   failed run — the same hue the card row's unread count wears, because it marks
+   the same fact and a second colour for it would read as a second fact. */
+.issue-unread-rule {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 14px 0 2px;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--color-err);
+  /* Scrolled to the TOP of the viewport, so the rule needs the page's own top
+     padding under the floating native header cleared or it lands beneath it. */
+  scroll-margin-top: calc(env(safe-area-inset-top, 0px) + 70px);
+}
+
+.issue-unread-rule::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--color-err);
+  opacity: 0.35;
+}

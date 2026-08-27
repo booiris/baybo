@@ -6,4 +6,4 @@
  * once. A discriminant, not a payload — the same role [`ActivityKind`]
  * plays on [`Frame::SessionActivity`].
  */
-export type ProjectChangeScope = "project" | "board" | "run" | "timeline";
+export type ProjectChangeScope = "project" | "board" | "run" | "timeline" | "unknown";

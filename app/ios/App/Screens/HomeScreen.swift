@@ -1,9 +1,10 @@
+import Combine
 import SwiftUI
 
 /// The bound app's home: a NATIVE `TabView` (Liquid Glass bar on iOS 26+, the
 /// classic system bar on 18–25) over
-/// four sections — Agents · Projects · Chats · Settings. Only Chats and Settings
-/// have real screens; Agents/Projects are placeholders. The chat push lives on the
+/// five sections — Deck · Projects · Chats · Settings · Search. The chat push
+/// lives on the
 /// OUTER `NavigationStack` in `RootView` that WRAPS this TabView, so a pushed
 /// `ChatScreen` covers the whole shell (tab bar included) and both slide back
 /// together on pop — an inner-stack `.toolbar(.hidden, for: .tabBar)` instead
@@ -18,6 +19,18 @@ import SwiftUI
 struct HomeTabView: View {
     @EnvironmentObject private var store: AppStore
     @ObservedObject private var lang = Lang.shared
+    /// Only for the Chats badge — the same rows the app icon counts.
+    @ObservedObject private var index = SessionIndex.shared
+    /// The Projects badge, pulled forward rather than read through `store`.
+    ///
+    /// `AppStore.projectsStore` is a nested `ObservableObject`, so its changes
+    /// do NOT republish `AppStore` and would leave this badge frozen at
+    /// whatever it read on first paint — a bug the demo fixture cannot show,
+    /// because that seeds before the first render. `@ObservedObject` is not
+    /// available for it (the instance comes from the environment), and making
+    /// `AppStore` forward the whole `objectWillChange` would repaint the chat
+    /// list on every board fetch. One published Int is the narrow version.
+    @State private var projectsWaiting = 0
 
     var body: some View {
         TabView(selection: searchAwareSelection) {
@@ -30,6 +43,14 @@ struct HomeTabView: View {
                 Tab(lang.t(tab.labelKey), systemImage: tab.icon, value: tab, role: tab.role) {
                     content(for: tab)
                 }
+                // A count rather than a dot, and the same shape on both tabs
+                // that carry one. It reads as a promise the press can keep:
+                // Chats opens a list whose rows each discharge part of it, and
+                // Projects opens the cards, whose rows carry the same per-board
+                // number, which is the board's parked approvals. Nothing pushes
+                // a board, so this only moves while the app is foreground —
+                // which is the honest state of the feature.
+                .badge(badge(for: tab))
             }
         }
         .tint(Theme.ink)
@@ -42,6 +63,16 @@ struct HomeTabView: View {
         // dismisses interactively. The chat composer is out of scope entirely: it
         // lives inside a pushed `ChatScreen` that covers this whole view.
         .ignoresSafeArea(.keyboard)
+        // A `Published` publisher replays its current value on subscribe, so
+        // this also seeds the badge rather than only tracking it from here on.
+        .onReceive(store.projectsStore.$attention) { attention in
+            // Parked approvals only — the same set a board's Waiting strip
+            // shows and a card's own badge counts. The server's `/attention`
+            // also counts failed runs and unread cards; neither is waiting on
+            // an answer, and a tab badge that cannot be discharged by
+            // answering anything is a mark you learn to ignore.
+            projectsWaiting = attention.values.reduce(0) { $0 + Int($1.approvals) }
+        }
         #if DEBUG
             .task { await demoTabCycleIfRequested() }
         #endif
@@ -87,7 +118,18 @@ struct HomeTabView: View {
         case .deck:
             section { DeckScreen() }
         case .projects:
-            section { PlaceholderScreen(icon: tab.icon, titleKey: tab.labelKey) }
+            // New project lives in the header, beside the wordmark — the same
+            // slot Chats puts compose in. It was a dashed card at the FOOT of
+            // the list, which put the one thing you cannot reach any other way
+            // behind however many boards you happen to have.
+            section(
+                action: {
+                    Haptics.tap()
+                    store.openNewProject()
+                }, icon: "plus", labelKey: "projects.new"
+            ) {
+                ProjectsScreen(store: store.projectsStore)
+            }
         case .search:
             // No `section` wrapper: this screen's field IS its header, and the
             // shared wordmark stacked above a search field is one header too many.
@@ -123,11 +165,31 @@ struct HomeTabView: View {
     }
 
 
+    /// What a tab's badge counts, or `0` for no badge.
+    ///
+    /// Chats reuses the very number the app icon already carries, so the two
+    /// cannot disagree by construction. Projects sums what every live board is
+    /// waiting on — approvals, failed runs, unread — which is exactly the set
+    /// `/projects/attention` reports and deliberately excludes runs the daily
+    /// ceiling is holding: a hold is a standing condition, not an event, and a
+    /// badge that cannot be cleared by acting is the one this feature already
+    /// got a complaint about on the web.
+    private func badge(for tab: AppStore.HomeTab) -> Int {
+        switch tab {
+        case .chats: BadgeCenter.total(index.rows)
+        case .projects: projectsWaiting
+        case .deck, .settings, .search: 0
+        }
+    }
+
     /// Non-chat sections: content under the shared wordmark header.
-    private func section<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
+    private func section<Content: View>(
+        action: (() -> Void)? = nil, icon: String = "plus", labelKey: String = "",
+        @ViewBuilder _ content: () -> Content
+    ) -> some View {
         ZStack(alignment: .top) {
             content()
-            HomeHeaderView()
+            HomeHeaderView(onAction: action, actionIcon: icon, actionLabelKey: labelKey)
         }
         .background(Theme.paper)
     }
@@ -188,7 +250,13 @@ extension AppStore.HomeTab {
 /// under it.
 struct HomeHeaderView: View {
     var notice: String? = nil
-    var onCompose: (() -> Void)? = nil
+    /// The trailing glass circle: this section's ONE action. Chats mints a
+    /// conversation, Projects a board. The glyph and label ride along rather
+    /// than being hardcoded here — the button is the header's, what it does is
+    /// the section's.
+    var onAction: (() -> Void)? = nil
+    var actionIcon: String = "square.and.pencil"
+    var actionLabelKey: String = "list.newChat"
     /// Chats only: the ☰ menu's entries — push the archived list, and the live
     /// scheduled jobs. The menu renders iff `onArchived` is set; both entries
     /// belong to the same Chats-only surface.
@@ -242,17 +310,18 @@ struct HomeHeaderView: View {
                     }
                 }
 
-                if let onCompose {
+                if let onAction {
                     HStack {
                         Spacer()
-                        Button(action: onCompose) {
-                            Image(systemName: "square.and.pencil")
+                        Button(action: onAction) {
+                            Image(systemName: actionIcon)
                                 .font(.system(size: 16, weight: .medium))
                                 .foregroundStyle(Theme.ink)
                                 .frame(width: 45, height: 45)
                         }
                         .glassSurface(interactive: true, in: .circle)
-                        .accessibilityLabel(Text(verbatim: Lang.shared.t("list.newChat")))
+                        .accessibilityIdentifier("header-action")
+                        .accessibilityLabel(Text(verbatim: Lang.shared.t(actionLabelKey)))
                     }
                 }
             }

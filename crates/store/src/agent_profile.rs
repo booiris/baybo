@@ -109,6 +109,12 @@ pub trait AgentProfileStore: Send + Sync {
     /// `Ok(false)` if no row matched.
     async fn set_avatar(&self, id: &AgentProfileId, blob_id: Option<&str>) -> Result<bool>;
 
+    /// Set the avatar only while the row is still faceless. This is the
+    /// compare-and-set door for generated defaults racing an operator's
+    /// explicit choice. Returns `Ok(false)` when the row is missing or already
+    /// has an avatar.
+    async fn set_avatar_if_empty(&self, id: &AgentProfileId, blob_id: &str) -> Result<bool>;
+
     /// Replace the LLM pin whole and bump `updated_at`.
     ///
     /// Whole, not per-level: the entry, the model within it and the thinking

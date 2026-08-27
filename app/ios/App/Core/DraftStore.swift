@@ -67,7 +67,6 @@ struct Draft: Codable, Equatable {
 /// Rust side opens it TWICE, once to hash and once for the body; see
 /// `ComposerStaging.discard`.)
 enum DraftStore {
-    private static let rootName = "drafts"
     private static let recordName = "draft.json"
     private static let thumbSuffix = "thumb"
     private static let sourceSuffix = "src"
@@ -75,9 +74,9 @@ enum DraftStore {
     // MARK: - Reading
 
     static func read(
-        sessionId: String, in supportDirectory: URL = SessionIndex.supportDirectory()
+        key: DraftKey, in supportDirectory: URL = SessionIndex.supportDirectory()
     ) -> Draft? {
-        let url = directory(for: sessionId, in: supportDirectory)
+        let url = directory(for: key, in: supportDirectory)
             .appendingPathComponent(recordName)
         guard let data = try? Data(contentsOf: url) else { return nil }
         return try? JSONDecoder().decode(Draft.self, from: data)
@@ -87,10 +86,12 @@ enum DraftStore {
     /// unsent new-chat draft the user walked away from: a draft session has no
     /// registry row and no gateway row, so nothing else on the device can name
     /// it, and minting a fresh id would strand it forever.
+    /// **`.chat` only.** A card's comment draft lives under its own root
+    /// precisely so it can never be answered here — see `DraftScope`.
     static func sessionIds(in supportDirectory: URL = SessionIndex.supportDirectory()) -> [String] {
         let contents =
             (try? FileManager.default.contentsOfDirectory(
-                at: root(in: supportDirectory), includingPropertiesForKeys: nil)) ?? []
+                at: root(.chat, in: supportDirectory), includingPropertiesForKeys: nil)) ?? []
         return contents.filter { url in
             FileManager.default.fileExists(
                 atPath: url.appendingPathComponent(recordName).path)
@@ -102,7 +103,7 @@ enum DraftStore {
     static func modified(
         sessionId: String, in supportDirectory: URL = SessionIndex.supportDirectory()
     ) -> Date {
-        let url = directory(for: sessionId, in: supportDirectory)
+        let url = directory(for: .chat(sessionId), in: supportDirectory)
             .appendingPathComponent(recordName)
         return (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
             .contentModificationDate ?? .distantPast
@@ -115,28 +116,32 @@ enum DraftStore {
     /// is also how a send, a cleared field and a stray write from a zombie
     /// upload all end up meaning the same thing.
     static func write(
-        _ draft: Draft, sessionId: String,
+        _ draft: Draft, key: DraftKey,
         in supportDirectory: URL = SessionIndex.supportDirectory()
     ) {
         guard !draft.isEmpty else {
-            delete(sessionId: sessionId, in: supportDirectory)
+            delete(key: key, in: supportDirectory)
             return
         }
-        let dir = prepareDirectory(for: sessionId, in: supportDirectory)
+        let dir = prepareDirectory(for: key, in: supportDirectory)
         guard let data = try? JSONEncoder().encode(draft) else { return }
         try? data.write(to: dir.appendingPathComponent(recordName), options: .atomic)
         prune(dir, keeping: keepNames(draft))
     }
 
     static func delete(
-        sessionId: String, in supportDirectory: URL = SessionIndex.supportDirectory()
+        key: DraftKey, in supportDirectory: URL = SessionIndex.supportDirectory()
     ) {
-        try? FileManager.default.removeItem(at: directory(for: sessionId, in: supportDirectory))
+        try? FileManager.default.removeItem(at: directory(for: key, in: supportDirectory))
     }
 
-    /// Logout / rebind: every draft belonged to the departing gateway.
+    /// Logout / rebind: every draft belonged to the departing gateway — BOTH
+    /// roots. A card draft left behind would keep a departing gateway's comment
+    /// text, and its hard-linked bytes, for whoever binds next.
     static func deleteAll(in supportDirectory: URL) {
-        try? FileManager.default.removeItem(at: root(in: supportDirectory))
+        for scope in [DraftScope.chat, .card] {
+            try? FileManager.default.removeItem(at: root(scope, in: supportDirectory))
+        }
     }
 
     // MARK: - Layout
@@ -145,9 +150,10 @@ enum DraftStore {
     /// restore that missed would otherwise leave an empty directory behind for
     /// every conversation ever opened, and `sessionIds` reads that tree.
     static func directory(
-        for sessionId: String, in supportDirectory: URL = SessionIndex.supportDirectory()
+        for key: DraftKey, in supportDirectory: URL = SessionIndex.supportDirectory()
     ) -> URL {
-        root(in: supportDirectory).appendingPathComponent(sanitize(sessionId), isDirectory: true)
+        root(key.scope, in: supportDirectory)
+            .appendingPathComponent(sanitize(key.id), isDirectory: true)
     }
 
     /// The same directory, created — with the backup exclusion applied to the
@@ -155,9 +161,9 @@ enum DraftStore {
     /// or linking a source, so those never land in an unmarked tree.
     @discardableResult
     static func prepareDirectory(
-        for sessionId: String, in supportDirectory: URL = SessionIndex.supportDirectory()
+        for key: DraftKey, in supportDirectory: URL = SessionIndex.supportDirectory()
     ) -> URL {
-        var root = self.root(in: supportDirectory)
+        var root = self.root(key.scope, in: supportDirectory)
         if (try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true))
             != nil
         {
@@ -165,7 +171,7 @@ enum DraftStore {
             values.isExcludedFromBackup = true
             try? root.setResourceValues(values)
         }
-        let dir = root.appendingPathComponent(sanitize(sessionId), isDirectory: true)
+        let dir = root.appendingPathComponent(sanitize(key.id), isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }
@@ -182,14 +188,19 @@ enum DraftStore {
     /// it, and it excludes the tree from backup: a draft's retained bytes run to
     /// 100 MiB a pick and are unsent scratch by definition, so they have no
     /// business in iCloud (the call the blob cache makes — `Baybo.blobCacheDir`).
-    private static func root(in supportDirectory: URL) -> URL {
-        supportDirectory.appendingPathComponent(rootName, isDirectory: true)
+    private static func root(_ scope: DraftScope, in supportDirectory: URL) -> URL {
+        supportDirectory.appendingPathComponent(scope.rawValue, isDirectory: true)
     }
 
-    /// Session ids are gateway-assigned or UUIDs, but never trust one as a raw
-    /// path component (`TranscriptStore` makes the same move).
-    private static func sanitize(_ sessionId: String) -> String {
-        sessionId.replacingOccurrences(of: "/", with: "_")
+    /// A key's id is gateway-assigned (a session id, a project id) or locally
+    /// minted, and never trusted as a raw path component — `TranscriptStore`
+    /// makes the same move. A whitelist rather than a blocklist now that a card
+    /// key carries a server-supplied project id and a `#`.
+    private static func sanitize(_ id: String) -> String {
+        let safe = id.map { ch -> Character in
+            ch.isLetter || ch.isNumber || ch == "-" || ch == "_" ? ch : "_"
+        }
+        return String(safe)
     }
 
     /// The files `draft` still refers to. A `.src` survives only for a pick that

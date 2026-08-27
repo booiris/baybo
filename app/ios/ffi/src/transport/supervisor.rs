@@ -17,7 +17,7 @@ use crate::core::{WireApprovalDecision, WireAttachment};
 use super::pump::{PumpCtx, pump};
 use super::{
     Connection, LegDialer, OutboundMessage, RoutingMap, SharedDeckSink, SharedListSink,
-    TransportError,
+    SharedProjectSink, TransportError,
 };
 
 /// Upper bound on a whole [`SessionRegistry::connect`] dial + handshake. Without
@@ -220,6 +220,7 @@ struct Supervisor {
     sinks: RoutingMap,
     list_sink: SharedListSink,
     deck_sink: SharedDeckSink,
+    project_sink: SharedProjectSink,
     ack_budget: Duration,
     /// Self-sender for dial children, pumps, and ack timers.
     tx: mpsc::UnboundedSender<Msg>,
@@ -668,6 +669,7 @@ impl Supervisor {
                 sinks: self.sinks.clone(),
                 list_sink: self.list_sink.clone(),
                 deck_sink: self.deck_sink.clone(),
+                project_sink: self.project_sink.clone(),
                 last_inbound: last_inbound.clone(),
                 leg_id,
                 events: self.tx.clone(),
@@ -873,6 +875,7 @@ pub(super) fn spawn(
     sinks: RoutingMap,
     list_sink: SharedListSink,
     deck_sink: SharedDeckSink,
+    project_sink: SharedProjectSink,
     ack_budget: Duration,
 ) -> mpsc::UnboundedSender<Msg> {
     let (tx, rx) = mpsc::unbounded_channel();
@@ -881,6 +884,7 @@ pub(super) fn spawn(
         sinks,
         list_sink,
         deck_sink,
+        project_sink,
         ack_budget,
         tx: tx.clone(),
         leg: Leg::Idle,

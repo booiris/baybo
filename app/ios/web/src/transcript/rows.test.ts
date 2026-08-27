@@ -1,3 +1,4 @@
+import { restoreImageDims } from "../attachments";
 import type { TFunction } from "i18next";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -24,7 +25,6 @@ import {
   outlineEntries,
   reconcileWork,
   restStepToWork,
-  restoreImageDims,
   rowOrdinal,
   rowsAboveFloor,
   sameTurnWorkIndex,

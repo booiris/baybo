@@ -367,6 +367,23 @@ impl AgentProfileStore for SqliteAgentProfileStore {
         Ok(affected > 0)
     }
 
+    async fn set_avatar_if_empty(&self, id: &AgentProfileId, blob_id: &str) -> Result<bool> {
+        let id = id.as_str().to_string();
+        let blob_id = blob_id.to_string();
+        let now = super::time::now_us();
+        let affected = self
+            .pool
+            .interact_write("agent_profiles.set_avatar_if_empty", move |conn| {
+                Ok(conn.execute(
+                    "UPDATE agent_profiles SET avatar_blob_id = ?2, updated_at = ?3 \
+                     WHERE id = ?1 AND avatar_blob_id IS NULL",
+                    rusqlite::params![id, blob_id, now],
+                )?)
+            })
+            .await?;
+        Ok(affected > 0)
+    }
+
     async fn set_llm(&self, id: &AgentProfileId, pin: &LlmPin) -> Result<bool> {
         let id = id.as_str().to_string();
         let entry = pin.entry.as_ref().map(|l| l.as_str().to_string());
@@ -714,6 +731,30 @@ mod tests {
                 .set_avatar(&AgentProfileId::parse("missing").expect("valid id"), None)
                 .await
                 .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn generated_avatar_compare_and_set_never_replaces_a_choice() {
+        let store = open_store().await;
+        let builtin = AgentProfileId::builtin();
+
+        assert!(
+            store
+                .set_avatar_if_empty(&builtin, "sha256:generated.token")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .set_avatar_if_empty(&builtin, "sha256:later.token")
+                .await
+                .unwrap()
+        );
+        let row = store.get(&builtin).await.unwrap().unwrap();
+        assert_eq!(
+            row.avatar_blob_id.as_deref(),
+            Some("sha256:generated.token")
         );
     }
 

@@ -38,6 +38,18 @@ final class AppStore: ObservableObject {
         case search
     }
 
+    struct ProjectIssueRoute: Hashable {
+        let id: UUID
+        let projectId: String
+        let number: Int64
+
+        init(id: UUID = UUID(), projectId: String, number: Int64) {
+            self.id = id
+            self.projectId = projectId
+            self.number = number
+        }
+    }
+
     /// One entry on the outer NavigationStack over the home shell: a pushed
     /// conversation, the archived list, or one scheduled job's fires.
     enum ChatRoute: Hashable {
@@ -56,6 +68,24 @@ final class AppStore: ObservableObject {
         /// The Deck's recycle bin: soft-deleted cards, each restorable. Pushed
         /// from the Deck header's ☰ menu, mirroring `archived` for Chats.
         case deckRecycle
+        /// One board, by project id. A pushed screen rather than the tab root:
+        /// the root is the cards, and changing project means backing out to
+        /// them — there is no switcher in the top-left, deliberately.
+        case projectBoard(String)
+        /// One card on a board. Pushed over its board, so the edge swipe goes
+        /// back to the column it came from.
+        case projectIssue(ProjectIssueRoute)
+        /// The new-board form. A pushed route rather than a sheet because it
+        /// types: this shell opts out of keyboard avoidance wholesale
+        /// (`HomeTabView.ignoresSafeArea(.keyboard)`), and a pushed screen sits
+        /// outside that.
+        case newProject
+        /// Filing a card. The column rides ON the route rather than in a
+        /// `@State` beside it: which column you are filing into is part of
+        /// WHERE this screen is, not something that happens to it — and a
+        /// route that forgot it would open every card in the backlog after a
+        /// state restoration.
+        case newIssue(project: String, status: IssueStatus)
     }
 
     /// A scheduled job's delete, waiting on the confirm dialog. Carries the name
@@ -64,6 +94,13 @@ final class AppStore: ObservableObject {
     struct PendingCronJobDelete: Equatable {
         let jobId: String
         let name: String
+    }
+
+    /// A board row whose terminal cancel is waiting on the root-hosted
+    /// destructive confirmation. Reopening is reversible and skips this step.
+    struct PendingIssueCancel: Equatable {
+        let projectId: String
+        let number: Int64
     }
 
     /// A conversation's rename, waiting on the editor dialog.
@@ -152,12 +189,16 @@ final class AppStore: ObservableObject {
         didSet {
             let open = Self.sessionIds(chatPath)
             let left = Self.sessionIds(oldValue).subtracting(open)
-            guard !left.isEmpty else { return }
-            if open.isEmpty {
+            if !left.isEmpty, open.isEmpty {
                 AudioPlayerCenter.shared.stop()
             }
             for sessionId in left {
                 chatStores[sessionId]?.leaveChat()
+            }
+            let openVisits = Self.issueVisitIds(chatPath)
+            let leftVisits = Self.issueVisitIds(oldValue).subtracting(openVisits)
+            for visitId in leftVisits {
+                issueVisits.removeValue(forKey: visitId)
             }
         }
     }
@@ -171,6 +212,13 @@ final class AppStore: ObservableObject {
             if case .session(let sessionId) = route { ids.insert(sessionId) }
         }
         return ids
+    }
+
+    static func issueVisitIds(_ path: [ChatRoute]) -> Set<UUID> {
+        Set(path.compactMap { route in
+            guard case .projectIssue(let issue) = route else { return nil }
+            return issue.id
+        })
     }
     /// Landing / pairing status line (localized, already resolved).
     @Published var status: String?
@@ -187,6 +235,8 @@ final class AppStore: ObservableObject {
     /// The session a swipe-delete is asking to confirm — hosted in `RootView`
     /// exactly like the logout confirm, and for the same latch/coverage reasons.
     @Published var confirmDeleteSession: String?
+    /// The issue-list cancel waiting on the same root-hosted confirmation.
+    @Published var confirmCancelIssue: PendingIssueCancel?
     /// The cron group a swipe-delete is asking to confirm, same host and reasons.
     @Published var confirmDeleteCronGroup: PendingCronGroupDelete?
     /// The conversation the list's long-press rename is editing — the one dialog
@@ -238,10 +288,13 @@ final class AppStore: ObservableObject {
     static let maxResidentStores = 12
     private var transcriptHost: TranscriptHost?
     private var prewarmedDraftId: String?
-    /// The Deck tab's engine + its kept-warm shell webview (the app's second
-    /// webview; prewarmed once a binding reaches home, torn down with the binding).
+    /// The Deck tab's engine + its kept-warm shell webview, prewarmed once a
+    /// binding reaches home and torn down with that binding.
     let deckStore = DeckStore()
+    let projectsStore = ProjectsStore()
     private var _deckHost: DeckHost?
+    let issueHostPool = IssueHostPool()
+    private var issueVisits: [UUID: IssueVisit] = [:]
     /// Sessions with an archive/hide request on the wire — the per-session
     /// serialization gate (`pumpSessionMutation`).
     private var sessionMutationsInFlight: Set<String> = []
@@ -301,6 +354,11 @@ final class AppStore: ObservableObject {
         // Deck pushes are session-less by design; the connection-global sink
         // is the only way they reach a user parked on the Deck tab.
         Baybo.client.setDeckSink(sink: DeckEventsRelay(store: { AppStore.shared?.deckStore }))
+        // Board invalidations are session-less broadcasts like the deck's, and
+        // this is the only way the phone learns a board moved — nothing about a
+        // board is ever pushed.
+        Baybo.client.setProjectSink(
+            sink: ProjectEventsRelay(store: { AppStore.shared?.projectsStore }))
         #if DEBUG
         // UI-verification hooks: land straight on interaction-gated screens so
         // they are screenshotable/log-verifiable headlessly on the simulator.
@@ -454,7 +512,28 @@ final class AppStore: ObservableObject {
             if args.contains("-baybo-demo-logout-confirm") {
                 confirmLogout = true
             }
+            // `-baybo-demo-board` (with `-baybo-demo-projects`): land straight
+            // on the seeded board, so the stage wall and the Waiting strip are
+            // reachable without driving two taps through the cards root.
+            if args.contains("-baybo-demo-board") {
+                homeTab = .projects
+                chatPath = [.projectBoard(ProjectsStore.demoBoardId)]
+            }
+            // `-baybo-demo-card`: one level deeper again, onto a card — #41 of
+            // the demo board, filled in from that board's own fixture (see
+            // `IssueStore.seedDemoCard`). It used to land on a page that could
+            // only ever say "Loading card…", since the card store talks to a
+            // gateway and the demo has none.
+            if args.contains(IssueStore.demoCardArg) {
+                homeTab = .projects
+                chatPath = [
+                    .projectBoard(ProjectsStore.demoBoardId),
+                    .projectIssue(
+                        ProjectIssueRoute(projectId: ProjectsStore.demoBoardId, number: 41)),
+                ]
+            }
             route = .home
+            if args.contains("-baybo-demo-projects") { issueHostPool.prewarm() }
             return
         }
         #endif
@@ -494,6 +573,7 @@ final class AppStore: ObservableObject {
             consumePendingPushRoute()
             prewarmTranscriptHost()
             prewarmDeckHost()
+            prewarmIssueHosts()
             resumeStrandedSends()
         }
     }
@@ -537,6 +617,7 @@ final class AppStore: ObservableObject {
         if route == .home {
             prewarmTranscriptHost()
             prewarmDeckHost()
+            prewarmIssueHosts()
         }
     }
 
@@ -711,6 +792,18 @@ final class AppStore: ObservableObject {
         return host
     }
 
+    func issueVisit(for route: ProjectIssueRoute) -> IssueVisit {
+        if let visit = issueVisits[route.id] { return visit }
+        let visit = IssueVisit(
+            id: route.id,
+            projectId: route.projectId,
+            number: route.number,
+            pool: issueHostPool,
+            seed: projectsStore.issueSeed(projectId: route.projectId, number: route.number))
+        issueVisits[route.id] = visit
+        return visit
+    }
+
     /// Open an existing session from the list.
     func openSession(_ sessionId: String) {
         Task {
@@ -731,6 +824,47 @@ final class AppStore: ObservableObject {
     func openArchived() {
         guard !chatPath.contains(.archived) else { return }
         chatPath.append(.archived)
+    }
+
+    /// Open a board over the cards root.
+    ///
+    /// Deliberately NOT `activateSession`'s shape: that one forces
+    /// `homeTab = .chats` and RESETS the path, which is right for a
+    /// conversation and wrong for everything here — the Projects tab must
+    /// stay selected underneath, and the push must stack rather than replace.
+    func openProjectBoard(_ projectId: String) {
+        let route = AppStore.ChatRoute.projectBoard(projectId)
+        guard chatPath.last != route else { return }
+        // Stamped here rather than in the card row's press, because this is
+        // the ONE door into a board — the cards root, the create flow, and a
+        // push tap all come through it, and a stamp on the row would miss the
+        // other two.
+        projectsStore.recordOpened(projectId)
+        chatPath.append(route)
+        Task { await projectsStore.refreshBoard(projectId) }
+    }
+
+    func openProjectIssue(project: String, number: Int64) {
+        if case .projectIssue(let current) = chatPath.last,
+            current.projectId == project, current.number == number
+        {
+            return
+        }
+        let issue = ProjectIssueRoute(projectId: project, number: number)
+        _ = issueVisit(for: issue)
+        chatPath.append(.projectIssue(issue))
+    }
+
+    /// File a card on a board, opening in the column the board was showing.
+    func openNewIssue(project: String, status: IssueStatus) {
+        let route = AppStore.ChatRoute.newIssue(project: project, status: status)
+        guard chatPath.last != route else { return }
+        chatPath.append(route)
+    }
+
+    func openNewProject() {
+        guard !chatPath.contains(.newProject) else { return }
+        chatPath.append(.newProject)
     }
 
     /// Open a conversation from a search result, parking it on the matched
@@ -1072,6 +1206,11 @@ final class AppStore: ObservableObject {
         _ = deckHost()
     }
 
+    private func prewarmIssueHosts() {
+        guard route == .home else { return }
+        issueHostPool.prewarm()
+    }
+
     /// A push-notification tap targeting `sessionId`: route straight into that
     /// conversation. Before the launch restore resolves the route, stash it —
     /// `restoreOnLaunch` consumes the stash once home is up.
@@ -1128,6 +1267,13 @@ final class AppStore: ObservableObject {
     func promptDeleteSession(_ sessionId: String) {
         withAnimation(ConfirmDialog.enterMotion) {
             confirmDeleteSession = sessionId
+        }
+    }
+
+    /// Raise the cancel confirm for a card selected from the board list.
+    func promptCancelIssue(projectId: String, number: Int64) {
+        withAnimation(ConfirmDialog.enterMotion) {
+            confirmCancelIssue = PendingIssueCancel(projectId: projectId, number: number)
         }
     }
 
@@ -1402,6 +1548,7 @@ final class AppStore: ObservableObject {
             guard let store = chatStores[sessionId], isEvictable(sessionId, store) else { continue }
             await evictStore(sessionId, store)
         }
+        issueHostPool.discardIfIdle()
     }
 
     private func isEvictable(_ sessionId: String, _: ChatStore) -> Bool {
@@ -1430,7 +1577,16 @@ final class AppStore: ObservableObject {
         // The deck belongs to the departing gateway too.
         _deckHost?.teardown()
         _deckHost = nil
+        issueVisits.removeAll()
+        issueHostPool.teardown()
         DeckStore.removeMirror()
+        // So do the boards: a mirror that outlived a binding is somebody
+        // else's account on screen.
+        ProjectsStore.removeMirror()
+        // And the agents' faces: a blob id means nothing under the next
+        // gateway, and a cached picture would be a departed account's agent
+        // looking back from the new one's board.
+        AgentAvatars.shared.reset()
         // As does the model catalog — a rebind must not offer the departed
         // gateway's LLM entries.
         ModelCatalog.shared.reset()
@@ -1451,6 +1607,7 @@ final class AppStore: ObservableObject {
             preconnectRelayBestEffort()
         }
         prewarmDeckHost()
+        prewarmIssueHosts()
     }
 
     /// Log out: tear down the live leg, wipe both credential sets, drop the

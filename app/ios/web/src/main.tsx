@@ -32,6 +32,7 @@ onInit((payload) => {
         key={payload.sessionId}
         restored={payload.restoredState}
         initialConnEpoch={payload.connEpoch}
+        expandUnansweredTail={payload.expandUnansweredTail}
       />
     </React.StrictMode>,
   );
@@ -48,5 +49,6 @@ if (!hasNativeBridge) {
     sessionId: "dev",
     restoredState: null,
     connEpoch: 0,
+    expandUnansweredTail: false,
   });
 }

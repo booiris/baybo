@@ -13,12 +13,31 @@ bar on 18–25 — system chrome, degrades on its own) with five sections
 
 - `deck` (`DeckScreen` — the board of agent-authored live cards, see
   [deck.md](deck.md) and `docs/modules/deck.md`),
+- `projects` (`ProjectsScreen` — one card per board, pushing a board and then a
+  card, see [projects.md](projects.md)),
 - `chats` (`ChatListScreen`),
 - `settings` (`SettingsScreen` — language, version, log out) and
 - `search` (`SearchScreen` — full-text over every conversation, see
-  [chat-list.md](chat-list.md#searching-conversations))
+  [chat-list.md](chat-list.md#searching-conversations)).
 
-have real screens; `projects` is `PlaceholderScreen`.
+**Tab badges.** Chats and Projects each carry a count; the other three never do.
+Chats reuses the very number the app icon carries (`BadgeCenter.total`), so the
+two cannot disagree by construction. Projects sums what every live board is
+waiting on — approvals + failed runs + unread, exactly the set
+`/projects/attention` reports — and deliberately excludes runs the daily ceiling
+is holding: a hold is a standing condition, not an event, and a badge that
+cannot be cleared by acting is worse than no badge.
+
+Two traps, both found on a simulator and neither visible in code:
+
+- **SwiftUI exposes `.badge` to accessibility NOWHERE.** The tab item's label
+  stays the bare section name and the badge has no child element. `ProjectsUITests`
+  therefore asserts the drawn disc in PIXELS
+  (`ScreenshotPixels.redCoverage(in:)`), with Deck as the no-badge control — a
+  test reading `label` would pass a build that drew no badge at all.
+- **`AppStore.projectsStore` is a nested `ObservableObject`,** so its changes do
+  not republish `AppStore`. `HomeTabView` subscribes to `$attention` directly;
+  reading the count through `store` froze it at whatever the first paint saw.
 
 **Why search does NOT use `.searchable` / the iOS 26 tab-bar morph.** On 26,
 selecting a search-role tab can turn the tab bar itself into a search field. It
@@ -191,10 +210,21 @@ layers**, which is the whole design:
 - the **panel** is an `.overlay` on the DOCK's content, because that is the only
   layer that stacks over the dock's own rows. Presented in the ZStack it drew
   UNDER everything the dock grows upward — the notice line, the approval card,
-  the staged strip — and under the jump-to-latest disc that shares the inset
-  stack, 44pt of which took the Files row's taps. An overlay adds nothing to the
-  inset, so the transcript's bottom inset is still what `ComposerView` alone
-  measures.
+  the staged strip — and under the jump-to-latest disc, 44pt of which took the
+  Files row's taps. An overlay adds nothing to the inset, so the transcript's
+  bottom inset is still what `ComposerView` alone measures.
+
+**The panel's floor is the composer's top edge, and the jump disc passes under
+it** (2026-08-27). The disc used to be a ROW in the dock's stack, which made it
+part of the panel's floor: raising the disc raised the whole panel by 56pt, so
+pressing `+` with the disc up opened the menu a disc's height clear of the `+`
+that opened it. `JumpToLatestDisc` is an `.overlay` on the composer now —
+`lift = 44 + 12` above its top edge, the same place it drew before — so the
+dock's content is the composer again and the panel opens in one place whether
+or not the disc is up. Covering the disc is only safe because the panel is
+ABOVE it in the same layer; the taps in the overlap go to the panel, which is
+the half `ComposerAttachUITests` and `IssueDockUITests` each pin with an
+`intersects` + `isHittable` pair.
 
 Its column is MEASURED, never hardcoded the way the header's `anchorLeading` can
 be: the `+` reports its own frame (`AttachMenu.report`) and `AttachMenuPanel.box`
@@ -236,3 +266,10 @@ edge — so scrolled content ghosts past the pill's flanks.
 The jump button is native: web posts `jumpVisible` on its `showJump` state,
 native taps call `jumpToLatest` back; the composer-top geometry is measured on
 the ComposerView alone so the button never inflates the web inset.
+
+One view, `JumpToLatestDisc`, for both pages — the chat's thread and a card's
+Activity draw the same 44pt disc 12pt above their dock, and it is an OVERLAY on
+the composer rather than a row above it, so it costs the dock no height and the
+attach panel opens over it rather than above it (see the panel's layering
+above). The card raises it off `onActivityAtBottom` rather than `jumpVisible`,
+which is the only difference left between the two.

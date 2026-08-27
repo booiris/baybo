@@ -45,10 +45,10 @@ const REFERENCE = /(^|[^0-9A-Za-z_&#])#([1-9][0-9]{0,4})(?![0-9A-Za-z_])/g;
 
 /// What a `#N` is counting when it is not counting cards.
 ///
-/// A run's ordinal is written `run #3` by the board itself — `timelineModel`
-/// says it on the timeline and `IssueGet` says it to the agent, which is where
-/// the agent picks the phrasing up — and on a board with three cards, `run #3`
-/// and card `#3` are the same three characters. The trailing clause is for
+/// Older board prose and `IssueGet` write a run's ordinal as `run #3`, which
+/// agents can pick up in comments even though the project UI now renders that
+/// ordinal as `turn 3`. On a board with three cards, legacy `run #3` and card
+/// `#3` are the same three characters. The trailing clause is for
 /// `run #3/#4` and `runs #1 and #2`, where only the first number wears the
 /// word. A `pr` is somebody else's forge, and cannot be resolved here at all.
 const COUNTING_SOMETHING_ELSE =

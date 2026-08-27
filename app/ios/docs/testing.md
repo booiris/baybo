@@ -70,6 +70,29 @@ Library) for its active/closed/toggle wiring, with no layout stubs at all.
 no-unnecessary-condition / react-hooks, with a suppression baseline for the
 existing backlog) gates the wiring-bug class over `src`.
 
+**Three compile-time drift sentinels live here**, all type-only, none producing
+a byte of runtime output — which is why `pnpm build` (not `pnpm test`) is the
+only thing that evaluates them:
+
+| file | pins | against |
+|---|---|---|
+| `src/wireSentinel.ts` | the live frame mirrors | the ts-rs contract under `sidecars/` |
+| `src/restSentinel.ts` | `TranscriptRowItem` | `app/web`'s generated `ChatTranscriptItem` |
+| `src/issue/issueSentinel.ts` | the card page's DTO mirrors | `app/web`'s generated `IssueDto` / `IssueEventDto` / `IssueRunDto` / `ActorDto` |
+
+Each reads `app/web`'s generated schema rather than generating a second copy:
+both would come from the one committed `docs/openapi.json` through the same
+generator and be byte-identical, and a second copy is a second thing to
+regenerate — a new drift surface inside the gate built to close one. The import
+is type-only under `noEmit`, so `tsc` follows the path and no bundler or pnpm
+resolution is involved.
+
+`issueSentinel.ts` is worth reading as a case for the pattern: the mirrors were
+written by hand from the Rust source, and it caught three wrong guesses at once
+(`assignee` as an object rather than a bare id, `IssueRun.agent` rather than
+`agent_id`, and an externally-tagged `Actor`). Every one of them fails silently
+at runtime as a missing `@handle`.
+
 ### `app/ios/Tests/` (`BayboTests`)
 
 Swift Testing (`@Test`/`#expect`), a **host-application** bundle (hostless would
@@ -78,6 +101,25 @@ an injected `any BayboClientProtocol` — the protocol UniFFI already generates 
 so the frame paths, the approval queue, and the outbox's two-stage confirmation
 are testable with no gateway. XCTest stays for `BayboUITests` (Swift Testing has
 no UI API); both bundles coexist.
+
+**`LocalizedKeyTests` is a gate, not a nicety.** `Lang.t` echoes the key on a
+miss, so a screen ships with a button labelled `chat.cancel` and every existing
+assertion stays green — an assertion on a label matches the key as happily as
+the word. The suite walks every `lang.t("…")` literal under `App/` and fails on
+one the catalog does not carry, and on a key one language has and the other does
+not. It has caught two already: `chat.cancel` (never existed) and `issue.system`
+(exists in the WEB locales and not in the Swift catalog).
+
+**Golden fixtures shared across ends** are read by BOTH a vitest suite and a
+Swift test: one file, two readers, so a rule with a copy per language cannot
+drift silently. `searchSnippetVectors.json` is the live example.
+`commentHintVectors.json` was the other and is **gone (2026-08-26)** along with
+both copies of the rule it pinned — what sending a comment will do is decided
+in Rust (`crates/project/src/comments.rs::comment_delivery`) and is not exposed
+over REST, so a composer that wants to say it in advance must re-derive it; the
+phone stopped drawing that sentence and the web only ever had it as a tooltip,
+so neither client re-derives anything now. A client that wants it back needs
+the port AND the fixture, in one commit.
 
 `ComposerStaging` takes the same injected client, which is what makes the
 composer's *lifetimes* testable below the UI: `FakeBayboClient.holdBlobUploads()`
@@ -108,6 +150,40 @@ Send `XCUIKeyboardKey.delete` once per existing character instead
 (`RenameMenuUITests.replaceText`), and do not tap the field first — a tap moves
 the caret into the middle of the text, where backspaces eat the wrong half. The
 dialog focuses the field itself and parks the caret at the end.
+
+### A `.plain` button is only tappable where it PAINTS
+
+Under `.buttonStyle(.plain)` the hit region is whatever the label actually
+draws. A `Text` hit-tests its own box; a `.frame(minHeight:)` is layout and
+adds nothing tappable; a stroke-only `Capsule` hit-tests a 1px outline. So a
+row without a `contentShape` is dead wherever there is no ink — and it looks
+completely healthy: `exists`, `isHittable` and the accessibility frame are all
+satisfied by a control whose paint does not fill it.
+
+`.tap()` will not find it either, because it lands dead centre — which on a
+card row is usually right on the title. **Walk coordinates to test this**, and
+measure the dead points rather than guessing them: a throwaway probe test that
+taps a grid of `coordinate(withNormalizedOffset:)` points and logs which ones
+open is ten minutes and tells you exactly which offsets a regression test has
+to use. `testEveryPartOfTheRowOpensTheCardNotJustItsText` uses three offsets
+found that way, and it fails without the fix — which the first version of it,
+written from reasoning, did not.
+
+The app has now shipped this bug three times: the logout pill
+(`OutlinePillButtonStyle`), a board card row, and the board's budget chip.
+
+### Assert that a thing GOES, not only that it appears
+
+`ProjectsUITests` asserted all four Waiting-strip kinds appear and nothing
+asserted any of them clears — which is how two of the four shipped answering
+nothing on screen. A strip that only ever grows looks identical to a healthy
+one at the moment the screenshot is taken.
+
+The same rule found the demo's blind spot: under `-baybo-demo-projects` a
+write's whole effect IS its `apply` closure (the network half is
+short-circuited), so a verb with no `apply` is a verb that visibly does
+nothing there. That makes the demo a decent detector for exactly this class —
+but only if a test presses the button and then asserts the row is gone.
 
 ### A tap lands on the element's CENTRE, so an a11y frame is a test surface
 
@@ -365,6 +441,39 @@ without touching `app/ios` at all.
   without a gateway — notice + catalog revert, which is itself the failure UI),
   and `app/ios/UITests/ModelPickerUITests.swift` drives the picks through the
   pill's accessibility VALUE (the label is the constant "Model").
+
+- **`-baybo-demo-projects`** (DEBUG) seeds a canned set of boards into
+  `ProjectsStore` and short-circuits every refresh, so the Projects tab renders
+  with no gateway to fetch from. Four boards on purpose: one wanting all three
+  attention kinds at once (so the tab badge and a card's waiting count both
+  paint), one merely busy, one idle, and one archived (so the archived toggle
+  exists to press). Nothing is persisted — a later plain launch on the same
+  simulator inherits none of it, which is why this flag needs no uninstall
+  between runs. Add **`-baybo-demo-board`** to land straight on the seeded
+  board rather than driving two taps through the cards root; that board is the
+  one with something in every stage and all four Waiting-strip kinds (the
+  parked approval and the agent's question are seeded directly, because
+  `refreshWaitingDetails` reads them off the network and the demo has none). Add
+  **`-baybo-demo-card`** to land one level deeper again, on card #41. Every
+  card page under `-baybo-demo-projects` fills itself in from that board's own
+  fixture (`IssueStore.seedDemoCard`) — the landing flag says which SCREEN to
+  open, never which card is real, since a card reached by tapping a row is the
+  same card — plus what the board's rows leave empty: a description, a branch,
+  a timeline, and a run LOG for the cards the board says have run (41, 42, 43;
+  the rest have never run, which the page draws differently). It used to open on the page's own
+  loading line for ever, since the card store talks to a gateway of its own and
+  the demo has none — so everything the card itself draws had no tier at all,
+  which is what `ProjectCardUITests` now covers: where the head, the text and
+  the state chips LAND, that the chips are really painted a hue (`redCoverage`,
+  since jsdom is blind to colour), the run log in the ⋯, and that the last
+  comment can be scrolled out from under the dock. Two of the demo board's eight teammates carry a
+  `demo-avatar-<hex>` blob, which `AgentAvatars` draws as a flat disc without a
+  gateway — so one screenshot shows both face paths side by side (an uploaded
+  picture and the monogram an agent without one falls back to). Eight is two
+  past what the face row draws, so the `+N` counter and the `dev-*`/`docs-*`
+  monogram widening both paint; card #42 arrives pinned, which is the only way
+  the Pinned band header and the row's pin glyph appear without driving a
+  swipe.
 
 - **`-baybo-demo-switch`** (DEBUG) opens session `demo-a` with a session-tagged
   turn, then switches `chatPath` to `demo-b` at 5s — exercising the single

@@ -251,6 +251,26 @@ async fn agents_api_round_trip() {
         builtin["avatar_blob_id"].as_str(),
         Some(png_blob.blob_id.as_str()),
     );
+    let generated_blob = tg
+        .deps
+        .stores
+        .blob
+        .put(b"generated", "image/png", None)
+        .await
+        .expect("upload generated avatar");
+    put_expect(
+        &router,
+        "/v1/agents/baybo/avatar",
+        json!({ "blob_id": generated_blob.blob_id, "only_if_empty": true }),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    let unchanged = get(&router, "/v1/agents/baybo", StatusCode::OK).await;
+    assert_eq!(
+        unchanged["avatar_blob_id"].as_str(),
+        Some(png_blob.blob_id.as_str()),
+        "a generated default must not replace the operator's avatar",
+    );
     put_expect(
         &router,
         "/v1/agents/baybo/avatar",

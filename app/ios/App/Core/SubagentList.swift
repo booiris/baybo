@@ -87,6 +87,6 @@ enum SubagentList {
 /// `.sheet(item:)` needs an identity, and the child's session id IS one — it is
 /// the argument every read of that child is keyed by. Declared here rather than
 /// in the generated FFI file, which is regenerated from Rust.
-extension ChatSubagentSummary: @retroactive Identifiable {
+extension ChatSubagentSummary: Identifiable {
     public var id: String { sessionId }
 }

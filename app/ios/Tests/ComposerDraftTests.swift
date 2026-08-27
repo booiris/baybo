@@ -53,7 +53,7 @@ struct ComposerDraftTests {
 
         staging.leaveConversation()
 
-        #expect(DraftStore.read(sessionId: "s-draft", in: temp.url)?.text == "half a thought")
+        #expect(DraftStore.read(key: .chat("s-draft"), in: temp.url)?.text == "half a thought")
     }
 
     @Test func whatWasTypedComesBackAfterARelaunch() {
@@ -72,7 +72,7 @@ struct ComposerDraftTests {
         staging.text = "   "
         staging.flushDraft()
 
-        #expect(DraftStore.read(sessionId: "s-draft", in: temp.url) == nil)
+        #expect(DraftStore.read(key: .chat("s-draft"), in: temp.url) == nil)
     }
 
     /// Clearing the field retires the draft, rather than leaving an empty record
@@ -81,12 +81,12 @@ struct ComposerDraftTests {
         let staging = relaunch()
         staging.text = "typed"
         staging.flushDraft()
-        #expect(DraftStore.read(sessionId: "s-draft", in: temp.url) != nil)
+        #expect(DraftStore.read(key: .chat("s-draft"), in: temp.url) != nil)
 
         staging.text = ""
         staging.flushDraft()
 
-        #expect(DraftStore.read(sessionId: "s-draft", in: temp.url) == nil)
+        #expect(DraftStore.read(key: .chat("s-draft"), in: temp.url) == nil)
     }
 
     /// The send is the one path that discards.
@@ -96,14 +96,14 @@ struct ComposerDraftTests {
         let id = try #require(staging.admitPhoto())
         await staging.acceptPhoto(id: id, data: Self.smallPNG(), declaredMime: "image/png")
         staging.flushDraft()
-        #expect(DraftStore.read(sessionId: "s-draft", in: temp.url) != nil)
+        #expect(DraftStore.read(key: .chat("s-draft"), in: temp.url) != nil)
 
         staging.discardDraft()
 
-        #expect(DraftStore.read(sessionId: "s-draft", in: temp.url) == nil)
+        #expect(DraftStore.read(key: .chat("s-draft"), in: temp.url) == nil)
         #expect(
             !FileManager.default.fileExists(
-                atPath: DraftStore.directory(for: "s-draft", in: temp.url).path),
+                atPath: DraftStore.directory(for: .chat("s-draft"), in: temp.url).path),
             "and every byte it was keeping")
     }
 
@@ -174,7 +174,7 @@ struct ComposerDraftTests {
         first.flushDraft()
 
         let retained = DraftStore.sourceURL(
-            pickId: id.uuidString, in: DraftStore.directory(for: "s-draft", in: temp.url))
+            pickId: id.uuidString, in: DraftStore.directory(for: .chat("s-draft"), in: temp.url))
         let spool = try #require(first.staged.first?.source?.url)
         #expect(FileManager.default.fileExists(atPath: retained.path))
         #expect(
@@ -204,14 +204,14 @@ struct ComposerDraftTests {
         staging.text = "keeps the draft alive"
         staging.flushDraft()
         let retained = DraftStore.sourceURL(
-            pickId: id.uuidString, in: DraftStore.directory(for: "s-draft", in: temp.url))
+            pickId: id.uuidString, in: DraftStore.directory(for: .chat("s-draft"), in: temp.url))
         #expect(FileManager.default.fileExists(atPath: retained.path))
 
         staging.remove(id)
         staging.flushDraft()
 
         #expect(!FileManager.default.fileExists(atPath: retained.path))
-        #expect(DraftStore.read(sessionId: "s-draft", in: temp.url)?.attachments.isEmpty == true)
+        #expect(DraftStore.read(key: .chat("s-draft"), in: temp.url)?.attachments.isEmpty == true)
     }
 
     /// A landed pick gives its retained bytes back as soon as the upload lands:
@@ -225,7 +225,7 @@ struct ComposerDraftTests {
         #expect(await waitUntil { client.blobUploadCalls.count == 1 })
         staging.flushDraft()
         let retained = DraftStore.sourceURL(
-            pickId: id.uuidString, in: DraftStore.directory(for: "s-draft", in: temp.url))
+            pickId: id.uuidString, in: DraftStore.directory(for: .chat("s-draft"), in: temp.url))
         #expect(FileManager.default.fileExists(atPath: retained.path))
 
         let work = try #require(staging.staged.first?.work)
@@ -234,7 +234,7 @@ struct ComposerDraftTests {
         staging.flushDraft()
 
         #expect(!FileManager.default.fileExists(atPath: retained.path))
-        #expect(DraftStore.read(sessionId: "s-draft", in: temp.url)?.attachments.count == 1)
+        #expect(DraftStore.read(key: .chat("s-draft"), in: temp.url)?.attachments.count == 1)
     }
 
     /// A photo admitted but not yet delivered by PhotosUI holds neither a blob
@@ -247,7 +247,7 @@ struct ComposerDraftTests {
         staging.flushDraft()
 
         #expect(staging.staged.count == 1)
-        #expect(DraftStore.read(sessionId: "s-draft", in: temp.url)?.attachments.isEmpty == true)
+        #expect(DraftStore.read(key: .chat("s-draft"), in: temp.url)?.attachments.isEmpty == true)
     }
 
     /// A pick the draft can no longer restore — a Files document the user moved
@@ -266,13 +266,13 @@ struct ComposerDraftTests {
                         filename: "gone.pdf", byteCount: 12, blobId: nil,
                         bookmark: Data("not a bookmark".utf8))
                 ]),
-            sessionId: "s-draft", in: temp.url)
+            key: .chat("s-draft"), in: temp.url)
 
         let staging = relaunch()
 
         #expect(staging.staged.isEmpty)
         #expect(
-            DraftStore.read(sessionId: "s-draft", in: temp.url) == nil,
+            DraftStore.read(key: .chat("s-draft"), in: temp.url) == nil,
             "an all-lost draft must retire itself rather than come back every open")
         #expect(await waitUntil { staging.text.isEmpty })
     }
@@ -285,11 +285,11 @@ struct ComposerDraftTests {
         let index = temp.makeIndex()
         index.recordUserSend(sessionId: "s-doomed", text: "hi")
         DraftStore.write(
-            Draft(text: "unsent", attachments: []), sessionId: "s-doomed", in: temp.url)
+            Draft(text: "unsent", attachments: []), key: .chat("s-doomed"), in: temp.url)
 
         index.beginHide("s-doomed")
 
-        #expect(DraftStore.read(sessionId: "s-doomed", in: temp.url) == nil)
+        #expect(DraftStore.read(key: .chat("s-doomed"), in: temp.url) == nil)
     }
 
     /// Deleting the FILE is only half of it. A resident store holds the draft in
@@ -313,7 +313,7 @@ struct ComposerDraftTests {
 
         #expect(discarded == ["s-doomed"], "the registry has to name what it removed")
         #expect(store.staging.text.isEmpty)
-        #expect(DraftStore.read(sessionId: "s-doomed", in: temp.url) == nil)
+        #expect(DraftStore.read(key: .chat("s-doomed"), in: temp.url) == nil)
     }
 
     /// The same hole one path over: a conversation deleted from ANOTHER client
@@ -322,14 +322,14 @@ struct ComposerDraftTests {
         let index = temp.makeIndex()
         index.recordUserSend(sessionId: "s-elsewhere", text: "hi")
         DraftStore.write(
-            Draft(text: "unsent", attachments: []), sessionId: "s-elsewhere", in: temp.url)
+            Draft(text: "unsent", attachments: []), key: .chat("s-elsewhere"), in: temp.url)
         var dropped: Set<String> = []
         index.onSessionsRemoved = { dropped.formUnion($0) }
 
         index.merge(remote: [], fetchEpoch: index.mutationEpoch)
 
         #expect(dropped == ["s-elsewhere"])
-        #expect(DraftStore.read(sessionId: "s-elsewhere", in: temp.url) == nil)
+        #expect(DraftStore.read(key: .chat("s-elsewhere"), in: temp.url) == nil)
     }
 
     /// A retired machine — its store evicted, but the object kept alive by an
@@ -340,13 +340,13 @@ struct ComposerDraftTests {
         let staging = relaunch()
         staging.text = "checkpointed"
         staging.retire()
-        #expect(DraftStore.read(sessionId: "s-draft", in: temp.url)?.text == "checkpointed")
+        #expect(DraftStore.read(key: .chat("s-draft"), in: temp.url)?.text == "checkpointed")
 
-        DraftStore.delete(sessionId: "s-draft", in: temp.url)
+        DraftStore.delete(key: .chat("s-draft"), in: temp.url)
         staging.text = "written by a zombie"
         staging.flushDraft()
 
-        #expect(DraftStore.read(sessionId: "s-draft", in: temp.url) == nil)
+        #expect(DraftStore.read(key: .chat("s-draft"), in: temp.url) == nil)
     }
 
     /// Two `ComposerStaging`s of one session can be alive at once (an eviction
@@ -376,7 +376,7 @@ struct ComposerDraftTests {
     @Test func unbindingWipesEveryDraft() {
         let index = temp.makeIndex()
         for id in ["s-1", "s-2"] {
-            DraftStore.write(Draft(text: "unsent", attachments: []), sessionId: id, in: temp.url)
+            DraftStore.write(Draft(text: "unsent", attachments: []), key: .chat(id), in: temp.url)
         }
 
         index.removeAll()
@@ -390,7 +390,7 @@ struct ComposerDraftTests {
     /// the only handle that exists: compose has to return to it, or what the user
     /// typed is stranded in a conversation nothing can ever name again.
     @Test func composeResumesTheUnsentDraftSession() {
-        DraftStore.write(Draft(text: "unsent", attachments: []), sessionId: "s-new", in: temp.url)
+        DraftStore.write(Draft(text: "unsent", attachments: []), key: .chat("s-new"), in: temp.url)
 
         #expect(
             AppStore.unsentDraftSessionId(in: temp.url, isListed: { _ in false }) == "s-new")
@@ -400,7 +400,7 @@ struct ComposerDraftTests {
     /// a row, so it is reachable from the list — where its own draft comes back
     /// on the tap — and compose must still open something new.
     @Test func aSentConversationsDraftIsNotWhatComposeResumes() {
-        DraftStore.write(Draft(text: "unsent", attachments: []), sessionId: "s-old", in: temp.url)
+        DraftStore.write(Draft(text: "unsent", attachments: []), key: .chat("s-old"), in: temp.url)
 
         #expect(AppStore.unsentDraftSessionId(in: temp.url, isListed: { $0 == "s-old" }) == nil)
     }
@@ -417,7 +417,7 @@ struct ComposerDraftTests {
         let outbox = temp.makeOutbox(sessionId: "s-offline")
         outbox.beginSend(platformMsgId: "m-1", text: "sent while offline", attachments: [])
         DraftStore.write(
-            Draft(text: "and then some more", attachments: []), sessionId: "s-offline",
+            Draft(text: "and then some more", attachments: []), key: .chat("s-offline"),
             in: temp.url)
 
         #expect(AppStore.unsentDraftSessionId(in: temp.url, isListed: { _ in false }) == nil)

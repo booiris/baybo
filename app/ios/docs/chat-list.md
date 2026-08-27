@@ -328,6 +328,13 @@ the NSE can set `content.badge` while the app is dead; it counts through the sam
 `fold_unread` as the chat list's per-row badges, so the icon and the rows cannot
 drift into two implementations.
 
+**Projects is deliberately absent from the icon.** Nothing about a board is
+pushed — no APNs payload carries a board's attention count — so an icon badge
+including it would be right only while the app was foreground and silently
+stale the rest of the time, which is worse than not claiming it. The Projects
+TAB badge does carry it, and moves only while the app is open, which is the
+honest state of that feature. See [navigation.md](navigation.md).
+
 Only `SessionIndex.shared` owns the icon (`ownsAppBadge`) — the suites run in
 parallel against temp directories and would otherwise race over the host app's
 real badge.

@@ -132,6 +132,11 @@ was tried and failed, and several name a bug that shipped once already.
   hand-rolled menu panel, and the per-session `(entry, model, effort)` pin.
 - [`docs/approvals.md`](docs/approvals.md) — the native tool-approval card and
   the four frames that drive it.
+- [`docs/projects.md`](docs/projects.md) — the Projects tab: the cards root,
+  the one-stage-at-a-time board, the Waiting-on-you strip, the Move sheet's
+  consequence rows, the card page (a third webview) and its run transcripts.
+  [`docs/projects-plan.md`](docs/projects-plan.md) is the build log — what each
+  phase changed and, more usefully, what the simulator corrected.
 - [`docs/deck.md`](docs/deck.md) — the iOS half of Deck;
   [`docs/modules/deck.md`](../../docs/modules/deck.md) is the design's source of
   truth.
@@ -147,4 +152,7 @@ was tried and failed, and several name a bug that shipped once already.
 - Voice input has no composer affordance — the mic placeholder button was
   removed with the Liquid Glass restyle. Wiring real capture later means
   re-adding the button, not just filling in a handler.
-- The Projects tab is a `PlaceholderScreen`.
+- The Projects tab has no device pass yet — every tier is simulator-only. The
+  comment field's `@` mention strip is the piece that most wants hardware: it
+  reads the caret off the focused UIKit document and holds itself back while an
+  IME composition is open, so a Chinese keyboard is what would find its edges.

@@ -149,33 +149,3 @@ struct ApprovalCardView: View {
     }
 }
 
-/// The card's own pill: shorter than `Theme`'s standard pills (which size for a
-/// full-page CTA and read bulky stacked inside a card over the composer). Local
-/// rather than a new Theme style — nothing else wants this proportion.
-///
-/// `fill: nil` draws the stroke-only variant. The 44pt floor is the HIG minimum
-/// hit target and is the real lower bound here: the padding may shrink, the
-/// tappable area may not — this is the one control in the app where a mis-tap
-/// runs a command the user meant to refuse.
-private struct CompactPillButtonStyle: ButtonStyle {
-    let fill: Color?
-    let color: Color
-
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .font(Theme.mono(14))
-            .foregroundStyle(color)
-            .padding(.vertical, 8)
-            .frame(maxWidth: .infinity, minHeight: 44)
-            .background {
-                if let fill {
-                    Capsule().fill(fill)
-                }
-            }
-            // Stroke-only pills don't hit-test their interior without a shape.
-            .contentShape(Capsule())
-            .overlay(fill == nil ? Capsule().strokeBorder(color, lineWidth: 1) : nil)
-            .opacity(configuration.isPressed ? 0.7 : 1)
-            .scaleEffect(configuration.isPressed ? 0.98 : 1)
-    }
-}

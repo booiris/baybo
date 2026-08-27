@@ -115,6 +115,14 @@ pub enum ProjectChangeScope {
     /// refetched every column to learn somebody said something would be
     /// doing the most expensive thing for the least reason.
     Timeline,
+    /// A scope this build has never heard of. Nothing constructs it; it
+    /// exists so a gateway that grows a scope costs an older client the
+    /// narrowing and not the frame — the alternative is that the whole
+    /// [`Frame`] fails to decode and the client stops learning that the
+    /// board changed at all. Refetching the board is the right answer to
+    /// every scope there is, so the degraded reading is still correct.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Reference to a media payload that travels alongside a [`Message`].
@@ -1249,6 +1257,51 @@ mod tests {
 
         let global = Frame::Gap { session_id: None };
         assert_eq!(global, decode(&encode(&global).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn round_trip_project_changed() {
+        let frame = Frame::ProjectChanged {
+            project_id: "proj-1".into(),
+            scope: ProjectChangeScope::Timeline,
+            issue_number: Some(7),
+        };
+        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn a_scope_this_build_has_never_heard_of_still_decodes() {
+        // A gateway one version ahead. What degrades is the narrowing —
+        // not the frame, and so not the client's knowledge that this
+        // board moved. Without the fallback arm the whole `Frame` fails
+        // to decode and the phone silently stops refreshing.
+        #[derive(Serialize)]
+        struct FutureFrame {
+            kind: &'static str,
+            project_id: &'static str,
+            scope: &'static str,
+            issue_number: u32,
+        }
+        let bytes = rmp_serde::to_vec_named(&FutureFrame {
+            kind: "project_changed",
+            project_id: "proj-1",
+            scope: "swimlane",
+            issue_number: 7,
+        })
+        .unwrap();
+
+        let frame = decode(&bytes).expect("an unknown scope must not fail the frame");
+        let Frame::ProjectChanged {
+            project_id,
+            scope,
+            issue_number,
+        } = frame
+        else {
+            panic!("expected a project_changed frame, got {frame:?}");
+        };
+        assert_eq!(project_id, "proj-1");
+        assert_eq!(scope, ProjectChangeScope::Unknown);
+        assert_eq!(issue_number, Some(7));
     }
 
     #[test]

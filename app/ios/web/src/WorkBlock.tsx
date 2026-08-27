@@ -262,6 +262,7 @@ function WorkRunView({
   live,
   cancelled,
   wholeBlockMs,
+  defaultExpanded,
   onToggle,
 }: {
   seg: Extract<WorkSegment, { kind: "machinery" }>;
@@ -270,10 +271,13 @@ function WorkRunView({
   /// Set only when this run is the block's ONLY segment, so its span is the
   /// block's own `elapsedMs` — see `workRunLabel`.
   wholeBlockMs?: number;
+  /// Read-only transcripts open an unanswered tail so its last visible thing
+  /// is the work itself, not a misleadingly final-looking `Worked` summary.
+  defaultExpanded?: boolean;
   onToggle?: (expanded: boolean) => void;
 }) {
   const { t } = useTranslation();
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useState(defaultExpanded ?? false);
   if (live) {
     return (
       <div className="work active">
@@ -319,9 +323,13 @@ function WorkRunView({
 
 export const WorkBlockView = memo(function WorkBlockView({
   row,
+  defaultExpanded,
   onToggle,
 }: {
   row: WorkRow;
+  /// Initial state only: a later final answer must not snap shut work the
+  /// reader was already looking at, and a manual collapse remains respected.
+  defaultExpanded?: boolean;
   /// Fired with the NEW expanded state on a user tap, so the transcript can
   /// disengage follow-to-bottom when a run opens — otherwise the pin chases
   /// the newest edge and the inserted steps shove the summary UP instead of
@@ -359,6 +367,7 @@ export const WorkBlockView = memo(function WorkBlockView({
             // are shorter than the block and there is nothing honest to fall
             // back to, so those keep the step count.
             wholeBlockMs={runs.length === 1 ? row.elapsedMs : undefined}
+            defaultExpanded={defaultExpanded}
             onToggle={onToggle}
           />
         ),

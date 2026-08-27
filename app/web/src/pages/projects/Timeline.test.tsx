@@ -39,6 +39,7 @@ const ISSUE: Issue = {
   stage: 0,
   unread: 0,
   last_run_failed: false,
+  approval_pending: false,
   opened_by_agent: false,
   pinned: false,
   created_at_ms: 0,
@@ -65,7 +66,6 @@ function renderTimeline(events: IssueEvent[], onComment = vi.fn(), busy = false)
     <Timeline
       events={events}
       issue={ISSUE}
-      runs={[]}
       onComment={onComment}
       onResolveApproval={vi.fn()}
       busy={busy}
@@ -86,7 +86,7 @@ describe('Timeline', () => {
     expect(screen.getByText('opened this issue')).toBeInTheDocument();
     expect(screen.getByText('moved it from Todo to In Progress')).toBeInTheDocument();
     expect(screen.getByText('check the reconnect path')).toBeInTheDocument();
-    expect(screen.getByText('run #2 failed — ran out')).toBeInTheDocument();
+    expect(screen.getByText('turn 2 failed — ran out')).toBeInTheDocument();
     expect(screen.getAllByText('@dev-1').length).toBeGreaterThan(0);
     expect(screen.getAllByText('you').length).toBeGreaterThan(0);
   });
@@ -102,7 +102,6 @@ describe('Timeline', () => {
       <Timeline
         events={[]}
         issue={ISSUE}
-        runs={[]}
         onComment={onComment}
         onResolveApproval={vi.fn()}
         team={TEAM}
@@ -123,7 +122,6 @@ describe('Timeline', () => {
       <Timeline
         events={[]}
         issue={ISSUE}
-        runs={[]}
         onComment={vi.fn()}
         onResolveApproval={vi.fn()}
         team={TEAM}
@@ -156,16 +154,6 @@ describe('Timeline', () => {
     expect(screen.getByRole('button', { name: 'Comment' })).toBeDisabled();
     expect(onComment).not.toHaveBeenCalled();
   });
-
-  it('tells the operator what sending will actually do', () => {
-    renderTimeline([]);
-    // The sentence lost its chip but not its job: whether sending spends
-    // money or only records is on the button you are about to press.
-    expect(screen.getByRole('button', { name: 'Comment' })).toHaveAttribute(
-      'title',
-      expect.stringContaining('Starts a run') as unknown as string,
-    );
-  });
 });
 
 describe('pending approvals', () => {
@@ -179,16 +167,16 @@ describe('pending approvals', () => {
             call_id: 'c1',
             tool: 'Bash',
             summary: 'rm -rf build',
+            attempt: 4,
           }),
         ]}
         issue={ISSUE}
-        runs={[]}
         onComment={vi.fn()}
         onResolveApproval={onResolveApproval}
         busy={false}
       />,
     );
-    expect(screen.getByText(/Waiting on you/)).toBeInTheDocument();
+    expect(screen.getByText('⚑ Waiting on you · turn 4')).toBeInTheDocument();
     // The command is what is being approved, so it gets its own box rather
     // than sharing a paragraph with the ask.
     expect(screen.getByText(/Bash · rm -rf build/)).toBeInTheDocument();
@@ -209,7 +197,6 @@ describe('pending approvals', () => {
           entry({ kind: 'approval_requested', call_id: 'c2', tool: 'Bash', summary: 'git push' }),
         ]}
         issue={ISSUE}
-        runs={[]}
         onComment={vi.fn()}
         onResolveApproval={vi.fn()}
         busy={false}
@@ -238,7 +225,6 @@ describe('pending approvals', () => {
           }),
         ]}
         issue={ISSUE}
-        runs={[]}
         onComment={vi.fn()}
         onResolveApproval={vi.fn()}
         busy={false}
@@ -266,7 +252,6 @@ describe('pending approvals', () => {
           },
         ]}
         issue={ISSUE}
-        runs={[]}
         onComment={vi.fn()}
         onResolveApproval={vi.fn()}
         busy={false}
@@ -291,7 +276,6 @@ describe('pending approvals', () => {
           },
         ]}
         issue={ISSUE}
-        runs={[]}
         onComment={vi.fn()}
         onResolveApproval={vi.fn()}
         busy={false}
@@ -312,7 +296,6 @@ describe('pending approvals', () => {
       <Timeline
         events={[entry({ kind: 'comment', text: 'the **root cause** is a timer' })]}
         issue={ISSUE}
-        runs={[]}
         onComment={vi.fn()}
         onResolveApproval={vi.fn()}
         busy={false}

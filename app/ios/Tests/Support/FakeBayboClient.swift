@@ -48,6 +48,13 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
         let mimeType: String
     }
 
+    struct CommentCall {
+        let number: Int64
+        let clientMsgId: String
+        let text: String
+        let attachments: [IssueAttachmentInput]
+    }
+
     /// Everything the app never calls under test. Distinct prose so an
     /// accidental reliance on it is obvious in the failure.
     private static let unsupported = BayboError.Other(
@@ -546,6 +553,313 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     }
 
     func setDeckSink(sink: DeckSink) {}
+
+    // MARK: - Projects
+    //
+    // Every one of these throws: the Projects tab drives a store that takes an
+    // injected client of its own, so a test that means to exercise a board
+    // seeds that store rather than reaching through here. These exist to keep
+    // `BayboClientProtocol` conformance — which is the only thing in the repo
+    // that catches UniFFI seam drift — and a live call landing in one is a
+    // test relying on a call it never declared.
+
+    /// The board reads a store drives. Programmable rather than throwing,
+    /// because `ProjectsStore` is exercised through this fake — the writes
+    /// below stay unsupported until a phase has a caller for one.
+    private var _stubProjects: [ProjectInfo] = []
+    private var _stubIssues: [IssueInfo] = []
+    private var _stubIssueDetail: IssueInfo?
+    private var _issueDetailStallMs = 0
+    private var _issueDetailCalls = 0
+    private var _stubIssueEventsJson: String?
+    private var _stubRunLog: IssueRunLog?
+    private var _approvalsResolved: [(Int64, String, IssueApprovalDecision)] = []
+    private var _approvalResolveError: Error?
+    private var _stubRuns: [IssueRunInfo] = []
+    private var _stubTeam: [TeamMemberInfo] = []
+    private var _stubAttention: [ProjectAttention] = []
+    private var _stubActivity: [ProjectActivity] = []
+    private var _patches: [(Int64, IssuePatch)] = []
+    private var _comments: [CommentCall] = []
+    private var _failComments = false
+    private var commentsHeld = false
+    private var commentWaiters: [CheckedContinuation<Void, Never>] = []
+    /// Make the board unreachable, which is how the store learns it is offline.
+    private var _failProjects = false
+
+    /// Every `PATCH /issues/{n}` this fake was sent, in order.
+    var patches: [(Int64, IssuePatch)] { lock.withLock { _patches } }
+
+    var stubProjects: [ProjectInfo] {
+        get { lock.withLock { _stubProjects } }
+        set { lock.withLock { _stubProjects = newValue } }
+    }
+    var stubIssues: [IssueInfo] {
+        get { lock.withLock { _stubIssues } }
+        set { lock.withLock { _stubIssues = newValue } }
+    }
+    /// One card, for `projectIssueGet` — separate from `stubIssues` (the
+    /// board's list), because a card page reads both for different things.
+    var stubIssueDetail: IssueInfo? {
+        get { lock.withLock { _stubIssueDetail } }
+        set { lock.withLock { _stubIssueDetail = newValue } }
+    }
+    var issueDetailStallMs: Int {
+        get { lock.withLock { _issueDetailStallMs } }
+        set { lock.withLock { _issueDetailStallMs = newValue } }
+    }
+    var issueDetailCalls: Int { lock.withLock { _issueDetailCalls } }
+    var stubIssueEventsJson: String? {
+        get { lock.withLock { _stubIssueEventsJson } }
+        set { lock.withLock { _stubIssueEventsJson = newValue } }
+    }
+    var stubRunLog: IssueRunLog? {
+        get { lock.withLock { _stubRunLog } }
+        set { lock.withLock { _stubRunLog = newValue } }
+    }
+    /// What was answered, so a test can assert the DECISION reached the wire
+    /// and not only that the row went away.
+    var approvalsResolved: [(Int64, String, IssueApprovalDecision)] {
+        get { lock.withLock { _approvalsResolved } }
+        set { lock.withLock { _approvalsResolved = newValue } }
+    }
+    var approvalResolveError: Error? {
+        get { lock.withLock { _approvalResolveError } }
+        set { lock.withLock { _approvalResolveError = newValue } }
+    }
+    var stubRuns: [IssueRunInfo] {
+        get { lock.withLock { _stubRuns } }
+        set { lock.withLock { _stubRuns = newValue } }
+    }
+    var stubTeam: [TeamMemberInfo] {
+        get { lock.withLock { _stubTeam } }
+        set { lock.withLock { _stubTeam = newValue } }
+    }
+    var stubAttention: [ProjectAttention] {
+        get { lock.withLock { _stubAttention } }
+        set { lock.withLock { _stubAttention = newValue } }
+    }
+    var stubActivity: [ProjectActivity] {
+        get { lock.withLock { _stubActivity } }
+        set { lock.withLock { _stubActivity = newValue } }
+    }
+    var failProjects: Bool {
+        get { lock.withLock { _failProjects } }
+        set { lock.withLock { _failProjects = newValue } }
+    }
+    var comments: [CommentCall] { lock.withLock { _comments } }
+    var failComments: Bool {
+        get { lock.withLock { _failComments } }
+        set { lock.withLock { _failComments = newValue } }
+    }
+    var parkedComments: Int { lock.withLock { commentWaiters.count } }
+
+    func holdComments() { lock.withLock { commentsHeld = true } }
+
+    func releaseComments() {
+        let parked: [CheckedContinuation<Void, Never>] = lock.withLock {
+            commentsHeld = false
+            let waiters = commentWaiters
+            commentWaiters.removeAll()
+            return waiters
+        }
+        for waiter in parked { waiter.resume() }
+    }
+
+    private func refuseIfOffline() throws {
+        if lock.withLock({ _failProjects }) { throw BayboError.NotConnected }
+    }
+
+    func projectList(includeArchived: Bool) async throws -> [ProjectInfo] {
+        try refuseIfOffline()
+        return stubProjects
+    }
+    func projectGet(projectId: String) async throws -> ProjectInfo { throw Self.unsupported }
+    func projectCreate(new: NewProject) async throws -> ProjectInfo { throw Self.unsupported }
+    func projectUpdate(projectId: String, settings: ProjectSettings) async throws {
+        throw Self.unsupported
+    }
+    func projectSetArchived(projectId: String, archived: Bool) async throws -> ProjectInfo {
+        throw Self.unsupported
+    }
+    func projectIssues(projectId: String) async throws -> [IssueInfo] {
+        try refuseIfOffline()
+        return stubIssues
+    }
+    func projectIssueGet(projectId: String, number: Int64) async throws -> IssueInfo {
+        try refuseIfOffline()
+        let (detail, stall) = lock.withLock {
+            _issueDetailCalls += 1
+            return (_stubIssueDetail, _issueDetailStallMs)
+        }
+        if stall > 0 { try? await Task.sleep(for: .milliseconds(stall)) }
+        guard let detail else { throw Self.unsupported }
+        return detail
+    }
+    func projectIssueCreate(projectId: String, new: NewIssue) async throws -> IssueInfo {
+        throw Self.unsupported
+    }
+    /// Records the patch and answers with the stubbed card.
+    ///
+    /// The recording is the point: `IssuePatch` is a FULL REPLACE of every
+    /// field it names, so a verb that means to change one thing and quietly
+    /// carries a second clears that second — which is a class of bug no
+    /// assertion about the resulting board can see, because the optimistic
+    /// edit is applied locally and looks right either way.
+    func projectIssuePatch(projectId: String, number: Int64, patch: IssuePatch) async throws
+        -> IssueInfo
+    {
+        lock.withLock { _patches.append((number, patch)) }
+        guard let card = stubIssueDetail else { throw Self.unsupported }
+        return card
+    }
+    func projectIssueMove(
+        projectId: String, number: Int64, status: IssueStatus, orderedNumbers: [Int64]
+    ) async throws -> IssueInfo { throw Self.unsupported }
+    func projectActiveRuns(projectId: String) async throws -> [IssueRunInfo] {
+        try refuseIfOffline()
+        return stubRuns
+    }
+    func projectIssueRuns(projectId: String, number: Int64) async throws -> IssueRunLog {
+        try refuseIfOffline()
+        guard let stubRunLog else { throw Self.unsupported }
+        return stubRunLog
+    }
+    func projectRunCancel(projectId: String, number: Int64) async throws { throw Self.unsupported }
+    func projectRunRetry(projectId: String, number: Int64) async throws -> IssueRunInfo {
+        try refuseIfOffline()
+        return IssueRunInfo(
+            number: number, attempt: 1, agentId: "a-dev", status: .queued, trigger: .retry,
+            sessionId: nil, error: nil, createdAtMs: 0, startedAtMs: nil, settledAtMs: nil,
+            costMicros: nil, inputTokens: nil, outputTokens: nil)
+    }
+    /// What a run's transcript answers with, per door. Two stubs rather than
+    /// one, because the doors differ in the only way that matters: the FRAME
+    /// KIND, and a fake that served both from one field could not tell a store
+    /// that took the wrong door from one that took the right one.
+    var stubRunBaselineJson: String?
+    var stubRunHistoryJson: String?
+    /// The `beforeOrdinal` of each scroll-up page asked for, in order.
+    var runHistoryAsks: [Int64?] = []
+    var runBaselineAsks = 0
+    func projectRunTranscript(
+        projectId: String, number: Int64, attempt: Int64, beforeOrdinal: Int64?, limit: UInt32?
+    ) async throws -> String {
+        runHistoryAsks.append(beforeOrdinal)
+        try refuseIfOffline()
+        guard let stubRunHistoryJson else { throw Self.unsupported }
+        return stubRunHistoryJson
+    }
+    func projectRunTranscriptBaseline(
+        projectId: String, number: Int64, attempt: Int64, limit: UInt32?
+    ) async throws -> String {
+        runBaselineAsks += 1
+        try refuseIfOffline()
+        guard let stubRunBaselineJson else { throw Self.unsupported }
+        return stubRunBaselineJson
+    }
+    func projectIssueEvents(projectId: String, number: Int64) async throws -> String {
+        try refuseIfOffline()
+        guard let stubIssueEventsJson else { throw Self.unsupported }
+        return stubIssueEventsJson
+    }
+    func projectIssueComment(
+        projectId: String, number: Int64, clientMsgId: String, text: String,
+        attachments: [IssueAttachmentInput]
+    ) async throws -> String {
+        try refuseIfOffline()
+        let held: Bool = lock.withLock {
+            _comments.append(
+                CommentCall(
+                    number: number, clientMsgId: clientMsgId, text: text, attachments: attachments))
+            return commentsHeld
+        }
+        if held {
+            await withCheckedContinuation { continuation in
+                let alreadyReleased: Bool = lock.withLock {
+                    guard commentsHeld else { return true }
+                    commentWaiters.append(continuation)
+                    return false
+                }
+                if alreadyReleased { continuation.resume() }
+            }
+        }
+        if failComments { throw Self.unsupported }
+        let wireAttachments: [[String: Any]] = attachments.map { attachment in
+            var wire: [String: Any] = [
+                "blob_id": attachment.blobId,
+                "mime_type": "application/octet-stream",
+                "size": 0,
+            ]
+            if let filename = attachment.filename { wire["filename"] = filename }
+            return wire
+        }
+        let row: [String: Any] = [
+            "id": "event-\(clientMsgId)",
+            "client_msg_id": clientMsgId,
+            "number": number,
+            "actor": ["kind": "user"],
+            "body": [
+                "kind": "comment",
+                "text": text,
+                "attachments": wireAttachments,
+            ],
+            "created_at_ms": 1,
+        ]
+        let data = try JSONSerialization.data(withJSONObject: row)
+        guard let json = String(data: data, encoding: .utf8) else { throw Self.unsupported }
+        return json
+    }
+    func projectIssueApprovalResolve(
+        projectId: String, number: Int64, callId: String, decision: IssueApprovalDecision
+    ) async throws {
+        try refuseIfOffline()
+        let error = lock.withLock {
+            _approvalsResolved.append((number, callId, decision))
+            return _approvalResolveError
+        }
+        if let error { throw error }
+    }
+    func projectIssueRead(projectId: String, number: Int64) async throws {
+        try refuseIfOffline()
+    }
+    func projectRead(projectId: String) async throws { try refuseIfOffline() }
+    func projectFeed(projectId: String, beforeMs: Int64?, limit: UInt32?) async throws -> String {
+        throw Self.unsupported
+    }
+    func projectTeam(projectId: String) async throws -> [TeamMemberInfo] {
+        try refuseIfOffline()
+        return stubTeam
+    }
+    func projectRemoveAgent(projectId: String, agentId: String) async throws {
+        throw Self.unsupported
+    }
+    /// Faces set through this fake, newest last. `nil` is a clear.
+    var avatarsSet: [(agentId: String, blobId: String?)] = []
+    func agentSetAvatar(agentId: String, blobId: String?) async throws {
+        try refuseIfOffline()
+        avatarsSet.append((agentId, blobId))
+    }
+    var generatedAvatarsSet: [(agentId: String, blobId: String)] = []
+    func agentSetAvatarIfEmpty(agentId: String, blobId: String) async throws {
+        try refuseIfOffline()
+        generatedAvatarsSet.append((agentId, blobId))
+    }
+
+    func agentSetModel(
+        agentId: String, llm: String?, model: String?, reasoningEffort: String?
+    ) async throws {
+        throw Self.unsupported
+    }
+    func projectsAttention() async throws -> [ProjectAttention] {
+        try refuseIfOffline()
+        return stubAttention
+    }
+    func projectsActivity(sinceMs: Int64?) async throws -> [ProjectActivity] {
+        try refuseIfOffline()
+        return stubActivity
+    }
+    func setProjectSink(sink: ProjectSink) {}
 
     /// Answers from the same seeded cache the cached-read paths use, so a test
     /// that wants a tapped attachment to have bytes seeds one map, not two.

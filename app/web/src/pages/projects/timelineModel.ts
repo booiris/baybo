@@ -1,16 +1,7 @@
 import type { components, paths } from '../../api/schema';
 
-import {
-  COLUMN_LABEL,
-  RUN_TRIGGER_LABEL,
-  formatDuration,
-  unsettledRun,
-  type Agent,
-  type IssueStatus,
-  type RunStatus,
-} from './boardModel';
-import { HELD_RUN_NOTE, formatTokens, formatUsd } from './budgetModel';
-import { handleOf } from './teamModel';
+import { COLUMN_LABEL, RUN_TRIGGER_LABEL, formatDuration } from './boardModel';
+import { formatTokens, formatUsd } from './budgetModel';
 
 export type IssueEvent = components['schemas']['IssueEventDto'];
 export type IssueEventBody = components['schemas']['IssueEventBodyDto'];
@@ -112,6 +103,12 @@ const DECISION_LABEL: Record<'approve' | 'approve_always' | 'deny', string> = {
   deny: 'refusal',
 };
 
+/// A run's ordinal as shown in project activity. Issue numbers own the `#N`
+/// spelling, so turns deliberately use a different visual namespace.
+export function turnLabel(attempt: number): string {
+  return `turn ${attempt}`;
+}
+
 export type PendingApproval = {
   callId: string;
   tool: string;
@@ -177,12 +174,12 @@ export function describeEvent(body: IssueEventBody): string | null {
       return `reassigned it from ${from} to ${to}`;
     }
     case 'run_started':
-      return `started run #${body.attempt} (${body.trigger})`;
+      return `started ${turnLabel(body.attempt)} (${body.trigger})`;
     case 'run_interrupted':
-      return `run #${body.attempt} was interrupted before it finished — the board picked it up again`;
+      return `${turnLabel(body.attempt)} was interrupted before it finished — the board picked it up again`;
     case 'run_settled': {
       const detail = body.error != null && body.error.length > 0 ? ` — ${body.error}` : '';
-      return `run #${body.attempt} ${body.status}${detail}`;
+      return `${turnLabel(body.attempt)} ${body.status}${detail}`;
     }
     case 'blocked':
       return `blocked it: ${body.reason}`;
@@ -225,7 +222,7 @@ export function describeEvent(body: IssueEventBody): string | null {
       // reader can act on: the card already shows the move or the handover
       // that was made, and this is the run it implied not happening.
       return body.attempt != null
-        ? `did not start a run (${RUN_TRIGGER_LABEL[body.trigger]}) — run #${body.attempt} still has this card`
+        ? `did not start a run (${RUN_TRIGGER_LABEL[body.trigger]}) — ${turnLabel(body.attempt)} still has this card`
         : `did not start a run (${RUN_TRIGGER_LABEL[body.trigger]}) — this card already had one in flight`;
     case 'filed':
       return `filed #${body.number} out of this card's work`;
@@ -248,52 +245,6 @@ export function describeEvent(body: IssueEventBody): string | null {
 
 function unnamedEvent(_body: never): string {
   return 'did something this page is too old to describe';
-}
-
-/// What sending will do, in the assignee's own name.
-///
-/// `team` is required rather than optional: the assignee on an issue is an
-/// agent **id**, and every sentence below addresses a person. Resolving it
-/// here — where the hint is written — is what stops a raw ULID reaching the
-/// composer, which is what happened while this took only the issue.
-export function commentHint(
-  issue: {
-    status: IssueStatus;
-    assignee?: string | null;
-    cancelled_at_ms?: number | null;
-    blocked_reason?: string | null;
-  },
-  runs: { status: RunStatus }[],
-  team: Agent[],
-): string {
-  const assignee = issue.assignee == null ? null : handleOf(team, issue.assignee);
-  // Ahead of every other case, including the unstaffed one: on a cancelled
-  // card the operator's comment is what takes the cancel back, and the
-  // ordinary rules only apply again to the card it leaves behind.
-  if (issue.cancelled_at_ms != null) {
-    return 'This issue is cancelled — commenting reopens it.';
-  }
-  if (assignee == null) {
-    return 'Records only — nobody is assigned to this issue yet.';
-  }
-  if (issue.status === 'backlog' || issue.status === 'done') {
-    return `Records only — @${assignee} is not working on this right now.`;
-  }
-  // A block takes precedence over any live run, matching the server.
-  if (issue.blocked_reason != null) {
-    return `Records only — a block has stopped this issue; @${assignee} picks this up when it is lifted.`;
-  }
-  const live = unsettledRun(runs);
-  if (live?.status === 'held') {
-    return `@${assignee} will read this when the held run starts — ${HELD_RUN_NOTE}.`;
-  }
-  if (live?.status === 'queued') {
-    return `@${assignee} will read this when the queued run starts.`;
-  }
-  if (live?.status === 'running') {
-    return `@${assignee} is mid-run — this is picked up when that run finishes.`;
-  }
-  return `Starts a run: @${assignee} will read this now.`;
 }
 
 /// When an entry happened, to the minute — always. An older entry used to
@@ -414,19 +365,19 @@ export function feedLine(entry: FeedEntry): Span[] {
     // so the feed read as if the assignee had run it. On a board where a
     // review handover is a reassignment, that is usually the wrong agent.
     case 'run_started':
-      return join(who(entry), `'s run #${body.attempt} started on `, at);
+      return join(who(entry), `'s ${turnLabel(body.attempt)} started on `, at);
     // The actor here is always the board, so it is left off: what the line
     // has to name is the card and the run that took its slot.
     case 'run_refused':
       return join(
         at,
         ` did not start a run (${RUN_TRIGGER_LABEL[body.trigger]})`,
-        body.attempt != null ? ` — run #${body.attempt} still has it` : ' — it already had one',
+        body.attempt != null ? ` — ${turnLabel(body.attempt)} still has it` : ' — it already had one',
       );
     case 'run_settled':
       return join(
         who(entry),
-        `'s run #${body.attempt} `,
+        `'s ${turnLabel(body.attempt)} `,
         { text: body.status, strong: true },
         ' on ',
         at,

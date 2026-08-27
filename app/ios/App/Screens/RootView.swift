@@ -47,6 +47,15 @@ struct RootView: View {
                                     CronJobsScreen()
                                 case .deckRecycle:
                                     DeckRecycleScreen()
+                                case .projectBoard(let projectId):
+                                    ProjectBoardScreen(projectId: projectId, store: store.projectsStore)
+                                case .projectIssue(let issue):
+                                    ProjectIssueScreen(visit: store.issueVisit(for: issue))
+                                case .newProject:
+                                    NewProjectScreen()
+                                case .newIssue(let projectId, let status):
+                                    NewIssueScreen(
+                                        projectId: projectId, initialStatus: status)
                                 }
                             }
                             .toolbar(.hidden, for: .navigationBar)
@@ -84,6 +93,24 @@ struct RootView: View {
                         dismissDeleteConfirm()
                         withAnimation {
                             store.requestDelete(sessionId)
+                        }
+                    }
+                )
+                .zIndex(1)
+            }
+
+            if let pending = store.confirmCancelIssue {
+                ConfirmDialog(
+                    titleKey: "board.cancelConfirmTitle",
+                    bodyKey: "board.cancelConfirmBody",
+                    bodyArg: String(pending.number),
+                    commitKey: "board.cancelIssue",
+                    onCancel: dismissCancelIssueConfirm,
+                    onConfirm: {
+                        dismissCancelIssueConfirm()
+                        Task {
+                            await store.projectsStore.setCancelled(
+                                board: pending.projectId, issue: pending.number, true)
                         }
                     }
                 )
@@ -165,6 +192,12 @@ struct RootView: View {
     private func dismissDeleteConfirm() {
         withAnimation(ConfirmDialog.exitMotion) {
             store.confirmDeleteSession = nil
+        }
+    }
+
+    private func dismissCancelIssueConfirm() {
+        withAnimation(ConfirmDialog.exitMotion) {
+            store.confirmCancelIssue = nil
         }
     }
 

@@ -86,16 +86,14 @@ final class ModelCatalog: ObservableObject {
     /// or when the pin names an entry the catalog no longer has (the caller
     /// falls back to the raw pin string for display).
     func effectiveEntry(pin: String?) -> LlmModelInfo? {
-        let name = pin ?? defaultName
-        return models.first { $0.name == name }
+        LlmPinOptions.effectiveEntry(in: models, defaultName: defaultName, pinned: pin)
     }
 
     /// The models an entry can be pinned to — its default `model` first, then
     /// each `model_candidates` id, de-duped. What the picker lists under the
     /// entry.
     func models(of entry: LlmModelInfo) -> [String] {
-        var seen = Set<String>()
-        return ([entry.model] + entry.modelCandidates).filter { seen.insert($0).inserted }
+        LlmPinOptions.models(of: entry)
     }
 
     // MARK: - Mirror (`models.json` — a pure cache, never a source of truth)

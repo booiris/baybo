@@ -63,17 +63,20 @@ place. That is what lets every caller *in this process* — the manager, the six
 board tools, the REST routes — answer a question the same way without any of
 them carrying a copy of the rule.
 
-The web board is not one of those callers, and this is the seam to know about.
-A composer has to say what sending will do while the text is still being typed,
-so it cannot ask the server. There are two hand-written TypeScript mirrors in
-`app/web/src/pages/projects/`: `commentHint` mirrors
-`comments::comment_delivery`, the block gate inside it included, and
-`mentionHint`/`mentionQuery` mirror `mentions::assigns_to` **and the refusal
-`mention_assignment` wraps it in** — a mention on a blocked card is recorded
-and staffs nobody, so the composer says that rather than promising a handover
-that will not happen. Nothing enforces the correspondence — not a generated
-binding, not a shared schema — only the two test suites, one per language,
-asserting the same cases. So widening `is_live_work` by one column, or adding a
+The clients used to be those callers, and the seam is worth knowing about even
+now that they are not. A composer cannot ask the server what sending will do —
+it has to say it while the text is still being typed — so both clients grew a
+hand-written mirror of `comments::comment_delivery` and of `mentions::assigns_to`
+(with the refusal `mention_assignment` wraps it in: a mention on a blocked card
+is recorded and staffs nobody). **Both are gone as of 2026-08-26**: the phone's
+never earned its two lines of chrome and the web's only ever surfaced as the
+send button's `title` tooltip, which is to say almost never. `commentHint`,
+`mentionHint` and the golden vectors that held the copies together were deleted
+with them, so THIS FILE'S rule is once again the only one — a client that wants
+to warn in advance again needs a mirror and a fixture to pin it. What survives
+in `app/web/src/pages/projects/` is `mentionQuery` / `mentionCandidates` /
+`applyMention`, which are the `@` autocomplete and assert nothing about what the
+server will do. So widening `is_live_work` by one column, or adding a
 run state that reads as idle, is a change on both sides in the same commit;
 `cargo test` alone will be green with a board that wakes an agent while the
 composer still promises "Records only".
@@ -244,7 +247,7 @@ three questions once each:
    placed to hand a live card over is the one holding its run slot.
 
    The entry names the **attempt holding the slot**, not just the refusal:
-   "refused" is not something an operator can act on and "run #4 still has
+   "refused" is not something an operator can act on and "turn 4 still has
    this card" is. It is recorded for every trigger, coordination included,
    with one exception (`runs::refused_itself`): a `Running` holder whose
    `agent_id` is the agent now asking. The intended case is an agent moving
@@ -498,7 +501,7 @@ A run's spend is **derived, never stored**: `RUN_COST_WINDOW`
 (`sqlite/project.rs`) attributes a `cost_records` row to the run whose
 claim→settle window on that session contains it, and the two readers —
 `run_spend` (a card's execution log) and `settled_run_facts` (the board
-feed's `run #1 done on #7 · 2m10s · $0.04`) — are the same predicate under
+feed's `turn 1 done on #7 · 2m10s · $0.04`) — are the same predicate under
 two addressings. Reach them through `ProjectManager::run_log` /
 `ProjectManager::feed`; a caller that joins `issue_runs.session_id` to
 `cost_records` itself over-counts by a factor of however many attempts
@@ -827,11 +830,12 @@ Six things it will not do, each of which is a rule and not a coincidence:
 
 Ordering is `(priority, position, number)` — the same order `IssueList` already
 reads a column in, deliberately, so "what is next in Todo" has one answer
-whether an agent asks or the board acts. Note that the **web board renders in
-`position` order with pinned cards lifted first and unread cards lifted within
-each partition** (`readingOrder`, a reading order that writes nothing), so on a
-column with mixed priorities the card the board takes next is not necessarily
-the one rendered at the top.
+whether an agent asks or the board acts. Note that both clients render pinned
+cards first and unread cards within each partition, then sort each resulting
+rank by `updated_at` descending (`readingOrder` / `BoardOrder`, a reading order
+that writes nothing); `position` and `number` only break equal timestamps. So
+on a column with mixed priorities the card the board takes next is not
+necessarily the one rendered at the top.
 
 **Asking the lead.** Some cards are not work the board can start — they are
 questions only the lead can answer, and the same pass that promotes asks them
@@ -1383,6 +1387,19 @@ timeline, from the issue and its unsettled run:
 | A `Held` or `Queued` run exists | `WaitsForQueuedRun` — it assembles its brief later, so it will read this |
 | A `Running` run exists | `AfterCurrentRun` — deferred |
 
+An operator comment may carry a client-minted UUID. `comment_idempotent` claims
+that key at the storage seam and returns the original timeline row on every
+replay. The same row carries `comment_consequences_applied`: a client-keyed
+insert writes false, and the manager flips it only after `timeline_changed`,
+uncancelling, mention assignment, and wake delivery have run. A retry exits
+immediately when that mark is true; when an interruption left it false, it
+re-drives the stored row's actor and text before marking completion. Those
+consequences are convergent, so a crash after applying one but before the mark
+may repeat it without duplicating a run or timeline transition. The first
+lookup happens before the archived-board write check, allowing a lost response
+to be replayed after the board was archived without turning an already-durable
+write into a failure.
+
 A **person's** comment on a cancelled card takes the cancel back
 (`ProjectManager::take_the_cancel_back`), before the delivery below is decided
 and before a mention is read. Without it the gesture is a dead end: the row
@@ -1480,9 +1497,11 @@ that cannot host a session).
 
 Both of those refusals are **log lines and nothing else** — the comment
 itself lands, so the card records the words and says nothing about the
-staffing they asked for. That is the reason `mentionHint` carries the block:
-the composer refuses in advance, in front of the person typing, which is the
-only place a refusal that writes nothing can be seen.
+staffing they asked for. That was the reason `mentionHint` carried the block:
+the composer refused in advance, in front of the person typing, which is the
+only place a refusal that writes nothing can be seen. With the hints gone
+(2026-08-26) nothing does — a mention on a blocked card is recorded, staffs
+nobody, and says so nowhere.
 
 That leaves `dispatch_if_triggered` — the last place `board_may_start` is
 not asked — exempt through exactly two doors, and both are an explicit
@@ -1956,7 +1975,13 @@ home of these rules:
   filter covers all three arms: the operator's own words, their own block and
   their own tidying are not news to them. An agent's block joins the other two
   because it is a decision the operator did not make, and on a blocked card it
-  is usually a question that gates the work.
+  is usually a question that gates the work. Two readers, one predicate:
+  `card_signals()` counts the matching rows, and `first_unread_event()` takes
+  the oldest of them — the entry a client should open the card at. That second
+  one exists so no client has to be told what "unread" means: handed the
+  cursor and the rows instead, it would answer the question a second time, and
+  its divider and this badge would be free to disagree. `GET
+  …/issues/{n}/events` ships it as `IssueTimelineDto.first_unread`.
 - `FAILED_CARD_PREDICATE` — a live card whose newest run failed. Both
   `card_signals()` (the badge) and `attention()` read it.
 - `UNSEEN_FAILURE_PREDICATE` — and that run settled after `read_at`.

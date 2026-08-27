@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 
@@ -26,6 +26,7 @@ function issue(overrides: Partial<Issue> = {}): Issue {
     updated_at_ms: 0,
     unread: 0,
     last_run_failed: false,
+    approval_pending: false,
     opened_by_agent: false,
     pinned: false,
     ...overrides,
@@ -58,6 +59,20 @@ const TEAM = [
 ];
 
 const ok = { status: 200, ok: true } as Response;
+
+type PatchReply = {
+  data: Issue | undefined;
+  error: { error: string } | undefined;
+  response: Response;
+};
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
 
 /// One run's conversation, as the board's transcript route answers it: the
 /// brief the card gave it, the work it did, what it said back.
@@ -603,6 +618,47 @@ describe('IssueDetailPage rail', () => {
     );
   });
 
+  it('cancels immediately, then rolls the whole preview back on refusal', async () => {
+    const write = deferred<PatchReply>();
+    client.PATCH.mockClear().mockImplementationOnce(() => write.promise);
+    renderIssue(issue(), [run('running')]);
+
+    await userEvent.click(await screen.findByRole('button', { name: 'More actions' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel issue' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel it' }));
+
+    // The same press updates every reading of cancellation. The card leaves
+    // the live queue, while the run ledger stays honest and keeps its separate
+    // stop action — cancelling a card does not rewrite a run's status.
+    expect(screen.getByText('Cancelled')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Wire the retry' }).className).toContain(
+      'line-through',
+    );
+    expect(screen.queryByText(/is working/)).toBeNull();
+    expect(screen.getByText('running')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'More actions' })).toBeDisabled();
+
+    await act(async () => {
+      write.resolve({
+        data: undefined,
+        error: { error: 'project is archived' },
+        response: { status: 409, ok: false } as Response,
+      });
+      await write.promise;
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByText('Cancelled')).toBeNull();
+    });
+    expect(screen.getByText('running')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeInTheDocument();
+    expect(screen.getByText(/is working/)).toBeInTheDocument();
+    expect(screen.getByRole('status')).toHaveTextContent(
+      'Cancel failed, rolled back — project is archived',
+    );
+  });
+
   it('asks what a card is blocked on in the panel, never in a browser dialog', async () => {
     const prompt = vi.spyOn(window, 'prompt');
     client.PATCH.mockClear().mockResolvedValue({
@@ -642,20 +698,26 @@ describe('IssueDetailPage rail', () => {
   });
 
   it('reopens without asking — putting a card back is not destructive', async () => {
-    client.PATCH.mockClear().mockResolvedValue({
-      data: issue(),
-      error: undefined,
-      response: ok,
-    });
+    const write = deferred<PatchReply>();
+    client.PATCH.mockClear().mockImplementationOnce(() => write.promise);
     renderIssue(issue({ cancelled_at_ms: 1 }));
 
     await userEvent.click(await screen.findByRole('button', { name: 'More actions' }));
     await userEvent.click(screen.getByRole('button', { name: 'Reopen issue' }));
 
+    expect(screen.queryByText('Cancelled')).toBeNull();
+    expect(screen.getByRole('button', { name: 'Wire the retry' }).className).not.toContain(
+      'line-through',
+    );
     expect(client.PATCH).toHaveBeenCalledWith(
       '/v1/projects/{project_id}/issues/{number}',
       expect.objectContaining({ body: { cancelled: false } }),
     );
+
+    await act(async () => {
+      write.resolve({ data: issue(), error: undefined, response: ok });
+      await write.promise;
+    });
   });
 
   it('reads as a property table, with every line answered', async () => {

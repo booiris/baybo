@@ -19,6 +19,11 @@ final class TranscriptSchemeHandler: NSObject, WKURLSchemeHandler {
     enum DynamicRoute: Equatable {
         case deckBlob
         case htmlPreview
+        /// Nothing but the bundled files. The card page's inline images ride
+        /// `requestBlob`/`blobResult` over the bridge exactly as the
+        /// transcript's do, so it needs no dynamic route at all — and a route
+        /// it does not use is a door it does not have.
+        case staticOnly
     }
 
     private static let deckBlobPathPrefix = "/blob/"

@@ -3,7 +3,6 @@ import { describe, expect, it } from 'vitest';
 import {
   actorLabel,
   approvalAsks,
-  commentHint,
   describeEvent,
   eventShape,
   eventTime,
@@ -57,7 +56,7 @@ describe('describeEvent', () => {
     // Named for the holder, because that is the half a reader can act on.
     expect(
       describeEvent({ kind: 'run_refused', trigger: 'assigned', attempt: 4 }),
-    ).toBe('did not start a run (assigned) — run #4 still has this card');
+    ).toBe('did not start a run (assigned) — turn 4 still has this card');
     // A read failure still records the refusal; it just cannot name who.
     expect(describeEvent({ kind: 'run_refused', trigger: 'started' })).toBe(
       'did not start a run (moved to In Progress) — this card already had one in flight',
@@ -67,8 +66,8 @@ describe('describeEvent', () => {
   it('carries a run’s failure reason, and omits the dash when there is none', () => {
     expect(
       describeEvent({ kind: 'run_settled', attempt: 3, status: 'failed', error: 'ran out' }),
-    ).toBe('run #3 failed — ran out');
-    expect(describeEvent({ kind: 'run_settled', attempt: 1, status: 'done' })).toBe('run #1 done');
+    ).toBe('turn 3 failed — ran out');
+    expect(describeEvent({ kind: 'run_settled', attempt: 1, status: 'done' })).toBe('turn 1 done');
   });
 
   it('distinguishes a reclaimed worktree from one that was left alone', () => {
@@ -155,87 +154,6 @@ describe('actorLabel', () => {
   });
 });
 
-describe('commentHint', () => {
-  // A real assignee is an agent **id**, not a handle. The fixture used to
-  // be 'dev-1', which is handle-shaped — so a hint that printed the id
-  // read correctly here while showing a raw ULID in the app.
-  const DEV_1 = '01KZAD1QBS4A1XH456XJ7AC0V9';
-  const team = [
-    { id: DEV_1, handle: 'dev-1' },
-  ] as unknown as Parameters<typeof commentHint>[2];
-  const live = [{ status: 'running' as const }];
-  const queued = [{ status: 'queued' as const }];
-  const settled = [{ status: 'done' as const }];
-  const held = [{ status: 'held' as const }];
-
-  it('says record-only when nobody is on the issue', () => {
-    const hint = commentHint({ status: 'in_progress', assignee: null }, [], team);
-    expect(hint).toContain('nobody is assigned');
-  });
-
-  it('says record-only for parked work even with an assignee', () => {
-    expect(commentHint({ status: 'backlog', assignee: DEV_1 }, [], team)).toContain(
-      'not working on this',
-    );
-    expect(commentHint({ status: 'done', assignee: DEV_1 }, [], team)).toContain(
-      'not working on this',
-    );
-  });
-
-  it('says a comment reopens a cancelled issue, whatever else is true of it', () => {
-    // Ahead of every other case, the unstaffed one included: the operator's
-    // comment is what takes the cancel back, so promising them 'records
-    // only' is the composer describing the card they are about to leave
-    // behind.
-    for (const issue of [
-      { status: 'in_progress' as const, assignee: DEV_1, cancelled_at_ms: 1 },
-      { status: 'in_progress' as const, assignee: null, cancelled_at_ms: 1 },
-      { status: 'backlog' as const, assignee: DEV_1, cancelled_at_ms: 1 },
-    ]) {
-      expect(commentHint(issue, [], team)).toBe('This issue is cancelled — commenting reopens it.');
-    }
-  });
-
-  it('promises a run when the assignee is on live work and nothing is reading', () => {
-    expect(commentHint({ status: 'todo', assignee: DEV_1 }, [], team)).toBe(
-      'Starts a run: @dev-1 will read this now.',
-    );
-    // The id must never reach the composer — a person is addressed by
-    // handle, and a ULID in a sentence is the tell that a raw row escaped.
-    expect(commentHint({ status: 'todo', assignee: DEV_1 }, [], team)).not.toContain(DEV_1);
-    expect(commentHint({ status: 'review', assignee: DEV_1 }, settled, team)).toContain(
-      'Starts a run',
-    );
-  });
-
-  it('distinguishes a queued run from one already going', () => {
-    expect(commentHint({ status: 'in_progress', assignee: DEV_1 }, queued, team)).toContain(
-      'when the queued run starts',
-    );
-    expect(commentHint({ status: 'in_progress', assignee: DEV_1 }, live, team)).toContain(
-      'when that run finishes',
-    );
-  });
-
-  it('says a block has stopped the issue, whatever is recorded against it', () => {
-    for (const runs of [[], queued, live, held, settled]) {
-      const hint = commentHint(
-        { status: 'in_progress', assignee: DEV_1, blocked_reason: 'which goal wins?' },
-        runs,
-        team,
-      );
-      expect(hint).toContain('a block has stopped this issue');
-      expect(hint).toContain('@dev-1');
-      expect(hint).not.toContain('Starts a run');
-    }
-  });
-
-  it('says a held run will read it, and why it has not started', () => {
-    const hint = commentHint({ status: 'in_progress', assignee: DEV_1 }, held, team);
-    expect(hint).toContain('held run starts');
-    expect(hint).toContain('daily ceilings');
-  });
-});
 
 describe('eventTone', () => {
   it('separates the outcomes a reader is scanning the rail for', () => {
@@ -341,7 +259,7 @@ describe('feedLine', () => {
       ['@dev-1', 'failed', '#7'],
     );
     expect(said(feed({ kind: 'run_settled', attempt: 3, status: 'failed', error: 'boom' }))).toBe(
-      "@dev-1's run #3 failed on #7 — boom",
+      "@dev-1's turn 3 failed on #7 — boom",
     );
     expect(
       bold(feed({ kind: 'assigned', from: null, to: { id: DEV_ID, handle: 'qa-2' } })),
@@ -356,12 +274,12 @@ describe('feedLine', () => {
       duration_ms: 130_000,
       cost_micros: 40_000,
     } as FeedEntry;
-    expect(said(settled)).toBe("@dev-1's run #1 done on #7 · 2m10s · $0.04");
+    expect(said(settled)).toBe("@dev-1's turn 1 done on #7 · 2m10s · $0.04");
 
     // Absent is not zero: a run nobody claimed has no window, and "0s · $0.00"
     // would report that as a run that finished instantly having spent nothing.
     expect(said(feed({ kind: 'run_settled', attempt: 2, status: 'cancelled' }))).toBe(
-      "@dev-1's run #2 cancelled on #7",
+      "@dev-1's turn 2 cancelled on #7",
     );
   });
 
@@ -370,7 +288,7 @@ describe('feedLine', () => {
     // exists at all only because it was written by hand — the compiler
     // would have accepted the entry vanishing from the feed.
     expect(said(feed({ kind: 'run_refused', trigger: 'assigned', attempt: 4 }))).toBe(
-      '#7 did not start a run (assigned) — run #4 still has it',
+      '#7 did not start a run (assigned) — turn 4 still has it',
     );
     // The actor is always the board here, so the line names the card, not
     // a who — and the card is what is bold, being the thing to press.

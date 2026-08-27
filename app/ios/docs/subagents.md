@@ -234,6 +234,13 @@ folds in-flight work steps by looking up `channel_registry.get(&session.channel)
 page carries persisted rows only. New content appears when a turn's rows land,
 not as the tool executes.
 
+Those persisted work rows are necessarily reconstructed as closed. If the
+child has no final assistant output yet (or ends without one), its trailing work
+sequence defaults open instead of shrinking to `Worked`; a compaction may split
+that sequence into adjacent rows, so both halves open around the `Compacted`
+divider. Once an assistant output is present, the work keeps the normal closed
+default.
+
 Registering a real `subagent` channel to fix this was considered and **rejected**.
 It is not one change but three: install a headless channel (it can safely omit an
 approval gate — `install` only inserts one when `channel.approval_gate()` is

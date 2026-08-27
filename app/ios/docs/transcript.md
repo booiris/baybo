@@ -374,6 +374,18 @@ left behind the toggle is reasoning, tool calls and status lines, so a tool-heav
 labelled as time spent thinking. 处理 is the neutral verb that covers both halves and mirrors the
 en copy's Working/Worked. Don't "fix" it back.
 
+The two REST-only readers (a subagent child and an issue run) set
+`TranscriptTarget.expandsUnansweredTail`. REST reconstructs every work row as closed, so when no
+final assistant message follows the tail, reducing it to `Worked` falsely reads as a normal sign-off.
+Those readers default every machinery run in the trailing work sequence open; ordinary chats keep
+the closed default. The sequence, not only the literal last row, matters: a compaction watermark can
+split the unanswered tail into two adjacent work rows, and both stay open with the `Compacted`
+divider at the server-declared seam. A real assistant output after them restores the ordinary
+collapsed default. This is initial state only—an arriving answer never snaps shut work already under
+the reader, and a manual collapse is respected. An issue run has no sync route, so its synthesized
+baseline `sync_page` must forward `ChatSessionDetail.compaction_points`; replacing them with an empty
+list leaves the two work halves but silently loses the divider.
+
 `bundleAnswer` is three-valued about the reply on screen, and the third value is the trap:
 `recovered` (the bundle's trailing prose IS the answer in flight — paint it into `streamingText`),
 `superseded` (it carries answer text but has moved past it — the reply on screen is stale, clear it)

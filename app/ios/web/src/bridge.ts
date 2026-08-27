@@ -16,6 +16,9 @@ export type InitPayload = {
   sessionId: string;
   restoredState: PersistedState | null;
   connEpoch: number;
+  /// Read-only subagent / issue-run pages expose a work-only tail instead of
+  /// presenting it as a completed `Worked` summary.
+  expandUnansweredTail: boolean;
 };
 
 export type UserSentPayload = {
@@ -129,6 +132,9 @@ type BayboGlobal = {
 declare global {
   interface Window {
     baybo: BayboGlobal;
+    /// The card page's inbound handler (src/issue/bridge.ts). Declared here
+    /// because a global interface may only be declared once per shape.
+    issuePage?: import("./issue/bridge").IssueGlobal;
     webkit?: {
       messageHandlers?: {
         baybo?: { postMessage(message: unknown): void };
@@ -144,9 +150,42 @@ const native = window.webkit?.messageHandlers?.baybo;
 
 export const hasNativeBridge = native !== undefined;
 
+let nativeTargetId: string | null = null;
+
 function post(message: Record<string, unknown>): void {
-  if (native) native.postMessage(message);
-  else console.log("[baybo bridge]", message);
+  const payload =
+    nativeTargetId === null || typeof message.targetId === "string"
+      ? message
+      : { ...message, targetId: nativeTargetId };
+  if (native) native.postMessage(payload);
+  else console.log("[baybo bridge]", payload);
+}
+
+/// The raw channel, for a second page that rides the same `baybo` handler.
+///
+/// `src/issue/bridge.ts` uses it for the card page's own messages. It is
+/// exported rather than duplicated so both pages agree on the dev-console
+/// fallback and on which handler is the channel — an issue bridge that reached
+/// for `window.webkit` itself would silently post nowhere the day that name
+/// changes here.
+export function postToNative(message: Record<string, unknown>): void {
+  post(message);
+}
+
+/// Scope the shared attachment bridge to one issue visit.
+///
+/// Set from the keyed React tree's layout effect, not from `issuePage.init`:
+/// during a retarget the old tree remains mounted for one commit, and anything
+/// it posts in that window must keep the OLD id so native can reject it.
+export function bindNativeTarget(targetId: string): () => void {
+  if (nativeTargetId !== targetId) {
+    blobPending.clear();
+    posterPending.clear();
+  }
+  nativeTargetId = targetId;
+  return () => {
+    if (nativeTargetId === targetId) nativeTargetId = null;
+  };
 }
 
 // For fire-and-forget posts whose failure must never surface as a page error
