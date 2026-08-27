@@ -42,7 +42,7 @@ Panel rows set `accessibilityLabel` = title and `accessibilityValue` = subtitle,
 
 ## The catalog
 
-The catalog (`GET /v1/llm/models`, FFI `llm_list_models`, narrowed to name/provider/model/**model_list**/reasoning_effort/**available_efforts**) is **global** and cached **per app run** in `ModelCatalog.shared`, plus a **`models.json` mirror** (the `deck.json` idiom, written on fetch + effort edits, deleted on logout/rebind) for offline cold-paint.
+The catalog (`GET /v1/llm/models`, FFI `llm_list_models`, narrowed to name/provider/model/**model_list**/reasoning_effort/**available_efforts**) is **global** and cached **per app run** in `ModelCatalog.shared`, plus a server-scoped **`models.json` mirror** (the `deck.json` idiom, written on fetch + effort edits and retained across logout/rebind) for offline cold-paint.
 
 Because of the mirror, a cold offline start still paints the pill and the panel. The pill renders only once the catalog has entries, and the pill **NEVER shows a placeholder** — always the best-known model id.
 

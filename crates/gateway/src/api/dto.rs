@@ -107,6 +107,8 @@ pub struct ChannelEntry {
 /// Minimal gateway health/status payload.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct StatusResponse {
+    /// Stable public identity of this gateway (hex-encoded X25519 key).
+    pub server_key: String,
     pub version: String,
     pub bind_address: String,
     pub sessions: usize,

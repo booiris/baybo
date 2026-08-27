@@ -278,8 +278,8 @@ final class AppStore: ObservableObject {
     private var prewarmedDraftId: String?
     /// The Deck tab's engine + its kept-warm shell webview, prewarmed once a
     /// binding reaches home and torn down with that binding.
-    let deckStore = DeckStore()
-    let projectsStore = ProjectsStore()
+    @Published private(set) var deckStore = DeckStore()
+    @Published private(set) var projectsStore = ProjectsStore()
     private var _deckHost: DeckHost?
     let issueHostPool = IssueHostPool()
     private var issueVisits: [UUID: IssueVisit] = [:]
@@ -562,8 +562,8 @@ final class AppStore: ObservableObject {
     /// showed — unreachable from the UI and drained by nothing. Re-drive every
     /// session that still has one: the store ensures its remote row, lists it,
     /// and dials, and the dial's reconciliation gate looks each entry up before
-    /// resending. Idempotent and cheap on the common path — logout wipes the
-    /// outboxes, so an unbound install finds an empty directory.
+    /// resending. Idempotent and cheap on the common path; only the active
+    /// server namespace is inspected.
     private func resumeStrandedSends() {
         for sessionId in OutboxStore.pendingSessionIds(in: SessionIndex.supportDirectory()) {
             chatStore(for: sessionId).resumePersistedSends()
@@ -693,7 +693,7 @@ final class AppStore: ObservableObject {
                 self.challenge = nil
                 status = nil
                 directBound = false
-                await enterHomeFreshBinding()
+                await enterHomeBinding()
             } catch {
                 self.challenge = nil
                 // The decline path errors by design ("pairing cancelled") —
@@ -720,7 +720,7 @@ final class AppStore: ObservableObject {
             _ = try await Baybo.client.directLogin(baseUrl: baseUrl, token: token)
             directBound = true
             await registerPushBestEffort()
-            await enterHomeFreshBinding()
+            await enterHomeBinding()
             return nil
         } catch let error as BayboError {
             if case .InvalidToken = error {
@@ -1547,26 +1547,27 @@ final class AppStore: ObservableObject {
         _deckHost = nil
         issueVisits.removeAll()
         issueHostPool.teardown()
-        DeckStore.removeMirror()
-        // So do the boards: a mirror that outlived a binding is somebody
-        // else's account on screen.
-        ProjectsStore.removeMirror()
         // Blob ids are binding-local; never show the departed gateway's faces.
         AgentAvatars.shared.reset()
-        // As does the model catalog — a rebind must not offer the departed
-        // gateway's LLM entries.
-        ModelCatalog.shared.reset()
+        ModelCatalog.shared.unload()
         for store in stores {
             await store.disconnect()
         }
     }
 
-    /// A fresh binding must not inherit the previous gateway's sessions: wipe
-    /// the local registry + transcript mirrors, then land on the (empty) list.
-    /// On direct the REST refresh repopulates it immediately.
-    private func enterHomeFreshBinding() async {
+    /// Activate the durable namespace owned by the newly-bound gateway. A
+    /// same-server rebind reloads its cached rows; a different server starts
+    /// from that server's own directory.
+    private func enterHomeBinding() async {
         await resetChatStores()
-        SessionIndex.shared.removeAll()
+        let supportDirectory = SessionIndex.supportDirectory()
+        SessionIndex.shared.activate(supportDirectory: supportDirectory)
+        deckStore = DeckStore(supportDirectory: supportDirectory)
+        projectsStore = ProjectsStore(supportDirectory: supportDirectory)
+        ModelCatalog.shared.activate(directory: supportDirectory)
+        if let blobDirectory = ServerCache.blobDirectory(in: supportDirectory) {
+            Baybo.client.setBlobCacheDir(directory: blobDirectory)
+        }
         chatPath = []
         route = .home
         if !directBound {
@@ -1576,8 +1577,8 @@ final class AppStore: ObservableObject {
         prewarmIssueHosts()
     }
 
-    /// Log out: tear down the live leg, wipe both credential sets, drop the
-    /// local session registry + transcripts, and return to landing.
+    /// Log out: tear down the live leg and wipe credentials, while retaining
+    /// this gateway's local namespace for a later rebind.
     func logout() async {
         guard !busy else { return }
         busy = true
@@ -1594,7 +1595,7 @@ final class AppStore: ObservableObject {
             // Teardown is best-effort by design; surface nothing fatal.
             NSLog("baybo: logout: %@", bayboErrorText(error))
         }
-        SessionIndex.shared.removeAll()
+        SessionIndex.shared.unload()
     }
 }
 

@@ -16,9 +16,8 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
     private(set) static var hasToken = false
 
     #if DEBUG
-    /// Wipe the device-local stores (`Application Support/baybo`: the session
-    /// registry, the transcript mirrors, the outboxes) before anything reads
-    /// them, so a `-baybo-demo-*` launch is IDEMPOTENT.
+    /// Wipe every device-local server namespace before anything reads it, so a
+    /// `-baybo-demo-*` launch is IDEMPOTENT.
     ///
     /// Without it the demo fixtures are not hermetic: their session ids are
     /// fixed, so every launch APPENDS its canned turn to the same persisted
@@ -39,7 +38,7 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         // built on the first body evaluation) and therefore every reader of the
         // support directory.
         if ProcessInfo.processInfo.arguments.contains(Self.resetStoreArg) {
-            try? FileManager.default.removeItem(at: SessionIndex.supportDirectory())
+            try? FileManager.default.removeItem(at: ServerCache.rootDirectory())
         }
         #endif
         // Tap routing (didReceive below); foreground presentation stays silent.

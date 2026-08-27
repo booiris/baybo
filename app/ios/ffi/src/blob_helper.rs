@@ -8,6 +8,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
+#[cfg(not(test))]
+use parking_lot::RwLock;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::OnceCell;
@@ -31,19 +33,38 @@ pub(crate) const FILE_READ_CHUNK_BYTES: usize = 64 * 1024;
 static UPLOAD_PART_COUNTER: AtomicU64 = AtomicU64::new(0);
 static UPLOAD_PART_SWEEP: OnceCell<()> = OnceCell::const_new();
 static CACHE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+#[cfg(not(test))]
+static BLOB_CACHE_DIR: OnceLock<RwLock<PathBuf>> = OnceLock::new();
+#[cfg(test)]
 static BLOB_CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
 
-/// Where downloaded blobs live. Set once at client construction from
-/// `ClientConfig.blob_cache_dir`; host tests (and any embedder that leaves it
-/// unset) fall back to the OS temp dir.
+/// Where downloaded blobs live. Seeded at client construction and retargeted
+/// whenever the app changes its active gateway namespace.
 ///
 /// Nothing evicts from here. The blobs are durable on purpose — a file the user
 /// downloaded stays downloaded — so the directory only ever grows. When that
 /// becomes a problem it wants a real retention policy, not a surprise sweep.
+#[cfg(not(test))]
+pub(crate) fn set_blob_cache_dir(dir: PathBuf) {
+    *BLOB_CACHE_DIR
+        .get_or_init(|| RwLock::new(fallback_dir()))
+        .write() = dir;
+}
+
+#[cfg(not(test))]
+fn blob_cache_dir() -> PathBuf {
+    BLOB_CACHE_DIR
+        .get_or_init(|| RwLock::new(fallback_dir()))
+        .read()
+        .clone()
+}
+
+#[cfg(test)]
 pub(crate) fn set_blob_cache_dir(dir: PathBuf) {
     let _ = BLOB_CACHE_DIR.set(dir);
 }
 
+#[cfg(test)]
 fn blob_cache_dir() -> PathBuf {
     BLOB_CACHE_DIR.get().cloned().unwrap_or_else(fallback_dir)
 }

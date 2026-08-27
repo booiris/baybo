@@ -517,8 +517,8 @@ final class ChatStore: ObservableObject, TranscriptTarget {
     /// Binding teardown (logout/rebind): cancel timers and drop the global pump
     /// deliberately, so the disconnected callback does not fire. The composer's
     /// draft machine is retired for the same reason `evict` does it — an upload
-    /// Task can keep it alive past this store, and `SessionIndex.removeAll` is
-    /// about to delete every draft on disk.
+    /// Task can keep it alive past this store, so the old draft machine must be
+    /// made inert before the binding is detached or replaced.
     func disconnect() async {
         composerDraft?.retire()
         composerDraft = nil

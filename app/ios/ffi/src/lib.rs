@@ -22,6 +22,7 @@ mod logging;
 mod qr;
 mod relay;
 mod runtime;
+mod server_cache;
 mod transport;
 
 use std::sync::Arc;
@@ -57,6 +58,13 @@ pub fn parse_pair_qr(text: String) -> Option<PairTarget> {
 #[uniffi::export]
 pub fn new_chat_session_id() -> String {
     baybo_model::SessionId::new().into()
+}
+
+/// The stable namespace for device-local data owned by the currently bound
+/// gateway. The public gateway identity is never a credential.
+#[uniffi::export]
+pub fn active_server_cache_key() -> Result<Option<String>, BayboError> {
+    server_cache::active_key().map_err(BayboError::from_msg)
 }
 
 /// The app's engine: one long-lived instance owns the live transport legs, the
@@ -112,6 +120,11 @@ impl BayboClient {
     /// relay token-refresh API call, and direct push registration.
     pub fn set_apns_token(&self, token_hex: String) {
         self.apns.set_token(token_hex);
+    }
+
+    /// Retarget the content-addressed blob cache after a binding changes.
+    pub fn set_blob_cache_dir(&self, directory: String) {
+        blob_helper::set_blob_cache_dir(directory.into());
     }
 
     /// Drop every warm relay API leg, and orphan the ones currently checked out.

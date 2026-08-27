@@ -35,7 +35,11 @@ async fn status(State(state): State<AdminState>) -> Result<axum::Json<StatusResp
         .count_by_status(baybo_turn::TurnStatusKind::InProgress)
         .await
         .map_err(|e: baybo_turn::TurnError| crate::GatewayError::Turn(e.to_string()))?;
+    let server_key = crate::device::load_or_create_static_keypair(&state.secret_vault)
+        .await
+        .map_err(|e| crate::GatewayError::Internal(e.to_string()))?;
     Ok(axum::Json(StatusResponse {
+        server_key: hex::encode(server_key.public()),
         version: env!("CARGO_PKG_VERSION").to_owned(),
         bind_address: state.bind_display.clone(),
         sessions,

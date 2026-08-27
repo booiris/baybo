@@ -190,6 +190,7 @@ final class DeckStore: ObservableObject {
     /// materializes on the first actual transport call.
     private lazy var client: any BayboClientProtocol = clientProvider()
     private let clientProvider: () -> any BayboClientProtocol
+    private let supportDirectory: URL
     /// Server-acked baseline for layout rollback (restore the BASELINE on
     /// failure, never the negation).
     private var layoutBaseline: [Card]?
@@ -202,13 +203,17 @@ final class DeckStore: ObservableObject {
     private(set) var layoutTask: Task<Void, Never>?
     private(set) var actionTask: Task<Void, Never>?
 
-    private static var mirrorURL: URL {
-        SessionIndex.supportDirectory().appendingPathComponent("deck.json")
+    private var mirrorURL: URL {
+        supportDirectory.appendingPathComponent("deck.json")
     }
 
-    init(clientProvider: @escaping () -> any BayboClientProtocol = { Baybo.client }) {
+    init(
+        supportDirectory: URL = SessionIndex.supportDirectory(),
+        clientProvider: @escaping () -> any BayboClientProtocol = { Baybo.client }
+    ) {
+        self.supportDirectory = supportDirectory
         self.clientProvider = clientProvider
-        if let data = try? Data(contentsOf: Self.mirrorURL),
+        if let data = try? Data(contentsOf: mirrorURL),
             let cached = try? JSONDecoder().decode(StatePayload.self, from: data)
         {
             state = cached
@@ -279,7 +284,7 @@ final class DeckStore: ObservableObject {
             let snapshots = view.snapshots.map(Self.snapshot(from:))
             state = StatePayload(cards: cards, snapshots: snapshots)
             persist()
-            Self.pruneBundleCache(keeping: Set(cards.map { $0.cardId }))
+            pruneBundleCache(keeping: Set(cards.map { $0.cardId }))
             bridge?.deliverState(state)
             // A card landed → the empty-board setup finished; drop the
             // in-flight session so the CTA returns to its normal state.
@@ -318,7 +323,7 @@ final class DeckStore: ObservableObject {
         // deliver it straight from disk (renders fully offline). Only a new
         // card or a spec change misses and needs the leg.
         let specHash = state.cards.first { $0.cardId == cardId }?.specHash
-        if let specHash, let html = Self.cachedBundle(cardId: cardId, specHash: specHash) {
+        if let specHash, let html = cachedBundle(cardId: cardId, specHash: specHash) {
             bridge?.deliverBundle(cardId: cardId, cardHtml: html)
             return
         }
@@ -328,7 +333,7 @@ final class DeckStore: ObservableObject {
                 let html = try await self.client.deckFetchBundle(cardId: cardId)
                 self.bridge?.deliverBundle(cardId: cardId, cardHtml: html)
                 if let specHash {
-                    Self.cacheBundle(cardId: cardId, specHash: specHash, html: html)
+                    self.cacheBundle(cardId: cardId, specHash: specHash, html: html)
                 }
             } catch {
                 NSLog("deck: bundle fetch failed for %@: %@", cardId, String(describing: error))
@@ -794,13 +799,15 @@ final class DeckStore: ObservableObject {
 
     private func persist() {
         guard let data = try? JSONEncoder().encode(state) else { return }
-        try? data.write(to: Self.mirrorURL, options: .atomic)
+        try? data.write(to: mirrorURL, options: .atomic)
     }
 
-    static func removeMirror() {
-        try? FileManager.default.removeItem(at: mirrorURL)
+    static func removeMirror(in supportDirectory: URL = SessionIndex.supportDirectory()) {
+        try? FileManager.default.removeItem(
+            at: supportDirectory.appendingPathComponent("deck.json"))
         // Bundles belong to the departing gateway too.
-        try? FileManager.default.removeItem(at: bundleCacheDir)
+        try? FileManager.default.removeItem(
+            at: supportDirectory.appendingPathComponent("deck-bundles", isDirectory: true))
     }
 
     // MARK: bundle cache
@@ -810,22 +817,22 @@ final class DeckStore: ObservableObject {
     // DATA is already in the `deck.json` mirror; this holds the rendering CODE).
     // spec_hash is the content hash of the bundle, so a hash match is a
     // byte-identical hit and a spec change is a clean miss. Bounded: pruned to
-    // the live card set on refresh, wiped on logout/rebind.
+    // the live card set on refresh and isolated in the gateway's namespace.
 
     private struct CachedBundle: Codable {
         let specHash: String
         let html: String
     }
 
-    private static var bundleCacheDir: URL {
-        SessionIndex.supportDirectory().appendingPathComponent("deck-bundles", isDirectory: true)
+    private var bundleCacheDir: URL {
+        supportDirectory.appendingPathComponent("deck-bundles", isDirectory: true)
     }
 
-    private static func bundleFileURL(_ cardId: String) -> URL {
+    private func bundleFileURL(_ cardId: String) -> URL {
         bundleCacheDir.appendingPathComponent(cardId + ".json")
     }
 
-    private static func cachedBundle(cardId: String, specHash: String) -> String? {
+    private func cachedBundle(cardId: String, specHash: String) -> String? {
         guard let data = try? Data(contentsOf: bundleFileURL(cardId)),
             let entry = try? JSONDecoder().decode(CachedBundle.self, from: data),
             entry.specHash == specHash
@@ -833,7 +840,7 @@ final class DeckStore: ObservableObject {
         return entry.html
     }
 
-    private static func cacheBundle(cardId: String, specHash: String, html: String) {
+    private func cacheBundle(cardId: String, specHash: String, html: String) {
         try? FileManager.default.createDirectory(
             at: bundleCacheDir, withIntermediateDirectories: true)
         guard let data = try? JSONEncoder().encode(CachedBundle(specHash: specHash, html: html))
@@ -842,7 +849,7 @@ final class DeckStore: ObservableObject {
     }
 
     /// Drop cached bundles for cards no longer live (deleted here or elsewhere).
-    private static func pruneBundleCache(keeping ids: Set<String>) {
+    private func pruneBundleCache(keeping ids: Set<String>) {
         guard
             let files = try? FileManager.default.contentsOfDirectory(
                 at: bundleCacheDir, includingPropertiesForKeys: nil)

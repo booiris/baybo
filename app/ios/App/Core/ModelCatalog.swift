@@ -9,8 +9,7 @@ import Foundation
 /// a failed fetch just retries on the next open. A `models.json` MIRROR (the
 /// `deck.json` idiom) makes the catalog cold-start-offline durable: the pill
 /// and panel paint from disk with zero network, and the next successful fetch
-/// rewrites it. Reset on logout/rebind — the catalog (and its mirror) belong
-/// to the gateway that served them.
+/// rewrites it. Each gateway has its own mirror namespace.
 @MainActor
 final class ModelCatalog: ObservableObject {
     static let shared = ModelCatalog()
@@ -21,9 +20,9 @@ final class ModelCatalog: ObservableObject {
     @Published private(set) var models: [LlmModelInfo] = []
 
     private let client: any BayboClientProtocol
-    private let mirrorURL: URL
+    private var mirrorURL: URL
     private var fetchTask: Task<Void, Never>?
-    /// Bumped on `reset` so a fetch that straddles a logout can't repopulate
+    /// Bumped on `unload` so a fetch that straddles a logout can't repopulate
     /// the next binding's catalog with the departed gateway's entries.
     private var epoch = 0
     /// One live fetch per app run — separate from `models.isEmpty`, which the
@@ -65,15 +64,25 @@ final class ModelCatalog: ObservableObject {
         }
     }
 
-    /// Logout/rebind: drop the departed gateway's entries, mirror included.
+    /// Explicit destructive reset used by isolated tests.
     func reset() {
+        unload()
+        try? FileManager.default.removeItem(at: mirrorURL)
+    }
+
+    func unload() {
         epoch += 1
         fetchTask?.cancel()
         fetchTask = nil
         fetchedThisRun = false
         defaultName = nil
         models = []
-        try? FileManager.default.removeItem(at: mirrorURL)
+    }
+
+    func activate(directory: URL) {
+        unload()
+        mirrorURL = directory.appendingPathComponent("models.json")
+        loadMirror()
     }
 
     /// The entry's reasoning-effort override; `nil` = provider default.

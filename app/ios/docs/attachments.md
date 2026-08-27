@@ -20,7 +20,10 @@ Bytes come from the core's `BlobProgress` callback (`blob_download_bytes(blob_id
 
 ### The blob cache
 
-Downloaded blobs live in `Application Support/baybo/blobs` (`ClientConfig.blobCacheDir`, set in `app/ios/App/Core/Baybo.swift`) — **not** the OS temp dir, which iOS reclaims under storage pressure: a file the user downloaded stays downloaded.
+Downloaded blobs live in the active server namespace's `blobs/` directory
+(`ClientConfig.blobCacheDir`, seeded in `Baybo.swift` and retargeted on binding)
+— **not** the OS temp dir, which iOS reclaims under storage pressure: a file the
+user downloaded stays downloaded.
 
 The directory is excluded from backup (a blob runs to 100 MiB and is always re-fetchable) and **nothing evicts from it** — it only grows. That is deliberate; when it needs bounding it wants a stated retention policy, not a surprise sweep.
 
@@ -251,7 +254,9 @@ The demo seed (`-baybo-demo-compose`) is planted in `ComposerStaging.init` rathe
 
 **Exactly two things end a draft: the message is sent, and the conversation is deleted.** Both go through `ComposerStaging.discardDraft()`. Everything else — a cover, backing out to the list, an LRU eviction, backgrounding, a jetsam, a relaunch — is a checkpoint, and the draft comes back on the next visit.
 
-It persists through `DraftStore`, one directory per session under `Application Support/baybo/drafts/`, a sibling of the transcript mirror and the send outbox:
+It persists through `DraftStore`, one directory per session under the active
+server namespace's `drafts/`, a sibling of the transcript mirror and the send
+outbox:
 
 ```
 drafts/<session id>/draft.json      { text, attachments: [...] }

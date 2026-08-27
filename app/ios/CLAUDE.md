@@ -82,6 +82,12 @@ error they can act on, no way back but a re-pair.
   byte format, shared with every already-shipped install. Renaming one is not a
   refactor — it silently loses the gateway binding of every device that
   upgrades. The golden-JSON tests in `ffi/` are what stands in the way.
+  `server_key` is required; a record without it is signed out and must log in
+  again rather than entering a non-canonical cache namespace.
+- Durable app caches live under
+  `Application Support/baybo/servers/gateway-<Noise-static-public-key>/`.
+  Logout unloads that namespace but never deletes it; binding the same gateway
+  restores it.
 - NSE `Info.plist` key `BayboKeychainAccessGroup`; push payload/decrypt
   contract unchanged (see
   [`docs/modules/mobile/relay-push-security.md`](../../docs/modules/mobile/relay-push-security.md)

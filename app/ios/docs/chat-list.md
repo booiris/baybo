@@ -4,8 +4,9 @@
 
 ## Chat list data
 
-`SessionIndex` (`Application Support/baybo/sessions.json`) is the device-local
-registry backing the list on BOTH legs.
+`SessionIndex`
+(`Application Support/baybo/servers/gateway-<server-key>/sessions.json`) is the
+device-local registry backing the list on BOTH legs.
 
 Both direct and relay merge `chat_list_sessions()` over it on
 appear/foreground/pull:
@@ -25,8 +26,8 @@ fills fields the server left nil (never overrides them).
 ### Transcript mirrors
 
 Per-session transcript mirrors live in
-`Application Support/baybo/transcripts/<id>.json`, one per session this device
-has rendered, and **nothing sweeps them** — see "Transcript mirror retention" in
+the active server namespace's `transcripts/<id>.json`, one per session this
+device has rendered, and **nothing sweeps them** — see "Transcript mirror retention" in
 [sync-and-outbox.md](sync-and-outbox.md).
 
 The legacy single-session UserDefaults keys (`ChatDefaults`) are migrated once

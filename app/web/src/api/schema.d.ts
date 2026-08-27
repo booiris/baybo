@@ -3594,6 +3594,8 @@ export interface components {
         /** @description Minimal gateway health/status payload. */
         StatusResponse: {
             bind_address: string;
+            /** @description Stable public identity of this gateway (hex-encoded X25519 key). */
+            server_key: string;
             sessions: number;
             turns_in_flight: number;
             version: string;

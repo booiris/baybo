@@ -11481,6 +11481,7 @@
         "type": "object",
         "description": "Minimal gateway health/status payload.",
         "required": [
+          "server_key",
           "version",
           "bind_address",
           "sessions",
@@ -11489,6 +11490,10 @@
         "properties": {
           "bind_address": {
             "type": "string"
+          },
+          "server_key": {
+            "type": "string",
+            "description": "Stable public identity of this gateway (hex-encoded X25519 key)."
           },
           "sessions": {
             "type": "integer",

@@ -59,7 +59,8 @@ final class ProjectsStore: ObservableObject {
     private var heldForGesture = false
     private var missedWhileHeld: Set<String> = []
     /// When each board was last opened on THIS phone. Drives the cards root's
-    /// order; see `ProjectRecency` for why it is local and why logout takes it.
+    /// order; see `ProjectRecency` for why it is local. Its server namespace
+    /// keeps the values from crossing bindings.
     private let recency: ProjectRecency
 
     init(

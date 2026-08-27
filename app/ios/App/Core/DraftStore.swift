@@ -136,8 +136,7 @@ enum DraftStore {
     }
 
     static func deleteAll(in supportDirectory: URL) {
-        // Logout/rebind clears both roots because every draft belongs to the
-        // departing gateway identity.
+        // Explicit destructive resets clear both roots together.
         for scope in [DraftScope.chat, .card] {
             try? FileManager.default.removeItem(at: root(scope, in: supportDirectory))
         }
@@ -183,7 +182,7 @@ enum DraftStore {
         directory.appendingPathComponent("\(pickId).\(sourceSuffix)")
     }
 
-    /// `Application Support/baybo/drafts`. `prepareDirectory` is what creates
+    /// The active server namespace's `drafts/`. `prepareDirectory` is what creates
     /// it, and it excludes the tree from backup: a draft's retained bytes run to
     /// 100 MiB a pick and are unsent scratch by definition, so they have no
     /// business in iCloud (the call the blob cache makes — `Baybo.blobCacheDir`).

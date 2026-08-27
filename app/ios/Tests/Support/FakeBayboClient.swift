@@ -283,6 +283,8 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
 
     // MARK: - BayboClientProtocol
 
+    func setBlobCacheDir(directory: String) {}
+
     func chatConnect(sessionId: String, sink: FrameSink) async throws {
         let error: Error? = lock.withLock {
             connects.append(sessionId)

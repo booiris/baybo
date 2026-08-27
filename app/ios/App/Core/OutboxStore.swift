@@ -1,7 +1,7 @@
 import Foundation
 
 /// Persisted send outbox (sync-v2). One entry per in-flight send, keyed by its
-/// `platform_msg_id`, persisted to `Application Support/baybo/outbox/<id>.json`
+/// `platform_msg_id`, persisted to the active server namespace's `outbox/<id>.json`
 /// (a sibling of the transcript mirror) so a relaunch keeps un-durable sends
 /// alive.
 ///
@@ -265,8 +265,7 @@ final class OutboxStore {
         try? data.write(to: url, options: .atomic)
     }
 
-    /// Wipe every session's outbox — called on logout/rebind alongside
-    /// `TranscriptStore.deleteAll(in:)`.
+    /// Wipe every session's outbox during an explicit destructive reset.
     nonisolated static func deleteAll(in supportDirectory: URL) {
         try? FileManager.default.removeItem(at: directory(in: supportDirectory))
     }

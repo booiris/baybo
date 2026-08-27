@@ -166,14 +166,14 @@ final class SessionIndex: ObservableObject {
     /// persisted: staleness is a fact about *this* connection, not about disk.
     @Published private(set) var listStaleEpoch: UInt64 = 0
 
-    /// The Application Support root this registry — and the transcript mirrors
-    /// and outboxes it wipes — lives under. Injected rather than resolved
+    /// The server-scoped Application Support root this registry — and its
+    /// transcript mirrors and outboxes — lives under. Injected rather than resolved
     /// from the static path so a test drives an isolated tree: the suites run in
     /// PARALLEL, and a shared `sessions.json` turns one suite's writes into
     /// another's "logic bug".
-    private let supportDirectory: URL
+    private var supportDirectory: URL
     private let defaults: UserDefaults
-    private let fileURL: URL
+    private var fileURL: URL
     /// The session whose `ChatScreen` is on top. A `SessionActivity` ping for it
     /// is not counted as unread (the user is looking at it); `nil` on the list.
     private var foregroundSessionId: String?
@@ -865,12 +865,9 @@ final class SessionIndex: ObservableObject {
         save()
     }
 
-    /// Logout / rebind: the rows belong to the old gateway — drop them, their
-    /// transcript mirrors, their unsent composer drafts, and any staged
-    /// mutations against it.
     /// Called with every session whose durable per-session state this registry
-    /// has just deleted — a local delete, a delete performed on another client
-    /// and learned in a merge, or an unbind.
+    /// has just deleted — a local delete or a delete performed on another
+    /// client and learned in a merge.
     ///
     /// It exists because deleting the files is only half of it. A resident
     /// `ChatStore` holds the composer's draft IN MEMORY and writes it back on
@@ -880,6 +877,8 @@ final class SessionIndex: ObservableObject {
     /// cannot reach the stores, so `AppStore` listens.
     var onSessionsRemoved: ((Set<String>) -> Void)?
 
+    /// Explicit destructive reset used by isolated tests. Binding changes use
+    /// `unload` so the server namespace stays intact.
     func removeAll() {
         rows = []
         pendingMutations = [:]
@@ -897,6 +896,36 @@ final class SessionIndex: ObservableObject {
         DraftStore.deleteAll(in: supportDirectory)
     }
 
+    /// Leave a binding without touching its durable namespace. A later binding
+    /// reloads its own rows through `activate`.
+    func unload() {
+        resetVolatileState()
+        rows = []
+        publishBadge(force: true)
+    }
+
+    func activate(supportDirectory: URL) {
+        resetVolatileState()
+        self.supportDirectory = supportDirectory
+        fileURL = supportDirectory.appendingPathComponent(Self.indexFileName)
+        rows = Self.load(from: fileURL)
+        migrateLegacySingleSession()
+        publishBadge(force: true)
+    }
+
+    private func resetVolatileState() {
+        pendingMutations = [:]
+        pendingCronPins = [:]
+        pinnedCronBaselines = [:]
+        hiddenBackups = [:]
+        archiveBaselines = [:]
+        pinBaselines = [:]
+        pendingTitles = [:]
+        titleBaselines = [:]
+        foregroundSessionId = nil
+        mutationEpoch += 1
+    }
+
     // MARK: - Persistence
 
     /// Writes the registry — and NOTHING else. It used to end by pruning the
@@ -909,7 +938,7 @@ final class SessionIndex: ObservableObject {
     /// had the mirror it just wrote deleted seconds later, and opened blank on
     /// every re-entry until the network answered. Mirrors are now kept for every
     /// session this device has rendered; they are dropped only when the user
-    /// deletes the session (`beginHide`) or unbinds the gateway (`removeAll`).
+    /// deletes the session (`beginHide`) or asks for a per-session resync.
     private func save() {
         // Every list mutation funnels through here, which makes it the one
         // place the icon can be kept in step with the rows without scattering
@@ -969,12 +998,7 @@ final class SessionIndex: ObservableObject {
     }
 
     nonisolated static func supportDirectory() -> URL {
-        let base = FileManager.default
-            .urls(for: .applicationSupportDirectory, in: .userDomainMask)
-            .first ?? FileManager.default.temporaryDirectory
-        let dir = base.appendingPathComponent("baybo", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir
+        ServerCache.activeSupportDirectory()
     }
 }
 

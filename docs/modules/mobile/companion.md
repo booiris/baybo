@@ -71,10 +71,21 @@ shared blind relay and is **not** bound 1:1.
 - **App (P):** one fixed keychain account (`baybo.paired-gateway`) holds the
   single `PairedRecord`; the UI offers **Log out** (`BayboClient::logout` →
   `forget_pairing` — drops the record + push key); re-pairing after logout
-  overwrites on success. The app's
+  overwrites on success. Logout does not delete the gateway's local caches:
+  they live under
+  `Application Support/baybo/servers/gateway-<gateway-static-public-key>/` and
+  are reloaded when that same gateway is bound again. Direct mode learns the
+  same stable key from `GET /v1/status`, so relay and direct bindings of one
+  gateway share a namespace. The app's
   Noise static identity lives under its own account (`baybo.device-identity`) and
   is **stable** across re-pairings, so the derived `device_id` (`device-<pubkey[..8]>`)
   is stable; *Log out* deliberately keeps it.
+
+The server key is the gateway's persisted Noise X25519 static public key, not a
+URL, token, relay node id, or mutable display value. It survives gateway restarts
+and address changes and is public by design. Direct credentials require the
+canonical key; a record written before the field existed is treated as signed
+out and must log in again.
 
 ## Components
 

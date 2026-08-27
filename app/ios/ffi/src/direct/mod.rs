@@ -53,6 +53,8 @@ pub(crate) use device_proto::DEVICE_ID_HEADER;
 pub(crate) struct DirectCredentials {
     pub(crate) base_url: String,
     pub(crate) token: String,
+    /// Hex-encoded stable gateway Noise public key.
+    pub(crate) server_key: String,
 }
 
 /// Direct leg state: one global chat socket registry plus one authenticated HTTP
@@ -427,9 +429,10 @@ pub(crate) async fn login(
     }
 
     let device_id = device_id()?;
-    let creds = DirectCredentials {
+    let mut creds = DirectCredentials {
         base_url: base.clone(),
         token,
+        server_key: String::new(),
     };
     let cached = DirectHttpCache::new(DirectHttpKey::new(creds.clone(), device_id))?;
     let resp = cached
@@ -447,6 +450,17 @@ pub(crate) async fn login(
     if !resp.status().is_success() {
         return Err(format!("Baybo returned HTTP {}", resp.status().as_u16()));
     }
+
+    #[derive(Deserialize)]
+    struct GatewayStatus {
+        server_key: String,
+    }
+    let status = resp
+        .json::<GatewayStatus>()
+        .await
+        .map_err(|e| format!("decode response: {e}"))?;
+    creds.server_key = status.server_key;
+    crate::server_cache::direct_key(&creds)?;
 
     let bytes = serde_json::to_vec(&creds).map_err(|e| e.to_string())?;
     // Record which bind happened last BEFORE committing the credential record, so
@@ -548,12 +562,15 @@ mod tests {
     /// literal TEXT: a round-trip stays green with every field renamed, while a
     /// renamed field on a real install reads back as `None` and the app silently
     /// forgets its gateway.
-    const GOLDEN_CREDENTIALS_JSON: &str = r#"{"base_url":"https://gw.example","token":"tok-1"}"#;
+    const TEST_SERVER_KEY: &str =
+        "0707070707070707070707070707070707070707070707070707070707070707";
+    const GOLDEN_CREDENTIALS_JSON: &str = r#"{"base_url":"https://gw.example","token":"tok-1","server_key":"0707070707070707070707070707070707070707070707070707070707070707"}"#;
 
     fn golden_credentials() -> DirectCredentials {
         DirectCredentials {
             base_url: "https://gw.example".to_string(),
             token: "tok-1".to_string(),
+            server_key: TEST_SERVER_KEY.to_string(),
         }
     }
 
@@ -588,6 +605,7 @@ mod tests {
             DirectCredentials {
                 base_url: base_url.to_string(),
                 token: "tok-1".to_string(),
+                server_key: TEST_SERVER_KEY.to_string(),
             },
             "device-1".to_string(),
         ))
@@ -613,7 +631,7 @@ mod tests {
             .map(String::as_str)
             .collect();
         keys.sort_unstable();
-        assert_eq!(keys, ["base_url", "token"]);
+        assert_eq!(keys, ["base_url", "server_key", "token"]);
     }
 
     #[test]
@@ -622,6 +640,7 @@ mod tests {
             serde_json::from_str(GOLDEN_CREDENTIALS_JSON).expect("decode");
         assert_eq!(creds.base_url, "https://gw.example");
         assert_eq!(creds.token, "tok-1");
+        assert_eq!(creds.server_key, TEST_SERVER_KEY);
         assert_eq!(
             serde_json::to_string(&creds).expect("serialize"),
             GOLDEN_CREDENTIALS_JSON
@@ -630,8 +649,10 @@ mod tests {
 
     #[test]
     fn an_unknown_credential_field_from_a_newer_build_is_ignored() {
-        let with_extra = r#"{"base_url":"https://gw.example","token":"tok-1","future":"x"}"#;
-        let creds: DirectCredentials = serde_json::from_str(with_extra).expect("decode");
+        let with_extra = format!(
+            r#"{{"base_url":"https://gw.example","token":"tok-1","server_key":"{TEST_SERVER_KEY}","future":"x"}}"#
+        );
+        let creds: DirectCredentials = serde_json::from_str(&with_extra).expect("decode");
         assert_eq!(creds.token, "tok-1");
     }
 
@@ -643,12 +664,15 @@ mod tests {
     /// The `direct` mirror of the relay stranding case: bytes `credentials`
     /// cannot parse must read as SIGNED OUT, so the app offers the login screen
     /// rather than routing every command to a leg that cannot construct.
-    /// `DirectCredentials` carries no defaults, so a missing field is this case.
+    /// Its three credential fields carry no defaults, so a missing one is this case.
     #[test]
     fn credentials_that_no_longer_decode_read_as_signed_out() {
         assert!(!credentials_decode(b""));
         assert!(!credentials_decode(br#"{"base_url":"https://gw.exa"#));
         assert!(!credentials_decode(br#"{"base_url":"https://gw.example"}"#));
+        assert!(!credentials_decode(
+            br#"{"base_url":"https://gw.example","token":"tok-1"}"#
+        ));
     }
 
     /// The coupling under test: `channel_ws_url`'s `strip_prefix` is case-SENSITIVE

@@ -52,31 +52,8 @@ enum Baybo {
             config: ClientConfig(
                 apnsEnv: apnsEnvironment,
                 logDir: logDir,
-                blobCacheDir: blobCacheDir()))
+                blobCacheDir: ServerCache.blobDirectory(in: SessionIndex.supportDirectory())))
     }()
-
-    /// `Application Support/baybo/blobs` — durable, alongside the session
-    /// registry and transcript mirrors. Deliberately NOT the OS temp dir: iOS
-    /// reclaims that under storage pressure, and a file the user downloaded
-    /// should stay downloaded.
-    ///
-    /// Excluded from backup: blobs can run to 100 MiB each and are always
-    /// re-fetchable from the gateway, so they have no business in iCloud.
-    private static func blobCacheDir() -> String? {
-        let dir = SessionIndex.supportDirectory()
-            .appendingPathComponent("blobs", isDirectory: true)
-        do {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            var url = dir
-            var values = URLResourceValues()
-            values.isExcludedFromBackup = true
-            try url.setResourceValues(values)
-        } catch {
-            NSLog("baybo: blob cache dir unavailable (%@); falling back to tmp", "\(error)")
-            return nil
-        }
-        return dir.path
-    }
 }
 
 /// LEGACY UserDefaults keys from the single-session era — never written

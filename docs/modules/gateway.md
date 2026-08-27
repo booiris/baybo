@@ -708,6 +708,11 @@ GET    /v1/logs/stream                  SSE tail of the same buffer
 GET    /v1/openapi.json                 live OpenAPI 3.1 document for the admin surface
 ```
 
+`GET /v1/status` includes `server_key`, the lowercase hex encoding of the
+gateway's persisted Noise X25519 static public key. It is a public, stable
+gateway identity for client-side cache namespacing: it does not change with the
+listen address, relay route, process restart, or admin-token rotation.
+
 `/v1/chat/*` is the web-chat family (`api/admin/chat.rs`, OpenAPI tag
 `chat`). Despite the admin/device bearer in front of these routes, they
 read and write session rows and transcripts — the admin/channel split is

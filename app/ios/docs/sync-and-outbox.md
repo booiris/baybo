@@ -375,10 +375,17 @@ fail outright offline.
 So: **a mirror is kept for every session this device has rendered, and no
 capacity sweeper evicts it.** `save()` writes the registry and nothing else.
 
-### The three deletion paths
+Every durable cache is scoped to the bound gateway under
+`Application Support/baybo/servers/gateway-<server-key>/`. The key is the
+gateway's persisted Noise static public key; direct mode reads it from
+`GET /v1/status`, while relay pairing already carries it. Logout unloads the
+active in-memory stores but leaves this directory intact, and binding the same
+gateway reloads it. A different gateway resolves to a different directory.
+
+### The two deletion paths
 
 A mirror is removed only when its conversation genuinely goes away, and there are
-exactly three such paths — all of them a user's deletion, none of them a sweep:
+exactly two such paths — both of them a user's deletion, neither a sweep:
 
 - `beginHide` — the user deleted the conversation here. Deletes the file BEFORE
   the row guard: a racing merge may already have dropped the row, and the delete
@@ -388,7 +395,10 @@ exactly three such paths — all of them a user's deletion, none of them a sweep
   transcript leaves with it (a targeted set difference against the surviving ids,
   skipping `pendingMutations`, which `beginHide`/`rollBackHide` own — **not** a
   directory sweep).
-- `removeAll` — logout/rebind: the rows belong to the gateway we just left.
+
+Logout and rebind are deliberately absent from this list: `SessionIndex.unload`
+clears only volatile in-memory state. The DEBUG reset path and isolated tests may
+remove a cache tree explicitly; normal runtime binding changes never do.
 
 The one delete that is **not** a conversation going away is
 `dropTranscriptMirror` — the per-session resync escape hatch
@@ -449,7 +459,8 @@ a compose draft, whose synthesized empty page lands well inside the delay.
 
 The one-shot "red dot, human retries" send is replaced by a **persisted outbox**
 (`app/ios/App/Core/OutboxStore.swift`, a JSON file per session under
-`Application Support/baybo/outbox/`, wiped with the mirrors on logout).
+the active server namespace's `outbox/` directory). Logout keeps it, so a later
+binding to the same gateway can resume stranded sends.
 
 Entries are keyed by `platform_msg_id` with a two-stage confirmation:
 
@@ -505,8 +516,8 @@ Issue comments use the same visible contract through a smaller REST-specific
 outbox (`IssueCommentOutbox`): persist before clearing the dock, render an
 optimistic user post, show the shared delayed spinner while the request is in
 flight, and leave a shared red retry control on failure. One JSON file per card
-lives under `Application Support/baybo/issue-comment-outbox/` and is wiped with
-the other gateway-owned mirrors on logout.
+lives under the active server namespace's `issue-comment-outbox/` directory and
+survives logout with the other gateway-owned mirrors.
 
 Each row is keyed by a client-minted UUID sent as `client_msg_id`. The gateway
 stores that key on `issue_events` under a unique `(issue_id, client_msg_id)` index;

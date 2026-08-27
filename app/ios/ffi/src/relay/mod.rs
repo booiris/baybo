@@ -12,7 +12,7 @@ mod blob;
 mod chat;
 mod dial;
 pub(crate) mod leg_pool;
-mod pairing;
+pub(crate) mod pairing;
 mod tunnel;
 
 pub(crate) use api::GatewayApi;
