@@ -247,7 +247,7 @@ three questions once each:
    placed to hand a live card over is the one holding its run slot.
 
    The entry names the **attempt holding the slot**, not just the refusal:
-   "refused" is not something an operator can act on and "run #4 still has
+   "refused" is not something an operator can act on and "turn 4 still has
    this card" is. It is recorded for every trigger, coordination included,
    with one exception (`runs::refused_itself`): a `Running` holder whose
    `agent_id` is the agent now asking. The intended case is an agent moving
@@ -501,7 +501,7 @@ A run's spend is **derived, never stored**: `RUN_COST_WINDOW`
 (`sqlite/project.rs`) attributes a `cost_records` row to the run whose
 claim→settle window on that session contains it, and the two readers —
 `run_spend` (a card's execution log) and `settled_run_facts` (the board
-feed's `run #1 done on #7 · 2m10s · $0.04`) — are the same predicate under
+feed's `turn 1 done on #7 · 2m10s · $0.04`) — are the same predicate under
 two addressings. Reach them through `ProjectManager::run_log` /
 `ProjectManager::feed`; a caller that joins `issue_runs.session_id` to
 `cost_records` itself over-counts by a factor of however many attempts

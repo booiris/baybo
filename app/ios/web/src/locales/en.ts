@@ -66,8 +66,8 @@ export const en = {
       nEvents_other: "{{count}} events",
       eventOpened: "opened this card",
       eventMoved: "moved it from {{from}} to {{to}}",
-      eventRunStarted: "started run #{{attempt}}",
-      eventRunSettled: "run #{{attempt}} {{status}}",
+      eventRunStarted: "started turn {{attempt}}",
+      eventRunSettled: "turn {{attempt}} {{status}}",
       eventCancelled: "cancelled this card",
       eventMerged: "merged {{branch}} into {{into}}",
       status: {

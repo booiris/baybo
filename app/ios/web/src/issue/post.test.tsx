@@ -65,6 +65,16 @@ function moved(id: string): IssueEvent {
   };
 }
 
+function runSettled(id: string, attempt: number): IssueEvent {
+  return {
+    id,
+    number: 7,
+    actor: AGENT,
+    body: { kind: "run_settled", attempt, status: "failed" },
+    created_at_ms: 1,
+  };
+}
+
 function opened(id: string): IssueEvent {
   return { id, number: 7, actor: { kind: "user" }, body: { kind: "opened" }, created_at_ms: 1 };
 }
@@ -206,6 +216,14 @@ describe("a comment is a post", () => {
     expect(line?.textContent).toContain("moved it");
     expect(line?.querySelector(".issue-line-dot")).not.toBeNull();
     expect(line?.querySelector(".issue-box")).toBeNull();
+  });
+
+  it("gives a turn its own label instead of making it look like an issue number", () => {
+    mount();
+    deliver([runSettled("e1", 3), comment("e2", "said")]);
+
+    expect(document.querySelector(".issue-line")?.textContent).toContain("turn 3 failed");
+    expect(document.querySelector(".issue-line")?.textContent).not.toContain("#3");
   });
 
   /// **A run of one is not a run.** A `1 event ›` is a control that hides

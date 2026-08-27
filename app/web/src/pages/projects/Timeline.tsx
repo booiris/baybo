@@ -26,6 +26,7 @@ import {
   eventTone,
   TONE_DOT,
   pendingApprovals,
+  turnLabel,
   type IssueEvent,
   type PendingApproval as PendingApprovalRow,
   type Tone,
@@ -186,7 +187,7 @@ function PendingApproval({
       <div className="max-w-[480px] border-2 border-black border-l-[6px] border-l-warn rounded-md bg-surface px-3.5 py-2.5 shadow-brutal-sm">
         <p className="font-mono text-[0.62rem] font-bold uppercase tracking-wider text-warn">
           ⚑ Waiting on you
-          {approval.attempt == null ? '' : ` · run #${approval.attempt}`}
+          {approval.attempt == null ? '' : ` · ${turnLabel(approval.attempt)}`}
         </p>
         <ApprovalCommand tool={approval.tool} summary={approval.summary} />
         <div className="mt-2 flex flex-wrap items-center gap-2">

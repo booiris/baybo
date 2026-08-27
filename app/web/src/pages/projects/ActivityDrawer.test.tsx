@@ -66,7 +66,7 @@ describe('ActivityDrawer', () => {
     render(
       <ActivityDrawer projectId="p" refreshKey={0} onClose={vi.fn()} onOpenIssue={vi.fn()} />,
     );
-    await screen.findByRole('button', { name: /run #3 failed on #9 — boom/ });
+    await screen.findByRole('button', { name: /turn 3 failed on #9 — boom/ });
     // The whole point of the feed is being skimmed down its left edge before
     // any of it is read.
     const dots = screen.getByRole('complementary').querySelectorAll('span[aria-hidden]');

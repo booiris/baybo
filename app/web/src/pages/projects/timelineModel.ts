@@ -103,6 +103,12 @@ const DECISION_LABEL: Record<'approve' | 'approve_always' | 'deny', string> = {
   deny: 'refusal',
 };
 
+/// A run's ordinal as shown in project activity. Issue numbers own the `#N`
+/// spelling, so turns deliberately use a different visual namespace.
+export function turnLabel(attempt: number): string {
+  return `turn ${attempt}`;
+}
+
 export type PendingApproval = {
   callId: string;
   tool: string;
@@ -168,12 +174,12 @@ export function describeEvent(body: IssueEventBody): string | null {
       return `reassigned it from ${from} to ${to}`;
     }
     case 'run_started':
-      return `started run #${body.attempt} (${body.trigger})`;
+      return `started ${turnLabel(body.attempt)} (${body.trigger})`;
     case 'run_interrupted':
-      return `run #${body.attempt} was interrupted before it finished — the board picked it up again`;
+      return `${turnLabel(body.attempt)} was interrupted before it finished — the board picked it up again`;
     case 'run_settled': {
       const detail = body.error != null && body.error.length > 0 ? ` — ${body.error}` : '';
-      return `run #${body.attempt} ${body.status}${detail}`;
+      return `${turnLabel(body.attempt)} ${body.status}${detail}`;
     }
     case 'blocked':
       return `blocked it: ${body.reason}`;
@@ -216,7 +222,7 @@ export function describeEvent(body: IssueEventBody): string | null {
       // reader can act on: the card already shows the move or the handover
       // that was made, and this is the run it implied not happening.
       return body.attempt != null
-        ? `did not start a run (${RUN_TRIGGER_LABEL[body.trigger]}) — run #${body.attempt} still has this card`
+        ? `did not start a run (${RUN_TRIGGER_LABEL[body.trigger]}) — ${turnLabel(body.attempt)} still has this card`
         : `did not start a run (${RUN_TRIGGER_LABEL[body.trigger]}) — this card already had one in flight`;
     case 'filed':
       return `filed #${body.number} out of this card's work`;
@@ -359,19 +365,19 @@ export function feedLine(entry: FeedEntry): Span[] {
     // so the feed read as if the assignee had run it. On a board where a
     // review handover is a reassignment, that is usually the wrong agent.
     case 'run_started':
-      return join(who(entry), `'s run #${body.attempt} started on `, at);
+      return join(who(entry), `'s ${turnLabel(body.attempt)} started on `, at);
     // The actor here is always the board, so it is left off: what the line
     // has to name is the card and the run that took its slot.
     case 'run_refused':
       return join(
         at,
         ` did not start a run (${RUN_TRIGGER_LABEL[body.trigger]})`,
-        body.attempt != null ? ` — run #${body.attempt} still has it` : ' — it already had one',
+        body.attempt != null ? ` — ${turnLabel(body.attempt)} still has it` : ' — it already had one',
       );
     case 'run_settled':
       return join(
         who(entry),
-        `'s run #${body.attempt} `,
+        `'s ${turnLabel(body.attempt)} `,
         { text: body.status, strong: true },
         ' on ',
         at,

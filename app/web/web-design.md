@@ -610,7 +610,7 @@ The row frame is one constant shared by a real line and its placeholder,
 because a skeleton is only worth anything if nothing moves when it is replaced.
 Only the first load shows them: a refresh keeps the rows it already has.
 
-A settled-run line carries what the run took and cost — `run #1 done on #7 ·
+A settled-run line carries what the run took and cost — `turn 1 done on #7 ·
 2m10s · $0.04`. Both numbers are **derived server-side** over the run's own
 cost window, by the same query the execution log uses, and arrive on the feed
 entry rather than in the stored event: a run's cost is not a column anywhere,
@@ -757,9 +757,9 @@ It is only a link when the board has that card. An unresolvable number stays
 plain text — never dimmed, never struck — because "no such card" and "the board
 has not answered yet" look identical from here, and plain text is the only
 rendering that asserts neither. The same bargain the composer strikes with an
-unknown `@handle`. Nor is a number that counts something else linked: the board
-writes a run's ordinal as `run #3`, and on a board with three cards those are
-the same three characters.
+unknown `@handle`. Nor is a number that counts something else linked: older
+board/tool prose wrote a run's ordinal as `run #3`, and agents can repeat that
+legacy spelling even though project activity now renders it as `turn 3`.
 
 The two surfaces mark it the same way and follow it differently. A comment is
 read, so a plain click opens the card. A description is an **editor**, where a

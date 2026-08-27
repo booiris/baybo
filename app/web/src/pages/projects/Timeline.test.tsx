@@ -86,7 +86,7 @@ describe('Timeline', () => {
     expect(screen.getByText('opened this issue')).toBeInTheDocument();
     expect(screen.getByText('moved it from Todo to In Progress')).toBeInTheDocument();
     expect(screen.getByText('check the reconnect path')).toBeInTheDocument();
-    expect(screen.getByText('run #2 failed — ran out')).toBeInTheDocument();
+    expect(screen.getByText('turn 2 failed — ran out')).toBeInTheDocument();
     expect(screen.getAllByText('@dev-1').length).toBeGreaterThan(0);
     expect(screen.getAllByText('you').length).toBeGreaterThan(0);
   });
@@ -167,6 +167,7 @@ describe('pending approvals', () => {
             call_id: 'c1',
             tool: 'Bash',
             summary: 'rm -rf build',
+            attempt: 4,
           }),
         ]}
         issue={ISSUE}
@@ -175,7 +176,7 @@ describe('pending approvals', () => {
         busy={false}
       />,
     );
-    expect(screen.getByText(/Waiting on you/)).toBeInTheDocument();
+    expect(screen.getByText('⚑ Waiting on you · turn 4')).toBeInTheDocument();
     // The command is what is being approved, so it gets its own box rather
     // than sharing a paragraph with the ask.
     expect(screen.getByText(/Bash · rm -rf build/)).toBeInTheDocument();

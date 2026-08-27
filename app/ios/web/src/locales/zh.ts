@@ -70,8 +70,8 @@ export const zh: typeof en = {
       nEvents_other: "{{count}} 条记录",
       eventOpened: "创建了这张卡片",
       eventMoved: "把它从 {{from}} 移到了 {{to}}",
-      eventRunStarted: "开始了第 {{attempt}} 次运行",
-      eventRunSettled: "第 {{attempt}} 次运行 {{status}}",
+      eventRunStarted: "开始了 turn {{attempt}}",
+      eventRunSettled: "turn {{attempt}} {{status}}",
       eventCancelled: "取消了这张卡片",
       eventMerged: "把 {{branch}} 合并进了 {{into}}",
       status: {
