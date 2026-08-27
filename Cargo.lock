@@ -532,6 +532,7 @@ dependencies = [
  "libc",
  "parking_lot",
  "qrcode",
+ "remote-host-protocol",
  "reqwest 0.13.2",
  "serde",
  "serde_json",

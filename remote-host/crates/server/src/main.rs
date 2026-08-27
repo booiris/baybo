@@ -72,7 +72,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let started_at = std::time::Instant::now();
 
     // The gateway relay admission allow-list: a SQLite table, hot-reloaded by
-    // polling for external edits. Push routes are keyless at this layer.
+    // polling for external edits. Push requests carry the same header for an
+    // upstream edge to inspect, but the application handlers do not resolve it.
     let db_path = std::env::var("ADMISSION_DB_PATH").unwrap_or_else(|_| DEFAULT_DB_PATH.into());
     let poll = Duration::from_secs(
         env_override("ADMISSION_POLL_SECS", |_: &u64| true).unwrap_or(DEFAULT_POLL_SECS),

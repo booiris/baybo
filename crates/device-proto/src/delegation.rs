@@ -1,12 +1,12 @@
-//! Ed25519 delegation that authenticates keyless push `/register` and `/notify`
-//! calls to the operator host (**C**).
+//! Ed25519 delegation that authenticates push `/register` and `/notify` calls to
+//! the operator host (**C**).
 //!
 //! Relay admission is keyed by `remote_api_key`, and the built-in public proxy's
-//! `guest` key may be shared by mutually-distrusting tenants. Push routes carry no
-//! admission key at all, so C's device-token store cannot use relay admission as a
-//! binding boundary: once a caller learns a victim `device_id`, an unauthenticated
-//! overwrite would let it redirect or suppress the victim's APNs binding and spam
-//! `/notify`.
+//! `guest` key may be shared by mutually-distrusting tenants. Push requests carry
+//! that key as an edge traffic marker, but C's device-token store cannot use it as
+//! a binding boundary: once a caller learns a victim `device_id`, an otherwise
+//! unauthenticated overwrite would let it redirect or suppress the victim's APNs
+//! binding and spam `/notify`.
 //!
 //! This module binds every binding mutation and notification to a signature chain
 //! C verifies with **no stored secret and no trust-on-first-use**:

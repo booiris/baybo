@@ -20,9 +20,10 @@
 //!
 //! Storage reuses the per-device secret names (`device.{id}.push_key` / `.apns` /
 //! `.push_delegation`) so [`super::PushDispatcher`]'s read sites need no change; a
-//! small `web_push.{id}` meta record carries the remote-host endpoint the
-//! dispatcher targets, and `SecretVault::list_names` enumerates them. Push is
-//! keyless, so no admission key is stored — the delegation chain authorizes it.
+//! small `web_push.{id}` meta record carries the remote-host endpoint and API key
+//! the dispatcher targets, and `SecretVault::list_names` enumerates them. The API
+//! key marks admitted traffic at the remote-host edge; the delegation chain
+//! remains the binding authorization.
 
 use baybo_security::SecretVault;
 use device_proto::aead;
@@ -54,10 +55,19 @@ pub(crate) struct WebPushBinding {
     /// `device-<hex(ed25519 pub)>` — the app's self-certifying identity.
     pub device_id: String,
     /// Remote-host base WS URL (the built-in [`super::DEFAULT_PUSH_RELAY_URL`]).
-    /// The dispatcher maps `wss→https` for the keyless `/register` + `/notify` POSTs.
+    /// The dispatcher maps `wss→https` for `/register` + `/notify` POSTs.
     pub relay_url: String,
+    /// Remote-host API key sent on `/register` and `/notify`. Old direct bindings
+    /// predate this field and target the built-in public host, whose default is
+    /// filled in during deserialization.
+    #[serde(default = "default_remote_api_key")]
+    pub remote_api_key: String,
     /// Unix seconds the binding was registered (for observability only).
     pub created_at: i64,
+}
+
+fn default_remote_api_key() -> String {
+    remote_host_protocol::DEFAULT_REMOTE_API_KEY.to_string()
 }
 
 /// Persist (or update) a verified web push binding: the routing meta plus the
@@ -150,6 +160,7 @@ mod tests {
         WebPushBinding {
             device_id: id.to_string(),
             relay_url: "wss://proxy.baybo.space".into(),
+            remote_api_key: remote_host_protocol::DEFAULT_REMOTE_API_KEY.into(),
             created_at: 1_700_000_000,
         }
     }
@@ -213,5 +224,19 @@ mod tests {
         let listed = list_bindings(&vault).await;
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].device_id, "device-cc");
+    }
+
+    #[test]
+    fn old_binding_defaults_to_the_public_remote_api_key() {
+        let old = r#"{
+            "device_id":"device-aa",
+            "relay_url":"wss://proxy.baybo.space",
+            "created_at":1700000000
+        }"#;
+        let binding: WebPushBinding = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            binding.remote_api_key,
+            remote_host_protocol::DEFAULT_REMOTE_API_KEY
+        );
     }
 }

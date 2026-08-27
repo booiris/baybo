@@ -59,8 +59,9 @@ pub enum Admit {
 /// "Auth" on C's relay = per-key admission only (machine-to-machine, no device
 /// auth and no plaintext). Relay routes resolve the `remote_api_key` header
 /// against this list — one source of truth for admit-or-reject + limit/expiry.
-/// Push routes are keyless at this layer and authenticate via the device→gateway
-/// delegation chain.
+/// Push requests carry the header for an upstream edge to inspect, but do not
+/// resolve it through this relay-admission trait; their binding authentication
+/// uses the device→gateway delegation chain.
 pub trait Admission: Send + Sync {
     /// Resolve a `remote_api_key`: admit-or-reject + limit/expiry in one shot. A
     /// NULL limit on the returned [`AdmissionEntry`] stays `None` for the caller's

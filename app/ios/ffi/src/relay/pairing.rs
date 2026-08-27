@@ -564,7 +564,7 @@ async fn connect_pair(url: &str, remote_api_key: Option<&str>) -> Result<Ws, Str
             match key.parse() {
                 Ok(v) => {
                     req.headers_mut()
-                        .insert(remote_host_protocol::relay::REMOTE_API_KEY_HEADER, v);
+                        .insert(remote_host_protocol::REMOTE_API_KEY_HEADER, v);
                 }
                 Err(e) => return Err(format!("bad instance key header: {e}")),
             }

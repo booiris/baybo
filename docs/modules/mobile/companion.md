@@ -35,10 +35,11 @@ C is a **separate Cargo workspace** that deliberately depends on no `baybo-*`
 crate — its `/notify` + `/register` payloads are a JSON contract
 (`remote-host-protocol`), so the `.p8`-holding push role stays isolatable. One C is
 a **multi-tenant** host fronting many, possibly mutually-distrusting gateways. The
-`remote_api_key` each relay leg presents in the `x-remote-api-key` dial header is
-C's relay tenant key: it gates relay admission, connection caps, and bandwidth
-quotas. Push is deliberately **keyless** at the HTTP caller layer; `/register` and
-`/notify` are authorized by the device→gateway Ed25519 delegation chain instead.
+`remote_api_key` each relay leg and push HTTP request presents in the
+`x-remote-api-key` header identifies expected Baybo traffic at the remote-host
+edge. The relay uses it for admission, connection caps, and bandwidth quotas;
+`/register` and `/notify` still authorize the device binding and request through
+the device→gateway Ed25519 delegation chain rather than trusting that header.
 C has **no "account" abstraction** and no `account_id`; it knows only relay
 `remote_api_key`s and their limits. Who owns or bills a key is a **control-plane**
 concern C never sees (`billing_account → {remote_api_key…}`, N:1); a leaked key is
@@ -241,10 +242,10 @@ C's blind relay, which only matches two legs by key and copies opaque frames
 - **Remote-host hardening** (C side) — relay abuse controls are keyed on
   `remote_api_key`, resolved through one shared seam
   (`Admission::resolve(remote_api_key) -> Admit{Ok|Unknown|Expired}`, which applies
-  the expiry check). Push does not call admission:
-  `/register` + `/notify` are keyless and rely on the device delegation chain,
-  per-device notify rate limits, a bounded device-token store, and the shared
-  per-source-IP request backstop:
+  the expiry check). Push requests carry the same key so a deployment edge can
+  recognize expected Baybo traffic, while C's push handlers continue to rely on
+  the device delegation chain, per-device notify rate limits, a bounded
+  device-token store, and the shared per-source-IP request backstop:
   - a **single-level connection cap** — a per-`remote_api_key` ceiling over all its
     relay legs (fallback `MAX_CONNS_PER_REMOTE_API_KEY_FALLBACK`, per-row
     `max_conns` override; the one control leg is exempt so a gateway at its cap can
@@ -408,7 +409,8 @@ gateway's relay `remote_api_key` in the polled SQLite `remote_api_keys` table,
 then pair the gateway against the host with
 `baybo device pair --relay-url <host> --remote-api-key <admitted key>` — the
 endpoint + relay key are baked into the QR and written to the device row, and the
-gateway auto-starts its relay control connection plus keyless push from that row.
+gateway auto-starts its relay control connection plus push carrying the same key
+from that row.
 
 ## Related
 

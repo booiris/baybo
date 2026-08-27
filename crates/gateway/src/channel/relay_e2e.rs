@@ -35,7 +35,7 @@ use device_proto::pairing::{
 use device_proto::psk_pair::{PskHandshake, build_prologue};
 use futures::{SinkExt, StreamExt};
 use remote_host_admission::InMemoryAdmission;
-use remote_host_protocol::relay::REMOTE_API_KEY_HEADER;
+use remote_host_protocol::REMOTE_API_KEY_HEADER;
 use remote_host_relay::serve::{IpLimitConfig, IpTrafficRegistry, RelayServices, build_router};
 use remote_host_relay::{
     BandwidthRegistry, ConnectionRegistry, ControlRegistry, RelayBroker, TrafficRegistry,

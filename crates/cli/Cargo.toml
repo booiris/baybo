@@ -21,6 +21,7 @@ baybo-context = { workspace = true }
 baybo-channels = { workspace = true }
 baybo-config = { workspace = true }
 baybo-gateway = { workspace = true }
+remote-host-protocol = { workspace = true }
 baybo-cron = { workspace = true }
 baybo-cost = { workspace = true }
 baybo-turn = { workspace = true }
