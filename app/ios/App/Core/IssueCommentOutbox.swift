@@ -5,9 +5,6 @@ enum IssueCommentSendState: String, Codable {
     case failed
 }
 
-/// The part of an uploaded attachment a comment retry needs. The blob already
-/// lives on the gateway; retaining its metadata also lets the optimistic row
-/// draw the same attachment card before the POST answers.
 struct IssueCommentAttachment: Codable, Equatable {
     let blobId: String
     let mimeType: String
@@ -39,10 +36,9 @@ struct PendingIssueComment: Codable, Equatable, Identifiable {
     var id: String { clientMsgId }
 }
 
-/// A persisted outbox per card. Unlike board moves, a comment is an append
-/// with a durable UUID idempotency key, so replaying it after a process death
-/// is both meaningful and safe.
 @MainActor
+/// Persisted per-card outbox. Comment appends carry a durable UUID idempotency
+/// key, so process-death replay is meaningful and safe.
 final class IssueCommentOutbox {
     private let file: URL
     private var items: [String: PendingIssueComment]

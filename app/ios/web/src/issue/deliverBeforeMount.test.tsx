@@ -5,28 +5,9 @@ import i18n from "../i18n";
 import type { IssuePayload } from "./bridge";
 import type { IssueDetail } from "./types";
 
-/// The card native ALREADY has must reach a page that has not mounted yet.
-///
-/// This is the whole open path, not a cold-start corner. `main.tsx` posts
-/// `issueReady` on the line after `createRoot().render(…)` — React has only
-/// SCHEDULED the tree at that point — and native answers in the same main-actor
-/// turn with everything it is holding: the flushed `pending` evals plus the
-/// `redeliver()` its ready handler runs. On a directly-connected gateway (or
-/// off a mirror that was on disk before the webview existed) that is the whole
-/// card, ~18 ms before the tree commits.
-///
-/// So the delivery lands with nothing subscribed, and the buffer is what
-/// carries it across. What broke it was `main.tsx` taking the subscription slot
-/// with a language stub whose `deliver` was `() => undefined`: the buffer only
-/// holds while the slot is EMPTY, so the card was handed to the stub, dropped,
-/// and never sent again — the page sat on "Loading card…" with the card
-/// already in the app. The relay leg hid it by being slow enough that the
-/// fetch landed after the tree had subscribed.
-///
-/// The real entry module is imported rather than `<IssuePage/>` mounted by
-/// hand, because the defect was in the WIRING: any test that mounts the page
-/// first passes on the broken code.
-
+// createRoot().render only schedules React; native can deliver in the same turn
+// before the subscription exists. This exercises the real entry wiring so that
+// pre-mount payload must survive in the bridge buffer.
 const card: IssueDetail = {
   number: 26,
   project_id: "01JBOARD",
@@ -60,8 +41,6 @@ beforeEach(() => {
 it("replays the card that landed while the tree was still being scheduled", async () => {
   await import("./main");
 
-  // Native's answer to `issueReady`, in the turn the page reported it — before
-  // React has committed anything.
   const page = window.issuePage;
   if (page === undefined) throw new Error("window.issuePage missing");
   page.init({
@@ -78,10 +57,6 @@ it("replays the card that landed while the tree was still being scheduled", asyn
   expect(document.querySelector(".issue-loading")).toBeNull();
   expect(document.body.textContent).toContain("Implement Go document structure");
 
-  // Reusing this warm document for a child card must disconnect the old
-  // subscriber before the child's delivery arrives. The two native evals are
-  // deliberately split across commits: no visible intermediate React tree may
-  // show the old card or "Loading card" between them.
   const root = document.getElementById("issue-root");
   if (root === null) throw new Error("issue-root missing");
   let sawLoading = false;
@@ -116,13 +91,6 @@ it("replays the card that landed while the tree was still being scheduled", asyn
   expect(document.body.textContent).not.toContain("Implement Go document structure");
 });
 
-/// The other half of the same move: language still reaches i18n.
-///
-/// It used to ride the subscription slot, which is why it was parked there in
-/// the first place — and it was ALREADY broken there, silently: `IssuePage`
-/// replaces the slot the moment it mounts, so every switch after the first
-/// paint went to a handler whose comment said main.tsx owned it. On its own
-/// listener both are true at once.
 it("still switches the language native asks for, after the page has mounted", async () => {
   await import("./main");
   const page = window.issuePage;

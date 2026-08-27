@@ -2,9 +2,6 @@ import Combine
 import SwiftUI
 import WebKit
 
-/// Which run a sheet is showing. A run is addressed by board, card and
-/// attempt — never by session id, because an attempt that never started has
-/// no session and is still a row somebody wants to read.
 struct ProjectRunRoute: Identifiable, Hashable {
     let projectId: String
     let number: Int64
@@ -18,17 +15,8 @@ struct ProjectRunRoute: Identifiable, Hashable {
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
 }
 
-/// One run's transcript, over the card that started it.
-///
-/// The same webview and the same React tree the chat uses: a run IS a session,
-/// and its rows ARE chat rows. What is different is everything around them —
-/// there is no composer, no outbox and no mirror — which is what
-/// `ProjectRunReadStore` is for.
 struct ProjectRunSheet: View {
     let route: ProjectRunRoute
-    /// Stopping is the card's, not the sheet's: this raises it and the card
-    /// runs the confirm, so there is one Stop with one confirmation rather
-    /// than two that can disagree.
     let onStop: () -> Void
 
     @StateObject private var store: ProjectRunReadStore
@@ -39,10 +27,6 @@ struct ProjectRunSheet: View {
     init(route: ProjectRunRoute, onStop: @escaping () -> Void) {
         self.route = route
         self.onStop = onStop
-        // One instance, held twice — the view observes the STORE (a nested
-        // `ObservableObject` republishes nothing through its owner, so a gate
-        // read through the host would latch without re-rendering), and the
-        // host exists to own the webview's lifetime. `SubagentScreen`'s scar.
         let store = ProjectRunReadStore(
             projectId: route.projectId, number: route.number, attempt: route.attempt,
             sessionId: route.sessionId, status: route.status)
@@ -129,15 +113,6 @@ struct ProjectRunSheet: View {
     }
 }
 
-/// Owns the run page's webview for the sheet's lifetime, and mirrors the
-/// bridge's gates.
-///
-/// The mirroring is load-bearing and not tidiness: the view observes THIS
-/// object, and a nested `ObservableObject` republishes nothing through its
-/// owner — so `host.bridge.contentVisible` would give the right first value,
-/// latch to `true` on the page's `ready`, and re-render nothing. That is a
-/// fully-loaded transcript behind a transparent view: blank page, no error
-/// anywhere. `SubagentHost` carries the same comment for the same reason.
 @MainActor
 final class ProjectRunHost: ObservableObject {
     let webView: WKWebView
@@ -157,10 +132,6 @@ final class ProjectRunHost: ObservableObject {
     }
 
     deinit {
-        // Also stops audio started from this page: `AudioPlayerCenter` is a
-        // process-wide singleton holding ONE weak bridge, so a track left
-        // playing here would leave the card and the engine disagreeing about
-        // what is playing.
         MainActor.assumeIsolated {
             AudioPlayerCenter.shared.stop()
             host.teardown()

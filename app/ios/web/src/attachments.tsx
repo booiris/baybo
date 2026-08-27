@@ -32,22 +32,7 @@ import {
 import { useLongPress } from "./gestures";
 import { blobContentDigest, type WireAttachment } from "./types";
 
-/// The attachment cards a message can carry — image, file, audio, video — and
-/// the bubble that dispatches to whichever one an attachment turns out to be.
-///
-/// Lifted out of `Transcript.tsx` when a SECOND surface needed them: a project
-/// card's description and comments carry the same attachments as a chat
-/// message, and a card page importing the transcript to get an image tile
-/// would drag the sync loop, the outbox and the scroll machinery in with it.
-///
-/// Nothing here knows about rows, ordinals or the transcript's state. What it
-/// knows is a `WireAttachment` and the bridge — which is precisely the seam the
-/// two surfaces have in common.
 
-/// How far outside the viewport (px, top + bottom) an attachment card begins
-/// asking native for anything — a preload band so a card is usually settled by
-/// the time it scrolls in, while a back-history page's off-screen ones stay
-/// silent. See `useNearViewport`.
 const LAZY_ATTACHMENT_ROOT_MARGIN = "400px 0px";
 
 
@@ -55,20 +40,8 @@ const LAZY_ATTACHMENT_ROOT_MARGIN = "400px 0px";
 /// cannot be read off the element that shows it (`measureIntrinsicSize`).
 const VECTOR_IMAGE_MIME = "image/svg+xml";
 
-/// How long a vector's pre-paint measurement may hold its image back. The probe
-/// decodes a blob the real `<img>` is about to decode anyway, so it settles in
-/// the same frame in practice; this only exists because an image that never
-/// paints would be a far worse failure than one sized from its loading tile.
 const INTRINSIC_PROBE_TIMEOUT_MS = 2000;
 
-/// The natural pixel size of every image this thread has decoded, keyed by blob
-/// digest and mirrored to disk with the rows (`PersistedState.imageDims`). A hit
-/// means the image rendered here before — so its blob is on the device and its
-/// box can be reserved at the exact final size before a single byte crosses the
-/// bridge, which is what keeps a re-opened thread from resizing under the reader
-/// (see `AttachmentBubble`). Carried on a context rather than props: the value's
-/// identity is stable for the transcript's life, so recording a size re-renders
-/// nothing and `MessageRow`'s memo survives.
 export type ImageDimsStore = {
   get(digest: string): [number, number] | undefined;
   record(digest: string, width: number, height: number): void;
@@ -76,9 +49,8 @@ export type ImageDimsStore = {
 
 export const ImageDimsContext = createContext<ImageDimsStore | null>(null);
 
-/// Rebuild the map from a restored mirror, dropping anything that isn't a usable
-/// size — a zero or garbage dimension would poison the reserved box's ratio (CSS
-/// divides by it), and the mirror is on-disk JSON, not a trusted type.
+/// Restored dimensions reserve the same box before media loads. Treat mirror
+/// data as untrusted so corrupt values cannot poison layout calculations.
 export function restoreImageDims(
   raw: Record<string, [number, number]> | undefined,
 ): Map<string, [number, number]> {
@@ -93,23 +65,9 @@ export function restoreImageDims(
   return out;
 }
 
-/// Load-once viewport gate for the attachment cards: `false` until the observed
-/// element first comes within `LAZY_ATTACHMENT_ROOT_MARGIN` of the viewport,
-/// then `true` for good — so scrolling back past a card never re-runs whatever
-/// it gates.
-///
-/// EVERY card in a restored thread mounts at once, and each ungated one costs
-/// native work on the app's main thread before the transcript can settle: an
-/// image blob crosses as a large base64 string plus an `atob` decode,
-/// `queryFileState` / `queryAudioState` are a post out and an
-/// `evaluateJavaScript` back apiece, and a downloaded video adds a poster frame
-/// (native spins an AVAssetImageGenerator per tile). A long conversation carries
-/// dozens of cards; the reader can see two or three. So the gate gets the whole
-/// card, not just the image inside it.
-///
-/// Without IntersectionObserver (not expected on WKWebView; a dev-browser
-/// guard) open the gate immediately rather than never loading at all.
 function useNearViewport(ref: RefObject<Element | null>): boolean {
+  // Restored transcripts mount every row; defer bridge traffic and decode work
+  // until a row approaches the viewport. Test/legacy runtimes fall back open.
   const [near, setNear] = useState(false);
   useEffect(() => {
     if (near) return;
@@ -134,19 +92,6 @@ function useNearViewport(ref: RefObject<Element | null>): boolean {
   return near;
 }
 
-/// One image attachment in a bubble: lazily downloads the blob via the bridge
-/// (cached on device) once its row scrolls near the viewport, wraps it in an
-/// object URL, shows a spinner while loading and a tap-to-retry on failure. The
-/// lazy gate is load-bearing for history: a back-page can carry dozens of
-/// images, and fetching every blob on mount floods the bridge — each image
-/// crosses as a large base64 string plus a main-thread `atob` decode
-/// (bridge.ts) — which stalls the whole transcript until they all settle (the
-/// whole page fails to appear while paging history). `useNearViewport` defers
-/// each fetch to when its row actually approaches the screen, so off-screen
-/// history images cost nothing until scrolled to. The old in-session previewUrl
-/// short-circuit is gone — native previews don't cross the bridge, so a
-/// just-sent image renders by fetching its own bytes back over requestBlob
-/// (device-cached, so fast).
 function AttachmentImage({
   attachment,
   connEpoch,
@@ -163,14 +108,8 @@ function AttachmentImage({
   const vector = isVectorImage(attachment);
   const [url, setUrl] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
-  // True once the fetched image has actually decoded — the frame reserves a box
-  // and holds the spinner until then, so the swap to the natural size happens in
-  // one step (no 0-height flash mid-decode).
   const [loaded, setLoaded] = useState(false);
   const [attempt, setAttempt] = useState(0);
-  // Mirrors `failed` for the connEpoch retry effect to read without taking
-  // `failed` as a dep (which would refetch in a tight loop the instant a fetch
-  // fails).
   const failedRef = useRef(false);
   // The reserved placeholder box the observer watches until the row nears the
   // viewport.
@@ -181,10 +120,6 @@ function AttachmentImage({
     if (!visible) return;
     let owned: string | null = null;
     let torndown = false;
-    // Read through a call, not the flag: the vector branch below checks it a
-    // SECOND time after an await, where the compiler — which cannot see the
-    // cleanup assign it — has already narrowed the bare flag to false and calls
-    // the check dead code.
     const cancelled = () => torndown;
     failedRef.current = false;
     setFailed(false);
@@ -197,11 +132,6 @@ function AttachmentImage({
           return;
         }
         owned = u;
-        // A vector is measured and sized BEFORE its image is handed over,
-        // never from its own `onLoad`: by then it is inside whatever box the
-        // bubble already picked, and WebKit would report that box back as the
-        // image's natural size (`measureIntrinsicSize`). The extra decode is a
-        // hit on the same blob the `<img>` below is about to decode.
         if (vector) {
           const dims = await measureIntrinsicSize(u);
           // The cleanup below has already revoked `owned`; nothing to undo.
@@ -223,9 +153,6 @@ function AttachmentImage({
       torndown = true;
       if (owned !== null && owned !== "") URL.revokeObjectURL(owned);
     };
-    // `imageDims` and `onIntrinsicSize` are both identity-stable by
-    // construction (a memoized context value, a `useCallback` with no deps);
-    // anything less would refetch the blob on every re-render of the row.
   }, [
     attachment.blob_id,
     attachment.mime_type,
@@ -236,11 +163,9 @@ function AttachmentImage({
     onIntrinsicSize,
   ]);
 
-  // A restored image can race ahead of its leg going live, so an early fetch
-  // fails before native has a live session. Retry the moment a (re)connect
-  // lands instead of stranding it on tap-to-load. Only bites once visible (an
-  // unfetched off-screen image has no failure to retry).
   useEffect(() => {
+    // A failed bridge read may have been caused by the old connection; retry
+    // once when native reports a new epoch, but only for a visible row.
     if (failedRef.current) setAttempt((a) => a + 1);
   }, [connEpoch]);
 
@@ -258,12 +183,6 @@ function AttachmentImage({
       </button>
     );
   }
-  // Reserved box → spinner while the blob is fetched and the image decodes
-  // underneath (invisible until `loaded`), then the box releases to the image's
-  // natural size in one step — no 0-height flash between the loading box and the
-  // painted image. That release is a small, bounded height change; WKWebView has
-  // no scroll anchoring to absorb it if it lands above the fold while reading
-  // history, an accepted tradeoff of not knowing image dimensions up front.
   return (
     <div
       className={`attachment-frame${loaded ? " loaded" : ""}`}
@@ -271,10 +190,6 @@ function AttachmentImage({
     >
       {!loaded && <span className="attachment-spinner" aria-hidden="true" />}
       {url !== null && url !== "" && (
-        // Tap opens the image full-screen in the native zoomable viewer
-        // (`viewImage` → pinch, double-tap-to-restore). A button wraps the img
-        // (not an onClick on it) so the wrapper stays put across the load — the
-        // img never remounts and its onLoad fires once.
         <button
           type="button"
           className="attachment-open"
@@ -290,16 +205,6 @@ function AttachmentImage({
             decoding="async"
             draggable={false}
             onLoad={(e) => {
-              // Remember the decoded size: it's what lets the NEXT open of this
-              // thread reserve this image's exact box up front instead of
-              // flashing a loading tile and then resizing (see
-              // `AttachmentBubble`). A zero dimension is never recorded — the
-              // reserved box divides by it.
-              //
-              // Raster only. A vector reports back the box it is standing in
-              // rather than a size of its own, so it is measured before it gets
-              // here (`measureIntrinsicSize`) and recording again from the
-              // element would overwrite that truth with the layout.
               if (!vector) {
                 const { naturalWidth: w, naturalHeight: h } = e.currentTarget;
                 if (w > 0 && h > 0) {
@@ -316,33 +221,6 @@ function AttachmentImage({
   );
 }
 
-/// One attachment on its OWN bubble — a lazy-loaded image tile or a named file
-/// chip, never sharing the text bubble. `children` carries the send-state chrome
-/// when this is a user message's last bubble (an image-only send).
-///
-/// An image whose size this thread already knows (`ImageDimsStore` — it decoded
-/// here before, so its blob is on the device) is `sized`: the bubble reserves the
-/// image's EXACT final box from the first paint, and the loading tile is dropped
-/// (`.attachment-bubble.sized` in styles.css). Nothing under it moves when the
-/// bytes land — an already-downloaded image no longer resizes the page, which is
-/// what shook a re-opened thread as each 12rem tile released to its real height.
-/// The box lives on the BUBBLE and not on the frame inside it: the frame's
-/// containing block is this bubble, a shrink-to-fit flex item, so a percentage
-/// width there is cyclic and resolves to zero.
-///
-/// Read once, at mount: a size recorded later belongs to an image that is already
-/// painted at its natural size, and re-reading would resize the bubble underneath
-/// it. The next open picks the entry up.
-///
-/// A VECTOR is the exception, and takes the same box by a different route: it
-/// gets measured before it paints (`measureIntrinsicSize`) and hands its size up
-/// here, so the box is reserved with nothing painted under it yet. Both halves
-/// of that matter. A vector carries no intrinsic width for this shrink-to-fit
-/// bubble to resolve, so without a reserved box an SVG written as a bare
-/// `viewBox` lays out at zero width — invisible, and untappable with it. And a
-/// stale entry from before it was measured this way (the mirror is on disk and
-/// outlives the fix) is corrected on the spot rather than sizing the bubble
-/// wrong for the life of the thread.
 export function AttachmentBubble({
   attachment,
   connEpoch,
@@ -406,11 +284,6 @@ export function isVideoAttachment(attachment: WireAttachment): boolean {
   return attachment.kind === "file" && attachment.mime_type.startsWith("video/");
 }
 
-/// An image with no pixel size of its own. Everything about how it is measured
-/// differs (`measureIntrinsicSize`), so it is asked once and answered here
-/// rather than by a mime comparison at each site. Parameters are stripped: the
-/// gateway sends a bare mime today, but `image/svg+xml; charset=utf-8` is a
-/// legal spelling of the same type and must not read as a raster blob.
 export function isVectorImage(attachment: WireAttachment): boolean {
   return (
     attachment.kind === "image" &&
@@ -418,21 +291,9 @@ export function isVectorImage(attachment: WireAttachment): boolean {
   );
 }
 
-/// The size an image takes with NOTHING constraining it, read off a detached
-/// `Image` — one that is never inserted into the document, so no layout can
-/// colour the answer.
-///
-/// For a raster blob that is just its pixel count, which is why only vectors pay
-/// for this. But WebKit answers `naturalWidth` for an SVG with the size the
-/// element is laid out at RIGHT NOW: the same 1200x400 page measures 1200
-/// detached, 192 while it decodes inside the 12rem loading tile, and 358 once
-/// released into the reading column (all three measured). `AttachmentImage` used
-/// to record what its own `onLoad` saw — the tile's number — so the next open of
-/// the thread reserved a 192px box for a diagram that had rendered full width,
-/// and the image shrank to fit it. An SVG with no `width`/`height` at all is
-/// worse off still: it has no intrinsic width for a shrink-to-fit bubble to
-/// resolve, and lays out at ZERO until something hands it a definite box.
 function measureIntrinsicSize(url: string): Promise<[number, number] | null> {
+  // Probe vectors before paint: WebKit can report a constrained or zero
+  // naturalWidth after the visible element participates in layout.
   return new Promise((resolve) => {
     const probe = new Image();
     const timer = window.setTimeout(() => {
@@ -463,10 +324,6 @@ export function formatBytes(bytes: number): string {
   return `${mb < 10 ? mb.toFixed(1) : Math.round(mb)} MB`;
 }
 
-/// A short, upper-case type badge. The filename's extension is the most
-/// honest source (`.docx` beats the mime's
-/// `vnd.openxmlformats-officedocument.wordprocessingml.document`); fall back to
-/// the mime subtype with its `+xml` suffix and `vnd.…` vendor path stripped.
 export function typeLabel(attachment: WireAttachment): string {
   const dot = attachment.filename?.lastIndexOf(".") ?? -1;
   const ext = dot > 0 ? attachment.filename?.slice(dot + 1) : undefined;
@@ -476,9 +333,6 @@ export function typeLabel(attachment: WireAttachment): string {
   return (bare || attachment.mime_type).toUpperCase();
 }
 
-/// How much of a long filename's tail always survives. `…-Q3-final.pdf` is what
-/// tells a reader this is the final and not the draft; a plain end-ellipsis
-/// throws exactly that away.
 const FILENAME_TAIL_CHARS = 10;
 
 /// Split a name so CSS can ellipsize the head while the tail stays pinned.
@@ -550,23 +404,14 @@ export function formatTime(totalSeconds: number): string {
   return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${sec}` : `${m}:${sec}`;
 }
 
-/// One file attachment's on-device lifecycle. Native owns the truth (the blob
-/// cache is a directory iOS may purge), so the card asks whenever it comes into
-/// view rather than trusting a `ready` it saw before.
-///
-/// `active` is the card's `useNearViewport` gate, and it covers the query as
-/// well as the subscription: this is one bridge round trip PER CARD, and a
-/// restored thread mounts every card it holds at once — on a long conversation
-/// that is a burst of main-thread work landing squarely in the window the
-/// transcript is trying to paint its first frame in. Nothing is lost by waiting:
-/// a card can only be downloaded or played by being tapped, which needs it on
-/// screen, and the gate opens a preload band ahead of that.
 function useFileState(blobId: string, active: boolean): { state: FileState; loaded: number } {
   const [state, setState] = useState<FileState>("idle");
   const [loaded, setLoaded] = useState(0);
 
   useEffect(() => {
     if (!active) return;
+    // Native may purge its downloaded-file cache between visits, so query the
+    // current state instead of trusting a prior rendered "ready" value.
     const unsubscribe = onFileState(blobId, (payload) => {
       setState(payload.state);
       if (payload.state === "loading") setLoaded(payload.loaded ?? 0);
@@ -578,14 +423,6 @@ function useFileState(blobId: string, active: boolean): { state: FileState; load
   return { state, loaded };
 }
 
-/// A non-image attachment: a stroked glyph (never the 📎 emoji — it arrives
-/// coloured and glossy, the one thing this monochrome system has no room for),
-/// the filename middle-clipped on one line, and the type + size beneath. The
-/// wire has carried `size` all along; nothing showed it.
-///
-/// Tapping an undownloaded file fetches it — the glyph becomes an indeterminate
-/// ring and the size turns into a `1.2 MB / 2.3 MB` counter, which is where the
-/// real progress lives. Tapping it once it's on disk opens the preview.
 function AttachmentFile({ attachment }: { attachment: WireAttachment }) {
   const rootRef = useRef<HTMLButtonElement | null>(null);
   const { state, loaded } = useFileState(attachment.blob_id, useNearViewport(rootRef));
@@ -641,15 +478,6 @@ function AttachmentFile({ attachment }: { attachment: WireAttachment }) {
   );
 }
 
-/// Mirror of one blob's slice of the native audio engine (there is ONE player
-/// app-wide — see `AudioPlayerCenter`). Subscribed by blob id like `fileState`,
-/// so a 2 Hz position tick re-renders one card; the query resyncs a card that
-/// appears mid-playback (session switch, thread reload).
-///
-/// Gated on the same `useNearViewport` flag as `useFileState`, for the same
-/// reason and with the same safety: a track can only be playing because someone
-/// tapped its card, and a card off-screen has nothing to show about it — the
-/// query runs the moment it scrolls back into the band.
 function useAudioState(blobId: string, active: boolean): AudioStatePayload {
   const [audio, setAudio] = useState<AudioStatePayload>({
     blobId,
@@ -668,19 +496,6 @@ function useAudioState(blobId: string, active: boolean): AudioStatePayload {
   return audio;
 }
 
-/// The audio card's seek bar — rendered in EVERY state so the card's height
-/// never jumps as playback starts/ends. Until the engine is engaged the bar is
-/// inert and empty: no handlers, so a tap on it bubbles to the card (play) and
-/// a hold arms the share like anywhere else on the card.
-///
-/// Engaged, a drag scrubs locally (the fill follows the finger, not the
-/// engine) and commits one `audioSeek` on lift; the committed value keeps
-/// rendering until the ENGINE's next push lands (native answers a seek with an
-/// optimistic state, so that's near-immediate), because falling back to the
-/// stale pre-seek `position` would snap the fill backwards for the round trip.
-/// Pointer events stop at the bar so a scrub never toggles the card under it;
-/// `touch-action: none` (CSS) keeps a horizontal drag from scrolling the
-/// thread.
 function AudioTrack({
   blobId,
   position,
@@ -697,6 +512,8 @@ function AudioTrack({
   const committed = useRef(false);
 
   useEffect(() => {
+    // Keep the local committed position until the engine pushes its next state;
+    // otherwise the fill snaps back between pointer-up and the seek response.
     if (committed.current) {
       committed.current = false;
       setScrub(null);
@@ -723,9 +540,6 @@ function AudioTrack({
     <div
       ref={barRef}
       className="audio-track"
-      // A still finger resting on the track (a slow scrub) must not arm the
-      // card's long-press share — touch events propagate independently of the
-      // pointer events captured below.
       onTouchStart={(e) => e.stopPropagation()}
       onPointerDown={(e) => {
         e.stopPropagation();
@@ -753,13 +567,6 @@ function AudioTrack({
   );
 }
 
-/// An audio attachment: the file card's layout with the glyph slot promoted to
-/// a play/pause control once the bytes are on disk. The ENGINE is native
-/// (AVPlayer on the device-cached blob, `audioToggle` over the bridge): bytes
-/// never cross as base64, the ringer switch can't silence it, and playback
-/// survives backing out of the chat — the card is only a mirror. Until
-/// downloaded it behaves exactly like a file card (tap fetches, ring + byte
-/// counter), so a history page of audio costs nothing until asked for.
 function AttachmentAudio({ attachment }: { attachment: WireAttachment }) {
   const { t } = useTranslation();
   const rootRef = useRef<HTMLButtonElement | null>(null);
@@ -770,16 +577,8 @@ function AttachmentAudio({ attachment }: { attachment: WireAttachment }) {
   const name = attachment.filename ?? type;
   const [head, tail] = splitForMiddleEllipsis(name);
   const playing = audio.state === "playing";
-  // Once the engine has touched this track the meta line becomes time and the
-  // scrubber goes live; `stopped` (never played / ended / usurped) reads like
-  // a resting card again.
   const engaged = state === "ready" && audio.state !== "stopped" && audio.duration > 0;
 
-  // The engine's duration is PRECISE (the asset is opened with precise
-  // timing) and permanently supersedes the wire's probe — after playback ends
-  // the resting meta must not fall back to an estimate the play just
-  // disproved. Held in a ref: it only matters on renders something else
-  // already triggered.
   const engineDurationMs = useRef(0);
   useEffect(() => {
     if (audio.duration > 0) engineDurationMs.current = audio.duration * 1000;
@@ -787,9 +586,6 @@ function AttachmentAudio({ attachment }: { attachment: WireAttachment }) {
   const restDurationMs =
     engineDurationMs.current > 0 ? engineDurationMs.current : (attachment.duration_ms ?? null);
 
-  // At rest the track's length rides the WIRE (`duration_ms`, probed at
-  // attach time), so it shows before any byte is downloaded — the engine
-  // takes over once it has loaded the real thing.
   const meta =
     state === "loading"
       ? `${formatBytes(loaded)} / ${formatBytes(attachment.size)}`
@@ -849,9 +645,6 @@ function AttachmentAudio({ attachment }: { attachment: WireAttachment }) {
   );
 }
 
-/// Tile ratios stay within a band — an ultra-wide strip or a 9:16 portrait
-/// column would blow the reading column open; the cover-fit poster absorbs the
-/// difference as a crop.
 const VIDEO_RATIO_DEFAULT = 16 / 9;
 
 const VIDEO_RATIO_MIN = 3 / 4;
@@ -885,15 +678,6 @@ function VideoProgressRing({ fraction }: { fraction: number }) {
   );
 }
 
-/// A video attachment: a fixed-width tile in the image idiom, not a file chip.
-/// Undownloaded it's a blank surface with a centered download disc and the size
-/// in the corner chip; while fetching, the disc becomes a DETERMINATE ring (the
-/// attachment declares its total) and the chip counts bytes; once on disk,
-/// native supplies a poster frame + duration (`requestVideoPoster`,
-/// AVAssetImageGenerator over the bridge) and the disc becomes a play glyph —
-/// tap hands the file to the native full-screen player. The poster's natural
-/// size is recorded in `ImageDimsStore`, so a re-opened thread draws this tile
-/// at the right ratio from the first paint.
 function AttachmentVideo({ attachment }: { attachment: WireAttachment }) {
   const { t } = useTranslation();
   const rootRef = useRef<HTMLButtonElement | null>(null);
@@ -931,12 +715,8 @@ function AttachmentVideo({ attachment }: { attachment: WireAttachment }) {
     return () => {
       cancelled = true;
       if (owned !== null && owned !== "") {
+        // Never leave a revoked object URL rendered in a pooled webview.
         URL.revokeObjectURL(owned);
-        // The render must never reference the revoked URL: a `ready → failed`
-        // flip (blob purged, download error) re-runs this effect, and keeping
-        // the stale poster would paint a broken <img>. On unmount these are
-        // no-ops. The duration falls back to the wire's value, not null — the
-        // track's length is still true.
         setPoster(null);
         setDurationMs(attachment.duration_ms ?? null);
       }
@@ -1002,13 +782,6 @@ function AttachmentVideo({ attachment }: { attachment: WireAttachment }) {
   );
 }
 
-/// Long-press → share, for a card that ALSO has a tap action: when the press
-/// fires, the synthetic click that follows the lift is swallowed in the
-/// capture phase, so a share never also downloads/plays/previews. `onShare`
-/// returns whether it fired — an undownloaded card shares nothing, and its
-/// follow-up click must stay a plain tap. The suppression re-arms on the next
-/// touch, so a fired press whose click never materialised (finger dragged
-/// away after the fire) can't eat a later genuine tap.
 function useSharePress(onShare: () => boolean): {
   onTouchStart: (e: ReactTouchEvent) => void;
   onTouchMove: (e: ReactTouchEvent) => void;
@@ -1029,6 +802,8 @@ function useSharePress(onShare: () => boolean): {
     [pressStart],
   );
   const onClickCapture = useCallback((e: ReactMouseEvent) => {
+    // Suppress the synthetic tap only when the long press actually shared;
+    // cancelled/failed long presses must retain the ordinary open action.
     if (suppress.current) {
       suppress.current = false;
       e.preventDefault();

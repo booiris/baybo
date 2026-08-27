@@ -1696,9 +1696,6 @@ final class ChatStore: ObservableObject, TranscriptTarget {
     }
 }
 
-/// A conversation is a composer host: it holds the notice line and names the
-/// draft. Nothing else of the staging machine's reaches in here — see
-/// `ComposerHost`.
 extension ChatStore: ComposerHost {
     var draftKey: DraftKey { .chat(sessionId) }
 }

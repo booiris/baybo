@@ -19,8 +19,6 @@ private actor WriteFailureGate {
     }
 }
 
-/// `ProjectsStore` with an injected fake: the mirror's cold paint, the REPLACE
-/// refresh, and a write's rollback.
 @MainActor
 struct ProjectsStoreTests {
     private func project(_ id: String, name: String, archived: Bool = false) -> ProjectInfo {
@@ -50,8 +48,6 @@ struct ProjectsStoreTests {
             hiredBy: nil, createdAtMs: 0)
     }
 
-    /// A cold start paints the mirror before the network answers — the whole
-    /// reason boards are mirrored at all.
     @Test func aSecondStorePaintsTheMirrorBeforeAnyFetch() async {
         let dir = TempSupportDir()
         let fake = FakeBayboClient()
@@ -67,15 +63,12 @@ struct ProjectsStoreTests {
         #expect(second.projects.map(\.name) == ["rglide"])
         #expect(second.boards["p1"]?.issues.map(\.title) == ["the parser"])
         #expect(second.boards["p1"]?.team.first?.handle == "dev-1")
-        // Enum words survive the round trip rather than degrading to unknown.
         #expect(second.boards["p1"]?.issues.first?.status == .todo)
         #expect(second.boards["p1"]?.issues.first?.priority == .high)
         #expect(second.boards["p1"]?.issues.first?.approvalPending == true)
         #expect(second.boards["p1"]?.issues.first?.subIssues?.total == 3)
     }
 
-    /// A run's cost is NEVER mirrored: the active-run poll does not price runs,
-    /// and a mirror that wrote `0` would report free work as fact.
     @Test func theMirrorRefusesToInventARunsCost() async {
         let dir = TempSupportDir()
         let fake = FakeBayboClient()
@@ -97,9 +90,6 @@ struct ProjectsStoreTests {
         #expect(run?.costMicros == nil)
     }
 
-    /// Boards with nothing waiting are ABSENT from `/attention`, not zeroed —
-    /// so the map is rebuilt, or a board that just went quiet keeps yesterday's
-    /// count forever.
     @Test func attentionIsReplacedNotMerged() async {
         let dir = TempSupportDir()
         let fake = FakeBayboClient()
@@ -117,8 +107,6 @@ struct ProjectsStoreTests {
         #expect(store.attention["p1"] == nil)
     }
 
-    /// A refresh REPLACES a board. There is no local state worth protecting
-    /// here, and a merge would only invent ways for the two to disagree.
     @Test func aRefreshReplacesTheBoardWholesale() async {
         let dir = TempSupportDir()
         let fake = FakeBayboClient()
@@ -133,9 +121,6 @@ struct ProjectsStoreTests {
         #expect(store.boards["p1"]?.issues.map(\.title) == ["second, renamed"])
     }
 
-    /// A failed write restores the board exactly as it was — the snapshot,
-    /// never the inverse of the optimistic edit — and surfaces the server's own
-    /// sentence, which is the only part the operator can act on.
     @Test func aFailedWriteRollsBackToTheSnapshotAndKeepsTheServersWords() async {
         let dir = TempSupportDir()
         let fake = FakeBayboClient()
@@ -159,9 +144,8 @@ struct ProjectsStoreTests {
             store.writeError == "this issue is blocked — lift the block before running it again")
     }
 
-    /// A rollback belongs to the optimistic version it created. If a live
-    /// refresh replaces that version while the request is suspended, restoring
-    /// the old snapshot would erase the server's newer board.
+    /// A failed optimistic write may roll back only the revision it created,
+    /// never a newer live refresh that completed while the request was suspended.
     @Test func aFailedOlderWriteDoesNotRestoreOverANewerRefresh() async {
         let dir = TempSupportDir()
         let fake = FakeBayboClient()
@@ -189,12 +173,6 @@ struct ProjectsStoreTests {
         #expect(store.boards["p1"]?.issues.map(\.title) == ["new from server"])
     }
 
-    /// **A patch says one thing.** `IssuePatch` is a full replace of every
-    /// field it names, so a verb that carries a field it did not mean to
-    /// change CLEARS it — and nothing about the resulting board would show it,
-    /// since the optimistic edit is applied locally and looks right either
-    /// way. The wire is the only place this is visible, which is why the fake
-    /// records it.
     @Test func settingThePriorityChangesThePriorityAndNothingElse() async {
         let dir = TempSupportDir()
         let fake = FakeBayboClient()
@@ -212,8 +190,6 @@ struct ProjectsStoreTests {
         let patch = fake.patches.last
         #expect(patch?.0 == 12)
         #expect(patch?.1.priority == .low)
-        // The card keeps its agent and its block: `.keep` on both, never a
-        // `nil` that reads as "clear it".
         #expect(patch?.1.assignee == .keep)
         #expect(patch?.1.blockedReason == .keep)
         #expect(patch?.1.pinned == nil)
@@ -225,9 +201,6 @@ struct ProjectsStoreTests {
         #expect(patch?.1.cancelled == nil)
     }
 
-    /// Cancel is a terminal state change, not a delete. The row is marked
-    /// locally at once, its active run and parked prompt leave with it, and the
-    /// sparse PATCH says exactly that one thing. Reopen reverses only the mark.
     @Test func cancellingAndReopeningACardUsesOneSparsePatchEachWay() async {
         let dir = TempSupportDir()
         let fake = FakeBayboClient()
@@ -276,8 +249,6 @@ struct ProjectsStoreTests {
         #expect(fake.patches.last?.1.cancelled == false)
     }
 
-    /// The parked prompt is outside `Board`, so the generic write rollback
-    /// cannot restore it. The cancel verb snapshots that side state itself.
     @Test func aRefusedCancelRestoresTheCardRunAndPrompt() async {
         let dir = TempSupportDir()
         let fake = FakeBayboClient()
@@ -308,9 +279,6 @@ struct ProjectsStoreTests {
         #expect(store.approvalPrompts["p1"]?[12]?.map(\.callId) == ["c1"])
     }
 
-    /// Offline disables writes rather than queueing them: a board moves while
-    /// the phone is away, so replaying a write authored against a board that
-    /// has since changed is worse than not having sent it.
     @Test func offlineRefusesTheWriteInsteadOfQueueingIt() async {
         let dir = TempSupportDir()
         let fake = FakeBayboClient()
@@ -326,8 +294,6 @@ struct ProjectsStoreTests {
         #expect(store.writeError?.contains("Offline") == true)
     }
 
-    /// Logout takes the boards with it — they belong to the departing gateway,
-    /// and a mirror that outlived one is somebody else's account on screen.
     @Test func removingTheMirrorTakesEveryBoardWithIt() async {
         let dir = TempSupportDir()
         let fake = FakeBayboClient()
@@ -344,23 +310,16 @@ struct ProjectsStoreTests {
         #expect(second.boards.isEmpty)
     }
 
-    /// A project id reaches the filesystem, so it may not name a path — `..`
-    /// would put a mirror wherever the app can write.
     @Test func aProjectIdCannotEscapeTheSupportDirectory() async {
         let dir = TempSupportDir()
         let fake = FakeBayboClient()
         fake.stubIssues = [issue(1, title: "one")]
         let store = ProjectsStore(supportDirectory: dir.url, clientProvider: { fake })
         await store.refreshBoard("../../escape")
-        // The board is held in memory, but nothing was written outside.
         let written = (try? FileManager.default.contentsOfDirectory(atPath: dir.url.path)) ?? []
         #expect(!written.contains { $0.contains("escape") })
     }
 
-    /// **An answered prompt leaves on the press.** It used to sit there for a
-    /// whole round trip — and the live queue being the truth is a reason to
-    /// let the refetch CORRECT this, not a reason to make the operator wait
-    /// for it.
     @Test func answeringAPromptRetiresItAtOnce() async {
         let dir = TempSupportDir()
         let fake = FakeBayboClient()
@@ -382,23 +341,15 @@ struct ProjectsStoreTests {
 
         _ = await store.resolveApproval(
             board: "p1", issue: 12, callId: "c1", decision: .approve)
-        // Only ITS OWN prompt goes: a card can hold several, and a resolution
-        // retires exactly one.
         #expect(store.approvalPrompts["p1"]?[12]?.map(\.callId) == ["c2"])
 
         _ = await store.resolveApproval(
             board: "p1", issue: 12, callId: "c2", decision: .deny)
-        // An empty list and an absent key must not both mean "none waiting" —
-        // the strip reads absence.
         #expect(store.approvalPrompts["p1"]?[12] == nil)
-        // And the decisions reached the wire, not just the screen.
         #expect(fake.approvalsResolved.map(\.1) == ["c1", "c2"])
         #expect(fake.approvalsResolved.map(\.2) == [.approve, .deny])
     }
 
-    /// A refusal that is NOT "already closed" puts the row back — otherwise
-    /// the operator is left with a prompt that is still waiting and can no
-    /// longer be seen.
     @Test func aRefusedAnswerPutsTheRowBack() async {
         let dir = TempSupportDir()
         let fake = FakeBayboClient()
@@ -424,9 +375,6 @@ struct ProjectsStoreTests {
             "a prompt still waiting must come back")
     }
 
-    /// A retry clears the failed flag at once, because that is what the server
-    /// will say: `last_run_failed` asks whether the NEWEST run failed, and a
-    /// retry makes the newest one queued.
     @Test func aRetryClearsTheFailedFlagWithoutWaitingForTheRoundTrip() async {
         let dir = TempSupportDir()
         let fake = FakeBayboClient()

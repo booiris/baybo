@@ -121,9 +121,6 @@ struct ComposerView: View {
                         send()
                     }
                 } label: {
-                    // A filled square is the "stop generating" affordance
-                    // (ChatGPT-style); the up arrow is send. One Image so the
-                    // glyph morphs between the two states.
                     ComposerSendCircle(
                         systemName: store.agentRunning ? "stop.fill" : "arrow.up",
                         glyphSize: store.agentRunning ? 13 : 15,

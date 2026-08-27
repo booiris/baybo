@@ -627,9 +627,6 @@ describe('IssueDetailPage rail', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Cancel issue' }));
     await userEvent.click(screen.getByRole('button', { name: 'Cancel it' }));
 
-    // The same press updates every reading of cancellation. The card leaves
-    // the live queue, while the run ledger stays honest and keeps its separate
-    // stop action — cancelling a card does not rewrite a run's status.
     expect(screen.getByText('Cancelled')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Wire the retry' }).className).toContain(
       'line-through',

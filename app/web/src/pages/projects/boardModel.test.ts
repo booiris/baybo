@@ -497,8 +497,6 @@ describe('readingOrder', () => {
   });
 
   it('sorts newest first inside each existing rank', () => {
-    // New still outranks Queue even when Queue holds the newest card; recency
-    // only decides the order among cards with the same reading rank.
     const view = readingOrder(
       board({
         backlog: [

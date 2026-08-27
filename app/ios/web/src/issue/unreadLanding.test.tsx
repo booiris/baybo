@@ -7,21 +7,6 @@ import type { IssuePayload } from "./bridge";
 import { IssuePage } from "./IssuePage";
 import type { IssueDetail, IssueEvent } from "./types";
 
-/// The card's Activity list: where it opens, and what it keeps folded away.
-///
-/// Opening a card where the reading stopped.
-///
-/// The boundary is the gateway's (`IssueTimelineDto.first_unread`) and this
-/// page only decides what to do with it, so what is worth pinning here is the
-/// *what to do*: draw the rule above the right row, land there once, and hold
-/// the rule still afterwards. That last one is the whole reason the state is
-/// frozen — painting the card stamps it read, and the refetch a second later
-/// answers with no boundary at all.
-///
-/// jsdom has no layout, so the landing itself is asserted through
-/// `scrollIntoView` (stubbed) rather than a scroll offset. What that cannot
-/// say anything about is whether the rule clears the floating native header —
-/// that is `scroll-margin-top` in issue.css, and only a device can confirm it.
 
 const card: IssueDetail = {
   number: 7,
@@ -82,8 +67,6 @@ function payload(firstUnread?: string): IssuePayload {
 }
 
 function deliver(p: IssuePayload): void {
-  // Set at import time by `./bridge`, which `IssuePage` pulls in — the global
-  // is optional for the transcript entry, which never defines it.
   const page = window.issuePage;
   if (page === undefined) throw new Error("window.issuePage missing");
   act(() => {
@@ -124,9 +107,8 @@ describe("opening a card at the unread boundary", () => {
     expect(scrolled).toHaveBeenCalledWith({ block: "start" });
   });
 
-  /// Painting the card stamps it read, which invalidates the timeline, which
-  /// refetches — and that answer carries no boundary. A rule that tracked the
-  /// payload would vanish under the reader a second after they arrived.
+  // Painting stamps the card read, so the next response omits the boundary;
+  // the page must keep the boundary it already showed the reader.
   it("holds the rule still once the card has been stamped read", () => {
     page();
     deliver(payload("e2"));
@@ -144,9 +126,6 @@ describe("opening a card at the unread boundary", () => {
     expect(scrolled).not.toHaveBeenCalled();
   });
 
-  /// The mirror paints first and the live answer lands a moment later. If the
-  /// reader has started reading in that gap the page is theirs — the rule
-  /// still marks the boundary, but nothing moves under their finger.
   it("never scrolls a reader who has already taken the page", () => {
     const { container } = page();
     deliver(payload(undefined));
@@ -159,11 +138,6 @@ describe("opening a card at the unread boundary", () => {
 });
 
 describe("machinery folds away", () => {
-  /// **A run of one is drawn, not folded** (2026-08-26). It was uniform for a
-  /// while — every run collapsed, a lone `moved` included, so the comments
-  /// would be findable down a column of identical closed lines. What that
-  /// bought in practice was a control hiding exactly one line and spending one
-  /// to say so, on most of the runs a card has.
   it("draws a run of one rather than folding it", () => {
     page();
     deliver(withEvents([comment("e1", "before"), moved("e5"), comment("e9", "after")]));
@@ -207,14 +181,8 @@ describe("machinery folds away", () => {
     });
   });
 
-  /// The exception, and it has to be one: the run carrying the boundary is
-  /// what the page just scrolled to, and landing a reader on a closed line is
-  /// landing them on nothing.
   it("opens the run the card lands on", () => {
     page();
-    // The boundary arrives on the SECOND delivery, as it does in the app —
-    // the mirror paints first and carries none. A row seeded at mount would
-    // read the landing before it exists.
     deliver(withEvents([comment("e1", "before"), moved("e5"), moved("e6")]));
     expect(fold()?.getAttribute("aria-expanded")).toBe("false");
 

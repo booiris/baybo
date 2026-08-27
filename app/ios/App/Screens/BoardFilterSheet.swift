@@ -1,10 +1,5 @@
 import SwiftUI
 
-/// Narrowing the board.
-///
-/// Everything here applies to the CURRENT stage only, which is why there is no
-/// status row: the segmented control above is the status filter, and a second
-/// one in here would be two controls for one question.
 struct BoardFilterSheet: View {
     @Binding var filter: BoardFilter
     let team: [TeamMemberInfo]

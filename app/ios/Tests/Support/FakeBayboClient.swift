@@ -555,17 +555,7 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     func setDeckSink(sink: DeckSink) {}
 
     // MARK: - Projects
-    //
-    // Every one of these throws: the Projects tab drives a store that takes an
-    // injected client of its own, so a test that means to exercise a board
-    // seeds that store rather than reaching through here. These exist to keep
-    // `BayboClientProtocol` conformance — which is the only thing in the repo
-    // that catches UniFFI seam drift — and a live call landing in one is a
-    // test relying on a call it never declared.
 
-    /// The board reads a store drives. Programmable rather than throwing,
-    /// because `ProjectsStore` is exercised through this fake — the writes
-    /// below stay unsupported until a phase has a caller for one.
     private var _stubProjects: [ProjectInfo] = []
     private var _stubIssues: [IssueInfo] = []
     private var _stubIssueDetail: IssueInfo?
@@ -584,10 +574,8 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     private var _failComments = false
     private var commentsHeld = false
     private var commentWaiters: [CheckedContinuation<Void, Never>] = []
-    /// Make the board unreachable, which is how the store learns it is offline.
     private var _failProjects = false
 
-    /// Every `PATCH /issues/{n}` this fake was sent, in order.
     var patches: [(Int64, IssuePatch)] { lock.withLock { _patches } }
 
     var stubProjects: [ProjectInfo] {
@@ -598,8 +586,6 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
         get { lock.withLock { _stubIssues } }
         set { lock.withLock { _stubIssues = newValue } }
     }
-    /// One card, for `projectIssueGet` — separate from `stubIssues` (the
-    /// board's list), because a card page reads both for different things.
     var stubIssueDetail: IssueInfo? {
         get { lock.withLock { _stubIssueDetail } }
         set { lock.withLock { _stubIssueDetail = newValue } }
@@ -617,8 +603,6 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
         get { lock.withLock { _stubRunLog } }
         set { lock.withLock { _stubRunLog = newValue } }
     }
-    /// What was answered, so a test can assert the DECISION reached the wire
-    /// and not only that the row went away.
     var approvalsResolved: [(Int64, String, IssueApprovalDecision)] {
         get { lock.withLock { _approvalsResolved } }
         set { lock.withLock { _approvalsResolved = newValue } }
@@ -699,13 +683,6 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     func projectIssueCreate(projectId: String, new: NewIssue) async throws -> IssueInfo {
         throw Self.unsupported
     }
-    /// Records the patch and answers with the stubbed card.
-    ///
-    /// The recording is the point: `IssuePatch` is a FULL REPLACE of every
-    /// field it names, so a verb that means to change one thing and quietly
-    /// carries a second clears that second — which is a class of bug no
-    /// assertion about the resulting board can see, because the optimistic
-    /// edit is applied locally and looks right either way.
     func projectIssuePatch(projectId: String, number: Int64, patch: IssuePatch) async throws
         -> IssueInfo
     {
@@ -733,13 +710,8 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
             sessionId: nil, error: nil, createdAtMs: 0, startedAtMs: nil, settledAtMs: nil,
             costMicros: nil, inputTokens: nil, outputTokens: nil)
     }
-    /// What a run's transcript answers with, per door. Two stubs rather than
-    /// one, because the doors differ in the only way that matters: the FRAME
-    /// KIND, and a fake that served both from one field could not tell a store
-    /// that took the wrong door from one that took the right one.
     var stubRunBaselineJson: String?
     var stubRunHistoryJson: String?
-    /// The `beforeOrdinal` of each scroll-up page asked for, in order.
     var runHistoryAsks: [Int64?] = []
     var runBaselineAsks = 0
     func projectRunTranscript(
@@ -834,7 +806,6 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     func projectRemoveAgent(projectId: String, agentId: String) async throws {
         throw Self.unsupported
     }
-    /// Faces set through this fake, newest last. `nil` is a clear.
     var avatarsSet: [(agentId: String, blobId: String?)] = []
     func agentSetAvatar(agentId: String, blobId: String?) async throws {
         try refuseIfOffline()

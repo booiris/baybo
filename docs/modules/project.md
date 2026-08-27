@@ -63,23 +63,11 @@ place. That is what lets every caller *in this process* — the manager, the six
 board tools, the REST routes — answer a question the same way without any of
 them carrying a copy of the rule.
 
-The clients used to be those callers, and the seam is worth knowing about even
-now that they are not. A composer cannot ask the server what sending will do —
-it has to say it while the text is still being typed — so both clients grew a
-hand-written mirror of `comments::comment_delivery` and of `mentions::assigns_to`
-(with the refusal `mention_assignment` wraps it in: a mention on a blocked card
-is recorded and staffs nobody). **Both are gone as of 2026-08-26**: the phone's
-never earned its two lines of chrome and the web's only ever surfaced as the
-send button's `title` tooltip, which is to say almost never. `commentHint`,
-`mentionHint` and the golden vectors that held the copies together were deleted
-with them, so THIS FILE'S rule is once again the only one — a client that wants
-to warn in advance again needs a mirror and a fixture to pin it. What survives
-in `app/web/src/pages/projects/` is `mentionQuery` / `mentionCandidates` /
-`applyMention`, which are the `@` autocomplete and assert nothing about what the
-server will do. So widening `is_live_work` by one column, or adding a
-run state that reads as idle, is a change on both sides in the same commit;
-`cargo test` alone will be green with a board that wakes an agent while the
-composer still promises "Records only".
+Clients do not predict comment delivery or mention assignment. The web
+`mentionQuery` / `mentionCandidates` / `applyMention` helpers and the iOS
+`IssueMention` helper implement autocomplete only; they make no claim about
+what the server will do. A future preflight hint would require a client mirror
+of the relevant rule plus shared fixtures that fail when the server changes.
 
 The retry button has **no** mirror, deliberately: nothing about it is typed
 into, so it can send and render what came back. Its refusals are still
@@ -1495,13 +1483,9 @@ which stays the pure "is this comment a handover" rule the web mirrors, and
 beside the other card-level refusal the mention already answers to (an agent
 that cannot host a session).
 
-Both of those refusals are **log lines and nothing else** — the comment
-itself lands, so the card records the words and says nothing about the
-staffing they asked for. That was the reason `mentionHint` carried the block:
-the composer refused in advance, in front of the person typing, which is the
-only place a refusal that writes nothing can be seen. With the hints gone
-(2026-08-26) nothing does — a mention on a blocked card is recorded, staffs
-nobody, and says so nowhere.
+Both refusals are **log lines and nothing else**. The comment lands, but the
+card records no separate staffing refusal. A mention on a blocked card is
+therefore visible as text, staffs nobody, and produces no additional notice.
 
 That leaves `dispatch_if_triggered` — the last place `board_may_start` is
 not asked — exempt through exactly two doors, and both are an explicit

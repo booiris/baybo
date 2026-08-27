@@ -1,13 +1,5 @@
 import SwiftUI
 
-/// The row of picks between the picker and the send: thumbnails, file pills,
-/// their upload state, a ✕ each and a tap-to-retry.
-///
-/// Store-free and surface-free — it draws `[StagedAttachment]` and reports two
-/// intents. That is the whole reason it is not still inside `ComposerView`: a
-/// project card stages the same picks through the same machine, and a second
-/// copy of the tile geometry would drift from this one the first time either
-/// moved.
 struct StagedStrip: View {
     let items: [StagedAttachment]
     let onRemove: (UUID) -> Void
@@ -51,9 +43,6 @@ struct StagedStrip: View {
         Group {
             switch item.preview {
             case .image(let image):
-                // No thumbnail until the pick's bytes land: the tile is on
-                // screen from the moment the pick is admitted, which is what
-                // makes the send gate see it.
                 Group {
                     if let image {
                         Image(uiImage: image)
@@ -93,10 +82,6 @@ struct StagedStrip: View {
         .accessibilityValue(Text(verbatim: metaText(item)))
     }
 
-    /// A file pill at the image thumbnail's height: glyph, middle-truncated
-    /// name (the extension has to stay visible — the mime it implies is what
-    /// decides whether the model can read the file at all), size or live upload
-    /// counter under it.
     private func fileTile(_ item: StagedAttachment, name: String, mime: String) -> some View {
         HStack(spacing: 8) {
             Group {
@@ -136,10 +121,6 @@ struct StagedStrip: View {
         return Lang.shared.t("attach.stagedImage")
     }
 
-    /// The tile's second line: bytes uploaded of the total while it streams,
-    /// the total once it lands, the retry affordance when it failed. Mirrors
-    /// how a DOWNLOAD presents progress (indeterminate spinner, byte counter
-    /// beside it as the real progress).
     private func metaText(_ item: StagedAttachment) -> String {
         switch item.state {
         case .queued, .uploading:

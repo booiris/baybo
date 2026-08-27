@@ -156,11 +156,7 @@ export interface WireApprovalCard {
   description?: string | null;
 }
 
-/** Mirror of Rust `ProjectChangeScope` — which plane of a project changed.
- *  `unknown` is the wire's own fallback arm for a scope a build has never
- *  heard of; it costs the narrowing, never the frame. Nothing here reads
- *  the scope anyway — `wantsRefresh` treats any frame for the board as
- *  "refetch" — so it needs no arm of its own. */
+/** Mirror of Rust `ProjectChangeScope`; every value currently triggers a refetch. */
 export type ProjectChangeScope = 'project' | 'board' | 'run' | 'timeline' | 'unknown';
 
 export type Frame =

@@ -135,10 +135,9 @@ enum DraftStore {
         try? FileManager.default.removeItem(at: directory(for: key, in: supportDirectory))
     }
 
-    /// Logout / rebind: every draft belonged to the departing gateway — BOTH
-    /// roots. A card draft left behind would keep a departing gateway's comment
-    /// text, and its hard-linked bytes, for whoever binds next.
     static func deleteAll(in supportDirectory: URL) {
+        // Logout/rebind clears both roots because every draft belongs to the
+        // departing gateway identity.
         for scope in [DraftScope.chat, .card] {
             try? FileManager.default.removeItem(at: root(scope, in: supportDirectory))
         }
@@ -192,11 +191,8 @@ enum DraftStore {
         supportDirectory.appendingPathComponent(scope.rawValue, isDirectory: true)
     }
 
-    /// A key's id is gateway-assigned (a session id, a project id) or locally
-    /// minted, and never trusted as a raw path component — `TranscriptStore`
-    /// makes the same move. A whitelist rather than a blocklist now that a card
-    /// key carries a server-supplied project id and a `#`.
     private static func sanitize(_ id: String) -> String {
+        // Gateway ids are never trusted as path components.
         let safe = id.map { ch -> Character in
             ch.isLetter || ch.isNumber || ch == "-" || ch == "_" ? ch : "_"
         }

@@ -3,8 +3,6 @@ import Testing
 
 @testable import Baybo
 
-/// A card's local cache: it paints before the network answers, and it is
-/// careful about what it is allowed to arm while doing so.
 @MainActor
 struct IssueMirrorTests {
     private func issue(
@@ -35,8 +33,6 @@ struct IssueMirrorTests {
             hiredBy: nil, createdAtMs: 0)
     }
 
-    /// A second store over the same directory paints without asking anybody —
-    /// the whole reason the cache exists.
     private func seeded(_ dir: TempSupportDir) async -> IssueStore {
         let fake = FakeBayboClient()
         fake.stubIssueDetail = issue(41)
@@ -67,10 +63,6 @@ struct IssueMirrorTests {
         #expect(second.isFromMirror)
     }
 
-    /// The board already has enough to draw the first screen of a card. A
-    /// first-ever open has no per-card mirror yet, so this seed closes the one
-    /// remaining cold-data gap while still withholding controls that require a
-    /// live card response.
     @Test func aBoardSeedPaintsAFirstEverCardWithoutArmingLiveControls() {
         let dir = TempSupportDir()
         let store = IssueStore(
@@ -89,15 +81,9 @@ struct IssueMirrorTests {
         #expect(store.pendingApprovals.isEmpty)
     }
 
-    /// **A cached prompt is never offered.** It is a live queue entry with a
-    /// 300s timeout, and one replayed off disk would ask for an answer to
-    /// something that stopped listening hours ago — the same reason the board
-    /// refuses to mirror prompts at all.
     @Test func aMirroredCardOffersNoApprovalUntilTheNetworkConfirmsIt() async {
         let dir = TempSupportDir()
         let first = await seeded(dir)
-        // Live, the prompt IS offered — so the test is about the mirror, not
-        // about the replay being broken.
         #expect(first.pendingApprovals.count == 1)
 
         let second = IssueStore(
@@ -106,13 +92,6 @@ struct IssueMirrorTests {
         #expect(second.pendingApprovals.isEmpty, "but nothing may be answered from disk")
     }
 
-    /// The faces the card page draws come with the team's OWN monograms.
-    ///
-    /// The distinction the test is on: `AgentMonogram.map` widens the whole set
-    /// when any pair collides, and `AgentMonogram.of` (one handle, no set)
-    /// cannot — `dev-1` and `docs-1` both reduce to `D1` under it. The page is
-    /// handed the resolved letters for exactly this reason, and a store that
-    /// resolved them per member would hand it two identical faces.
     @Test func theCardPageIsHandedTheTeamsOwnMonograms() async {
         let dir = TempSupportDir()
         let fake = FakeBayboClient()
@@ -137,10 +116,6 @@ struct IssueMirrorTests {
             store.people["a-docs"] == IssuePerson(handle: "docs-1", avatar: nil, monogram: "DO1"))
     }
 
-    /// And the same rule for where the card opens. The envelope on disk still
-    /// carries the boundary it was fetched with, and replaying it would open
-    /// the card halfway up a thread under a rule promising news that is not
-    /// there — this card was read the moment it was last opened.
     @Test func aMirroredCardOpensAtTheTopRatherThanAtAStaleBoundary() async {
         let dir = TempSupportDir()
         let fake = FakeBayboClient()
@@ -160,9 +135,6 @@ struct IssueMirrorTests {
         #expect(second.firstUnread == nil, "but the boundary waits for the network")
     }
 
-    /// Same rule for Stop: a run unsettled when this was written may have
-    /// finished hours ago, and the header's Stop would be offering to end
-    /// something already over.
     @Test func aMirroredCardShowsNoLiveRunUntilTheNetworkConfirmsIt() async {
         let dir = TempSupportDir()
         let first = await seeded(dir)
@@ -174,9 +146,6 @@ struct IssueMirrorTests {
         #expect(second.liveRun == nil, "but Stop stays away until the network says so")
     }
 
-    /// A failed refresh must not arm the live controls — `self.issue` is
-    /// non-nil the moment a mirror loads, so the flag has to read THIS fetch's
-    /// own answer.
     @Test func aRefreshThatFailedLeavesTheCardMarkedAsMirrored() async {
         let dir = TempSupportDir()
         _ = await seeded(dir)
@@ -192,9 +161,6 @@ struct IssueMirrorTests {
         #expect(second.issue != nil, "and the cached content stays on screen")
     }
 
-    /// A card response cannot vouch for the independently fetched control
-    /// planes. The cached run and prompt still paint as content here, but a
-    /// failed run/timeline fetch must not expose Stop or Approve.
     @Test func oneSuccessfulPlaneDoesNotArmFailedMirroredControlPlanes() async {
         let dir = TempSupportDir()
         _ = await seeded(dir)
@@ -272,8 +238,6 @@ struct IssueMirrorTests {
         #expect(store.issue?.title == "new")
     }
 
-    /// A card page draws its files; the board never did, so the shape gained a
-    /// field. An older mirror without it still decodes.
     @Test func attachmentsSurviveTheRoundTrip() async {
         let dir = TempSupportDir()
         let fake = FakeBayboClient()
@@ -293,8 +257,6 @@ struct IssueMirrorTests {
         #expect(second.issue?.attachments.first?.filename == "a.png")
     }
 
-    /// Logout takes every cached card — one belongs to the gateway that
-    /// served it.
     @Test func logoutTakesEveryCachedCard() async {
         let dir = TempSupportDir()
         _ = await seeded(dir)
@@ -307,7 +269,6 @@ struct IssueMirrorTests {
         #expect(!second.isFromMirror)
     }
 
-    /// A project id reaches the filesystem, so it may not name a path.
     @Test func aProjectIdCannotEscapeTheSupportDirectory() async {
         let dir = TempSupportDir()
         let fake = FakeBayboClient()
@@ -319,15 +280,11 @@ struct IssueMirrorTests {
         #expect(!written.contains { $0.contains("escape") })
     }
 
-    /// The hatch: the mirror goes, the memory goes, and the next open is a
-    /// cold one. What it must NOT do is leave a copy anywhere.
     @Test func resyncLeavesNothingBehindOnDiskOrInMemory() async {
         let dir = TempSupportDir()
         let first = await seeded(dir)
         #expect(first.issue != nil)
 
-        // Resync with a client that answers nothing, so the refetch cannot
-        // quietly repopulate what the clear was supposed to remove.
         let offline = FakeBayboClient()
         offline.failProjects = true
         let store = IssueStore(
@@ -341,14 +298,11 @@ struct IssueMirrorTests {
         #expect(!store.isFromMirror, "nothing is mirrored, because nothing is here")
         #expect(store.pendingApprovals.isEmpty)
 
-        // And a third store finds no file to paint from.
         let third = IssueStore(
             projectId: "p1", number: 41, client: FakeBayboClient(), supportDirectory: dir.url)
         #expect(third.issue == nil, "the mirror is gone from disk too")
     }
 
-    /// A resync must not take the BOARD's mirror with it — a card is not its
-    /// board, and rebuilding one card should not cost the list its cold paint.
     @Test func resyncLeavesTheBoardsOwnMirrorAlone() async {
         let dir = TempSupportDir()
         let fake = FakeBayboClient()
@@ -371,17 +325,11 @@ struct IssueMirrorTests {
         #expect(reopened.boards["p1"]?.issues.count == 1)
     }
 
-    /// Read is stamped once per card — and a rebuild is a fresh look at it, so
-    /// the stamp re-arms. Otherwise a card resynced after being read would
-    /// never mark itself read again on this device.
     @Test func resyncReArmsTheReadStamp() async {
         let dir = TempSupportDir()
         let store = await seeded(dir)
         store.markRendered()
         store.resync()
-        // Nothing observable to assert but the absence of a crash and the
-        // flag's reset; `markRendered` is idempotent by design, so this pins
-        // that the reset happened at all.
         store.markRendered()
         #expect(store.issue == nil)
     }

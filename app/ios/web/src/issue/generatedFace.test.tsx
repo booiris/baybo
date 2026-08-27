@@ -7,14 +7,6 @@ import type { IssuePayload } from "./bridge";
 import { IssuePage } from "./IssuePage";
 import type { IssueDetail, IssueEvent } from "./types";
 
-/// Giving a faceless teammate the face `app/web` already draws for it.
-///
-/// What is testable here is the TRIGGER — once per agent, only for the ones
-/// with no avatar — and not the rasterising: jsdom has no canvas, so
-/// `botttsPng` is stubbed. The drawing is the library's, and the one thing
-/// this repo adds to it (an explicit destination rect, because an SVG in a
-/// detached `<img>` reports whatever it was laid out at) only means anything
-/// in a real engine.
 
 const posted: { type: string; agentId?: string }[] = [];
 
@@ -92,9 +84,6 @@ describe("a faceless teammate gets the generated face", () => {
     expect(faces()).toEqual(["a-dev"]);
   });
 
-  /// The card refetches on every frame its board sends, and each delivery
-  /// carries the whole roster — so without the latch this would upload a face
-  /// per frame, for every teammate, until one landed.
   it("does it once per agent, however many deliveries arrive", async () => {
     deliver({ "a-dev": { handle: "dev-1", monogram: "D1" } });
     await settle();

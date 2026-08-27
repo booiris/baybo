@@ -422,11 +422,8 @@ async fn deck_changed_goes_to_the_deck_sink_and_never_to_a_session_sink() {
     );
 }
 
-/// A board invalidation is session-less like the deck frames, and the lane
-/// exists to stop it falling through: without it the frame reaches
-/// `route_per_session`, which broadcasts a session-less frame to EVERY
-/// subscribed transcript sink — none of which can use it — and to nobody at
-/// all when no chat is open, which is exactly when a board is on screen.
+/// Project broadcasts are session-less; they must use the global project sink
+/// rather than fan out to transcript sinks or disappear when no chat is open.
 #[tokio::test]
 async fn project_changed_goes_to_the_project_sink_and_never_to_a_session_sink() {
     let (fixture, sinks) = Fixture::new(&["s1"]);
@@ -474,10 +471,6 @@ async fn a_scope_this_build_cannot_name_still_reaches_the_project_sink() {
     );
 }
 
-/// A session-less `Gap` is the gateway saying it dropped a broadcast, and a
-/// `ProjectChanged` is exactly the kind of thing that goes with it. The board
-/// has no other way to learn it missed one, so the same frame nudges both the
-/// list and the project sink.
 #[tokio::test]
 async fn a_session_less_gap_makes_the_board_stale_too() {
     let (fixture, sinks) = Fixture::new(&["s1"]);
@@ -489,9 +482,6 @@ async fn a_session_less_gap_makes_the_board_stale_too() {
     assert!(sinks[0].frames().is_empty());
 }
 
-/// No project sink installed (the Projects tab was never opened): the frame
-/// is DROPPED, never rerouted to the per-session sinks. The board refetches
-/// on its next open, so nothing is lost.
 #[tokio::test]
 async fn a_project_frame_without_a_project_sink_is_dropped_not_broadcast() {
     let (fixture, sinks) = Fixture::new(&["s1"]);

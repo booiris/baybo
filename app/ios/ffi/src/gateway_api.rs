@@ -48,9 +48,8 @@ pub(crate) trait GatewayJsonClient {
     where
         T: DeserializeOwned + Send + 'static;
 
-    /// POST a non-idempotent create and decode what came back. Relay mode
-    /// never replays this after pooled-leg silence: the gateway may already
-    /// have committed the first request without returning its response head.
+    /// Non-idempotent creates are never replayed after relay silence: the first
+    /// request may already have committed without returning its response.
     fn post_json_once<'a, T>(
         &'a self,
         path: &'a str,
@@ -59,12 +58,6 @@ pub(crate) trait GatewayJsonClient {
     where
         T: DeserializeOwned + Send + 'static;
 
-    /// PATCH a sparse body and decode what came back.
-    ///
-    /// Distinct from [`Self::put_empty`] in both halves: a board's card is
-    /// edited field by field (an absent key means "leave it"), and the
-    /// gateway answers with the whole updated card, which is what the
-    /// caller renders instead of refetching.
     fn patch_json<'a, T>(
         &'a self,
         path: &'a str,
@@ -1013,12 +1006,6 @@ async fn history_page<C: GatewayJsonClient + Sync>(
     history_page_at(client, path, before_ordinal, limit).await
 }
 
-/// The page fetch itself, against a path the caller has already built.
-///
-/// Split out because a card's run transcript is not addressed by a session
-/// id at all — it hangs off the board, the card and the attempt
-/// (`…/issues/{n}/runs/{a}/transcript`) — while answering the identical DTO
-/// and feeding the identical webview frame.
 async fn history_page_at<C: GatewayJsonClient + Sync>(
     client: &C,
     mut path: String,
@@ -1277,12 +1264,7 @@ pub(crate) async fn fetch_session_model<C: GatewayJsonClient + Sync>(
     })
 }
 
-/// Pin the session to LLM entry `llm` and model `model` within it — clear the
-/// entry (`llm = None` → follow `default-llm`) and/or fall back to the entry's
-/// default model (`model = None`). `PUT /v1/chat/sessions/{id}/model`; the
-/// gateway persists the pin first and re-pins any live actor, so it applies
-/// from the session's next turn. The response body (the echoed pin) is
-/// deliberately discarded — the route validates the pin, so a 200 means it took.
+/// Persist a session model pin; `None` follows the configured defaults.
 pub(crate) async fn set_session_model<C: GatewayJsonClient + Sync>(
     client: &C,
     session_id: String,
@@ -1314,18 +1296,6 @@ pub(crate) async fn update_apns_token<C: GatewayJsonClient + Sync>(
     client.post_empty(PATH_MOBILE_APNS_TOKEN, body).await
 }
 
-// ─────────────────────────── projects (kanban boards) ───────────────────────
-//
-// Every enum decodes tolerantly (`#[serde(other)] Unknown`) for the reason
-// `WireSubagentStatus` does: a gateway that grows a status must cost one card
-// its word, not fail the whole board's decode. Encoding refuses `Unknown` —
-// asking the server to move a card into a column this build cannot name is a
-// request nobody can honour.
-
-/// The gateway's `ListResponse<T>` envelope. Generic here rather than one
-/// wrapper per route, as the older surfaces have: this path space answers
-/// six different lists in the same shape, and `next_cursor` is unused by
-/// every one of them (the feed pages by `before_ms` instead).
 #[derive(Deserialize)]
 struct WireList<T> {
     #[serde(default = "Vec::new")]
@@ -1374,6 +1344,7 @@ fn status_wire(status: IssueStatus) -> Result<&'static str, String> {
         IssueStatus::InProgress => Ok("in_progress"),
         IssueStatus::Review => Ok("review"),
         IssueStatus::Done => Ok("done"),
+        // Tolerant decoding must not become an invented write on an older client.
         IssueStatus::Unknown => Err("cannot move a card to an unknown status".to_string()),
     }
 }
@@ -1559,9 +1530,6 @@ struct WireIssue {
     sub_issues: Option<WireSubIssues>,
     unread: i64,
     last_run_failed: bool,
-    // Predates this client on a gateway that has not shipped the field yet;
-    // absent reads as "nothing waiting", the direction that shows no badge
-    // rather than a badge with nothing behind it.
     #[serde(default)]
     approval_pending: bool,
     #[serde(default)]
@@ -1750,9 +1718,6 @@ struct NewProjectRequest<'a> {
     max_parallel_issue_runs: Option<i64>,
 }
 
-/// A full replace — every knob is written as given, so nothing here is
-/// skipped when absent. `null` clears a ceiling, which is what "no limit"
-/// is on the wire.
 #[derive(Serialize)]
 struct UpdateProjectRequest<'a> {
     name: &'a str,
@@ -1760,9 +1725,6 @@ struct UpdateProjectRequest<'a> {
     daily_budget_micros: Option<i64>,
     daily_budget_tokens: Option<i64>,
     max_parallel_issue_runs: Option<i64>,
-    /// Never omitted. `#[serde(default)]` on the gateway's side reads a
-    /// missing `agents_may_merge` as `false`, so leaving it out of a
-    /// full-replace body is not "leave it alone" — it is "turn it off".
     agents_may_merge: bool,
 }
 
@@ -1774,9 +1736,6 @@ struct SetProjectArchivedRequest {
 #[derive(Serialize)]
 struct AttachmentRequest<'a> {
     blob_id: &'a str,
-    /// What to call the file. The gateway reads mime and size off the blob
-    /// itself, but nothing there knows what the user picked it as — omit this
-    /// and every file card on a card page prints an inferred name.
     #[serde(skip_serializing_if = "Option::is_none")]
     filename: Option<&'a str>,
 }
@@ -1798,9 +1757,6 @@ struct NewIssueRequest<'a> {
     stage: Option<i64>,
 }
 
-/// Sparse: an omitted key leaves the field alone. `assignee` and
-/// `blocked_reason` are doubly optional — `Some(None)` serializes as an
-/// explicit `null`, which is how a card is unassigned or a block lifted.
 #[derive(Serialize)]
 struct UpdateIssueRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1894,14 +1850,6 @@ pub(crate) async fn create_project<C: GatewayJsonClient + Sync>(
     Ok(wire.into())
 }
 
-/// Write the board's knobs. A **full replace**: an omitted ceiling is a
-/// cleared ceiling, so callers read the current settings, change one and
-/// send them all.
-///
-/// Returns nothing on purpose. The route answers with the row, but a full
-/// replace is a body the caller authored field by field — there is nothing
-/// in the response it does not already hold, and the board refetches after
-/// a write regardless (a ceiling change releases held runs).
 pub(crate) async fn update_project<C: GatewayJsonClient + Sync>(
     client: &C,
     project: String,
@@ -2032,9 +1980,6 @@ pub(crate) async fn move_issue<C: GatewayJsonClient + Sync>(
     Ok(wire.into())
 }
 
-/// Unsettled runs across the whole board — what the card faces read their
-/// working / queued / held word from. These carry **no cost fields**; the
-/// per-card log does.
 pub(crate) async fn list_active_runs<C: GatewayJsonClient + Sync>(
     client: &C,
     project: String,
@@ -2068,9 +2013,6 @@ pub(crate) async fn cancel_run<C: GatewayJsonClient + Sync>(
     client.post_empty(&path, Vec::new()).await
 }
 
-/// The one press that discharges a failed card, and the press that releases a
-/// held one — the gateway lets the ceiling through what it can before it
-/// refuses, so this is never a no-op on a held run.
 pub(crate) async fn retry_run<C: GatewayJsonClient + Sync>(
     client: &C,
     project: String,
@@ -2081,10 +2023,6 @@ pub(crate) async fn retry_run<C: GatewayJsonClient + Sync>(
     Ok(wire.into())
 }
 
-/// One agent's session on this card, as a backward transcript page. The same
-/// `ChatSessionDetail` the chat routes answer, so the transcript webview
-/// renders it unchanged; an attempt's page also holds the attempts before it,
-/// because one agent's runs on a card share a session.
 pub(crate) async fn fetch_run_transcript_page<C: GatewayJsonClient + Sync>(
     client: &C,
     project: String,
@@ -2102,21 +2040,6 @@ pub(crate) async fn fetch_run_transcript_page<C: GatewayJsonClient + Sync>(
     .await
 }
 
-/// The run's newest page, as a **baseline `sync_page`**.
-///
-/// A run has no sync route, so this reads the same backward-paging endpoint
-/// with no cursor — the newest page IS the whole tail. What matters is the
-/// frame it is dressed as. The web arms an in-flight guard when it asks for a
-/// sync and unwinds it on `sync_page` / `sync_failed` and nothing else; and it
-/// DROPS a `history_page` that matches no in-flight backward-paging request, as
-/// stale. Answering the initial load with a history page — which is what this
-/// did until 2026-08-26 — therefore lost twice: the rows were discarded and the
-/// guard stayed armed, so a run sat on "Loading conversation…" forever with its
-/// transcript already fetched.
-///
-/// `since_ordinal: None` makes it a baseline, which is honest: this is the
-/// newest page and not a difference. The web's REPLACE keeps whatever history
-/// the reader had paged in above it.
 pub(crate) async fn fetch_run_transcript_baseline<C: GatewayJsonClient + Sync>(
     client: &C,
     project: String,
@@ -2150,11 +2073,6 @@ fn run_transcript_path(project: &str, number: i64, attempt: i64) -> Result<Strin
     ))
 }
 
-/// A card's timeline, verbatim. Raw JSON rather than a typed record: the
-/// entries are a 20-arm tagged union the issue webview renders, and the
-/// pieces the native side needs off them (a parked prompt's `call_id`, who
-/// blocked the card) are read by one small model rather than by mirroring
-/// every arm through UniFFI.
 pub(crate) async fn fetch_issue_events<C: GatewayJsonClient + Sync>(
     client: &C,
     project: String,
@@ -2215,9 +2133,6 @@ pub(crate) async fn resolve_issue_approval<C: GatewayJsonClient + Sync>(
     client.post_empty(&path, body).await
 }
 
-/// Stamp one card read. The web only sends this once a card's timeline has
-/// actually rendered, and the phone follows: a read cursor moved by a screen
-/// nobody saw is unread work quietly discarded.
 pub(crate) async fn mark_issue_read<C: GatewayJsonClient + Sync>(
     client: &C,
     project: String,
@@ -2270,13 +2185,6 @@ pub(crate) async fn list_team<C: GatewayJsonClient + Sync>(
         .collect())
 }
 
-/// Pin (or clear) an agent's LLM, model and thinking level.
-///
-/// **The whole pin, replaced as one.** Absent means "inherit" at each level,
-/// so an empty body clears it entirely rather than leaving two thirds of it
-/// pointing at an entry the agent no longer uses. Sending a model without an
-/// entry is a 400 — there is no entry to pick it within — which is why the
-/// caller must send both or neither.
 pub(crate) async fn set_agent_model<C: GatewayJsonClient + Sync>(
     client: &C,
     agent_id: String,
@@ -2301,16 +2209,6 @@ pub(crate) async fn set_agent_model<C: GatewayJsonClient + Sync>(
     client.put_empty(&path, body).await
 }
 
-/// Give an agent a face, or take it away (`blob_id: None`).
-///
-/// The blob must already exist and be an image — the gateway stats it and
-/// refuses a dangling or non-image reference, because after this the id is a
-/// soft reference (no foreign keys).
-///
-/// **PNG, not SVG.** The generated faces are drawn as SVG by DiceBear, but a
-/// native iOS view has no SVG decoder at all: an `image/svg+xml` avatar
-/// passes the gateway's `image/*` check and then renders as nothing on every
-/// board row. Whoever uploads one rasterises it first.
 pub(crate) async fn set_agent_avatar<C: GatewayJsonClient + Sync>(
     client: &C,
     agent_id: String,
@@ -2367,9 +2265,6 @@ pub(crate) async fn remove_team_member<C: GatewayJsonClient + Sync>(
     client.delete_empty(&path).await
 }
 
-/// Boards with something waiting on the operator. Boards with nothing are
-/// **absent**, not zero-valued — a caller summing this must treat a missing
-/// board as quiet.
 pub(crate) async fn projects_attention<C: GatewayJsonClient + Sync>(
     client: &C,
 ) -> Result<Vec<ProjectAttention>, String> {
@@ -2388,9 +2283,6 @@ pub(crate) async fn projects_attention<C: GatewayJsonClient + Sync>(
         .collect())
 }
 
-/// What each board has been doing since `since_ms`, which must be the
-/// **budget's** day — UTC midnight, not the device's — or the burn figure is
-/// measured against a window the ceiling does not use.
 pub(crate) async fn projects_activity<C: GatewayJsonClient + Sync>(
     client: &C,
     since_ms: Option<i64>,
@@ -3839,11 +3731,6 @@ mod tests {
         assert_eq!(call.path, "/v1/projects/p1/issues");
     }
 
-    /// THE pin for the card patch. The gateway reads `assignee` and
-    /// `blocked_reason` as double options: absent leaves the field alone, an
-    /// explicit `null` clears it. Collapse the two and there is no way to
-    /// unassign a card or lift a block at all — every "clear" silently becomes
-    /// "leave it", and a blocked card can never be unblocked from the phone.
     #[tokio::test]
     async fn a_card_patch_tells_leave_it_apart_from_clear_it() {
         let client = RecordingClient::new(ISSUE_RESPONSE);
@@ -3876,9 +3763,6 @@ mod tests {
         assert_eq!(call.body, r#"{"blocked_reason":null,"pinned":true}"#);
     }
 
-    /// The other half: setting a value writes it, and the card comes back
-    /// decoded — including the badge the board reads to say a run on this card
-    /// is waiting for an answer.
     #[tokio::test]
     async fn a_card_patch_sets_a_value_and_decodes_the_card_it_answers_with() {
         let client = RecordingClient::new(ISSUE_RESPONSE);
@@ -3953,9 +3837,6 @@ mod tests {
         }
     }
 
-    /// A move carries the destination column's WHOLE order, this card in it —
-    /// the gateway renumbers the column in one transaction, so a body that
-    /// named only the moved card would renumber the column to just that card.
     #[tokio::test]
     async fn a_move_carries_the_destination_columns_whole_order() {
         let client = RecordingClient::new(ISSUE_RESPONSE);
@@ -4007,9 +3888,6 @@ mod tests {
         );
     }
 
-    /// A status this build cannot name never reaches the wire: asking the
-    /// server to move a card into a column we have no word for is a request
-    /// nobody can honour, and it must fail before the request, not after.
     #[tokio::test]
     async fn a_move_to_a_status_this_build_cannot_name_is_refused_locally() {
         let client = RecordingClient::new(ISSUE_RESPONSE);
@@ -4068,9 +3946,6 @@ mod tests {
         assert_eq!(call.body, r#"{"decision":"deny"}"#);
     }
 
-    /// A run's transcript hangs off the board, the card and the attempt — not
-    /// off a session id — and still answers the same page frame the chat
-    /// transcript renders.
     #[tokio::test]
     async fn a_run_transcript_page_is_addressed_by_card_and_attempt() {
         let client = RecordingClient::new(
@@ -4090,10 +3965,6 @@ mod tests {
         );
     }
 
-    /// Setting a face and clearing one are the same door, and the difference
-    /// is whether `blob_id` is THERE: the gateway reads an absent field as
-    /// "clear", so a clear that sent `null` and a clear that sent nothing must
-    /// not be two behaviours here.
     #[tokio::test]
     async fn an_avatar_is_set_by_blob_and_cleared_by_absence() {
         let client = RecordingClient::empty();
@@ -4129,16 +4000,6 @@ mod tests {
         );
     }
 
-    /// A run's transcript answers its two callers with two DIFFERENT frames,
-    /// and that is the whole feature rather than an implementation detail.
-    ///
-    /// The web arms a guard when it asks for a sync and unwinds it on
-    /// `sync_page` / `sync_failed` and nothing else; separately it DROPS a
-    /// `history_page` that matches no in-flight backward-paging request. So the
-    /// initial load answered with a history page lost twice over — rows
-    /// discarded, guard left armed — and every run sat on "Loading
-    /// conversation…" with its transcript already in hand. Both kinds are
-    /// asserted here because either one alone passes on the broken pairing.
     #[tokio::test]
     async fn a_runs_first_page_is_a_sync_frame_and_its_scrollback_a_history_one() {
         let body =
@@ -4168,10 +4029,6 @@ mod tests {
         assert!(frame.starts_with(r#"{"kind":"history_page""#), "{frame}");
     }
 
-    /// A run has no `/sync` endpoint, so its baseline transcript response is
-    /// the only place iOS can learn where context compaction split the rows.
-    /// Dropping this metadata leaves the split work cards visible but removes
-    /// the divider that explains why there are two of them.
     #[tokio::test]
     async fn a_runs_baseline_carries_compaction_points_into_its_sync_frame() {
         let client = RecordingClient::new(
@@ -4188,13 +4045,6 @@ mod tests {
         assert_eq!(json["compaction_points"][0]["at"], "2026-08-27T08:00:00Z");
     }
 
-    /// The board's settings are a FULL REPLACE, and `agents_may_merge` is the
-    /// field where that is dangerous: it is a plain `bool` with no "unset", and
-    /// the gateway defaults a missing one to `false`. So an omission is not
-    /// "leave it alone" — it silently turns a board's merging off, which is
-    /// what every Save from this app did until this field existed. Both
-    /// directions are pinned, because a body that always said `true` would
-    /// pass a test that only checked the interesting one.
     #[tokio::test]
     async fn the_settings_body_always_states_whether_the_board_merges() {
         for merges in [true, false] {
@@ -4225,10 +4075,6 @@ mod tests {
         }
     }
 
-    /// An id reaches a URL, so it goes through the same gate every other path
-    /// segment on this client does: a separator is REFUSED rather than
-    /// encoded (an id that could carry one could address another route), and
-    /// what is merely awkward is encoded.
     #[tokio::test]
     async fn an_avatar_id_is_gated_like_any_path_segment() {
         let client = RecordingClient::empty();
@@ -4244,10 +4090,6 @@ mod tests {
         assert_eq!(client.only_call().path, "/v1/agents/a%20dev/avatar");
     }
 
-    /// The pin is replaced WHOLE, so every level is sent — including the ones
-    /// that are `null`. An encoder that skipped them would leave two thirds of
-    /// a pin pointing at an entry the agent no longer uses, and clearing would
-    /// be unreachable.
     #[tokio::test]
     async fn an_agent_model_pin_sends_every_level_including_the_cleared_ones() {
         let client = RecordingClient::empty();

@@ -346,9 +346,8 @@ pub struct ProjectManager {
     /// and this only nudges — a send that fails, or a receiver that died,
     /// costs a delay until the next boot sweep, never a lost run.
     dispatch: RunDispatch,
-    /// Serialises the durable comment insert → consequences handoff. A crash
-    /// leaves the row pending for the next retry; concurrent retries in one
-    /// process must not both re-drive it before either can mark completion.
+    /// Serializes durable comment insert → consequences so concurrent retries
+    /// cannot both re-drive side effects before either marks completion.
     commenting: tokio::sync::Mutex<()>,
     /// Serialises [`drive`](Self::drive). See the comment there: deciding
     /// how much room a board has and then filling it is a read-then-write,
@@ -1746,9 +1745,8 @@ impl ProjectManager {
             .await
     }
 
-    /// Record a client comment exactly once. A retry returns the original
-    /// timeline row, re-driving consequences only when their durable
-    /// completion mark was not reached by the inserting request.
+    /// Return the original row on retry, re-driving only consequences whose
+    /// durable completion mark was not reached.
     pub async fn comment_idempotent(
         &self,
         project: &ProjectId,
@@ -1784,9 +1782,8 @@ impl ProjectManager {
             None
         };
         let issue = self.get_issue(project, number).await?;
-        // Idempotency replays the original response even if the board became
-        // archived after the first request landed. Re-running current write
-        // validation would turn an already-durable comment into a failure.
+        // Replay before current write validation: an already-durable comment
+        // must still return successfully if the board was archived afterward.
         if let Some(client_msg_id) = &client_msg_id
             && let Some(claim) = self
                 .store
@@ -2027,14 +2024,6 @@ impl ProjectManager {
         Ok(self.store.list_events(&issue.id).await?)
     }
 
-    /// Where a reader opening this card should land: its oldest entry the
-    /// operator has not seen, or `None` on a card with nothing new.
-    ///
-    /// The resolved id, never the read cursor — see
-    /// [`ProjectStore::first_unread_event`](baybo_store::project::ProjectStore::first_unread_event).
-    /// A client handed the cursor would decide for itself which rows are
-    /// new, and the divider it drew would be free to disagree with the
-    /// unread badge that sent the operator here.
     pub async fn first_unread_event(
         &self,
         project: &ProjectId,
@@ -2592,26 +2581,6 @@ impl ProjectManager {
             })
     }
 
-    /// The card an approval may be answered on.
-    ///
-    /// Answering releases an agent to act, which makes it a write in the
-    /// only sense this gate measures, so it goes through the same archived
-    /// check every other write does. An archived board's parked prompt is
-    /// left to time out — the alternative is a board that takes no comments
-    /// and no moves yet can still be talked into running a command.
-    ///
-    /// Two consequences worth stating, because neither is visible from the
-    /// call site. Archiving does not stop a run that is already executing
-    /// (only `promotions` reads the flag), so a run that reaches a gate
-    /// just after the operator archives its board now waits out
-    /// `APPROVAL_TIMEOUT` and self-denies rather than being answered
-    /// either way — the same end state a denial reaches, later. And this
-    /// gate covers the REST door only: `Frame::ResolveApproval` resolves a
-    /// bare `call_id` against the same queue with no card and no board in
-    /// hand (`gateway/src/channel/route.rs`), so a client subscribed to an
-    /// issue's session could still answer one there. No shipped client
-    /// does — issue sessions are excluded from every chat surface — but
-    /// this is a gate with two doors and only one of them checks.
     pub async fn approvable_issue(&self, project: &ProjectId, number: i64) -> Result<IssueRow> {
         self.writable_project(project).await?;
         self.get_issue(project, number).await

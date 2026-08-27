@@ -1,16 +1,5 @@
 import SwiftUI
 
-/// One board, pushed over the cards root.
-///
-/// **One stage at a time**, which is the web's `ColumnPage` on a phone. A wall
-/// of five columns needs horizontal room this screen does not have, and the
-/// alternative — `TabView(.page)` — puts three horizontal gestures in the same
-/// square inch: a row's swipe actions, the page paging, and the edge-back. The
-/// bar strip at the top takes the horizontal swipe instead, so the card rows
-/// keep their own.
-///
-/// There is no project switcher in this header. Changing board means backing
-/// out to the cards root, which is what the back gesture already does.
 struct ProjectBoardScreen: View {
     @EnvironmentObject private var appStore: AppStore
     @ObservedObject private var lang = Lang.shared
@@ -48,13 +37,6 @@ struct ProjectBoardScreen: View {
         _projects = ObservedObject(wrappedValue: store)
     }
 
-    /// A move's confirmation line.
-    ///
-    /// `reverse` is nil for a move that STARTED something. Undoing it would
-    /// put the card back while the run it triggered kept going, so the toast
-    /// would be offering to unwind something it cannot reach — and a "Queued
-    /// for @dev-1" line with an Undo beside it is a lie the operator only
-    /// finds out about after pressing.
     struct Toast: Equatable {
         let label: String
         let reverse: Reverse?
@@ -69,9 +51,6 @@ struct ProjectBoardScreen: View {
         projects.projects.first { $0.id == projectId }
     }
     private var board: ProjectsStore.Board? { projects.boards[projectId] }
-    /// An archived board is a read-only record. Its runs are stopped and its
-    /// gates self-deny, so every write here would be refused by the server —
-    /// better to not offer them than to offer them and be told no.
     private var isArchived: Bool { project?.archivedAtMs != nil }
     private var isReadOnly: Bool { isArchived || projects.isOffline }
 
@@ -96,9 +75,6 @@ struct ProjectBoardScreen: View {
             await projects.refreshBoard(projectId)
             await projects.refreshApprovalPrompts(board: projectId)
         }
-        // One pass over the roster rather than one fetch per drawing: the same
-        // teammate appears on every card it owns, in the face strip and in
-        // every picker.
         .onChange(of: board?.team.count) { _, _ in
             AgentAvatars.shared.load(team: board?.team ?? [])
         }
@@ -124,11 +100,6 @@ struct ProjectBoardScreen: View {
                 onPick: { row in pick(row, for: issue) })
         }
         .sheet(item: $assigning) { assignThenMoveTo = nil } content: { issue in
-            // Swiped away without an answer, the pending move has to go with
-            // it — otherwise the NEXT assignment, made from the ⋯ minutes
-            // later, silently carries the card to the column this one was
-            // opened for. The picked path has already taken the target by the
-            // time this fires.
             AssigneePicker(
                 team: board?.team ?? [], current: issue.assignee,
                 onPick: { agentId in assign(issue, to: agentId) })
@@ -313,11 +284,6 @@ struct ProjectBoardScreen: View {
                     }
                 }
             }
-            // The chat's escape hatch, on a card — reached from the LIST since
-            // 2026-08-26 rather than from the card's own ⋯, because a card
-            // whose local copy is wrong is a card whose own chrome you have
-            // just stopped trusting. Read-only boards keep it: it throws away
-            // nothing but this phone's copy.
             Button { rebuild(issue) } label: {
                 Label(lang.t("board.rebuild"), systemImage: "arrow.triangle.2.circlepath")
             }
@@ -352,23 +318,8 @@ struct ProjectBoardScreen: View {
     }
 
     // MARK: - The stage bar
-    //
-    // The five stages are PINNED under the header rather than scrolled with
-    // the board, and that is what they are for: they are navigation, not
-    // content. The list beneath them is one column out of five, and a control
-    // that scrolls away leaves you dragging back to the top every time you
-    // want to read a different one — on the screen whose whole shape is "one
-    // stage at a time".
-    //
-    // Only the segments. The board row and the Waiting strip stay in the
-    // scroll: the strip is a row per parked prompt and pinning it would take
-    // half the screen with it, and the board row is chrome you reach for
-    // occasionally rather than a thing you steer by.
 
     private enum StageBar {
-        /// The control itself. Read by `stageSegments` AND by the inset the
-        /// list keeps clear of it — two numbers that must agree or the first
-        /// card sits under the bar.
         static let control: CGFloat = 40
         /// Between the header and the control.
         static let breath: CGFloat = 12
@@ -383,12 +334,6 @@ struct ProjectBoardScreen: View {
     private var pinnedStages: some View {
         VStack(spacing: 0) {
             VStack(spacing: 0) {
-                // The header's own band, held open and painted here. The
-                // header floats on a VEIL — a gradient that is clear by its
-                // bottom edge, so content shows through the last few points
-                // of it, which is right on a transcript and wrong here: it
-                // put a sliver of a card row between the title and the
-                // segments, in a strip of screen nothing scrolls through.
                 Spacer().frame(height: ChatHeaderView.barHeight)
                 stageSegments
                     .padding(.horizontal, 20)
@@ -406,10 +351,6 @@ struct ProjectBoardScreen: View {
     }
 
     // MARK: - The bar strip
-    //
-    // The board row and the Waiting strip. Both take the horizontal swipe,
-    // as the pinned segments above do — the card rows keep theirs for the
-    // swipe actions.
 
     private var barStrip: some View {
         VStack(spacing: 10) {
@@ -507,10 +448,6 @@ struct ProjectBoardScreen: View {
                     .padding(.horizontal, 8)
                     .frame(height: 26)
                     .overlay(Capsule().strokeBorder(Theme.lineStrong, lineWidth: 1))
-                    // Stroke-only: the capsule paints a 1px outline and
-                    // nothing else, so without a shape only the glyphs
-                    // hit-test and the pill's interior is dead. This app has
-                    // shipped that bug before, on the logout pill.
                     .contentShape(Capsule())
                 }
                 .buttonStyle(.plain)
@@ -593,9 +530,6 @@ struct ProjectBoardScreen: View {
                 .font(Theme.mono(16))
                 .foregroundStyle(Theme.ink)
                 .lineLimit(1)
-                // Both circles on the right, plus their gap — kept symmetric so
-                // the name stays centred on the screen rather than on whatever
-                // is left of it.
                 .padding(.horizontal, 114)
                 .overlay(alignment: .trailing) {
                     BoardRefreshRing(isRefreshing: isRefreshing).offset(x: 16)
@@ -611,10 +545,6 @@ struct ProjectBoardScreen: View {
                 .glassSurface(interactive: true, in: .circle)
                 .accessibilityLabel(Text(verbatim: lang.t("board.back")))
                 Spacer()
-                // The two are mutually exclusive by construction: an archived
-                // board takes no writes, so the thing that would file a card is
-                // exactly the thing it cannot do — and the chip explains why the
-                // slot is not a button.
                 if isArchived {
                     Text(verbatim: lang.t("projects.archivedChip"))
                         .font(Theme.mono(10))
@@ -626,18 +556,8 @@ struct ProjectBoardScreen: View {
                 } else {
                     Button {
                         Haptics.tap()
-                        // The column you are looking at, which is the web's rule
-                        // too — filing from Todo and finding the card in Backlog
-                        // is a small betrayal every time.
                         appStore.openNewIssue(project: projectId, status: stage)
                     } label: {
-                        // The compose glyph, not a `+`. The cards root one push
-                        // back already wears `+` for a new BOARD, and two
-                        // different creates in the same corner of the same tab
-                        // looked like the same button. `square.and.pencil` is
-                        // this app's "make a thing you write" — the chat list's
-                        // own — and a card is document-first, which is exactly
-                        // what the sheet behind this button opens with.
                         Image(systemName: "square.and.pencil")
                             .font(.system(size: 16, weight: .medium))
                             .foregroundStyle(Theme.ink)
@@ -681,11 +601,6 @@ struct ProjectBoardScreen: View {
                             .font(Theme.sys(13, weight: .bold))
                             .foregroundStyle(Theme.paper)
                             .frame(minHeight: 44)
-                            // `minHeight` is LAYOUT; a `Text` still hit-tests
-                            // its own box, so the 44pt target it was reaching
-                            // for was never tappable. This is the one control
-                            // here with a three-second life — a missed tap on
-                            // it cannot be tried again.
                             .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
@@ -701,9 +616,6 @@ struct ProjectBoardScreen: View {
         .transition(.opacity)
     }
 
-    /// The server's own sentence. Never paraphrased: the board's refusals name
-    /// which ceiling, which block, which card holds the slot — and that is the
-    /// only part an operator can act on.
     private func errorBanner(_ message: String) -> some View {
         VStack {
             Spacer()
@@ -758,9 +670,6 @@ struct ProjectBoardScreen: View {
 
     private var budgetMeter: BudgetMeter.Meter? { projects.budgetMeter(board: projectId) }
     private var isOverCeiling: Bool { budgetMeter?.burn == .over }
-    /// Which ceiling the board is over. Taken from the meter rather than
-    /// guessed: an operator told "over its daily budget" on a token-limited
-    /// board goes and raises a dollar figure that was never what stopped it.
     private var heldCeiling: MoveConsequence.HeldCeiling {
         budgetMeter?.ceiling ?? .unknown
     }
@@ -830,9 +739,6 @@ struct ProjectBoardScreen: View {
             guard await projects.assign(board: projectId, issue: issue.number, to: agentId) else {
                 return
             }
-            // The picker was opened BY a move, so finish it — and re-derive the
-            // consequence from the card as it now is, rather than replaying the
-            // row that was built when nobody was assigned.
             guard let target, let agentId,
                 let fresh = projects.boards[projectId]?.issues.first(
                     where: { $0.number == issue.number })
@@ -846,12 +752,6 @@ struct ProjectBoardScreen: View {
         }
     }
 
-    /// Throw away this phone's copy of a card, so the next open refetches it.
-    ///
-    /// No confirm — it costs a round trip and nothing else — but it does say
-    /// so: the row does not change, the card is not on screen, and a press
-    /// with no visible answer is a press that did nothing as far as anyone can
-    /// tell. `IssueStore` owns the file; this only names the card.
     private func rebuild(_ issue: IssueInfo) {
         Haptics.tap()
         IssueStore.discardMirror(projectId: projectId, number: issue.number)
@@ -861,10 +761,8 @@ struct ProjectBoardScreen: View {
     private func setPinned(_ issue: IssueInfo, _ pinned: Bool) {
         Haptics.tap()
         Task {
-            // The swipe panel's teardown stalls List's reorder, so the row
-            // would sit in a blank slot while UIKit finishes. Letting the
-            // panel close first costs nothing the eye can see and buys a
-            // destination slot that is not empty.
+            // Let the swipe panel finish closing before a pin-triggered reorder;
+            // otherwise List briefly leaves the row's destination slot blank.
             try? await Task.sleep(for: .milliseconds(320))
             await projects.setPinned(board: projectId, issue: issue.number, pinned)
         }
@@ -910,9 +808,6 @@ extension IssueInfo: Identifiable {
     public var id: Int64 { number }
 }
 
-/// The board header's pull indicator. Same shape as the chat list's, which is
-/// `private` to that file — one ring is not worth a shared module, but two
-/// that drift apart would be a visible bug on two screens with one gesture.
 private struct BoardRefreshRing: View {
     var isRefreshing: Bool
     @State private var angle: Double = 0

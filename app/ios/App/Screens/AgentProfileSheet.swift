@@ -1,19 +1,6 @@
 import PhotosUI
 import SwiftUI
 
-/// One teammate: who it is, and what it runs on.
-///
-/// The pin is edited **whole** — entry, model and thinking level go over the
-/// wire together on every pick, because absent means "inherit" at each level
-/// on the server and a per-field save could leave the row naming a model that
-/// belongs to an entry it no longer names. Setting a model without an entry is
-/// a 400 there, so picking an entry drops the model that belonged to the old
-/// one; the thinking level survives, being the one level the server accepts on
-/// its own.
-///
-/// The three rows and their contents mirror `app/web`'s `LlmPinFields`, down
-/// to which rows exist at all — see `LlmPinOptions`, where the rules both
-/// clients obey are written once.
 struct AgentProfileSheet: View {
     let member: TeamMemberInfo
     let projectId: String
@@ -30,9 +17,6 @@ struct AgentProfileSheet: View {
     @State private var facePick: PhotosPickerItem?
     @State private var level: Level = .profile
 
-    /// Which list the sheet is showing. A drill-down INSIDE the sheet rather
-    /// than a sheet on a sheet — a third layer over a board is a place to get
-    /// lost, and the back row says where you are.
     private enum Level: Equatable {
         case profile
         case llm
@@ -43,9 +27,6 @@ struct AgentProfileSheet: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
-                // The face stays put at every level: it says whose pin is
-                // being changed, which is the one thing a list of model names
-                // cannot.
                 head
                 if let error {
                     Text(verbatim: error)
@@ -74,9 +55,6 @@ struct AgentProfileSheet: View {
 
     private var head: some View {
         HStack(spacing: 12) {
-            // The face is the picker. A row of its own would be a fourth thing
-            // on a sheet that is mostly a list of models, and the thing you
-            // press to change a picture should be the picture.
             PhotosPicker(selection: $facePick, matching: .images) {
                 AgentFace(
                     handle: member.handle, avatarBlobId: member.avatarBlobId,
@@ -128,13 +106,6 @@ struct AgentProfileSheet: View {
         }
     }
 
-    /// The pin, as three fields — the `baybo.json` entry, the model within it,
-    /// and how hard it thinks. `app/web`'s `LlmPinFields`, in this app's
-    /// grammar.
-    ///
-    /// The thinking field is ABSENT, not disabled, when the entry the pin
-    /// resolves to expresses no rungs: baybo sends that provider no effort at
-    /// all, and a greyed row would advertise a knob that does not exist.
     @ViewBuilder private var pinRows: some View {
         if catalog.models.isEmpty {
             Text(verbatim: lang.t("agent.noModels"))
@@ -226,10 +197,6 @@ struct AgentProfileSheet: View {
         case .profile:
             return
         case .llm:
-            // The model goes with the entry it belonged to. Carrying it across
-            // would pin a model the new entry cannot serve, which the gateway
-            // refuses — so the picker refuses it first. The thinking level
-            // stays: the server takes it with no entry at all.
             setPin(llm: row.value, model: nil, effort: member.reasoningEffort)
         case .model:
             setPin(llm: member.llm, model: row.value, effort: member.reasoningEffort)
@@ -268,9 +235,6 @@ struct AgentProfileSheet: View {
         .disabled(saving)
         .opacity(saving ? 0.5 : 1)
         .accessibilityIdentifier(identifier)
-        // The label alone is not the row: two rows reading `llm` and `model`
-        // say nothing about what they are set to, which is the whole reason to
-        // press one.
         .accessibilityLabel(Text(verbatim: "\(label) \(value)"))
     }
 
@@ -341,14 +305,6 @@ struct AgentProfileSheet: View {
             .padding(.bottom, 8)
     }
 
-    /// The pin is replaced WHOLE, every time. Anything less leaves two thirds
-    /// of a pin pointing at an entry the agent no longer uses.
-    ///
-    /// The sheet stays open and drops back to the profile: three fields means
-    /// an operator usually sets two of them, and dismissing after the first
-    /// would make the second a re-open. `onChanged` refetches the roster, and
-    /// `member` is read from it — so what these rows show after a write is the
-    /// server's answer, never a local echo of the pick.
     private func setPin(llm: String?, model: String?, effort: String?) {
         saving = true
         error = nil
@@ -365,13 +321,6 @@ struct AgentProfileSheet: View {
         }
     }
 
-    /// Give this agent the picture the operator picked.
-    ///
-    /// Two calls, in this order and no other: the bytes become a blob, and
-    /// only then does the agent point at it. The gateway stats the blob on
-    /// the way in and refuses a dangling or non-image reference — an id set
-    /// first and uploaded after would be refused, and an upload whose PUT
-    /// then failed leaves an unreferenced blob rather than a broken face.
     private func setFace(_ pick: PhotosPickerItem) {
         saving = true
         error = nil

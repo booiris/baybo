@@ -1,17 +1,5 @@
 import SwiftUI
 
-/// File a card on a board.
-///
-/// A pushed route rather than a sheet, for the reason the new-board form is
-/// one: the home shell opts out of keyboard avoidance wholesale
-/// (`HomeTabView.ignoresSafeArea(.keyboard)`), and a pushed screen sits
-/// outside that, so the title field can rise with the keyboard the ordinary
-/// way.
-///
-/// **It opens in the column you were looking at**, which is the web's rule
-/// (`CreateIssueModal`'s `initialStatus`) and the only one that does not
-/// surprise: filing from the Todo tab and finding the card in Backlog is a
-/// small betrayal every time.
 struct NewIssueScreen: View {
     @EnvironmentObject private var appStore: AppStore
     @ObservedObject private var lang = Lang.shared
@@ -92,9 +80,6 @@ struct NewIssueScreen: View {
 
                 section(lang.t("newIssue.opensIn"))
                 stageChips
-                // Only In Progress has anything to say — the other four open a
-                // card and do nothing, and a sentence about a run that never
-                // existed would be worse than silence.
                 if let note = MoveConsequence.openingNote(
                     in: status, assigneeHandle: assigneeHandle,
                     overCeiling: isOverCeiling, heldCeiling: heldCeiling)
@@ -291,9 +276,6 @@ struct NewIssueScreen: View {
                     new: NewIssue(
                         title: title.trimmingCharacters(in: .whitespacesAndNewlines),
                         description: description,
-                        // Attachments want the composer's staging strip, which
-                        // is bound to `ChatStore`; a card takes files from its
-                        // own page instead.
                         attachments: [],
                         status: status,
                         priority: priority,

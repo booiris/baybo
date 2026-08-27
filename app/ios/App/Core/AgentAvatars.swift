@@ -1,18 +1,9 @@
 import SwiftUI
 import UIKit
 
-/// The uploaded picture for each agent that has one.
-///
-/// **One store for the whole app, not a fetch per drawing.** The same teammate
-/// is drawn on every card it owns, in the board's face strip, in the assignee
-/// picker, in the filter sheet and again on its own profile — and a per-view
-/// fetch pulls the same bytes once per drawing. `app/web`'s `useTeamPortraits`
-/// carries the same comment for the same reason.
-///
-/// Keyed by BLOB id, not agent id: replacing an agent's avatar mints a new
-/// blob, so a stale picture cannot survive under the agent's key — and two
-/// agents sharing one uploaded image cost one fetch rather than two.
 @MainActor
+/// App-wide avatar cache keyed by blob id: repeated drawings share one fetch,
+/// while replacing an avatar naturally changes the key.
 final class AgentAvatars: ObservableObject {
     static let shared = AgentAvatars()
 
@@ -22,10 +13,7 @@ final class AgentAvatars: ObservableObject {
 
     /// In flight, so a board with the same agent on twelve cards asks once.
     private var loading: Set<String> = []
-    /// Blobs that answered with something unusable. Kept so a broken avatar
-    /// costs one round trip rather than one per repaint — a failed fetch that
-    /// retried on every draw would hammer the leg for a picture that is not
-    /// coming.
+    /// Remember broken blobs so a repaint does not retry them once per face.
     private var failed: Set<String> = []
 
     private let clientProvider: () -> any BayboClientProtocol
@@ -40,11 +28,6 @@ final class AgentAvatars: ObservableObject {
         return images[blobId]
     }
 
-    /// Fetch every avatar this roster names, once.
-    ///
-    /// Called from wherever a team arrives rather than from each face: a face
-    /// knows its own blob id and nothing about the others, so a face-driven
-    /// fetch is a fetch per face by construction.
     func load(team: [TeamMemberInfo]) {
         for member in team {
             load(blobId: member.avatarBlobId)
@@ -57,9 +40,6 @@ final class AgentAvatars: ObservableObject {
             return
         }
         #if DEBUG
-            // `-baybo-demo-projects` has no gateway to fetch from, and an
-            // avatar is the one thing on this screen that cannot be faked from
-            // a record alone — so the demo draws its own.
             if let drawn = Self.demoAvatar(for: blobId) {
                 images[blobId] = drawn
                 return
@@ -71,9 +51,7 @@ final class AgentAvatars: ObservableObject {
             defer { self.loading.remove(blobId) }
             do {
                 let bytes = try await self.client.blobDownloadBytes(blobId: blobId, progress: nil)
-                // Decoded off the main actor: an avatar is small, but a board
-                // arriving with a dozen of them would decode a dozen images in
-                // one hop and drop the frame the list is painting in.
+                // A full roster can arrive together; decode off the main actor.
                 let decoded = await Task.detached(priority: .userInitiated) {
                     UIImage(data: bytes)
                 }.value
@@ -84,9 +62,6 @@ final class AgentAvatars: ObservableObject {
                 }
                 self.images[blobId] = Image(uiImage: decoded)
             } catch {
-                // One unreachable blob costs that agent its upload, not the
-                // board its faces — it falls back to the monogram like an
-                // agent that never had one.
                 self.failed.insert(blobId)
                 NSLog("baybo: agent avatar %@: %@", blobId, bayboErrorText(error))
             }
@@ -94,10 +69,6 @@ final class AgentAvatars: ObservableObject {
     }
 
     #if DEBUG
-        /// Demo blob ids are `demo-avatar-<hex>`; the hex is the fill. A flat
-        /// disc rather than a fake robot: what the screenshot has to prove is
-        /// that the PICTURE path replaced the monogram, and a solid colour
-        /// proves it more clearly than a drawing would.
         static let demoPrefix = "demo-avatar-"
 
         private static func demoAvatar(for blobId: String) -> Image? {

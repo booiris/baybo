@@ -3,11 +3,6 @@ import Testing
 
 @testable import Baybo
 
-/// What the native side reads off a card's timeline.
-///
-/// The timeline arrives as raw gateway JSON because the issue webview renders
-/// it; these are the three questions the native dock and the Waiting strip ask
-/// of it, and each has a wrong answer that looks right.
 @Suite struct IssueTimelineTests {
     private func events(_ items: String) -> [IssueEvent] {
         try! IssueEvent.decodeList("{\"items\":[\(items)]}")
@@ -32,9 +27,6 @@ import Testing
         """
     }
 
-    /// A prompt is retired by `call_id`, not by "the newest resolution wins" —
-    /// one card can hold several across a run, and a resolution retires exactly
-    /// one of them.
     @Test func aResolutionRetiresItsOwnPromptAndLeavesTheRest() {
         let timeline = events(
             [
@@ -48,8 +40,6 @@ import Testing
         #expect(pending.first?.askedBy == "dev-1")
     }
 
-    /// A re-request after a resolution opens the prompt again — the same call
-    /// id can be asked twice in a run.
     @Test func aReRequestReopensThePrompt() {
         let timeline = events(
             [
@@ -60,10 +50,6 @@ import Testing
         #expect(IssueTimeline.pendingApprovals(in: timeline).map(\.callId) == ["c1"])
     }
 
-    /// An OPERATOR's block is that operator saying stop, and nothing should
-    /// invite them to answer themselves. Only an agent-authored block is a
-    /// question — which is also the one card the board's own driver never
-    /// comes back to.
     @Test func onlyAnAgentAuthoredBlockIsAQuestion() {
         let byAgent = events(
             """
@@ -83,7 +69,6 @@ import Testing
         #expect(IssueTimeline.agentQuestion(blockedReason: "stop for now", events: byOperator) == nil)
     }
 
-    /// An unblocked card asks nothing, whatever its history says.
     @Test func aCardThatIsNotBlockedAsksNothing() {
         let timeline = events(
             """
@@ -93,8 +78,6 @@ import Testing
         #expect(IssueTimeline.agentQuestion(blockedReason: nil, events: timeline) == nil)
     }
 
-    /// The NEWEST block is the one in force: an earlier one may have been
-    /// lifted and re-applied by somebody else entirely.
     @Test func theNewestBlockIsTheOneInForce() {
         let timeline = events(
             [
@@ -110,9 +93,6 @@ import Testing
         #expect(IssueTimeline.agentQuestion(blockedReason: "second", events: timeline) == nil)
     }
 
-    /// A kind this build has never heard of is carried, not dropped: the
-    /// timeline is rendered by the webview, and a native decoder that threw on
-    /// a new kind would take the whole card's Activity with it.
     @Test func anUnknownKindStillDecodes() {
         let timeline = events(
             """
@@ -124,17 +104,12 @@ import Testing
         #expect(IssueTimeline.pendingApprovals(in: timeline).isEmpty)
     }
 
-    /// Malformed input costs the entry, not the card.
     @Test func aMalformedEnvelopeYieldsNoEntriesRatherThanThrowing() throws {
         #expect(try IssueEvent.decodeList("{\"items\":[]}").isEmpty)
         #expect(try IssueEvent.decodeList("{}").isEmpty)
-        // An entry without an id or a body kind is not one.
         #expect(try IssueEvent.decodeList("{\"items\":[{\"number\":1}]}").isEmpty)
     }
 
-    /// The envelope carries the entries AND where the reader should land in
-    /// them. The id is the gateway's answer — nothing here decides what counts
-    /// as unread, which is why there is no rule to test, only a field to read.
     @Test func theEnvelopeCarriesWhereTheReaderStopped() throws {
         let envelope = """
             {"items":[
@@ -146,8 +121,6 @@ import Testing
         #expect(timeline.events.map(\.id) == ["e1", "e2"])
         #expect(timeline.firstUnread == "e2")
 
-        // Omitted, never null, on a card with nothing new — a gateway that
-        // started sending `null` would read the same here.
         #expect(try IssueEvent.decodeTimeline("{\"items\":[]}").firstUnread == nil)
         #expect(try IssueEvent.decodeTimeline("{\"items\":[],\"first_unread\":null}").firstUnread == nil)
     }

@@ -1,20 +1,9 @@
 import type { WireAttachment } from "../types";
 
-/// Hand-written mirrors of the gateway's issue DTOs.
-///
-/// Hand-written for the same reason `types.ts` is: these arrive as raw JSON
-/// the ffi passes through untouched, so no generated binding sits on this path.
-/// `issueSentinel.ts` pins them to the utoipa schema at compile time — that
-/// file, not this one, is what fails when the gateway moves.
-
+// Hand-written raw-JSON mirrors; issueSentinel.ts pins them to the generated
+// OpenAPI schema because no generated binding sits on this FFI path.
 export type AgentRef = { id: string; handle: string };
 
-/// Who did the thing an entry records.
-///
-/// **Internally** tagged by `kind` — an agent arrives as
-/// `{ kind: "agent", id, handle }`, flat, not nested under an `agent` key.
-/// Getting this wrong costs every `@handle` on the page and nothing else, so
-/// it fails silently; the sentinel is what catches it.
 export type Actor =
   | { kind: "user" }
   | { kind: "system" }
@@ -31,9 +20,6 @@ export type IssueAttachment = {
   filename?: string;
 };
 
-/// How many of a card's children are done. The card DTO carries the COUNT, not
-/// the children — listing them needs the board, which is why the native side
-/// puts them on the payload instead (`IssuePayload.children`).
 export type SubIssueProgress = { done: number; total: number };
 
 export type IssueDetail = {
@@ -80,11 +66,8 @@ export type IssueRun = {
   output_tokens?: number;
 };
 
-/// One timeline entry. `body` is internally tagged by `kind`, and this mirror
-/// keeps it OPEN — a kind this build has never heard of must render as a
-/// generic line rather than take the card's whole Activity down with it. The
-/// gateway adds kinds on its own schedule, and the phone is not the thing that
-/// should gate that.
+/// Open by design so a future event kind renders generically instead of
+/// crashing the whole activity list.
 export type IssueEventBody = { kind: string } & Record<string, unknown>;
 
 export type IssueEvent = {
@@ -114,13 +97,6 @@ export function isAgent(actor: Actor): boolean {
   return actor.kind === "agent";
 }
 
-/// An issue attachment as the attachment cards want it.
-///
-/// The cards dispatch on `kind`, which the issue DTO does not carry — the
-/// transcript's wire frames classify server-side and the issue rows do not.
-/// Derived here rather than in a component so there is ONE answer to "is this
-/// an image": a second `startsWith("image/")` inside a view is how the two
-/// surfaces end up disagreeing about an `image/svg+xml`.
 export function toWireAttachment(a: IssueAttachment): WireAttachment {
   const mime = a.mime_type;
   const kind: WireAttachment["kind"] = mime.startsWith("image/")
@@ -137,12 +113,7 @@ export function toWireAttachment(a: IssueAttachment): WireAttachment {
   };
 }
 
-/// Whether a run still holds the card's slot. `settled_at_ms` is the question,
-/// never a status match — the server picks the row the same way, and a
-/// `running` row carrying a settle stamp is a finished run, not a live one.
 export function isLiveRun(run: IssueRun): boolean {
-  // Absent, never `null`: every optional field here carries
-  // `skip_serializing_if = "Option::is_none"`, so `None` is omitted from the
-  // JSON entirely — and `issueSentinel.ts` is what holds that true.
+  // The server's rule is unsettled, not a status match.
   return run.settled_at_ms === undefined;
 }

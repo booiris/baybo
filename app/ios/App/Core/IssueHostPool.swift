@@ -3,11 +3,7 @@ import SwiftUI
 import UIKit
 import WebKit
 
-/// The pure allocation half of the two-slot issue renderer.
-///
-/// Visits keep their original slot. With a stack A → B → C, A and C both
-/// use slot 0 while B uses slot 1. Only adjacent pages can be visible, so C may
-/// replace A; after C pops, slot 0 restores A while B still covers it.
+// Adjacent navigation pages need two renderers; older visits may reuse a slot.
 struct IssueHostPoolPlan {
     static let capacity = 2
 
@@ -264,9 +260,7 @@ struct IssueWebView: UIViewRepresentable {
     }
 }
 
-/// SwiftUI's `onAppear` fires at the start of a pop. Reusing the outgoing
-/// page's slot there changes its pixels mid-animation, so the pool waits for a
-/// child controller's real `viewDidAppear`, after UIKit has completed it.
+// Restore a reused slot after UIKit finishes the pop animation, not at onAppear.
 struct IssueDidAppearReporter: UIViewControllerRepresentable {
     let action: () -> Void
 

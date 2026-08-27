@@ -134,9 +134,8 @@ was tried and failed, and several name a bug that shipped once already.
   the four frames that drive it.
 - [`docs/projects.md`](docs/projects.md) — the Projects tab: the cards root,
   the one-stage-at-a-time board, the Waiting-on-you strip, the Move sheet's
-  consequence rows, the card page (a third webview) and its run transcripts.
-  [`docs/projects-plan.md`](docs/projects-plan.md) is the build log — what each
-  phase changed and, more usefully, what the simulator corrected.
+  consequence rows, the card page (a third webview), its mirrors and warm
+  renderer pool, and its run transcripts.
 - [`docs/deck.md`](docs/deck.md) — the iOS half of Deck;
   [`docs/modules/deck.md`](../../docs/modules/deck.md) is the design's source of
   truth.

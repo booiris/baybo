@@ -1,15 +1,5 @@
 import Foundation
 
-/// The card timeline, decoded far enough for the native side to answer three
-/// questions: what is waiting on an answer, whether an agent is asking one,
-/// and who said the last thing.
-///
-/// The entries arrive as raw gateway JSON because their real consumer is the
-/// issue webview, which renders the gateway's own shape — see
-/// `BayboClient.projectIssueEvents`. What is decoded here is the handful of
-/// fields the native dock and the Waiting strip need; every other kind rides
-/// through as its raw `kind`, so a gateway that grows one costs a row its
-/// sentence and nothing else.
 struct IssueEvent: Equatable {
     enum ActorKind: Equatable {
         case user
@@ -39,27 +29,10 @@ struct IssueEvent: Equatable {
     let reason: String?
     let text: String?
 
-    /// Decode the `{"items":[…]}` envelope `projectIssueEvents` answers with.
-    ///
-    /// Tolerant by construction: an entry missing the fields this build reads
-    /// still decodes, and an unknown `kind` is carried rather than dropped —
-    /// the timeline is rendered by the webview, and a native decoder that
-    /// threw on a new kind would take the whole card's Activity with it.
     static func decodeList(_ json: String) throws -> [IssueEvent] {
         try decodeTimeline(json).events
     }
 
-    /// The same envelope, read whole: the entries AND `first_unread`, the
-    /// entry the operator has not seen yet.
-    ///
-    /// One pass rather than two calls over the same bytes — a card's timeline
-    /// is the largest thing this app decodes on the main actor, and it is
-    /// re-read on every frame its board sends.
-    ///
-    /// The id is the gateway's answer, never re-derived here: which entries
-    /// count as unread is one rule with one home (`UNREAD_EVENT_PREDICATE`),
-    /// and a second copy of it in this file would put the card page's rule
-    /// somewhere the board's unread badge disagrees with.
     static func decodeTimeline(_ json: String) throws -> (
         events: [IssueEvent], firstUnread: String?
     ) {
@@ -98,13 +71,6 @@ struct IssueEvent: Equatable {
     }
 }
 
-/// Who an agent id is, once the board has resolved it.
-///
-/// A type rather than a `[String: Any]` because it crosses a boundary and the
-/// far side reads it by name: the page's `Person` in `issue/bridge.ts`.
-/// `monogram` travels WITH the handle because it is a property of the whole
-/// team — see `AgentMonogram` — and a page handed only the handle would
-/// re-derive it wrongly for exactly the pairs the rule exists for.
 struct IssuePerson: Equatable {
     let handle: String
     /// The blob the page fetches over the bridge. Most agents have none.
@@ -112,14 +78,6 @@ struct IssuePerson: Equatable {
     let monogram: String
 }
 
-/// A tool call parked on this card, waiting to be answered.
-///
-/// Distinct from the chat surface's `PendingApproval` on purpose, and not
-/// merely to avoid the name: a chat prompt is derived from a subscribed
-/// session's frame stream and answered over the WS, while a board prompt is
-/// read off the card's timeline and answered by `call_id` over REST. The two
-/// planes never meet — an issue session is excluded from every chat surface —
-/// so one type spanning both would be a shape with two irreconcilable halves.
 struct IssueApprovalPrompt: Equatable {
     let callId: String
     let tool: String
@@ -131,19 +89,8 @@ struct IssueApprovalPrompt: Equatable {
 }
 
 enum IssueTimeline {
-    /// Prompts requested and not resolved, oldest first.
-    ///
-    /// A replay rather than a scan for the newest: a prompt is answered by
-    /// `call_id`, one card can hold several across a run, and a resolution
-    /// retires exactly one of them.
-    ///
-    /// **The live queue is the truth, not this.** A gateway restart drops
-    /// every parked prompt without writing a resolution, and a prompt that
-    /// times out self-denies the same way — so an entry surviving here can
-    /// name a prompt nothing is waiting for. That is why the card's badge
-    /// comes from `IssueDto.approval_pending` (which reads the queue) and
-    /// this only supplies the `call_id` to answer with, and why a 404 on
-    /// answering means "already closed" rather than a failure to retry.
+    /// Replays history into candidate prompts. Callers must still gate results
+    /// with live `approval_pending` state before offering an action.
     static func pendingApprovals(in events: [IssueEvent]) -> [IssueApprovalPrompt] {
         var open: [String: IssueApprovalPrompt] = [:]
         var order: [String] = []
@@ -172,18 +119,6 @@ enum IssueTimeline {
         return order.compactMap { open[$0] }
     }
 
-    /// The agent's own question, when an agent is what stopped this card.
-    ///
-    /// The distinction matters and is the whole reason this exists: an
-    /// operator's block is that operator saying stop, and nothing should
-    /// invite them to answer themselves. An **agent-authored** block is a
-    /// question nobody has come back to — the board's own driver deliberately
-    /// asks nobody about a blocked card, so it is the one card nothing ever
-    /// returns to on its own.
-    ///
-    /// Unlike an approval this never expires: it waits until somebody lifts
-    /// the block, which is what makes it worth a row of its own next to
-    /// prompts that self-deny in five minutes.
     static func agentQuestion(blockedReason: String?, events: [IssueEvent]) -> PendingQuestion? {
         guard let reason = blockedReason, !reason.isEmpty else { return nil }
         // The newest block is the one in force; an older one may have been

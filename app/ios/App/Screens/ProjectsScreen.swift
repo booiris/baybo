@@ -1,13 +1,5 @@
 import SwiftUI
 
-/// The Projects tab root: one card per board.
-///
-/// This is the tab's home, and there is deliberately **no project switcher
-/// anywhere else** — a board is a pushed screen, and changing board means
-/// backing out to here. That diverges from the web, whose rail entry restores
-/// the last board directly and switches from a pill on its header; on a phone
-/// a pushed board covers the tab bar, so a switcher in its header would be a
-/// second way to do what the back gesture already does.
 struct ProjectsScreen: View {
     @EnvironmentObject private var appStore: AppStore
     @ObservedObject private var lang = Lang.shared
@@ -19,10 +11,6 @@ struct ProjectsScreen: View {
         _projects = ObservedObject(wrappedValue: store)
     }
 
-    /// **Most recently opened on this phone first**, then everything never
-    /// opened here. The order is the store's answer, not this view's — the same
-    /// list is sorted for the live and the archived block, and two call sites
-    /// deciding it separately is how they drift.
     private var live: [ProjectInfo] {
         projects.inRecencyOrder(projects.projects.filter { $0.archivedAtMs == nil })
     }
@@ -42,9 +30,6 @@ struct ProjectsScreen: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Theme.paper)
         .task { await projects.refreshRoot() }
-        // The tab's pages stay alive, so `onAppear` re-fires on every return
-        // from a pushed board and is useless as a "came back" signal. The tab
-        // selection is the one that actually changes.
         .onChange(of: appStore.homeTab) { _, tab in
             guard tab == .projects else { return }
             Task { await projects.refreshRoot() }
@@ -161,14 +146,6 @@ struct ProjectCardView: View {
 
     private var isArchived: Bool { project.archivedAtMs != nil }
 
-    /// **Parked approvals, and nothing else** — the same set the board's
-    /// Waiting strip shows, so the number you press and the rows you land on
-    /// are the same number.
-    ///
-    /// The server's `/attention` also counts failed runs and unread cards, and
-    /// this deliberately does not: neither is waiting on an answer. A failed
-    /// run is over and an unread card is news, and a red count that cannot be
-    /// discharged by answering anything is a mark you learn to ignore.
     private var waiting: Int {
         Int(attention?.approvals ?? 0)
     }
@@ -253,9 +230,6 @@ struct ProjectCardView: View {
             }
             if let meter {
                 Text(verbatim: "·")
-                // Over the ceiling the figure is underlined rather than
-                // reddened: red is the failure token, and a board that has
-                // spent its budget has not failed at anything.
                 Text(verbatim: "\(meter.spent) / \(meter.limit)")
                     .underline(meter.burn == .over)
             }
@@ -280,12 +254,6 @@ struct ProjectCardView: View {
         }
     }
 
-    /// The card's one line of "what is going on here".
-    ///
-    /// Derived from the board it already holds rather than from the activity
-    /// feed: the feed would be one more fetch per board on a screen that
-    /// repaints on every tab entry, and this line only has to say enough to
-    /// pick a board out of three.
     static func headline(for board: ProjectsStore.Board) -> String? {
         if let running = board.runs.first(where: { $0.status == .running }) {
             let who = board.handle(forAgent: running.agentId)
@@ -334,10 +302,6 @@ private struct StageStrip: View {
     }
 }
 
-/// Overlapping faces, the lead heavier and whoever is running ringed.
-/// The row of faces a board shows for its team: who is on it, and who is
-/// working right now. Shared by the cards root and the board's own bar strip —
-/// the two say the same thing about the same team and must not drift.
 struct TeamFaces: View {
     let team: [TeamMemberInfo]
     let runs: [IssueRunInfo]
@@ -346,18 +310,8 @@ struct TeamFaces: View {
         Set(runs.filter { $0.status == .running && $0.settledAtMs == nil }.map(\.agentId))
     }
 
-    /// How many faces the row draws before it starts COUNTING instead.
-    ///
-    /// Six is what fits beside the board row's budget and filter chips on the
-    /// narrowest phone this app supports; the cards root's row is wider. The
-    /// cap used to be five and the remainder was simply dropped — a team of
-    /// six drew as a team of five, with nothing on screen admitting it.
     static let maxFaces = 6
 
-    /// How many of a team's faces get drawn.
-    ///
-    /// A `+1` would cost exactly the width of the face it replaced, so the
-    /// counter only ever stands for two or more.
     static func facesDrawn(of count: Int) -> Int {
         count <= maxFaces + 1 ? count : maxFaces
     }
@@ -367,15 +321,7 @@ struct TeamFaces: View {
     }
 
     var body: some View {
-        // Over the WHOLE team, never the part that fits: one colliding pair
-        // widens the entire set, so a monogram computed over a prefix is how
-        // this row comes to print `D1` where the assignee picker prints `DE1`
-        // for the same agent — the exact drift `AgentMonogram` exists to stop.
         let monograms = AgentMonogram.map(for: team)
-        // Set apart rather than stacked. The overlapping-avatars idiom saves
-        // room this card does not need, and it costs the thing the row is FOR:
-        // a working member's ring lands on its neighbour's edge, and four
-        // agents read as a tangle of arcs instead of as who is busy.
         return HStack(spacing: 4) {
             ForEach(shown, id: \.id) { member in
                 AgentFace(
@@ -397,22 +343,9 @@ struct TeamFaces: View {
     }
 }
 
-/// One agent, as initials in a hairline circle.
-///
-/// Monochrome by decree — the web draws generated Bottts robots on warm tints,
-/// which is its palette, not this one. Initials off the handle keep the face
-/// stable across a rename that cannot happen anyway (a handle is fixed at
-/// hire).
 struct AgentFace: View {
     let handle: String
-    /// Precomputed by whoever draws the whole team, so the monogram can be
-    /// made unique across it (`AgentMonogram.map`). A face drawn on its own
-    /// falls back to the plain rule.
     var monogram: String? = nil
-    /// The agent's uploaded picture, if it has one. Resolved through
-    /// `AgentAvatars` rather than fetched here: a face knows its own blob and
-    /// nothing about the others, so a face-driven fetch is one fetch per
-    /// DRAWING — and a busy board draws the same teammate a dozen times.
     var avatarBlobId: String? = nil
     var lead: Bool = false
     var working: Bool = false
@@ -424,28 +357,12 @@ struct AgentFace: View {
 
     private var initials: String { monogram ?? AgentMonogram.of(handle) }
 
-    /// **An uploaded avatar or a monogram, and nothing in between.**
-    ///
-    /// `app/web` fills that gap with a Bottts robot generated from the agent
-    /// id, and this deliberately does not match it: DiceBear is not portable
-    /// to Swift, and a *different* generated face on each device would be
-    /// worse than none — two surfaces claiming to depict the same teammate
-    /// with different pictures. The monogram is honestly "there is no
-    /// picture", and it is derived from the handle printed beside it.
     var body: some View {
         picture
             .overlay(
                 Circle().strokeBorder(lead ? Theme.ink : Theme.lineStrong, lineWidth: lead ? 1.5 : 1)
             )
             .overlay(
-                // The working mark is a dot at the corner, matching the one the
-                // card's own status line leads with. It was an open ring at the
-                // face's edge, which failed twice on screen: outset it bled
-                // across the neighbouring faces, and inset it vanished under
-                // the LEAD's heavier border — leaving the one agent most likely
-                // to be working as the one face that could never show it. There
-                // is no room inside a 22pt circle for both a monogram and a
-                // second ring, so the mark moved off the rim entirely.
                 Group {
                     if working {
                         Circle()
@@ -466,17 +383,11 @@ struct AgentFace: View {
         if let uploaded = avatars.image(for: avatarBlobId) {
             uploaded
                 .resizable()
-                // `.fill`, not `.fit`: an avatar that is not square would
-                // otherwise letterbox inside the circle and read as a broken
-                // image rather than a cropped one.
                 .aspectRatio(contentMode: .fill)
                 .frame(width: size, height: size)
                 .clipShape(Circle())
         } else {
             Text(verbatim: initials)
-                // Three glyphs only happen on a collision, and they have to fit
-                // the same circle — the row's rhythm is the point, not the type
-                // size.
                 .font(Theme.mono(size * (initials.count > 2 ? 0.30 : 0.36)))
                 .foregroundStyle(Theme.ink)
                 .frame(width: size, height: size)

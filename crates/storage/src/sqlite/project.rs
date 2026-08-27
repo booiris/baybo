@@ -102,6 +102,8 @@ impl SqliteProjectStore {
                 })?;
                 let existing = tx
                     .query_row(
+                        // Use the badge's exact unread predicate and timeline order
+                        // so the divider cannot disagree with the count.
                         &format!(
                             "SELECT {EVENT_COLUMNS} FROM issue_events \
                              WHERE issue_id = ?1 AND client_msg_id = ?2"
@@ -1602,10 +1604,6 @@ impl ProjectStore for SqliteProjectStore {
             .interact("issue_events.first_unread", move |conn| {
                 Ok(conn
                     .query_row(
-                        // `UNREAD_EVENT_PREDICATE` verbatim, and the ordering
-                        // `events_query` lists with — "the first unread one"
-                        // has to mean the first one the page will draw, not
-                        // the first one some other sort would have put there.
                         &format!(
                             "SELECT e.id FROM issue_events e \
                              JOIN issues i ON i.id = e.issue_id \
@@ -4360,13 +4358,6 @@ mod tests {
         );
     }
 
-    /// Where a reader opening a card should land: the OLDEST entry it has
-    /// not seen, chosen by the same predicate the unread badge counts with.
-    ///
-    /// The two must not be able to disagree — a badge saying 2 over a
-    /// divider drawn above the operator's own comment is a card that
-    /// contradicts itself — which is why the id is resolved here rather
-    /// than by a client handed the cursor and the rows.
     #[tokio::test]
     async fn a_card_opens_at_the_oldest_thing_the_operator_has_not_seen() {
         let (_dir, store) = store().await;
@@ -4412,9 +4403,6 @@ mod tests {
             "and opening it leaves nothing to land on"
         );
 
-        // The operator's own comment is not news to the operator, and a
-        // system entry is machinery — neither is what the badge counts, so
-        // neither may be what the divider sits above.
         store
             .append_event(&event(&issue, IssueActor::User, comment("mine")))
             .await

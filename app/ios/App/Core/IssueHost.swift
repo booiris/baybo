@@ -1,13 +1,8 @@
 import SwiftUI
 import WebKit
 
-/// One of the issue surface's two kept-warm rendering engines.
-///
-/// The hosts belong to `IssueHostPool`, not to a card. A visit keeps its own
-/// `IssueStore`; the pool retargets one of these already-loaded pages to that
-/// store before navigation starts. Two are the minimum for a native push: the
-/// source and destination are both visible during the transition.
 @MainActor
+/// Kept-warm renderer owned by the two-slot pool rather than by one card visit.
 final class IssueHost {
     static let issueURL = URL(string: "\(TranscriptSchemeHandler.scheme)://localhost/issue.html")
 
@@ -72,16 +67,9 @@ final class IssueHost {
     }
 }
 
-/// Two jobs. A visible-time WebContent death is the host's to recover (WebKit
-/// auto-reloads only offscreen views), and the page may navigate its own main
-/// frame to exactly one place: itself.
-///
-/// That second one is not paranoia about our own bundle — the card body renders
-/// **agent-authored markdown**, and a link in a description that navigated the
-/// main frame would replace the card with whatever it pointed at, inside a
-/// webview holding the native message handler. Links go to the system browser
-/// through `openUrl` instead.
 @MainActor
+/// Recovers visible WebKit crashes and prevents agent-authored links from
+/// navigating the privileged main frame; external links open through native.
 private final class IssueNavigationPolicy: NSObject, WKNavigationDelegate {
     weak var bridge: IssueBridge?
 

@@ -2,17 +2,6 @@
 
     import Foundation
 
-    /// `-baybo-demo-projects`: a canned set of boards so the Projects tab
-    /// renders headlessly with no gateway to fetch from.
-    ///
-    /// Seeded into memory only — never persisted, and every refresh is
-    /// short-circuited rather than answered, so a later plain launch on the same
-    /// simulator inherits nothing (`ModelCatalog`'s rule, for the same reason).
-    ///
-    /// The shape is chosen to make every branch of the cards root paintable in
-    /// one screenshot: a board that wants you (all three attention kinds at
-    /// once), a board that is merely busy, a board doing nothing, and an
-    /// archived one so the archived toggle exists to press.
     extension ProjectsStore {
         static let demoArg = "-baybo-demo-projects"
         /// The board `-baybo-demo-board` opens: the one with something in
@@ -89,11 +78,6 @@
                     Self.demoRun(42, agent: "a-dev2", status: .queued, trigger: .retry),
                     Self.demoRun(43, agent: "a-lead", status: .running, trigger: .started),
                 ],
-                // Eight, which is two past what the face row draws: the row
-                // caps at `TeamFaces.maxFaces` and counts the rest, and a
-                // fixture that fits leaves both the counter and the truncation
-                // it replaced unpaintable. `dev-*` against `docs-*` also forces
-                // `AgentMonogram` to widen the whole set.
                 team: [
                     Self.demoMember("a-lead", "lead", lead: true),
                     Self.demoMember("a-dev", "dev-1"),
@@ -145,13 +129,6 @@
                 createdAtMs: 0, updatedAtMs: 0)
         }
 
-        /// Todo's tail: enough cards that the stage does not fit on a phone.
-        ///
-        /// A fixture where every stage fits leaves the whole SCROLLING half of
-        /// this screen unpaintable — the pinned stage bar, the band headers
-        /// passing under it, pull-to-refresh. Deliberately plain: these are
-        /// here to have height, and anything interesting on them would compete
-        /// with the cards above that are here to show a state.
         private static func demoQueue() -> [IssueInfo] {
             [
                 "drop the retired pump tee", "name the fence generations",
@@ -202,9 +179,6 @@
         private static func demoMember(_ id: String, _ handle: String, lead: Bool = false)
             -> TeamMemberInfo
         {
-            // Two carry a picture, so one screenshot shows both paths: an
-            // uploaded avatar and the monogram an agent without one falls back
-            // to.
             let avatar: String? =
                 switch handle {
                 case "lead": "\(AgentAvatars.demoPrefix)1f6f5b"

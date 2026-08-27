@@ -175,13 +175,6 @@ struct ScreenshotPixels {
         return CGFloat(luma.filter { $0 > threshold }.count) / scale
     }
 
-    /// The fraction of `rect` (in POINTS) painted a saturated red.
-    ///
-    /// Luma cannot answer this one: a badge's red and the black glyph beside it
-    /// are both dark against paper. Written for the tab badges, which SwiftUI
-    /// draws but exposes to accessibility NOWHERE — the tab item's label stays
-    /// the bare section name, and the badge has no child element — so a
-    /// screenshot is the only place the count exists to be read at all.
     func redCoverage(in rect: CGRect) -> CGFloat {
         let x = Int(rect.minX * scale)
         let y = Int(rect.minY * scale)
@@ -210,15 +203,6 @@ struct ScreenshotPixels {
         return CGFloat(red) / CGFloat(w * h)
     }
 
-    /// The fraction of `rect` (in POINTS) painted INK — anything materially
-    /// darker than the page under it.
-    ///
-    /// The question this answers is "did anything render here at all", which
-    /// neither `exists` nor a frame can: a webview that was unparented, or one
-    /// parked on an empty document, lays out and measures exactly like a card
-    /// full of text. Paper is ~0.98 luma and the type is near-black, so a
-    /// threshold well below the paper catches type, rules and chips alike
-    /// without being fooled by the page's own faint washes.
     func inkCoverage(in rect: CGRect, threshold: CGFloat = 0.6) -> CGFloat {
         let x = Int(rect.minX * scale)
         let y = Int(rect.minY * scale)

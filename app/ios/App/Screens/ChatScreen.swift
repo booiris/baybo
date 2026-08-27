@@ -118,16 +118,8 @@ struct ChatScreen: View {
                     .onGeometryChange(for: CGFloat.self) { proxy in
                         proxy.frame(in: .global).minY
                     } action: { minY in
-                        // The composer's own geometry is the one signal that
-                        // tracks BOTH the keyboard it rides and its own growth
-                        // (notice line, staged strip, multiline field). The
-                        // bridge converts to the covered strip against the
-                        // WINDOW bottom.
                         bridge.setComposerTop(minY)
                     }
-                    // An overlay, so the disc costs the dock no height: the
-                    // attach panel hangs off this content's top edge, and a
-                    // disc in the stack pushed the panel up by 56pt.
                     .jumpToLatestDisc(
                         visible: bridge.jumpVisible,
                         label: Lang.shared.t("chat.jumpToLatest"), identifier: "chat-jump"

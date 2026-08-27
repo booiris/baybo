@@ -30,9 +30,6 @@ describe("activity fold", () => {
     }
   });
 
-  /// A kind this build has never heard of must still fold and still render —
-  /// the gateway adds kinds on its own schedule, and a card whose Activity
-  /// threw would take its comments down with it.
   it("folds an unknown kind as machinery rather than dropping it", () => {
     const folded = fold([event("e1", "swimlane_changed", { lane: "fast" })]);
     expect(folded).toHaveLength(1);
@@ -43,9 +40,6 @@ describe("activity fold", () => {
     expect(fold([])).toEqual([]);
   });
 
-  /// The unread rule is drawn above a fold, and a fold is drawn at its first
-  /// member — so a boundary swallowed mid-group would put "New" above entries
-  /// the operator read yesterday.
   it("splits a run of machinery at the unread boundary", () => {
     const events = [
       event("e1", "moved", { from: "todo", to: "in_progress" }),
@@ -67,8 +61,6 @@ describe("activity fold", () => {
     expect(foldHead(comment[0] as Fold)?.id).toBe("e9");
   });
 
-  /// A boundary naming an entry that is not here — a response the page never
-  /// drew, a card resynced mid-read — folds exactly as if none was given.
   it("an unknown boundary changes nothing", () => {
     const events = [event("e1", "moved"), event("e2", "run_started")];
     expect(fold(events, "e404")).toEqual(fold(events));
@@ -76,8 +68,6 @@ describe("activity fold", () => {
 });
 
 describe("pending approvals", () => {
-  /// Retired by `call_id`, not by "the newest resolution wins" — one card can
-  /// hold several across a run and a resolution retires exactly one.
   it("a resolution retires its own prompt and leaves the rest", () => {
     const open = pendingApprovals([
       event("e1", "approval_requested", { call_id: "c1", tool: "exec_command" }),
@@ -102,8 +92,6 @@ describe("pending approvals", () => {
 });
 
 describe("agent question", () => {
-  /// An OPERATOR's block is that operator saying stop, and nothing should
-  /// invite them to answer themselves.
   it("only an agent-authored block is a question", () => {
     const byAgent = [event("e1", "blocked", { reason: "which token?" }, agent("lead"))];
     expect(agentQuestion("which token?", byAgent)).toEqual({
@@ -119,8 +107,6 @@ describe("agent question", () => {
     expect(agentQuestion("", [event("e1", "blocked", {}, agent("lead"))])).toBeNull();
   });
 
-  /// The NEWEST block is the one in force: an earlier one may have been lifted
-  /// and re-applied by somebody else entirely.
   it("the newest block decides", () => {
     const timeline = [
       event("e1", "blocked", { reason: "first" }, agent("lead")),

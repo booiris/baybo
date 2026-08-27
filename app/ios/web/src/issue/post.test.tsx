@@ -8,12 +8,6 @@ import type { IssuePayload } from "./bridge";
 import { IssuePage } from "./IssuePage";
 import type { Actor, IssueDetail, IssueEvent } from "./types";
 
-/// A card reads as a thread: what somebody said is a boxed post with their
-/// face beside it, and what the board did is one line.
-///
-/// The rules worth pinning are the ones that fail SILENTLY — a face that says
-/// nothing, a name that says the wrong thing, and a page that asks native for
-/// the same picture once per row that draws it.
 
 const blobRequests: string[] = [];
 const nativePosts: Record<string, unknown>[] = [];
@@ -108,9 +102,6 @@ function mount() {
   );
 }
 
-/// The Activity's heads only — the description is a post too, and its box is
-/// titled by what it IS ("Description") on a card whose opening nothing
-/// recorded.
 function heads(): string[] {
   return [...document.querySelectorAll(".issue-activity .issue-said-who")].map(
     (el) => el.textContent,
@@ -136,9 +127,6 @@ describe("a comment is a post", () => {
     expect(nativePosts.filter((post) => post.type === "issueRendered")).toHaveLength(1);
   });
 
-  /// The head names the author and stands OUTSIDE the box: the box holds the
-  /// words and nothing else, which is what stops a comment being three nested
-  /// rectangles deep.
   it("boxes the words under a bare head naming its author", () => {
     mount();
     deliver([comment("e1", "pulled the flag")]);
@@ -148,13 +136,9 @@ describe("a comment is a post", () => {
     expect(box?.textContent).toContain("pulled the flag");
     expect(box?.querySelector(".issue-said-who")).toBeNull();
     expect(heads()).toContain("@dev-1");
-    // The monogram is NATIVE's — it is unique across the team, which one
-    // handle on its own cannot tell you.
     expect(document.querySelector(".issue-activity .issue-face")?.textContent).toBe("D1");
   });
 
-  /// This said "board" until 2026-08-25: `actorHandle` answers `null` for both
-  /// a user and the system, and the row printed the system's word for either.
   it("calls the operator themselves, not the board", () => {
     mount();
     deliver([comment("e1", "mine", { kind: "user" }), comment("e2", "theirs")]);
@@ -223,8 +207,6 @@ describe("a comment is a post", () => {
     expect(faces.every((el) => el.getAttribute("src") === "blob:blob-7")).toBe(true);
   });
 
-  /// Machinery has no body worth a box: a `moved` is one sentence, and giving
-  /// it the same frame as a paragraph makes the card a wall of rectangles.
   it("leaves the board's own entries as a line", () => {
     mount();
     deliver([moved("e1"), comment("e2", "said")]);
@@ -244,8 +226,6 @@ describe("a comment is a post", () => {
     expect(document.querySelector(".issue-line")?.textContent).not.toContain("#3");
   });
 
-  /// **A run of one is not a run.** A `1 event ›` is a control that hides
-  /// exactly one line and spends one saying so; two or more still collapse.
   it("draws a lone machinery entry rather than folding it", () => {
     mount();
     deliver([moved("e1"), comment("e2", "said")]);
@@ -268,10 +248,6 @@ describe("a comment is a post", () => {
     expect(document.querySelectorAll(".issue-line")).toHaveLength(2);
   });
 
-  /// Who opened the card is one line of provenance under the head, not a
-  /// bordered bar with a face beside it — and it is said ONCE: leaving the
-  /// `opened` entry in the Activity too printed the same fact twice, a screen
-  /// apart.
   it("puts the opening on the meta line and drops it from the timeline", () => {
     mount();
     deliver([opened("e1"), comment("e2", "said")]);
@@ -280,9 +256,6 @@ describe("a comment is a post", () => {
     expect(document.querySelector(".issue-activity")?.textContent).not.toContain("opened this");
   });
 
-  /// **The description is not a post.** It is what the title is about, one
-  /// line above it — so it carries no box, no author bar and no face, and
-  /// every framed thing on the page belongs to somebody who wrote it.
   it("leaves the card's own text unboxed", () => {
     mount();
     deliver([opened("e1"), comment("e2", "said")]);
@@ -292,8 +265,6 @@ describe("a comment is a post", () => {
     expect(document.querySelector(".issue-body")).not.toBeNull();
   });
 
-  /// Chips are for CONTROLS. The branch opens nothing and the row was five
-  /// identical pills — four objects of equal weight saying unrelated things.
   it("keeps the chip row to the three things you can change", () => {
     mount();
     deliver([comment("e2", "said")]);

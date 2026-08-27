@@ -1,18 +1,5 @@
 import Foundation
 
-/// The card page's payload, encoded from the FFI records.
-///
-/// **This is a mirror, and mirrors drift.** The FFI's `IssueInfo` is already
-/// the gateway's `IssueDto` decoded once; this turns it back into the gateway's
-/// own JSON shape so `src/issue/types.ts` — which `issueSentinel.ts` pins to
-/// the utoipa schema — can read it unchanged. The timeline does not go through
-/// here at all: it crosses as the gateway's raw JSON, because its only consumer
-/// is the page and a Swift re-encoding would be a third place every new event
-/// kind has to be taught about.
-///
-/// What holds this half honest is `issueCardFixture.json`: the Swift test
-/// writes it from a fully-populated record and the vitest test reads it back as
-/// an `IssueDetail`. A field renamed on either side fails one of the two.
 enum IssueWire {
     static func card(_ issue: IssueInfo) -> [String: Any] {
         var out: [String: Any] = [
@@ -32,10 +19,6 @@ enum IssueWire {
             "created_at_ms": issue.createdAtMs,
             "updated_at_ms": issue.updatedAtMs,
         ]
-        // Absent, never null: every optional here carries
-        // `skip_serializing_if = "Option::is_none"` on the gateway, and the
-        // page's mirror is asserted against that under `Undefinedify`. A `null`
-        // would type-check nowhere and read as present everywhere.
         if !issue.attachments.isEmpty {
             out["attachments"] = issue.attachments.map(attachment(_:))
         }
@@ -70,10 +53,6 @@ enum IssueWire {
         return out
     }
 
-    /// A child card, as the page's `ChildIssue`. Only what a row needs — the
-    /// list is drawn from the board's own issues, and sending each one whole
-    /// would put a board's worth of cards through the bridge for four lines of
-    /// text.
     static func child(_ issue: IssueInfo) -> [String: Any] {
         var out: [String: Any] = [
             "number": issue.number,
@@ -84,9 +63,6 @@ enum IssueWire {
         return out
     }
 
-    /// One agent, as the page's `Person`: what to call them, and what to draw
-    /// for them. camelCase because this half is NATIVE's own — unlike the
-    /// card, the runs and the children above, no gateway DTO has this shape.
     static func person(_ person: IssuePerson) -> [String: Any] {
         var out: [String: Any] = [
             "handle": person.handle,
@@ -107,11 +83,7 @@ enum IssueWire {
     }
 
     // MARK: - Enum words
-    //
-    // The gateway's own spellings. `unknown` is what the FFI decodes an
-    // unrecognised word into, and it must NOT be encoded — sending it would
-    // hand the page a value its union has never heard of. It rides back as the
-    // nearest honest thing instead.
+    // Never encode `unknown`; use the nearest value understood by the page.
 
     static func word(_ status: IssueStatus) -> String {
         switch status {

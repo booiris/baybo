@@ -1,20 +1,7 @@
 import Foundation
 
-/// What an attachment card's native half needs from whichever webview is
-/// showing it.
-///
-/// Two pages now render the same cards — the chat transcript and a project
-/// card — because both carry the same `WireAttachment` and both import the
-/// same components. `TranscriptMedia` does all the actual work (fetching,
-/// caching, poster generation, the preview and player presentations) and had
-/// exactly one thing tying it to the transcript: the concrete
-/// `TranscriptBridge` it answered through. This is that tie, narrowed to the
-/// four replies it actually makes.
-///
-/// Deliberately NOT "the whole bridge behind a protocol": what the two pages
-/// share is the attachment lifecycle, and nothing else about them is alike —
-/// one has a sync loop, an outbox and a scroll anchor, the other has a
-/// description editor. Sharing the seam, not the surface.
+/// Narrow shared attachment seam for transcript and issue pages; their other
+/// lifecycles remain separate.
 @MainActor
 protocol WebMediaSink: AnyObject {
     /// A `requestBlob` answer. `id` is the one-shot promise the page is
@@ -35,19 +22,10 @@ protocol WebMediaSink: AnyObject {
         id: Int, dataBase64: String?, width: Int, height: Int, durationMs: Int, error: String?)
 }
 
-/// The inbound half of the same seam: the message names an attachment card
-/// posts, dispatched once for both pages.
-///
-/// Returns whether the message was consumed, so each bridge's own `switch`
-/// runs only on what is left — a card message reaching a page-specific arm
-/// would be a silent no-op, and a page-specific message swallowed here would
-/// be worse.
 @MainActor
 enum WebMediaDispatch {
-    /// Every message an attachment card can send. Held as a function rather
-    /// than duplicated into two switch statements: the two pages must agree on
-    /// the whole set, and a card kind added to one bridge and forgotten in the
-    /// other fails only on the page nobody tested.
+    /// Returns whether the shared handler consumed the message so a page
+    /// bridge neither swallows nor double-handles it.
     static func handle(type: String, body: [String: Any], target: any WebMediaTarget) -> Bool {
         switch type {
         case "requestBlob":

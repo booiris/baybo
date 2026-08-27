@@ -39,10 +39,7 @@ struct ComposerDock<Content: View, Panel: View>: View {
     @ViewBuilder let content: () -> Content
     /// The attach panel, or nothing. Presented HERE rather than in the screen's
     /// own stack because this is the only layer that composites over the dock's
-    /// own rows — the notice line, the approval card, the staged strip — and
-    /// over the jump disc that floats above them (`JumpToLatestDisc`). From the
-    /// screen's ZStack the panel drew behind the strip and the disc took its
-    /// taps.
+    /// own rows and the jump disc.
     @ViewBuilder let panel: () -> Panel
 
     var body: some View {

@@ -114,9 +114,6 @@ impl GatewayJsonClient for GatewayApi {
         T: DeserializeOwned + Send + 'static,
     {
         async move {
-            // Default `Converges` like every other verb here: a card PATCH
-            // carries absolute values, so a replayed one lands the same
-            // edit twice with the same result.
             let body = request(
                 "PATCH",
                 path,

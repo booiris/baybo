@@ -5300,7 +5300,7 @@
                         "properties": {
                           "approval_pending": {
                             "type": "boolean",
-                            "description": "A run on this card is parked on an approval prompt, waiting to be\nanswered. Read off the live queue rather than the timeline, for the\nsame reason [`ProjectAttentionDto::approvals`] is: a prompt that\ntimed out leaves `approval_requested` behind with no resolution, so\na card deriving this from its own entries would keep asking for an\nanswer nothing is waiting for. `false` on an archived board — its\nprompts are not answerable, and pointing at one would be a badge\nwith no press behind it."
+                            "description": "True only while this card has an answerable prompt in the live queue."
                           },
                           "assignee": {
                             "type": [
@@ -9503,7 +9503,7 @@
         "properties": {
           "approval_pending": {
             "type": "boolean",
-            "description": "A run on this card is parked on an approval prompt, waiting to be\nanswered. Read off the live queue rather than the timeline, for the\nsame reason [`ProjectAttentionDto::approvals`] is: a prompt that\ntimed out leaves `approval_requested` behind with no resolution, so\na card deriving this from its own entries would keep asking for an\nanswer nothing is waiting for. `false` on an archived board — its\nprompts are not answerable, and pointing at one would be a badge\nwith no press behind it."
+            "description": "True only while this card has an answerable prompt in the live queue."
           },
           "assignee": {
             "type": [
@@ -10206,7 +10206,7 @@
               "string",
               "null"
             ],
-            "description": "Client idempotency key on an operator comment. Its presence lets a\nclient reconcile an optimistic row even when a timeline invalidation\nwins the race against the POST response."
+            "description": "Client idempotency key used to reconcile an optimistic comment."
           },
           "created_at_ms": {
             "type": "integer",
@@ -10361,7 +10361,7 @@
       },
       "IssueTimelineDto": {
         "type": "object",
-        "description": "A card's timeline, and where the operator's eye should land in it.\n\nIts own envelope rather than [`ListResponse`] because the second field\nis the whole point: a client that got only the rows would have to work\nout which of them are new from a read cursor and a rule, and that rule\nalready has a home — see\n[`ProjectStore::first_unread_event`](baybo_store::project::ProjectStore::first_unread_event).\nShipping the resolved id is what keeps the divider and the unread badge\ntwo views of one answer instead of two answers.",
+        "description": "Timeline entries plus the server-resolved unread boundary.",
         "required": [
           "items"
         ],
@@ -10371,7 +10371,7 @@
               "string",
               "null"
             ],
-            "description": "The oldest entry the operator has not seen, by `id`. **Absent** on a\ncard with nothing new — which is every card a moment after it is\nopened, because opening one stamps it read."
+            "description": "Oldest unread event id; absent when the card is caught up."
           },
           "items": {
             "type": "array",

@@ -115,12 +115,8 @@ pub enum ProjectChangeScope {
     /// refetched every column to learn somebody said something would be
     /// doing the most expensive thing for the least reason.
     Timeline,
-    /// A scope this build has never heard of. Nothing constructs it; it
-    /// exists so a gateway that grows a scope costs an older client the
-    /// narrowing and not the frame — the alternative is that the whole
-    /// [`Frame`] fails to decode and the client stops learning that the
-    /// board changed at all. Refetching the board is the right answer to
-    /// every scope there is, so the degraded reading is still correct.
+    /// Forward-compatible fallback: an older client still receives the frame
+    /// and can conservatively refetch instead of failing the whole decode.
     #[serde(other)]
     Unknown,
 }
@@ -1271,10 +1267,6 @@ mod tests {
 
     #[test]
     fn a_scope_this_build_has_never_heard_of_still_decodes() {
-        // A gateway one version ahead. What degrades is the narrowing —
-        // not the frame, and so not the client's knowledge that this
-        // board moved. Without the fallback arm the whole `Frame` fails
-        // to decode and the phone silently stops refreshing.
         #[derive(Serialize)]
         struct FutureFrame {
             kind: &'static str,

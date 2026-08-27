@@ -1,11 +1,5 @@
 import SwiftUI
 
-/// Who is on a board.
-///
-/// A sheet rather than a pushed screen: it is a reference, not a place — you
-/// open it to see who `@docs-1` is or to change what an agent runs on, and
-/// then you are back on the board. A push would put it in the back chain
-/// between the board and a card.
 struct ProjectTeamSheet: View {
     let projectId: String
     var client: any BayboClientProtocol = Baybo.client
@@ -14,10 +8,6 @@ struct ProjectTeamSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var team: [TeamMemberInfo] = []
     @State private var loaded = false
-    /// The last read failed. Kept apart from "empty" for the reason the
-    /// subagent sheet keeps them apart: an older gateway 404s this route, and
-    /// answering that with "this board has no team" is a lie about the board
-    /// rather than a fact about the connection.
     @State private var failed = false
     @State private var profile: TeamMemberInfo?
     @State private var removing: TeamMemberInfo?
@@ -34,10 +24,6 @@ struct ProjectTeamSheet: View {
         .background(Theme.paper)
         .task { await load() }
         .sheet(item: $profile) { member in
-            // Presented by identity, READ from the roster: the profile writes
-            // a pin and then refetches, and a sheet holding the snapshot it was
-            // handed would go on showing the value the operator just replaced.
-            // The roster row is the source of truth on both clients.
             AgentProfileSheet(
                 member: team.first { $0.id == member.id } ?? member,
                 projectId: projectId, client: client
@@ -106,9 +92,6 @@ struct ProjectTeamSheet: View {
                     .listRowBackground(Theme.paper)
                     .accessibilityIdentifier("team-row-\(member.handle)")
                     .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                        // The lead is the coordinator every board has and none
-                        // may remove — the server refuses it, so the swipe does
-                        // not offer it rather than offering it and being told no.
                         if !member.lead {
                             Button(role: .destructive) { removing = member } label: {
                                 Label(lang.t("team.remove"), systemImage: "person.badge.minus")
@@ -157,10 +140,6 @@ struct ProjectTeamSheet: View {
         .contentShape(Rectangle())
     }
 
-    /// What this teammate runs on, or what it is. The framework is worth
-    /// saying: only a `baybo` teammate can host a card's session, so only one
-    /// can be assigned — an operator wondering why `@codex-1` is missing from
-    /// the assignee picker finds the answer here.
     static func subtitle(_ member: TeamMemberInfo) -> String {
         var parts: [String] = []
         if member.framework != "baybo" { parts.append(member.framework) }
@@ -190,16 +169,10 @@ struct ProjectTeamSheet: View {
                 try await client.projectRemoveAgent(projectId: projectId, agentId: member.id)
                 await load()
             } catch {
-                // The server's own sentence: it names whether the refusal was
-                // the lead or a run in flight, and those want different things
-                // done about them.
                 self.error = ProjectsStore.message(from: error)
             }
         }
     }
 }
 
-/// The record already carries an `id` (the agent's profile id), so the
-/// conformance is a declaration and nothing else — a computed `id` here would
-/// be a second answer to which agent this is.
 extension TeamMemberInfo: Identifiable {}

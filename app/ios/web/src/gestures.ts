@@ -1,23 +1,10 @@
 import { type TouchEvent as ReactTouchEvent, useCallback, useEffect, useRef } from "react";
 
-/// Press-and-hold, shared by the two surfaces that want it: a message bubble
-/// (hold to copy) and a file card (hold to share).
-///
-/// Its own module rather than living in either one — each is the other's
-/// consumer, so whichever owned it would be imported by the other for a
-/// gesture that has nothing to do with what that module is about.
 
-/// Long-press-to-copy on a user bubble: hold ~450ms without dragging (a drag is
-/// a scroll, which cancels). Native owns the clipboard write + confirming haptic
-/// (`copyText`); the web side plays the squish + "copied" pill for
-/// `COPY_TOAST_MS` before it fades.
 const LONG_PRESS_MS = 450;
 
 const LONG_PRESS_MOVE_CANCEL_PX = 10;
 
-/// Fire `onLongPress` after a still ~`LONG_PRESS_MS` press; any drag past
-/// `LONG_PRESS_MOVE_CANCEL_PX` (a scroll) or a lift first cancels it. Touch-only
-/// — the pointer here is always a finger on the transcript webview.
 export function useLongPress(onLongPress: () => void): {
   onTouchStart: (e: ReactTouchEvent) => void;
   onTouchMove: (e: ReactTouchEvent) => void;
@@ -51,10 +38,9 @@ export function useLongPress(onLongPress: () => void): {
         cancel();
         onLongPress();
       }, LONG_PRESS_MS);
-      // A second finger landing anywhere — even off the bubble — is a pinch or
-      // scroll, not a copy. onTouchStart only re-fires for touches ON the bubble,
-      // so watch the whole document while armed; `cancel` removes the listener.
       const watch = (ev: TouchEvent) => {
+        // A second finger may land outside this element; the document watch
+        // cancels what is now a pinch or scroll rather than a long press.
         if (ev.touches.length > 1) cancel();
       };
       docWatch.current = watch;

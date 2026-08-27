@@ -1,15 +1,8 @@
 import Foundation
 
 // MARK: - Mirror shapes
-//
-// Deliberately separate from the FFI records: this is a file format an
-// upgrade has to keep reading, and every field is optional-tolerant so a
-// mirror written by an older build still paints.
-//
-// Lifted out of `ProjectsStore` when a SECOND mirror needed them: a card page
-// caches its own content (`IssueContentMirror`), and the card, its runs and
-// its team are the same records the board already writes. Two copies of these
-// shapes would be two file formats that have to stay identical by hand.
+// Codable file-format structs stay separate from UniFFI DTOs; defaults keep
+// older mirrors readable.
 
 extension ProjectsStore {
     struct RootMirror: Codable {
@@ -140,9 +133,6 @@ extension ProjectsStore {
         var cancelledAtMs: Int64?
         var createdAtMs: Int64 = 0
         var updatedAtMs: Int64 = 0
-        /// Absent in mirrors written before a card page existed — the board
-        /// never drew a card's files, so it never wrote them. Decodes empty,
-        /// which reads as "no attachments" until the next live fetch.
         var attachments: [AttachmentMirror]?
 
         init(info: IssueInfo) {
@@ -380,16 +370,9 @@ extension ProjectsStore {
         }
     }
 
-    /// One card's page, cached so it paints before the network answers.
-    ///
-    /// **The timeline rides as its raw envelope**, the same bytes the gateway
-    /// sent: its only consumer is the webview, and a Swift mirror of it would
-    /// be a third place every new event kind has to be taught about.
-    ///
-    /// The team rides along rather than being read from the board's mirror,
-    /// because a card can be opened without its board ever having been —
-    /// a `#N` link inside another card's prose is a door straight to it.
     struct IssueContentMirror: Codable {
+        // Preserve the raw timeline envelope so new event kinds do not require
+        // a second Swift wire model merely to paint cached content.
         var issue: IssueMirror
         var eventsJson: String = "{\"items\":[]}"
         var runs: [RunMirror] = []

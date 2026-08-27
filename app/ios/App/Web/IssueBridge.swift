@@ -2,22 +2,13 @@ import Foundation
 import UIKit
 import WebKit
 
-/// The card page ⇄ native bridge.
-///
-/// It answers on the **same** `baybo` handler name the transcript uses, and
-/// that is deliberate: the page imports `Markdown`, the attachment cards and
-/// `blobObjectUrl` unchanged, and all of those post through that channel. A
-/// second handler name would have meant forking every one of them.
-///
-/// A warm issue host and the transcript never coexist on one webview — each
-/// has its own `WKUserContentController` — so sharing the name costs nothing
-/// and buys the whole shared half of the web bundle.
 @MainActor
 final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
     /// Same name as the transcript's. See the type doc.
     static let messageHandlerName = TranscriptBridge.messageHandlerName
 
     weak var webView: WKWebView?
+    /// Weak because stores and pooled renderers refer to each other while leased.
     private(set) weak var store: IssueStore?
 
     private var ready = false
@@ -30,10 +21,6 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
         _ userContentController: WKUserContentController,
         didReceive message: WKScriptMessage
     ) {
-        // Main frame only. The card body renders agent-authored markdown, and
-        // WKWebView injects a message handler into EVERY frame — so without
-        // this an iframe smuggled into a description would reach the native
-        // surface directly. The transcript's bridge draws the same line.
         guard message.frameInfo.isMainFrame,
             message.name == Self.messageHandlerName,
             let body = message.body as? [String: Any],
@@ -43,9 +30,6 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
     }
 
     private func handle(type: String, body: [String: Any]) {
-        // The attachment cards' messages first, through the shared dispatch —
-        // whatever it consumes never reaches this page's own switch, and what
-        // it does not consume is this page's alone.
         if let store, isCurrent(body),
             WebMediaDispatch.handle(type: type, body: body, target: store)
         {
@@ -106,9 +90,6 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
             }
         case "copy":
             guard isCurrent(body) else { return }
-            // Native owns the write, as it does for the transcript: a
-            // WKWebView refuses `navigator.clipboard` outside a live gesture,
-            // and only native can fire the confirming haptic.
             if let text = body["text"] as? String, !text.isEmpty {
                 UIPasteboard.general.string = text
                 UIImpactFeedbackGenerator(style: .medium).impactOccurred()
@@ -127,28 +108,9 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
         return body["targetId"] as? String == targetId
     }
 
-    // Opening a run sheet and presenting a picker are PRESENTATION, and a
-    // bridge that reached for the view hierarchy would be a second place
-    // navigation happens — so those two, and the page's at-bottom report, are
-    // raised to the screen rather than handled here.
-    //
-    // Raised as STATE ON THE STORE (`pickRequest` / `openRunRequest` /
-    // `setAtBottom`), never as `onPick` / `onOpenRun` / `onActivityAtBottom`
-    // closures the screen installs — which is what they were until 2026-08-26.
-    // A closure written inside a `View`'s body captures the whole view struct,
-    // `@StateObject` storage included, so storing one here closed the cycle
-    // `IssueHost → bridge → closure → view → host` and made the card page
-    // immortal: every card ever opened kept an invalidation observer refetching
-    // behind it. A warm host makes that invariant stricter: `store` is weak, so
-    // retargeting cannot retain any prior visit whatever the screen does.
 
     // MARK: - native → web
 
-    /// The transcript and deck bridges' crash-recovery twin: a WebContent
-    /// death under a VISIBLE page leaves `ready` latched and every eval a
-    /// silent no-op — bricked until the screen is left and re-entered. Reload
-    /// and let the fresh `ready` replay. The 30s window bounds a crash storm:
-    /// three reloads, then quiet until it lapses.
     private static let maxConsecutiveDeaths = 3
     private static let deathWindowSeconds: TimeInterval = 30
     private var consecutiveDeaths = 0
@@ -193,12 +155,6 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
         pushBottomInset()
     }
 
-    /// Reload the page from scratch — the third step of `IssueStore.resync`.
-    ///
-    /// The same load `IssueHost.init` performs, so every piece of in-memory
-    /// web state dies with the document: the rendered card, the scroll
-    /// position, an open description editor. The fresh `issueReady` replays
-    /// whatever the refetch has landed by then, and buffers what it has not.
     func rebuild() {
         guard let webView, let url = IssueHost.issueURL else { return }
         ready = false
@@ -208,6 +164,8 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
     }
 
     func contentProcessDied() {
+        // A visible card can recover by replaying its target after reload, but
+        // cap the loop when WebKit repeatedly crashes on the same content.
         let now = Date()
         if now.timeIntervalSince(lastDeathAt) > Self.deathWindowSeconds { consecutiveDeaths = 0 }
         lastDeathAt = now
@@ -296,11 +254,6 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
                 pendingComments: pendingComments))
     }
 
-    /// Everything the page draws, as the JSON it is handed.
-    ///
-    /// Split out from `deliver` so the SPLICE below has a test: it is string
-    /// surgery on an encoder's output, and getting it wrong produces valid
-    /// JSON with a field quietly missing rather than anything that fails.
     static func payload(
         issue: IssueInfo, eventsJson: String, runs: [IssueRunInfo],
         people: [String: IssuePerson], children: [IssueInfo], firstUnread: String?,
@@ -315,14 +268,8 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
             "timelineLive": timelineLive,
             "pendingComments": pendingComments.map { pendingComment($0, number: issue.number) },
         ]
-        // Omitted rather than sent as null when there is nothing new: the page
-        // latches the first boundary it is given and never clears it, so a
-        // `null` arriving after the card is stamped read must be indistinguish-
-        // able from silence.
+        // Omit rather than send null: the page latches the first boundary it sees.
         if let firstUnread { payload["firstUnread"] = firstUnread }
-        // The timeline is SPLICED in as the gateway's own bytes rather than
-        // re-encoded: its only consumer is the page, and a Swift mirror of it
-        // would be a third place every new event kind has to be taught about.
         var json = jsonObject(payload)
         if json.hasSuffix("}"), let items = itemsArray(eventsJson) {
             json.removeLast()
@@ -361,9 +308,6 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
         ]
     }
 
-    /// The `items` array out of the timeline envelope, verbatim. Nil when the
-    /// envelope is not the shape it claims — the page then simply renders no
-    /// Activity, which is better than a card that fails to open.
     private static func itemsArray(_ envelope: String) -> String? {
         guard let data = envelope.data(using: .utf8),
             let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -374,9 +318,6 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
         return json
     }
 
-    /// The dock's top in `.global` coordinates. Convert against this
-    /// webview's WINDOW, not `UIScreen`: the latter over-insets an iPad window
-    /// and mixes two coordinate spaces even on a full-screen phone.
     func setComposerTop(_ minYInWindow: CGFloat) {
         composerTop = minYInWindow
         pushBottomInset()
@@ -401,9 +342,7 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
     }
 
     // MARK: - WebMediaSink
-    //
-    // The attachment cards listen on `window.baybo` — they ARE the transcript's
-    // components — so these four go to the shared target, not the page's.
+    // Attachment cards listen on the shared transcript target.
 
     func blobResult(id: Int, dataBase64: String?, mimeType: String, error: String?) {
         shared(

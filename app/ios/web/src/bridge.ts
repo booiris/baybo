@@ -161,23 +161,13 @@ function post(message: Record<string, unknown>): void {
   else console.log("[baybo bridge]", payload);
 }
 
-/// The raw channel, for a second page that rides the same `baybo` handler.
-///
-/// `src/issue/bridge.ts` uses it for the card page's own messages. It is
-/// exported rather than duplicated so both pages agree on the dev-console
-/// fallback and on which handler is the channel — an issue bridge that reached
-/// for `window.webkit` itself would silently post nowhere the day that name
-/// changes here.
 export function postToNative(message: Record<string, unknown>): void {
   post(message);
 }
 
-/// Scope the shared attachment bridge to one issue visit.
-///
-/// Set from the keyed React tree's layout effect, not from `issuePage.init`:
-/// during a retarget the old tree remains mounted for one commit, and anything
-/// it posts in that window must keep the OLD id so native can reject it.
 export function bindNativeTarget(targetId: string): () => void {
+  // Bound by the keyed tree layout effect, not init: during retargeting the
+  // outgoing tree keeps its old id so native can reject late messages.
   if (nativeTargetId !== targetId) {
     blobPending.clear();
     posterPending.clear();

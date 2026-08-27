@@ -1,17 +1,5 @@
 import SwiftUI
 
-/// One card, as a list row.
-///
-/// `ChatRowBody`'s grammar rather than the web's card: a phone row is a row,
-/// and a board that drew the desk's tiles would fit two of them on a screen.
-/// What survives from the tile is what the operator scans for — the number,
-/// how urgent it is, what is wrong with it, who is on it, and whether anything
-/// is running.
-///
-/// **Red appears exactly twice**: the unread count and a failed run. Priority
-/// is drawn in ink at four weights, because an urgent card is not a broken one
-/// — a board whose top row is all red says nothing about which card is on
-/// fire.
 struct IssueCardRow: View {
     let issue: IssueInfo
     let run: IssueRunInfo?
@@ -20,9 +8,6 @@ struct IssueCardRow: View {
     /// And its picture, resolved the same way. A row knows a handle and
     /// nothing about the roster; the board holds both.
     var assigneeAvatar: String? = nil
-    /// The running agent's handle, when a run is on this card and it is NOT
-    /// the assignee's — about a third of a working board's runs are
-    /// coordination runs, which execute as the lead.
     let runnerHandle: String?
     var runnerAvatar: String? = nil
     let langCode: String
@@ -62,26 +47,11 @@ struct IssueCardRow: View {
         .frame(minHeight: 52)
         .padding(.vertical, 13)
         .opacity(isCancelled ? 0.5 : 1)
-        // THE WHOLE ROW is the tap target, and saying so is required rather
-        // than tidy. Under `.buttonStyle(.plain)` a label's hit region is
-        // whatever it actually PAINTS — a `Text` hit-tests its glyphs and
-        // nothing else — so without this the row opened only where letters
-        // happened to be and was dead everywhere else: the gap after a short
-        // title, the space between the handle and the run word, the right
-        // margin. It reads as a list that ignores half its taps.
-        //
-        // Invisible to every assertion the suite already had, too: `exists`,
-        // `isHittable` and the a11y frame are all satisfied by a row whose
-        // paint does not fill it, and `.tap()` lands dead centre — which on a
-        // card row is usually over the title.
         .contentShape(Rectangle())
         .accessibilityElement(children: .combine)
         .accessibilityIdentifier("issue-row-\(issue.number)")
     }
 
-    /// A 3px bar on the leading edge, carrying priority as weight rather than
-    /// as hue. Low has none at all: an absent mark is what "nothing special"
-    /// should look like.
     @ViewBuilder private var spine: some View {
         let color: Color? =
             switch issue.priority {
@@ -138,16 +108,6 @@ struct IssueCardRow: View {
         }
     }
 
-    /// The side padding an SF Symbol carries INSIDE its image box, as a share
-    /// of its point size (measured: `pin.fill` 17/90, `hand.raised` 21/90 and
-    /// 14/90).
-    ///
-    /// The rest of this line is monospace text whose glyphs sit flush in their
-    /// cells — the Menlo triangle the priority marks come from has a bearing of
-    /// 0.03pt at 10pt — so a symbol's own padding lands on top of the stack's
-    /// 6pt and nothing else's does. That is what put the pin in a wider trough
-    /// than every gap around it, and pushed it off-centre between its two
-    /// neighbours. Cancelling it puts the symbols on the text's rhythm.
     private static func symbolBearing(_ pointSize: CGFloat) -> CGFloat {
         pointSize * 0.19
     }
@@ -170,9 +130,6 @@ struct IssueCardRow: View {
         if issue.lastRunFailed {
             out.append(("xmark", lang.t("board.runFailed"), true))
         }
-        // Only once the branch has a commit on it: a branch name minted at
-        // checkout and never written to is noise on every card the board has
-        // ever touched.
         if let branch = issue.branch, !branch.isEmpty {
             out.append(("arrow.branch", branch, false))
         }
@@ -217,10 +174,6 @@ struct IssueCardRow: View {
                     .font(Theme.mono(10.5))
                     .foregroundStyle(Theme.inkSoft)
             }
-            // The second face is the RUNNER, and it only appears when the two
-            // differ. The footer has room for one handle — the assignee's, who
-            // is on the work — so whoever is burning the tokens arrives as a
-            // face and nothing else.
             if let runnerHandle {
                 AgentFace(
                     handle: runnerHandle, avatarBlobId: runnerAvatar, working: true, size: 18)
@@ -250,9 +203,6 @@ struct IssueCardRow: View {
         }
     }
 
-    /// How long since the card was last touched. `updated_at_ms` rather than
-    /// created: the column already says roughly where a card is in its life,
-    /// and what an operator scans for is which of them has gone quiet.
     private var age: Int {
         max(0, Int(now.timeIntervalSince1970 - Double(issue.updatedAtMs) / 1000))
     }
@@ -283,11 +233,6 @@ struct IssueCardRow: View {
     }
 }
 
-/// A card's sub-issue progress, as a ring rather than `2/5`.
-///
-/// Filled, and that is consistent rather than a contradiction of the faces'
-/// open ring: this arc IS a count — the fraction done — while a face's ring
-/// was a state.
 struct SubIssueRing: View {
     let done: Int
     let total: Int

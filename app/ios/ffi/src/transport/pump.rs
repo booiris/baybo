@@ -221,17 +221,13 @@ fn with_global_sink<S: ?Sized>(
     }
 }
 
-/// The gateway's own word for a [`ProjectChangeScope`], passed through rather
-/// than mirrored as an enum: a client that refetches the whole board on every
-/// scope needs the string only to log it, and a mirrored enum would need a new
-/// arm — and a new UniFFI binding — every time the gateway grows a plane.
-/// `Unknown` is the wire's fallback arm and reaches Swift as `"unknown"`.
 fn scope_word(scope: ProjectChangeScope) -> &'static str {
     match scope {
         ProjectChangeScope::Project => "project",
         ProjectChangeScope::Board => "board",
         ProjectChangeScope::Run => "run",
         ProjectChangeScope::Timeline => "timeline",
+        // Preserve the frame for older apps; every scope still dirties the board.
         ProjectChangeScope::Unknown => "unknown",
     }
 }
@@ -304,11 +300,6 @@ pub(super) async fn dispatch_inbound_frame(ctx: &PumpCtx, frame: Frame) {
             with_global_sink(deck_sink, |sink| sink.on_deck_changed());
             false
         }
-        // A board moved. Session-less like the deck frames, and it MUST be
-        // consumed here: falling through to the per-session path broadcasts
-        // it to every subscribed transcript sink — which cannot use it — and
-        // reaches nobody at all when no chat is open, which is precisely
-        // when a board is on screen.
         Frame::ProjectChanged {
             project_id,
             scope,

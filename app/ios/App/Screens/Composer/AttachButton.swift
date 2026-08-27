@@ -1,13 +1,6 @@
 import PhotosUI
 import SwiftUI
 
-/// The composer's inline `+`, and the anchor its panel blooms from.
-///
-/// The anchor report is the whole reason this is a type rather than four lines
-/// in each dock: the button reports its frame in the DOCK's coordinate space —
-/// not `.global` — because the panel is laid out in that same space, and two
-/// frames measured in different containers disagreed by ~14pt, enough that the
-/// top of a row was scrim and the gap under the panel fired a picker.
 struct AttachButton: View {
     @ObservedObject var attach: AttachMenu
     /// Whether the clipboard is worth offering. Read ONCE per opening (the
@@ -42,11 +35,6 @@ struct AttachButton: View {
 }
 
 extension View {
-    /// The three pickers a panel row can ask for, answering into `staging`.
-    ///
-    /// A modifier rather than a view because two of them are presentations
-    /// (`.photosPicker`, `.fileImporter`) that must hang off the dock that
-    /// owns the panel, and the third is not a picker at all.
     func attachmentPickers(
         attach: AttachMenu, staging: ComposerStaging, photoPicks: Binding<[PhotosPickerItem]>
     ) -> some View {
@@ -58,9 +46,6 @@ extension View {
                     1, ComposerStaging.maxStagedAttachments - staging.staged.count),
                 matching: .images
             )
-            // No type restriction: whatever the model can be handed, the user
-            // can attach — the mime the extension implies is what decides
-            // server-side whether it is readable at all.
             .fileImporter(
                 isPresented: AttachPickers.binding(attach, .files),
                 allowedContentTypes: [.data],
@@ -78,12 +63,6 @@ extension View {
                 photoPicks.wrappedValue = []
                 staging.stage(photos: picks)
             }
-            // Paste is the one row with no picker to answer it, so the binding
-            // above cannot serve it: that binding retires `attach.pick` on a
-            // sheet's DISMISSAL, and a second tap on a row whose `pick` is
-            // already set publishes no change at all — the row would work
-            // exactly once. Clearing the request here, in the same turn, is
-            // what keeps it live.
             .onChange(of: attach.pick) { _, pick in
                 guard pick == .paste else { return }
                 attach.pick = nil

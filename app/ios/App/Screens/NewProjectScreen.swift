@@ -1,11 +1,5 @@
 import SwiftUI
 
-/// The new-board form.
-///
-/// A pushed route rather than a sheet because it types: the home shell opts out
-/// of keyboard avoidance wholesale (`HomeTabView.ignoresSafeArea(.keyboard)`),
-/// and a pushed screen sits outside that, so the field can rise with the
-/// keyboard the ordinary way.
 struct NewProjectScreen: View {
     @EnvironmentObject private var appStore: AppStore
     @ObservedObject private var lang = Lang.shared
@@ -198,10 +192,6 @@ struct NewProjectScreen: View {
                     new: NewProject(
                         name: name.trimmingCharacters(in: .whitespacesAndNewlines),
                         description: description,
-                        // Left empty on purpose: the server creates and
-                        // git-initialises `work/<name>`. Pointing a board at an
-                        // existing repository needs an absolute path, which is
-                        // not something to type on a phone.
                         workdir: nil,
                         dailyBudgetMicros: Self.micros(fromUsd: budgetUsd),
                         dailyBudgetTokens: Int64(budgetTokens.trimmingCharacters(in: .whitespaces)),

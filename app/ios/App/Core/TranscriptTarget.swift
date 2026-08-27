@@ -22,9 +22,7 @@ protocol TranscriptTarget: AnyObject {
     /// paint gate only — a target that is deliberately absent from the list
     /// (a subagent child) reports `false`.
     var listed: Bool { get }
-    /// Presentation policy for REST-only readers. Their newest work row is
-    /// reconstructed as closed even when no final assistant output exists, so
-    /// those surfaces open the unanswered edge rather than calling it Worked.
+    /// REST readers expose a final work row when no assistant output follows it.
     var expandsUnansweredTail: Bool { get }
 
     func attachBridge(_ bridge: TranscriptBridge)

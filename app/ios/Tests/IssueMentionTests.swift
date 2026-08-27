@@ -3,13 +3,6 @@ import Testing
 
 @testable import Baybo
 
-/// Completing an `@handle` in a comment.
-///
-/// The grammar under test is not this file's invention: it is
-/// `crates/project/src/mentions.rs`, mirrored so the strip offers a handle
-/// exactly where the gateway will read one. Every case below that looks like a
-/// curiosity — `me@dev-1`, `@Dev`, `(@lead` — is one of that suite's, kept in
-/// step deliberately.
 struct IssueMentionTests {
     private func member(_ id: String, _ handle: String) -> TeamMemberInfo {
         TeamMemberInfo(
@@ -25,8 +18,6 @@ struct IssueMentionTests {
         ]
     }
 
-    /// The caret is the whole question — a mention is open only while it is
-    /// being typed, so every case here is "text plus where the cursor is".
     private func query(_ text: String, caret: Int? = nil) -> IssueMentionQuery? {
         IssueMention.query(in: text, caret: caret ?? text.utf16.count)
     }
@@ -38,16 +29,11 @@ struct IssueMentionTests {
         #expect(query("a line\n@dev")?.prefix == "dev")
     }
 
-    /// The mention that pays for the grammar: an address is not a handle, and
-    /// offering one here promises a delivery the gateway will not make.
     @Test func anAddressIsNotAMention() {
         #expect(query("mail me@dev") == nil)
         #expect(query("docs/x@lea") == nil)
     }
 
-    /// Anything outside `[a-z0-9-]` between the `@` and the caret closes it —
-    /// including the space that ends a finished handle, which is what stops
-    /// the strip hanging over a comment that has moved on.
     @Test func somethingOutsideTheGrammarClosesIt() {
         #expect(query("@dev ") == nil)
         #expect(query("@Dev") == nil)
@@ -55,15 +41,12 @@ struct IssueMentionTests {
         #expect(query("nothing typed yet") == nil)
     }
 
-    /// A bare `@` is a request for the roster rather than a failed match.
     @Test func aBareAtAsksForTheWholeRoster() {
         let open = query("look: @")
         #expect(open?.prefix == "")
         #expect(IssueMention.candidates(in: team, prefix: "", assignee: nil).count == team.count)
     }
 
-    /// Which mention is open is decided by the caret, not by the last one in
-    /// the text — the operator can go back and finish an earlier one.
     @Test func theCaretDecidesWhichMentionIsOpen() {
         let text = "@de and @qa-1 look"
         let open = query(text, caret: 3)
@@ -72,9 +55,6 @@ struct IssueMentionTests {
         #expect(open?.prefix == "de")
     }
 
-    /// **Offsets are UTF-16**, because they cross into `UITextInput`, which
-    /// counts its positions the same way. Counted in Characters, an emoji
-    /// earlier in the draft would shift the insert one place left per emoji.
     @Test func anEmojiDoesNotShiftWhereTheHandleLands() {
         let text = "🙂 @de"
         let open = query(text)
@@ -89,9 +69,6 @@ struct IssueMentionTests {
         #expect(IssueMention.candidates(in: team, prefix: "zz", assignee: nil).isEmpty)
     }
 
-    /// The strip shows about three chips before it scrolls, so its order is
-    /// what most operators will ever see — and the agent on the card is who a
-    /// comment is most often addressed to.
     @Test func theCardsAssigneeLeadsTheStrip() {
         let offered = IssueMention.candidates(in: team, prefix: "", assignee: "a-doc")
 
@@ -103,31 +80,17 @@ struct IssueMentionTests {
             "an assignee off this board leaves the roster alone")
     }
 
-    /// The completion carries its own space: a handle run up against the next
-    /// word is not a mention any more.
     @Test func completingLeavesExactlyOneSpaceBehindTheHandle() {
         #expect(complete("@de", "dev-1") == "@dev-1 ")
         #expect(complete("please @de", "dev-1") == "please @dev-1 ")
         #expect(complete("@de ", "dev-1", caret: 3) == "@dev-1 ", "the space already there is kept")
     }
 
-    /// Only what was typed of the handle is replaced. The tail is somebody's
-    /// half-written sentence.
     @Test func theRestOfTheDraftIsLeftAlone() {
         #expect(complete("@de look at this", "dev-1", caret: 3) == "@dev-1 look at this")
         #expect(complete("hi @qa, and @de", "dev-2") == "hi @qa, and @dev-2 ")
     }
 
-    /// **The doubled handle** (2026-08-27). The dock asked for the edit,
-    /// applied it to the field's document, and then asked what the draft now
-    /// read — but writing the document updates the binding under it, so the
-    /// second question was answered about text that already carried the
-    /// handle, and the edit went in twice: `@d` completed to `@dev-1 ev-1 `.
-    ///
-    /// The completion carries both halves off ONE reading now, so the shape of
-    /// the bug is unrepresentable. What this pins is the arithmetic that made
-    /// it visible — the range and the text are the same edit the draft
-    /// describes, so a caller who applies one gets the other.
     @Test func theEditAndTheDraftAreTheSameEdit() {
         guard let open = query("please @d") else {
             Issue.record("no mention open")
@@ -138,8 +101,6 @@ struct IssueMentionTests {
         #expect(done.draft == "please @dev-1 ")
         #expect(done.range == 7..<9, "the range covers the @ and what was typed of the handle")
         #expect(done.text == "@dev-1 ")
-        // What the document is handed, applied to what the binding held: the
-        // two agree, which is the only reason writing both is safe.
         let byHand = "please @d".prefix(7) + done.text + "please @d".dropFirst(9)
         #expect(String(byHand) == done.draft)
     }

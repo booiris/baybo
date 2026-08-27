@@ -72,33 +72,14 @@ async fn on_board(state: &AdminState, project: &ProjectId, row: IssueRow) -> Res
     Ok(IssueDto::on_board(row, &board, &awaiting))
 }
 
-/// Which of this board's cards have a run parked on an approval prompt.
-///
-/// The live queue is the only thing that knows one is still answerable: a
-/// prompt the gateway timed out leaves `approval_requested` behind with no
-/// resolution, so a card reading its own timeline would go on asking for
-/// an answer nothing is waiting for. Empty on an archived board, because
-/// those prompts cannot be answered — the same exclusion
-/// [`projects_attention`] makes, kept in one place rather than two that
-/// can come to disagree about what is waiting.
-///
-/// A parked session is placed on its board through `trigger.issue()`, the
-/// same reading [`resolve_approval`] answers by, so a card asks for an
-/// answer exactly when the door that takes one would accept it. The rail's
-/// count reaches the same fact the other way, through `issue_runs`
-/// (`ProjectManager::attention`) — two spellings of one question, agreeing
-/// today because a run's session is minted from the card it runs.
+/// Resolve answerable cards from the live queue, never from historical timeline
+/// entries. Archived boards return empty because their prompts cannot be answered.
 async fn cards_awaiting_approval(
     state: &AdminState,
     project: &ProjectId,
 ) -> std::collections::HashSet<baybo_model::IssueId> {
-    // One snapshot of the queue, then reads against it. Unlike
-    // `projects_attention`, resolving a session to its card has to await,
-    // so a prompt answered inside that window is reported pending for this
-    // one response — self-healing, since every answer refetches the board.
-    // The direction is deliberate: a badge that lingers a beat costs a
-    // wasted tap, where the other way round hides a prompt from the only
-    // person who can answer it.
+    // Snapshot before awaited session reads. It may over-report for one response
+    // if an answer races us, which is safer than hiding an actionable prompt.
     let parked: Vec<baybo_model::SessionId> = state
         .channel_registry
         .get(&baybo_model::ChannelType::owner())
@@ -426,14 +407,7 @@ pub struct IssueDto {
     /// shows it, because a failure that leaves the card looking untouched
     /// is a badge pointing at something the operator cannot find.
     pub last_run_failed: bool,
-    /// A run on this card is parked on an approval prompt, waiting to be
-    /// answered. Read off the live queue rather than the timeline, for the
-    /// same reason [`ProjectAttentionDto::approvals`] is: a prompt that
-    /// timed out leaves `approval_requested` behind with no resolution, so
-    /// a card deriving this from its own entries would keep asking for an
-    /// answer nothing is waiting for. `false` on an archived board — its
-    /// prompts are not answerable, and pointing at one would be a badge
-    /// with no press behind it.
+    /// True only while this card has an answerable prompt in the live queue.
     pub approval_pending: bool,
     /// An agent filed this card, rather than the operator. The board's own
     /// work breakdown, and the same fact `RunTrigger::Grooming` turns on —
@@ -465,10 +439,6 @@ impl IssueDto {
     /// runs would answer "did this card's newest run fail" a second time,
     /// and the board's badge and the card's face would then be two
     /// answers to one question.
-    ///
-    /// `awaiting_approval` comes from the live queue via
-    /// [`cards_awaiting_approval`] for the same reason — the queue is the
-    /// only thing that knows a prompt is still answerable.
     pub fn on_board(
         row: IssueRow,
         board: &BoardCards,
@@ -939,9 +909,7 @@ impl IssueEventBodyDto {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct IssueEventDto {
     pub id: String,
-    /// Client idempotency key on an operator comment. Its presence lets a
-    /// client reconcile an optimistic row even when a timeline invalidation
-    /// wins the race against the POST response.
+    /// Client idempotency key used to reconcile an optimistic comment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_msg_id: Option<String>,
     pub number: i64,
@@ -950,22 +918,12 @@ pub struct IssueEventDto {
     pub created_at_ms: i64,
 }
 
-/// A card's timeline, and where the operator's eye should land in it.
-///
-/// Its own envelope rather than [`ListResponse`] because the second field
-/// is the whole point: a client that got only the rows would have to work
-/// out which of them are new from a read cursor and a rule, and that rule
-/// already has a home — see
-/// [`ProjectStore::first_unread_event`](baybo_store::project::ProjectStore::first_unread_event).
-/// Shipping the resolved id is what keeps the divider and the unread badge
-/// two views of one answer instead of two answers.
+/// Timeline entries plus the server-resolved unread boundary.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct IssueTimelineDto {
     /// Oldest first.
     pub items: Vec<IssueEventDto>,
-    /// The oldest entry the operator has not seen, by `id`. **Absent** on a
-    /// card with nothing new — which is every card a moment after it is
-    /// opened, because opening one stamps it read.
+    /// Oldest unread event id; absent when the card is caught up.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_unread: Option<String>,
 }
@@ -1788,10 +1746,6 @@ async fn resolve_approval(
     Json(req): Json<ResolveApprovalRequest>,
 ) -> Result<StatusCode> {
     let id = parse_project_id(&project_id)?;
-    // A point read, and its result is used three ways: it 404s an unknown
-    // board or card before the queue is touched, it 409s an archived one
-    // rather than letting a read-only board release an agent, and the
-    // card's own id is what the parked prompt is checked against below.
     let issue = state
         .project_manager
         .approvable_issue(&id, number)

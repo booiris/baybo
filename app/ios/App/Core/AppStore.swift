@@ -68,23 +68,11 @@ final class AppStore: ObservableObject {
         /// The Deck's recycle bin: soft-deleted cards, each restorable. Pushed
         /// from the Deck header's ☰ menu, mirroring `archived` for Chats.
         case deckRecycle
-        /// One board, by project id. A pushed screen rather than the tab root:
-        /// the root is the cards, and changing project means backing out to
-        /// them — there is no switcher in the top-left, deliberately.
         case projectBoard(String)
         /// One card on a board. Pushed over its board, so the edge swipe goes
         /// back to the column it came from.
         case projectIssue(ProjectIssueRoute)
-        /// The new-board form. A pushed route rather than a sheet because it
-        /// types: this shell opts out of keyboard avoidance wholesale
-        /// (`HomeTabView.ignoresSafeArea(.keyboard)`), and a pushed screen sits
-        /// outside that.
         case newProject
-        /// Filing a card. The column rides ON the route rather than in a
-        /// `@State` beside it: which column you are filing into is part of
-        /// WHERE this screen is, not something that happens to it — and a
-        /// route that forgot it would open every card in the backlog after a
-        /// state restoration.
         case newIssue(project: String, status: IssueStatus)
     }
 
@@ -354,9 +342,7 @@ final class AppStore: ObservableObject {
         // Deck pushes are session-less by design; the connection-global sink
         // is the only way they reach a user parked on the Deck tab.
         Baybo.client.setDeckSink(sink: DeckEventsRelay(store: { AppStore.shared?.deckStore }))
-        // Board invalidations are session-less broadcasts like the deck's, and
-        // this is the only way the phone learns a board moved — nothing about a
-        // board is ever pushed.
+        // Board invalidations are session-less; this is their only live route.
         Baybo.client.setProjectSink(
             sink: ProjectEventsRelay(store: { AppStore.shared?.projectsStore }))
         #if DEBUG
@@ -512,18 +498,10 @@ final class AppStore: ObservableObject {
             if args.contains("-baybo-demo-logout-confirm") {
                 confirmLogout = true
             }
-            // `-baybo-demo-board` (with `-baybo-demo-projects`): land straight
-            // on the seeded board, so the stage wall and the Waiting strip are
-            // reachable without driving two taps through the cards root.
             if args.contains("-baybo-demo-board") {
                 homeTab = .projects
                 chatPath = [.projectBoard(ProjectsStore.demoBoardId)]
             }
-            // `-baybo-demo-card`: one level deeper again, onto a card — #41 of
-            // the demo board, filled in from that board's own fixture (see
-            // `IssueStore.seedDemoCard`). It used to land on a page that could
-            // only ever say "Loading card…", since the card store talks to a
-            // gateway and the demo has none.
             if args.contains(IssueStore.demoCardArg) {
                 homeTab = .projects
                 chatPath = [
@@ -826,19 +804,9 @@ final class AppStore: ObservableObject {
         chatPath.append(.archived)
     }
 
-    /// Open a board over the cards root.
-    ///
-    /// Deliberately NOT `activateSession`'s shape: that one forces
-    /// `homeTab = .chats` and RESETS the path, which is right for a
-    /// conversation and wrong for everything here — the Projects tab must
-    /// stay selected underneath, and the push must stack rather than replace.
     func openProjectBoard(_ projectId: String) {
         let route = AppStore.ChatRoute.projectBoard(projectId)
         guard chatPath.last != route else { return }
-        // Stamped here rather than in the card row's press, because this is
-        // the ONE door into a board — the cards root, the create flow, and a
-        // push tap all come through it, and a stamp on the row would miss the
-        // other two.
         projectsStore.recordOpened(projectId)
         chatPath.append(route)
         Task { await projectsStore.refreshBoard(projectId) }
@@ -1583,9 +1551,7 @@ final class AppStore: ObservableObject {
         // So do the boards: a mirror that outlived a binding is somebody
         // else's account on screen.
         ProjectsStore.removeMirror()
-        // And the agents' faces: a blob id means nothing under the next
-        // gateway, and a cached picture would be a departed account's agent
-        // looking back from the new one's board.
+        // Blob ids are binding-local; never show the departed gateway's faces.
         AgentAvatars.shared.reset()
         // As does the model catalog — a rebind must not offer the departed
         // gateway's LLM entries.

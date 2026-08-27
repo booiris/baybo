@@ -2675,16 +2675,7 @@ export interface components {
             filename?: string | null;
         };
         IssueDto: {
-            /**
-             * @description A run on this card is parked on an approval prompt, waiting to be
-             *     answered. Read off the live queue rather than the timeline, for the
-             *     same reason [`ProjectAttentionDto::approvals`] is: a prompt that
-             *     timed out leaves `approval_requested` behind with no resolution, so
-             *     a card deriving this from its own entries would keep asking for an
-             *     answer nothing is waiting for. `false` on an archived board — its
-             *     prompts are not answerable, and pointing at one would be a badge
-             *     with no press behind it.
-             */
+            /** @description True only while this card has an answerable prompt in the live queue. */
             approval_pending: boolean;
             /** @description The agent on it, if any. In Progress always has one. */
             assignee?: string | null;
@@ -2925,11 +2916,7 @@ export interface components {
         IssueEventDto: {
             actor: components["schemas"]["ActorDto"];
             body: components["schemas"]["IssueEventBodyDto"];
-            /**
-             * @description Client idempotency key on an operator comment. Its presence lets a
-             *     client reconcile an optimistic row even when a timeline invalidation
-             *     wins the race against the POST response.
-             */
+            /** @description Client idempotency key used to reconcile an optimistic comment. */
             client_msg_id?: string | null;
             /** Format: int64 */
             created_at_ms: number;
@@ -3010,23 +2997,9 @@ export interface components {
          * @enum {string}
          */
         IssueStatusDto: "backlog" | "todo" | "in_progress" | "review" | "done";
-        /**
-         * @description A card's timeline, and where the operator's eye should land in it.
-         *
-         *     Its own envelope rather than [`ListResponse`] because the second field
-         *     is the whole point: a client that got only the rows would have to work
-         *     out which of them are new from a read cursor and a rule, and that rule
-         *     already has a home — see
-         *     [`ProjectStore::first_unread_event`](baybo_store::project::ProjectStore::first_unread_event).
-         *     Shipping the resolved id is what keeps the divider and the unread badge
-         *     two views of one answer instead of two answers.
-         */
+        /** @description Timeline entries plus the server-resolved unread boundary. */
         IssueTimelineDto: {
-            /**
-             * @description The oldest entry the operator has not seen, by `id`. **Absent** on a
-             *     card with nothing new — which is every card a moment after it is
-             *     opened, because opening one stamps it read.
-             */
+            /** @description Oldest unread event id; absent when the card is caught up. */
             first_unread?: string | null;
             /** @description Oldest first. */
             items: components["schemas"]["IssueEventDto"][];
@@ -7954,16 +7927,7 @@ export interface operations {
                 content: {
                     "application/json": {
                         items: {
-                            /**
-                             * @description A run on this card is parked on an approval prompt, waiting to be
-                             *     answered. Read off the live queue rather than the timeline, for the
-                             *     same reason [`ProjectAttentionDto::approvals`] is: a prompt that
-                             *     timed out leaves `approval_requested` behind with no resolution, so
-                             *     a card deriving this from its own entries would keep asking for an
-                             *     answer nothing is waiting for. `false` on an archived board — its
-                             *     prompts are not answerable, and pointing at one would be a badge
-                             *     with no press behind it.
-                             */
+                            /** @description True only while this card has an answerable prompt in the live queue. */
                             approval_pending: boolean;
                             /** @description The agent on it, if any. In Progress always has one. */
                             assignee?: string | null;

@@ -3,16 +3,9 @@ import Testing
 
 @testable import Baybo
 
-/// Every `lang.t("…")` key must exist in the catalog.
-///
-/// A miss is INVISIBLE. `Lang.t` falls back to echoing the key, so a screen
-/// ships with a button labelled `chat.cancel` and every existing assertion
-/// stays green — an `XCTAssert` on a label matches the key just as happily as
-/// the word. This suite found exactly that on the card screen's Stop dialog,
-/// where `chat.cancel` had never existed.
+/// Missing translations echo their key, so ordinary label assertions can stay
+/// green while raw keys ship. Keep source references and both locales complete.
 @Suite struct LocalizedKeyTests {
-    /// Keys built at runtime rather than written as literals. `lang.label` is
-    /// `Lang`'s own `"lang.\(code)"`.
     private static let dynamicPrefixes = ["lang."]
 
     @Test func everyReferencedKeyIsInTheCatalog() throws {
@@ -28,9 +21,6 @@ import Testing
         #expect(missing.sorted() == [], "keys referenced but never defined")
     }
 
-    /// Both languages carry every key. One present in `en` and absent in
-    /// `zh-Hans` renders as the raw key on that language's screen, and the
-    /// suite runs pinned to English — so nothing else here would ever see it.
     @Test func bothLanguagesCarryEveryKey() throws {
         let root = try Self.catalog()
         var missing: [String] = []
@@ -46,7 +36,6 @@ import Testing
     // MARK: - Sources
 
     private static func repoRoot() -> URL {
-        // `#filePath` is `<app/ios>/Tests/LocalizedKeyTests.swift`.
         URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()

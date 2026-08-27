@@ -1,9 +1,5 @@
 import React, { useEffect, useState } from "react";
 import ReactDOM from "react-dom/client";
-// The same self-hosted faces and KaTeX css the transcript loads. Repeated here
-// rather than shared through a module because these are Vite entry-level side
-// effects: an import in a shared file would pull the css into whichever chunk
-// happened to reach it first, and the two entries do not share a chunk.
 import "@fontsource/space-mono/latin-400.css";
 import "@fontsource/space-mono/latin-ext-400.css";
 import "@fontsource/space-mono/latin-700.css";
@@ -22,10 +18,8 @@ import {
 } from "./bridge";
 import { IssuePage } from "./IssuePage";
 
-// Language is native's to set, exactly as it is for the transcript — and on
-// its OWN listener, never through `subscribeIssue`. That slot has one holder
-// and it is the card: a stub parked there to catch `init` is handed the first
-// `deliver` too, and a `deliver: () => undefined` swallows the card whole.
+// Language uses its own listener: taking the issue subscription here would
+// swallow a delivery that arrives before React mounts.
 onIssueLanguage((lang) => void i18n.changeLanguage(lang));
 onIssueInit((payload) => void i18n.changeLanguage(payload.language));
 
@@ -54,5 +48,4 @@ ReactDOM.createRoot(root).render(
   </React.StrictMode>,
 );
 
-// Native buffers everything until this lands — the transcript's ready contract.
 postIssueReady();

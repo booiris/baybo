@@ -20,7 +20,6 @@ final class ComposerAttachUITests: BayboUITestCase {
     /// Mirrors `Pasteboards.demoPasteArg` — the app module is not importable here.
     private static let demoPasteArg = "-baybo-demo-paste"
     private static let jumpToLatestLabel = "Jump to the latest message"
-    /// The dock's trailing control, in both of its states.
     private static let sendLabel = "Send"
     private static let stopLabel = "Stop"
     /// The transcript's own attachments, driven to `ready`, so the chat has
@@ -103,37 +102,8 @@ final class ComposerAttachUITests: BayboUITestCase {
         attachScreenshot(app, name: "composer-plus-panel-staged")
     }
 
-    /// **The panel covers the jump disc rather than clearing it** (2026-08-27).
-    /// The disc is 44×44, centred, 12pt above the dock — squarely inside the
-    /// panel's band. It used to be a ROW in the composer's stack, so the
-    /// panel's floor (the dock content's top edge) rose with it and the panel
-    /// opened a disc's height clear of the `+` that raised it. It is an overlay
-    /// now (`JumpToLatestDisc`), and the panel simply covers it.
-    ///
-    /// Covering is only safe from ABOVE, which is what the two claims here
-    /// are: the bottom row and the disc SHARE that space, and the row is still
-    /// hittable in it. The reverse shipped once — the panel drawn in the
-    /// screen's ZStack, under the dock's `.safeAreaInset` — and the disc ate
-    /// 44pt of the Files row: a pick that scrolled the transcript instead.
-    ///
-    /// The disc is raised by DRAGGING, not by `-baybo-demo-jump`. That flag
-    /// fires a flat `scrollBy(-1400)` exactly 4s after launch and takes the disc
-    /// back 3s later, which needs a thread already that tall at 4s — and
-    /// `launch()` forces `-baybo-reset-store`, so the demo thread is still
-    /// streaming in from nothing at that moment and the scroll moves zero
-    /// pixels. The disc never appeared and this case failed on its own
-    /// precondition twice, saying nothing about the panel. Dragging waits for
-    /// the content first and leaves the disc up indefinitely.
     func testPlusPanelFloatsOverTheJumpButton() {
         let app = launch(["-baybo-open-chat", "-baybo-demo-frames"])
-        // The send button reverts from Stop to Send when the demo turn ends —
-        // the one signal from outside the webview that the thread is now as
-        // tall as it is going to get. BOTH edges are waited on: Send is also
-        // what the dock shows at launch, before the demo turn has started, so
-        // waiting for it alone returns immediately and the swipes below drag
-        // an empty thread that has nothing to scroll. That is what this case
-        // did, and it failed on its own precondition depending on how fast the
-        // webview happened to boot.
         XCTAssertTrue(
             app.buttons[Self.stopLabel].waitForExistence(timeout: Self.webviewTimeout),
             "the demo turn never started")
@@ -156,10 +126,6 @@ final class ComposerAttachUITests: BayboUITestCase {
         XCTAssertTrue(
             app.buttons[Self.filesRow].isHittable, "nor may the disc take the Files row's taps")
 
-        // The panel's LOWEST row is the one in the disc's band, and which row
-        // that is depends on the clipboard: `Paste` is offered only when there
-        // is an image on it, and the simulator's board is not this suite's to
-        // decide.
         let bottom = try? XCTUnwrap(
             [Self.photosRow, Self.filesRow, Self.pasteRow]
                 .map { app.buttons[$0] }

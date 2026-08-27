@@ -1,11 +1,5 @@
 import SwiftUI
 
-/// A board's activity feed: what happened, most recent first.
-///
-/// Shaped like a card's timeline because most lines are one — but `number` is
-/// optional here, since joining the team is a fact about the BOARD and has no
-/// card to point at. A line naming a card opens it; one that names none does
-/// nothing, rather than opening something arbitrary.
 struct ProjectActivityScreen: View {
     let projectId: String
     var client: any BayboClientProtocol = Baybo.client
@@ -119,13 +113,6 @@ struct ProjectActivityScreen: View {
     }
 }
 
-/// One line of a board's feed.
-///
-/// Decoded leniently and shallowly, exactly as `IssueEvent` is and for the
-/// same reason: the gateway adds kinds on its own schedule, and a decoder that
-/// threw on one would take the whole feed with it. An unrecognised kind prints
-/// as its own name — more useful than a blank row, and infinitely more useful
-/// than a screen that fails to open.
 struct FeedEntry: Identifiable {
     let id: String
     let number: Int64?
@@ -150,9 +137,6 @@ struct FeedEntry: Identifiable {
             else { return nil }
             let actor = item["actor"] as? [String: Any]
             return FeedEntry(
-                // The feed carries no entry id — a board-level line has no row
-                // of its own — so position stands in. Stable within one read,
-                // which is all a list that replaces wholesale needs.
                 id: "\(index)",
                 number: (item["number"] as? NSNumber)?.int64Value,
                 who: (actor?["handle"] as? String).map { "@\($0)" },

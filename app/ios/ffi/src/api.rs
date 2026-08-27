@@ -699,52 +699,17 @@ pub trait PairAbortListener: Send + Sync {
     fn on_abort(&self, reason: String);
 }
 
-/// Where the connection-global board invalidations land — the [`DeckSink`]
-/// pattern. `Frame::ProjectChanged` is a session-less broadcast (a board has
-/// no session to subscribe), so the transport routes it here and NEVER to a
-/// per-session [`FrameSink`]. One sink per client, registered via
-/// [`crate::BayboClient::set_project_sink`]; both legs share it. Calls arrive
-/// on the core's tokio workers, so the Swift impl must be thread-safe (hop to
-/// the main actor before touching UI).
-///
-/// The Swift implementor must NOT be named `ProjectSinkImpl` — UniFFI
-/// generates a class of exactly that name for every `with_foreign` trait, and
-/// a same-named class collides.
+/// Receives sessionless board invalidations on core worker threads. Swift must
+/// hop to the main actor and avoid UniFFI's generated `ProjectSinkImpl` name.
 #[uniffi::export(with_foreign)]
 pub trait ProjectSink: Send + Sync {
-    /// Something on `project_id` changed; refetch it.
-    ///
-    /// `scope` is the gateway's own word for which plane moved — `project`,
-    /// `board`, `run`, `timeline`, or anything a later gateway invents.
-    /// **Treat every scope as "this board is dirty"**: a move emits no
-    /// board-scope frame at all (it records a timeline entry and, entering In
-    /// Progress, a run), so a client that refetched the board only on
-    /// `board` would miss exactly the change it most needs to draw.
-    ///
-    /// `issue_number` is present when the change is about one card, which a
-    /// card page uses to ignore everything for another number.
+    /// `scope` is a hint only; every scope makes the named board dirty.
     fn on_project_changed(&self, project_id: String, scope: String, issue_number: Option<u32>);
-    /// The gateway dropped a session-less broadcast on this connection, so a
-    /// `ProjectChanged` may have gone with it: whatever board is on screen is
-    /// suspect. Fires on the same `Frame::Gap { session_id: None }` that
-    /// staleness-nudges the chat list — without it, an invalidation lost to a
-    /// full broadcast queue is lost for good, and the board sits wrong until
-    /// something else happens to move it.
+    /// A connection gap may have dropped an invalidation; refetch visible boards.
     fn on_project_stale(&self);
 }
 
-// ─────────────────────────── projects (kanban boards) ───────────────────────
-//
-// Mirrors of the gateway's `/v1/projects/*` DTOs. Every enum carries an
-// `Unknown` arm for the reason [`ChatSubagentStatus::Unknown`] does: a board
-// whose gateway grew a status must cost one card its word, not blank the whole
-// board with a decode error. The rules behind these fields live in
-// `docs/modules/project.md`; what the phone does with them is
-// `app/ios/docs/projects.md`.
-
-/// Which column a card sits in. Entering [`Self::InProgress`] is the board's
-/// single execution trigger, and it is the one status that requires an
-/// assignee.
+/// Unknown is a tolerant decode fallback and must never be sent as a move.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum IssueStatus {
     Backlog,
@@ -767,14 +732,9 @@ pub enum IssuePriority {
     Unknown,
 }
 
-/// Where a run is. `Held`, `Queued` and `Running` are the unsettled states —
-/// a card showing any of them is a card being worked, and a card has at most
-/// one such run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum RunStatus {
-    /// Recorded but not started: the board is over one of its daily
-    /// ceilings. It starts by itself once there is headroom — or when the
-    /// operator presses Run again, which releases what the ceiling allows.
+    /// Recorded but waiting for a budget ceiling to be lifted.
     Held,
     Queued,
     Running,
@@ -784,11 +744,6 @@ pub enum RunStatus {
     Unknown,
 }
 
-/// Why a run was started. The execution log prints it verbatim, and the four
-/// coordination triggers (`Triage`/`Review`/`Stalled`/`Blocked`) are the ones
-/// that run as the board's `@lead` rather than as the card's assignee — which
-/// is why a card's face draws the ring on whoever is running, not the
-/// assignee.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum RunTrigger {
     Started,
@@ -816,14 +771,9 @@ pub struct ProjectInfo {
     /// Absolute path to the git repository this board's agents work in. Set
     /// once, at creation.
     pub workdir: String,
-    /// Daily spend ceiling in micro-USD; `None` means no limit. Note this
-    /// ceiling measures nothing on a subscription plan — the token one is
-    /// what bites there.
     pub daily_budget_micros: Option<i64>,
     pub daily_budget_tokens: Option<i64>,
-    /// How many runs the board starts on its own by taking cards off the top
-    /// of Todo. `0` means it starts only what somebody moves into In
-    /// Progress.
+    /// `0` disables automatic starts; explicit moves may still start runs.
     pub max_parallel_issue_runs: i64,
     pub agents_may_merge: bool,
     /// Present only while the board sits in the archive, which makes it
@@ -883,9 +833,7 @@ pub struct IssueInfo {
     /// operator last opened it. The operator's own acts never count.
     pub unread: i64,
     pub last_run_failed: bool,
-    /// A run on this card is parked on an approval prompt. Resolved
-    /// server-side off the live queue — never re-derived here from the
-    /// timeline, which cannot tell an answered prompt from a timed-out one.
+    /// Derived from the live approval queue, never from historical events.
     pub approval_pending: bool,
     pub opened_by_agent: bool,
     /// Present once cancelled. The row is never deleted, and a cancelled
@@ -906,18 +854,12 @@ pub struct IssueRunInfo {
     pub agent_id: String,
     pub status: RunStatus,
     pub trigger: RunTrigger,
-    /// The session it executed in, present once claimed. One agent's runs on
-    /// a card share a session, which is why a transcript page holds the
-    /// attempts before it.
     pub session_id: Option<String>,
     pub error: Option<String>,
     pub created_at_ms: i64,
     pub started_at_ms: Option<i64>,
     pub settled_at_ms: Option<i64>,
-    /// Micro-USD over this run's own window. **`None` is not zero** — the
-    /// active-run poll does not price runs at all, and a run that has not
-    /// billed yet is a real zero, so a caller that renders the two the same
-    /// reports free work as fact.
+    /// `None` means unpriced, not zero cost.
     pub cost_micros: Option<i64>,
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
@@ -962,10 +904,7 @@ pub struct TeamMemberInfo {
     pub created_at_ms: i64,
 }
 
-/// One board with something waiting on the operator. Every count here is an
-/// event that a press can discharge — runs the daily ceiling is holding are a
-/// standing condition and are deliberately absent, and archived boards are
-/// excluded wholesale.
+/// Operator-action counts only; budget holds are standing conditions and absent.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ProjectAttention {
     pub project_id: String,
@@ -981,30 +920,17 @@ pub struct ProjectAttention {
 pub struct ProjectActivity {
     pub project_id: String,
     pub working: u32,
-    /// Spend since the caller's `since_ms`, which must be the **budget's**
-    /// day — UTC midnight — or the figure accuses the board of crossing a
-    /// ceiling it did not.
     pub burn_micros: i64,
     pub burn_tokens: i64,
 }
 
-/// How an approval prompt was answered from a card. Two answers, not the
-/// web's three: `approve_always` widens a policy from a surface with no room
-/// to show what was widened, so it is deliberately absent — the same rule
-/// [`ApprovalDecision`] follows for chat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum IssueApprovalDecision {
     Approve,
     Deny,
 }
 
-/// One field of a sparse card edit.
-///
-/// The gateway reads `assignee` and `blocked_reason` as double options —
-/// absent means "leave it", an explicit `null` means "clear it" — and UniFFI
-/// cannot express `Option<Option<T>>`, so the three states are spelled out.
-/// Without the distinction there is no way to unassign a card or lift a block
-/// at all, since both are "write null" and neither is "omit".
+/// UniFFI cannot express the gateway's keep/set/clear `Option<Option<String>>`.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum StringPatch {
     /// Leave whatever is there: the key is omitted from the body.
@@ -1046,14 +972,6 @@ pub struct IssuePatch {
     pub pinned: Option<bool>,
 }
 
-/// One file a card comment carries.
-///
-/// A record rather than a bare blob id because the gateway resolves a blob's
-/// mime and size itself but has no idea what the user picked the file AS — and
-/// the card page prints file cards by name. `AttachmentRef`'s other fields
-/// (kind, mime, size) are deliberately absent: they are the chat frame's, and
-/// sending them here would be a second, disagreeing copy of what the blob
-/// already knows.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct IssueAttachmentInput {
     pub blob_id: String,
@@ -1075,9 +993,6 @@ pub struct NewIssue {
     pub stage: Option<i64>,
 }
 
-/// A new board. Leaving `workdir` empty has the server create and
-/// git-initialise `<workspace>/work/<name>`; giving one requires an absolute
-/// path to an existing repository.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct NewProject {
     pub name: String,
@@ -1088,9 +1003,7 @@ pub struct NewProject {
     pub max_parallel_issue_runs: Option<i64>,
 }
 
-/// The board's own knobs. **A full replace**: every field is written as
-/// given, so a caller that omits a ceiling clears it rather than leaving it
-/// alone. Read the current values, change one, send them all.
+/// Full replacement payload for the project's PUT endpoint.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ProjectSettings {
     pub name: String,
@@ -1098,14 +1011,6 @@ pub struct ProjectSettings {
     pub daily_budget_micros: Option<i64>,
     pub daily_budget_tokens: Option<i64>,
     pub max_parallel_issue_runs: Option<i64>,
-    /// Whether a finished card's branch merges itself.
-    ///
-    /// The full-replace rule bites hardest here, because this one is a plain
-    /// `bool` with no "unset": the gateway's request struct defaults it to
-    /// `false`, so a client that leaves it out of the body does not keep the
-    /// board's setting — it turns merging **off**. This field is absent from
-    /// this record until 2026-08-26, which is exactly how long every Save from
-    /// this app was silently doing that.
     pub agents_may_merge: bool,
 }
 

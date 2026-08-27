@@ -904,16 +904,6 @@ async fn a_run_can_be_stopped_and_started_again() {
     .await;
 }
 
-/// A card's timeline says where the reader should land, and the id it
-/// names is one of the rows it just shipped.
-///
-/// The client is handed the resolved entry rather than the read cursor on
-/// purpose: deciding which rows are new is one rule, it already lives in
-/// the store, and a second copy of it in a client would draw its divider
-/// somewhere the unread badge disagrees with. The agent comments are
-/// planted through the store for the reason `one_press_reads_every_card`
-/// explains — the endpoint speaks as the operator, and the operator's own
-/// words are never unread.
 #[tokio::test]
 async fn a_timeline_says_where_to_land_in_it() {
     let (router, tg) = router().await;
@@ -1508,8 +1498,6 @@ async fn an_archived_board_does_not_answer_the_prompts_it_left_parked() {
     )
     .await;
 
-    // Answering releases an agent to act, so it is a write, and an
-    // archived board takes none. The prompt is left to time out.
     post(
         &router,
         &format!("/v1/projects/{p}/issues/1/approvals/c-archived"),
@@ -1523,8 +1511,6 @@ async fn an_archived_board_does_not_answer_the_prompts_it_left_parked() {
         "the prompt is still parked"
     );
 
-    // And the card stops asking, so nothing points at a prompt the board
-    // will not take an answer for.
     let card = get(
         &router,
         &format!("/v1/projects/{p}/issues/1"),
@@ -1600,8 +1586,6 @@ async fn a_card_says_when_a_run_on_it_is_waiting_for_an_answer() {
     .await;
     blocked.await.expect("the blocked call returns");
 
-    // Answered is answered: the badge follows the queue, not the timeline
-    // entry, which still records that it was asked.
     let card = get(
         &router,
         &format!("/v1/projects/{p}/issues/1"),

@@ -200,9 +200,6 @@ pub(crate) type SharedListSink = Arc<parking_lot::Mutex<Option<Arc<dyn SessionLi
 /// [`FrameSink`].
 pub(crate) type SharedDeckSink = Arc<parking_lot::Mutex<Option<Arc<dyn DeckSink>>>>;
 
-/// The connection-global project sink — the [`SharedDeckSink`] pattern.
-/// `ProjectChanged` is a session-less broadcast (a board has no session to
-/// subscribe), so it lands here and never on a per-session [`FrameSink`].
 pub(crate) type SharedProjectSink = Arc<parking_lot::Mutex<Option<Arc<dyn ProjectSink>>>>;
 
 /// The shared per-session frame-routing map: pump reads on every inbound

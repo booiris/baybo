@@ -559,15 +559,7 @@ export function hasSubagentSpawn(rows: Row[]): boolean {
   );
 }
 
-/// Work rows at the unanswered edge of a read-only transcript.
-///
-/// A subagent / issue run is rebuilt from persisted REST rows, so even work
-/// that is still the last thing the agent did arrives `active:false`. Leaving
-/// that edge collapsed as `Worked` makes an unfinished, failed, or cancelled
-/// run look as though it signed off normally. Trailing notices do not count as
-/// the agent's final output, and adjacent work rows are kept together because
-/// a context-compaction watermark deliberately splits one tail into two rows
-/// with the `Compacted` divider between them.
+/// Keep an unanswered read-only tail expanded even though persisted rows are inactive.
 export function unansweredTailWorkIds(rows: Row[]): ReadonlySet<string> {
   const ids = new Set<string>();
   let at = rows.length - 1;
@@ -1853,9 +1845,6 @@ export function Transcript({
 }: {
   restored: PersistedState | null;
   initialConnEpoch: number;
-  /// The subagent and issue-run readers have no live output plane. If their
-  /// persisted tail has no assistant reply, show its work instead of reducing
-  /// it to one or more closed `Worked` summaries.
   expandUnansweredTail?: boolean;
 }) {
   const { t } = useTranslation();

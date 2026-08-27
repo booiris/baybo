@@ -5,10 +5,7 @@ import react from "@vitejs/plugin-react";
 // base './': the bundle is loaded from a custom scheme inside the WKWebView,
 // so every asset URL must stay relative to the entry html.
 //
-// Three entries, one dist: index.html (the transcript, TranscriptHost),
-// deck.html (the deck shell, DeckHost) and issue.html (a project card,
-// IssueHost). All three ride the same App/Resources/transcript copy + scheme
-// handler — a second resource dir would buy nothing but a second copy step.
+// Transcript, deck, and project-card entries share one embedded resource bundle.
 export default defineConfig({
   base: "./",
   plugins: [react()],

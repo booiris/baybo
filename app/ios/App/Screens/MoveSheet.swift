@@ -1,13 +1,5 @@
 import SwiftUI
 
-/// Where to put a card, and what that will do.
-///
-/// **The consequence is the sheet.** A desktop board makes moving obvious by
-/// making it a drag; a phone has no drag here, so every row says out loud what
-/// the tap does — above all the two an operator gets wrong: that moving a card
-/// OUT of In Progress does not stop its run, and that moving one IN starts
-/// one. The sentences come from `MoveConsequence`, which is where they can be
-/// tested without a screen.
 struct MoveSheet: View {
     let issue: IssueInfo
     let liveRun: IssueRunInfo?
@@ -111,13 +103,6 @@ struct MoveSheet: View {
     }
 }
 
-/// How urgent this card is.
-///
-/// The board has never had one: priority is set when a card is filed and then
-/// only ever read, so the one place that can change it is the card itself.
-/// `AssigneePicker`'s grammar rather than `MoveSheet`'s — a priority has no
-/// consequence to spell out, it orders no column and starts no run, so a row
-/// is a mark, a word and a tick.
 struct PriorityPicker: View {
     let current: IssuePriority
     let onPick: (IssuePriority) -> Void
@@ -125,9 +110,6 @@ struct PriorityPicker: View {
     @ObservedObject private var lang = Lang.shared
     @Environment(\.dismiss) private var dismiss
 
-    /// Loudest first, the way the board's own filter and the New issue sheet
-    /// order them — `none` last, because it is the absence of an answer rather
-    /// than the quietest one.
     private static let levels: [IssuePriority] = [.urgent, .high, .medium, .low, .none]
 
     var body: some View {
@@ -159,9 +141,6 @@ struct PriorityPicker: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Theme.paper)
-        // Header + five 52pt rows. Its own number rather than the Move sheet's
-        // 430: those rows are taller and each carries a sentence, and a detent
-        // copied from them leaves this one standing in a hand's width of paper.
         .presentationDetents([.height(330)])
         .presentationDragIndicator(.visible)
     }
@@ -191,12 +170,6 @@ struct PriorityPicker: View {
     }
 }
 
-/// Who is on this card.
-///
-/// Reached two ways, and the second is why it exists: from the ⋯ menu, and
-/// from the Move sheet's In Progress row when nobody is assigned. A disabled
-/// "needs an assignee" row would leave the operator to work out what to do
-/// about it; this picks up where that row left off and finishes the move.
 struct AssigneePicker: View {
     let team: [TeamMemberInfo]
     let current: String?

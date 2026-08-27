@@ -1,11 +1,7 @@
 import SwiftUI
 
-/// A board's own settings.
-///
-/// **The PUT is a full replace**, so this form sends every field back on every
-/// save — including the ones nobody touched. A partial body would clear a
-/// budget by omitting it, which is the same shape of bug as a partial agent
-/// pin and fails just as silently: nothing errors, the ceiling is simply gone.
+/// The settings PUT replaces the whole record, so every field must be sent on
+/// every save; omission would silently clear an untouched value.
 struct ProjectSettingsSheet: View {
     let project: ProjectInfo
     var client: any BayboClientProtocol = Baybo.client
@@ -97,10 +93,6 @@ struct ProjectSettingsSheet: View {
             }
             Button(lang.t("common.cancel"), role: .cancel) {}
         } message: {
-            // Says the part an operator gets wrong: archiving does NOT stop
-            // what is already running. It stops the board taking writes and
-            // answering approvals — so a run mid-flight finishes, and its gate
-            // self-denies.
             Text(verbatim: lang.t(isArchived ? "settings.unarchiveExplain" : "settings.archiveExplain"))
         }
     }
@@ -120,15 +112,6 @@ struct ProjectSettingsSheet: View {
         .frame(height: 52)
     }
 
-    /// The app has ONE way to draw a destructive action — the red outline pill
-    /// Settings logs out with — and this sheet had invented a second: bare sans
-    /// text, left-aligned, dangling under the working-directory path with
-    /// nothing around it. It read as an unstyled link rather than as the peer
-    /// of the Save pill directly above it.
-    ///
-    /// Red only for the archiving direction. Restoring a board takes nothing
-    /// away, and red in this app means destructive or error, never "this row is
-    /// the important one".
     private var archiveRow: some View {
         Button {
             Haptics.tap()
@@ -153,18 +136,6 @@ struct ProjectSettingsSheet: View {
             .padding(.bottom, 4)
     }
 
-    /// Whether a finished card's branch merges itself.
-    ///
-    /// It is a `Toggle` rather than a checkmark row because it is the only
-    /// thing on this sheet that is a STATE rather than a value being typed —
-    /// and unlike the ceilings it takes effect on the board's own behaviour,
-    /// not on a number.
-    ///
-    /// The hint says which of the two things happens, in both directions: an
-    /// operator reading `Auto-merge` alone cannot tell whether "off" means the
-    /// branch waits for them or is thrown away. The two sentences are
-    /// `app/web`'s `agentsMayMergeHint`, so the boards do not describe
-    /// themselves differently on the two clients.
     private var autoMergeRow: some View {
         VStack(alignment: .leading, spacing: 6) {
             Toggle(isOn: $autoMerge) {
@@ -221,9 +192,6 @@ struct ProjectSettingsSheet: View {
         error = nil
         Task {
             do {
-                // Every field, every time — see the type doc. An empty budget
-                // is `nil`, which is what "no ceiling" means to the server; a
-                // blank field is not the same as an unsent one.
                 try await client.projectUpdate(
                     projectId: project.id,
                     settings: ProjectSettings(

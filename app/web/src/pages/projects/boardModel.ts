@@ -112,9 +112,7 @@ export function unreadTotal(board: Board): number {
   );
 }
 
-/// The order a column is **read** in: pinned cards first, then cards with
-/// something new, then everything else. Inside each rank, the most recently
-/// updated card leads; the board's stored position and number break ties.
+/// The order a column is read in: pinned, then unread, newest first per band.
 ///
 /// Two lifts, ranked, and the rank is the point. A pin is the operator
 /// saying "keep this in front of me"; an unread count is something that
@@ -132,11 +130,7 @@ export function unreadTotal(board: Board): number {
 /// inside its column before the first `over` resolved, so a 4px twitch
 /// posted a reorder of a column nobody had touched.
 ///
-/// It writes no `position`, not even through a drag: recency is a rendered
-/// order only, while a move sends [`persistedOrder`] — the stored order with
-/// one card moved — rather than the order on screen. The stored order remains
-/// the deterministic fallback when two cards have the same update time and
-/// remains available to the board's own scheduling rules.
+/// This rendered order never changes persisted position or scheduling order.
 ///
 /// A cancelled card is never lifted **by its unread count**. Cancel is
 /// terminal, and floating a struck-through card over live work because
