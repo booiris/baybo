@@ -16,6 +16,9 @@ export type InitPayload = {
   sessionId: string;
   restoredState: PersistedState | null;
   connEpoch: number;
+  /// Read-only subagent / issue-run pages expose a work-only tail instead of
+  /// presenting it as a completed `Worked` summary.
+  expandUnansweredTail: boolean;
 };
 
 export type UserSentPayload = {

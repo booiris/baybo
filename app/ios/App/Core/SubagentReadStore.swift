@@ -21,6 +21,10 @@ final class SubagentReadStore: ObservableObject, TranscriptTarget {
     /// only to decide whether to hold the first paint, and `false` is both true
     /// and the behaviour we want (fade in once the page reports `shown`).
     let listed = false
+    /// REST reconstruction cannot mark the child's newest work row live. When
+    /// no final assistant output follows it, expose the work instead of
+    /// collapsing it into a completed-looking `Worked` line.
+    let expandsUnansweredTail = true
     /// No mirror, enforced (docs/subagents.md always claimed it; the bridge
     /// used to read/write one anyway): a child page rendered against an old
     /// gateway would otherwise restore rows the fixed read path no longer

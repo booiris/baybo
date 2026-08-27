@@ -82,6 +82,7 @@ struct ProjectRunReadTests {
             client: FakeBayboClient())
         #expect(!store.mirrored)
         #expect(!store.listed)
+        #expect(store.expandsUnansweredTail)
         #expect(store.connEpoch == 0)
         // The React tree is keyed on it, so two attempts never share a tree.
         #expect(store.sessionId == "s")

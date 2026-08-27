@@ -470,7 +470,8 @@ final class TranscriptBridge: NSObject, ObservableObject, WebMediaSink {
             {"language":\(jsonLiteral(language)),\
             "sessionId":\(jsonLiteral(store.sessionId)),\
             "restoredState":\(restored ?? "null"),\
-            "connEpoch":\(store.connEpoch)}
+            "connEpoch":\(store.connEpoch),\
+            "expandUnansweredTail":\(store.expandsUnansweredTail)}
             """
         call("init", payload)
     }

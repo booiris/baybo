@@ -559,6 +559,26 @@ export function hasSubagentSpawn(rows: Row[]): boolean {
   );
 }
 
+/// Work rows at the unanswered edge of a read-only transcript.
+///
+/// A subagent / issue run is rebuilt from persisted REST rows, so even work
+/// that is still the last thing the agent did arrives `active:false`. Leaving
+/// that edge collapsed as `Worked` makes an unfinished, failed, or cancelled
+/// run look as though it signed off normally. Trailing notices do not count as
+/// the agent's final output, and adjacent work rows are kept together because
+/// a context-compaction watermark deliberately splits one tail into two rows
+/// with the `Compacted` divider between them.
+export function unansweredTailWorkIds(rows: Row[]): ReadonlySet<string> {
+  const ids = new Set<string>();
+  let at = rows.length - 1;
+  while (at >= 0 && rows[at].role === "notice") at--;
+  while (at >= 0 && rows[at].role === "work") {
+    ids.add(rows[at].id);
+    at--;
+  }
+  return ids;
+}
+
 /// Identity of a work step for dedup when folding two representations of the
 /// same turn's block. Text steps key by kind + text.
 ///
@@ -1829,9 +1849,14 @@ const MessageRow = memo(function MessageRow({
 export function Transcript({
   restored,
   initialConnEpoch,
+  expandUnansweredTail = false,
 }: {
   restored: PersistedState | null;
   initialConnEpoch: number;
+  /// The subagent and issue-run readers have no live output plane. If their
+  /// persisted tail has no assistant reply, show its work instead of reducing
+  /// it to one or more closed `Worked` summaries.
+  expandUnansweredTail?: boolean;
 }) {
   const { t } = useTranslation();
   // The mirror, split so the first commit paints only the newest screenfuls
@@ -3658,6 +3683,9 @@ export function Transcript({
     const prev = messages[i - 1];
     return !(prev && prev.role === "notice" && prev.stopped);
   });
+  const defaultExpandedWorkIds = expandUnansweredTail
+    ? unansweredTailWorkIds(renderRows)
+    : undefined;
   // Row ids that get a pre-compaction divider rendered before them.
   const dividerBeforeId = compactionDividerIds(renderRows, compactionPoints);
 
@@ -3675,7 +3703,12 @@ export function Transcript({
         {renderRows.map((m) => {
           const row =
             m.role === "work" ? (
-              <WorkBlockView key={m.id} row={m} onToggle={handleWorkToggle} />
+              <WorkBlockView
+                key={m.id}
+                row={m}
+                defaultExpanded={defaultExpandedWorkIds?.has(m.id)}
+                onToggle={handleWorkToggle}
+              />
             ) : (
               <MessageRow
                 key={m.id}

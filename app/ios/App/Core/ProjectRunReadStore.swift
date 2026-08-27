@@ -28,6 +28,10 @@ final class ProjectRunReadStore: ObservableObject, TranscriptTarget {
     /// A run is deliberately absent from the chat list. The bridge reads this
     /// only to decide whether to hold the first paint.
     let listed = false
+    /// A run can settle or pause without a final assistant output. Its REST
+    /// work rows are all closed, so the transcript opens that unanswered tail
+    /// instead of presenting it as a completed `Worked` summary.
+    let expandsUnansweredTail = true
     let mirrored = false
 
     /// Whether the run can still gain rows. Drives the poll's stop condition

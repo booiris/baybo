@@ -14,7 +14,13 @@ const PERSIST_DEBOUNCE_MS = 500;
 let posted: Record<string, unknown>[];
 
 function initPayload(sessionId: string): InitPayload {
-  return { language: "en", sessionId, restoredState: null, connEpoch: 1 };
+  return {
+    language: "en",
+    sessionId,
+    restoredState: null,
+    connEpoch: 1,
+    expandUnansweredTail: false,
+  };
 }
 
 function mirror(text: string): PersistedState {

@@ -373,6 +373,10 @@ struct ChatSessionDetail {
     oldest_ordinal: Option<i64>,
     #[serde(default)]
     newest_ordinal: Option<i64>,
+    /// Present on the baseline/meta fetch. A run has no sync route of its own,
+    /// so this is the only source for the transcript's compaction dividers.
+    #[serde(default)]
+    compaction_points: Vec<CompactionPoint>,
 }
 
 /// Native-synthesized frame for the web transcript bridge: one backward
@@ -2117,7 +2121,7 @@ pub(crate) async fn fetch_run_transcript_baseline<C: GatewayJsonClient + Sync>(
         rebased: false,
         oldest_ordinal: detail.oldest_ordinal,
         has_more_older: detail.has_more,
-        compaction_points: Vec::new(),
+        compaction_points: detail.compaction_points,
     };
     serde_json::to_string(&frame).map_err(|e| format!("encode run sync page: {e}"))
 }
@@ -3999,6 +4003,26 @@ mod tests {
             "/v1/projects/p-1/issues/26/runs/2/transcript?before_ordinal=4&limit=80"
         );
         assert!(frame.starts_with(r#"{"kind":"history_page""#), "{frame}");
+    }
+
+    /// A run has no `/sync` endpoint, so its baseline transcript response is
+    /// the only place iOS can learn where context compaction split the rows.
+    /// Dropping this metadata leaves the split work cards visible but removes
+    /// the divider that explains why there are two of them.
+    #[tokio::test]
+    async fn a_runs_baseline_carries_compaction_points_into_its_sync_frame() {
+        let client = RecordingClient::new(
+            r#"{"transcript":[{"id":"w5"}],"has_more":false,"oldest_ordinal":2,"newest_ordinal":5,"compaction_points":[{"ordinal":4,"at":"2026-08-27T08:00:00Z"}]}"#,
+        );
+
+        let frame = fetch_run_transcript_baseline(&client, "p-1".into(), 26, 2, Some(80))
+            .await
+            .expect("baseline");
+        let json: serde_json::Value = serde_json::from_str(&frame).expect("parse");
+
+        assert_eq!(json["kind"], "sync_page");
+        assert_eq!(json["compaction_points"][0]["ordinal"], 4);
+        assert_eq!(json["compaction_points"][0]["at"], "2026-08-27T08:00:00Z");
     }
 
     /// The board's settings are a FULL REPLACE, and `agents_may_merge` is the

@@ -22,6 +22,10 @@ protocol TranscriptTarget: AnyObject {
     /// paint gate only — a target that is deliberately absent from the list
     /// (a subagent child) reports `false`.
     var listed: Bool { get }
+    /// Presentation policy for REST-only readers. Their newest work row is
+    /// reconstructed as closed even when no final assistant output exists, so
+    /// those surfaces open the unanswered edge rather than calling it Worked.
+    var expandsUnansweredTail: Bool { get }
 
     func attachBridge(_ bridge: TranscriptBridge)
     func detachBridge(_ bridge: TranscriptBridge)
@@ -66,6 +70,7 @@ protocol TranscriptTarget: AnyObject {
 /// (so nothing renders a send↔stop button). Anything that later needs real
 /// behaviour here belongs on the conforming type, where it can be seen.
 extension TranscriptTarget {
+    var expandsUnansweredTail: Bool { false }
     var mirrored: Bool { true }
     func replayUnconfirmedSends(to transcript: any TranscriptSurface) {}
     func flushPendingSendConfirms(to transcript: any TranscriptSurface) {}

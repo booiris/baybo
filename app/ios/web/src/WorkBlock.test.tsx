@@ -30,10 +30,10 @@ const workRow = (over: Partial<WorkRow> = {}): WorkRow => ({
   ...over,
 });
 
-function renderWork(row: WorkRow, onToggle = vi.fn()) {
+function renderWork(row: WorkRow, onToggle = vi.fn(), defaultExpanded = false) {
   const { container } = render(
     <I18nextProvider i18n={i18n}>
-      <WorkBlockView row={row} onToggle={onToggle} />
+      <WorkBlockView row={row} defaultExpanded={defaultExpanded} onToggle={onToggle} />
     </I18nextProvider>,
   );
   return { onToggle, container };
@@ -225,6 +225,17 @@ describe("WorkBlockView — the ladder", () => {
     expect(container.querySelectorAll(".work-steps")).toHaveLength(1);
     expect(container.textContent).toContain("Grep");
     expect(container.textContent).not.toContain("thinking");
+  });
+
+  it("can open a closed run on its first paint without taking away the toggle", async () => {
+    const user = userEvent.setup();
+    const { container, onToggle } = renderWork(ladderRow(), vi.fn(), true);
+    expect(container.querySelectorAll(".work-steps")).toHaveLength(3);
+    expect(container.querySelectorAll(".work-chevron.open")).toHaveLength(3);
+
+    await user.click(container.querySelectorAll(".work-summary")[1]);
+    expect(onToggle).toHaveBeenCalledWith(false);
+    expect(container.querySelectorAll(".work-steps")).toHaveLength(2);
   });
 
   it("only the LAST run of a live turn reads as running", () => {
