@@ -5,12 +5,12 @@ import SwiftUI
 ///
 /// A SHELL WITH SLOTS, not a view with a mode. The two docks that use it
 /// differ genuinely in what hangs off either end — the chat's control morphs
-/// between send and stop off a running turn, the card's is a plain send beside
-/// an unblock toggle — and a `variant: .chat / .card` parameter would put both
-/// bodies in here behind a branch, which is the false dedup this codebase has
-/// a rule against. What is shared is what is literally identical: the 48pt
-/// floor, the 17pt field and its 13pt padding, the hit slop that makes the
-/// whole capsule focus the field, the glass, and the shadow that carries the
+/// between send and stop off a running turn, while the card always sends a
+/// comment — and a `variant: .chat / .card` parameter would put both bodies in
+/// here behind a branch, which is the false dedup this codebase has a rule
+/// against. What is shared is what is literally identical: the 48pt floor,
+/// the 17pt field and its 13pt padding, the hit slop that makes the whole
+/// capsule focus the field, the glass, and the shadow that carries the
 /// boundary over blank paper.
 ///
 /// **The gutters are here** (2026-08-26). They used to belong to each dock,

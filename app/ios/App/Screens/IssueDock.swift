@@ -1,8 +1,7 @@
 import PhotosUI
 import SwiftUI
 
-/// The card's bottom dock: what you can say, what saying it will do, and the
-/// files it will carry.
+/// The card's bottom dock: what you can say and the files it will carry.
 ///
 /// **Its own type, on shared parts.** It was its own type AND its own surface
 /// until 2026-08-25, because `ComposerView` was bound to `ChatStore` from its
@@ -10,9 +9,8 @@ import SwiftUI
 /// the glass pill, and attachments were written up as deferred. What actually
 /// bound them was two fields, now a `ComposerHost`; the pill, the `+`, the
 /// strip and the pickers are shared views, and this file keeps only what a
-/// card genuinely does differently: the unblock toggle, the REST approval
-/// card, and a send that posts a comment and then — in that order — lifts a
-/// block.
+/// card genuinely does differently: the REST approval card, and a send that
+/// posts a comment and then — in that order — lifts an agent-authored block.
 struct IssueDock: View {
     @ObservedObject var store: IssueStore
     @ObservedObject var staging: ComposerStaging
@@ -36,12 +34,6 @@ struct IssueDock: View {
     /// as a "just completed" flag, so it retires itself: the next keystroke
     /// makes the draft something else and the strip is live again.
     @State private var completedDraft: String?
-    /// Send the comment AND lift the block. Checked by default when an agent
-    /// is the one asking: answering a question and leaving the card parked is
-    /// almost never what somebody meant, and the unblock is what hands the run
-    /// back out carrying the answer.
-    @State private var unblockAfterSend = true
-
     /// `IssueDockUITests` addresses the field by this.
     static let fieldIdentifier = "issue.field"
 
@@ -69,8 +61,6 @@ struct IssueDock: View {
                     // this one, whose buttons have already fired.
                     .id(prompt.callId)
             }
-            answerRow
-                .padding(.horizontal, Self.rowGutter)
             if !staging.staged.isEmpty {
                 StagedStrip(
                     items: staging.staged,
@@ -124,43 +114,6 @@ struct IssueDock: View {
     }
 
     // MARK: - Composer
-
-    /// The one row above the pill, and only when an agent is waiting on an
-    /// answer: who it goes to, and whether sending also lifts the block.
-    ///
-    /// **This is a control, not a caption.** The composer HINT that used to
-    /// live here — the sentence saying what sending would do — came out on
-    /// 2026-08-26: two lines of full-width mono over every card, mostly
-    /// repeating what the state band above it already said (`WORKING @dev-1`
-    /// and then "@dev-1 is mid-run"), and never localized. The toggle stays
-    /// because it changes what the send DOES.
-    @ViewBuilder private var answerRow: some View {
-        if let question {
-            HStack(spacing: 6) {
-                Text(verbatim: lang.t("issue.answering", "@\(question.askedBy)"))
-                    .font(Theme.mono(10.5))
-                    .foregroundStyle(Theme.inkSoft)
-                Spacer(minLength: 6)
-                Button {
-                    Haptics.tap()
-                    unblockAfterSend.toggle()
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: unblockAfterSend ? "checkmark.square" : "square")
-                            .font(.system(size: 11))
-                        Text(verbatim: lang.t("issue.unblockAfterSend"))
-                            .font(Theme.mono(10.5))
-                    }
-                    .foregroundStyle(unblockAfterSend ? Theme.ink : Theme.inkSoft)
-                    .frame(minHeight: 32)
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityIdentifier("issue-unblock-toggle")
-                .accessibilityValue(Text(verbatim: unblockAfterSend ? "1" : "0"))
-            }
-        }
-    }
 
     // MARK: - Mentions
 
@@ -323,7 +276,7 @@ struct IssueDock: View {
         // holds the send, and says so on its own tile.
         guard let payload = staging.claimSend() else { return }
         Haptics.tap()
-        let lifting = question != nil && unblockAfterSend
+        let lifting = question != nil
         store.sendComment(
             payload.text,
             attachments: payload.picks.compactMap(\.attachmentRef),

@@ -517,7 +517,7 @@ and retries with the same key.
 
 Confirmation has two equivalent doors: the comment POST returns the exact
 timeline entry, or a racing timeline refresh sees the same `client_msg_id`. Whichever
-arrives first removes the outbox row and is the sole owner of a requested
-"unblock after sending" action. The exact POST entry is merged into the local
-timeline immediately; the card's wider five-route refresh is follow-up work and
-never delays the comment appearing.
+arrives first removes the outbox row and is the sole owner of the automatic
+follow-up unblock for an agent-authored question. The exact POST entry is
+merged into the local timeline immediately; the card's wider five-route refresh
+is follow-up work and never delays the comment appearing.

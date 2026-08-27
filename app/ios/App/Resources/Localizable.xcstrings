@@ -2959,23 +2959,6 @@
         }
       }
     },
-    "issue.answering": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Answers %@"
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "回复 %@"
-          }
-        }
-      }
-    },
     "issue.commentField": {
       "extractionState": "manual",
       "localizations": {
@@ -3108,23 +3091,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "停止这次运行？"
-          }
-        }
-      }
-    },
-    "issue.unblockAfterSend": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Unblock after sending"
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "发送后解除阻塞"
           }
         }
       }

@@ -178,9 +178,9 @@ Moving out of In Progress **never kills the run**; Stop is the only kill switch.
   a hover tooltip nobody had seen — so `commentHint`, `mentionHint`, the
   generator and the shared vectors are all gone, and the rule is back to ONE
   implementation, the gateway's. A client that wants to warn in advance again
-  needs a mirror and a fixture in the same commit. What stays on the dock is the
-  ANSWER row, which is a control rather than a caption: it carries "Unblock #N
-  after sending".
+  needs a mirror and a fixture in the same commit. The ANSWER row is gone too:
+  agent-authored blocks still make a successful answer lift the block, but the
+  composer does not put internal run state above the field.
 - **The mention strip** (2026-08-26): a half-typed `@` puts the board's roster
   on one scrolling row directly above the field, and a chip writes `@handle `
   over what was typed. The card's own assignee leads it — a phone shows about
@@ -224,7 +224,7 @@ Moving out of In Progress **never kills the run**; Stop is the only kill switch.
     from. Nothing is offered against an open IME composition either, or
     `@ceshi` on the way to `@测试` would be read as a handle prefix.
 - **The approval card**: `ApprovalCardView` unchanged in the dock (`CompactPillButtonStyle` lifted out of its file first), two answers; the pending set is the card's `events` replayed by `call_id` (requested without resolved). The live queue is the truth, so tolerate a 404 on answer.
-- **The Answer flow** (an agent's question): Answer from the Waiting strip or the blocked banner opens the card with the composer focused and `@lead ` prefilled, the answer row reading "Answers @lead" beside "Unblock #N after sending", checked by default → `POST comment` first, then `PATCH {blocked_reason: null}` (the unblock door hands the parked run back out, and its brief carries your answer). A block the operator wrote themselves does not get this treatment.
+- **The Answer flow** (an agent's question): Answer from the Waiting strip or the blocked banner opens the card with the composer focused and `@lead ` prefilled. The composer draws no answer/status row; sending does `POST comment` first, then automatically `PATCH {blocked_reason: null}` (the unblock door hands the parked run back out, and its brief carries your answer). A block the operator wrote themselves does not get this treatment.
 - **Rebuild is on the LIST, and the description editor has no door**
   (2026-08-26). The card's ⋯ had two unconditional entries and both went. The
   hatch belongs to the board row's long press: a card whose local copy is wrong
