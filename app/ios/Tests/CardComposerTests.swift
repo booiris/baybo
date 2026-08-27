@@ -189,12 +189,13 @@ struct CardComposerTests {
         let png = Data([0x89, 0x50, 0x4E, 0x47]).base64EncodedString()
 
         card.storeGeneratedFace(agentId: "a-dev", pngBase64: png)
-        #expect(await waitUntil { !fake.avatarsSet.isEmpty })
+        #expect(await waitUntil { !fake.generatedAvatarsSet.isEmpty })
 
         let upload = fake.blobUploadCalls.first
         #expect(upload?.mimeType == "image/png", "a native row cannot draw an SVG")
-        #expect(fake.avatarsSet.first?.agentId == "a-dev")
-        #expect(fake.avatarsSet.first?.blobId != nil)
+        #expect(fake.generatedAvatarsSet.first?.agentId == "a-dev")
+        #expect(fake.generatedAvatarsSet.first?.blobId.isEmpty == false)
+        #expect(fake.avatarsSet.isEmpty, "generated defaults never use the unconditional door")
     }
 
     /// Nobody asked for it, so a refusal costs nothing: the agent keeps the
@@ -210,9 +211,9 @@ struct CardComposerTests {
             agentId: "a-dev", pngBase64: Data([0x89]).base64EncodedString())
         #expect(await waitUntil { !fake.blobUploadCalls.isEmpty })
         // The PUT is what refuses; give its task a turn to land in.
-        _ = await waitUntil { fake.avatarsSet.count == 1 }
+        _ = await waitUntil { !fake.blobUploadCalls.isEmpty }
 
-        #expect(fake.avatarsSet.isEmpty, "a refused face sets nothing")
+        #expect(fake.generatedAvatarsSet.isEmpty, "a refused face sets nothing")
         #expect(card.writeError == nil, "and raises no banner over an untouched card")
     }
 

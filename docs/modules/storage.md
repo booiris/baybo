@@ -324,7 +324,12 @@ NULL on every legacy/non-client event. A partial unique index on
 `(issue_id, client_msg_id) WHERE client_msg_id IS NOT NULL` is the durable idempotency
 claim. `append_event_idempotent` inserts and, on a conflicting claim, reads the
 original row in the same transaction; callers receive `Inserted` versus
-`Existing` so only the winner may run domain side effects.
+`Existing`. Client-keyed inserts also write
+`comment_consequences_applied = 0`; the project manager marks it 1 after the
+comment's uncancel / mention / wake consequences finish. Existing databases add
+the column with default 1, so migration never replays historical comments whose
+old code already completed (or intentionally best-effort attempted) those
+effects.
 
 ### Deletable tables hard-delete except `cron_jobs`, `deck_cards`, `projects`, `issues` and a project's agents
 

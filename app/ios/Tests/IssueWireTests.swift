@@ -123,11 +123,12 @@ import Testing
         let json = IssueBridge.payload(
             issue: issue(), eventsJson: envelope, runs: [],
             people: ["a-dev": IssuePerson(handle: "dev-1", avatar: nil, monogram: "D1")],
-            children: [], firstUnread: "e1")
+            children: [], firstUnread: "e1", timelineLive: true)
         let decoded =
             try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any] ?? [:]
 
         #expect(decoded["firstUnread"] as? String == "e1")
+        #expect(decoded["timelineLive"] as? Bool == true)
         let events = decoded["events"] as? [[String: Any]] ?? []
         #expect(events.count == 1)
         // A kind this build has never heard of arrives intact, which is the

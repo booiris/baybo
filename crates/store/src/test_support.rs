@@ -125,6 +125,18 @@ impl AgentProfileStore for MemoryAgentProfileStore {
         Ok(true)
     }
 
+    async fn set_avatar_if_empty(&self, id: &AgentProfileId, blob_id: &str) -> Result<bool> {
+        let mut rows = self.rows.lock();
+        let Some(row) = rows.get_mut(id) else {
+            return Ok(false);
+        };
+        if row.avatar_blob_id.is_some() {
+            return Ok(false);
+        }
+        row.avatar_blob_id = Some(blob_id.to_owned());
+        Ok(true)
+    }
+
     async fn delete(&self, id: &AgentProfileId) -> Result<bool> {
         let mut rows = self.rows.lock();
         if rows.get(id).is_some_and(|row| row.team.is_some()) {

@@ -139,6 +139,9 @@ propagates immediately; their correctness concern is replay convergence
 (`should_retry` / `ReplayPolicy`), which the supervisor cannot help with; and
 the pool has its own lifecycle (two-clock staleness, TTLs, `.background`
 invalidation) whose worst case is one failed request retried on a fresh leg.
+That retry is route-specific: absolute/idempotent writes use `Converges`, while
+issue creation uses `post_json_once` / `ReplayPolicy::Never` because it carries
+no source key and a committed replay would mint a second card.
 
 The rule: **if a leg ever grows push semantics, a subscription, or any
 cross-request server-side state, it moves under the supervisor** — do not

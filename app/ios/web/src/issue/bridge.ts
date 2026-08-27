@@ -48,6 +48,9 @@ export type Person = { handle: string; avatar?: string; monogram: string };
 export type IssuePayload = {
   issue: IssueDetail;
   events: IssueEvent[];
+  /// True only after this visit fetched the timeline from the gateway. Mirror
+  /// content may paint, but it must never advance the server read cursor.
+  timelineLive?: boolean;
   pendingComments?: IssueEvent[];
   runs: IssueRun[];
   /// Agent profile id → who they are. An id that resolves to nothing prints as

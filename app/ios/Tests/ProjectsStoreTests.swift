@@ -3,6 +3,22 @@ import Testing
 
 @testable import Baybo
 
+private actor WriteFailureGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var released = false
+
+    func wait() async {
+        guard !released else { return }
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func release() {
+        released = true
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
 /// `ProjectsStore` with an injected fake: the mirror's cold paint, the REPLACE
 /// refresh, and a write's rollback.
 @MainActor
@@ -141,6 +157,36 @@ struct ProjectsStoreTests {
         #expect(store.boards["p1"]?.issues.map(\.title) == ["the parser"])
         #expect(
             store.writeError == "this issue is blocked — lift the block before running it again")
+    }
+
+    /// A rollback belongs to the optimistic version it created. If a live
+    /// refresh replaces that version while the request is suspended, restoring
+    /// the old snapshot would erase the server's newer board.
+    @Test func aFailedOlderWriteDoesNotRestoreOverANewerRefresh() async {
+        let dir = TempSupportDir()
+        let fake = FakeBayboClient()
+        fake.stubIssues = [issue(12, title: "old")]
+        let store = ProjectsStore(supportDirectory: dir.url, clientProvider: { fake })
+        await store.refreshBoard("p1")
+        let gate = WriteFailureGate()
+
+        let write = Task {
+            await store.write(
+                board: "p1",
+                apply: { $0.issues.removeAll() },
+                call: { _ in
+                    await gate.wait()
+                    throw BayboError.Other(message: "refused")
+                })
+        }
+        while store.boards["p1"]?.issues.isEmpty != true { await Task.yield() }
+
+        fake.stubIssues = [issue(12, title: "new from server")]
+        await store.refreshBoard("p1")
+        await gate.release()
+
+        #expect(await write.value == false)
+        #expect(store.boards["p1"]?.issues.map(\.title) == ["new from server"])
     }
 
     /// **A patch says one thing.** `IssuePatch` is a full replace of every

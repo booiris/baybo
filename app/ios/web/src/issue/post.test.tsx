@@ -79,10 +79,16 @@ function opened(id: string): IssueEvent {
   return { id, number: 7, actor: { kind: "user" }, body: { kind: "opened" }, created_at_ms: 1 };
 }
 
-function deliver(events: IssueEvent[], avatar?: string, pendingComments?: IssueEvent[]): void {
+function deliver(
+  events: IssueEvent[],
+  avatar?: string,
+  pendingComments?: IssueEvent[],
+  timelineLive = false,
+): void {
   const payload: IssuePayload = {
     issue: card,
     events,
+    timelineLive,
     pendingComments,
     runs: [],
     people: { "a-dev": { handle: "dev-1", monogram: "D1", avatar } },
@@ -118,6 +124,18 @@ beforeEach(() => {
 });
 
 describe("a comment is a post", () => {
+  it("waits for a live timeline before stamping the card read", () => {
+    mount();
+    deliver([comment("e1", "from disk")]);
+    expect(nativePosts.filter((post) => post.type === "issueRendered")).toHaveLength(0);
+
+    deliver([comment("e1", "from disk"), comment("e2", "from live")], undefined, undefined, true);
+    expect(nativePosts.filter((post) => post.type === "issueRendered")).toHaveLength(1);
+
+    deliver([comment("e1", "from disk"), comment("e2", "from live")], undefined, undefined, true);
+    expect(nativePosts.filter((post) => post.type === "issueRendered")).toHaveLength(1);
+  });
+
   /// The head names the author and stands OUTSIDE the box: the box holds the
   /// words and nothing else, which is what stops a comment being three nested
   /// rectangles deep.

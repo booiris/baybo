@@ -285,13 +285,14 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
     func deliver(
         issue: IssueInfo, eventsJson: String, runs: [IssueRunInfo],
         people: [String: IssuePerson], children: [IssueInfo], firstUnread: String?,
+        timelineLive: Bool,
         pendingComments: [PendingIssueComment]
     ) {
         page(
             "deliver",
             Self.payload(
                 issue: issue, eventsJson: eventsJson, runs: runs, people: people,
-                children: children, firstUnread: firstUnread,
+                children: children, firstUnread: firstUnread, timelineLive: timelineLive,
                 pendingComments: pendingComments))
     }
 
@@ -303,6 +304,7 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
     static func payload(
         issue: IssueInfo, eventsJson: String, runs: [IssueRunInfo],
         people: [String: IssuePerson], children: [IssueInfo], firstUnread: String?,
+        timelineLive: Bool = false,
         pendingComments: [PendingIssueComment] = []
     ) -> String {
         var payload: [String: Any] = [
@@ -310,6 +312,7 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
             "runs": runs.map(IssueWire.run(_:)),
             "people": people.mapValues(IssueWire.person(_:)),
             "children": children.map(IssueWire.child(_:)),
+            "timelineLive": timelineLive,
             "pendingComments": pendingComments.map { pendingComment($0, number: issue.number) },
         ]
         // Omitted rather than sent as null when there is nothing new: the page

@@ -954,6 +954,21 @@ impl BayboClient {
         .await
     }
 
+    /// Install a generated face only while the profile is still faceless.
+    /// The compare-and-set happens in the gateway, after upload, so a photo
+    /// picked while generation is in flight always wins.
+    pub async fn agent_set_avatar_if_empty(
+        self: Arc<Self>,
+        agent_id: String,
+        blob_id: String,
+    ) -> Result<(), BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::set_agent_avatar_if_empty(&client, agent_id, blob_id).await
+        })
+        .await
+    }
+
     /// Take an agent off a board. Refused for the lead, and for an agent
     /// with a run in flight.
     pub async fn project_remove_agent(

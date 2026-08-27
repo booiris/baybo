@@ -669,12 +669,20 @@ impl IssueEventClientMsgId {
     }
 }
 
-/// Result of claiming a client comment id. `Existing` is the original row:
-/// callers return it without repeating any comment side effects.
+/// A client-keyed comment plus the durable completion bit for the consequences
+/// that follow its timeline insert.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdempotentIssueEvent {
+    pub event: IssueEventRow,
+    pub consequences_applied: bool,
+}
+
+/// Result of claiming a client comment id. An existing row whose consequences
+/// are unfinished must be re-driven before the original response is returned.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IssueEventAppendOutcome {
     Inserted(IssueEventRow),
-    Existing(IssueEventRow),
+    Existing(IdempotentIssueEvent),
 }
 
 /// What a caller supplies to append to a timeline.
@@ -843,7 +851,11 @@ pub trait ProjectStore: Send + Sync {
         &self,
         issue: &IssueId,
         client_msg_id: &IssueEventClientMsgId,
-    ) -> Result<Option<IssueEventRow>>;
+    ) -> Result<Option<IdempotentIssueEvent>>;
+
+    /// Complete the durable insert → consequences handoff for one
+    /// client-keyed comment. Returns false if no such event exists.
+    async fn mark_comment_consequences_applied(&self, event: &IssueEventId) -> Result<bool>;
 
     async fn list_events(&self, issue: &IssueId) -> Result<Vec<IssueEventRow>>;
 

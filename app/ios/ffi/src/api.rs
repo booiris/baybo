@@ -1037,6 +1037,9 @@ pub struct IssuePatch {
     pub cancelled: Option<bool>,
     /// `0` detaches the card from its parent.
     pub parent: Option<i64>,
+    /// Explicit detach intent for callers that do not use the legacy `0`
+    /// sentinel. Detach wins if both fields are supplied.
+    pub detach_parent: bool,
     pub stage: Option<i64>,
     /// A reading order and nothing else: it never touches `position`, and
     /// the board does not take work out of Todo by it.

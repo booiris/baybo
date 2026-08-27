@@ -9,14 +9,15 @@ import Testing
 struct IssueMirrorTests {
     private func issue(
         _ number: Int64, title: String = "the dial loop",
-        attachments: [IssueAttachmentInfo] = [], blocked: String? = nil
+        attachments: [IssueAttachmentInfo] = [], blocked: String? = nil,
+        approvalPending: Bool = true
     ) -> IssueInfo {
         IssueInfo(
             number: number, projectId: "p1", title: title, description: "why",
             attachments: attachments, status: .inProgress, priority: .high, assignee: "a-dev",
             position: 3, pinned: false, branch: "b", blockedReason: blocked, parent: nil,
             filedFrom: nil, stage: 0, subIssues: SubIssueProgress(done: 1, total: 2), unread: 2,
-            lastRunFailed: false, approvalPending: true, openedByAgent: false,
+            lastRunFailed: false, approvalPending: approvalPending, openedByAgent: false,
             cancelledAtMs: nil, createdAtMs: 1, updatedAtMs: 2)
     }
 
@@ -189,6 +190,86 @@ struct IssueMirrorTests {
         #expect(second.isFromMirror, "a failed fetch confirms nothing")
         #expect(second.pendingApprovals.isEmpty)
         #expect(second.issue != nil, "and the cached content stays on screen")
+    }
+
+    /// A card response cannot vouch for the independently fetched control
+    /// planes. The cached run and prompt still paint as content here, but a
+    /// failed run/timeline fetch must not expose Stop or Approve.
+    @Test func oneSuccessfulPlaneDoesNotArmFailedMirroredControlPlanes() async {
+        let dir = TempSupportDir()
+        _ = await seeded(dir)
+
+        let partial = FakeBayboClient()
+        partial.stubIssueDetail = issue(41, title: "live card only")
+        let store = IssueStore(
+            projectId: "p1", number: 41, client: partial, supportDirectory: dir.url)
+        await store.refresh()
+
+        #expect(!store.isFromMirror, "the card itself did answer live")
+        #expect(store.runs.count == 1, "cached content stays visible")
+        #expect(store.events.count == 1)
+        #expect(store.liveRun == nil, "but the failed run plane cannot arm Stop")
+        #expect(store.pendingApprovals.isEmpty, "nor can the failed timeline arm Approve")
+    }
+
+    @Test func historicalPromptsStayHiddenWhenTheLiveCardHasNoApproval() async {
+        let dir = TempSupportDir()
+        let fake = FakeBayboClient()
+        fake.stubIssueDetail = issue(41, approvalPending: false)
+        fake.stubIssueEventsJson = """
+            {"items":[{"id":"e1","number":41,"actor":{"kind":"agent","id":"a-dev","handle":"dev-1"},
+             "created_at_ms":1,"body":{"kind":"approval_requested","call_id":"dead","tool":"exec","summary":"old"}}]}
+            """
+        let store = IssueStore(
+            projectId: "p1", number: 41, client: fake, supportDirectory: dir.url)
+        await store.refresh()
+
+        #expect(store.events.count == 1, "history still renders")
+        #expect(store.pendingApprovals.isEmpty, "live gate state says nobody is listening")
+    }
+
+    @Test func aGoneApprovalIsRetiredSoTheNextLivePromptIsReachable() async {
+        let dir = TempSupportDir()
+        let fake = FakeBayboClient()
+        fake.stubIssueDetail = issue(41)
+        fake.stubIssueEventsJson = """
+            {"items":[
+              {"id":"e1","number":41,"actor":{"kind":"agent","id":"a-dev","handle":"dev-1"},"created_at_ms":1,
+               "body":{"kind":"approval_requested","call_id":"gone","tool":"exec","summary":"old"}},
+              {"id":"e2","number":41,"actor":{"kind":"agent","id":"a-dev","handle":"dev-1"},"created_at_ms":2,
+               "body":{"kind":"approval_requested","call_id":"live","tool":"exec","summary":"new"}}
+            ]}
+            """
+        let store = IssueStore(
+            projectId: "p1", number: 41, client: fake, supportDirectory: dir.url)
+        await store.refresh()
+        #expect(store.pendingApprovals.map(\.callId) == ["gone", "live"])
+
+        fake.approvalResolveError = BayboError.Other(message: "404 approval call not found")
+        store.resolveApproval(callId: "gone", decision: .deny)
+
+        #expect(store.pendingApprovals.map(\.callId) == ["live"])
+        #expect(await waitUntil { fake.approvalsResolved.count == 1 })
+        #expect(await waitUntil { fake.issueDetailCalls >= 2 }, "a gone call triggers reconciliation")
+        #expect(store.writeError == nil, "a dead historical call is retired, not raised as a write failure")
+    }
+
+    @Test func anOlderRefreshCannotOverwriteANewerOne() async {
+        let dir = TempSupportDir()
+        let fake = FakeBayboClient()
+        fake.stubIssueDetail = issue(41, title: "old")
+        fake.issueDetailStallMs = 150
+        let store = IssueStore(
+            projectId: "p1", number: 41, client: fake, supportDirectory: dir.url)
+
+        let older = Task { await store.refresh() }
+        #expect(await waitUntil { fake.issueDetailCalls == 1 })
+        fake.stubIssueDetail = issue(41, title: "new")
+        fake.issueDetailStallMs = 0
+        await store.refresh()
+        await older.value
+
+        #expect(store.issue?.title == "new")
     }
 
     /// A card page draws its files; the board never did, so the shape gained a

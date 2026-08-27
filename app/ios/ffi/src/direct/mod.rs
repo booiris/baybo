@@ -208,6 +208,17 @@ impl GatewayJsonClient for DirectHttp {
         }
     }
 
+    fn post_json_once<'a, T>(
+        &'a self,
+        path: &'a str,
+        body: Vec<u8>,
+    ) -> impl std::future::Future<Output = Result<T, String>> + Send + 'a
+    where
+        T: DeserializeOwned + Send + 'static,
+    {
+        self.post_json(path, body)
+    }
+
     fn patch_json<'a, T>(
         &'a self,
         path: &'a str,

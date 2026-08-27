@@ -7,11 +7,11 @@ use rusqlite::OptionalExtension;
 use super::SqlitePool;
 use baybo_store::StorageError;
 use baybo_store::project::{
-    ACTOR_AGENT_PREFIX, AttentionCounts, BoardActivity, CardSignals, DrainMarks, IssueActor,
-    IssueAttachment, IssueEventAppendOutcome, IssueEventBody, IssueEventClientMsgId, IssueEventRow,
-    IssuePriority, IssueRow, IssueRunRow, IssueStatus, IssueUpdate, NewIssue, NewIssueEvent,
-    NewIssueRun, ProjectRow, ProjectStore, ProjectUpdate, Result, RunSpend, RunStatus, RunTrigger,
-    SettledRunFacts, Spend,
+    ACTOR_AGENT_PREFIX, AttentionCounts, BoardActivity, CardSignals, DrainMarks,
+    IdempotentIssueEvent, IssueActor, IssueAttachment, IssueEventAppendOutcome, IssueEventBody,
+    IssueEventClientMsgId, IssueEventRow, IssuePriority, IssueRow, IssueRunRow, IssueStatus,
+    IssueUpdate, NewIssue, NewIssueEvent, NewIssueRun, ProjectRow, ProjectStore, ProjectUpdate,
+    Result, RunSpend, RunStatus, RunTrigger, SettledRunFacts, Spend,
 };
 
 pub struct SqliteProjectStore {
@@ -67,6 +67,7 @@ impl SqliteProjectStore {
         let body = serde_json::to_string(&row.body)
             .map_err(|e| StorageError::Storage(format!("serialize issue event: {e}")))?;
         let created = super::time::to_us(row.created_at);
+        let consequences_applied = row.client_msg_id.is_none();
         let client_msg_id = row.client_msg_id.as_ref().map(|id| id.as_str().to_owned());
         let existing = self
             .pool
@@ -74,8 +75,8 @@ impl SqliteProjectStore {
                 let tx = conn.transaction()?;
                 let inserted = tx.execute(
                     "INSERT INTO issue_events (id, issue_id, project_id, number, actor, kind, \
-                     body, created_at, client_msg_id) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+                     body, created_at, client_msg_id, comment_consequences_applied) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
                      ON CONFLICT DO NOTHING",
                     rusqlite::params![
                         id,
@@ -86,7 +87,8 @@ impl SqliteProjectStore {
                         kind,
                         body,
                         created,
-                        client_msg_id
+                        client_msg_id,
+                        consequences_applied,
                     ],
                 )?;
                 if inserted == 1 {
@@ -118,14 +120,16 @@ impl SqliteProjectStore {
             })
             .await?;
         match existing {
-            Some(raw) => Ok(IssueEventAppendOutcome::Existing(event_from_raw(raw)?)),
+            Some(raw) => Ok(IssueEventAppendOutcome::Existing(
+                idempotent_event_from_raw(raw)?,
+            )),
             None => Ok(IssueEventAppendOutcome::Inserted(row)),
         }
     }
 }
 
-const EVENT_COLUMNS: &str =
-    "id, issue_id, project_id, number, actor, body, created_at, client_msg_id";
+const EVENT_COLUMNS: &str = "id, issue_id, project_id, number, actor, body, created_at, client_msg_id, \
+     comment_consequences_applied";
 
 type RawEvent = (
     String,
@@ -136,6 +140,7 @@ type RawEvent = (
     String,
     i64,
     Option<String>,
+    bool,
 );
 
 fn read_raw_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawEvent> {
@@ -148,11 +153,12 @@ fn read_raw_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawEvent> {
         row.get(5)?,
         row.get(6)?,
         row.get(7)?,
+        row.get(8)?,
     ))
 }
 
 fn event_from_raw(raw: RawEvent) -> Result<IssueEventRow> {
-    let (id, issue_id, project_id, number, actor, body, created_at, client_msg_id) = raw;
+    let (id, issue_id, project_id, number, actor, body, created_at, client_msg_id, _) = raw;
     Ok(IssueEventRow {
         id: baybo_model::IssueEventId::from(id),
         issue_id: IssueId::from(issue_id),
@@ -171,6 +177,14 @@ fn event_from_raw(raw: RawEvent) -> Result<IssueEventRow> {
             })
             .transpose()?,
         created_at: ts("issue_events.created_at", created_at)?,
+    })
+}
+
+fn idempotent_event_from_raw(raw: RawEvent) -> Result<IdempotentIssueEvent> {
+    let consequences_applied = raw.8;
+    Ok(IdempotentIssueEvent {
+        event: event_from_raw(raw)?,
+        consequences_applied,
     })
 }
 
@@ -1531,7 +1545,7 @@ impl ProjectStore for SqliteProjectStore {
         &self,
         issue: &IssueId,
         client_msg_id: &IssueEventClientMsgId,
-    ) -> Result<Option<IssueEventRow>> {
+    ) -> Result<Option<IdempotentIssueEvent>> {
         let issue = issue.as_str().to_owned();
         let client_msg_id = client_msg_id.as_str().to_owned();
         let raw = self
@@ -1549,7 +1563,28 @@ impl ProjectStore for SqliteProjectStore {
                     .optional()?)
             })
             .await?;
-        raw.map(event_from_raw).transpose()
+        raw.map(idempotent_event_from_raw).transpose()
+    }
+
+    async fn mark_comment_consequences_applied(
+        &self,
+        event: &baybo_model::IssueEventId,
+    ) -> Result<bool> {
+        let event = event.as_str().to_owned();
+        let affected = self
+            .pool
+            .interact_write(
+                "issue_events.mark_comment_consequences_applied",
+                move |conn| {
+                    Ok(conn.execute(
+                        "UPDATE issue_events SET comment_consequences_applied = 1 \
+                     WHERE id = ?1 AND client_msg_id IS NOT NULL",
+                        rusqlite::params![event],
+                    )?)
+                },
+            )
+            .await?;
+        Ok(affected > 0)
     }
 
     async fn list_events(&self, issue: &IssueId) -> Result<Vec<IssueEventRow>> {
@@ -2548,17 +2583,23 @@ mod tests {
             IssueEventAppendOutcome::Existing(row) => row,
             IssueEventAppendOutcome::Inserted(_) => panic!("the retry inserted a second row"),
         };
-        assert_eq!(first.id, second.id);
-        assert_eq!(second.client_msg_id.as_ref(), Some(&client_msg_id));
-        assert_eq!(store.list_events(&issue.id).await.unwrap().len(), 1);
-        assert_eq!(
+        assert_eq!(first.id, second.event.id);
+        assert_eq!(second.event.client_msg_id.as_ref(), Some(&client_msg_id));
+        assert!(!second.consequences_applied);
+        assert!(
             store
-                .event_by_client_msg_id(&issue.id, &client_msg_id)
+                .mark_comment_consequences_applied(&first.id)
                 .await
                 .unwrap()
-                .map(|row| row.id),
-            Some(first.id)
         );
+        assert_eq!(store.list_events(&issue.id).await.unwrap().len(), 1);
+        let completed = store
+            .event_by_client_msg_id(&issue.id, &client_msg_id)
+            .await
+            .unwrap()
+            .expect("comment");
+        assert_eq!(completed.event.id, first.id);
+        assert!(completed.consequences_applied);
     }
 
     #[tokio::test]

@@ -3448,6 +3448,11 @@ export interface components {
              *     the avatar.
              */
             blob_id?: string | null;
+            /**
+             * @description Compare-and-set mode for generated defaults: if the profile acquired
+             *     an avatar since the caller read it, leave that newer choice untouched.
+             */
+            only_if_empty?: boolean;
         };
         /** @description Request body for the per-agent identity-file writes. */
         SetAgentIdentityFileRequest: {

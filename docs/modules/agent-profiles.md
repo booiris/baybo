@@ -208,6 +208,7 @@ pub trait AgentProfileStore: Send + Sync {
     async fn create(&self, row: &AgentProfileRow) -> Result<()>;     // duplicate id → Conflict; never binds `builtin`
     async fn update(&self, id: &AgentProfileId, update: &AgentProfileUpdate) -> Result<bool>; // reaches the builtin, never its framework
     async fn set_avatar(&self, id: &AgentProfileId, blob_id: Option<&str>) -> Result<bool>;   // builtin allowed
+    async fn set_avatar_if_empty(&self, id: &AgentProfileId, blob_id: &str) -> Result<bool>;  // generated default CAS
     async fn set_llm(&self, id: &AgentProfileId, pin: &LlmPin) -> Result<bool>;             // whole pin; never the builtin
     async fn delete(&self, id: &AgentProfileId) -> Result<bool>;     // WHERE builtin = 0 AND project_id IS NULL; plain row DELETE
     async fn remove_from_team(&self, id: &AgentProfileId) -> Result<bool>;                  // stamps `deleted_at`
@@ -231,7 +232,7 @@ Route module `crates/gateway/src/api/admin/agents.rs`, tag `agents`, DTOs inline
 | `DELETE /v1/agents/{agent_id}` | 204 | 400 builtin; 401, 404 |
 
 - `POST` body = full content state (`name` required; `description` defaults empty; `framework` defaults `baybo`; nullable fields absent = `NULL`) **plus** optional `avatar_blob_id` — create can't hit the builtin lock, so no avatar asymmetry is needed there. `PUT` body = the same shape minus `avatar_blob_id`, with `name`/`description`/`framework` required.
-- `PUT …/avatar` body = `{ "blob_id": "sha256:…" | null }`; `null` clears the avatar.
+- `PUT …/avatar` body = `{ "blob_id": "sha256:…" | null, "only_if_empty": bool }`; `null` clears the avatar. `only_if_empty: true` requires a blob id and atomically leaves an avatar chosen since the caller's read untouched; generated defaults use this compare-and-set door, explicit operator edits do not.
 - `PUT …/model` body = `{ llm, model, reasoning_effort }`, each nullable — the **whole pin, replaced as one**, deliberately named the same as `SetSessionModelRequest` so the two write surfaces read identically. An empty body clears the pin entirely rather than leaving two thirds of it pointing at an entry the agent no longer uses. The same three fields are optional on `POST /v1/agents` and on the board's `POST /v1/projects/{project_id}/agents`, so a hire can be staffed in one call.
 - Builtin refusals are `GatewayError::BadRequest` (the admin surface's "operation not allowed" convention — there is no `Forbidden` variant), with the store's `builtin = 0` guard as backstop.
 - `AdminState` carries `agent_profile_store` and `blob_store` (for the avatar `stat`), both off `deps.stores`.

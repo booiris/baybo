@@ -123,6 +123,19 @@ final class IssueStore: ObservableObject, WebMediaTarget {
     /// those drive controls that ACT. Content paints from the mirror; anything
     /// that presses a live queue waits for the network.
     @Published private(set) var isFromMirror = false
+    /// Freshness is tracked for each response that can arm a control. A live
+    /// card response says nothing about whether the independently fetched run
+    /// log or timeline is live too.
+    private var issueIsLive = false
+    private var timelineIsLive = false
+    private var runsAreLive = false
+    /// Only the newest refresh may commit. Actor reentrancy lets a second
+    /// invalidation finish while the first refresh is suspended in I/O.
+    private var refreshGeneration: UInt64 = 0
+    /// A historical approval row outlives its live gateway call. Once the
+    /// gateway says a call is gone, keep it out of the actionable queue so a
+    /// newer live prompt behind it remains reachable.
+    @Published private var retiredApprovalCallIds: Set<String> = []
     /// The card is stamped read once its timeline has rendered, and once —
     /// re-stamping per delivery would spend a round trip per comment.
     private var stampedRead = false
@@ -232,8 +245,12 @@ final class IssueStore: ObservableObject, WebMediaTarget {
                 return
             }
         #endif
+        refreshGeneration &+= 1
+        let generation = refreshGeneration
         isRefreshing = true
-        defer { isRefreshing = false }
+        defer {
+            if refreshGeneration == generation { isRefreshing = false }
+        }
         async let issue = try? client.projectIssueGet(projectId: projectId, number: number)
         async let eventsJson = try? client.projectIssueEvents(
             projectId: projectId, number: number)
@@ -241,29 +258,38 @@ final class IssueStore: ObservableObject, WebMediaTarget {
         async let team = try? client.projectTeam(projectId: projectId)
         async let siblings = try? client.projectIssues(projectId: projectId)
 
-        let fetchedIssue = await issue
+        let fetched = await (issue, eventsJson, runs, team, siblings)
+        guard refreshGeneration == generation else { return }
+        let (fetchedIssue, fetchedEventsJson, fetchedRuns, fetchedTeam, fetchedSiblings) = fetched
         if let fetchedIssue { self.issue = fetchedIssue }
-        if let json = await eventsJson {
+        if let json = fetchedEventsJson {
             self.eventsJson = json
             let timeline =
                 (try? IssueEvent.decodeTimeline(json)) ?? (events: [], firstUnread: nil)
             events = timeline.events
             firstUnread = timeline.firstUnread
+            timelineIsLive = true
             reconcileConfirmedComments()
         }
         // The log carries totals beside the rows; the page prints the rows and
         // the totals belong to a screen that does not exist yet (P7).
-        if let fetched = await runs { self.runs = fetched.runs }
-        if let fetched = await team { self.team = fetched }
+        if let fetchedRuns {
+            self.runs = fetchedRuns.runs
+            runsAreLive = true
+        }
+        if let fetchedTeam { self.team = fetchedTeam }
         // Children come from the board: the card DTO carries a done/total
         // count and no list at all.
-        if let fetched = await siblings {
-            children = fetched.filter { $0.parent == number }
+        if let fetchedSiblings {
+            children = fetchedSiblings.filter { $0.parent == number }
         }
         // THIS fetch's own answer, not `self.issue` — that is non-nil the
         // moment a mirror loads, so reading it would arm the live controls off
         // a cached card the network never confirmed.
-        if fetchedIssue != nil { isFromMirror = false }
+        if fetchedIssue != nil {
+            issueIsLive = true
+            isFromMirror = false
+        }
         persistMirror()
         deliver()
         resumePersistedComments()
@@ -387,6 +413,10 @@ final class IssueStore: ObservableObject, WebMediaTarget {
         pageState = nil
         // Nothing is from a mirror any more, because nothing is here at all.
         isFromMirror = false
+        issueIsLive = false
+        timelineIsLive = false
+        runsAreLive = false
+        refreshGeneration &+= 1
         stampedRead = false
         bridge?.rebuild()
         Task { await refresh() }
@@ -577,10 +607,21 @@ final class IssueStore: ObservableObject, WebMediaTarget {
     }
 
     func resolveApproval(callId: String, decision: IssueApprovalDecision) {
+        retiredApprovalCallIds.insert(callId)
+        writeError = nil
         Task {
-            await write { [projectId, number] client in
+            do {
                 try await client.projectIssueApprovalResolve(
                     projectId: projectId, number: number, callId: callId, decision: decision)
+                await refresh()
+            } catch {
+                let message = ProjectsStore.message(from: error)
+                if ProjectsStore.readsAsGone(message) {
+                    await refresh()
+                } else {
+                    retiredApprovalCallIds.remove(callId)
+                    writeError = message
+                }
             }
         }
     }
@@ -614,7 +655,7 @@ final class IssueStore: ObservableObject, WebMediaTarget {
                     patch: IssuePatch(
                         title: nil, description: nil, attachments: nil, priority: nil,
                         assignee: .keep, blockedReason: .clear, cancelled: nil, parent: nil,
-                        stage: nil, pinned: nil))
+                        detachParent: false, stage: nil, pinned: nil))
             }
         }
     }
@@ -647,7 +688,7 @@ final class IssueStore: ObservableObject, WebMediaTarget {
         Task { [client, projectId] in
             do {
                 let blobId = try await AgentFaceUpload.put(data, client: client)
-                try await client.agentSetAvatar(agentId: agentId, blobId: blobId)
+                try await client.agentSetAvatarIfEmpty(agentId: agentId, blobId: blobId)
             } catch {
                 NSLog("baybo: generated face for %@: %@", agentId, bayboErrorText(error))
                 return
@@ -705,7 +746,7 @@ final class IssueStore: ObservableObject, WebMediaTarget {
         #if DEBUG
             if isDemoCard { return }
         #endif
-        guard !stampedRead else { return }
+        guard timelineIsLive, !stampedRead else { return }
         // Latched BEFORE the await so a second `issueRendered` in the same
         // breath cannot send twice, and cleared again if the send failed —
         // otherwise one lost POST leaves the card unread for this screen's
@@ -739,7 +780,7 @@ final class IssueStore: ObservableObject, WebMediaTarget {
     /// header's Stop — a button that would then be offering to stop something
     /// already over.
     var liveRun: IssueRunInfo? {
-        guard !isFromMirror else { return nil }
+        guard runsAreLive else { return nil }
         return runs.first { $0.settledAtMs == nil }
     }
 
@@ -750,8 +791,10 @@ final class IssueStore: ObservableObject, WebMediaTarget {
     /// replayed off disk would offer an answer to something that stopped
     /// listening hours ago.
     var pendingApprovals: [IssueApprovalPrompt] {
-        guard !isFromMirror else { return [] }
-        return IssueTimeline.pendingApprovals(in: events)
+        guard issueIsLive, timelineIsLive, issue?.approvalPending == true else { return [] }
+        return IssueTimeline.pendingApprovals(in: events).filter {
+            !retiredApprovalCallIds.contains($0.callId)
+        }
     }
 
     func handle(forAgent agentId: String) -> String {
@@ -769,7 +812,7 @@ final class IssueStore: ObservableObject, WebMediaTarget {
         guard let issue else { return }
         bridge?.deliver(
             issue: issue, eventsJson: eventsJson, runs: runs, people: people,
-            children: children, firstUnread: firstUnread,
+            children: children, firstUnread: firstUnread, timelineLive: timelineIsLive,
             pendingComments: pendingComments)
     }
 
@@ -909,6 +952,9 @@ extension IssueStore: ComposerHost {
             // said, so the controls a mirror withholds — Stop, the run rows —
             // are armed and therefore paintable.
             isFromMirror = false
+            issueIsLive = true
+            timelineIsLive = true
+            runsAreLive = true
             return true
         }
 

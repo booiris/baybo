@@ -71,6 +71,10 @@ final class ProjectsStore: ObservableObject {
     private lazy var client: any BayboClientProtocol = clientProvider()
     private let clientProvider: () -> any BayboClientProtocol
     private let supportDirectory: URL
+    /// Every local board replacement gets a revision. A write suspends while
+    /// its request is in flight, so its rollback may only restore the snapshot
+    /// if no refresh or newer write has replaced that board meanwhile.
+    private var boardRevisions: [String: UInt64] = [:]
 
     /// Board refetches in flight, kept so tests can await them and so a burst
     /// of frames collapses into one fetch per board.
@@ -186,6 +190,18 @@ final class ProjectsStore: ObservableObject {
         try? data.write(to: url, options: .atomic)
     }
 
+    @discardableResult
+    private func replaceBoard(_ board: Board?, projectId: String) -> UInt64 {
+        let revision = boardRevisions[projectId, default: 0] &+ 1
+        boardRevisions[projectId] = revision
+        if let board {
+            boards[projectId] = board
+        } else {
+            boards.removeValue(forKey: projectId)
+        }
+        return revision
+    }
+
     /// Drop every board this gateway owns. Called on logout and rebind — the
     /// boards belong to the departing gateway, and a mirror that outlived one
     /// is a board from somebody else's account.
@@ -248,9 +264,11 @@ final class ProjectsStore: ObservableObject {
             let issues = try await client.projectIssues(projectId: projectId)
             let runs = try await client.projectActiveRuns(projectId: projectId)
             let team = try await client.projectTeam(projectId: projectId)
-            boards[projectId] = Board(
-                issues: issues, runs: runs, team: team,
-                fetchedAtMs: Int64(Date().timeIntervalSince1970 * 1000))
+            replaceBoard(
+                Board(
+                    issues: issues, runs: runs, team: team,
+                    fetchedAtMs: Int64(Date().timeIntervalSince1970 * 1000)),
+                projectId: projectId)
             isOffline = false
             persistBoard(projectId)
         } catch {
@@ -320,9 +338,10 @@ final class ProjectsStore: ObservableObject {
     /// Run one board write with the mirror as its undo.
     ///
     /// `apply` moves the local board immediately so the press lands, `call`
-    /// does the write, and a failure restores the board **exactly as it was**
-    /// — the snapshot, never the inverse of the optimistic edit, which is the
-    /// same discipline `SessionIndex` rolls back by. The server's own sentence
+    /// does the write, and a failure restores the snapshot only while that
+    /// optimistic revision is still current. A superseding change is reconciled
+    /// from the server instead of being overwritten by a stale snapshot. The
+    /// server's own sentence
     /// is surfaced verbatim: the board's refusals name which ceiling, which
     /// block, which card holds the slot, and a paraphrase loses the only part
     /// the operator can act on.
@@ -344,16 +363,17 @@ final class ProjectsStore: ObservableObject {
             if isDemo {
                 if var board = boards[projectId] {
                     apply(&board)
-                    boards[projectId] = board
+                    replaceBoard(board, projectId: projectId)
                 }
                 writeError = nil
                 return true
             }
         #endif
         let snapshot = boards[projectId]
+        var optimisticRevision: UInt64?
         if var board = snapshot {
             apply(&board)
-            boards[projectId] = board
+            optimisticRevision = replaceBoard(board, projectId: projectId)
         }
         writeError = nil
         do {
@@ -365,7 +385,13 @@ final class ProjectsStore: ObservableObject {
             scheduleRootRefresh()
             return true
         } catch {
-            boards[projectId] = snapshot
+            if let optimisticRevision,
+                boardRevisions[projectId] == optimisticRevision
+            {
+                replaceBoard(snapshot, projectId: projectId)
+            } else if optimisticRevision != nil {
+                await refreshBoard(projectId)
+            }
             writeError = Self.message(from: error)
             return false
         }
@@ -669,13 +695,13 @@ final class ProjectsStore: ObservableObject {
         IssuePatch(
             title: nil, description: nil, attachments: nil, priority: priority,
             assignee: assignee, blockedReason: blockedReason, cancelled: cancelled, parent: nil,
-            stage: nil, pinned: pinned)
+            detachParent: false, stage: nil, pinned: pinned)
     }
 
     /// Whether the server's refusal was "that prompt no longer exists". The
     /// gateway answers a stale `call_id` with a 404 whose body says so, and
     /// `BayboError.Other` carries that sentence verbatim.
-    private static func readsAsGone(_ message: String?) -> Bool {
+    static func readsAsGone(_ message: String?) -> Bool {
         guard let message = message?.lowercased() else { return false }
         return message.contains("404") || message.contains("not found")
     }

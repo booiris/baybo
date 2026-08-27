@@ -527,6 +527,11 @@ const ADD_COLUMNS: &[AddColumn] = &[
         definition: "TEXT",
     },
     AddColumn {
+        table: "issue_events",
+        column: "comment_consequences_applied",
+        definition: "INTEGER NOT NULL DEFAULT 1",
+    },
+    AddColumn {
         table: "projects",
         column: "rules_changed_at",
         definition: "INTEGER",
@@ -1730,6 +1735,10 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     -- UUID minted by a client for an operator comment.
                     -- NULL for every other timeline event.
                     client_msg_id TEXT,
+                    -- Client-keyed comments insert 0, then flip to 1 after
+                    -- uncancel / mention / wake consequences finish. Existing
+                    -- rows default complete so a migration replays nothing.
+                    comment_consequences_applied INTEGER NOT NULL DEFAULT 1,
                     created_at INTEGER NOT NULL
                 );
                 -- Reading order for one issue, and the range scan a

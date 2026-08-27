@@ -112,7 +112,7 @@ export function IssuePage({
   /// card: a card whose timeline threw has not been read, and re-stamping on
   /// every delivery would spend a round trip per comment.
   useEffect(() => {
-    if (!payload) return;
+    if (payload?.timelineLive !== true) return;
     const key = `${payload.issue.project_id}#${payload.issue.number}`;
     if (renderedFor.current === key) return;
     renderedFor.current = key;

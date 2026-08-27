@@ -569,9 +569,12 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     private var _stubProjects: [ProjectInfo] = []
     private var _stubIssues: [IssueInfo] = []
     private var _stubIssueDetail: IssueInfo?
+    private var _issueDetailStallMs = 0
+    private var _issueDetailCalls = 0
     private var _stubIssueEventsJson: String?
     private var _stubRunLog: IssueRunLog?
     private var _approvalsResolved: [(Int64, String, IssueApprovalDecision)] = []
+    private var _approvalResolveError: Error?
     private var _stubRuns: [IssueRunInfo] = []
     private var _stubTeam: [TeamMemberInfo] = []
     private var _stubAttention: [ProjectAttention] = []
@@ -601,6 +604,11 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
         get { lock.withLock { _stubIssueDetail } }
         set { lock.withLock { _stubIssueDetail = newValue } }
     }
+    var issueDetailStallMs: Int {
+        get { lock.withLock { _issueDetailStallMs } }
+        set { lock.withLock { _issueDetailStallMs = newValue } }
+    }
+    var issueDetailCalls: Int { lock.withLock { _issueDetailCalls } }
     var stubIssueEventsJson: String? {
         get { lock.withLock { _stubIssueEventsJson } }
         set { lock.withLock { _stubIssueEventsJson = newValue } }
@@ -614,6 +622,10 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     var approvalsResolved: [(Int64, String, IssueApprovalDecision)] {
         get { lock.withLock { _approvalsResolved } }
         set { lock.withLock { _approvalsResolved = newValue } }
+    }
+    var approvalResolveError: Error? {
+        get { lock.withLock { _approvalResolveError } }
+        set { lock.withLock { _approvalResolveError = newValue } }
     }
     var stubRuns: [IssueRunInfo] {
         get { lock.withLock { _stubRuns } }
@@ -676,8 +688,13 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     }
     func projectIssueGet(projectId: String, number: Int64) async throws -> IssueInfo {
         try refuseIfOffline()
-        guard let stubIssueDetail else { throw Self.unsupported }
-        return stubIssueDetail
+        let (detail, stall) = lock.withLock {
+            _issueDetailCalls += 1
+            return (_stubIssueDetail, _issueDetailStallMs)
+        }
+        if stall > 0 { try? await Task.sleep(for: .milliseconds(stall)) }
+        guard let detail else { throw Self.unsupported }
+        return detail
     }
     func projectIssueCreate(projectId: String, new: NewIssue) async throws -> IssueInfo {
         throw Self.unsupported
@@ -797,7 +814,11 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
         projectId: String, number: Int64, callId: String, decision: IssueApprovalDecision
     ) async throws {
         try refuseIfOffline()
-        approvalsResolved.append((number, callId, decision))
+        let error = lock.withLock {
+            _approvalsResolved.append((number, callId, decision))
+            return _approvalResolveError
+        }
+        if let error { throw error }
     }
     func projectIssueRead(projectId: String, number: Int64) async throws {
         try refuseIfOffline()
@@ -818,6 +839,11 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     func agentSetAvatar(agentId: String, blobId: String?) async throws {
         try refuseIfOffline()
         avatarsSet.append((agentId, blobId))
+    }
+    var generatedAvatarsSet: [(agentId: String, blobId: String)] = []
+    func agentSetAvatarIfEmpty(agentId: String, blobId: String) async throws {
+        try refuseIfOffline()
+        generatedAvatarsSet.append((agentId, blobId))
     }
 
     func agentSetModel(

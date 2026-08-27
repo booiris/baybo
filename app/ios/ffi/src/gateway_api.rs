@@ -48,6 +48,17 @@ pub(crate) trait GatewayJsonClient {
     where
         T: DeserializeOwned + Send + 'static;
 
+    /// POST a non-idempotent create and decode what came back. Relay mode
+    /// never replays this after pooled-leg silence: the gateway may already
+    /// have committed the first request without returning its response head.
+    fn post_json_once<'a, T>(
+        &'a self,
+        path: &'a str,
+        body: Vec<u8>,
+    ) -> impl Future<Output = Result<T, String>> + Send + 'a
+    where
+        T: DeserializeOwned + Send + 'static;
+
     /// PATCH a sparse body and decode what came back.
     ///
     /// Distinct from [`Self::put_empty`] in both halves: a board's card is
@@ -1808,6 +1819,8 @@ struct UpdateIssueRequest<'a> {
     cancelled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     parent: Option<i64>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    detach_parent: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     stage: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1963,7 +1976,7 @@ pub(crate) async fn create_issue<C: GatewayJsonClient + Sync>(
         stage: new.stage,
     })
     .map_err(|e| format!("encode new issue: {e}"))?;
-    let wire: WireIssue = client.post_json(&path, body).await?;
+    let wire: WireIssue = client.post_json_once(&path, body).await?;
     Ok(wire.into())
 }
 
@@ -1975,6 +1988,8 @@ pub(crate) async fn patch_issue<C: GatewayJsonClient + Sync>(
 ) -> Result<IssueInfo, String> {
     let path = issue_path(&project, number)?;
     let priority = patch.priority.map(priority_wire).transpose()?;
+    let detach_parent = patch.detach_parent || patch.parent.is_some_and(|parent| parent <= 0);
+    let parent = patch.parent.filter(|parent| *parent > 0);
     let body = serde_json::to_vec(&UpdateIssueRequest {
         title: patch.title.as_deref(),
         description: patch.description.as_deref(),
@@ -1990,7 +2005,8 @@ pub(crate) async fn patch_issue<C: GatewayJsonClient + Sync>(
         assignee: patch_field(&patch.assignee),
         blocked_reason: patch_field(&patch.blocked_reason),
         cancelled: patch.cancelled,
-        parent: patch.parent,
+        parent,
+        detach_parent,
         stage: patch.stage,
         pinned: patch.pinned,
     })
@@ -2300,10 +2316,30 @@ pub(crate) async fn set_agent_avatar<C: GatewayJsonClient + Sync>(
     agent_id: String,
     blob_id: Option<String>,
 ) -> Result<(), String> {
+    put_agent_avatar(client, agent_id, blob_id, false).await
+}
+
+/// Install a generated default only if the profile is still faceless when
+/// the gateway commits the write.
+pub(crate) async fn set_agent_avatar_if_empty<C: GatewayJsonClient + Sync>(
+    client: &C,
+    agent_id: String,
+    blob_id: String,
+) -> Result<(), String> {
+    put_agent_avatar(client, agent_id, Some(blob_id), true).await
+}
+
+async fn put_agent_avatar<C: GatewayJsonClient + Sync>(
+    client: &C,
+    agent_id: String,
+    blob_id: Option<String>,
+    only_if_empty: bool,
+) -> Result<(), String> {
     validate_path_segment(&agent_id, "agent_id")?;
     let path = format!("{PATH_AGENTS}/{}/avatar", percent_encode(&agent_id));
     let body = serde_json::to_vec(&SetAgentAvatarRequest {
         blob_id: blob_id.as_deref(),
+        only_if_empty,
     })
     .map_err(|e| format!("encode agent avatar: {e}"))?;
     client.put_empty(&path, body).await
@@ -2313,6 +2349,8 @@ pub(crate) async fn set_agent_avatar<C: GatewayJsonClient + Sync>(
 struct SetAgentAvatarRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     blob_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    only_if_empty: bool,
 }
 
 pub(crate) async fn remove_team_member<C: GatewayJsonClient + Sync>(
@@ -2503,6 +2541,20 @@ mod tests {
         {
             async move {
                 self.record("POST", path, &body);
+                self.decode()
+            }
+        }
+
+        fn post_json_once<'a, T>(
+            &'a self,
+            path: &'a str,
+            body: Vec<u8>,
+        ) -> impl Future<Output = Result<T, String>> + Send + 'a
+        where
+            T: DeserializeOwned + Send + 'static,
+        {
+            async move {
+                self.record("POST_ONCE", path, &body);
                 self.decode()
             }
         }
@@ -3762,6 +3814,31 @@ mod tests {
 
     const ISSUE_RESPONSE: &str = r#"{"number":12,"project_id":"p1","title":"t","description":"d","status":"in_progress","priority":"high","position":3,"pinned":false,"stage":0,"unread":0,"last_run_failed":false,"approval_pending":true,"opened_by_agent":false,"created_at_ms":1,"updated_at_ms":2}"#;
 
+    #[tokio::test]
+    async fn issue_creation_uses_the_non_replayable_post_seam() {
+        let client = RecordingClient::new(ISSUE_RESPONSE);
+        create_issue(
+            &client,
+            "p1".to_string(),
+            crate::api::NewIssue {
+                title: "card".to_string(),
+                description: String::new(),
+                attachments: Vec::new(),
+                status: None,
+                priority: None,
+                assignee: None,
+                parent: None,
+                stage: None,
+            },
+        )
+        .await
+        .expect("create");
+
+        let call = client.only_call();
+        assert_eq!(call.method, "POST_ONCE");
+        assert_eq!(call.path, "/v1/projects/p1/issues");
+    }
+
     /// THE pin for the card patch. The gateway reads `assignee` and
     /// `blocked_reason` as double options: absent leaves the field alone, an
     /// explicit `null` clears it. Collapse the two and there is no way to
@@ -3785,6 +3862,7 @@ mod tests {
                 blocked_reason: crate::api::StringPatch::Clear,
                 cancelled: None,
                 parent: None,
+                detach_parent: false,
                 stage: None,
                 pinned: Some(true),
             },
@@ -3819,6 +3897,7 @@ mod tests {
                 blocked_reason: crate::api::StringPatch::Keep,
                 cancelled: None,
                 parent: None,
+                detach_parent: false,
                 stage: None,
                 pinned: None,
             },
@@ -3834,6 +3913,44 @@ mod tests {
         assert!(matches!(issue.status, IssueStatus::InProgress));
         assert!(matches!(issue.priority, IssuePriority::High));
         assert!(issue.approval_pending);
+    }
+
+    #[tokio::test]
+    async fn a_card_patch_encodes_both_explicit_and_legacy_parent_detach() {
+        for patch in [
+            crate::api::IssuePatch {
+                title: None,
+                description: None,
+                attachments: None,
+                priority: None,
+                assignee: crate::api::StringPatch::Keep,
+                blocked_reason: crate::api::StringPatch::Keep,
+                cancelled: None,
+                parent: Some(0),
+                detach_parent: false,
+                stage: None,
+                pinned: None,
+            },
+            crate::api::IssuePatch {
+                title: None,
+                description: None,
+                attachments: None,
+                priority: None,
+                assignee: crate::api::StringPatch::Keep,
+                blocked_reason: crate::api::StringPatch::Keep,
+                cancelled: None,
+                parent: None,
+                detach_parent: true,
+                stage: None,
+                pinned: None,
+            },
+        ] {
+            let client = RecordingClient::new(ISSUE_RESPONSE);
+            patch_issue(&client, "p1".to_string(), 12, patch)
+                .await
+                .expect("detach");
+            assert_eq!(client.only_call().body, r#"{"detach_parent":true}"#);
+        }
     }
 
     /// A move carries the destination column's WHOLE order, this card in it —
@@ -3997,6 +4114,19 @@ mod tests {
             .await
             .expect("clear avatar");
         assert_eq!(client.only_call().body, "{}");
+    }
+
+    #[tokio::test]
+    async fn a_generated_avatar_requests_gateway_compare_and_set() {
+        let client = RecordingClient::empty();
+        set_agent_avatar_if_empty(&client, "a-dev".into(), "sha256:aa.tok".into())
+            .await
+            .expect("set generated avatar");
+
+        assert_eq!(
+            client.only_call().body,
+            r#"{"blob_id":"sha256:aa.tok","only_if_empty":true}"#
+        );
     }
 
     /// A run's transcript answers its two callers with two DIFFERENT frames,

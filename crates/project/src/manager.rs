@@ -346,6 +346,10 @@ pub struct ProjectManager {
     /// and this only nudges — a send that fails, or a receiver that died,
     /// costs a delay until the next boot sweep, never a lost run.
     dispatch: RunDispatch,
+    /// Serialises the durable comment insert → consequences handoff. A crash
+    /// leaves the row pending for the next retry; concurrent retries in one
+    /// process must not both re-drive it before either can mark completion.
+    commenting: tokio::sync::Mutex<()>,
     /// Serialises [`drive`](Self::drive). See the comment there: deciding
     /// how much room a board has and then filling it is a read-then-write,
     /// and every run that settles asks the question again.
@@ -429,6 +433,7 @@ impl ProjectManager {
             paths,
             events,
             dispatch,
+            commenting: tokio::sync::Mutex::new(()),
             driving: tokio::sync::Mutex::new(()),
             leadless: parking_lot::Mutex::default(),
             merging: tokio::sync::Mutex::new(()),
@@ -1742,8 +1747,8 @@ impl ProjectManager {
     }
 
     /// Record a client comment exactly once. A retry returns the original
-    /// timeline row and repeats none of the wake, mention, or uncancel side
-    /// effects that followed its first insertion.
+    /// timeline row, re-driving consequences only when their durable
+    /// completion mark was not reached by the inserting request.
     pub async fn comment_idempotent(
         &self,
         project: &ProjectId,
@@ -1773,16 +1778,27 @@ impl ProjectManager {
         attachments: &[AttachmentRequest],
         client_msg_id: Option<IssueEventClientMsgId>,
     ) -> Result<IssueEventRow> {
+        let _commenting = if client_msg_id.is_some() {
+            Some(self.commenting.lock().await)
+        } else {
+            None
+        };
         let issue = self.get_issue(project, number).await?;
         // Idempotency replays the original response even if the board became
         // archived after the first request landed. Re-running current write
         // validation would turn an already-durable comment into a failure.
         if let Some(client_msg_id) = &client_msg_id
-            && let Some(entry) = self
+            && let Some(claim) = self
                 .store
                 .event_by_client_msg_id(&issue.id, client_msg_id)
                 .await?
         {
+            let needs_consequences = !claim.consequences_applied;
+            let entry = claim.event;
+            if needs_consequences {
+                self.apply_comment_consequences(&issue, &entry).await;
+                self.complete_comment_consequences(&entry).await?;
+            }
             return Ok(entry);
         }
         self.writable_project(project).await?;
@@ -1795,39 +1811,60 @@ impl ProjectManager {
             issue_id: issue.id.clone(),
             project_id: project.clone(),
             number,
-            actor: actor.clone(),
+            actor,
             body: IssueEventBody::Comment {
                 text: text.to_owned(),
                 attachments,
             },
         };
-        let entry = match client_msg_id {
+        let (entry, apply_consequences, persist_completion) = match client_msg_id {
             Some(client_msg_id) => match self
                 .store
                 .append_event_idempotent(&event, &client_msg_id)
                 .await?
             {
-                IssueEventAppendOutcome::Inserted(entry) => entry,
-                IssueEventAppendOutcome::Existing(entry) => return Ok(entry),
+                IssueEventAppendOutcome::Inserted(entry) => (entry, true, true),
+                IssueEventAppendOutcome::Existing(entry) => {
+                    let apply = !entry.consequences_applied;
+                    (entry.event, apply, apply)
+                }
             },
-            None => self.store.append_event(&event).await?,
+            None => (self.store.append_event(&event).await?, true, false),
         };
-        self.events.timeline_changed(project, number);
+        if apply_consequences {
+            self.apply_comment_consequences(&issue, &entry).await;
+        }
+        if persist_completion {
+            self.complete_comment_consequences(&entry).await?;
+        }
+        Ok(entry)
+    }
+
+    async fn apply_comment_consequences(&self, issue: &IssueRow, entry: &IssueEventRow) {
+        self.events
+            .timeline_changed(&entry.project_id, entry.number);
+        let IssueEventBody::Comment { text, .. } = &entry.body else {
+            tracing::error!(event = %entry.id, "client-keyed issue event was not a comment");
+            return;
+        };
         // After the entry, not before: the comment is the reason the card is
         // coming back, and a timeline that reopened it first would read as
         // the operator explaining a decision they had already taken.
         let issue = self
-            .take_the_cancel_back(&issue, &actor)
+            .take_the_cancel_back(issue, &entry.actor)
             .await
-            .unwrap_or(issue);
+            .unwrap_or_else(|| issue.clone());
 
-        let issue = match self.mention_assignment(project, &issue, text).await {
+        let issue = match self
+            .mention_assignment(&issue.project_id, &issue, text)
+            .await
+        {
             Some(assignee) => {
                 match self
                     .update_issue(
-                        project,
-                        number,
-                        actor,
+                        &issue.project_id,
+                        issue.number,
+                        entry.actor.clone(),
                         IssueUpdate {
                             assignee: Some(Some(assignee)),
                             ..IssueUpdate::default()
@@ -1840,7 +1877,7 @@ impl ProjectManager {
                     // the delivery decision below sees that.
                     Ok(after) => after,
                     Err(e) => {
-                        tracing::debug!(issue = number, error = %e, "a mention named somebody who cannot take this card");
+                        tracing::debug!(issue = issue.number, error = %e, "a mention named somebody who cannot take this card");
                         issue
                     }
                 }
@@ -1849,7 +1886,21 @@ impl ProjectManager {
         };
 
         self.wake_if_listening(&issue).await;
-        Ok(entry)
+    }
+
+    async fn complete_comment_consequences(&self, entry: &IssueEventRow) -> Result<()> {
+        if self
+            .store
+            .mark_comment_consequences_applied(&entry.id)
+            .await?
+        {
+            return Ok(());
+        }
+        Err(baybo_store::StorageError::Storage(format!(
+            "comment event {} disappeared before its consequences were completed",
+            entry.id
+        ))
+        .into())
     }
 
     /// A person commenting on a cancelled card is asking for it back.

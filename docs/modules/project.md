@@ -1389,12 +1389,16 @@ timeline, from the issue and its unsettled run:
 
 An operator comment may carry a client-minted UUID. `comment_idempotent` claims
 that key at the storage seam and returns the original timeline row on every
-replay. The duplicate path exits before `timeline_changed`, uncancelling,
-mention assignment, or wake delivery, so a retry is not merely one row on disk;
-it is one execution of every consequence of saying it. The first lookup happens
-before the archived-board write check, allowing a lost response to be replayed
-after the board was archived without turning an already-durable write into a
-failure.
+replay. The same row carries `comment_consequences_applied`: a client-keyed
+insert writes false, and the manager flips it only after `timeline_changed`,
+uncancelling, mention assignment, and wake delivery have run. A retry exits
+immediately when that mark is true; when an interruption left it false, it
+re-drives the stored row's actor and text before marking completion. Those
+consequences are convergent, so a crash after applying one but before the mark
+may repeat it without duplicating a run or timeline transition. The first
+lookup happens before the archived-board write check, allowing a lost response
+to be replayed after the board was archived without turning an already-durable
+write into a failure.
 
 A **person's** comment on a cancelled card takes the cancel back
 (`ProjectManager::take_the_cancel_back`), before the delivery below is decided

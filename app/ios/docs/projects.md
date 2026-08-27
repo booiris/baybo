@@ -465,6 +465,10 @@ Moving out of In Progress **never kills the run**; Stop is the only kill switch.
     restored from the mirror (the same rule as `liveRun` and
     `pendingApprovals`), because a boundary replayed off disk points at a line
     already crossed.
+    The native payload also carries `timelineLive`; `issueRendered` is not sent
+    for the mirror's first paint, only after the live events response has
+    rendered. Otherwise the read POST can race the refresh, advance `read_at`,
+    and make still-unrendered events disappear from `first_unread`.
   - **A finger wins.** The mirror paints first and the live answer lands a
     moment later; a `pointerdown` before it does disarms the scroll and leaves
     the rule.
@@ -517,7 +521,7 @@ Moving out of In Progress **never kills the run**; Stop is the only kill switch.
 
 ## 5. Liveness and data flow
 
-- **The mirror (decision 5)**: `projects.json` (list + activity + attention snapshot) and one `board-<id>.json` per board (issues + active runs + team) under the support directory. Template: DeckStore's REPLACE plus SessionIndex's injected directory (so parallel tests are isolated). A cold start paints the mirror, then fetches; **the remote wins wholesale — no per-field merge**; a failed write rolls back to the mirror; logout/rebind calls `removeMirror()`. Run transcripts are never mirrored. Mind the Done paging (`7fcec51d`): a board snapshot keeps only Done's first page plus its count.
+- **The mirror (decision 5)**: `projects.json` (list + activity + attention snapshot) and one `board-<id>.json` per board (issues + active runs + team) under the support directory. Template: DeckStore's REPLACE plus SessionIndex's injected directory (so parallel tests are isolated). A cold start paints the mirror, then fetches; **the remote wins wholesale — no per-field merge**; a failed write rolls back to the mirror only if its optimistic board revision is still current. If a newer write or server refresh replaced it while the request was suspended, the failure refetches instead of restoring its captured snapshot over newer state. Logout/rebind calls `removeMirror()`. Run transcripts are never mirrored. Mind the Done paging (`7fcec51d`): a board snapshot keeps only Done's first page plus its count.
 - **Fetches**: opening a board = project / issues / agents / active runs (a card adds events / runs); the cards root = projects / activity / attention / feed head.
 - **Pushes**: `project_changed` on the owner WS → **any scope means the board is dirty** (`move_issue` emits no board-scope frame), debounced 300ms for the open board; a card page reacts only to its own number; a run sheet re-reads on `run|timeline`. `Gap{session_id: null}` triggers the same refresh. While a row's swipe panel is open, refreshes are held and applied on release.
 - **Attention**: foreground poll every 60s, plus after every write, plus on entering the tab (keyed on `homeTab` — `onAppear` re-fires and is unreliable), plus `scenePhase == .active`, plus when `chatPath` empties.
@@ -620,13 +624,12 @@ there is no parent in view here).
 An agent draws its **uploaded avatar** (`TeamMemberInfo.avatar_blob_id`) when
 it has one, and a monogram when it does not.
 
-**iOS deliberately does not draw the generated face `app/web` shows.** The web
-fills that gap with a Bottts robot seeded on the agent's profile id
-(`components/botttsFace.ts`); DiceBear is not portable to Swift, and a
-*different* generated face on each device would be worse than none — two
-surfaces claiming to depict the same teammate with different pictures. The
-monogram is honestly "there is no picture", and it is derived from the handle
-printed beside it, so the two agree.
+The issue webview draws the same deterministic Bottts face as `app/web`,
+rasterises it, uploads it, and asks the gateway to install it only while the
+profile is still faceless. That final write is an atomic compare-and-set: a
+photo picked while drawing or uploading is in flight always wins. Until the
+stored avatar returns on the roster, native surfaces use the handle-derived
+monogram.
 
 `AgentAvatars` is one store for the whole app, keyed by BLOB id:
 
@@ -679,14 +682,18 @@ straight to it.
   one replayed off disk would ask for an answer to something that stopped
   listening hours ago. `ProjectsStore` refuses to cache prompts at all for
   exactly this reason; a card caches its timeline (the Activity has to paint)
-  but withholds `pendingApprovals` until a live answer lands.
+  but withholds `pendingApprovals` until both the card and timeline answer live
+  and the card's live `approval_pending` bit agrees. A 404 retires that
+  historical call id and refetches, exposing any newer live prompt behind it.
 - **The live run, and therefore Stop.** A run unsettled when the mirror was
   written may have finished long ago, and the header's Stop would be offering
   to end something already over.
 
-Both hang off one flag, `isFromMirror`, cleared by **this fetch's own answer**
-— not by `self.issue != nil`, which is true the moment a mirror loads and would
-arm the live controls off a card the network never confirmed.
+Each hangs off its own freshness bit. The issue, timeline, and runs routes are
+independent; a live card response cannot arm a cached prompt or Stop when the
+events or runs request failed. Refresh commits are generation-fenced too, so an
+older request that resumes after a newer invalidation cannot restore stale card,
+timeline, or run state.
 
 Logout deletes every cached card with the board mirrors: one belongs to the
 gateway that served it.

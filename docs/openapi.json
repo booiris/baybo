@@ -11231,6 +11231,10 @@
               "null"
             ],
             "description": "Full blob id from `POST /v1/blobs`, or `null`/absent to clear\nthe avatar."
+          },
+          "only_if_empty": {
+            "type": "boolean",
+            "description": "Compare-and-set mode for generated defaults: if the profile acquired\nan avatar since the caller read it, leave that newer choice untouched."
           }
         }
       },
