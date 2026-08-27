@@ -205,6 +205,17 @@ final class ProjectsStore: ObservableObject {
 
     // MARK: - Reads
 
+    func issueSeed(projectId: String, number: Int64) -> IssueStore.Seed? {
+        guard let board = boards[projectId],
+            let issue = board.issues.first(where: { $0.number == number })
+        else { return nil }
+        return IssueStore.Seed(
+            issue: issue,
+            runs: board.runs.filter { $0.number == number },
+            team: board.team,
+            children: board.issues.filter { $0.parent == number })
+    }
+
     /// The cards root: every board, what each is burning today, and what is
     /// waiting on the operator.
     func refreshRoot() async {

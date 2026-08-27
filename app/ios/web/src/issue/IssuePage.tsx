@@ -2,6 +2,7 @@ import {
   Fragment,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -9,18 +10,21 @@ import {
 } from "react";
 import { useTranslation } from "react-i18next";
 import { AttachmentBubble } from "../attachments";
-import { currentConnEpoch } from "../bridge";
+import { bindNativeTarget, currentConnEpoch } from "../bridge";
 import { MarkdownBody } from "../Markdown";
 import {
-  onIssueInit,
   openIssue,
   openRun,
   pickField,
   postActivityAtBottom,
   postGeneratedFace,
   postIssueRendered,
+  postIssueState,
+  provideIssueState,
+  revealIssueTarget,
   subscribeIssue,
   type IssuePayload,
+  type IssueViewState,
   type Person,
 } from "./bridge";
 import { avatarUrl } from "./avatars";
@@ -44,12 +48,30 @@ import {
 /// webview is exactly `ChatScreen`'s existing layering — header, webview, dock,
 /// streamed bottom inset. Comment markdown, KaTeX, `#N` links and the
 /// attachment cards all come along for free.
-export function IssuePage() {
+type IssuePageProps = {
+  targetId?: string;
+  initialBottomInset?: number;
+  initialState?: IssueViewState;
+  initialPayload?: IssuePayload;
+};
+
+export function IssuePage({
+  targetId = "test",
+  initialBottomInset = 0,
+  initialState,
+  initialPayload,
+}: IssuePageProps = {}) {
   const { t } = useTranslation();
-  const [payload, setPayload] = useState<IssuePayload | null>(null);
-  const [bottomInset, setBottomInset] = useState(0);
+  const [payload, setPayload] = useState<IssuePayload | null>(initialPayload ?? null);
+  const [bottomInset, setBottomInset] = useState(initialBottomInset);
+  const [folds, setFolds] = useState<Record<string, boolean>>(() => ({
+    ...(initialState?.folds ?? {}),
+  }));
+  const foldsRef = useRef(folds);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const renderedFor = useRef<string | null>(null);
+  const restoredScroll = useRef(false);
+  const stateTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   /// Where the operator stopped reading, FROZEN for the life of this page.
   ///
   /// It has to be: painting the card stamps it read (`postIssueRendered`), the
@@ -65,12 +87,11 @@ export function IssuePage() {
   /// theirs: a live payload arriving mid-read must not yank them anywhere.
   const grabbed = useRef(false);
 
-  /// The dock's height at first paint. On its own listener rather than in the
-  /// subscription below, and BEFORE it: the init landed with `ready`, long
-  /// before this tree committed, so it is replayed out of the latch — and it
-  /// has to be applied before the buffered `bottomInset` updates that followed
-  /// it drain, or the oldest number would win.
-  useEffect(() => onIssueInit((p) => setBottomInset(p.bottomInset)), []);
+  useLayoutEffect(() => {
+    const unbind = bindNativeTarget(targetId);
+    revealIssueTarget(targetId);
+    return unbind;
+  }, [targetId]);
 
   useEffect(
     () =>
@@ -93,8 +114,8 @@ export function IssuePage() {
     const key = `${payload.issue.project_id}#${payload.issue.number}`;
     if (renderedFor.current === key) return;
     renderedFor.current = key;
-    postIssueRendered();
-  }, [payload]);
+    postIssueRendered(targetId);
+  }, [payload, targetId]);
 
   // Latched on the first payload that names one and never cleared — see
   // `landing`. A second boundary never arrives while this page lives: the only
@@ -140,21 +161,75 @@ export function IssuePage() {
       if (person.avatar !== undefined || drawnFor.current.has(id)) continue;
       drawnFor.current.add(id);
       void botttsPng(id)
-        .then((png) => postGeneratedFace(id, png))
+        .then((png) => postGeneratedFace(targetId, id, png))
         .catch(() => {
           // A face that could not be drawn leaves the agent as it already
           // was — with a monogram — and does not retry this page's life.
         });
     }
-  }, [payload?.people]);
+  }, [payload?.people, targetId]);
 
   /// Tell native whether the newest activity is on screen — it draws the way
   /// back down, and only when there is one.
   const reportAtBottom = useCallback(() => {
     const el = scrollRef.current;
     if (!el) return;
-    postActivityAtBottom(el.scrollHeight - el.scrollTop - el.clientHeight < 48);
+    postActivityAtBottom(targetId, el.scrollHeight - el.scrollTop - el.clientHeight < 48);
+  }, [targetId]);
+
+  const readPageState = useCallback((): IssueViewState | null => {
+    const el = scrollRef.current;
+    if (!el) return null;
+    return { scrollTop: Math.max(0, el.scrollTop), folds: { ...foldsRef.current } };
   }, []);
+
+  useLayoutEffect(() => provideIssueState(readPageState), [readPageState]);
+
+  const flushPageState = useCallback(() => {
+    const state = readPageState();
+    if (state !== null) postIssueState(targetId, state);
+  }, [readPageState, targetId]);
+
+  const schedulePageState = useCallback(() => {
+    if (stateTimer.current !== null) return;
+    stateTimer.current = setTimeout(() => {
+      stateTimer.current = null;
+      flushPageState();
+    }, 80);
+  }, [flushPageState]);
+
+  useEffect(
+    () => () => {
+      if (stateTimer.current !== null) clearTimeout(stateTimer.current);
+      flushPageState();
+    },
+    [flushPageState],
+  );
+
+  useEffect(() => {
+    foldsRef.current = folds;
+    schedulePageState();
+  }, [folds, schedulePageState]);
+
+  const changeFold = useCallback((key: string, open: boolean) => {
+    setFolds((current) => {
+      const next = { ...current, [key]: open };
+      foldsRef.current = next;
+      return next;
+    });
+  }, []);
+
+  useLayoutEffect(() => {
+    if (payload === null || restoredScroll.current) return;
+    const el = scrollRef.current;
+    if (!el) return;
+    restoredScroll.current = true;
+    if (initialState === undefined) return;
+    grabbed.current = true;
+    el.scrollTop = Math.max(0, initialState.scrollTop);
+    reportAtBottom();
+    schedulePageState();
+  }, [initialState, payload, reportAtBottom, schedulePageState]);
 
   /// On every delivery as well as on every scroll. A card that arrives taller
   /// than its screen fires no scroll event at all, so a page reported only
@@ -187,7 +262,10 @@ export function IssuePage() {
     <div
       className="issue-page"
       ref={scrollRef}
-      onScroll={reportAtBottom}
+      onScroll={() => {
+        reportAtBottom();
+        schedulePageState();
+      }}
       // `pointerdown`, not `scroll`: the auto-scroll below fires a scroll of
       // its own, and a guard that could not tell the two apart would disarm
       // itself on the very first thing it does.
@@ -212,7 +290,13 @@ export function IssuePage() {
         </section>
       )}
       <SubIssues issue={issue} children={payload.children ?? []} />
-      <Activity events={timeline} landing={landing} who={who} />
+      <Activity
+        events={timeline}
+        landing={landing}
+        who={who}
+        folds={folds}
+        onFold={changeFold}
+      />
     </div>
   );
 }
@@ -423,10 +507,14 @@ function Activity({
   events,
   landing,
   who,
+  folds,
+  onFold,
 }: {
   events: IssueEvent[];
   landing: string | null;
   who: (id: string) => Person;
+  folds: Record<string, boolean>;
+  onFold: (key: string, open: boolean) => void;
 }) {
   const { t } = useTranslation();
   const folded = useMemo(() => fold(events, landing ?? undefined), [events, landing]);
@@ -435,16 +523,25 @@ function Activity({
     <section className="issue-section">
       <h2 className="issue-ruled">{t("issue.activity")}</h2>
       <ol className="issue-activity">
-        {folded.map((item, i) => (
-          <Fragment key={rowKey(item, i)}>
-            {foldHead(item)?.id === landing && (
-              <li className="issue-unread-rule" data-unread-rule>
-                {t("issue.unreadFrom")}
-              </li>
-            )}
-            <FoldRow item={item} landed={foldHead(item)?.id === landing} who={who} />
-          </Fragment>
-        ))}
+        {folded.map((item, i) => {
+          const key = rowKey(item, i);
+          return (
+            <Fragment key={key}>
+              {foldHead(item)?.id === landing && (
+                <li className="issue-unread-rule" data-unread-rule>
+                  {t("issue.unreadFrom")}
+                </li>
+              )}
+              <FoldRow
+                item={item}
+                landed={foldHead(item)?.id === landing}
+                who={who}
+                toggled={folds[key]}
+                onToggle={(open) => onFold(key, open)}
+              />
+            </Fragment>
+          );
+        })}
       </ol>
     </section>
   );
@@ -475,17 +572,16 @@ function FoldRow({
   item,
   landed,
   who,
+  toggled,
+  onToggle,
 }: {
   item: Fold;
   landed: boolean;
   who: (id: string) => Person;
+  toggled: boolean | undefined;
+  onToggle: (open: boolean) => void;
 }) {
   const { t } = useTranslation();
-  /// The reader's own choice, once they make one — `null` means "follow the
-  /// landing". Not seeded with `useState(landed)`: the boundary arrives with
-  /// the live payload, a beat after the mirror has already mounted this row,
-  /// and an initial value would be read before it exists.
-  const [toggled, setToggled] = useState<boolean | null>(null);
 
   if (item.kind === "entry") return <EntryRow event={item.event} who={who} />;
   if (item.events.length === 1) return <EntryRow event={item.events[0]} who={who} />;
@@ -494,7 +590,7 @@ function FoldRow({
   return (
     <>
       <li className="issue-fold">
-        <button type="button" onClick={() => setToggled(!open)} aria-expanded={open}>
+        <button type="button" onClick={() => onToggle(!open)} aria-expanded={open}>
           {t("issue.nEvents", { count: item.events.length })}
           {/* ONE glyph, rotated — the transcript's `.work-chevron`. Two
               characters (`›` and `⌄`) have two sets of metrics, so the mark

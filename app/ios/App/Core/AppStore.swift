@@ -38,6 +38,18 @@ final class AppStore: ObservableObject {
         case search
     }
 
+    struct ProjectIssueRoute: Hashable {
+        let id: UUID
+        let projectId: String
+        let number: Int64
+
+        init(id: UUID = UUID(), projectId: String, number: Int64) {
+            self.id = id
+            self.projectId = projectId
+            self.number = number
+        }
+    }
+
     /// One entry on the outer NavigationStack over the home shell: a pushed
     /// conversation, the archived list, or one scheduled job's fires.
     enum ChatRoute: Hashable {
@@ -62,7 +74,7 @@ final class AppStore: ObservableObject {
         case projectBoard(String)
         /// One card on a board. Pushed over its board, so the edge swipe goes
         /// back to the column it came from.
-        case projectIssue(project: String, number: Int64)
+        case projectIssue(ProjectIssueRoute)
         /// The new-board form. A pushed route rather than a sheet because it
         /// types: this shell opts out of keyboard avoidance wholesale
         /// (`HomeTabView.ignoresSafeArea(.keyboard)`), and a pushed screen sits
@@ -170,12 +182,16 @@ final class AppStore: ObservableObject {
         didSet {
             let open = Self.sessionIds(chatPath)
             let left = Self.sessionIds(oldValue).subtracting(open)
-            guard !left.isEmpty else { return }
-            if open.isEmpty {
+            if !left.isEmpty, open.isEmpty {
                 AudioPlayerCenter.shared.stop()
             }
             for sessionId in left {
                 chatStores[sessionId]?.leaveChat()
+            }
+            let openVisits = Self.issueVisitIds(chatPath)
+            let leftVisits = Self.issueVisitIds(oldValue).subtracting(openVisits)
+            for visitId in leftVisits {
+                issueVisits.removeValue(forKey: visitId)
             }
         }
     }
@@ -189,6 +205,13 @@ final class AppStore: ObservableObject {
             if case .session(let sessionId) = route { ids.insert(sessionId) }
         }
         return ids
+    }
+
+    static func issueVisitIds(_ path: [ChatRoute]) -> Set<UUID> {
+        Set(path.compactMap { route in
+            guard case .projectIssue(let issue) = route else { return nil }
+            return issue.id
+        })
     }
     /// Landing / pairing status line (localized, already resolved).
     @Published var status: String?
@@ -256,11 +279,13 @@ final class AppStore: ObservableObject {
     static let maxResidentStores = 12
     private var transcriptHost: TranscriptHost?
     private var prewarmedDraftId: String?
-    /// The Deck tab's engine + its kept-warm shell webview (the app's second
-    /// webview; prewarmed once a binding reaches home, torn down with the binding).
+    /// The Deck tab's engine + its kept-warm shell webview, prewarmed once a
+    /// binding reaches home and torn down with that binding.
     let deckStore = DeckStore()
     let projectsStore = ProjectsStore()
     private var _deckHost: DeckHost?
+    let issueHostPool = IssueHostPool()
+    private var issueVisits: [UUID: IssueVisit] = [:]
     /// Sessions with an archive/hide request on the wire — the per-session
     /// serialization gate (`pumpSessionMutation`).
     private var sessionMutationsInFlight: Set<String> = []
@@ -494,10 +519,12 @@ final class AppStore: ObservableObject {
                 homeTab = .projects
                 chatPath = [
                     .projectBoard(ProjectsStore.demoBoardId),
-                    .projectIssue(project: ProjectsStore.demoBoardId, number: 41),
+                    .projectIssue(
+                        ProjectIssueRoute(projectId: ProjectsStore.demoBoardId, number: 41)),
                 ]
             }
             route = .home
+            if args.contains("-baybo-demo-projects") { issueHostPool.prewarm() }
             return
         }
         #endif
@@ -537,6 +564,7 @@ final class AppStore: ObservableObject {
             consumePendingPushRoute()
             prewarmTranscriptHost()
             prewarmDeckHost()
+            prewarmIssueHosts()
             resumeStrandedSends()
         }
     }
@@ -580,6 +608,7 @@ final class AppStore: ObservableObject {
         if route == .home {
             prewarmTranscriptHost()
             prewarmDeckHost()
+            prewarmIssueHosts()
         }
     }
 
@@ -754,6 +783,18 @@ final class AppStore: ObservableObject {
         return host
     }
 
+    func issueVisit(for route: ProjectIssueRoute) -> IssueVisit {
+        if let visit = issueVisits[route.id] { return visit }
+        let visit = IssueVisit(
+            id: route.id,
+            projectId: route.projectId,
+            number: route.number,
+            pool: issueHostPool,
+            seed: projectsStore.issueSeed(projectId: route.projectId, number: route.number))
+        issueVisits[route.id] = visit
+        return visit
+    }
+
     /// Open an existing session from the list.
     func openSession(_ sessionId: String) {
         Task {
@@ -795,9 +836,14 @@ final class AppStore: ObservableObject {
     }
 
     func openProjectIssue(project: String, number: Int64) {
-        let route = AppStore.ChatRoute.projectIssue(project: project, number: number)
-        guard chatPath.last != route else { return }
-        chatPath.append(route)
+        if case .projectIssue(let current) = chatPath.last,
+            current.projectId == project, current.number == number
+        {
+            return
+        }
+        let issue = ProjectIssueRoute(projectId: project, number: number)
+        _ = issueVisit(for: issue)
+        chatPath.append(.projectIssue(issue))
     }
 
     /// File a card on a board, opening in the column the board was showing.
@@ -1151,6 +1197,11 @@ final class AppStore: ObservableObject {
         _ = deckHost()
     }
 
+    private func prewarmIssueHosts() {
+        guard route == .home else { return }
+        issueHostPool.prewarm()
+    }
+
     /// A push-notification tap targeting `sessionId`: route straight into that
     /// conversation. Before the launch restore resolves the route, stash it —
     /// `restoreOnLaunch` consumes the stash once home is up.
@@ -1481,6 +1532,7 @@ final class AppStore: ObservableObject {
             guard let store = chatStores[sessionId], isEvictable(sessionId, store) else { continue }
             await evictStore(sessionId, store)
         }
+        issueHostPool.discardIfIdle()
     }
 
     private func isEvictable(_ sessionId: String, _: ChatStore) -> Bool {
@@ -1509,6 +1561,8 @@ final class AppStore: ObservableObject {
         // The deck belongs to the departing gateway too.
         _deckHost?.teardown()
         _deckHost = nil
+        issueVisits.removeAll()
+        issueHostPool.teardown()
         DeckStore.removeMirror()
         // So do the boards: a mirror that outlived a binding is somebody
         // else's account on screen.
@@ -1537,6 +1591,7 @@ final class AppStore: ObservableObject {
             preconnectRelayBestEffort()
         }
         prewarmDeckHost()
+        prewarmIssueHosts()
     }
 
     /// Log out: tear down the live leg, wipe both credential sets, drop the

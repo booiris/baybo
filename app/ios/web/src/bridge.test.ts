@@ -111,6 +111,30 @@ describe("outbound posts", () => {
       { type: "runState", running: true },
     ]);
   });
+
+  it("keeps shared attachment posts on the keyed issue visit", async () => {
+    const bridge = await loadBridge();
+    const releaseA = bridge.bindNativeTarget("visit-a");
+    const releaseB = bridge.bindNativeTarget("visit-b");
+    releaseA();
+    bridge.postToNative({ type: "requestBlob", id: 7, blobId: "blob-b" });
+
+    expect(posted[posted.length - 1]).toEqual({
+      type: "requestBlob",
+      id: 7,
+      blobId: "blob-b",
+      targetId: "visit-b",
+    });
+    bridge.postToNative({ type: "generatedFace", targetId: "visit-a" });
+    expect(posted[posted.length - 1]).toEqual({
+      type: "generatedFace",
+      targetId: "visit-a",
+    });
+
+    releaseB();
+    bridge.postToNative({ type: "requestBlob", id: 8, blobId: "plain" });
+    expect(posted[posted.length - 1]).toEqual({ type: "requestBlob", id: 8, blobId: "plain" });
+  });
 });
 
 describe("persistState — the cross-session mirror guard", () => {

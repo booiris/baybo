@@ -150,9 +150,15 @@ const native = window.webkit?.messageHandlers?.baybo;
 
 export const hasNativeBridge = native !== undefined;
 
+let nativeTargetId: string | null = null;
+
 function post(message: Record<string, unknown>): void {
-  if (native) native.postMessage(message);
-  else console.log("[baybo bridge]", message);
+  const payload =
+    nativeTargetId === null || typeof message.targetId === "string"
+      ? message
+      : { ...message, targetId: nativeTargetId };
+  if (native) native.postMessage(payload);
+  else console.log("[baybo bridge]", payload);
 }
 
 /// The raw channel, for a second page that rides the same `baybo` handler.
@@ -164,6 +170,22 @@ function post(message: Record<string, unknown>): void {
 /// changes here.
 export function postToNative(message: Record<string, unknown>): void {
   post(message);
+}
+
+/// Scope the shared attachment bridge to one issue visit.
+///
+/// Set from the keyed React tree's layout effect, not from `issuePage.init`:
+/// during a retarget the old tree remains mounted for one commit, and anything
+/// it posts in that window must keep the OLD id so native can reject it.
+export function bindNativeTarget(targetId: string): () => void {
+  if (nativeTargetId !== targetId) {
+    blobPending.clear();
+    posterPending.clear();
+  }
+  nativeTargetId = targetId;
+  return () => {
+    if (nativeTargetId === targetId) nativeTargetId = null;
+  };
 }
 
 // For fire-and-forget posts whose failure must never surface as a page error

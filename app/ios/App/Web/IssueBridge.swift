@@ -9,20 +9,22 @@ import WebKit
 /// `blobObjectUrl` unchanged, and all of those post through that channel. A
 /// second handler name would have meant forking every one of them.
 ///
-/// The two bridges never coexist on one webview — each page is its own
-/// `WKWebView` with its own `WKUserContentController` — so sharing the name
-/// costs nothing and buys the whole shared half of the web bundle.
+/// A warm issue host and the transcript never coexist on one webview — each
+/// has its own `WKUserContentController` — so sharing the name costs nothing
+/// and buys the whole shared half of the web bundle.
 @MainActor
 final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
     /// Same name as the transcript's. See the type doc.
     static let messageHandlerName = TranscriptBridge.messageHandlerName
 
     weak var webView: WKWebView?
-    weak var store: IssueStore?
+    private(set) weak var store: IssueStore?
 
     private var ready = false
     private var pending: [String] = []
     private var lastBottomInset = Int.min
+    private var composerTop: CGFloat?
+    private var targetId: String?
 
     func userContentController(
         _ userContentController: WKUserContentController,
@@ -44,45 +46,61 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
         // The attachment cards' messages first, through the shared dispatch —
         // whatever it consumes never reaches this page's own switch, and what
         // it does not consume is this page's alone.
-        if let store, WebMediaDispatch.handle(type: type, body: body, target: store) { return }
+        if let store, isCurrent(body),
+            WebMediaDispatch.handle(type: type, body: body, target: store)
+        {
+            return
+        }
 
         switch type {
         case "issueReady", "ready":
             consecutiveDeaths = 0
             ready = true
+            let hadPending = !pending.isEmpty
             for js in pending { webView?.evaluateJavaScript(js) }
             pending.removeAll()
-            // The page's tree is brand new — after a crash reload it holds
-            // nothing at all — so hand it everything again rather than waiting
-            // for the next invalidation.
-            store?.redeliver()
+            if !hadPending { replayTarget() }
         case "issueRendered":
+            guard isCurrent(body) else { return }
             store?.markRendered()
         case "openIssue":
+            guard isCurrent(body) else { return }
             if let number = (body["number"] as? NSNumber)?.int64Value, let store {
                 AppStore.shared?.openProjectIssue(project: store.projectId, number: number)
             }
         case "openRun":
+            guard isCurrent(body) else { return }
             if let attempt = (body["attempt"] as? NSNumber)?.int64Value {
                 store?.openRunRequest = attempt
             }
         case "pick":
+            guard isCurrent(body) else { return }
             if let field = body["field"] as? String {
                 store?.pickRequest = field
             }
         case "generatedFace":
+            guard isCurrent(body) else { return }
             if let agentId = body["agentId"] as? String,
                 let png = body["pngBase64"] as? String
             {
                 store?.storeGeneratedFace(agentId: agentId, pngBase64: png)
             }
         case "activityAtBottom":
+            guard isCurrent(body) else { return }
             store?.setAtBottom(body["atBottom"] as? Bool ?? true)
+        case "issueState":
+            guard isCurrent(body),
+                let scrollTop = (body["scrollTop"] as? NSNumber)?.doubleValue,
+                let folds = body["folds"] as? [String: Bool]
+            else { return }
+            store?.rememberPageState(scrollTop: scrollTop, folds: folds)
         case "openUrl":
+            guard isCurrent(body) else { return }
             if let url = body["url"] as? String, let parsed = URL(string: url) {
                 UIApplication.shared.open(parsed)
             }
         case "copy":
+            guard isCurrent(body) else { return }
             // Native owns the write, as it does for the transcript: a
             // WKWebView refuses `navigator.clipboard` outside a live gesture,
             // and only native can fire the confirming haptic.
@@ -99,6 +117,11 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
         }
     }
 
+    private func isCurrent(_ body: [String: Any]) -> Bool {
+        guard let targetId else { return false }
+        return body["targetId"] as? String == targetId
+    }
+
     // Opening a run sheet and presenting a picker are PRESENTATION, and a
     // bridge that reached for the view hierarchy would be a second place
     // navigation happens — so those two, and the page's at-bottom report, are
@@ -110,9 +133,9 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
     // A closure written inside a `View`'s body captures the whole view struct,
     // `@StateObject` storage included, so storing one here closed the cycle
     // `IssueHost → bridge → closure → view → host` and made the card page
-    // immortal: its `deinit` teardown never ran, so every card ever opened kept
-    // a live WebContent process and an invalidation observer refetching behind
-    // it. `store` is weak, so this route cannot cycle whatever the screen does.
+    // immortal: every card ever opened kept an invalidation observer refetching
+    // behind it. A warm host makes that invariant stricter: `store` is weak, so
+    // retargeting cannot retain any prior visit whatever the screen does.
 
     // MARK: - native → web
 
@@ -125,6 +148,45 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
     private static let deathWindowSeconds: TimeInterval = 30
     private var consecutiveDeaths = 0
     private var lastDeathAt = Date.distantPast
+
+    func retarget(to next: IssueStore, targetId: String) {
+        if self.targetId == targetId, store === next { return }
+        let previous = store
+        store?.detach(self)
+        pending.removeAll()
+        self.targetId = targetId
+        store = next
+        composerTop = next.composerTop
+        lastBottomInset = Int.min
+        next.attach(self)
+        deliverInit(capturing: previous)
+        next.redeliver()
+        pushBottomInset()
+    }
+
+    func clearTarget(_ targetId: String) {
+        guard self.targetId == targetId else { return }
+        store?.detach(self)
+        store = nil
+        self.targetId = nil
+        composerTop = nil
+        pending.removeAll()
+    }
+
+    func teardown() {
+        if let targetId { clearTarget(targetId) }
+        ready = false
+        pending.removeAll()
+        webView = nil
+    }
+
+    private func replayTarget() {
+        guard store != nil, targetId != nil else { return }
+        deliverInit()
+        store?.redeliver()
+        lastBottomInset = Int.min
+        pushBottomInset()
+    }
 
     /// Reload the page from scratch — the third step of `IssueStore.resync`.
     ///
@@ -171,15 +233,48 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
     /// because they are literally the transcript's components.
     private func shared(_ fn: String, _ jsonPayload: String) { eval("baybo", fn, jsonPayload) }
 
-    func deliverInit(language: String, bottomInset: Int) {
-        guard let store else { return }
-        let payload: [String: Any] = [
-            "language": language,
+    private func deliverInit(capturing previous: IssueStore? = nil) {
+        guard let store, let targetId else { return }
+        var payload: [String: Any] = [
+            "language": Lang.shared.current.lproj,
             "projectId": store.projectId,
             "number": store.number,
-            "bottomInset": bottomInset,
+            "targetId": targetId,
+            "bottomInset": store.bottomInset,
         ]
-        page("init", Self.jsonObject(payload))
+        if let state = store.pageState {
+            payload["restoredState"] = [
+                "scrollTop": state.scrollTop,
+                "folds": state.folds,
+            ]
+        }
+        let json = Self.jsonObject(payload)
+        guard let previous, ready, let webView else {
+            page("init", json)
+            return
+        }
+        let js = """
+            JSON.stringify((function() {
+              const state = window.issuePage.snapshotState();
+              window.issuePage.init(\(json));
+              return state;
+            })());
+            """
+        webView.evaluateJavaScript(js) { [weak previous] value, error in
+            MainActor.assumeIsolated {
+                if let error {
+                    NSLog("baybo: issue retarget failed: %@", error.localizedDescription)
+                    return
+                }
+                guard let previous, let json = value as? String, json != "null",
+                    let data = json.data(using: .utf8),
+                    let state = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                    let scrollTop = (state["scrollTop"] as? NSNumber)?.doubleValue,
+                    let folds = state["folds"] as? [String: Bool]
+                else { return }
+                previous.rememberPageState(scrollTop: scrollTop, folds: folds)
+            }
+        }
     }
 
     func deliver(
@@ -237,9 +332,20 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
         return json
     }
 
-    func setBottomInset(_ px: Int) {
+    /// The dock's top in `.global` coordinates. Convert against this
+    /// webview's WINDOW, not `UIScreen`: the latter over-insets an iPad window
+    /// and mixes two coordinate spaces even on a full-screen phone.
+    func setComposerTop(_ minYInWindow: CGFloat) {
+        composerTop = minYInWindow
+        pushBottomInset()
+    }
+
+    private func pushBottomInset() {
+        guard let composerTop, let window = webView?.window else { return }
+        let px = max(0, Int((window.bounds.height - composerTop).rounded()))
         guard px != lastBottomInset else { return }
         lastBottomInset = px
+        store?.rememberBottomInset(px)
         page("setBottomInset", String(px))
     }
 

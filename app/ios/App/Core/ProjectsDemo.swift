@@ -60,17 +60,19 @@
                     Self.demoIssue(
                         41, "p-rglide", title: "the dial loop drops its subscription",
                         status: .inProgress, priority: .urgent, assignee: "a-dev",
-                        unread: 2, approvalPending: true),
+                        unread: 2, approvalPending: true,
+                        subIssues: SubIssueProgress(done: 2, total: 5)),
                     Self.demoIssue(
                         42, "p-rglide", title: "keepalive should feed liveness, not the timer",
                         status: .inProgress, priority: .high, assignee: "a-dev2",
-                        lastRunFailed: true, pinned: true),
+                        lastRunFailed: true, pinned: true, parent: 41,
+                        subIssues: SubIssueProgress(done: 0, total: 1)),
                     Self.demoIssue(
                         43, "p-rglide", title: "write the connection doc", status: .todo,
-                        priority: .medium, assignee: nil, unread: 1),
+                        priority: .medium, assignee: nil, unread: 1, parent: 42),
                     Self.demoIssue(
                         44, "p-rglide", title: "retire the old pump tee", status: .todo,
-                        priority: .low, assignee: nil),
+                        priority: .low, assignee: nil, parent: 41),
                     Self.demoIssue(
                         40, "p-rglide", title: "NACK a send with no live leg", status: .review,
                         priority: .high, assignee: "a-dev"),
@@ -167,14 +169,14 @@
             _ number: Int64, _ projectId: String, title: String, status: IssueStatus,
             priority: IssuePriority, assignee: String?, unread: Int64 = 0,
             lastRunFailed: Bool = false, approvalPending: Bool = false,
-            blockedReason: String? = nil, pinned: Bool = false
+            blockedReason: String? = nil, pinned: Bool = false, parent: Int64? = nil,
+            subIssues: SubIssueProgress? = nil
         ) -> IssueInfo {
             IssueInfo(
                 number: number, projectId: projectId, title: title, description: "",
                 attachments: [], status: status, priority: priority, assignee: assignee,
                 position: number, pinned: pinned, branch: nil, blockedReason: blockedReason,
-                parent: nil, filedFrom: nil, stage: 0,
-                subIssues: number == 41 ? SubIssueProgress(done: 2, total: 5) : nil,
+                parent: parent, filedFrom: nil, stage: 0, subIssues: subIssues,
                 unread: unread, lastRunFailed: lastRunFailed, approvalPending: approvalPending,
                 openedByAgent: number == 38, cancelledAtMs: nil,
                 createdAtMs: nowMs - 86_400_000,

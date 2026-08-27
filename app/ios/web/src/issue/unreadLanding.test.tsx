@@ -187,6 +187,26 @@ describe("machinery folds away", () => {
     expect(document.body.textContent).not.toContain("moved it");
   });
 
+  it("restores the scroll and fold state when a warm slot returns to this card", () => {
+    render(
+      <I18nextProvider i18n={i18n}>
+        <IssuePage
+          targetId="visit-restored"
+          initialState={{ scrollTop: 143, folds: { "sys-e5": true } }}
+        />
+      </I18nextProvider>,
+    );
+    deliver(withEvents([moved("e5"), moved("e6")]));
+
+    const scroller = document.querySelector<HTMLElement>(".issue-page");
+    expect(scroller?.scrollTop).toBe(143);
+    expect(fold()?.getAttribute("aria-expanded")).toBe("true");
+    expect(window.issuePage?.snapshotState()).toEqual({
+      scrollTop: 143,
+      folds: { "sys-e5": true },
+    });
+  });
+
   /// The exception, and it has to be one: the run carrying the boundary is
   /// what the page just scrolled to, and landing a reader on a closed line is
   /// landing them on nothing.

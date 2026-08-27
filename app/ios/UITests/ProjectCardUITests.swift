@@ -426,9 +426,8 @@ final class ProjectCardUITests: BayboUITestCase {
 
     // MARK: - Leaving and coming back
 
-    /// **A card survives being covered.** Tapping a sub-issue pushes a second
-    /// card over this one, and coming back must return the card you left, not
-    /// an empty page.
+    /// **Every card survives being covered.** A → B → C uses both warm slots:
+    /// C reuses A's slot, then the two pops must reveal B and A in turn.
     ///
     /// Two assertions, because either alone is fooled. The webview's own
     /// elements vanish with it, so `exists` catches an unparented page — but
@@ -436,7 +435,7 @@ final class ProjectCardUITests: BayboUITestCase {
     /// a claim about PIXELS, which every other assertion in this suite is blind
     /// to (see `screenPixels`). A card that came back holds ink: dark text on
     /// paper, across the band between the header and the dock.
-    func testComingBackFromASubIssueLeavesTheCardPainted() throws {
+    func testNestedSubIssuesRestoreBothCoveredCards() throws {
         let app = openCard()
         let child = app.buttons.containing(
             NSPredicate(format: "label CONTAINS '#42'")
@@ -449,6 +448,25 @@ final class ProjectCardUITests: BayboUITestCase {
                 timeout: Self.webviewTimeout),
             "the sub-issue never opened")
 
+        let grandchild = app.buttons.containing(
+            NSPredicate(format: "label CONTAINS '#43'")
+        ).firstMatch
+        XCTAssertTrue(
+            grandchild.waitForExistence(timeout: Self.webviewTimeout),
+            "the child card has no nested sub-issue row")
+        grandchild.tap()
+
+        XCTAssertTrue(
+            app.staticTexts["write the connection doc"].waitForExistence(
+                timeout: Self.webviewTimeout),
+            "the nested sub-issue never opened")
+
+        app.buttons["Back to projects"].firstMatch.tap()
+        XCTAssertTrue(
+            app.staticTexts["keepalive should feed liveness, not the timer"].waitForExistence(
+                timeout: Self.webviewTimeout),
+            "the child card did not return after its child popped")
+
         app.buttons["Back to projects"].firstMatch.tap()
 
         let title = app.staticTexts[Self.title]
@@ -460,7 +478,7 @@ final class ProjectCardUITests: BayboUITestCase {
         XCTAssertGreaterThan(
             shot.inkCoverage(in: bodyBand(app)), 0.005,
             "the card came back blank — laid out, but painting nothing")
-        attachScreenshot(app, name: "card-after-sub-issue")
+        attachScreenshot(app, name: "card-after-nested-sub-issue")
     }
 
     /// The reading band: everything between the header's bottom edge and the

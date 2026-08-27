@@ -10,22 +10,13 @@ import SwiftUI
 struct ProjectIssueScreen: View {
     @EnvironmentObject private var appStore: AppStore
     @ObservedObject private var lang = Lang.shared
-    @StateObject private var store: IssueStore
+    @StateObject private var visit: IssueVisit
     @Environment(\.dismiss) private var dismiss
 
     let projectId: String
     let number: Int64
 
-    /// The card's webview. One card, one webview — see `IssueHost`.
-    ///
-    /// The SCREEN owns no part of it. It used to hold the host in a `@State`
-    /// optional built inside `.task` behind an `if host == nil` gate, and tore
-    /// it down from `.onDisappear` — a destructor on a hook that also fires
-    /// when a push merely covers the card, and a gate that made the wreckage
-    /// permanent. It belongs to the store, and the store belongs to the screen,
-    /// so the pop takes all three and nothing has to decide what "leaving"
-    /// means.
-    private var host: IssueHost { store.host }
+    private var store: IssueStore { visit.store }
     /// The `+`'s panel, owned HERE rather than by the dock: it floats over the
     /// dock's own rows — the hint line, the approval card, the strip — and a
     /// panel presented from inside them draws behind them and loses its taps.
@@ -50,20 +41,18 @@ struct ProjectIssueScreen: View {
     /// still a row somebody wants to read.
     @State private var openRun: ProjectRunRoute?
 
-    init(projectId: String, number: Int64) {
-        self.projectId = projectId
-        self.number = number
-        // Inside the `@autoclosure`, deliberately: `RootView` re-evaluates its
-        // navigation destination on every update, so a store built here as a
-        // plain statement would run a mirror read and two JSON decodes on the
-        // main thread each time, only to be thrown away.
-        _store = StateObject(wrappedValue: IssueStore(projectId: projectId, number: number))
+    init(visit: IssueVisit) {
+        projectId = visit.store.projectId
+        number = visit.store.number
+        _visit = StateObject(wrappedValue: visit)
     }
 
     var body: some View {
         ZStack(alignment: .top) {
             page
             header
+            IssueDidAppearReporter { visit.didAppear() }
+                .frame(width: 0, height: 0)
             // Only the attach panel's SCRIM lands here — the panel itself rides
             // inside the dock's layer, above the dock's own rows.
             if attach.isOpen {
@@ -80,14 +69,12 @@ struct ProjectIssueScreen: View {
         .safeAreaInset(edge: .bottom, spacing: 0) { dock }
         // Re-runs on every re-appear, which is what the refetch wants: a card
         // that was covered while its board moved on comes back current. The
-        // webview is not rebuilt here — it belongs to `host`, and rebuilding it
-        // per appearance would cold-start a WebContent process and throw the
-        // reader's scroll away every time they peek at a sub-issue.
+        // pool keeps the renderer warm; this refresh only replaces data.
         .task { await store.refresh() }
         // The page's two requests, ANSWERED HERE and cleared. They arrive as
         // store state rather than as closures installed on the bridge, because
-        // a closure written here captures this whole struct — `_host` and all —
-        // and the bridge outlives the body. See `IssueBridge`.
+        // a closure written here captures this whole struct and a pool bridge
+        // outlives many such bodies. See `IssueBridge`.
         .onChange(of: store.pickRequest) { _, field in
             guard let field else { return }
             store.pickRequest = nil
@@ -99,7 +86,7 @@ struct ProjectIssueScreen: View {
             guard let run = store.runs.first(where: { $0.attempt == attempt }) else { return }
             show(run)
         }
-        .onChange(of: lang.current.lproj) { _, code in host.bridge.setLanguage(code) }
+        .onChange(of: lang.current.lproj) { _, code in store.setLanguage(code) }
         .onAppear {
             // The paste row's source. A process-global slot with one occupant:
             // the chat screen and this one are never both on screen, and the
@@ -111,8 +98,8 @@ struct ProjectIssueScreen: View {
         // sub-issue covers this card without ending the visit — so anything
         // irreversible would destroy the page the reader is coming back to.
         // The paste target survives it because `detach` is identity-guarded and
-        // `onAppear` puts it back; the destructors are `IssueHost.deinit` and
-        // `IssueStore.deinit`, which fire when the screen actually goes.
+        // `onAppear` puts it back; the visit/store destructors fire when the
+        // navigation entry actually goes.
         .onDisappear {
             ComposerPasteTarget.shared.detach(store.staging)
         }
@@ -150,8 +137,13 @@ struct ProjectIssueScreen: View {
     }
 
     private var page: some View {
-        IssueWebView(host: host)
-            .ignoresSafeArea(.container, edges: .bottom)
+        IssueWebView(lease: visit.lease)
+            // The frame stays fixed while the keyboard moves, exactly like
+            // the chat transcript. The dock/keyboard obstruction reaches the
+            // page once, through `setComposerTop`; letting the keyboard safe
+            // area shrink this view as well charges that height twice and a
+            // jump exposes the duplicate as a keyboard-sized blank tail.
+            .ignoresSafeArea(.all, edges: .bottom)
     }
 
     private var dock: some View {
@@ -165,8 +157,7 @@ struct ProjectIssueScreen: View {
                 .onGeometryChange(for: CGFloat.self) { proxy in
                     proxy.frame(in: .global).minY
                 } action: { _, minY in
-                    let screenHeight = UIScreen.main.bounds.height
-                    host.bridge.setBottomInset(max(0, Int(screenHeight - minY)))
+                    store.setComposerTop(minY)
                 }
                 // An overlay rather than a row above the dock: the attach
                 // panel hangs off this content's top edge, and a disc in the
@@ -175,7 +166,7 @@ struct ProjectIssueScreen: View {
                     visible: !store.atBottom, label: lang.t("issue.jumpToLatest"),
                     identifier: "issue-jump"
                 ) {
-                    host.bridge.jumpToLatest()
+                    store.jumpToLatest()
                 }
         } panel: {
             if attach.isOpen {

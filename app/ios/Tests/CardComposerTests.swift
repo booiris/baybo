@@ -200,38 +200,28 @@ struct CardComposerTests {
             "a retired machine may not touch the draft again")
     }
 
-    /// **And the death has to be reachable.** Everything the card page cleans
-    /// up now hangs off `deinit` — the composer above, and `IssueHost`'s
-    /// stopping the page, unhooking the native surface and letting the
-    /// WebContent process go — so one retain cycle anywhere in
-    /// store → host → bridge is not a tidy little leak. It is a card whose
-    /// webview never stops, whose `ProjectInvalidations` observer refetches
-    /// five REST routes on every board broadcast for the life of the process,
-    /// and whose staging machine is never retired, once per card ever opened.
-    ///
-    /// It has happened: the screen installed `onPick` / `onOpenRun` /
-    /// `onActivityAtBottom` on the bridge from inside its own `body`, and a
-    /// closure written there captures the whole view struct — `@StateObject`
-    /// storage included — closing `host → bridge → closure → view → host`.
-    /// Those callbacks are gone (`IssueBridge` says why); this is what notices
-    /// if anything like them comes back.
-    @Test func droppingTheCardReleasesItsWebviewHost() async {
+    /// The renderer deliberately outlives a card now; the STORE must not.
+    /// `IssueBridge.store` is weak so a warm slot cannot keep every card it has
+    /// rendered, along with its invalidation observer and staging machine.
+    @Test func droppingTheCardReleasesItsStoreButKeepsTheWarmHost() async {
         let dir = TempSupportDir()
         weak var weakStore: IssueStore?
         weak var weakHost: IssueHost?
+        let pool = IssueHostPool()
+        var lease: IssueHostPool.Lease?
         autoreleasepool {
             let card = store(dir, client: FakeBayboClient())
             weakStore = card
-            // Everything the screen touches, touched: the page's host and the
-            // composer's machine both wire themselves into the store on first
-            // read, and either could be the end that will not let go.
-            weakHost = card.host
+            lease = pool.open(id: UUID(), store: card)
+            weakHost = lease?.host
             _ = card.staging
         }
 
         #expect(weakStore == nil, "the card's store outlived the card")
-        #expect(
-            weakHost == nil,
-            "the card's webview host outlived the card — its page is still running")
+        #expect(weakHost != nil, "the app's warm renderer died with one card")
+        if let lease { pool.close(lease) }
+        lease = nil
+        pool.teardown()
+        #expect(weakHost == nil, "tearing down the binding left a renderer alive")
     }
 }

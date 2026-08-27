@@ -64,13 +64,56 @@ it("replays the card that landed while the tree was still being scheduled", asyn
   // React has committed anything.
   const page = window.issuePage;
   if (page === undefined) throw new Error("window.issuePage missing");
-  page.init({ language: "en", projectId: "01JBOARD", number: 26, bottomInset: 24 });
+  page.init({
+    language: "en",
+    projectId: "01JBOARD",
+    number: 26,
+    targetId: "visit-26",
+    bottomInset: 24,
+  });
   page.deliver(payload);
 
   await act(async () => undefined);
 
   expect(document.querySelector(".issue-loading")).toBeNull();
   expect(document.body.textContent).toContain("Implement Go document structure");
+
+  // Reusing this warm document for a child card must disconnect the old
+  // subscriber before the child's delivery arrives. The two native evals are
+  // deliberately split across commits: no visible intermediate React tree may
+  // show the old card or "Loading card" between them.
+  const root = document.getElementById("issue-root");
+  if (root === null) throw new Error("issue-root missing");
+  let sawLoading = false;
+  const observer = new MutationObserver(() => {
+    sawLoading ||= root.querySelector(".issue-loading") !== null;
+  });
+  observer.observe(root, { childList: true, subtree: true });
+
+  await act(async () => {
+    page.init({
+      language: "en",
+      projectId: "01JBOARD",
+      number: 27,
+      targetId: "visit-27",
+      bottomInset: 24,
+    });
+  });
+  expect(root).toHaveClass("issue-retargeting");
+  expect(root.querySelector(".issue-loading")).toBeNull();
+
+  await act(async () => {
+    page.deliver({
+      ...payload,
+      issue: { ...card, number: 27, title: "Retarget the warm issue renderer" },
+    });
+  });
+  observer.disconnect();
+
+  expect(sawLoading).toBe(false);
+  expect(root).not.toHaveClass("issue-retargeting");
+  expect(document.body.textContent).toContain("Retarget the warm issue renderer");
+  expect(document.body.textContent).not.toContain("Implement Go document structure");
 });
 
 /// The other half of the same move: language still reaches i18n.
@@ -84,7 +127,13 @@ it("still switches the language native asks for, after the page has mounted", as
   await import("./main");
   const page = window.issuePage;
   if (page === undefined) throw new Error("window.issuePage missing");
-  page.init({ language: "en", projectId: "01JBOARD", number: 26, bottomInset: 0 });
+  page.init({
+    language: "en",
+    projectId: "01JBOARD",
+    number: 26,
+    targetId: "visit-26-language",
+    bottomInset: 0,
+  });
   await act(async () => undefined);
 
   page.setLanguage("zh");

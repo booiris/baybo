@@ -135,6 +135,10 @@
   font-size: 12px;
 }
 
+#issue-root.issue-retargeting {
+  visibility: hidden;
+}
+
 .issue-head h1 {
   margin: 0 0 8px;
   font-family: var(--font-sans);

@@ -66,6 +66,28 @@ struct IssueMirrorTests {
         #expect(second.isFromMirror)
     }
 
+    /// The board already has enough to draw the first screen of a card. A
+    /// first-ever open has no per-card mirror yet, so this seed closes the one
+    /// remaining cold-data gap while still withholding controls that require a
+    /// live card response.
+    @Test func aBoardSeedPaintsAFirstEverCardWithoutArmingLiveControls() {
+        let dir = TempSupportDir()
+        let store = IssueStore(
+            projectId: "p1", number: 41, client: FakeBayboClient(),
+            supportDirectory: dir.url,
+            seed: IssueStore.Seed(
+                issue: issue(41), runs: [run(settled: nil)], team: [member()],
+                children: [issue(42, title: "child")]))
+
+        #expect(store.issue?.title == "the dial loop")
+        #expect(store.runs.count == 1)
+        #expect(store.team.first?.handle == "dev-1")
+        #expect(store.children.first?.title == "child")
+        #expect(store.isFromMirror)
+        #expect(store.liveRun == nil, "Stop must wait for the card's live response")
+        #expect(store.pendingApprovals.isEmpty)
+    }
+
     /// **A cached prompt is never offered.** It is a live queue entry with a
     /// 300s timeout, and one replayed off disk would ask for an answer to
     /// something that stopped listening hours ago — the same reason the board

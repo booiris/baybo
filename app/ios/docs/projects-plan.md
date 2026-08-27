@@ -81,7 +81,7 @@ Six pure models (`BoardOrder`, `RunLabels`, `MoveConsequence`, `CommentHint`, `I
 ## P3 · Cards root, navigation, badges — **done**
 
 1. Replace the `PlaceholderScreen` at `HomeScreen.swift:89-90` with the Projects cards root (the `section{}` wrapper supplies the wordmark header); empty state and New project.
-2. Routes: add `.projectBoard(String)` and `.projectIssue(String, Int64)` to `AppStore.ChatRoute` (Hashable with payloads, as `.cronGroup` is; **keep transient state off the route** — the comment at AppStore:124-134); add two arms to the `RootView.swift:33-50` switch (the surrounding Group hides nav chrome for free); push with the guard-then-append shape of `openArchived` (AppStore:731-734) rather than `activateSession`, which switches tabs and resets the path; attach `PopGestureEnabler().frame(width: 0, height: 0)` to every pushed screen. The board→issue two-deep stack exercises PopGesture's peer-inheritance path (`PopGesture.swift:158-193`), which already exists.
+2. Routes: add `.projectBoard(String)` and an issue route to `AppStore.ChatRoute`; add two arms to the `RootView.swift:33-50` switch (the surrounding Group hides nav chrome for free); push with the guard-then-append shape of `openArchived` (AppStore:731-734) rather than `activateSession`, which switches tabs and resets the path; attach `PopGestureEnabler().frame(width: 0, height: 0)` to every pushed screen. The board→issue two-deep stack exercises PopGesture's peer-inheritance path (`PopGesture.swift:158-193`), which already exists. The shipped route later became `.projectIssue(ProjectIssueRoute)`: its UUID is the navigation-entry identity used by the warm renderer lease, while scroll/fold/draft state still stays off the route in `IssueVisit`.
 3. **Tab badges**: `Tab(...).badge(n)` chained inside the existing ForEach (`HomeScreen.swift:23-33`). This is the repo's first `.badge` — **verify on a simulator before building on it**. Chats = `BadgeCenter.total(index.rows)` (:53-55); Projects = the attention sum. `HomeTabView` starts observing `SessionIndex` and the ProjectsStore.
 4. The New project form (the `DirectLoginView` shape); on success, push the new board.
 5. Strings: hand-edit `Localizable.xcstrings` with both `en` and `zh-Hans` units (`home.tab.projects` already exists).
@@ -142,6 +142,13 @@ contact:
 
 - **Web half**: add the `issue` entry to `vite.config.ts:17-22` and an `issue.html` (viewport meta copied from deck.html); a new `src/issue/` (new files start with zero eslint suppressions); **extract the attachment components out of `Transcript.tsx` into `src/attachments.tsx`** (AttachmentImage/Bubble/Video/Audio/File, `useNearViewport`, …) — this shifts the suppression baseline, so do it as its own commit; reuse `Markdown.tsx` directly (which pulls in `bridge.ts`: the cheapest resolution is to register the `baybo` handler on the issue webview too so `openUrl` works, otherwise parameterize it); repeat the KaTeX css and fontsource imports in the entry; an `issueSentinel.ts` pinning the hand-written DTO mirrors through `restSentinel`'s type-only import; `issue.*` strings in both locales with the parity test; collapsed activity (consecutive system events → "N events ›").
 - **Native half**: `IssueBridge` (the DeckBridge pattern, main-frame guard, crash budget; `requestBlob`/`blobResult` as the transcript does) and `IssueHost` (if it adopts the transcript's `permitsNavigation`, that gate must admit `/issue.html`; deck's ungated delegate is the alternative); the bottom-inset stream (`setComposerTop` → `pushBottomInset`, replayed on `ready`); the dock (composer pill, hint chip from `CommentHint`, @ chips, `ApprovalCardView` with `CompactPillButtonStyle` lifted out first, the Unblock-after-send toggle, the Editing mode bar — the hint chip and the editor were both removed again on 2026-08-26, see `projects.md` §3.3); the Stop `ConfirmDialog` (a snapshot struct like `PendingCronJobDelete`, hosted on RootView); native pickers; the ⋯ menu; `RenameDialog` for the title.
+- **Warm-open follow-up (2026-08-27)**: `IssueHostPool` owns two prewarmed hosts for the binding, and every pushed route owns an `IssueVisit` plus a slot lease. A/B/C alternate 0/1/0; the completed C→B pop restores A under B. Retargeting snapshots per-visit scroll/folds before the new `targetId` is initialized, and every issue-specific callback carries that id. A board snapshot seeds a first-ever card while its detailed reads land.
+- **Retarget-paint follow-up (2026-08-27)**: native `init` and the first
+  `deliver` are separate JavaScript evaluations. Keying React from `init`
+  exposed an old-card → Loading card → new-card flash, so the bridge now hides
+  the reused root, latches `{init, firstPayload}`, and changes the keyed tree
+  from that pair in one commit; its layout effect reveals only the still-current
+  `targetId`.
 - `POST read` fires after the card renders, then attention refetches.
 - Gates: `app/ios/web` `pnpm lint && pnpm test && pnpm build` (the build is the only evaluator of both drift sentinels), the two-step Swift test run, and a device pass — put the description editor through a Chinese keyboard.
 
@@ -281,7 +288,8 @@ it is the only one where the difference between "covered" and "gone" ever
 showed. Everything else it raises is a `.sheet`, and a sheet does not fire the
 presenter's `onDisappear`.
 
-**Fix.** Hang the teardown off OWNERSHIP, which is push-proof by construction:
+**Historical fix (superseded by the warm pool below).** Hang the teardown off
+OWNERSHIP, which is push-proof by construction:
 a covered screen's state storage is retained by the NavigationStack, so no
 "is this a real exit" predicate has to be written, or kept in sync. The card's
 `IssueStore` owns the host (`IssueStore.host`, built on first read), the screen
@@ -308,7 +316,7 @@ which would have made it worse than the bug:
    (`pickRequest` / `openRunRequest` / `atBottom`) and the screen answers them
    with `onChange`. `IssueBridge.store` is weak, so that route cannot cycle —
    and with no closure properties left there is nowhere to install one.
-   `CardComposerTests.droppingTheCardReleasesItsWebviewHost` is what notices if
+   `CardComposerTests.droppingTheCardReleasesItsStoreButKeepsTheWarmHost` is what notices if
    anything like them comes back.
 2. **The first cut held the store and the host as two `@StateObject`s** (the
    `SubagentHost` / `ProjectRunHost` shape), which needs the shared instance in
@@ -334,7 +342,8 @@ Two more things rode the same wrong hook and moved with it:
 `ComposerPasteTarget` stayed on the appearance pair, deliberately: it is the
 reversible, identity-guarded handover that hook is FOR.
 
-**Test.** `ProjectCardUITests.testComingBackFromASubIssueLeavesTheCardPainted`,
+**Test.** This became
+`ProjectCardUITests.testNestedSubIssuesRestoreBothCoveredCards`,
 with two assertions on purpose. Existence catches an unparented page; it does
 not catch one parked on an empty document — a white body is a claim about
 PIXELS, and this suite is otherwise blind to those (`ScreenshotPixels` gained
@@ -342,9 +351,42 @@ PIXELS, and this suite is otherwise blind to those (`ScreenshotPixels` gained
 cannot reach: `CardComposerTests.theCardsDeathRetiresItsStagingMachine` now
 drives the rule by DROPPING the store rather than by calling it — a test that
 calls `leaveCard()` itself passes on the broken wiring, which is why the
-existing one never saw this — and `droppingTheCardReleasesItsWebviewHost`
-asserts the drop is actually reachable, which is the assertion the first cut of
-this fix would have failed.
+existing one never saw this — and
+`droppingTheCardReleasesItsStoreButKeepsTheWarmHost` asserts the store drop is
+actually reachable while the renderer deliberately remains warm.
+
+### A cold WebContent process made every issue open feel cold (2026-08-27)
+
+The ownership fix above stopped the white return page, but it also made every
+new card pay for a fresh `WKWebView`, JavaScript parse and React mount. The
+content mirror removed the network wait and could not remove that runtime
+boot, so a cached card still did not feel instant.
+
+The current shape separates a navigation visit from a renderer. `AppStore`
+prewarms exactly two `IssueHost`s at Home; a `ProjectIssueRoute` carries a fresh
+UUID whose `IssueVisit` owns the `IssueStore`, draft and page state, and whose
+lease names one host slot. The visit is created and its host retargeted before
+the route is appended. The pool alternates slots by issue-stack depth:
+A/B/C/D use 0/1/0/1. Only adjacent pages are visible, so the newest page may
+replace the grandparent. After a pop finishes, a child `UIViewController`'s
+real `viewDidAppear` restores the page below the new top while that top still
+covers it; using SwiftUI `onAppear` would change the outgoing page's pixels in
+the middle of the pop animation.
+
+Each visit remembers scroll and fold state. The retarget JavaScript snapshots
+the outgoing state and calls the incoming `init` in one evaluation, in that
+order. React is keyed by `targetId`; the bridge drops the old subscriber and
+buffers the new delivery until the keyed tree mounts. Every delayed
+issue-specific callback carries the same id and native rejects stale ids, so an
+avatar render or scroll debounce from A cannot land in C's store after slot 0
+has changed hands.
+
+A per-card mirror still wins when present. On a first-ever open,
+`ProjectsStore.issueSeed` supplies the board's issue/runs/team/children as an
+unconfirmed snapshot, so the warm runtime can paint before the five detailed
+reads return without arming Stop or approvals. `IssueHostPoolTests` pins the
+arbitrary-depth allocator and both pop orders; the UI smoke drives A→B→C→B→A,
+and the web tests pin retarget buffering plus scroll/fold restoration.
 
 ## Risks and mitigations
 

@@ -17,9 +17,21 @@ export type IssueInit = {
   language: string;
   projectId: string;
   number: number;
+  targetId: string;
   /// Bottom chrome (the dock, plus a ridden keyboard) at first paint, in CSS
   /// px. Streamed from then on — the webview never resizes.
   bottomInset: number;
+  restoredState?: IssueViewState;
+};
+
+export type IssueViewState = {
+  scrollTop: number;
+  folds: Record<string, boolean>;
+};
+
+export type IssuePresentation = {
+  init: IssueInit;
+  payload: IssuePayload;
 };
 
 /// Who an agent id is: what to call them, and what to draw for them.
@@ -77,6 +89,7 @@ export type IssueGlobal = {
   setBottomInset(px: number): void;
   setLanguage(lang: string): void;
   jumpToLatest(): void;
+  snapshotState(): IssueViewState | null;
 };
 
 type Buffered =
@@ -100,7 +113,11 @@ const buffer: Buffered[] = [];
 /// must still be told, exactly as the transcript's `onInit` does.
 let initPayload: IssueInit | null = null;
 const initListeners = new Set<(payload: IssueInit) => void>();
+let presentation: IssuePresentation | null = null;
+const presentationListeners = new Set<(value: IssuePresentation) => void>();
 const languageListeners = new Set<(lang: string) => void>();
+let stateProvider: (() => IssueViewState | null) | null = null;
+const retargetingClass = "issue-retargeting";
 
 /// Hear the init — now if it has already landed, otherwise when it does.
 export function onIssueInit(cb: (payload: IssueInit) => void): () => void {
@@ -108,6 +125,22 @@ export function onIssueInit(cb: (payload: IssueInit) => void): () => void {
   if (initPayload !== null) cb(initPayload);
   return () => {
     initListeners.delete(cb);
+  };
+}
+
+/// Switch React trees only when the new target's first frame is present.
+///
+/// `init` and `deliver` are two native evals. Rendering from `init` alone
+/// creates a real intermediate page with `payload === null`: the reused slot
+/// briefly shows its old card, then "Loading card", then the new card. This
+/// latch hands the key and its first payload to React in one state update.
+export function onIssuePresentation(
+  cb: (value: IssuePresentation) => void,
+): () => void {
+  presentationListeners.add(cb);
+  if (presentation !== null) cb(presentation);
+  return () => {
+    presentationListeners.delete(cb);
   };
 }
 
@@ -154,18 +187,46 @@ export function subscribeIssue(e: IssueEvents): () => void {
   };
 }
 
+export function provideIssueState(provider: () => IssueViewState | null): () => void {
+  stateProvider = provider;
+  return () => {
+    if (stateProvider === provider) stateProvider = null;
+  };
+}
+
 window.issuePage = {
   init: (payload) => {
+    if (initPayload !== null && initPayload.targetId !== payload.targetId) {
+      events = null;
+      buffer.length = 0;
+      stateProvider = null;
+      presentation = null;
+    }
     initPayload = payload;
+    document.getElementById("issue-root")?.classList.add(retargetingClass);
     for (const cb of [...initListeners]) cb(payload);
   },
-  deliver: (payload) => dispatch({ kind: "deliver", payload }),
+  deliver: (payload) => {
+    if (initPayload !== null) {
+      presentation = { init: initPayload, payload };
+      for (const cb of [...presentationListeners]) cb(presentation);
+    }
+    dispatch({ kind: "deliver", payload });
+  },
   setBottomInset: (px) => dispatch({ kind: "bottomInset", px }),
   setLanguage: (lang) => {
     for (const cb of [...languageListeners]) cb(lang);
   },
   jumpToLatest: () => dispatch({ kind: "jumpToLatest" }),
+  snapshotState: () => stateProvider?.() ?? null,
 };
+
+/// Reveal only the tree that still belongs to the bridge's current target.
+/// A late layout effect from the outgoing keyed tree must not expose it.
+export function revealIssueTarget(targetId: string): void {
+  if (initPayload?.targetId !== targetId) return;
+  document.getElementById("issue-root")?.classList.remove(retargetingClass);
+}
 
 // ---- outbound --------------------------------------------------------------
 
@@ -175,23 +236,23 @@ export function postIssueReady(): void {
 
 /// The card rendered. Native stamps it read only now — never on the way in,
 /// because a card whose timeline failed to paint has not been read.
-export function postIssueRendered(): void {
-  postToNative({ type: "issueRendered" });
+export function postIssueRendered(targetId: string = activeTargetId()): void {
+  postToNative({ type: "issueRendered", targetId });
 }
 
 /// Open another card on this board.
 export function openIssue(number: number): void {
-  postToNative({ type: "openIssue", number });
+  postToNative({ type: "openIssue", targetId: activeTargetId(), number });
 }
 
 /// Open a run's transcript.
 export function openRun(attempt: number): void {
-  postToNative({ type: "openRun", attempt });
+  postToNative({ type: "openRun", targetId: activeTargetId(), attempt });
 }
 
 /// Ask native to open a picker for a field the header/chips own.
 export function pickField(field: "status" | "priority" | "assignee" | "stage"): void {
-  postToNative({ type: "pick", field });
+  postToNative({ type: "pick", targetId: activeTargetId(), field });
 }
 
 /// A face this page drew for an agent that has none, as PNG base64.
@@ -200,12 +261,20 @@ export function pickField(field: "status" | "priority" | "assignee" | "stage"): 
 /// and this page speaks no REST — exactly as it never sends a comment itself.
 /// Fire-and-forget: the answer arrives as the next delivery, with the agent's
 /// `avatar` filled in.
-export function postGeneratedFace(agentId: string, pngBase64: string): void {
-  postToNative({ type: "generatedFace", agentId, pngBase64 });
+export function postGeneratedFace(targetId: string, agentId: string, pngBase64: string): void {
+  postToNative({ type: "generatedFace", targetId, agentId, pngBase64 });
 }
 
 /// How tall the rendered card is, so native can decide whether its "new
 /// activity" pill is worth showing.
-export function postActivityAtBottom(atBottom: boolean): void {
-  postToNative({ type: "activityAtBottom", atBottom });
+export function postActivityAtBottom(targetId: string, atBottom: boolean): void {
+  postToNative({ type: "activityAtBottom", targetId, atBottom });
+}
+
+export function postIssueState(targetId: string, state: IssueViewState): void {
+  postToNative({ type: "issueState", targetId, ...state });
+}
+
+function activeTargetId(): string {
+  return initPayload?.targetId ?? "test";
 }

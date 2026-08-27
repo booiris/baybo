@@ -3,16 +3,28 @@ import Foundation
 /// One project card, as the card page renders it.
 ///
 /// A separate type from `ProjectsStore` rather than a slice of it, and for the
-/// reason the board's own writes are in the store: this holds a WEBVIEW's
-/// worth of state — a bridge, a bottom inset, a live approval queue — none of
-/// which a board screen has any business carrying, and all of which would need a
-/// per-card key inside a store that is keyed by board.
+/// reason the board's own writes are in the store: this holds one card visit's
+/// state — a weak renderer bridge, page position, bottom inset and live
+/// approval queue — none of which a board screen has any business carrying,
+/// and all of which would need a per-card key inside a store keyed by board.
 ///
 /// Attachments are not reimplemented: `TranscriptMedia` is the same engine the
 /// chat transcript uses, so a file card on a project card behaves exactly as
 /// it does in a conversation.
 @MainActor
 final class IssueStore: ObservableObject, WebMediaTarget {
+    struct Seed {
+        let issue: IssueInfo
+        let runs: [IssueRunInfo]
+        let team: [TeamMemberInfo]
+        let children: [IssueInfo]
+    }
+
+    struct PageState: Equatable {
+        let scrollTop: Double
+        let folds: [String: Bool]
+    }
+
     let projectId: String
     let number: Int64
 
@@ -60,13 +72,12 @@ final class IssueStore: ObservableObject, WebMediaTarget {
     // quietly made the screen immortal.
     //
     // A closure written inside a `View`'s body captures that whole struct,
-    // property wrappers included, so one stored on a bridge closed the cycle
-    // `IssueHost → bridge → closure → view → _host → IssueHost`. Neither
-    // destructor could ever run: a WebContent process per card opened, a
-    // `ProjectInvalidations` observer per card refetching forever, and a
-    // composer staging machine that was never retired. `IssueBridge.store` is
-    // WEAK, so routing through the store cannot cycle no matter what the screen
-    // does — and with the closures gone there is nowhere to install one.
+    // property wrappers included. A pool host retaining such a closure would
+    // retain every visit it had rendered: its invalidation observer would
+    // refetch forever and its staging machine would never retire.
+    // `IssueBridge.store` is WEAK, so routing through the store cannot cycle no
+    // matter what the screen does — and with the closures gone there is nowhere
+    // to install one.
 
     /// A chip was pressed: `status` / `priority` / `assignee` / `stage`, as the
     /// page spells them. The screen consumes it and clears it.
@@ -94,6 +105,9 @@ final class IssueStore: ObservableObject, WebMediaTarget {
     /// the real board surfaces as another's logic bug.
     private let pasteboard: any PasteboardReading
     private weak var bridge: IssueBridge?
+    private(set) var pageState: PageState?
+    private(set) var composerTop: CGFloat?
+    private(set) var bottomInset = 0
     /// Everything on screen came off DISK and no live fetch has landed yet.
     ///
     /// Load-bearing, not cosmetic: a mirrored card may name a prompt that
@@ -123,24 +137,6 @@ final class IssueStore: ObservableObject, WebMediaTarget {
         return made
     }
 
-    /// The card's webview, built on first use and owned for this store's whole
-    /// life — the screen keeps no second reference and never observes it.
-    ///
-    /// **Built here rather than beside the store in the screen**, and an
-    /// explicit optional rather than a `lazy var`, for `staging`'s reason plus
-    /// one of its own: two `@StateObject`s over one instance would need that
-    /// instance in `ProjectIssueScreen.init`, out of `StateObject`'s
-    /// `@autoclosure` — which means constructing a whole `IssueStore` (a
-    /// synchronous mirror read and two JSON decodes) on EVERY re-evaluation of
-    /// the navigation destination, and throwing it away.
-    private var webHost: IssueHost?
-    var host: IssueHost {
-        if let webHost { return webHost }
-        let made = IssueHost(store: self)
-        webHost = made
-        return made
-    }
-
     private lazy var media: TranscriptMedia = {
         let media = TranscriptMedia(client: client)
         media.onPreview = { [weak self] in self?.filePreview = $0 }
@@ -154,7 +150,8 @@ final class IssueStore: ObservableObject, WebMediaTarget {
         projectId: String, number: Int64,
         client: any BayboClientProtocol = Baybo.client,
         supportDirectory: URL = SessionIndex.supportDirectory(),
-        pasteboard: any PasteboardReading = Pasteboards.launch()
+        pasteboard: any PasteboardReading = Pasteboards.launch(),
+        seed: Seed? = nil
     ) {
         self.projectId = projectId
         self.number = number
@@ -164,22 +161,27 @@ final class IssueStore: ObservableObject, WebMediaTarget {
         #if DEBUG
             if seedDemoCard() { return }
         #endif
-        loadMirror()
+        if !loadMirror(), let seed {
+            issue = seed.issue
+            runs = seed.runs
+            team = seed.team
+            children = seed.children
+            isFromMirror = true
+        }
     }
 
     deinit {
         MainActor.assumeIsolated { leaveCard() }
     }
 
-    /// Wire the page's bridge in. Called once, from `IssueHost.init`, which
-    /// this store owns — so there is no inverse: everything `detach` used to
-    /// undo (the invalidation token, the media sink, the bridge reference) dies
-    /// with the store itself, and an inverse reachable from a screen is an
-    /// inverse a `.onDisappear` eventually calls on a card that was only
-    /// covered.
+    /// Attach whichever warm renderer currently leases this visit.
     func attach(_ bridge: IssueBridge) {
+        if let current = self.bridge, current !== bridge {
+            media.detach(current)
+        }
         self.bridge = bridge
         media.attach(bridge)
+        guard invalidations == nil else { return }
         invalidations = ProjectInvalidations.shared.observe { [weak self] change in
             guard let self else { return }
             // A stale broadcast names no board, and every scope means dirty —
@@ -189,6 +191,12 @@ final class IssueStore: ObservableObject, WebMediaTarget {
             guard change.issueNumber == nil || change.issueNumber == self.number else { return }
             self.invalidated()
         }
+    }
+
+    func detach(_ bridge: IssueBridge) {
+        guard self.bridge === bridge else { return }
+        media.detach(bridge)
+        self.bridge = nil
     }
 
     // MARK: - Reads
@@ -276,9 +284,9 @@ final class IssueStore: ObservableObject, WebMediaTarget {
     ///
     /// The same first step as `resync`, and the only one that means anything
     /// from a list: there is no page to reload and no memory to clear, so the
-    /// next open is the cold-open path by construction. Deliberately not a
-    /// store method: making one for a card nobody is looking at would build a
-    /// webview host and a composer draft to delete a file.
+    /// next open starts without card content by construction. Deliberately not
+    /// a store method: making one for a card nobody is looking at would install
+    /// observers and card state merely to delete a file.
     static func discardMirror(
         projectId: String, number: Int64,
         supportDirectory: URL = SessionIndex.supportDirectory()
@@ -288,11 +296,12 @@ final class IssueStore: ObservableObject, WebMediaTarget {
         try? FileManager.default.removeItem(at: url)
     }
 
-    private func loadMirror() {
+    @discardableResult
+    private func loadMirror() -> Bool {
         guard let url = mirrorURL, let data = try? Data(contentsOf: url),
             let mirror = try? JSONDecoder().decode(
                 ProjectsStore.IssueContentMirror.self, from: data)
-        else { return }
+        else { return false }
         issue = mirror.issue.info
         eventsJson = mirror.eventsJson
         // The entries, and deliberately not the boundary they were written
@@ -302,6 +311,7 @@ final class IssueStore: ObservableObject, WebMediaTarget {
         team = mirror.team.map(\.info)
         children = mirror.children.map(\.info)
         isFromMirror = true
+        return true
     }
 
     private func persistMirror() {
@@ -362,6 +372,7 @@ final class IssueStore: ObservableObject, WebMediaTarget {
         runs = []
         children = []
         writeError = nil
+        pageState = nil
         // Nothing is from a mirror any more, because nothing is here at all.
         isFromMirror = false
         stampedRead = false
@@ -535,6 +546,28 @@ final class IssueStore: ObservableObject, WebMediaTarget {
 
     func setAtBottom(_ value: Bool) {
         atBottom = value
+    }
+
+    func rememberPageState(scrollTop: Double, folds: [String: Bool]) {
+        guard scrollTop.isFinite, scrollTop >= 0 else { return }
+        pageState = PageState(scrollTop: scrollTop, folds: folds)
+    }
+
+    func setComposerTop(_ value: CGFloat) {
+        composerTop = value
+        bridge?.setComposerTop(value)
+    }
+
+    func rememberBottomInset(_ value: Int) {
+        bottomInset = value
+    }
+
+    func setLanguage(_ code: String) {
+        bridge?.setLanguage(code)
+    }
+
+    func jumpToLatest() {
+        bridge?.jumpToLatest()
     }
 
     /// Stamp the card read. Called from the page's own "I rendered" message —
@@ -742,11 +775,7 @@ extension IssueStore: ComposerHost {
             runs = board.runs.contains { $0.number == number } ? Self.demoRuns(number: number) : []
             eventsJson = Self.demoEventsJson(number: number, assignee: card.assignee ?? "a-dev")
             events = (try? IssueEvent.decodeList(eventsJson)) ?? []
-            // The board fixture parents nothing, so take two rows as this
-            // card's children: the section prints a header off the DTO's
-            // done/total and its LIST off the board, and a header with no rows
-            // under it is not a state worth shipping a fixture of.
-            children = Array(board.issues.filter { $0.number != number }.prefix(2))
+            children = board.issues.filter { $0.parent == number }
             // NOT from a mirror: the fixture is what a live answer would have
             // said, so the controls a mirror withholds — Stop, the run rows —
             // are armed and therefore paintable.
