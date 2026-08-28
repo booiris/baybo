@@ -212,17 +212,17 @@ struct SessionIndexMirrorTests {
         #expect(mirror(Self.sessionId) == nil)
     }
 
-    /// A failed DELETE puts the row back but NOT the mirror — the same contract
-    /// the prune-era code had (`rollBackHide`: "its mirror stays gone"). The row
-    /// re-entry just refetches, which is exactly the no-cache path.
-    @Test func aRolledBackDeleteRestoresTheRowButNotTheMirror() {
+    /// An offline DELETE keeps both the row and mirror gone across a restart;
+    /// the durable mutation queue will retry the server write later.
+    @Test func anOfflineDeleteKeepsTheRowAndMirrorGone() {
         writeMirror(Self.sessionId)
         index.recordUserSend(sessionId: Self.sessionId, text: "mine")
 
         index.beginHide(Self.sessionId)
-        index.rollBackHide(Self.sessionId)
+        let reloaded = temp.makeIndex()
 
-        #expect(index.rows.contains { $0.id == Self.sessionId })
+        #expect(!reloaded.rows.contains { $0.id == Self.sessionId })
+        #expect(reloaded.pendingMutation(for: Self.sessionId) == .hidden)
         #expect(mirror(Self.sessionId) == nil)
     }
 

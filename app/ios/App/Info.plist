@@ -2,10 +2,10 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>BayboKeychainAccessGroup</key>
-	<string>$(AppIdentifierPrefix)com.baybo.app</string>
 	<key>BayboApnsEnvironment</key>
 	<string>$(BAYBO_APNS_ENVIRONMENT)</string>
+	<key>BayboKeychainAccessGroup</key>
+	<string>$(AppIdentifierPrefix)com.baybo.app</string>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
@@ -21,11 +21,15 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.0</string>
+	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
-	<string>0.1.0</string>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
 	<key>NSCameraUsageDescription</key>
 	<string>Baybo uses the camera to scan the pairing QR code.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Baybo uses your local network to connect to the Baybo service on your computer and sync conversations.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>Baybo saves a chat image to your photo library when you share it there.</string>
 	<key>UIAppFonts</key>
@@ -45,12 +49,7 @@
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
-	<key>UISupportedInterfaceOrientations~ipad</key>
-	<array>
-		<string>UIInterfaceOrientationPortrait</string>
-		<string>UIInterfaceOrientationPortraitUpsideDown</string>
-		<string>UIInterfaceOrientationLandscapeLeft</string>
-		<string>UIInterfaceOrientationLandscapeRight</string>
-	</array>
+	<key>UIUserInterfaceStyle</key>
+	<string>Light</string>
 </dict>
 </plist>

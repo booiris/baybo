@@ -7,7 +7,7 @@
 	     UserDefaults (Baybo.swift / SessionIndex.swift / Lang.swift),
 	     file timestamps + system uptime via the Rust core's libstd (stat /
 	     mach_absolute_time reached through std::fs / std::time on the
-	     mirrors, blob cache, and reconnect timers). -->
+	     mirrors, blob cache, reconnect timers, and user-selected files). -->
 	<key>NSPrivacyTracking</key>
 	<false/>
 	<key>NSPrivacyTrackingDomains</key>
@@ -30,6 +30,7 @@
 			<key>NSPrivacyAccessedAPITypeReasons</key>
 			<array>
 				<string>C617.1</string>
+				<string>3B52.1</string>
 			</array>
 		</dict>
 		<dict>

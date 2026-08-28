@@ -30,7 +30,7 @@ use baybo_store::{DeviceRow, DeviceStatus};
 use device_proto::delegation;
 use device_proto::noise::{FrameReassembler, NOISE_MAX_MESSAGE, StaticKeypair, write_chunked};
 use device_proto::pairing::{
-    ApnsEnv, DeviceConfirm, DeviceDelegation, DeviceHello, GatewayWelcome, PairFrame,
+    DeviceConfirm, DeviceDelegation, DeviceHello, GatewayWelcome, PairFrame,
 };
 use device_proto::psk_pair::{PskHandshake, build_prologue};
 use futures::{SinkExt, StreamExt};
@@ -369,8 +369,6 @@ async fn real_relay_pairs_gateway_and_mock_app() {
     let device_id = delegation::device_id_for(&app_ed.verifying_key());
     let hello = DeviceHello {
         device_id: device_id.clone(),
-        apns_token: "apns-tok".into(),
-        apns_env: ApnsEnv::Sandbox,
     };
     let msg3 = hs
         .write_handshake(&device_proto::pairing::encode(&hello).unwrap())

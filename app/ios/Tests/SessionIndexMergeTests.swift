@@ -148,6 +148,40 @@ struct SessionIndexMergeTests {
         #expect(index.rows.first?.archived == true)
     }
 
+    @Test func matchingSnapshotAcknowledgesAPendingArchive() {
+        index.recordUserSend(sessionId: Self.sessionId, text: "hello")
+        index.beginArchive(Self.sessionId, archived: true)
+
+        index.merge(
+            remote: [summary(lastUserText: "hello", archived: true)],
+            fetchEpoch: index.mutationEpoch)
+
+        #expect(index.rows.first?.archived == true)
+        #expect(index.pendingMutation(for: Self.sessionId) == nil)
+    }
+
+    @Test func mismatchingSnapshotKeepsAPendingArchive() {
+        index.recordUserSend(sessionId: Self.sessionId, text: "hello")
+        index.beginArchive(Self.sessionId, archived: true)
+
+        index.merge(
+            remote: [summary(lastUserText: "hello", archived: false)],
+            fetchEpoch: index.mutationEpoch)
+
+        #expect(index.rows.first?.archived == true)
+        #expect(index.pendingMutation(for: Self.sessionId) == .archived(true))
+    }
+
+    @Test func missingRowAcknowledgesAPendingHide() {
+        index.recordUserSend(sessionId: Self.sessionId, text: "hello")
+        index.beginHide(Self.sessionId)
+
+        index.merge(remote: [], fetchEpoch: index.mutationEpoch)
+
+        #expect(index.rows.isEmpty)
+        #expect(index.pendingMutation(for: Self.sessionId) == nil)
+    }
+
     @Test func pendingPinFlipBeatsTheFetchedSnapshot() {
         index.recordUserSend(sessionId: Self.sessionId, text: "hello")
         index.beginPin(Self.sessionId, pinned: true)

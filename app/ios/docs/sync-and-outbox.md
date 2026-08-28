@@ -510,6 +510,27 @@ unconfirmed entries resend. A **rebased** sync hides the floor, so each
 unconfirmed entry goes `unknown` and resolves via the per-key point lookup
 (`chatLookupMessage`) — found → released, absent → retry resumes.
 
+## Session-list mutation outbox
+
+Archive/unarchive and conversation hide are local-first even when the gateway
+is unreachable. `SessionIndex` writes the latest absolute intent to
+`session-mutations.json` under the active server namespace before it changes
+`sessions.json` or removes the row. A process death in that window therefore
+replays the intent on launch and restores the same optimistic projection: an
+archived row stays on the Archived screen and a hidden row stays gone.
+
+`AppStore` pumps those durable intents immediately, then retries failures with a
+2, 5, 15, 30, 60-second capped backoff. Launch, foreground, and a successful
+transport preconnect wake the queue immediately. Replays are safe because both
+wire operations are assignments (`archived = value`, `hidden = true`), never
+toggles. A full list pull is the second acknowledgement path: a matching archive
+flag retires that PUT, while an absent row retires a hide whose server write may
+have landed even though its response was lost.
+
+Pin and rename deliberately keep their existing rollback-on-failure contract;
+they are not entries in this outbox. Logout cancels live retry tasks but keeps
+the namespaced intent file, so reconnecting the same gateway resumes it.
+
 ## Issue comment outbox
 
 Issue comments use the same visible contract through a smaller REST-specific

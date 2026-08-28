@@ -20,10 +20,16 @@ options:
   deploymentTarget:
     iOS: "18.0"
   createIntermediateGroups: true
+configs:
+  Debug: debug
+  Release: release
+  Distribution: release
 settings:
   base:
     DEVELOPMENT_TEAM: KLK5BP5YS6
     CODE_SIGN_STYLE: Automatic
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
     # One source of truth for both the signed entitlement and the runtime APNs
     # route. Local/debugging exports use development even when optimized
     # (`Release`); distribution builds override this to production.
@@ -32,6 +38,9 @@ settings:
     ENABLE_BITCODE: NO
     ARCHS: arm64
     "EXCLUDED_ARCHS[sdk=iphonesimulator*]": x86_64
+  configs:
+    Distribution:
+      BAYBO_APNS_ENVIRONMENT: production
 # One explicit shared scheme so Xcode's Run button always targets the app —
 # without it Xcode auto-creates a scheme per target, and picking the
 # NotificationExtension one makes Run ask "choose an app to run" (an extension
@@ -51,7 +60,7 @@ schemes:
     profile:
       config: Release
     archive:
-      config: Release
+      config: Distribution
 targets:
   Baybo:
     type: application
@@ -80,29 +89,27 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.baybo.app
         PRODUCT_NAME: Baybo
-        TARGETED_DEVICE_FAMILY: "1,2"
+        TARGETED_DEVICE_FAMILY: "1"
         ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES: YES
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
     info:
       path: App/Info.plist
       properties:
         CFBundleDisplayName: Baybo
-        CFBundleShortVersionString: "0.1.0"
-        CFBundleVersion: "0.1.0"
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         UILaunchScreen: {}
+        UIUserInterfaceStyle: Light
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
-        "UISupportedInterfaceOrientations~ipad":
-          - UIInterfaceOrientationPortrait
-          - UIInterfaceOrientationPortraitUpsideDown
-          - UIInterfaceOrientationLandscapeLeft
-          - UIInterfaceOrientationLandscapeRight
         NSCameraUsageDescription: "Baybo uses the camera to scan the pairing QR code."
+        NSLocalNetworkUsageDescription: "Baybo uses your local network to connect to the Baybo service on your computer and sync conversations."
         # Required by the image viewer's share sheet: without it, tapping "Save
         # Image" TERMINATES the app (add-only access still needs a purpose string).
         NSPhotoLibraryAddUsageDescription: "Baybo saves a chat image to your photo library when you share it there."
+        ITSAppUsesNonExemptEncryption: false
         # Chat audio (AudioPlayerCenter) keeps playing through lock/background;
         # Now Playing + remote commands give it the Control Center transport.
         UIBackgroundModes:
@@ -195,8 +202,8 @@ targets:
       path: NotificationExtension/Info.plist
       properties:
         CFBundleDisplayName: Baybo
-        CFBundleShortVersionString: "0.1.0"
-        CFBundleVersion: "0.1.0"
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         NSExtension:
           NSExtensionPointIdentifier: com.apple.usernotifications.service
           NSExtensionPrincipalClass: "$(PRODUCT_MODULE_NAME).NotificationService"

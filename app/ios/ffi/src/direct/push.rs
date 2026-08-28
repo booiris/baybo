@@ -9,7 +9,7 @@
 //! notifies through its configured remote host (C) exactly as for a paired
 //! device, so C and the NSE are unchanged.
 //!
-//! Best-effort: a no-op when iOS hasn't issued an APNs token yet, or the gateway
+//! Best-effort: a no-op when the platform hasn't issued a push token yet, or the gateway
 //! has no `[push]` remote host configured. The caller re-runs it on foreground so
 //! a token that arrives after login still binds. The preview key rides TLS + the
 //! stored Bearer rather than a Noise handshake — a weaker (but still
@@ -20,6 +20,7 @@ use device_proto::aead::KEY_LEN;
 use device_proto::delegation;
 use serde::{Deserialize, Serialize};
 
+use crate::api::PushToken;
 use crate::keychain;
 
 #[derive(Deserialize)]
@@ -30,8 +31,7 @@ struct PushParams {
 #[derive(Serialize)]
 struct RegisterReq {
     device_id: String,
-    apns_token: String,
-    apns_env: String,
+    target: remote_host_protocol::push::PushTarget,
     push_key: String,
     delegation: String,
 }
@@ -42,19 +42,15 @@ struct RegisterResp {
 }
 
 /// Register (or refresh) this app's direct-mode push binding with the connected
-/// gateway. `Ok(None)` when there is no APNs token yet (the caller retries on the
+/// gateway. `Ok(None)` when there is no push token yet (the caller retries on the
 /// next foreground); `Ok(Some(device_id))` on success.
 pub async fn register(
     sessions: &super::DirectSessions,
-    apns_token: String,
-    apns_env: &str,
+    token: Option<PushToken>,
 ) -> Result<Option<String>, String> {
-    // No token yet (iOS hasn't delivered it) → nothing to register; the caller
-    // retries on the next foreground once it lands.
-    let apns_token = apns_token.trim().to_string();
-    if apns_token.is_empty() {
+    let Some(token) = token else {
         return Ok(None);
-    }
+    };
     let http = sessions.http_client()?;
 
     // 1. Fetch the gateway push key to sign the delegation over.
@@ -96,8 +92,7 @@ pub async fn register(
     // 5. Register the binding (Bearer + device id over TLS).
     let body = RegisterReq {
         device_id: device_id.clone(),
-        apns_token,
-        apns_env: apns_env.to_string(),
+        target: token.to_wire(),
         push_key: hex::encode(push_key),
         delegation: hex::encode(deleg.to_bytes()),
     };

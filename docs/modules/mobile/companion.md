@@ -99,7 +99,7 @@ out and must log in again.
     chunks a `Frame` past the Noise ~64 KiB per-message ceiling).
   - `aead` — ChaCha20-Poly1305 preview framing; `kdf` — HKDF-SHA256 → `channel`
     bindings + a 32-byte `push_key` + the confirmation code; `pairing` —
-    `PairFrame` / `DeviceHello` / `GatewayWelcome` / `ApnsEnv`; `fixtures` — the
+    `PairFrame` / `DeviceHello` / `GatewayWelcome`; `fixtures` — the
     pinned cross-language AEAD vector.
 - `crates/pairing` — `DevicePairingService` (`mint` / `complete` / slot lookup +
   operator/device decisions).
@@ -111,7 +111,7 @@ out and must log in again.
 - `remote-host/` (C, separate workspace):
   - `crates/protocol` — `remote-host-protocol`, the wire contract (route paths,
     the relay `x-remote-api-key` header, keyless `/notify` + `/register` bodies,
-    `ControlHello` / `ControlSignal`, `ApnsEnv`, URL builders); path-depended
+    `ControlHello` / `ControlSignal`, provider-tagged `PushTarget`, URL builders); path-depended
     across the boundary.
   - `crates/relay` — the blind byte-pipe `RelayBroker` + the WS rendezvous/content
     server; `crates/admission` — the hot-reloaded `remote_api_key` allow-list;
@@ -196,18 +196,17 @@ indistinguishable. The Rust producer (`device_proto::aead`) and the Swift
 consumer (CryptoKit `ChaChaPoly`) are pinned to one byte-exact vector in
 `device_proto::fixtures`; a drift on either side fails a test.
 
-**Registration:** if the APNs token is available during pairing, P threads it
-(hex) plus the build's APNs env into `DeviceHello`, and A persists that
-registration material in its vault. A advertises its gateway push public key in
-`GatewayWelcome`; P returns a sealed `DeviceDelegation` that authorizes that key
-for this device. Before the first push to a device in a gateway run, A
-best-effort POSTs a signed `/register` carrying `{device_id, apns_token, env,
-gateway_pubkey, delegation, sig, counter}` from the persisted material, so a
-restarted/pruned C can recover before `/notify`. If iOS delivers or rotates the
-APNs token after pairing, P sends it to A through the device API
-`POST /v1/mobile/apns-token`; the gateway persists it and re-registers on the
-next push. The phone never POSTs C's `/register` directly and never holds the
-APNs `.p8` or any push provider credential; it only holds its APNs device token,
+**Registration:** pairing establishes the device identity, preview `push_key`,
+and delegation, but carries no provider token. A advertises its gateway push
+public key in `GatewayWelcome`; P returns a sealed `DeviceDelegation` that
+authorizes that key for this device. Whenever the platform supplies or rotates a
+token, P sends a tagged target such as
+`{provider:"apns",token:"…",environment:"sandbox"}` through
+`POST /v1/mobile/push-token`. A persists it and, before the first push in a
+gateway run, best-effort POSTs a signed `/register` carrying
+`{device_id,target,gateway_pubkey,delegation,sig,counter}`, so a restarted/pruned
+C can recover before `/notify`. The phone never POSTs C's `/register` directly
+and never holds APNs/FCM provider credentials; it holds only its platform token,
 relay admission key, device identity, and `push_key`.
 
 **Direct-mode push (no pairing):** the direct transport has no pairing handshake,
@@ -239,7 +238,10 @@ C's blind relay, which only matches two legs by key and copies opaque frames
   splices it to the phone's `/content/join/{node}` leg. The manager self-gates on
   the approved device row (idle when none), reading the relay URL + admission key
   recorded on the row at pairing — there is **no `relay`/`push` config block**. It
-  is spawned + tracked under the shared `ShutdownSignal`
+  keeps polling that row while connected: a re-pair that changes the relay URL or
+  admission key tears down the stale control leg and immediately reconnects from
+  the new row, while a transient store read failure leaves the healthy leg alone.
+  It is spawned + tracked under the shared `ShutdownSignal`
   (`baybo_gateway::spawn_relay_content`), owns its child tasks (the control pump +
   per-signal data legs), and drains on shutdown.
 - **Device dedup is gateway-only** (`channel/state.rs` `LegDedup`): the relay is

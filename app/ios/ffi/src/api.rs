@@ -46,10 +46,7 @@ impl BayboError {
     }
 }
 
-/// APNs environment of this build. Passed in from Swift (from the Xcode build
-/// configuration) instead of `cfg!(debug_assertions)`: the Rust core is usually
-/// compiled in release even for a debug app, so a Rust-side cfg would misreport
-/// `production` for a sandbox-token build.
+/// APNs environment attached to an Apple push token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum ApnsEnvironment {
     Sandbox,
@@ -57,18 +54,51 @@ pub enum ApnsEnvironment {
 }
 
 impl ApnsEnvironment {
-    /// The wire string the gateway / pairing protocol expects.
-    pub(crate) fn as_str(self) -> &'static str {
+    pub(crate) fn to_wire(self) -> remote_host_protocol::push::ApnsEnvironment {
         match self {
-            Self::Sandbox => "sandbox",
-            Self::Production => "production",
+            Self::Sandbox => remote_host_protocol::push::ApnsEnvironment::Sandbox,
+            Self::Production => remote_host_protocol::push::ApnsEnvironment::Production,
+        }
+    }
+}
+
+/// A provider-tagged device token delivered by the platform shell.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum PushToken {
+    Apns {
+        token: String,
+        environment: ApnsEnvironment,
+    },
+    Fcm {
+        token: String,
+    },
+}
+
+impl PushToken {
+    pub(crate) fn normalized(self) -> Option<Self> {
+        fn valid_token(token: String) -> Option<String> {
+            let token = token.trim().to_string();
+            (!token.is_empty() && token.len() <= remote_host_protocol::push::PUSH_TOKEN_MAX_LEN)
+                .then_some(token)
+        }
+
+        match self {
+            Self::Apns { token, environment } => {
+                valid_token(token).map(|token| Self::Apns { token, environment })
+            }
+            Self::Fcm { token } => valid_token(token).map(|token| Self::Fcm { token }),
         }
     }
 
-    pub(crate) fn to_pairing(self) -> device_proto::pairing::ApnsEnv {
+    pub(crate) fn to_wire(&self) -> remote_host_protocol::push::PushTarget {
         match self {
-            Self::Sandbox => device_proto::pairing::ApnsEnv::Sandbox,
-            Self::Production => device_proto::pairing::ApnsEnv::Production,
+            Self::Apns { token, environment } => remote_host_protocol::push::PushTarget::Apns {
+                token: token.clone(),
+                environment: environment.to_wire(),
+            },
+            Self::Fcm { token } => remote_host_protocol::push::PushTarget::Fcm {
+                token: token.clone(),
+            },
         }
     }
 }
@@ -76,9 +106,6 @@ impl ApnsEnvironment {
 /// Construction-time configuration for [`crate::BayboClient`].
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ClientConfig {
-    /// Which APNs environment issued this build's tokens (development signing →
-    /// `Sandbox`, distribution signing → `Production`).
-    pub apns_env: ApnsEnvironment,
     /// Directory for the rotating `baybo.log` (2 MiB × 3 files — the exportable
     /// log bundle). `None` disables file logging (host tests).
     pub log_dir: Option<String>,

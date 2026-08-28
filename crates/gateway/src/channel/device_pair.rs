@@ -206,12 +206,6 @@ pub(crate) async fn drive<T: PairTransport + ?Sized>(
     let push_key =
         derive_push_key(noise.handshake_hash()).map_err(|e| format!("derive push key: {e}"))?;
     let push_key_name = crate::push::device_push_key_secret_name(&hello.device_id);
-    let apns_reg = crate::push::DeviceApnsRegistration {
-        apns_token: hello.apns_token.clone(),
-        apns_env: hello.apns_env,
-    };
-    let apns_bytes =
-        serde_json::to_vec(&apns_reg).map_err(|e| format!("encode apns registration: {e}"))?;
     let (relay_node_id, relay_url) = if state.relay_url.is_empty() {
         (String::new(), String::new())
     } else {
@@ -256,21 +250,6 @@ pub(crate) async fn drive<T: PairTransport + ?Sized>(
         revoke_staged_device(state, &hello.device_id).await;
         return Err(format!("store push key: {e}"));
     }
-    // 6b. Persist the APNs registration material (token + env) in the vault so a
-    //     transient `/register` failure is retriable — the push dispatcher
-    //     re-registers an approved device from this before its first push.
-    if let Err(e) = state
-        .secret_vault
-        .store_secret(
-            &crate::push::device_apns_secret_name(&hello.device_id),
-            &apns_bytes,
-        )
-        .await
-    {
-        revoke_staged_device(state, &hello.device_id).await;
-        return Err(format!("store apns registration: {e}"));
-    }
-
     // 7. Sealed GatewayWelcome — the routing the app reaches A by (the gateway's
     //    stable relay_node_id + the relay's base URL when a relay is configured)
     //    + the active auth_token. A's static is not carried: the app already
@@ -304,7 +283,7 @@ pub(crate) async fn drive<T: PairTransport + ?Sized>(
         return Err(format!("approve pairing: {e}"));
     }
 
-    // 8. DeviceDelegation — the device authorizes our push key to manage its APNs
+    // 8. DeviceDelegation — the device authorizes our push key to manage its push
     //    binding at C. Best-effort and after approval: a missing/invalid
     //    delegation only disables push for this device (relay/content still work),
     //    so it must neither delay approval nor fail the pair.
@@ -434,7 +413,6 @@ mod tests {
     use crate::test_support::{TestGateway, build_test_deps};
     use baybo_store::DeviceStatus;
     use device_proto::noise::StaticKeypair;
-    use device_proto::pairing::ApnsEnv;
     use device_proto::psk_pair::PairingSecret;
     use tokio::task::JoinHandle;
 
@@ -543,8 +521,6 @@ mod tests {
 
         let hello = DeviceHello {
             device_id: device_id.to_string(),
-            apns_token: "apns-tok".into(),
-            apns_env: ApnsEnv::Sandbox,
         };
         let msg3 = hs
             .write_handshake(&pairing::encode(&hello).unwrap())

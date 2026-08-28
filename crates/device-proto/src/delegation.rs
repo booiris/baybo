@@ -5,7 +5,7 @@
 //! `guest` key may be shared by mutually-distrusting tenants. Push requests carry
 //! that key as an edge traffic marker, but C's device-token store cannot use it as
 //! a binding boundary: once a caller learns a victim `device_id`, an otherwise
-//! unauthenticated overwrite would let it redirect or suppress the victim's APNs
+//! unauthenticated overwrite would let it redirect or suppress the victim's push
 //! binding and spam `/notify`.
 //!
 //! This module binds every binding mutation and notification to a signature chain
@@ -22,18 +22,18 @@
 //! C checks: `device_id == device-<hex(D_pub)>`, the delegation under `D_pub`,
 //! and the request signature under `G_pub`. Only the holder of `D` can authorize a
 //! `G`, and only the holder of `G` can mutate/notify the binding — independent of
-//! relay admission. C (a separate Cargo workspace that cannot link this
-//! crate) re-implements verification against this byte layout. The domain-
-//! separation context strings are a single source of truth in the shared
-//! `remote-host-protocol` crate both workspaces link; the `env` byte mapping and
-//! the length-prefix framing below stay defined here and are guarded against
-//! drift by the cross-impl `pinned_vector` test.
+//! relay admission. C lives in a separate Cargo workspace, but both sides use
+//! the canonical signed bytes from `remote-host-protocol`; signing and
+//! verification remain separate here and at C.
 
 use zeroize::Zeroize;
 
 pub use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use ed25519_dalek::{Signer, Verifier};
-use remote_host_protocol::push::{DELEGATION_CONTEXT, NOTIFY_CONTEXT, REGISTER_CONTEXT};
+use remote_host_protocol::push::{
+    NotifySigningInput, PushTarget, delegation_signing_message, notify_signing_message,
+    register_signing_message,
+};
 
 use crate::error::ProtoError;
 
@@ -46,11 +46,6 @@ pub const PUBLIC_LEN: usize = 32;
 pub const SIGNATURE_LEN: usize = 64;
 /// Ed25519 secret seed length.
 pub const SEED_LEN: usize = 32;
-
-/// Canonical `env` byte in the signed register message: APNs sandbox vs
-/// production. Pinned here so C's independent verifier maps identically.
-pub const ENV_SANDBOX: u8 = 0;
-pub const ENV_PRODUCTION: u8 = 1;
 
 /// Mint a fresh Ed25519 identity from the OS CSPRNG. Used for both the device
 /// identity (P) and the gateway push-signing key (A).
@@ -100,45 +95,10 @@ pub fn signature_from_bytes(bytes: &[u8]) -> Result<Signature, ProtoError> {
     Ok(Signature::from_bytes(&arr))
 }
 
-/// Append `bytes` as a `u32`-LE length prefix followed by the bytes, so the
-/// signed message is an unambiguous concatenation of variable-length fields.
-fn push_field(buf: &mut Vec<u8>, bytes: &[u8]) {
-    buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-    buf.extend_from_slice(bytes);
-}
-
-fn delegation_message(gateway_pub: &VerifyingKey) -> Vec<u8> {
-    let mut m = Vec::with_capacity(DELEGATION_CONTEXT.len() + PUBLIC_LEN);
-    m.extend_from_slice(DELEGATION_CONTEXT);
-    m.extend_from_slice(&gateway_pub.to_bytes());
-    m
-}
-
-fn register_message(device_id: &str, apns_token: &str, env: u8, counter: u64) -> Vec<u8> {
-    let mut m = Vec::new();
-    m.extend_from_slice(REGISTER_CONTEXT);
-    push_field(&mut m, device_id.as_bytes());
-    push_field(&mut m, apns_token.as_bytes());
-    m.push(env);
-    m.extend_from_slice(&counter.to_le_bytes());
-    m
-}
-
-fn notify_message(device_id: &str, enc: &str, n: &str, bid: &str, counter: u64) -> Vec<u8> {
-    let mut m = Vec::new();
-    m.extend_from_slice(NOTIFY_CONTEXT);
-    push_field(&mut m, device_id.as_bytes());
-    push_field(&mut m, enc.as_bytes());
-    push_field(&mut m, n.as_bytes());
-    push_field(&mut m, bid.as_bytes());
-    m.extend_from_slice(&counter.to_le_bytes());
-    m
-}
-
 /// P signs a delegation authorizing `gateway_pub` to manage P's push binding.
 /// `device_sk` is the device identity key whose public half is `device_id`.
 pub fn sign_delegation(device_sk: &SigningKey, gateway_pub: &VerifyingKey) -> Signature {
-    device_sk.sign(&delegation_message(gateway_pub))
+    device_sk.sign(&delegation_signing_message(&gateway_pub.to_bytes()))
 }
 
 /// Verify a delegation: `device_pub` (i.e. the `device_id` owner) authorized
@@ -149,7 +109,7 @@ pub fn verify_delegation(
     sig: &Signature,
 ) -> bool {
     device_pub
-        .verify(&delegation_message(gateway_pub), sig)
+        .verify(&delegation_signing_message(&gateway_pub.to_bytes()), sig)
         .is_ok()
 }
 
@@ -157,57 +117,52 @@ pub fn verify_delegation(
 pub fn sign_register(
     gateway_sk: &SigningKey,
     device_id: &str,
-    apns_token: &str,
-    env: u8,
+    target: &PushTarget,
     counter: u64,
 ) -> Signature {
-    gateway_sk.sign(&register_message(device_id, apns_token, env, counter))
+    gateway_sk.sign(&register_signing_message(device_id, target, counter))
 }
 
 /// Verify a `/register` signature under the (delegated) `gateway_pub`.
 pub fn verify_register(
     gateway_pub: &VerifyingKey,
     device_id: &str,
-    apns_token: &str,
-    env: u8,
+    target: &PushTarget,
     counter: u64,
     sig: &Signature,
 ) -> bool {
     gateway_pub
-        .verify(&register_message(device_id, apns_token, env, counter), sig)
+        .verify(&register_signing_message(device_id, target, counter), sig)
         .is_ok()
 }
 
 /// A signs a `/notify` for `device_id` with its delegated gateway key.
-pub fn sign_notify(
-    gateway_sk: &SigningKey,
-    device_id: &str,
-    enc: &str,
-    n: &str,
-    bid: &str,
-    counter: u64,
-) -> Signature {
-    gateway_sk.sign(&notify_message(device_id, enc, n, bid, counter))
+pub fn sign_notify(gateway_sk: &SigningKey, input: &NotifySigningInput<'_>) -> Signature {
+    gateway_sk.sign(&notify_signing_message(input))
 }
 
 /// Verify a `/notify` signature under the (delegated) `gateway_pub`.
 pub fn verify_notify(
     gateway_pub: &VerifyingKey,
-    device_id: &str,
-    enc: &str,
-    n: &str,
-    bid: &str,
-    counter: u64,
+    input: &NotifySigningInput<'_>,
     sig: &Signature,
 ) -> bool {
     gateway_pub
-        .verify(&notify_message(device_id, enc, n, bid, counter), sig)
+        .verify(&notify_signing_message(input), sig)
         .is_ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use remote_host_protocol::push::ApnsEnvironment;
+
+    fn apns_target(token: &str, environment: ApnsEnvironment) -> PushTarget {
+        PushTarget::Apns {
+            token: token.to_string(),
+            environment,
+        }
+    }
 
     #[test]
     fn device_id_round_trips_through_key() {
@@ -257,98 +212,86 @@ mod tests {
     fn register_signature_binds_every_field() {
         let gateway = generate_signing_key();
         let gp = gateway.verifying_key();
-        let sig = sign_register(&gateway, "device-aa", "tok", ENV_SANDBOX, 7);
-        assert!(verify_register(
-            &gp,
-            "device-aa",
-            "tok",
-            ENV_SANDBOX,
-            7,
-            &sig
-        ));
+        let target = apns_target("tok", ApnsEnvironment::Sandbox);
+        let sig = sign_register(&gateway, "device-aa", &target, 7);
+        assert!(verify_register(&gp, "device-aa", &target, 7, &sig));
         // Each field is covered: flipping any one breaks verification.
+        assert!(!verify_register(&gp, "device-bb", &target, 7, &sig));
         assert!(!verify_register(
             &gp,
-            "device-bb",
-            "tok",
-            ENV_SANDBOX,
+            "device-aa",
+            &apns_target("tok2", ApnsEnvironment::Sandbox),
             7,
             &sig
         ));
         assert!(!verify_register(
             &gp,
             "device-aa",
-            "tok2",
-            ENV_SANDBOX,
+            &apns_target("tok", ApnsEnvironment::Production),
             7,
             &sig
         ));
         assert!(!verify_register(
             &gp,
             "device-aa",
-            "tok",
-            ENV_PRODUCTION,
+            &PushTarget::Fcm {
+                token: "tok".into(),
+            },
             7,
             &sig
         ));
-        assert!(!verify_register(
-            &gp,
-            "device-aa",
-            "tok",
-            ENV_SANDBOX,
-            8,
-            &sig
-        ));
+        assert!(!verify_register(&gp, "device-aa", &target, 8, &sig));
     }
 
     #[test]
     fn notify_signature_binds_every_field() {
         let gateway = generate_signing_key();
         let gp = gateway.verifying_key();
-        let sig = sign_notify(&gateway, "device-aa", "enc", "n", "device-aa", 42);
-        assert!(verify_notify(
+        let input = NotifySigningInput {
+            device_id: "device-aa",
+            collapse_key: "collapse",
+            enc: "enc",
+            n: "n",
+            bid: "device-aa",
+            counter: 42,
+        };
+        let sig = sign_notify(&gateway, &input);
+        assert!(verify_notify(&gp, &input, &sig));
+        assert!(!verify_notify(
             &gp,
-            "device-aa",
-            "enc",
-            "n",
-            "device-aa",
-            42,
+            &NotifySigningInput {
+                collapse_key: "collapse2",
+                ..input
+            },
             &sig
         ));
         assert!(!verify_notify(
             &gp,
-            "device-aa",
-            "enc2",
-            "n",
-            "device-aa",
-            42,
+            &NotifySigningInput {
+                enc: "enc2",
+                ..input
+            },
             &sig
         ));
         assert!(!verify_notify(
             &gp,
-            "device-aa",
-            "enc",
-            "n2",
-            "device-aa",
-            42,
+            &NotifySigningInput { n: "n2", ..input },
             &sig
         ));
         assert!(!verify_notify(
             &gp,
-            "device-aa",
-            "enc",
-            "n",
-            "device-bb",
-            42,
+            &NotifySigningInput {
+                bid: "device-bb",
+                ..input
+            },
             &sig
         ));
         assert!(!verify_notify(
             &gp,
-            "device-aa",
-            "enc",
-            "n",
-            "device-aa",
-            43,
+            &NotifySigningInput {
+                counter: 43,
+                ..input
+            },
             &sig
         ));
     }
@@ -359,22 +302,29 @@ mod tests {
         // with otherwise-matching fields — the domain-separation contexts differ.
         let gateway = generate_signing_key();
         let gp = gateway.verifying_key();
-        let reg = sign_register(&gateway, "device-aa", "x", ENV_SANDBOX, 1);
+        let reg = sign_register(
+            &gateway,
+            "device-aa",
+            &apns_target("x", ApnsEnvironment::Sandbox),
+            1,
+        );
         assert!(!verify_notify(
             &gp,
-            "device-aa",
-            "x",
-            "x",
-            "device-aa",
-            1,
+            &NotifySigningInput {
+                device_id: "device-aa",
+                collapse_key: "x",
+                enc: "x",
+                n: "x",
+                bid: "device-aa",
+                counter: 1,
+            },
             &reg
         ));
     }
 
     /// Pin the wire byte layout to fixed vectors. The remote-host push crate
-    /// (a separate workspace that re-implements verification) asserts the SAME
-    /// vectors in `verify_accepts_pinned_device_proto_vector`, so any drift on
-    /// either side breaks a test before it silently breaks every push.
+    /// verifies the same vectors, so any drift breaks a test before it silently
+    /// breaks every push.
     #[test]
     fn pinned_vector() {
         let device = SigningKey::from_bytes(&[1u8; 32]);
@@ -394,15 +344,32 @@ mod tests {
         );
         assert_eq!(
             hex::encode(
-                sign_register(&gateway, &device_id, "apns-tok", ENV_SANDBOX, 42).to_bytes()
+                sign_register(
+                    &gateway,
+                    &device_id,
+                    &apns_target("apns-tok", ApnsEnvironment::Sandbox),
+                    42,
+                )
+                .to_bytes()
             ),
-            "bd2f828205bcdf66a7676b9a073e74b2ad546de3577adff293ac63eb65f81c2623e1d9e7cbfb2bd66038413f73a0731e62f979b719aac5db8aee2f3c66c28b02"
+            "1d2912846d9c0c25dbd696319e0cb78194d960a24d0f006bbe02482b49b7fb2855b4b93b784c290f92c0d57f00af459f55a346ec9af0c572777b13ae3afc8a03"
         );
         assert_eq!(
             hex::encode(
-                sign_notify(&gateway, &device_id, "ZW5j", "bm9uY2U", &device_id, 42).to_bytes()
+                sign_notify(
+                    &gateway,
+                    &NotifySigningInput {
+                        device_id: &device_id,
+                        collapse_key: "collapse-key",
+                        enc: "ZW5j",
+                        n: "bm9uY2U",
+                        bid: &device_id,
+                        counter: 42,
+                    },
+                )
+                .to_bytes()
             ),
-            "0cfd42d4b7af3d5c361993a4c9adb0afcf416931b900f57d3dab37a88c00ea801c2a3a3ca61062178a2958793c50938a1303e1b6ab7c3770df6e7bab31a13a0f"
+            "7966784813eaf926ea7852a744291626e3980c5430de7e6f73e640e4e247723570e6775b5f51edc0545bfcc9212cceb88398c3fbb5fc6a70d1f08a55f6462f09"
         );
     }
 
@@ -416,18 +383,22 @@ mod tests {
         let device_id = device_id_for(&device.verifying_key());
 
         let deleg = sign_delegation(&device, &gateway.verifying_key());
-        let notify = sign_notify(&gateway, &device_id, "enc", "n", &device_id, 1);
+        let notify_input = NotifySigningInput {
+            device_id: &device_id,
+            collapse_key: "collapse",
+            enc: "enc",
+            n: "n",
+            bid: &device_id,
+            counter: 1,
+        };
+        let notify = sign_notify(&gateway, &notify_input);
 
         // C-side: recover device key from device_id, check the chain.
         let dpub = device_pubkey_from_id(&device_id).unwrap();
         assert!(verify_delegation(&dpub, &gateway.verifying_key(), &deleg));
         assert!(verify_notify(
             &gateway.verifying_key(),
-            &device_id,
-            "enc",
-            "n",
-            &device_id,
-            1,
+            &notify_input,
             &notify
         ));
     }

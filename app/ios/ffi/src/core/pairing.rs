@@ -3,7 +3,7 @@
 use device_proto::aead::KEY_LEN;
 use device_proto::kdf::{derive_confirm_code, derive_push_key};
 use device_proto::pairing::{
-    self, ApnsEnv, DeviceConfirm, DeviceDelegation, DeviceHello, GatewayWelcome, PairFrame,
+    self, DeviceConfirm, DeviceDelegation, DeviceHello, GatewayWelcome, PairFrame,
 };
 use device_proto::psk_pair::{PairingSecret, PskHandshake, PskTransport, build_prologue};
 
@@ -15,8 +15,6 @@ pub struct PairingRequest {
     pub endpoint: String,
     pub device_id: String,
     pub static_secret: [u8; KEY_LEN],
-    pub apns_token: String,
-    pub apns_env: ApnsEnv,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,8 +64,6 @@ impl PairingClient {
         let msg1 = handshake.write_handshake(&[])?;
         let hello = DeviceHello {
             device_id: req.device_id,
-            apns_token: req.apns_token,
-            apns_env: req.apns_env,
         };
         let frame = PairFrame::Hello {
             rendezvous_id: req.rendezvous_id,

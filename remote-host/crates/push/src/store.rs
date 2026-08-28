@@ -1,8 +1,8 @@
-//! The push role's device registry: `device_id → { apns_token, env,
-//! gateway_pubkey, last_counter }` — the only per-device state it holds.
+//! The push role's device registry: `device_id → { target, gateway_pubkey,
+//! last_counter }` — the only per-device state it holds.
 //!
 //! It carries no conversation content — just the mapping from an opaque
-//! `device_id` to its APNs token plus the material to authenticate binding
+//! `device_id` to its provider-tagged token plus the material to authenticate binding
 //! mutations.
 //!
 //! The store is keyed by `device_id` alone — a 32-byte Ed25519 public key, so
@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
-use crate::apns::ApnsEnv;
+use remote_host_protocol::push::{ApnsEnvironment, PushProvider, PushTarget};
 
 /// Soft cap on tracked device bindings before idle/unconfirmed entries are
 /// evicted, mirroring the rate-limiter maps' bounded-growth pattern
@@ -37,16 +37,15 @@ pub const DEVICE_STORE_SOFT_CAP: usize = 65_536;
 /// cap pressure. A real device is pushed to (→ confirmed) well within it; the
 /// attacker's register-only floods age past it and are the first evicted when the
 /// store is full. Confirmed bindings are exempt — a live device is never aged out;
-/// a token that later dies is instead pruned on its next `/notify` `BadDeviceToken`.
+/// a token that later dies is instead pruned when its provider rejects it.
 pub const UNCONFIRMED_TTL: Duration = Duration::from_secs(3600);
 
-/// A device's APNs binding plus the material authenticating its mutations.
+/// A device's push binding plus the material authenticating its mutations.
 /// Registered by the device's delegated gateway (A) on the device's behalf
-/// (gateway-mediated — the app never holds APNs provider credentials).
+/// (gateway-mediated — the app never holds provider service credentials).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceRegistration {
-    pub apns_token: String,
-    pub env: ApnsEnv,
+    pub target: PushTarget,
     /// The gateway Ed25519 push key C verified the device's delegation against at
     /// `/register`. `/notify` signatures are checked against it.
     pub gateway_pubkey: [u8; 32],
@@ -55,19 +54,20 @@ pub struct DeviceRegistration {
     pub last_counter: u64,
 }
 
-/// Number of trailing `apns_token` characters retained when masking a device
+/// Number of trailing token characters retained when masking a device
 /// binding for the operator dashboard; the rest of the secret never leaves the
 /// push crate.
 const DEVICE_TOKEN_MASK_TAIL: usize = 4;
 
 /// Content-controlled view of a device binding for the operator dashboard. The
-/// `apns_token` secret is masked to its last [`DEVICE_TOKEN_MASK_TAIL`] chars
+/// provider token is masked to its last [`DEVICE_TOKEN_MASK_TAIL`] chars
 /// **inside this crate**, so the raw token never crosses the crate boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceSummary {
     pub device_id: String,
-    pub env: ApnsEnv,
-    /// Last [`DEVICE_TOKEN_MASK_TAIL`] chars of the `apns_token` only.
+    pub provider: PushProvider,
+    pub environment: Option<ApnsEnvironment>,
+    /// Last [`DEVICE_TOKEN_MASK_TAIL`] chars of the provider token only.
     pub token_masked: String,
     pub gateway_pubkey: [u8; 32],
     pub last_counter: u64,
@@ -86,11 +86,11 @@ pub trait DeviceTokenStore: Send + Sync {
     fn register(&self, device_id: &str, reg: DeviceRegistration) -> bool;
     /// Resolve a device's current binding.
     fn get(&self, device_id: &str) -> Option<DeviceRegistration>;
-    /// Unbind a device's token (on `400`/`410`). The device row on the gateway
-    /// is never touched — only the APNs token mapping here.
+    /// Unbind a rejected provider token. The device row on the gateway is never
+    /// touched — only the push binding here.
     fn unbind(&self, device_id: &str);
-    /// Mark a device's binding **confirmed by a successful `/notify`** (APNs
-    /// accepted its token) and refresh its idle clock, so a live device is never
+    /// Mark a device's binding **confirmed by a successful `/notify`** (the
+    /// provider accepted its token) and refresh its idle clock, so a live device is never
     /// aged out under cap pressure while an unconfirmed register-only flood is.
     fn confirm(&self, device_id: &str);
     /// Atomically advance the replay floor: stores `counter` and returns `true`
@@ -103,7 +103,7 @@ pub trait DeviceTokenStore: Send + Sync {
         self.len() == 0
     }
     /// Content-controlled snapshot of every binding for the operator dashboard,
-    /// with the `apns_token` masked inside this crate.
+    /// with the provider token masked inside this crate.
     fn summaries(&self) -> Vec<DeviceSummary>;
 }
 
@@ -239,16 +239,20 @@ impl DeviceTokenStore for InMemoryDeviceTokenStore {
             .lock()
             .iter()
             .map(|(device_id, e)| {
-                let chars = e.reg.apns_token.chars().count();
-                let token_masked: String = e
-                    .reg
-                    .apns_token
+                let token = e.reg.target.token();
+                let chars = token.chars().count();
+                let token_masked: String = token
                     .chars()
                     .skip(chars.saturating_sub(DEVICE_TOKEN_MASK_TAIL))
                     .collect();
+                let environment = match &e.reg.target {
+                    PushTarget::Apns { environment, .. } => Some(*environment),
+                    PushTarget::Fcm { .. } => None,
+                };
                 DeviceSummary {
                     device_id: device_id.clone(),
-                    env: e.reg.env,
+                    provider: e.reg.target.provider(),
+                    environment,
                     token_masked,
                     gateway_pubkey: e.reg.gateway_pubkey,
                     last_counter: e.reg.last_counter,
@@ -266,8 +270,10 @@ mod tests {
 
     fn reg(token: &str, counter: u64) -> DeviceRegistration {
         DeviceRegistration {
-            apns_token: token.into(),
-            env: ApnsEnv::Sandbox,
+            target: PushTarget::Apns {
+                token: token.into(),
+                environment: ApnsEnvironment::Sandbox,
+            },
             gateway_pubkey: [7u8; 32],
             last_counter: counter,
         }
@@ -279,20 +285,22 @@ mod tests {
         assert!(s.is_empty());
         assert!(s.register("dev-1", reg("tok", 5)));
         assert_eq!(s.len(), 1);
-        assert_eq!(s.get("dev-1").unwrap().apns_token, "tok");
+        assert_eq!(s.get("dev-1").unwrap().target.token(), "tok");
         assert!(s.get("dev-2").is_none());
         s.unbind("dev-1");
         assert!(s.get("dev-1").is_none());
     }
 
     #[test]
-    fn summaries_mask_the_apns_token_and_carry_metadata() {
+    fn summaries_mask_the_provider_token_and_carry_metadata() {
         let s = InMemoryDeviceTokenStore::new();
         s.register("dev-1", reg("supersecrettoken", 9));
         let sums = s.summaries();
         assert_eq!(sums.len(), 1);
         let sum = &sums[0];
         assert_eq!(sum.device_id, "dev-1");
+        assert_eq!(sum.provider, PushProvider::Apns);
+        assert_eq!(sum.environment, Some(ApnsEnvironment::Sandbox));
         assert_eq!(sum.last_counter, 9);
         assert_eq!(sum.gateway_pubkey, [7u8; 32]);
         // Only the last 4 chars survive; the raw secret never leaves the crate.
@@ -309,6 +317,24 @@ mod tests {
             sums[0].token_masked, "ab",
             "a <4-char token masks to itself"
         );
+    }
+
+    #[test]
+    fn fcm_summary_has_no_apns_environment() {
+        let s = InMemoryDeviceTokenStore::new();
+        assert!(s.register(
+            "dev-fcm",
+            DeviceRegistration {
+                target: PushTarget::Fcm {
+                    token: "fcm-token".into(),
+                },
+                gateway_pubkey: [8u8; 32],
+                last_counter: 1,
+            },
+        ));
+        let summary = &s.summaries()[0];
+        assert_eq!(summary.provider, PushProvider::Fcm);
+        assert_eq!(summary.environment, None);
     }
 
     #[test]
@@ -380,6 +406,6 @@ mod tests {
         // confirmed, so it stays protected from eviction.
         assert!(s.register_at("d", reg("b", 2), t0));
         assert_eq!(s.len(), 1);
-        assert_eq!(s.get("d").unwrap().apns_token, "b");
+        assert_eq!(s.get("d").unwrap().target.token(), "b");
     }
 }

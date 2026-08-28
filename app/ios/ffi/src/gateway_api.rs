@@ -27,7 +27,7 @@ const PATH_DECK: &str = "/v1/deck";
 /// The kanban boards. Every card, run, comment and approval on the phone
 /// rides this path space — see `app/ios/docs/projects.md`.
 const PATH_PROJECTS: &str = "/v1/projects";
-const PATH_MOBILE_APNS_TOKEN: &str = "/v1/mobile/apns-token";
+const PATH_MOBILE_PUSH_TOKEN: &str = "/v1/mobile/push-token";
 pub(crate) const PATH_BLOBS: &str = "/v1/blobs";
 /// Content-type for every JSON-bodied request, shared by both legs.
 pub(crate) const MEDIA_TYPE_JSON: &str = "application/json";
@@ -586,9 +586,8 @@ struct SetSessionModelRequest<'a> {
 }
 
 #[derive(Serialize)]
-struct UpdateApnsTokenRequest<'a> {
-    apns_token: &'a str,
-    apns_env: &'a str,
+struct UpdatePushTokenRequest<'a> {
+    target: &'a remote_host_protocol::push::PushTarget,
 }
 
 pub(crate) async fn create_session<C: GatewayJsonClient + Sync>(
@@ -1283,17 +1282,13 @@ pub(crate) async fn set_session_model<C: GatewayJsonClient + Sync>(
     client.put_empty(&path, body).await
 }
 
-pub(crate) async fn update_apns_token<C: GatewayJsonClient + Sync>(
+pub(crate) async fn update_push_token<C: GatewayJsonClient + Sync>(
     client: &C,
-    apns_token: &str,
-    apns_env: &str,
+    target: &remote_host_protocol::push::PushTarget,
 ) -> Result<(), String> {
-    let body = serde_json::to_vec(&UpdateApnsTokenRequest {
-        apns_token,
-        apns_env,
-    })
-    .map_err(|e| format!("encode APNs token update: {e}"))?;
-    client.post_empty(PATH_MOBILE_APNS_TOKEN, body).await
+    let body = serde_json::to_vec(&UpdatePushTokenRequest { target })
+        .map_err(|e| format!("encode push token update: {e}"))?;
+    client.post_empty(PATH_MOBILE_PUSH_TOKEN, body).await
 }
 
 #[derive(Deserialize)]
@@ -3689,17 +3684,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_apns_token_posts_the_token_and_its_environment() {
+    async fn update_push_token_posts_the_provider_target() {
         let client = RecordingClient::empty();
-        update_apns_token(&client, "abcd", "sandbox")
-            .await
-            .expect("apns");
+        let target = remote_host_protocol::push::PushTarget::Apns {
+            token: "abcd".into(),
+            environment: remote_host_protocol::push::ApnsEnvironment::Sandbox,
+        };
+        update_push_token(&client, &target).await.expect("push");
         assert_eq!(
             client.only_call(),
             RecordedCall {
                 method: "POST",
-                path: PATH_MOBILE_APNS_TOKEN.to_string(),
-                body: r#"{"apns_token":"abcd","apns_env":"sandbox"}"#.to_string(),
+                path: PATH_MOBILE_PUSH_TOKEN.to_string(),
+                body: r#"{"target":{"provider":"apns","token":"abcd","environment":"sandbox"}}"#
+                    .to_string(),
             }
         );
     }
