@@ -280,6 +280,12 @@ Table schemas are created centrally in `SqlitePool::init_db()`, but each Store s
 
 Fields difficult to fully structure (`SessionState.extra`, `Turn.input` / `Turn.final_result`) are stored as JSON. The trace stack stores the entire entity as a JSON `data` blob; queryable fields (`turn_id`, `step_id`, `started_at`, `ended_at`) surface as `GENERATED ALWAYS AS (json_extract(...)) VIRTUAL` columns SQLite keeps in lockstep with `data` automatically — no two-side write contract for the storage layer to enforce. The security requirement still applies: values must already be sanitized before persistence.
 
+`cron_jobs.data` also carries the authored, sorted exact MCP tool grants. The
+field is serde-defaulted, so legacy rows grant nothing. `cron_executions.data`
+contains a fire-time copy: pending-execution recovery must authorize against
+that immutable snapshot, never the job's current list. No migration column is
+needed because both records already use their versioned JSON blobs.
+
 ### Renaming a persisted name
 
 `init_db` runs on every open and is the only migration runner: additive

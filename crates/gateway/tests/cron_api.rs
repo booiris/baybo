@@ -5,9 +5,13 @@
 
 use axum::body::{self, Body};
 use axum::http::{Request, StatusCode};
-use baybo_gateway::test_support::build_test_deps;
+use baybo_gateway::test_support::{TEST_ADMIN_TOKEN, build_test_deps};
+use baybo_model::{McpTransportIdentity, TrustLevel};
+use baybo_tools::mcp::McpToolMetadata;
+use baybo_tools::{Tool, ToolContext, ToolManifest, ToolOutput};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
+use std::sync::Arc;
 use tower::ServiceExt;
 
 #[tokio::test]
@@ -481,7 +485,242 @@ async fn a_blank_prompt_is_refused_on_create_and_on_edit() {
     assert_eq!(trigger_at(&unchanged), trigger_at(&created));
 }
 
+#[tokio::test]
+async fn grantable_mcp_tool_listing_is_authenticated_live_typed_and_sorted() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let zeta_identity =
+        register_mcp_tool(&tg, "zeta", "zeta/search", "search", "Search zeta", 0x22);
+    let alpha_identity = register_mcp_tool(&tg, "alpha", "alpha/read", "read", "Read alpha", 0x11);
+    let router = build_authenticated_router(&tg);
+
+    get(&router, "/v1/cron/mcp-tools", StatusCode::UNAUTHORIZED).await;
+    let listed = admin_get(&router, "/v1/cron/mcp-tools", StatusCode::OK).await;
+    assert_eq!(
+        listed["items"],
+        json!([
+            {
+                "server": "alpha",
+                "tool": "alpha/read",
+                "upstream": "read",
+                "description": "Read alpha",
+                "transport_identity": alpha_identity.to_string(),
+            },
+            {
+                "server": "zeta",
+                "tool": "zeta/search",
+                "upstream": "search",
+                "description": "Search zeta",
+                "transport_identity": zeta_identity.to_string(),
+            },
+        ])
+    );
+
+    tg.deps.tool_registry.unregister_for_source("alpha");
+    let live = admin_get(&router, "/v1/cron/mcp-tools", StatusCode::OK).await;
+    assert_eq!(live["items"].as_array().expect("items").len(), 1);
+    assert_eq!(live["items"][0]["tool"].as_str(), Some("zeta/search"));
+}
+
+#[tokio::test]
+async fn cron_create_patch_replace_and_revoke_exact_mcp_grants() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let first_identity = register_mcp_tool(&tg, "alpha", "alpha/read", "read", "Read alpha", 0x11);
+    let second_identity = register_mcp_tool(&tg, "beta", "beta/write", "write", "Write beta", 0x22);
+    let router = build_authenticated_router(&tg);
+
+    let default_empty = admin_post_expect(
+        &router,
+        "/v1/cron",
+        new_cron_body("No grants"),
+        StatusCode::CREATED,
+    )
+    .await;
+    assert_eq!(default_empty["mcp_tool_grants"], json!([]));
+
+    let first_grant = grant_json("alpha/read", &first_identity);
+    let mut create = new_cron_body("Granted");
+    create["mcp_tool_grants"] = json!([first_grant.clone()]);
+    let created = admin_post_expect(&router, "/v1/cron", create, StatusCode::CREATED).await;
+    assert_eq!(created["mcp_tool_grants"], json!([first_grant.clone()]));
+    let uri = format!("/v1/cron/{}", created["id"].as_str().expect("id"));
+
+    let prompt_only = admin_patch_expect(
+        &router,
+        &uri,
+        json!({"prompt": "Updated without touching grants"}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(prompt_only["mcp_tool_grants"], json!([first_grant]));
+
+    let second_grant = grant_json("beta/write", &second_identity);
+    let replaced = admin_patch_expect(
+        &router,
+        &uri,
+        json!({
+            "prompt": "Mixed authored and grant update",
+            "mcp_tool_grants": [second_grant.clone()],
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(replaced["mcp_tool_grants"], json!([second_grant]));
+    assert_eq!(
+        replaced["prompt"].as_str(),
+        Some("Mixed authored and grant update")
+    );
+
+    let revoked = admin_patch_expect(
+        &router,
+        &uri,
+        json!({"mcp_tool_grants": []}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(revoked["mcp_tool_grants"], json!([]));
+}
+
+#[tokio::test]
+async fn stale_unknown_and_disconnected_mcp_grants_are_rejected() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let live_identity = register_mcp_tool(&tg, "alpha", "alpha/read", "read", "Read alpha", 0x11);
+    let router = build_authenticated_router(&tg);
+
+    let live_grant = grant_json("alpha/read", &live_identity);
+    let mut create = new_cron_body("Granted");
+    create["mcp_tool_grants"] = json!([live_grant.clone()]);
+    let created = admin_post_expect(&router, "/v1/cron", create, StatusCode::CREATED).await;
+    let uri = format!("/v1/cron/{}", created["id"].as_str().expect("id"));
+
+    let stale_identity = McpTransportIdentity::from_sha256([0x99; 32]);
+    let stale = admin_patch_expect(
+        &router,
+        &uri,
+        json!({"mcp_tool_grants": [grant_json("alpha/read", &stale_identity)]}),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert!(
+        stale["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("stale MCP grant")
+    );
+    let unchanged = admin_get(&router, &uri, StatusCode::OK).await;
+    assert_eq!(unchanged["mcp_tool_grants"], json!([live_grant.clone()]));
+
+    tg.deps.tool_registry.unregister_for_source("alpha");
+    let disconnected = admin_patch_expect(
+        &router,
+        &uri,
+        json!({"mcp_tool_grants": [live_grant]}),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert!(
+        disconnected["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not currently live")
+    );
+
+    let mut unknown_create = new_cron_body("Unknown grant");
+    unknown_create["mcp_tool_grants"] = json!([grant_json("missing/tool", &stale_identity)]);
+    let unknown =
+        admin_post_expect(&router, "/v1/cron", unknown_create, StatusCode::BAD_REQUEST).await;
+    assert!(
+        unknown["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not currently live")
+    );
+}
+
 // ── helpers ─────────────────────────────────────────────────────────
+
+struct TestMcpTool {
+    server: String,
+    name: String,
+    upstream: String,
+    description: String,
+    transport_identity: McpTransportIdentity,
+}
+
+#[async_trait::async_trait]
+impl Tool for TestMcpTool {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> String {
+        self.description.clone()
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+
+    fn mcp_metadata(&self) -> Option<McpToolMetadata> {
+        Some(McpToolMetadata {
+            tool_name: self.name.clone(),
+            server_name: self.server.clone(),
+            upstream_name: self.upstream.clone(),
+            transport_identity: self.transport_identity.clone(),
+            transport_accesses: Vec::new(),
+        })
+    }
+
+    async fn execute(&self, _params: Value, _ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
+        Ok(ToolOutput::Text(String::new()))
+    }
+}
+
+fn register_mcp_tool(
+    tg: &baybo_gateway::test_support::TestGateway,
+    server: &str,
+    name: &str,
+    upstream: &str,
+    description: &str,
+    identity_byte: u8,
+) -> McpTransportIdentity {
+    let transport_identity = McpTransportIdentity::from_sha256([identity_byte; 32]);
+    tg.deps.tool_registry.register_dynamic(
+        server,
+        Arc::new(TestMcpTool {
+            server: server.to_string(),
+            name: name.to_string(),
+            upstream: upstream.to_string(),
+            description: description.to_string(),
+            transport_identity: transport_identity.clone(),
+        }),
+        ToolManifest {
+            name: name.to_string(),
+            description: description.to_string(),
+            trust_level: TrustLevel::Trusted,
+            parameters_schema: json!({"type": "object"}),
+            capabilities: Vec::new(),
+            channels: Vec::new(),
+        },
+    );
+    transport_identity
+}
+
+fn grant_json(tool_name: &str, transport_identity: &McpTransportIdentity) -> Value {
+    json!({
+        "tool_name": tool_name,
+        "transport_identity": transport_identity.to_string(),
+    })
+}
+
+fn new_cron_body(title: &str) -> Value {
+    json!({
+        "schedule": "0 9 * * *",
+        "user_id": "owner",
+        "title": title,
+        "text": "Summarize the news",
+        "timezone": "UTC",
+    })
+}
 
 fn trigger_at(job: &Value) -> Option<DateTime<Utc>> {
     job["next_trigger_at"].as_str().map(|s| {
@@ -516,6 +755,10 @@ fn build_router(state: baybo_gateway::server::AdminState) -> axum::Router {
     router.with_state(state)
 }
 
+fn build_authenticated_router(tg: &baybo_gateway::test_support::TestGateway) -> axum::Router {
+    baybo_gateway::server::build_admin_router_for_tests(&tg.deps)
+}
+
 async fn request(
     router: &axum::Router,
     method: &str,
@@ -523,7 +766,21 @@ async fn request(
     body: Option<Value>,
     expected: StatusCode,
 ) -> Value {
-    let builder = Request::builder().method(method).uri(uri);
+    request_with_token(router, method, uri, body, expected, None).await
+}
+
+async fn request_with_token(
+    router: &axum::Router,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+    expected: StatusCode,
+    token: Option<&str>,
+) -> Value {
+    let mut builder = Request::builder().method(method).uri(uri);
+    if let Some(token) = token {
+        builder = builder.header("authorization", format!("Bearer {token}"));
+    }
     let request = match body {
         Some(v) => builder
             .header("content-type", "application/json")
@@ -551,12 +808,44 @@ async fn request(
     serde_json::from_slice(&bytes).expect("response is json")
 }
 
+async fn admin_request(
+    router: &axum::Router,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+    expected: StatusCode,
+) -> Value {
+    request_with_token(router, method, uri, body, expected, Some(TEST_ADMIN_TOKEN)).await
+}
+
 async fn get(router: &axum::Router, uri: &str, expected: StatusCode) -> Value {
     request(router, "GET", uri, None, expected).await
 }
 
 async fn post_expect(router: &axum::Router, uri: &str, body: Value, expected: StatusCode) -> Value {
     request(router, "POST", uri, Some(body), expected).await
+}
+
+async fn admin_get(router: &axum::Router, uri: &str, expected: StatusCode) -> Value {
+    admin_request(router, "GET", uri, None, expected).await
+}
+
+async fn admin_post_expect(
+    router: &axum::Router,
+    uri: &str,
+    body: Value,
+    expected: StatusCode,
+) -> Value {
+    admin_request(router, "POST", uri, Some(body), expected).await
+}
+
+async fn admin_patch_expect(
+    router: &axum::Router,
+    uri: &str,
+    body: Value,
+    expected: StatusCode,
+) -> Value {
+    admin_request(router, "PATCH", uri, Some(body), expected).await
 }
 
 async fn patch_expect(

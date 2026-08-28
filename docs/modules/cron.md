@@ -103,6 +103,40 @@ previous-fire cursor rides `CronExecution::previous_fire_at` rather than the
 job row: the row is advanced before the trigger is dispatched, so it already
 holds *this* fire's stamp by the time anything downstream reads it.
 
+## Exact MCP authority for unattended fires
+
+A cron job may carry `mcp_tool_grants`, a sorted/deduplicated list of exact
+`{ tool_name, transport_identity }` pairs. Legacy rows deserialize to an empty
+list. Each `CronExecution` snapshots the list when the fire is recorded, so
+recovery uses the policy that existed at fire time rather than a later job edit.
+The transport identity is a versioned SHA-256 digest of canonical non-secret MCP
+configuration: transport type; stdio command and ordered arguments or normalized
+HTTP URL; trust; sorted capabilities; trigger scope; public OAuth settings; and
+environment variable names. Credential values are excluded, so rotation does not
+revoke authority. A renamed tool or changed command, arguments, URL, trust,
+capabilities, scope, OAuth settings, or env-name set fails closed.
+
+The snapshot reaches `ToolExecutor` only through the initial `CronTrigger` turn.
+It is never copied into `SessionState::approved_resources`, and a user reply in a
+recurring fire's conversation gets ordinary interactive approval behavior. An
+exact match bypasses only that MCP tool's declared transport access. A different
+operation on the same server, a different Node MCP server, and every non-MCP
+resource remain uncovered. Because the initial fire is unattended, any uncovered
+access is denied immediately with a settings-oriented diagnostic instead of
+opening the five-minute approval prompt.
+
+Only authenticated operator surfaces can author these grants. `GET
+/v1/cron/mcp-tools` lists currently connected typed MCP operations; admin create
+and PATCH accept exact pairs, with PATCH omission preserving the list and `[]`
+revoking it. Unknown, disconnected, or stale identities are rejected rather than
+silently rebound. The Web editor groups live operations by server, selects none
+by default, warns before bulk selection, and keeps stale grants visible until the
+operator explicitly removes them. `CronCreate` and `CronUpdate` deliberately have
+no grant parameter, so an LLM cannot grant authority to its own future fires.
+
+iOS support is tracked separately on board issue #6; the transient phone approval
+card does not gain `ApproveAlways`.
+
 ## Design Decisions
 
 ### Framing lives in the persisted content, not in a wire envelope

@@ -94,6 +94,8 @@ pub enum AgentMessage {
         job_id: String,
         title: String,
         prompt: String,
+        /// Exact MCP tool grants snapshotted onto this execution.
+        mcp_tool_grants: Vec<baybo_model::McpToolGrant>,
         delivery: CronDelivery,
         /// Present only for a runtime-owned job's fire — see
         /// [`BuiltinFireContext`]. `None` for every job a user created.
@@ -513,12 +515,20 @@ impl AgentActor {
                 job_id,
                 title,
                 prompt,
+                mcp_tool_grants,
                 delivery,
                 builtin,
             } => {
                 debug!(session_id = %session_id, job_id = %job_id, ?delivery, "received cron trigger");
                 if let Err(e) = self
-                    .dispatch_cron_prompt(&prompt, &job_id, &title, delivery, builtin)
+                    .dispatch_cron_prompt(
+                        &prompt,
+                        &job_id,
+                        &title,
+                        mcp_tool_grants,
+                        delivery,
+                        builtin,
+                    )
                     .await
                 {
                     if is_turn_cancelled(&e) {
@@ -590,6 +600,7 @@ impl AgentActor {
     /// `AgentLoop::append_user_message` / `append_cron_fire` /
     /// `append_background_notification_prompt_once`) so framing lives in
     /// `baybo-context` and the loop just iterates.
+    #[allow(clippy::too_many_arguments)]
     async fn run_agent_loop(
         &mut self,
         turn_input: TurnInput,
@@ -604,6 +615,9 @@ impl AgentActor {
         // A recurring cron fire's silence handle for `report_nothing`;
         // `None` for every other turn. See `dispatch_cron_prompt`.
         notify_silence: Option<baybo_tools::NotifySilence>,
+        // Present only for the first cron-triggered turn. A later reply in the
+        // same session passes `None` despite its persistent Cron trigger.
+        initial_cron: Option<crate::runtime::tool_executor::InitialCronToolContext>,
     ) -> anyhow::Result<OutgoingMessage> {
         let is_user_turn = matches!(turn_input.input_kind(), baybo_turn::TurnInputKind::UserChat);
         // Kept so the error path below can tell a user `/stop` (token
@@ -615,21 +629,41 @@ impl AgentActor {
         // `agent_loop.run`, the end edge from its terminal transition. So
         // chat turn-activity has a single producer sourced from the one
         // truth, and the per-`Subscribe` snapshot can't disagree with it.
-        let result = self
-            .volatile
-            .agent_loop
-            .run(
-                &mut self.durable.session,
-                turn_input,
-                &self.volatile.turn_lifecycle,
-                &self.volatile.span_recorder,
-                parent_turn_id,
-                delta_tx,
-                turn_token.clone(),
-                interjections,
-                notify_silence,
-            )
-            .await;
+        let result = match initial_cron {
+            Some(context) => {
+                self.volatile
+                    .agent_loop
+                    .run_initial_cron(
+                        &mut self.durable.session,
+                        turn_input,
+                        &self.volatile.turn_lifecycle,
+                        &self.volatile.span_recorder,
+                        parent_turn_id,
+                        delta_tx,
+                        turn_token.clone(),
+                        interjections,
+                        notify_silence,
+                        context,
+                    )
+                    .await
+            }
+            None => {
+                self.volatile
+                    .agent_loop
+                    .run(
+                        &mut self.durable.session,
+                        turn_input,
+                        &self.volatile.turn_lifecycle,
+                        &self.volatile.span_recorder,
+                        parent_turn_id,
+                        delta_tx,
+                        turn_token.clone(),
+                        interjections,
+                        notify_silence,
+                    )
+                    .await
+            }
+        };
         let cancelled = turn_token.is_cancelled();
         if let Some(out) = stopped_out {
             *out = cancelled;
@@ -685,7 +719,7 @@ impl AgentActor {
             .agent_loop
             .append_issue_brief(number, checkout, brief, &files)
             .await?;
-        self.run_agent_loop(turn_input, None, None, None, None, None)
+        self.run_agent_loop(turn_input, None, None, None, None, None, None)
             .await?;
         Ok(())
     }
@@ -709,6 +743,7 @@ impl AgentActor {
         prompt: &str,
         job_id: &str,
         title: &str,
+        mcp_tool_grants: Vec<baybo_model::McpToolGrant>,
         delivery: CronDelivery,
         builtin: Option<BuiltinFireContext>,
     ) -> anyhow::Result<()> {
@@ -729,7 +764,17 @@ impl AgentActor {
         let silence =
             matches!(delivery, CronDelivery::Channel).then(baybo_tools::NotifySilence::new);
         let response = self
-            .run_agent_loop(turn_input, None, None, None, None, silence.clone())
+            .run_agent_loop(
+                turn_input,
+                None,
+                None,
+                None,
+                None,
+                silence.clone(),
+                Some(crate::runtime::tool_executor::InitialCronToolContext::new(
+                    mcp_tool_grants,
+                )),
+            )
             .await?;
         let silenced = silence.as_ref().is_some_and(|s| s.requested());
         match delivery {
@@ -1142,6 +1187,7 @@ impl AgentActor {
                 None,
                 None,
                 None,
+                None,
             )
             .await?;
         self.send_user_reply(response).await;
@@ -1203,6 +1249,7 @@ impl AgentActor {
                 Some(response_tx),
                 Some(&mut interjections),
                 Some(&mut stopped),
+                None,
                 None,
             )
             .await;
@@ -1452,6 +1499,7 @@ impl AgentActor {
                 },
                 Some(parent_turn_id),
                 Some(response_tx),
+                None,
                 None,
                 None,
                 None,
@@ -1740,6 +1788,7 @@ mod tests {
             job_id: "j".into(),
             title: "t".into(),
             prompt: "p".into(),
+            mcp_tool_grants: Vec::new(),
             delivery: CronDelivery::Channel,
         })
         .await

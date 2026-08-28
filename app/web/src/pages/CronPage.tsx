@@ -13,6 +13,7 @@ import {
   RiArrowGoBackLine,
   RiPencilLine,
   RiSaveLine,
+  RiErrorWarningLine,
 } from 'react-icons/ri';
 import { Button } from '../components/Button';
 import { IconButton } from '../components/IconButton';
@@ -20,13 +21,16 @@ import { SelectBox } from '../components/SelectBox';
 import { SearchBox } from '../components/SearchBox';
 import { useAdminClient, useAuth } from '../api/auth';
 import type { AdminClient } from '../api/client';
-import type { components } from '../api/schema';
+import type { components, operations } from '../api/schema';
 import { useMockMode, MOCK_CRONS } from '../api/mock';
 
-type CronJob = components['schemas']['CronJob'];
+export type McpToolGrant = components['schemas']['McpToolGrant'];
+export type GrantableMcpTool =
+  operations['list_grantable_mcp_tools']['responses'][200]['content']['application/json']['items'][number];
+export type CronJob = components['schemas']['CronJob'];
 type CronStatus = components['schemas']['CronStatus'];
 type CronSchedule = components['schemas']['CronSchedule'];
-type UpdateCronRequest = components['schemas']['UpdateCronRequest'];
+export type UpdateCronRequest = components['schemas']['UpdateCronRequest'];
 
 // Default page size for cron jobs
 const DEFAULT_PAGE_SIZE = 20;
@@ -62,6 +66,11 @@ export type CronListOutcome =
   | { kind: 'unauthorized' }
   | { kind: 'failed'; message: string };
 
+export type McpToolListOutcome =
+  | { kind: 'ok'; items: GrantableMcpTool[] }
+  | { kind: 'unauthorized' }
+  | { kind: 'failed'; message: string };
+
 export type CronMutationOutcome =
   | { kind: 'ok' }
   | { kind: 'unauthorized' }
@@ -80,6 +89,179 @@ function networkMessage(e: unknown): string {
   return e instanceof Error ? `Network error: ${e.message}` : 'Network error contacting gateway';
 }
 
+function responseErrorMessage(
+  error: components['schemas']['ErrorBody'] | undefined,
+  status: number,
+): string {
+  const message = error?.error;
+  return message !== null && message !== undefined && message.length > 0
+    ? message
+    : `HTTP Error ${status}`;
+}
+
+function compareMcpGrants(a: McpToolGrant, b: McpToolGrant): number {
+  if (a.tool_name !== b.tool_name) return a.tool_name < b.tool_name ? -1 : 1;
+  if (a.transport_identity === b.transport_identity) return 0;
+  return a.transport_identity < b.transport_identity ? -1 : 1;
+}
+
+export function mcpGrantKey(grant: McpToolGrant): string {
+  return JSON.stringify([grant.tool_name, grant.transport_identity]);
+}
+
+export function normalizeMcpGrants(grants: readonly McpToolGrant[]): McpToolGrant[] {
+  const byExactTuple = new Map<string, McpToolGrant>();
+  for (const grant of grants) {
+    byExactTuple.set(mcpGrantKey(grant), { ...grant });
+  }
+  return [...byExactTuple.values()].sort(compareMcpGrants);
+}
+
+export function mcpGrantForTool(tool: GrantableMcpTool): McpToolGrant {
+  return {
+    tool_name: tool.tool,
+    transport_identity: tool.transport_identity,
+  };
+}
+
+function includesExactGrant(grants: readonly McpToolGrant[], wanted: McpToolGrant): boolean {
+  const wantedKey = mcpGrantKey(wanted);
+  return grants.some((grant) => mcpGrantKey(grant) === wantedKey);
+}
+
+export function replaceMcpGrantSelection(
+  selected: readonly McpToolGrant[],
+  grant: McpToolGrant,
+  checked: boolean,
+): McpToolGrant[] {
+  const withoutExactTuple = selected.filter((item) => mcpGrantKey(item) !== mcpGrantKey(grant));
+  return normalizeMcpGrants(checked ? [...withoutExactTuple, grant] : withoutExactTuple);
+}
+
+export function mcpGrantReplacement(
+  persisted: readonly McpToolGrant[],
+  selected: readonly McpToolGrant[],
+): McpToolGrant[] | undefined {
+  const before = normalizeMcpGrants(persisted);
+  const after = normalizeMcpGrants(selected);
+  if (
+    before.length === after.length
+    && before.every((grant, index) => mcpGrantKey(grant) === mcpGrantKey(after[index]))
+  ) {
+    return undefined;
+  }
+  return after;
+}
+
+export interface McpGrantOption {
+  kind: 'live' | 'stale';
+  server: string;
+  upstream: string;
+  description: string;
+  grant: McpToolGrant;
+  selected: boolean;
+  staleReason?: string;
+}
+
+export interface McpGrantGroup {
+  server: string;
+  options: McpGrantOption[];
+}
+
+export function groupMcpGrantOptions(
+  available: readonly GrantableMcpTool[],
+  selected: readonly McpToolGrant[],
+): McpGrantGroup[] {
+  const normalizedSelection = normalizeMcpGrants(selected);
+  const liveByTuple = new Map<string, GrantableMcpTool>();
+  const liveByName = new Map<string, GrantableMcpTool>();
+  const options: McpGrantOption[] = [];
+
+  for (const tool of available) {
+    const grant = mcpGrantForTool(tool);
+    const key = mcpGrantKey(grant);
+    if (liveByTuple.has(key)) continue;
+    liveByTuple.set(key, tool);
+    liveByName.set(tool.tool, tool);
+    options.push({
+      kind: 'live',
+      server: tool.server,
+      upstream: tool.upstream,
+      description: tool.description,
+      grant,
+      selected: includesExactGrant(normalizedSelection, grant),
+    });
+  }
+
+  for (const grant of normalizedSelection) {
+    if (liveByTuple.has(mcpGrantKey(grant))) continue;
+    const sameName = liveByName.get(grant.tool_name);
+    options.push({
+      kind: 'stale',
+      server: sameName?.server ?? 'Unavailable grants',
+      upstream: sameName?.upstream ?? grant.tool_name,
+      description: 'Persisted grant; it does not match a currently connected operation.',
+      grant,
+      selected: true,
+      staleReason: sameName
+        ? 'The live operation has a different transport identity.'
+        : 'The server is disconnected, or this operation was removed.',
+    });
+  }
+
+  const grouped = new Map<string, McpGrantOption[]>();
+  for (const option of options) {
+    const group = grouped.get(option.server) ?? [];
+    group.push(option);
+    grouped.set(option.server, group);
+  }
+
+  return [...grouped.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([server, groupOptions]) => ({
+      server,
+      options: groupOptions.sort((a, b) => {
+        if (a.kind !== b.kind) return a.kind === 'stale' ? -1 : 1;
+        return compareMcpGrants(a.grant, b.grant);
+      }),
+    }));
+}
+
+export function retainedStaleMcpGrants(
+  available: readonly GrantableMcpTool[],
+  selected: readonly McpToolGrant[],
+): McpToolGrant[] {
+  const liveKeys = new Set(available.map((tool) => mcpGrantKey(mcpGrantForTool(tool))));
+  return normalizeMcpGrants(selected).filter((grant) => !liveKeys.has(mcpGrantKey(grant)));
+}
+
+export type McpServerBulkIntent =
+  | { kind: 'noop' }
+  | {
+      kind: 'confirm';
+      server: string;
+      additionCount: number;
+      warning: string;
+      selection: McpToolGrant[];
+    };
+
+export function planMcpServerBulkSelect(
+  group: McpGrantGroup,
+  selected: readonly McpToolGrant[],
+): McpServerBulkIntent {
+  const additions = group.options
+    .filter((option) => option.kind === 'live' && !includesExactGrant(selected, option.grant))
+    .map((option) => option.grant);
+  if (additions.length === 0) return { kind: 'noop' };
+  return {
+    kind: 'confirm',
+    server: group.server,
+    additionCount: additions.length,
+    warning: `Bulk grant warning: select all ${additions.length} remaining operation${additions.length === 1 ? '' : 's'} from server "${group.server}"? Each selected operation will be available to every future fire of this cron job.`,
+    selection: normalizeMcpGrants([...selected, ...additions]),
+  };
+}
+
 /**
  * Which slot paints a mutation failure. A modal's overlay covers the page-level
  * banner, so a failure raised while a modal is open has to render *inside* that
@@ -89,7 +271,7 @@ export function mutationErrorSlot(
   message: string | null,
   openModal: CronModal,
 ): 'none' | 'page' | Exclude<CronModal, null> {
-  if (!message) return 'none';
+  if (message === null || message.length === 0) return 'none';
   return openModal ?? 'page';
 }
 
@@ -109,8 +291,33 @@ export async function fetchCronJobs(client: AdminClient, view: CronView): Promis
       params: { query: { deleted: view === 'deleted' } },
     });
     if (response.status === 401) return { kind: 'unauthorized' };
-    if (error || !response.ok) {
-      return { kind: 'failed', message: error?.error || `HTTP Error ${response.status}` };
+    if (error !== undefined || !response.ok) {
+      return { kind: 'failed', message: responseErrorMessage(error, response.status) };
+    }
+    return { kind: 'ok', items: data?.items ?? [] };
+  } catch (e) {
+    return { kind: 'failed', message: networkMessage(e) };
+  }
+}
+
+interface ForwardMcpToolsClient {
+  GET(path: '/v1/cron/mcp-tools'): Promise<{
+    data?: { items: GrantableMcpTool[]; next_cursor?: string | null };
+    error?: components['schemas']['ErrorBody'];
+    response: Response;
+  }>;
+}
+
+export async function fetchCronMcpTools(client: AdminClient): Promise<McpToolListOutcome> {
+  try {
+    // The route and DTOs are present in the backend change while generated TS
+    // is intentionally updated later; this structural seam remains compatible
+    // with the generated client once that update lands.
+    const forwardClient = client as unknown as ForwardMcpToolsClient;
+    const { data, error, response } = await forwardClient.GET('/v1/cron/mcp-tools');
+    if (response.status === 401) return { kind: 'unauthorized' };
+    if (error !== undefined || !response.ok) {
+      return { kind: 'failed', message: responseErrorMessage(error, response.status) };
     }
     return { kind: 'ok', items: data?.items ?? [] };
   } catch (e) {
@@ -124,8 +331,8 @@ async function runMutation(
   try {
     const { error, response } = await call();
     if (response.status === 401) return { kind: 'unauthorized' };
-    if (error || !response.ok) {
-      return { kind: 'failed', message: error?.error || `HTTP Error ${response.status}` };
+    if (error !== undefined || !response.ok) {
+      return { kind: 'failed', message: responseErrorMessage(error, response.status) };
     }
     return { kind: 'ok' };
   } catch (e) {
@@ -173,8 +380,8 @@ export async function updateCronJob(
       body: patch,
     });
     if (response.status === 401) return { kind: 'unauthorized' };
-    if (error || !response.ok || !data) {
-      return { kind: 'failed', message: error?.error || `HTTP Error ${response.status}` };
+    if (error !== undefined || !response.ok) {
+      return { kind: 'failed', message: responseErrorMessage(error, response.status) };
     }
     return { kind: 'ok', job: data };
   } catch (e) {
@@ -239,7 +446,7 @@ function editedSchedule(initial: CronEditForm, form: CronEditForm): CronSchedule
   const time = isoFromLocalInput(form.at);
   // Compared as instants, not as text: the box holds only minutes, so a job whose
   // `at` carries seconds must still read as untouched when nobody touched it.
-  if (!time || (initial.scheduleKind === 'at' && time === isoFromLocalInput(initial.at))) {
+  if (time === null || (initial.scheduleKind === 'at' && time === isoFromLocalInput(initial.at))) {
     return null;
   }
   return { kind: 'at', time };
@@ -250,7 +457,11 @@ function editedSchedule(initial: CronEditForm, form: CronEditForm): CronSchedule
  * field out is what keeps the edit from re-arming a schedule nobody changed:
  * re-sending the same expression would still recompute the next fire from now.
  */
-export function cronEditPatch(job: CronJob, form: CronEditForm): UpdateCronRequest {
+export function cronEditPatch(
+  job: CronJob,
+  form: CronEditForm,
+  selectedMcpToolGrants?: readonly McpToolGrant[],
+): UpdateCronRequest {
   const initial = jobToEditForm(job);
   const patch: UpdateCronRequest = {};
   if (form.title !== initial.title) patch.title = form.title;
@@ -258,11 +469,15 @@ export function cronEditPatch(job: CronJob, form: CronEditForm): UpdateCronReque
   if (form.timezone.trim() !== initial.timezone) patch.timezone = form.timezone.trim();
   const schedule = editedSchedule(initial, form);
   if (schedule) patch.schedule = schedule;
+  if (selectedMcpToolGrants !== undefined) {
+    const replacement = mcpGrantReplacement(job.mcp_tool_grants ?? [], selectedMcpToolGrants);
+    if (replacement !== undefined) patch.mcp_tool_grants = replacement;
+  }
   return patch;
 }
 
 function formatTimestamp(iso: string | null | undefined): string {
-  if (!iso) return '-';
+  if (iso === null || iso === undefined || iso.length === 0) return '-';
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
   return d.toLocaleString('sv-SE', {
@@ -299,11 +514,11 @@ export function CronPage() {
   const deletedView = view === 'deleted';
 
   // Topmost first — that is the dialog a failure has to render inside.
-  const openModal: CronModal = pendingDeleteId
+  const openModal: CronModal = pendingDeleteId !== null
     ? 'trash'
-    : editing
+    : editing !== null
       ? 'edit'
-      : selected
+      : selected !== null
         ? 'detail'
         : null;
   const errorSlot = mutationErrorSlot(mutationError, openModal);
@@ -558,7 +773,7 @@ export function CronPage() {
         </SelectBox>
       </div>
 
-      {error && (
+      {error !== null && (
         <div className="mb-6 bg-white border-[3px] border-err text-err rounded-md shadow-brutal-sm px-4 py-3 font-mono text-sm break-words">
           {error}
         </div>
@@ -768,9 +983,12 @@ export function CronPage() {
             setMutationError(null);
             setSelected(null);
           }}
-          onEdit={selected.deleted_at ? undefined : () => openEditor(selected)}
+          onEdit={selected.deleted_at !== null && selected.deleted_at !== undefined
+            ? undefined
+            : () => openEditor(selected)}
           onTrash={
-            selected.deleted_at || selected.builtin === true
+            (selected.deleted_at !== null && selected.deleted_at !== undefined)
+              || selected.builtin === true
               ? undefined
               : () => {
                   setMutationError(null);
@@ -778,7 +996,7 @@ export function CronPage() {
                 }
           }
           onRestore={
-            selected.deleted_at
+            selected.deleted_at !== null && selected.deleted_at !== undefined
               ? () => {
                   void handleAction(selected.id, 'restore');
                 }
@@ -790,8 +1008,11 @@ export function CronPage() {
         <CronEditModal
           key={editing.id}
           job={editing}
+          client={client}
+          isMock={isMock}
           submitting={mutating}
           error={errorSlot === 'edit' ? mutationError : null}
+          onUnauthorized={logout}
           onClose={() => {
             setMutationError(null);
             setEditing(null);
@@ -801,7 +1022,7 @@ export function CronPage() {
           }}
         />
       )}
-      {pendingDeleteId && (
+      {pendingDeleteId !== null && (
         <TrashConfirmModal
           id={pendingDeleteId}
           submitting={mutating}
@@ -892,7 +1113,7 @@ function CronDetailModal({
           </div>
         </header>
         <div className="px-6 py-4 space-y-4 overflow-y-auto min-h-0">
-          {error && (
+          {error !== null && (
             <div className="bg-white border-[3px] border-err text-err rounded-md shadow-brutal-sm px-4 py-3 font-mono text-sm break-words">
               {error}
             </div>
@@ -918,7 +1139,7 @@ function CronDetailModal({
               <label className={fieldLabel}>Timezone</label>
               <div className="font-mono text-[0.9rem]">{job.timezone}</div>
             </div>
-            {job.deleted_at && (
+            {job.deleted_at !== null && job.deleted_at !== undefined && (
               <div>
                 <label className={fieldLabel}>Deleted At</label>
                 <div className="text-[0.9rem]">{formatTimestamp(job.deleted_at)}</div>
@@ -933,7 +1154,7 @@ function CronDetailModal({
             </div>
           </div>
 
-          {job.origin_session_id && (
+          {job.origin_session_id !== null && job.origin_session_id !== undefined && (
             <div>
               <label className={fieldLabel}>Origin Session</label>
               <code className="font-mono text-[0.85rem] break-all">{job.origin_session_id}</code>
@@ -947,26 +1168,93 @@ function CronDetailModal({
 
 function CronEditModal({
   job,
+  client,
+  isMock,
   submitting,
   error,
+  onUnauthorized,
   onClose,
   onSave,
 }: {
   job: CronJob;
+  client: AdminClient;
+  isMock: boolean;
   submitting: boolean;
   error: string | null;
+  onUnauthorized: () => void;
   onClose: () => void;
   onSave: (patch: UpdateCronRequest) => void;
 }) {
   const [form, setForm] = useState<CronEditForm>(() => jobToEditForm(job));
+  const [selectedMcpToolGrants, setSelectedMcpToolGrants] = useState<McpToolGrant[]>(() =>
+    normalizeMcpGrants(job.mcp_tool_grants ?? []),
+  );
+  const [grantableMcpTools, setGrantableMcpTools] = useState<GrantableMcpTool[]>([]);
+  const [mcpToolsLoadState, setMcpToolsLoadState] = useState<
+    'loading' | 'ok' | 'failed' | 'mock'
+  >(isMock ? 'mock' : 'loading');
+  const [mcpToolsError, setMcpToolsError] = useState<string | null>(null);
+  const [mcpToolsRefreshKey, setMcpToolsRefreshKey] = useState(0);
 
-  const patch = cronEditPatch(job, form);
+  useEffect(() => {
+    if (isMock) {
+      setMcpToolsLoadState('mock');
+      setMcpToolsError(null);
+      setGrantableMcpTools([]);
+      return;
+    }
+    let canceled = false;
+    setMcpToolsLoadState('loading');
+    setMcpToolsError(null);
+    async function loadMcpTools() {
+      const outcome = await fetchCronMcpTools(client);
+      if (canceled) return;
+      if (outcome.kind === 'unauthorized') {
+        onUnauthorized();
+        return;
+      }
+      if (outcome.kind === 'failed') {
+        setGrantableMcpTools([]);
+        setMcpToolsError(outcome.message);
+        setMcpToolsLoadState('failed');
+        return;
+      }
+      setGrantableMcpTools(outcome.items);
+      setMcpToolsLoadState('ok');
+    }
+    void loadMcpTools();
+    return () => {
+      canceled = true;
+    };
+  }, [client, isMock, mcpToolsRefreshKey, onUnauthorized]);
+
+  const patch = cronEditPatch(job, form, selectedMcpToolGrants);
   const changed = Object.keys(patch);
-  const blocked = submitting || changed.length === 0 || cronEditIncomplete(form);
+  const mcpGroups = groupMcpGrantOptions(grantableMcpTools, selectedMcpToolGrants);
+  const staleMcpGrants = mcpToolsLoadState === 'ok'
+    ? retainedStaleMcpGrants(grantableMcpTools, selectedMcpToolGrants)
+    : [];
+  const selectedMcpGrantsUnverified =
+    mcpToolsLoadState !== 'ok'
+    && mcpToolsLoadState !== 'mock'
+    && selectedMcpToolGrants.length > 0;
+  const blocked =
+    submitting
+    || changed.length === 0
+    || cronEditIncomplete(form)
+    || staleMcpGrants.length > 0
+    || selectedMcpGrantsUnverified;
   const reschedules = patch.schedule !== undefined || patch.timezone !== undefined;
 
   const set = <K extends keyof CronEditForm>(key: K, value: CronEditForm[K]) =>
     setForm((f) => ({ ...f, [key]: value }));
+
+  const selectServerOperations = (group: McpGrantGroup) => {
+    const intent = planMcpServerBulkSelect(group, selectedMcpToolGrants);
+    if (intent.kind === 'confirm' && window.confirm(intent.warning)) {
+      setSelectedMcpToolGrants(intent.selection);
+    }
+  };
 
   return (
     <div
@@ -997,7 +1285,7 @@ function CronEditModal({
         </header>
 
         <div className="px-6 py-4 space-y-4 overflow-y-auto min-h-0">
-          {error && (
+          {error !== null && (
             <div className="bg-white border-[3px] border-err text-err rounded-md shadow-brutal-sm px-4 py-3 font-mono text-sm break-words">
               {error}
             </div>
@@ -1131,6 +1419,164 @@ function CronEditModal({
             />
           </div>
 
+          <section className="border-2 border-black rounded-md overflow-hidden shadow-brutal-xs">
+            <div className="flex items-start justify-between gap-4 px-3 py-3 bg-canvas border-b-2 border-black">
+              <div>
+                <h4 className="font-bold uppercase tracking-wider text-[0.8rem]">
+                  MCP Operations
+                </h4>
+                <p className="mt-1 text-[0.75rem] text-ink-soft leading-snug">
+                  No operation is granted by default. Each checkbox is one exact operation and
+                  transport identity; checking a current operation never upgrades an older grant.
+                </p>
+              </div>
+              {mcpToolsLoadState === 'loading' && (
+                <RiLoader4Line className="animate-spin text-lg shrink-0" aria-label="Loading MCP operations" />
+              )}
+            </div>
+
+            {mcpToolsLoadState === 'mock' && (
+              <div className="px-3 py-3 text-[0.8rem] text-ink-soft">
+                Connected MCP operations are not loaded in mock mode.
+              </div>
+            )}
+
+            {mcpToolsLoadState === 'failed' && (
+              <div className="px-3 py-3 space-y-3">
+                <div className="flex items-start gap-2 text-[0.8rem] text-err leading-snug">
+                  <RiErrorWarningLine className="text-lg shrink-0" />
+                  <span>
+                    Could not verify connected MCP operations: {mcpToolsError}. Existing selections
+                    are unchanged. Saving is blocked while any selected grant cannot be verified;
+                    retry, or clear every saved grant to revoke them.
+                  </span>
+                </div>
+                <Button
+                  type="button"
+                  onClick={() => setMcpToolsRefreshKey((key) => key + 1)}
+                  disabled={submitting}
+                  className="!py-1 !px-3 !text-[0.8rem] h-8 gap-1.5"
+                >
+                  <RiRefreshLine /> Retry MCP List
+                </Button>
+                {selectedMcpToolGrants.length > 0 && (
+                  <Button
+                    type="button"
+                    onClick={() => setSelectedMcpToolGrants([])}
+                    disabled={submitting}
+                    className="!py-1 !px-3 !text-[0.8rem] h-8 ml-2 !border-err !text-err"
+                  >
+                    Revoke All Saved Grants
+                  </Button>
+                )}
+              </div>
+            )}
+
+            {mcpToolsLoadState === 'loading' && (
+              <div className="px-3 py-3 text-[0.8rem] text-ink-soft">
+                Checking the currently connected operations and exact transport identities…
+              </div>
+            )}
+
+            {mcpToolsLoadState === 'ok' && staleMcpGrants.length > 0 && (
+              <div className="flex items-start gap-2 px-3 py-3 bg-brand/15 border-b-2 border-black text-[0.8rem] leading-snug">
+                <RiErrorWarningLine className="text-lg shrink-0" />
+                <span>
+                  <strong>Save blocked:</strong> {staleMcpGrants.length} stale grant
+                  {staleMcpGrants.length === 1 ? '' : 's'} remain selected. Clear each stale
+                  checkbox to revoke it. If a replacement is live, select its separate unchecked
+                  row explicitly.
+                </span>
+              </div>
+            )}
+
+            {mcpToolsLoadState === 'ok' && mcpGroups.length === 0 && (
+              <div className="px-3 py-3 text-[0.8rem] text-ink-soft">
+                No typed MCP operations are currently connected.
+              </div>
+            )}
+
+            {mcpToolsLoadState === 'ok' && mcpGroups.map((group) => {
+              const bulkIntent = planMcpServerBulkSelect(group, selectedMcpToolGrants);
+              return (
+                <fieldset key={group.server} className="border-b last:border-b-0 border-black">
+                  <legend className="sr-only">MCP server {group.server}</legend>
+                  <div className="flex items-center justify-between gap-3 px-3 py-2 bg-gray-50 border-b border-black">
+                    <div className="min-w-0">
+                      <span className="font-bold font-mono text-[0.85rem] break-all">
+                        {group.server}
+                      </span>
+                      <span className="ml-2 text-[0.7rem] uppercase text-ink-soft">
+                        {group.options.filter((option) => option.kind === 'live').length} live
+                      </span>
+                    </div>
+                    <Button
+                      type="button"
+                      onClick={() => selectServerOperations(group)}
+                      disabled={submitting || bulkIntent.kind === 'noop'}
+                      title="Shows a warning before selecting every live operation on this server"
+                      className="!py-1 !px-2 !text-[0.72rem] h-7 shrink-0"
+                    >
+                      Select all…
+                    </Button>
+                  </div>
+                  <div className="divide-y divide-black">
+                    {group.options.map((option) => (
+                      <label
+                        key={`${option.kind}:${mcpGrantKey(option.grant)}`}
+                        className={`flex items-start gap-3 px-3 py-3 cursor-pointer ${
+                          option.kind === 'stale' ? 'bg-brand/10' : 'bg-white'
+                        }`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={option.selected}
+                          disabled={submitting}
+                          onChange={(event) =>
+                            setSelectedMcpToolGrants((selected) =>
+                              replaceMcpGrantSelection(
+                                selected,
+                                option.grant,
+                                event.target.checked,
+                              ),
+                            )
+                          }
+                          className="mt-1 size-4 accent-black shrink-0"
+                        />
+                        <span className="min-w-0 flex-1">
+                          <span className="flex flex-wrap items-center gap-2">
+                            <strong className="font-mono text-[0.85rem] break-all">
+                              {option.upstream}
+                            </strong>
+                            {option.kind === 'stale' && (
+                              <span className="px-1.5 py-0.5 bg-brand border border-black rounded text-[0.65rem] font-bold uppercase">
+                                Stale saved grant
+                              </span>
+                            )}
+                          </span>
+                          <code className="block mt-1 text-[0.72rem] break-all text-ink-soft">
+                            tool: {option.grant.tool_name}
+                          </code>
+                          <code className="block mt-0.5 text-[0.68rem] break-all text-ink-soft">
+                            transport: {option.grant.transport_identity}
+                          </code>
+                          <span className="block mt-1 text-[0.75rem] leading-snug">
+                            {option.description}
+                          </span>
+                          {option.staleReason !== undefined && (
+                            <span className="block mt-1 text-[0.75rem] font-bold text-err leading-snug">
+                              {option.staleReason} Clear this checkbox to revoke the saved tuple.
+                            </span>
+                          )}
+                        </span>
+                      </label>
+                    ))}
+                  </div>
+                </fieldset>
+              );
+            })}
+          </section>
+
           {reschedules && job.status !== 'disabled' && (
             <div className={modalNotice}>
               <RiTimeLine className="text-base shrink-0 mt-0.5 text-ink-soft" />
@@ -1210,7 +1656,7 @@ function TrashConfirmModal({
             {' '}to the recycle bin? It stops firing and leaves this list, but the record is kept —
             you can restore it from the Recycle Bin view.
           </p>
-          {error && (
+          {error !== null && (
             <div className="bg-white border-[2px] border-err text-err rounded-md px-3 py-2 font-mono text-[0.85rem] break-words">
               {error}
             </div>

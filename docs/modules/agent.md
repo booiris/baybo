@@ -131,6 +131,15 @@ See [trace.md](trace.md#toolcall-output-storage).
 4. If any remain, call `gate.request(...)` with the uncovered set and a truncated params preview. The gate returns an `ApprovalOutcome`, not a bare decision; on `Deny` the call short-circuits to `ToolError::Denied` (recorded on the trace before return) whose `reason` is worded from `baybo_tools::refusal_reason(outcome.resolution)`. That distinction is the point: a 300 s window nobody answered, a prompt torn down by a cancel, and a standing policy are not a human refusal, and reporting them to the model as one teaches it to re-argue with somebody who was never there. A cancel that fires while the prompt is still up records `Abandoned` — nobody decided anything — rather than being written down as a decision.
 5. On `ApproveAlways`, the executor de-dupes and pushes the newly-approved accesses directly into the shared `Mutex<Vec<ApprovedResource>>` passed by `AgentLoop`. After all tool calls complete, `AgentLoop` flushes the contents back into `session.state.approved_resources`, which persists through session save/restore because the types live in `baybo-model`.
 
+5. On the initial turn of a cron fire only, the router supplies a separate
+   `InitialCronToolContext` built from the execution's snapshotted exact MCP
+   grants. A matching tool name + live transport identity removes only that
+   MCP tool's transport accesses from the uncovered set. Any access still
+   uncovered is denied immediately because no operator is present; the channel
+   gate is not called. This context is passed explicitly rather than inferred
+   from `TriggerSource::Cron`, which remains on the conversation when the user
+   replies later. It never seeds or mutates `SessionState::approved_resources`.
+
 Parallel tool calls within a turn each go through the gate independently; the gate implementation is responsible for its own serialization (TUI queues and shows one inline prompt at a time).
 
 ### Long-running model

@@ -16,7 +16,7 @@ use crate::mcp::McpError;
 use crate::mcp::config::{McpFile, McpServerEntry, McpTransportConfig};
 use crate::mcp::embedded::EmbeddedMcpServer;
 use crate::mcp::runtime::McpRuntime;
-use crate::mcp::transport::{McpServerSession, connect_with_extra_env};
+use crate::mcp::transport::{McpServerSession, connect_with_extra_env, load_env_names};
 use crate::{Tool, ToolRegistry};
 
 const TICK_INTERVAL: Duration = Duration::from_secs(5);
@@ -427,6 +427,13 @@ impl McpReconciler {
                 })??
         };
         let resources = resource_access_for(entry, is_embedded);
+        let mut env_names = if matches!(entry.transport, McpTransportConfig::Stdio { .. }) {
+            load_env_names(&self.vault, &entry.name).await?
+        } else {
+            Vec::new()
+        };
+        env_names.extend(extra_env.keys().cloned());
+        let transport_identity = entry.transport_identity(env_names)?;
         let trust_level: baybo_model::TrustLevel = entry.trust_level.into();
 
         for descriptor in session.tools().to_vec() {
@@ -434,6 +441,7 @@ impl McpReconciler {
                 entry.name.clone(),
                 descriptor.clone(),
                 resources.clone(),
+                transport_identity.clone(),
                 entry.trigger_scope,
                 session.peer(),
                 self.blob_store.clone(),

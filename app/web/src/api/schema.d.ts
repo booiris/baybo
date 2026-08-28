@@ -568,6 +568,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/cron/mcp-tools": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_grantable_mcp_tools"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/cron/{id}": {
         parameters: {
             query?: never;
@@ -2342,6 +2358,11 @@ export interface components {
          */
         CreateCronRequest: {
             channel?: null | components["schemas"]["ChannelType"];
+            /**
+             * @description Exact live MCP operations this job may invoke without an interactive
+             *     approval when a fire starts. Omitted means no grants.
+             */
+            mcp_tool_grants?: components["schemas"]["McpToolGrant"][];
             origin_session_id?: string | null;
             /**
              * @description Point this job at a board: its fires run as that project's lead and
@@ -2470,6 +2491,8 @@ export interface components {
             id: string;
             /** Format: date-time */
             last_triggered_at?: string | null;
+            /** @description Exact MCP operations and transport configurations granted to a fire. */
+            mcp_tool_grants?: components["schemas"]["McpToolGrant"][];
             /** Format: date-time */
             next_trigger_at?: string | null;
             origin_session_id?: string | null;
@@ -3254,6 +3277,11 @@ export interface components {
              */
             ordinal: number;
         };
+        /** @description Exact authority for one namespaced MCP operation on one live transport. */
+        McpToolGrant: {
+            tool_name: string;
+            transport_identity: string;
+        };
         MoveFolderRequest: {
             /** @description New parent id, or `null` to promote the folder to top-level. */
             parent_id?: string | null;
@@ -3749,6 +3777,11 @@ export interface components {
          *     or moved by `POST /v1/cron/{id}/{pause,resume}`.
          */
         UpdateCronRequest: {
+            /**
+             * @description Replace the job's exact MCP grants. Omitted preserves the current
+             *     grants; an empty list revokes all of them.
+             */
+            mcp_tool_grants?: components["schemas"]["McpToolGrant"][] | null;
             prompt?: string | null;
             schedule?: null | components["schemas"]["CronSchedule"];
             /**
@@ -6060,6 +6093,8 @@ export interface operations {
                             id: string;
                             /** Format: date-time */
                             last_triggered_at?: string | null;
+                            /** @description Exact MCP operations and transport configurations granted to a fire. */
+                            mcp_tool_grants?: components["schemas"]["McpToolGrant"][];
                             /** Format: date-time */
                             next_trigger_at?: string | null;
                             origin_session_id?: string | null;
@@ -6136,6 +6171,47 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_grantable_mcp_tools: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Currently connected typed MCP tools that can be granted to a cron job, sorted by full tool name */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        items: {
+                            description: string;
+                            /** @description Configured MCP server name. */
+                            server: string;
+                            /** @description Full namespaced registry name used in a grant. */
+                            tool: string;
+                            transport_identity: string;
+                            /** @description Tool name reported by the upstream MCP server. */
+                            upstream: string;
+                        }[];
+                        next_cursor?: string | null;
+                    };
                 };
             };
             /** @description Unauthorized */

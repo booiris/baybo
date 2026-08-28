@@ -249,6 +249,20 @@ rule, MCP tools never bridge to slash, mention, or elicitation surfaces.
   `ResourceAccess::ExecCommand { command }` (stdio) so the approval
   gate can prompt per host or per command.
 
+- **Grant metadata and transport identity** — each `McpTool` exposes typed
+  `McpToolMetadata` through the `Tool`/`ToolRegistry` seam: the exact namespaced
+  tool name, configured server and upstream names, transport identity, and the
+  transport accesses the approval gate sees. Consumers never recover this by
+  splitting `<server>/<tool>`. The identity is a separate versioned SHA-256 over
+  canonical non-secret config (transport; ordered stdio args or normalized URL;
+  trust; sorted capabilities; trigger scope; public OAuth config; env names).
+  Secret/env values are excluded. It is deliberately distinct from the
+  reconciler's process-lifecycle hash, which may include secret values.
+- **Cron grants** — an unattended initial cron turn may bypass an MCP transport
+  prompt only when its snapshotted exact tool name and transport identity match
+  this live metadata. The bypass does not cover sibling operations or additional
+  resources and is never installed as a session approval. See [`cron.md`](cron.md).
+
 ### Embedded MCP servers
 
 Beyond user-configured `.mcp.json` servers, the binary ships its own

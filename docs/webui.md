@@ -16,6 +16,15 @@ The admin TCP listener serves an embedded React dashboard baked into the gateway
 - Admin API types are generated: `docs/openapi.json` is produced by `baybo-gateway` (utoipa) and kept in sync by `crates/gateway/tests/openapi_spec_sync.rs` (regen with `UPDATE_OPENAPI=1 cargo test -p baybo-gateway --test all openapi_json_is_in_sync`). The web build runs `openapi-typescript` over that file (`pnpm --filter baybo-web gen:api`, wired into `pnpm --filter baybo-web build`) to emit `app/web/src/api/schema.d.ts`; the runtime client lives in `app/web/src/api/client.ts` (`openapi-fetch` with Bearer auth pre-applied). `utoipa` itself is only a dependency of `baybo-gateway` — domain crates stay framework-agnostic, and new HTTP-visible fields are added by editing the mirror DTOs in `crates/gateway/src/api/dto.rs`.
 - Design tokens (`--color-brand`, `--shadow-brutal*`, `--font-mono`, …) live in `app/web/src/index.css` under Tailwind v4's `@theme` block. Keep the heavy-border + offset-shadow aesthetic consistent when adding new components.
 
+- The Cron job editor is the operator surface for unattended MCP authority. It
+  fetches `GET /v1/cron/mcp-tools`, groups exact operations by configured
+  server, starts with no selection for ungranted jobs, and emits a complete
+  `mcp_tool_grants` replacement only when the selection changes (`[]` revokes).
+  A per-server bulk select always presents an explicit warning. Persisted grants
+  that no longer match a live exact tool+transport tuple remain visible as stale
+  and are never rebound by tool name; Save is blocked until the operator removes
+  them. API helpers and merge/diff rules are covered in `cronActions.test.ts`.
+
 ## PWA
 
 The dashboard is an installable, offline-capable app: a web app manifest, an icon set, and a service worker that precaches the shell. What that buys is a standalone window (its own icon, no address bar, its own OS task-switcher entry) and a shell that paints without the gateway — the data behind it still needs a live `/v1`, so offline means "the app opens and tells you it can't reach the gateway", not "the app works".

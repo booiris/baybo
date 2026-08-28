@@ -350,6 +350,17 @@ explicit edit wherever that type's mirror lives to surface it on HTTP;
 that's a feature, not a bug, because the drift test below will force
 the question.
 
+The authenticated cron family also owns operator-only MCP authority:
+`GET /v1/cron/mcp-tools` lists currently connected typed MCP operations and
+their versioned transport identities. `POST /v1/cron` accepts an optional
+`mcp_tool_grants` list; `PATCH /v1/cron/{id}` treats omission as preserve and
+`[]` as revoke. Both mutation paths validate every exact pair against the live
+`ToolRegistry` and reject disconnected, renamed, or stale identities with 400;
+they never substitute the current identity for caller-authored input. A mixed
+cron PATCH (for example prompt plus grants) becomes one optimistic scheduler
+edit, so it cannot partially apply one half. These fields are intentionally
+absent from the LLM-invocable `CronCreate`/`CronUpdate` tools.
+
 ### OpenAPI spec generation and the TypeScript client
 
 `admin/mod.rs::v1_router_and_spec()` returns `(Router<AdminState>,

@@ -7,7 +7,7 @@
 //! in the cron scheduler) so `baybo-cron` can stay free of `baybo-storage`.
 
 use async_trait::async_trait;
-use baybo_model::{CronExecution, CronJob, ExecutionStatus};
+use baybo_model::{CronExecution, CronJob, ExecutionStatus, normalize_mcp_tool_grants};
 use baybo_store::StorageError;
 use baybo_store::cron::{CronFire, CronStore, ExecutionCompletion, Result};
 use chrono::{DateTime, Utc};
@@ -59,6 +59,7 @@ fn job_from_row(
     // And for `builtin`: written once by the seed, never by `save`, and
     // `#[serde(skip)]` so no blob write can invent it.
     job.builtin = builtin_col != 0;
+    normalize_mcp_tool_grants(&mut job.mcp_tool_grants);
     Ok(job)
 }
 
@@ -71,6 +72,7 @@ fn execution_from_row(status_col: &str, data: &str) -> Result<CronExecution> {
         "dispatched" => ExecutionStatus::Dispatched,
         _ => ExecutionStatus::Pending,
     };
+    normalize_mcp_tool_grants(&mut exec.mcp_tool_grants);
     Ok(exec)
 }
 
@@ -134,16 +136,19 @@ fn execution_status_str(status: ExecutionStatus) -> &'static str {
 /// recycle-bin state (see [`job_from_row`]); keeping it out of the blob is what
 /// stops a stale snapshot's copy from ever contradicting the column.
 fn serialize_job(job: &CronJob) -> Result<String> {
-    let job = CronJob {
+    let mut job = CronJob {
         deleted_at: None,
         ..job.clone()
     };
+    normalize_mcp_tool_grants(&mut job.mcp_tool_grants);
     serde_json::to_string(&job)
         .map_err(|e| StorageError::Storage(format!("failed to serialize cron job: {e}")))
 }
 
 fn serialize_execution(exec: &CronExecution) -> Result<String> {
-    serde_json::to_string(exec)
+    let mut exec = exec.clone();
+    normalize_mcp_tool_grants(&mut exec.mcp_tool_grants);
+    serde_json::to_string(&exec)
         .map_err(|e| StorageError::Storage(format!("failed to serialize execution: {e}")))
 }
 
@@ -755,7 +760,7 @@ impl SqliteCronStore {
 mod tests {
     use super::*;
     use baybo_model::ChannelType;
-    use baybo_model::{CronSchedule, CronStatus};
+    use baybo_model::{CronSchedule, CronStatus, McpToolGrant, McpTransportIdentity};
     use chrono::Utc;
 
     /// A job row from before the recycle bin: no `deleted_at` key at all.
@@ -822,6 +827,7 @@ mod tests {
             updated_at: now,
             project_id: None,
             origin_session_id: None,
+            mcp_tool_grants: Vec::new(),
             deleted_at: None,
             pinned: false,
             builtin: false,
@@ -857,6 +863,33 @@ mod tests {
         let loaded = store.get("cj-1").await.unwrap().unwrap();
         assert_eq!(loaded.id, "cj-1");
         assert_eq!(loaded.user_id, "u1");
+    }
+
+    #[tokio::test]
+    async fn exact_mcp_tool_grants_persist_canonically_and_snapshot_onto_execution() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
+        let store = SqliteCronStore::new(pool);
+        let a = McpToolGrant::new("server/a", McpTransportIdentity::from_sha256([0x01; 32]));
+        let b = McpToolGrant::new("server/b", McpTransportIdentity::from_sha256([0x02; 32]));
+        let mut job = test_job("cj-grants", "u1", CronStatus::Enabled);
+        job.mcp_tool_grants = vec![b.clone(), a.clone(), b.clone()];
+        store.create(&job).await.unwrap();
+
+        let stored = store.get(&job.id).await.unwrap().expect("job");
+        assert_eq!(stored.mcp_tool_grants, vec![a.clone(), b.clone()]);
+        let execution = CronExecution::pending(&stored, future_dt(), future_dt());
+        store.record_execution(&execution).await.unwrap();
+
+        job.mcp_tool_grants = vec![McpToolGrant::new(
+            "server/c",
+            McpTransportIdentity::from_sha256([0x03; 32]),
+        )];
+        store.save(&job).await.unwrap();
+        let loaded = store.list_executions_by_job("cj-grants").await.unwrap();
+        assert_eq!(loaded[0].mcp_tool_grants, vec![a, b]);
     }
 
     /// The whole reason `pinned` is a flat column and not a blob field. Every
@@ -1855,6 +1888,7 @@ mod tests {
             "no title existed when it was written"
         );
         assert!(exec.outcome.is_none());
+        assert!(exec.mcp_tool_grants.is_empty());
         assert!(
             !exec.awaits_delivery(),
             "a fire from before the ledger never completed *into* it, so there is \
@@ -1980,6 +2014,7 @@ mod tests {
 
         let job = store.get("cj-legacy").await.unwrap().expect("row loads");
         assert!(!job.is_deleted(), "a row written before the column is live");
+        assert!(job.mcp_tool_grants.is_empty());
         assert_eq!(store.list_all().await.unwrap().len(), 1);
         let due = store.list_due(now_us()).await.unwrap();
         assert_eq!(due.len(), 1, "a legacy job keeps firing");

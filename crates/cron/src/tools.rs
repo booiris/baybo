@@ -442,6 +442,7 @@ impl Tool for CronUpdateTool {
                     prompt: set_field(p.prompt),
                     schedule,
                     timezone,
+                    mcp_tool_grants: None,
                 },
             )
             .await
@@ -713,7 +714,7 @@ mod tests {
     use super::*;
     use crate::shutdown::NeverShutdown;
     use crate::test_support::InMemoryCronStore;
-    use baybo_model::{CronStatus, TriggerSource};
+    use baybo_model::{CronStatus, McpToolGrant, McpTransportIdentity, TriggerSource};
     use tokio::sync::mpsc;
 
     fn ctx_with_trigger(session_id: &str, trigger: TriggerSource) -> ToolContext {
@@ -928,6 +929,88 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn cron_tools_cannot_create_or_replace_mcp_grants() {
+        let (scheduler, _rx) = test_scheduler();
+        let create = CronCreateTool::new(Arc::clone(&scheduler));
+        let update = CronUpdateTool::new(Arc::clone(&scheduler));
+        assert!(
+            create.parameters_schema()["properties"]
+                .get("mcp_tool_grants")
+                .is_none()
+        );
+        assert!(
+            update.parameters_schema()["properties"]
+                .get("mcp_tool_grants")
+                .is_none()
+        );
+
+        let attempted = McpToolGrant::new(
+            "server/attempted",
+            McpTransportIdentity::from_sha256([7; 32]),
+        );
+        let created = json_output(
+            create
+                .execute(
+                    json!({
+                        "title": "MCP job",
+                        "timezone": "UTC",
+                        "prompt": "use a server",
+                        "schedule": "0 9 * * *",
+                        "mcp_tool_grants": [serde_json::to_value(&attempted).expect("grant")],
+                    }),
+                    &ToolContext::for_test(),
+                )
+                .await
+                .expect("create runs"),
+        );
+        let id = created["id"].as_str().expect("job id");
+        assert!(
+            scheduler
+                .get_job(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .mcp_tool_grants
+                .is_empty()
+        );
+
+        let existing = McpToolGrant::new(
+            "server/existing",
+            McpTransportIdentity::from_sha256([8; 32]),
+        );
+        scheduler
+            .update_job(
+                id,
+                CronJobPatch {
+                    mcp_tool_grants: Some(vec![existing.clone()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        update
+            .execute(
+                json!({
+                    "id": id,
+                    "title": "Renamed MCP job",
+                    "mcp_tool_grants": [serde_json::to_value(&attempted).expect("grant")],
+                }),
+                &ToolContext::for_test(),
+            )
+            .await
+            .expect("update runs");
+        assert_eq!(
+            scheduler
+                .get_job(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .mcp_tool_grants,
+            vec![existing]
+        );
     }
 
     /// Editing nothing is always a caller bug, and the model must see it as one

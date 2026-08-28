@@ -48,9 +48,6 @@
   "src/pages/CronPage.tsx": {
     "@typescript-eslint/no-unnecessary-condition": {
       "count": 3
-    },
-    "@typescript-eslint/strict-boolean-expressions": {
-      "count": 18
     }
   },
   "src/pages/JobsPage.tsx": {

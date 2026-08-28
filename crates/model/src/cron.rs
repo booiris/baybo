@@ -1,4 +1,4 @@
-use crate::{ChannelType, SessionId};
+use crate::{ChannelType, McpToolGrant, SessionId, normalize_mcp_tool_grants};
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
@@ -120,6 +120,10 @@ pub struct CronJob {
     /// Session where this cron job was created (for traceability).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_session_id: Option<SessionId>,
+    /// Exact MCP operations and transport configs an initial fire may use.
+    /// Sorted and de-duplicated at the scheduler and storage boundaries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_tool_grants: Vec<McpToolGrant>,
     /// When the user moved this job to the recycle bin. `None` = live.
     ///
     /// Orthogonal to [`Self::status`]: a deleted one-shot that already fired
@@ -206,6 +210,11 @@ impl CronJob {
         self.schedule.is_one_shot()
     }
 
+    pub fn set_mcp_tool_grants(&mut self, mut grants: Vec<McpToolGrant>) {
+        normalize_mcp_tool_grants(&mut grants);
+        self.mcp_tool_grants = grants;
+    }
+
     /// Format a UTC instant as RFC3339 in this job's `timezone`.
     /// Falls back to UTC (with a warn log) if the stored zone string
     /// is unparseable — display must never blow up on a single bad
@@ -268,9 +277,10 @@ pub fn display_title(title: &str, prompt: &str) -> String {
 /// something else". It is not delete-and-recreate: the job keeps its id, and
 /// with it the executions it has run and the conversations they opened.
 ///
-/// Only the fields a user authored are here. `status`, `next_trigger_at` and
+/// Only editable configuration is here. `status`, `next_trigger_at` and
 /// `last_triggered_at` are the scheduler's, derived from the schedule — see
-/// `CronScheduler::update_job`.
+/// `CronScheduler::update_job`. Caller schemas decide which editable fields a
+/// particular surface may populate.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CronJobPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -281,6 +291,10 @@ pub struct CronJobPatch {
     pub schedule: Option<CronSchedule>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timezone: Option<String>,
+    /// Replace the exact MCP grants. `None` preserves them; `Some([])` revokes
+    /// all grants.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_tool_grants: Option<Vec<McpToolGrant>>,
 }
 
 impl CronJobPatch {
@@ -290,6 +304,7 @@ impl CronJobPatch {
             && self.prompt.is_none()
             && self.schedule.is_none()
             && self.timezone.is_none()
+            && self.mcp_tool_grants.is_none()
     }
 
     /// True when the patch moves the job's fire times, so `next_trigger_at` has
@@ -312,6 +327,9 @@ impl CronJobPatch {
         }
         if let Some(timezone) = &self.timezone {
             job.timezone = timezone.clone();
+        }
+        if let Some(grants) = &self.mcp_tool_grants {
+            job.set_mcp_tool_grants(grants.clone());
         }
     }
 }
@@ -399,6 +417,10 @@ pub struct CronExecution {
     /// lineage plumbing for subagents and maintenance.
     #[serde(default)]
     pub origin_session_id: Option<SessionId>,
+    /// Exact MCP tool grants snapshotted when this fire was recorded.
+    /// A later job edit cannot widen an already-recorded execution.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_tool_grants: Vec<McpToolGrant>,
     /// The board this fire files work on, snapshotted from the job.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<crate::ProjectId>,
@@ -454,6 +476,8 @@ impl CronExecution {
         scheduled_fire_time: DateTime<Utc>,
         triggered_at: DateTime<Utc>,
     ) -> Self {
+        let mut mcp_tool_grants = job.mcp_tool_grants.clone();
+        normalize_mcp_tool_grants(&mut mcp_tool_grants);
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             job_id: job.id.clone(),
@@ -468,6 +492,7 @@ impl CronExecution {
             triggered_at,
             status: ExecutionStatus::Pending,
             origin_session_id: job.origin_session_id.clone(),
+            mcp_tool_grants,
             // Snapshotted as the execution is recorded, because advancing
             // the job row is about to overwrite its copy with `triggered_at`.
             previous_fire_at: job.last_triggered_at,
@@ -546,6 +571,7 @@ mod tests {
             updated_at: Utc::now(),
             project_id: None,
             origin_session_id: None,
+            mcp_tool_grants: Vec::new(),
             deleted_at: None,
             pinned: false,
             builtin: false,
@@ -592,6 +618,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             origin_session_id: Some(SessionId::from("sess-1")),
+            mcp_tool_grants: Vec::new(),
             deleted_at: None,
             pinned: false,
             builtin: false,
@@ -628,6 +655,7 @@ mod tests {
             updated_at: Utc::now(),
             project_id: None,
             origin_session_id: None,
+            mcp_tool_grants: Vec::new(),
             deleted_at: None,
             pinned: false,
             builtin: false,
@@ -766,9 +794,15 @@ mod tests {
         assert!(!patch.reschedules());
 
         let mut job = job_with_tz("UTC");
+        let existing = McpToolGrant::new(
+            "server/existing",
+            crate::McpTransportIdentity::from_sha256([9; 32]),
+        );
+        job.mcp_tool_grants = vec![existing.clone()];
         patch.apply_to(&mut job);
         assert_eq!(job.title, "fmt job");
         assert_eq!(job.prompt, "fmt");
+        assert_eq!(job.mcp_tool_grants, vec![existing]);
     }
 
     /// A patch writes exactly the fields it carries: the rest of the job — down
@@ -822,6 +856,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_grant_patch_is_nonempty_and_normalizes_the_replacement() {
+        let first = McpToolGrant::new(
+            "server/first",
+            crate::McpTransportIdentity::from_sha256([1; 32]),
+        );
+        let second = McpToolGrant::new(
+            "server/second",
+            crate::McpTransportIdentity::from_sha256([2; 32]),
+        );
+        let patch = CronJobPatch {
+            mcp_tool_grants: Some(vec![second.clone(), first.clone(), second.clone()]),
+            ..Default::default()
+        };
+        assert!(!patch.is_empty());
+        assert!(!patch.reschedules());
+
+        let mut job = job_with_tz("UTC");
+        patch.apply_to(&mut job);
+        assert_eq!(job.mcp_tool_grants, vec![first, second]);
+
+        let revoke = CronJobPatch {
+            mcp_tool_grants: Some(Vec::new()),
+            ..Default::default()
+        };
+        assert!(!revoke.is_empty());
+        revoke.apply_to(&mut job);
+        assert!(job.mcp_tool_grants.is_empty());
+    }
+
     /// A patch is what a client sends back over the wire, so it has to survive
     /// the trip: every field it set comes out the far side, and the fields it
     /// left alone are not serialized at all — an explicit `null` for `prompt`
@@ -829,14 +893,20 @@ mod tests {
     /// what the type means to say.
     #[test]
     fn a_patch_round_trips_through_json() {
+        let grant = McpToolGrant::new(
+            "server/read",
+            crate::McpTransportIdentity::from_sha256([5; 32]),
+        );
         let patch = CronJobPatch {
             title: Some("Evening digest".to_string()),
             prompt: Some("summarise the standup".to_string()),
             schedule: Some(CronSchedule::at("2026-07-15T08:00:00Z".parse().unwrap())),
             timezone: Some("Asia/Shanghai".to_string()),
+            mcp_tool_grants: Some(vec![grant.clone()]),
         };
 
         let wire = serde_json::to_value(&patch).unwrap();
+        let grant_wire = serde_json::to_value(&grant).unwrap();
         assert_eq!(
             wire,
             serde_json::json!({
@@ -844,6 +914,7 @@ mod tests {
                 "prompt": "summarise the standup",
                 "schedule": { "kind": "at", "time": "2026-07-15T08:00:00Z" },
                 "timezone": "Asia/Shanghai",
+                "mcp_tool_grants": [grant_wire],
             }),
         );
 
@@ -855,6 +926,7 @@ mod tests {
             back.schedule,
             Some(CronSchedule::at("2026-07-15T08:00:00Z".parse().unwrap())),
         );
+        assert_eq!(back.mcp_tool_grants, Some(vec![grant]));
         assert!(back.reschedules());
     }
 

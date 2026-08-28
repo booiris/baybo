@@ -259,12 +259,24 @@ impl ToolRegistry {
         out
     }
 
+    /// Resolve a tool and its manifest from one registry snapshot. Dynamic
+    /// registrations can be replaced while a call is in flight, so security
+    /// checks and execution must pin this pair rather than performing several
+    /// name lookups that could observe different server generations.
+    pub fn get_with_manifest(&self, name: &str) -> Option<(Arc<dyn Tool>, Option<ToolManifest>)> {
+        let dynamic = self.dynamic.read();
+        if let Some(tool) = dynamic.tools.get(name) {
+            return Some((Arc::clone(tool), dynamic.manifests.get(name).cloned()));
+        }
+        self.builtin
+            .get(name)
+            .cloned()
+            .map(|tool| (tool, self.builtin_manifests.get(name).cloned()))
+    }
+
     /// Look up a tool by name. Dynamic registrations shadow builtins.
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
-        if let Some(t) = self.dynamic.read().tools.get(name) {
-            return Some(Arc::clone(t));
-        }
-        self.builtin.get(name).cloned()
+        self.get_with_manifest(name).map(|(tool, _)| tool)
     }
 
     /// Short progress preview for a pending call via
@@ -284,6 +296,12 @@ impl ToolRegistry {
         self.get(name)
             .map(|tool| tool.concurrency())
             .unwrap_or(ToolConcurrency::Exclusive)
+    }
+
+    /// Typed MCP operation and transport provenance for authorization. The
+    /// registry asks the tool directly; callers never parse its display name.
+    pub fn mcp_metadata(&self, name: &str) -> Option<crate::mcp::McpToolMetadata> {
+        self.get(name).and_then(|tool| tool.mcp_metadata())
     }
 
     /// Execute a tool by name with the given parameters and context.

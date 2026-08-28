@@ -170,6 +170,13 @@ pub trait Tool: Send + Sync {
         Vec::new()
     }
 
+    /// Typed MCP provenance for unattended cron authorization. Native tools
+    /// return `None`; MCP wrappers return the exact operation and transport
+    /// identity plus only the transport resources its cron grant may bypass.
+    fn mcp_metadata(&self) -> Option<mcp::McpToolMetadata> {
+        None
+    }
+
     /// Output provenance for prompt-injection severity; defaults to opaque.
     fn output_source(&self) -> OutputSource {
         OutputSource::default()

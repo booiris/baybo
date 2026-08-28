@@ -413,6 +413,17 @@ async fn load_string_map(vault: &Arc<SecretVault>, key: &str) -> McpResult<Vec<(
     Ok(out)
 }
 
+pub(crate) async fn load_env_names(
+    vault: &Arc<SecretVault>,
+    server_name: &str,
+) -> McpResult<Vec<String>> {
+    Ok(load_string_map(vault, &vault_keys::env_bag(server_name))
+        .await?
+        .into_iter()
+        .map(|(name, _value)| name)
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

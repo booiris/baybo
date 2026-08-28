@@ -2,19 +2,30 @@ import { describe, expect, it } from 'vitest';
 import createClient from 'openapi-fetch';
 
 import type { AdminClient } from '../api/client';
-import type { components, paths } from '../api/schema';
+import type { paths } from '../api/schema';
 import {
   actOnCronJob,
   cronEditIncomplete,
   cronEditPatch,
   deleteCronJob,
   fetchCronJobs,
+  fetchCronMcpTools,
+  groupMcpGrantOptions,
   isoToLocalInput,
   jobToEditForm,
+  mcpGrantForTool,
   mutationErrorSlot,
+  normalizeMcpGrants,
+  planMcpServerBulkSelect,
+  replaceMcpGrantSelection,
+  retainedStaleMcpGrants,
   toggleActionFor,
   updateCronJob,
+  type CronJob,
   type CronView,
+  type GrantableMcpTool,
+  type McpToolGrant,
+  type UpdateCronRequest,
 } from './CronPage';
 
 // Drives the page's real API helpers (the generated `openapi-fetch` client, so
@@ -22,10 +33,8 @@ import {
 // production ones) against an in-memory gateway that mirrors the Rust cron
 // semantics: delete is soft, pause/resume flip `status`, resume of an elapsed
 // one-shot 400s, and an edit is a partial patch that reschedules from now,
-// never re-arms a paused job, and is refused on a binned one.
-
-type CronJob = components['schemas']['CronJob'];
-type UpdateCronRequest = components['schemas']['UpdateCronRequest'];
+// never re-arms a paused job, replaces exact MCP grant tuples, and is refused
+// on a binned one.
 
 const NOW = Date.parse('2026-07-14T12:00:00.000Z');
 const HOUR = 60 * 60 * 1000;
@@ -34,6 +43,25 @@ const DAY = 24 * HOUR;
 const EXPIRED_ONE_SHOT = 'invalid schedule: the one-shot time has already passed';
 const NOT_FOUND = 'cron job not found';
 const EMPTY_PATCH = 'the update sets no fields';
+const STALE_GRANT = 'stale MCP grant';
+
+function transportIdentity(byte: string): string {
+  return `mcp-transport:v1:sha256:${byte.repeat(64)}`;
+}
+
+function mcpTool(over: Partial<GrantableMcpTool> & Pick<GrantableMcpTool, 'server' | 'tool'>): GrantableMcpTool {
+  const upstream = over.tool.includes('/') ? over.tool.slice(over.tool.indexOf('/') + 1) : over.tool;
+  return {
+    upstream,
+    description: `Run ${upstream}`,
+    transport_identity: transportIdentity('1'),
+    ...over,
+  };
+}
+
+function grant(tool: GrantableMcpTool): McpToolGrant {
+  return mcpGrantForTool(tool);
+}
 
 function job(over: Partial<CronJob> & Pick<CronJob, 'id'>): CronJob {
   return {
@@ -50,6 +78,7 @@ function job(over: Partial<CronJob> & Pick<CronJob, 'id'>): CronJob {
     next_trigger_at: new Date(NOW + HOUR).toISOString(),
     deleted_at: null,
     origin_session_id: null,
+    mcp_tool_grants: [],
     ...over,
   };
 }
@@ -74,7 +103,10 @@ class FakeGateway {
   unauthorized = false;
   offline = false;
 
-  constructor(private readonly jobs: CronJob[]) {}
+  constructor(
+    private readonly jobs: CronJob[],
+    private readonly mcpTools: GrantableMcpTool[] = [],
+  ) {}
 
   client(): AdminClient {
     return createClient<paths>({
@@ -102,6 +134,10 @@ class FakeGateway {
       const deleted = url.searchParams.get('deleted') === 'true';
       const items = this.jobs.filter((j) => Boolean(j.deleted_at) === deleted);
       return json(200, { items, next_cursor: null });
+    }
+
+    if (id === 'mcp-tools' && req.method === 'GET') {
+      return json(200, { items: this.mcpTools, next_cursor: null });
     }
 
     const target = this.find(id); // `get` resolves deleted rows too
@@ -159,6 +195,18 @@ class FakeGateway {
     if (patch.prompt != null) draft.prompt = patch.prompt;
     if (patch.timezone != null) draft.timezone = patch.timezone;
     if (patch.schedule != null) draft.schedule = patch.schedule;
+    if (patch.mcp_tool_grants != null) {
+      for (const requested of patch.mcp_tool_grants) {
+        if (!this.mcpTools.some((tool) => {
+          const live = grant(tool);
+          return live.tool_name === requested.tool_name
+            && live.transport_identity === requested.transport_identity;
+        })) {
+          return json(400, { error: STALE_GRANT });
+        }
+      }
+      draft.mcp_tool_grants = normalizeMcpGrants(patch.mcp_tool_grants);
+    }
 
     if (patch.schedule != null || patch.timezone != null) {
       if (draft.status === 'disabled') {
@@ -183,6 +231,169 @@ async function listOk(client: AdminClient, view: CronView): Promise<CronJob[]> {
   if (outcome.kind !== 'ok') throw new Error(`expected an ok list, got ${outcome.kind}`);
   return outcome.items;
 }
+
+describe('exact MCP tool grants', () => {
+  const alphaRead = mcpTool({
+    server: 'alpha',
+    tool: 'alpha/read',
+    upstream: 'read',
+    description: 'Read from alpha',
+    transport_identity: transportIdentity('1'),
+  });
+  const alphaWrite = mcpTool({
+    server: 'alpha',
+    tool: 'alpha/write',
+    upstream: 'write',
+    description: 'Write to alpha',
+    transport_identity: transportIdentity('1'),
+  });
+  const betaSearch = mcpTool({
+    server: 'beta',
+    tool: 'beta/search',
+    upstream: 'search',
+    description: 'Search beta',
+    transport_identity: transportIdentity('2'),
+  });
+
+  it('lists the currently connected exact operations through the real client route', async () => {
+    const gw = new FakeGateway([], [alphaRead, alphaWrite, betaSearch]);
+
+    expect(await fetchCronMcpTools(gw.client())).toEqual({
+      kind: 'ok',
+      items: [alphaRead, alphaWrite, betaSearch],
+    });
+    expect(gw.seen).toEqual(['GET /v1/cron/mcp-tools']);
+  });
+
+  it('groups by server with no default selections and gates bulk select behind a warning', () => {
+    const groups = groupMcpGrantOptions([betaSearch, alphaWrite, alphaRead], []);
+
+    expect(groups.map((group) => ({
+      server: group.server,
+      tools: group.options.map((option) => option.grant.tool_name),
+      selected: group.options.map((option) => option.selected),
+    }))).toEqual([
+      {
+        server: 'alpha',
+        tools: ['alpha/read', 'alpha/write'],
+        selected: [false, false],
+      },
+      { server: 'beta', tools: ['beta/search'], selected: [false] },
+    ]);
+
+    const intent = planMcpServerBulkSelect(groups[0], []);
+    expect(intent.kind).toBe('confirm');
+    if (intent.kind !== 'confirm') throw new Error('expected an explicit bulk confirmation');
+    expect(intent.additionCount).toBe(2);
+    expect(intent.warning).toContain('Bulk grant warning');
+    expect(intent.warning).toContain('server "alpha"');
+    expect(intent.selection).toEqual(normalizeMcpGrants([grant(alphaRead), grant(alphaWrite)]));
+
+    const selectedGroup = groupMcpGrantOptions(
+      [alphaRead, alphaWrite],
+      intent.selection,
+    )[0];
+    expect(planMcpServerBulkSelect(selectedGroup, intent.selection)).toEqual({ kind: 'noop' });
+  });
+
+  it('checkbox changes replace only the exact tuple, not every grant with the same name', () => {
+    const oldRead = {
+      ...grant(alphaRead),
+      transport_identity: transportIdentity('8'),
+    };
+    const currentRead = grant(alphaRead);
+
+    const withCurrent = replaceMcpGrantSelection([oldRead], currentRead, true);
+    expect(withCurrent).toEqual(normalizeMcpGrants([oldRead, currentRead]));
+    expect(replaceMcpGrantSelection(withCurrent, oldRead, false)).toEqual([currentRead]);
+    expect(replaceMcpGrantSelection([currentRead], currentRead, false)).toEqual([]);
+  });
+
+  it('keeps a same-name old identity stale and never auto-upgrades it to the live tuple', () => {
+    const persisted = {
+      ...grant(alphaRead),
+      transport_identity: transportIdentity('8'),
+    };
+    const groups = groupMcpGrantOptions([alphaRead], [persisted]);
+    const options = groups[0].options;
+
+    expect(options).toHaveLength(2);
+    expect(options[0]).toMatchObject({
+      kind: 'stale',
+      selected: true,
+      grant: persisted,
+      staleReason: 'The live operation has a different transport identity.',
+    });
+    expect(options[1]).toMatchObject({
+      kind: 'live',
+      selected: false,
+      grant: grant(alphaRead),
+    });
+    expect(retainedStaleMcpGrants([alphaRead], [persisted])).toEqual([persisted]);
+
+    const revoked = replaceMcpGrantSelection([persisted], persisted, false);
+    expect(revoked).toEqual([]);
+    expect(retainedStaleMcpGrants([alphaRead], revoked)).toEqual([]);
+  });
+
+  it('marks a saved operation from a disconnected server as stale and revocable', () => {
+    const disconnected = {
+      tool_name: 'offline/pull',
+      transport_identity: transportIdentity('7'),
+    };
+    const groups = groupMcpGrantOptions([alphaRead], [disconnected]);
+    const unavailable = groups.find((group) => group.server === 'Unavailable grants');
+
+    expect(unavailable?.options).toEqual([
+      expect.objectContaining({
+        kind: 'stale',
+        selected: true,
+        grant: disconnected,
+        staleReason: 'The server is disconnected, or this operation was removed.',
+      }),
+    ]);
+    expect(retainedStaleMcpGrants([alphaRead], [disconnected])).toEqual([disconnected]);
+    expect(replaceMcpGrantSelection([disconnected], disconnected, false)).toEqual([]);
+  });
+
+  it('omits an unchanged selection, sends a full replacement, and sends [] to revoke', () => {
+    const original = job({ id: 'c1', mcp_tool_grants: [grant(alphaRead)] });
+    const form = jobToEditForm(original);
+
+    expect(cronEditPatch(original, form, [grant(alphaRead)])).toEqual({});
+    expect(cronEditPatch(original, form, [grant(betaSearch)])).toEqual({
+      mcp_tool_grants: [grant(betaSearch)],
+    });
+    expect(cronEditPatch(original, form, [])).toEqual({ mcp_tool_grants: [] });
+  });
+
+  it('replaces and revokes grants over PATCH while omission preserves them', async () => {
+    const gw = new FakeGateway(
+      [job({ id: 'c1', mcp_tool_grants: [grant(alphaRead)] })],
+      [alphaRead, betaSearch],
+    );
+    const client = gw.client();
+
+    const replaced = await updateCronJob(client, 'c1', {
+      mcp_tool_grants: [grant(betaSearch)],
+    });
+    if (replaced.kind !== 'ok') throw new Error(`expected replacement, got ${replaced.kind}`);
+    expect(replaced.job.mcp_tool_grants).toEqual([grant(betaSearch)]);
+
+    const promptOnly = await updateCronJob(client, 'c1', { prompt: 'Still exact' });
+    if (promptOnly.kind !== 'ok') throw new Error(`expected prompt edit, got ${promptOnly.kind}`);
+    expect(promptOnly.job.mcp_tool_grants).toEqual([grant(betaSearch)]);
+
+    const revoked = await updateCronJob(client, 'c1', { mcp_tool_grants: [] });
+    if (revoked.kind !== 'ok') throw new Error(`expected revocation, got ${revoked.kind}`);
+    expect(revoked.job.mcp_tool_grants).toEqual([]);
+    expect(gw.patched).toEqual([
+      { mcp_tool_grants: [grant(betaSearch)] },
+      { prompt: 'Still exact' },
+      { mcp_tool_grants: [] },
+    ]);
+  });
+});
 
 describe('toggleActionFor — which control a row offers', () => {
   it('offers pause on a running job and resume on a paused one', () => {
@@ -532,6 +743,7 @@ describe('failure mapping', () => {
 
     expect(await actOnCronJob(client, 'c1', 'restore')).toEqual({ kind: 'unauthorized' });
     expect(await fetchCronJobs(client, 'deleted')).toEqual({ kind: 'unauthorized' });
+    expect(await fetchCronMcpTools(client)).toEqual({ kind: 'unauthorized' });
     expect(await updateCronJob(client, 'c1', { title: 'Nope' })).toEqual({ kind: 'unauthorized' });
   });
 
@@ -545,6 +757,10 @@ describe('failure mapping', () => {
       message: 'Network error: connection refused',
     });
     expect(await fetchCronJobs(client, 'live')).toEqual({
+      kind: 'failed',
+      message: 'Network error: connection refused',
+    });
+    expect(await fetchCronMcpTools(client)).toEqual({
       kind: 'failed',
       message: 'Network error: connection refused',
     });
