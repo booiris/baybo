@@ -52,7 +52,7 @@ quickSetup/maximize/haptic/log
 ```
 
 - `quickSetup` is the empty-board CTA: native opens a fresh chat and auto-sends
-  a `/deck` request, via `AppStore.startCardDraft`.
+  an ordinary-language card request, via `AppStore.startCardDraft`.
 - `maximize` reports a card entered/left its full-screen layout so `DeckScreen`
   fades the wordmark header out — the tab bar stays — while `DeckStore.maximized`
   is set.

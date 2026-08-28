@@ -141,7 +141,7 @@ struct ComposerView: View {
         .background { composerVeil }
         .attachmentPickers(attach: attach, staging: staging, photoPicks: $photoPicks)
         .onAppear {
-            // One-shot for the Deck "Quick setup": seed the /deck request and
+            // One-shot for the Deck "Quick setup": seed the card request and
             // send it immediately, so the user lands in the conversation
             // already working. Clear `initialDraft` FIRST so a re-appear can't
             // double-send.

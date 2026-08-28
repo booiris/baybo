@@ -94,10 +94,10 @@ export const zh: typeof en = {
       },
     },
     deck: {
-      empty: "还没有卡片 — 在聊天里输入 /deck 创建一张。",
+      empty: "还没有卡片 — 在聊天里创建一张。",
       quickSetup: "创建卡片",
       createCardInflight: "创建中 · 查看",
-      quickSetupPrompt: "/deck 帮我做一个监控 baybo token 使用量的卡片",
+      quickSetupPrompt: "帮我做一个监控 baybo token 使用量的卡片",
       quarantined: "此卡片因反复失败已被停用。",
       disabled: "已暂停",
       reenable: "重新启用",

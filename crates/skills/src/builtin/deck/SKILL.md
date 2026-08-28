@@ -1,7 +1,7 @@
 ---
 name: deck
 version: 0.4.0
-description: "Author, install, and update live cards on the user's Deck (the persistent dashboard tab of agent-written cards). Covers the bundle contract, per-size adaptation and the optional maximized layout, the service and card SDK surface, worked examples, and the install flow via DeckCardCreate/DeckCardUpdate."
+description: "Create, install, or update persistent Deck dashboard cards from ordinary-language requests."
 when_to_use: "Use when the user asks to create, add, modify, fix, or redesign a persistent Deck/dashboard card — such as a Claude/Codex quota monitor, machine-status board, or API watcher — whether they use /deck or ordinary language."
 command: deck
 user-invocable: true

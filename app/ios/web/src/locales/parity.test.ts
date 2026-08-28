@@ -38,4 +38,11 @@ describe("locale parity", () => {
       expect(empty).toEqual([]);
     }
   });
+
+  it("deck quick setup exercises ordinary-language skill selection", () => {
+    expect(en.translation.deck.quickSetupPrompt).not.toMatch(/^\s*\//);
+    expect(zh.translation.deck.quickSetupPrompt).not.toMatch(/^\s*\//);
+    expect(en.translation.deck.empty).not.toContain("/deck");
+    expect(zh.translation.deck.empty).not.toContain("/deck");
+  });
 });
