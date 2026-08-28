@@ -1155,7 +1155,8 @@ function deviceRow(d) {
     "tr",
     {},
     el("td", {}, el("code", { text: d.device_id })),
-    el("td", {}, el("span", { class: "tag", text: d.apns_env })),
+    el("td", {}, el("span", { class: "tag", text: d.provider })),
+    el("td", {}, el("span", { class: "tag", text: d.environment || "—" })),
     el("td", {}, el("code", { text: d.token_masked })),
     el("td", {}, el("code", { class: "pubkey", text: shortHex(d.gateway_pubkey_hex) })),
     el("td", { class: "num", text: fmtCount(d.last_counter) }),
@@ -1176,7 +1177,7 @@ function ipTable(headers, rows, render) {
 }
 
 function devicesView(devices) {
-  const devCols = ["Device", "APNs env", "Token", "Gateway pubkey", "Counter", "Sends", "Bytes"];
+  const devCols = ["Device", "Provider", "Environment", "Token", "Gateway pubkey", "Counter", "Sends", "Bytes"];
   const devBody = devices.length ? devices.map(deviceRow) : [emptyRow(devCols.length, "No devices bound.")];
   const devTable = el(
     "table",

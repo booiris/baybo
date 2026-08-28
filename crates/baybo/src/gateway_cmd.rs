@@ -478,8 +478,8 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
         // non-loopback egress target subject to the operator's egress proxy.
         let push_client =
             baybo_security::http::client(boot::proxy_settings(&graph.config).as_ref())?;
-        let registrar: Arc<dyn baybo_gateway::push::ApnsRegistrar> = Arc::new(
-            baybo_gateway::push::HttpApnsRegistrar::new(push_client.clone()),
+        let registrar: Arc<dyn baybo_gateway::push::PushRegistrar> = Arc::new(
+            baybo_gateway::push::HttpPushRegistrar::new(push_client.clone()),
         );
         let dispatcher = Arc::new(baybo_gateway::push::PushDispatcher::new(
             graph.stores.device.clone(),

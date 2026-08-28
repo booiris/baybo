@@ -1539,7 +1539,7 @@ async fn admin_device_header_creates_and_lists_device_sessions() {
 }
 
 #[tokio::test]
-async fn device_apns_token_api_persists_registration() {
+async fn device_push_token_api_persists_registration() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let router = build_admin_router_for_tests(&tg.deps);
     let device_key = device_proto::delegation::generate_signing_key();
@@ -1549,14 +1549,17 @@ async fn device_apns_token_api_persists_registration() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/v1/mobile/apns-token")
+                .uri("/v1/mobile/push-token")
                 .header("authorization", format!("Bearer {}", tg.deps.admin_token))
                 .header(DEVICE_ID_HEADER, &device_id)
                 .header("content-type", "application/json")
                 .body(Body::from(
                     json!({
-                        "apns_token": "new-token",
-                        "apns_env": "production",
+                        "target": {
+                            "provider": "apns",
+                            "token": "new-token",
+                            "environment": "production",
+                        },
                     })
                     .to_string(),
                 ))
@@ -1569,13 +1572,14 @@ async fn device_apns_token_api_persists_registration() {
     let secret = tg
         .deps
         .secret_vault
-        .get_secret(&format!("device.{device_id}.apns"))
+        .get_secret(&format!("device.{device_id}.push_registration"))
         .await
         .expect("vault read")
-        .expect("apns registration persisted");
+        .expect("push registration persisted");
     let reg: Value = serde_json::from_slice(secret.as_bytes()).expect("registration json");
-    assert_eq!(reg["apns_token"].as_str(), Some("new-token"));
-    assert_eq!(reg["apns_env"].as_str(), Some("production"));
+    assert_eq!(reg["target"]["provider"].as_str(), Some("apns"));
+    assert_eq!(reg["target"]["token"].as_str(), Some("new-token"));
+    assert_eq!(reg["target"]["environment"].as_str(), Some("production"));
 }
 
 #[tokio::test]

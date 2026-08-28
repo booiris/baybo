@@ -414,7 +414,8 @@ fn traffic_and_device_field_names() {
 
     let device = DeviceRow {
         device_id: "d1".into(),
-        apns_env: "sandbox".into(),
+        provider: "apns".into(),
+        environment: Some("sandbox".into()),
         token_masked: "··cd".into(),
         gateway_pubkey_hex: "ab".into(),
         last_counter: 7,
@@ -424,7 +425,8 @@ fn traffic_and_device_field_names() {
     let v = serde_json::to_value(&device).expect("value");
     for field in [
         "device_id",
-        "apns_env",
+        "provider",
+        "environment",
         "token_masked",
         "gateway_pubkey_hex",
         "last_counter",

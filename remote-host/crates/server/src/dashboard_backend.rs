@@ -23,7 +23,7 @@ use remote_host_dashboard::{
     PushTotals, PushTrafficSeries, Range, RelayBucket, RelayKeyTotal, RelayTotals,
     RelayTrafficSeries, RevealedKey,
 };
-use remote_host_push::{ApnsEnv, DeviceTokenStore};
+use remote_host_push::{ApnsEnvironment, DeviceTokenStore};
 
 use crate::admission_db::{
     AdmissionDb, AdmissionDbError, KeyLimits, NewKey, generate_remote_api_key,
@@ -321,7 +321,8 @@ impl DashboardBackend for RuntimeDashboardBackend {
                     totals.get(&s.device_id).copied().unwrap_or((0, 0));
                 DeviceRow {
                     device_id: s.device_id,
-                    apns_env: apns_env_str(s.env).to_string(),
+                    provider: s.provider.as_str().to_string(),
+                    environment: s.environment.map(apns_environment_str).map(str::to_string),
                     token_masked: s.token_masked,
                     gateway_pubkey_hex: hex::encode(s.gateway_pubkey),
                     last_counter: s.last_counter,
@@ -568,10 +569,10 @@ fn warn_traffic(which: &str, e: &TrafficQueryError) {
 
 // --- Mapping + masking helpers ---
 
-fn apns_env_str(env: ApnsEnv) -> &'static str {
-    match env {
-        ApnsEnv::Sandbox => "sandbox",
-        ApnsEnv::Production => "production",
+fn apns_environment_str(environment: ApnsEnvironment) -> &'static str {
+    match environment {
+        ApnsEnvironment::Sandbox => "sandbox",
+        ApnsEnvironment::Production => "production",
     }
 }
 

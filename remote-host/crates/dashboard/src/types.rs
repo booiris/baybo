@@ -233,7 +233,8 @@ pub struct IpEndpointBreakdown {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceRow {
     pub device_id: String,
-    pub apns_env: String,
+    pub provider: String,
+    pub environment: Option<String>,
     pub token_masked: String,
     pub gateway_pubkey_hex: String,
     pub last_counter: u64,

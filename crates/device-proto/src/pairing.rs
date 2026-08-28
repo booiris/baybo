@@ -19,7 +19,7 @@
 //! 6. P → A [`PairFrame::Sealed`] — the [`DeviceDelegation`], a transport
 //!    message: the device signs (under its Ed25519 identity key, whose public
 //!    half is its `device_id`) an authorization for the gateway push key from
-//!    step 5 to manage its APNs binding at C. This is what lets C reject another
+//!    step 5 to manage its push binding at C. This is what lets C reject another
 //!    tenant's `/register`/`/notify` under a shared `remote_api_key`.
 //!
 //! The statics are exchanged in-band as XX handshake tokens, so neither
@@ -37,16 +37,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ProtoError;
 
-/// Which APNs environment the app's device token is bound to. A sandbox token
-/// is rejected by the production host and vice versa, so it is tracked
-/// per-device from pairing onward (never guessed at send time).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ApnsEnv {
-    Sandbox,
-    Production,
-}
-
 /// App → gateway, as the Noise payload of the app's `msg3` (so it is
 /// authenticated by the app static that rides the same message). The app's
 /// static itself is an XX handshake token, not a field here.
@@ -54,10 +44,6 @@ pub enum ApnsEnv {
 pub struct DeviceHello {
     /// Client-generated, per-binding (one row per `device_id`).
     pub device_id: String,
-    /// APNs device token (gateway-mediated registration relays it to C).
-    pub apns_token: String,
-    /// Environment the token is bound to.
-    pub apns_env: ApnsEnv,
 }
 
 /// Gateway → app, as a Noise transport message. The gateway's static is learned
@@ -82,7 +68,7 @@ pub struct GatewayWelcome {
     /// both the phone user and the operator confirmed the pairing.
     pub auth_token: String,
     /// The gateway's Ed25519 push-signing public key (32 bytes). The device
-    /// signs a [`DeviceDelegation`] authorizing this key to manage its APNs
+    /// signs a [`DeviceDelegation`] authorizing this key to manage its push
     /// binding at C. Empty when the gateway has no relay/push configured.
     #[serde(default)]
     pub gateway_push_pubkey: Vec<u8>,
@@ -90,7 +76,7 @@ pub struct GatewayWelcome {
 
 /// App → gateway, the final sealed pairing message (a Noise transport message).
 /// The device authorizes the gateway's push-signing key (from
-/// [`GatewayWelcome::gateway_push_pubkey`]) to bind/notify its APNs token at the
+/// [`GatewayWelcome::gateway_push_pubkey`]) to bind/notify its push target at the
 /// untrusted host C. The signature is over the gateway push pubkey under the
 /// device's Ed25519 identity key (its public half is the `device_id`); the
 /// byte layout is [`crate::delegation::sign_delegation`]. Sent last because the
@@ -164,8 +150,6 @@ mod tests {
     fn device_hello_round_trips() {
         let hello = DeviceHello {
             device_id: "dev-123".into(),
-            apns_token: "abc123".into(),
-            apns_env: ApnsEnv::Sandbox,
         };
         let decoded: DeviceHello = decode(&encode(&hello).unwrap()).unwrap();
         assert_eq!(hello, decoded);
@@ -234,8 +218,6 @@ mod tests {
         // msg3 carries the DeviceHello body.
         let hello = DeviceHello {
             device_id: "dev-1".into(),
-            apns_token: "tok".into(),
-            apns_env: ApnsEnv::Production,
         };
         let msg3 = app.write_handshake(&encode(&hello).unwrap()).unwrap();
         let got_hello: DeviceHello = decode(&gw.read_handshake(&msg3).unwrap()).unwrap();
