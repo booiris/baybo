@@ -1,9 +1,10 @@
 import SwiftUI
 
 /// The Settings section of the home shell: the account/app controls that used
-/// to hang off the chat header. Language toggle, app version, and log out —
-/// laid out flat and monochrome, logout pinned above the menu bar.
+/// to hang off the chat header. Language, legal/support links, version, and log
+/// out — laid out flat and monochrome, logout pinned above the menu bar.
 struct SettingsScreen: View {
+    @Environment(\.openURL) private var openURL
     @EnvironmentObject private var appStore: AppStore
     @ObservedObject private var lang = Lang.shared
 
@@ -14,6 +15,9 @@ struct SettingsScreen: View {
 
     private static let version =
         (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "—"
+    private static let privacyPolicyURL =
+        "https://github.com/booiris/privacy-page/blob/master/baybo/README.md"
+    private static let supportURL = "https://github.com/booiris/baybo/issues"
 
     var body: some View {
         VStack(spacing: 0) {
@@ -25,6 +29,24 @@ struct SettingsScreen: View {
                 ) {
                     Haptics.tap()
                     lang.toggle()
+                }
+                divider
+                actionRow(
+                    icon: "hand.raised",
+                    title: lang.t("settings.privacyPolicy"),
+                    value: "GitHub"
+                ) {
+                    Haptics.tap()
+                    openExternalURL(Self.privacyPolicyURL)
+                }
+                divider
+                actionRow(
+                    icon: "questionmark.circle",
+                    title: lang.t("settings.support"),
+                    value: "GitHub"
+                ) {
+                    Haptics.tap()
+                    openExternalURL(Self.supportURL)
                 }
                 divider
                 infoRow(
@@ -72,6 +94,11 @@ struct SettingsScreen: View {
             rowContent(icon: icon, title: title, value: value, chevron: true)
         }
         .buttonStyle(.plain)
+    }
+
+    private func openExternalURL(_ value: String) {
+        guard let url = URL(string: value) else { return }
+        openURL(url)
     }
 
     private func infoRow(icon: String, title: String, value: String) -> some View {

@@ -8,7 +8,7 @@
 
 use async_trait::async_trait;
 
-use crate::apns::{ApnsEnv, ApnsOutcome, ApnsRequest, ApnsSender, host};
+use crate::apns::{ApnsEnvironment, ApnsOutcome, ApnsRequest, ApnsSender, host};
 
 /// reqwest-backed APNs sender. One shared client (its connection pool keeps the
 /// HTTP/2 connection to APNs warm across pushes).
@@ -31,8 +31,8 @@ impl Default for HttpApnsSender {
 }
 
 /// The APNs request URL for an env + device token.
-fn apns_url(env: ApnsEnv, device_token: &str) -> String {
-    format!("https://{}/3/device/{}", host(env), device_token)
+fn apns_url(environment: ApnsEnvironment, device_token: &str) -> String {
+    format!("https://{}/3/device/{}", host(environment), device_token)
 }
 
 /// APNs "accepted" HTTP status.
@@ -74,7 +74,7 @@ fn parse_error_body(body: &[u8]) -> (Option<String>, Option<u64>) {
 #[async_trait]
 impl ApnsSender for HttpApnsSender {
     async fn send(&self, req: ApnsRequest) -> ApnsOutcome {
-        let url = apns_url(req.env, &req.device_token);
+        let url = apns_url(req.environment, &req.device_token);
         let token_len = req.device_token.len();
         let resp = self
             .client
@@ -111,7 +111,7 @@ impl ApnsSender for HttpApnsSender {
                             .as_deref()
                             .unwrap_or(if body_read { "<none>" } else { "<unreadable body>" }),
                         apns_id = apns_id.as_deref().unwrap_or("<none>"),
-                        env = ?req.env,
+                        environment = ?req.environment,
                         token_len,
                         "push: APNs response"
                     );
@@ -123,7 +123,7 @@ impl ApnsSender for HttpApnsSender {
                 // device token — strip it before the string is logged or bubbled.
                 let e = e.without_url();
                 tracing::warn!(
-                    host = host(req.env),
+                    host = host(req.environment),
                     error = %e,
                     "push: APNs HTTP request failed (transport)"
                 );
@@ -140,11 +140,11 @@ mod tests {
     #[test]
     fn url_uses_the_env_host() {
         assert_eq!(
-            apns_url(ApnsEnv::Production, "tok-1"),
+            apns_url(ApnsEnvironment::Production, "tok-1"),
             "https://api.push.apple.com/3/device/tok-1",
         );
         assert_eq!(
-            apns_url(ApnsEnv::Sandbox, "tok-1"),
+            apns_url(ApnsEnvironment::Sandbox, "tok-1"),
             "https://api.sandbox.push.apple.com/3/device/tok-1",
         );
     }

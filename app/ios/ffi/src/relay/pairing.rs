@@ -33,7 +33,6 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::api::{PairAbortListener, PairTarget};
-use crate::apns::ApnsState;
 use crate::core::{PairChallenge, PairedSummary, PairingClient, PairingRequest};
 
 /// How long the decline path waits for the gateway to acknowledge our
@@ -165,7 +164,6 @@ fn load_or_create_device_identity() -> Result<StaticKeypair, String> {
 /// once the user decides via [`pair_confirm`].
 pub(crate) async fn pair_begin(
     sessions: &PairingSessions,
-    apns: &ApnsState,
     target: PairTarget,
     on_abort: Arc<dyn PairAbortListener>,
 ) -> Result<PairChallenge, String> {
@@ -191,7 +189,7 @@ pub(crate) async fn pair_begin(
     // launches, and content sessions reuse the same static across relaunches.
     let keypair = load_or_create_device_identity()?;
     // The device's Ed25519 push-delegation identity; its public half IS the
-    // device_id, so C can self-certify the APNs binding. Separate from the X25519
+    // device_id, so C can self-certify the push binding. Separate from the X25519
     // Noise static above (which authenticates content sessions). Shared with the
     // direct push-register path so a phone keeps one stable push identity.
     let sign_key = crate::keychain::load_or_create_device_sign_key()?;
@@ -207,14 +205,6 @@ pub(crate) async fn pair_begin(
         // The app static rides the handshake as an XX token; the gateway learns
         // the public half in-band.
         static_secret: keypair.secret(),
-        // Delivered by Swift's `didRegisterForRemoteNotifications` (registration
-        // kicks off at launch, so by pairing time the token is often ready);
-        // empty if it has not arrived yet, in which case the paired app registers
-        // it directly with C after the later token callback.
-        apns_token: apns.token().unwrap_or_default(),
-        // Which APNs host issued this build's tokens — from the Xcode build
-        // configuration via `ClientConfig`, not a Rust-side cfg.
-        apns_env: apns.env().to_pairing(),
     };
 
     let (mut client, hello) = PairingClient::start(req).map_err(|e| e.to_string())?;
@@ -438,7 +428,7 @@ async fn finish_pair(
         _ => return Err("expected sealed GatewayWelcome".into()),
     };
 
-    // 6th message: authorize the gateway's push key to manage our APNs binding at
+    // 6th message: authorize the gateway's push key to manage our push binding at
     // C, signed under our Ed25519 device identity (whose public half is the
     // device_id). Best-effort — if the gateway advertised no push key (relay off)
     // or the send fails, the pairing still stands; only push is affected, so each

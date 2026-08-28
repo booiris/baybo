@@ -23,6 +23,7 @@ struct ServerCacheTests {
         let temp = TempSupportDir()
         let index = temp.makeIndex()
         index.recordUserSend(sessionId: "s-1", text: "hello")
+        index.beginArchive("s-1", archived: true)
         DraftStore.write(
             Draft(text: "unfinished", attachments: []), key: .chat("s-1"), in: temp.url)
         TranscriptStore.write(sessionId: "s-1", stateJson: "{}", in: temp.url)
@@ -34,5 +35,7 @@ struct ServerCacheTests {
 
         index.activate(supportDirectory: temp.url)
         #expect(index.rows.map(\.id) == ["s-1"])
+        #expect(index.rows.first?.archived == true)
+        #expect(index.pendingMutation(for: "s-1") == .archived(true))
     }
 }

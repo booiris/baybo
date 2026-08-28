@@ -1,11 +1,13 @@
 # Building the iOS app
 
-*How the app is built and installed — governs `app/ios/scripts/build-app.sh`, `app/ios/scripts/build-core.sh`, `app/ios/scripts/install.mjs`, `app/ios/project.yml`, and the build products under `app/ios/Generated/` and `app/ios/Externals/`.*
+*How the app is built and installed — governs `app/ios/scripts/build-app.sh`, `app/ios/scripts/build-core.sh`, `app/ios/scripts/install.mjs`, `app/ios/scripts/release.mjs`, `app/ios/scripts/ExportOptions-AppStore.plist`, `app/ios/project.yml`, and the build products under `app/ios/Generated/` and `app/ios/Externals/`.*
 
 ```bash
 scripts/build-app.sh             # web → rust xcframework → xcodegen → sim build
 scripts/build-app.sh --device --release
 node scripts/install.mjs         # archive + export + devicectl install (USB)
+node scripts/release.mjs --version 0.1.0 --build-number 1
+node scripts/release.mjs --version 0.1.0 --build-number 1 --upload
 cargo clippy --workspace --all-targets --all-features   # zero warnings
 cargo nextest run --workspace    # ffi host tests
 (cd web && pnpm build)           # tsc --noEmit + vite build
@@ -13,14 +15,26 @@ cargo nextest run --workspace    # ffi host tests
 
 `Debug` versus `Release` controls optimization, not the APNs service. Local
 device builds and `install.mjs` are development-signed, so both use the default
-`BAYBO_APNS_ENVIRONMENT=development` and register sandbox tokens. A distribution
-archive must set `BAYBO_APNS_ENVIRONMENT=production`; that one build setting
-feeds both the signed `aps-environment` entitlement and the app's runtime
-`BayboApnsEnvironment`, so they cannot disagree:
+`BAYBO_APNS_ENVIRONMENT=development` and register sandbox tokens. `Distribution`
+inherits Release optimization but overrides that setting to `production`; the
+Baybo scheme's Archive action uses `Distribution`. The setting feeds both the
+signed `aps-environment` entitlement and the app's runtime
+`BayboApnsEnvironment`, so they cannot disagree.
 
-```bash
-xcodebuild ... archive BAYBO_APNS_ENVIRONMENT=production
-```
+`release.mjs` is the supported App Store path. It requires an explicit marketing
+version and monotonically increasing build number, rebuilds the transcript and
+the Rust core with `--release`, regenerates the project, then creates a fresh
+archive. Before succeeding it checks the archived runtime APNs value, app and
+notification-extension versions, and absence of the debug push-key seed symbol.
+It only uploads when passed `--upload`, using the tracked App Store export
+options.
+
+The main app declares `ITSAppUsesNonExemptEncryption=false`: its Rust core ships
+industry-standard Noise and rustls algorithms, and the initial App Store
+availability excludes France, so this release does not require encryption
+documentation in App Store Connect. Reassess the declaration before enabling
+France or adding proprietary/non-standard cryptography; exempt encryption may
+still carry separate government reporting obligations.
 
 The last three lines are the check/test entry points; the four test tiers and how
 they map onto CI live in [testing.md](testing.md).
@@ -36,8 +50,9 @@ matters:
 
 1. web bundle
 2. `App/Resources/transcript/`
-3. xcodegen
-4. xcodebuild
+3. Rust core + Swift bindings + device xcframework
+4. xcodegen
+5. xcodebuild
 
 ## Device builds need the device slice AND a signed xcframework
 

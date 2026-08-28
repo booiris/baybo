@@ -132,6 +132,7 @@ final class SessionIndex: ObservableObject {
         supportDirectory: supportDirectory(), defaults: .standard, ownsAppBadge: true)
 
     private static let indexFileName = "sessions.json"
+    private static let mutationFileName = "session-mutations.json"
 
     /// Mirrors the gateway CHAT-LIST `PREVIEW_MAX_CHARS` (`api/admin/chat.rs`
     /// — 120, NOT push's 200) so a locally-captured preview and a REST-fetched
@@ -159,6 +160,41 @@ final class SessionIndex: ObservableObject {
         case hidden
     }
 
+    /// The subset of list mutations that is safe to replay after an ambiguous
+    /// transport failure. Both operations are absolute assignments on the
+    /// gateway, so repeating one cannot toggle the state twice.
+    private struct DurableMutation: Codable {
+        enum Kind: String, Codable {
+            case archived
+            case hidden
+        }
+
+        let kind: Kind
+        let archived: Bool?
+
+        init?(_ mutation: PendingMutation) {
+            switch mutation {
+            case .archived(let archived):
+                kind = .archived
+                self.archived = archived
+            case .hidden:
+                kind = .hidden
+                archived = nil
+            case .pinned:
+                return nil
+            }
+        }
+
+        var pending: PendingMutation? {
+            switch kind {
+            case .archived:
+                archived.map(PendingMutation.archived)
+            case .hidden:
+                .hidden
+            }
+        }
+    }
+
     @Published private(set) var rows: [SessionRow] = []
 
     /// Bumped whenever the gateway tells us our list mirror is behind — see
@@ -174,11 +210,14 @@ final class SessionIndex: ObservableObject {
     private var supportDirectory: URL
     private let defaults: UserDefaults
     private var fileURL: URL
+    private var mutationFileURL: URL
     /// The session whose `ChatScreen` is on top. A `SessionActivity` ping for it
     /// is not counted as unread (the user is looking at it); `nil` on the list.
     private var foregroundSessionId: String?
-    /// In-memory only: a kill mid-flight loses the intent and the next merge
-    /// restores server truth, which is the honest fallback.
+    /// Latest local intent. Archive and hide are also persisted in
+    /// `mutationFileURL`, so an offline operation survives suspension or a kill
+    /// and keeps shielding the optimistic row until the gateway acknowledges it.
+    /// Pin remains an in-memory, rollback-on-failure mutation.
     private var pendingMutations: [String: PendingMutation] = [:]
     /// In-flight **cron group** pin intents, keyed by JOB id — a different id
     /// space from `pendingMutations`' session ids, which is exactly why it is a
@@ -188,16 +227,10 @@ final class SessionIndex: ObservableObject {
     /// first pending pin lands, so a chained failure rolls back to truth rather
     /// than to the negation of a flip that never happened.
     private var pinnedCronBaselines: [String: Bool] = [:]
-    /// Rows removed by `beginHide`, kept for the failure rollback (the mirror is
-    /// deleted with the row and stays gone — a rolled-back delete refetches its
-    /// history on re-entry).
-    private var hiddenBackups: [String: SessionRow] = [:]
-    /// The archived value last acknowledged by the server, staged when a
-    /// session's FIRST pending mutation lands. A chained failure (archive →
-    /// undo, both dead offline) must roll back here — negating the failed
-    /// intent would re-archive a row the server never archived.
-    private var archiveBaselines: [String: Bool] = [:]
-    /// Same idea as `archiveBaselines`, for the pin toggle.
+    /// The pinned value last acknowledged by the server, staged when a
+    /// session's first pending pin lands. Archive and hide do not need a
+    /// baseline: they stay queued through transport failures instead of
+    /// rolling back.
     private var pinBaselines: [String: Bool] = [:]
     /// In-flight rename intents — the LATEST title the user asked for, held per
     /// session until its PUT resolves.
@@ -231,8 +264,11 @@ final class SessionIndex: ObservableObject {
         self.defaults = defaults
         self.ownsAppBadge = ownsAppBadge
         fileURL = supportDirectory.appendingPathComponent(Self.indexFileName)
+        mutationFileURL = supportDirectory.appendingPathComponent(Self.mutationFileName)
         rows = Self.load(from: fileURL)
         migrateLegacySingleSession()
+        pendingMutations = Self.loadDurableMutations(from: mutationFileURL)
+        reapplyDurableMutations()
         // A cold launch must correct a badge left over from pushes that landed
         // while the app was dead — including down to zero, which no later
         // mutation would necessarily produce.
@@ -470,12 +506,10 @@ final class SessionIndex: ObservableObject {
     /// flight — a stale undo toast must not overwrite a hide intent.
     func beginArchive(_ sessionId: String, archived: Bool) {
         guard pendingMutations[sessionId] != .hidden,
-            let idx = rows.firstIndex(where: { $0.id == sessionId })
+            rows.contains(where: { $0.id == sessionId })
         else { return }
-        if pendingMutations[sessionId] == nil {
-            archiveBaselines[sessionId] = rows[idx].archived
-        }
         pendingMutations[sessionId] = .archived(archived)
+        saveDurableMutations()
         mutationEpoch += 1
         setArchivedFlag(sessionId, archived: archived)
     }
@@ -535,6 +569,7 @@ final class SessionIndex: ObservableObject {
             pinBaselines[sessionId] = rows[idx].pinned
         }
         pendingMutations[sessionId] = .pinned(pinned)
+        saveDurableMutations()
         mutationEpoch += 1
         setPinnedFlag(sessionId, pinned: pinned)
     }
@@ -598,13 +633,13 @@ final class SessionIndex: ObservableObject {
     /// with no row left to reach it from.
     func beginHide(_ sessionId: String) {
         pendingMutations[sessionId] = .hidden
+        saveDurableMutations()
         mutationEpoch += 1
         TranscriptStore.delete(sessionId: sessionId, in: supportDirectory)
         DraftStore.delete(key: .chat(sessionId), in: supportDirectory)
         onSessionsRemoved?([sessionId])
-        guard let idx = rows.firstIndex(where: { $0.id == sessionId }) else { return }
-        hiddenBackups[sessionId] = rows[idx]
-        rows.remove(at: idx)
+        guard rows.contains(where: { $0.id == sessionId }) else { return }
+        rows.removeAll { $0.id == sessionId }
         save()
     }
 
@@ -625,11 +660,9 @@ final class SessionIndex: ObservableObject {
             TranscriptStore.delete(sessionId: sessionId, in: supportDirectory)
             DraftStore.delete(key: .chat(sessionId), in: supportDirectory)
         }
+        saveDurableMutations()
         onSessionsRemoved?(targets)
         mutationEpoch += 1
-        for row in rows where targets.contains(row.id) {
-            hiddenBackups[row.id] = row
-        }
         rows.removeAll { targets.contains($0.id) }
         save()
     }
@@ -647,69 +680,33 @@ final class SessionIndex: ObservableObject {
         pendingMutations[sessionId]
     }
 
+    /// Durable archive/hide work waiting for the gateway. `AppStore` calls this
+    /// on launch, foreground, and reconnect retries; pin is deliberately absent
+    /// because it keeps its existing rollback-on-failure contract.
+    var durableMutationSessionIds: [String] {
+        pendingMutations.compactMap { sessionId, mutation in
+            DurableMutation(mutation) == nil ? nil : sessionId
+        }
+    }
+
     /// The staged intent reached the server (or was superseded and re-sent):
     /// remote truth takes over again.
     func finishMutation(_ sessionId: String) {
         pendingMutations.removeValue(forKey: sessionId)
-        hiddenBackups.removeValue(forKey: sessionId)
-        archiveBaselines.removeValue(forKey: sessionId)
+        saveDurableMutations()
         pinBaselines.removeValue(forKey: sessionId)
         mutationEpoch += 1
-    }
-
-    /// Archive PUT failed with the intent still current: rewind to the last
-    /// server-acknowledged value (NOT the failed intent's negation — after a
-    /// failed archive→undo chain that negation would re-archive a row the
-    /// server never archived).
-    func rollBackArchive(_ sessionId: String) {
-        pendingMutations.removeValue(forKey: sessionId)
-        mutationEpoch += 1
-        guard let baseline = archiveBaselines.removeValue(forKey: sessionId) else { return }
-        setArchivedFlag(sessionId, archived: baseline)
     }
 
     /// Pin PUT failed: rewind to the last server-acknowledged value.
     func rollBackPin(_ sessionId: String) {
         pendingMutations.removeValue(forKey: sessionId)
+        saveDurableMutations()
         mutationEpoch += 1
         guard let baseline = pinBaselines.removeValue(forKey: sessionId) else { return }
         setPinnedFlag(sessionId, pinned: baseline)
     }
 
-    /// Hide DELETE failed: re-insert the removed row (its mirror stays gone;
-    /// re-entry refetches history).
-    func rollBackHide(_ sessionId: String) {
-        pendingMutations.removeValue(forKey: sessionId)
-        archiveBaselines.removeValue(forKey: sessionId)
-        mutationEpoch += 1
-        guard let row = hiddenBackups.removeValue(forKey: sessionId),
-            !rows.contains(where: { $0.id == row.id })
-        else { return }
-        rows.append(row)
-        save()
-    }
-
-    /// Batch hide failed: re-insert every row it removed. The user made ONE
-    /// gesture, so it rewinds as one — a partial local state would be a list
-    /// nobody asked for. The gateway refuses the whole batch if any id is out of
-    /// scope, but a failure mid-write can still leave some rows hidden there; the
-    /// next merge reconciles those back out, since remote wins for existence.
-    func rollBackHideMany(_ sessionIds: [String]) {
-        var restored: [SessionRow] = []
-        for sessionId in sessionIds {
-            pendingMutations.removeValue(forKey: sessionId)
-            archiveBaselines.removeValue(forKey: sessionId)
-            if let row = hiddenBackups.removeValue(forKey: sessionId) {
-                restored.append(row)
-            }
-        }
-        mutationEpoch += 1
-        let present = Set(rows.map(\.id))
-        let fresh = restored.filter { !present.contains($0.id) }
-        guard !fresh.isEmpty else { return }
-        rows.append(contentsOf: fresh)
-        save()
-    }
 
     /// The batch reached the server: drop every staged intent it held.
     func finishHideMany(_ sessionIds: [String]) {
@@ -731,8 +728,8 @@ final class SessionIndex: ObservableObject {
         }
     #endif
 
-    /// Plain local flip with no staged intent — rollback and the DEBUG demo
-    /// seed use it; user-driven flips go through `beginArchive`.
+    /// Plain local flip with no staged intent — the DEBUG demo seed and tests
+    /// use it; user-driven flips go through `beginArchive`.
     func setArchivedFlag(_ sessionId: String, archived: Bool) {
         guard let idx = rows.firstIndex(where: { $0.id == sessionId }),
             rows[idx].archived != archived
@@ -767,6 +764,7 @@ final class SessionIndex: ObservableObject {
     /// refresh re-merges.
     func merge(remote: [ChatSessionSummary], fetchEpoch: Int) {
         guard fetchEpoch == mutationEpoch else { return }
+        reconcileDurableMutations(remote: remote)
         var merged: [SessionRow] = []
         let local = Dictionary(uniqueKeysWithValues: rows.map { ($0.id, $0) })
         for summary in remote {
@@ -850,8 +848,8 @@ final class SessionIndex: ObservableObject {
         // never runs for a delete performed elsewhere — so without this the
         // conversation the user deleted on the web would keep its full transcript
         // on this phone forever. A targeted set difference, NOT a directory sweep:
-        // rows still staged in `pendingMutations` are owned by beginHide /
-        // rollBackHide, and a draft (never a row) is never considered here.
+        // rows still staged in `pendingMutations` are owned by `beginHide`, and
+        // a draft (never a row) is never considered here.
         let survivors = Set(merged.map(\.id))
         var dropped: Set<String> = []
         for row in rows
@@ -863,6 +861,32 @@ final class SessionIndex: ObservableObject {
         if !dropped.isEmpty { onSessionsRemoved?(dropped) }
         rows = merged
         save()
+    }
+
+    /// A successful full-list pull is also an acknowledgement path for a write
+    /// whose response was lost. Matching archive state proves the PUT landed;
+    /// absence proves a hide landed (or that another client removed the row,
+    /// which makes either pending intent moot). This is what lets an idempotent
+    /// retry that receives a 404 after an already-landed hide retire cleanly.
+    private func reconcileDurableMutations(remote: [ChatSessionSummary]) {
+        let summaries = Dictionary(uniqueKeysWithValues: remote.map { ($0.sessionId, $0) })
+        let acknowledged = pendingMutations.compactMap { sessionId, mutation -> String? in
+            switch mutation {
+            case .archived(let archived):
+                guard let summary = summaries[sessionId] else { return sessionId }
+                return summary.archived == archived ? sessionId : nil
+            case .hidden:
+                return summaries[sessionId] == nil ? sessionId : nil
+            case .pinned:
+                return nil
+            }
+        }
+        guard !acknowledged.isEmpty else { return }
+        for sessionId in acknowledged {
+            pendingMutations.removeValue(forKey: sessionId)
+        }
+        saveDurableMutations()
+        mutationEpoch += 1
     }
 
     /// Called with every session whose durable per-session state this registry
@@ -884,12 +908,11 @@ final class SessionIndex: ObservableObject {
         pendingMutations = [:]
         pendingCronPins = [:]
         pinnedCronBaselines = [:]
-        hiddenBackups = [:]
-        archiveBaselines = [:]
         pinBaselines = [:]
         pendingTitles = [:]
         titleBaselines = [:]
         mutationEpoch += 1
+        saveDurableMutations()
         save()
         TranscriptStore.deleteAll(in: supportDirectory)
         OutboxStore.deleteAll(in: supportDirectory)
@@ -908,8 +931,11 @@ final class SessionIndex: ObservableObject {
         resetVolatileState()
         self.supportDirectory = supportDirectory
         fileURL = supportDirectory.appendingPathComponent(Self.indexFileName)
+        mutationFileURL = supportDirectory.appendingPathComponent(Self.mutationFileName)
         rows = Self.load(from: fileURL)
         migrateLegacySingleSession()
+        pendingMutations = Self.loadDurableMutations(from: mutationFileURL)
+        reapplyDurableMutations()
         publishBadge(force: true)
     }
 
@@ -917,8 +943,6 @@ final class SessionIndex: ObservableObject {
         pendingMutations = [:]
         pendingCronPins = [:]
         pinnedCronBaselines = [:]
-        hiddenBackups = [:]
-        archiveBaselines = [:]
         pinBaselines = [:]
         pendingTitles = [:]
         titleBaselines = [:]
@@ -927,6 +951,50 @@ final class SessionIndex: ObservableObject {
     }
 
     // MARK: - Persistence
+
+    /// Re-establish the optimistic projection after a process restart. The
+    /// intent file is written before the row/file mutation, so this also closes
+    /// the crash window between those two atomic writes.
+    private func reapplyDurableMutations() {
+        var changed = false
+        var hidden: Set<String> = []
+        for (sessionId, mutation) in pendingMutations {
+            switch mutation {
+            case .archived(let archived):
+                guard let idx = rows.firstIndex(where: { $0.id == sessionId }) else { continue }
+                if rows[idx].archived != archived {
+                    rows[idx].archived = archived
+                    changed = true
+                }
+            case .hidden:
+                hidden.insert(sessionId)
+                TranscriptStore.delete(sessionId: sessionId, in: supportDirectory)
+                DraftStore.delete(key: .chat(sessionId), in: supportDirectory)
+            case .pinned:
+                break
+            }
+        }
+        if !hidden.isEmpty {
+            let before = rows.count
+            rows.removeAll { hidden.contains($0.id) }
+            changed = changed || rows.count != before
+        }
+        if changed { save() }
+    }
+
+    private func saveDurableMutations() {
+        let durable = pendingMutations.compactMapValues(DurableMutation.init)
+        let encoder = JSONEncoder()
+        guard let data = try? encoder.encode(durable) else { return }
+        try? data.write(to: mutationFileURL, options: .atomic)
+    }
+
+    private static func loadDurableMutations(from url: URL) -> [String: PendingMutation] {
+        guard let data = try? Data(contentsOf: url),
+            let durable = try? JSONDecoder().decode([String: DurableMutation].self, from: data)
+        else { return [:] }
+        return durable.compactMapValues(\.pending)
+    }
 
     /// Writes the registry — and NOTHING else. It used to end by pruning the
     /// transcript mirrors down to the ten most recently active rows, which made

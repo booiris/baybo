@@ -912,6 +912,6 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     func registerPush() async throws -> String? { throw Self.unsupported }
     func relayInvalidateApiLegs() { lock.withLock { apiLegInvalidations += 1 } }
     func relayPreconnect() async throws { throw Self.unsupported }
-    func setApnsToken(tokenHex: String) {}
+    func setPushToken(token: PushToken) {}
     func setSessionListSink(sink: SessionListSink) {}
 }

@@ -178,7 +178,7 @@ final class DeckStore: ObservableObject {
     @Published var shareItem: FilePreview?
 
     private(set) var state = StatePayload(cards: [], snapshots: [])
-    /// The chat session of an in-flight empty-board `/deck` creation (set by
+    /// The chat session of an in-flight empty-board card creation (set by
     /// `AppStore.startCardDraft`, cleared when a card actually lands). While
     /// set, the empty-board CTA shows an in-flight state and a re-tap returns
     /// to this chat instead of starting a new one.

@@ -50,7 +50,6 @@ enum Baybo {
             .path
         return BayboClient(
             config: ClientConfig(
-                apnsEnv: apnsEnvironment,
                 logDir: logDir,
                 blobCacheDir: ServerCache.blobDirectory(in: SessionIndex.supportDirectory())))
     }()

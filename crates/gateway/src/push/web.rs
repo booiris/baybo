@@ -1,8 +1,8 @@
 //! Direct-mode device push bindings.
 //!
-//! A scan-to-pair device gets its push material — Ed25519 identity, `push_key`,
-//! delegation, APNs token, and a remote-host endpoint — bootstrapped by the Noise
-//! pairing handshake and recorded on the device row. The **direct** transport has
+//! A scan-to-pair device gets its Ed25519 identity, `push_key`, delegation, and
+//! remote-host endpoint from the Noise pairing handshake, then posts its
+//! provider target through the authenticated device API. The **direct** transport has
 //! no pairing, so the app bootstraps the *same* material over the authenticated
 //! admin-token REST channel (`POST /v1/push/register`) plus
 //! `x-baybo-device-id` instead: it mints its own Ed25519 identity (so
@@ -12,14 +12,15 @@
 //!
 //! The binding is cryptographically **identical** to a device binding, so the
 //! dispatcher's `/register` + `/notify` builders, the remote host (C), and the
-//! APNs NSE path is unchanged. The only divergences are (a) the `push_key` rides
+//! platform decrypt path are unchanged. The only divergences are (a) the `push_key` rides
 //! TLS + the admin bearer token rather than a Noise handshake hash — a weaker
 //! (but still endpoint-to-endpoint) trust model, see
 //! `docs/modules/mobile/relay-push-security.md`; and (b) the remote-host endpoint
 //! is the built-in default ([`super::DEFAULT_PUSH_RELAY_URL`]), not a pairing QR.
 //!
-//! Storage reuses the per-device secret names (`device.{id}.push_key` / `.apns` /
-//! `.push_delegation`) so [`super::PushDispatcher`]'s read sites need no change; a
+//! Storage reuses the per-device secret names (`device.{id}.push_key` /
+//! `.push_registration` / `.push_delegation`) so [`super::PushDispatcher`]'s read
+//! sites need no change; a
 //! small `web_push.{id}` meta record carries the remote-host endpoint and API key
 //! the dispatcher targets, and `SecretVault::list_names` enumerates them. The API
 //! key marks admitted traffic at the remote-host edge; the delegation chain
@@ -28,12 +29,12 @@
 use baybo_security::SecretVault;
 use device_proto::aead;
 use device_proto::delegation;
-use device_proto::pairing::ApnsEnv;
+use remote_host_protocol::push::PushTarget;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    DeviceApnsRegistration, device_apns_secret_name, device_push_delegation_secret_name,
-    device_push_key_secret_name,
+    DevicePushRegistration, device_push_delegation_secret_name, device_push_key_secret_name,
+    device_push_registration_secret_name,
 };
 
 /// Prefix for a direct-binding meta record's vault key. Disjoint from the
@@ -47,8 +48,8 @@ fn web_binding_secret_name(device_id: &str) -> String {
 }
 
 /// A direct-mode push binding's routing meta: which remote host (C) the
-/// dispatcher reaches it through. The push material (`push_key`, APNs token +
-/// env, delegation) lives under the shared `device.{id}.*` secret names so the
+/// dispatcher reaches it through. The push material (`push_key`, provider
+/// target, delegation) lives under the shared `device.{id}.*` secret names so the
 /// dispatcher reads it the same way it reads a paired device's.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct WebPushBinding {
@@ -57,29 +58,21 @@ pub(crate) struct WebPushBinding {
     /// Remote-host base WS URL (the built-in [`super::DEFAULT_PUSH_RELAY_URL`]).
     /// The dispatcher maps `wss→https` for `/register` + `/notify` POSTs.
     pub relay_url: String,
-    /// Remote-host API key sent on `/register` and `/notify`. Old direct bindings
-    /// predate this field and target the built-in public host, whose default is
-    /// filled in during deserialization.
-    #[serde(default = "default_remote_api_key")]
+    /// Remote-host API key sent on `/register` and `/notify`.
     pub remote_api_key: String,
     /// Unix seconds the binding was registered (for observability only).
     pub created_at: i64,
 }
 
-fn default_remote_api_key() -> String {
-    remote_host_protocol::DEFAULT_REMOTE_API_KEY.to_string()
-}
-
 /// Persist (or update) a verified web push binding: the routing meta plus the
 /// push material under the shared `device.{id}.*` names the dispatcher reads.
 /// Idempotent — re-registering the same `device_id` overwrites in place (a fresh
-/// app launch mints a new `push_key`, or the APNs token rotated).
+/// app launch mints a new `push_key`, or the provider target changed).
 pub(crate) async fn store_binding(
     vault: &SecretVault,
     binding: &WebPushBinding,
     push_key: &[u8; aead::KEY_LEN],
-    apns_token: &str,
-    apns_env: ApnsEnv,
+    target: &PushTarget,
     delegation_sig: &[u8; delegation::SIGNATURE_LEN],
 ) -> anyhow::Result<()> {
     let id = binding.device_id.as_str();
@@ -89,14 +82,13 @@ pub(crate) async fn store_binding(
         .map_err(|e| anyhow::anyhow!("store push_key: {e}"))?;
     vault
         .store_typed(
-            &device_apns_secret_name(id),
-            &DeviceApnsRegistration {
-                apns_token: apns_token.to_string(),
-                apns_env,
+            &device_push_registration_secret_name(id),
+            &DevicePushRegistration {
+                target: target.clone(),
             },
         )
         .await
-        .map_err(|e| anyhow::anyhow!("store apns: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("store push registration: {e}"))?;
     vault
         .store_secret(&device_push_delegation_secret_name(id), delegation_sig)
         .await
@@ -146,7 +138,15 @@ pub(crate) async fn list_bindings(vault: &SecretVault) -> Vec<WebPushBinding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use remote_host_protocol::push::ApnsEnvironment;
     use std::sync::Arc;
+
+    fn apns_target(token: &str) -> PushTarget {
+        PushTarget::Apns {
+            token: token.to_string(),
+            environment: ApnsEnvironment::Sandbox,
+        }
+    }
 
     fn vault() -> SecretVault {
         SecretVault::new(
@@ -173,8 +173,7 @@ mod tests {
             &vault,
             &b,
             &[3u8; aead::KEY_LEN],
-            "tok",
-            ApnsEnv::Sandbox,
+            &apns_target("tok"),
             &[4u8; 64],
         )
         .await
@@ -192,12 +191,12 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        let apns: DeviceApnsRegistration = vault
-            .get_typed(&device_apns_secret_name("device-aa"))
+        let registration: DevicePushRegistration = vault
+            .get_typed(&device_push_registration_secret_name("device-aa"))
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(apns.apns_token, "tok");
+        assert_eq!(registration.target, apns_target("tok"));
     }
 
     #[tokio::test]
@@ -215,8 +214,7 @@ mod tests {
             &vault,
             &binding("device-cc"),
             &[0u8; aead::KEY_LEN],
-            "t",
-            ApnsEnv::Sandbox,
+            &apns_target("t"),
             &[0u8; 64],
         )
         .await
@@ -224,19 +222,5 @@ mod tests {
         let listed = list_bindings(&vault).await;
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].device_id, "device-cc");
-    }
-
-    #[test]
-    fn old_binding_defaults_to_the_public_remote_api_key() {
-        let old = r#"{
-            "device_id":"device-aa",
-            "relay_url":"wss://proxy.baybo.space",
-            "created_at":1700000000
-        }"#;
-        let binding: WebPushBinding = serde_json::from_str(old).unwrap();
-        assert_eq!(
-            binding.remote_api_key,
-            remote_host_protocol::DEFAULT_REMOTE_API_KEY
-        );
     }
 }

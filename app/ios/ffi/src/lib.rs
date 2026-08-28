@@ -10,7 +10,6 @@
 //! on the runtime this crate owns in [`runtime`].
 
 mod api;
-mod apns;
 mod binding;
 mod blob_helper;
 mod core;
@@ -19,6 +18,7 @@ mod gateway_api;
 mod gateway_client;
 mod keychain;
 mod logging;
+mod push;
 mod qr;
 mod relay;
 mod runtime;
@@ -38,12 +38,12 @@ pub use api::{
     IssueInfo, IssuePatch, IssuePriority, IssueRunInfo, IssueRunLog, IssueStatus, LlmModelCatalog,
     LlmModelInfo, MessageLookup, NewIssue, NewProject, PairAbortListener, PairChallenge,
     PairTarget, PairedSummary, ProjectActivity, ProjectAttention, ProjectInfo, ProjectSettings,
-    ProjectSink, RunStatus, RunTrigger, SessionListSink, SessionModelPin, StringPatch,
+    ProjectSink, PushToken, RunStatus, RunTrigger, SessionListSink, SessionModelPin, StringPatch,
     SubIssueProgress, SubagentCursor, TeamMemberInfo,
 };
-use apns::ApnsState;
 use binding::{ActiveLeg, active_leg};
 use gateway_client::ActiveGatewayClient;
+use push::PushState;
 
 uniffi::setup_scaffolding!();
 
@@ -68,14 +68,14 @@ pub fn active_server_cache_key() -> Result<Option<String>, BayboError> {
 }
 
 /// The app's engine: one long-lived instance owns the live transport legs, the
-/// in-flight pairing sessions, and the APNs state. Construct once at launch and
+/// in-flight pairing sessions, and the push-token state. Construct once at launch and
 /// share it; the pumps it spawns keep running between calls.
 #[derive(uniffi::Object)]
 pub struct BayboClient {
     relay: relay::RelaySessions,
     direct: direct::DirectSessions,
     pairing: relay::PairingSessions,
-    apns: Arc<ApnsState>,
+    push: Arc<PushState>,
 }
 
 impl BayboClient {
@@ -106,20 +106,18 @@ impl BayboClient {
         }
         #[cfg(all(debug_assertions, target_os = "ios"))]
         debug_seed_push_key();
-        let apns = Arc::new(ApnsState::new(config.apns_env));
+        let push = Arc::new(PushState::new());
         Arc::new(Self {
             relay: relay::RelaySessions::new(),
             direct: direct::DirectSessions::default(),
             pairing: relay::PairingSessions::default(),
-            apns,
+            push,
         })
     }
 
-    /// Store the APNs device token (lowercase hex), delivered by Swift's
-    /// `didRegisterForRemoteNotificationsWithDeviceToken`. Read by pairing, the
-    /// relay token-refresh API call, and direct push registration.
-    pub fn set_apns_token(&self, token_hex: String) {
-        self.apns.set_token(token_hex);
+    /// Store the current provider-tagged device token delivered by the platform.
+    pub fn set_push_token(&self, token: PushToken) {
+        self.push.set_token(token);
     }
 
     /// Retarget the content-addressed blob cache after a binding changes.
@@ -197,7 +195,7 @@ impl BayboClient {
     ) -> Result<PairChallenge, BayboError> {
         let this = self;
         runtime::run(async move {
-            relay::pair_begin(&this.pairing, &this.apns, target, on_abort)
+            relay::pair_begin(&this.pairing, target, on_abort)
                 .await
                 .map(PairChallenge::from)
         })
@@ -214,9 +212,10 @@ impl BayboClient {
     ) -> Result<PairedSummary, BayboError> {
         let this = self;
         runtime::run(async move {
-            relay::pair_confirm(&this.pairing, &device_id, accepted)
-                .await
-                .map(PairedSummary::from)
+            let paired = relay::pair_confirm(&this.pairing, &device_id, accepted).await?;
+            this.push.invalidate_gateway();
+            refresh_relay_push_best_effort(this.push.clone());
+            Ok(PairedSummary::from(paired))
         })
         .await
     }
@@ -235,16 +234,13 @@ impl BayboClient {
 
     /// Best-effort direct-mode push registration: provision (or refresh) this
     /// app's push binding with the directly-connected gateway so a backgrounded
-    /// direct chat can still buzz. `None` when iOS hasn't issued an APNs token
+    /// direct chat can still buzz. `None` when the platform hasn't issued a push token
     /// yet or the gateway has no `[push]` remote host. Returns the bound device
     /// id on success.
     pub async fn register_push(self: Arc<Self>) -> Result<Option<String>, BayboError> {
         let this = self;
-        runtime::run(async move {
-            let token = this.apns.token().unwrap_or_default();
-            direct::register_push(&this.direct, token, this.apns.env().as_str()).await
-        })
-        .await
+        runtime::run(async move { direct::register_push(&this.direct, this.push.token()).await })
+            .await
     }
 
     /// Log out (the unified "disconnect"): tear down the live leg and wipe the
@@ -975,7 +971,7 @@ impl BayboClient {
                     // Then park one API leg, so the list refresh the user is about
                     // to trigger does not pay a dial.
                     relay::leg_pool::warm(epoch).await;
-                    refresh_relay_apns_best_effort(this.apns.clone());
+                    refresh_relay_push_best_effort(this.push.clone());
                     Ok(())
                 }
                 ActiveLeg::Direct => Ok(()),
@@ -1015,7 +1011,7 @@ impl BayboClient {
         runtime::run(async move {
             match active_leg()? {
                 ActiveLeg::Relay => {
-                    refresh_relay_apns_best_effort(this.apns.clone());
+                    refresh_relay_push_best_effort(this.push.clone());
                     transport::connect(&this.relay, session_id, sink).await
                 }
                 ActiveLeg::Direct => transport::connect(&this.direct, session_id, sink).await,
@@ -1095,7 +1091,7 @@ impl BayboClient {
                 attachments.into_iter().map(Into::into).collect();
             match active_leg()? {
                 ActiveLeg::Relay => {
-                    refresh_relay_apns_best_effort(this.apns.clone());
+                    refresh_relay_push_best_effort(this.push.clone());
                     transport::connect_and_send(
                         &this.relay,
                         session_id,
@@ -1570,7 +1566,7 @@ fn debug_seed_push_key() {
     log::debug!("keychain self-check: {result}");
 }
 
-/// Tell the gateway this device's APNs token, if it does not already know it.
+/// Tell the gateway this device's provider-tagged target, if it does not already know it.
 ///
 /// Detached from every caller's critical path on purpose. It used to be `.await`ed
 /// BEFORE `transport::connect`, so every chat-leg subscribe queued behind it — and
@@ -1578,35 +1574,32 @@ fn debug_seed_push_key() {
 /// resident stores at once) would have put a dozen identical POSTs in front of the
 /// chat leg the user is waiting on. The steady-state answer is to send nothing at
 /// all; when there IS something to send, it does not need to be first.
-fn refresh_relay_apns_best_effort(apns: Arc<ApnsState>) {
-    let Some(token) = apns.claim_post() else {
+fn refresh_relay_push_best_effort(push: Arc<PushState>) {
+    let Some(claim) = push.claim_post() else {
         return;
     };
     tokio::spawn(async move {
-        let mut token = token;
+        let mut claim = claim;
         loop {
-            let delivered = match gateway_api::update_apns_token(
-                &relay::GatewayApi,
-                &token,
-                apns.env().as_str(),
-            )
-            .await
-            {
-                Ok(()) => true,
-                Err(e) => {
-                    log::warn!("relay APNs token refresh failed: {e}");
-                    false
-                }
-            };
-            apns.finish_post(token, delivered);
+            let delivered =
+                match gateway_api::update_push_token(&relay::GatewayApi, &claim.token.to_wire())
+                    .await
+                {
+                    Ok(()) => true,
+                    Err(e) => {
+                        log::warn!("relay push token refresh failed: {e}");
+                        false
+                    }
+                };
+            push.finish_post(claim, delivered);
             if !delivered {
                 return;
             }
-            // iOS rotated the token while that POST was on the wire. Chase it here
-            // rather than leave the gateway bound to the one it just retired and
+            // The platform rotated the token while that POST was on the wire. Chase it here
+            // rather than leave the gateway bound to the target it just retired and
             // hope some later connect notices.
-            match apns.claim_post() {
-                Some(next) => token = next,
+            match push.claim_post() {
+                Some(next) => claim = next,
                 None => return,
             }
         }

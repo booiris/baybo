@@ -4324,17 +4324,17 @@
         }
       }
     },
-    "/v1/mobile/apns-token": {
+    "/v1/mobile/push-token": {
       "post": {
         "tags": [
           "push"
         ],
-        "operationId": "update_device_apns_token",
+        "operationId": "update_device_push_token",
         "requestBody": {
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/UpdateDeviceApnsTokenRequest"
+                "$ref": "#/components/schemas/UpdateDevicePushTokenRequest"
               }
             }
           },
@@ -4342,7 +4342,17 @@
         },
         "responses": {
           "204": {
-            "description": "Paired device APNs token refreshed"
+            "description": "Paired device push token refreshed"
+          },
+          "400": {
+            "description": "Provider token has invalid length",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
           },
           "401": {
             "description": "Unauthorized",
@@ -8043,6 +8053,13 @@
           }
         }
       },
+      "ApnsEnvironmentRequest": {
+        "type": "string",
+        "enum": [
+          "sandbox",
+          "production"
+        ]
+      },
       "ApprovalDecisionDto": {
         "type": "string",
         "description": "Mirror of [`baybo_model::ApprovalDecision`], so the client gets the same\ndiscriminated union it switches on everywhere else here.",
@@ -11180,25 +11197,60 @@
           }
         }
       },
+      "PushTargetRequest": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "token",
+              "environment",
+              "provider"
+            ],
+            "properties": {
+              "environment": {
+                "$ref": "#/components/schemas/ApnsEnvironmentRequest"
+              },
+              "provider": {
+                "type": "string",
+                "enum": [
+                  "apns"
+                ]
+              },
+              "token": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "token",
+              "provider"
+            ],
+            "properties": {
+              "provider": {
+                "type": "string",
+                "enum": [
+                  "fcm"
+                ]
+              },
+              "token": {
+                "type": "string"
+              }
+            }
+          }
+        ]
+      },
       "RegisterPushRequest": {
         "type": "object",
         "description": "Request body for `POST /v1/push/register`.",
         "required": [
           "device_id",
-          "apns_token",
-          "apns_env",
+          "target",
           "push_key",
           "delegation"
         ],
         "properties": {
-          "apns_env": {
-            "type": "string",
-            "description": "APNs environment: `\"sandbox\"` (development-signed) or `\"production\"`\n(distribution-signed)."
-          },
-          "apns_token": {
-            "type": "string",
-            "description": "The client's current APNs device token (hex)."
-          },
           "delegation": {
             "type": "string",
             "description": "Lowercase hex of the 64-byte Ed25519 delegation: the client's device key\nauthorizing the gateway push key returned by `GET /v1/push/params`."
@@ -11210,6 +11262,10 @@
           "push_key": {
             "type": "string",
             "description": "Lowercase hex of the 32-byte preview AEAD key the client also stored in\nits App-Group keychain (so its NSE can decrypt). Generated client-side and\ndelivered over this TLS + admin-token channel."
+          },
+          "target": {
+            "$ref": "#/components/schemas/PushTargetRequest",
+            "description": "The client's current provider-tagged token."
           }
         }
       },
@@ -12019,21 +12075,15 @@
           }
         }
       },
-      "UpdateDeviceApnsTokenRequest": {
+      "UpdateDevicePushTokenRequest": {
         "type": "object",
-        "description": "Request body for `POST /v1/mobile/apns-token`.",
+        "description": "Request body for `POST /v1/mobile/push-token`.",
         "required": [
-          "apns_token",
-          "apns_env"
+          "target"
         ],
         "properties": {
-          "apns_env": {
-            "type": "string",
-            "description": "APNs environment: `\"sandbox\"` (development-signed) or `\"production\"`\n(distribution-signed)."
-          },
-          "apns_token": {
-            "type": "string",
-            "description": "The device's current APNs device token (hex)."
+          "target": {
+            "$ref": "#/components/schemas/PushTargetRequest"
           }
         }
       },

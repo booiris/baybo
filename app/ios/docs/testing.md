@@ -504,6 +504,10 @@ see the device checklist below.
 2. Pairing: scan → confirm code matches → pair; decline + gateway-side abort
    both dismiss cleanly.
 3. Direct login incl. `invalid_token` rendering; push binding after foreground.
+   On a physical device, fresh-install the app (or reset its Local Network
+   permission), connect to a private IPv4 address, and verify the system prompt
+   appears. Accepting must allow the connection; after denying, enabling Baybo
+   again under Settings → Privacy & Security → Local Network must recover it.
 4. Chat: streaming, history paging at top, image send/receive, background >45s
    → foreground sync (no duplicates), a `gap`/reconnect sync run, and the
    outbox (send offline → red dot / auto-retry → reconnect resend confirms).

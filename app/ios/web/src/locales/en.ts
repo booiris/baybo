@@ -91,10 +91,10 @@ export const en = {
       },
     },
     deck: {
-      empty: "No cards yet — type /deck in a chat to make one.",
+      empty: "No cards yet — create one in a chat.",
       quickSetup: "Create a card",
       createCardInflight: "Creating · view",
-      quickSetupPrompt: "/deck Make a card that monitors baybo's token usage",
+      quickSetupPrompt: "Make a card that monitors baybo's token usage",
       quarantined: "This card was stopped after repeated failures.",
       disabled: "Paused",
       reenable: "Re-enable",

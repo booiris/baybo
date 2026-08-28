@@ -11,9 +11,9 @@
 //! approved device row (one gateway = one app). It idles until a device is
 //! paired, then dials the relay URL + admission key recorded on that row at
 //! pairing ([`baybo_store::DeviceRow::relay_url`] / `remote_api_key`), re-dialing
-//! with a fixed backoff after any drop. When the device is revoked the control
-//! connection is torn down promptly, so the gateway stops advertising a route it
-//! can no longer authenticate a content session for.
+//! with a fixed backoff after any drop. When the device is revoked or re-paired
+//! against different relay settings, the old control connection is torn down
+//! promptly so the gateway stops advertising a stale route.
 
 use std::time::Duration;
 
@@ -69,6 +69,10 @@ enum ControlEnd {
     /// The relay closed an established connection; the Close frame (when it
     /// sent one) carries the relay's stated reason.
     ClosedByRelay(Option<ControlCloseFrame>),
+    /// The approved device was re-paired with different relay settings. Redial
+    /// immediately from the freshly resolved row rather than waiting for the
+    /// ordinary failure backoff.
+    Reconfigure,
     /// Torn down locally — device revoked/superseded or gateway shutdown.
     TornDown,
 }
@@ -120,6 +124,7 @@ fn note_connection_ended(
 
 /// The relay endpoint + admission key the gateway dials, resolved from the single
 /// approved device row.
+#[derive(Clone, PartialEq, Eq)]
 struct RelaySettings {
     relay_url: String,
     remote_api_key: String,
@@ -142,6 +147,24 @@ enum RelayResolution {
     /// The device store read failed transiently — the device's state is unknown,
     /// so keep whatever connection is already up and retry on the next tick.
     Unavailable,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ControlBindingState {
+    Keep,
+    Reconfigure,
+    TearDown,
+}
+
+fn control_binding_state(
+    resolution: &RelayResolution,
+    active: &RelaySettings,
+) -> ControlBindingState {
+    match resolution {
+        RelayResolution::Ready(current) if current != active => ControlBindingState::Reconfigure,
+        RelayResolution::Ready(_) | RelayResolution::Unavailable => ControlBindingState::Keep,
+        RelayResolution::Absent => ControlBindingState::TearDown,
+    }
 }
 
 /// Resolve the relay settings from the approved device row (one gateway = one
@@ -314,6 +337,10 @@ async fn run(state: WsChannelState, shutdown: ShutdownSignal) {
             Ok(ControlEnd::TornDown) => {
                 consecutive_failures = 0;
             }
+            Ok(ControlEnd::Reconfigure) => {
+                consecutive_failures = 0;
+                continue;
+            }
             Err(e) => {
                 let kind = note_connection_ended(
                     attempt_started,
@@ -355,10 +382,11 @@ async fn run(state: WsChannelState, shutdown: ShutdownSignal) {
     tracing::debug!("relay-content: control manager stopped");
 }
 
-/// Hold one control connection until it closes (or the device is revoked, or the
-/// gateway shuts down), opening a content data leg for each `OpenDataLeg` signal C
-/// pushes. Polls the device row alongside so a revoke tears the connection down
-/// rather than letting it linger.
+/// Hold one control connection until it closes (or the device is revoked,
+/// re-paired, or the gateway shuts down), opening a content data leg for each
+/// `OpenDataLeg` signal C pushes. Polls the device row alongside so a revoke or
+/// relay-settings change tears the stale connection down rather than letting it
+/// linger.
 ///
 /// Owns every child task it spawns: the control pump (a [`JoinHandle`], aborted
 /// on revoke/shutdown) and the per-signal data legs (a [`tokio::task::JoinSet`],
@@ -396,6 +424,7 @@ async fn run_once(
     // shutdown), so its cancellation JoinError isn't surfaced as a connection
     // error.
     let mut pump_aborted = false;
+    let mut reconfigure = false;
     loop {
         tokio::select! {
             signal = rx.recv() => match signal {
@@ -429,20 +458,34 @@ async fn run_once(
                 None => break,
             },
             _ = poll.tick() => {
-                // Tear down only on an authoritative Absent (revoked/superseded);
-                // a transient Unavailable keeps the live connection (its warn is
-                // already logged) and retries on the next tick.
-                if let RelayResolution::Absent =
-                    approved_relay_settings(state, no_relay_diagnosed).await
-                {
-                    tracing::info!(
-                        relay = %settings.relay_url,
-                        "relay-content: approved relay device gone (revoked or superseded); \
-                         tearing down control connection"
-                    );
-                    pump.abort();
-                    pump_aborted = true;
-                    break;
+                let resolution = approved_relay_settings(state, no_relay_diagnosed).await;
+                match control_binding_state(&resolution, settings) {
+                    ControlBindingState::Keep => {}
+                    ControlBindingState::Reconfigure => {
+                        if let RelayResolution::Ready(current) = &resolution {
+                            tracing::info!(
+                                old_relay = %settings.relay_url,
+                                new_relay = %current.relay_url,
+                                old_key_tag = %key_tag(&settings.remote_api_key),
+                                new_key_tag = %key_tag(&current.remote_api_key),
+                                "relay-content: approved relay settings changed; moving control connection"
+                            );
+                        }
+                        pump.abort();
+                        pump_aborted = true;
+                        reconfigure = true;
+                        break;
+                    }
+                    ControlBindingState::TearDown => {
+                        tracing::info!(
+                            relay = %settings.relay_url,
+                            "relay-content: approved relay device gone (revoked or superseded); \
+                             tearing down control connection"
+                        );
+                        pump.abort();
+                        pump_aborted = true;
+                        break;
+                    }
                 }
             }
             // Reap a finished data leg (disabled while none are in flight).
@@ -466,10 +509,15 @@ async fn run_once(
     if pump_aborted {
         // Even if the pump ended on its own right as we tore it down, this was a
         // local teardown from the caller's perspective.
-        return match outcome {
-            Ok(_) => Ok(ControlEnd::TornDown),
-            Err(e) if e.is_cancelled() => Ok(ControlEnd::TornDown),
-            Err(e) => Err(format!("control task panicked: {e}")),
+        match outcome {
+            Ok(_) => {}
+            Err(e) if e.is_cancelled() => {}
+            Err(e) => return Err(format!("control task panicked: {e}")),
+        }
+        return if reconfigure {
+            Ok(ControlEnd::Reconfigure)
+        } else {
+            Ok(ControlEnd::TornDown)
         };
     }
     match outcome {
@@ -576,6 +624,45 @@ async fn open_data_leg(
 mod tests {
     use super::*;
     use crate::test_support::build_test_deps;
+
+    fn relay_settings(relay_url: &str, remote_api_key: &str) -> RelaySettings {
+        RelaySettings {
+            relay_url: relay_url.to_owned(),
+            remote_api_key: remote_api_key.to_owned(),
+        }
+    }
+
+    #[test]
+    fn live_control_binding_reconfigures_when_relay_settings_change() {
+        let active = relay_settings("wss://old.example", "old-key");
+
+        assert_eq!(
+            control_binding_state(&RelayResolution::Ready(active.clone()), &active),
+            ControlBindingState::Keep
+        );
+        assert_eq!(
+            control_binding_state(
+                &RelayResolution::Ready(relay_settings("wss://new.example", "old-key")),
+                &active,
+            ),
+            ControlBindingState::Reconfigure
+        );
+        assert_eq!(
+            control_binding_state(
+                &RelayResolution::Ready(relay_settings("wss://old.example", "new-key")),
+                &active,
+            ),
+            ControlBindingState::Reconfigure
+        );
+        assert_eq!(
+            control_binding_state(&RelayResolution::Unavailable, &active),
+            ControlBindingState::Keep
+        );
+        assert_eq!(
+            control_binding_state(&RelayResolution::Absent, &active),
+            ControlBindingState::TearDown
+        );
+    }
 
     /// While idle (no device paired), the manager must return promptly when
     /// shutdown fires — not run until the next poll tick, and certainly not leak

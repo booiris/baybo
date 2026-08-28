@@ -2,12 +2,9 @@
 //!
 //! C (this crate) cannot link the gateway/app `device-proto` crate (separate
 //! workspace), so it re-implements *verification* of the signatures those sign,
-//! against `device-proto`'s byte layout. The domain-separation context strings
-//! come from the shared `remote-host-protocol` crate both workspaces link (a
-//! single source of truth); the `env` byte mapping and the length-prefix framing
-//! below are re-implemented here and MUST match `device-proto` exactly, or every
-//! signature will (safely) fail to verify — drift in that part is caught by the
-//! pinned cross-impl vector in `verify_accepts_pinned_device_proto_vector`.
+//! against the canonical byte layout in `remote-host-protocol`, which both
+//! workspaces link. Signing and verification remain separate, but their input
+//! framing has one source of truth.
 //!
 //! C verifies, with no stored secret and no trust-on-first-use:
 //! - `device_id == device-<hex(device_pubkey)>` — the binding self-certifies;
@@ -21,14 +18,13 @@
 //! request signature.
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use remote_host_protocol::push::{DELEGATION_CONTEXT, NOTIFY_CONTEXT, REGISTER_CONTEXT};
+use remote_host_protocol::push::{
+    NotifySigningInput, PushTarget, delegation_signing_message, notify_signing_message,
+    register_signing_message,
+};
 
 /// `device_id` text prefix; the remainder is `hex(device_pubkey)` (32 bytes).
 pub const DEVICE_ID_PREFIX: &str = "device-";
-
-/// Canonical `env` byte in the signed register message (matches `device-proto`).
-pub const ENV_SANDBOX: u8 = 0;
-pub const ENV_PRODUCTION: u8 = 1;
 
 const PUBLIC_LEN: usize = 32;
 const SIGNATURE_LEN: usize = 64;
@@ -53,39 +49,6 @@ pub fn signature_from_bytes(bytes: &[u8]) -> Option<Signature> {
     Some(Signature::from_bytes(&arr))
 }
 
-fn push_field(buf: &mut Vec<u8>, bytes: &[u8]) {
-    buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-    buf.extend_from_slice(bytes);
-}
-
-fn delegation_message(gateway_pub: &VerifyingKey) -> Vec<u8> {
-    let mut m = Vec::with_capacity(DELEGATION_CONTEXT.len() + PUBLIC_LEN);
-    m.extend_from_slice(DELEGATION_CONTEXT);
-    m.extend_from_slice(&gateway_pub.to_bytes());
-    m
-}
-
-fn register_message(device_id: &str, apns_token: &str, env: u8, counter: u64) -> Vec<u8> {
-    let mut m = Vec::new();
-    m.extend_from_slice(REGISTER_CONTEXT);
-    push_field(&mut m, device_id.as_bytes());
-    push_field(&mut m, apns_token.as_bytes());
-    m.push(env);
-    m.extend_from_slice(&counter.to_le_bytes());
-    m
-}
-
-fn notify_message(device_id: &str, enc: &str, n: &str, bid: &str, counter: u64) -> Vec<u8> {
-    let mut m = Vec::new();
-    m.extend_from_slice(NOTIFY_CONTEXT);
-    push_field(&mut m, device_id.as_bytes());
-    push_field(&mut m, enc.as_bytes());
-    push_field(&mut m, n.as_bytes());
-    push_field(&mut m, bid.as_bytes());
-    m.extend_from_slice(&counter.to_le_bytes());
-    m
-}
-
 /// The device (`device_pub`) authorized `gateway_pub` to manage its binding.
 pub fn verify_delegation(
     device_pub: &VerifyingKey,
@@ -93,7 +56,7 @@ pub fn verify_delegation(
     sig: &Signature,
 ) -> bool {
     device_pub
-        .verify(&delegation_message(gateway_pub), sig)
+        .verify(&delegation_signing_message(&gateway_pub.to_bytes()), sig)
         .is_ok()
 }
 
@@ -101,36 +64,31 @@ pub fn verify_delegation(
 pub fn verify_register(
     gateway_pub: &VerifyingKey,
     device_id: &str,
-    apns_token: &str,
-    env: u8,
+    target: &PushTarget,
     counter: u64,
     sig: &Signature,
 ) -> bool {
     gateway_pub
-        .verify(&register_message(device_id, apns_token, env, counter), sig)
+        .verify(&register_signing_message(device_id, target, counter), sig)
         .is_ok()
 }
 
 /// A `/notify` signature by the (delegated) `gateway_pub`.
 pub fn verify_notify(
     gateway_pub: &VerifyingKey,
-    device_id: &str,
-    enc: &str,
-    n: &str,
-    bid: &str,
-    counter: u64,
+    input: &NotifySigningInput<'_>,
     sig: &Signature,
 ) -> bool {
     gateway_pub
-        .verify(&notify_message(device_id, enc, n, bid, counter), sig)
+        .verify(&notify_signing_message(input), sig)
         .is_ok()
 }
 
 /// Signing side of the same byte layout — TEST ONLY (the gateway/app sign in
 /// production via `device-proto`). Used by the push crate's own tests to mint
 /// valid signed requests, and proves sign↔verify here are self-consistent. The
-/// cross-implementation match with `device-proto` is guarded by the pinned
-/// vector in [`tests::verify_accepts_pinned_device_proto_vector`].
+/// signer/verifier match with `device-proto` is guarded by the pinned vector in
+/// [`tests::verify_accepts_pinned_device_proto_vector`].
 #[cfg(test)]
 pub(crate) mod test_sign {
     use super::*;
@@ -143,32 +101,32 @@ pub(crate) mod test_sign {
         format!("{DEVICE_ID_PREFIX}{}", hex::encode(vk.to_bytes()))
     }
     pub fn sign_delegation(device_sk: &SigningKey, gateway_pub: &VerifyingKey) -> Signature {
-        device_sk.sign(&delegation_message(gateway_pub))
+        device_sk.sign(&delegation_signing_message(&gateway_pub.to_bytes()))
     }
     pub fn sign_register(
         gateway_sk: &SigningKey,
         device_id: &str,
-        apns_token: &str,
-        env: u8,
+        target: &PushTarget,
         counter: u64,
     ) -> Signature {
-        gateway_sk.sign(&register_message(device_id, apns_token, env, counter))
+        gateway_sk.sign(&register_signing_message(device_id, target, counter))
     }
-    pub fn sign_notify(
-        gateway_sk: &SigningKey,
-        device_id: &str,
-        enc: &str,
-        n: &str,
-        bid: &str,
-        counter: u64,
-    ) -> Signature {
-        gateway_sk.sign(&notify_message(device_id, enc, n, bid, counter))
+    pub fn sign_notify(gateway_sk: &SigningKey, input: &NotifySigningInput<'_>) -> Signature {
+        gateway_sk.sign(&notify_signing_message(input))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use remote_host_protocol::push::ApnsEnvironment;
+
+    fn apns_target(token: &str) -> PushTarget {
+        PushTarget::Apns {
+            token: token.to_string(),
+            environment: ApnsEnvironment::Sandbox,
+        }
+    }
 
     #[test]
     fn sign_verify_round_trips_and_rejects_tampering() {
@@ -186,30 +144,25 @@ mod tests {
             &deleg
         ));
 
-        let reg = test_sign::sign_register(&gateway, &device_id, "tok", ENV_SANDBOX, 5);
-        assert!(verify_register(
-            &gpub,
-            &device_id,
-            "tok",
-            ENV_SANDBOX,
-            5,
-            &reg
-        ));
-        assert!(!verify_register(
-            &gpub,
-            &device_id,
-            "tok",
-            ENV_SANDBOX,
-            6,
-            &reg
-        ));
+        let target = apns_target("tok");
+        let reg = test_sign::sign_register(&gateway, &device_id, &target, 5);
+        assert!(verify_register(&gpub, &device_id, &target, 5, &reg));
+        assert!(!verify_register(&gpub, &device_id, &target, 6, &reg));
 
-        let ntf = test_sign::sign_notify(&gateway, &device_id, "e", "n", &device_id, 7);
-        assert!(verify_notify(
-            &gpub, &device_id, "e", "n", &device_id, 7, &ntf
-        ));
+        let input = NotifySigningInput {
+            device_id: &device_id,
+            collapse_key: "collapse",
+            enc: "e",
+            n: "n",
+            bid: &device_id,
+            counter: 7,
+        };
+        let ntf = test_sign::sign_notify(&gateway, &input);
+        assert!(verify_notify(&gpub, &input, &ntf));
         assert!(!verify_notify(
-            &gpub, &device_id, "e2", "n", &device_id, 7, &ntf
+            &gpub,
+            &NotifySigningInput { enc: "e2", ..input },
+            &ntf
         ));
     }
 
@@ -239,18 +192,20 @@ mod tests {
         assert!(verify_register(
             &gateway_pub,
             PIN_DEVICE_ID,
-            "apns-tok",
-            ENV_SANDBOX,
+            &apns_target("apns-tok"),
             42,
             &sig(PIN_REGISTER),
         ));
         assert!(verify_notify(
             &gateway_pub,
-            PIN_DEVICE_ID,
-            "ZW5j",
-            "bm9uY2U",
-            PIN_DEVICE_ID,
-            42,
+            &NotifySigningInput {
+                device_id: PIN_DEVICE_ID,
+                collapse_key: "collapse-key",
+                enc: "ZW5j",
+                n: "bm9uY2U",
+                bid: PIN_DEVICE_ID,
+                counter: 42,
+            },
             &sig(PIN_NOTIFY),
         ));
     }
@@ -263,6 +218,6 @@ mod tests {
     const PIN_GATEWAY_PUB: &str =
         "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394";
     const PIN_DELEGATION: &str = "3d3d3bc2446e76a660d2ea8cfe0ce39d3ffaec4586afe941b1c8b5b09183143b1aea130de49118eb8da5f30c4069f884e0b53902ac7faf4654a0a9a600df170c";
-    const PIN_REGISTER: &str = "bd2f828205bcdf66a7676b9a073e74b2ad546de3577adff293ac63eb65f81c2623e1d9e7cbfb2bd66038413f73a0731e62f979b719aac5db8aee2f3c66c28b02";
-    const PIN_NOTIFY: &str = "0cfd42d4b7af3d5c361993a4c9adb0afcf416931b900f57d3dab37a88c00ea801c2a3a3ca61062178a2958793c50938a1303e1b6ab7c3770df6e7bab31a13a0f";
+    const PIN_REGISTER: &str = "1d2912846d9c0c25dbd696319e0cb78194d960a24d0f006bbe02482b49b7fb2855b4b93b784c290f92c0d57f00af459f55a346ec9af0c572777b13ae3afc8a03";
+    const PIN_NOTIFY: &str = "7966784813eaf926ea7852a744291626e3980c5430de7e6f73e640e4e247723570e6775b5f51edc0545bfcc9212cceb88398c3fbb5fc6a70d1f08a55f6462f09";
 }

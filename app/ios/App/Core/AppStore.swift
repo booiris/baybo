@@ -252,8 +252,8 @@ final class AppStore: ObservableObject {
     /// `sessionNotice`: that belongs to the chat list's mutations, and would
     /// surface this on a screen the user already left.
     @Published var cronJobNotice: String?
-    /// Transient archive/delete failure line, rendered by the list headers the
-    /// way compose failures are. Cleared when the next mutation starts.
+    /// Transient pin/rename failure line, rendered by the list headers the way
+    /// compose failures are. Cleared when the next mutation starts.
     @Published var sessionNotice: String?
     /// Whether the active binding is direct (drives push re-registration).
     @Published private(set) var directBound = false
@@ -286,6 +286,14 @@ final class AppStore: ObservableObject {
     /// Sessions with an archive/hide request on the wire — the per-session
     /// serialization gate (`pumpSessionMutation`).
     private var sessionMutationsInFlight: Set<String> = []
+    /// Durable archive/hide retries. A bounded backoff keeps an offline app from
+    /// hot-looping, while foreground/rebind explicitly wakes every pending id.
+    private var sessionMutationRetryTasks: [String: Task<Void, Never>] = [:]
+    private var sessionMutationRetryAttempts: [String: Int] = [:]
+    private var sessionMutationGeneration = 0
+    private static let sessionMutationRetryDelays: [Duration] = [
+        .seconds(2), .seconds(5), .seconds(15), .seconds(30), .seconds(60),
+    ]
     /// Sessions with a rename on the wire — `pumpRename`'s gate. Its own set,
     /// because a rename and an archive are independent requests that may fly at
     /// the same time; sharing the gate would serialize two unrelated PUTs.
@@ -553,6 +561,7 @@ final class AppStore: ObservableObject {
             prewarmDeckHost()
             prewarmIssueHosts()
             resumeStrandedSends()
+            resumePendingSessionMutations()
         }
     }
 
@@ -592,6 +601,7 @@ final class AppStore: ObservableObject {
         // cancel a recovery's timers mid-flight, and a recovery that failed
         // offline deserves the next live leg.
         resumeStrandedSends()
+        resumePendingSessionMutations()
         if route == .home {
             prewarmTranscriptHost()
             prewarmDeckHost()
@@ -629,6 +639,7 @@ final class AppStore: ObservableObject {
             defer { relayPreconnectInFlight = false }
             do {
                 try await Baybo.client.relayPreconnect()
+                resumePendingSessionMutations()
             } catch {
                 NSLog("baybo: relay preconnect: %@", String(describing: error))
             }
@@ -645,6 +656,7 @@ final class AppStore: ObservableObject {
             defer { directPreconnectInFlight = false }
             do {
                 try await Baybo.client.directPreconnect()
+                resumePendingSessionMutations()
             } catch {
                 NSLog("baybo: direct preconnect: %@", String(describing: error))
             }
@@ -1145,7 +1157,7 @@ final class AppStore: ObservableObject {
     }
 
     /// The Deck empty-board CTA. First tap: open a fresh chat on the Chats
-    /// tab and auto-send a `/deck …` request (seed the store BEFORE
+    /// tab and auto-send an ordinary-language card request (seed the store BEFORE
     /// activating so `ComposerView` sends it on appear), tracking the session
     /// as the in-flight setup. A re-tap while it's still running (no card
     /// yet) returns to THAT chat instead of spawning a duplicate — the
@@ -1299,7 +1311,7 @@ final class AppStore: ObservableObject {
     func requestArchive(_ sessionId: String, archived: Bool) {
         sessionNotice = nil
         SessionIndex.shared.beginArchive(sessionId, archived: archived)
-        pumpSessionMutation(sessionId)
+        pumpSessionMutationNow(sessionId)
     }
 
     /// Pin or unpin, optimistically: the row re-sorts to the pinned block at
@@ -1353,7 +1365,7 @@ final class AppStore: ObservableObject {
         // resident store's in-memory copy, over `onSessionsRemoved`, which the
         // eviction above would otherwise flush back to disk.
         SessionIndex.shared.beginHide(sessionId)
-        pumpSessionMutation(sessionId)
+        pumpSessionMutationNow(sessionId)
     }
 
     /// Delete a **cron group**, after the confirm dialog: soft-hide every member
@@ -1375,19 +1387,30 @@ final class AppStore: ObservableObject {
             Task { await evictStore(sessionId, store) }
         }
         SessionIndex.shared.beginHideMany(memberIds)
+        for sessionId in memberIds {
+            cancelSessionMutationRetry(sessionId, resetAttempts: true)
+        }
         #if DEBUG
             if demoHomeMode {
                 SessionIndex.shared.finishHideMany(memberIds)
                 return
             }
         #endif
+        let generation = sessionMutationGeneration
         Task { @MainActor in
             do {
                 try await Baybo.client.chatHideMany(sessionIds: memberIds)
+                guard generation == sessionMutationGeneration else { return }
                 SessionIndex.shared.finishHideMany(memberIds)
+                for sessionId in memberIds {
+                    cancelSessionMutationRetry(sessionId, resetAttempts: true)
+                }
             } catch {
-                SessionIndex.shared.rollBackHideMany(memberIds)
-                sessionNotice = Lang.shared.t("list.deleteFailed")
+                guard generation == sessionMutationGeneration else { return }
+                NSLog("baybo: batch session hide queued for retry: %@", bayboErrorText(error))
+                for sessionId in memberIds {
+                    scheduleSessionMutationRetry(sessionId)
+                }
             }
         }
     }
@@ -1396,9 +1419,10 @@ final class AppStore: ObservableObject {
     /// the latest desired state. On a stale ack (the user flipped again while
     /// the request flew — archive→undo inside the 3s toast window is the common
     /// case) the newer intent is sent instead of resolving; on failure the
-    /// still-current intent rolls back with a notice, a superseded one just
-    /// yields to the newer send. Every user action gets at most one send — no
-    /// retry loops.
+    /// still-current pin rolls back with a notice. Archive and hide are durable
+    /// outbox intents: a transport failure leaves the optimistic state standing
+    /// and schedules an idempotent retry; a superseded request yields to the
+    /// newer desired value immediately.
     private func pumpSessionMutation(_ sessionId: String) {
         guard !sessionMutationsInFlight.contains(sessionId),
             let desired = SessionIndex.shared.pendingMutation(for: sessionId)
@@ -1410,6 +1434,7 @@ final class AppStore: ObservableObject {
             }
         #endif
         sessionMutationsInFlight.insert(sessionId)
+        let generation = sessionMutationGeneration
         Task { @MainActor in
             do {
                 switch desired {
@@ -1422,13 +1447,16 @@ final class AppStore: ObservableObject {
                 case .hidden:
                     try await Baybo.client.chatHideSession(sessionId: sessionId)
                 }
+                guard generation == sessionMutationGeneration else { return }
                 sessionMutationsInFlight.remove(sessionId)
                 if SessionIndex.shared.pendingMutation(for: sessionId) == desired {
                     SessionIndex.shared.finishMutation(sessionId)
+                    cancelSessionMutationRetry(sessionId, resetAttempts: true)
                 } else {
                     pumpSessionMutation(sessionId)
                 }
             } catch {
+                guard generation == sessionMutationGeneration else { return }
                 sessionMutationsInFlight.remove(sessionId)
                 NSLog("baybo: session mutation: %@", bayboErrorText(error))
                 guard SessionIndex.shared.pendingMutation(for: sessionId) == desired else {
@@ -1437,16 +1465,57 @@ final class AppStore: ObservableObject {
                 }
                 switch desired {
                 case .archived:
-                    SessionIndex.shared.rollBackArchive(sessionId)
-                    sessionNotice = Lang.shared.t("list.archiveFailed")
+                    scheduleSessionMutationRetry(sessionId)
                 case .pinned:
                     SessionIndex.shared.rollBackPin(sessionId)
                     sessionNotice = Lang.shared.t("list.pinFailed")
                 case .hidden:
-                    SessionIndex.shared.rollBackHide(sessionId)
-                    sessionNotice = Lang.shared.t("list.deleteFailed")
+                    scheduleSessionMutationRetry(sessionId)
                 }
             }
+        }
+    }
+
+    private func pumpSessionMutationNow(_ sessionId: String) {
+        cancelSessionMutationRetry(sessionId, resetAttempts: true)
+        pumpSessionMutation(sessionId)
+    }
+
+    /// Re-drive every mutation restored from disk. A foreground or successful
+    /// preconnect wakes it immediately instead of waiting for the current
+    /// backoff slot.
+    private func resumePendingSessionMutations() {
+        for sessionId in SessionIndex.shared.durableMutationSessionIds {
+            cancelSessionMutationRetry(sessionId, resetAttempts: false)
+            pumpSessionMutation(sessionId)
+        }
+    }
+
+    private func scheduleSessionMutationRetry(_ sessionId: String) {
+        guard sessionMutationRetryTasks[sessionId] == nil,
+            SessionIndex.shared.durableMutationSessionIds.contains(sessionId)
+        else { return }
+        let attempt = sessionMutationRetryAttempts[sessionId, default: 0]
+        let delay = Self.sessionMutationRetryDelays[
+            min(attempt, Self.sessionMutationRetryDelays.count - 1)]
+        sessionMutationRetryAttempts[sessionId] = attempt + 1
+        let generation = sessionMutationGeneration
+        sessionMutationRetryTasks[sessionId] = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: delay)
+            } catch {
+                return
+            }
+            guard let self, generation == self.sessionMutationGeneration else { return }
+            self.sessionMutationRetryTasks.removeValue(forKey: sessionId)
+            self.pumpSessionMutation(sessionId)
+        }
+    }
+
+    private func cancelSessionMutationRetry(_ sessionId: String, resetAttempts: Bool) {
+        sessionMutationRetryTasks.removeValue(forKey: sessionId)?.cancel()
+        if resetAttempts {
+            sessionMutationRetryAttempts.removeValue(forKey: sessionId)
         }
     }
 
@@ -1530,6 +1599,11 @@ final class AppStore: ObservableObject {
     }
 
     private func resetChatStores() async {
+        sessionMutationGeneration += 1
+        for task in sessionMutationRetryTasks.values { task.cancel() }
+        sessionMutationRetryTasks.removeAll()
+        sessionMutationRetryAttempts.removeAll()
+        sessionMutationsInFlight.removeAll()
         let stores = Array(chatStores.values)
         chatStores.removeAll()
         chatStoreLRU.removeAll()
@@ -1562,6 +1636,7 @@ final class AppStore: ObservableObject {
         await resetChatStores()
         let supportDirectory = SessionIndex.supportDirectory()
         SessionIndex.shared.activate(supportDirectory: supportDirectory)
+        resumePendingSessionMutations()
         deckStore = DeckStore(supportDirectory: supportDirectory)
         projectsStore = ProjectsStore(supportDirectory: supportDirectory)
         ModelCatalog.shared.activate(directory: supportDirectory)

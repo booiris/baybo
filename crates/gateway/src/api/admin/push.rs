@@ -1,18 +1,18 @@
 //! `/v1/push/*` — admin-side direct-mode device push registration.
 //!
-//! Scan-to-pair devices bootstrap their push binding over the Noise pairing
-//! handshake. The **direct** transport (URL + admin token, no pairing) has no
-//! handshake, so a web client bootstraps the same binding over this
+//! Scan-to-pair devices bootstrap their push identity/key/delegation over the
+//! Noise pairing handshake, then post their provider target through the device
+//! API. The **direct** transport (URL + admin token, no pairing) bootstraps the same binding over this
 //! admin-token-authenticated REST surface instead:
 //!
 //! 1. `GET /v1/push/params` → the gateway's Ed25519 push verifying key (so the
 //!    client can sign a delegation over it) and whether push is configured.
-//! 2. `POST /v1/push/register` → the client's Ed25519 public key, APNs token, a
+//! 2. `POST /v1/push/register` → the client's Ed25519 public key, push target, a
 //!    client-generated preview `push_key`, and the delegation. The gateway
 //!    verifies the delegation and persists the binding ([`crate::push::web`]).
 //!
 //! The resulting binding is cryptographically identical to a paired device's, so
-//! the dispatcher, the remote host (C), and the APNs NSE path are unchanged. See
+//! the dispatcher, the remote host (C), and platform decrypt paths are unchanged. See
 //! `docs/modules/mobile/relay-push-security.md` for the (weaker, TLS-bearer)
 //! trust model versus the Noise path.
 
@@ -21,7 +21,7 @@ use axum::http::StatusCode;
 use axum::{Extension, Json};
 use device_proto::aead;
 use device_proto::delegation;
-use device_proto::pairing::ApnsEnv;
+use remote_host_protocol::push::{ApnsEnvironment, PushTarget};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
@@ -37,7 +37,7 @@ pub fn routes() -> OpenApiRouter<AdminState> {
     OpenApiRouter::new()
         .routes(routes!(push_params))
         .routes(routes!(register_push))
-        .routes(routes!(update_device_apns_token))
+        .routes(routes!(update_device_push_token))
 }
 
 /// Response of `GET /v1/push/params`.
@@ -73,11 +73,8 @@ pub struct RegisterPushRequest {
     /// The client's self-certifying `device_id` (`device-<hex(ed25519 pub)>`); the
     /// gateway recovers the public key from it and re-derives the canonical id.
     pub device_id: String,
-    /// The client's current APNs device token (hex).
-    pub apns_token: String,
-    /// APNs environment: `"sandbox"` (development-signed) or `"production"`
-    /// (distribution-signed).
-    pub apns_env: String,
+    /// The client's current provider-tagged token.
+    pub target: PushTargetRequest,
     /// Lowercase hex of the 32-byte preview AEAD key the client also stored in
     /// its App-Group keychain (so its NSE can decrypt). Generated client-side and
     /// delivered over this TLS + admin-token channel.
@@ -94,20 +91,56 @@ pub struct RegisterPushResponse {
     pub device_id: String,
 }
 
-/// Request body for `POST /v1/mobile/apns-token`.
+#[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ApnsEnvironmentRequest {
+    Sandbox,
+    Production,
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
-pub struct UpdateDeviceApnsTokenRequest {
-    /// The device's current APNs device token (hex).
-    pub apns_token: String,
-    /// APNs environment: `"sandbox"` (development-signed) or `"production"`
-    /// (distribution-signed).
-    pub apns_env: String,
+#[serde(tag = "provider", rename_all = "snake_case")]
+pub enum PushTargetRequest {
+    Apns {
+        token: String,
+        environment: ApnsEnvironmentRequest,
+    },
+    Fcm {
+        token: String,
+    },
+}
+
+impl PushTargetRequest {
+    fn into_target(self) -> Option<PushTarget> {
+        fn valid_token(token: String) -> Option<String> {
+            let token = token.trim().to_string();
+            (!token.is_empty() && token.len() <= remote_host_protocol::push::PUSH_TOKEN_MAX_LEN)
+                .then_some(token)
+        }
+
+        match self {
+            Self::Apns { token, environment } => valid_token(token).map(|token| PushTarget::Apns {
+                token,
+                environment: match environment {
+                    ApnsEnvironmentRequest::Sandbox => ApnsEnvironment::Sandbox,
+                    ApnsEnvironmentRequest::Production => ApnsEnvironment::Production,
+                },
+            }),
+            Self::Fcm { token } => valid_token(token).map(|token| PushTarget::Fcm { token }),
+        }
+    }
+}
+
+/// Request body for `POST /v1/mobile/push-token`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateDevicePushTokenRequest {
+    pub target: PushTargetRequest,
 }
 
 /// Refuse a `POST /v1/push/register` with a 400, leaving a gateway-side record:
 /// the app only shows a generic error, so this warn is the operator's sole
 /// evidence the register reached the gateway and why it was refused. Never log
-/// the delegation / push_key / apns_token values themselves.
+/// the delegation, push key, or provider token values themselves.
 fn reject_register(device_id: &str, reason: &str) -> GatewayError {
     tracing::warn!(device = %device_id, reason = %reason, "push: direct-mode register rejected");
     GatewayError::BadRequest(reason.to_string())
@@ -159,19 +192,17 @@ async fn register_push(
         .try_into()
         .map_err(|_| reject_register(&device_id, "delegation is not a 64-byte signature"))?;
 
-    // Decode the preview AEAD key + APNs env.
+    // Decode the preview AEAD key and validate the provider target.
     let push_key_bytes = hex::decode(req.push_key.trim())
         .map_err(|_| reject_register(&device_id, "push_key is not valid hex"))?;
     let push_key: [u8; aead::KEY_LEN] = push_key_bytes
         .as_slice()
         .try_into()
         .map_err(|_| reject_register(&device_id, "push_key must be 32 bytes"))?;
-    let apns_env = match req.apns_env.trim() {
-        "production" => ApnsEnv::Production,
-        // Default unknown/empty to sandbox — the conservative pick (a sandbox
-        // token sent to the production host just fails to deliver).
-        _ => ApnsEnv::Sandbox,
-    };
+    let target = req
+        .target
+        .into_target()
+        .ok_or_else(|| reject_register(&device_id, "push token has invalid length"))?;
 
     let binding = web::WebPushBinding {
         device_id: device_id.clone(),
@@ -183,8 +214,7 @@ async fn register_push(
         &state.secret_vault,
         &binding,
         &push_key,
-        req.apns_token.trim(),
-        apns_env,
+        &target,
         &deleg_arr,
     )
     .await
@@ -196,45 +226,37 @@ async fn register_push(
 
 #[utoipa::path(
     post,
-    path = "/mobile/apns-token",
+    path = "/mobile/push-token",
     tag = "push",
-    request_body = UpdateDeviceApnsTokenRequest,
+    request_body = UpdateDevicePushTokenRequest,
     responses(
-        (status = 204, description = "Paired device APNs token refreshed"),
+        (status = 204, description = "Paired device push token refreshed"),
+        (status = 400, description = "Provider token has invalid length", body = ErrorBody),
         (status = 401, description = "Unauthorized", body = ErrorBody),
         (status = 500, description = "Persist failed", body = ErrorBody),
     )
 )]
-async fn update_device_apns_token(
+async fn update_device_push_token(
     State(state): State<AdminState>,
     authed: Option<Extension<AuthedClient>>,
-    Json(req): Json<UpdateDeviceApnsTokenRequest>,
+    Json(req): Json<UpdateDevicePushTokenRequest>,
 ) -> Result<StatusCode> {
     let Some(Extension(AuthedClient::Device { device_id })) = authed else {
         return Err(GatewayError::Unauthorized);
     };
 
-    let apns_token = req.apns_token.trim();
-    if apns_token.is_empty() {
-        tracing::debug!(
-            device = %device_id,
-            "push: device sent empty APNs token; registration unchanged"
-        );
-        return Ok(StatusCode::NO_CONTENT);
-    }
-    let apns_env = match req.apns_env.trim() {
-        "production" => ApnsEnv::Production,
-        _ => ApnsEnv::Sandbox,
+    let target = req
+        .target
+        .into_target()
+        .ok_or_else(|| GatewayError::BadRequest("push token has invalid length".to_string()))?;
+    let reg = crate::push::DevicePushRegistration {
+        target: target.clone(),
     };
-    let reg = crate::push::DeviceApnsRegistration {
-        apns_token: apns_token.to_owned(),
-        apns_env,
-    };
-    // The app re-posts its token on every launch/foreground; skip the vault
+    // The app re-posts its target on every launch/foreground; skip the vault
     // rewrite (and the INFO) when nothing changed. Any doubt — no stored
     // entry, unreadable vault, undecodable bytes — falls open to the write:
     // rewriting is also the recovery path for a malformed stored registration.
-    let secret_name = crate::push::device_apns_secret_name(&device_id);
+    let secret_name = crate::push::device_push_registration_secret_name(&device_id);
     let stored = state
         .secret_vault
         .get_secret(&secret_name)
@@ -242,28 +264,73 @@ async fn update_device_apns_token(
         .ok()
         .flatten()
         .and_then(|s| {
-            serde_json::from_slice::<crate::push::DeviceApnsRegistration>(s.as_bytes()).ok()
+            serde_json::from_slice::<crate::push::DevicePushRegistration>(s.as_bytes()).ok()
         });
     if stored.as_ref() == Some(&reg) {
         tracing::debug!(
             device = %device_id,
-            "push: device re-posted an unchanged APNs token; registration untouched"
+            "push: device re-posted an unchanged target; registration untouched"
         );
         return Ok(StatusCode::NO_CONTENT);
     }
     let bytes = serde_json::to_vec(&reg)
-        .map_err(|e| GatewayError::Internal(format!("encode APNs registration: {e}")))?;
+        .map_err(|e| GatewayError::Internal(format!("encode push registration: {e}")))?;
     state
         .secret_vault
         .store_secret(&secret_name, &bytes)
         .await
-        .map_err(|e| GatewayError::Internal(format!("persist APNs registration: {e}")))?;
+        .map_err(|e| GatewayError::Internal(format!("persist push registration: {e}")))?;
 
     tracing::info!(
         device = %device_id,
-        apns_env = ?apns_env,
-        token_len = apns_token.len(),
-        "push: device APNs token updated via API"
+        provider = target.provider().as_str(),
+        token_len = target.token().len(),
+        "push: device target updated via API"
     );
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn target_request_preserves_provider_specific_metadata() {
+        assert_eq!(
+            PushTargetRequest::Apns {
+                token: " token ".into(),
+                environment: ApnsEnvironmentRequest::Production,
+            }
+            .into_target(),
+            Some(PushTarget::Apns {
+                token: "token".into(),
+                environment: ApnsEnvironment::Production,
+            })
+        );
+        assert_eq!(
+            PushTargetRequest::Fcm {
+                token: " fcm-token ".into(),
+            }
+            .into_target(),
+            Some(PushTarget::Fcm {
+                token: "fcm-token".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn target_request_rejects_empty_and_oversized_tokens() {
+        assert!(
+            PushTargetRequest::Fcm { token: "  ".into() }
+                .into_target()
+                .is_none()
+        );
+        assert!(
+            PushTargetRequest::Fcm {
+                token: "x".repeat(remote_host_protocol::push::PUSH_TOKEN_MAX_LEN + 1),
+            }
+            .into_target()
+            .is_none()
+        );
+    }
 }

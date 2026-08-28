@@ -6,8 +6,9 @@
 //! SubagentNotification) **on the `owner` chat pool**, encrypts a short
 //! preview **per approved device**
 //! with that device's push key and POSTs the opaque ciphertext to the remote
-//! host (C). A encrypts, C relays blind, the iOS NSE decrypts — so the preview
-//! is real on the lock screen while C and Apple see only ciphertext.
+//! host (C). A encrypts, C relays blind, and the platform client decrypts — so
+//! the preview is real on the lock screen while C and the provider see only
+//! ciphertext.
 //!
 //! The reply's persisted ordinal rides the `Completed` event
 //! ([`TurnPhase::Completed { reply_ordinal }`](baybo_turn::TurnPhase)); the
@@ -51,7 +52,7 @@ use tokio::sync::OnceCell;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
-/// Max preview characters (kept well under the 4 KB APNs payload once
+/// Max preview characters (kept well under provider payload limits once
 /// encrypted + base64'd).
 const PREVIEW_MAX_CHARS: usize = 200;
 /// How many active rows to pull from the reply's ordinal when building the
@@ -81,23 +82,21 @@ pub(crate) fn device_push_key_secret_name(device_id: &str) -> String {
     format!("device.{device_id}.push_key")
 }
 
-/// Secret-vault name for a device's persisted APNs registration material.
-pub(crate) fn device_apns_secret_name(device_id: &str) -> String {
-    format!("device.{device_id}.apns")
+/// Secret-vault name for a device's provider-tagged push registration.
+pub(crate) fn device_push_registration_secret_name(device_id: &str) -> String {
+    format!("device.{device_id}.push_registration")
 }
 
-/// The per-device APNs registration A persists at pairing (vault, keyed by
-/// device_id) so the dispatcher can restore C's APNs binding before its first
-/// push when the token was available to A.
+/// The per-device provider target A persists so the dispatcher can restore C's
+/// binding before its first push.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct DeviceApnsRegistration {
-    pub apns_token: String,
-    pub apns_env: device_proto::pairing::ApnsEnv,
+pub(crate) struct DevicePushRegistration {
+    pub target: remote_host_protocol::push::PushTarget,
 }
 
 /// Secret-vault name for a device's push delegation — the 64-byte Ed25519
 /// signature the device made at pairing authorizing A's gateway push key to
-/// manage its APNs binding at C. Absent → push is disabled for the device (the
+/// manage its push binding at C. Absent → push is disabled for the device (the
 /// gateway can't prove ownership of the binding to the push routes).
 pub(crate) fn device_push_delegation_secret_name(device_id: &str) -> String {
     format!("device.{device_id}.push_delegation")
@@ -156,12 +155,10 @@ fn mint_counter(counter: &AtomicU64, now: u64) -> u64 {
     }
 }
 
-/// The APNs `apns-collapse-id` for a (device, session): a short hash, never the
-/// raw `device_id:session_id`. This keeps it under APNs' 64-byte collapse-id
-/// limit (a 32-byte Ed25519 `device_id` alone would overflow the old form) and
-/// stops C from learning the cleartext `session_id`, while preserving per-session
-/// coalescing on the lock screen (the hash is stable per device+session).
-fn push_collapse_id(device_id: &str, session_id: &SessionId) -> String {
+/// Provider-neutral collapse key for a (device, session): a short hash, never
+/// the raw `device_id:session_id`. It fits APNs' strictest current limit and
+/// keeps C blind to the cleartext session id.
+fn push_collapse_key(device_id: &str, session_id: &SessionId) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(device_id.as_bytes());
@@ -172,18 +169,9 @@ fn push_collapse_id(device_id: &str, session_id: &SessionId) -> String {
 
 /// The `/notify` + `/register` request bodies are the shared protocol wire
 /// types, so A and C serialize/deserialize the exact same shapes.
-use remote_host_protocol::push::{NotifyRequest, RegisterRequest};
-
-/// Map the pairing-side [`device_proto::pairing::ApnsEnv`] onto the C-wire
-/// [`remote_host_protocol::push::ApnsEnv`] (same variants, distinct crates).
-fn to_wire_env(env: device_proto::pairing::ApnsEnv) -> remote_host_protocol::push::ApnsEnv {
-    match env {
-        device_proto::pairing::ApnsEnv::Sandbox => remote_host_protocol::push::ApnsEnv::Sandbox,
-        device_proto::pairing::ApnsEnv::Production => {
-            remote_host_protocol::push::ApnsEnv::Production
-        }
-    }
-}
+use remote_host_protocol::push::{
+    NotifyRequest, NotifySigningInput, PushTarget as ProviderTarget, RegisterRequest,
+};
 
 /// Compose the error string for a rejected push POST (`op` = `notify` /
 /// `register`): the status, a spelled-out reason where the bare status is the
@@ -216,12 +204,18 @@ fn push_status_error(op: &str, status: reqwest::StatusCode, body: &str) -> Strin
 /// notify would fail identically (and double the log noise + round-trips).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum RegisterOutcome {
-    /// C accepted a register for the current token (now or cached this run).
+    /// C accepted a register for the current provider target (now or cached this run).
     Registered,
     /// Nothing was sent: no registrar wired, or no usable durable material.
     Skipped,
     /// A register was sent and failed (transport error or a non-2xx from C).
     Rejected,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct RegisteredPushTarget {
+    remote_host: String,
+    target: ProviderTarget,
 }
 
 /// Why a `/notify` POST to C failed. Distinguishes the one outcome the
@@ -298,11 +292,10 @@ impl NotifySink for HttpNotifySink {
 }
 
 /// Seam over the POST to C's `/register`. The dispatcher calls it before a
-/// `/notify`, using APNs material persisted at pairing, so C can recover from a
-/// missing or stale in-memory APNs binding. Real impl uses reqwest; tests use a
-/// mock.
+/// `/notify`, using provider-tagged material persisted by the client, so C can
+/// recover from a missing or stale in-memory binding.
 #[async_trait::async_trait]
-pub trait ApnsRegistrar: Send + Sync {
+pub trait PushRegistrar: Send + Sync {
     async fn register(
         &self,
         register_url: &str,
@@ -314,11 +307,11 @@ pub trait ApnsRegistrar: Send + Sync {
 /// reqwest-backed registrar POSTing to a per-device `<base>/register`. The
 /// target's base and remote API key arrive per call, so it holds only the
 /// proxy-aware client.
-pub struct HttpApnsRegistrar {
+pub struct HttpPushRegistrar {
     client: reqwest::Client,
 }
 
-impl HttpApnsRegistrar {
+impl HttpPushRegistrar {
     /// `client` should be the workspace's proxy-aware client
     /// ([`baybo_security::http::client`]) — `/register` POSTs to the remote
     /// host (C), a non-loopback egress target subject to the egress proxy.
@@ -328,7 +321,7 @@ impl HttpApnsRegistrar {
 }
 
 #[async_trait::async_trait]
-impl ApnsRegistrar for HttpApnsRegistrar {
+impl PushRegistrar for HttpPushRegistrar {
     async fn register(
         &self,
         register_url: &str,
@@ -401,14 +394,10 @@ pub struct PushDispatcher {
     session_manager: Arc<SessionManager>,
     secret_vault: Arc<SecretVault>,
     sink: Arc<dyn NotifySink>,
-    /// Re-registers an approved device with C from the material A persisted at
-    /// pairing, self-healing a missing or stale remote-host APNs binding.
-    apns_registrar: Option<Arc<dyn ApnsRegistrar>>,
-    /// The APNs token last registered with C per device this run, so we register
-    /// at most once per (device, token): a token that **changed** (APNs rotation,
-    /// pushed to A via `POST /v1/mobile/apns-token`) differs from the cached one
-    /// and re-registers; an unchanged token is skipped.
-    registered: Mutex<HashMap<String, String>>,
+    /// Re-registers an approved device with C from durable provider material.
+    registrar: Option<Arc<dyn PushRegistrar>>,
+    /// The exact remote host + provider target last registered per device this run.
+    registered: Mutex<HashMap<String, RegisteredPushTarget>>,
     /// A's gateway Ed25519 push-signing key, lazily loaded from the vault and
     /// cached for the dispatcher's lifetime.
     push_signing_key: OnceCell<Arc<delegation::SigningKey>>,
@@ -440,7 +429,7 @@ impl PushDispatcher {
         session_manager: Arc<SessionManager>,
         secret_vault: Arc<SecretVault>,
         sink: Arc<dyn NotifySink>,
-        apns_registrar: Option<Arc<dyn ApnsRegistrar>>,
+        registrar: Option<Arc<dyn PushRegistrar>>,
     ) -> Self {
         Self {
             device_store,
@@ -448,7 +437,7 @@ impl PushDispatcher {
             session_manager,
             secret_vault,
             sink,
-            apns_registrar,
+            registrar,
             registered: Mutex::new(HashMap::new()),
             push_signing_key: OnceCell::new(),
             push_counter: AtomicU64::new(0),
@@ -694,12 +683,12 @@ impl PushDispatcher {
         for t in &targets {
             match self.dispatch_to_target(t, session_id, &preview).await {
                 // A 2xx from C's `/notify` means C handled the request. C also
-                // returns 200 after APNs prunes a bad/unregistered token, so only
-                // C's own `delivered to APNs` log proves Apple accepted it.
+                // returns 200 after a provider prunes a bad/unregistered token,
+                // so only C's provider verdict log proves upstream acceptance.
                 Ok(()) => {
                     tracing::info!(
                         device = %t.device_id,
-                        "push: remote host handled preview request; check its APNs verdict"
+                        "push: remote host handled preview request; check its provider verdict"
                     )
                 }
                 Err(e) => {
@@ -816,7 +805,7 @@ impl PushDispatcher {
             // did land (now or earlier this run). Our "already registered" cache is
             // stale: drop it, re-register from durable material, and retry the
             // push once so delivery self-heals on this very turn instead of
-            // 404'ing until A restarts or the APNs token rotates.
+            // 404'ing until A restarts or the provider token changes.
             Err(NotifyError::DeviceUnknown) if first_register == RegisterOutcome::Registered => {
                 tracing::info!(
                     device = %target.device_id,
@@ -847,7 +836,7 @@ impl PushDispatcher {
             Err(NotifyError::DeviceUnknown) => Err(format!(
                 "remote host does not know this device (404); register {}",
                 match first_register {
-                    RegisterOutcome::Skipped => "was skipped (no registrar or APNs material)",
+                    RegisterOutcome::Skipped => "was skipped (no registrar or push target)",
                     _ => "was rejected",
                 }
             )),
@@ -890,24 +879,24 @@ impl PushDispatcher {
     /// device, so `/notify` would be rejected as unknown until the app registers
     /// again. Cached so it costs at most one `/register` per device per run.
     async fn ensure_registered(&self, target: &PushTarget, base_http: &str) -> RegisterOutcome {
-        let Some(registrar) = &self.apns_registrar else {
+        let Some(registrar) = &self.registrar else {
             tracing::debug!(
                 device = %target.device_id,
-                "push: no APNs registrar wired; register skipped"
+                "push: no registrar wired; register skipped"
             );
             return RegisterOutcome::Skipped;
         };
         let device_id = target.device_id.as_str();
         let secret = match self
             .secret_vault
-            .get_secret(&device_apns_secret_name(device_id))
+            .get_secret(&device_push_registration_secret_name(device_id))
             .await
         {
             Ok(Some(secret)) => secret,
             Ok(None) => {
                 tracing::debug!(
                     device = %device_id,
-                    "push: skipping remote-host register (no APNs material persisted)"
+                    "push: skipping remote-host register (no push target persisted)"
                 );
                 return RegisterOutcome::Skipped;
             }
@@ -915,34 +904,36 @@ impl PushDispatcher {
                 tracing::warn!(
                     device = %device_id,
                     error = %e,
-                    "push: vault read of APNs material failed; register skipped"
+                    "push: vault read of push registration failed; register skipped"
                 );
                 return RegisterOutcome::Skipped;
             }
         };
-        let reg = match serde_json::from_slice::<DeviceApnsRegistration>(secret.as_bytes()) {
+        let reg = match serde_json::from_slice::<DevicePushRegistration>(secret.as_bytes()) {
             Ok(reg) => reg,
             Err(e) => {
                 tracing::warn!(
                     device = %device_id,
                     error = %e,
-                    "push: persisted APNs registration is malformed; register skipped \
-                     (re-pair or reconnect the app to rewrite it)"
+                    "push: persisted registration is malformed; register skipped"
                 );
                 return RegisterOutcome::Skipped;
             }
         };
-        if reg.apns_token.is_empty() {
+        if reg.target.token().is_empty() {
             tracing::debug!(
                 device = %device_id,
-                "push: skipping remote-host register (empty APNs token)"
+                "push: skipping remote-host register (empty provider token)"
             );
             return RegisterOutcome::Skipped;
         }
-        // Already registered this exact token this run → nothing to do. A token
-        // that changed (read from the vault after the app pushed a fresh one over
-        // the content channel) differs here and re-registers below.
-        if self.registered.lock().get(device_id) == Some(&reg.apns_token) {
+        // Provider, token, and provider-specific configuration all participate
+        // in equality, so any registration change is sent once this run.
+        let registered = RegisteredPushTarget {
+            remote_host: base_http.to_string(),
+            target: reg.target.clone(),
+        };
+        if self.registered.lock().get(device_id) == Some(&registered) {
             return RegisterOutcome::Registered;
         }
         let signing_key = match self.signing_key().await {
@@ -957,8 +948,8 @@ impl PushDispatcher {
             }
         };
         // The binding is authenticated to C by the device's pairing-time
-        // delegation plus our gateway push signature. No delegation (older
-        // pairing, or it never arrived) → we can't prove ownership of the binding,
+        // delegation plus our gateway push signature. No delegation means we
+        // cannot prove ownership of the binding,
         // so skip registration rather than send an unverifiable one.
         let delegation_sig = match self
             .secret_vault
@@ -981,8 +972,7 @@ impl PushDispatcher {
         };
         let body = build_register_body(
             device_id,
-            &reg.apns_token,
-            reg.apns_env,
+            &reg.target,
             &signing_key,
             delegation_sig.as_bytes(),
             self.next_counter().await,
@@ -995,14 +985,14 @@ impl PushDispatcher {
             Ok(()) => {
                 tracing::info!(
                     device = %device_id,
-                    apns_env = ?reg.apns_env,
-                    token_len = reg.apns_token.len(),
+                    provider = reg.target.provider().as_str(),
+                    token_len = reg.target.token().len(),
                     counter = body.counter,
-                    "push: registered device APNs binding with remote host"
+                    "push: registered device binding with remote host"
                 );
                 self.registered
                     .lock()
-                    .insert(device_id.to_string(), reg.apns_token);
+                    .insert(device_id.to_string(), registered);
                 RegisterOutcome::Registered
             }
             Err(e) => {
@@ -1077,7 +1067,7 @@ impl PushDispatcher {
 /// `session_id` rides INSIDE the sealed plaintext — never the outer APNs
 /// payload — so the app can deep-link a notification tap to its conversation
 /// while C stays blind to session ids (the same invariant that hashes
-/// [`push_collapse_id`]). Older NSE builds ignore the extra field
+/// [`push_collapse_key`]). Older clients ignore the extra field
 /// (`JSONDecoder` tolerates unknown keys); newer ones treat it as optional.
 fn reply_preview_json(text: Option<&str>, session_id: &SessionId, badge: Option<i64>) -> String {
     let body = match text {
@@ -1124,10 +1114,21 @@ fn build_notify_body(
     // Sign the notify so C can verify it against the gateway key it stored at
     // register and reject a forged push to this device_id (the traffic key is
     // not device-binding authorization).
-    let sig = delegation::sign_notify(signing_key, device_id, &enc, &n, device_id, counter);
+    let collapse_key = push_collapse_key(device_id, session_id);
+    let sig = delegation::sign_notify(
+        signing_key,
+        &NotifySigningInput {
+            device_id,
+            collapse_key: &collapse_key,
+            enc: &enc,
+            n: &n,
+            bid: device_id,
+            counter,
+        },
+    );
     Ok(NotifyRequest {
         device_id: device_id.to_string(),
-        collapse_id: push_collapse_id(device_id, session_id),
+        collapse_key,
         bid: device_id.to_string(),
         enc,
         n,
@@ -1142,22 +1143,16 @@ fn build_notify_body(
 /// remote API key as device-binding authorization.
 fn build_register_body(
     device_id: &str,
-    apns_token: &str,
-    env: device_proto::pairing::ApnsEnv,
+    target: &ProviderTarget,
     signing_key: &delegation::SigningKey,
     delegation_sig: &[u8],
     counter: u64,
 ) -> RegisterRequest {
-    let env_byte = match env {
-        device_proto::pairing::ApnsEnv::Sandbox => delegation::ENV_SANDBOX,
-        device_proto::pairing::ApnsEnv::Production => delegation::ENV_PRODUCTION,
-    };
-    let sig = delegation::sign_register(signing_key, device_id, apns_token, env_byte, counter);
+    let sig = delegation::sign_register(signing_key, device_id, target, counter);
     let b64 = base64::engine::general_purpose::STANDARD;
     RegisterRequest {
         device_id: device_id.to_string(),
-        apns_token: apns_token.to_string(),
-        env: to_wire_env(env),
+        target: target.clone(),
         gateway_pubkey: b64.encode(signing_key.verifying_key().to_bytes()),
         delegation: b64.encode(delegation_sig),
         sig: b64.encode(sig.to_bytes()),
@@ -1268,6 +1263,14 @@ where
 mod tests {
     use super::*;
     use baybo_model::TurnId;
+    use remote_host_protocol::push::ApnsEnvironment;
+
+    fn apns_target(token: &str) -> ProviderTarget {
+        ProviderTarget::Apns {
+            token: token.to_string(),
+            environment: ApnsEnvironment::Sandbox,
+        }
+    }
 
     fn event(phase: TurnPhase, kind: TurnInputKind) -> TurnLifecycleEvent {
         TurnLifecycleEvent {
@@ -1376,21 +1379,17 @@ mod tests {
         assert_eq!(body.device_id, "dev-1");
         assert_eq!(body.bid, "dev-1");
         assert_eq!(body.counter, 11);
-        // collapse_id is now a short hash — it neither equals the raw
+        // collapse_key is a short hash — it neither equals the raw
         // device_id:session_id nor leaks the session id, but is stable per pair.
-        assert_eq!(body.collapse_id, push_collapse_id("dev-1", &session));
-        assert_ne!(body.collapse_id, "dev-1:sess-7");
+        assert_eq!(body.collapse_key, push_collapse_key("dev-1", &session));
+        assert_ne!(body.collapse_key, "dev-1:sess-7");
 
         let b64 = base64::engine::general_purpose::STANDARD;
         // The notify is signed by the gateway key over the exact wire fields.
         let sig = delegation::signature_from_bytes(&b64.decode(&body.sig).unwrap()).unwrap();
         assert!(delegation::verify_notify(
             &signing.verifying_key(),
-            &body.device_id,
-            &body.enc,
-            &body.n,
-            &body.bid,
-            body.counter,
+            &body.signing_input(),
             &sig,
         ));
 
@@ -1484,19 +1483,13 @@ mod tests {
     #[test]
     fn register_body_matches_remote_host_wire_shape() {
         let signing = delegation::generate_signing_key();
-        let body = build_register_body(
-            "dev-1",
-            "tok",
-            device_proto::pairing::ApnsEnv::Sandbox,
-            &signing,
-            &[7u8; 64],
-            5,
-        );
+        let target = apns_target("tok");
+        let body = build_register_body("dev-1", &target, &signing, &[7u8; 64], 5);
         let v: serde_json::Value = serde_json::to_value(&body).unwrap();
         assert_eq!(v["device_id"], "dev-1");
-        assert_eq!(v["apns_token"], "tok");
-        // Must serialize the same as the push role's RegisterRequest.env.
-        assert_eq!(v["env"], "sandbox");
+        assert_eq!(v["target"]["provider"], "apns");
+        assert_eq!(v["target"]["token"], "tok");
+        assert_eq!(v["target"]["environment"], "sandbox");
         assert_eq!(v["counter"], 5);
         // The signing material rides the wire (base64), so C can verify the chain.
         assert!(!v["gateway_pubkey"].as_str().unwrap().is_empty());
@@ -1509,8 +1502,7 @@ mod tests {
         assert!(delegation::verify_register(
             &signing.verifying_key(),
             "dev-1",
-            "tok",
-            delegation::ENV_SANDBOX,
+            &target,
             5,
             &sig,
         ));
@@ -1586,14 +1578,14 @@ mod tests {
         }
     }
 
-    /// An `ApnsRegistrar` that always succeeds and counts `/register` calls.
+    /// A registrar that always succeeds and counts `/register` calls.
     #[derive(Default)]
     struct CountingRegistrar {
         calls: AtomicUsize,
         remote_api_keys: Mutex<Vec<String>>,
     }
     #[async_trait::async_trait]
-    impl ApnsRegistrar for CountingRegistrar {
+    impl PushRegistrar for CountingRegistrar {
         async fn register(
             &self,
             _url: &str,
@@ -1610,7 +1602,7 @@ mod tests {
     /// material `ensure_registered` reads already seeded in the vault.
     async fn test_dispatcher(
         sink: Arc<dyn NotifySink>,
-        registrar: Arc<dyn ApnsRegistrar>,
+        registrar: Arc<dyn PushRegistrar>,
     ) -> (Arc<PushDispatcher>, DeviceRow, tempfile::TempDir) {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let stores = baybo_storage::Store::open(&tempdir.path().join("push-test.db"))
@@ -1628,10 +1620,9 @@ mod tests {
         let device_id = "dev-1";
         vault
             .store_secret(
-                &device_apns_secret_name(device_id),
-                &serde_json::to_vec(&DeviceApnsRegistration {
-                    apns_token: "apns-tok".into(),
-                    apns_env: device_proto::pairing::ApnsEnv::Sandbox,
+                &device_push_registration_secret_name(device_id),
+                &serde_json::to_vec(&DevicePushRegistration {
+                    target: apns_target("apns-tok"),
                 })
                 .unwrap(),
             )
@@ -1680,7 +1671,7 @@ mod tests {
         let registrar = Arc::new(CountingRegistrar::default());
         let (dispatcher, row, _td) = test_dispatcher(
             Arc::clone(&sink) as Arc<dyn NotifySink>,
-            Arc::clone(&registrar) as Arc<dyn ApnsRegistrar>,
+            Arc::clone(&registrar) as Arc<dyn PushRegistrar>,
         )
         .await;
 
@@ -1698,13 +1689,13 @@ mod tests {
         );
     }
 
-    /// An `ApnsRegistrar` that always fails and counts `/register` calls.
+    /// A registrar that always fails and counts `/register` calls.
     #[derive(Default)]
     struct FailingRegistrar {
         calls: AtomicUsize,
     }
     #[async_trait::async_trait]
-    impl ApnsRegistrar for FailingRegistrar {
+    impl PushRegistrar for FailingRegistrar {
         async fn register(
             &self,
             _url: &str,
@@ -1728,7 +1719,7 @@ mod tests {
         let registrar = Arc::new(FailingRegistrar::default());
         let (dispatcher, row, _td) = test_dispatcher(
             Arc::clone(&sink) as Arc<dyn NotifySink>,
-            Arc::clone(&registrar) as Arc<dyn ApnsRegistrar>,
+            Arc::clone(&registrar) as Arc<dyn PushRegistrar>,
         )
         .await;
 
@@ -1743,7 +1734,7 @@ mod tests {
 
     #[tokio::test]
     async fn notify_404_with_no_register_material_does_not_retry() {
-        // No durable APNs material for this device (register skipped): a 404'd
+        // No durable push target for this device (register skipped): a 404'd
         // notify cannot be healed, so there is exactly one attempt and no
         // register at all.
         let sink = Arc::new(ScriptedSink {
@@ -1753,7 +1744,7 @@ mod tests {
         let registrar = Arc::new(CountingRegistrar::default());
         let (dispatcher, row, _td) = test_dispatcher(
             Arc::clone(&sink) as Arc<dyn NotifySink>,
-            Arc::clone(&registrar) as Arc<dyn ApnsRegistrar>,
+            Arc::clone(&registrar) as Arc<dyn PushRegistrar>,
         )
         .await;
         let bare = DeviceRow {
@@ -1821,7 +1812,7 @@ mod tests {
         let registrar = Arc::new(CountingRegistrar::default());
         let (dispatcher, row, _td) = test_dispatcher(
             Arc::clone(&sink) as Arc<dyn NotifySink>,
-            Arc::clone(&registrar) as Arc<dyn ApnsRegistrar>,
+            Arc::clone(&registrar) as Arc<dyn PushRegistrar>,
         )
         .await;
 
@@ -1860,12 +1851,12 @@ mod tests {
         let registrar = Arc::new(CountingRegistrar::default());
         let (dispatcher, _row, _td) = test_dispatcher(
             Arc::clone(&sink) as Arc<dyn NotifySink>,
-            Arc::clone(&registrar) as Arc<dyn ApnsRegistrar>,
+            Arc::clone(&registrar) as Arc<dyn PushRegistrar>,
         )
         .await;
 
         // Register a web binding (mirrors what POST /v1/push/register persists):
-        // a client Ed25519 identity, a random push key, APNs token, delegation.
+        // a client Ed25519 identity, random push key, provider target, delegation.
         let push_key = [5u8; aead::KEY_LEN];
         let device = delegation::generate_signing_key();
         let device_id = delegation::device_id_for(&device.verifying_key());
@@ -1879,8 +1870,7 @@ mod tests {
             &dispatcher.secret_vault,
             &binding,
             &push_key,
-            "apns-tok",
-            device_proto::pairing::ApnsEnv::Sandbox,
+            &apns_target("apns-tok"),
             &[7u8; 64],
         )
         .await
@@ -1933,7 +1923,7 @@ mod tests {
         let registrar = Arc::new(CountingRegistrar::default());
         let (dispatcher, _row, _td) = test_dispatcher(
             Arc::clone(&sink) as Arc<dyn NotifySink>,
-            Arc::clone(&registrar) as Arc<dyn ApnsRegistrar>,
+            Arc::clone(&registrar) as Arc<dyn PushRegistrar>,
         )
         .await;
         // Well above any plausible current unix-nanos, so only the high-water (not

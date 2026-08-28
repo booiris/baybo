@@ -92,8 +92,8 @@ final class DeckBridge: NSObject, WKScriptMessageHandler {
             // The long-press reorder pickup.
             UIImpactFeedbackGenerator(style: .medium).impactOccurred()
         case "quickSetup":
-            // Empty-board CTA: open a fresh chat and auto-send a `/deck …`
-            // request.
+            // Empty-board CTA: open a fresh chat and auto-send an
+            // ordinary-language card request.
             if let prompt = body["prompt"] as? String {
                 AppStore.shared?.startCardDraft(prompt: prompt)
             }

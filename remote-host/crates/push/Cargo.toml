@@ -18,7 +18,7 @@ parking_lot = { workspace = true }
 axum = { workspace = true }
 # Real APNs egress: reqwest negotiates HTTP/2 over TLS (ALPN), as APNs requires.
 reqwest = { workspace = true }
-# The shared wire contract: route paths + NotifyRequest/RegisterRequest/ApnsEnv.
+# The shared wire contract: route paths + provider-tagged push requests.
 remote-host-protocol = { workspace = true }
 # The token-bucket primitive backing the per-device /notify frequency control.
 remote-host-edge = { workspace = true }

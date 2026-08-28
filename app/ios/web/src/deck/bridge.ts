@@ -155,7 +155,7 @@ export function postHaptic(): void {
 }
 
 /// Empty-board "Quick setup": ask native to open a fresh chat on the Chats
-/// tab and auto-send `prompt` (a `/deck …` request) so the user lands in the
+/// tab and auto-send an ordinary-language `prompt` so the user lands in the
 /// conversation already working.
 export function postQuickSetup(prompt: string): void {
   post({ type: "quickSetup", prompt });

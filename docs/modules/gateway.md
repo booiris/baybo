@@ -670,8 +670,8 @@ POST   /v1/chat/folders/reorder         reorder folders among siblings
 DELETE /v1/chat/folders/:id             delete (dissolves; member sessions ⇒ Uncategorized); 204
 
 GET    /v1/push/params                  the gateway's Ed25519 push verifying key (hex) to delegate over
-POST   /v1/push/register                register a direct-mode device push binding (device id + APNs token + push_key + delegation)
-POST   /v1/mobile/apns-token            store a device's APNs token
+POST   /v1/push/register                register a direct-mode device push binding (device id + provider-tagged target + push_key + delegation)
+POST   /v1/mobile/push-token            store a paired device's provider-tagged push target
 
 GET    /v1/deck                         live cards + latest snapshot per card (the deck paint source)
 PUT    /v1/deck/layout                  apply the full layout ({ card_id, position, size } entries); 204

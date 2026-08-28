@@ -80,11 +80,12 @@ msg5 ◄─ Sealed( GatewayWelcome )      (transport msg, only after the operato
                                        carries the active auth_token + gateway_push_pubkey)
 msg6 ─► Sealed( DeviceDelegation )    (transport msg; the device signs the welcome's
                                        gateway_push_pubkey, authorizing it to manage the
-                                       device's APNs binding at C — see relay-push-security.md)
+                                       device's push binding at C — see relay-push-security.md)
 ```
 
-`DeviceHello`'s non-static fields (`device_id`, `apns_token`, `apns_env`) ride as
-the **msg3 payload** (authenticated by the app static); the statics themselves are
+`DeviceHello` carries only `device_id` as the **msg3 payload** (authenticated by
+the app static). Push-token registration is deliberately outside pairing and
+uses the authenticated device API after the binding exists. The statics themselves are
 XX handshake tokens, not payload fields — so neither `DeviceHello` nor
 `GatewayWelcome` carries a `static_pubkey`. `DeviceConfirm` / `GatewayWelcome` /
 `DeviceDelegation` are transport-mode messages (snow's implicit nonce).
