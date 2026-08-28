@@ -29,6 +29,13 @@ notification-extension versions, and absence of the debug push-key seed symbol.
 It only uploads when passed `--upload`, using the tracked App Store export
 options.
 
+The main app declares `ITSAppUsesNonExemptEncryption=false`: its Rust core ships
+industry-standard Noise and rustls algorithms, and the initial App Store
+availability excludes France, so this release does not require encryption
+documentation in App Store Connect. Reassess the declaration before enabling
+France or adding proprietary/non-standard cryptography; exempt encryption may
+still carry separate government reporting obligations.
+
 The last three lines are the check/test entry points; the four test tiers and how
 they map onto CI live in [testing.md](testing.md).
 

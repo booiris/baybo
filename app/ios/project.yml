@@ -89,7 +89,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.baybo.app
         PRODUCT_NAME: Baybo
-        TARGETED_DEVICE_FAMILY: "1,2"
+        TARGETED_DEVICE_FAMILY: "1"
         ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES: YES
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
     info:
@@ -104,16 +104,12 @@ targets:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
-        "UISupportedInterfaceOrientations~ipad":
-          - UIInterfaceOrientationPortrait
-          - UIInterfaceOrientationPortraitUpsideDown
-          - UIInterfaceOrientationLandscapeLeft
-          - UIInterfaceOrientationLandscapeRight
         NSCameraUsageDescription: "Baybo uses the camera to scan the pairing QR code."
         NSLocalNetworkUsageDescription: "Baybo uses your local network to connect to the Baybo service on your computer and sync conversations."
         # Required by the image viewer's share sheet: without it, tapping "Save
         # Image" TERMINATES the app (add-only access still needs a purpose string).
         NSPhotoLibraryAddUsageDescription: "Baybo saves a chat image to your photo library when you share it there."
+        ITSAppUsesNonExemptEncryption: false
         # Chat audio (AudioPlayerCenter) keeps playing through lock/background;
         # Now Playing + remote commands give it the Control Center transport.
         UIBackgroundModes:
