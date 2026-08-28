@@ -782,6 +782,8 @@ impl ToolExecutor {
                             && context.grants(&tool_name_owned, &metadata.transport_identity)
                     })
                 });
+                let initial_cron_requires_mcp_grant =
+                    initial_cron.is_some() && mcp_metadata.is_some() && !exact_mcp_grant;
                 let uncovered: Vec<ResourceAccess> = {
                     let approved = approved_resources.lock();
                     accesses
@@ -806,7 +808,7 @@ impl ToolExecutor {
                     hook();
                 }
 
-                if !uncovered.is_empty() {
+                if initial_cron_requires_mcp_grant || !uncovered.is_empty() {
                     if initial_cron.is_some() {
                         *approval_sink.lock() = Some(ApprovalDecision::Deny);
                         for access in &uncovered {
@@ -1911,6 +1913,7 @@ mod tests {
         namespaced_name: &'static str,
         upstream_name: &'static str,
         transport_identity: McpTransportIdentity,
+        declares_transport_access: bool,
         extra_access: bool,
         mid_execution_access: bool,
         ran: Arc<AtomicBool>,
@@ -1939,7 +1942,11 @@ mod tests {
         }
 
         fn accessed_resources(&self, _params: &Value) -> Vec<ResourceAccess> {
-            let mut accesses = vec![Self::transport_access()];
+            let mut accesses = if self.declares_transport_access {
+                vec![Self::transport_access()]
+            } else {
+                Vec::new()
+            };
             if self.extra_access {
                 accesses.push(ResourceAccess::WriteFile {
                     path: PathBuf::from("/tmp/not-transport"),
@@ -1954,7 +1961,11 @@ mod tests {
                 server_name: "lighthouse".to_string(),
                 upstream_name: self.upstream_name.to_string(),
                 transport_identity: self.transport_identity.clone(),
-                transport_accesses: vec![Self::transport_access()],
+                transport_accesses: if self.declares_transport_access {
+                    vec![Self::transport_access()]
+                } else {
+                    Vec::new()
+                },
             })
         }
 
@@ -2134,6 +2145,7 @@ mod tests {
                 namespaced_name: SELECTED_MCP_TOOL,
                 upstream_name: "run_audit",
                 transport_identity: identity.clone(),
+                declares_transport_access: true,
                 extra_access: false,
                 mid_execution_access: false,
                 ran: Arc::clone(&ran),
@@ -2154,6 +2166,70 @@ mod tests {
         assert!(approved.lock().is_empty());
     }
 
+    #[tokio::test]
+    async fn initial_cron_denies_ungranted_zero_access_typed_mcp() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let (gate_calls, gate) = counting_gate();
+        let executed = execute_authorization_tool(
+            Arc::new(TypedMcpTool {
+                namespaced_name: SELECTED_MCP_TOOL,
+                upstream_name: "run_audit",
+                transport_identity: McpTransportIdentity::from_sha256([19; 32]),
+                declares_transport_access: false,
+                extra_access: false,
+                mid_execution_access: false,
+                ran: Arc::clone(&ran),
+            }),
+            gate,
+            Arc::new(Mutex::new(Vec::new())),
+            Some(InitialCronToolContext::default()),
+        )
+        .await;
+
+        let error = executed
+            .output
+            .expect_err("zero-access typed MCP still requires an exact grant");
+        assert!(
+            error
+                .to_string()
+                .contains("exact MCP tool and transport configuration"),
+            "{error}"
+        );
+        assert_eq!(executed.approval, Some(ApprovalDecision::Deny));
+        assert!(!ran.load(Ordering::SeqCst));
+        assert_eq!(gate_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn initial_cron_allows_granted_zero_access_typed_mcp() {
+        let identity = McpTransportIdentity::from_sha256([20; 32]);
+        let ran = Arc::new(AtomicBool::new(false));
+        let (gate_calls, gate) = counting_gate();
+        let executed = execute_authorization_tool(
+            Arc::new(TypedMcpTool {
+                namespaced_name: SELECTED_MCP_TOOL,
+                upstream_name: "run_audit",
+                transport_identity: identity.clone(),
+                declares_transport_access: false,
+                extra_access: false,
+                mid_execution_access: false,
+                ran: Arc::clone(&ran),
+            }),
+            gate,
+            Arc::new(Mutex::new(Vec::new())),
+            Some(InitialCronToolContext::new(vec![McpToolGrant::new(
+                SELECTED_MCP_TOOL,
+                identity,
+            )])),
+        )
+        .await;
+
+        assert!(executed.output.is_ok(), "{:?}", executed.output.err());
+        assert_eq!(executed.approval, None);
+        assert!(ran.load(Ordering::SeqCst));
+        assert_eq!(gate_calls.load(Ordering::SeqCst), 0);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dynamic_replacement_after_authorization_executes_the_pinned_tool() {
         let granted_identity = McpTransportIdentity::from_sha256([17; 32]);
@@ -2164,6 +2240,7 @@ mod tests {
             namespaced_name: SELECTED_MCP_TOOL,
             upstream_name: "run_audit",
             transport_identity: granted_identity.clone(),
+            declares_transport_access: true,
             extra_access: false,
             mid_execution_access: false,
             ran: Arc::clone(&original_ran),
@@ -2172,6 +2249,7 @@ mod tests {
             namespaced_name: SELECTED_MCP_TOOL,
             upstream_name: "run_audit",
             transport_identity: replacement_identity.clone(),
+            declares_transport_access: true,
             extra_access: true,
             mid_execution_access: false,
             ran: Arc::clone(&replacement_ran),
@@ -2247,6 +2325,7 @@ mod tests {
                 namespaced_name: SIBLING_MCP_TOOL,
                 upstream_name: "get_report",
                 transport_identity: identity.clone(),
+                declares_transport_access: true,
                 extra_access: false,
                 mid_execution_access: false,
                 ran: Arc::clone(&ran),
@@ -2285,6 +2364,7 @@ mod tests {
                 namespaced_name: SELECTED_MCP_TOOL,
                 upstream_name: "run_audit",
                 transport_identity: current_identity,
+                declares_transport_access: true,
                 extra_access: false,
                 mid_execution_access: false,
                 ran: Arc::clone(&ran),
@@ -2322,6 +2402,7 @@ mod tests {
                 namespaced_name: SELECTED_MCP_TOOL,
                 upstream_name: "run_audit",
                 transport_identity: identity.clone(),
+                declares_transport_access: true,
                 extra_access: true,
                 mid_execution_access: false,
                 ran: Arc::clone(&ran),
@@ -2368,6 +2449,7 @@ mod tests {
                 namespaced_name: SELECTED_MCP_TOOL,
                 upstream_name: "run_audit",
                 transport_identity: identity.clone(),
+                declares_transport_access: true,
                 extra_access: false,
                 mid_execution_access: true,
                 ran: Arc::clone(&ran),
@@ -2400,6 +2482,7 @@ mod tests {
                 namespaced_name: SELECTED_MCP_TOOL,
                 upstream_name: "run_audit",
                 transport_identity: McpTransportIdentity::from_sha256([16; 32]),
+                declares_transport_access: true,
                 extra_access: false,
                 mid_execution_access: false,
                 ran: Arc::clone(&ran),

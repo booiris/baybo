@@ -522,6 +522,81 @@ impl CronStore for SqliteCronStore {
         Ok(())
     }
 
+    async fn record_execution_if_job_unchanged(
+        &self,
+        exec: &CronExecution,
+        expected_job: &CronJob,
+    ) -> Result<bool> {
+        let data = serialize_execution(exec)?;
+        let scheduled_us = exec.scheduled_fire_time.timestamp_micros();
+        let triggered_us = exec.triggered_at.timestamp_micros();
+        let execution_id = exec.id.clone();
+        let job_id = exec.job_id.clone();
+        let user_id = exec.user_id.clone();
+        let status = execution_status_str(exec.status).to_string();
+        let expected_updated_at = expected_job.updated_at;
+        let expected_mcp_tool_grants = expected_job.mcp_tool_grants.clone();
+        let expected = Unmoved::from(expected_job);
+
+        let outcome = self
+            .pool
+            .interact_write("cron.record_execution_if_job_unchanged", move |conn| {
+                // Take the write lock before checking the row. A revocation that
+                // committed first makes this return false; one that commits after
+                // this transaction necessarily happened after the execution row
+                // (and its documented fire-time snapshot) already existed.
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let stored: Option<String> = tx
+                    .query_row(
+                        &format!("SELECT data FROM cron_jobs WHERE id = :id AND {UNMOVED}"),
+                        rusqlite::named_params! {
+                            ":id": job_id,
+                            ":expected_status": expected.status,
+                            ":expected_next_trigger_at": expected.next_trigger_us,
+                        },
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let Some(stored) = stored else {
+                    return Ok(0_u8);
+                };
+                let stored_job = job_from_row(None, 0, 0, &stored)?;
+                if stored_job.updated_at != expected_updated_at
+                    || stored_job.mcp_tool_grants != expected_mcp_tool_grants
+                {
+                    return Ok(0_u8);
+                }
+
+                let affected = tx.execute(
+                    "INSERT OR IGNORE INTO cron_executions (id, job_id, user_id, scheduled_fire_time, triggered_at, status, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    rusqlite::params![
+                        execution_id,
+                        job_id,
+                        user_id,
+                        scheduled_us,
+                        triggered_us,
+                        status,
+                        data,
+                    ],
+                )?;
+                if affected == 0 {
+                    return Ok(2_u8);
+                }
+                tx.commit()?;
+                Ok(1_u8)
+            })
+            .await?;
+        match outcome {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(StorageError::Conflict(format!(
+                "{}@{}",
+                exec.job_id, scheduled_us
+            ))),
+        }
+    }
+
     async fn list_executions_by_job(&self, job_id: &str) -> Result<Vec<CronExecution>> {
         let job_id = job_id.to_string();
         let rows = self
@@ -1676,6 +1751,60 @@ mod tests {
     }
 
     // ── Execution record tests ──
+
+    #[tokio::test]
+    async fn conditional_execution_insert_rejects_a_previously_committed_revocation() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
+        let store = SqliteCronStore::new(pool);
+        let mut expected = test_job("cj-revoked", "u1", CronStatus::Enabled);
+        expected.set_mcp_tool_grants(vec![McpToolGrant::new(
+            "lighthouse/audit",
+            McpTransportIdentity::from_sha256([43; 32]),
+        )]);
+        store.create(&expected).await.unwrap();
+        let stale_execution =
+            CronExecution::pending(&expected, expected.next_trigger_at.unwrap(), Utc::now());
+
+        let mut revoked = expected.clone();
+        revoked.set_mcp_tool_grants(Vec::new());
+        // Deliberately retain the timestamp: the authorization tuple itself is
+        // also compared, so a clock collision cannot resurrect the stale grant.
+        revoked.updated_at = expected.updated_at;
+        assert!(store.save_if_unchanged(&revoked, &expected).await.unwrap());
+
+        assert!(
+            !store
+                .record_execution_if_job_unchanged(&stale_execution, &expected)
+                .await
+                .unwrap(),
+            "a stale execution snapshot was inserted after revocation"
+        );
+        assert!(
+            store
+                .list_executions_by_job(&expected.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let current = store.get(&expected.id).await.unwrap().unwrap();
+        let current_execution =
+            CronExecution::pending(&current, current.next_trigger_at.unwrap(), Utc::now());
+        assert!(
+            store
+                .record_execution_if_job_unchanged(&current_execution, &current)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store.list_executions_by_job(&expected.id).await.unwrap()[0]
+                .mcp_tool_grants
+                .is_empty()
+        );
+    }
 
     #[tokio::test]
     async fn record_execution_dedup_returns_already_dispatched() {

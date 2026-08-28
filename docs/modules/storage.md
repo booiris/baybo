@@ -283,7 +283,13 @@ Fields difficult to fully structure (`SessionState.extra`, `Turn.input` / `Turn.
 `cron_jobs.data` also carries the authored, sorted exact MCP tool grants. The
 field is serde-defaulted, so legacy rows grant nothing. `cron_executions.data`
 contains a fire-time copy: pending-execution recovery must authorize against
-that immutable snapshot, never the job's current list. No migration column is
+that immutable snapshot, never the job's current list. For scheduled fires,
+`CronStore::record_execution_if_job_unchanged` checks the source job's
+schedule/lifecycle columns, `updated_at` version, and exact grant list, then
+inserts the execution in one immediate transaction. The direct grant comparison
+is a backstop against equal wall-clock timestamps. A
+grant revocation that commits before the execution exists therefore invalidates
+the stale snapshot; a later tick retries from the current row. No migration column is
 needed because both records already use their versioned JSON blobs.
 
 ### Renaming a persisted name

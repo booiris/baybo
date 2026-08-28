@@ -109,7 +109,12 @@ A cron job may carry `mcp_tool_grants`, a sorted/deduplicated list of exact
 `{ tool_name, transport_identity }` pairs. Legacy rows deserialize to an empty
 list. Each `CronExecution` snapshots the list when the fire is recorded, so
 recovery uses the policy that existed at fire time rather than a later job edit.
-The transport identity is a versioned SHA-256 digest of canonical non-secret MCP
+The source job's schedule/lifecycle columns, monotonic `updated_at` version, and
+exact grant list are checked in the same write transaction that inserts the
+execution (the direct grant comparison also closes equal-clock-timestamp cases):
+if revocation commits before the execution row exists, the stale snapshot is
+refused and a later tick retries from the current job; once the
+execution exists, its fire-time policy is immutable. The transport identity is a versioned SHA-256 digest of canonical non-secret MCP
 configuration: transport type; stdio command and ordered arguments or normalized
 HTTP URL; trust; sorted capabilities; trigger scope; public OAuth settings; and
 environment variable names. Credential values are excluded, so rotation does not
@@ -118,8 +123,10 @@ capabilities, scope, OAuth settings, or env-name set fails closed.
 
 The snapshot reaches `ToolExecutor` only through the initial `CronTrigger` turn.
 It is never copied into `SessionState::approved_resources`, and a user reply in a
-recurring fire's conversation gets ordinary interactive approval behavior. An
-exact match bypasses only that MCP tool's declared transport access. A different
+recurring fire's conversation gets ordinary interactive approval behavior. Every
+typed MCP call on that unattended turn requires an exact grant, including an
+embedded transport that declares zero resource accesses. An exact match bypasses
+only that MCP tool's declared transport access. A different
 operation on the same server, a different Node MCP server, and every non-MCP
 resource remain uncovered. Because the initial fire is unattended, any uncovered
 access is denied immediately with a settings-oriented diagnostic instead of
