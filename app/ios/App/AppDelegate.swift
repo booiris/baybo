@@ -51,15 +51,16 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         _ application: UIApplication,
         didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
     ) {
-        // Lowercase hex — the token format the core, pairing protocol, and
-        // gateway all expect.
+        // Lowercase hex — the APNs token format the provider expects.
         let hex = deviceToken.map { String(format: "%02x", $0) }.joined()
         Self.hasToken = true
         NSLog(
             "baybo: APNs device token received — env=%@ token_len=%ld",
             Baybo.apnsEnvironmentName,
             hex.count)
-        Baybo.client.setApnsToken(tokenHex: hex)
+        Baybo.client.setPushToken(token: .apns(
+            token: hex,
+            environment: Baybo.apnsEnvironment))
     }
 
     func application(

@@ -1,10 +1,10 @@
 //! Per-`device_id` push traffic accounting — how many notifications each device was
-//! sent and how many payload bytes egressed to APNs.
+//! sent and how many payload bytes egressed to push providers.
 //!
 //! Push is low-rate (one send per pushable turn, per-device rate-limited), so unlike
 //! the relay's lock-free byte pump this just takes the map lock and increments under
 //! it — no shared `Arc` handle is needed. A send is recorded **after** egress, for
-//! every outcome (a send that APNs later rejects still consumed a request), keyed by
+//! every outcome (a send that a provider later rejects still consumed a request), keyed by
 //! the device that was actually pushed. The record point sits past the
 //! `store.get` / signature / rate checks, so the map is bounded by the *registered*
 //! device set, never by forged ids.
@@ -35,9 +35,9 @@ pub const DEFAULT_PUSH_IDLE_EVICT_EPOCHS: u32 = 5;
 /// [`snapshot`](PushTrafficRegistry::snapshot).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PushCounts {
-    /// APNs sends issued (every egress, regardless of APNs's verdict).
+    /// Provider sends issued (every egress, regardless of the provider's verdict).
     pub sends: u64,
-    /// Total payload bytes handed to APNs across those sends.
+    /// Total payload bytes handed to providers across those sends.
     pub bytes: u64,
 }
 
@@ -107,7 +107,7 @@ impl PushTrafficRegistry {
         }
     }
 
-    /// Record one APNs send of `bytes` for `device_id`. A new device past
+    /// Record one provider send of `bytes` for `device_id`. A new device past
     /// [`max_tracked`](Self::with_limits) is dropped (not recorded) rather than
     /// growing the map; an already-tracked device is always counted.
     pub fn record(&self, device_id: &str, bytes: usize) {

@@ -62,8 +62,9 @@ async fn register(
     };
     match state.service.register(req) {
         RegisterOutcome::Registered => StatusCode::OK,
-        // The `apns_token` isn't a plausible APNs device token.
+        // The provider token is empty or exceeds the generic storage cap.
         RegisterOutcome::InvalidToken => StatusCode::BAD_REQUEST,
+        RegisterOutcome::ProviderUnavailable => StatusCode::SERVICE_UNAVAILABLE,
         // The delegation chain / signature / counter didn't verify.
         RegisterOutcome::Rejected => StatusCode::FORBIDDEN,
         // The store is full with nothing evictable — shed, back off and retry.
@@ -92,6 +93,7 @@ async fn notify(
         NotifyOutcome::Delivered | NotifyOutcome::Pruned => StatusCode::OK,
         NotifyOutcome::RateLimited => StatusCode::TOO_MANY_REQUESTS,
         NotifyOutcome::UnknownDevice => StatusCode::NOT_FOUND,
+        NotifyOutcome::ProviderUnavailable => StatusCode::SERVICE_UNAVAILABLE,
         // Signature / delegation / replay-counter verification failed.
         NotifyOutcome::Rejected => StatusCode::FORBIDDEN,
         NotifyOutcome::Failed(_) => StatusCode::BAD_GATEWAY,
@@ -102,15 +104,17 @@ async fn notify(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::apns::{ApnsEnv, ApnsOutcome, ApnsRequest, ApnsSender};
-    use crate::delegation::{ENV_SANDBOX, test_sign};
+    use crate::apns::{ApnsEnvironment, ApnsOutcome, ApnsProvider, ApnsRequest, ApnsSender};
+    use crate::delegation::test_sign;
     use crate::jwt::ApnsProviderToken;
+    use crate::provider::{ProviderSender, PushProviders};
     use crate::store::{DeviceRegistration, DeviceTokenStore, InMemoryDeviceTokenStore};
     use async_trait::async_trait;
     use axum::body::Body;
     use axum::http::{Request, header};
     use base64::Engine;
     use ed25519_dalek::SigningKey;
+    use remote_host_protocol::push::PushTarget;
     use tower::ServiceExt;
 
     const TEST_P8: &str = r#"-----BEGIN PRIVATE KEY-----
@@ -145,18 +149,21 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
         store.register(
             &device_id(),
             DeviceRegistration {
-                apns_token: "tok".into(),
-                env: ApnsEnv::Sandbox,
+                target: PushTarget::Apns {
+                    token: "tok".into(),
+                    environment: ApnsEnvironment::Sandbox,
+                },
                 gateway_pubkey: gateway().verifying_key().to_bytes(),
                 last_counter: 0,
             },
         );
+        let signer = Arc::new(ApnsProviderToken::new("KID", "TEAM", TEST_P8.as_bytes()).unwrap());
+        let provider = Arc::new(ApnsProvider::new(Arc::new(OkApns), signer, "com.baybo.app"))
+            as Arc<dyn ProviderSender>;
         let service = Arc::new(NotifyService::new(
             Arc::new(store),
-            Arc::new(OkApns),
-            Arc::new(ApnsProviderToken::new("KID", "TEAM", TEST_P8.as_bytes()).unwrap()),
+            Arc::new(PushProviders::new([provider])),
             Arc::new(crate::traffic::PushTrafficRegistry::new()),
-            "com.baybo.app",
             crate::ratelimit::NotifyRateLimiter::default(),
         ));
         router(PushState { service })
@@ -174,10 +181,21 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
 
     fn notify_body(device_id: &str, counter: u64) -> serde_json::Value {
         let (enc, n) = ("Y2lwaGVy", "bm9uY2U=");
-        let sig = test_sign::sign_notify(&gateway(), device_id, enc, n, device_id, counter);
+        let collapse_key = "c";
+        let sig = test_sign::sign_notify(
+            &gateway(),
+            &remote_host_protocol::push::NotifySigningInput {
+                device_id,
+                collapse_key,
+                enc,
+                n,
+                bid: device_id,
+                counter,
+            },
+        );
         serde_json::json!({
             "device_id": device_id,
-            "collapse_id": "c",
+            "collapse_key": collapse_key,
             "bid": device_id,
             "enc": enc,
             "n": n,
@@ -196,18 +214,20 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
         app().oneshot(req).await.unwrap().status()
     }
 
-    /// A plausible APNs device token (32 bytes hex) that clears the `/register`
-    /// length cap.
+    /// A representative APNs token that clears the cross-provider length cap.
     const APNS_TOK: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
     fn reg_body(counter: u64) -> serde_json::Value {
         let did = device_id();
         let deleg = test_sign::sign_delegation(&device(), &gateway().verifying_key());
-        let sig = test_sign::sign_register(&gateway(), &did, APNS_TOK, ENV_SANDBOX, counter);
+        let target = PushTarget::Apns {
+            token: APNS_TOK.into(),
+            environment: ApnsEnvironment::Sandbox,
+        };
+        let sig = test_sign::sign_register(&gateway(), &did, &target, counter);
         serde_json::json!({
             "device_id": did,
-            "apns_token": APNS_TOK,
-            "env": "sandbox",
+            "target": target,
             "gateway_pubkey": b64(&gateway().verifying_key().to_bytes()),
             "delegation": b64(&deleg.to_bytes()),
             "sig": b64(&sig.to_bytes()),

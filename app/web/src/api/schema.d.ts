@@ -952,7 +952,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/mobile/apns-token": {
+    "/v1/mobile/push-token": {
         parameters: {
             query?: never;
             header?: never;
@@ -961,7 +961,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        post: operations["update_device_apns_token"];
+        post: operations["update_device_push_token"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1707,6 +1707,8 @@ export interface components {
              */
             until: string;
         };
+        /** @enum {string} */
+        ApnsEnvironmentRequest: "sandbox" | "production";
         /**
          * @description Mirror of [`baybo_model::ApprovalDecision`], so the client gets the same
          *     discriminated union it switches on everywhere else here.
@@ -3339,15 +3341,18 @@ export interface components {
              */
             gateway_push_pubkey: string;
         };
+        PushTargetRequest: {
+            environment: components["schemas"]["ApnsEnvironmentRequest"];
+            /** @enum {string} */
+            provider: "apns";
+            token: string;
+        } | {
+            /** @enum {string} */
+            provider: "fcm";
+            token: string;
+        };
         /** @description Request body for `POST /v1/push/register`. */
         RegisterPushRequest: {
-            /**
-             * @description APNs environment: `"sandbox"` (development-signed) or `"production"`
-             *     (distribution-signed).
-             */
-            apns_env: string;
-            /** @description The client's current APNs device token (hex). */
-            apns_token: string;
             /**
              * @description Lowercase hex of the 64-byte Ed25519 delegation: the client's device key
              *     authorizing the gateway push key returned by `GET /v1/push/params`.
@@ -3364,6 +3369,8 @@ export interface components {
              *     delivered over this TLS + admin-token channel.
              */
             push_key: string;
+            /** @description The client's current provider-tagged token. */
+            target: components["schemas"]["PushTargetRequest"];
         };
         /** @description Response of `POST /v1/push/register`. */
         RegisterPushResponse: {
@@ -3759,15 +3766,9 @@ export interface components {
             timezone?: string | null;
             title?: string | null;
         };
-        /** @description Request body for `POST /v1/mobile/apns-token`. */
-        UpdateDeviceApnsTokenRequest: {
-            /**
-             * @description APNs environment: `"sandbox"` (development-signed) or `"production"`
-             *     (distribution-signed).
-             */
-            apns_env: string;
-            /** @description The device's current APNs device token (hex). */
-            apns_token: string;
+        /** @description Request body for `POST /v1/mobile/push-token`. */
+        UpdateDevicePushTokenRequest: {
+            target: components["schemas"]["PushTargetRequest"];
         };
         UpdateFolderRequest: {
             /** @description New name (absent = unchanged). */
@@ -7234,7 +7235,7 @@ export interface operations {
             };
         };
     };
-    update_device_apns_token: {
+    update_device_push_token: {
         parameters: {
             query?: never;
             header?: never;
@@ -7243,16 +7244,25 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["UpdateDeviceApnsTokenRequest"];
+                "application/json": components["schemas"]["UpdateDevicePushTokenRequest"];
             };
         };
         responses: {
-            /** @description Paired device APNs token refreshed */
+            /** @description Paired device push token refreshed */
             204: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /** @description Provider token has invalid length */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
             };
             /** @description Unauthorized */
             401: {

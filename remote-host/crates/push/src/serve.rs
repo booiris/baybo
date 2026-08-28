@@ -1,5 +1,5 @@
 //! Wiring the push role into a runnable service: [`PushConfig`] + the
-//! [`build_router`] that assembles the signer, device store, the live
+//! [`build_router`] that assembles the provider registry, device store, the live
 //! [`HttpApnsSender`], and the `/notify` + `/register` routes. `main.rs` loads the
 //! config from the environment, reads the `.p8`, and serves the returned router;
 //! `build_router` is host-tested with a throwaway key.
@@ -11,11 +11,13 @@ use std::time::Duration;
 use axum::Router;
 use remote_host_edge::ip_limit::{self, IpLimitConfig};
 
+use crate::apns::ApnsProvider;
 use crate::apns_http::HttpApnsSender;
 use crate::error::PushError;
 use crate::http::{PushState, router};
 use crate::jwt::ApnsProviderToken;
 use crate::notify::NotifyService;
+use crate::provider::{ProviderSender, PushProviders};
 use crate::ratelimit::NotifyRateLimiter;
 use crate::store::DeviceTokenStore;
 use crate::traffic::PushTrafficRegistry;
@@ -170,7 +172,7 @@ impl PushConfig {
 /// client-IP resolution as the relay (see [`remote_host_edge::ip_limit`]).
 ///
 /// `traffic` is the per-device send/byte ledger (created by the caller so it can
-/// also hand it to the server's flush task); every issued APNs send is recorded
+/// also hand it to the server's flush task); every issued provider send is recorded
 /// against it.
 pub fn build_router(
     config: &PushConfig,
@@ -185,12 +187,13 @@ pub fn build_router(
         p8_pem,
     )?);
     let sender = Arc::new(HttpApnsSender::new());
+    let apns_provider = Arc::new(ApnsProvider::new(sender, signer, config.topic.clone()))
+        as Arc<dyn ProviderSender>;
+    let providers = Arc::new(PushProviders::new([apns_provider]));
     let service = Arc::new(NotifyService::new(
         store,
-        sender,
-        signer,
+        providers,
         traffic,
-        config.topic.clone(),
         NotifyRateLimiter::for_store_cap(
             config.limits.notify_rate_per_min,
             config.limits.notify_burst,

@@ -434,7 +434,7 @@ exactly "pre-head failure, side effect already committed". Therefore:
 | `PUT …/archive`, `…/pin` | ✔ | absolute assignment, not a toggle |
 | `PUT …/read {ordinal}` | ✔ | server-side max-wins, monotonic |
 | `DELETE …/{id}` | ✔ | soft `set_hidden(true)` (session rows are never deleted) |
-| `POST /v1/mobile/apns-token` | ✔ | upsert per device |
+| `POST /v1/mobile/push-token` | ✔ | provider-tagged upsert per device |
 | **`POST /v1/blobs`** | ✘ | **every put mints a fresh `blob_id`** — which is exactly why attachment dedup keys on the sha256 digest instead. It **cannot reach the pool**: uploads ride `GatewayBlobClient` on a one-shot blob leg, never `GatewayJsonClient`. That structural separation is the guarantee. |
 
 Chat message sends never go through `GatewayJsonClient` either — they ride the chat
@@ -497,30 +497,28 @@ blackhole.
 
 Two more things are required or the barrier is pointless:
 
-**The APNs POST must leave the pool's critical path.** `lib.rs:358-361` awaits
-`refresh_relay_apns_best_effort` **before** `transport::connect` — if that POST goes
+**The push-target POST must leave the pool's critical path.** Awaiting
+`refresh_relay_push_best_effort` **before** `transport::connect` would make that POST go
 through the pool, **every chat-leg subscribe queues behind the API pool**. And
 `AppStore.swift:326` calls `scheduleReconnect()` on up to 12 stores at once on
-foreground, i.e. 12 identical APNs POSTs hitting the pool together. This design
+foreground, i.e. 12 identical target POSTs hitting the pool together. This design
 kills "REST over the chat leg" for head-of-line blocking; it must not build the
-mirror image of that coupling. Fix: have `ApnsState` remember `last_posted: (token,
-env)` and **skip the request entirely when unchanged** (the steady state);
+mirror image of that coupling. Fix: have `PushState` remember the last posted
+provider-tagged target and **skip the request entirely when unchanged** (the steady state);
 `tokio::spawn` it when it does fire; stop gating `transport::connect` on it.
 
 **Pre-dialling must be explicit.** The claim that `relay_preconnect` already dials a
-leg for APNs (so a warm leg is free) is **false**:
-`refresh_relay_apns_best_effort` returns without sending anything when there is no
-APNs token (`lib.rs:707-711`) — the simulator, users who declined push, and the
-window on every cold start before APNs hands the token back (`AppStore.swift:311-313`
-re-arms registration on every foreground precisely because the app expects to often
-have no token).
+leg for a push refresh (so a warm leg is free) is **false**:
+`refresh_relay_push_best_effort` returns without sending anything when there is no
+platform token — the simulator, users who declined push, and the window on every
+cold start before the platform hands the token back all commonly have no target.
 
 ```rust
 // lib.rs, relay_preconnect:
 ActiveLeg::Relay => {
     transport::preconnect(&this.relay).await?;      // chat leg first — don't race it for a relay conn slot
     relay::leg_pool::warm().await;                  // dial one API leg and park it (unproven, 12s TTL)
-    tokio::spawn(refresh_relay_apns_best_effort(this.apns.clone()));
+    tokio::spawn(refresh_relay_push_best_effort(this.push.clone()));
     Ok(())
 }
 ```
