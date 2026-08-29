@@ -350,19 +350,13 @@ explicit edit wherever that type's mirror lives to surface it on HTTP;
 that's a feature, not a bug, because the drift test below will force
 the question.
 
-The authenticated cron family also exposes exact MCP authority for external
-automation:
-`GET /v1/cron/mcp-tools` lists currently connected, auto-executable typed MCP
-operations and their versioned transport identities. `POST /v1/cron` accepts an optional
-`mcp_tool_grants` list; `PATCH /v1/cron/{id}` treats omission as preserve and
-`[]` as revoke. Both mutation paths validate every exact pair against the live
-`ToolRegistry` and reject disconnected, non-executable, renamed, or stale identities with 400;
-they never substitute the current identity for caller-authored input. A mixed
-cron PATCH (for example prompt plus grants) becomes one optimistic scheduler
-edit, so it cannot partially apply one half. The LLM-facing `CronCreate` and
-`CronUpdate` use a different shape: they accept operation names under
-`permissions.mcp_tools`, and the runtime resolves those names to exact live
-identities before calling the scheduler.
+The authenticated cron HTTP family does not expose or mutate MCP authority.
+`POST /v1/cron` creates a job without grants, `PATCH /v1/cron/{id}` preserves
+whatever authority the agent-managed job already has, and the response mirror
+omits that internal policy. MCP grants are managed only through the LLM-facing
+`CronCreate` and `CronUpdate` tools, which accept operation names under
+`permissions.mcp_tools` and resolve them to exact live identities before
+calling the scheduler.
 
 ### OpenAPI spec generation and the TypeScript client
 

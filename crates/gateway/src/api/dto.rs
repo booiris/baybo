@@ -480,10 +480,6 @@ pub struct CreateCronRequest {
     /// touches.
     #[serde(default)]
     pub project_id: Option<String>,
-    /// Exact live MCP operations this job may invoke without an interactive
-    /// approval when a fire starts. Omitted means no grants.
-    #[serde(default)]
-    pub mcp_tool_grants: Vec<McpToolGrant>,
 }
 
 /// `PATCH /v1/cron/{id}` body: a partial edit of the job's authored fields.
@@ -509,9 +505,6 @@ pub struct UpdateCronRequest {
     /// reschedules the job: the same expression names a different instant in a
     /// different zone.
     pub timezone: Option<String>,
-    /// Replace the job's exact MCP grants. Omitted preserves the current
-    /// grants; an empty list revokes all of them.
-    pub mcp_tool_grants: Option<Vec<McpToolGrant>>,
 }
 
 // ── Turn ──────────────────────────────────────────────────────────────
@@ -701,35 +694,6 @@ impl From<baybo_turn::Turn> for Turn {
 
 // ── CronJob ──────────────────────────────────────────────────────────
 
-/// Exact authority for one namespaced MCP operation on one live transport.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct McpToolGrant {
-    pub tool_name: String,
-    pub transport_identity: String,
-}
-
-impl From<baybo_model::McpToolGrant> for McpToolGrant {
-    fn from(v: baybo_model::McpToolGrant) -> Self {
-        Self {
-            tool_name: v.tool_name,
-            transport_identity: v.transport_identity.to_string(),
-        }
-    }
-}
-
-/// One currently connected auto-executable MCP tool that may be granted to a cron job.
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct GrantableMcpTool {
-    /// Configured MCP server name.
-    pub server: String,
-    /// Full namespaced registry name used in a grant.
-    pub tool: String,
-    /// Tool name reported by the upstream MCP server.
-    pub upstream: String,
-    pub description: String,
-    pub transport_identity: String,
-}
-
 /// Mirror of [`baybo_cron::CronStatus`].
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -801,9 +765,6 @@ pub struct CronJob {
     pub deleted_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_session_id: Option<String>,
-    /// Exact MCP operations and transport configurations granted to a fire.
-    #[serde(default)]
-    pub mcp_tool_grants: Vec<McpToolGrant>,
     /// Whether this job's **cron group** — the chat-list row collapsing its
     /// fires — is pinned to the top of the list (`docs/cron-groups.md`).
     /// `#[serde(default)]` so it is not required on the wire (defaults false),
@@ -835,11 +796,6 @@ impl From<baybo_cron::CronJob> for CronJob {
             updated_at: v.updated_at,
             deleted_at: v.deleted_at,
             origin_session_id: v.origin_session_id.map(|s| s.into_inner()),
-            mcp_tool_grants: v
-                .mcp_tool_grants
-                .into_iter()
-                .map(McpToolGrant::from)
-                .collect(),
             pinned: v.pinned,
             builtin: v.builtin,
         }
@@ -1268,7 +1224,6 @@ mod tests {
         assert!(req.title.is_none());
         assert!(req.schedule.is_none());
         assert!(req.timezone.is_none());
-        assert!(req.mcp_tool_grants.is_none());
     }
 
     #[test]
@@ -1278,7 +1233,6 @@ mod tests {
         assert!(req.prompt.is_none());
         assert!(req.schedule.is_none());
         assert!(req.timezone.is_none());
-        assert!(req.mcp_tool_grants.is_none());
     }
 
     /// The schedule crosses the wire in the tagged shape `CronJob` reports it
@@ -1301,18 +1255,5 @@ mod tests {
                 "2026-07-15T08:00:00Z".parse().unwrap()
             )),
         );
-    }
-
-    #[test]
-    fn grant_omission_and_revocation_stay_distinct() {
-        let omitted: UpdateCronRequest = serde_json::from_str("{}").unwrap();
-        assert!(omitted.mcp_tool_grants.is_none());
-
-        let revoked: UpdateCronRequest =
-            serde_json::from_str(r#"{"mcp_tool_grants": []}"#).unwrap();
-        assert!(matches!(
-            revoked.mcp_tool_grants,
-            Some(grants) if grants.is_empty()
-        ));
     }
 }

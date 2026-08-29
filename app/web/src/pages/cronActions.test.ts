@@ -50,7 +50,6 @@ function job(over: Partial<CronJob> & Pick<CronJob, 'id'>): CronJob {
     next_trigger_at: new Date(NOW + HOUR).toISOString(),
     deleted_at: null,
     origin_session_id: null,
-    mcp_tool_grants: [],
     ...over,
   };
 }

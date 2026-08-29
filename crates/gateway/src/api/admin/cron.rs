@@ -9,12 +9,12 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use baybo_cron::{CronError, CronSchedule};
-use baybo_model::{ChannelType as ChannelTypeModel, McpToolGrant as McpToolGrantModel};
+use baybo_model::ChannelType as ChannelTypeModel;
 
 use crate::api::admin::chat::{broadcast_session_list_stale, chat_list_channel};
 use crate::api::dto::{
-    ChannelType, CreateCronRequest, CronJob, ErrorBody, GrantableMcpTool, ListResponse,
-    McpToolGrant, SetCronPinRequest, UpdateCronRequest,
+    ChannelType, CreateCronRequest, CronJob, ErrorBody, ListResponse, SetCronPinRequest,
+    UpdateCronRequest,
 };
 use crate::auth::AuthedClient;
 use crate::server::AdminState;
@@ -23,60 +23,11 @@ use crate::{GatewayError, Result};
 pub fn routes() -> OpenApiRouter<AdminState> {
     OpenApiRouter::new()
         .routes(routes!(list_cron, create_cron))
-        .routes(routes!(list_grantable_mcp_tools))
         .routes(routes!(get_cron, update_cron, delete_cron))
         .routes(routes!(set_cron_pin))
         .routes(routes!(pause_cron))
         .routes(routes!(resume_cron))
         .routes(routes!(restore_cron))
-}
-
-fn validate_mcp_tool_grants(
-    state: &AdminState,
-    grants: Vec<McpToolGrant>,
-) -> Result<Vec<McpToolGrantModel>> {
-    let grants = grants
-        .into_iter()
-        .map(|grant| {
-            let transport_identity = grant.transport_identity.parse().map_err(|e| {
-                GatewayError::BadRequest(format!(
-                    "invalid transport identity for MCP tool {:?}: {e}",
-                    grant.tool_name
-                ))
-            })?;
-            Ok(McpToolGrantModel::new(grant.tool_name, transport_identity))
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    for grant in &grants {
-        let Some((tool, Some(manifest))) = state.tool_registry.get_with_manifest(&grant.tool_name)
-        else {
-            return Err(GatewayError::BadRequest(format!(
-                "MCP tool {:?} is not currently live; refresh GET /v1/cron/mcp-tools before granting it",
-                grant.tool_name
-            )));
-        };
-        manifest.validate_auto_execution().map_err(|error| {
-            GatewayError::BadRequest(format!(
-                "MCP tool {:?} cannot be granted: {error}",
-                grant.tool_name
-            ))
-        })?;
-        let Some(metadata) = tool.mcp_metadata() else {
-            return Err(GatewayError::BadRequest(format!(
-                "MCP tool {:?} is not currently live; refresh GET /v1/cron/mcp-tools before granting it",
-                grant.tool_name
-            )));
-        };
-        if metadata.transport_identity != grant.transport_identity {
-            return Err(GatewayError::BadRequest(format!(
-                "stale MCP grant for {:?}: its live transport identity changed; refresh GET /v1/cron/mcp-tools",
-                grant.tool_name
-            )));
-        }
-    }
-
-    Ok(grants)
 }
 
 /// Map a scheduler error onto the right HTTP status: an unknown job id is
@@ -147,38 +98,6 @@ async fn list_cron(
 }
 
 #[utoipa::path(
-    get,
-    path = "/cron/mcp-tools",
-    tag = "cron",
-    responses(
-        (status = 200, description = "Currently connected auto-executable typed MCP tools that can be granted to a cron job, sorted by full tool name", body = inline(ListResponse<GrantableMcpTool>)),
-        (status = 401, description = "Unauthorized", body = ErrorBody),
-    )
-)]
-async fn list_grantable_mcp_tools(
-    State(state): State<AdminState>,
-) -> Json<ListResponse<GrantableMcpTool>> {
-    let items = state
-        .tool_registry
-        .tool_definitions()
-        .into_iter()
-        .filter_map(|definition| {
-            let (tool, manifest) = state.tool_registry.get_with_manifest(&definition.name)?;
-            manifest?.validate_auto_execution().ok()?;
-            let metadata = tool.mcp_metadata()?;
-            Some(GrantableMcpTool {
-                server: metadata.server_name,
-                tool: metadata.tool_name,
-                upstream: metadata.upstream_name,
-                description: tool.description(),
-                transport_identity: metadata.transport_identity.to_string(),
-            })
-        })
-        .collect();
-    Json(ListResponse::new(items))
-}
-
-#[utoipa::path(
     post,
     path = "/cron",
     tag = "cron",
@@ -193,7 +112,6 @@ async fn create_cron(
     State(state): State<AdminState>,
     Json(req): Json<CreateCronRequest>,
 ) -> Result<(StatusCode, Json<CronJob>)> {
-    let mcp_tool_grants = validate_mcp_tool_grants(&state, req.mcp_tool_grants)?;
     // Validated here rather than inside `baybo-cron`: this is the only
     // caller that can name a board (the tool inherits its own), so giving
     // the cron crate a `ProjectStore` dependency would be paying for a
@@ -218,19 +136,16 @@ async fn create_cron(
         .unwrap_or_else(ChannelTypeModel::owner);
     let job = state
         .cron_scheduler
-        .create_job_with_mcp_tool_grants(
-            baybo_cron::NewCronJob {
-                user_id: req.user_id,
-                channel,
-                title: req.title,
-                schedule,
-                prompt: req.text,
-                timezone: req.timezone,
-                origin_session_id: req.origin_session_id.map(Into::into),
-                project_id,
-            },
-            mcp_tool_grants,
-        )
+        .create_job(baybo_cron::NewCronJob {
+            user_id: req.user_id,
+            channel,
+            title: req.title,
+            schedule,
+            prompt: req.text,
+            timezone: req.timezone,
+            origin_session_id: req.origin_session_id.map(Into::into),
+            project_id,
+        })
         .await
         .map_err(cron_err)?;
     Ok((StatusCode::CREATED, Json(CronJob::from(job))))
@@ -289,17 +204,13 @@ async fn update_cron(
         prompt,
         schedule,
         timezone,
-        mcp_tool_grants,
     } = req;
-    let mcp_tool_grants = mcp_tool_grants
-        .map(|grants| validate_mcp_tool_grants(&state, grants))
-        .transpose()?;
     let patch = baybo_cron::CronJobPatch {
         title,
         prompt,
         schedule: schedule.map(Into::into),
         timezone,
-        mcp_tool_grants,
+        mcp_tool_grants: None,
     };
     let job = state
         .cron_scheduler

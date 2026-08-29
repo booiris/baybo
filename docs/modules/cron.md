@@ -146,10 +146,10 @@ out-of-scope operation rejects the entire call rather than silently dropping or
 rebinding authority. `CronList` and both mutation results return the granted
 operation names so a later edit can preserve or replace them deliberately.
 
-The authenticated admin API remains an exact-tuple surface for external
-automation: `GET /v1/cron/mcp-tools` lists connected auto-executable typed operations, while
-admin create and PATCH validate caller-supplied pairs. The Web cron editor does
-not expose MCP authority; conversational creation and editing use the cron tools.
+The authenticated admin HTTP API does not expose or mutate this authority:
+admin-created jobs start without grants, admin PATCH preserves any grants the
+job already has, and HTTP responses omit them. MCP permissions are managed only
+through conversational `CronCreate` and `CronUpdate` calls.
 
 iOS support is tracked separately on board issue #6; the transient phone approval
 card does not gain `ApproveAlways`.

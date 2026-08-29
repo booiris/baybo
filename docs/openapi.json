@@ -2750,13 +2750,6 @@
                             ],
                             "format": "date-time"
                           },
-                          "mcp_tool_grants": {
-                            "type": "array",
-                            "items": {
-                              "$ref": "#/components/schemas/McpToolGrant"
-                            },
-                            "description": "Exact MCP operations and transport configurations granted to a fire."
-                          },
                           "next_trigger_at": {
                             "type": [
                               "string",
@@ -2865,82 +2858,6 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Unauthorized",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/cron/mcp-tools": {
-      "get": {
-        "tags": [
-          "cron"
-        ],
-        "operationId": "list_grantable_mcp_tools",
-        "responses": {
-          "200": {
-            "description": "Currently connected auto-executable typed MCP tools that can be granted to a cron job, sorted by full tool name",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "description": "Envelope for list endpoints. `next_cursor` is opaque — clients\npass it back as `?cursor=` to fetch the next page, and treat\n`None` as \"no more pages.\" The cursor's internal scheme may change\nacross releases; clients must not parse it.",
-                  "required": [
-                    "items"
-                  ],
-                  "properties": {
-                    "items": {
-                      "type": "array",
-                      "items": {
-                        "type": "object",
-                        "description": "One currently connected auto-executable MCP tool that may be granted to a cron job.",
-                        "required": [
-                          "server",
-                          "tool",
-                          "upstream",
-                          "description",
-                          "transport_identity"
-                        ],
-                        "properties": {
-                          "description": {
-                            "type": "string"
-                          },
-                          "server": {
-                            "type": "string",
-                            "description": "Configured MCP server name."
-                          },
-                          "tool": {
-                            "type": "string",
-                            "description": "Full namespaced registry name used in a grant."
-                          },
-                          "transport_identity": {
-                            "type": "string"
-                          },
-                          "upstream": {
-                            "type": "string",
-                            "description": "Tool name reported by the upstream MCP server."
-                          }
-                        }
-                      }
-                    },
-                    "next_cursor": {
-                      "type": [
-                        "string",
-                        "null"
-                      ]
-                    }
-                  }
                 }
               }
             }
@@ -8899,13 +8816,6 @@
               }
             ]
           },
-          "mcp_tool_grants": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/McpToolGrant"
-            },
-            "description": "Exact live MCP operations this job may invoke without an interactive\napproval when a fire starts. Omitted means no grants."
-          },
           "origin_session_id": {
             "type": [
               "string",
@@ -9130,13 +9040,6 @@
               "null"
             ],
             "format": "date-time"
-          },
-          "mcp_tool_grants": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/McpToolGrant"
-            },
-            "description": "Exact MCP operations and transport configurations granted to a fire."
           },
           "next_trigger_at": {
             "type": [
@@ -11020,22 +10923,6 @@
           }
         }
       },
-      "McpToolGrant": {
-        "type": "object",
-        "description": "Exact authority for one namespaced MCP operation on one live transport.",
-        "required": [
-          "tool_name",
-          "transport_identity"
-        ],
-        "properties": {
-          "tool_name": {
-            "type": "string"
-          },
-          "transport_identity": {
-            "type": "string"
-          }
-        }
-      },
       "MoveFolderRequest": {
         "type": "object",
         "properties": {
@@ -12033,16 +11920,6 @@
         "type": "object",
         "description": "`PATCH /v1/cron/{id}` body: a partial edit of the job's authored fields.\nEvery field is optional and named exactly as it is on [`CronJob`], so a\nclient patches by sending back the subset it changed on the job it fetched.\nAn absent field keeps the value the job already has, and a body that sets\nnothing at all is rejected — there is nothing to write, and answering with\nthe unchanged job would tell the user their edit landed.\n\nThe scheduler's own fields (`status`, `next_trigger_at`,\n`last_triggered_at`) are not patchable: they are derived from the schedule,\nor moved by `POST /v1/cron/{id}/{pause,resume}`.",
         "properties": {
-          "mcp_tool_grants": {
-            "type": [
-              "array",
-              "null"
-            ],
-            "items": {
-              "$ref": "#/components/schemas/McpToolGrant"
-            },
-            "description": "Replace the job's exact MCP grants. Omitted preserves the current\ngrants; an empty list revokes all of them."
-          },
           "prompt": {
             "type": [
               "string",
