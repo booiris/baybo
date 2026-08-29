@@ -184,6 +184,7 @@ async fn compression_call_records_cost_with_matching_span_id() {
             baybo_trace::LlmCallInputs::Persisted {
                 last_ordinal,
                 prefix_len,
+                ordinals,
                 suffix,
             } => {
                 assert!(
@@ -194,6 +195,7 @@ async fn compression_call_records_cost_with_matching_span_id() {
                     *prefix_len >= 1,
                     "compression span must record a real prefix_len tripwire count end-to-end"
                 );
+                assert!(ordinals.is_empty());
                 assert_eq!(
                     suffix.len(),
                     1,

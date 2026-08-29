@@ -155,7 +155,7 @@ reader who never looks.
 
 ### Single-table persistence
 
-Step and Span lifecycle writes go to the canonical tables (`steps`, `spans`, `span_events`, plus the content-addressed `llm_tool_sets` above). Each row stores the entity as a single JSON `data` blob; queryable fields (`turn_id`, `step_id`, `started_at`, `ended_at`) surface as `GENERATED ALWAYS AS (json_extract(...)) VIRTUAL` columns that SQLite keeps in lockstep with `data` automatically. There is no two-side write contract — adding a new field is a serde change in `baybo-trace`, no schema migration. New indexed lookups need a new generated column; that is the only schema change vector.
+Step and Span lifecycle writes go to the canonical tables (`steps`, `spans`, `span_events`, plus the content-addressed `llm_tool_sets` above). Logically each row stores the entity as one JSON `data` value. On every write, a value of at least 1 KiB is stored in the shared zstd-compressed `content_payloads` table when compression makes it smaller; the owner row keeps the generated-column fields in a small projection. Every TraceStore read goes through a `*_read` view and returns the original JSON. Queryable fields (`turn_id`, `step_id`, `started_at`, `ended_at`) surface as `GENERATED ALWAYS AS (json_extract(...)) VIRTUAL` columns that SQLite keeps in lockstep with that projection. There is no two-side domain write contract — adding a non-indexed field is a serde change in `baybo-trace`; new indexed lookups need a generated column and projection entry.
 
 The earlier two-layer WAL (`trace_events` table mirroring every begin/end) was removed once it became clear no reader consumed it: recovery scans `spans` directly, and there is no replay / OTel-export path yet that would benefit from the append-only log. If one lands later, the WAL can come back together with its consumer.
 
@@ -167,7 +167,7 @@ An `LlmCall` span records what the model saw in `begin.input_messages`
 - **`Inline(Vec<ChatMessage>)`** — messages embedded directly. Used only when the
   input is genuinely not in `session_messages`. Self-contained (cannot desync) but
   costs the full message bytes per span.
-- **`Persisted { last_ordinal, prefix_len, suffix }`** — a *reference* to the
+- **`Persisted { last_ordinal, prefix_len, ordinals, suffix }`** — a *reference* to the
   `session_messages` active-as-of-`last_ordinal` slice (the ordinal log in
   [storage.md](storage.md)). The main agent, compression, and the progress
   observer all use it. It exists to avoid embedding the prefix: the main agent
@@ -176,11 +176,15 @@ An `LlmCall` span records what the model saw in `begin.input_messages`
   on every fire. `suffix` carries the framing that is *not* a `session_messages`
   row — a compression instruction, the observer prompt, the background-summary
   sub-loop's own turns — appended verbatim after the reconstructed prefix so the
-  rebuilt view equals exactly what the LLM saw.
+  rebuilt view equals exactly what the LLM saw. `ordinals` is omitted in the
+  healthy case. When transcript repair quarantines an orphan/duplicate result
+  or repositions a valid result beside its `ToolUse`, it records the exact
+  durable ordinal subset/order instead of falling back to a full inline copy.
 
 Hydration (`QueryApi::replay`, and the web client's `hydratePersistedInput`)
 collapses every `Persisted` back to `Inline` for consumers: it reconstructs the
-prefix with the "active as of N" filter and appends `suffix`.
+prefix with the "active as of N" filter, validates and applies `ordinals` when
+present, and appends `suffix`.
 
 **Per-session resolution.** Background compression runs as an in-actor detached
 step on the parent's own `AgentLoop`, so its `StepKind::Compression` / `LlmCall`
@@ -198,7 +202,8 @@ row, or a read/write-filter divergence could silently rehydrate the wrong slice.
 `prefix_len` records how many prefix messages the writer expected; hydration
 compares it against the reconstructed count and, on mismatch, prepends a visible
 `Role::System` marker (and logs a warning) rather than returning a plausible-but-
-wrong input. A `Persisted` marker is only emitted when the count is known, so
+wrong input. An explicit projection additionally rejects duplicate ordinals or
+an ordinal outside that active-as-of candidate set. A `Persisted` marker is only emitted when the count is known, so
 every reference is validated — there is no skip path. A hydration *code* bug is
 recoverable (the truth lives in durable `session_messages`; `replay` is pure and
 re-runnable after the fix) — the tripwire only makes drift loud, not silent. The
@@ -206,8 +211,10 @@ marker path is pinned by a negative test
 (`replay_flags_prefix_len_tripwire_mismatch`). There is no second, write-side
 copy of the active-message filter to keep in lockstep with it: the
 `superseded_by > N` form is applied only by the read-side reconstruction, while
-the write side anchors on `latest_session_ordinal` + `count_active_messages` and
-emits an inline copy whenever those disagree with the in-memory window.
+the common write side anchors on `latest_session_ordinal` +
+`count_active_messages`; on a representable mismatch it names exact ordinals,
+and emits inline only for a memory-only message. Title-generation and other
+one-off prompts remain Inline when no durable prefix can reconstruct them.
 
 ### Synchronous lifecycle writes
 

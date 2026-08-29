@@ -231,7 +231,7 @@ async fn get_trace_lineage(
     responses(
         (
             status = 200,
-            description = "Per-turn step/span tree. `LlmCall` spans keep `input_messages` as `{ last_ordinal: i64, prefix_len: usize, suffix?: ChatMessage[] }` (Persisted) or `ChatMessage[]` (Inline). A larger `ToolCall.result.output` may be `{ $baybo_ref: 'session_tool_result', tool_use_id, attachments?, llm_images? }`; the client resolves both reference kinds against the session message log returned by the overview call, a persisted tool output to its transcript row's `ToolResult` content by `tool_use_id`.",
+            description = "Per-turn step/span tree. `LlmCall` spans keep `input_messages` as `{ last_ordinal: i64, prefix_len: usize, ordinals?: i64[], suffix?: ChatMessage[] }` (Persisted) or `ChatMessage[]` (Inline). `ordinals` records an exact repaired transcript subset/order when present. A larger `ToolCall.result.output` may be `{ $baybo_ref: 'session_tool_result', tool_use_id, attachments?, llm_images? }`; the client resolves both reference kinds against the session message log returned by the overview call, a persisted tool output to its transcript row's `ToolResult` content by `tool_use_id`.",
             body = serde_json::Value,
             content_type = "application/json",
         ),

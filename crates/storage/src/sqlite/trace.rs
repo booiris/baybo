@@ -1,11 +1,9 @@
 //! sqlite implementation of `TraceStore`.
 //!
-//! Schema lives in `super::mod::init_db`. Each table stores the entity as
-//! a single canonical JSON `data` blob; queryable fields surface as
-//! VIRTUAL generated columns derived from `json_extract`. SQLite keeps
-//! generated columns in lockstep with `data`, so writers only ever set
-//! `data` (plus the natural key) — `baybo-trace` owns the rich-type <->
-//! row conversion, this layer just shuttles rows.
+//! Schema lives in `super::mod::init_db`. Each row logically stores one
+//! canonical JSON value. Large values are zstd payload-backed while `data`
+//! retains the fields needed by VIRTUAL generated columns. `baybo-trace` owns
+//! the rich-type <-> row conversion; this layer owns the physical encoding.
 
 use async_trait::async_trait;
 use rusqlite::OptionalExtension;
@@ -13,7 +11,7 @@ use rusqlite::OptionalExtension;
 use super::SqlitePool;
 use baybo_model::{SpanId, StepId, ToolSetHash, TurnId};
 use baybo_store::trace::Result;
-use baybo_store::{SpanEventRow, SpanRow, StepRow, ToolSetRow, TraceStore};
+use baybo_store::{SpanEventRow, SpanRow, StepRow, StorageError, ToolSetRow, TraceStore};
 
 pub struct SqliteTraceStore {
     pool: SqlitePool,
@@ -29,13 +27,23 @@ impl SqliteTraceStore {
 impl TraceStore for SqliteTraceStore {
     async fn save_step(&self, step: &StepRow) -> Result<()> {
         let id = step.id.to_string();
-        let data = step.data.clone();
+        let data = super::payload::EncodedText::prepare_json_fields(
+            step.data.clone(),
+            &["turn_id", "started_at", "ended_at"],
+        )
+        .map_err(StorageError::Internal)?;
         self.pool
             .interact_write("trace.save_step", move |conn| {
-                conn.execute(
-                    "INSERT OR REPLACE INTO steps (id, data) VALUES (?1, ?2)",
-                    rusqlite::params![id, data],
+                let tx = conn.transaction()?;
+                data.persist(&tx)?;
+                tx.execute(
+                    "INSERT INTO steps (id, data, data_payload_hash) VALUES (?1, ?2, ?3) \
+                     ON CONFLICT(id) DO UPDATE SET \
+                         data = excluded.data, \
+                         data_payload_hash = excluded.data_payload_hash",
+                    rusqlite::params![id, data.inline, data.hash],
                 )?;
+                tx.commit()?;
                 Ok(())
             })
             .await
@@ -48,9 +56,9 @@ impl TraceStore for SqliteTraceStore {
             .interact("trace.load_step", move |conn| {
                 let data = conn
                     .query_row(
-                        "SELECT data FROM steps WHERE id = ?1",
+                        "SELECT data FROM steps_read WHERE id = ?1",
                         rusqlite::params![key],
-                        |row| row.get::<_, String>(0),
+                        |row| super::payload::read_text(row, 0),
                     )
                     .optional()?;
                 Ok(data.map(|data| StepRow { id, data }))
@@ -62,11 +70,12 @@ impl TraceStore for SqliteTraceStore {
         let turn_id = turn_id.to_string();
         self.pool
             .interact("trace.list_steps_by_turn", move |conn| {
-                let mut stmt = conn
-                    .prepare("SELECT id, data FROM steps WHERE turn_id = ?1 ORDER BY started_at")?;
+                let mut stmt = conn.prepare(
+                    "SELECT id, data FROM steps_read WHERE turn_id = ?1 ORDER BY started_at",
+                )?;
                 let rows = stmt
                     .query_map(rusqlite::params![turn_id], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        Ok((row.get::<_, String>(0)?, super::payload::read_text(row, 1)?))
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 let mut out = Vec::with_capacity(rows.len());
@@ -90,16 +99,16 @@ impl TraceStore for SqliteTraceStore {
                 // UNION also dedups a step that is open on both counts.
                 let mut stmt = conn.prepare(
                     "SELECT id, data FROM ( \
-                         SELECT id, data, started_at FROM steps WHERE ended_at IS NULL \
+                         SELECT id, data, started_at FROM steps_read WHERE ended_at IS NULL \
                          UNION \
-                         SELECT st.id, st.data, st.started_at FROM steps st \
+                         SELECT st.id, st.data, st.started_at FROM steps_read st \
                              JOIN spans sp ON sp.step_id = st.id \
                              WHERE sp.ended_at IS NULL \
                      ) ORDER BY started_at",
                 )?;
                 let rows = stmt
                     .query_map([], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        Ok((row.get::<_, String>(0)?, super::payload::read_text(row, 1)?))
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 let mut out = Vec::with_capacity(rows.len());
@@ -116,13 +125,23 @@ impl TraceStore for SqliteTraceStore {
 
     async fn save_span(&self, span: &SpanRow) -> Result<()> {
         let id = span.id.to_string();
-        let data = span.data.clone();
+        let data = super::payload::EncodedText::prepare_json_fields(
+            span.data.clone(),
+            &["step_id", "started_at", "ended_at"],
+        )
+        .map_err(StorageError::Internal)?;
         self.pool
             .interact_write("trace.save_span", move |conn| {
-                conn.execute(
-                    "INSERT OR REPLACE INTO spans (id, data) VALUES (?1, ?2)",
-                    rusqlite::params![id, data],
+                let tx = conn.transaction()?;
+                data.persist(&tx)?;
+                tx.execute(
+                    "INSERT INTO spans (id, data, data_payload_hash) VALUES (?1, ?2, ?3) \
+                     ON CONFLICT(id) DO UPDATE SET \
+                         data = excluded.data, \
+                         data_payload_hash = excluded.data_payload_hash",
+                    rusqlite::params![id, data.inline, data.hash],
                 )?;
+                tx.commit()?;
                 Ok(())
             })
             .await
@@ -135,9 +154,9 @@ impl TraceStore for SqliteTraceStore {
             .interact("trace.load_span", move |conn| {
                 let data = conn
                     .query_row(
-                        "SELECT data FROM spans WHERE id = ?1",
+                        "SELECT data FROM spans_read WHERE id = ?1",
                         rusqlite::params![key],
-                        |row| row.get::<_, String>(0),
+                        |row| super::payload::read_text(row, 0),
                     )
                     .optional()?;
                 Ok(data.map(|data| SpanRow { id, data }))
@@ -149,11 +168,12 @@ impl TraceStore for SqliteTraceStore {
         let step_id = step_id.to_string();
         self.pool
             .interact("trace.list_spans_by_step", move |conn| {
-                let mut stmt = conn
-                    .prepare("SELECT id, data FROM spans WHERE step_id = ?1 ORDER BY started_at")?;
+                let mut stmt = conn.prepare(
+                    "SELECT id, data FROM spans_read WHERE step_id = ?1 ORDER BY started_at",
+                )?;
                 let rows = stmt
                     .query_map(rusqlite::params![step_id], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        Ok((row.get::<_, String>(0)?, super::payload::read_text(row, 1)?))
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 let mut out = Vec::with_capacity(rows.len());
@@ -173,13 +193,13 @@ impl TraceStore for SqliteTraceStore {
         self.pool
             .interact("trace.list_spans_by_turn", move |conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT sp.id, sp.data FROM spans sp \
+                    "SELECT sp.id, sp.data FROM spans_read sp \
                      JOIN steps st ON sp.step_id = st.id \
                      WHERE st.turn_id = ?1 ORDER BY sp.started_at",
                 )?;
                 let rows = stmt
                     .query_map(rusqlite::params![turn_id], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        Ok((row.get::<_, String>(0)?, super::payload::read_text(row, 1)?))
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 let mut out = Vec::with_capacity(rows.len());
@@ -212,16 +232,24 @@ impl TraceStore for SqliteTraceStore {
 
     async fn save_tool_set(&self, set: &ToolSetRow) -> Result<()> {
         let hash = set.hash.to_string();
-        let data = set.data.clone();
+        let data = super::payload::EncodedText::prepare(set.data.clone(), "{}".to_string())
+            .map_err(StorageError::Internal)?;
         self.pool
             .interact_write("trace.save_tool_set", move |conn| {
                 // OR IGNORE, not OR REPLACE: the key IS the digest of the
                 // body, so a second write of the same hash carries the same
                 // bytes and rewriting them would only churn the page.
-                conn.execute(
-                    "INSERT OR IGNORE INTO llm_tool_sets (hash, data) VALUES (?1, ?2)",
-                    rusqlite::params![hash, data],
+                let tx = conn.transaction()?;
+                data.persist(&tx)?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO llm_tool_sets \
+                     (hash, data, data_payload_hash) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![hash, data.inline, data.hash],
                 )?;
+                if let Some(hash) = data.hash.as_deref() {
+                    super::payload::delete_unreferenced(&tx, hash)?;
+                }
+                tx.commit()?;
                 Ok(())
             })
             .await
@@ -234,9 +262,9 @@ impl TraceStore for SqliteTraceStore {
             .interact("trace.load_tool_set", move |conn| {
                 let data = conn
                     .query_row(
-                        "SELECT data FROM llm_tool_sets WHERE hash = ?1",
+                        "SELECT data FROM llm_tool_sets_read WHERE hash = ?1",
                         rusqlite::params![key],
-                        |row| row.get::<_, String>(0),
+                        |row| super::payload::read_text(row, 0),
                     )
                     .optional()?;
                 Ok(data.map(|data| ToolSetRow { hash, data }))
@@ -247,13 +275,21 @@ impl TraceStore for SqliteTraceStore {
     async fn append_span_event(&self, event: &SpanEventRow) -> Result<()> {
         let span_id = event.span_id.to_string();
         let seq = event.seq as i64;
-        let data = event.data.clone();
+        let data = super::payload::EncodedText::prepare(event.data.clone(), "{}".to_string())
+            .map_err(StorageError::Internal)?;
         self.pool
             .interact_write("trace.append_span_event", move |conn| {
-                conn.execute(
-                    "INSERT OR REPLACE INTO span_events (span_id, seq, data) VALUES (?1, ?2, ?3)",
-                    rusqlite::params![span_id, seq, data],
+                let tx = conn.transaction()?;
+                data.persist(&tx)?;
+                tx.execute(
+                    "INSERT INTO span_events (span_id, seq, data, data_payload_hash) \
+                     VALUES (?1, ?2, ?3, ?4) \
+                     ON CONFLICT(span_id, seq) DO UPDATE SET \
+                         data = excluded.data, \
+                         data_payload_hash = excluded.data_payload_hash",
+                    rusqlite::params![span_id, seq, data.inline, data.hash],
                 )?;
+                tx.commit()?;
                 Ok(())
             })
             .await
@@ -264,14 +300,15 @@ impl TraceStore for SqliteTraceStore {
         let key = span_id.to_string();
         self.pool
             .interact("trace.list_span_events", move |conn| {
-                let mut stmt = conn
-                    .prepare("SELECT seq, data FROM span_events WHERE span_id = ?1 ORDER BY seq")?;
+                let mut stmt = conn.prepare(
+                    "SELECT seq, data FROM span_events_read WHERE span_id = ?1 ORDER BY seq",
+                )?;
                 let out = stmt
                     .query_map(rusqlite::params![key], |row| {
                         Ok(SpanEventRow {
                             span_id,
                             seq: row.get::<_, i64>(0)? as u32,
-                            data: row.get::<_, String>(1)?,
+                            data: super::payload::read_text(row, 1)?,
                         })
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -296,7 +333,7 @@ impl TraceStore for SqliteTraceStore {
                 .interact("trace.list_span_events_for_spans", move |conn| {
                     let placeholders = super::in_placeholders(keys.len());
                     let mut stmt = conn.prepare(&format!(
-                        "SELECT span_id, seq, data FROM span_events \
+                        "SELECT span_id, seq, data FROM span_events_read \
                          WHERE span_id IN ({placeholders}) ORDER BY span_id, seq"
                     ))?;
                     let raw = stmt
@@ -304,7 +341,7 @@ impl TraceStore for SqliteTraceStore {
                             Ok((
                                 row.get::<_, String>(0)?,
                                 row.get::<_, i64>(1)?,
-                                row.get::<_, String>(2)?,
+                                super::payload::read_text(row, 2)?,
                             ))
                         })?
                         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -404,6 +441,75 @@ mod tests {
         assert_eq!(loaded.id, s.id);
     }
 
+    #[tokio::test]
+    async fn trace_rows_are_compressed_on_write_and_keep_index_projections() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
+        let store = SqliteTraceStore::new(pool.clone());
+        let turn_id = TurnId::new();
+        let step_id = StepId::new();
+        let span_id = SpanId::new();
+        let step = StepRow {
+            id: step_id,
+            data: serde_json::json!({
+                "turn_id": turn_id,
+                "started_at": "2026-01-01T00:00:00Z",
+                "ended_at": null,
+                "padding": "step payload ".repeat(2_000),
+            })
+            .to_string(),
+        };
+        let span = SpanRow {
+            id: span_id,
+            data: serde_json::json!({
+                "step_id": step_id,
+                "started_at": "2026-01-01T00:00:00Z",
+                "ended_at": null,
+                "padding": "span payload ".repeat(2_000),
+            })
+            .to_string(),
+        };
+        let event = SpanEventRow {
+            span_id,
+            seq: 0,
+            data: serde_json::json!({ "padding": "event payload ".repeat(2_000) }).to_string(),
+        };
+        store.save_step(&step).await.unwrap();
+        store.save_span(&span).await.unwrap();
+        store.append_span_event(&event).await.unwrap();
+
+        assert_eq!(
+            store.load_step(&step_id).await.unwrap().unwrap().data,
+            step.data
+        );
+        assert_eq!(
+            store.load_span(&span_id).await.unwrap().unwrap().data,
+            span.data
+        );
+        assert_eq!(
+            store.list_span_events(&span_id).await.unwrap()[0].data,
+            event.data
+        );
+        let (backed, payloads, references): (i64, i64, i64) = pool
+            .interact("test.read_trace_payloads", move |conn| {
+                Ok(conn.query_row(
+                    "SELECT \
+                         (SELECT COUNT(*) FROM steps WHERE data_payload_hash IS NOT NULL) + \
+                         (SELECT COUNT(*) FROM spans WHERE data_payload_hash IS NOT NULL) + \
+                         (SELECT COUNT(*) FROM span_events WHERE data_payload_hash IS NOT NULL), \
+                         (SELECT COUNT(*) FROM content_payloads), \
+                         (SELECT COALESCE(SUM(ref_count), 0) FROM content_payloads)",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!((backed, payloads, references), (3, 3, 3));
+    }
+
     /// The row is keyed by the digest of its own body, so re-saving the
     /// same set has to be a no-op rather than an error or a rewrite — the
     /// agent calls this on every LLM call of every session.
@@ -413,11 +519,11 @@ mod tests {
         let pool = SqlitePool::open(tmpdir.path().join("test.db"))
             .await
             .unwrap();
-        let store = SqliteTraceStore::new(pool);
+        let store = SqliteTraceStore::new(pool.clone());
 
         let set = LlmToolSet::new(vec![LlmToolDefinition {
             name: "bash".into(),
-            description: "runs a command".into(),
+            description: "runs a command ".repeat(2_000),
             parameters_schema: serde_json::json!({ "type": "object" }),
         }]);
         let row = set.to_row().unwrap();
@@ -427,6 +533,21 @@ mod tests {
         let loaded = store.load_tool_set(&row.hash).await.unwrap().unwrap();
         assert_eq!(loaded.hash, row.hash);
         assert_eq!(LlmToolSet::from_row(loaded).unwrap(), set);
+        let (backed, payloads, references): (bool, i64, i64) = pool
+            .interact("test.read_tool_set_payload", |conn| {
+                Ok(conn.query_row(
+                    "SELECT data_payload_hash IS NOT NULL, \
+                            (SELECT COUNT(*) FROM content_payloads), \
+                            (SELECT COALESCE(SUM(ref_count), 0) FROM content_payloads) \
+                       FROM llm_tool_sets",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert!(backed);
+        assert_eq!((payloads, references), (1, 1));
     }
 
     /// An `LlmCall` span whose `tools` hash has no row must read back as a
@@ -461,6 +582,49 @@ mod tests {
 
         let spans = store.list_spans_by_step(&step.id).await.unwrap();
         assert_eq!(spans.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn updating_a_payload_backed_span_releases_the_previous_body() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
+        let store = SqliteTraceStore::new(pool.clone());
+        let mut span = make_llm_span(StepId::new());
+
+        let SpanKind::LlmCall { begin, .. } = &mut span.kind else {
+            panic!("fixture must be an LLM span");
+        };
+        begin.input_messages =
+            LlmCallInputs::Inline(vec![baybo_model::ChatMessage::agent_context(vec![
+                baybo_model::ContentBlock::Text("first payload ".repeat(2_000)),
+            ])]);
+        store.save_span(&span.to_row().unwrap()).await.unwrap();
+
+        let SpanKind::LlmCall { begin, .. } = &mut span.kind else {
+            panic!("fixture must be an LLM span");
+        };
+        begin.input_messages =
+            LlmCallInputs::Inline(vec![baybo_model::ChatMessage::agent_context(vec![
+                baybo_model::ContentBlock::Text("replacement payload ".repeat(2_000)),
+            ])]);
+        store.save_span(&span.to_row().unwrap()).await.unwrap();
+
+        let (payloads, references): (i64, i64) = pool
+            .interact("test.payload_refs", |conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*), COALESCE(SUM(ref_count), 0) FROM content_payloads",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!((payloads, references), (1, 1));
+
+        let loaded = Span::from_row(store.load_span(&span.id).await.unwrap().unwrap()).unwrap();
+        assert_eq!(loaded.kind, span.kind);
     }
 
     #[tokio::test]

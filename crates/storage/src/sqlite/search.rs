@@ -254,7 +254,7 @@ pub(crate) fn rebuild_if_stale(conn: &mut rusqlite::Connection) -> anyhow::Resul
     let mut indexed = 0usize;
     {
         let mut stmt = tx.prepare(
-            "SELECT session_id, ordinal, role, content, source FROM session_messages \
+            "SELECT session_id, ordinal, role, content, source FROM session_messages_read \
              ORDER BY session_id, ordinal",
         )?;
         let mut rows = stmt.query([])?;
@@ -263,7 +263,7 @@ pub(crate) fn rebuild_if_stale(conn: &mut rusqlite::Connection) -> anyhow::Resul
             let session_id: String = row.get(0)?;
             let ordinal: i64 = row.get(1)?;
             let role: String = row.get(2)?;
-            let content: String = row.get(3)?;
+            let content = super::payload::read_text(row, 3)?;
             let source: String = row.get(4)?;
             // A row this build cannot decode is skipped, not fatal: refusing to
             // open the store over one unreadable historical row would be a far
@@ -392,7 +392,7 @@ impl baybo_store::MessageSearchStore for SqliteMessageSearchStore {
                          ORDER BY score \
                          LIMIT ?7 \
                      ) f \
-                     JOIN session_messages m \
+                     JOIN session_messages_read m \
                        ON m.session_id = f.session_id AND m.ordinal = f.ordinal \
                       AND m.compaction_inserted = 0 \
                      ORDER BY f.score",
@@ -412,7 +412,7 @@ impl baybo_store::MessageSearchStore for SqliteMessageSearchStore {
                         row.get::<_, i64>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
+                        super::payload::read_text(row, 4)?,
                         row.get::<_, String>(5)?,
                         row.get::<_, String>(6)?,
                         row.get::<_, i64>(7)?,
@@ -611,6 +611,46 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn search_returns_payload_backed_message_content() {
+        let text = "compressed-search-needle ".repeat(200);
+        let expected = ChatMessage::user(vec![ContentBlock::Text(text)]);
+        let tmpdir = tempfile::tempdir().unwrap();
+        let path = tmpdir.path().join("test.db");
+        let pool = super::super::SqlitePool::open(&path).await.unwrap();
+        let sessions = super::super::SqliteSessionStore::new(pool.clone());
+        let sid = SessionId::from(TEST_SESSION);
+        sessions
+            .append_session_message(&sid, &expected)
+            .await
+            .unwrap();
+
+        let payload_hash: Option<String> = pool
+            .interact("test.read_payload_hash", |conn| {
+                Ok(conn.query_row(
+                    "SELECT content_payload_hash FROM session_messages \
+                     WHERE session_id = ?1 AND ordinal = 0",
+                    rusqlite::params![TEST_SESSION],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert!(
+            payload_hash.is_some(),
+            "large messages must be compressed on write"
+        );
+        let store = SqliteMessageSearchStore::new(pool);
+
+        let hits = store
+            .search_messages("compressed-search-needle", &SearchScope::default(), 10)
+            .await
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].message, expected);
     }
 
     /// Latin keeps word semantics, and the prefix is what reaches its suffixes.

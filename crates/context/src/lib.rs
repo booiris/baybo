@@ -297,6 +297,11 @@ pub struct ContextManager {
     shape: crate::prompts::soul::PromptShape,
     /// Owned conversation transcript — the sole source of truth.
     pub(crate) messages: Vec<ChatMessage>,
+    /// Whether the in-memory window intentionally differs from the durable
+    /// active rows (tool-pairing repair or a not-yet-persisted replacement).
+    /// Trace markers then carry an explicit ordinal subset/order even when the
+    /// two sides happen to have the same message count.
+    persisted_order_diverged: bool,
     /// Per-message token count, kept in lockstep with `messages`.
     /// Both vectors are mutated together on every append / insert /
     /// compression apply, so they cannot drift.
@@ -477,6 +482,26 @@ pub struct ContextManagerConfig {
     pub builtin_memory: bool,
 }
 
+fn explicit_message_ordinals(
+    messages: &[ChatMessage],
+    rows: &[baybo_session::ActiveMessageRow],
+) -> Option<Vec<i64>> {
+    if messages.is_empty() {
+        return rows.is_empty().then(Vec::new);
+    }
+    let mut used = vec![false; rows.len()];
+    let mut ordinals = Vec::with_capacity(messages.len());
+    for message in messages {
+        let index = rows
+            .iter()
+            .enumerate()
+            .position(|(index, row)| !used[index] && row.message == *message)?;
+        used[index] = true;
+        ordinals.push(rows[index].ordinal);
+    }
+    Some(ordinals)
+}
+
 impl ContextManager {
     pub fn from_config(config: ContextManagerConfig) -> Self {
         Self {
@@ -493,6 +518,7 @@ impl ContextManager {
             channel: config.channel,
             shape: config.shape,
             messages: Vec::new(),
+            persisted_order_diverged: false,
             per_message_tokens: Vec::new(),
             called_skills: Vec::new(),
             baseline: RwLock::new(None),
@@ -1362,6 +1388,7 @@ impl ContextManager {
         }
         self.per_message_tokens[0] = self.message_budget_tokens(&msg);
         self.messages[0] = msg;
+        self.persisted_order_diverged = true;
         // The cached baseline was anchored to the prior message[0]
         // token count; invalidate so the next `count_tokens` recomputes.
         self.invalidate_baseline();
@@ -1387,6 +1414,7 @@ impl ContextManager {
         self.per_message_tokens = per_message_tokens;
         self.called_skills = self.called_skills_in(&messages);
         self.messages = messages;
+        self.persisted_order_diverged = true;
         // These rows were written by another process — very possibly another
         // build, which is the whole reason a session's prompt goes stale. What
         // this actor knows about the version behind them is nothing.
@@ -1819,6 +1847,7 @@ impl ContextManager {
         }
 
         self.messages = new_messages;
+        self.persisted_order_diverged = true;
         self.per_message_tokens = new_per_message;
         // The transcript this version described is gone — including whatever
         // system-prompt updates the summary folded away. `reseed_system_row`
@@ -1871,17 +1900,21 @@ impl ContextManager {
     /// Failures are logged, not propagated: the in-memory window stays the
     /// source of truth for this actor's lifetime, and hydration re-reads the
     /// (un-compacted) persisted set on the next boot.
-    async fn persist_compaction(&self) {
-        if let Err(e) = self
+    async fn persist_compaction(&mut self) {
+        match self
             .sessions
             .apply_session_compaction(&self.session_id, &self.messages)
             .await
         {
-            warn!(
-                session_id = %self.session_id,
-                error = %e,
-                "failed to persist session compaction"
-            );
+            Ok(_) => self.persisted_order_diverged = false,
+            Err(e) => {
+                self.persisted_order_diverged = true;
+                warn!(
+                    session_id = %self.session_id,
+                    error = %e,
+                    "failed to persist session compaction"
+                );
+            }
         }
     }
 
@@ -1907,8 +1940,10 @@ impl ContextManager {
         // the next request, so normalize pairing before the window goes
         // live: synthetic fills are persisted (append-only) and the
         // repaired order is what the loop builds requests from.
-        match sessions.load_active_session_messages(&session_id).await {
-            Ok(messages) if !messages.is_empty() => {
+        match sessions.load_active_session_message_rows(&session_id).await {
+            Ok(rows) if !rows.is_empty() => {
+                let messages: Vec<ChatMessage> = rows.into_iter().map(|row| row.message).collect();
+                let original = messages.clone();
                 let transcript_repair::ToolPairingRepair {
                     messages: repaired,
                     fills,
@@ -1952,6 +1987,7 @@ impl ContextManager {
                     }
                 }
                 self.restore_messages(repaired);
+                self.persisted_order_diverged = self.messages != original;
             }
             Ok(_) => {}
             Err(e) => warn!(
@@ -1984,30 +2020,34 @@ impl ContextManager {
     /// non-persisted suffix rows. Falls back to inline when persisted state
     /// does not match memory.
     pub async fn input_marker_with_suffix(&self, suffix: Vec<ChatMessage>) -> LlmCallInputs {
-        // Emit a `Persisted` reference only when the anchor ordinal and the
-        // prefix count are both known AND the persisted active set mirrors the
-        // in-memory window (`count == messages.len()` — the same invariant
-        // `synced_last_ordinal` guards). The common divergence is not damage:
-        // `transcript_repair::quarantine_invalid_results` drops an orphan or
-        // duplicate `tool_result` row from the window on purpose and leaves its
-        // durable row in place, so a session carrying one reads short here at
-        // *every* hydration, not just once. Falling back to a self-contained
-        // inline copy is correct but not cheap — the whole transcript then
-        // rides in every `LlmCall` span, and it never reverts, because
-        // rehydration re-derives the same exclusion. Making the marker able to
-        // say which ordinals the window excluded is what would let these
-        // sessions keep the ordinal indirection; until then the cost is real
-        // and the fallback is deliberate, not a symptom. The tripwire can't
-        // catch an under-counted prefix either (the reconstructed count would
-        // match it), so any miss takes the same inline path.
+        // Healthy transcripts use the compact active-as-of marker. A repaired
+        // transcript may exclude or reposition durable tool-result rows; when
+        // that happens, map every in-memory message back to its row and persist
+        // the exact ordinal order. Only a genuinely unrepresentable in-memory
+        // mutation falls back to cloning the whole input inline.
         if let (Ok(Some(last_ordinal)), Ok(prefix_len)) = (
             self.sessions.latest_session_ordinal(&self.session_id).await,
             self.sessions.count_active_messages(&self.session_id).await,
         ) && prefix_len == self.messages.len()
+            && !self.persisted_order_diverged
         {
             LlmCallInputs::Persisted {
                 last_ordinal,
                 prefix_len,
+                ordinals: vec![],
+                suffix,
+            }
+        } else if let (Ok(Some(last_ordinal)), Ok(rows)) = (
+            self.sessions.latest_session_ordinal(&self.session_id).await,
+            self.sessions
+                .load_active_session_message_rows(&self.session_id)
+                .await,
+        ) && let Some(ordinals) = explicit_message_ordinals(&self.messages, &rows)
+        {
+            LlmCallInputs::Persisted {
+                last_ordinal,
+                prefix_len: ordinals.len(),
+                ordinals,
                 suffix,
             }
         } else {
@@ -2015,22 +2055,6 @@ impl ContextManager {
             messages.extend(suffix);
             LlmCallInputs::Inline(messages)
         }
-    }
-
-    /// Return the last ordinal and count only when memory matches the persisted
-    /// active set; callers otherwise embed the request inline.
-    async fn synced_last_ordinal(&self) -> Option<(i64, usize)> {
-        let last = self
-            .sessions
-            .latest_session_ordinal(&self.session_id)
-            .await
-            .ok()??;
-        let active_count = self
-            .sessions
-            .count_active_messages(&self.session_id)
-            .await
-            .ok()?;
-        (active_count == self.messages.len()).then_some((last, active_count))
     }
 
     /// Read-only access to the token budget.
@@ -3068,6 +3092,16 @@ mod tests {
             vec![user, orphan],
             "repair must not rewrite or delete user-facing transcript rows"
         );
+        assert_eq!(
+            restored.input_marker_with_suffix(Vec::new()).await,
+            LlmCallInputs::Persisted {
+                last_ordinal: 1,
+                prefix_len: 1,
+                ordinals: vec![0],
+                suffix: vec![],
+            },
+            "the trace must name the repaired window without embedding it inline"
+        );
     }
 
     #[tokio::test]
@@ -3170,10 +3204,12 @@ mod tests {
             LlmCallInputs::Persisted {
                 last_ordinal,
                 prefix_len,
+                ordinals,
                 suffix,
             } => {
                 assert_eq!(prefix_len, 2, "prefix_len must equal the active-set size");
                 assert_eq!(last_ordinal, 1, "MAX ordinal of two 0-based rows");
+                assert!(ordinals.is_empty());
                 assert!(suffix.is_empty());
             }
             other => panic!("expected Persisted, got {other:?}"),
@@ -3258,15 +3294,11 @@ mod tests {
         }
     }
 
-    /// A window/log divergence (a store row the window doesn't have, or vice
-    /// versa) means a `Persisted` marker would hydrate the wrong slice AND
-    /// slip past the `prefix_len` tripwire, so the marker must fall back to a
-    /// self-contained `Inline` copy of the whole window plus the suffix. Every
-    /// append persists in lockstep, so this is defense against a store error
-    /// that slipped through — simulated here by writing a row behind the
-    /// manager's back.
+    /// A durable row appended behind the manager's back is excluded by naming
+    /// the exact ordinals in the live window. This is the same representation
+    /// hydration repair uses for a quarantined orphan tool result.
     #[tokio::test]
-    async fn input_marker_falls_back_to_inline_on_window_log_divergence() {
+    async fn input_marker_projects_exact_window_on_representable_log_divergence() {
         let mut ctx = make_ctx(5, 100_000, 0.75);
         ctx.append(&make_msg(Role::System, "sys")).await.unwrap(); // persisted (active = 1)
         ctx.append(&make_msg(Role::User, "hi")).await.unwrap(); // persisted (active = 2)
@@ -3277,15 +3309,79 @@ mod tests {
 
         let suffix = vec![make_msg(Role::User, "observer prompt")];
         match ctx.input_marker_with_suffix(suffix).await {
-            LlmCallInputs::Inline(messages) => {
-                assert_eq!(
-                    messages.len(),
-                    3,
-                    "Inline must carry the full window (2) + suffix (1) verbatim"
-                );
+            LlmCallInputs::Persisted {
+                last_ordinal,
+                prefix_len,
+                ordinals,
+                suffix,
+            } => {
+                assert_eq!(last_ordinal, 2);
+                assert_eq!(prefix_len, 2);
+                assert_eq!(ordinals, vec![0, 1]);
+                assert_eq!(suffix.len(), 1);
             }
-            other => panic!("expected Inline fallback, got {other:?}"),
+            other => panic!("expected exact Persisted projection, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn input_marker_stays_inline_for_unpersisted_message_replacement() {
+        let mut ctx = make_ctx(5, 100_000, 0.75);
+        ctx.append(&make_msg(Role::System, "persisted system"))
+            .await
+            .unwrap();
+        ctx.replace_first_message(make_msg(Role::System, "memory-only replacement"));
+
+        assert!(matches!(
+            ctx.input_marker_with_suffix(Vec::new()).await,
+            LlmCallInputs::Inline(messages)
+                if messages == vec![make_msg(Role::System, "memory-only replacement")]
+        ));
+    }
+
+    #[tokio::test]
+    async fn compression_uses_exact_marker_for_repaired_window() {
+        let sessions = test_sessions();
+        sessions
+            .append_session_message(&test_session_id(), &make_msg(Role::User, "question"))
+            .await
+            .expect("persist user row");
+        sessions
+            .append_session_message(
+                &test_session_id(),
+                &ChatMessage::tool_result_with_meta(
+                    "call-orphan".into(),
+                    "orphan output".into(),
+                    None,
+                ),
+            )
+            .await
+            .expect("persist orphan row");
+
+        let mut restored = make_ctx_with_sessions(sessions, 0, 100_000, 0.75);
+        restored.restore_from_store().await;
+
+        let outcome = restored
+            .force_compress("test-model", Vec::new(), |_request, marker| async move {
+                let LlmCallInputs::Persisted {
+                    last_ordinal,
+                    prefix_len,
+                    ordinals,
+                    suffix,
+                } = marker
+                else {
+                    panic!("repaired compression input must stay ordinal-backed")
+                };
+                assert_eq!(last_ordinal, 1);
+                assert_eq!(prefix_len, 1);
+                assert_eq!(ordinals, vec![0]);
+                assert_eq!(suffix.len(), 1);
+                Err(ContextError::Compression("stop after marker".into()))
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, CompressionOutcome::Failed { .. }));
     }
 
     /// The threshold gate fires — and when the summariser behind it is

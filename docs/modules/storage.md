@@ -68,7 +68,7 @@ Owning those lines is also what keeps the `rusqlite` version free to move: a poo
 Every `*Store` trait contract lives in `baybo-store`; `baybo-storage` only *implements* them. Most traits trade in plain value types (`baybo-model` domain types, or row/DTO types defined alongside the trait in `baybo-store`). Two of them — `TurnStore` and `TraceStore` — trade in **row DTOs** (`TurnRow`, `StepRow` / `SpanRow` / `SpanEventRow`: a queryable key plus the serialized entity in a `data` column) so the trait can sit in the leaf ports crate while the rich `Turn` / `Step` / `Span` types — which carry the state-machine and recorder logic — stay in `baybo-turn` / `baybo-trace`. Those two crates own the `to_row` / `from_row` conversions and convert at the call boundary. `TraceStore::list_unfinished_steps` is the recovery-oriented indexed query: it returns steps that are themselves open or have an open child span, including detached steps under terminal turns. Both traits also expose aggregate queries that answer list-surface questions without shipping `data` blobs: `TraceStore::trace_counts_by_turn` (a turn's step/span counts) and `TurnStore::session_turn_stats` (per-session turn count + latest turn's `status_kind`, one grouped query).
 
 ```
-sqlite/session.rs         → impl SessionStore                         (trait + StoredMessage from baybo-store)
+sqlite/session.rs         → impl SessionStore                         (trait + ActiveMessageRow / StoredMessage from baybo-store)
 sqlite/search.rs          → impl MessageSearchStore                   (trait + SearchHit / SearchScope from baybo-store; also owns the message_fts DDL)
 sqlite/trace.rs           → impl TraceStore                           (trait from baybo-store; rows ↔ Step/Span/SpanEvent via baybo-trace)
 sqlite/secret.rs          → impl SecretStore                          (trait from baybo-store; one secrets table shared by minted placeholders, mcp.* creds, and user_env.* user secrets)
@@ -90,9 +90,9 @@ sqlite/deck.rs            → impl DeckCardStore                        (trait +
 
 Each file above holds its store's queries, but the table DDL is not colocated: every `CREATE TABLE` lives in `sqlite/mod.rs`'s schema initialization — the single place to read the full set of persisted tables or add a new one. One table is deliberately outside it: the FTS5 index `message_fts` is owned by `sqlite/search.rs`, which drops and recreates it from `search::rebuild_if_stale` whenever the segmenter fingerprint changes, because `CREATE ... IF NOT EXISTS` cannot migrate a column onto a table that already exists. It is therefore the one table whose DDL is not `IF NOT EXISTS` and not in `mod.rs`; only its fingerprint row's table, `search_meta`, is (see [`search.md`](../search.md)).
 
-`Session`, `User`, `ChannelType`, and `SessionState` live in `baybo-model` so that both `baybo-session` (the `SessionManager` facade) and `baybo-storage` (sqlite impl) can type against them without either crate dragging the other along. The `SessionStore` trait and its `StoredMessage` row type live in `baybo-store`; `baybo-storage` implements it and `baybo-session` calls it.
+`Session`, `User`, `ChannelType`, and `SessionState` live in `baybo-model` so that both `baybo-session` (the `SessionManager` facade) and `baybo-storage` (sqlite impl) can type against them without either crate dragging the other along. The `SessionStore` trait and its row types live in `baybo-store`; current active rows use the narrow `ActiveMessageRow { ordinal, message }`, while historical trace reads use `StoredMessage` with supersede and timestamp metadata. `baybo-storage` implements the trait and `baybo-session` calls it.
 
-The conversation transcript itself is **not** stored on `Session` — it's owned by `baybo_context::ContextManager` while the actor is alive and persisted via the per-message `SessionStore` log: `append_session_message` for ordinary turns, `append_session_message_idempotent` for replayable source events, `apply_session_compaction` for `/compact`, and `load_active_session_messages` for cold-start hydration. Rows live in the `session_messages` table (append-only, with a `superseded_by` marker for compactions).
+The conversation transcript itself is **not** stored on `Session` — it's owned by `baybo_context::ContextManager` while the actor is alive and persisted via the per-message `SessionStore` log: `append_session_message` for ordinary turns, `append_session_message_idempotent` for replayable source events, `apply_session_compaction` for `/compact`, and `load_active_session_message_rows` for cold-start hydration. Rows live in the `session_messages` table (append-only, with a `superseded_by` marker for compactions). Large serialized contents may live behind the lossless payload indirection described below; that changes physical representation, never the row's logical transcript value.
 
 Read/unread state is **server-side at session granularity**: a `read_cursor` flat column on `sessions` holds the highest `session_messages.ordinal` a viewer has read. It is advanced max-wins (a lower ordinal is a no-op) by `PUT /v1/chat/sessions/:id/read` via `SessionStore::set_read_cursor` — the same targeted-UPDATE anti-clobber discipline as `hidden` / `last_llm` — and the chat list endpoint derives each row's `unread_count` from it. The web sidebar seeds its badge from that server-computed `unread_count` and bumps it live on `Frame::SessionActivity` pulses (see [channels.md](channels.md)). Cron fires need nothing extra: a recurring fire's conversation and a one-shot's notification are both ordinary rows in an ordinary session, so they accrue unread counts like any other reply.
 
@@ -152,7 +152,8 @@ ordinal.
 
 - **Active set** — rows where `superseded_by IS NULL`, ordered by `ordinal`:
   the live LLM context (machinery included). Served by
-  `load_active_session_messages`; a partial index
+  `load_active_session_message_rows`, with `load_active_session_messages` as its
+  value-only projection; a partial index
   `idx_session_messages_active` on `(session_id, ordinal) WHERE superseded_by IS
   NULL` makes it a back-of-index walk, never a full scan. **The context reads
   never filter `compaction_inserted`** — the re-injected turns ARE what the model
@@ -183,14 +184,17 @@ A row superseded by a *later* compaction (`superseded_by > N`) was still part of
 the snapshot at `N`; a row superseded at or before `N` was not. This filter is
 what makes the ordinal references above replay-stable across compaction.
 
-**One implementation of that filter.** The write side takes no ordinal-bounded
-snapshot at all: `ContextManager::input_marker_with_suffix` anchors a reference
-on `latest_session_ordinal` + `count_active_messages` and emits `Persisted` only
-while the persisted active count still mirrors the in-memory window, falling
-back to a self-contained inline copy when it does not. So only the read-side
-reconstruction — trace hydration over `load_session_messages_with_supersede`,
-which loads every row plus its marker — applies the `superseded_by > N` form
-above, and there is no second filter to keep in lockstep. Three anchoring
+**One implementation of that filter.** The common write path takes no
+ordinal-bounded snapshot at all: `ContextManager::input_marker_with_suffix`
+anchors on `latest_session_ordinal` + `count_active_messages`. When the durable
+active set mirrors memory it stores only that head and count. When hydration
+repair has quarantined or repositioned a durable tool-result row, it loads the
+current active rows and stores the exact in-memory ordinal subset/order instead;
+only a message that cannot be mapped to any durable row forces a self-contained
+inline copy. The read-side reconstruction over
+`load_session_messages_with_supersede` applies the `superseded_by > N` form
+above, validates any explicit ordinal projection against that candidate set,
+and then emits it in the recorded order. Three anchoring
 helpers — `latest_session_ordinal`, `count_active_messages`,
 `active_index_of_ordinal` — exist to anchor and validate those references; the
 sync/backfill read surface (`load_active_session_messages_tail` / `_since`,
@@ -292,6 +296,35 @@ grant revocation that commits before the execution exists therefore invalidates
 the stale snapshot; a later tick retries from the current row. No migration column is
 needed because both records already use their versioned JSON blobs.
 
+### Large JSON payloads use online zstd storage
+
+Every owner write evaluates its serialized value immediately. Values smaller
+than 1 KiB stay inline. For a larger value, zstd level 3 is used only when the
+compressed bytes are smaller; the canonical bytes are inserted once into
+`content_payloads`, keyed by `sha256:<digest>`, while the owner stores the hash
+and a tiny valid-JSON projection. Exact repeats deduplicate, while unique tool
+text still benefits from compression. The payload and owner writes share one
+SQLite transaction, so neither side can become durable without the other.
+
+This covers `session_messages.content`, `turns.data`, `steps.data`, `spans.data`,
+`span_events.data`, and `llm_tool_sets.data`. There is no age cutoff or tier
+transition: new large values use this representation from their first write.
+
+The projection is `[]`/`{}` unless SQLite needs fields for generated columns;
+step/span rows retain `turn_id`/`step_id` and lifecycle timestamps. Rust reads
+always use the corresponding `*_read` view: it returns inline TEXT or
+the referenced zstd BLOB, and `payload::read_text` restores the original bytes
+before serde sees them. Message search keeps indexing prose at append time and
+also reads result rows through `session_messages_read`, so payload backing does
+not change recall or returned content.
+
+Owner-table triggers maintain `content_payloads.ref_count` in the same
+transaction as every insert/update/delete. Updating a payload-backed mutable
+turn, step, span, or event atomically swaps its reference and releases the
+previous body immediately. The payload row is representation data, not
+user-facing history: deleting it at reference count zero does not delete a
+session, message, turn, step, or span.
+
 ### Renaming a persisted name
 
 `init_db` runs on every open and is the only migration runner: additive
@@ -378,7 +411,7 @@ CREATE TRIGGER IF NOT EXISTS agent_profiles_team_is_insert_only
     BEGIN SELECT RAISE(ABORT, '…'); END;
 ```
 
-The only trigger in the schema, and it earns that by guarding the one column a *human* typed into prose that is already stored: `@dev-1` in a comment resolves through this row and nothing else. It fires on the value, not on the column being mentioned, so a write-back of the same membership passes and `remove_from_team`'s `deleted_at` stamp never touches it. It lives with the post-migration indexes rather than the `CREATE TABLE` batch, for the same reason they do — on a pre-team DB the columns do not exist until the `ALTER` loop runs.
+This policy trigger earns its place by guarding the one column a *human* typed into prose that is already stored: `@dev-1` in a comment resolves through this row and nothing else. (The other schema triggers are mechanical `content_payloads.ref_count` maintenance.) It fires on the value, not on the column being mentioned, so a write-back of the same membership passes and `remove_from_team`'s `deleted_at` stamp never touches it. It lives with the post-migration indexes rather than the `CREATE TABLE` batch, for the same reason they do — on a pre-team DB the columns do not exist until the `ALTER` loop runs.
 
 It is also half of an invariant that SQL alone cannot hold. The display name the handle was derived from is frozen in the same way and for the same reason, but it is a line in the agent's own `IDENTITY.md` — there is no name column here to constrain, deliberately (see [`agent-profiles.md`](agent-profiles.md)). That half is enforced inside the one writer of that file in each crate that has one; this is the half a trigger can keep.
 

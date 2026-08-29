@@ -7,6 +7,7 @@ mod cost;
 mod cron;
 mod deck;
 mod device;
+mod payload;
 mod project;
 mod search;
 mod secret;
@@ -1101,6 +1102,10 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     -- `_up_to`) and trace reads MUST ignore this column: the
                     -- machinery rows ARE the model's context.
                     compaction_inserted INTEGER NOT NULL DEFAULT 0,
+                    -- Large content arrays live in `content_payloads`; this
+                    -- row keeps `[]` so generated/inspection paths still see
+                    -- valid JSON. NULL means `content` itself is authoritative.
+                    content_payload_hash TEXT,
                     PRIMARY KEY (session_id, ordinal)
                 );
                 CREATE INDEX IF NOT EXISTS idx_session_messages_active
@@ -1221,6 +1226,20 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                 CREATE INDEX IF NOT EXISTS idx_cost_session ON cost_records(session_id);
                 CREATE INDEX IF NOT EXISTS idx_cost_turn ON cost_records(turn_id);
 
+                -- Shared immutable zstd payloads. Compressible JSON bodies of
+                -- at least 1 KiB point here by SHA-256 from their first write;
+                -- small or incompressible rows stay inline.
+                -- The owning row keeps a tiny valid-JSON projection so its
+                -- generated/index columns continue to work without teaching
+                -- SQLite how to decompress zstd.
+                CREATE TABLE IF NOT EXISTS content_payloads (
+                    hash          TEXT PRIMARY KEY,
+                    codec         TEXT NOT NULL CHECK (codec = 'zstd'),
+                    original_size INTEGER NOT NULL,
+                    data          BLOB NOT NULL,
+                    ref_count     INTEGER NOT NULL DEFAULT 0 CHECK (ref_count >= 0)
+                );
+
                 CREATE TABLE IF NOT EXISTS turns (
                     id                       TEXT PRIMARY KEY,
                     session_id               TEXT NOT NULL,
@@ -1230,7 +1249,8 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     created_at               INTEGER NOT NULL,
                     started_at               INTEGER,
                     ended_at                 INTEGER,
-                    data                     TEXT NOT NULL
+                    data                     TEXT NOT NULL,
+                    data_payload_hash        TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_turns_session
                     ON turns(session_id, created_at);
@@ -1248,16 +1268,15 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                 -- audit — the writer is gone, existing rows stay inert
                 -- (no data migration), and fresh DBs no longer create it.
 
-                -- Trace tables: a single canonical JSON `data` blob per
-                -- row plus VIRTUAL generated columns extracted by
-                -- `json_extract` for the indexed lookups. SQLite keeps
-                -- the virtual columns in lockstep with `data`, so there
-                -- is no two-side write contract for the storage layer
-                -- to enforce — adding a new field is a serde change in
-                -- `baybo-trace`, no schema migration.
+                -- Trace tables: one logical canonical JSON value per row.
+                -- Large values are payload-backed while `data` retains the
+                -- fields VIRTUAL generated columns need for indexed lookups.
+                -- Adding a non-indexed field remains a serde-only change in
+                -- `baybo-trace`.
                 CREATE TABLE IF NOT EXISTS steps (
                     id         TEXT PRIMARY KEY,
                     data       TEXT NOT NULL,
+                    data_payload_hash TEXT,
                     turn_id    TEXT GENERATED ALWAYS AS (json_extract(data, '$.turn_id')) VIRTUAL,
                     started_at TEXT GENERATED ALWAYS AS (json_extract(data, '$.started_at')) VIRTUAL,
                     ended_at   TEXT GENERATED ALWAYS AS (json_extract(data, '$.ended_at')) VIRTUAL
@@ -1273,6 +1292,7 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                 CREATE TABLE IF NOT EXISTS spans (
                     id         TEXT PRIMARY KEY,
                     data       TEXT NOT NULL,
+                    data_payload_hash TEXT,
                     step_id    TEXT GENERATED ALWAYS AS (json_extract(data, '$.step_id')) VIRTUAL,
                     started_at TEXT GENERATED ALWAYS AS (json_extract(data, '$.started_at')) VIRTUAL,
                     ended_at   TEXT GENERATED ALWAYS AS (json_extract(data, '$.ended_at')) VIRTUAL
@@ -1291,6 +1311,7 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     span_id         TEXT    NOT NULL,
                     seq             INTEGER NOT NULL,
                     data            TEXT    NOT NULL,
+                    data_payload_hash TEXT,
                     PRIMARY KEY (span_id, seq)
                 );
 
@@ -1302,7 +1323,8 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                 -- IGNORE and rows are immutable.
                 CREATE TABLE IF NOT EXISTS llm_tool_sets (
                     hash            TEXT    PRIMARY KEY,
-                    data            TEXT    NOT NULL
+                    data            TEXT    NOT NULL,
+                    data_payload_hash TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS cron_jobs (
@@ -1758,14 +1780,70 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
     for migration in ADD_COLUMNS {
         migration.apply(conn)?;
     }
+    payload::install_refcount_triggers(conn)?;
 
-    // Indexes and triggers on migration-added columns. Created AFTER the
-    // ALTER loop, not in the schema batch above: on a legacy DB the column
-    // doesn't exist until the ALTER runs, so a batch-time statement
-    // referencing it would fail. `IF NOT EXISTS` keeps them idempotent on
-    // every subsequent boot.
+    // Read views, indexes, and triggers that reference migration-added columns
+    // are created after the ALTER loop. `IF NOT EXISTS` keeps subsequent boots
+    // read-only with respect to existing view definitions.
     conn.execute_batch(
-        "CREATE INDEX IF NOT EXISTS idx_sessions_folder
+        "CREATE VIEW IF NOT EXISTS session_messages_read AS
+         SELECT sm.session_id,
+                sm.ordinal,
+                sm.role,
+                CASE WHEN sm.content_payload_hash IS NULL
+                     THEN sm.content ELSE cp.data END AS content,
+                sm.created_at,
+                sm.superseded_by,
+                sm.source,
+                sm.platform_msg_id,
+                sm.source_event_id,
+                sm.compaction_inserted,
+                sm.content_payload_hash
+           FROM session_messages sm
+           LEFT JOIN content_payloads cp ON cp.hash = sm.content_payload_hash;
+
+         CREATE VIEW IF NOT EXISTS turns_read AS
+         SELECT t.id, t.session_id, t.parent_turn_id, t.kind, t.status_kind,
+                t.created_at, t.started_at, t.ended_at,
+                CASE WHEN t.data_payload_hash IS NULL
+                     THEN t.data ELSE cp.data END AS data,
+                t.data_payload_hash
+           FROM turns t
+           LEFT JOIN content_payloads cp ON cp.hash = t.data_payload_hash;
+
+         CREATE VIEW IF NOT EXISTS steps_read AS
+         SELECT s.id,
+                CASE WHEN s.data_payload_hash IS NULL
+                     THEN s.data ELSE cp.data END AS data,
+                s.turn_id, s.started_at, s.ended_at, s.data_payload_hash
+           FROM steps s
+           LEFT JOIN content_payloads cp ON cp.hash = s.data_payload_hash;
+
+         CREATE VIEW IF NOT EXISTS spans_read AS
+         SELECT s.id,
+                CASE WHEN s.data_payload_hash IS NULL
+                     THEN s.data ELSE cp.data END AS data,
+                s.step_id, s.started_at, s.ended_at, s.data_payload_hash
+           FROM spans s
+           LEFT JOIN content_payloads cp ON cp.hash = s.data_payload_hash;
+
+         CREATE VIEW IF NOT EXISTS span_events_read AS
+         SELECT e.span_id, e.seq,
+                CASE WHEN e.data_payload_hash IS NULL
+                     THEN e.data ELSE cp.data END AS data,
+                e.data_payload_hash
+           FROM span_events e
+           LEFT JOIN content_payloads cp ON cp.hash = e.data_payload_hash;
+
+         CREATE VIEW IF NOT EXISTS llm_tool_sets_read AS
+         SELECT s.hash,
+                CASE WHEN s.data_payload_hash IS NULL
+                     THEN s.data ELSE cp.data END AS data,
+                s.data_payload_hash
+           FROM llm_tool_sets s
+           LEFT JOIN content_payloads cp ON cp.hash = s.data_payload_hash;
+
+         CREATE INDEX IF NOT EXISTS idx_sessions_folder
              ON sessions(folder_id) WHERE folder_id IS NOT NULL;
          -- Serves the boot re-drive's 'completed but not yet delivered' scan.
          CREATE INDEX IF NOT EXISTS idx_cron_executions_awaiting_delivery

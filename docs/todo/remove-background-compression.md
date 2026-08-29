@@ -190,7 +190,8 @@ for the background tool loop).
 **Survives despite appearances:** `pair_preserving_cut` (the truncate fallback's only guard against
 splitting a `tool_use`/`tool_result` pair — a provider 400 on the failure path of the failure path),
 `partition_system`, `parse_summary_response`, `insert_skill_trailer`, `scan_skill_calls` (also used by
-`crates/cli/src/commands/session.rs`), `synced_last_ordinal`, `ContextManagerConfig.workspace`.
+`crates/cli/src/commands/session.rs`), `ContextManager::input_marker_with_suffix`,
+`ContextManagerConfig.workspace`.
 
 **C5 — session → store → storage, one commit** (the `SessionManager::new` arity change ripples to 24
 call sites). Delete the `summary_store` field + param, the five summary methods,

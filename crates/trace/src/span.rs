@@ -214,6 +214,14 @@ pub enum LlmCallInputs {
         /// when the count is known, so every reference is validated.
         /// See `docs/modules/trace.md`.
         prefix_len: usize,
+        /// Exact ordinal order for a repaired transcript window. Empty means
+        /// the ordinary active-as-of slice above. A non-empty list lets the
+        /// writer omit quarantined orphan/duplicate results and reposition a
+        /// valid result beside its `ToolUse` without cloning every message
+        /// into the span. Hydration verifies that every ordinal belongs to the
+        /// active-as-of set, then emits rows in this order.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        ordinals: Vec<i64>,
         /// Framing messages appended after the persisted active set
         /// that are NOT themselves rows in `session_messages` — the
         /// compression `SUMMARIZE_INSTRUCTION`, the progress-observer
@@ -628,12 +636,17 @@ mod tests {
         let persisted = LlmCallInputs::Persisted {
             last_ordinal: 7,
             prefix_len: 3,
+            ordinals: vec![],
             suffix: vec![],
         };
         let json = serde_json::to_value(&persisted).unwrap();
         assert!(json.is_object(), "Persisted must serialize as an object");
         assert_eq!(json["last_ordinal"], 7);
         assert_eq!(json["prefix_len"], 3);
+        assert!(
+            json.get("ordinals").is_none(),
+            "healthy transcript markers must not pay for an empty projection"
+        );
         assert!(
             json.get("suffix").is_none(),
             "an empty suffix must be skipped so main-agent spans stay wire-compact"
@@ -649,26 +662,32 @@ mod tests {
                 .unwrap();
         assert!(matches!(
             v2,
-            LlmCallInputs::Persisted { last_ordinal: 1, prefix_len: 2, ref suffix }
-                if suffix.is_empty()
+            LlmCallInputs::Persisted {
+                last_ordinal: 1,
+                prefix_len: 2,
+                ref ordinals,
+                ref suffix,
+            } if ordinals.is_empty() && suffix.is_empty()
         ));
     }
 
-    /// A `Persisted` with a non-empty `suffix` survives a serde round-trip
-    /// and stays distinguishable from the bare-array `Inline` shape.
+    /// A repaired ordinal projection and non-empty suffix survive a serde
+    /// round-trip and stay distinguishable from bare-array `Inline`.
     #[test]
-    fn persisted_suffix_round_trips() {
+    fn persisted_projection_and_suffix_round_trip() {
         let suffix = vec![baybo_model::ChatMessage::agent_context(vec![
             baybo_model::ContentBlock::Text("SUMMARIZE NOW".into()),
         ])];
         let persisted = LlmCallInputs::Persisted {
             last_ordinal: 42,
-            prefix_len: 5,
+            prefix_len: 2,
+            ordinals: vec![7, 3],
             suffix: suffix.clone(),
         };
         let json = serde_json::to_value(&persisted).unwrap();
         assert!(json.is_object());
         assert_eq!(json["last_ordinal"], 42);
+        assert_eq!(json["ordinals"], serde_json::json!([7, 3]));
         assert!(json["suffix"].is_array());
 
         let back: LlmCallInputs = serde_json::from_value(json).unwrap();
@@ -676,7 +695,8 @@ mod tests {
             back,
             LlmCallInputs::Persisted {
                 last_ordinal: 42,
-                prefix_len: 5,
+                prefix_len: 2,
+                ordinals: vec![7, 3],
                 suffix,
             }
         );
