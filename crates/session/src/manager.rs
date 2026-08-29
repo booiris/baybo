@@ -10,8 +10,8 @@ use chrono::{DateTime, Duration, Utc};
 use tracing::{debug, warn};
 
 use crate::SessionError;
+use baybo_store::{ActiveMessageRow, SessionMessageAppendOutcome, SessionStore, StoredMessage};
 use baybo_store::{SessionFolderRow, SessionFolderStore};
-use baybo_store::{SessionMessageAppendOutcome, SessionStore, StoredMessage};
 
 type Result<T> = std::result::Result<T, SessionError>;
 
@@ -699,15 +699,25 @@ impl SessionManager {
             .map_err(SessionError::from)
     }
 
-    /// Load the active transcript for `session_id` — used by the
-    /// router to seed `ContextManager` on actor cold start. Returns
-    /// an empty vector when no turns have been recorded yet.
+    /// Load only the active transcript values, without durable row identity.
     pub async fn load_active_session_messages(
         &self,
         session_id: &SessionId,
     ) -> Result<Vec<ChatMessage>> {
         self.store
             .load_active_session_messages(session_id)
+            .await
+            .map_err(SessionError::from)
+    }
+
+    /// Load the active transcript with the durable ordinal for each message.
+    /// Context hydration uses this form to preserve repaired subset/order.
+    pub async fn load_active_session_message_rows(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<ActiveMessageRow>> {
+        self.store
+            .load_active_session_message_rows(session_id)
             .await
             .map_err(SessionError::from)
     }

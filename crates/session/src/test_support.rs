@@ -424,23 +424,6 @@ impl SessionStore for MemorySessionStore {
         Ok(next_ordinal as i64)
     }
 
-    async fn load_active_session_messages(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<Vec<ChatMessage>> {
-        Ok(self
-            .transcripts
-            .lock()
-            .get(session_id)
-            .map(|log| {
-                let mut active: Vec<&StoredMessageRow> =
-                    log.iter().filter(|m| m.superseded_by.is_none()).collect();
-                active.sort_by_key(|m| m.ordinal);
-                active.into_iter().map(|m| m.message.clone()).collect()
-            })
-            .unwrap_or_default())
-    }
-
     async fn latest_session_ordinal(&self, session_id: &SessionId) -> Result<Option<i64>> {
         Ok(self
             .transcripts

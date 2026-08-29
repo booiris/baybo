@@ -146,6 +146,8 @@ export interface ToolCallOrigin {
  * inline array variant matches the long-standing wire shape; the
  * `{ last_ordinal }` object variant is what the per-turn trace endpoint
  * returns for spans whose transcript prefix lives in `session_messages`.
+ * `ordinals` is an exact subset/order for a repaired transcript whose
+ * quarantined or repositioned tool results differ from raw ordinal order.
  * `suffix` (compression / progress-observer spans) carries the framing
  * messages appended after that prefix which are *not* themselves rows in
  * the log; it is absent for main-agent spans. `prefix_len` is a tripwire:
@@ -156,7 +158,12 @@ export interface ToolCallOrigin {
  */
 export type LlmCallInputs =
   | ChatMessage[]
-  | { last_ordinal: number; prefix_len: number; suffix?: ChatMessage[] };
+  | {
+      last_ordinal: number;
+      prefix_len: number;
+      ordinals?: number[];
+      suffix?: ChatMessage[];
+    };
 
 export interface LlmCallBegin {
   model_id: string;
@@ -544,6 +551,7 @@ export function hydratePersistedInput(
   lastOrdinal: number,
   spanStartedAt: string,
   prefixLen: number,
+  ordinals: number[] = [],
   suffix: ChatMessage[] = [],
 ): ChatMessage[] {
   const candidates = log.filter(
@@ -555,8 +563,19 @@ export function hydratePersistedInput(
   if (candidates.some((m) => new Date(m.created_at).getTime() > spanStart)) {
     return [];
   }
-  const prefix = candidates.map((c) => c.message);
-  if (prefix.length !== prefixLen) {
+  const byOrdinal = new Map(candidates.map((row) => [row.ordinal, row]));
+  const uniqueOrdinals = new Set(ordinals);
+  const projectionMismatch =
+    uniqueOrdinals.size !== ordinals.length ||
+    ordinals.some((ordinal) => !byOrdinal.has(ordinal));
+  const prefix =
+    ordinals.length === 0
+      ? candidates.map((c) => c.message)
+      : ordinals.flatMap((ordinal) => {
+          const row = byOrdinal.get(ordinal);
+          return row ? [row.message] : [];
+        });
+  if (prefix.length !== prefixLen || projectionMismatch) {
     return [
       reconstructionWarning(prefixLen, prefix.length),
       ...prefix,
@@ -607,6 +626,7 @@ export function resolveInputMessages(
     input.last_ordinal,
     spanStartedAt,
     input.prefix_len,
+    input.ordinals ?? [],
     input.suffix ?? [],
   );
 }

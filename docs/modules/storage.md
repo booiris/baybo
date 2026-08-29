@@ -68,7 +68,7 @@ Owning those lines is also what keeps the `rusqlite` version free to move: a poo
 Every `*Store` trait contract lives in `baybo-store`; `baybo-storage` only *implements* them. Most traits trade in plain value types (`baybo-model` domain types, or row/DTO types defined alongside the trait in `baybo-store`). Two of them — `TurnStore` and `TraceStore` — trade in **row DTOs** (`TurnRow`, `StepRow` / `SpanRow` / `SpanEventRow`: a queryable key plus the serialized entity in a `data` column) so the trait can sit in the leaf ports crate while the rich `Turn` / `Step` / `Span` types — which carry the state-machine and recorder logic — stay in `baybo-turn` / `baybo-trace`. Those two crates own the `to_row` / `from_row` conversions and convert at the call boundary. `TraceStore::list_unfinished_steps` is the recovery-oriented indexed query: it returns steps that are themselves open or have an open child span, including detached steps under terminal turns. Both traits also expose aggregate queries that answer list-surface questions without shipping `data` blobs: `TraceStore::trace_counts_by_turn` (a turn's step/span counts) and `TurnStore::session_turn_stats` (per-session turn count + latest turn's `status_kind`, one grouped query).
 
 ```
-sqlite/session.rs         → impl SessionStore                         (trait + StoredMessage from baybo-store)
+sqlite/session.rs         → impl SessionStore                         (trait + ActiveMessageRow / StoredMessage from baybo-store)
 sqlite/search.rs          → impl MessageSearchStore                   (trait + SearchHit / SearchScope from baybo-store; also owns the message_fts DDL)
 sqlite/trace.rs           → impl TraceStore                           (trait from baybo-store; rows ↔ Step/Span/SpanEvent via baybo-trace)
 sqlite/secret.rs          → impl SecretStore                          (trait from baybo-store; one secrets table shared by minted placeholders, mcp.* creds, and user_env.* user secrets)
@@ -90,9 +90,9 @@ sqlite/deck.rs            → impl DeckCardStore                        (trait +
 
 Each file above holds its store's queries, but the table DDL is not colocated: every `CREATE TABLE` lives in `sqlite/mod.rs`'s schema initialization — the single place to read the full set of persisted tables or add a new one. One table is deliberately outside it: the FTS5 index `message_fts` is owned by `sqlite/search.rs`, which drops and recreates it from `search::rebuild_if_stale` whenever the segmenter fingerprint changes, because `CREATE ... IF NOT EXISTS` cannot migrate a column onto a table that already exists. It is therefore the one table whose DDL is not `IF NOT EXISTS` and not in `mod.rs`; only its fingerprint row's table, `search_meta`, is (see [`search.md`](../search.md)).
 
-`Session`, `User`, `ChannelType`, and `SessionState` live in `baybo-model` so that both `baybo-session` (the `SessionManager` facade) and `baybo-storage` (sqlite impl) can type against them without either crate dragging the other along. The `SessionStore` trait and its `StoredMessage` row type live in `baybo-store`; `baybo-storage` implements it and `baybo-session` calls it.
+`Session`, `User`, `ChannelType`, and `SessionState` live in `baybo-model` so that both `baybo-session` (the `SessionManager` facade) and `baybo-storage` (sqlite impl) can type against them without either crate dragging the other along. The `SessionStore` trait and its row types live in `baybo-store`; current active rows use the narrow `ActiveMessageRow { ordinal, message }`, while historical trace reads use `StoredMessage` with supersede and timestamp metadata. `baybo-storage` implements it and `baybo-session` calls it.
 
-The conversation transcript itself is **not** stored on `Session` — it's owned by `baybo_context::ContextManager` while the actor is alive and persisted via the per-message `SessionStore` log: `append_session_message` for ordinary turns, `append_session_message_idempotent` for replayable source events, `apply_session_compaction` for `/compact`, and `load_active_session_messages` for cold-start hydration. Rows live in the `session_messages` table (append-only, with a `superseded_by` marker for compactions).
+The conversation transcript itself is **not** stored on `Session` — it's owned by `baybo_context::ContextManager` while the actor is alive and persisted via the per-message `SessionStore` log: `append_session_message` for ordinary turns, `append_session_message_idempotent` for replayable source events, `apply_session_compaction` for `/compact`, and `load_active_session_message_rows` for cold-start hydration. Rows live in the `session_messages` table (append-only, with a `superseded_by` marker for compactions).
 
 Read/unread state is **server-side at session granularity**: a `read_cursor` flat column on `sessions` holds the highest `session_messages.ordinal` a viewer has read. It is advanced max-wins (a lower ordinal is a no-op) by `PUT /v1/chat/sessions/:id/read` via `SessionStore::set_read_cursor` — the same targeted-UPDATE anti-clobber discipline as `hidden` / `last_llm` — and the chat list endpoint derives each row's `unread_count` from it. The web sidebar seeds its badge from that server-computed `unread_count` and bumps it live on `Frame::SessionActivity` pulses (see [channels.md](channels.md)). Cron fires need nothing extra: a recurring fire's conversation and a one-shot's notification are both ordinary rows in an ordinary session, so they accrue unread counts like any other reply.
 
@@ -152,7 +152,8 @@ ordinal.
 
 - **Active set** — rows where `superseded_by IS NULL`, ordered by `ordinal`:
   the live LLM context (machinery included). Served by
-  `load_active_session_messages`; a partial index
+  `load_active_session_message_rows`, with `load_active_session_messages` as its
+  value-only projection; a partial index
   `idx_session_messages_active` on `(session_id, ordinal) WHERE superseded_by IS
   NULL` makes it a back-of-index walk, never a full scan. **The context reads
   never filter `compaction_inserted`** — the re-injected turns ARE what the model
@@ -183,14 +184,17 @@ A row superseded by a *later* compaction (`superseded_by > N`) was still part of
 the snapshot at `N`; a row superseded at or before `N` was not. This filter is
 what makes the ordinal references above replay-stable across compaction.
 
-**One implementation of that filter.** The write side takes no ordinal-bounded
-snapshot at all: `ContextManager::input_marker_with_suffix` anchors a reference
-on `latest_session_ordinal` + `count_active_messages` and emits `Persisted` only
-while the persisted active count still mirrors the in-memory window, falling
-back to a self-contained inline copy when it does not. So only the read-side
-reconstruction — trace hydration over `load_session_messages_with_supersede`,
-which loads every row plus its marker — applies the `superseded_by > N` form
-above, and there is no second filter to keep in lockstep. Three anchoring
+**One implementation of that filter.** The common write path takes no
+ordinal-bounded snapshot at all: `ContextManager::input_marker_with_suffix`
+anchors on `latest_session_ordinal` + `count_active_messages`. When the durable
+active set mirrors memory it stores only that head and count. When hydration
+repair has quarantined or repositioned a durable tool-result row, it loads the
+current active rows and stores the exact in-memory ordinal subset/order instead;
+only a message that cannot be mapped to any durable row forces a self-contained
+inline copy. The read-side reconstruction over
+`load_session_messages_with_supersede` applies the `superseded_by > N` form
+above, validates any explicit ordinal projection against that candidate set,
+and then emits it in the recorded order. Three anchoring
 helpers — `latest_session_ordinal`, `count_active_messages`,
 `active_index_of_ordinal` — exist to anchor and validate those references; the
 sync/backfill read surface (`load_active_session_messages_tail` / `_since`,

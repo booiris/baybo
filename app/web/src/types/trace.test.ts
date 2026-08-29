@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import type { PersistedToolCallOutput, SessionMessageRow } from './trace';
-import { resolveToolCallOutput } from './trace';
+import type {
+  ChatMessage,
+  PersistedToolCallOutput,
+  SessionMessageRow,
+} from './trace';
+import { hydratePersistedInput, resolveToolCallOutput } from './trace';
 
 function toolResultRow(
   ordinal: number,
@@ -57,5 +61,29 @@ describe('resolveToolCallOutput', () => {
       type: 'trace_reconstruction_error',
       tool_use_id: 'missing',
     });
+  });
+});
+
+describe('hydratePersistedInput', () => {
+  it('uses an explicit repaired ordinal subset and order', () => {
+    const message = (text: string): ChatMessage => ({
+      role: 'user',
+      source: 'agent',
+      content: [{ Text: text }],
+    });
+    const at = '2026-07-15T00:00:01Z';
+    const a = message('a');
+    const quarantined = message('orphan');
+    const b = message('b');
+    const suffix = message('suffix');
+    const log: SessionMessageRow[] = [a, quarantined, b].map((entry, ordinal) => ({
+      ordinal,
+      created_at: at,
+      message: entry,
+    }));
+
+    expect(
+      hydratePersistedInput(log, 2, '2026-07-15T00:00:02Z', 2, [2, 0], [suffix]),
+    ).toEqual([b, a, suffix]);
   });
 });

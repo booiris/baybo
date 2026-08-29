@@ -9,7 +9,8 @@ use baybo_model::{
 };
 use baybo_store::StorageError;
 use baybo_store::session::{
-    DreamCandidate, Result, SessionMessageAppendOutcome, SessionStore, StoredMessage,
+    ActiveMessageRow, DreamCandidate, Result, SessionMessageAppendOutcome, SessionStore,
+    StoredMessage,
 };
 
 pub struct SqliteSessionStore {
@@ -259,10 +260,6 @@ fn decode_session_list_rows(rows: Vec<RawSessionListRow>) -> Vec<Session> {
         }
     }
     sessions
-}
-
-fn read_message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawMessageRow> {
-    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
 }
 
 #[async_trait]
@@ -1035,27 +1032,43 @@ impl SessionStore for SqliteSessionStore {
             .await
     }
 
-    async fn load_active_session_messages(
+    async fn load_active_session_message_rows(
         &self,
         session_id: &SessionId,
-    ) -> Result<Vec<ChatMessage>> {
+    ) -> Result<Vec<ActiveMessageRow>> {
         let sid = session_id.as_str().to_string();
         let rows = self
             .pool
-            .interact("sessions.load_active_session_messages", move |conn| {
+            .interact("sessions.load_active_session_message_rows", move |conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT role, content, source, platform_msg_id FROM session_messages \
+                    "SELECT ordinal, role, content, source, platform_msg_id \
+                     FROM session_messages \
                      WHERE session_id = ?1 AND superseded_by IS NULL \
                      ORDER BY ordinal",
                 )?;
                 let rows = stmt
-                    .query_map(rusqlite::params![sid], read_message_row)?
+                    .query_map(rusqlite::params![sid], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                        ))
+                    })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 Ok(rows)
             })
             .await?;
 
-        rows.into_iter().map(decode_message_row).collect()
+        rows.into_iter()
+            .map(|(ordinal, role, content, source, platform_msg_id)| {
+                Ok(ActiveMessageRow {
+                    ordinal,
+                    message: decode_message_row((role, content, source, platform_msg_id))?,
+                })
+            })
+            .collect()
     }
 
     async fn latest_session_ordinal(&self, session_id: &SessionId) -> Result<Option<i64>> {

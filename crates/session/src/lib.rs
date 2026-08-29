@@ -2,7 +2,7 @@
 //!
 //! Domain types (`Session`, `User`, `ChannelType`, `SessionState`,
 //! `Lineage`, `TriggerSource`) live in `baybo-model`; the `SessionStore`
-//! trait and its per-row `StoredMessage` value type live in
+//! trait and its `ActiveMessageRow` / `StoredMessage` row types live in
 //! `baybo-store` (the ports
 //! crate). This crate owns the `SessionManager` business-logic facade;
 //! `baybo-storage` provides the sqlite implementations of both stores.
@@ -14,7 +14,8 @@ mod manager;
 pub mod test_support;
 
 pub use baybo_store::{
-    SessionFolderRow, SessionFolderStore, SessionMessageAppendOutcome, SessionStore, StoredMessage,
+    ActiveMessageRow, SessionFolderRow, SessionFolderStore, SessionMessageAppendOutcome,
+    SessionStore, StoredMessage,
 };
 pub use error::SessionError;
 pub use manager::SessionManager;

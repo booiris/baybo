@@ -1563,6 +1563,7 @@ impl QueryApi {
                         && let LlmCallInputs::Persisted {
                             last_ordinal,
                             prefix_len,
+                            ordinals,
                             suffix,
                         } = &begin.input_messages
                     {
@@ -1599,8 +1600,24 @@ impl QueryApi {
                             // Active prefix (by ordinal) then the inline
                             // suffix (framing / sub-loop turns not in the
                             // log) — together the exact slice the LLM saw.
-                            let mut active: Vec<baybo_model::ChatMessage> =
-                                candidates.iter().map(|m| m.message.clone()).collect();
+                            let mut projection_mismatch = false;
+                            let mut active: Vec<baybo_model::ChatMessage> = if ordinals.is_empty() {
+                                candidates.iter().map(|m| m.message.clone()).collect()
+                            } else {
+                                let mut seen = std::collections::HashSet::new();
+                                let mut selected = Vec::with_capacity(ordinals.len());
+                                for ordinal in ordinals {
+                                    if !seen.insert(*ordinal) {
+                                        projection_mismatch = true;
+                                        continue;
+                                    }
+                                    match candidates.iter().find(|row| row.ordinal == *ordinal) {
+                                        Some(row) => selected.push(row.message.clone()),
+                                        None => projection_mismatch = true,
+                                    }
+                                }
+                                selected
+                            };
                             // Tripwire: the reconstructed prefix count must
                             // match what the writer recorded. A divergence
                             // means the log drifted under the reference (a
@@ -1608,13 +1625,14 @@ impl QueryApi {
                             // read/write filter divergence) — flag it with a
                             // visible marker rather than returning a
                             // plausible-but-wrong slice silently.
-                            if active.len() != expected_prefix {
+                            if active.len() != expected_prefix || projection_mismatch {
                                 tracing::warn!(
                                     log_session_id = %log_session_id,
                                     span_id = %span.id,
                                     last_ordinal = last,
                                     expected = expected_prefix,
                                     reconstructed = active.len(),
+                                    projection_mismatch,
                                     "trace input reconstruction count mismatch — \
                                      session_messages drifted under the Persisted reference; \
                                      flagging the rehydrated input"
@@ -2015,22 +2033,6 @@ mod tests {
                 });
             }
             Ok(next_ordinal)
-        }
-        async fn load_active_session_messages(
-            &self,
-            id: &SessionId,
-        ) -> std::result::Result<Vec<baybo_model::ChatMessage>, baybo_store::StorageError> {
-            Ok(self
-                .messages
-                .lock()
-                .get(id)
-                .map(|log| {
-                    log.iter()
-                        .filter(|m| m.superseded_by.is_none())
-                        .map(|m| m.message.clone())
-                        .collect()
-                })
-                .unwrap_or_default())
         }
         async fn latest_session_ordinal(
             &self,
@@ -3025,10 +3027,8 @@ mod tests {
         assert!(replay.turns[0].turn.created_at <= replay.turns[1].turn.created_at);
     }
 
-    /// A `Persisted` span with a non-empty `suffix` (compression /
-    /// progress-observer framing that is not itself in `session_messages`)
-    /// hydrates to the active prefix *followed by* that suffix — the exact
-    /// slice the LLM saw, without the prefix being cloned into span storage.
+    /// A repaired `Persisted` span hydrates its exact ordinal subset/order,
+    /// then appends framing that is not itself in `session_messages`.
     #[tokio::test]
     async fn replay_appends_persisted_suffix() {
         use baybo_model::{ChatMessage, ContentBlock, SpanId, StepId};
@@ -3048,6 +3048,10 @@ mod tests {
                 &s.id,
                 &ChatMessage::system(vec![ContentBlock::Text("sys".into())]),
             )
+            .await
+            .unwrap();
+        session_store
+            .append_session_message(&s.id, &msg("quarantined"))
             .await
             .unwrap();
         session_store
@@ -3103,7 +3107,8 @@ mod tests {
                             reasoning_effort: None,
                             input_messages: LlmCallInputs::Persisted {
                                 last_ordinal: last,
-                                prefix_len: active.len(),
+                                prefix_len: 2,
+                                ordinals: vec![2, 0],
                                 suffix: vec![instruction.clone()],
                             },
                             temperature: None,
@@ -3147,7 +3152,7 @@ mod tests {
             );
         };
 
-        let mut expected = active.clone();
+        let mut expected = vec![active[2].clone(), active[0].clone()];
         expected.push(instruction);
         assert_eq!(
             hydrated, &expected,
@@ -3327,6 +3332,7 @@ mod tests {
                             input_messages: LlmCallInputs::Persisted {
                                 last_ordinal: n,
                                 prefix_len: 99,
+                                ordinals: vec![],
                                 suffix: vec![],
                             },
                             temperature: None,
@@ -3478,6 +3484,7 @@ mod tests {
                             input_messages: LlmCallInputs::Persisted {
                                 last_ordinal: pre_last,
                                 prefix_len: pre_active.len(),
+                                ordinals: vec![],
                                 suffix: vec![],
                             },
                             temperature: None,
@@ -3567,6 +3574,7 @@ mod tests {
                             input_messages: LlmCallInputs::Persisted {
                                 last_ordinal: post_last,
                                 prefix_len: post_active_count,
+                                ordinals: vec![],
                                 suffix: vec![],
                             },
                             temperature: None,
@@ -3952,6 +3960,7 @@ mod tests {
                             input_messages: LlmCallInputs::Persisted {
                                 last_ordinal: last,
                                 prefix_len: 1,
+                                ordinals: vec![],
                                 suffix: vec![],
                             },
                             temperature: None,
@@ -4073,6 +4082,7 @@ mod tests {
                             input_messages: LlmCallInputs::Persisted {
                                 last_ordinal: last,
                                 prefix_len: 2,
+                                ordinals: vec![],
                                 suffix: vec![],
                             },
                             temperature: None,

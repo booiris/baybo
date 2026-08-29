@@ -42,6 +42,16 @@ pub struct DreamCandidate {
     pub latest_ordinal: i64,
 }
 
+/// Minimal identity for one currently-active transcript row.
+///
+/// Context hydration and trace markers need the durable ordinal alongside the
+/// message, but not the historical metadata carried by [`StoredMessage`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActiveMessageRow {
+    pub ordinal: i64,
+    pub message: ChatMessage,
+}
+
 /// One row of `session_messages`, paired with its supersede marker.
 /// Yielded by [`SessionStore::load_session_messages_with_supersede`]
 /// so the trace API can replay "active as of ordinal X" filters
@@ -351,7 +361,7 @@ pub trait SessionStore: Send + Sync {
     /// after the strategy applies — i.e. the post-compression active
     /// transcript, system message included. The caller passes it
     /// through unfiltered; rows are typed by `role` so the leading
-    /// system row resurfaces on the next `load_active_session_messages`.
+    /// system row resurfaces on the next `load_active_session_message_rows`.
     ///
     /// Returns the ordinal of the FIRST newly-inserted row; `new_active`
     /// lands contiguously, so `base + i` addresses row `i`.
@@ -361,14 +371,38 @@ pub trait SessionStore: Send + Sync {
         new_active: &[ChatMessage],
     ) -> Result<i64>;
 
-    /// Load the active transcript (rows where `superseded_by IS NULL`)
-    /// in ordinal order. Used by the router on actor cold start to
-    /// seed `ContextManager`. Returns empty when the session has no
-    /// turns yet.
+    /// Load active transcript rows (`superseded_by IS NULL`) in ordinal order.
+    /// Context repair uses the durable identity to encode an exact trace
+    /// projection while leaving the transcript itself untouched.
+    async fn load_active_session_message_rows(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<ActiveMessageRow>> {
+        Ok(self
+            .load_session_messages_with_supersede(session_id)
+            .await?
+            .into_iter()
+            .filter(|row| row.superseded_by.is_none())
+            .map(|row| ActiveMessageRow {
+                ordinal: row.ordinal,
+                message: row.message,
+            })
+            .collect())
+    }
+
+    /// Value-only projection of [`Self::load_active_session_message_rows`].
+    /// Consumers that do not need durable row identity should use this form.
     async fn load_active_session_messages(
         &self,
         session_id: &SessionId,
-    ) -> Result<Vec<ChatMessage>>;
+    ) -> Result<Vec<ChatMessage>> {
+        Ok(self
+            .load_active_session_message_rows(session_id)
+            .await?
+            .into_iter()
+            .map(|row| row.message)
+            .collect())
+    }
 
     /// Highest `session_messages.ordinal` ever assigned for this
     /// session — i.e. the last row inserted, regardless of whether

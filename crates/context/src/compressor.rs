@@ -321,24 +321,9 @@ impl ContextManager {
         let mut request_messages: Vec<ChatMessage> = self.llm_prefix();
         request_messages.push(instruction.clone());
 
-        // Reference the (large) transcript prefix by ordinal in the trace
-        // when the in-memory set provably mirrors the persisted log;
-        // `instruction` is the only message not in `session_messages`, so
-        // it rides as the suffix. On any mismatch fall back to inline.
-        //
-        // This is also why the whole transcript is sent even though the tail
-        // is about to be kept verbatim: `Persisted` can only name the entire
-        // active set, so trimming the request to a strict prefix would force
-        // an `Inline` marker and re-embed the transcript into every
-        // compaction span.
-        let input_marker = match self.synced_last_ordinal().await {
-            Some((last_ordinal, prefix_len)) => LlmCallInputs::Persisted {
-                last_ordinal,
-                prefix_len,
-                suffix: vec![instruction],
-            },
-            None => LlmCallInputs::Inline(request_messages.clone()),
-        };
+        // The instruction is not persisted. Reuse the common marker path so a
+        // repaired transcript keeps its exact ordinal projection here too.
+        let input_marker = self.input_marker_with_suffix(vec![instruction]).await;
         let request = ChatRequest {
             messages: request_messages,
             temperature: None,
