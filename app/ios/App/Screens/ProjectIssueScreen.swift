@@ -78,11 +78,9 @@ struct ProjectIssueScreen: View {
                 .presentationBackground(Theme.paper)
                 .presentationCornerRadius(Theme.radiusModal)
         }
-        .confirmationDialog(
-            lang.t("issue.stopTitle"), isPresented: $confirmingStop, titleVisibility: .visible
-        ) {
-            Button(lang.t("issue.stopConfirm"), role: .destructive) { store.stopRun() }
+        .alert(lang.t("issue.stopTitle"), isPresented: $confirmingStop) {
             Button(lang.t("common.cancel"), role: .cancel) {}
+            Button(lang.t("issue.stopConfirm"), role: .destructive) { store.stopRun() }
         } message: {
             Text(verbatim: lang.t("issue.stopExplain"))
         }
@@ -123,9 +121,30 @@ struct ProjectIssueScreen: View {
 
     private var header: some View {
         ZStack {
-            Text(verbatim: "#\(number)")
-                .font(Theme.mono(16))
-                .foregroundStyle(Theme.ink)
+            if !store.atTop {
+                Button {
+                    Haptics.tap()
+                    store.scrollToTop()
+                } label: {
+                    HStack(alignment: .center, spacing: 7) {
+                        Text(verbatim: "#\(number)")
+                            .font(Theme.mono(16))
+                        Image(systemName: "arrow.up")
+                            .font(.system(size: 13, weight: .semibold))
+                    }
+                    .foregroundStyle(Theme.ink)
+                    .padding(.horizontal, 8)
+                    .frame(height: 42)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("issue-scroll-top")
+                .accessibilityLabel(Text(verbatim: lang.t("issue.jumpToTop", "#\(number)")))
+            } else {
+                Text(verbatim: "#\(number)")
+                    .font(Theme.mono(16))
+                    .foregroundStyle(Theme.ink)
+            }
 
             HStack(spacing: 6) {
                 Button { dismiss() } label: {
@@ -165,11 +184,24 @@ struct ProjectIssueScreen: View {
     }
 
     private var hasMenu: Bool {
-        !store.runs.isEmpty || store.issue?.lastRunFailed == true
+        canMove || !store.runs.isEmpty || store.issue?.lastRunFailed == true
+    }
+
+    private var canMove: Bool {
+        let archived = appStore.projectsStore.projects.first { $0.id == projectId }?.archivedAtMs
+        return store.issue != nil && archived == nil && !appStore.projectsStore.isOffline
     }
 
     private var menu: some View {
         Menu {
+            if canMove {
+                Button {
+                    Haptics.tap()
+                    raise(CardField.status.rawValue)
+                } label: {
+                    Label(lang.t("issue.moveStatus"), systemImage: "arrow.left.arrow.right")
+                }
+            }
             if store.issue?.lastRunFailed == true {
                 Button {
                     Haptics.tap()

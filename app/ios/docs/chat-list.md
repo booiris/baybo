@@ -15,6 +15,12 @@ appear/foreground/pull:
   `x-baybo-device-id`;
 - **relay** uses the Noise-protected API tunnel.
 
+Every mutation publishes the in-memory rows immediately, then snapshots them for
+`sessions.json`. JSON encoding and atomic replacement run on one utility queue,
+with a short coalescing window so a burst of activity pings writes only its latest
+snapshot. A same-process rebind reads the pending snapshot while disk catches up,
+so moving persistence off the main actor does not reintroduce stale rows.
+
 ### Merge rules
 
 Remote wins for existence (a row missing remotely was hidden elsewhere).
@@ -54,6 +60,32 @@ that lists a conversation applies it** — this list, `CronGroupScreen`'s fires 
 `ArchivedScreen` — because where a row is listed says nothing about whether it
 can be named or its transcript can drift. A new session-listing screen wires it
 in too.
+
+### Scroll hot path
+
+The app opts into the full ProMotion range with
+`CADisableMinimumFrameDurationOnPhone=true` in `project.yml` (and its generated
+`App/Info.plist`). Without it, Core Animation cannot present the SwiftUI list
+above the system-default frame rate on supported iPhones.
+
+`ChatListTimeLabel` owns the time column's clock / weekday / date rule and keeps
+its `DateFormatter`s on the main actor. A formatter is reused by locale,
+template, calendar and time zone; constructing one in every row body makes cell
+creation unnecessarily expensive, while keying only by language makes a time-zone
+change reuse stale formatting state.
+
+The REST merge likewise reuses one fractional and one plain
+`Date.ISO8601FormatStyle` parser.
+`/v1/chat/sessions` returns the whole list, so constructing both parsers for each
+row's `createdAt` and `lastActive` turns a few hundred rows into hundreds of ICU
+formatter initialisations on the main actor, precisely while the list is returning
+onscreen.
+
+An identical REST snapshot is also a no-op at the publication seam: it neither
+assigns `SessionIndex.rows` nor asks SwiftUI to diff the list again. When a real
+row change does publish, the list derives its cron buckets once per body pass and
+wraps each chat/group row in an equatable view so unchanged visible row bodies do
+not render again.
 
 ## Searching conversations
 

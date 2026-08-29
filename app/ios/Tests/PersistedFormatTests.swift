@@ -85,11 +85,15 @@ struct PersistedFormatTests {
     /// And it is WRITTEN in that shape — the keys spelled as the installed base
     /// expects, dates as ISO-8601 strings (switch the strategy to epoch seconds
     /// and every existing file stops decoding, while a round-trip test sails on).
-    @Test func sessionsJsonIsWrittenInTheSameShapeItReads() throws {
+    @Test func sessionsJsonIsWrittenInTheSameShapeItReads() async throws {
         let index = temp.makeIndex()
         index.recordUserSend(sessionId: Self.sessionId, text: "what is the answer")
         index.setPinnedFlag(Self.sessionId, pinned: true)
 
+        let latestReachedDisk = await waitUntil {
+            (try? read(Self.indexFile).contains(#""pinned":true"#)) == true
+        }
+        #expect(latestReachedDisk, "the newest queued snapshot must reach disk")
         let json = try read(Self.indexFile)
         for key in ["\"id\"", "\"createdAt\"", "\"lastActive\"", "\"preview\"", "\"userText\"",
                     "\"pinned\"", "\"archived\"", "\"unread\""]

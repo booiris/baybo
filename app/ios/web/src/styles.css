@@ -17,15 +17,14 @@
   --color-err: #d40000;
 
   --syntax-background: #fafafa;
-  --syntax-foreground: #383a42;
-  --syntax-comment: #a0a1a7;
-  --syntax-keyword: #a626a4;
-  --syntax-tag: #e45649;
-  --syntax-literal: #0184bb;
-  --syntax-string: #50a14f;
-  --syntax-attribute: #986801;
-  --syntax-title: #4078f2;
-  --syntax-built-in: #c18401;
+  --syntax-foreground: #2a2c2d;
+  --syntax-comment: #676b79;
+  --syntax-orange: #b45500;
+  --syntax-pink: #c51d7f;
+  --syntax-rose: #b04778;
+  --syntax-blue: #2874ae;
+  --syntax-teal: #087466;
+  --syntax-purple: #7040ad;
 
   --font-mono: "Space Mono", ui-monospace, SFMono-Regular, monospace;
   --font-sans: "Inter Variable", "Inter", -apple-system, BlinkMacSystemFont, sans-serif;
@@ -494,7 +493,7 @@ button {
   background: var(--syntax-background);
   color: var(--syntax-foreground);
 }
-.md-code-block pre code { padding-top: 2.85rem; }
+.md-code-block pre code { padding-top: 2.45rem; }
 .md-code-language {
   position: absolute;
   z-index: 1;
@@ -512,15 +511,15 @@ button {
 .md-code-copy {
   position: absolute;
   z-index: 2;
-  top: 0.42rem;
-  right: 0.42rem;
+  top: 0.48rem;
+  right: 0.48rem;
   display: grid;
-  width: 2.25rem;
-  height: 2.25rem;
+  width: 1.75rem;
+  height: 1.75rem;
   padding: 0;
   place-items: center;
   border: 1px solid var(--color-line-strong);
-  border-radius: 9px;
+  border-radius: 7px;
   background: var(--color-paper);
   color: var(--color-ink);
   -webkit-tap-highlight-color: transparent;
@@ -528,49 +527,66 @@ button {
   -webkit-user-select: none;
   user-select: none;
 }
+/* Keep the compact glyph visually quiet without shrinking its touch target. */
+.md-code-copy::before {
+  content: "";
+  position: absolute;
+  inset: -0.5rem;
+}
 .md-code-copy:active { opacity: 0.7; transform: scale(0.96); }
 .md-code-copy svg {
-  width: 1.1rem;
-  height: 1.1rem;
+  width: 0.85rem;
+  height: 0.85rem;
   fill: none;
   stroke: currentColor;
-  stroke-width: 1.35;
+  stroke-width: 1.45;
   stroke-linecap: round;
   stroke-linejoin: round;
 }
 .hljs-comment,
 .hljs-quote { color: var(--syntax-comment); font-style: italic; }
-.hljs-doctag,
-.hljs-keyword,
-.hljs-formula { color: var(--syntax-keyword); }
-.hljs-section,
-.hljs-name,
+.hljs-params { color: var(--syntax-comment); }
+.hljs-punctuation { color: var(--syntax-foreground); }
 .hljs-selector-tag,
-.hljs-deletion,
-.hljs-subst { color: var(--syntax-tag); }
-.hljs-literal { color: var(--syntax-literal); }
-.hljs-string,
+.hljs-name,
+.hljs-meta,
+.hljs-operator,
+.hljs-char.escape_ { color: var(--syntax-orange); }
+.hljs-keyword,
+.hljs-deletion { color: var(--syntax-pink); }
 .hljs-regexp,
-.hljs-addition,
-.hljs-attribute,
-.hljs-meta .hljs-string { color: var(--syntax-string); }
-.hljs-attr,
-.hljs-variable,
-.hljs-template-variable,
-.hljs-type,
-.hljs-selector-class,
-.hljs-selector-attr,
 .hljs-selector-pseudo,
-.hljs-number { color: var(--syntax-attribute); }
+.hljs-selector-attr,
+.hljs-variable.language_ { color: var(--syntax-rose); }
+.hljs-subst,
+.hljs-property,
+.hljs-code,
+.hljs-formula,
+.hljs-section,
+.hljs-title.function_ { color: var(--syntax-blue); }
+.hljs-string,
 .hljs-symbol,
 .hljs-bullet,
-.hljs-link,
-.hljs-meta,
-.hljs-selector-id,
-.hljs-title { color: var(--syntax-title); }
-.hljs-built_in,
+.hljs-addition,
+.hljs-selector-class,
 .hljs-title.class_,
-.hljs-class .hljs-title { color: var(--syntax-built-in); }
+.hljs-title.class_.inherited__,
+.hljs-meta .hljs-string { color: var(--syntax-teal); }
+.hljs-variable,
+.hljs-template-variable,
+.hljs-number,
+.hljs-literal,
+.hljs-type,
+.hljs-link,
+.hljs-built_in,
+.hljs-title,
+.hljs-selector-id,
+.hljs-tag,
+.hljs-doctag,
+.hljs-attr,
+.hljs-attribute,
+.hljs-template-tag,
+.hljs-meta .hljs-keyword { color: var(--syntax-purple); }
 .hljs-emphasis { font-style: italic; }
 .hljs-strong { font-weight: 700; }
 .hljs-link { text-decoration: underline; }

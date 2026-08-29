@@ -292,9 +292,14 @@ It answers with one `SubscribeState` bundle (turn/work state) and live frames.
 
 ### The mirror stays a pure `{rows, cursor}` cache
 
-Written atomically. It is never a source of truth — a mirror-less open just syncs
-a baseline. The cursor is `number | null` (`null` = no baseline, never a
-sentinel); it lives in the persisted mirror blob (`lastOrdinal`), advanced from
+Written by atomic replacement on the shared utility writer, never on the app's
+main actor. The web bundle stringifies the snapshot in its WebContent process;
+native only queues the resulting string. Until the replacement lands,
+`TranscriptStore` serves the pending snapshot (or pending deletion) from memory,
+so a rapid back → re-enter cannot restore the older file. It is never a source of
+truth — a mirror-less open just syncs a baseline. The cursor is `number | null`
+(`null` = no baseline, never a sentinel); it lives in the persisted mirror blob
+(`lastOrdinal`), advanced from
 the sync coverage watermark and live final-reply ordinals, frozen while
 **rebase-dirty**.
 

@@ -234,7 +234,8 @@ delivering other traffic is left alone and only this connect fails.
 `requestSync` / `collapseHtmlPreview` / `flushPersist`.
 
 **web→native:**
-`ready` / `shown` / `sync` / `mark_read` / `persist` / `fetchHistory` / `requestBlob` /
+`ready` / `shown` / `sync` / `mark_read` / `persist` (`stateJson`, stringified in the
+WebContent process) / `fetchHistory` / `requestBlob` /
 `queryFileState` / `downloadFile` / `previewFile` / `shareFile` / `viewImage` /
 `audioToggle` / `audioSeek` / `queryAudioState` / `playVideo` / `requestVideoPoster` /
 `retry` / `openUrl` / `copy` / `log` / `jumpVisible` / `runState` / `outline` /
@@ -451,7 +452,9 @@ code (without the fence or CommonMark's synthetic trailing newline) through the 
 `navigator.clipboard`, which is unreliable in the `file://` WKWebView. The language label,
 button, scroll/wrap bound, and syntax palette all live in the shared `styles.css`, so chat
 and issue do not grow separate code-block skins. The token colours and code surface use
-Atom One Light while the surrounding controls follow the native Baybo chrome.
+Panda Syntax Light while the surrounding controls follow the native Baybo chrome. The
+theme maps parameters, properties, operators, escapes, and language variables explicitly;
+leaving those token classes at the base foreground makes ordinary source look nearly plain.
 
 ### Agent-authored HTML previews
 

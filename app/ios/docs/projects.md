@@ -26,6 +26,19 @@ Native screens own navigation, forms, pickers, confirmation, attachments, and
 write state. The card web page owns markdown, timeline layout, attachment
 cards, sub-issue links, and scroll/fold state.
 
+A new card visit follows the bottom through the mirror paint and the first live
+timeline response, so the newest activity is the opening position. The page
+keeps a small loading indicator at the activity tail until that live timeline
+arrives. That timeline is delivered and marked read without waiting for the run
+log, children, or team. The Issue List's team seeds the detail store; only a
+direct open with no team data fetches `/agents`. The native
+`#number ↑` header is one tap target that scrolls the web page smoothly to the
+top. The arrow is present only while the page is away from the top, including
+after a later downward scroll; at the top the header is the plain issue number.
+Returning to an already-covered visit still restores that visit's saved scroll
+position. The header's ellipsis offers `Move status` through the same native
+`MoveSheet` as the status chip; run history and retry actions remain there too.
+
 Card descriptions and comments use the transcript bundle's shared Markdown renderer.
 Fenced code therefore has the same syntax highlighting and upper-right native-clipboard
 copy control as chat and run transcripts; the card does not carry a second renderer.
@@ -46,7 +59,8 @@ mirror so its first frame can paint before the five detail reads finish. Cached
 data may render content, but it must not arm live-only actions:
 
 - approvals require the current gateway approval queue;
-- Stop requires a currently unsettled run;
+- Stop requires a currently unsettled run and an alert with explicit Cancel and
+  destructive Stop actions;
 - the unread divider comes only from a live timeline response.
 
 `IssueHostPool` keeps two `IssueHost` renderers warm. Adjacent pages need two

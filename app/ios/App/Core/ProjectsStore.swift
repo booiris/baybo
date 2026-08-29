@@ -541,6 +541,16 @@ final class ProjectsStore: ObservableObject {
             call: { client in try await client.projectRead(projectId: projectId) })
     }
 
+    func noteIssueRead(board projectId: String, issue number: Int64) {
+        guard var board = boards[projectId],
+            let index = board.issues.firstIndex(where: { $0.number == number }),
+            board.issues[index].unread != 0
+        else { return }
+        board.issues[index] = board.issues[index].with(unread: 0)
+        replaceBoard(board, projectId: projectId)
+        persistBoard(projectId)
+    }
+
     func refreshApprovalPrompts(board projectId: String) async {
         guard !isDemo else { return }
         let flagged = (boards[projectId]?.issues ?? [])

@@ -382,7 +382,7 @@ function flushPersist(): void {
   if (pendingPersist === null) return;
   const { sessionId, state } = pendingPersist;
   pendingPersist = null;
-  postSafe({ type: "persist", sessionId, state });
+  postSafe({ type: "persist", sessionId, stateJson: JSON.stringify(state) });
 }
 
 /// Replaces the old localStorage saveChatState: debounced so a catch-up burst

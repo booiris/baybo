@@ -86,6 +86,8 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     private var blobUploadsHeld = false
     private var blobUploadWaiters: [CheckedContinuation<Void, Never>] = []
     private var blobUploadOutcome: Result<String, Error> = .success(FakeBayboClient.uploadedBlobId)
+    private var blobDownloads: [String] = []
+    private var blobCachedReads: [String] = []
 
     private var apiLegInvalidations = 0
 
@@ -150,6 +152,8 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     var deckFileUploadCalls: [DeckFileUpload] { lock.withLock { deckFileUploads } }
     /// Composer uploads, in the order they reached the wire.
     var blobUploadCalls: [BlobUploadCall] { lock.withLock { blobUploads } }
+    var blobDownloadCalls: [String] { lock.withLock { blobDownloads } }
+    var blobCachedReadCalls: [String] { lock.withLock { blobCachedReads } }
     /// Composer uploads currently PARKED, i.e. the ones a one-at-a-time release
     /// can actually finish. The call log records an upload the moment it
     /// arrives, a beat before its continuation is registered — waiting on the
@@ -563,12 +567,14 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     private var _stubIssueDetail: IssueInfo?
     private var _issueDetailStallMs = 0
     private var _issueDetailCalls = 0
+    private var _issueReads: [Int64] = []
     private var _stubIssueEventsJson: String?
     private var _stubRunLog: IssueRunLog?
     private var _approvalsResolved: [(Int64, String, IssueApprovalDecision)] = []
     private var _approvalResolveError: Error?
     private var _stubRuns: [IssueRunInfo] = []
     private var _stubTeam: [TeamMemberInfo] = []
+    private var _projectTeamCalls = 0
     private var _stubAttention: [ProjectAttention] = []
     private var _stubActivity: [ProjectActivity] = []
     private var _patches: [(Int64, IssuePatch)] = []
@@ -597,6 +603,7 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
         set { lock.withLock { _issueDetailStallMs = newValue } }
     }
     var issueDetailCalls: Int { lock.withLock { _issueDetailCalls } }
+    var issueReads: [Int64] { lock.withLock { _issueReads } }
     var stubIssueEventsJson: String? {
         get { lock.withLock { _stubIssueEventsJson } }
         set { lock.withLock { _stubIssueEventsJson = newValue } }
@@ -621,6 +628,7 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
         get { lock.withLock { _stubTeam } }
         set { lock.withLock { _stubTeam = newValue } }
     }
+    var projectTeamCalls: Int { lock.withLock { _projectTeamCalls } }
     var stubAttention: [ProjectAttention] {
         get { lock.withLock { _stubAttention } }
         set { lock.withLock { _stubAttention = newValue } }
@@ -796,12 +804,14 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     }
     func projectIssueRead(projectId: String, number: Int64) async throws {
         try refuseIfOffline()
+        lock.withLock { _issueReads.append(number) }
     }
     func projectRead(projectId: String) async throws { try refuseIfOffline() }
     func projectFeed(projectId: String, beforeMs: Int64?, limit: UInt32?) async throws -> String {
         throw Self.unsupported
     }
     func projectTeam(projectId: String) async throws -> [TeamMemberInfo] {
+        lock.withLock { _projectTeamCalls += 1 }
         try refuseIfOffline()
         return stubTeam
     }
@@ -837,7 +847,10 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     /// Answers from the same seeded cache the cached-read paths use, so a test
     /// that wants a tapped attachment to have bytes seeds one map, not two.
     func blobDownloadBytes(blobId: String, progress: BlobProgress?) async throws -> Data {
-        guard let data = cachedBlobs[blobId] else { throw Self.unsupported }
+        lock.withLock { blobDownloads.append(blobId) }
+        guard let data = downloadableBlobs[blobId] ?? cachedBlobs[blobId] else {
+            throw Self.unsupported
+        }
         return data
     }
 
@@ -845,7 +858,11 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
 
     /// Seeded cache for tests (`deck.shareBlob` / display fast path).
     var cachedBlobs: [String: Data] = [:]
-    func blobReadCached(blobId: String) async -> Data? { cachedBlobs[blobId] }
+    var downloadableBlobs: [String: Data] = [:]
+    func blobReadCached(blobId: String) async -> Data? {
+        lock.withLock { blobCachedReads.append(blobId) }
+        return cachedBlobs[blobId]
+    }
 
     func blobBytesForDisplay(blobId: String, maxBytes: UInt64) async -> BlobServeOutcome {
         guard let data = cachedBlobs[blobId] else { return .notFound }

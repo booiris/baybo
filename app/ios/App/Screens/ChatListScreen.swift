@@ -71,12 +71,13 @@ struct ChatListScreen: View {
     }
 
     var body: some View {
+        let items = listItems
         ZStack(alignment: .top) {
             Group {
-                if listItems.isEmpty {
+                if items.isEmpty {
                     emptyState
                 } else {
-                    sessionList
+                    sessionList(items)
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -132,9 +133,9 @@ struct ChatListScreen: View {
         #endif
     }
 
-    private var sessionList: some View {
+    private func sessionList(_ items: [ChatListItem]) -> some View {
         List {
-            ForEach(listItems) { item in
+            ForEach(items) { item in
                 switch item {
                 case .chat(let row): chatRow(row)
                 case .cronGroup(let group): cronGroupRow(group)
@@ -176,7 +177,7 @@ struct ChatListScreen: View {
         Button {
             appStore.openSession(row.id)
         } label: {
-            SessionRowView(row: row, langCode: lang.current.lproj)
+            SessionRowView(row: row, langCode: lang.current.lproj).equatable()
         }
         // CONSTANT background — the pinned tint lives in the row content
         // (see SessionRowView), so a pin flip is a pure move, not a
@@ -243,7 +244,7 @@ struct ChatListScreen: View {
         Button {
             appStore.openCronGroup(group.jobId)
         } label: {
-            CronGroupRowView(group: group, langCode: lang.current.lproj)
+            CronGroupRowView(group: group, langCode: lang.current.lproj).equatable()
         }
         .listRowBackground(Theme.paper)
         .listRowSeparatorTint(Theme.line)
@@ -411,7 +412,7 @@ struct ChatListScreen: View {
 /// short snippet of the user's last message until the title pass runs) over a
 /// grey last-message preview on the left; the last-active time over an unread
 /// badge on the right. Pinned rows are marked by a tinted background, not a glyph.
-struct SessionRowView: View {
+struct SessionRowView: View, Equatable {
     let row: SessionRow
     /// The app language's locale identifier (drives the time formatter, so it
     /// can't diverge from the chrome language).
@@ -509,7 +510,7 @@ struct SessionContextMenu: ViewModifier {
 /// *"a folder"*. Cron is the meaningful category; the grouping is just how we
 /// keep it from flooding the list. A clock also implies *recurring*, so "there
 /// are several of these inside" comes free.
-struct CronGroupRowView: View {
+struct CronGroupRowView: View, Equatable {
     let group: CronGroup
     let langCode: String
 
@@ -568,10 +569,6 @@ struct ChatRowBody: View {
     /// SF Symbol drawn before the headline, or `nil` for a plain conversation.
     let glyph: String?
 
-    /// The window (in days from today) over which the time column shows a
-    /// weekday name rather than a clock time (today) or a calendar date (older).
-    private static let weekdayWindow: Range<Int> = 1..<7
-
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
             textColumn
@@ -623,7 +620,7 @@ struct ChatRowBody: View {
     /// badge pinned to the bottom (beside the preview).
     private var metaColumn: some View {
         VStack(alignment: .trailing, spacing: 6) {
-            Text(verbatim: Self.timeLabel(lastActive, locale: langCode))
+            Text(verbatim: ChatListTimeLabel.text(lastActive, locale: langCode))
                 .font(Theme.sys(11))
                 .foregroundStyle(Theme.inkSoft)
             Spacer(minLength: 0)
@@ -675,32 +672,63 @@ struct ChatRowBody: View {
             .background(Theme.ink, in: Capsule())
             .accessibilityLabel(Text(verbatim: "\(unread)"))
     }
-    /// Telegram-style time column: a clock time for today, the weekday name
-    /// within the last week, then a calendar date (with year once it rolls
-    /// over). Locale drives digit shape and weekday/date ordering.
-    private static func timeLabel(
-        _ date: Date, locale: String, relativeTo now: Date = Date()
+}
+
+/// Telegram-style list time: clock today, weekday inside a week, then a date.
+/// Formatters are expensive mutable Foundation objects, so the main-actor UI
+/// reuses one per locale/template/calendar/time-zone combination.
+@MainActor
+enum ChatListTimeLabel {
+    private struct FormatterKey: Hashable {
+        let locale: String
+        let template: String
+        let calendar: Calendar.Identifier
+        let timeZone: String
+    }
+
+    private static let weekdayWindow: Range<Int> = 1..<7
+    private static var formatters: [FormatterKey: DateFormatter] = [:]
+
+    static func text(
+        _ date: Date,
+        locale: String,
+        relativeTo now: Date = Date(),
+        calendar: Calendar = .autoupdatingCurrent
     ) -> String {
-        // A server-stamped `lastActive` can land slightly ahead of the device
-        // clock (skew, or a just-sent row); clamp to now so a "tomorrow" value
-        // reads as the current time, not a future calendar date.
         let date = min(date, now)
-        let calendar = Calendar.current
+        let template: String
+        if calendar.isDate(date, inSameDayAs: now) {
+            template = "jm"
+        } else {
+            let days = calendar.dateComponents(
+                [.day], from: calendar.startOfDay(for: date), to: calendar.startOfDay(for: now)
+            ).day
+            if let days, weekdayWindow.contains(days) {
+                template = "EEE"
+            } else {
+                template = calendar.isDate(date, equalTo: now, toGranularity: .year)
+                    ? "Md" : "yMd"
+            }
+        }
+        return formatter(locale: locale, template: template, calendar: calendar).string(from: date)
+    }
+
+    private static func formatter(
+        locale: String, template: String, calendar: Calendar
+    ) -> DateFormatter {
+        let key = FormatterKey(
+            locale: locale,
+            template: template,
+            calendar: calendar.identifier,
+            timeZone: calendar.timeZone.identifier)
+        if let formatter = formatters[key] { return formatter }
+
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: locale)
-        if calendar.isDateInToday(date) {
-            formatter.setLocalizedDateFormatFromTemplate("jm")
-            return formatter.string(from: date)
-        }
-        let days = calendar.dateComponents(
-            [.day], from: calendar.startOfDay(for: date), to: calendar.startOfDay(for: now)
-        ).day
-        if let days, Self.weekdayWindow.contains(days) {
-            formatter.setLocalizedDateFormatFromTemplate("EEE")
-            return formatter.string(from: date)
-        }
-        let sameYear = calendar.isDate(date, equalTo: now, toGranularity: .year)
-        formatter.setLocalizedDateFormatFromTemplate(sameYear ? "Md" : "yMd")
-        return formatter.string(from: date)
+        formatter.calendar = calendar
+        formatter.timeZone = calendar.timeZone
+        formatter.setLocalizedDateFormatFromTemplate(template)
+        formatters[key] = formatter
+        return formatter
     }
 }

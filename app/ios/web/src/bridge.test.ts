@@ -155,7 +155,7 @@ describe("persistState — the cross-session mirror guard", () => {
 
     vi.advanceTimersByTime(PERSIST_DEBOUNCE_MS);
     expect(persistPosts()).toEqual([
-      { type: "persist", sessionId: SESSION_A, state: mirror("three") },
+      { type: "persist", sessionId: SESSION_A, stateJson: JSON.stringify(mirror("three")) },
     ]);
   });
 
@@ -186,7 +186,7 @@ describe("persistState — the cross-session mirror guard", () => {
     vi.advanceTimersByTime(PERSIST_DEBOUNCE_MS);
 
     expect(persistPosts()).toEqual([
-      { type: "persist", sessionId: SESSION_B, state: mirror("b-rows") },
+      { type: "persist", sessionId: SESSION_B, stateJson: JSON.stringify(mirror("b-rows")) },
     ]);
   });
 
@@ -197,7 +197,11 @@ describe("persistState — the cross-session mirror guard", () => {
 
     window.baybo.flushPersist();
     expect(persistPosts()).toEqual([
-      { type: "persist", sessionId: SESSION_A, state: mirror("live steps") },
+      {
+        type: "persist",
+        sessionId: SESSION_A,
+        stateJson: JSON.stringify(mirror("live steps")),
+      },
     ]);
 
     // The debounce timer it pre-empted must not fire a second write, and a

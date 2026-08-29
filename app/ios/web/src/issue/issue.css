@@ -46,11 +46,47 @@
 }
 
 .issue-loading {
-  padding: calc(env(safe-area-inset-top, 0px) + 90px) 20px 40px;
-  text-align: center;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  height: 100dvh;
+  padding: 0 20px 40px;
+  box-sizing: border-box;
+  color: var(--color-ink);
+  background: var(--color-paper);
+}
+
+.issue-loading-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
   color: var(--color-ink-soft);
   font-family: var(--font-mono);
   font-size: 12px;
+  pointer-events: none;
+  animation: delayed-in 160ms ease-out 400ms both;
+}
+
+.issue-tail-loading {
+  margin: 20px 0 4px;
+}
+
+.issue-loading-ring {
+  width: 14px;
+  height: 14px;
+  box-sizing: border-box;
+  border: 1.5px solid var(--color-ink-soft);
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: send-spin 0.7s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .issue-loading-row,
+  .issue-loading-ring {
+    animation: none;
+  }
 }
 
 #issue-root.issue-retargeting {
