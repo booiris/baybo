@@ -43,6 +43,16 @@ describe("MarkdownBody code blocks", () => {
     expect(screen.getByRole("button", { name: "Copy code" })).toBeInTheDocument();
   });
 
+  it("emits the richer function, parameter, and property token classes", () => {
+    const source = "function greet(name) { return user.profile.name ?? name; }";
+    const { container } = render(
+      <MarkdownBody text={`\`\`\`javascript\n${source}\n\`\`\``} />,
+    );
+    expect(container.querySelector(".hljs-title.function_")?.textContent).toBe("greet");
+    expect(container.querySelector(".hljs-params")?.textContent).toBe("name");
+    expect(container.querySelectorAll(".hljs-property")).toHaveLength(2);
+  });
+
   it("hands the raw code to the native clipboard bridge", () => {
     render(<MarkdownBody text={"```rust\nlet ready = true;\n```"} />);
     fireEvent.click(screen.getByRole("button", { name: "Copy code" }));

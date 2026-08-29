@@ -451,7 +451,9 @@ code (without the fence or CommonMark's synthetic trailing newline) through the 
 `navigator.clipboard`, which is unreliable in the `file://` WKWebView. The language label,
 button, scroll/wrap bound, and syntax palette all live in the shared `styles.css`, so chat
 and issue do not grow separate code-block skins. The token colours and code surface use
-Atom One Light while the surrounding controls follow the native Baybo chrome.
+Panda Syntax Light while the surrounding controls follow the native Baybo chrome. The
+theme maps parameters, properties, operators, escapes, and language variables explicitly;
+leaving those token classes at the base foreground makes ordinary source look nearly plain.
 
 ### Agent-authored HTML previews
 
