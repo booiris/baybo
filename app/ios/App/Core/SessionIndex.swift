@@ -1,8 +1,71 @@
 import Foundation
 
+/// Serialises replace-style cache writes away from the main actor. A short
+/// window collapses activity bursts, and keying by URL makes the newest snapshot
+/// the only one that reaches disk when several saves arrive together.
+private final class BackgroundFileWriter: @unchecked Sendable {
+    static let shared = BackgroundFileWriter()
+
+    private static let coalescingDelay = DispatchTimeInterval.milliseconds(25)
+
+    private struct Job {
+        let token: UUID
+        let operation: () throws -> Void
+        let completion: @MainActor (UUID) -> Void
+    }
+
+    private let queue = DispatchQueue(
+        label: "com.baybo.background-file-writer", qos: .utility)
+    private var pending: [URL: Job] = [:]
+    private var drainScheduled = false
+
+    private init() {}
+
+    func submit(
+        url: URL, token: UUID, operation: @escaping () throws -> Void,
+        completion: @escaping @MainActor (UUID) -> Void
+    ) {
+        queue.async { [self] in
+            pending[url] = Job(token: token, operation: operation, completion: completion)
+            scheduleDrain()
+        }
+    }
+
+    func flush() {
+        queue.sync { [self] in
+            drainScheduled = false
+            drain()
+        }
+    }
+
+    private func scheduleDrain() {
+        guard !drainScheduled else { return }
+        drainScheduled = true
+        queue.asyncAfter(deadline: .now() + Self.coalescingDelay) { [self] in
+            drainScheduled = false
+            drain()
+        }
+    }
+
+    private func drain() {
+        let jobs = Array(pending.values)
+        pending.removeAll()
+        for job in jobs {
+            try? job.operation()
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    job.completion(job.token)
+                }
+            }
+        }
+    }
+}
+
 /// One chat-list row. The device-local truth for sessions this device opened;
 /// on a direct binding the REST list merges over it (see `merge(remote:)`).
-struct SessionRow: Codable, Identifiable, Equatable {
+struct SessionRow: Codable, Identifiable, Equatable, Sendable {
+    private static let restoredApprovalPending = false
+
     /// The session id.
     let id: String
     var createdAt: Date
@@ -118,7 +181,13 @@ struct SessionRow: Codable, Identifiable, Equatable {
         //
         // It is still ENCODED (synthesized) so `SessionRow` stays one shape;
         // `PersistedFormatTests` asserts key presence, not round-tripping.
-        approvalPending = false
+        approvalPending = Self.restoredApprovalPending
+    }
+
+    fileprivate var persistenceSnapshot: Self {
+        var snapshot = self
+        snapshot.approvalPending = Self.restoredApprovalPending
+        return snapshot
     }
 }
 
@@ -133,6 +202,16 @@ final class SessionIndex: ObservableObject {
 
     private static let indexFileName = "sessions.json"
     private static let mutationFileName = "session-mutations.json"
+    private static let fractionalDateParser = Date.ISO8601FormatStyle(
+        includingFractionalSeconds: true)
+    private static let plainDateParser = Date.ISO8601FormatStyle()
+
+    private struct PendingRows {
+        let token: UUID
+        let rows: [SessionRow]
+    }
+
+    private static var pendingRows: [URL: PendingRows] = [:]
 
     /// Mirrors the gateway CHAT-LIST `PREVIEW_MAX_CHARS` (`api/admin/chat.rs`
     /// — 120, NOT push's 200) so a locally-captured preview and a REST-fetched
@@ -859,6 +938,7 @@ final class SessionIndex: ObservableObject {
             dropped.insert(row.id)
         }
         if !dropped.isEmpty { onSessionsRemoved?(dropped) }
+        guard merged != rows else { return }
         rows = merged
         save()
     }
@@ -996,7 +1076,7 @@ final class SessionIndex: ObservableObject {
         return durable.compactMapValues(\.pending)
     }
 
-    /// Writes the registry — and NOTHING else. It used to end by pruning the
+    /// Queues a registry snapshot — and NOTHING else. It used to end by pruning the
     /// transcript mirrors down to the ten most recently active rows, which made
     /// the mirror useless for exactly the sessions it exists to serve: `save()`
     /// runs on every list merge (including the one the pop back from a chat
@@ -1013,10 +1093,24 @@ final class SessionIndex: ObservableObject {
         // badge writes across a dozen call sites. `BadgeCenter` coalesces, so
         // the saves that do not move the number cost nothing.
         publishBadge()
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        guard let data = try? encoder.encode(rows) else { return }
-        try? data.write(to: fileURL, options: .atomic)
+        // `rows` is value-typed: later main-actor mutations detach its storage,
+        // so this immutable snapshot is safe to encode on the writer queue.
+        let snapshot = rows.map(\.persistenceSnapshot)
+        let target = fileURL
+        let token = UUID()
+        Self.pendingRows[target] = PendingRows(token: token, rows: snapshot)
+        BackgroundFileWriter.shared.submit(
+            url: target, token: token,
+            operation: {
+                let encoder = JSONEncoder()
+                encoder.dateEncodingStrategy = .iso8601
+                let data = try encoder.encode(snapshot)
+                try data.write(to: target, options: .atomic)
+            },
+            completion: { token in
+                guard Self.pendingRows[target]?.token == token else { return }
+                Self.pendingRows.removeValue(forKey: target)
+            })
     }
 
     private func publishBadge(force: Bool = false) {
@@ -1025,6 +1119,7 @@ final class SessionIndex: ObservableObject {
     }
 
     private static func load(from url: URL) -> [SessionRow] {
+        if let pending = pendingRows[url] { return pending.rows }
         guard let data = try? Data(contentsOf: url) else { return [] }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
@@ -1056,13 +1151,9 @@ final class SessionIndex: ObservableObject {
     /// RFC 3339 with or without fractional seconds (the gateway emits both
     /// across endpoints). Unparseable → epoch, so a malformed row sinks to the
     /// bottom instead of crashing the list.
-    nonisolated static func parseDate(_ rfc3339: String) -> Date {
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = fractional.date(from: rfc3339) { return date }
-        let plain = ISO8601DateFormatter()
-        plain.formatOptions = [.withInternetDateTime]
-        return plain.date(from: rfc3339) ?? Date(timeIntervalSince1970: 0)
+    static func parseDate(_ rfc3339: String) -> Date {
+        let preferred = rfc3339.contains(".") ? fractionalDateParser : plainDateParser
+        return (try? preferred.parse(rfc3339)) ?? Date(timeIntervalSince1970: 0)
     }
 
     nonisolated static func supportDirectory() -> URL {
@@ -1125,16 +1216,28 @@ final class SessionActivityHandler: SessionListSink, @unchecked Sendable {
 /// The files carry message text, the sync cursor and image dimensions; never
 /// blob bytes (those live in their own cache, which is also never swept). Only a
 /// user-triggered delete (`SessionIndex.beginHide`) or unbinding the gateway
-/// (`removeAll`) removes one. Bounding this wants a stated retention policy, not
-/// a surprise sweep.
+/// (`removeAll`) removes one. Writes are queued off the main actor; `pending`
+/// keeps read-after-write/delete semantics while the atomic replacement catches
+/// up. Bounding this wants a stated retention policy, not a surprise sweep.
+@MainActor
 enum TranscriptStore {
+    private enum PendingMirror {
+        case write(String)
+        case delete
+    }
+
+    private struct PendingOperation {
+        let token: UUID
+        let mirror: PendingMirror
+    }
+
+    private static var pending: [URL: PendingOperation] = [:]
+
     /// The support root defaults to the production one; `SessionIndex` passes
     /// its own so an isolated registry deletes/wipes its own tree (see its
     /// `supportDirectory`).
     private static func directory(in supportDirectory: URL) -> URL {
-        let dir = supportDirectory.appendingPathComponent("transcripts", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir
+        supportDirectory.appendingPathComponent("transcripts", isDirectory: true)
     }
 
     /// Session ids are gateway-assigned or UUIDs, but never trust them as raw
@@ -1150,7 +1253,14 @@ enum TranscriptStore {
     static func read(
         sessionId: String, in supportDirectory: URL = SessionIndex.supportDirectory()
     ) -> String? {
-        guard let data = try? Data(contentsOf: fileURL(for: sessionId, in: supportDirectory))
+        let url = fileURL(for: sessionId, in: supportDirectory)
+        if let pending = pending[url] {
+            switch pending.mirror {
+            case .write(let stateJson): return stateJson
+            case .delete: return nil
+            }
+        }
+        guard let data = try? Data(contentsOf: url)
         else { return nil }
         return String(data: data, encoding: .utf8)
     }
@@ -1159,17 +1269,45 @@ enum TranscriptStore {
         sessionId: String, stateJson: String,
         in supportDirectory: URL = SessionIndex.supportDirectory()
     ) {
-        try? stateJson.data(using: .utf8)?
-            .write(to: fileURL(for: sessionId, in: supportDirectory), options: .atomic)
+        let url = fileURL(for: sessionId, in: supportDirectory)
+        let directory = directory(in: supportDirectory)
+        let token = UUID()
+        pending[url] = PendingOperation(token: token, mirror: .write(stateJson))
+        BackgroundFileWriter.shared.submit(
+            url: url, token: token,
+            operation: {
+                try FileManager.default.createDirectory(
+                    at: directory, withIntermediateDirectories: true)
+                try Data(stateJson.utf8).write(to: url, options: .atomic)
+            },
+            completion: { token in
+                guard pending[url]?.token == token else { return }
+                pending.removeValue(forKey: url)
+            })
     }
 
     /// Drop one session's mirror — the user deleted the conversation. The only
     /// per-session removal there is; see the type's note on why nothing sweeps.
     static func delete(sessionId: String, in supportDirectory: URL) {
-        try? FileManager.default.removeItem(at: fileURL(for: sessionId, in: supportDirectory))
+        let url = fileURL(for: sessionId, in: supportDirectory)
+        let token = UUID()
+        pending[url] = PendingOperation(token: token, mirror: .delete)
+        BackgroundFileWriter.shared.submit(
+            url: url, token: token,
+            operation: {
+                guard FileManager.default.fileExists(atPath: url.path) else { return }
+                try FileManager.default.removeItem(at: url)
+            },
+            completion: { token in
+                guard pending[url]?.token == token else { return }
+                pending.removeValue(forKey: url)
+            })
     }
 
     static func deleteAll(in supportDirectory: URL) {
+        BackgroundFileWriter.shared.flush()
+        let root = directory(in: supportDirectory)
+        pending = pending.filter { !$0.key.path.hasPrefix(root.path + "/") }
         try? FileManager.default.removeItem(at: directory(in: supportDirectory))
     }
 }

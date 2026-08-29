@@ -194,7 +194,7 @@ struct CronGroupBucketTests {
 /// round-trip through disk.
 @Suite @MainActor
 struct CronGroupPersistenceTests {
-    @Test func theGroupingKeySurvivesAColdStart() throws {
+    @Test func theGroupingKeySurvivesAColdStart() async throws {
         let temp = TempSupportDir()
         let index = temp.makeIndex()
 
@@ -217,15 +217,21 @@ struct CronGroupPersistenceTests {
             ],
             fetchEpoch: index.mutationEpoch)
 
-        // A second index over the same directory IS the cold start: it loads
-        // sessions.json from disk with no in-memory state carried over.
-        let reloaded = temp.makeIndex()
-        let row = try #require(reloaded.rows.first { $0.id == "fire-1" })
+        let file = temp.url.appendingPathComponent("sessions.json")
+        let latestReachedDisk = await waitUntil {
+            (try? String(contentsOf: file, encoding: .utf8).contains(#""cronJobId":"cj-1""#))
+                == true
+        }
+        #expect(latestReachedDisk)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let reloaded = try decoder.decode([SessionRow].self, from: Data(contentsOf: file))
+        let row = try #require(reloaded.first { $0.id == "fire-1" })
 
         #expect(row.cronJobId == "cj-1")
         #expect(row.cronJobTitle == "Morning brief")
         #expect(
-            ChatListBuckets.items(from: reloaded.rows).first?.id == "cron:cj-1",
+            ChatListBuckets.items(from: reloaded).first?.id == "cron:cj-1",
             "a reloaded fire must still group — a missing decode reads nil off disk forever")
     }
 

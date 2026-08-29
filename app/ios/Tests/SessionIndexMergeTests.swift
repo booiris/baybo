@@ -200,6 +200,19 @@ struct SessionIndexMergeTests {
         #expect(index.rows.first?.unread == 7)
     }
 
+    @Test func fractionalGatewayDatesAreParsed() {
+        index.merge(
+            remote: [
+                summary(
+                    lastActive: "2026-07-10T12:00:00.123456789Z",
+                    lastMessageText: "reply")
+            ],
+            fetchEpoch: index.mutationEpoch)
+
+        let parsed = index.rows.first?.lastActive.timeIntervalSince1970 ?? 0
+        #expect(abs(parsed - 1_783_684_800.123_456_7) < 0.000_001)
+    }
+
     /// Existence is remote-authoritative: a row hidden from another client is
     /// gone from the snapshot, so it must leave the local list too.
     @Test func aRowMissingFromTheSnapshotIsDropped() {
@@ -209,5 +222,17 @@ struct SessionIndexMergeTests {
             remote: [summary(id: "s-2", lastMessageText: "second")],
             fetchEpoch: index.mutationEpoch)
         #expect(index.rows.map(\.id) == ["s-2"])
+    }
+
+    @Test func anIdenticalSnapshotDoesNotRepublishTheList() {
+        let remote = [summary(lastMessageText: "answer")]
+        index.merge(remote: remote, fetchEpoch: index.mutationEpoch)
+        var publishes = 0
+        let subscription = index.objectWillChange.sink { _ in publishes += 1 }
+
+        index.merge(remote: remote, fetchEpoch: index.mutationEpoch)
+
+        #expect(publishes == 0)
+        withExtendedLifetime(subscription) {}
     }
 }

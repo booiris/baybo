@@ -612,11 +612,9 @@ extension TranscriptBridge: WKScriptMessageHandler {
             // backstop for a flush that slips through a mid-retarget nil store.
             if let store, !store.mirrored { break }
             if let sessionId = (body["sessionId"] as? String) ?? store?.sessionId,
-                let state = body["state"],
-                let data = try? JSONSerialization.data(withJSONObject: state),
-                let json = String(data: data, encoding: .utf8)
+                let stateJson = body["stateJson"] as? String
             {
-                TranscriptStore.write(sessionId: sessionId, stateJson: json)
+                TranscriptStore.write(sessionId: sessionId, stateJson: stateJson)
             }
         case "fetchHistory":
             let before = (body["beforeOrdinal"] as? NSNumber)?.int64Value

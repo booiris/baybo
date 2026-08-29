@@ -71,12 +71,13 @@ struct ChatListScreen: View {
     }
 
     var body: some View {
+        let items = listItems
         ZStack(alignment: .top) {
             Group {
-                if listItems.isEmpty {
+                if items.isEmpty {
                     emptyState
                 } else {
-                    sessionList
+                    sessionList(items)
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -132,9 +133,9 @@ struct ChatListScreen: View {
         #endif
     }
 
-    private var sessionList: some View {
+    private func sessionList(_ items: [ChatListItem]) -> some View {
         List {
-            ForEach(listItems) { item in
+            ForEach(items) { item in
                 switch item {
                 case .chat(let row): chatRow(row)
                 case .cronGroup(let group): cronGroupRow(group)
@@ -176,7 +177,7 @@ struct ChatListScreen: View {
         Button {
             appStore.openSession(row.id)
         } label: {
-            SessionRowView(row: row, langCode: lang.current.lproj)
+            SessionRowView(row: row, langCode: lang.current.lproj).equatable()
         }
         // CONSTANT background — the pinned tint lives in the row content
         // (see SessionRowView), so a pin flip is a pure move, not a
@@ -243,7 +244,7 @@ struct ChatListScreen: View {
         Button {
             appStore.openCronGroup(group.jobId)
         } label: {
-            CronGroupRowView(group: group, langCode: lang.current.lproj)
+            CronGroupRowView(group: group, langCode: lang.current.lproj).equatable()
         }
         .listRowBackground(Theme.paper)
         .listRowSeparatorTint(Theme.line)
@@ -411,7 +412,7 @@ struct ChatListScreen: View {
 /// short snippet of the user's last message until the title pass runs) over a
 /// grey last-message preview on the left; the last-active time over an unread
 /// badge on the right. Pinned rows are marked by a tinted background, not a glyph.
-struct SessionRowView: View {
+struct SessionRowView: View, Equatable {
     let row: SessionRow
     /// The app language's locale identifier (drives the time formatter, so it
     /// can't diverge from the chrome language).
@@ -509,7 +510,7 @@ struct SessionContextMenu: ViewModifier {
 /// *"a folder"*. Cron is the meaningful category; the grouping is just how we
 /// keep it from flooding the list. A clock also implies *recurring*, so "there
 /// are several of these inside" comes free.
-struct CronGroupRowView: View {
+struct CronGroupRowView: View, Equatable {
     let group: CronGroup
     let langCode: String
 

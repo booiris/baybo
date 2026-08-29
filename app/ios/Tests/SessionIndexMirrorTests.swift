@@ -41,6 +41,18 @@ struct SessionIndexMirrorTests {
         TranscriptStore.read(sessionId: sessionId, in: temp.url)
     }
 
+    @Test func theLatestQueuedMirrorReachesDisk() async throws {
+        let latest = #"{"messages":[{"id":"latest"}],"lastOrdinal":9}"#
+        writeMirror(Self.sessionId, #"{"messages":[{"id":"old"}]}"#)
+        writeMirror(Self.sessionId, latest)
+
+        let file = temp.url.appendingPathComponent("transcripts/s-mirror.json")
+        let latestReachedDisk = await waitUntil {
+            (try? String(contentsOf: file, encoding: .utf8)) == latest
+        }
+        #expect(latestReachedDisk)
+    }
+
     private func summary(
         id: String, lastActive: String, lastMessageText: String? = "hi"
     ) -> ChatSessionSummary {

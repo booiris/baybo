@@ -234,7 +234,8 @@ delivering other traffic is left alone and only this connect fails.
 `requestSync` / `collapseHtmlPreview` / `flushPersist`.
 
 **web→native:**
-`ready` / `shown` / `sync` / `mark_read` / `persist` / `fetchHistory` / `requestBlob` /
+`ready` / `shown` / `sync` / `mark_read` / `persist` (`stateJson`, stringified in the
+WebContent process) / `fetchHistory` / `requestBlob` /
 `queryFileState` / `downloadFile` / `previewFile` / `shareFile` / `viewImage` /
 `audioToggle` / `audioSeek` / `queryAudioState` / `playVideo` / `requestVideoPoster` /
 `retry` / `openUrl` / `copy` / `log` / `jumpVisible` / `runState` / `outline` /
