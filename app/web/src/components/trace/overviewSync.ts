@@ -3,9 +3,8 @@
  *
  * A poll asks only for rows above the cursor it already holds
  * (`since_ordinal`), so the client must decide what to do with the page it
- * gets back. That decision is subtle enough — and now made in two places, for
- * the session being viewed and for each expanded subagent child — that it
- * lives here as a pure function rather than inline in an effect.
+ * gets back. That decision is subtle enough to live here as a pure function
+ * rather than inline in the page's fetch effect.
  */
 import type { SessionMessageRow, TraceOverview } from '../../types/trace';
 

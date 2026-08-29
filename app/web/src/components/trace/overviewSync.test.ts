@@ -8,10 +8,9 @@
  * client a compaction has re-marked rows inside the prefix it still holds.
  * `turns` is always the full, tiny array — replaced, never merged.
  *
- * The call sequences pinned here are the two real ones in
- * `pages/TraceSessionPage.tsx`: `loadOverview` (the viewed session) and
- * `fetchChildOverview` (each expanded subagent child, whose live external
- * transcript is polled into the tree).
+ * The call sequence pinned here is `loadOverview` in
+ * `pages/TraceSessionPage.tsx`; child traces use their own page rather than
+ * being polled into the parent.
  */
 import { describe, expect, it } from 'vitest';
 import type { SessionMessageRow, TraceOverview, TraceTurnSummary } from '../../types/trace';

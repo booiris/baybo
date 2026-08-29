@@ -234,17 +234,14 @@ describe('isExternalAgentTurn / traceHasPendingSpan', () => {
 });
 
 describe('turnLabels', () => {
-  it('numbers only the turns the chat transcript showed', () => {
-    // Two user messages with a compaction between them: the chat rendered two
-    // turns, so the viewer must too — numbering the compaction as #2 is the
-    // disagreement this labelling exists to prevent.
+  it('numbers every turn in storage order so child markers share its prefix', () => {
     const turns = [
       mkKindTurn('a', 'user_chat'),
       mkKindTurn('b', 'compact'),
       mkKindTurn('c', 'user_chat'),
     ];
-    expect(turnLabels(turns).map((l) => l.long)).toEqual(['Turn #1', 'Compaction', 'Turn #2']);
-    expect(turnLabels(turns).map((l) => l.short)).toEqual(['#1', 'cmp', '#2']);
+    expect(turnLabels(turns).map((l) => l.long)).toEqual(['Turn #1', 'Compaction #2', 'Turn #3']);
+    expect(turnLabels(turns).map((l) => l.short)).toEqual(['#1', '#2', '#3']);
   });
 
   it('treats a cron-result delivery as non-chat, and a cron fire as a turn', () => {
@@ -256,15 +253,15 @@ describe('turnLabels', () => {
     ];
     expect(turnLabels(turns).map((l) => l.long)).toEqual([
       'Turn #1',
-      'Cron delivery',
-      'Turn #2',
+      'Cron delivery #2',
       'Turn #3',
+      'Turn #4',
     ]);
   });
 
   it('is empty-safe and numbers a pure-maintenance session with no turns at all', () => {
     expect(turnLabels([])).toEqual([]);
-    expect(turnLabels([mkKindTurn('a', 'compact')]).map((l) => l.long)).toEqual(['Compaction']);
+    expect(turnLabels([mkKindTurn('a', 'compact')]).map((l) => l.long)).toEqual(['Compaction #1']);
   });
 });
 
@@ -449,18 +446,18 @@ describe('order', () => {
   ]);
 
   it('numbers a step by its position among the turn steps', () => {
-    expect(stepOrder(trace, 'step-b')).toEqual({ step: 2, stepTotal: 2 });
+    expect(stepOrder(trace, 'step-b', 4)).toEqual({ turn: 4, step: 2, stepTotal: 2 });
   });
 
   it('numbers a span within its own step, carrying the step position', () => {
-    expect(spanOrder(trace, 'span-b2')).toEqual({ step: 2, stepTotal: 2, span: 2, spanTotal: 2 });
+    expect(spanOrder(trace, 'span-b2', 4)).toEqual({ turn: 4, step: 2, stepTotal: 2, span: 2, spanTotal: 2 });
   });
 
   it('has no number for an id the trace does not hold', () => {
-    expect(stepOrder(trace, 'nope')).toBeNull();
-    expect(spanOrder(trace, 'nope')).toBeNull();
-    expect(stepOrder(undefined, 'step-a')).toBeNull();
-    expect(spanOrder(undefined, 'span-a1')).toBeNull();
+    expect(stepOrder(trace, 'nope', 1)).toBeNull();
+    expect(spanOrder(trace, 'nope', 1)).toBeNull();
+    expect(stepOrder(undefined, 'step-a', 1)).toBeNull();
+    expect(spanOrder(undefined, 'span-a1', 1)).toBeNull();
   });
 });
 
@@ -539,47 +536,66 @@ describe('resolveOrdinalTarget', () => {
     ]),
   ]);
 
+  const turns = [mkKindTurn('before', 'user_chat'), mkKindTurn('turn', 'user_chat')];
+  const traces = new Map([['turn', trace]]);
+
+  it('resolves the marker the tree prints on a turn row', () => {
+    expect(resolveOrdinalTarget(turns, traces, '#2')).toEqual({
+      turnId: 'turn',
+      stepId: null,
+      spanId: null,
+    });
+  });
+
   it('resolves the marker the tree prints on a step row', () => {
-    expect(resolveOrdinalTarget(trace, '#2')).toEqual({ stepId: 'step-b', spanId: null });
+    expect(resolveOrdinalTarget(turns, traces, '2.2')).toEqual({
+      turnId: 'turn',
+      stepId: 'step-b',
+      spanId: null,
+    });
   });
 
   it('resolves a span marker to the span, carrying its step', () => {
-    expect(resolveOrdinalTarget(trace, '#2.2')).toEqual({
+    expect(resolveOrdinalTarget(turns, traces, '2.2.2')).toEqual({
+      turnId: 'turn',
       stepId: 'step-b',
       spanId: 'span-b2',
     });
   });
 
-  it('tolerates surrounding whitespace from a paste', () => {
-    expect(resolveOrdinalTarget(trace, '  #1  ')).toEqual({ stepId: 'step-a', spanId: null });
+  it('tolerates whitespace and a leading hash on a child path', () => {
+    expect(resolveOrdinalTarget(turns, traces, '  #2.1  ')).toEqual({
+      turnId: 'turn',
+      stepId: 'step-a',
+      spanId: null,
+    });
   });
 
   it('leaves a bare number alone so searching for content still works', () => {
-    // Someone typing `2` is looking for text, not navigating. The `#` is what
-    // makes the intent explicit.
-    expect(resolveOrdinalTarget(trace, '2')).toBeNull();
-    expect(resolveOrdinalTarget(trace, '2.2')).toBeNull();
+    expect(resolveOrdinalTarget(turns, traces, '2')).toBeNull();
   });
 
-  it('refuses #0 rather than silently selecting the last row', () => {
+  it('refuses zero rather than silently selecting the last row', () => {
     // `Number('0') - 1` is -1, and `Array.at(-1)` is the LAST element — a
     // marker nothing prints, resolving to a row the reader did not ask for.
-    expect(resolveOrdinalTarget(trace, '#0')).toBeNull();
-    expect(resolveOrdinalTarget(trace, '#1.0')).toBeNull();
+    expect(resolveOrdinalTarget(turns, traces, '#0')).toBeNull();
+    expect(resolveOrdinalTarget(turns, traces, '2.0')).toBeNull();
   });
 
-  it('is null for a position the turn does not have', () => {
-    expect(resolveOrdinalTarget(trace, '#9')).toBeNull();
-    expect(resolveOrdinalTarget(trace, '#1.5')).toBeNull();
+  it('is null for a position the tree does not have', () => {
+    expect(resolveOrdinalTarget(turns, traces, '#9')).toBeNull();
+    expect(resolveOrdinalTarget(turns, traces, '2.5')).toBeNull();
+    expect(resolveOrdinalTarget(turns, traces, '2.1.5')).toBeNull();
   });
 
   it('rejects malformed markers instead of guessing', () => {
-    for (const text of ['#', '#1.', '#1.2.3', '#a', '#1a', '']) {
-      expect(resolveOrdinalTarget(trace, text)).toBeNull();
+    for (const text of ['#', '#1.', '1.2.3.4', '#a', '#1a', '']) {
+      expect(resolveOrdinalTarget(turns, traces, text)).toBeNull();
     }
   });
 
-  it('is null without a loaded trace', () => {
-    expect(resolveOrdinalTarget(undefined, '#1')).toBeNull();
+  it('needs a loaded trace only below the turn level', () => {
+    expect(resolveOrdinalTarget(turns, new Map(), '#2')?.turnId).toBe('turn');
+    expect(resolveOrdinalTarget(turns, new Map(), '2.1')).toBeNull();
   });
 });

@@ -214,7 +214,7 @@ time and `before→after` tokens, clickable to jump to that step. The token figu
 cache reads and cache writes as context, because they occupied the window that got
 compacted.
 
-## PR2 — subagent lineage nesting — SHIPPED
+## PR2 — subagent lineage navigation — SHIPPED
 
 Delivers pain **3**.
 
@@ -231,19 +231,16 @@ Delivers pain **3**.
     a lineage cycle once per level and emit each session repeatedly; plus
     `MAX_LINEAGE_SESSIONS` for breadth, with a `warn!` when either trims.
 - **Front-end:** `buildForest` (`components/trace/traceForest.ts`) indexes the response;
-  children nest in place under their spawning span (or their parent turn, when
-  `parent_span_id` predates the field). A child's own overview + step trees stay lazy on
-  expand — and an **external** child's per-turn fetches are skipped entirely, since that
-  backend has no step tree to return. The drill-out navigate is now the secondary "open
-  as its own trace" action. `MAX_RENDER_DEPTH` backstops the recursive render.
+  each child appears as a jump under its spawning span (or its parent turn, when
+  `parent_span_id` predates the field). Clicking the row opens the child's own trace page;
+  the parent fetches and renders none of the child's overview, transcript, steps, or spans.
 - Cross-boundary roll-up badges come from the turn statuses the lineage response supplies
-  up front, so a collapsed subagent can say "something failed in there" before anything
-  is expanded.
+  up front, so the jump can say "something failed in there" before the child is opened.
 - Polling refreshes `/lineage` on the same tick as the overview, and a running subagent
-  now holds the page on the **fast** tier (see `liveSessions`).
+  keeps the parent on the **slow** tier until the jump row settles (see `liveSessions`).
 - Mock: `buildExplorerChild` (baybo-backed, full step tree) + `buildClaudeChild`
-  (external, live, zero steps, transcript with an in-flight tool call) in
-  `app/web/src/api/mock.ts`, plus a live third turn on the parent that spawns the latter.
+  (external, live, zero steps, transcript with an in-flight tool call) remain available
+  as standalone child trace pages in `app/web/src/api/mock.ts`.
 
 ## Deferred / cheap-approximation decisions (on the record)
 

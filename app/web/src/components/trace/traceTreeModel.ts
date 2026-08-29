@@ -10,6 +10,7 @@ import type {
   ReplayStep,
   SessionMessageRow,
   Span,
+  TurnInputKind,
   TraceTurnSummary,
   TurnStatusKind,
   TurnTrace,
@@ -31,32 +32,29 @@ export interface TurnLabel {
   long: string;
 }
 
-/** Labels for the two kinds the chat never showed as turns. */
-const NON_CHAT_TURN_LABEL: Record<string, TurnLabel> = {
-  compact: { short: 'cmp', long: 'Compaction' },
-  cron_notification: { short: 'dlv', long: 'Cron delivery' },
+/** Labels for maintenance turns that need a more precise title than `Turn`. */
+const NON_CHAT_TURN_LABEL: Partial<Record<TurnInputKind, string>> = {
+  compact: 'Compaction',
+  cron_notification: 'Cron delivery',
 };
 
 /**
  * Label every turn row, in the overview's own oldest-first order.
  *
- * Only chat turns are numbered, and they are numbered among themselves — a
- * `/compact` or a cron-result delivery opens a real turn row but was never a
- * turn the transcript showed, so counting them made the sidebar say "#3" for a
- * session the chat rendered as two turns. Non-chat rows get their kind as the
- * label instead of a number.
+ * Every recorded turn gets its storage-order position. Step and span markers
+ * carry this number as their first path segment, so skipping maintenance turns
+ * here would make `2.1` appear under a row labelled `Turn #1`.
  *
  * Returned as a whole array rather than a per-index lookup so the numbering is
  * one pass, not one per rendered row.
  */
 export function turnLabels(turns: TraceTurnSummary[]): TurnLabel[] {
-  let n = 0;
-  return turns.map((turn) => {
-    if (!isChatTurn(turn.turn_input_kind)) {
-      return NON_CHAT_TURN_LABEL[turn.turn_input_kind] ?? { short: '·', long: turn.turn_input_kind };
-    }
-    n++;
-    return { short: `#${n}`, long: `Turn #${n}` };
+  return turns.map((turn, index) => {
+    const number = index + 1;
+    const title = isChatTurn(turn.turn_input_kind)
+      ? 'Turn'
+      : (NON_CHAT_TURN_LABEL[turn.turn_input_kind] ?? turn.turn_input_kind);
+    return { short: `#${number}`, long: `${title} #${number}` };
   });
 }
 
@@ -190,7 +188,7 @@ export function looksLikeTraceId(text: string): boolean {
 /** The node a pasted id names, across every loaded turn. */
 export interface JumpTarget {
   turnId: string;
-  stepId: string;
+  stepId: string | null;
   spanId: string | null;
 }
 
@@ -217,32 +215,37 @@ export function resolveJumpTarget(
 }
 
 /**
- * Resolve the position marker the tree prints on its own rows — `#3` for a
- * step, `#3.2` for its second span — back to the node it names.
- *
- * Scoped to one turn because that is what the numbers are scoped to: `#3` is
- * the third step *of this turn*, and the same marker exists in every other
- * turn. The `#` is required so an ordinary search for `3` stays a text
- * filter; a reader typing a bare number is looking for content, not
- * navigating.
+ * Resolve the hierarchical position marker printed by the tree: `#3` is the
+ * third turn, `3.2` its second step, and `3.2.4` that step's fourth span.
+ * A leading `#` is also accepted on step/span paths for paste compatibility.
+ * A bare integer remains ordinary search text; only the turn form carries `#`.
  */
 export function resolveOrdinalTarget(
-  trace: TurnTrace | undefined,
+  turns: TraceTurnSummary[],
+  traces: Map<string, TurnTrace>,
   text: string,
-): { stepId: string; spanId: string | null } | null {
+): JumpTarget | null {
   const raw = text.trim();
-  if (trace == null || !raw.startsWith('#')) return null;
-  // Positive integers only. `#0` would otherwise index -1, and `.at(-1)` is
-  // the LAST element — a marker nothing prints, silently selecting the wrong
+  const explicitTurn = raw.startsWith('#');
+  const parts = (explicitTurn ? raw.slice(1) : raw).split('.');
+  if ((!explicitTurn && parts.length === 1) || parts.length > 3) return null;
+  // Positive integers only. Zero would otherwise index -1, and `.at(-1)` is
+  // the last element — a marker nothing prints, silently selecting the wrong
   // row.
-  const parts = raw.slice(1).split('.');
-  if (parts.length > 2 || parts.some((p) => !/^[1-9]\d*$/.test(p))) return null;
+  if (parts.some((p) => !/^[1-9]\d*$/.test(p))) return null;
 
-  const step = trace.steps.at(Number(parts[0]) - 1);
+  const turn = turns.at(Number(parts[0]) - 1);
+  if (turn == null) return null;
+  if (parts.length === 1) return { turnId: turn.turn_id, stepId: null, spanId: null };
+
+  const trace = traces.get(turn.turn_id);
+  const step = trace?.steps.at(Number(parts[1]) - 1);
   if (step == null) return null;
-  if (parts.length === 1) return { stepId: step.step.id, spanId: null };
-  const span = step.spans.at(Number(parts[1]) - 1);
-  return span == null ? null : { stepId: step.step.id, spanId: span.id };
+  if (parts.length === 2) return { turnId: turn.turn_id, stepId: step.step.id, spanId: null };
+  const span = step.spans.at(Number(parts[2]) - 1);
+  return span == null
+    ? null
+    : { turnId: turn.turn_id, stepId: step.step.id, spanId: span.id };
 }
 
 /**
@@ -251,9 +254,10 @@ export function resolveOrdinalTarget(
  * `steps` come back ordered by `started_at` within their turn and `spans`
  * likewise within their step (`ORDER BY started_at` in both queries), so a
  * node's position in the array it arrived in IS its recorded order. Numbers
- * are 1-based for display: step `#3`, its second span `#3.2`.
+ * are 1-based for display: turn `#2`, step `2.3`, span `2.3.2`.
  */
 export interface StepOrder {
+  turn: number;
   step: number;
   stepTotal: number;
 }
@@ -263,18 +267,19 @@ export interface SpanOrder extends StepOrder {
   spanTotal: number;
 }
 
-export function stepOrder(trace: TurnTrace | undefined, stepId: string): StepOrder | null {
+export function stepOrder(trace: TurnTrace | undefined, stepId: string, turn: number): StepOrder | null {
   if (!trace) return null;
   const i = trace.steps.findIndex((rs) => rs.step.id === stepId);
-  return i < 0 ? null : { step: i + 1, stepTotal: trace.steps.length };
+  return i < 0 ? null : { turn, step: i + 1, stepTotal: trace.steps.length };
 }
 
-export function spanOrder(trace: TurnTrace | undefined, spanId: string): SpanOrder | null {
+export function spanOrder(trace: TurnTrace | undefined, spanId: string, turn: number): SpanOrder | null {
   if (!trace) return null;
   for (let i = 0; i < trace.steps.length; i++) {
     const j = trace.steps[i].spans.findIndex((s) => s.id === spanId);
     if (j >= 0) {
       return {
+        turn,
         step: i + 1,
         stepTotal: trace.steps.length,
         span: j + 1,

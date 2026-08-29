@@ -7,10 +7,8 @@ import {
   RiCornerDownLeftLine,
   RiCornerDownRightLine,
   RiCpuLine,
-  RiExternalLinkLine,
   RiLoader4Line,
   RiRefreshLine,
-  RiTeamLine,
 } from 'react-icons/ri';
 import { IconButton } from '../components/IconButton';
 import { Button } from '../components/Button';
@@ -75,7 +73,7 @@ import {
   turnTokens,
   TRANSCRIPT_VISUALS,
 } from '../components/trace/traceFormat';
-import { buildForest, liveSessions, sessionIsLive } from '../components/trace/traceForest';
+import { buildForest, liveSessions } from '../components/trace/traceForest';
 import { mergeOverviewPage, pollCursor } from '../components/trace/overviewSync';
 import type { TranscriptNode } from '../components/trace/transcriptModel';
 import { buildTranscriptNodes } from '../components/trace/transcriptModel';
@@ -86,7 +84,6 @@ import {
   isTurnLive,
   neededTurnIds,
   partitionTranscript,
-  resolveExpanded,
   resolveJumpTarget,
   resolveOrdinalTarget,
   spanOrder,
@@ -310,7 +307,7 @@ function MetaTab({ span, order }: { span: Span; order: SpanOrder | null }) {
   if (order) {
     baseRows.push([
       'Order',
-      `step #${order.step} of ${order.stepTotal} · span #${order.span} of ${order.spanTotal}`,
+      `${order.turn}.${order.step}.${order.span} · step ${order.step} of ${order.stepTotal} · span ${order.span} of ${order.spanTotal}`,
     ]);
   }
   baseRows.push(
@@ -648,7 +645,9 @@ function SpanDetailPanel({
               <Icon className={`${visual.accent} text-xl`} />
             </div>
             <div className="min-w-0">
-              <h3 className="font-bold uppercase tracking-wider leading-tight text-[1rem] truncate">{visual.label}</h3>
+              <h3 className="font-bold uppercase tracking-wider leading-tight text-[1rem] truncate">
+                {order ? `${visual.label} ${order.turn}.${order.step}.${order.span}` : visual.label}
+              </h3>
               <div className="text-ink-soft text-[0.8rem] font-mono">
                 {span.kind.kind} • {formatDuration(ms)}
               </div>
@@ -752,7 +751,7 @@ function StepDetail({
         </div>
         <div className="min-w-0">
           <h3 className="font-bold uppercase tracking-wider leading-tight text-[1rem] truncate">
-            {order ? `${visual.label} #${order.step}` : visual.label}
+            {order ? `${visual.label} ${order.turn}.${order.step}` : visual.label}
           </h3>
           <div className="text-ink-soft text-[0.8rem] font-mono flex items-center gap-2">
             <OutcomeBadge state={step.outcome} /> • {formatDuration(ms)}
@@ -779,7 +778,7 @@ function StepDetail({
               <>
                 <dt className="font-bold text-ink-soft">Order</dt>
                 <dd>
-                  #{order.step} of {order.stepTotal}
+                  {order.turn}.{order.step} · step {order.step} of {order.stepTotal}
                 </dd>
               </>
             )}
@@ -836,7 +835,7 @@ function StepDetail({
                     className="w-full text-left flex items-center gap-3 px-3 py-2 border-2 border-black rounded-md bg-white hover:bg-gray-50 hover:shadow-brutal-xs transition-all"
                   >
                     <span className="shrink-0 font-mono text-[0.7rem] font-bold text-ink-soft tabular-nums">
-                      {order ? `${order.step}.${i + 1}` : `#${i + 1}`}
+                      {order ? `${order.turn}.${order.step}.${i + 1}` : `${i + 1}`}
                     </span>
                     <div className={`w-8 h-8 rounded-full border-2 border-black flex items-center justify-center shrink-0 ${sv.bg}`}>
                       <SvIcon className={`${sv.accent} text-base`} />
@@ -872,7 +871,6 @@ function TurnSummaryPanel({
   turnMessages,
   externalAgent,
   turnIndex,
-  totalTurns,
   interjections,
 }: {
   summary: TraceTurnSummary | undefined;
@@ -884,7 +882,6 @@ function TurnSummaryPanel({
   turnMessages: SessionMessageRow[];
   externalAgent: ExternalAgentKind | null | undefined;
   turnIndex: number;
-  totalTurns: number;
   interjections: SessionMessageRow[];
 }) {
   const interjectionCount = interjections.length;
@@ -924,7 +921,7 @@ function TurnSummaryPanel({
           </div>
           <div className="min-w-0">
             <h3 className="font-bold uppercase tracking-wider leading-tight text-[1rem] truncate">
-              {turnIndex >= 0 && totalTurns > 1 ? `Turn #${turnIndex + 1}` : 'Turn Overview'}
+              {turnIndex >= 0 ? `Turn #${turnIndex + 1}` : 'Turn overview'}
             </h3>
             <div className="text-ink-soft text-[0.8rem] font-mono truncate">
               {externalAgent != null && `${externalAgentLabel(externalAgent)} · `}
@@ -1144,92 +1141,6 @@ function safeJson(value: unknown): string {
   }
 }
 
-/** Detail for a selected subagent boundary: what it is, how its turns went,
- *  and the way out to its own page. */
-function ChildSessionPanel({
-  child,
-  overview,
-  onOpenFullPage,
-  onSelectTurn,
-}: {
-  child: LineageSession;
-  overview: TraceOverview | undefined;
-  onOpenFullPage: () => void;
-  onSelectTurn: (turnId: string) => void;
-}) {
-  const turns = overview && overview.turns.length > 0 ? overview.turns : child.turns;
-  const backend = child.external_agent != null ? externalAgentLabel(child.external_agent) : 'baybo (in-process)';
-  const tokens = turns.reduce(
-    (acc, t) => ({ input: acc.input + t.input_tokens, output: acc.output + t.output_tokens }),
-    { input: 0, output: 0 },
-  );
-
-  return (
-    <div className="flex-1 min-h-0 flex flex-col">
-      <div className="flex items-center gap-3 min-w-0 p-4 border-b-[3px] border-black bg-canvas">
-        <div className="w-10 h-10 rounded-full border-2 border-black flex items-center justify-center shrink-0 bg-brand/10">
-          <RiTeamLine className="text-brand text-xl" />
-        </div>
-        <div className="min-w-0">
-          <h3 className="font-bold uppercase tracking-wider leading-tight text-[1rem] truncate">
-            {child.subagent_type ?? 'Subagent'}
-          </h3>
-          <div className="text-ink-soft text-[0.8rem] font-mono truncate">{backend}</div>
-        </div>
-      </div>
-      <div className="flex-1 overflow-y-scroll p-5 space-y-6">
-        <section>
-          <h4 className="font-bold uppercase tracking-wider text-[0.8rem] mb-2 border-b-2 border-black pb-1">Turns</h4>
-          {turns.length > 0 ? (
-            <div className="space-y-2">
-              {turns.map((t, i) => (
-                <button
-                  key={t.turn_id}
-                  type="button"
-                  onClick={() => onSelectTurn(t.turn_id)}
-                  className="w-full text-left flex items-center gap-3 px-3 py-2 border-2 border-black rounded-md bg-white hover:bg-gray-50 hover:shadow-brutal-xs transition-all"
-                >
-                  <span className="font-bold text-[0.8rem] shrink-0">#{i + 1}</span>
-                  <span className="flex-1 min-w-0 truncate font-mono text-[0.75rem] text-ink-soft">
-                    {t.turn_status_kind}
-                  </span>
-                  <span className="shrink-0 font-mono text-[0.7rem] text-ink-soft">
-                    ↑{t.input_tokens.toLocaleString()} ↓{t.output_tokens.toLocaleString()}
-                  </span>
-                </button>
-              ))}
-            </div>
-          ) : (
-            <div className="text-ink-soft text-[0.8rem] italic">No turns recorded yet.</div>
-          )}
-        </section>
-
-        <section>
-          <h4 className="font-bold uppercase tracking-wider text-[0.8rem] mb-2 border-b-2 border-black pb-1">
-            Details
-          </h4>
-          <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 font-mono text-[0.85rem]">
-            <dt className="font-bold text-ink-soft">Session</dt>
-            <dd className="break-all">
-              <code>{child.session_id}</code>
-            </dd>
-            <dt className="font-bold text-ink-soft">Backend</dt>
-            <dd>{backend}</dd>
-            <dt className="font-bold text-ink-soft">Input tokens</dt>
-            <dd>{tokens.input.toLocaleString()}</dd>
-            <dt className="font-bold text-ink-soft">Output tokens</dt>
-            <dd>{tokens.output.toLocaleString()}</dd>
-          </dl>
-        </section>
-
-        <Button onClick={onOpenFullPage} className="w-full gap-2">
-          <RiExternalLinkLine className="text-base shrink-0" /> Open as its own trace
-        </Button>
-      </div>
-    </div>
-  );
-}
-
 // ── Interjection index ───────────────────────────────────────────────
 
 // Precomputed lookup over a session's transcript so the per-span interjection
@@ -1323,8 +1234,6 @@ export function TraceSessionPage() {
   // Lets the throttled lineage poll see what it currently holds without making
   // its effect depend on the state it sets.
   const lineageRef = useRef<LineageSession[]>([]);
-  const [childOverviews, setChildOverviews] = useState<Map<string, TraceOverview>>(() => new Map());
-  const [loadingChildren, setLoadingChildren] = useState<Set<string>>(() => new Set());
   const [turnTraces, setTurnTraces] = useState<Map<string, TurnTrace>>(() => new Map());
   const [loadingTurns, setLoadingTurns] = useState<Set<string>>(() => new Set());
   const [toolSets, setToolSets] = useState<ToolSetCache>(() => new Map());
@@ -1370,7 +1279,6 @@ export function TraceSessionPage() {
   const stepIdParam = searchParams.get('step');
   const spanIdParam = searchParams.get('span');
   const msgIdParam = searchParams.get('msg');
-  const childIdParam = searchParams.get('child');
   const tabParam = (searchParams.get('tab') as DetailTab | null) ?? 'io';
 
   // Reset per-session caches when the session id changes.
@@ -1387,7 +1295,6 @@ export function TraceSessionPage() {
     setLineage([]);
     lineageRef.current = [];
     lastLineageFetch.current = 0;
-    setChildOverviews(new Map());
     inFlight.current = new Set();
     fetchedStatus.current = new Map();
   }, [sessionId]);
@@ -1600,20 +1507,13 @@ export function TraceSessionPage() {
 
   const forest = useMemo(() => buildForest(lineage), [lineage]);
 
-  // Every turn the tree can show, root and subagent alike, keyed by turn id
-  // (globally unique) with the session that owns it. A nested child's turn is
-  // selectable exactly like a root one, so selection needs no separate
-  // "which session" URL param.
+  // The parent page owns only this session's turns. Subagents are links to
+  // their own trace pages, so their turns never enter this selection index.
   const turnIndex = useMemo(() => {
     const map = new Map<string, { turn: TraceTurnSummary; sessionId: string }>();
     for (const t of overview?.turns ?? []) map.set(t.turn_id, { turn: t, sessionId: overview?.session_id ?? '' });
-    for (const child of lineage) {
-      const co = childOverviews.get(child.session_id);
-      const turns = co && co.turns.length > 0 ? co.turns : child.turns;
-      for (const t of turns) map.set(t.turn_id, { turn: t, sessionId: child.session_id });
-    }
     return map;
-  }, [overview, lineage, childOverviews]);
+  }, [overview]);
 
   // Derive the active turn id from URL ∩ known turns. Default to the oldest
   // turn of the session being viewed.
@@ -1623,30 +1523,16 @@ export function TraceSessionPage() {
   const activeTurnSummary = activeTurnEntry?.turn;
   const activeTurnTrace = activeTurnId ? turnTraces.get(activeTurnId) : undefined;
   const messageLog = useMemo(() => overview?.session_messages ?? [], [overview]);
-  // The transcript of whichever session owns the active turn — a child's own
-  // log when the selection is inside a subagent.
-  const activeMessageLog = useMemo(() => {
-    if (!activeTurnEntry || activeTurnEntry.sessionId === overview?.session_id) return messageLog;
-    return childOverviews.get(activeTurnEntry.sessionId)?.session_messages ?? [];
-  }, [activeTurnEntry, childOverviews, messageLog, overview?.session_id]);
-  const activeExternalAgent =
-    activeTurnEntry?.sessionId === overview?.session_id
-      ? overview?.external_agent
-      : (childOverviews.get(activeTurnEntry?.sessionId ?? '')?.external_agent ??
-        forest.byId.get(activeTurnEntry?.sessionId ?? '')?.external_agent);
+  const activeMessageLog = messageLog;
+  const activeExternalAgent = overview?.external_agent;
 
   // The active turn's own slice of its session's transcript — the same
   // partition the tree renders, so a selected row resolves to the same node
   // the reader clicked.
   const activeTurnMessages = useMemo(() => {
-    const owner = activeTurnEntry?.sessionId;
-    if (owner == null || owner === '' || activeTurnId === '') return [];
-    const turns =
-      owner === overview?.session_id
-        ? overview.turns
-        : (childOverviews.get(owner)?.turns ?? forest.byId.get(owner)?.turns ?? []);
-    return partitionTranscript(activeMessageLog, turns).get(activeTurnId) ?? [];
-  }, [activeTurnEntry, activeTurnId, activeMessageLog, childOverviews, forest, overview]);
+    if (activeTurnId === '') return [];
+    return partitionTranscript(activeMessageLog, overview?.turns ?? []).get(activeTurnId) ?? [];
+  }, [activeTurnId, activeMessageLog, overview?.turns]);
   const interjectionIndex = useMemo(() => buildInterjectionIndex(messageLog), [messageLog]);
 
   const fetchTurnTrace = useCallback(
@@ -1702,82 +1588,9 @@ export function TraceSessionPage() {
     [client, isMock, logout, sessionId],
   );
 
-  // A subagent's own overview — its transcript plus its turns. Fetched only
-  // when its node is expanded, and polled incrementally from there, so a live
-  // external child's messages stream into the tree as they land without
-  // re-pulling a long transcript every tick.
-  const childOverviewsRef = useRef<Map<string, TraceOverview>>(childOverviews);
-  childOverviewsRef.current = childOverviews;
-
-  const fetchChildOverview = useCallback(
-    async (childId: string) => {
-      const key = `child:${childId}`;
-      if (inFlight.current.has(key)) return;
-      inFlight.current.add(key);
-      setLoadingChildren((prev) => new Set(prev).add(childId));
-      try {
-        if (isMock) {
-          const mock = getMockTraceOverview(childId);
-          setChildOverviews((prev) => new Map(prev).set(childId, mock));
-          return;
-        }
-        const held = childOverviewsRef.current.get(childId);
-        const sinceOrdinal = pollCursor(held, childId);
-        const page = async (since: number | undefined) => {
-          const { data, error: apiError, response } = await client.GET('/v1/traces/{session_id}', {
-            params: {
-              path: { session_id: childId },
-              query: since != null ? { since_ordinal: since } : undefined,
-            },
-          });
-          if (response.status === 401) {
-            logout();
-            return null;
-          }
-          // A child session exists before its first turn does, and the overview
-          // 404s until then — non-fatal, the next poll picks it up.
-          if (apiError || !response.ok) return null;
-          return data as unknown as TraceOverview;
-        };
-        const fresh = await page(sinceOrdinal);
-        if (!fresh) return;
-        const merged = mergeOverviewPage(held, fresh, sinceOrdinal);
-        const final = merged.action === 'reload' ? await page(undefined) : merged.overview;
-        if (final) setChildOverviews((prev) => new Map(prev).set(childId, final));
-      } catch {
-        // Network errors on a child fetch are non-fatal.
-      } finally {
-        inFlight.current.delete(key);
-        setLoadingChildren((prev) => {
-          const next = new Set(prev);
-          next.delete(childId);
-          return next;
-        });
-      }
-    },
-    [client, isMock, logout],
-  );
-
-  // Load an expanded child's overview, and keep a live one fresh. A collapsed
-  // child costs nothing — its badge already comes from the lineage summaries.
-  useEffect(() => {
-    for (const child of lineage) {
-      if (!resolveExpanded(child.session_id, userToggles, true)) continue;
-      const missing = !childOverviews.has(child.session_id);
-      if (missing || sessionIsLive(forest, child.session_id)) void fetchChildOverview(child.session_id);
-    }
-    // `childOverviews` is a snapshot read, not a dep: making a completed fetch
-    // re-fire this effect would refetch a live child forever.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [lineage, userToggles, forest, refreshKey, fetchChildOverview]);
-
   // The turns whose step tree we need loaded: the failure path + expanded +
   // selection. While a filter is active every turn must load — a content filter
   // that searched only the already-loaded turns would silently hide matches.
-  //
-  // Subagent turns are in scope too — a nested child renders its own step tree
-  // in place. Except an external child's: that backend records no steps at
-  // all, so fetching per turn would be a guaranteed-empty round trip per poll.
   const neededTurns = useMemo(() => {
     const out: { turnId: string; status: TurnStatusKind; sessionId: string }[] = [];
     if (!overview) return out;
@@ -1790,14 +1603,8 @@ export function TraceSessionPage() {
       }
     };
     take(overview.turns, overview.session_id);
-    for (const child of lineage) {
-      if (child.external_agent != null) continue;
-      if (!resolveExpanded(child.session_id, userToggles, true)) continue;
-      const co = childOverviews.get(child.session_id);
-      take(co && co.turns.length > 0 ? co.turns : child.turns, child.session_id);
-    }
     return out;
-  }, [overview, lineage, childOverviews, userToggles, activeTurnId, filtering]);
+  }, [overview, userToggles, activeTurnId, filtering]);
 
   // Load missing needed turns and keep live ones fresh. A poll bumps
   // `refreshKey` → overview refetches → `neededIds` gets a new identity → this
@@ -1905,17 +1712,15 @@ export function TraceSessionPage() {
   // Polling — visibility-aware, two-tier. A single `refreshKey` bump refetches
   // the overview; that cascades (via `neededIds`) into refetching live turns.
   //
-  // A running subagent counts as active work even when the selected turn is
-  // idle: the parent's `spawn_subagent` span sits pending while the child
-  // streams, and the child's rows are what the reader is watching. Without
-  // this a nested live subagent would refresh on the slow tier — or, once the
-  // parent turn went terminal, not at all.
+  // A running subagent keeps the page on the slow polling tier so its jump row
+  // can settle from running to completed. It no longer selects the fast tier:
+  // the child trace is not rendered here, so there is no streamed child data
+  // for the parent page to chase every two seconds.
   const liveChildren = useMemo(() => liveSessions(forest).length > 0, [forest]);
   const activeIsLive =
-    liveChildren ||
     (!!activeTurnSummary && (isTurnLive(activeTurnSummary.turn_status_kind) || traceHasPendingSpan(activeTurnTrace)));
   const anyTurnLive = [...turnIndex.values()].some((e) => isTurnLive(e.turn.turn_status_kind));
-  const polling = activeIsLive || anyTurnLive;
+  const polling = activeIsLive || anyTurnLive || liveChildren;
 
   useEffect(() => {
     if (isMock || !polling) return;
@@ -2014,12 +1819,6 @@ export function TraceSessionPage() {
       updateUrl({ turn: turnId, msg: nodeId, step: null, span: null, child: null }),
     [updateUrl],
   );
-  const handleSelectSession = useCallback(
-    (childSessionId: string) =>
-      updateUrl({ child: childSessionId, turn: null, step: null, span: null, msg: null }),
-    [updateUrl],
-  );
-
   const handleJumpToLlm = useCallback(
     (llmSpanId: string) => {
       updateUrl({ span: llmSpanId, step: null });
@@ -2033,8 +1832,7 @@ export function TraceSessionPage() {
     [activeTurnTrace, updateUrl],
   );
 
-  // The secondary action now that a subagent renders in place: open it as its
-  // own root, for when the child's own tree is what you want to work in.
+  // Child traces are separate pages; the parent tree renders only this jump.
   const handleDrillIntoChild = useCallback(
     (childSessionId: string) => navigate(`/traces/${encodeURIComponent(childSessionId)}`),
     [navigate],
@@ -2048,13 +1846,11 @@ export function TraceSessionPage() {
   // than only in the turn that happens to be open. Once it resolves, select
   // the node, scroll to it, and drop the filter so the tree comes back.
   useEffect(() => {
-    // Two ways to name a node: its id (from a log line or a deep link), or
-    // the `#3` / `#3.2` marker the tree prints on its own rows. The id can
-    // come from anywhere in the session; the marker is scoped to the turn
-    // whose rows carry it, which is the one on screen.
+    // Two ways to name a node: its id (from a log line or a deep link), or the
+    // hierarchical marker the tree prints: `#3`, `3.2`, or `3.2.1`.
     const byId = resolveJumpTarget(turnTraces, filterRaw);
-    const byOrdinal = byId ? null : resolveOrdinalTarget(activeTurnTrace, filterRaw);
-    const target = byId ?? (byOrdinal ? { turnId: activeTurnId, ...byOrdinal } : null);
+    const byOrdinal = byId ? null : resolveOrdinalTarget(overview?.turns ?? [], turnTraces, filterRaw);
+    const target = byId ?? byOrdinal;
     if (!target) return;
     setFilterRaw('');
     setFilter('');
@@ -2065,8 +1861,11 @@ export function TraceSessionPage() {
       msg: null,
       child: null,
     });
-    scrollToAnchor(`[data-step-id="${target.stepId}"]`, 'center');
-  }, [filterRaw, turnTraces, activeTurnTrace, activeTurnId, updateUrl]);
+    scrollToAnchor(
+      target.stepId == null ? `[data-turn-id="${target.turnId}"]` : `[data-step-id="${target.stepId}"]`,
+      'center',
+    );
+  }, [filterRaw, turnTraces, overview?.turns, updateUrl]);
 
   // The tool definitions behind the selected span's reference, fetched only
   // when its tab is open: one session's spans share a single set, so this is
@@ -2152,15 +1951,11 @@ export function TraceSessionPage() {
 
   const selectedSpan = spanIdParam != null ? (findSpan(activeTurnTrace, spanIdParam)?.span ?? null) : null;
   const selectedStepRs = !selectedSpan && stepIdParam != null ? findStep(activeTurnTrace, stepIdParam) : null;
-  const selectedChild = childIdParam != null ? (forest.byId.get(childIdParam) ?? null) : null;
-  // The transcript row the tree has selected. Resolved against the owning
-  // session's log, so a row inside a nested subagent resolves too.
+  // The transcript row selected in this session's tree.
   const selectedMessage =
     !selectedSpan && !selectedStepRs && msgIdParam != null
       ? (buildTranscriptNodes(activeTurnMessages).find((n) => n.id === msgIdParam) ?? null)
       : null;
-  // The turn column numbers turns of the session being viewed; a selected
-  // subagent turn isn't one of them, so it has no index to show.
   const activeTurnIndex = activeTurnSummary ? overview.turns.indexOf(activeTurnSummary) : -1;
 
   const activeTokens = activeTurnSummary ? turnTokens(activeTurnSummary, activeTurnTrace) : null;
@@ -2189,11 +1984,7 @@ export function TraceSessionPage() {
           {activeTurnSummary && activeTokens && (
             <span className="shrink-0 inline-flex items-center gap-2">
               <span className="text-ink-soft uppercase text-[0.7rem] font-bold tracking-wider">
-                {activeTurnIndex < 0
-                  ? 'Subagent turn'
-                  : overview.turns.length === 1
-                    ? 'Tokens'
-                    : `Turn #${activeTurnIndex + 1}`}
+                {activeTurnIndex < 0 ? 'Tokens' : `Turn #${activeTurnIndex + 1}`}
               </span>
               <span className="text-ink">↑ {activeTokens.input.toLocaleString()}</span>
               <span className="text-ink">↓ {activeTokens.output.toLocaleString()}</span>
@@ -2245,19 +2036,15 @@ export function TraceSessionPage() {
           selectedStepId={selectedStepRs?.step.id ?? null}
           selectedSpanId={selectedSpan?.id ?? null}
           selectedMessageId={selectedMessage?.id ?? null}
-          selectedSessionId={selectedChild?.session_id ?? null}
           onSelectTurn={handleSelectTurn}
           onSelectStep={handleSelectStep}
           onSelectSpan={handleSelectSpan}
           onSelectMessage={handleSelectMessage}
-          onSelectSession={handleSelectSession}
           onOpenSession={handleDrillIntoChild}
           interjectionCountByTurn={interjectionCountByTurn}
           interjectionSpanIds={interjectionSpanIds}
           messageLog={messageLog}
           forest={forest}
-          childOverviews={childOverviews}
-          loadingChildren={loadingChildren}
           highlight={highlight}
           filterRaw={filterRaw}
           onFilterRawChange={setFilterRaw}
@@ -2270,7 +2057,7 @@ export function TraceSessionPage() {
           {selectedSpan ? (
             <SpanDetailPanel
               span={selectedSpan}
-              order={spanOrder(activeTurnTrace, selectedSpan.id)}
+              order={spanOrder(activeTurnTrace, selectedSpan.id, activeTurnIndex + 1)}
               messageLog={activeMessageLog}
               tab={tabParam}
               onTabChange={(t) => updateUrl({ tab: t })}
@@ -2289,19 +2076,12 @@ export function TraceSessionPage() {
           ) : selectedStepRs ? (
             <StepDetail
               rs={selectedStepRs}
-              order={stepOrder(activeTurnTrace, selectedStepRs.step.id)}
+              order={stepOrder(activeTurnTrace, selectedStepRs.step.id, activeTurnIndex + 1)}
               turnId={activeTurnId}
               onSelectSpan={handleSelectSpan}
             />
           ) : selectedMessage ? (
             <TranscriptNodePanel node={selectedMessage} externalAgent={activeExternalAgent} />
-          ) : selectedChild ? (
-            <ChildSessionPanel
-              child={selectedChild}
-              overview={childOverviews.get(selectedChild.session_id)}
-              onOpenFullPage={() => handleDrillIntoChild(selectedChild.session_id)}
-              onSelectTurn={handleSelectTurn}
-            />
           ) : (
             <TurnSummaryPanel
               summary={activeTurnSummary}
@@ -2311,7 +2091,6 @@ export function TraceSessionPage() {
               turnMessages={activeTurnMessages}
               externalAgent={activeExternalAgent}
               turnIndex={activeTurnIndex}
-              totalTurns={overview.turns.length}
               interjections={interjectionsByTurn.get(activeTurnId) ?? []}
             />
           )}
