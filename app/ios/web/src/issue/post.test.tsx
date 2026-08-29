@@ -1,4 +1,4 @@
-import { act, render } from "@testing-library/react";
+import { act, render, waitFor } from "@testing-library/react";
 import { I18nextProvider } from "react-i18next";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -11,6 +11,7 @@ import type { Actor, IssueDetail, IssueEvent } from "./types";
 
 const blobRequests: string[] = [];
 const nativePosts: Record<string, unknown>[] = [];
+let avatarFailures = 0;
 
 vi.mock("../bridge", async (importOriginal) => {
   const real = await importOriginal<typeof import("../bridge")>();
@@ -19,6 +20,10 @@ vi.mock("../bridge", async (importOriginal) => {
     postToNative: (message: Record<string, unknown>) => nativePosts.push(message),
     blobObjectUrl: (blobId: string) => {
       blobRequests.push(blobId);
+      if (avatarFailures > 0) {
+        avatarFailures -= 1;
+        return Promise.reject(new Error("transient avatar failure"));
+      }
       return Promise.resolve(`blob:${blobId}`);
     },
   };
@@ -111,6 +116,7 @@ function heads(): string[] {
 beforeEach(() => {
   blobRequests.length = 0;
   nativePosts.length = 0;
+  avatarFailures = 0;
   forgetAvatars();
 });
 
@@ -205,6 +211,17 @@ describe("a comment is a post", () => {
     const faces = [...document.querySelectorAll(".issue-activity img.issue-face")];
     expect(faces).toHaveLength(3);
     expect(faces.every((el) => el.getAttribute("src") === "blob:blob-7")).toBe(true);
+  });
+
+  it("retries a transient avatar failure without reopening the card", async () => {
+    avatarFailures = 1;
+    mount();
+    deliver([comment("e1", "one"), comment("e2", "two")], "blob-7");
+
+    await waitFor(() => {
+      expect(document.querySelectorAll(".issue-activity img.issue-face")).toHaveLength(2);
+    });
+    expect(blobRequests).toEqual(["blob-7", "blob-7"]);
   });
 
   it("leaves the board's own entries as a line", () => {

@@ -56,10 +56,15 @@ final class TranscriptMedia {
         #endif
         Task {
             do {
-                // A thumbnail fetch: nobody is watching the byte count, and the
-                // core skips the tick machinery entirely for a nil observer.
-                let bytes = try await client.blobDownloadBytes(
-                    blobId: blobId, progress: nil)
+                let bytes: Data
+                if let cached = await client.blobReadCached(blobId: blobId) {
+                    bytes = cached
+                } else {
+                    // A thumbnail fetch: nobody is watching the byte count, and the
+                    // core skips the tick machinery entirely for a nil observer.
+                    bytes = try await client.blobDownloadBytes(
+                        blobId: blobId, progress: nil)
+                }
                 // Encode off the main actor: base64 of a large blob (up to
                 // 100 MiB) would stall every tap for seconds.
                 let (encoded, mime) = await Task.detached(priority: .userInitiated) {

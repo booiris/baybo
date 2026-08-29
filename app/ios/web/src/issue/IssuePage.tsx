@@ -588,15 +588,18 @@ function Avatar({ actor, who }: { actor: Actor | null; who: (id: string) => Pers
       setUrl(null);
       return;
     }
+    const avatarBlob = blob;
     let live = true;
-    avatarUrl(blob)
-      .then((next) => {
-        if (live) setUrl(next);
-      })
-      .catch(() => {
-        // A face that will not load is a monogram, not an error: the card is
-        // about what was said, and nothing here is worth a broken-image icon.
-      });
+    function load(retryOnFailure: boolean): void {
+      avatarUrl(avatarBlob)
+        .then((next) => {
+          if (live) setUrl(next);
+        })
+        .catch(() => {
+          if (live && retryOnFailure) load(false);
+        });
+    }
+    load(true);
     return () => {
       live = false;
     };

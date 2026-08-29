@@ -86,6 +86,8 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     private var blobUploadsHeld = false
     private var blobUploadWaiters: [CheckedContinuation<Void, Never>] = []
     private var blobUploadOutcome: Result<String, Error> = .success(FakeBayboClient.uploadedBlobId)
+    private var blobDownloads: [String] = []
+    private var blobCachedReads: [String] = []
 
     private var apiLegInvalidations = 0
 
@@ -150,6 +152,8 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     var deckFileUploadCalls: [DeckFileUpload] { lock.withLock { deckFileUploads } }
     /// Composer uploads, in the order they reached the wire.
     var blobUploadCalls: [BlobUploadCall] { lock.withLock { blobUploads } }
+    var blobDownloadCalls: [String] { lock.withLock { blobDownloads } }
+    var blobCachedReadCalls: [String] { lock.withLock { blobCachedReads } }
     /// Composer uploads currently PARKED, i.e. the ones a one-at-a-time release
     /// can actually finish. The call log records an upload the moment it
     /// arrives, a beat before its continuation is registered — waiting on the
@@ -837,7 +841,10 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     /// Answers from the same seeded cache the cached-read paths use, so a test
     /// that wants a tapped attachment to have bytes seeds one map, not two.
     func blobDownloadBytes(blobId: String, progress: BlobProgress?) async throws -> Data {
-        guard let data = cachedBlobs[blobId] else { throw Self.unsupported }
+        lock.withLock { blobDownloads.append(blobId) }
+        guard let data = downloadableBlobs[blobId] ?? cachedBlobs[blobId] else {
+            throw Self.unsupported
+        }
         return data
     }
 
@@ -845,7 +852,11 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
 
     /// Seeded cache for tests (`deck.shareBlob` / display fast path).
     var cachedBlobs: [String: Data] = [:]
-    func blobReadCached(blobId: String) async -> Data? { cachedBlobs[blobId] }
+    var downloadableBlobs: [String: Data] = [:]
+    func blobReadCached(blobId: String) async -> Data? {
+        lock.withLock { blobCachedReads.append(blobId) }
+        return cachedBlobs[blobId]
+    }
 
     func blobBytesForDisplay(blobId: String, maxBytes: UInt64) async -> BlobServeOutcome {
         guard let data = cachedBlobs[blobId] else { return .notFound }
