@@ -164,15 +164,6 @@ impl AddColumn {
     }
 }
 
-fn has_table(conn: &rusqlite::Connection, table: &str) -> anyhow::Result<bool> {
-    conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
-        rusqlite::params![table],
-        |row| row.get(0),
-    )
-    .map_err(|e| anyhow::anyhow!("failed to inspect table {table}: {e}"))
-}
-
 /// `table_xinfo` rather than `table_info`: the latter omits VIRTUAL generated
 /// columns entirely, so `steps.turn_id` — a generated column — would read as
 /// absent and every guard keyed on it would silently take the wrong branch.
@@ -185,372 +176,12 @@ fn has_column(conn: &rusqlite::Connection, table: &str, column: &str) -> anyhow:
     .map_err(|e| anyhow::anyhow!("failed to inspect {table}.{column}: {e}"))
 }
 
-/// One-time rename of the turn entity's persistence: the `jobs` table, the
-/// `job_id` / `parent_job_id` columns on `cost_records` / `sessions`, and the
-/// same keys inside every `data` blob that carries them.
+/// Columns introduced after the current schema baseline ships.
 ///
-/// Runs BEFORE the DDL batch, and that ordering is load-bearing:
-/// `CREATE TABLE IF NOT EXISTS turns` against a pre-rename DB would mint an
-/// empty table, after which `ALTER TABLE jobs RENAME TO turns` can only fail
-/// and every historical row would stay stranded under the old name.
-///
-/// Each step guards on the pre-rename shape, so a second pass is a no-op.
-fn migrate_turn_entity_rename(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
-    let tx = conn
-        .transaction()
-        .map_err(|e| anyhow::anyhow!("turn-rename migration could not open a transaction: {e}"))?;
-
-    if has_table(&tx, "jobs")? && !has_table(&tx, "turns")? {
-        // The indexes ride the table across the rename but keep their old
-        // names, so the DDL's `idx_turns_*` would build a second copy of each.
-        tx.execute_batch(
-            "ALTER TABLE jobs RENAME TO turns;
-             ALTER TABLE turns RENAME COLUMN parent_job_id TO parent_turn_id;
-             DROP INDEX IF EXISTS idx_jobs_session;
-             DROP INDEX IF EXISTS idx_jobs_status;
-             DROP INDEX IF EXISTS idx_jobs_created;
-             DROP INDEX IF EXISTS idx_jobs_parent;
-             UPDATE turns
-                SET data = json_remove(
-                        json_set(data, '$.parent_turn_id',
-                                 json_extract(data, '$.parent_job_id')),
-                        '$.parent_job_id')
-              WHERE json_type(data, '$.parent_job_id') IS NOT NULL;",
-        )
-        .map_err(|e| anyhow::anyhow!("turn-rename migration failed on `jobs`: {e}"))?;
-    }
-
-    if has_column(&tx, "cost_records", "job_id")? {
-        tx.execute_batch(
-            "ALTER TABLE cost_records RENAME COLUMN job_id TO turn_id;
-             DROP INDEX IF EXISTS idx_cost_job;",
-        )
-        .map_err(|e| anyhow::anyhow!("turn-rename migration failed on `cost_records`: {e}"))?;
-    }
-
-    // `Lineage.parent_turn_id` is a REQUIRED serde field inside `sessions.data`,
-    // and the list decoder skips any row whose blob fails to deserialize. Miss
-    // this rewrite and every spawned session silently vanishes from the chat
-    // list. The flat column is write-only; the blob is the live read path.
-    if has_table(&tx, "sessions")? {
-        if has_column(&tx, "sessions", "parent_job_id")? {
-            tx.execute_batch("ALTER TABLE sessions RENAME COLUMN parent_job_id TO parent_turn_id;")
-                .map_err(|e| anyhow::anyhow!("turn-rename migration failed on `sessions`: {e}"))?;
-        }
-        tx.execute_batch(
-            "UPDATE sessions
-                SET data = json_remove(
-                        json_set(data, '$.lineage.parent_turn_id',
-                                 json_extract(data, '$.lineage.parent_job_id')),
-                        '$.lineage.parent_job_id')
-              WHERE json_type(data, '$.lineage.parent_job_id') IS NOT NULL;",
-        )
-        .map_err(|e| anyhow::anyhow!("turn-rename migration failed on session lineage: {e}"))?;
-    }
-
-    // `steps.job_id` is a GENERATED column. sqlite can rename one but cannot
-    // rewrite its expression, so the only way to re-point it at `$.turn_id` is
-    // to rebuild the table — and the blob key has to move with it, or the
-    // column reads NULL for every historical row and the trace tree renders
-    // empty with no error anywhere. `DROP TABLE` takes the old indexes with it;
-    // the DDL batch recreates them under their new names.
-    if has_column(&tx, "steps", "job_id")? {
-        tx.execute_batch(
-            "CREATE TABLE steps_turn_rename (
-                 id         TEXT PRIMARY KEY,
-                 data       TEXT NOT NULL,
-                 turn_id    TEXT GENERATED ALWAYS AS (json_extract(data, '$.turn_id')) VIRTUAL,
-                 started_at TEXT GENERATED ALWAYS AS (json_extract(data, '$.started_at')) VIRTUAL,
-                 ended_at   TEXT GENERATED ALWAYS AS (json_extract(data, '$.ended_at')) VIRTUAL
-             );
-             INSERT INTO steps_turn_rename (id, data)
-                 SELECT id,
-                        json_remove(
-                            json_set(data, '$.turn_id', json_extract(data, '$.job_id')),
-                            '$.job_id')
-                   FROM steps;
-             DROP TABLE steps;
-             ALTER TABLE steps_turn_rename RENAME TO steps;",
-        )
-        .map_err(|e| anyhow::anyhow!("turn-rename migration failed on `steps`: {e}"))?;
-    }
-
-    tx.commit()
-        .map_err(|e| anyhow::anyhow!("turn-rename migration could not commit: {e}"))?;
-    Ok(())
-}
-
-/// Columns added after their `CREATE TABLE` shipped.
-const ADD_COLUMNS: &[AddColumn] = &[
-    AddColumn {
-        table: "agent_profiles",
-        column: "project_id",
-        definition: "TEXT",
-    },
-    AddColumn {
-        table: "agent_profiles",
-        column: "handle",
-        definition: "TEXT",
-    },
-    AddColumn {
-        table: "agent_profiles",
-        column: "hired_by",
-        definition: "TEXT",
-    },
-    AddColumn {
-        table: "agent_profiles",
-        column: "deleted_at",
-        definition: "INTEGER",
-    },
-    AddColumn {
-        table: "agent_profiles",
-        column: "llm_model",
-        definition: "TEXT",
-    },
-    AddColumn {
-        table: "agent_profiles",
-        column: "llm_effort",
-        definition: "TEXT",
-    },
-    AddColumn {
-        table: "projects",
-        column: "daily_budget_micros",
-        definition: "INTEGER",
-    },
-    AddColumn {
-        table: "issues",
-        column: "parent_issue_id",
-        definition: "TEXT",
-    },
-    AddColumn {
-        table: "issues",
-        column: "stage",
-        definition: "INTEGER NOT NULL DEFAULT 0",
-    },
-    AddColumn {
-        table: "issues",
-        column: "source_key",
-        definition: "TEXT",
-    },
-    AddColumn {
-        table: "issues",
-        column: "branch",
-        definition: "TEXT",
-    },
-    AddColumn {
-        table: "issues",
-        column: "assignee",
-        definition: "TEXT",
-    },
-    AddColumn {
-        table: "issues",
-        column: "attachments",
-        definition: "TEXT NOT NULL DEFAULT '[]'",
-    },
-    AddColumn {
-        table: "issues",
-        column: "read_at",
-        definition: "INTEGER",
-    },
-    AddColumn {
-        table: "issues",
-        column: "pinned",
-        definition: "INTEGER NOT NULL DEFAULT 0",
-    },
-    AddColumn {
-        table: "issues",
-        column: "filed_from_issue_id",
-        definition: "TEXT",
-    },
-    AddColumn {
-        table: "sessions",
-        column: "parent_span_id",
-        definition: "TEXT",
-    },
-    AddColumn {
-        table: "sessions",
-        column: "last_llm",
-        definition: "TEXT",
-    },
-    AddColumn {
-        table: "sessions",
-        column: "pinned",
-        definition: "INTEGER NOT NULL DEFAULT 0",
-    },
-    AddColumn {
-        table: "cost_records",
-        column: "reason",
-        definition: "TEXT",
-    },
-    AddColumn {
-        table: "cost_records",
-        column: "reasoning_effort",
-        definition: "TEXT",
-    },
-    AddColumn {
-        table: "cron_jobs",
-        column: "builtin",
-        definition: "INTEGER NOT NULL DEFAULT 0",
-    },
-    AddColumn {
-        table: "sessions",
-        column: "folder_id",
-        definition: "TEXT",
-    },
-    AddColumn {
-        table: "sessions",
-        column: "title",
-        definition: "TEXT",
-    },
-    AddColumn {
-        table: "devices",
-        column: "relay_url",
-        definition: "TEXT NOT NULL DEFAULT ''",
-    },
-    AddColumn {
-        table: "devices",
-        column: "remote_api_key",
-        definition: "TEXT NOT NULL DEFAULT ''",
-    },
-    AddColumn {
-        table: "devices",
-        column: "push_url",
-        definition: "TEXT NOT NULL DEFAULT ''",
-    },
-    AddColumn {
-        table: "session_messages",
-        column: "platform_msg_id",
-        definition: "TEXT NOT NULL DEFAULT ''",
-    },
-    AddColumn {
-        table: "sessions",
-        column: "archived",
-        definition: "INTEGER NOT NULL DEFAULT 0",
-    },
-    AddColumn {
-        table: "sessions",
-        column: "read_cursor",
-        definition: "INTEGER",
-    },
-    AddColumn {
-        table: "cron_executions",
-        column: "completed_at",
-        definition: "INTEGER",
-    },
-    AddColumn {
-        table: "cron_executions",
-        column: "notified_at",
-        definition: "INTEGER",
-    },
-    AddColumn {
-        table: "session_messages",
-        column: "source_event_id",
-        definition: "TEXT",
-    },
-    AddColumn {
-        table: "cron_jobs",
-        column: "deleted_at",
-        definition: "INTEGER",
-    },
-    AddColumn {
-        table: "cron_jobs",
-        column: "pinned",
-        definition: "INTEGER NOT NULL DEFAULT 0",
-    },
-    AddColumn {
-        table: "sessions",
-        column: "channel",
-        definition: "TEXT",
-    },
-    AddColumn {
-        table: "session_control_events",
-        column: "platform_msg_id",
-        definition: "TEXT NOT NULL DEFAULT ''",
-    },
-    AddColumn {
-        table: "deck_cards",
-        column: "sizes",
-        definition: "TEXT NOT NULL DEFAULT ''",
-    },
-    AddColumn {
-        table: "deck_cards",
-        column: "maximize",
-        definition: "INTEGER NOT NULL DEFAULT 0",
-    },
-    AddColumn {
-        table: "sessions",
-        column: "agent_id",
-        definition: "TEXT",
-    },
-    AddColumn {
-        table: "sessions",
-        column: "agent_framework",
-        definition: "TEXT",
-    },
-    AddColumn {
-        table: "sessions",
-        column: "last_model",
-        definition: "TEXT",
-    },
-    AddColumn {
-        table: "sessions",
-        column: "last_effort",
-        definition: "TEXT",
-    },
-    AddColumn {
-        table: "session_messages",
-        column: "compaction_inserted",
-        definition: "INTEGER NOT NULL DEFAULT 0",
-    },
-    AddColumn {
-        table: "sessions",
-        column: "dreamed_through_ordinal",
-        definition: "INTEGER",
-    },
-    AddColumn {
-        table: "projects",
-        column: "max_parallel_issue_runs",
-        definition: "INTEGER",
-    },
-    AddColumn {
-        table: "projects",
-        column: "daily_budget_tokens",
-        definition: "INTEGER",
-    },
-    AddColumn {
-        table: "projects",
-        column: "agents_may_merge",
-        definition: "INTEGER",
-    },
-    AddColumn {
-        table: "issue_runs",
-        column: "resumes",
-        definition: "INTEGER NOT NULL DEFAULT 0",
-    },
-    AddColumn {
-        table: "issue_events",
-        column: "client_msg_id",
-        definition: "TEXT",
-    },
-    AddColumn {
-        table: "issue_events",
-        column: "comment_consequences_applied",
-        definition: "INTEGER NOT NULL DEFAULT 1",
-    },
-    AddColumn {
-        table: "projects",
-        column: "rules_changed_at",
-        definition: "INTEGER",
-    },
-    // VIRTUAL, so this reads existing rows the moment it is added: there is
-    // no backfill to write and nothing to keep in step with `data`. STORED
-    // would need both.
-    AddColumn {
-        table: "sessions",
-        column: "project_id",
-        definition: "TEXT GENERATED ALWAYS AS (json_extract(data, '$.trigger.project_id')) VIRTUAL",
-    },
-];
+/// Keep the migration runner even when the list is empty. A future additive
+/// change belongs both in the table's `CREATE` statement (fresh databases) and
+/// here (databases created from this baseline).
+const ADD_COLUMNS: &[AddColumn] = &[];
 
 /// Pool of sqlite connections.
 ///
@@ -903,12 +534,14 @@ pub(crate) fn already_there(e: &rusqlite::Error) -> bool {
 /// the rest of the schema uses; querying these columns means
 /// string comparison, not integer comparison.
 fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
-    migrate_turn_entity_rename(conn)?;
     conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS sessions (
                     id                    TEXT PRIMARY KEY,
                     root_session_id       TEXT NOT NULL,
                     trigger_kind          TEXT NOT NULL,
+                    -- Flat projection used to scope chat-list reads without
+                    -- deserializing every session blob.
+                    channel               TEXT,
                     parent_session_id     TEXT,
                     parent_turn_id        TEXT,
                     -- `ToolCall(spawn_subagent)` span on the parent
@@ -916,8 +549,7 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     -- viewers can hop from the parent's span to the
                     -- child's session and so sibling subagents from
                     -- one parent turn stay distinguishable. NULL for
-                    -- non-subagent (root) sessions and for sessions
-                    -- migrated from before this column existed.
+                    -- non-subagent (root) sessions.
                     parent_span_id        TEXT,
                     lineage_kind          TEXT,
                     created_at            INTEGER NOT NULL,
@@ -992,7 +624,7 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     -- The agent profile this session's work belongs to: its
                     -- soul, skill overlay and memory partition. NULL ⇒ the
                     -- built-in `baybo` profile, which is what every
-                    -- pre-binding row and every channel/TUI session reads as.
+                    -- unbound channel/TUI session reads as.
                     -- Unlike the other flat columns these two have NO setter
                     -- at all: `save`'s INSERT seeds them and its DO UPDATE
                     -- omits them, which is what makes the binding write-once
@@ -1213,7 +845,7 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     reason                          TEXT,
                     model                           TEXT    NOT NULL,
                     -- Reasoning effort carried by the call request. Nullable
-                    -- for requests without the setting and legacy rows.
+                    -- for requests without the setting.
                     reasoning_effort                TEXT,
                     input_tokens                    INTEGER NOT NULL,
                     output_tokens                   INTEGER NOT NULL,
@@ -1266,13 +898,6 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                 CREATE INDEX IF NOT EXISTS idx_turns_parent
                     ON turns(parent_turn_id);
 
-                -- Old DBs may carry an orphan `job_transitions` table (+
-                -- idx_job_transitions_job_id): a per-transition audit
-                -- ledger whose read API was never wired to any surface, so
-                -- it only ever grew. Retired in the 2026-07 unused-column
-                -- audit — the writer is gone, existing rows stay inert
-                -- (no data migration), and fresh DBs no longer create it.
-
                 -- Trace tables: one logical canonical JSON value per row.
                 -- Large values are payload-backed while `data` retains the
                 -- fields VIRTUAL generated columns need for indexed lookups.
@@ -1307,11 +932,6 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                 CREATE INDEX IF NOT EXISTS idx_spans_open_step
                     ON spans(step_id) WHERE ended_at IS NULL;
 
-                -- Old DBs may additionally carry two orphan GENERATED
-                -- VIRTUAL columns (`kind`, `tool_event_kind`) plus
-                -- `idx_span_events_kind` — pre-built for kind-filtered
-                -- analytics that never landed; fresh DBs no longer create
-                -- any of it (2026-07 unused-column audit).
                 CREATE TABLE IF NOT EXISTS span_events (
                     span_id         TEXT    NOT NULL,
                     seq             INTEGER NOT NULL,
@@ -1359,9 +979,6 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     builtin         INTEGER NOT NULL DEFAULT 0,
                     data            TEXT    NOT NULL
                 );
-                -- idx_cron_jobs_user_id is no longer created (2026-07
-                -- unused-column audit: per-user cron queries are dead code
-                -- in a single-user product). Old DBs keep their orphan copy.
                 CREATE INDEX IF NOT EXISTS idx_cron_jobs_due ON cron_jobs(status, next_trigger_at);
 
                 CREATE TABLE IF NOT EXISTS cron_executions (
@@ -1386,11 +1003,6 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                 CREATE INDEX IF NOT EXISTS idx_cron_executions_job_id ON cron_executions(job_id);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_cron_executions_dedup ON cron_executions(job_id, scheduled_fire_time);
                 CREATE INDEX IF NOT EXISTS idx_cron_executions_status ON cron_executions(status);
-                -- idx_cron_executions_user_id / _triggered_at are no longer
-                -- created (2026-07 unused-column audit: they backed queries
-                -- that never shipped; consumers read both fields from the
-                -- data blob). Old DBs keep their orphan copies.
-
                 CREATE TABLE IF NOT EXISTS skill_risk_assessments (
                     skill_name   TEXT NOT NULL,
                     content_hash TEXT NOT NULL,
@@ -1412,11 +1024,6 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     updated_at   INTEGER NOT NULL,
                     PRIMARY KEY (skill_name, content_hash)
                 );
-                -- idx_skill_risk_jobs_status is no longer created (2026-07
-                -- unused-column audit: status is operator-inspection
-                -- telemetry; no query filters on it). Old DBs keep their
-                -- orphan copy.
-
                 CREATE TABLE IF NOT EXISTS channel_sessions (
                     channel_type TEXT    NOT NULL,
                     user_id      TEXT    NOT NULL,
@@ -1541,9 +1148,7 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     position       INTEGER NOT NULL,
                     size           TEXT    NOT NULL,
                     -- Comma-separated grid sizes the card implements; the ⤢
-                    -- cycle stays inside this set. Empty on a row migrated
-                    -- before the column existed → the reader falls back to
-                    -- [size] (a legacy single-size card).
+                    -- cycle stays inside this set. Empty falls back to [size].
                     sizes          TEXT    NOT NULL DEFAULT '',
                     -- Whether the card declares a maximized layout (⛶).
                     maximize       INTEGER NOT NULL DEFAULT 0,
@@ -1600,6 +1205,9 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     -- `IssueMerge`. NULL resolves to
                     -- `DEFAULT_AGENTS_MAY_MERGE`, for the reason above.
                     agents_may_merge INTEGER,
+                    -- Last time a scheduling rule changed; ordinary metadata
+                    -- edits leave it untouched.
+                    rules_changed_at INTEGER,
                     archived_at INTEGER,
                     created_at  INTEGER NOT NULL,
                     updated_at  INTEGER NOT NULL
@@ -1764,8 +1372,8 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     -- NULL for every other timeline event.
                     client_msg_id TEXT,
                     -- Client-keyed comments insert 0, then flip to 1 after
-                    -- uncancel / mention / wake consequences finish. Existing
-                    -- rows default complete so a migration replays nothing.
+                    -- uncancel / mention / wake consequences finish. Other
+                    -- event kinds are complete at insertion.
                     comment_consequences_applied INTEGER NOT NULL DEFAULT 1,
                     created_at INTEGER NOT NULL
                 );
@@ -1780,17 +1388,16 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("failed to initialize sqlite schema: {e}"))?;
 
-    // Migrations for DBs created before a column was added. Add new migrations
-    // to this list rather than mutating the CREATE TABLE — fresh DBs pick the
-    // column up from CREATE, existing DBs from the ALTER.
+    // Keep new columns in both the CREATE statement above and this migration
+    // list: fresh databases use the baseline, existing databases use ALTER.
     for migration in ADD_COLUMNS {
         migration.apply(conn)?;
     }
     payload::install_refcount_triggers(conn)?;
 
-    // Read views, indexes, and triggers that reference migration-added columns
-    // are created after the ALTER loop. `IF NOT EXISTS` keeps subsequent boots
-    // read-only with respect to existing view definitions.
+    // Views, indexes, and triggers are installed after migrations so future
+    // entries may add columns that these objects reference. `IF NOT EXISTS`
+    // keeps subsequent boots read-only with respect to existing definitions.
     conn.execute_batch(
         "CREATE VIEW IF NOT EXISTS session_messages_read AS
          SELECT sm.session_id,
@@ -1902,8 +1509,8 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
          -- The other half of the budget gate's membership test: every
          -- session whose trigger names the board, which is what brings a
          -- board-bound cron fire — and every subagent of one — inside the
-         -- ceiling. On the migration-added generated column, so it is
-         -- created here rather than in the schema batch.
+         -- ceiling. Kept after the migration loop so the generated column may
+         -- be introduced additively in a future schema revision.
          CREATE INDEX IF NOT EXISTS idx_sessions_project
              ON sessions(project_id) WHERE project_id IS NOT NULL;
          -- Serves the budget gate: one board's run sessions, which the
@@ -1931,36 +1538,7 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
              ON issues(parent_issue_id, stage, position)
              WHERE parent_issue_id IS NOT NULL;",
     )
-    .map_err(|e| anyhow::anyhow!("failed to create post-migration indexes and triggers: {e}"))?;
-
-    // One-time data collapse: the retired per-surface channel tags `http`
-    // (web) and `device` (mobile) were unified into a single `owner` pool
-    // channel. Re-tag every pre-collapse session and cron job so it stays
-    // reachable — the chat/cron scope now matches `owner`, so a lingering
-    // `http`/`device` tag would scope the row out and make it invisible. The
-    // channel rides in the JSON `data` blob for both tables. Idempotent:
-    // after one pass the WHERE clauses match nothing. Data-preserving — only
-    // the channel tag changes; transcript, summary, and all else are untouched.
-    conn.execute_batch(
-        "UPDATE sessions \
-            SET data = json_set(json_set(data, '$.channel', 'owner'), '$.user.channel', 'owner') \
-            WHERE json_extract(data, '$.channel') IN ('http', 'device') \
-               OR json_extract(data, '$.user.channel') IN ('http', 'device'); \
-         UPDATE cron_jobs \
-            SET data = json_set(data, '$.channel', 'owner') \
-            WHERE json_extract(data, '$.channel') IN ('http', 'device');",
-    )
-    .map_err(|e| anyhow::anyhow!("owner-channel collapse migration failed: {e}"))?;
-
-    // Backfill the flat `channel` column from the blob for rows written
-    // before the column existed. Runs AFTER the owner-collapse pass so a
-    // collapsed tag lands, not the retired one. Idempotent: after one
-    // pass no row has a NULL channel (new writes set it directly).
-    conn.execute(
-        "UPDATE sessions SET channel = json_extract(data, '$.channel') WHERE channel IS NULL",
-        [],
-    )
-    .map_err(|e| anyhow::anyhow!("channel column backfill failed: {e}"))?;
+    .map_err(|e| anyhow::anyhow!("failed to create schema indexes and triggers: {e}"))?;
 
     search::rebuild_if_stale(conn)
         .map_err(|e| anyhow::anyhow!("search index rebuild failed: {e}"))?;
@@ -2535,154 +2113,6 @@ mod tests {
         .await
         .expect("migration interact");
     }
-
-    #[tokio::test]
-    async fn a_pre_team_database_migrates_and_gains_the_handle_index_and_trigger() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("legacy.db");
-        {
-            let conn = rusqlite::Connection::open(&path).expect("open raw");
-            conn.execute_batch(
-                "CREATE TABLE agent_profiles (
-                     id             TEXT PRIMARY KEY,
-                     description    TEXT NOT NULL,
-                     avatar_blob_id TEXT,
-                     framework      TEXT NOT NULL,
-                     llm            TEXT,
-                     builtin        INTEGER NOT NULL DEFAULT 0,
-                     created_at     INTEGER NOT NULL,
-                     updated_at     INTEGER NOT NULL
-                 );
-                 INSERT INTO agent_profiles
-                     (id, description, framework, created_at, updated_at)
-                     VALUES ('01JOLD', 'a persona from before', 'baybo', 1, 1);",
-            )
-            .expect("seed the pre-migration shape");
-        }
-
-        let pool = SqlitePool::open(&path).await.expect("open must migrate");
-        pool.interact("test.assert_migrated", |conn| {
-            let indexed: i64 = conn.query_row(
-                "SELECT count(*) FROM sqlite_master \
-                 WHERE type = 'index' AND name = 'idx_agent_profiles_handle'",
-                [],
-                |r| r.get(0),
-            )?;
-            assert_eq!(indexed, 1, "the handle index must exist after migration");
-            // Both statements name columns the ALTER loop adds, so both have
-            // to be created after it — a DB that migrated without the trigger
-            // would enforce nothing and say nothing.
-            let triggered: i64 = conn.query_row(
-                "SELECT count(*) FROM sqlite_master \
-                 WHERE type = 'trigger' AND name = 'agent_profiles_team_is_insert_only'",
-                [],
-                |r| r.get(0),
-            )?;
-            assert_eq!(triggered, 1, "the membership trigger must exist too");
-            let (project_id, handle): (Option<String>, Option<String>) = conn.query_row(
-                "SELECT project_id, handle FROM agent_profiles WHERE id = '01JOLD'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?;
-            assert_eq!((project_id, handle), (None, None));
-            // The other two levels of the LLM pin arrived by ALTER as well,
-            // reading NULL — an agent configured before they existed inherits
-            // the entry's own model and rung. Every read selects them by
-            // name, so a missing ALTER is not a degraded profile, it is every
-            // profile read failing.
-            let (model, effort): (Option<String>, Option<String>) = conn.query_row(
-                "SELECT llm_model, llm_effort FROM agent_profiles WHERE id = '01JOLD'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?;
-            assert_eq!((model, effort), (None, None));
-            Ok(())
-        })
-        .await
-        .expect("assert interact");
-    }
-
-    /// `sessions.project_id` is GENERATED, which puts it on the one pragma
-    /// that reports generated columns: `table_xinfo` sees it, `table_info`
-    /// does not. `has_column` reads `table_xinfo` — read the other and the
-    /// ALTER is re-attempted on every boot and trips `duplicate column
-    /// name`, so the second start of an upgraded install fails, not the
-    /// first. Being VIRTUAL, it also has to read rows written long before
-    /// it existed with no backfill.
-    #[tokio::test]
-    async fn a_pre_board_database_gains_the_generated_project_column_and_reopens() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("legacy.db");
-        // The pre-change shape is this schema minus the one column, taken by
-        // dropping it rather than by hand-copying the CREATE TABLE — a copy
-        // rots the moment any other column moves, and would then be testing
-        // a database no install ever had.
-        {
-            SqlitePool::open(&path).await.expect("build current");
-            let conn = rusqlite::Connection::open(&path).expect("open raw");
-            conn.execute_batch(
-                "DROP INDEX IF EXISTS idx_sessions_project;
-                 ALTER TABLE sessions DROP COLUMN project_id;
-                 INSERT INTO sessions
-                     (id, root_session_id, trigger_kind, created_at, last_active, data)
-                 VALUES
-                     ('s-board', 's-board', 'issue', 1, 1,
-                      '{\"trigger\":{\"kind\":\"issue\",\"project_id\":\"01JBOARD\"}}'),
-                     ('s-chat', 's-chat', 'user', 1, 1,
-                      '{\"trigger\":{\"kind\":\"user\"}}');",
-            )
-            .expect("seed the pre-board shape");
-            let gone: i64 = conn
-                .query_row(
-                    "SELECT count(*) FROM pragma_table_xinfo('sessions') WHERE name = 'project_id'",
-                    [],
-                    |r| r.get(0),
-                )
-                .expect("probe");
-            assert_eq!(gone, 0, "the fixture must actually predate the column");
-        }
-
-        for _ in 0..3 {
-            SqlitePool::open(&path).await.expect("reopen must migrate");
-        }
-
-        let pool = SqlitePool::open(&path).await.expect("open must migrate");
-        pool.interact("test.assert_project_column", |conn| {
-            let declared: i64 = conn.query_row(
-                "SELECT count(*) FROM pragma_table_xinfo('sessions') WHERE name = 'project_id'",
-                [],
-                |r| r.get(0),
-            )?;
-            assert_eq!(declared, 1, "added exactly once across repeated boots");
-            let indexed: i64 = conn.query_row(
-                "SELECT count(*) FROM sqlite_master \
-                 WHERE type = 'index' AND name = 'idx_sessions_project'",
-                [],
-                |r| r.get(0),
-            )?;
-            assert_eq!(indexed, 1, "and its index is created after the ALTER");
-            let board: Option<String> = conn.query_row(
-                "SELECT project_id FROM sessions WHERE id = 's-board'",
-                [],
-                |r| r.get(0),
-            )?;
-            assert_eq!(
-                board.as_deref(),
-                Some("01JBOARD"),
-                "a row written before the column reads its board with no backfill"
-            );
-            let chat: Option<String> = conn.query_row(
-                "SELECT project_id FROM sessions WHERE id = 's-chat'",
-                [],
-                |r| r.get(0),
-            )?;
-            assert_eq!(chat, None, "ordinary chat belongs to no board");
-            Ok(())
-        })
-        .await
-        .expect("assert interact");
-    }
-
     /// A migration naming a missing table is a programming error in
     /// [`ADD_COLUMNS`], not a benign already-applied case, and must surface as
     /// one.

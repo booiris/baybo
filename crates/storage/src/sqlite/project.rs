@@ -3283,40 +3283,6 @@ mod tests {
         let again = store.requeue_unsettled().await.unwrap();
         assert_eq!(again[0].resumes, 2, "each process start counts once");
     }
-
-    #[tokio::test]
-    async fn a_run_recorded_before_the_resume_meter_existed_migrates_in_never_interrupted() {
-        let (_dir, store) = store().await;
-        let p = project("proj-a", "A");
-        store.create_project(&p).await.unwrap();
-        let issue = store
-            .create_issue(&new_issue(&p.id, "legacy", IssueStatus::Backlog))
-            .await
-            .unwrap();
-        let run = store.enqueue_run(&new_run(&issue)).await.unwrap();
-
-        store
-            .pool
-            .interact_write("test.rewind_the_resume_migration", move |conn| {
-                conn.execute("ALTER TABLE issue_runs DROP COLUMN resumes", [])?;
-                let migration = super::super::ADD_COLUMNS
-                    .iter()
-                    .find(|m| m.table == "issue_runs" && m.column == "resumes")
-                    .expect("the resume meter is a listed migration");
-                migration.apply(conn)?;
-                migration.apply(conn)?;
-                Ok(())
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(
-            store.get_run(&run.id).await.unwrap().unwrap().resumes,
-            0,
-            "a row that predates the column has never been handed back out"
-        );
-    }
-
     #[tokio::test]
     async fn sparse_update_leaves_unnamed_fields_alone() {
         let (_dir, store) = store().await;
@@ -3538,101 +3504,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_card_opened_before_the_pin_existed_migrates_in_unpinned() {
-        let (_dir, store) = store().await;
-        let p = project("proj-a", "A");
-        store.create_project(&p).await.unwrap();
-        store
-            .create_issue(&new_issue(&p.id, "legacy", IssueStatus::Backlog))
-            .await
-            .unwrap();
-
-        store
-            .pool
-            .interact_write("test.rewind_the_pin_migration", move |conn| {
-                conn.execute("ALTER TABLE issues DROP COLUMN pinned", [])?;
-                let migration = super::super::ADD_COLUMNS
-                    .iter()
-                    .find(|m| m.table == "issues" && m.column == "pinned")
-                    .expect("the pin is a listed migration");
-                migration.apply(conn)?;
-                migration.apply(conn)?;
-                Ok(())
-            })
-            .await
-            .unwrap();
-
-        assert!(
-            !store.get_issue(&p.id, 1).await.unwrap().unwrap().pinned,
-            "a row that predates the column was never pinned"
-        );
-        store
-            .update_issue(
-                &p.id,
-                1,
-                &IssueUpdate {
-                    pinned: Some(true),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        assert!(store.get_issue(&p.id, 1).await.unwrap().unwrap().pinned);
-    }
-
-    #[tokio::test]
-    async fn a_card_opened_before_the_origin_existed_migrates_in_rootless() {
-        let (_dir, store) = store().await;
-        let p = project("proj-a", "A");
-        store.create_project(&p).await.unwrap();
-        let origin = store
-            .create_issue(&new_issue(&p.id, "origin", IssueStatus::Backlog))
-            .await
-            .unwrap();
-        store
-            .create_issue(&NewIssue {
-                filed_from: Some(origin.id.clone()),
-                ..new_issue(&p.id, "filed out of it", IssueStatus::Backlog)
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(
-            store.get_issue(&p.id, 2).await.unwrap().unwrap().filed_from,
-            Some(origin.id.clone()),
-            "the edge survives the round trip"
-        );
-
-        store
-            .pool
-            .interact_write("test.rewind_the_origin_migration", move |conn| {
-                conn.execute("ALTER TABLE issues DROP COLUMN filed_from_issue_id", [])?;
-                let migration = super::super::ADD_COLUMNS
-                    .iter()
-                    .find(|m| m.table == "issues" && m.column == "filed_from_issue_id")
-                    .expect("the origin is a listed migration");
-                migration.apply(conn)?;
-                migration.apply(conn)?;
-                Ok(())
-            })
-            .await
-            .unwrap();
-
-        for number in [1, 2] {
-            assert_eq!(
-                store
-                    .get_issue(&p.id, number)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .filed_from,
-                None,
-                "a row that predates the column came out of nothing"
-            );
-        }
-    }
-
-    #[tokio::test]
     async fn spend_since_sums_one_board_and_never_double_counts_a_session() {
         let dir = tempfile::tempdir().unwrap();
         let pool = SqlitePool::open(dir.path().join("test.db")).await.unwrap();
@@ -3751,7 +3622,6 @@ mod tests {
             }
         );
     }
-
     #[tokio::test]
     async fn run_spend_bills_each_run_of_a_shared_session_only_its_own_window() {
         let dir = tempfile::tempdir().unwrap();

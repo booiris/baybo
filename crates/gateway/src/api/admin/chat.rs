@@ -2897,11 +2897,9 @@ async fn create_or_load_chat_session(
         .await
         .map_err(|e| GatewayError::Internal(format!("load requested chat session: {e}")))?
     {
-        // Scope by channel only (`owner` for every chat caller). The `user.id`
-        // equality the pre-unification code also checked is intentionally
-        // gone: one gateway is one owner, and pre-unification rows still carry
-        // the old `web-operator`/`device_id` ids in `user.id` (only the
-        // `channel` is migrated), so equating it would 404 legacy sessions.
+        // Scope by channel only (`owner` for every chat caller). One gateway is
+        // one owner; web/device identity is an authentication concern, not a
+        // partition within the owner's conversations.
         if existing.channel != channel_type || is_excluded_from_global_chat(&existing) {
             return Err(GatewayError::NotFound(format!("chat session {session_id}")));
         }

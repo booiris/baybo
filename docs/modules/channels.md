@@ -313,9 +313,7 @@ The owner's self-service surfaces — the web dashboard and the mobile app —
 are **one identity on two screens**, so they are **one channel**:
 `ChannelType::owner()`. There is no web-vs-device channel split; `owner` is an
 ordinary `Subscribed` channel that both surfaces speak, the same way `tui` is
-the terminal's. (The retired `http`/`device` channel types are gone from the
-model entirely — a boot-time migration re-tags any pre-collapse
-session/cron-job row to `owner`; see `crates/storage/src/sqlite/mod.rs`.)
+the terminal's. The model exposes no separate `http` or `device` channel type.
 Because it is one channel, nothing here needs special pooling logic:
 
 - **One `Channel` object, plain `get`.** Boot installs the single `owner`
