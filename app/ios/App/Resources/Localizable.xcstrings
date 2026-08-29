@@ -2993,6 +2993,40 @@
         }
       }
     },
+    "issue.jumpToTop": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Scroll %@ to the top"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "滑到 %@ 顶部"
+          }
+        }
+      }
+    },
+    "issue.moveStatus": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Move status"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "移动状态"
+          }
+        }
+      }
+    },
     "issue.runs": {
       "extractionState": "manual",
       "localizations": {

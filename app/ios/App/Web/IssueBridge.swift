@@ -72,6 +72,9 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
         case "activityAtBottom":
             guard isCurrent(body) else { return }
             store?.setAtBottom(body["atBottom"] as? Bool ?? true)
+        case "activityAtTop":
+            guard isCurrent(body) else { return }
+            store?.setAtTop(body["atTop"] as? Bool ?? true)
         case "issueState":
             guard isCurrent(body),
                 let scrollTop = (body["scrollTop"] as? NSNumber)?.doubleValue,
@@ -339,6 +342,10 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
 
     func jumpToLatest() {
         page("jumpToLatest", "")
+    }
+
+    func scrollToTop() {
+        page("scrollToTop", "")
     }
 
     // MARK: - WebMediaSink

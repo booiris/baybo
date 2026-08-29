@@ -14,11 +14,21 @@ final class ProjectCardUITests: BayboUITestCase {
         launch(["-baybo-open-home", "-baybo-demo-projects", "-baybo-demo-board"])
     }
 
-    private func openCard() -> XCUIApplication {
+    private func openCard(atTop: Bool = true) -> XCUIApplication {
         let app = launch(Self.cardArguments)
         XCTAssertTrue(
             app.staticTexts[Self.title].waitForExistence(timeout: Self.webviewTimeout),
             "the card page never rendered its title")
+        if atTop {
+            let scrollTop = app.buttons["issue-scroll-top"]
+            XCTAssertTrue(
+                scrollTop.waitForExistence(timeout: Self.webviewTimeout),
+                "the issue number has no scroll-to-top action")
+            scrollTop.tap()
+            XCTAssertTrue(
+                scrollTop.waitForNonExistence(timeout: 5),
+                "the issue number kept its arrow after scrolling to the top")
+        }
         return app
     }
 
@@ -67,7 +77,7 @@ final class ProjectCardUITests: BayboUITestCase {
             "the assignee chip is tinted; the hue is supposed to be keyed by a STATE")
     }
 
-    func testACardWithNoRunsHasNoMenu() {
+    func testACardWithNoRunsStillOffersMoveStatus() {
         let app = openBoard()
         XCTAssertTrue(app.buttons["stage-todo"].waitForExistence(timeout: 8), "no stage bar")
         app.buttons["stage-todo"].tap()
@@ -80,9 +90,19 @@ final class ProjectCardUITests: BayboUITestCase {
             app.staticTexts["retire the old pump tee"].waitForExistence(
                 timeout: Self.webviewTimeout),
             "the card never opened")
-        XCTAssertFalse(
-            app.buttons["issue-menu"].exists,
-            "a card with no runs draws a ⋯ that opens nothing")
+        let menu = app.buttons["issue-menu"]
+        XCTAssertTrue(menu.waitForExistence(timeout: 3), "a card with no runs has no ⋯ menu")
+        menu.tap()
+
+        let moveStatus = app.buttons["Move status"]
+        XCTAssertTrue(
+            moveStatus.waitForExistence(timeout: 3),
+            "the card's ⋯ menu offers no Move status action")
+        XCTAssertFalse(app.buttons["Runs"].exists, "a card with no runs offers an empty run log")
+        moveStatus.tap()
+        XCTAssertTrue(
+            app.buttons["move-review"].waitForExistence(timeout: 3),
+            "Move status did not open the existing Move sheet")
     }
 
     func testTheRunLogLivesInTheCardsMenu() {
@@ -112,6 +132,20 @@ final class ProjectCardUITests: BayboUITestCase {
         XCTAssertFalse(
             neverRan.isEnabled,
             "an attempt with no session has no transcript and must not offer one")
+    }
+
+    func testStoppingTheRunOffersAnExplicitCancelButton() {
+        let app = openCard()
+        app.buttons["issue-stop"].tap()
+
+        let cancel = app.buttons["Cancel"]
+        XCTAssertTrue(cancel.waitForExistence(timeout: 3), "the stop alert has no Cancel button")
+        XCTAssertTrue(app.buttons["Stop run"].exists, "the stop alert lost its destructive action")
+
+        cancel.tap()
+        XCTAssertTrue(
+            app.buttons["issue-stop"].waitForExistence(timeout: 3),
+            "cancelling the alert stopped or hid the live run")
     }
 
     func testTheStatusChipMovesTheCard() {
@@ -159,6 +193,32 @@ final class ProjectCardUITests: BayboUITestCase {
     }
 
     // MARK: - The dock
+
+    func testTheCardOpensAtTheNewestActivity() {
+        let app = openCard(atTop: false)
+        let last = app.staticTexts.containing(
+            NSPredicate(format: "label CONTAINS 'once the fence lands'")
+        ).firstMatch
+        let field = app.textFields[IssueDockFields.field]
+
+        XCTAssertTrue(
+            last.waitForExistence(timeout: Self.webviewTimeout),
+            "the newest comment never loaded")
+        let scrollTop = app.buttons["issue-scroll-top"]
+        XCTAssertTrue(scrollTop.exists, "the issue number has no up arrow")
+        XCTAssertFalse(app.buttons["issue-jump"].exists, "the card did not open at the bottom")
+        XCTAssertLessThan(last.frame.maxY, field.frame.minY, "the dock covers the newest comment")
+
+        scrollTop.tap()
+        XCTAssertTrue(
+            scrollTop.waitForNonExistence(timeout: 5),
+            "the up arrow stayed beside the issue number after scrolling to the top")
+
+        app.swipeUp()
+        XCTAssertTrue(
+            scrollTop.waitForExistence(timeout: 5),
+            "the up arrow did not return after leaving the top")
+    }
 
     func testTheFieldMatchesTheChatsRestingGeometry() {
         let chat = launch(["-baybo-open-chat"])

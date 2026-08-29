@@ -1,6 +1,6 @@
 import { act, fireEvent, render } from "@testing-library/react";
 import { I18nextProvider } from "react-i18next";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import i18n from "../i18n";
 import type { IssuePayload } from "./bridge";
@@ -62,8 +62,8 @@ const EVENTS: IssueEvent[] = [
   comment("e3", "and a later one"),
 ];
 
-function payload(firstUnread?: string): IssuePayload {
-  return { issue: card, events: EVENTS, runs: [], people: PEOPLE, firstUnread };
+function payload(firstUnread?: string, timelineLive = false): IssuePayload {
+  return { issue: card, events: EVENTS, runs: [], people: PEOPLE, firstUnread, timelineLive };
 }
 
 function deliver(p: IssuePayload): void {
@@ -87,14 +87,49 @@ function rule(): HTMLElement | null {
 }
 
 let scrolled: ReturnType<typeof vi.fn>;
+const originalScrollHeight = Object.getOwnPropertyDescriptor(
+  HTMLElement.prototype,
+  "scrollHeight",
+);
+const originalClientHeight = Object.getOwnPropertyDescriptor(
+  HTMLElement.prototype,
+  "clientHeight",
+);
+const originalScrollTo = HTMLElement.prototype.scrollTo;
 
 beforeEach(() => {
   scrolled = vi.fn();
-  Element.prototype.scrollIntoView = scrolled;
+  HTMLElement.prototype.scrollTo = scrolled;
+  Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
+    configurable: true,
+    get: () => 900,
+  });
+  Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+    configurable: true,
+    get: () => 300,
+  });
 });
 
-describe("opening a card at the unread boundary", () => {
-  it("draws the rule above the first unread entry and lands on it", () => {
+afterEach(() => {
+  if (originalScrollHeight === undefined) {
+    Reflect.deleteProperty(HTMLElement.prototype, "scrollHeight");
+  } else {
+    Object.defineProperty(HTMLElement.prototype, "scrollHeight", originalScrollHeight);
+  }
+  if (originalClientHeight === undefined) {
+    Reflect.deleteProperty(HTMLElement.prototype, "clientHeight");
+  } else {
+    Object.defineProperty(HTMLElement.prototype, "clientHeight", originalClientHeight);
+  }
+  HTMLElement.prototype.scrollTo = originalScrollTo;
+});
+
+function scroller(): HTMLElement | null {
+  return document.querySelector<HTMLElement>(".issue-page");
+}
+
+describe("opening a card at its latest activity", () => {
+  it("draws the unread rule but lands at the bottom", () => {
     page();
     deliver(payload("e2"));
 
@@ -102,38 +137,78 @@ describe("opening a card at the unread boundary", () => {
     expect(marker).not.toBeNull();
     expect(marker?.textContent).toBe("New");
     expect(marker?.nextElementSibling?.textContent).toContain("the first new one");
-    expect(scrolled).toHaveBeenCalledTimes(1);
-    expect(scrolled.mock.instances[0]).toBe(marker);
-    expect(scrolled).toHaveBeenCalledWith({ block: "start" });
+    expect(scroller()?.scrollTop).toBe(900);
   });
 
-  // Painting stamps the card read, so the next response omits the boundary;
-  // the page must keep the boundary it already showed the reader.
-  it("holds the rule still once the card has been stamped read", () => {
+  it("holds the unread rule still once the card has been stamped read", () => {
     page();
     deliver(payload("e2"));
     deliver(payload(undefined));
 
     expect(rule()).not.toBeNull();
-    expect(scrolled).toHaveBeenCalledTimes(1);
+    expect(scroller()?.scrollTop).toBe(900);
   });
 
-  it("a card with nothing new opens at the top", () => {
+  it("a card with nothing unread still opens at the bottom", () => {
     page();
     deliver(payload(undefined));
 
     expect(rule()).toBeNull();
-    expect(scrolled).not.toHaveBeenCalled();
+    expect(scroller()?.scrollTop).toBe(900);
+  });
+
+  it("follows a mirror to the bottom again when the live timeline lands", () => {
+    page();
+    deliver(payload(undefined));
+    const el = scroller();
+    if (el === null) throw new Error("issue scroller missing");
+    el.scrollTop = 500;
+
+    deliver(
+      {
+        ...payload(undefined, true),
+        events: [...EVENTS, comment("e8", "the newest live comment")],
+      },
+    );
+
+    expect(el.scrollTop).toBe(900);
+  });
+
+  it("waits for the dock inset before releasing the initial bottom", () => {
+    page();
+    deliver(payload(undefined, true));
+    const el = scroller();
+    if (el === null) throw new Error("issue scroller missing");
+    el.scrollTop = 400;
+
+    act(() => window.issuePage?.setBottomInset(96));
+    expect(el.scrollTop).toBe(900);
+
+    el.scrollTop = 240;
+    act(() => window.issuePage?.setBottomInset(104));
+    expect(el.scrollTop).toBe(240);
   });
 
   it("never scrolls a reader who has already taken the page", () => {
     const { container } = page();
     deliver(payload(undefined));
+    const el = scroller();
+    if (el === null) throw new Error("issue scroller missing");
     fireEvent.pointerDown(container.querySelector(".issue-page") as Element);
-    deliver(payload("e2"));
+    el.scrollTop = 120;
+    deliver(payload("e2", true));
 
     expect(rule()).not.toBeNull();
-    expect(scrolled).not.toHaveBeenCalled();
+    expect(el.scrollTop).toBe(120);
+  });
+
+  it("obeys the native header's smooth scroll-to-top command", () => {
+    page();
+    deliver(payload(undefined));
+
+    window.issuePage?.scrollToTop();
+
+    expect(scrolled).toHaveBeenCalledWith({ top: 0, behavior: "smooth" });
   });
 });
 

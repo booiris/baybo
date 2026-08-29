@@ -50,6 +50,7 @@ export type IssueEvents = {
   /// Scroll the newest activity into view (the "new activity" pill, and the
   /// jump native runs after a comment lands).
   jumpToLatest(): void;
+  scrollToTop(): void;
 };
 
 export type IssueGlobal = {
@@ -58,13 +59,15 @@ export type IssueGlobal = {
   setBottomInset(px: number): void;
   setLanguage(lang: string): void;
   jumpToLatest(): void;
+  scrollToTop(): void;
   snapshotState(): IssueViewState | null;
 };
 
 type Buffered =
   | { kind: "deliver"; payload: IssuePayload }
   | { kind: "bottomInset"; px: number }
-  | { kind: "jumpToLatest" };
+  | { kind: "jumpToLatest" }
+  | { kind: "scrollToTop" };
 
 let events: IssueEvents | null = null;
 // Native can deliver in the same turn that React schedules its mount. Buffering
@@ -116,9 +119,20 @@ function dispatch(item: Buffered): void {
 }
 
 function deliver(e: IssueEvents, item: Buffered): void {
-  if (item.kind === "deliver") e.deliver(item.payload);
-  else if (item.kind === "bottomInset") e.bottomInset(item.px);
-  else e.jumpToLatest();
+  switch (item.kind) {
+    case "deliver":
+      e.deliver(item.payload);
+      break;
+    case "bottomInset":
+      e.bottomInset(item.px);
+      break;
+    case "jumpToLatest":
+      e.jumpToLatest();
+      break;
+    case "scrollToTop":
+      e.scrollToTop();
+      break;
+  }
 }
 
 export function subscribeIssue(e: IssueEvents): () => void {
@@ -160,6 +174,7 @@ window.issuePage = {
     for (const cb of [...languageListeners]) cb(lang);
   },
   jumpToLatest: () => dispatch({ kind: "jumpToLatest" }),
+  scrollToTop: () => dispatch({ kind: "scrollToTop" }),
   snapshotState: () => stateProvider?.() ?? null,
 };
 
@@ -205,6 +220,10 @@ export function postGeneratedFace(targetId: string, agentId: string, pngBase64: 
 /// activity" pill is worth showing.
 export function postActivityAtBottom(targetId: string, atBottom: boolean): void {
   postToNative({ type: "activityAtBottom", targetId, atBottom });
+}
+
+export function postActivityAtTop(targetId: string, atTop: boolean): void {
+  postToNative({ type: "activityAtTop", targetId, atTop });
 }
 
 export function retryComment(clientMsgId: string): void {

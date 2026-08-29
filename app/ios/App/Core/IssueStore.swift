@@ -44,6 +44,7 @@ final class IssueStore: ObservableObject, WebMediaTarget {
     /// pick.
     @Published var openRunRequest: Int64?
     @Published private(set) var atBottom = true
+    @Published private(set) var atTop = true
 
     @Published var filePreview: FilePreview?
     @Published var fileShare: FilePreview?
@@ -535,6 +536,10 @@ final class IssueStore: ObservableObject, WebMediaTarget {
         atBottom = value
     }
 
+    func setAtTop(_ value: Bool) {
+        atTop = value
+    }
+
     func rememberPageState(scrollTop: Double, folds: [String: Bool]) {
         guard scrollTop.isFinite, scrollTop >= 0 else { return }
         pageState = PageState(scrollTop: scrollTop, folds: folds)
@@ -555,6 +560,10 @@ final class IssueStore: ObservableObject, WebMediaTarget {
 
     func jumpToLatest() {
         bridge?.jumpToLatest()
+    }
+
+    func scrollToTop() {
+        bridge?.scrollToTop()
     }
 
     func markRendered() {

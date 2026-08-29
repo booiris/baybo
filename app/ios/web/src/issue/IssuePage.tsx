@@ -17,6 +17,7 @@ import {
   openRun,
   pickField,
   postActivityAtBottom,
+  postActivityAtTop,
   postGeneratedFace,
   postIssueRendered,
   postIssueState,
@@ -66,12 +67,10 @@ export function IssuePage({
   const restoredScroll = useRef(false);
   const stateTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [landing, setLanding] = useState<string | null>(null);
-  /// The landing already scrolled to. One scroll per boundary, not per
-  /// delivery — a card refetches on every frame its board sends.
-  const landedOn = useRef<string | null>(null);
   /// The reader has put a finger on the page. From then on the scroll is
   /// theirs: a live payload arriving mid-read must not yank them anywhere.
   const grabbed = useRef(false);
+  const followingInitialLatest = useRef(initialState === undefined);
   const followedLocalComment = useRef<string | null>(null);
 
   useLayoutEffect(() => {
@@ -88,6 +87,11 @@ export function IssuePage({
         jumpToLatest: () => {
           const el = scrollRef.current;
           if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+        },
+        scrollToTop: () => {
+          followingInitialLatest.current = false;
+          grabbed.current = true;
+          scrollRef.current?.scrollTo({ top: 0, behavior: "smooth" });
         },
       }),
     [],
@@ -106,16 +110,6 @@ export function IssuePage({
     if (anchor === undefined) return;
     setLanding((current) => current ?? anchor);
   }, [payload?.firstUnread]);
-
-  useEffect(() => {
-    if (landing === null || landedOn.current === landing) return;
-    const el = scrollRef.current;
-    const rule = el?.querySelector<HTMLElement>("[data-unread-rule]");
-    if (!el || !rule) return;
-    landedOn.current = landing;
-    if (grabbed.current) return;
-    rule.scrollIntoView({ block: "start" });
-  }, [landing, payload]);
 
   const drawnFor = useRef(new Set<string>());
   useEffect(() => {
@@ -139,6 +133,12 @@ export function IssuePage({
     const el = scrollRef.current;
     if (!el) return;
     postActivityAtBottom(targetId, el.scrollHeight - el.scrollTop - el.clientHeight < 48);
+  }, [targetId]);
+
+  const reportAtTop = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    postActivityAtTop(targetId, el.scrollTop < 1);
   }, [targetId]);
 
   const readPageState = useCallback((): IssueViewState | null => {
@@ -184,18 +184,32 @@ export function IssuePage({
   }, []);
 
   useLayoutEffect(() => {
-    if (payload === null || restoredScroll.current) return;
+    if (payload === null || restoredScroll.current || initialState === undefined) return;
     const el = scrollRef.current;
     if (!el) return;
     restoredScroll.current = true;
-    if (initialState === undefined) return;
     grabbed.current = true;
     el.scrollTop = Math.max(0, initialState.scrollTop);
     reportAtBottom();
+    reportAtTop();
     schedulePageState();
-  }, [initialState, payload, reportAtBottom, schedulePageState]);
+  }, [initialState, payload, reportAtBottom, reportAtTop, schedulePageState]);
+
+  useLayoutEffect(() => {
+    if (payload === null || !followingInitialLatest.current || grabbed.current) return;
+    const el = scrollRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+    reportAtBottom();
+    reportAtTop();
+    schedulePageState();
+    if (payload.timelineLive === true && bottomInset > 0) {
+      followingInitialLatest.current = false;
+    }
+  }, [bottomInset, payload, reportAtBottom, reportAtTop, schedulePageState]);
 
   useEffect(reportAtBottom, [reportAtBottom, payload, landing]);
+  useEffect(reportAtTop, [reportAtTop, payload, landing]);
 
   const pending = payload?.pendingComments ?? [];
   const latestLocalComment = pending[pending.length - 1]?.client_msg_id;
@@ -244,9 +258,13 @@ export function IssuePage({
       ref={scrollRef}
       onScroll={() => {
         reportAtBottom();
+        reportAtTop();
         schedulePageState();
       }}
-      onPointerDown={() => (grabbed.current = true)}
+      onPointerDown={() => {
+        grabbed.current = true;
+        followingInitialLatest.current = false;
+      }}
       style={{ paddingBottom: `${String(bottomInset + 24)}px` }}
     >
       <IssueHead issue={issue} opened={opened} who={who} />
