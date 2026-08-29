@@ -100,6 +100,8 @@ targets:
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         UILaunchScreen: {}
         UIUserInterfaceStyle: Light
+        # Unlock UIKit/SwiftUI scrolling above 60 Hz on ProMotion iPhones.
+        CADisableMinimumFrameDurationOnPhone: true
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationLandscapeLeft

@@ -6,6 +6,8 @@
 	<string>$(BAYBO_APNS_ENVIRONMENT)</string>
 	<key>BayboKeychainAccessGroup</key>
 	<string>$(AppIdentifierPrefix)com.baybo.app</string>
+	<key>CADisableMinimumFrameDurationOnPhone</key>
+	<true/>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>

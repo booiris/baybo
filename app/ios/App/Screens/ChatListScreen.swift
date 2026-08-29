@@ -568,10 +568,6 @@ struct ChatRowBody: View {
     /// SF Symbol drawn before the headline, or `nil` for a plain conversation.
     let glyph: String?
 
-    /// The window (in days from today) over which the time column shows a
-    /// weekday name rather than a clock time (today) or a calendar date (older).
-    private static let weekdayWindow: Range<Int> = 1..<7
-
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
             textColumn
@@ -623,7 +619,7 @@ struct ChatRowBody: View {
     /// badge pinned to the bottom (beside the preview).
     private var metaColumn: some View {
         VStack(alignment: .trailing, spacing: 6) {
-            Text(verbatim: Self.timeLabel(lastActive, locale: langCode))
+            Text(verbatim: ChatListTimeLabel.text(lastActive, locale: langCode))
                 .font(Theme.sys(11))
                 .foregroundStyle(Theme.inkSoft)
             Spacer(minLength: 0)
@@ -675,32 +671,63 @@ struct ChatRowBody: View {
             .background(Theme.ink, in: Capsule())
             .accessibilityLabel(Text(verbatim: "\(unread)"))
     }
-    /// Telegram-style time column: a clock time for today, the weekday name
-    /// within the last week, then a calendar date (with year once it rolls
-    /// over). Locale drives digit shape and weekday/date ordering.
-    private static func timeLabel(
-        _ date: Date, locale: String, relativeTo now: Date = Date()
+}
+
+/// Telegram-style list time: clock today, weekday inside a week, then a date.
+/// Formatters are expensive mutable Foundation objects, so the main-actor UI
+/// reuses one per locale/template/calendar/time-zone combination.
+@MainActor
+enum ChatListTimeLabel {
+    private struct FormatterKey: Hashable {
+        let locale: String
+        let template: String
+        let calendar: Calendar.Identifier
+        let timeZone: String
+    }
+
+    private static let weekdayWindow: Range<Int> = 1..<7
+    private static var formatters: [FormatterKey: DateFormatter] = [:]
+
+    static func text(
+        _ date: Date,
+        locale: String,
+        relativeTo now: Date = Date(),
+        calendar: Calendar = .autoupdatingCurrent
     ) -> String {
-        // A server-stamped `lastActive` can land slightly ahead of the device
-        // clock (skew, or a just-sent row); clamp to now so a "tomorrow" value
-        // reads as the current time, not a future calendar date.
         let date = min(date, now)
-        let calendar = Calendar.current
+        let template: String
+        if calendar.isDate(date, inSameDayAs: now) {
+            template = "jm"
+        } else {
+            let days = calendar.dateComponents(
+                [.day], from: calendar.startOfDay(for: date), to: calendar.startOfDay(for: now)
+            ).day
+            if let days, weekdayWindow.contains(days) {
+                template = "EEE"
+            } else {
+                template = calendar.isDate(date, equalTo: now, toGranularity: .year)
+                    ? "Md" : "yMd"
+            }
+        }
+        return formatter(locale: locale, template: template, calendar: calendar).string(from: date)
+    }
+
+    private static func formatter(
+        locale: String, template: String, calendar: Calendar
+    ) -> DateFormatter {
+        let key = FormatterKey(
+            locale: locale,
+            template: template,
+            calendar: calendar.identifier,
+            timeZone: calendar.timeZone.identifier)
+        if let formatter = formatters[key] { return formatter }
+
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: locale)
-        if calendar.isDateInToday(date) {
-            formatter.setLocalizedDateFormatFromTemplate("jm")
-            return formatter.string(from: date)
-        }
-        let days = calendar.dateComponents(
-            [.day], from: calendar.startOfDay(for: date), to: calendar.startOfDay(for: now)
-        ).day
-        if let days, Self.weekdayWindow.contains(days) {
-            formatter.setLocalizedDateFormatFromTemplate("EEE")
-            return formatter.string(from: date)
-        }
-        let sameYear = calendar.isDate(date, equalTo: now, toGranularity: .year)
-        formatter.setLocalizedDateFormatFromTemplate(sameYear ? "Md" : "yMd")
-        return formatter.string(from: date)
+        formatter.calendar = calendar
+        formatter.timeZone = calendar.timeZone
+        formatter.setLocalizedDateFormatFromTemplate(template)
+        formatters[key] = formatter
+        return formatter
     }
 }

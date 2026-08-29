@@ -55,6 +55,19 @@ that lists a conversation applies it** — this list, `CronGroupScreen`'s fires 
 can be named or its transcript can drift. A new session-listing screen wires it
 in too.
 
+### Scroll hot path
+
+The app opts into the full ProMotion range with
+`CADisableMinimumFrameDurationOnPhone=true` in `project.yml` (and its generated
+`App/Info.plist`). Without it, Core Animation cannot present the SwiftUI list
+above the system-default frame rate on supported iPhones.
+
+`ChatListTimeLabel` owns the time column's clock / weekday / date rule and keeps
+its `DateFormatter`s on the main actor. A formatter is reused by locale,
+template, calendar and time zone; constructing one in every row body makes cell
+creation unnecessarily expensive, while keying only by language makes a time-zone
+change reuse stale formatting state.
+
 ## Searching conversations
 
 Full-text search over every conversation's prose, served by the gateway's
