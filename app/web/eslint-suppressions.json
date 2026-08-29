@@ -50,14 +50,6 @@
       "count": 3
     }
   },
-  "src/pages/JobsPage.tsx": {
-    "@typescript-eslint/no-unnecessary-condition": {
-      "count": 1
-    },
-    "@typescript-eslint/strict-boolean-expressions": {
-      "count": 2
-    }
-  },
   "src/pages/LlmPage.tsx": {
     "@typescript-eslint/no-unnecessary-condition": {
       "count": 2

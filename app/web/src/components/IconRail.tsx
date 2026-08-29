@@ -10,7 +10,6 @@ import {
   RiInstallLine,
   RiKanbanView2,
   RiLogoutBoxRLine,
-  RiStackLine,
 } from 'react-icons/ri';
 import type { IconType } from 'react-icons';
 import { useAuth } from '../api/auth';
@@ -34,7 +33,6 @@ const DESTINATIONS: { to: string; label: string; Icon: IconType }[] = [
   { to: '/logs', label: 'Log', Icon: RiFileList3Line },
   { to: '/traces', label: 'Trace', Icon: RiGitMergeLine },
   { to: '/cron', label: 'Cron', Icon: RiAlarmLine },
-  { to: '/jobs', label: 'Jobs', Icon: RiStackLine },
   { to: '/analytics', label: 'Analytics', Icon: RiBarChartBoxLine },
   { to: '/llm', label: 'LLM', Icon: RiCpuLine },
 ];
