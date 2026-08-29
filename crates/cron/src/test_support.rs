@@ -238,9 +238,36 @@ impl CronStore for InMemoryCronStore {
             .collect())
     }
 
-    async fn record_execution(&self, exec: &CronExecution) -> Result<()> {
-        self.executions.lock().push(exec.clone());
-        Ok(())
+    async fn record_execution_if_job_unchanged(
+        &self,
+        exec: &CronExecution,
+        expected_job: &CronJob,
+    ) -> Result<bool> {
+        // Hold the job snapshot lock until the execution is inserted, mirroring
+        // sqlite's immediate transaction around the version check and insert.
+        let jobs = self.jobs.lock();
+        let unchanged = jobs.iter().any(|stored| {
+            stored.id == expected_job.id
+                && unmoved(stored, expected_job)
+                && stored.updated_at == expected_job.updated_at
+                && stored.mcp_tool_grants == expected_job.mcp_tool_grants
+        });
+        if !unchanged {
+            return Ok(false);
+        }
+        let mut executions = self.executions.lock();
+        if executions.iter().any(|existing| {
+            existing.job_id == exec.job_id
+                && existing.scheduled_fire_time == exec.scheduled_fire_time
+        }) {
+            return Err(StorageError::Conflict(format!(
+                "{}@{}",
+                exec.job_id,
+                exec.scheduled_fire_time.timestamp_micros()
+            )));
+        }
+        executions.push(exec.clone());
+        Ok(true)
     }
 
     async fn list_executions_by_job(&self, job_id: &str) -> Result<Vec<CronExecution>> {

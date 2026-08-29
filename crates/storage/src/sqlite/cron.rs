@@ -7,7 +7,7 @@
 //! in the cron scheduler) so `baybo-cron` can stay free of `baybo-storage`.
 
 use async_trait::async_trait;
-use baybo_model::{CronExecution, CronJob, ExecutionStatus};
+use baybo_model::{CronExecution, CronJob, ExecutionStatus, normalize_mcp_tool_grants};
 use baybo_store::StorageError;
 use baybo_store::cron::{CronFire, CronStore, ExecutionCompletion, Result};
 use chrono::{DateTime, Utc};
@@ -59,6 +59,7 @@ fn job_from_row(
     // And for `builtin`: written once by the seed, never by `save`, and
     // `#[serde(skip)]` so no blob write can invent it.
     job.builtin = builtin_col != 0;
+    normalize_mcp_tool_grants(&mut job.mcp_tool_grants);
     Ok(job)
 }
 
@@ -71,6 +72,7 @@ fn execution_from_row(status_col: &str, data: &str) -> Result<CronExecution> {
         "dispatched" => ExecutionStatus::Dispatched,
         _ => ExecutionStatus::Pending,
     };
+    normalize_mcp_tool_grants(&mut exec.mcp_tool_grants);
     Ok(exec)
 }
 
@@ -134,16 +136,19 @@ fn execution_status_str(status: ExecutionStatus) -> &'static str {
 /// recycle-bin state (see [`job_from_row`]); keeping it out of the blob is what
 /// stops a stale snapshot's copy from ever contradicting the column.
 fn serialize_job(job: &CronJob) -> Result<String> {
-    let job = CronJob {
+    let mut job = CronJob {
         deleted_at: None,
         ..job.clone()
     };
+    normalize_mcp_tool_grants(&mut job.mcp_tool_grants);
     serde_json::to_string(&job)
         .map_err(|e| StorageError::Storage(format!("failed to serialize cron job: {e}")))
 }
 
 fn serialize_execution(exec: &CronExecution) -> Result<String> {
-    serde_json::to_string(exec)
+    let mut exec = exec.clone();
+    normalize_mcp_tool_grants(&mut exec.mcp_tool_grants);
+    serde_json::to_string(&exec)
         .map_err(|e| StorageError::Storage(format!("failed to serialize execution: {e}")))
 }
 
@@ -479,25 +484,56 @@ impl CronStore for SqliteCronStore {
 
     // ── Execution records ──
 
-    async fn record_execution(&self, exec: &CronExecution) -> Result<()> {
+    async fn record_execution_if_job_unchanged(
+        &self,
+        exec: &CronExecution,
+        expected_job: &CronJob,
+    ) -> Result<bool> {
         let data = serialize_execution(exec)?;
         let scheduled_us = exec.scheduled_fire_time.timestamp_micros();
         let triggered_us = exec.triggered_at.timestamp_micros();
-        let id = exec.id.clone();
+        let execution_id = exec.id.clone();
         let job_id = exec.job_id.clone();
         let user_id = exec.user_id.clone();
         let status = execution_status_str(exec.status).to_string();
-        // INSERT OR IGNORE so the (job_id, scheduled_fire_time) unique
-        // index distinguishes "lost the dedup race" from "DB is broken".
-        // 0 affected rows means another scheduler beat us to this slot;
-        // the caller treats that as benign and skips the dispatch.
-        let affected = self
+        let expected_updated_at = expected_job.updated_at;
+        let expected_mcp_tool_grants = expected_job.mcp_tool_grants.clone();
+        let expected = Unmoved::from(expected_job);
+
+        let outcome = self
             .pool
-            .interact_write("cron.record_execution", move |conn| {
-                Ok(conn.execute(
+            .interact_write("cron.record_execution_if_job_unchanged", move |conn| {
+                // Take the write lock before checking the row. A revocation that
+                // committed first makes this return false; one that commits after
+                // this transaction necessarily happened after the execution row
+                // (and its documented fire-time snapshot) already existed.
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let stored: Option<String> = tx
+                    .query_row(
+                        &format!("SELECT data FROM cron_jobs WHERE id = :id AND {UNMOVED}"),
+                        rusqlite::named_params! {
+                            ":id": job_id,
+                            ":expected_status": expected.status,
+                            ":expected_next_trigger_at": expected.next_trigger_us,
+                        },
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let Some(stored) = stored else {
+                    return Ok(0_u8);
+                };
+                let stored_job = job_from_row(None, 0, 0, &stored)?;
+                if stored_job.updated_at != expected_updated_at
+                    || stored_job.mcp_tool_grants != expected_mcp_tool_grants
+                {
+                    return Ok(0_u8);
+                }
+
+                let affected = tx.execute(
                     "INSERT OR IGNORE INTO cron_executions (id, job_id, user_id, scheduled_fire_time, triggered_at, status, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     rusqlite::params![
-                        id,
+                        execution_id,
                         job_id,
                         user_id,
                         scheduled_us,
@@ -505,16 +541,22 @@ impl CronStore for SqliteCronStore {
                         status,
                         data,
                     ],
-                )?)
+                )?;
+                if affected == 0 {
+                    return Ok(2_u8);
+                }
+                tx.commit()?;
+                Ok(1_u8)
             })
             .await?;
-        if affected == 0 {
-            return Err(StorageError::Conflict(format!(
+        match outcome {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(StorageError::Conflict(format!(
                 "{}@{}",
                 exec.job_id, scheduled_us
-            )));
+            ))),
         }
-        Ok(())
     }
 
     async fn list_executions_by_job(&self, job_id: &str) -> Result<Vec<CronExecution>> {
@@ -755,7 +797,7 @@ impl SqliteCronStore {
 mod tests {
     use super::*;
     use baybo_model::ChannelType;
-    use baybo_model::{CronSchedule, CronStatus};
+    use baybo_model::{CronSchedule, CronStatus, McpToolGrant, McpTransportIdentity};
     use chrono::Utc;
 
     /// A job row from before the recycle bin: no `deleted_at` key at all.
@@ -822,6 +864,7 @@ mod tests {
             updated_at: now,
             project_id: None,
             origin_session_id: None,
+            mcp_tool_grants: Vec::new(),
             deleted_at: None,
             pinned: false,
             builtin: false,
@@ -843,6 +886,23 @@ mod tests {
         exec
     }
 
+    async fn record_test_execution(store: &SqliteCronStore, execution: CronExecution) {
+        let job = match store.get(&execution.job_id).await.unwrap() {
+            Some(job) => job,
+            None => {
+                let job = test_job(&execution.job_id, &execution.user_id, CronStatus::Enabled);
+                store.create(&job).await.unwrap();
+                job
+            }
+        };
+        assert!(
+            store
+                .record_execution_if_job_unchanged(&execution, &job)
+                .await
+                .unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn create_and_get() {
         let tmpdir = tempfile::tempdir().unwrap();
@@ -857,6 +917,38 @@ mod tests {
         let loaded = store.get("cj-1").await.unwrap().unwrap();
         assert_eq!(loaded.id, "cj-1");
         assert_eq!(loaded.user_id, "u1");
+    }
+
+    #[tokio::test]
+    async fn exact_mcp_tool_grants_persist_canonically_and_snapshot_onto_execution() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
+        let store = SqliteCronStore::new(pool);
+        let a = McpToolGrant::new("server/a", McpTransportIdentity::from_sha256([0x01; 32]));
+        let b = McpToolGrant::new("server/b", McpTransportIdentity::from_sha256([0x02; 32]));
+        let mut job = test_job("cj-grants", "u1", CronStatus::Enabled);
+        job.mcp_tool_grants = vec![b.clone(), a.clone(), b.clone()];
+        store.create(&job).await.unwrap();
+
+        let stored = store.get(&job.id).await.unwrap().expect("job");
+        assert_eq!(stored.mcp_tool_grants, vec![a.clone(), b.clone()]);
+        let execution = CronExecution::pending(&stored, future_dt(), future_dt());
+        assert!(
+            store
+                .record_execution_if_job_unchanged(&execution, &stored)
+                .await
+                .unwrap()
+        );
+
+        job.mcp_tool_grants = vec![McpToolGrant::new(
+            "server/c",
+            McpTransportIdentity::from_sha256([0x03; 32]),
+        )];
+        store.save(&job).await.unwrap();
+        let loaded = store.list_executions_by_job("cj-grants").await.unwrap();
+        assert_eq!(loaded[0].mcp_tool_grants, vec![a, b]);
     }
 
     /// The whole reason `pinned` is a flat column and not a blob field. Every
@@ -1645,6 +1737,60 @@ mod tests {
     // ── Execution record tests ──
 
     #[tokio::test]
+    async fn conditional_execution_insert_rejects_a_previously_committed_revocation() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
+        let store = SqliteCronStore::new(pool);
+        let mut expected = test_job("cj-revoked", "u1", CronStatus::Enabled);
+        expected.set_mcp_tool_grants(vec![McpToolGrant::new(
+            "lighthouse/audit",
+            McpTransportIdentity::from_sha256([43; 32]),
+        )]);
+        store.create(&expected).await.unwrap();
+        let stale_execution =
+            CronExecution::pending(&expected, expected.next_trigger_at.unwrap(), Utc::now());
+
+        let mut revoked = expected.clone();
+        revoked.set_mcp_tool_grants(Vec::new());
+        // Deliberately retain the timestamp: the authorization tuple itself is
+        // also compared, so a clock collision cannot resurrect the stale grant.
+        revoked.updated_at = expected.updated_at;
+        assert!(store.save_if_unchanged(&revoked, &expected).await.unwrap());
+
+        assert!(
+            !store
+                .record_execution_if_job_unchanged(&stale_execution, &expected)
+                .await
+                .unwrap(),
+            "a stale execution snapshot was inserted after revocation"
+        );
+        assert!(
+            store
+                .list_executions_by_job(&expected.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let current = store.get(&expected.id).await.unwrap().unwrap();
+        let current_execution =
+            CronExecution::pending(&current, current.next_trigger_at.unwrap(), Utc::now());
+        assert!(
+            store
+                .record_execution_if_job_unchanged(&current_execution, &current)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store.list_executions_by_job(&expected.id).await.unwrap()[0]
+                .mcp_tool_grants
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn record_execution_dedup_returns_already_dispatched() {
         let tmpdir = tempfile::tempdir().unwrap();
         let pool = SqlitePool::open(tmpdir.path().join("test.db"))
@@ -1652,13 +1798,23 @@ mod tests {
             .unwrap();
         let store = SqliteCronStore::new(pool);
 
+        let job = test_job("cj-dup", "u1", CronStatus::Enabled);
+        store.create(&job).await.unwrap();
         let mut exec = test_execution("ce-dup-a", "cj-dup", "u1");
-        store.record_execution(&exec).await.unwrap();
+        assert!(
+            store
+                .record_execution_if_job_unchanged(&exec, &job)
+                .await
+                .unwrap()
+        );
 
         // Second instance of the same scheduler racing onto the same
         // (job_id, scheduled_fire_time) slot — different `id`, same dedup key.
         exec.id = "ce-dup-b".into();
-        let err = store.record_execution(&exec).await.unwrap_err();
+        let err = store
+            .record_execution_if_job_unchanged(&exec, &job)
+            .await
+            .unwrap_err();
         match err {
             StorageError::Conflict(key) => {
                 assert!(key.starts_with("cj-dup@"), "key was {key}");
@@ -1680,18 +1836,9 @@ mod tests {
             .unwrap();
         let store = SqliteCronStore::new(pool);
 
-        store
-            .record_execution(&test_execution("ce-1", "cj-1", "u1"))
-            .await
-            .unwrap();
-        store
-            .record_execution(&test_execution("ce-2", "cj-1", "u1"))
-            .await
-            .unwrap();
-        store
-            .record_execution(&test_execution("ce-3", "cj-2", "u1"))
-            .await
-            .unwrap();
+        record_test_execution(&store, test_execution("ce-1", "cj-1", "u1")).await;
+        record_test_execution(&store, test_execution("ce-2", "cj-1", "u1")).await;
+        record_test_execution(&store, test_execution("ce-3", "cj-2", "u1")).await;
 
         let execs = store.list_executions_by_job("cj-1").await.unwrap();
         assert_eq!(execs.len(), 2);
@@ -1705,18 +1852,9 @@ mod tests {
             .unwrap();
         let store = SqliteCronStore::new(pool);
 
-        store
-            .record_execution(&test_execution("ce-4", "cj-1", "u1"))
-            .await
-            .unwrap();
-        store
-            .record_execution(&test_execution("ce-5", "cj-2", "u2"))
-            .await
-            .unwrap();
-        store
-            .record_execution(&test_execution("ce-6", "cj-3", "u1"))
-            .await
-            .unwrap();
+        record_test_execution(&store, test_execution("ce-4", "cj-1", "u1")).await;
+        record_test_execution(&store, test_execution("ce-5", "cj-2", "u2")).await;
+        record_test_execution(&store, test_execution("ce-6", "cj-3", "u1")).await;
 
         let u1 = store.list_executions_by_user("u1").await.unwrap();
         assert_eq!(u1.len(), 2);
@@ -1730,10 +1868,7 @@ mod tests {
             .unwrap();
         let store = SqliteCronStore::new(pool);
 
-        store
-            .record_execution(&test_execution("ce-led", "cj-led", "u1"))
-            .await
-            .unwrap();
+        record_test_execution(&store, test_execution("ce-led", "cj-led", "u1")).await;
         // A dispatched-but-unfinished fire is not awaiting delivery yet.
         assert!(
             store
@@ -1855,6 +1990,7 @@ mod tests {
             "no title existed when it was written"
         );
         assert!(exec.outcome.is_none());
+        assert!(exec.mcp_tool_grants.is_empty());
         assert!(
             !exec.awaits_delivery(),
             "a fire from before the ledger never completed *into* it, so there is \
@@ -1922,10 +2058,7 @@ mod tests {
             .create(&test_job("cj-evict", "u1", CronStatus::Enabled))
             .await
             .unwrap();
-        store
-            .record_execution(&test_execution("ce-7", "cj-evict", "u1"))
-            .await
-            .unwrap();
+        record_test_execution(&store, test_execution("ce-7", "cj-evict", "u1")).await;
 
         store.delete("cj-evict").await.unwrap();
 
@@ -1980,6 +2113,7 @@ mod tests {
 
         let job = store.get("cj-legacy").await.unwrap().expect("row loads");
         assert!(!job.is_deleted(), "a row written before the column is live");
+        assert!(job.mcp_tool_grants.is_empty());
         assert_eq!(store.list_all().await.unwrap().len(), 1);
         let due = store.list_due(now_us()).await.unwrap();
         assert_eq!(due.len(), 1, "a legacy job keeps firing");

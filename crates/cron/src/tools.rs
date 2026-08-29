@@ -5,9 +5,10 @@ use std::sync::Arc;
 
 use crate::{CronError, CronJobPatch, CronSchedule, CronScheduler, NewCronJob};
 use async_trait::async_trait;
-use baybo_model::SessionId;
+use baybo_model::{CronJob, ProjectId, SessionId, TriggerSource};
 use baybo_tools::{
-    Tool, ToolConcurrency, ToolContext, ToolError, ToolManifest, ToolOutput, ToolTriggerScope,
+    McpToolGrantResolver, Tool, ToolConcurrency, ToolContext, ToolError, ToolManifest, ToolOutput,
+    ToolTriggerScope,
 };
 use chrono::{DateTime, LocalResult, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
@@ -46,13 +47,26 @@ fn parse_tz(name: &str) -> Result<Tz, ToolError> {
         .map_err(|e| ToolError::InvalidParams(format!("invalid timezone {name}: {e}")))
 }
 
+fn granted_mcp_tool_names(job: &CronJob) -> Vec<&str> {
+    job.mcp_tool_grants
+        .iter()
+        .map(|grant| grant.tool_name.as_str())
+        .collect()
+}
+
 /// Build every cron tool with its manifest, ready to be registered with a
 /// `ToolRegistry`. Always `Trusted` with no capabilities — they operate on
 /// agent-internal scheduler state, not on the host filesystem or network.
-pub fn agent_tools(scheduler: Arc<CronScheduler>) -> Vec<(Arc<dyn Tool>, ToolManifest)> {
+pub fn agent_tools(
+    scheduler: Arc<CronScheduler>,
+    mcp_grants: Arc<dyn McpToolGrantResolver>,
+) -> Vec<(Arc<dyn Tool>, ToolManifest)> {
     let tools: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(CronCreateTool::new(Arc::clone(&scheduler))),
-        Arc::new(CronUpdateTool::new(Arc::clone(&scheduler))),
+        Arc::new(CronCreateTool::new(
+            Arc::clone(&scheduler),
+            Arc::clone(&mcp_grants),
+        )),
+        Arc::new(CronUpdateTool::new(Arc::clone(&scheduler), mcp_grants)),
         Arc::new(CronDeleteTool::new(Arc::clone(&scheduler))),
         Arc::new(CronPauseTool::new(Arc::clone(&scheduler))),
         Arc::new(CronResumeTool::new(Arc::clone(&scheduler))),
@@ -136,12 +150,21 @@ impl Tool for CronReportNothingTool {
 
 struct CronCreateTool {
     scheduler: Arc<CronScheduler>,
+    mcp_grants: Arc<dyn McpToolGrantResolver>,
 }
 
 impl CronCreateTool {
-    fn new(scheduler: Arc<CronScheduler>) -> Self {
-        Self { scheduler }
+    fn new(scheduler: Arc<CronScheduler>, mcp_grants: Arc<dyn McpToolGrantResolver>) -> Self {
+        Self {
+            scheduler,
+            mcp_grants,
+        }
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct CronPermissions {
+    mcp_tools: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -153,6 +176,8 @@ struct CreateParams {
     title: String,
     prompt: String,
     timezone: String,
+    #[serde(default)]
+    permissions: Option<CronPermissions>,
 }
 
 #[async_trait]
@@ -189,6 +214,19 @@ impl Tool for CronCreateTool {
                 "at": {
                     "type": "string",
                     "description": "One-shot timestamp; fires once, then the job stops and stays in the list as `executed`. Either RFC3339 with offset (e.g. \"2026-04-17T14:25:00Z\" or \"2026-04-17T22:25:00+08:00\") or a naive `YYYY-MM-DDTHH:MM:SS` interpreted in `timezone`. Supply exactly one non-empty value across `schedule` and `at`; use an empty string for the unused field when the strict schema materializes both."
+                },
+                "permissions": {
+                    "type": "object",
+                    "description": "MCP access for future unattended fires. Omit it when none is needed.",
+                    "properties": {
+                        "mcp_tools": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Exact current names of every MCP operation the task may call (for example `browser/navigate_page`)."
+                        }
+                    },
+                    "required": ["mcp_tools"],
+                    "additionalProperties": false
                 }
             },
             "required": ["title", "timezone", "prompt"]
@@ -224,24 +262,37 @@ impl Tool for CronCreateTool {
             }
         };
 
+        let project_id = ctx.session_trigger.project().cloned();
+        let mcp_tool_grants = self
+            .mcp_grants
+            .resolve_for_session(
+                &p.permissions.map_or_else(Vec::new, |value| value.mcp_tools),
+                &ctx.user.channel,
+                &scheduled_trigger(&schedule, project_id.clone()),
+            )
+            .map_err(|error| ToolError::InvalidParams(error.to_string()))?;
+
         let job = self
             .scheduler
-            .create_job(NewCronJob {
-                user_id: ctx.user.id.clone(),
-                channel: ctx.user.channel.clone(),
-                title: p.title,
-                schedule,
-                prompt: p.prompt,
-                timezone,
-                origin_session_id: Some(origin_session(ctx)),
-                // Inherited from the calling session, never a parameter —
-                // exactly like `origin_session` above, and for the same
-                // reason: a model may no more choose which board a job
-                // files work on than it may choose which board a tool call
-                // touches. A job scheduled from inside a board belongs to
-                // that board; one scheduled from a chat belongs to none.
-                project_id: ctx.session_trigger.project().cloned(),
-            })
+            .create_job_with_mcp_tool_grants(
+                NewCronJob {
+                    user_id: ctx.user.id.clone(),
+                    channel: ctx.user.channel.clone(),
+                    title: p.title,
+                    schedule,
+                    prompt: p.prompt,
+                    timezone,
+                    origin_session_id: Some(origin_session(ctx)),
+                    // Inherited from the calling session, never a parameter —
+                    // exactly like `origin_session` above, and for the same
+                    // reason: a model may no more choose which board a job
+                    // files work on than it may choose which board a tool call
+                    // touches. A job scheduled from inside a board belongs to
+                    // that board; one scheduled from a chat belongs to none.
+                    project_id,
+                },
+                mcp_tool_grants,
+            )
             .await
             .map_err(cron_tool_error)?;
 
@@ -251,6 +302,7 @@ impl Tool for CronCreateTool {
             "schedule": job.schedule.display(),
             "timezone": job.timezone,
             "next_trigger_at": job.format_time_opt(job.next_trigger_at),
+            "mcp_tools": granted_mcp_tool_names(&job),
         })))
     }
 }
@@ -285,31 +337,15 @@ fn origin_session(ctx: &ToolContext) -> SessionId {
 
 struct CronUpdateTool {
     scheduler: Arc<CronScheduler>,
+    mcp_grants: Arc<dyn McpToolGrantResolver>,
 }
 
 impl CronUpdateTool {
-    fn new(scheduler: Arc<CronScheduler>) -> Self {
-        Self { scheduler }
-    }
-
-    /// The zone a naive `at` in this call is read in: the one the call sets, or
-    /// else the one the job already has. Either way the user means a wall-clock
-    /// time in the zone their job lives in — a naive `at` read as UTC would move
-    /// the reminder by the offset.
-    async fn effective_timezone(
-        &self,
-        job_id: &str,
-        patched: Option<&str>,
-    ) -> Result<String, ToolError> {
-        if let Some(timezone) = patched {
-            return Ok(timezone.to_string());
+    fn new(scheduler: Arc<CronScheduler>, mcp_grants: Arc<dyn McpToolGrantResolver>) -> Self {
+        Self {
+            scheduler,
+            mcp_grants,
         }
-        self.scheduler
-            .get_job(job_id)
-            .await
-            .map_err(cron_tool_error)?
-            .map(|job| job.timezone)
-            .ok_or_else(|| cron_tool_error(CronError::NotFound(job_id.to_string())))
     }
 }
 
@@ -326,6 +362,18 @@ struct UpdateParams {
     at: Option<String>,
     #[serde(default)]
     timezone: Option<String>,
+    #[serde(default)]
+    permissions: Option<CronPermissions>,
+}
+
+fn scheduled_trigger(schedule: &CronSchedule, project_id: Option<ProjectId>) -> TriggerSource {
+    TriggerSource::Cron {
+        cron_job_id: String::new(),
+        origin_session_id: None,
+        conversation: !schedule.is_one_shot(),
+        job_title: None,
+        project_id,
+    }
 }
 
 /// A field the caller left blank is a field it did not set — the model reaches
@@ -369,7 +417,7 @@ impl Tool for CronUpdateTool {
     }
 
     fn description(&self) -> String {
-        r#"Edit an existing cron job in place, by its ID: change its `prompt`, `title`, `schedule` / `at`, or `timezone`. This is how you change a job the user already has ("move the reminder to 8am", "make it remind me about the dentist instead") — always prefer it to CronDelete + CronCreate, which mints a new job and throws away the old one's history; an edited job keeps its ID, its past runs, and the conversations they opened. Pass the ID plus only the fields that change: anything you leave out keeps its current value, and setting nothing at all is an error. Changing `schedule` / `at` / `timezone` recomputes the next fire time FROM NOW — the fires the job missed are never made up — and a new `at` that has already passed is rejected. A PAUSED job stays paused: editing it does not start it again, so call CronResume when the user wants it running. A one-shot job that already fired CAN be re-armed by giving it a new `at` in the future. The updated job comes back with its new `next_trigger_at`, in its own timezone — tell the user when it will actually run next."#
+        r#"Edit an existing cron job in place, by its ID: change its `prompt`, `title`, `schedule` / `at`, `timezone`, or MCP permissions. This is how you change a job the user already has ("move the reminder to 8am", "make it remind me about the dentist instead") — always prefer it to CronDelete + CronCreate, which mints a new job and throws away the old one's history; an edited job keeps its ID, its past runs, and the conversations they opened. Pass the ID plus only the fields that change: anything you leave out keeps its current value, and setting nothing at all is an error. Changing `schedule` / `at` / `timezone` recomputes the next fire time FROM NOW — the fires the job missed are never made up — and a new `at` that has already passed is rejected. A PAUSED job stays paused: editing it does not start it again, so call CronResume when the user wants it running. A one-shot job that already fired CAN be re-armed by giving it a new `at` in the future. The updated job comes back with its new `next_trigger_at`, in its own timezone — tell the user when it will actually run next."#
             .to_string()
     }
 
@@ -400,6 +448,19 @@ impl Tool for CronUpdateTool {
                 "timezone": {
                     "type": "string",
                     "description": "New IANA timezone (e.g. \"Asia/Shanghai\") for the job. Omit it, or use an empty string under a strict schema, to keep the current one. Changing it alone moves the job: the same cron expression names a different instant in a different zone."
+                },
+                "permissions": {
+                    "type": "object",
+                    "description": "Replacement MCP access for future unattended fires. Omit it to preserve the current grants.",
+                    "properties": {
+                        "mcp_tools": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Exact current names of every permitted MCP operation; use an empty list to revoke all grants."
+                        }
+                    },
+                    "required": ["mcp_tools"],
+                    "additionalProperties": false
                 }
             },
             "required": ["id"]
@@ -418,6 +479,13 @@ impl Tool for CronUpdateTool {
         let p: UpdateParams =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
 
+        let current = self
+            .scheduler
+            .get_job(&p.id)
+            .await
+            .map_err(cron_tool_error)?
+            .ok_or_else(|| cron_tool_error(CronError::NotFound(p.id.clone())))?;
+
         let timezone = set_field(p.timezone);
         let schedule = match (set_field(p.schedule), set_field(p.at)) {
             (Some(_), Some(_)) => {
@@ -427,11 +495,26 @@ impl Tool for CronUpdateTool {
             }
             (Some(expr), None) => Some(CronSchedule::cron(expr)),
             (None, Some(at)) => {
-                let tz = self.effective_timezone(&p.id, timezone.as_deref()).await?;
-                Some(CronSchedule::at(parse_at_in_tz(&at, &tz)?))
+                let tz = timezone.as_deref().unwrap_or(&current.timezone);
+                Some(CronSchedule::at(parse_at_in_tz(&at, tz)?))
             }
             (None, None) => None,
         };
+
+        let mcp_tool_grants = p
+            .permissions
+            .map(|permissions| {
+                self.mcp_grants.resolve_for_session(
+                    &permissions.mcp_tools,
+                    &current.channel,
+                    &scheduled_trigger(
+                        schedule.as_ref().unwrap_or(&current.schedule),
+                        current.project_id.clone(),
+                    ),
+                )
+            })
+            .transpose()
+            .map_err(|error| ToolError::InvalidParams(error.to_string()))?;
 
         let job = self
             .scheduler
@@ -442,6 +525,7 @@ impl Tool for CronUpdateTool {
                     prompt: set_field(p.prompt),
                     schedule,
                     timezone,
+                    mcp_tool_grants,
                 },
             )
             .await
@@ -455,6 +539,7 @@ impl Tool for CronUpdateTool {
             "timezone": job.timezone,
             "status": job.status.as_str(),
             "next_trigger_at": job.format_time_opt(job.next_trigger_at),
+            "mcp_tools": granted_mcp_tool_names(&job),
         })))
     }
 }
@@ -672,8 +757,8 @@ impl Tool for CronListTool {
     }
 
     fn description(&self) -> String {
-        "List all scheduled cron jobs. Trigger times are rendered in \
-         each job's own `timezone`."
+        "List all scheduled cron jobs, including the exact MCP operation names \
+         granted to each job. Trigger times are rendered in each job's own `timezone`."
             .to_string()
     }
 
@@ -700,6 +785,7 @@ impl Tool for CronListTool {
                     "timezone": j.timezone,
                     "next_trigger_at": j.format_time_opt(j.next_trigger_at),
                     "last_triggered_at": j.format_time_opt(j.last_triggered_at),
+                    "mcp_tools": granted_mcp_tool_names(j),
                 })
             })
             .collect();
@@ -713,8 +799,56 @@ mod tests {
     use super::*;
     use crate::shutdown::NeverShutdown;
     use crate::test_support::InMemoryCronStore;
-    use baybo_model::{CronStatus, TriggerSource};
+    use baybo_model::{CronStatus, McpToolGrant, McpTransportIdentity, TriggerSource};
+    use baybo_tools::McpToolGrantResolveError;
+    use std::collections::HashMap;
     use tokio::sync::mpsc;
+
+    #[derive(Default)]
+    struct TestMcpGrantResolver {
+        grants: HashMap<String, McpToolGrant>,
+    }
+
+    impl McpToolGrantResolver for TestMcpGrantResolver {
+        fn resolve_for_session(
+            &self,
+            tool_names: &[String],
+            _channel: &baybo_model::ChannelType,
+            _trigger: &TriggerSource,
+        ) -> Result<Vec<McpToolGrant>, McpToolGrantResolveError> {
+            tool_names
+                .iter()
+                .map(|tool_name| {
+                    self.grants.get(tool_name).cloned().ok_or_else(|| {
+                        McpToolGrantResolveError::NotConnected {
+                            tool_name: tool_name.clone(),
+                        }
+                    })
+                })
+                .collect()
+        }
+    }
+
+    fn test_mcp_grants() -> Arc<dyn McpToolGrantResolver> {
+        Arc::new(TestMcpGrantResolver::default())
+    }
+
+    fn test_mcp_grants_with(grants: Vec<McpToolGrant>) -> Arc<dyn McpToolGrantResolver> {
+        Arc::new(TestMcpGrantResolver {
+            grants: grants
+                .into_iter()
+                .map(|grant| (grant.tool_name.clone(), grant))
+                .collect(),
+        })
+    }
+
+    fn create_tool(scheduler: Arc<CronScheduler>) -> CronCreateTool {
+        CronCreateTool::new(scheduler, test_mcp_grants())
+    }
+
+    fn update_tool(scheduler: Arc<CronScheduler>) -> CronUpdateTool {
+        CronUpdateTool::new(scheduler, test_mcp_grants())
+    }
 
     fn ctx_with_trigger(session_id: &str, trigger: TriggerSource) -> ToolContext {
         ToolContext {
@@ -851,7 +985,7 @@ mod tests {
     }
 
     async fn update(scheduler: &Arc<CronScheduler>, params: Value) -> baybo_tools::Result<Value> {
-        CronUpdateTool::new(Arc::clone(scheduler))
+        update_tool(Arc::clone(scheduler))
             .execute(params, &ToolContext::for_test())
             .await
             .map(json_output)
@@ -916,8 +1050,8 @@ mod tests {
     fn schedule_pair_describes_its_strict_schema_filler() {
         let (scheduler, _rx) = test_scheduler();
         for schema in [
-            CronCreateTool::new(Arc::clone(&scheduler)).parameters_schema(),
-            CronUpdateTool::new(scheduler).parameters_schema(),
+            create_tool(Arc::clone(&scheduler)).parameters_schema(),
+            update_tool(scheduler).parameters_schema(),
         ] {
             for field in ["schedule", "at"] {
                 assert!(
@@ -928,6 +1062,134 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn cron_tools_resolve_create_replace_and_revoke_mcp_permissions() {
+        let (scheduler, _rx) = test_scheduler();
+        let first = McpToolGrant::new("server/read", McpTransportIdentity::from_sha256([7; 32]));
+        let second = McpToolGrant::new("server/search", McpTransportIdentity::from_sha256([8; 32]));
+        let resolver = test_mcp_grants_with(vec![first.clone(), second.clone()]);
+        let create = CronCreateTool::new(Arc::clone(&scheduler), Arc::clone(&resolver));
+        let update = CronUpdateTool::new(Arc::clone(&scheduler), resolver);
+        assert!(
+            create.parameters_schema()["properties"]
+                .get("permissions")
+                .is_some()
+        );
+        assert!(
+            update.parameters_schema()["properties"]
+                .get("permissions")
+                .is_some()
+        );
+
+        let created = json_output(
+            create
+                .execute(
+                    json!({
+                        "title": "MCP job",
+                        "timezone": "UTC",
+                        "prompt": "use a server",
+                        "schedule": "0 9 * * *",
+                        "permissions": { "mcp_tools": ["server/read"] },
+                    }),
+                    &ToolContext::for_test(),
+                )
+                .await
+                .expect("create runs"),
+        );
+        let id = created["id"].as_str().expect("job id");
+        assert_eq!(
+            scheduler
+                .get_job(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .mcp_tool_grants,
+            vec![first.clone()]
+        );
+
+        update
+            .execute(
+                json!({
+                    "id": id,
+                    "title": "Renamed MCP job",
+                }),
+                &ToolContext::for_test(),
+            )
+            .await
+            .expect("update runs");
+        assert_eq!(
+            scheduler
+                .get_job(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .mcp_tool_grants,
+            vec![first]
+        );
+
+        update
+            .execute(
+                json!({
+                    "id": id,
+                    "permissions": { "mcp_tools": ["server/search"] },
+                }),
+                &ToolContext::for_test(),
+            )
+            .await
+            .expect("replacement runs");
+        assert_eq!(
+            scheduler
+                .get_job(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .mcp_tool_grants,
+            vec![second]
+        );
+
+        update
+            .execute(
+                json!({
+                    "id": id,
+                    "permissions": { "mcp_tools": [] },
+                }),
+                &ToolContext::for_test(),
+            )
+            .await
+            .expect("revocation runs");
+        assert!(
+            scheduler
+                .get_job(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .mcp_tool_grants
+                .is_empty()
+        );
+
+        let error = update
+            .execute(
+                json!({
+                    "id": id,
+                    "permissions": { "mcp_tools": ["server/disconnected"] },
+                }),
+                &ToolContext::for_test(),
+            )
+            .await
+            .expect_err("a disconnected operation must fail closed");
+        assert!(matches!(error, ToolError::InvalidParams(_)), "{error:?}");
+        assert!(
+            scheduler
+                .get_job(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .mcp_tool_grants
+                .is_empty(),
+            "a failed replacement must not partially update the job"
+        );
     }
 
     /// Editing nothing is always a caller bug, and the model must see it as one

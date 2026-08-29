@@ -53,13 +53,16 @@ impl SkillSummary {
 /// Skills every agent sees regardless of persona, because they are runtime
 /// infrastructure rather than a capability someone chose to grant.
 ///
-/// `baybo-cli` is the whole list: it tells the agent how to introspect the
-/// instance it is running inside (the Bash tool injects `BAYBO_HELP_AGENT`
-/// and `BAYBO_CONFIG_PATH` for exactly this). Withholding it would not make
-/// a persona narrower, only blinder. Every other compiled-in skill is a
-/// capability, so a custom agent gets it only by having a copy in its own
-/// directory.
-pub const UNIVERSAL_SKILLS: &[&str] = &[crate::builtin::BAYBO_CLI_SKILL_NAME];
+/// `baybo-cli` introspects the instance an agent is running inside, while
+/// `baybo-help` explains and diagnoses that runtime from shipped guidance,
+/// local evidence, and an explicitly gated source fallback. Withholding either
+/// would not make a persona narrower, only blinder. Every other compiled-in
+/// skill is a capability, so a custom agent gets it only by having a copy in
+/// its own directory.
+pub const UNIVERSAL_SKILLS: &[&str] = &[
+    crate::builtin::BAYBO_CLI_SKILL_NAME,
+    crate::builtin::BAYBO_HELP_SKILL_NAME,
+];
 
 /// The id [`SkillRegistry::owner`] resolves an unbound scope to. Interned
 /// because that resolution happens on every scoped read, including the
@@ -923,8 +926,8 @@ mod tests {
         assert!(reg.agent_dir_loaded(&agent_a));
     }
 
-    /// Infrastructure, not a capability: every agent can introspect the
-    /// instance it runs inside, however narrow its persona.
+    /// Infrastructure, not a capability: every agent can understand and
+    /// introspect the instance it runs inside, however narrow its persona.
     #[test]
     fn a_custom_agent_still_reaches_the_universal_skills() {
         let reg = SkillRegistry::new();

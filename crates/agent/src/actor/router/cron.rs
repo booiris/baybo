@@ -1151,6 +1151,7 @@ fn cron_trigger(event: &CronTriggerEvent, builtin: Option<BuiltinFireContext>) -
         job_id: event.job_id.clone(),
         title: event.title.clone(),
         prompt: event.prompt.clone(),
+        mcp_tool_grants: event.mcp_tool_grants.clone(),
         delivery: if event.one_shot {
             CronDelivery::OriginSession
         } else {
@@ -1374,6 +1375,7 @@ mod tests {
                 one_shot,
                 project_id: None,
                 origin_session_id: Some(SessionId::from("sess-user")),
+                mcp_tool_grants: Vec::new(),
                 previous_fire_at: None,
             }
         }
@@ -1386,13 +1388,20 @@ mod tests {
         /// Record the execution the fire event refers to, as the scheduler
         /// would have before dispatching it — the waiter stamps its outcome
         /// onto this row.
-        async fn record_execution(&self) {
-            let mut exec = CronExecution::pending(&job("每日新闻"), Utc::now(), Utc::now());
-            exec.id = "ce-1".into();
+        async fn seed_execution(&self) {
+            let job = job("每日新闻");
             self.cron_store
-                .record_execution(&exec)
+                .create(&job)
                 .await
-                .expect("record execution");
+                .expect("record source job");
+            let mut exec = CronExecution::pending(&job, Utc::now(), Utc::now());
+            exec.id = "ce-1".into();
+            assert!(
+                self.cron_store
+                    .record_execution_if_job_unchanged(&exec, &job)
+                    .await
+                    .expect("record execution")
+            );
         }
 
         /// Put `session` mid-turn, as a live reply would.
@@ -2039,16 +2048,84 @@ mod tests {
         // The skip is keyed on the built-in job id alone; a user's own job
         // must fire whether or not anyone has spoken lately.
         let mut h = RouterHarness::new();
+        let grant = baybo_model::McpToolGrant::new(
+            "server/tool",
+            baybo_model::McpTransportIdentity::from_sha256([0x42; 32]),
+        );
+        let mut event = RouterHarness::event(false);
+        event.mcp_tool_grants = vec![grant.clone()];
         h.router
-            .handle_cron_trigger(RouterHarness::event(false))
+            .handle_cron_trigger(event)
             .await
             .expect("route the fire");
 
         let (_, mut mailbox) = h.fire();
-        assert!(matches!(
-            mailbox.try_recv(),
-            Ok(AgentMessage::CronTrigger { builtin: None, .. })
-        ));
+        let Ok(AgentMessage::CronTrigger {
+            builtin: None,
+            mcp_tool_grants,
+            ..
+        }) = mailbox.try_recv()
+        else {
+            panic!("ordinary fire trigger")
+        };
+        assert_eq!(mcp_tool_grants, vec![grant]);
+    }
+
+    #[tokio::test]
+    async fn separate_recurring_fires_start_with_fresh_session_approvals() {
+        let mut h = RouterHarness::new();
+        h.router
+            .handle_cron_trigger(RouterHarness::event(false))
+            .await
+            .expect("route the first fire");
+        let (first_session_id, _first_mailbox) = h.fire();
+        let mut first_session = h
+            .sessions
+            .get(&first_session_id)
+            .await
+            .unwrap()
+            .expect("first fire session");
+        first_session
+            .state
+            .approved_resources
+            .push(baybo_model::ApprovedResource::ExecCommand {
+                command: "approved-in-first-fire".to_string(),
+            });
+        h.sessions
+            .store()
+            .save(&first_session)
+            .await
+            .expect("persist the first fire's approval");
+
+        let mut second_event = RouterHarness::event(false);
+        second_event.execution_id = "ce-2".to_string();
+        h.router
+            .handle_cron_trigger(second_event)
+            .await
+            .expect("route the second fire");
+        let (second_session_id, _second_mailbox) = h.fire();
+        assert_ne!(
+            second_session_id, first_session_id,
+            "each recurring fire must mint an isolated session"
+        );
+
+        let first_after = h
+            .sessions
+            .get(&first_session_id)
+            .await
+            .unwrap()
+            .expect("first fire still persists");
+        assert_eq!(first_after.state.approved_resources.len(), 1);
+        let second = h
+            .sessions
+            .get(&second_session_id)
+            .await
+            .unwrap()
+            .expect("second fire session");
+        assert!(
+            second.state.approved_resources.is_empty(),
+            "a prior fire's durable approvals must not seed a later fire"
+        );
     }
 
     /// A recurring fire's session is a conversation the user can reply in, so
@@ -2173,7 +2250,7 @@ mod tests {
     #[tokio::test]
     async fn a_one_shot_whose_actor_is_gone_still_reports_a_failure() {
         let mut h = RouterHarness::new();
-        h.record_execution().await;
+        h.seed_execution().await;
         // The fake spawner hands back a mailbox whose receiver it immediately
         // drops — the closed-mailbox state the race produces.
         h.close_spawned_mailboxes();
@@ -2221,6 +2298,7 @@ mod tests {
             updated_at: Utc::now(),
             project_id: None,
             origin_session_id: None,
+            mcp_tool_grants: Vec::new(),
             deleted_at: None,
             pinned: false,
             builtin: false,

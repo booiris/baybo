@@ -524,7 +524,10 @@ pub async fn build_managers(
     // `wire_router`, once the supervisor + actor spawner exist.
     let subagent_spawner_slot: baybo_subagent::tool::SubagentSpawnerSlot =
         Arc::new(std::sync::OnceLock::new());
-    for (tool, manifest) in baybo_cron::tools::agent_tools(Arc::clone(&cron_scheduler)) {
+    let mcp_tool_grants = tool_registry.mcp_tool_grant_resolver();
+    for (tool, manifest) in
+        baybo_cron::tools::agent_tools(Arc::clone(&cron_scheduler), mcp_tool_grants)
+    {
         tool_registry.register(tool, manifest);
     }
 

@@ -80,6 +80,16 @@ function networkMessage(e: unknown): string {
   return e instanceof Error ? `Network error: ${e.message}` : 'Network error contacting gateway';
 }
 
+function responseErrorMessage(
+  error: components['schemas']['ErrorBody'] | undefined,
+  status: number,
+): string {
+  const message = error?.error;
+  return message !== null && message !== undefined && message.length > 0
+    ? message
+    : `HTTP Error ${status}`;
+}
+
 /**
  * Which slot paints a mutation failure. A modal's overlay covers the page-level
  * banner, so a failure raised while a modal is open has to render *inside* that
@@ -89,7 +99,7 @@ export function mutationErrorSlot(
   message: string | null,
   openModal: CronModal,
 ): 'none' | 'page' | Exclude<CronModal, null> {
-  if (!message) return 'none';
+  if (message === null || message.length === 0) return 'none';
   return openModal ?? 'page';
 }
 
@@ -109,8 +119,8 @@ export async function fetchCronJobs(client: AdminClient, view: CronView): Promis
       params: { query: { deleted: view === 'deleted' } },
     });
     if (response.status === 401) return { kind: 'unauthorized' };
-    if (error || !response.ok) {
-      return { kind: 'failed', message: error?.error || `HTTP Error ${response.status}` };
+    if (error !== undefined || !response.ok) {
+      return { kind: 'failed', message: responseErrorMessage(error, response.status) };
     }
     return { kind: 'ok', items: data?.items ?? [] };
   } catch (e) {
@@ -124,8 +134,8 @@ async function runMutation(
   try {
     const { error, response } = await call();
     if (response.status === 401) return { kind: 'unauthorized' };
-    if (error || !response.ok) {
-      return { kind: 'failed', message: error?.error || `HTTP Error ${response.status}` };
+    if (error !== undefined || !response.ok) {
+      return { kind: 'failed', message: responseErrorMessage(error, response.status) };
     }
     return { kind: 'ok' };
   } catch (e) {
@@ -173,8 +183,8 @@ export async function updateCronJob(
       body: patch,
     });
     if (response.status === 401) return { kind: 'unauthorized' };
-    if (error || !response.ok || !data) {
-      return { kind: 'failed', message: error?.error || `HTTP Error ${response.status}` };
+    if (error !== undefined || !response.ok) {
+      return { kind: 'failed', message: responseErrorMessage(error, response.status) };
     }
     return { kind: 'ok', job: data };
   } catch (e) {
@@ -239,7 +249,7 @@ function editedSchedule(initial: CronEditForm, form: CronEditForm): CronSchedule
   const time = isoFromLocalInput(form.at);
   // Compared as instants, not as text: the box holds only minutes, so a job whose
   // `at` carries seconds must still read as untouched when nobody touched it.
-  if (!time || (initial.scheduleKind === 'at' && time === isoFromLocalInput(initial.at))) {
+  if (time === null || (initial.scheduleKind === 'at' && time === isoFromLocalInput(initial.at))) {
     return null;
   }
   return { kind: 'at', time };
@@ -262,7 +272,7 @@ export function cronEditPatch(job: CronJob, form: CronEditForm): UpdateCronReque
 }
 
 function formatTimestamp(iso: string | null | undefined): string {
-  if (!iso) return '-';
+  if (iso === null || iso === undefined || iso.length === 0) return '-';
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
   return d.toLocaleString('sv-SE', {
@@ -299,11 +309,11 @@ export function CronPage() {
   const deletedView = view === 'deleted';
 
   // Topmost first — that is the dialog a failure has to render inside.
-  const openModal: CronModal = pendingDeleteId
+  const openModal: CronModal = pendingDeleteId !== null
     ? 'trash'
-    : editing
+    : editing !== null
       ? 'edit'
-      : selected
+      : selected !== null
         ? 'detail'
         : null;
   const errorSlot = mutationErrorSlot(mutationError, openModal);
@@ -558,7 +568,7 @@ export function CronPage() {
         </SelectBox>
       </div>
 
-      {error && (
+      {error !== null && (
         <div className="mb-6 bg-white border-[3px] border-err text-err rounded-md shadow-brutal-sm px-4 py-3 font-mono text-sm break-words">
           {error}
         </div>
@@ -768,9 +778,12 @@ export function CronPage() {
             setMutationError(null);
             setSelected(null);
           }}
-          onEdit={selected.deleted_at ? undefined : () => openEditor(selected)}
+          onEdit={selected.deleted_at !== null && selected.deleted_at !== undefined
+            ? undefined
+            : () => openEditor(selected)}
           onTrash={
-            selected.deleted_at || selected.builtin === true
+            (selected.deleted_at !== null && selected.deleted_at !== undefined)
+              || selected.builtin === true
               ? undefined
               : () => {
                   setMutationError(null);
@@ -778,7 +791,7 @@ export function CronPage() {
                 }
           }
           onRestore={
-            selected.deleted_at
+            selected.deleted_at !== null && selected.deleted_at !== undefined
               ? () => {
                   void handleAction(selected.id, 'restore');
                 }
@@ -801,7 +814,7 @@ export function CronPage() {
           }}
         />
       )}
-      {pendingDeleteId && (
+      {pendingDeleteId !== null && (
         <TrashConfirmModal
           id={pendingDeleteId}
           submitting={mutating}
@@ -892,7 +905,7 @@ function CronDetailModal({
           </div>
         </header>
         <div className="px-6 py-4 space-y-4 overflow-y-auto min-h-0">
-          {error && (
+          {error !== null && (
             <div className="bg-white border-[3px] border-err text-err rounded-md shadow-brutal-sm px-4 py-3 font-mono text-sm break-words">
               {error}
             </div>
@@ -918,7 +931,7 @@ function CronDetailModal({
               <label className={fieldLabel}>Timezone</label>
               <div className="font-mono text-[0.9rem]">{job.timezone}</div>
             </div>
-            {job.deleted_at && (
+            {job.deleted_at !== null && job.deleted_at !== undefined && (
               <div>
                 <label className={fieldLabel}>Deleted At</label>
                 <div className="text-[0.9rem]">{formatTimestamp(job.deleted_at)}</div>
@@ -933,7 +946,7 @@ function CronDetailModal({
             </div>
           </div>
 
-          {job.origin_session_id && (
+          {job.origin_session_id !== null && job.origin_session_id !== undefined && (
             <div>
               <label className={fieldLabel}>Origin Session</label>
               <code className="font-mono text-[0.85rem] break-all">{job.origin_session_id}</code>
@@ -962,7 +975,10 @@ function CronEditModal({
 
   const patch = cronEditPatch(job, form);
   const changed = Object.keys(patch);
-  const blocked = submitting || changed.length === 0 || cronEditIncomplete(form);
+  const blocked =
+    submitting
+    || changed.length === 0
+    || cronEditIncomplete(form);
   const reschedules = patch.schedule !== undefined || patch.timezone !== undefined;
 
   const set = <K extends keyof CronEditForm>(key: K, value: CronEditForm[K]) =>
@@ -997,7 +1013,7 @@ function CronEditModal({
         </header>
 
         <div className="px-6 py-4 space-y-4 overflow-y-auto min-h-0">
-          {error && (
+          {error !== null && (
             <div className="bg-white border-[3px] border-err text-err rounded-md shadow-brutal-sm px-4 py-3 font-mono text-sm break-words">
               {error}
             </div>
@@ -1210,7 +1226,7 @@ function TrashConfirmModal({
             {' '}to the recycle bin? It stops firing and leaves this list, but the record is kept —
             you can restore it from the Recycle Bin view.
           </p>
-          {error && (
+          {error !== null && (
             <div className="bg-white border-[2px] border-err text-err rounded-md px-3 py-2 font-mono text-[0.85rem] break-words">
               {error}
             </div>

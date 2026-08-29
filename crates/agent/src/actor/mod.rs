@@ -94,6 +94,8 @@ pub enum AgentMessage {
         job_id: String,
         title: String,
         prompt: String,
+        /// Exact MCP tool grants snapshotted onto this execution.
+        mcp_tool_grants: Vec<baybo_model::McpToolGrant>,
         delivery: CronDelivery,
         /// Present only for a runtime-owned job's fire — see
         /// [`BuiltinFireContext`]. `None` for every job a user created.
@@ -134,6 +136,10 @@ pub enum AgentMessage {
     SubagentSpawned {
         initial_message: Box<IncomingMessage>,
         parent_turn_id: baybo_model::TurnId,
+        /// Transient tool authority inherited from the dispatching execution.
+        /// It follows in-process delegation, but is never reconstructed from
+        /// the persistent child session.
+        inherited_context: Option<baybo_model::InheritedToolContext>,
     },
     /// A detached subagent or `Bash` command reached a terminal state. The
     /// completion enters `session.state.background_notifications`, where it
@@ -513,12 +519,20 @@ impl AgentActor {
                 job_id,
                 title,
                 prompt,
+                mcp_tool_grants,
                 delivery,
                 builtin,
             } => {
                 debug!(session_id = %session_id, job_id = %job_id, ?delivery, "received cron trigger");
                 if let Err(e) = self
-                    .dispatch_cron_prompt(&prompt, &job_id, &title, delivery, builtin)
+                    .dispatch_cron_prompt(
+                        &prompt,
+                        &job_id,
+                        &title,
+                        mcp_tool_grants,
+                        delivery,
+                        builtin,
+                    )
                     .await
                 {
                     if is_turn_cancelled(&e) {
@@ -545,9 +559,10 @@ impl AgentActor {
             AgentMessage::SubagentSpawned {
                 initial_message,
                 parent_turn_id,
+                inherited_context,
             } => {
                 if let Err(e) = self
-                    .handle_subagent_spawned(*initial_message, parent_turn_id)
+                    .handle_subagent_spawned(*initial_message, parent_turn_id, inherited_context)
                     .await
                 {
                     if is_turn_cancelled(&e) {
@@ -590,6 +605,7 @@ impl AgentActor {
     /// `AgentLoop::append_user_message` / `append_cron_fire` /
     /// `append_background_notification_prompt_once`) so framing lives in
     /// `baybo-context` and the loop just iterates.
+    #[allow(clippy::too_many_arguments)]
     async fn run_agent_loop(
         &mut self,
         turn_input: TurnInput,
@@ -604,6 +620,9 @@ impl AgentActor {
         // A recurring cron fire's silence handle for `report_nothing`;
         // `None` for every other turn. See `dispatch_cron_prompt`.
         notify_silence: Option<baybo_tools::NotifySilence>,
+        // Transient authority supplied by the turn dispatcher. It is not
+        // reconstructed from persistent session metadata on later turns.
+        inherited_context: Option<baybo_model::InheritedToolContext>,
     ) -> anyhow::Result<OutgoingMessage> {
         let is_user_turn = matches!(turn_input.input_kind(), baybo_turn::TurnInputKind::UserChat);
         // Kept so the error path below can tell a user `/stop` (token
@@ -615,21 +634,41 @@ impl AgentActor {
         // `agent_loop.run`, the end edge from its terminal transition. So
         // chat turn-activity has a single producer sourced from the one
         // truth, and the per-`Subscribe` snapshot can't disagree with it.
-        let result = self
-            .volatile
-            .agent_loop
-            .run(
-                &mut self.durable.session,
-                turn_input,
-                &self.volatile.turn_lifecycle,
-                &self.volatile.span_recorder,
-                parent_turn_id,
-                delta_tx,
-                turn_token.clone(),
-                interjections,
-                notify_silence,
-            )
-            .await;
+        let result = match inherited_context {
+            Some(context) => {
+                self.volatile
+                    .agent_loop
+                    .run_with_inherited_context(
+                        &mut self.durable.session,
+                        turn_input,
+                        &self.volatile.turn_lifecycle,
+                        &self.volatile.span_recorder,
+                        parent_turn_id,
+                        delta_tx,
+                        turn_token.clone(),
+                        interjections,
+                        notify_silence,
+                        context,
+                    )
+                    .await
+            }
+            None => {
+                self.volatile
+                    .agent_loop
+                    .run(
+                        &mut self.durable.session,
+                        turn_input,
+                        &self.volatile.turn_lifecycle,
+                        &self.volatile.span_recorder,
+                        parent_turn_id,
+                        delta_tx,
+                        turn_token.clone(),
+                        interjections,
+                        notify_silence,
+                    )
+                    .await
+            }
+        };
         let cancelled = turn_token.is_cancelled();
         if let Some(out) = stopped_out {
             *out = cancelled;
@@ -685,7 +724,7 @@ impl AgentActor {
             .agent_loop
             .append_issue_brief(number, checkout, brief, &files)
             .await?;
-        self.run_agent_loop(turn_input, None, None, None, None, None)
+        self.run_agent_loop(turn_input, None, None, None, None, None, None)
             .await?;
         Ok(())
     }
@@ -709,6 +748,7 @@ impl AgentActor {
         prompt: &str,
         job_id: &str,
         title: &str,
+        mcp_tool_grants: Vec<baybo_model::McpToolGrant>,
         delivery: CronDelivery,
         builtin: Option<BuiltinFireContext>,
     ) -> anyhow::Result<()> {
@@ -729,7 +769,15 @@ impl AgentActor {
         let silence =
             matches!(delivery, CronDelivery::Channel).then(baybo_tools::NotifySilence::new);
         let response = self
-            .run_agent_loop(turn_input, None, None, None, None, silence.clone())
+            .run_agent_loop(
+                turn_input,
+                None,
+                None,
+                None,
+                None,
+                silence.clone(),
+                Some(baybo_model::InheritedToolContext::new(mcp_tool_grants)),
+            )
             .await?;
         let silenced = silence.as_ref().is_some_and(|s| s.requested());
         match delivery {
@@ -1142,6 +1190,7 @@ impl AgentActor {
                 None,
                 None,
                 None,
+                None,
             )
             .await?;
         self.send_user_reply(response).await;
@@ -1203,6 +1252,7 @@ impl AgentActor {
                 Some(response_tx),
                 Some(&mut interjections),
                 Some(&mut stopped),
+                None,
                 None,
             )
             .await;
@@ -1438,6 +1488,7 @@ impl AgentActor {
         &mut self,
         incoming: IncomingMessage,
         parent_turn_id: baybo_model::TurnId,
+        inherited_context: Option<baybo_model::InheritedToolContext>,
     ) -> anyhow::Result<()> {
         let content = incoming.message.content;
         let response_tx = self.volatile.response_tx.clone();
@@ -1455,6 +1506,7 @@ impl AgentActor {
                 None,
                 None,
                 None,
+                inherited_context,
             )
             .await?;
         self.send_response(response.into(), "subagent").await;
@@ -1740,6 +1792,7 @@ mod tests {
             job_id: "j".into(),
             title: "t".into(),
             prompt: "p".into(),
+            mcp_tool_grants: Vec::new(),
             delivery: CronDelivery::Channel,
         })
         .await

@@ -18,14 +18,16 @@ use baybo_model::{ArtifactSource, TrustLevel};
 use crate::SkillDefinition;
 use crate::loader::parse_skill_md;
 
-/// Name of the CLI-introspection skill. Referenced by
+/// Names of the runtime-reference skills. Referenced by
 /// [`crate::registry::UNIVERSAL_SKILLS`] as well as the registration below,
-/// so it is a const rather than two literals.
+/// so they are consts rather than repeated literals.
 pub const BAYBO_CLI_SKILL_NAME: &str = "baybo-cli";
+pub const BAYBO_HELP_SKILL_NAME: &str = "baybo-help";
 const DECK_SKILL_NAME: &str = "deck";
 const HTML_GEN_SKILL_NAME: &str = "html-gen";
 
 const BAYBO_CLI_SKILL_MD: &str = include_str!("builtin/baybo-cli/SKILL.md");
+const BAYBO_HELP_SKILL_MD: &str = include_str!("builtin/baybo-help/SKILL.md");
 const DECK_SKILL_MD: &str = include_str!("builtin/deck/SKILL.md");
 const HTML_GEN_SKILL_MD: &str = include_str!("builtin/html-gen/SKILL.md");
 
@@ -43,6 +45,7 @@ pub(crate) fn all() -> Vec<SkillDefinition> {
     let bin = resolve_baybo_bin();
     let raw = [
         (BAYBO_CLI_SKILL_NAME, BAYBO_CLI_SKILL_MD),
+        (BAYBO_HELP_SKILL_NAME, BAYBO_HELP_SKILL_MD),
         (DECK_SKILL_NAME, DECK_SKILL_MD),
         (HTML_GEN_SKILL_NAME, HTML_GEN_SKILL_MD),
     ];
@@ -156,6 +159,26 @@ mod tests {
         assert!(skill.description.contains("ordinary language"));
         assert!(summary.allows_channel(&baybo_model::ChannelType::owner()));
         assert!(!summary.allows_channel(&baybo_model::ChannelType::telegram()));
+    }
+
+    #[test]
+    fn baybo_help_is_an_invocable_source_backed_reference() {
+        let skill = all()
+            .into_iter()
+            .find(|skill| skill.name == BAYBO_HELP_SKILL_NAME)
+            .expect("baybo-help builtin parses");
+
+        assert!(skill.agent_invocable);
+        assert_eq!(skill.command.as_deref(), Some(BAYBO_HELP_SKILL_NAME));
+        for tool in ["Bash", "Read", "Grep", "Glob"] {
+            assert!(skill.allowed_tools.contains(&tool.to_string()), "{tool}");
+        }
+        assert!(
+            skill
+                .prompt_template
+                .contains("https://github.com/booiris/baybo"),
+            "the fallback repository must remain discoverable"
+        );
     }
 
     #[test]

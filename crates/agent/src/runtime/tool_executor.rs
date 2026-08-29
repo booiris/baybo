@@ -5,14 +5,18 @@ use std::time::Duration;
 use parking_lot::Mutex;
 
 use baybo_llm::{Attribution, BillableLlm, BilledChat};
-use baybo_model::{ContentBlock, ParallelGroup, SessionId, SpanId, TrustLevel, TurnId, User};
+#[cfg(test)]
+use baybo_model::TrustLevel;
+use baybo_model::{
+    ContentBlock, InheritedToolContext, ParallelGroup, SessionId, SpanId, TurnId, User,
+};
 
 use baybo_sandbox::{NetworkPolicy, SandboxRunner, default_sensitive_denylist};
 use baybo_tools::{
-    ApprovalDecision, ApprovalGateMap, ApprovalHandle, ApprovalOutcome, ApprovalRequest,
-    ApprovedResource, ExecSandbox, ReadTracker, ResourceAccess, ToolCapability, ToolContext,
-    ToolError, ToolManifest, ToolOutput, ToolRegistry, VirtualReadResolver,
-    approval::preview_params, refusal_reason,
+    ApprovalDecision, ApprovalGate, ApprovalGateMap, ApprovalHandle, ApprovalOutcome,
+    ApprovalRequest, ApprovedResource, AutoDenyGate, ExecSandbox, ReadTracker, ResourceAccess,
+    ToolCapability, ToolContext, ToolError, ToolManifest, ToolOutput, ToolRegistry,
+    VirtualReadResolver, approval::preview_params, refusal_reason,
 };
 use baybo_trace::{
     LifecycleOutcome, PersistedToolCallOutput, SpanEventKind, SpanFinalize, SpanKind, SpanRecorder,
@@ -429,6 +433,8 @@ pub struct ToolExecutor {
     /// board wired (argv-mode boots, tests), and issue sessions then behave
     /// like ordinary ones.
     board: Option<BoardStores>,
+    #[cfg(test)]
+    after_authorization_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl ToolExecutor {
@@ -458,7 +464,15 @@ impl ToolExecutor {
             background_jobs,
             background_control,
             board,
+            #[cfg(test)]
+            after_authorization_hook: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_after_authorization_hook(mut self, hook: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.after_authorization_hook = Some(hook);
+        self
     }
 
     /// Scrub leak-detector matches out of every text field carried in
@@ -540,39 +554,9 @@ impl ToolExecutor {
 
     /// Validate that the tool's trust level permits execution with its declared capabilities.
     fn validate_trust(&self, tool_name: &str, manifest: &ToolManifest) -> anyhow::Result<()> {
-        match manifest.trust_level {
-            TrustLevel::Untrusted => {
-                anyhow::bail!(
-                    "security: tool '{}' has Untrusted trust level and cannot be auto-executed",
-                    tool_name
-                );
-            }
-            TrustLevel::Installed => {
-                for cap in &manifest.capabilities {
-                    match cap {
-                        ToolCapability::WriteFile => {
-                            anyhow::bail!(
-                                "security: tool '{}' is Installed but declares WriteFile capability; \
-                                 requires Trusted level",
-                                tool_name
-                            );
-                        }
-                        ToolCapability::ExecCommand => {
-                            anyhow::bail!(
-                                "security: tool '{}' is Installed but declares ExecCommand capability; \
-                                 requires Trusted level",
-                                tool_name
-                            );
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            TrustLevel::Trusted => {
-                // Trusted tools are allowed all capabilities
-            }
-        }
-        Ok(())
+        manifest
+            .validate_auto_execution()
+            .map_err(|error| anyhow::anyhow!("security: tool '{}' {error}", tool_name))
     }
 
     /// Execute a tool call inside the given `step`, with full
@@ -623,11 +607,16 @@ impl ToolExecutor {
         // Handle a cron-fire tool (`report_nothing`) flips to suppress this
         // fire's notification. `None` for every turn that cannot be silenced.
         notify_silence: Option<baybo_tools::NotifySilence>,
+        // Transient authority attached to this execution lineage. In-process
+        // subagents inherit it unchanged; independent turns do not reconstruct
+        // it from persistent session state.
+        inherited_context: Option<InheritedToolContext>,
     ) -> ExecutedTool {
         debug!(tool = tool_name, "executing tool");
 
-        if let Some(manifest) = self.tool_registry.get_manifest(tool_name) {
-            if let Err(e) = self.validate_trust(tool_name, &manifest) {
+        let registration = self.tool_registry.get_with_manifest(tool_name);
+        if let Some((_, Some(manifest))) = registration.as_ref() {
+            if let Err(e) = self.validate_trust(tool_name, manifest) {
                 return ExecutedTool {
                     output: Err(e),
                     approval: None,
@@ -648,7 +637,7 @@ impl ToolExecutor {
             }
         }
         // Registry omission is not an enforcement boundary for hallucinated calls.
-        if let Some(tool) = self.tool_registry.get(tool_name)
+        if let Some((tool, _)) = registration.as_ref()
             && !tool.trigger_scope().allows_trigger(session_trigger)
         {
             return ExecutedTool {
@@ -659,6 +648,10 @@ impl ToolExecutor {
                 approval: None,
             };
         }
+        let (pinned_tool, pinned_manifest) = match registration {
+            Some((tool, manifest)) => (Some(tool), manifest),
+            None => (None, None),
+        };
 
         let turn_id = step.turn_id;
         let tool_name_owned = tool_name.to_string();
@@ -706,9 +699,8 @@ impl ToolExecutor {
                 // and check them against the session's cached approvals.
                 // Also pull the tool's declared `max_timeout` (default
                 // 30 s) so the executor uses the right deadline below.
-                let (accesses, call_label, effective_timeout, output_source) = self
-                    .tool_registry
-                    .get(&tool_name_owned)
+                let (accesses, call_label, effective_timeout, output_source) = pinned_tool
+                    .as_ref()
                     .map(|tool| {
                         (
                             tool.accessed_resources(&params),
@@ -726,6 +718,19 @@ impl ToolExecutor {
                         )
                     });
 
+                let mcp_metadata = pinned_tool.as_ref().and_then(|tool| tool.mcp_metadata());
+                let exact_mcp_grant = inherited_context.as_ref().is_some_and(|context| {
+                    mcp_metadata.as_ref().is_some_and(|metadata| {
+                        metadata.tool_name == tool_name_owned
+                            && context.grants_mcp_tool(
+                                &tool_name_owned,
+                                &metadata.transport_identity,
+                            )
+                    })
+                });
+                let inherited_context_requires_mcp_grant = inherited_context.is_some()
+                    && mcp_metadata.is_some()
+                    && !exact_mcp_grant;
                 let uncovered: Vec<ResourceAccess> = {
                     let approved = approved_resources.lock();
                     accesses
@@ -734,13 +739,61 @@ impl ToolExecutor {
                             if matches!(acc, ResourceAccess::ReadFile { .. }) {
                                 return false;
                             }
-                            !approved.iter().any(|ar| ar.covers(acc))
+                            if approved.iter().any(|ar| ar.covers(acc)) {
+                                return false;
+                            }
+                            !(exact_mcp_grant
+                                && mcp_metadata.as_ref().is_some_and(|metadata| {
+                                    metadata.transport_accesses.contains(acc)
+                                }))
                         })
                         .cloned()
                         .collect()
                 };
+                #[cfg(test)]
+                if let Some(hook) = &self.after_authorization_hook {
+                    hook();
+                }
 
-                if !uncovered.is_empty() {
+                if inherited_context_requires_mcp_grant || !uncovered.is_empty() {
+                    if inherited_context.is_some() {
+                        *approval_sink.lock() = Some(ApprovalDecision::Deny);
+                        for access in &uncovered {
+                            let _ = recorder
+                                .emit_event(
+                                    span_handle.span_id,
+                                    event_seq,
+                                    SpanEventKind::Approval {
+                                        decision: ApprovalDecision::Deny,
+                                        resource: access.clone(),
+                                    },
+                                )
+                                .await;
+                            event_seq += 1;
+                        }
+                        let reason = match (&mcp_metadata, exact_mcp_grant) {
+                            (Some(_), false) => String::from(
+                                "this execution inherited unattended authority and this exact MCP \
+                                 tool and transport configuration is not granted; grant the current \
+                                 namespaced operation and transport identity in the originating \
+                                 execution's permission settings",
+                            ),
+                            (Some(_), true) => String::from(
+                                "the inherited exact MCP tool grant covers only that operation's \
+                                 transport access; the call requested additional approval-gated \
+                                 resources, which this unattended execution cannot approve",
+                            ),
+                            (None, _) => String::from(
+                                "this execution inherited unattended authority and cannot request new \
+                                 approval for a non-MCP tool; run this operation from a user reply \
+                                 or expose it through an exact MCP tool grant",
+                            ),
+                        };
+                        return Err(anyhow::Error::new(ToolError::Denied {
+                            tool: tool_name_owned.clone(),
+                            reason,
+                        }));
+                    }
                     let gate = self.gate_map.get(&user.channel, session_id);
                     let request = gate.request(ApprovalRequest {
                         call_id: Uuid::new_v4().to_string(),
@@ -814,12 +867,9 @@ impl ToolExecutor {
 
                 // Build per-call sandbox adapter for tools declaring
                 // ExecCommand.
-                let uses_exec_command = self
-                    .tool_registry
-                    .get_manifest(&tool_name_owned)
-                    .is_some_and(|manifest| {
-                        manifest.capabilities.contains(&ToolCapability::ExecCommand)
-                    });
+                let uses_exec_command = pinned_manifest.as_ref().is_some_and(|manifest| {
+                    manifest.capabilities.contains(&ToolCapability::ExecCommand)
+                });
                 let checkout = self.issue_checkout(session_trigger).await;
                 let agent_handle = match (&checkout, &self.board, session_trigger.project()) {
                     (Some(_), Some(board), Some(project)) => {
@@ -873,7 +923,11 @@ impl ToolExecutor {
                 // Mid-execution approval handle. The probe clone shares the
                 // handle's decision cell, so after the tool returns we can
                 // read back what any mid-call prompt decided.
-                let approval_gate = self.gate_map.get(&user.channel, session_id);
+                let approval_gate: Arc<dyn ApprovalGate> = if inherited_context.is_some() {
+                    Arc::new(AutoDenyGate)
+                } else {
+                    self.gate_map.get(&user.channel, session_id)
+                };
                 let approval = ApprovalHandle::new(
                     approval_gate,
                     Arc::clone(approved_resources),
@@ -937,6 +991,7 @@ impl ToolExecutor {
                     // interactive agent loop, so `Edit`/`Write` enforce the
                     // contract here (unlike the background-summary pass).
                     read_tracker: Some(read_tracker),
+                    inherited_context: inherited_context.clone(),
                     background_eligible,
                     background_jobs: self.background_jobs.clone(),
                     background_control: self.background_control.clone(),
@@ -960,12 +1015,13 @@ impl ToolExecutor {
                 // (e.g. the session transcript) is served inside `ReadTool` from
                 // `ctx.virtual_reads` before it touches the filesystem.
                 let outer_deadline = ctx.timeout + APPROVAL_HEADROOM;
-                let result = tokio::time::timeout(
-                    outer_deadline,
-                    self.tool_registry
-                        .execute(&tool_name_owned, params_revealed, &ctx),
-                )
-                .await;
+                let execution = async {
+                    let tool = pinned_tool.as_ref().ok_or_else(|| {
+                        ToolError::NotFound(format!("tool not found: {tool_name_owned}"))
+                    })?;
+                    tool.execute(params_revealed, &ctx).await
+                };
+                let result = tokio::time::timeout(outer_deadline, execution).await;
 
                 // A tool can raise its own prompts mid-execution (through
                 // `ctx.approval`), and those come AFTER the pre-execute gate —
@@ -1119,8 +1175,11 @@ impl ToolExecutor {
 
 #[cfg(test)]
 mod tests {
-    use super::{admits_repo, admits_worktree, permissive_scope};
+    use super::{ExecutedTool, ToolExecutor, admits_repo, admits_worktree, permissive_scope};
+    use baybo_model::{InheritedToolContext, McpToolGrant, McpTransportIdentity};
     use std::path::{Path, PathBuf};
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     #[test]
     fn the_mask_covers_the_live_workspace_not_just_the_default_location() {
@@ -1545,6 +1604,7 @@ mod tests {
                 false,
                 ReadTracker::default(),
                 None,
+                None,
             )
             .await;
         assert!(executed.output.is_ok(), "the capture tool ran");
@@ -1780,6 +1840,605 @@ mod tests {
         }
     }
 
+    struct CountingApproveGate {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl baybo_tools::ApprovalGate for CountingApproveGate {
+        async fn request(&self, _req: ApprovalRequest) -> ApprovalOutcome {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            ApprovalOutcome::answered(ApprovalDecision::Approve)
+        }
+    }
+
+    const SELECTED_MCP_TOOL: &str = "lighthouse/run_audit";
+    const SIBLING_MCP_TOOL: &str = "lighthouse/get_report";
+
+    struct TypedMcpTool {
+        namespaced_name: &'static str,
+        upstream_name: &'static str,
+        transport_identity: McpTransportIdentity,
+        declares_transport_access: bool,
+        extra_access: bool,
+        mid_execution_access: bool,
+        ran: Arc<AtomicBool>,
+    }
+
+    impl TypedMcpTool {
+        fn transport_access() -> ResourceAccess {
+            ResourceAccess::Http {
+                host: "mcp.example".to_string(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl baybo_tools::Tool for TypedMcpTool {
+        fn name(&self) -> &str {
+            self.namespaced_name
+        }
+
+        fn description(&self) -> String {
+            "typed MCP authorization test".to_string()
+        }
+
+        fn parameters_schema(&self) -> Value {
+            json!({"type": "object", "properties": {}})
+        }
+
+        fn accessed_resources(&self, _params: &Value) -> Vec<ResourceAccess> {
+            let mut accesses = if self.declares_transport_access {
+                vec![Self::transport_access()]
+            } else {
+                Vec::new()
+            };
+            if self.extra_access {
+                accesses.push(ResourceAccess::WriteFile {
+                    path: PathBuf::from("/tmp/not-transport"),
+                });
+            }
+            accesses
+        }
+
+        fn mcp_metadata(&self) -> Option<baybo_tools::mcp::McpToolMetadata> {
+            Some(baybo_tools::mcp::McpToolMetadata {
+                tool_name: self.namespaced_name.to_string(),
+                server_name: "lighthouse".to_string(),
+                upstream_name: self.upstream_name.to_string(),
+                transport_identity: self.transport_identity.clone(),
+                transport_accesses: if self.declares_transport_access {
+                    vec![Self::transport_access()]
+                } else {
+                    Vec::new()
+                },
+            })
+        }
+
+        async fn execute(
+            &self,
+            _params: Value,
+            ctx: &ToolContext,
+        ) -> baybo_tools::Result<ToolOutput> {
+            if self.mid_execution_access {
+                let outcome = ctx
+                    .approval
+                    .as_ref()
+                    .expect("approval handle")
+                    .request(
+                        self.name(),
+                        &ctx.session_id,
+                        &ctx.user,
+                        vec![ResourceAccess::WriteFile {
+                            path: PathBuf::from("/tmp/discovered-late"),
+                        }],
+                        "{}".to_string(),
+                    )
+                    .await;
+                if outcome.decision == ApprovalDecision::Deny {
+                    return Err(ToolError::Denied {
+                        tool: self.name().to_string(),
+                        reason: "mid-execution access denied".to_string(),
+                    });
+                }
+            }
+            self.ran.store(true, Ordering::SeqCst);
+            Ok(ToolOutput::Text("ran".to_string()))
+        }
+    }
+
+    fn ordinary_trigger() -> baybo_model::TriggerSource {
+        baybo_model::TriggerSource::User
+    }
+
+    async fn execute_authorization_tool(
+        tool: Arc<dyn baybo_tools::Tool>,
+        gate: Arc<dyn baybo_tools::ApprovalGate>,
+        approved_resources: Arc<Mutex<Vec<ApprovedResource>>>,
+        inherited_context: Option<InheritedToolContext>,
+    ) -> ExecutedTool {
+        let tool_name = tool.name().to_string();
+        let mut registry = ToolRegistry::new();
+        registry.register(tool, authorization_manifest(&tool_name));
+        execute_authorization_registration(
+            Arc::new(registry),
+            tool_name,
+            gate,
+            approved_resources,
+            inherited_context,
+            None,
+        )
+        .await
+    }
+
+    fn authorization_manifest(tool_name: &str) -> ToolManifest {
+        ToolManifest {
+            name: tool_name.to_string(),
+            description: "authorization test".to_string(),
+            trust_level: TrustLevel::Trusted,
+            parameters_schema: json!({"type": "object", "properties": {}}),
+            capabilities: vec![ToolCapability::Http, ToolCapability::WriteFile],
+            channels: Vec::new(),
+        }
+    }
+
+    async fn execute_authorization_registration(
+        registry: Arc<ToolRegistry>,
+        tool_name: String,
+        gate: Arc<dyn baybo_tools::ApprovalGate>,
+        approved_resources: Arc<Mutex<Vec<ApprovedResource>>>,
+        inherited_context: Option<InheritedToolContext>,
+        after_authorization_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> ExecutedTool {
+        let home = tempfile::tempdir().expect("tempdir");
+        let paths = baybo_workspace::WorkspacePaths::new(home.path().join(".baybo"));
+        std::fs::create_dir_all(paths.work_dir()).expect("work dir");
+        let sandbox_root = paths.work_dir().canonicalize().expect("canonical work dir");
+
+        let gates = ApprovalGateMap::new();
+        gates.insert(baybo_model::ChannelType::tui(), gate);
+        let key = baybo_security::EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec())
+            .expect("key");
+        let security_gateway = Arc::new(SecurityGateway::new(
+            Arc::new(baybo_security::LeakDetector::with_default_rules()),
+            Arc::new(baybo_security::SecretVault::new(
+                key,
+                Arc::new(baybo_security::test_support::MemorySecretStore::new()),
+            )),
+        ));
+        let mut executor = ToolExecutor::new(
+            registry,
+            Arc::new(gates),
+            security_gateway,
+            sandbox_root,
+            paths,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        if let Some(hook) = after_authorization_hook {
+            executor = executor.with_after_authorization_hook(hook);
+        }
+
+        let session_id = SessionId::from("sess-inherited-authorization");
+        let recorder = Arc::new(SpanRecorder::new(
+            session_id.clone(),
+            "u1".to_string(),
+            Arc::new(baybo_trace::test_support::MemoryTraceStore::new()),
+            baybo_trace::TraceEventStream::default(),
+        ));
+        let step = recorder
+            .begin_step(TurnId::new(), baybo_trace::StepKind::LlmIteration)
+            .await
+            .expect("step");
+        let user = User {
+            id: "u1".to_string(),
+            name: None,
+            channel: baybo_model::ChannelType::tui(),
+        };
+
+        executor
+            .execute(
+                &tool_name,
+                json!({}),
+                &session_id,
+                &ordinary_trigger(),
+                &baybo_model::AgentProfileId::generate(),
+                &user,
+                &approved_resources,
+                &recorder,
+                &step,
+                None,
+                "tool-use-inherited-context".to_string(),
+                None,
+                None,
+                CancellationToken::new(),
+                None,
+                None,
+                false,
+                ReadTracker::default(),
+                None,
+                inherited_context,
+            )
+            .await
+    }
+
+    fn counting_gate() -> (Arc<AtomicUsize>, Arc<dyn baybo_tools::ApprovalGate>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let gate: Arc<dyn baybo_tools::ApprovalGate> = Arc::new(CountingApproveGate {
+            calls: Arc::clone(&calls),
+        });
+        (calls, gate)
+    }
+
+    #[tokio::test]
+    async fn exact_mcp_tool_grant_bypasses_only_its_transport_access() {
+        let identity = McpTransportIdentity::from_sha256([10; 32]);
+        let ran = Arc::new(AtomicBool::new(false));
+        let (gate_calls, gate) = counting_gate();
+        let approved = Arc::new(Mutex::new(Vec::new()));
+        let executed = execute_authorization_tool(
+            Arc::new(TypedMcpTool {
+                namespaced_name: SELECTED_MCP_TOOL,
+                upstream_name: "run_audit",
+                transport_identity: identity.clone(),
+                declares_transport_access: true,
+                extra_access: false,
+                mid_execution_access: false,
+                ran: Arc::clone(&ran),
+            }),
+            gate,
+            Arc::clone(&approved),
+            Some(InheritedToolContext::new(vec![McpToolGrant::new(
+                SELECTED_MCP_TOOL,
+                identity,
+            )])),
+        )
+        .await;
+
+        assert!(executed.output.is_ok(), "{:?}", executed.output.err());
+        assert_eq!(executed.approval, None);
+        assert!(ran.load(Ordering::SeqCst));
+        assert_eq!(gate_calls.load(Ordering::SeqCst), 0);
+        assert!(approved.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn inherited_context_denies_ungranted_zero_access_typed_mcp() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let (gate_calls, gate) = counting_gate();
+        let executed = execute_authorization_tool(
+            Arc::new(TypedMcpTool {
+                namespaced_name: SELECTED_MCP_TOOL,
+                upstream_name: "run_audit",
+                transport_identity: McpTransportIdentity::from_sha256([19; 32]),
+                declares_transport_access: false,
+                extra_access: false,
+                mid_execution_access: false,
+                ran: Arc::clone(&ran),
+            }),
+            gate,
+            Arc::new(Mutex::new(Vec::new())),
+            Some(InheritedToolContext::default()),
+        )
+        .await;
+
+        let error = executed
+            .output
+            .expect_err("zero-access typed MCP still requires an exact grant");
+        assert!(
+            error
+                .to_string()
+                .contains("exact MCP tool and transport configuration"),
+            "{error}"
+        );
+        assert_eq!(executed.approval, Some(ApprovalDecision::Deny));
+        assert!(!ran.load(Ordering::SeqCst));
+        assert_eq!(gate_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn inherited_context_allows_granted_zero_access_typed_mcp() {
+        let identity = McpTransportIdentity::from_sha256([20; 32]);
+        let ran = Arc::new(AtomicBool::new(false));
+        let (gate_calls, gate) = counting_gate();
+        let executed = execute_authorization_tool(
+            Arc::new(TypedMcpTool {
+                namespaced_name: SELECTED_MCP_TOOL,
+                upstream_name: "run_audit",
+                transport_identity: identity.clone(),
+                declares_transport_access: false,
+                extra_access: false,
+                mid_execution_access: false,
+                ran: Arc::clone(&ran),
+            }),
+            gate,
+            Arc::new(Mutex::new(Vec::new())),
+            Some(InheritedToolContext::new(vec![McpToolGrant::new(
+                SELECTED_MCP_TOOL,
+                identity,
+            )])),
+        )
+        .await;
+
+        assert!(executed.output.is_ok(), "{:?}", executed.output.err());
+        assert_eq!(executed.approval, None);
+        assert!(ran.load(Ordering::SeqCst));
+        assert_eq!(gate_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dynamic_replacement_after_authorization_executes_the_pinned_tool() {
+        let granted_identity = McpTransportIdentity::from_sha256([17; 32]);
+        let replacement_identity = McpTransportIdentity::from_sha256([18; 32]);
+        let original_ran = Arc::new(AtomicBool::new(false));
+        let replacement_ran = Arc::new(AtomicBool::new(false));
+        let original: Arc<dyn baybo_tools::Tool> = Arc::new(TypedMcpTool {
+            namespaced_name: SELECTED_MCP_TOOL,
+            upstream_name: "run_audit",
+            transport_identity: granted_identity.clone(),
+            declares_transport_access: true,
+            extra_access: false,
+            mid_execution_access: false,
+            ran: Arc::clone(&original_ran),
+        });
+        let replacement: Arc<dyn baybo_tools::Tool> = Arc::new(TypedMcpTool {
+            namespaced_name: SELECTED_MCP_TOOL,
+            upstream_name: "run_audit",
+            transport_identity: replacement_identity.clone(),
+            declares_transport_access: true,
+            extra_access: true,
+            mid_execution_access: false,
+            ran: Arc::clone(&replacement_ran),
+        });
+        let registry = Arc::new(ToolRegistry::new());
+        registry.replace_source(
+            "lighthouse",
+            vec![(original, authorization_manifest(SELECTED_MCP_TOOL))],
+        );
+
+        let barrier = Arc::new(Barrier::new(2));
+        let hook_barrier = Arc::clone(&barrier);
+        let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            hook_barrier.wait();
+            hook_barrier.wait();
+        });
+        let replacement_registry = Arc::clone(&registry);
+        let replacement_barrier = Arc::clone(&barrier);
+        let replacement_task = tokio::task::spawn_blocking(move || {
+            replacement_barrier.wait();
+            replacement_registry.replace_source(
+                "lighthouse",
+                vec![(replacement, authorization_manifest(SELECTED_MCP_TOOL))],
+            );
+            replacement_barrier.wait();
+        });
+
+        let (gate_calls, gate) = counting_gate();
+        let approved = Arc::new(Mutex::new(Vec::new()));
+        let executed = execute_authorization_registration(
+            Arc::clone(&registry),
+            SELECTED_MCP_TOOL.to_string(),
+            gate,
+            Arc::clone(&approved),
+            Some(InheritedToolContext::new(vec![McpToolGrant::new(
+                SELECTED_MCP_TOOL,
+                granted_identity,
+            )])),
+            Some(hook),
+        )
+        .await;
+        replacement_task.await.expect("replacement task");
+
+        assert_eq!(
+            registry
+                .mcp_metadata(SELECTED_MCP_TOOL)
+                .expect("replacement remains registered")
+                .transport_identity,
+            replacement_identity,
+            "the registry replacement must complete before the pinned call resumes"
+        );
+        assert!(executed.output.is_ok(), "{:?}", executed.output.err());
+        assert_eq!(executed.approval, None);
+        assert!(
+            original_ran.load(Ordering::SeqCst),
+            "the generation whose identity and accesses were authorized must execute"
+        );
+        assert!(
+            !replacement_ran.load(Ordering::SeqCst),
+            "a same-name replacement must not execute under the prior generation's grant"
+        );
+        assert_eq!(gate_calls.load(Ordering::SeqCst), 0);
+        assert!(approved.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn inherited_context_denies_another_tool_on_the_same_mcp_transport() {
+        let identity = McpTransportIdentity::from_sha256([11; 32]);
+        let ran = Arc::new(AtomicBool::new(false));
+        let (gate_calls, gate) = counting_gate();
+        let executed = execute_authorization_tool(
+            Arc::new(TypedMcpTool {
+                namespaced_name: SIBLING_MCP_TOOL,
+                upstream_name: "get_report",
+                transport_identity: identity.clone(),
+                declares_transport_access: true,
+                extra_access: false,
+                mid_execution_access: false,
+                ran: Arc::clone(&ran),
+            }),
+            gate,
+            Arc::new(Mutex::new(Vec::new())),
+            Some(InheritedToolContext::new(vec![McpToolGrant::new(
+                SELECTED_MCP_TOOL,
+                identity,
+            )])),
+        )
+        .await;
+
+        let error = executed
+            .output
+            .expect_err("a sibling operation must not inherit the grant");
+        assert!(
+            error
+                .to_string()
+                .contains("exact MCP tool and transport configuration"),
+            "{error}"
+        );
+        assert_eq!(executed.approval, Some(ApprovalDecision::Deny));
+        assert!(!ran.load(Ordering::SeqCst));
+        assert_eq!(gate_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn inherited_context_denies_the_granted_tool_after_its_transport_identity_changes() {
+        let granted_identity = McpTransportIdentity::from_sha256([12; 32]);
+        let current_identity = McpTransportIdentity::from_sha256([13; 32]);
+        let ran = Arc::new(AtomicBool::new(false));
+        let (gate_calls, gate) = counting_gate();
+        let executed = execute_authorization_tool(
+            Arc::new(TypedMcpTool {
+                namespaced_name: SELECTED_MCP_TOOL,
+                upstream_name: "run_audit",
+                transport_identity: current_identity,
+                declares_transport_access: true,
+                extra_access: false,
+                mid_execution_access: false,
+                ran: Arc::clone(&ran),
+            }),
+            gate,
+            Arc::new(Mutex::new(Vec::new())),
+            Some(InheritedToolContext::new(vec![McpToolGrant::new(
+                SELECTED_MCP_TOOL,
+                granted_identity,
+            )])),
+        )
+        .await;
+
+        let error = executed
+            .output
+            .expect_err("a changed transport identity must invalidate the grant");
+        assert!(
+            error
+                .to_string()
+                .contains("exact MCP tool and transport configuration"),
+            "{error}"
+        );
+        assert_eq!(executed.approval, Some(ApprovalDecision::Deny));
+        assert!(!ran.load(Ordering::SeqCst));
+        assert_eq!(gate_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn exact_mcp_tool_grant_does_not_cover_non_transport_access() {
+        let identity = McpTransportIdentity::from_sha256([14; 32]);
+        let ran = Arc::new(AtomicBool::new(false));
+        let (gate_calls, gate) = counting_gate();
+        let executed = execute_authorization_tool(
+            Arc::new(TypedMcpTool {
+                namespaced_name: SELECTED_MCP_TOOL,
+                upstream_name: "run_audit",
+                transport_identity: identity.clone(),
+                declares_transport_access: true,
+                extra_access: true,
+                mid_execution_access: false,
+                ran: Arc::clone(&ran),
+            }),
+            gate,
+            Arc::new(Mutex::new(Vec::new())),
+            Some(InheritedToolContext::new(vec![McpToolGrant::new(
+                SELECTED_MCP_TOOL,
+                identity,
+            )])),
+        )
+        .await;
+
+        let error = executed.output.expect_err("extra access must fail");
+        assert!(error.to_string().contains("covers only"), "{error}");
+        assert!(!ran.load(Ordering::SeqCst));
+        assert_eq!(gate_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn inherited_context_denies_unapproved_non_mcp_access_without_prompting() {
+        let (gate_calls, gate) = counting_gate();
+        let executed = execute_authorization_tool(
+            Arc::new(GatedTool),
+            gate,
+            Arc::new(Mutex::new(Vec::new())),
+            Some(InheritedToolContext::default()),
+        )
+        .await;
+
+        let error = executed.output.expect_err("non-MCP access must fail");
+        assert!(error.to_string().contains("non-MCP tool"), "{error}");
+        assert_eq!(gate_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn inherited_context_auto_denies_access_discovered_during_mcp_execution() {
+        let identity = McpTransportIdentity::from_sha256([15; 32]);
+        let ran = Arc::new(AtomicBool::new(false));
+        let (gate_calls, gate) = counting_gate();
+        let approved = Arc::new(Mutex::new(Vec::new()));
+        let executed = execute_authorization_tool(
+            Arc::new(TypedMcpTool {
+                namespaced_name: SELECTED_MCP_TOOL,
+                upstream_name: "run_audit",
+                transport_identity: identity.clone(),
+                declares_transport_access: true,
+                extra_access: false,
+                mid_execution_access: true,
+                ran: Arc::clone(&ran),
+            }),
+            gate,
+            Arc::clone(&approved),
+            Some(InheritedToolContext::new(vec![McpToolGrant::new(
+                SELECTED_MCP_TOOL,
+                identity,
+            )])),
+        )
+        .await;
+
+        let error = executed
+            .output
+            .expect_err("mid-execution access must fail closed");
+        assert!(error.to_string().contains("mid-execution access denied"));
+        assert_eq!(executed.approval, Some(ApprovalDecision::Deny));
+        assert!(!ran.load(Ordering::SeqCst));
+        assert_eq!(gate_calls.load(Ordering::SeqCst), 0);
+        assert!(approved.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn later_reply_in_a_cron_session_uses_ordinary_approval() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let (gate_calls, gate) = counting_gate();
+        let executed = execute_authorization_tool(
+            Arc::new(TypedMcpTool {
+                namespaced_name: SELECTED_MCP_TOOL,
+                upstream_name: "run_audit",
+                transport_identity: McpTransportIdentity::from_sha256([16; 32]),
+                declares_transport_access: true,
+                extra_access: false,
+                mid_execution_access: false,
+                ran: Arc::clone(&ran),
+            }),
+            gate,
+            Arc::new(Mutex::new(Vec::new())),
+            None,
+        )
+        .await;
+
+        assert!(executed.output.is_ok(), "{:?}", executed.output.err());
+        assert_eq!(executed.approval, Some(ApprovalDecision::Approve));
+        assert!(ran.load(Ordering::SeqCst));
+        assert_eq!(gate_calls.load(Ordering::SeqCst), 1);
+    }
+
     async fn gated_call_error(outcome: ApprovalOutcome) -> String {
         let home = tempfile::tempdir().expect("tempdir");
         let paths = baybo_workspace::WorkspacePaths::new(home.path().join(".baybo"));
@@ -1866,6 +2525,7 @@ mod tests {
                 None,
                 false,
                 ReadTracker::default(),
+                None,
                 None,
             )
             .await;

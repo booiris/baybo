@@ -159,7 +159,6 @@ class FakeGateway {
     if (patch.prompt != null) draft.prompt = patch.prompt;
     if (patch.timezone != null) draft.timezone = patch.timezone;
     if (patch.schedule != null) draft.schedule = patch.schedule;
-
     if (patch.schedule != null || patch.timezone != null) {
       if (draft.status === 'disabled') {
         // Load-bearing: an edit is not a resume. It keeps `disabled` and no

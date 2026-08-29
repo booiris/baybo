@@ -9,7 +9,7 @@ use crate::{Tool, ToolConcurrency, ToolContext, ToolDefinition, ToolManifest, To
 pub struct ToolRegistry {
     builtin: HashMap<String, Arc<dyn Tool>>,
     builtin_manifests: HashMap<String, ToolManifest>,
-    dynamic: RwLock<DynamicState>,
+    dynamic: Arc<RwLock<DynamicState>>,
 }
 
 #[derive(Default)]
@@ -17,6 +17,87 @@ struct DynamicState {
     tools: HashMap<String, Arc<dyn Tool>>,
     manifests: HashMap<String, ToolManifest>,
     by_source: HashMap<String, Vec<String>>,
+}
+
+/// Narrow, cloneable view used by authoring surfaces that turn current MCP
+/// operation names into exact, persisted grants. It shares only the dynamic
+/// registry state; holding it from a builtin tool does not create an `Arc`
+/// cycle back to the whole [`ToolRegistry`].
+#[derive(Clone)]
+struct RegistryMcpToolGrantResolver {
+    dynamic: Arc<RwLock<DynamicState>>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum McpToolGrantResolveError {
+    #[error("MCP tool {tool_name:?} is not currently connected")]
+    NotConnected { tool_name: String },
+    #[error("tool {tool_name:?} is not a typed MCP operation")]
+    NotMcp { tool_name: String },
+    #[error("MCP tool {tool_name:?} is not available to this scheduled job")]
+    OutOfScope { tool_name: String },
+    #[error("MCP tool {tool_name:?} cannot be granted: {reason}")]
+    NotAutoExecutable { tool_name: String, reason: String },
+}
+
+/// Resolves model-visible MCP operation names to exact transport-bound grants.
+/// Implementations must resolve one stable registry snapshot so a reconnect
+/// cannot pair an old operation with a new transport identity.
+pub trait McpToolGrantResolver: Send + Sync {
+    fn resolve_for_session(
+        &self,
+        tool_names: &[String],
+        channel: &baybo_model::ChannelType,
+        trigger: &baybo_model::TriggerSource,
+    ) -> Result<Vec<baybo_model::McpToolGrant>, McpToolGrantResolveError>;
+}
+
+impl McpToolGrantResolver for RegistryMcpToolGrantResolver {
+    fn resolve_for_session(
+        &self,
+        tool_names: &[String],
+        channel: &baybo_model::ChannelType,
+        trigger: &baybo_model::TriggerSource,
+    ) -> Result<Vec<baybo_model::McpToolGrant>, McpToolGrantResolveError> {
+        let dynamic = self.dynamic.read();
+        let mut grants = Vec::with_capacity(tool_names.len());
+        for requested in tool_names {
+            let tool_name = requested.trim();
+            let tool = dynamic.tools.get(tool_name).ok_or_else(|| {
+                McpToolGrantResolveError::NotConnected {
+                    tool_name: tool_name.to_string(),
+                }
+            })?;
+            let metadata = tool
+                .mcp_metadata()
+                .ok_or_else(|| McpToolGrantResolveError::NotMcp {
+                    tool_name: tool_name.to_string(),
+                })?;
+            let manifest = dynamic.manifests.get(tool_name).ok_or_else(|| {
+                McpToolGrantResolveError::NotConnected {
+                    tool_name: tool_name.to_string(),
+                }
+            })?;
+            manifest.validate_auto_execution().map_err(|error| {
+                McpToolGrantResolveError::NotAutoExecutable {
+                    tool_name: tool_name.to_string(),
+                    reason: error.to_string(),
+                }
+            })?;
+            let channel_allowed = manifest.allows_channel(channel);
+            if !channel_allowed || !tool.trigger_scope().allows_trigger(trigger) {
+                return Err(McpToolGrantResolveError::OutOfScope {
+                    tool_name: tool_name.to_string(),
+                });
+            }
+            grants.push(baybo_model::McpToolGrant::new(
+                metadata.tool_name,
+                metadata.transport_identity,
+            ));
+        }
+        baybo_model::normalize_mcp_tool_grants(&mut grants);
+        Ok(grants)
+    }
 }
 
 impl Default for ToolRegistry {
@@ -30,7 +111,7 @@ impl ToolRegistry {
         Self {
             builtin: HashMap::new(),
             builtin_manifests: HashMap::new(),
-            dynamic: RwLock::new(DynamicState::default()),
+            dynamic: Arc::new(RwLock::new(DynamicState::default())),
         }
     }
 
@@ -64,6 +145,15 @@ impl ToolRegistry {
         );
         self.builtin_manifests.insert(name.clone(), manifest);
         self.builtin.insert(name, tool);
+    }
+
+    /// A live MCP grant resolver for tools registered during startup. The
+    /// resolver follows later reconciler connects, disconnects and identity
+    /// changes through the shared dynamic-state lock.
+    pub fn mcp_tool_grant_resolver(&self) -> Arc<dyn McpToolGrantResolver> {
+        Arc::new(RegistryMcpToolGrantResolver {
+            dynamic: Arc::clone(&self.dynamic),
+        })
     }
 
     /// Register a tool sourced from an external provider (an MCP server,
@@ -259,12 +349,24 @@ impl ToolRegistry {
         out
     }
 
+    /// Resolve a tool and its manifest from one registry snapshot. Dynamic
+    /// registrations can be replaced while a call is in flight, so security
+    /// checks and execution must pin this pair rather than performing several
+    /// name lookups that could observe different server generations.
+    pub fn get_with_manifest(&self, name: &str) -> Option<(Arc<dyn Tool>, Option<ToolManifest>)> {
+        let dynamic = self.dynamic.read();
+        if let Some(tool) = dynamic.tools.get(name) {
+            return Some((Arc::clone(tool), dynamic.manifests.get(name).cloned()));
+        }
+        self.builtin
+            .get(name)
+            .cloned()
+            .map(|tool| (tool, self.builtin_manifests.get(name).cloned()))
+    }
+
     /// Look up a tool by name. Dynamic registrations shadow builtins.
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
-        if let Some(t) = self.dynamic.read().tools.get(name) {
-            return Some(Arc::clone(t));
-        }
-        self.builtin.get(name).cloned()
+        self.get_with_manifest(name).map(|(tool, _)| tool)
     }
 
     /// Short progress preview for a pending call via
@@ -284,6 +386,12 @@ impl ToolRegistry {
         self.get(name)
             .map(|tool| tool.concurrency())
             .unwrap_or(ToolConcurrency::Exclusive)
+    }
+
+    /// Typed MCP operation and transport provenance for authorization. The
+    /// registry asks the tool directly; callers never parse its display name.
+    pub fn mcp_metadata(&self, name: &str) -> Option<crate::mcp::McpToolMetadata> {
+        self.get(name).and_then(|tool| tool.mcp_metadata())
     }
 
     /// Execute a tool by name with the given parameters and context.
@@ -732,6 +840,15 @@ mod tests {
             fn trigger_scope(&self) -> ToolTriggerScope {
                 ToolTriggerScope::SharedWorkspace
             }
+            fn mcp_metadata(&self) -> Option<crate::mcp::McpToolMetadata> {
+                Some(crate::mcp::McpToolMetadata {
+                    tool_name: self.name().to_string(),
+                    server_name: "browser".to_string(),
+                    upstream_name: "navigate_page".to_string(),
+                    transport_identity: baybo_model::McpTransportIdentity::from_sha256([7; 32]),
+                    transport_accesses: Vec::new(),
+                })
+            }
             async fn execute(
                 &self,
                 _p: serde_json::Value,
@@ -790,6 +907,69 @@ mod tests {
             }),
             "a card's run has its own checkout; the shared browser is not its to hold"
         );
+
+        let resolver = registry.mcp_tool_grant_resolver();
+        let cron = TriggerSource::Cron {
+            cron_job_id: "future".into(),
+            origin_session_id: None,
+            conversation: true,
+            job_title: None,
+            project_id: None,
+        };
+        let grants = resolver
+            .resolve_for_session(
+                &["browser/navigate_page".to_string()],
+                &baybo_model::ChannelType::owner(),
+                &cron,
+            )
+            .expect("live typed MCP resolves");
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].tool_name, "browser/navigate_page");
+
+        let issue = TriggerSource::Issue {
+            project_id: baybo_model::ProjectId::generate(),
+            issue_id: baybo_model::IssueId::generate(),
+            number: 2,
+        };
+        assert!(matches!(
+            resolver.resolve_for_session(
+                &["browser/navigate_page".to_string()],
+                &baybo_model::ChannelType::owner(),
+                &issue,
+            ),
+            Err(super::McpToolGrantResolveError::OutOfScope { .. })
+        ));
+
+        registry.unregister_for_source("browser");
+        assert!(matches!(
+            resolver.resolve_for_session(
+                &["browser/navigate_page".to_string()],
+                &baybo_model::ChannelType::owner(),
+                &cron,
+            ),
+            Err(super::McpToolGrantResolveError::NotConnected { .. })
+        ));
+
+        registry.register_dynamic(
+            "browser",
+            Arc::new(WatchedOnly),
+            crate::ToolManifest {
+                name: "browser/navigate_page".into(),
+                description: "x".into(),
+                trust_level: baybo_model::TrustLevel::Untrusted,
+                parameters_schema: serde_json::json!({"type": "object"}),
+                capabilities: vec![],
+                channels: Vec::new(),
+            },
+        );
+        assert!(matches!(
+            resolver.resolve_for_session(
+                &["browser/navigate_page".to_string()],
+                &baybo_model::ChannelType::owner(),
+                &cron,
+            ),
+            Err(super::McpToolGrantResolveError::NotAutoExecutable { .. })
+        ));
     }
 
     fn recording(name: &str) -> (Arc<dyn crate::Tool>, crate::ToolManifest) {

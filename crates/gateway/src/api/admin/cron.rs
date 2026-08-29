@@ -199,9 +199,22 @@ async fn update_cron(
     Path(id): Path<String>,
     Json(req): Json<UpdateCronRequest>,
 ) -> Result<Json<CronJob>> {
+    let UpdateCronRequest {
+        title,
+        prompt,
+        schedule,
+        timezone,
+    } = req;
+    let patch = baybo_cron::CronJobPatch {
+        title,
+        prompt,
+        schedule: schedule.map(Into::into),
+        timezone,
+        mcp_tool_grants: None,
+    };
     let job = state
         .cron_scheduler
-        .update_job(&id, req.into())
+        .update_job(&id, patch)
         .await
         .map_err(cron_err)?;
     Ok(Json(CronJob::from(job)))
