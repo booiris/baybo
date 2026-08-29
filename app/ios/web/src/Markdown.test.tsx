@@ -1,11 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
-import { render } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { I18nextProvider } from "react-i18next";
 
 // bridge.ts reads `window.webkit` at module scope; MarkdownBody imports it for
 // `openUrl`. jsdom has no bridge, but only link clicks touch it, so a stub keeps
 // the import graph happy.
 vi.mock("./bridge", () => ({
+  copyText: vi.fn(),
   openUrl: vi.fn(),
   postHtmlPreviewMaximized: vi.fn(),
 }));
@@ -28,7 +29,33 @@ vi.mock("./mathDelimiters", async (importOriginal) => {
 });
 
 import { MarkdownBody } from "./Markdown";
+import { copyText } from "./bridge";
 import i18n from "./i18n";
+
+describe("MarkdownBody code blocks", () => {
+  it("highlights fenced code without changing the source text", () => {
+    const source = "let answer: Int = 42";
+    const { container } = render(
+      <MarkdownBody text={`\`\`\`swift\n${source}\n\`\`\``} />,
+    );
+    expect(container.querySelector(".hljs-keyword")?.textContent).toBe("let");
+    expect(container.querySelector("pre")?.textContent).toBe(source);
+    expect(screen.getByRole("button", { name: "Copy code" })).toBeInTheDocument();
+  });
+
+  it("hands the raw code to the native clipboard bridge", () => {
+    render(<MarkdownBody text={"```rust\nlet ready = true;\n```"} />);
+    fireEvent.click(screen.getByRole("button", { name: "Copy code" }));
+    expect(vi.mocked(copyText)).toHaveBeenCalledWith("let ready = true;");
+    expect(screen.getByRole("button", { name: "Copied" })).toBeInTheDocument();
+  });
+
+  it("leaves inline code compact and without a copy button", () => {
+    const { container } = render(<MarkdownBody text={"Run `cargo test` now."} />);
+    expect(container.querySelector("code")?.textContent).toBe("cargo test");
+    expect(screen.queryByRole("button", { name: "Copy code" })).toBeNull();
+  });
+});
 
 // The math pipeline (normalize -> remark-math -> rehype-katex -> KaTeX) is wired
 // end to end here — a pure-function test can't prove the plugins are actually

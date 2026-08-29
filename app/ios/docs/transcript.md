@@ -435,6 +435,24 @@ a mirror written before this existed simply have none.
 Markdown links post `openUrl` to native (system browser) — an in-webview navigation would
 replace the thread.
 
+### Fenced code
+
+`MarkdownCodeBlock.tsx` is the one fenced-code renderer used by the ordinary transcript,
+read-only run transcripts, and the project card page. A declared fence language selects a
+registered `highlight.js` grammar; an untagged fence is auto-detected, `text` / `plaintext`
+stays plain, and an unknown grammar or highlighting failure preserves the original source.
+The token markup is safe to mount because `highlight.js` escapes the source before adding
+its own spans.
+
+Every block has an always-visible copy button in its upper-right corner. It sends the raw
+code (without the fence or CommonMark's synthetic trailing newline) through the existing
+`copy` native bridge and briefly changes to a check. Both `TranscriptBridge` and
+`IssueBridge` handle that message with `UIPasteboard`; do not replace it with
+`navigator.clipboard`, which is unreliable in the `file://` WKWebView. The language label,
+button, scroll/wrap bound, and syntax palette all live in the shared `styles.css`, so chat
+and issue do not grow separate code-block skins. The token colours and code surface use
+Atom One Light while the surrounding controls follow the native Baybo chrome.
+
 ### Agent-authored HTML previews
 
 An assistant opts into a live preview with one fenced marker whose body is a blob

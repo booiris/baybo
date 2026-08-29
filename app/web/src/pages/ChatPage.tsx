@@ -43,6 +43,7 @@ import {
 } from 'react-icons/ri';
 
 import { atBottom, useHoldBottomEdge } from '../components/scrollPin';
+import { MarkdownCodeBlock } from '../components/MarkdownCodeBlock';
 import { useAdminClient, useAuth } from '../api/auth';
 import {
   ChatWs,
@@ -6047,11 +6048,32 @@ const MARKDOWN_COMPONENTS: Components = {
       </code>
     );
   },
-  pre: ({ children }) => (
-    <pre className="font-mono my-2 first:mt-0 last:mb-0 bg-canvas border-2 border-black rounded-md p-2 overflow-x-auto text-xs leading-snug">
-      {children}
-    </pre>
-  ),
+  pre: ({ node, children }) => {
+    const codeNode = node?.children[0];
+    if (codeNode?.type === 'element' && codeNode.tagName === 'code') {
+      const code = codeNode.children
+        .map((child) => (child.type === 'text' ? child.value : ''))
+        .join('');
+      const rawClasses = codeNode.properties.className;
+      const classes = Array.isArray(rawClasses)
+        ? rawClasses.map(String)
+        : typeof rawClasses === 'string'
+          ? rawClasses.split(/\s+/)
+          : [];
+      const languageClass = classes.find((value) => value.startsWith('language-'));
+      return (
+        <MarkdownCodeBlock
+          code={code}
+          language={languageClass?.slice('language-'.length) ?? null}
+        />
+      );
+    }
+    return (
+      <pre className="font-mono my-2 first:mt-0 last:mb-0 bg-canvas border-2 border-black rounded-md p-2 overflow-x-auto text-xs leading-snug">
+        {children}
+      </pre>
+    );
+  },
   table: ({ children }) => (
     <div className="my-2 first:mt-0 last:mb-0 overflow-x-auto">
       <table className="border-2 border-black border-collapse text-xs">{children}</table>

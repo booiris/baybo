@@ -9,6 +9,7 @@ import rehypeKatex from "rehype-katex";
 import { openUrl } from "./bridge";
 import { HtmlPreview, InvalidHtmlPreview } from "./HtmlPreview";
 import { htmlPreviewBlobId } from "./htmlPreviewProtocol";
+import { MarkdownCodeBlock } from "./MarkdownCodeBlock";
 import { normalizeMath } from "./mathDelimiters";
 
 // GFM (tables, strikethrough, autolinks) + math. `remark-math` tokenizes the
@@ -133,10 +134,33 @@ function TableBlock({ children }: { children?: ReactNode }) {
 
 const COMPONENTS: Components = {
   code({ className, children }) {
-    const blobId = htmlPreviewBlobId(className, String(children));
-    if (blobId === "") return <InvalidHtmlPreview />;
-    if (blobId !== null) return <HtmlPreview blobId={blobId} />;
     return <code className={className}>{children}</code>;
+  },
+  pre({ node, children }) {
+    const codeNode = node?.children[0];
+    if (codeNode?.type !== "element" || codeNode.tagName !== "code") {
+      return <pre>{children}</pre>;
+    }
+    const code = codeNode.children
+      .map((child) => (child.type === "text" ? child.value : ""))
+      .join("");
+    const rawClasses = codeNode.properties.className;
+    const classes = Array.isArray(rawClasses)
+      ? rawClasses.map(String)
+      : typeof rawClasses === "string"
+        ? rawClasses.split(/\s+/)
+        : [];
+    const languageClass = classes.find((value) => value.startsWith("language-"));
+    const className = classes.join(" ");
+    const blobId = htmlPreviewBlobId(className, code);
+    if (blobId === "") return <pre><InvalidHtmlPreview /></pre>;
+    if (blobId !== null) return <pre><HtmlPreview blobId={blobId} /></pre>;
+    return (
+      <MarkdownCodeBlock
+        code={code}
+        language={languageClass?.slice("language-".length) ?? null}
+      />
+    );
   },
   // Every link hands off to native (system browser); an in-webview navigation
   // would replace the transcript page.

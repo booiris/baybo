@@ -26,6 +26,10 @@ Native screens own navigation, forms, pickers, confirmation, attachments, and
 write state. The card web page owns markdown, timeline layout, attachment
 cards, sub-issue links, and scroll/fold state.
 
+Card descriptions and comments use the transcript bundle's shared Markdown renderer.
+Fenced code therefore has the same syntax highlighting and upper-right native-clipboard
+copy control as chat and run transcripts; the card does not carry a second renderer.
+
 ## Data ownership
 
 `ProjectsStore` owns the project list and open-board snapshots. It persists:

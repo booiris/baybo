@@ -1,4 +1,4 @@
-import { act, render } from "@testing-library/react";
+import { act, render, screen } from "@testing-library/react";
 import { I18nextProvider } from "react-i18next";
 import { describe, expect, it } from "vitest";
 
@@ -98,6 +98,15 @@ describe("the head, then the text, then the state", () => {
     expect(head).toBeGreaterThanOrEqual(0);
     expect(body).toBeGreaterThan(head);
     expect(state).toBeGreaterThan(body);
+  });
+
+  it("uses the shared highlighted, copyable code block in the description", () => {
+    mount({
+      issue: { ...card, description: "```swift\nlet retries = 2\n```" },
+    });
+
+    expect(document.querySelector(".issue-body .hljs-keyword")?.textContent).toBe("let");
+    expect(screen.getByRole("button", { name: "Copy code" })).toBeInTheDocument();
   });
 
   it("leaves no control in the head", () => {
