@@ -993,6 +993,9 @@ pub struct TraceOverviewQuery {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct TraceSessionSummary {
     pub session_id: String,
+    /// Stored conversation title, falling back to a truncated first message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub created_at: DateTime<Utc>,
     pub last_active: DateTime<Utc>,
     /// `None` when the session has no turns (those rows are filtered
@@ -1013,6 +1016,7 @@ impl From<baybo_query::SessionSummary> for TraceSessionSummary {
     fn from(v: baybo_query::SessionSummary) -> Self {
         Self {
             session_id: v.session_id.to_string(),
+            title: v.title,
             created_at: v.created_at,
             last_active: v.last_active,
             latest_turn_status: v.latest_turn_status.map(Into::into),

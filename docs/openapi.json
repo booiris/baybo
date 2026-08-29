@@ -11721,6 +11721,13 @@
             "type": "integer",
             "minimum": 0
           },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Stored conversation title, falling back to a truncated first message."
+          },
           "turn_count": {
             "type": "integer",
             "minimum": 0

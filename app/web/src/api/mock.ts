@@ -121,6 +121,12 @@ function generateMockSummaries(count: number): TraceSessionSummary[] {
       session_id: `sess-${Math.random().toString(36).substring(2, 12)}-${Math.random()
         .toString(36)
         .substring(2, 8)}`,
+      title: [
+        'Investigate gateway latency',
+        'Summarize the release changes',
+        'Fix flaky workspace tests',
+        'Plan the database migration',
+      ][i % 4],
       created_at: created.toISOString(),
       last_active: lastActive.toISOString(),
       latest_turn_status: makeTurnStatus(status),

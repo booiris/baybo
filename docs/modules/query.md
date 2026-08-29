@@ -37,7 +37,7 @@ The turn read path needs `TurnLifecycle::list_by_session` / `list_recoverable` /
 
 ### `list_session_summaries` paginates before aggregating
 
-The trace-browser listing must scale with page size, not total history. Everything needed pre-pagination — has-turns, latest turn's `status_kind`, turn count — comes from one session scan plus one grouped `TurnStore::session_turn_stats` query. Per-session aggregates that need further store reads (the full latest `TurnStatus`, span counts via `TraceStore::trace_counts_by_turn`, token totals via `CostStore::query_session`) run for the returned page only. Span counting never materialises span `data` blobs — those inline LLM/tool payloads run to hundreds of KB each, and the listing needs only the number.
+The trace-browser listing must scale with page size, not total history. Everything needed pre-pagination — has-turns, latest turn's `status_kind`, turn count — comes from one session scan plus one grouped `TurnStore::session_turn_stats` query. Per-session aggregates that need further store reads (the full latest `TurnStatus`, span counts via `TraceStore::trace_counts_by_turn`, token totals via `CostStore::query_session`) run for the returned page only. The row title prefers `Session.title`; untitled rows derive a one-line, `MAX_SESSION_TITLE_LEN`-bounded fallback from the earliest text-bearing turn input already loaded for the page, so the list does not read full transcripts. Span counting never materialises span `data` blobs — those inline LLM/tool payloads run to hundreds of KB each, and the listing needs only the number.
 
 ### Trace trees assemble from batched reads
 
