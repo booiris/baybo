@@ -95,12 +95,6 @@ pub trait CronStore: Send + Sync {
 
     // ── Execution records ──
 
-    /// Persist a fresh execution. Returns [`StorageError::Conflict`] when
-    /// two scheduler instances race on the same `(job_id,
-    /// scheduled_fire_time)` slot — the unique index rejected the loser's
-    /// insert. The tick path treats this as benign and skips the
-    /// duplicate dispatch.
-    async fn record_execution(&self, exec: &CronExecution) -> Result<()>;
     /// Persist a scheduled execution only while the job row still matches the
     /// snapshot from which `exec` was built: its schedule/lifecycle columns,
     /// `updated_at` version, and exact MCP grants. Comparing the grants directly
@@ -109,8 +103,10 @@ pub trait CronStore: Send + Sync {
     /// The checks and insert are one write transaction. This prevents a
     /// grant revocation (or any other edit) that commits after `list_due` but
     /// before the execution exists from being missed by a stale fire snapshot.
-    /// Returns `false` when the job moved; duplicate schedule slots still return
-    /// [`StorageError::Conflict`] like [`CronStore::record_execution`].
+    /// Returns `false` when the job moved. When two scheduler instances race on
+    /// the same `(job_id, scheduled_fire_time)` slot, the unique index rejects
+    /// the loser with [`StorageError::Conflict`]; the tick path treats that as
+    /// benign and skips the duplicate dispatch.
     async fn record_execution_if_job_unchanged(
         &self,
         exec: &CronExecution,

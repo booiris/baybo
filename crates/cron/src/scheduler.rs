@@ -1824,7 +1824,13 @@ mod tests {
             .unwrap();
         let stored = scheduler.store.get(&job.id).await.unwrap().unwrap();
         let exec = CronExecution::pending(&stored, Utc::now(), Utc::now());
-        scheduler.store.record_execution(&exec).await.unwrap();
+        assert!(
+            scheduler
+                .store
+                .record_execution_if_job_unchanged(&exec, &stored)
+                .await
+                .unwrap()
+        );
 
         scheduler.delete_job(&job.id).await.unwrap();
         scheduler.recover_pending().await;
@@ -1857,7 +1863,13 @@ mod tests {
             .unwrap();
         let stored = scheduler.store.get(&job.id).await.unwrap().unwrap();
         let exec = CronExecution::pending(&stored, Utc::now(), Utc::now());
-        scheduler.store.record_execution(&exec).await.unwrap();
+        assert!(
+            scheduler
+                .store
+                .record_execution_if_job_unchanged(&exec, &stored)
+                .await
+                .unwrap()
+        );
 
         scheduler.recover_pending().await;
 
@@ -2562,9 +2574,6 @@ mod tests {
         async fn list_due(&self, now_us: i64) -> StoreResult<Vec<CronJob>> {
             self.inner.list_due(now_us).await
         }
-        async fn record_execution(&self, exec: &CronExecution) -> StoreResult<()> {
-            self.inner.record_execution(exec).await
-        }
         async fn record_execution_if_job_unchanged(
             &self,
             exec: &CronExecution,
@@ -3067,7 +3076,12 @@ mod tests {
         store.create(&job).await.unwrap();
         let mut exec = CronExecution::pending(&job, Utc::now(), Utc::now());
         exec.id = "ce-pending".to_string();
-        store.record_execution(&exec).await.unwrap();
+        assert!(
+            store
+                .record_execution_if_job_unchanged(&exec, &job)
+                .await
+                .unwrap()
+        );
 
         let (scheduler, mut rx) = make_scheduler(store);
         scheduler.recover_pending().await;
@@ -3114,7 +3128,13 @@ mod tests {
             .await
             .unwrap();
         let execution = CronExecution::pending(&job, Utc::now(), Utc::now());
-        scheduler.store.record_execution(&execution).await.unwrap();
+        assert!(
+            scheduler
+                .store
+                .record_execution_if_job_unchanged(&execution, &job)
+                .await
+                .unwrap()
+        );
 
         let current = scheduler
             .update_job(

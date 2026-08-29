@@ -238,11 +238,6 @@ impl CronStore for InMemoryCronStore {
             .collect())
     }
 
-    async fn record_execution(&self, exec: &CronExecution) -> Result<()> {
-        self.executions.lock().push(exec.clone());
-        Ok(())
-    }
-
     async fn record_execution_if_job_unchanged(
         &self,
         exec: &CronExecution,

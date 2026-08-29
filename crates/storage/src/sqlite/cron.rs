@@ -484,44 +484,6 @@ impl CronStore for SqliteCronStore {
 
     // ── Execution records ──
 
-    async fn record_execution(&self, exec: &CronExecution) -> Result<()> {
-        let data = serialize_execution(exec)?;
-        let scheduled_us = exec.scheduled_fire_time.timestamp_micros();
-        let triggered_us = exec.triggered_at.timestamp_micros();
-        let id = exec.id.clone();
-        let job_id = exec.job_id.clone();
-        let user_id = exec.user_id.clone();
-        let status = execution_status_str(exec.status).to_string();
-        // INSERT OR IGNORE so the (job_id, scheduled_fire_time) unique
-        // index distinguishes "lost the dedup race" from "DB is broken".
-        // 0 affected rows means another scheduler beat us to this slot;
-        // the caller treats that as benign and skips the dispatch.
-        let affected = self
-            .pool
-            .interact_write("cron.record_execution", move |conn| {
-                Ok(conn.execute(
-                    "INSERT OR IGNORE INTO cron_executions (id, job_id, user_id, scheduled_fire_time, triggered_at, status, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    rusqlite::params![
-                        id,
-                        job_id,
-                        user_id,
-                        scheduled_us,
-                        triggered_us,
-                        status,
-                        data,
-                    ],
-                )?)
-            })
-            .await?;
-        if affected == 0 {
-            return Err(StorageError::Conflict(format!(
-                "{}@{}",
-                exec.job_id, scheduled_us
-            )));
-        }
-        Ok(())
-    }
-
     async fn record_execution_if_job_unchanged(
         &self,
         exec: &CronExecution,
@@ -924,6 +886,23 @@ mod tests {
         exec
     }
 
+    async fn record_test_execution(store: &SqliteCronStore, execution: CronExecution) {
+        let job = match store.get(&execution.job_id).await.unwrap() {
+            Some(job) => job,
+            None => {
+                let job = test_job(&execution.job_id, &execution.user_id, CronStatus::Enabled);
+                store.create(&job).await.unwrap();
+                job
+            }
+        };
+        assert!(
+            store
+                .record_execution_if_job_unchanged(&execution, &job)
+                .await
+                .unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn create_and_get() {
         let tmpdir = tempfile::tempdir().unwrap();
@@ -956,7 +935,12 @@ mod tests {
         let stored = store.get(&job.id).await.unwrap().expect("job");
         assert_eq!(stored.mcp_tool_grants, vec![a.clone(), b.clone()]);
         let execution = CronExecution::pending(&stored, future_dt(), future_dt());
-        store.record_execution(&execution).await.unwrap();
+        assert!(
+            store
+                .record_execution_if_job_unchanged(&execution, &stored)
+                .await
+                .unwrap()
+        );
 
         job.mcp_tool_grants = vec![McpToolGrant::new(
             "server/c",
@@ -1814,13 +1798,23 @@ mod tests {
             .unwrap();
         let store = SqliteCronStore::new(pool);
 
+        let job = test_job("cj-dup", "u1", CronStatus::Enabled);
+        store.create(&job).await.unwrap();
         let mut exec = test_execution("ce-dup-a", "cj-dup", "u1");
-        store.record_execution(&exec).await.unwrap();
+        assert!(
+            store
+                .record_execution_if_job_unchanged(&exec, &job)
+                .await
+                .unwrap()
+        );
 
         // Second instance of the same scheduler racing onto the same
         // (job_id, scheduled_fire_time) slot — different `id`, same dedup key.
         exec.id = "ce-dup-b".into();
-        let err = store.record_execution(&exec).await.unwrap_err();
+        let err = store
+            .record_execution_if_job_unchanged(&exec, &job)
+            .await
+            .unwrap_err();
         match err {
             StorageError::Conflict(key) => {
                 assert!(key.starts_with("cj-dup@"), "key was {key}");
@@ -1842,18 +1836,9 @@ mod tests {
             .unwrap();
         let store = SqliteCronStore::new(pool);
 
-        store
-            .record_execution(&test_execution("ce-1", "cj-1", "u1"))
-            .await
-            .unwrap();
-        store
-            .record_execution(&test_execution("ce-2", "cj-1", "u1"))
-            .await
-            .unwrap();
-        store
-            .record_execution(&test_execution("ce-3", "cj-2", "u1"))
-            .await
-            .unwrap();
+        record_test_execution(&store, test_execution("ce-1", "cj-1", "u1")).await;
+        record_test_execution(&store, test_execution("ce-2", "cj-1", "u1")).await;
+        record_test_execution(&store, test_execution("ce-3", "cj-2", "u1")).await;
 
         let execs = store.list_executions_by_job("cj-1").await.unwrap();
         assert_eq!(execs.len(), 2);
@@ -1867,18 +1852,9 @@ mod tests {
             .unwrap();
         let store = SqliteCronStore::new(pool);
 
-        store
-            .record_execution(&test_execution("ce-4", "cj-1", "u1"))
-            .await
-            .unwrap();
-        store
-            .record_execution(&test_execution("ce-5", "cj-2", "u2"))
-            .await
-            .unwrap();
-        store
-            .record_execution(&test_execution("ce-6", "cj-3", "u1"))
-            .await
-            .unwrap();
+        record_test_execution(&store, test_execution("ce-4", "cj-1", "u1")).await;
+        record_test_execution(&store, test_execution("ce-5", "cj-2", "u2")).await;
+        record_test_execution(&store, test_execution("ce-6", "cj-3", "u1")).await;
 
         let u1 = store.list_executions_by_user("u1").await.unwrap();
         assert_eq!(u1.len(), 2);
@@ -1892,10 +1868,7 @@ mod tests {
             .unwrap();
         let store = SqliteCronStore::new(pool);
 
-        store
-            .record_execution(&test_execution("ce-led", "cj-led", "u1"))
-            .await
-            .unwrap();
+        record_test_execution(&store, test_execution("ce-led", "cj-led", "u1")).await;
         // A dispatched-but-unfinished fire is not awaiting delivery yet.
         assert!(
             store
@@ -2085,10 +2058,7 @@ mod tests {
             .create(&test_job("cj-evict", "u1", CronStatus::Enabled))
             .await
             .unwrap();
-        store
-            .record_execution(&test_execution("ce-7", "cj-evict", "u1"))
-            .await
-            .unwrap();
+        record_test_execution(&store, test_execution("ce-7", "cj-evict", "u1")).await;
 
         store.delete("cj-evict").await.unwrap();
 

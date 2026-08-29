@@ -3351,9 +3351,16 @@ async fn one_shot_cron_result_lands_in_the_scheduling_conversation() {
     let execution = CronExecution::pending(&turn, chrono::Utc::now(), chrono::Utc::now());
     harness
         .cron_store
-        .record_execution(&execution)
+        .create(&turn)
         .await
-        .expect("record execution");
+        .expect("record source job");
+    assert!(
+        harness
+            .cron_store
+            .record_execution_if_job_unchanged(&execution, &turn)
+            .await
+            .expect("record execution")
+    );
     harness
         .cron_store
         .record_execution_completion(
@@ -3508,11 +3515,14 @@ async fn replayed_cron_result_does_not_duplicate_the_notification() {
         builtin: false,
     };
     let execution = CronExecution::pending(&turn, chrono::Utc::now(), chrono::Utc::now());
-    harness
-        .cron_store
-        .record_execution(&execution)
-        .await
-        .unwrap();
+    harness.cron_store.create(&turn).await.unwrap();
+    assert!(
+        harness
+            .cron_store
+            .record_execution_if_job_unchanged(&execution, &turn)
+            .await
+            .unwrap()
+    );
     harness
         .cron_store
         .record_execution_completion(
@@ -3727,11 +3737,14 @@ async fn a_cron_notification_that_cannot_be_persisted_is_not_marked_delivered() 
         builtin: false,
     };
     let execution = CronExecution::pending(&turn, chrono::Utc::now(), chrono::Utc::now());
-    harness
-        .cron_store
-        .record_execution(&execution)
-        .await
-        .unwrap();
+    harness.cron_store.create(&turn).await.unwrap();
+    assert!(
+        harness
+            .cron_store
+            .record_execution_if_job_unchanged(&execution, &turn)
+            .await
+            .unwrap()
+    );
     harness
         .cron_store
         .record_execution_completion(

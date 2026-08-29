@@ -1388,13 +1388,20 @@ mod tests {
         /// Record the execution the fire event refers to, as the scheduler
         /// would have before dispatching it — the waiter stamps its outcome
         /// onto this row.
-        async fn record_execution(&self) {
-            let mut exec = CronExecution::pending(&job("每日新闻"), Utc::now(), Utc::now());
-            exec.id = "ce-1".into();
+        async fn seed_execution(&self) {
+            let job = job("每日新闻");
             self.cron_store
-                .record_execution(&exec)
+                .create(&job)
                 .await
-                .expect("record execution");
+                .expect("record source job");
+            let mut exec = CronExecution::pending(&job, Utc::now(), Utc::now());
+            exec.id = "ce-1".into();
+            assert!(
+                self.cron_store
+                    .record_execution_if_job_unchanged(&exec, &job)
+                    .await
+                    .expect("record execution")
+            );
         }
 
         /// Put `session` mid-turn, as a live reply would.
@@ -2243,7 +2250,7 @@ mod tests {
     #[tokio::test]
     async fn a_one_shot_whose_actor_is_gone_still_reports_a_failure() {
         let mut h = RouterHarness::new();
-        h.record_execution().await;
+        h.seed_execution().await;
         // The fake spawner hands back a mailbox whose receiver it immediately
         // drops — the closed-mailbox state the race produces.
         h.close_spawned_mailboxes();
