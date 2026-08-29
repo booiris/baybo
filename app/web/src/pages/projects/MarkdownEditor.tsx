@@ -8,6 +8,7 @@ import { listener, listenerCtx } from '@milkdown/kit/plugin/listener';
 import { math } from '@milkdown/plugin-math';
 import { replaceAll } from '@milkdown/kit/utils';
 import type { MilkdownPlugin } from '@milkdown/kit/ctx';
+import { markdownCodePlugins } from './markdownCodePlugin';
 
 /// A what-you-see markdown editor, shared by the card's description and the
 /// comment composer so the two behave identically.
@@ -89,6 +90,7 @@ function Editing({
         .use(history)
         .use(math)
         .use(listener)
+        .use(markdownCodePlugins)
         .use(plugins),
     [],
   );

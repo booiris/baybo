@@ -175,6 +175,12 @@ the word. The rules that keep it from becoming decoration:
 Nothing else in the app takes a hue. A second surface wanting one is a conversation, not a
 precedent.
 
+**Syntax highlighting is the second recorded exception** (2026-08-29), confined to fenced
+code under `.md-code-block`. Its Atom One Light token colours encode grammar rather than
+product state. The palette lives only in `web/src/styles.css` because both chat and Projects
+render code in webviews and no native surface renders source code. Do not reuse the syntax
+tokens for chrome, badges, or board state.
+
 ### Borders
 
 **1px hairlines.** Light `--color-line` for incidental containers (inputs, bubbles,

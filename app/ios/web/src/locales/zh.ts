@@ -27,6 +27,7 @@ export const zh: typeof en = {
       recoverFailed: "无法重新加载历史记录：{{error}}",
       jumpNotFound: "没能定位到那条消息 —— 它比这个会话已加载的部分更靠前。",
       retrySend: "发送失败，点按重试",
+      copyCode: "复制代码",
       copied: "已复制",
       stopped: "已停止",
       working: "处理中",

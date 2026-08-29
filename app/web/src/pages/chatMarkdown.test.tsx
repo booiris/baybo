@@ -1,9 +1,39 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import { render } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 
 import { MarkdownBody } from './ChatPage';
+
+describe('MarkdownBody code blocks', () => {
+  it('highlights fenced code without changing the source text', () => {
+    const source = 'const answer: number = 42;';
+    const { container } = render(
+      <MarkdownBody text={`\`\`\`typescript\n${source}\n\`\`\``} />,
+    );
+    expect(container.querySelector('.hljs-keyword')?.textContent).toBe('const');
+    expect(container.querySelector('pre')?.textContent).toBe(source);
+    expect(screen.getByRole('button', { name: 'Copy code' })).toBeInTheDocument();
+  });
+
+  it('copies the raw code and confirms the action', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    });
+    render(<MarkdownBody text={'```rust\nlet ready = true;\n```'} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Copy code' }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith('let ready = true;'));
+    expect(screen.getByRole('button', { name: 'Copied' })).toBeInTheDocument();
+  });
+
+  it('leaves inline code compact and without a copy button', () => {
+    const { container } = render(<MarkdownBody text={'Run `cargo test` now.'} />);
+    expect(container.querySelector('code')?.textContent).toBe('cargo test');
+    expect(screen.queryByRole('button', { name: 'Copy code' })).toBeNull();
+  });
+});
 
 // Delegates to the real normalizer everywhere except one sentinel, so the math
 // suite below still exercises the shipped code. The sentinel is how the

@@ -47,6 +47,16 @@
    different surface, read full-width and one message at a time. */
 :root {
   --text-card: 13.5px;
+  --syntax-background: #fafafa;
+  --syntax-foreground: #383a42;
+  --syntax-comment: #a0a1a7;
+  --syntax-keyword: #a626a4;
+  --syntax-tag: #e45649;
+  --syntax-literal: #0184bb;
+  --syntax-string: #50a14f;
+  --syntax-attribute: #986801;
+  --syntax-title: #4078f2;
+  --syntax-built-in: #c18401;
 }
 
 /* Assistant prose in the chat thread reads as Inter sans at a comfortable
@@ -122,6 +132,106 @@
   white-space: pre-wrap;
   word-break: break-word;
 }
+
+.md-code-block {
+  position: relative;
+  margin: 0.5rem 0;
+  min-width: 0;
+  font-family: var(--font-mono);
+}
+
+.md-code-block:first-child { margin-top: 0; }
+.md-code-block:last-child { margin-bottom: 0; }
+
+.md-code-block pre {
+  margin: 0;
+  overflow-x: auto;
+  border: 2px solid var(--color-ink);
+  border-radius: 6px;
+  background: var(--syntax-background);
+  color: var(--syntax-foreground);
+  font-size: 0.75rem;
+  line-height: 1.5;
+}
+
+.md-code-block pre code {
+  display: block;
+  width: max-content;
+  min-width: 100%;
+  padding: 2.55rem 0.75rem 0.75rem;
+  white-space: pre;
+}
+
+.md-code-language {
+  position: absolute;
+  z-index: 1;
+  top: 0.6rem;
+  left: 0.75rem;
+  color: var(--color-ink-soft);
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: lowercase;
+  pointer-events: none;
+}
+
+.md-code-copy {
+  position: absolute;
+  z-index: 2;
+  top: 0.42rem;
+  right: 0.42rem;
+  display: grid;
+  width: 1.75rem;
+  height: 1.75rem;
+  place-items: center;
+  border: 1px solid var(--color-ink);
+  border-radius: 4px;
+  background: var(--color-surface);
+  color: var(--color-ink);
+  box-shadow: 2px 2px 0 var(--color-ink);
+  cursor: pointer;
+}
+
+.md-code-copy:hover { background: var(--color-brand); }
+.md-code-copy:active { transform: translate(1px, 1px); box-shadow: 1px 1px 0 var(--color-ink); }
+.md-code-copy svg { width: 0.95rem; height: 0.95rem; }
+
+.hljs-comment,
+.hljs-quote { color: var(--syntax-comment); font-style: italic; }
+.hljs-doctag,
+.hljs-keyword,
+.hljs-formula { color: var(--syntax-keyword); }
+.hljs-section,
+.hljs-name,
+.hljs-selector-tag,
+.hljs-deletion,
+.hljs-subst { color: var(--syntax-tag); }
+.hljs-literal { color: var(--syntax-literal); }
+.hljs-string,
+.hljs-regexp,
+.hljs-addition,
+.hljs-attribute,
+.hljs-meta .hljs-string { color: var(--syntax-string); }
+.hljs-attr,
+.hljs-variable,
+.hljs-template-variable,
+.hljs-type,
+.hljs-selector-class,
+.hljs-selector-attr,
+.hljs-selector-pseudo,
+.hljs-number { color: var(--syntax-attribute); }
+.hljs-symbol,
+.hljs-bullet,
+.hljs-link,
+.hljs-meta,
+.hljs-selector-id,
+.hljs-title { color: var(--syntax-title); }
+.hljs-built_in,
+.hljs-title.class_,
+.hljs-class .hljs-title { color: var(--syntax-built-in); }
+.hljs-emphasis { font-style: italic; }
+.hljs-strong { font-weight: 700; }
+.hljs-link { text-decoration: underline; }
 
 /* A work block's reasoning step is the model's OWN markdown, so it renders
    through `MarkdownBody` like any other prose (the iOS transcript already does
@@ -408,11 +518,39 @@ ol.md-list > li::before {
 .md-editor .ProseMirror pre {
   font-family: var(--font-mono);
   font-size: 0.82rem;
-  background: var(--color-canvas);
+  background: var(--syntax-background);
+  color: var(--syntax-foreground);
   border: 2px solid var(--color-ink);
   border-radius: 6px;
   padding: 0.6rem 0.75rem;
   overflow-x: auto;
+}
+.md-editor-code-block {
+  position: relative;
+  min-width: 0;
+}
+.md-editor .ProseMirror .md-editor-code-block pre {
+  margin: 0;
+  padding-top: 2.55rem;
+}
+.md-editor-code-block pre[data-language]::before {
+  content: attr(data-language);
+  position: absolute;
+  top: 0.68rem;
+  left: 0.75rem;
+  color: var(--color-ink-soft);
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: lowercase;
+  pointer-events: none;
+}
+.md-editor-code-block .md-code-copy svg {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.35;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 .md-editor .ProseMirror pre code {
   background: none;

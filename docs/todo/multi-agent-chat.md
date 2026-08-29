@@ -48,8 +48,9 @@ so memory partitions by `(user, agent)` and cost still bills one owner.
 - **Skills**: a custom agent starts with **only its own overlay** — it does not
   inherit the shared set (builtins + `<workspace>/skills/`), which belongs to
   the built-in. Granting a skill to a persona is a decision, made by putting it
-  in that agent's folder. The lone exception is `baybo-cli`, which is runtime
-  infrastructure rather than a capability.
+  in that agent's folder. The exceptions are the runtime-reference skills in
+  `UNIVERSAL_SKILLS` (`baybo-cli` and `baybo-help`), which are infrastructure
+  rather than capabilities.
 - **Memory**: one configured backend, partitioned per agent — every
   recall/write carries the session's agent id. Agent A never recalls agent B's
   memories.

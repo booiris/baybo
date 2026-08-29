@@ -25,6 +25,7 @@
     "@milkdown/plugin-math": "^7.5.9",
     "@milkdown/react": "7.22.0",
     "@msgpack/msgpack": "^3.0.0-beta2",
+    "highlight.js": "^11.11.1",
     "katex": "^0.16.47",
     "openapi-fetch": "^0.13.0",
     "react": "^19.0.0",

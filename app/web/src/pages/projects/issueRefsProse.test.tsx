@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { describe, expect, it, vi } from 'vitest';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { Schema } from '@milkdown/kit/prose/model';
 
@@ -156,6 +156,20 @@ function click(node: Element, modified: boolean) {
 // — the suite otherwise mocks `MarkdownEditor` away, so nothing else here has
 // ever rendered a ProseMirror document.
 describe('a description’s card references', () => {
+  it('highlights and copies code blocks in the editable description', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    });
+    const { container } = description('```typescript\nconst card = 12;\n```');
+    await waitFor(() => {
+      expect(container.querySelector('.hljs-keyword')?.textContent).toBe('const');
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Copy code' }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith('const card = 12;'));
+  });
+
   it('marks the card this board has, and only that one', async () => {
     const { container } = description('see #12 and #99 now');
     await waitFor(() => {
