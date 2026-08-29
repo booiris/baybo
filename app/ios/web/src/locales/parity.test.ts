@@ -42,6 +42,14 @@ describe("locale parity", () => {
   it("deck quick setup exercises ordinary-language skill selection", () => {
     expect(en.translation.deck.quickSetupPrompt).not.toMatch(/^\s*\//);
     expect(zh.translation.deck.quickSetupPrompt).not.toMatch(/^\s*\//);
+    expect(en.translation.deck.quickSetupPrompt).toContain("line chart");
+    expect(zh.translation.deck.quickSetupPrompt).toContain("折线图");
+    expect(en.translation.deck.quickSetupPrompt).toContain("concise");
+    expect(zh.translation.deck.quickSetupPrompt).toContain("保持简洁");
+    expect(en.translation.deck.quickSetupPrompt).toContain("detailed usage data");
+    expect(zh.translation.deck.quickSetupPrompt).toContain("详细的使用数据");
+    expect(en.translation.deck.quickSetupPrompt).toContain("maximized view");
+    expect(zh.translation.deck.quickSetupPrompt).toContain("最大化视图");
     expect(en.translation.deck.empty).not.toContain("/deck");
     expect(zh.translation.deck.empty).not.toContain("/deck");
   });

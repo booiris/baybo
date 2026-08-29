@@ -16,6 +16,13 @@
   const pending = new Map();
   let nextId = 1;
 
+  function applySize(nextSize) {
+    size = nextSize;
+    document.documentElement.dataset.deckSize = nextSize;
+  }
+
+  applySize(size);
+
   function notifySize() {
     for (const cb of sizeCbs) {
       try {
@@ -68,7 +75,7 @@
       else p.reject(new Error(msg.error || "pick failed"));
     } else if (msg.type === "size") {
       if (msg.size && msg.size !== size) {
-        size = msg.size;
+        applySize(msg.size);
         notifySize();
       }
     }
@@ -92,7 +99,7 @@
     ) {
       initialized = true;
       port = e.ports[0];
-      if (e.data.size) size = e.data.size;
+      if (e.data.size) applySize(e.data.size);
       port.onmessage = onPortMessage;
       flushQueued();
       // The card's inline script runs (and registers onSizeChange) BEFORE this

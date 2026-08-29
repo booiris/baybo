@@ -61,6 +61,25 @@ beforeEach(() => {
 });
 
 describe("an echo-appended first send survives the raced baseline", () => {
+  it("does not append an optimistic twin when it lands in the echo's React batch", async () => {
+    await mountFresh();
+
+    await act(async () => {
+      window.baybo.pushFrame(
+        JSON.stringify({
+          kind: "message",
+          role: "user",
+          content: "hi",
+          platform_msg_id: "pm-1",
+        }),
+      );
+      window.baybo.userSent({ msgId: "pm-1", text: "hi", attachments: [] });
+    });
+    await settle();
+
+    expect(rowIds()).toEqual(["pm-1"]);
+  });
+
   it("enrols the ordinal-less echo row in the kept set, so a page without it cannot delete it", async () => {
     await mountFresh();
 

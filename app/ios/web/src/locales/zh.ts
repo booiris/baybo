@@ -99,7 +99,7 @@ export const zh: typeof en = {
       empty: "还没有卡片 — 在聊天里创建一张。",
       quickSetup: "创建卡片",
       createCardInflight: "创建中 · 查看",
-      quickSetupPrompt: "帮我做一个监控 baybo token 使用量的卡片",
+      quickSetupPrompt: "帮我创建一张监控 Baybo token 使用量的卡片。普通卡片视图保持简洁，只展示关键指标，并用折线图清晰呈现使用趋势；在最大化视图中再提供尽可能完整、详细的使用数据与分析",
       quarantined: "此卡片因反复失败已被停用。",
       disabled: "已暂停",
       reenable: "重新启用",

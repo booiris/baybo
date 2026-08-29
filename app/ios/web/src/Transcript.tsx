@@ -3215,6 +3215,11 @@ export function Transcript({
   // suppresses the duplicate APPEND, not the bookkeeping; leave the add below it
   // and a restored unconfirmed send never enters the kept set, so the next
   // REPLACE deletes the very bubble this path exists to preserve.
+  //
+  // The ref guard is only the fast path. An echo and this callback can run in
+  // one React batch, before `messagesRef` observes the echo's queued append, so
+  // the state updater must repeat the identity check against the actual rows it
+  // receives.
   const handleUserSent = (payload: UserSentPayload) => {
     unconfirmedSends.current.add(payload.msgId);
     if (holdsUserSend(messagesRef.current, payload.msgId)) return;
@@ -3223,17 +3228,20 @@ export function Transcript({
     // Optimistically enter the "awaiting reply" window so the composer's stop
     // button appears immediately, before the first `turn_state` lands.
     setAwaitingReply(true);
-    setMessages((m) => [
-      ...m,
-      {
-        id: payload.msgId,
-        role: "user",
-        content: payload.text,
-        attachments: payload.attachments.length > 0 ? payload.attachments : undefined,
-        sendState: "sending",
-        createdAt: new Date().toISOString(),
-      },
-    ]);
+    setMessages((rows) => {
+      if (holdsUserSend(rows, payload.msgId)) return rows;
+      return [
+        ...rows,
+        {
+          id: payload.msgId,
+          role: "user",
+          content: payload.text,
+          attachments: payload.attachments.length > 0 ? payload.attachments : undefined,
+          sendState: "sending",
+          createdAt: new Date().toISOString(),
+        },
+      ];
+    });
   };
 
   // Native chrome (composer + ridden keyboard) covering the webview's bottom.

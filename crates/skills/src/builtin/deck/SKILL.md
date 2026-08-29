@@ -280,10 +280,15 @@ Only declare a `sizes` entry you've actually laid out this way.
 
 ### Card design — a base stylesheet is injected, use it
 
-The app is **soft monochrome line minimalism**: near-black ink on
-paper-white, thin hairlines, generous whitespace, zero decoration. To
-keep every card in that language, the shell injects a **base
-stylesheet before your fragment** — body font/color defaults plus:
+The default style is **soft monochrome line minimalism**: near-black ink on
+paper-white, thin hairlines, generous whitespace, zero decoration. Use this
+style when the user has not requested another one. If the user asks for a
+different visual style, follow their requested style instead; it overrides the
+aesthetic defaults and visual rules in this section, but never the sandbox,
+security, size-adaptation, clipping, or maximize-layout requirements.
+
+To keep default-styled cards in the app's visual language, the shell injects a
+**base stylesheet before your fragment** — body font/color defaults plus:
 
 - Tokens: `--ink` `--muted` `--line` `--ok` `--bad`.
 - Classes: `.card` (flex column filling the tile, padded),
@@ -297,7 +302,13 @@ is overridable — your `<style>` comes after the base in the cascade,
 and the palette is custom properties — but overriding the look is the
 exception, not the norm.
 
-Hard rules:
+As a suggested type scale, use `10px` at weight `400` for the card title
+(`.label`) and size the primary number (`.hero`) at weight `400`: `24px` in
+`wide`, `26px` in `large`, and `42px` in `max`. These are visual guidelines,
+not hard requirements; adapt them when the content or the user's requested
+style needs a different scale.
+
+Default-style rules:
 
 - **No gradients, no box-shadows, no emoji, no icon fonts.** Flat
   paper. Color is for STATUS only (`--ok`/`--bad` dots or a bar fill) —
@@ -333,11 +344,14 @@ full history, a chart, a table. Rules:
   right-aligns a control: `padding-right: 42px`). At `max` the corner is
   yours again (the ✕ is up in the app header), so a right-aligned control can
   go to the far right.
-- **Clear the header at max.** The app's header stays visible above the
-  maximized card, so start your `max` content below it:
-  `padding-top: calc(env(safe-area-inset-top) + 54px)`.
-- **Clear the tab bar at max.** It floats over the bottom. End your content
-  with `padding-bottom: calc(env(safe-area-inset-bottom) + 64px)`.
+- **The shell clears the header at max.** The header floats over the
+  full-height scrolling surface, and the injected `.card` style supplies the
+  leading top inset so initial content starts below it. Do not add another
+  header spacer or top safe-area inset of your own.
+- **The shell clears the tab bar at max.** It floats over the full-height
+  scrolling surface, and the injected `.card` style supplies the trailing
+  bottom inset so the final content can scroll above it. Do not add another
+  tab-bar spacer or bottom safe-area inset of your own.
 
 If you don't provide a `"max"` layout, leave `maximize` out — a ⛶ that
 expands to the same tile layout stretched full-screen looks broken.
@@ -391,7 +405,7 @@ export function start(ctx) {
   .hero { margin-top: 6px; }
 </style>
 <div class="card">
-  <div class="label"><span class="dot" id="dot"></span>负载</div>
+  <div class="label"><span class="dot" id="dot"></span>Load</div>
   <div class="hero" id="v">–</div>
   <div class="foot" id="d"></div>
 </div>
@@ -401,7 +415,7 @@ export function start(ctx) {
     document.getElementById("dot").className = "dot" + (bad ? " bad" : "");
     document.getElementById("v").textContent = s.error ?? s.load ?? "–";
     document.getElementById("d").textContent =
-      s.at ? new Date(s.at).toLocaleTimeString() + " 更新" : "";
+      s.at ? "Updated " + new Date(s.at).toLocaleTimeString() : "";
   });
 </script>
 ```

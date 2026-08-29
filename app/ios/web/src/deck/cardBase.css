@@ -11,6 +11,8 @@
   --line: rgba(28, 27, 25, 0.14);
   --ok: #2e7d4f;
   --bad: #b43c28;
+  --deck-header-clearance: calc(env(safe-area-inset-top) + 54px);
+  --deck-tab-bar-clearance: calc(env(safe-area-inset-bottom) + 64px);
 }
 
 html,
@@ -39,6 +41,13 @@ body {
   flex-direction: column;
   height: 100%;
   padding: 10px 12px;
+}
+
+html[data-deck-size="max"] .card {
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  padding-top: var(--deck-header-clearance);
+  padding-bottom: var(--deck-tab-bar-clearance);
 }
 
 .label {

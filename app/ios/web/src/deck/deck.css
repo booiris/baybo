@@ -320,8 +320,8 @@ html.deck-maximized body {
 /* Maximized card: lifted out of flow and filling the viewport (inline
    left/top/width/height drive the rect). Full-bleed, so no border or radius;
    the placeholder holds its grid slot for the collapse. The tab bar floats
-   over the bottom (per the maximize design) — the card's own max layout keeps
-   content clear of it. */
+   over the bottom (per the maximize design); the iframe's injected base style
+   gives its max scroll surface enough trailing clearance. */
 .deck-card.maximized {
   position: fixed;
   z-index: 20;
