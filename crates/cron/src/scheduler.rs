@@ -2,7 +2,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use baybo_model::{ChannelType, SessionId};
+use baybo_model::{ChannelType, McpToolGrant, SessionId};
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use tokio::sync::mpsc;
@@ -51,6 +51,8 @@ pub struct CronTriggerEvent {
     /// "what user action created this cron job" — and, for a one-shot, so
     /// the fire's result can be delivered back into that conversation.
     pub origin_session_id: Option<SessionId>,
+    /// Exact MCP operations and transport configs granted to this fire.
+    pub mcp_tool_grants: Vec<McpToolGrant>,
     /// When this job last fired, as of just before this fire advanced the
     /// row — see [`CronExecution::previous_fire_at`]. `None` on a first
     /// fire. The dream pass reads it as the lower bound of "what has
@@ -73,6 +75,7 @@ impl CronTriggerEvent {
             prompt: execution.prompt.clone(),
             one_shot: execution.is_one_shot(),
             origin_session_id: execution.origin_session_id.clone(),
+            mcp_tool_grants: execution.mcp_tool_grants.clone(),
             project_id: execution.project_id.clone(),
             previous_fire_at: execution.previous_fire_at,
         }
@@ -194,6 +197,17 @@ impl CronScheduler {
     /// trigger time. A `CronSchedule::At` whose time is already in the past
     /// is rejected.
     pub async fn create_job(&self, spec: NewCronJob) -> Result<CronJob> {
+        self.create_job_with_mcp_tool_grants(spec, Vec::new()).await
+    }
+
+    /// Create a job with exact MCP tool grants already resolved by the calling
+    /// authoring surface. The LLM-facing tool resolves operation names through
+    /// the live registry; HTTP callers validate exact tuples at their boundary.
+    pub async fn create_job_with_mcp_tool_grants(
+        &self,
+        spec: NewCronJob,
+        mcp_tool_grants: Vec<McpToolGrant>,
+    ) -> Result<CronJob> {
         let NewCronJob {
             user_id,
             channel,
@@ -210,7 +224,7 @@ impl CronScheduler {
         let now = Utc::now();
         let next_trigger_at = arm_schedule(&schedule, &timezone, now)?;
 
-        let job = CronJob {
+        let mut job = CronJob {
             id: uuid::Uuid::new_v4().to_string(),
             user_id,
             channel,
@@ -225,10 +239,12 @@ impl CronScheduler {
             updated_at: now,
             project_id,
             origin_session_id,
+            mcp_tool_grants: Vec::new(),
             deleted_at: None,
             pinned: false,
             builtin: false,
         };
+        job.set_mcp_tool_grants(mcp_tool_grants);
 
         self.store.create(&job).await?;
         Ok(job)
@@ -318,6 +334,7 @@ impl CronScheduler {
             created_at: now,
             updated_at: now,
             origin_session_id: None,
+            mcp_tool_grants: Vec::new(),
             deleted_at: None,
             pinned: false,
             builtin: true,
@@ -433,7 +450,12 @@ impl CronScheduler {
             let mut updated = current.clone();
             let now = Utc::now();
             change(&mut updated, now)?;
-            updated.updated_at = now;
+            // `updated_at` is the optimistic row version. It must advance even
+            // when two edits land within one clock tick or the wall clock moves
+            // backwards, otherwise execution snapshot insertion could mistake a
+            // committed grant revocation for the snapshot it was built from.
+            updated.updated_at =
+                std::cmp::max(now, current.updated_at + chrono::Duration::microseconds(1));
 
             if self.store.save_if_unchanged(&updated, &current).await? {
                 return Ok(updated);
@@ -672,35 +694,48 @@ impl CronScheduler {
     /// A job in the recycle bin does not fire, on demand no more than on
     /// schedule: it reads as absent here, the way it does in every listing.
     pub async fn trigger_now(&self, job_id: &str) -> Result<CronExecution> {
-        let job = self
-            .store
-            .get(job_id)
-            .await?
-            .filter(|job| !job.is_deleted())
-            .ok_or_else(|| CronError::NotFound(job_id.to_string()))?;
+        for _ in 0..UPDATE_ATTEMPTS {
+            let job = self
+                .store
+                .get(job_id)
+                .await?
+                .filter(|job| !job.is_deleted())
+                .ok_or_else(|| CronError::NotFound(job_id.to_string()))?;
 
-        let now = Utc::now();
-        let execution = CronExecution::pending(&job, now, now);
+            let now = Utc::now();
+            let execution = CronExecution::pending(&job, now, now);
+            if !self
+                .store
+                .record_execution_if_job_unchanged(&execution, &job)
+                .await?
+            {
+                debug!(
+                    job_id,
+                    "cron job moved before its manual execution snapshot was recorded; retrying from the current row"
+                );
+                continue;
+            }
 
-        self.store.record_execution(&execution).await?;
+            self.trigger_tx
+                .send(CronTriggerEvent::for_execution(&execution))
+                .await
+                .map_err(|e| CronError::Storage(format!("failed to dispatch trigger: {e}")))?;
 
-        self.trigger_tx
-            .send(CronTriggerEvent::for_execution(&execution))
-            .await
-            .map_err(|e| CronError::Storage(format!("failed to dispatch trigger: {e}")))?;
+            self.store
+                .update_execution_status(&execution.id, ExecutionStatus::Dispatched)
+                .await?;
 
-        self.store
-            .update_execution_status(&execution.id, ExecutionStatus::Dispatched)
-            .await?;
+            if job.is_one_shot() {
+                info!(job_id = %job.id, "marking one-shot cron job as executed after manual trigger");
+                self.mark_one_shot_executed(&job, now).await;
+            }
 
-        if job.is_one_shot() {
-            info!(job_id = %job.id, "marking one-shot cron job as executed after manual trigger");
-            self.mark_one_shot_executed(&job, now).await;
+            let mut updated = execution;
+            updated.status = ExecutionStatus::Dispatched;
+            return Ok(updated);
         }
 
-        let mut updated = execution;
-        updated.status = ExecutionStatus::Dispatched;
-        Ok(updated)
+        Err(CronError::Contended(job_id.to_string()))
     }
 
     /// List execution records for a job.
@@ -841,15 +876,23 @@ impl CronScheduler {
                 }
             }
 
-            // Phase 1: Record execution as Pending
+            // Phase 1: Record execution as Pending, but only if no edit (in
+            // particular, no grant revocation) committed after `list_due`.
             let execution = CronExecution::pending(&job, scheduled_fire_time, now);
             match self
                 .store
-                .record_execution(&execution)
+                .record_execution_if_job_unchanged(&execution, &job)
                 .await
                 .map_err(CronError::from)
             {
-                Ok(()) => {}
+                Ok(true) => {}
+                Ok(false) => {
+                    debug!(
+                        job_id = %job.id,
+                        "job changed before its execution snapshot was recorded; retrying from the current row on a later tick"
+                    );
+                    continue;
+                }
                 Err(CronError::AlreadyDispatched(key)) => {
                     debug!(job_id = %job.id, slot = %key, "skipping duplicate cron execution slot");
                     continue;
@@ -1019,7 +1062,7 @@ mod tests {
     use baybo_store::cron::Result as StoreResult;
     use parking_lot::Mutex;
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn make_scheduler(
         store: InMemoryCronStore,
@@ -1781,7 +1824,13 @@ mod tests {
             .unwrap();
         let stored = scheduler.store.get(&job.id).await.unwrap().unwrap();
         let exec = CronExecution::pending(&stored, Utc::now(), Utc::now());
-        scheduler.store.record_execution(&exec).await.unwrap();
+        assert!(
+            scheduler
+                .store
+                .record_execution_if_job_unchanged(&exec, &stored)
+                .await
+                .unwrap()
+        );
 
         scheduler.delete_job(&job.id).await.unwrap();
         scheduler.recover_pending().await;
@@ -1814,7 +1863,13 @@ mod tests {
             .unwrap();
         let stored = scheduler.store.get(&job.id).await.unwrap().unwrap();
         let exec = CronExecution::pending(&stored, Utc::now(), Utc::now());
-        scheduler.store.record_execution(&exec).await.unwrap();
+        assert!(
+            scheduler
+                .store
+                .record_execution_if_job_unchanged(&exec, &stored)
+                .await
+                .unwrap()
+        );
 
         scheduler.recover_pending().await;
 
@@ -2383,6 +2438,7 @@ mod tests {
         inner: InMemoryCronStore,
         pending: Mutex<VecDeque<Interference>>,
         attempts: AtomicUsize,
+        revoke_before_record: AtomicBool,
     }
 
     impl ContendedStore {
@@ -2391,6 +2447,7 @@ mod tests {
                 inner: InMemoryCronStore::new(),
                 pending: Mutex::new(pending.into_iter().collect()),
                 attempts: AtomicUsize::new(0),
+                revoke_before_record: AtomicBool::new(false),
             }
         }
 
@@ -2405,6 +2462,24 @@ mod tests {
         fn arm(&self, pending: impl IntoIterator<Item = Interference>) {
             self.pending.lock().extend(pending);
             self.attempts.store(0, Ordering::Relaxed);
+        }
+
+        fn arm_revoke_before_record(&self) {
+            self.revoke_before_record.store(true, Ordering::SeqCst);
+        }
+
+        async fn revoke_grants(&self, job_id: &str) {
+            let current = self.inner.get(job_id).await.unwrap().unwrap();
+            let mut revoked = current.clone();
+            revoked.set_mcp_tool_grants(Vec::new());
+            revoked.updated_at = current.updated_at + chrono::Duration::microseconds(1);
+            assert!(
+                self.inner
+                    .save_if_unchanged(&revoked, &current)
+                    .await
+                    .unwrap(),
+                "the injected grant revocation did not land",
+            );
         }
 
         /// The tick loop's write-back for `job`'s current slot, exactly as
@@ -2499,8 +2574,17 @@ mod tests {
         async fn list_due(&self, now_us: i64) -> StoreResult<Vec<CronJob>> {
             self.inner.list_due(now_us).await
         }
-        async fn record_execution(&self, exec: &CronExecution) -> StoreResult<()> {
-            self.inner.record_execution(exec).await
+        async fn record_execution_if_job_unchanged(
+            &self,
+            exec: &CronExecution,
+            expected_job: &CronJob,
+        ) -> StoreResult<bool> {
+            if self.revoke_before_record.swap(false, Ordering::SeqCst) {
+                self.revoke_grants(&expected_job.id).await;
+            }
+            self.inner
+                .record_execution_if_job_unchanged(exec, expected_job)
+                .await
         }
         async fn list_executions_by_job(&self, job_id: &str) -> StoreResult<Vec<CronExecution>> {
             self.inner.list_executions_by_job(job_id).await
@@ -2560,6 +2644,59 @@ mod tests {
         (CronScheduler::new(store, tx, Arc::new(NeverShutdown)), rx)
     }
 
+    #[tokio::test]
+    async fn a_revocation_committed_before_execution_recording_wins() {
+        let store = Arc::new(ContendedStore::new([]));
+        let (scheduler, mut rx) = scheduler_over(Arc::clone(&store) as Arc<dyn CronStore>);
+        let job = create_prompt_cron(&scheduler, "u1", "*/5 * * * *", "audit").await;
+        let grant = McpToolGrant::new(
+            "lighthouse/audit",
+            baybo_model::McpTransportIdentity::from_sha256([42; 32]),
+        );
+        scheduler
+            .update_job(
+                &job.id,
+                CronJobPatch {
+                    mcp_tool_grants: Some(vec![grant]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        backdate_next_trigger(&scheduler, &job.id).await;
+        store.arm_revoke_before_record();
+
+        scheduler.tick().await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "the stale granted execution was dispatched after revocation"
+        );
+        assert!(
+            store.inner.executions().is_empty(),
+            "the stale granted execution was recorded after revocation"
+        );
+        assert!(
+            scheduler
+                .get_job(&job.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .mcp_tool_grants
+                .is_empty(),
+            "the injected revocation did not commit"
+        );
+
+        // The unchanged overdue row is retried from its current policy on the
+        // next tick; it may fire, but only with the revoked (empty) snapshot.
+        scheduler.tick().await;
+        let fired = rx.try_recv().expect("the current row should be retried");
+        assert!(fired.mcp_tool_grants.is_empty());
+        let executions = store.inner.executions();
+        assert_eq!(executions.len(), 1);
+        assert!(executions[0].mcp_tool_grants.is_empty());
+    }
+
     /// The race the edit's retry loop is for, driven through `update_job`: the
     /// slot fires between the read and the write. The edit must land on the row
     /// the fire left — keeping the fire, not reverting the job to the overdue
@@ -2571,8 +2708,19 @@ mod tests {
         let job = create_prompt_cron(&scheduler, "u1", "*/5 * * * *", "old prompt").await;
         backdate_next_trigger(&scheduler, &job.id).await;
 
+        let grant = McpToolGrant::new(
+            "server/read",
+            baybo_model::McpTransportIdentity::from_sha256([4; 32]),
+        );
         let updated = scheduler
-            .update_job(&job.id, patch_prompt("new prompt"))
+            .update_job(
+                &job.id,
+                CronJobPatch {
+                    prompt: Some("new prompt".to_string()),
+                    mcp_tool_grants: Some(vec![grant.clone()]),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("the edit re-applies itself to the row the fire left");
 
@@ -2580,6 +2728,11 @@ mod tests {
         assert_eq!(
             updated.prompt, "new prompt",
             "the edit was lost to the fire"
+        );
+        assert_eq!(
+            updated.mcp_tool_grants,
+            vec![grant],
+            "the grant half of the edit was lost to the fire"
         );
         assert!(
             updated.last_triggered_at.is_some(),
@@ -2758,6 +2911,7 @@ mod tests {
                     prompt: Some("new prompt".to_string()),
                     schedule: Some(CronSchedule::cron("0 9 * * *")),
                     timezone: Some("Asia/Shanghai".to_string()),
+                    mcp_tool_grants: None,
                 },
             )
             .await
@@ -2913,6 +3067,7 @@ mod tests {
             updated_at: Utc::now(),
             project_id: None,
             origin_session_id: None,
+            mcp_tool_grants: Vec::new(),
             deleted_at: None,
             pinned: false,
             builtin: false,
@@ -2921,7 +3076,12 @@ mod tests {
         store.create(&job).await.unwrap();
         let mut exec = CronExecution::pending(&job, Utc::now(), Utc::now());
         exec.id = "ce-pending".to_string();
-        store.record_execution(&exec).await.unwrap();
+        assert!(
+            store
+                .record_execution_if_job_unchanged(&exec, &job)
+                .await
+                .unwrap()
+        );
 
         let (scheduler, mut rx) = make_scheduler(store);
         scheduler.recover_pending().await;
@@ -2947,6 +3107,67 @@ mod tests {
             .await
             .unwrap();
         assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_recovery_dispatches_the_execution_grant_snapshot() {
+        let (scheduler, mut rx) = make_scheduler(InMemoryCronStore::new());
+        let snapshotted = McpToolGrant::new(
+            "lighthouse/run_audit",
+            baybo_model::McpTransportIdentity::from_sha256([21; 32]),
+        );
+        let replacement = McpToolGrant::new(
+            "lighthouse/get_report",
+            baybo_model::McpTransportIdentity::from_sha256([22; 32]),
+        );
+        let job = scheduler
+            .create_job_with_mcp_tool_grants(
+                spec("u1", CronSchedule::cron("0 9 * * *"), "recover grant"),
+                vec![snapshotted.clone()],
+            )
+            .await
+            .unwrap();
+        let execution = CronExecution::pending(&job, Utc::now(), Utc::now());
+        assert!(
+            scheduler
+                .store
+                .record_execution_if_job_unchanged(&execution, &job)
+                .await
+                .unwrap()
+        );
+
+        let current = scheduler
+            .update_job(
+                &job.id,
+                CronJobPatch {
+                    mcp_tool_grants: Some(vec![replacement.clone()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(current.mcp_tool_grants, vec![replacement]);
+
+        scheduler.recover_pending().await;
+
+        let event = rx
+            .try_recv()
+            .expect("the pending execution should be recovered");
+        assert_eq!(event.execution_id, execution.id);
+        assert_eq!(
+            event.mcp_tool_grants,
+            vec![snapshotted.clone()],
+            "recovery must dispatch the immutable execution snapshot, not the edited job"
+        );
+        let recovered = scheduler
+            .list_executions(&job.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == execution.id)
+            .expect("execution row");
+        assert_eq!(recovered.mcp_tool_grants, vec![snapshotted]);
+        assert_eq!(recovered.status, ExecutionStatus::Dispatched);
     }
 
     #[tokio::test]
@@ -2998,6 +3219,65 @@ mod tests {
         let execs = scheduler.list_executions(&job.id).await.unwrap();
         assert_eq!(execs.len(), 1);
         assert_eq!(execs[0].status, ExecutionStatus::Dispatched);
+    }
+
+    #[tokio::test]
+    async fn exact_mcp_tool_grants_are_normalized_and_snapshotted_for_dispatch() {
+        let (scheduler, mut rx) = make_scheduler(InMemoryCronStore::new());
+        let first = McpToolGrant::new(
+            "server/first",
+            baybo_model::McpTransportIdentity::from_sha256([1; 32]),
+        );
+        let second = McpToolGrant::new(
+            "server/second",
+            baybo_model::McpTransportIdentity::from_sha256([2; 32]),
+        );
+        let replacement = McpToolGrant::new(
+            "server/replacement",
+            baybo_model::McpTransportIdentity::from_sha256([3; 32]),
+        );
+        let job = scheduler
+            .create_job_with_mcp_tool_grants(
+                spec("u1", CronSchedule::cron("0 9 * * *"), "manual fire"),
+                vec![second.clone(), first.clone(), second.clone()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(job.mcp_tool_grants, vec![first.clone(), second]);
+
+        scheduler
+            .update_job(
+                &job.id,
+                CronJobPatch {
+                    prompt: Some("updated prompt".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let unchanged = scheduler.get_job(&job.id).await.unwrap().unwrap();
+        assert_eq!(unchanged.mcp_tool_grants, job.mcp_tool_grants);
+
+        let execution = scheduler.trigger_now(&job.id).await.unwrap();
+        let event = rx.try_recv().unwrap();
+        assert_eq!(execution.mcp_tool_grants, job.mcp_tool_grants);
+        assert_eq!(event.mcp_tool_grants, job.mcp_tool_grants);
+
+        let current = scheduler
+            .update_job(
+                &job.id,
+                CronJobPatch {
+                    prompt: Some("replacement prompt".to_string()),
+                    mcp_tool_grants: Some(vec![replacement.clone(), replacement.clone()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(current.mcp_tool_grants, vec![replacement]);
+        assert_eq!(current.prompt, "replacement prompt");
+        assert_eq!(execution.mcp_tool_grants, job.mcp_tool_grants);
+        assert_eq!(event.mcp_tool_grants, job.mcp_tool_grants);
     }
 
     #[tokio::test]

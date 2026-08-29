@@ -350,6 +350,14 @@ explicit edit wherever that type's mirror lives to surface it on HTTP;
 that's a feature, not a bug, because the drift test below will force
 the question.
 
+The authenticated cron HTTP family does not expose or mutate MCP authority.
+`POST /v1/cron` creates a job without grants, `PATCH /v1/cron/{id}` preserves
+whatever authority the agent-managed job already has, and the response mirror
+omits that internal policy. MCP grants are managed only through the LLM-facing
+`CronCreate` and `CronUpdate` tools, which accept operation names under
+`permissions.mcp_tools` and resolve them to exact live identities before
+calling the scheduler.
+
 ### OpenAPI spec generation and the TypeScript client
 
 `admin/mod.rs::v1_router_and_spec()` returns `(Router<AdminState>,

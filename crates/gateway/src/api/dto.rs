@@ -507,17 +507,6 @@ pub struct UpdateCronRequest {
     pub timezone: Option<String>,
 }
 
-impl From<UpdateCronRequest> for baybo_cron::CronJobPatch {
-    fn from(v: UpdateCronRequest) -> Self {
-        Self {
-            title: v.title,
-            prompt: v.prompt,
-            schedule: v.schedule.map(Into::into),
-            timezone: v.timezone,
-        }
-    }
-}
-
 // ── Turn ──────────────────────────────────────────────────────────────
 
 /// Wire mirror of [`baybo_turn::TurnStatus`]. Carries the same payload
@@ -1230,23 +1219,20 @@ mod tests {
     #[test]
     fn a_patch_body_that_names_one_field_leaves_the_others_unset() {
         let req: UpdateCronRequest = serde_json::from_str(r#"{"prompt": "new prompt"}"#).unwrap();
-        let patch: baybo_cron::CronJobPatch = req.into();
 
-        assert_eq!(patch.prompt.as_deref(), Some("new prompt"));
-        assert!(patch.title.is_none());
-        assert!(patch.schedule.is_none());
-        assert!(patch.timezone.is_none());
-        assert!(!patch.is_empty());
-        assert!(
-            !patch.reschedules(),
-            "a prompt edit does not move the fire times",
-        );
+        assert_eq!(req.prompt.as_deref(), Some("new prompt"));
+        assert!(req.title.is_none());
+        assert!(req.schedule.is_none());
+        assert!(req.timezone.is_none());
     }
 
     #[test]
     fn an_empty_patch_body_sets_nothing() {
         let req: UpdateCronRequest = serde_json::from_str("{}").unwrap();
-        assert!(baybo_cron::CronJobPatch::from(req).is_empty());
+        assert!(req.title.is_none());
+        assert!(req.prompt.is_none());
+        assert!(req.schedule.is_none());
+        assert!(req.timezone.is_none());
     }
 
     /// The schedule crosses the wire in the tagged shape `CronJob` reports it
@@ -1255,19 +1241,16 @@ mod tests {
     fn a_patch_body_carries_either_kind_of_schedule() {
         let cron: UpdateCronRequest =
             serde_json::from_str(r#"{"schedule": {"kind": "cron", "expr": "0 8 * * *"}}"#).unwrap();
-        let patch = baybo_cron::CronJobPatch::from(cron);
         assert_eq!(
-            patch.schedule,
+            cron.schedule.map(Into::into),
             Some(baybo_cron::CronSchedule::cron("0 8 * * *")),
         );
-        assert!(patch.reschedules());
 
         let at: UpdateCronRequest =
             serde_json::from_str(r#"{"schedule": {"kind": "at", "time": "2026-07-15T08:00:00Z"}}"#)
                 .unwrap();
-        let patch = baybo_cron::CronJobPatch::from(at);
         assert_eq!(
-            patch.schedule,
+            at.schedule.map(Into::into),
             Some(baybo_cron::CronSchedule::at(
                 "2026-07-15T08:00:00Z".parse().unwrap()
             )),

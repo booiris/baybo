@@ -131,6 +131,20 @@ See [trace.md](trace.md#toolcall-output-storage).
 4. If any remain, call `gate.request(...)` with the uncovered set and a truncated params preview. The gate returns an `ApprovalOutcome`, not a bare decision; on `Deny` the call short-circuits to `ToolError::Denied` (recorded on the trace before return) whose `reason` is worded from `baybo_tools::refusal_reason(outcome.resolution)`. That distinction is the point: a 300 s window nobody answered, a prompt torn down by a cancel, and a standing policy are not a human refusal, and reporting them to the model as one teaches it to re-argue with somebody who was never there. A cancel that fires while the prompt is still up records `Abandoned` — nobody decided anything — rather than being written down as a decision.
 5. On `ApproveAlways`, the executor de-dupes and pushes the newly-approved accesses directly into the shared `Mutex<Vec<ApprovedResource>>` passed by `AgentLoop`. After all tool calls complete, `AgentLoop` flushes the contents back into `session.state.approved_resources`, which persists through session save/restore because the types live in `baybo-model`.
 
+5. The router starts a cron fire with an `InheritedToolContext` built from the
+   execution's snapshotted exact MCP grants. A matching tool name + live
+   transport identity removes only that MCP tool's transport accesses from the
+   uncovered set. Any access still uncovered is denied immediately because no
+   operator is present; the channel gate is not called. When that execution
+   invokes `spawn_subagent`, `ToolContext::inherited_context` carries the same
+   context through `SubagentParentContext` and `AgentMessage::SubagentSpawned`,
+   so every in-process descendant runs under the same exact, fail-closed
+   authority. `Some(default())` stays distinct from ordinary `None`. Cron is
+   only one producer of this generic execution context; consumers do not infer
+   its source from `TriggerSource::Cron`. The context never seeds or mutates
+   `SessionState::approved_resources`; a later independent user reply or child
+   resume therefore uses ordinary approval.
+
 Parallel tool calls within a turn each go through the gate independently; the gate implementation is responsible for its own serialization (TUI queues and shows one inline prompt at a time).
 
 ### Long-running model
@@ -204,7 +218,7 @@ The title input is the first genuine user question — the first `MessageSource:
 
 ### LLM-invocable cron tools
 
-`baybo_cron::tools::agent_tools` returns `CronCreateTool`, `CronUpdateTool`, `CronDeleteTool`, `CronPauseTool`, `CronResumeTool`, and `CronListTool` — `Tool` trait implementations that let the LLM schedule, edit, pause, resume, cancel and inspect cron jobs mid-conversation. They live in `baybo-cron::tools` (not `baybo-tools`) because they each hold `Arc<CronScheduler>`, and `baybo-tools` cannot depend on `baybo-cron` without creating a cycle. `crates/baybo/src/runtime.rs` registers them into the `ToolRegistry` after the scheduler is constructed.
+`baybo_cron::tools::agent_tools` returns `CronCreateTool`, `CronUpdateTool`, `CronDeleteTool`, `CronPauseTool`, `CronResumeTool`, and `CronListTool` — `Tool` trait implementations that let the LLM schedule, edit, pause, resume, cancel and inspect cron jobs mid-conversation. They live in `baybo-cron::tools` (not `baybo-tools`) because they hold `Arc<CronScheduler>`, and `baybo-tools` cannot depend on `baybo-cron` without creating a cycle. Create/update additionally receive the registry's narrow `McpToolGrantResolver`, which converts their `permissions.mcp_tools` names into live transport-bound grants without handing the cron crate the registry itself. `crates/baybo/src/runtime.rs` registers them after the scheduler is constructed.
 
 ### Startup recovery
 

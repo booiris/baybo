@@ -18,7 +18,10 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 #[cfg(any(test, feature = "test-support"))]
 use baybo_model::ChannelType;
-use baybo_model::{AgentHandle, AgentProfileId, SessionId, SpanId, TriggerSource, TurnId, User};
+use baybo_model::{
+    AgentHandle, AgentProfileId, InheritedToolContext, SessionId, SpanId, TriggerSource, TurnId,
+    User,
+};
 use baybo_trace::ToolEventPayload;
 use baybo_workspace::WorkspacePaths;
 use serde::{Deserialize, Serialize};
@@ -168,6 +171,13 @@ pub trait Tool: Send + Sync {
     /// Tools with no side effects return an empty vec (the default).
     fn accessed_resources(&self, _params: &Value) -> Vec<ResourceAccess> {
         Vec::new()
+    }
+
+    /// Typed MCP provenance for unattended cron authorization. Native tools
+    /// return `None`; MCP wrappers return the exact operation and transport
+    /// identity plus only the transport resources its cron grant may bypass.
+    fn mcp_metadata(&self) -> Option<mcp::McpToolMetadata> {
+        None
     }
 
     /// Output provenance for prompt-injection severity; defaults to opaque.
@@ -413,6 +423,12 @@ pub struct ToolContext {
     /// for the interactive agent loop**; argv-mode / test call sites leave it
     /// `None`, which disables the contract. See [`ReadTracker`].
     pub read_tracker: Option<ReadTracker>,
+    /// Transient tool authority inherited by this execution. `Some`, including
+    /// `Some(default())`, makes the executor fail closed instead of prompting,
+    /// and `spawn_subagent` forwards it unchanged to in-process children. It
+    /// is not persistent session state, so a later independent turn receives
+    /// `None`.
+    pub inherited_context: Option<InheritedToolContext>,
     /// Whether this call may **create** background work: a `Bash` command
     /// that converts to background on timeout, or a subagent that converts
     /// (or is dispatched) instead of blocking. Decided per turn by the agent
@@ -496,6 +512,7 @@ impl ToolContext {
             secrets: None,
             virtual_reads: None,
             read_tracker: None,
+            inherited_context: None,
             // Inert on its own — nothing backgrounds until a test also wires
             // `background_jobs`, so defaulting to eligible keeps a fixture
             // that wires the sink meaning what it says.
@@ -1012,6 +1029,40 @@ impl ToolManifest {
     pub fn allows_channel(&self, channel: &baybo_model::ChannelType) -> bool {
         self.channels.is_empty() || self.channels.contains(channel)
     }
+
+    /// Validate the trust/capability combination used by every automatic tool
+    /// execution path. Approval can narrow concrete resources, but it cannot
+    /// upgrade the manifest's governance level.
+    pub fn validate_auto_execution(&self) -> std::result::Result<(), ToolManifestTrustError> {
+        match self.trust_level {
+            baybo_model::TrustLevel::Untrusted => Err(ToolManifestTrustError::Untrusted),
+            baybo_model::TrustLevel::Installed => {
+                for capability in &self.capabilities {
+                    match capability {
+                        ToolCapability::WriteFile => {
+                            return Err(ToolManifestTrustError::InstalledWriteFile);
+                        }
+                        ToolCapability::ExecCommand => {
+                            return Err(ToolManifestTrustError::InstalledExecCommand);
+                        }
+                        ToolCapability::ReadFile | ToolCapability::Http => {}
+                    }
+                }
+                Ok(())
+            }
+            baybo_model::TrustLevel::Trusted => Ok(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ToolManifestTrustError {
+    #[error("has Untrusted trust level and cannot be auto-executed")]
+    Untrusted,
+    #[error("is Installed but declares WriteFile capability; requires Trusted level")]
+    InstalledWriteFile,
+    #[error("is Installed but declares ExecCommand capability; requires Trusted level")]
+    InstalledExecCommand,
 }
 
 /// Coarse capability ceiling declared in a tool's manifest.
@@ -1038,7 +1089,7 @@ pub fn resource_path(p: impl Into<PathBuf>) -> PathBuf {
     p.into()
 }
 
-pub use registry::ToolRegistry;
+pub use registry::{McpToolGrantResolveError, McpToolGrantResolver, ToolRegistry};
 
 #[cfg(test)]
 mod multi_modal_text_tests {

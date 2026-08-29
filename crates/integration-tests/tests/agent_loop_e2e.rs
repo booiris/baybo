@@ -2755,6 +2755,7 @@ async fn cron_fire_is_framed_as_a_task_not_a_user_message() {
             job_id: "cj-demo".into(),
             title: "greeting".into(),
             prompt: "你好".into(),
+            mcp_tool_grants: Vec::new(),
             delivery: baybo_agent::actor::CronDelivery::Channel,
         })
         .await
@@ -2803,6 +2804,336 @@ async fn cron_fire_is_framed_as_a_task_not_a_user_message() {
         baybo_context::prompts::cron::original_cron_prompt(framed),
         "你好"
     );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn cron_tool_grants_are_initial_turn_only_and_never_persist_as_approvals() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const TOOL_NAME: &str = "lighthouse/run_audit";
+
+    struct CronMcpProbe {
+        calls: Arc<AtomicUsize>,
+        identity: baybo_model::McpTransportIdentity,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for CronMcpProbe {
+        fn name(&self) -> &str {
+            TOOL_NAME
+        }
+
+        fn description(&self) -> String {
+            "exercise a typed MCP grant through the live actor".to_string()
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type": "object", "properties": {}})
+        }
+
+        fn accessed_resources(
+            &self,
+            _params: &serde_json::Value,
+        ) -> Vec<baybo_model::ResourceAccess> {
+            vec![baybo_model::ResourceAccess::Http {
+                host: "mcp.example".to_string(),
+            }]
+        }
+
+        fn mcp_metadata(&self) -> Option<baybo_tools::mcp::McpToolMetadata> {
+            Some(baybo_tools::mcp::McpToolMetadata {
+                tool_name: TOOL_NAME.to_string(),
+                server_name: "lighthouse".to_string(),
+                upstream_name: "run_audit".to_string(),
+                transport_identity: self.identity.clone(),
+                transport_accesses: self.accessed_resources(&json!({})),
+            })
+        }
+
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _ctx: &baybo_tools::ToolContext,
+        ) -> baybo_tools::Result<ToolOutput> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolOutput::Text("audit complete".to_string()))
+        }
+    }
+
+    let identity = baybo_model::McpTransportIdentity::from_sha256([31; 32]);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let tool: Arc<dyn Tool> = Arc::new(CronMcpProbe {
+        calls: Arc::clone(&calls),
+        identity: identity.clone(),
+    });
+    let manifest = baybo_tools::ToolManifest {
+        name: TOOL_NAME.to_string(),
+        description: "exercise a typed MCP grant through the live actor".to_string(),
+        trust_level: baybo_model::TrustLevel::Trusted,
+        parameters_schema: json!({"type": "object", "properties": {}}),
+        capabilities: vec![baybo_tools::ToolCapability::Http],
+        channels: Vec::new(),
+    };
+    let mut session = SessionBuilder::new().build();
+    session.trigger = TriggerSource::Cron {
+        cron_job_id: "cj-granted".to_string(),
+        origin_session_id: None,
+        conversation: true,
+        job_title: Some("Granted job".to_string()),
+        project_id: None,
+    };
+    let session_id = session.id.clone();
+    let mut harness = AgentTestHarness::builder()
+        .session(session)
+        .with_tool(tool, manifest)
+        .build();
+
+    harness.stub_llm.push_response(LlmResponse {
+        content: String::new(),
+        content_blocks: vec![],
+        tool_calls: vec![ToolCallInfo {
+            id: "cron-call".to_string(),
+            name: TOOL_NAME.to_string(),
+            arguments: json!({}),
+            signature: None,
+        }],
+        usage: Default::default(),
+        thinking: None,
+    });
+    harness.stub_llm.push_response(LlmResponse {
+        content: "initial fire finished".to_string(),
+        content_blocks: vec![],
+        tool_calls: vec![],
+        usage: Default::default(),
+        thinking: None,
+    });
+    harness
+        .mailbox
+        .send(AgentMessage::CronTrigger {
+            builtin: None,
+            job_id: "cj-granted".to_string(),
+            title: "Granted job".to_string(),
+            prompt: "run the selected audit".to_string(),
+            mcp_tool_grants: vec![baybo_model::McpToolGrant::new(TOOL_NAME, identity)],
+            delivery: baybo_agent::actor::CronDelivery::Channel,
+        })
+        .await
+        .expect("mailbox accepts the fire");
+    harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the exact grant must authorize the selected tool on the initial cron turn"
+    );
+    let after_fire = harness
+        .session_manager
+        .get(&session_id)
+        .await
+        .unwrap()
+        .expect("fire session persists");
+    assert!(
+        after_fire.state.approved_resources.is_empty(),
+        "initial cron grants must never be copied into durable SessionState"
+    );
+
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::ToolCall(ToolCallInfo {
+            id: "reply-call".to_string(),
+            name: TOOL_NAME.to_string(),
+            arguments: json!({}),
+            signature: None,
+        })]);
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("approval unavailable".to_string())]);
+    harness.send_text("run that audit again").await.unwrap();
+    harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a later reply must not inherit the initial cron turn's grant"
+    );
+    let after_reply = harness
+        .session_manager
+        .get(&session_id)
+        .await
+        .unwrap()
+        .expect("fire session persists after a reply");
+    assert!(
+        after_reply.state.approved_resources.is_empty(),
+        "neither the initial grant nor the denied later call may seed session approvals"
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn cron_mcp_grants_follow_a_spawned_child_without_becoming_session_approvals() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const TOOL_NAME: &str = "browser/navigate_page";
+
+    struct ZeroAccessMcpProbe {
+        calls: Arc<AtomicUsize>,
+        identity: baybo_model::McpTransportIdentity,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for ZeroAccessMcpProbe {
+        fn name(&self) -> &str {
+            TOOL_NAME
+        }
+
+        fn description(&self) -> String {
+            "zero-access typed MCP probe".to_string()
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type": "object", "properties": {}})
+        }
+
+        fn mcp_metadata(&self) -> Option<baybo_tools::mcp::McpToolMetadata> {
+            Some(baybo_tools::mcp::McpToolMetadata {
+                tool_name: TOOL_NAME.to_string(),
+                server_name: "browser".to_string(),
+                upstream_name: "navigate_page".to_string(),
+                transport_identity: self.identity.clone(),
+                transport_accesses: Vec::new(),
+            })
+        }
+
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _ctx: &baybo_tools::ToolContext,
+        ) -> baybo_tools::Result<ToolOutput> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolOutput::Text("page opened".to_string()))
+        }
+    }
+
+    let identity = baybo_model::McpTransportIdentity::from_sha256([41; 32]);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let tool: Arc<dyn Tool> = Arc::new(ZeroAccessMcpProbe {
+        calls: Arc::clone(&calls),
+        identity: identity.clone(),
+    });
+    let manifest = baybo_tools::ToolManifest {
+        name: TOOL_NAME.to_string(),
+        description: "zero-access typed MCP probe".to_string(),
+        trust_level: baybo_model::TrustLevel::Trusted,
+        parameters_schema: json!({"type": "object", "properties": {}}),
+        capabilities: Vec::new(),
+        channels: Vec::new(),
+    };
+    let mut session = SessionBuilder::new()
+        .channel(baybo_model::ChannelType::from("subagent"))
+        .build();
+    session.trigger = TriggerSource::Cron {
+        cron_job_id: "cj-child-grant".to_string(),
+        origin_session_id: None,
+        conversation: true,
+        job_title: Some("Child grant".to_string()),
+        project_id: None,
+    };
+    let session_id = session.id.clone();
+    let mut harness = AgentTestHarness::builder()
+        .session(session)
+        .with_tool(tool, manifest)
+        .build();
+
+    let child_session_id = harness.session.id.clone();
+    let child_channel = harness.session.channel.clone();
+    let child_user = harness.session.user.clone();
+    let child_message = move |id: &str| IncomingMessage {
+        message: Message {
+            id: id.to_string(),
+            session_id: child_session_id.clone(),
+            channel: child_channel.clone(),
+            sender: child_user.clone(),
+            content: vec![ContentBlock::Text("open the page".to_string())],
+            timestamp: Utc::now(),
+            reply_to: None,
+            metadata: MessageMetadata::default(),
+        },
+        platform_msg_id: String::new(),
+        bot_id: String::new(),
+    };
+    let queue_turn = |harness: &AgentTestHarness, id: &str| {
+        harness
+            .stub_llm
+            .push_stream(vec![StreamEvent::ToolCall(ToolCallInfo {
+                id: format!("call-{id}"),
+                name: TOOL_NAME.to_string(),
+                arguments: json!({}),
+                signature: None,
+            })]);
+        harness
+            .stub_llm
+            .push_stream(vec![StreamEvent::Text(format!("finished {id}"))]);
+    };
+
+    queue_turn(&harness, "granted");
+    harness
+        .mailbox
+        .send(AgentMessage::SubagentSpawned {
+            initial_message: Box::new(child_message("spawn-granted")),
+            parent_turn_id: baybo_model::TurnId::default(),
+            inherited_context: Some(baybo_model::InheritedToolContext::new(vec![
+                baybo_model::McpToolGrant::new(TOOL_NAME, identity),
+            ])),
+        })
+        .await
+        .expect("child turn accepted");
+    harness.drain_outputs(DRAIN_TIMEOUT).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    queue_turn(&harness, "ungranted");
+    harness
+        .mailbox
+        .send(AgentMessage::SubagentSpawned {
+            initial_message: Box::new(child_message("spawn-ungranted")),
+            parent_turn_id: baybo_model::TurnId::default(),
+            inherited_context: Some(baybo_model::InheritedToolContext::default()),
+        })
+        .await
+        .expect("ungranted child turn accepted");
+    harness.drain_outputs(DRAIN_TIMEOUT).await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "Some(empty) must retain unattended fail-closed policy"
+    );
+
+    queue_turn(&harness, "ordinary-resume");
+    harness
+        .mailbox
+        .send(AgentMessage::SubagentSpawned {
+            initial_message: Box::new(child_message("spawn-ordinary")),
+            parent_turn_id: baybo_model::TurnId::default(),
+            inherited_context: None,
+        })
+        .await
+        .expect("ordinary resumed child turn accepted");
+    harness.drain_outputs(DRAIN_TIMEOUT).await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "cron authority must not leak into an independently resumed child turn"
+    );
+
+    let stored = harness
+        .session_manager
+        .get(&session_id)
+        .await
+        .unwrap()
+        .expect("child session persists");
+    assert!(stored.state.approved_resources.is_empty());
 
     harness.shutdown().await;
 }
@@ -2901,6 +3232,7 @@ async fn recurring_fire_that_reports_nothing_notifies_no_one() {
             job_id: "cj-watch".into(),
             title: "Watcher".into(),
             prompt: "check the build; report only if it broke".into(),
+            mcp_tool_grants: Vec::new(),
             delivery: baybo_agent::actor::CronDelivery::Channel,
         })
         .await
@@ -3011,6 +3343,7 @@ async fn one_shot_cron_result_lands_in_the_scheduling_conversation() {
         updated_at: chrono::Utc::now(),
         project_id: None,
         origin_session_id: Some(origin_id.clone()),
+        mcp_tool_grants: Vec::new(),
         deleted_at: None,
         pinned: false,
         builtin: false,
@@ -3018,9 +3351,16 @@ async fn one_shot_cron_result_lands_in_the_scheduling_conversation() {
     let execution = CronExecution::pending(&turn, chrono::Utc::now(), chrono::Utc::now());
     harness
         .cron_store
-        .record_execution(&execution)
+        .create(&turn)
         .await
-        .expect("record execution");
+        .expect("record source job");
+    assert!(
+        harness
+            .cron_store
+            .record_execution_if_job_unchanged(&execution, &turn)
+            .await
+            .expect("record execution")
+    );
     harness
         .cron_store
         .record_execution_completion(
@@ -3169,16 +3509,20 @@ async fn replayed_cron_result_does_not_duplicate_the_notification() {
         updated_at: chrono::Utc::now(),
         project_id: None,
         origin_session_id: Some(origin_id.clone()),
+        mcp_tool_grants: Vec::new(),
         deleted_at: None,
         pinned: false,
         builtin: false,
     };
     let execution = CronExecution::pending(&turn, chrono::Utc::now(), chrono::Utc::now());
-    harness
-        .cron_store
-        .record_execution(&execution)
-        .await
-        .unwrap();
+    harness.cron_store.create(&turn).await.unwrap();
+    assert!(
+        harness
+            .cron_store
+            .record_execution_if_job_unchanged(&execution, &turn)
+            .await
+            .unwrap()
+    );
     harness
         .cron_store
         .record_execution_completion(
@@ -3308,6 +3652,7 @@ async fn a_failed_recurring_fire_reports_a_real_notification_in_its_conversation
             job_id: "cj-news".into(),
             title: "Daily news".into(),
             prompt: "Summarise the news".into(),
+            mcp_tool_grants: Vec::new(),
             delivery: baybo_agent::actor::CronDelivery::Channel,
         })
         .await
@@ -3386,16 +3731,20 @@ async fn a_cron_notification_that_cannot_be_persisted_is_not_marked_delivered() 
         updated_at: chrono::Utc::now(),
         project_id: None,
         origin_session_id: Some(origin_id.clone()),
+        mcp_tool_grants: Vec::new(),
         deleted_at: None,
         pinned: false,
         builtin: false,
     };
     let execution = CronExecution::pending(&turn, chrono::Utc::now(), chrono::Utc::now());
-    harness
-        .cron_store
-        .record_execution(&execution)
-        .await
-        .unwrap();
+    harness.cron_store.create(&turn).await.unwrap();
+    assert!(
+        harness
+            .cron_store
+            .record_execution_if_job_unchanged(&execution, &turn)
+            .await
+            .unwrap()
+    );
     harness
         .cron_store
         .record_execution_completion(

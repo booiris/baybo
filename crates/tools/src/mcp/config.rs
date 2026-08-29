@@ -91,6 +91,17 @@ pub struct McpServerEntry {
 }
 
 impl McpServerEntry {
+    pub fn transport_identity<I, S>(
+        &self,
+        env_names: I,
+    ) -> McpResult<baybo_model::McpTransportIdentity>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        crate::mcp::identity::transport_identity(self, env_names)
+    }
+
     pub fn validate(&self) -> McpResult<()> {
         if self.name.is_empty() {
             return Err(McpError::InvalidConfig(

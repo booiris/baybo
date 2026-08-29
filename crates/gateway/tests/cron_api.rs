@@ -5,7 +5,7 @@
 
 use axum::body::{self, Body};
 use axum::http::{Request, StatusCode};
-use baybo_gateway::test_support::build_test_deps;
+use baybo_gateway::test_support::{TEST_ADMIN_TOKEN, build_test_deps};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -481,6 +481,63 @@ async fn a_blank_prompt_is_refused_on_create_and_on_edit() {
     assert_eq!(trigger_at(&unchanged), trigger_at(&created));
 }
 
+#[tokio::test]
+async fn cron_mcp_tools_route_is_not_exposed() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let router = build_authenticated_router(&tg);
+
+    admin_get(&router, "/v1/cron/mcp-tools", StatusCode::NOT_FOUND).await;
+}
+
+#[tokio::test]
+async fn admin_http_hides_and_preserves_agent_managed_mcp_grants() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let grant = baybo_model::McpToolGrant::new(
+        "alpha/read",
+        baybo_model::McpTransportIdentity::from_sha256([0x11; 32]),
+    );
+    let job = tg
+        .deps
+        .cron_scheduler
+        .create_job_with_mcp_tool_grants(
+            baybo_cron::NewCronJob {
+                user_id: "owner".to_string(),
+                channel: baybo_model::ChannelType::owner(),
+                title: "Agent-managed grant".to_string(),
+                schedule: baybo_model::CronSchedule::cron("0 9 * * *"),
+                prompt: "Read the report".to_string(),
+                timezone: "UTC".to_string(),
+                origin_session_id: None,
+                project_id: None,
+            },
+            vec![grant.clone()],
+        )
+        .await
+        .expect("create agent-managed job");
+    let uri = format!("/v1/cron/{}", job.id);
+    let router = build_router(build_admin_state(&tg));
+
+    let fetched = get(&router, &uri, StatusCode::OK).await;
+    assert!(fetched.get("mcp_tool_grants").is_none());
+    let updated = patch_expect(
+        &router,
+        &uri,
+        json!({"prompt": "Read the updated report"}),
+        StatusCode::OK,
+    )
+    .await;
+    assert!(updated.get("mcp_tool_grants").is_none());
+
+    let stored = tg
+        .deps
+        .cron_scheduler
+        .get_job(&job.id)
+        .await
+        .expect("read job")
+        .expect("job exists");
+    assert_eq!(stored.mcp_tool_grants, vec![grant]);
+}
+
 // ── helpers ─────────────────────────────────────────────────────────
 
 fn trigger_at(job: &Value) -> Option<DateTime<Utc>> {
@@ -516,6 +573,10 @@ fn build_router(state: baybo_gateway::server::AdminState) -> axum::Router {
     router.with_state(state)
 }
 
+fn build_authenticated_router(tg: &baybo_gateway::test_support::TestGateway) -> axum::Router {
+    baybo_gateway::server::build_admin_router_for_tests(&tg.deps)
+}
+
 async fn request(
     router: &axum::Router,
     method: &str,
@@ -523,7 +584,21 @@ async fn request(
     body: Option<Value>,
     expected: StatusCode,
 ) -> Value {
-    let builder = Request::builder().method(method).uri(uri);
+    request_with_token(router, method, uri, body, expected, None).await
+}
+
+async fn request_with_token(
+    router: &axum::Router,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+    expected: StatusCode,
+    token: Option<&str>,
+) -> Value {
+    let mut builder = Request::builder().method(method).uri(uri);
+    if let Some(token) = token {
+        builder = builder.header("authorization", format!("Bearer {token}"));
+    }
     let request = match body {
         Some(v) => builder
             .header("content-type", "application/json")
@@ -551,12 +626,26 @@ async fn request(
     serde_json::from_slice(&bytes).expect("response is json")
 }
 
+async fn admin_request(
+    router: &axum::Router,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+    expected: StatusCode,
+) -> Value {
+    request_with_token(router, method, uri, body, expected, Some(TEST_ADMIN_TOKEN)).await
+}
+
 async fn get(router: &axum::Router, uri: &str, expected: StatusCode) -> Value {
     request(router, "GET", uri, None, expected).await
 }
 
 async fn post_expect(router: &axum::Router, uri: &str, body: Value, expected: StatusCode) -> Value {
     request(router, "POST", uri, Some(body), expected).await
+}
+
+async fn admin_get(router: &axum::Router, uri: &str, expected: StatusCode) -> Value {
+    admin_request(router, "GET", uri, None, expected).await
 }
 
 async fn patch_expect(
