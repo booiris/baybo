@@ -897,13 +897,14 @@ export function ChatPage() {
     (sid: string, entry: OutboxEntry): boolean => {
       const ws = wsRef.current;
       if (!ws || statusRef.current.state !== 'connected') return false;
-      ws.sendMessage({
+      const sent = ws.sendMessage({
         sessionId: sid,
         userId: 'web-operator',
         content: entry.text,
         clientMsgId: entry.platformMsgId,
         attachments: entry.attachments,
       });
+      if (!sent) return false;
       outbox.recordTransmission(sid, entry.platformMsgId);
       return true;
     },
@@ -1657,6 +1658,7 @@ export function ChatPage() {
     releaseSessionView,
     enqueueDelta,
     cancelPacer,
+    seedPacer,
     flushPacerKeepStreaming,
     folderStore,
     outbox,
@@ -2568,7 +2570,7 @@ export function ChatPage() {
         }
       }
     },
-    [sendToSession],
+    [sendToSession, sendBatchToSession],
   );
 
   useEffect(() => {

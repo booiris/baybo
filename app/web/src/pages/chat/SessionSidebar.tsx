@@ -955,7 +955,7 @@ export function SessionSidebar({
     const ids: string[] = [];
     for (const f of folders) ids.push(`${FOLDER_PREFIX}${f.id}`);
     return ids;
-  }, [folders, sessions]);
+  }, [folders]);
 
   const draggingSession =
     dragging?.kind === 'chat'
