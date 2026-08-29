@@ -427,12 +427,43 @@ struct DeckStoreTests {
         #expect(store.recycle.map(\.cardId) == ["gone"])
 
         store.restore(cardId: "gone")
-        // OPTIMISTIC: the row leaves at the tap, before the (slow —
-        // dry-run-gated) restore call returns.
+        // OPTIMISTIC: the row leaves at the tap, before the restore returns.
         #expect(store.recycle.isEmpty, "row leaves the bin at the tap")
         await store.actionTask?.value
         #expect(fake.deckRestores == ["gone"])
         #expect(store.recycle.isEmpty)
+        DeckStore.removeMirror()
+    }
+
+    @Test func purgePermanentlyDeletesTheRecycledCard() async {
+        let fake = FakeBayboClient()
+        fake.deckRecycleList = [card("gone", position: 0)]
+        fake.deckView = DeckView(cards: [], snapshots: [])
+        let store = makeStore(fake)
+        await store.fetchRecycleNow()
+
+        store.purge(cardId: "gone")
+        #expect(store.recycle.isEmpty, "row leaves the bin at the confirmed action")
+        await store.actionTask?.value
+        #expect(fake.deckPurges == ["gone"])
+        #expect(store.recycle.isEmpty)
+        DeckStore.removeMirror()
+    }
+
+    @Test func purgeFailureRollsTheRowBackIntoTheBin() async {
+        let fake = FakeBayboClient()
+        fake.deckRecycleList = [card("gone", position: 0)]
+        fake.deckView = DeckView(cards: [], snapshots: [])
+        let store = makeStore(fake)
+        await store.fetchRecycleNow()
+
+        fake.deckRecycleList = []
+        store.purge(cardId: "gone")
+        #expect(store.recycle.isEmpty, "optimistic removal still happens")
+        await store.actionTask?.value
+        #expect(
+            store.recycle.map(\.cardId) == ["gone"],
+            "failed purge rolls the row back")
         DeckStore.removeMirror()
     }
 
@@ -443,8 +474,8 @@ struct DeckStoreTests {
         let store = makeStore(fake)
         await store.fetchRecycleNow()
 
-        // The fake throws for a card absent from its recycle list — the
-        // gateway's dry-run gate refusing the restore looks the same.
+        // The fake throws for a card absent from its recycle list — the same
+        // failure shape as a gateway refusing the restore.
         fake.deckRecycleList = []
         store.restore(cardId: "gone")
         #expect(store.recycle.isEmpty, "optimistic removal still happens")

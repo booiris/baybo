@@ -21,6 +21,7 @@ private struct DeckRecycleContent: View {
     @ObservedObject var deck: DeckStore
     let dismiss: () -> Void
     @ObservedObject private var lang = Lang.shared
+    @State private var pendingPurge: DeckStore.RecycledCard?
 
     var body: some View {
         ZStack(alignment: .top) {
@@ -41,6 +42,26 @@ private struct DeckRecycleContent: View {
         .background(PopGestureEnabler().frame(width: 0, height: 0))
         .task {
             await deck.fetchRecycleNow()
+        }
+        .alert(
+            Text(verbatim: lang.t("deck.purgeTitle")),
+            isPresented: Binding(
+                get: { pendingPurge != nil },
+                set: { if !$0 { pendingPurge = nil } }
+            )
+        ) {
+            Button(lang.t("common.cancel"), role: .cancel) {
+                pendingPurge = nil
+            }
+            Button(lang.t("deck.purge"), role: .destructive) {
+                if let card = pendingPurge {
+                    pendingPurge = nil
+                    deck.purge(cardId: card.cardId)
+                }
+            }
+            .accessibilityIdentifier("deck-purge-confirm")
+        } message: {
+            Text(verbatim: lang.t("deck.purgeBody", pendingPurge?.title ?? ""))
         }
     }
 
@@ -90,6 +111,22 @@ private struct DeckRecycleContent: View {
                 .listRowBackground(Theme.paper)
                 .listRowSeparatorTint(Theme.line)
                 .listRowInsets(EdgeInsets(top: 0, leading: 24, bottom: 0, trailing: 24))
+                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                    Button(role: .destructive) {
+                        pendingPurge = card
+                    } label: {
+                        Label(lang.t("deck.purge"), systemImage: "trash")
+                    }
+                    .accessibilityIdentifier("deck-purge-\(card.cardId)")
+                }
+                .contextMenu {
+                    Button(role: .destructive) {
+                        pendingPurge = card
+                    } label: {
+                        Label(lang.t("deck.purge"), systemImage: "trash")
+                    }
+                    .accessibilityIdentifier("deck-purge-context-\(card.cardId)")
+                }
             }
         }
         .listStyle(.plain)
@@ -106,8 +143,8 @@ private struct DeckRecycleContent: View {
 }
 
 /// One recycled card: title + when it was deleted, with the restore action as
-/// the right column. The restore is a plain ink pill — the row's only action,
-/// no swipe to discover.
+/// the right column. Permanent deletion stays behind a destructive swipe or
+/// long-press menu and a native confirmation.
 struct DeckRecycleRowView: View {
     let card: DeckStore.RecycledCard
     let langCode: String

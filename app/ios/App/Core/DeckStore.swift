@@ -65,6 +65,27 @@ final class DeckStore: ObservableObject {
         var id: String { cardId }
     }
 
+    private enum RecycleMutation {
+        case restore
+        case purge
+
+        var logName: String {
+            switch self {
+            case .restore: "restore"
+            case .purge: "purge"
+            }
+        }
+
+        func perform(client: any BayboClientProtocol, cardId: String) async throws {
+            switch self {
+            case .restore:
+                _ = try await client.deckRestore(cardId: cardId)
+            case .purge:
+                try await client.deckPurge(cardId: cardId)
+            }
+        }
+    }
+
     /// The blob ref returned to a card from `deck.pickBlob` — serialized as the
     /// `pick_result.ref` the card SDK resolves with.
     struct PickRef: Encodable {
@@ -770,22 +791,28 @@ final class DeckStore: ObservableObject {
         }
     }
 
-    /// Restore one card out of the bin. OPTIMISTIC: the row leaves the
-    /// list at the tap — the gateway's restore is slow by design (it
-    /// re-runs the dry-run admission gate: boot the service, invoke the
-    /// refresh op once, vet the snapshot — a deleted card is never
-    /// resurrected unvetted), and waiting on it left the row sitting
-    /// there for seconds. On failure the row comes back (the mutation
-    /// idiom: roll back to the baseline, never the negation).
+    /// Restore one card out of the bin. The shared recycle mutation removes
+    /// the row optimistically, then puts that exact baseline row back at its
+    /// prior position on failure.
     func restore(cardId: String) {
+        mutateRecycledCard(cardId: cardId, mutation: .restore)
+    }
+
+    /// Permanently delete a card that is already in the recycle bin. This is
+    /// reachable only after the native destructive confirmation.
+    func purge(cardId: String) {
+        mutateRecycledCard(cardId: cardId, mutation: .purge)
+    }
+
+    private func mutateRecycledCard(cardId: String, mutation: RecycleMutation) {
         guard let index = recycle.firstIndex(where: { $0.cardId == cardId }) else { return }
         let removed = recycle.remove(at: index)
         actionTask = Task { [weak self] in
             guard let self else { return }
             do {
-                _ = try await self.client.deckRestore(cardId: cardId)
+                try await mutation.perform(client: self.client, cardId: cardId)
             } catch {
-                NSLog("deck: restore failed: %@", String(describing: error))
+                NSLog("deck: %@ failed: %@", mutation.logName, String(describing: error))
                 if !self.recycle.contains(where: { $0.cardId == cardId }) {
                     self.recycle.insert(removed, at: min(index, self.recycle.count))
                 }

@@ -478,6 +478,7 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     private(set) var deckEnableCalls: [(String, Bool)] = []
     private(set) var deckDeletes: [String] = []
     private(set) var deckRestores: [String] = []
+    private(set) var deckPurges: [String] = []
     var deckLayoutError: Error?
 
     func deckFetch() async throws -> DeckView {
@@ -555,6 +556,16 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
             }
             deckRecycleList.removeAll { $0.cardId == cardId }
             return info
+        }
+    }
+
+    func deckPurge(cardId: String) async throws {
+        try lock.withLock {
+            deckPurges.append(cardId)
+            guard deckRecycleList.contains(where: { $0.cardId == cardId }) else {
+                throw Self.unsupported
+            }
+            deckRecycleList.removeAll { $0.cardId == cardId }
         }
     }
 

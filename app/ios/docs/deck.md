@@ -33,6 +33,12 @@ identity.
 
 Destructive card actions confirm **NATIVELY** — the shell only reports intent.
 
+The recycle bin is also native. Restore is the visible row action; permanent
+delete is available from either a long-press menu or a trailing destructive
+swipe with full-swipe disabled, followed by an explicit Cancel / Delete
+Permanently alert. Both remove the row optimistically and restore it in place
+if the active-leg request fails.
+
 ## Bridge
 
 `app/ios/App/Web/DeckBridge.swift` ⇄ `app/ios/web/src/deck/bridge.ts`.

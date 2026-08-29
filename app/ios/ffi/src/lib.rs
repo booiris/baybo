@@ -533,8 +533,7 @@ impl BayboClient {
 
     /// Soft-delete a card into the recycle bin (`DELETE /v1/deck/cards/{id}`):
     /// the service stops, the bundle files stay, and [`Self::deck_restore`]
-    /// undoes it. Purging is a desktop affordance; the phone offers only the
-    /// recoverable delete.
+    /// undoes it.
     pub async fn deck_delete(self: Arc<Self>, card_id: String) -> Result<(), BayboError> {
         runtime::run(async move {
             let client = self.gateway_client()?;
@@ -543,9 +542,20 @@ impl BayboClient {
         .await
     }
 
+    /// Permanently delete a card from the recycle bin
+    /// (`POST /v1/deck/cards/{id}/purge`). The gateway refuses a card that has
+    /// not first been soft-deleted.
+    pub async fn deck_purge(self: Arc<Self>, card_id: String) -> Result<(), BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::purge_deck_card(&client, card_id).await
+        })
+        .await
+    }
+
     /// Restore a card from the recycle bin (`POST /v1/deck/cards/{id}/restore`).
-    /// The gateway re-runs the dry-run gate first; failure leaves the card in
-    /// the bin with the error surfaced here. Success returns the live row.
+    /// The gateway clears the tombstone, starts the service, and returns the
+    /// live row; failure leaves the card in the bin.
     pub async fn deck_restore(
         self: Arc<Self>,
         card_id: String,

@@ -782,9 +782,20 @@ pub(crate) async fn delete_deck_card<C: GatewayJsonClient + Sync>(
     client.delete_empty(&path).await
 }
 
+/// Permanently delete a card from the recycle bin
+/// (`POST /v1/deck/cards/{id}/purge`). The gateway refuses live cards.
+pub(crate) async fn purge_deck_card<C: GatewayJsonClient + Sync>(
+    client: &C,
+    card_id: String,
+) -> Result<(), String> {
+    validate_path_segment(&card_id, "card_id")?;
+    let path = format!("{PATH_DECK}/cards/{card_id}/purge");
+    client.post_empty(&path, Vec::new()).await
+}
+
 /// Restore a card from the recycle bin (`POST /v1/deck/cards/{id}/restore`).
-/// The gateway re-runs the dry-run gate first; a failed gate leaves the card
-/// in the bin with the error returned here. Success returns the live row.
+/// The gateway clears the tombstone, starts the service, and returns the live
+/// row; a failed restore leaves the card in the bin.
 pub(crate) async fn restore_deck_card<C: GatewayJsonClient + Sync>(
     client: &C,
     card_id: String,
@@ -3654,6 +3665,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn purge_deck_card_posts_the_purge_path() {
+        let client = RecordingClient::empty();
+        purge_deck_card(&client, "c1".to_string())
+            .await
+            .expect("purge");
+        assert_eq!(
+            client.only_call(),
+            RecordedCall {
+                method: "POST",
+                path: "/v1/deck/cards/c1/purge".to_string(),
+                body: String::new(),
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn restore_deck_card_posts_restore_and_parses_the_returned_row() {
         let client = RecordingClient::new(
             r#"{"card_id":"c9","title":"Old card","position":3,"size":"wide","enabled":true,"quarantined":false,"spec_hash":"h9","last_seq":2,"created_at_ms":1751000000000}"#,
@@ -3678,6 +3705,7 @@ mod tests {
                 .is_err()
         );
         assert!(delete_deck_card(&client, "a/b".to_string()).await.is_err());
+        assert!(purge_deck_card(&client, "a/b".to_string()).await.is_err());
         assert!(restore_deck_card(&client, "a#b".to_string()).await.is_err());
         assert!(fetch_deck_bundle(&client, "a?b".to_string()).await.is_err());
         assert!(client.calls.lock().is_empty());
