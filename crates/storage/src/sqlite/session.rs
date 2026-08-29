@@ -721,6 +721,8 @@ impl SessionStore for SqliteSessionStore {
         let role = message.role.as_str().to_string();
         let content = serde_json::to_string(&message.content)
             .map_err(|e| StorageError::Storage(format!("serialize message content: {e}")))?;
+        let content = super::payload::EncodedText::prepare(content, "[]".to_string())
+            .map_err(StorageError::Internal)?;
         let now_us = super::time::to_us(chrono::Utc::now());
         let source = message.source().as_str().to_string();
         let platform_msg_id = message.platform_msg_id().to_string();
@@ -736,14 +738,24 @@ impl SessionStore for SqliteSessionStore {
                 // the two leaves the message permanently unsearchable, and
                 // nothing downstream can detect the gap.
                 let tx = conn.transaction()?;
+                content.persist(&tx)?;
                 let ordinal: i64 = tx
                     .query_row(
                         "INSERT INTO session_messages \
-                     (session_id, ordinal, role, content, created_at, source, platform_msg_id) \
-                     SELECT ?1, COALESCE(MAX(ordinal), -1) + 1, ?2, ?3, ?4, ?5, ?6 \
+                     (session_id, ordinal, role, content, created_at, source, platform_msg_id, \
+                      content_payload_hash) \
+                     SELECT ?1, COALESCE(MAX(ordinal), -1) + 1, ?2, ?3, ?4, ?5, ?6, ?7 \
                      FROM session_messages WHERE session_id = ?1 \
                      RETURNING ordinal",
-                        rusqlite::params![sid, role, content, now_us, source, platform_msg_id],
+                        rusqlite::params![
+                            sid,
+                            role,
+                            content.inline,
+                            now_us,
+                            source,
+                            platform_msg_id,
+                            content.hash,
+                        ],
                         |row| row.get(0),
                     )
                     .optional()?
@@ -772,6 +784,8 @@ impl SessionStore for SqliteSessionStore {
         let role = message.role.as_str().to_string();
         let content = serde_json::to_string(&message.content)
             .map_err(|e| StorageError::Storage(format!("serialize message content: {e}")))?;
+        let content = super::payload::EncodedText::prepare(content, "[]".to_string())
+            .map_err(StorageError::Internal)?;
         let now_us = super::time::to_us(chrono::Utc::now());
         let session_id = session_id.as_str().to_string();
         let source_event_id = source_event_id.to_string();
@@ -781,23 +795,25 @@ impl SessionStore for SqliteSessionStore {
         self.pool
             .interact_write("sessions.append_session_message_idempotent", move |conn| {
                 let tx = conn.transaction()?;
+                content.persist(&tx)?;
                 let inserted: Option<i64> = tx
                     .query_row(
                         "INSERT INTO session_messages \
                          (session_id, ordinal, role, content, created_at, source, \
-                          platform_msg_id, source_event_id) \
-                         SELECT ?1, COALESCE(MAX(ordinal), -1) + 1, ?2, ?3, ?4, ?5, ?6, ?7 \
+                          platform_msg_id, source_event_id, content_payload_hash) \
+                         SELECT ?1, COALESCE(MAX(ordinal), -1) + 1, ?2, ?3, ?4, ?5, ?6, ?7, ?8 \
                          FROM session_messages WHERE session_id = ?1 \
                          ON CONFLICT DO NOTHING \
                          RETURNING ordinal",
                         rusqlite::params![
                             session_id,
                             role,
-                            content,
+                            content.inline,
                             now_us,
                             source,
                             platform_msg_id,
                             source_event_id,
+                            content.hash,
                         ],
                         |row| row.get(0),
                     )
@@ -825,6 +841,9 @@ impl SessionStore for SqliteSessionStore {
                             "idempotent session_message insert returned no row and no existing key"
                         )
                     })?;
+                if let Some(hash) = content.hash.as_deref() {
+                    super::payload::delete_unreferenced(&tx, hash)?;
+                }
                 tx.commit()?;
                 Ok(SessionMessageAppendOutcome::Existing { ordinal })
             })
@@ -925,7 +944,7 @@ impl SessionStore for SqliteSessionStore {
         // deriving it inside the closure would mean carrying `ChatMessage` in.
         struct PreparedRow {
             role: String,
-            content: String,
+            content: super::payload::EncodedText,
             source: String,
             platform_msg_id: String,
             /// `None` for a row a chat surface never renders — the reseeded
@@ -936,6 +955,8 @@ impl SessionStore for SqliteSessionStore {
         for msg in new_active {
             let content = serde_json::to_string(&msg.content)
                 .map_err(|e| StorageError::Storage(format!("serialize message content: {e}")))?;
+            let content = super::payload::EncodedText::prepare(content, "[]".to_string())
+                .map_err(StorageError::Internal)?;
             prepared.push(PreparedRow {
                 role: msg.role.as_str().to_string(),
                 content,
@@ -969,11 +990,11 @@ impl SessionStore for SqliteSessionStore {
 
                 let now_us = super::time::to_us(chrono::Utc::now());
                 // Multi-row INSERT, batched under SQLite's 999-bind limit.
-                // 7 columns per row → 142 rows per batch leaves 5 spare;
+                // 8 columns per row → 124 rows per batch leaves 7 spare;
                 // typical Summarize emits ≤4 rows so this is one batch in
                 // practice. Keeps the whole compaction inside one tx and
                 // round-trip count constant (1) instead of O(new_active).
-                const COLS_PER_ROW: usize = 7;
+                const COLS_PER_ROW: usize = 8;
                 const ROWS_PER_BATCH: usize = 999 / COLS_PER_ROW;
                 for (chunk_idx, chunk) in prepared.chunks(ROWS_PER_BATCH).enumerate() {
                     // `compaction_inserted` is a literal `1` on every row this
@@ -984,7 +1005,8 @@ impl SessionStore for SqliteSessionStore {
                     // bound column, so `COLS_PER_ROW` stays the bind count.
                     let mut sql = String::from(
                         "INSERT INTO session_messages \
-                         (session_id, ordinal, role, content, created_at, source, platform_msg_id, compaction_inserted) VALUES ",
+                         (session_id, ordinal, role, content, created_at, source, platform_msg_id, \
+                          content_payload_hash, compaction_inserted) VALUES ",
                     );
                     let mut params: Vec<rusqlite::types::Value> =
                         Vec::with_capacity(chunk.len() * COLS_PER_ROW);
@@ -995,23 +1017,29 @@ impl SessionStore for SqliteSessionStore {
                         }
                         let p = i * COLS_PER_ROW;
                         sql.push_str(&format!(
-                            "(?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, 1)",
+                            "(?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, 1)",
                             p + 1,
                             p + 2,
                             p + 3,
                             p + 4,
                             p + 5,
                             p + 6,
-                            p + 7
+                            p + 7,
+                            p + 8
                         ));
                         let ordinal = next_ordinal + (chunk_idx * ROWS_PER_BATCH) as i64 + i as i64;
                         params.push(rusqlite::types::Value::Text(session_param.clone()));
                         params.push(rusqlite::types::Value::Integer(ordinal));
                         params.push(rusqlite::types::Value::Text(row.role.clone()));
-                        params.push(rusqlite::types::Value::Text(row.content.clone()));
+                        row.content.persist(&tx)?;
+                        params.push(rusqlite::types::Value::Text(row.content.inline.clone()));
                         params.push(rusqlite::types::Value::Integer(now_us));
                         params.push(rusqlite::types::Value::Text(row.source.clone()));
                         params.push(rusqlite::types::Value::Text(row.platform_msg_id.clone()));
+                        params.push(match &row.content.hash {
+                            Some(hash) => rusqlite::types::Value::Text(hash.clone()),
+                            None => rusqlite::types::Value::Null,
+                        });
                         if let Some(segmented) = row.segmented.as_deref() {
                             fts.push((ordinal, segmented));
                         }
@@ -1042,7 +1070,7 @@ impl SessionStore for SqliteSessionStore {
             .interact("sessions.load_active_session_message_rows", move |conn| {
                 let mut stmt = conn.prepare(
                     "SELECT ordinal, role, content, source, platform_msg_id \
-                     FROM session_messages \
+                     FROM session_messages_read \
                      WHERE session_id = ?1 AND superseded_by IS NULL \
                      ORDER BY ordinal",
                 )?;
@@ -1051,7 +1079,7 @@ impl SessionStore for SqliteSessionStore {
                         Ok((
                             row.get::<_, i64>(0)?,
                             row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
+                            super::payload::read_text(row, 2)?,
                             row.get::<_, String>(3)?,
                             row.get::<_, String>(4)?,
                         ))
@@ -1164,7 +1192,7 @@ impl SessionStore for SqliteSessionStore {
             .pool
             .interact("sessions.load_active_session_messages_tail", move |conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT ordinal, role, content, source, created_at, platform_msg_id FROM session_messages \
+                    "SELECT ordinal, role, content, source, created_at, platform_msg_id FROM session_messages_read \
                      WHERE session_id = ?1 AND compaction_inserted = 0 \
                        AND (?2 IS NULL OR ordinal < ?2) \
                      ORDER BY ordinal DESC \
@@ -1177,7 +1205,7 @@ impl SessionStore for SqliteSessionStore {
                             Ok((
                                 row.get::<_, i64>(0)?,
                                 row.get::<_, String>(1)?,
-                                row.get::<_, String>(2)?,
+                                super::payload::read_text(row, 2)?,
                                 row.get::<_, String>(3)?,
                                 row.get::<_, i64>(4)?,
                                 row.get::<_, String>(5)?,
@@ -1231,7 +1259,7 @@ impl SessionStore for SqliteSessionStore {
             .pool
             .interact("sessions.load_active_session_messages_since", move |conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT ordinal, role, content, source, created_at, platform_msg_id FROM session_messages \
+                    "SELECT ordinal, role, content, source, created_at, platform_msg_id FROM session_messages_read \
                      WHERE session_id = ?1 AND compaction_inserted = 0 \
                        AND ordinal > ?2 \
                      ORDER BY ordinal ASC \
@@ -1244,7 +1272,7 @@ impl SessionStore for SqliteSessionStore {
                             Ok((
                                 row.get::<_, i64>(0)?,
                                 row.get::<_, String>(1)?,
-                                row.get::<_, String>(2)?,
+                                super::payload::read_text(row, 2)?,
                                 row.get::<_, String>(3)?,
                                 row.get::<_, i64>(4)?,
                                 row.get::<_, String>(5)?,
@@ -1559,7 +1587,7 @@ impl SessionStore for SqliteSessionStore {
                     "SELECT session_id, created_at, role, content, source, platform_msg_id FROM ( \
                          SELECT session_id, created_at, role, content, source, platform_msg_id, \
                                 ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY ordinal DESC) rn \
-                         FROM session_messages \
+                         FROM session_messages_read \
                          WHERE session_id IN ({placeholders}) AND compaction_inserted = 0 \
                            AND source IN ({HUMAN_SOURCES_SQL}) \
                      ) WHERE rn = 1"
@@ -1570,7 +1598,7 @@ impl SessionStore for SqliteSessionStore {
                             row.get::<_, String>(0)?,
                             row.get::<_, i64>(1)?,
                             row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
+                            super::payload::read_text(row, 3)?,
                             row.get::<_, String>(4)?,
                             row.get::<_, String>(5)?,
                         ))
@@ -1613,7 +1641,7 @@ impl SessionStore for SqliteSessionStore {
                     "SELECT session_id, ordinal, created_at, role, content, source, platform_msg_id FROM ( \
                          SELECT session_id, ordinal, created_at, role, content, source, platform_msg_id, \
                                 ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY ordinal DESC) rn \
-                         FROM session_messages \
+                         FROM session_messages_read \
                          WHERE session_id IN ({placeholders}) AND compaction_inserted = 0 \
                      ) WHERE rn <= ? ORDER BY session_id, ordinal"
                 ))?;
@@ -1629,7 +1657,7 @@ impl SessionStore for SqliteSessionStore {
                             row.get::<_, i64>(1)?,
                             row.get::<_, i64>(2)?,
                             row.get::<_, String>(3)?,
-                            row.get::<_, String>(4)?,
+                            super::payload::read_text(row, 4)?,
                             row.get::<_, String>(5)?,
                             row.get::<_, String>(6)?,
                         ))
@@ -1673,7 +1701,7 @@ impl SessionStore for SqliteSessionStore {
                     "SELECT session_id, role, content, source, platform_msg_id FROM ( \
                          SELECT sm.session_id, sm.role, sm.content, sm.source, sm.platform_msg_id, \
                                 ROW_NUMBER() OVER (PARTITION BY sm.session_id ORDER BY sm.ordinal) rn \
-                         FROM session_messages sm JOIN sessions s ON s.id = sm.session_id \
+                         FROM session_messages_read sm JOIN sessions s ON s.id = sm.session_id \
                          WHERE sm.session_id IN ({placeholders}) AND sm.compaction_inserted = 0 \
                            AND sm.ordinal > COALESCE(s.read_cursor, -1) \
                      ) WHERE rn <= ? ORDER BY session_id"
@@ -1688,7 +1716,7 @@ impl SessionStore for SqliteSessionStore {
                         Ok((
                             row.get::<_, String>(0)?,
                             row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
+                            super::payload::read_text(row, 2)?,
                             row.get::<_, String>(3)?,
                             row.get::<_, String>(4)?,
                         ))
@@ -1864,7 +1892,7 @@ impl SqliteSessionStore {
             .interact("sessions.load_session_messages_with_supersede", move |conn| {
                 let mut stmt = conn.prepare(
                     "SELECT ordinal, superseded_by, role, content, created_at, source, platform_msg_id, compaction_inserted \
-                     FROM session_messages \
+                     FROM session_messages_read \
                      WHERE session_id = ?1 AND ordinal > ?2 ORDER BY ordinal",
                 )?;
                 let rows = stmt
@@ -1873,7 +1901,7 @@ impl SqliteSessionStore {
                             row.get::<_, i64>(0)?,
                             row.get::<_, Option<i64>>(1)?,
                             row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
+                            super::payload::read_text(row, 3)?,
                             row.get::<_, i64>(4)?,
                             row.get::<_, String>(5)?,
                             row.get::<_, String>(6)?,
@@ -2524,6 +2552,7 @@ mod tests {
             .unwrap();
         assert_eq!(loaded[0].platform_msg_id(), "device-msg-1");
 
+        exec(&pool, "DROP VIEW session_messages_read", Vec::new()).await;
         exec(
             &pool,
             "ALTER TABLE session_messages DROP COLUMN platform_msg_id",
@@ -2630,6 +2659,7 @@ mod tests {
             Vec::new(),
         )
         .await;
+        exec(&pool, "DROP VIEW session_messages_read", Vec::new()).await;
         exec(
             &pool,
             "ALTER TABLE session_messages DROP COLUMN source_event_id",

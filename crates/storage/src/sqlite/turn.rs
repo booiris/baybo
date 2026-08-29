@@ -52,7 +52,7 @@ fn raw_turn_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawTurnRow> {
         row.get(5)?,
         row.get(6)?,
         row.get(7)?,
-        row.get(8)?,
+        super::payload::read_text(row, 8)?,
     ))
 }
 
@@ -89,14 +89,17 @@ impl TurnStore for SqliteTurnStore {
         let created_at = super::time::to_us(turn.created_at);
         let started_at = turn.started_at.map(super::time::to_us);
         let ended_at = turn.ended_at.map(super::time::to_us);
-        let data = turn.data.clone();
+        let data = super::payload::EncodedText::prepare(turn.data.clone(), "{}".to_string())
+            .map_err(StorageError::Internal)?;
         self.pool
             .interact_write("turns.create", move |conn| {
-                conn.execute(
+                let tx = conn.transaction()?;
+                data.persist(&tx)?;
+                tx.execute(
                     "INSERT INTO turns \
                      (id, session_id, parent_turn_id, kind, status_kind, \
-                      created_at, started_at, ended_at, data) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                      created_at, started_at, ended_at, data, data_payload_hash) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                     rusqlite::params![
                         id,
                         session_id,
@@ -106,9 +109,11 @@ impl TurnStore for SqliteTurnStore {
                         created_at,
                         started_at,
                         ended_at,
-                        data,
+                        data.inline,
+                        data.hash,
                     ],
                 )?;
+                tx.commit()?;
                 Ok(())
             })
             .await
@@ -120,7 +125,7 @@ impl TurnStore for SqliteTurnStore {
             .interact("turns.get", move |conn| {
                 let raw = conn
                     .query_row(
-                        &format!("SELECT {SELECT_COLS} FROM turns WHERE id = ?1"),
+                        &format!("SELECT {SELECT_COLS} FROM turns_read WHERE id = ?1"),
                         rusqlite::params![id],
                         raw_turn_row,
                     )
@@ -134,16 +139,31 @@ impl TurnStore for SqliteTurnStore {
         let status_kind = turn.status_kind.clone();
         let started_at = turn.started_at.map(super::time::to_us);
         let ended_at = turn.ended_at.map(super::time::to_us);
-        let data = turn.data.clone();
+        let data = super::payload::EncodedText::prepare(turn.data.clone(), "{}".to_string())
+            .map_err(StorageError::Internal)?;
         let id = turn.id.to_string();
         let rows_affected = self
             .pool
             .interact_write("turns.save", move |conn| {
-                Ok(conn.execute(
-                    "UPDATE turns SET status_kind = ?1, started_at = ?2, ended_at = ?3, data = ?4 \
-                     WHERE id = ?5",
-                    rusqlite::params![status_kind, started_at, ended_at, data, id],
-                )?)
+                let tx = conn.transaction()?;
+                data.persist(&tx)?;
+                let rows_affected = tx.execute(
+                    "UPDATE turns SET status_kind = ?1, started_at = ?2, ended_at = ?3, \
+                                      data = ?4, data_payload_hash = ?5 \
+                     WHERE id = ?6",
+                    rusqlite::params![
+                        status_kind,
+                        started_at,
+                        ended_at,
+                        data.inline,
+                        data.hash,
+                        id,
+                    ],
+                )?;
+                if rows_affected > 0 {
+                    tx.commit()?;
+                }
+                Ok(rows_affected)
             })
             .await?;
         if rows_affected == 0 {
@@ -155,7 +175,9 @@ impl TurnStore for SqliteTurnStore {
     async fn list_by_session(&self, session_id: &SessionId) -> Result<Vec<TurnRow>> {
         self.collect(
             "turns.list_by_session",
-            format!("SELECT {SELECT_COLS} FROM turns WHERE session_id = ?1 ORDER BY created_at"),
+            format!(
+                "SELECT {SELECT_COLS} FROM turns_read WHERE session_id = ?1 ORDER BY created_at"
+            ),
             vec![Value::from(session_id.as_str().to_string())],
         )
         .await
@@ -165,7 +187,7 @@ impl TurnStore for SqliteTurnStore {
         self.collect(
             "turns.list_active_by_session",
             format!(
-                "SELECT {SELECT_COLS} FROM turns \
+                "SELECT {SELECT_COLS} FROM turns_read \
                  WHERE session_id = ?1 AND status_kind IN ({NON_TERMINAL_STATUS_SQL}) \
                  ORDER BY created_at"
             ),
@@ -193,7 +215,9 @@ impl TurnStore for SqliteTurnStore {
     async fn list_by_status_kind(&self, status_kind: &str) -> Result<Vec<TurnRow>> {
         self.collect(
             "turns.list_by_status_kind",
-            format!("SELECT {SELECT_COLS} FROM turns WHERE status_kind = ?1 ORDER BY created_at"),
+            format!(
+                "SELECT {SELECT_COLS} FROM turns_read WHERE status_kind = ?1 ORDER BY created_at"
+            ),
             vec![Value::from(status_kind.to_string())],
         )
         .await
@@ -203,7 +227,7 @@ impl TurnStore for SqliteTurnStore {
         self.collect(
             "turns.list_recoverable",
             format!(
-                "SELECT {SELECT_COLS} FROM turns \
+                "SELECT {SELECT_COLS} FROM turns_read \
                  WHERE status_kind IN ({NON_TERMINAL_STATUS_SQL}) ORDER BY created_at"
             ),
             vec![],
@@ -215,7 +239,7 @@ impl TurnStore for SqliteTurnStore {
         self.collect(
             "turns.list_children",
             format!(
-                "SELECT {SELECT_COLS} FROM turns WHERE parent_turn_id = ?1 ORDER BY created_at"
+                "SELECT {SELECT_COLS} FROM turns_read WHERE parent_turn_id = ?1 ORDER BY created_at"
             ),
             vec![Value::from(parent_turn_id.to_string())],
         )
@@ -225,7 +249,7 @@ impl TurnStore for SqliteTurnStore {
     async fn list_all(&self) -> Result<Vec<TurnRow>> {
         self.collect(
             "turns.list_all",
-            format!("SELECT {SELECT_COLS} FROM turns"),
+            format!("SELECT {SELECT_COLS} FROM turns_read"),
             vec![],
         )
         .await
@@ -260,7 +284,7 @@ impl TurnStore for SqliteTurnStore {
                     ("?1", "?2")
                 };
                 let mut stmt = conn.prepare(&format!(
-                    "SELECT {SELECT_COLS} FROM turns {filter} \
+                    "SELECT {SELECT_COLS} FROM turns_read {filter} \
                      ORDER BY created_at DESC, id DESC LIMIT {limit_ref} OFFSET {offset_ref}"
                 ))?;
                 let raws = stmt
@@ -565,6 +589,45 @@ mod tests {
         let j = test_turn();
         create(&store, &j).await;
         assert_eq!(load(&store, &j.id).await.unwrap().id, j.id);
+    }
+
+    #[tokio::test]
+    async fn large_turn_data_is_compressed_on_create_and_save() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
+        let store = SqliteTurnStore::new(pool.clone());
+        let mut row = test_turn().to_row().unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&row.data).unwrap();
+        value["payload_test"] = serde_json::Value::String("first body ".repeat(2_000));
+        row.data = serde_json::to_string(&value).unwrap();
+        store.create(&row).await.unwrap();
+
+        value["payload_test"] = serde_json::Value::String("replacement body ".repeat(2_000));
+        row.data = serde_json::to_string(&value).unwrap();
+        store.save(&row).await.unwrap();
+
+        let loaded = store.get(&row.id).await.unwrap().unwrap();
+        assert_eq!(loaded.data, row.data);
+        let (backed, payloads, references): (bool, i64, i64) = pool
+            .interact("test.read_turn_payload", {
+                let id = row.id.to_string();
+                move |conn| {
+                    Ok(conn.query_row(
+                        "SELECT data_payload_hash IS NOT NULL, \
+                                (SELECT COUNT(*) FROM content_payloads), \
+                                (SELECT COALESCE(SUM(ref_count), 0) FROM content_payloads) \
+                           FROM turns WHERE id = ?1",
+                        [id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )?)
+                }
+            })
+            .await
+            .unwrap();
+        assert!(backed);
+        assert_eq!((payloads, references), (1, 1));
     }
 
     #[tokio::test]
