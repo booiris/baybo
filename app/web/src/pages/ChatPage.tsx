@@ -34,7 +34,6 @@ import {
   RiCloseLine,
   RiDeleteBin6Line,
   RiErrorWarningLine,
-  RiFileLine,
   RiHistoryLine,
   RiInformation2Line,
   RiLoader4Line,
@@ -56,7 +55,7 @@ import {
   type WireWorkStep,
 } from '../api/chatWs';
 import type { components } from '../api/schema';
-import { AttachmentImage } from './chat/AttachmentImage';
+import { AttachmentList } from './chat/AttachmentList';
 import { QueuePanel } from './chat/QueuePanel';
 import { SessionSidebar } from './chat/SessionSidebar';
 import {
@@ -6210,41 +6209,6 @@ export const MarkdownBody = memo(function MarkdownBody({
     </MarkdownFallback>
   );
 });
-
-function AttachmentList({
-  attachments,
-  baseUrl,
-  adminToken,
-}: {
-  attachments: WireAttachment[];
-  baseUrl: string;
-  adminToken: string | null;
-}) {
-  return (
-    <div className="flex flex-wrap gap-2">
-      {attachments.map((a, i) =>
-        a.kind === 'image' ? (
-          <AttachmentImage
-            key={`${a.blob_id}-${i}`}
-            blobId={a.blob_id}
-            alt={a.filename ?? 'image'}
-            baseUrl={baseUrl}
-            adminToken={adminToken}
-          />
-        ) : (
-          <span
-            key={`${a.blob_id}-${i}`}
-            className="flex items-center gap-1.5 px-2 py-1 bg-canvas border-2 border-black rounded-md font-mono text-[0.7rem] max-w-full"
-            title={a.filename ?? a.mime_type}
-          >
-            <RiFileLine className="text-sm shrink-0" />
-            <span className="truncate">{a.filename ?? a.mime_type}</span>
-          </span>
-        ),
-      )}
-    </div>
-  );
-}
 
 /// A thread with no compaction behind it. Module-level so a reader that
 /// passes none doesn't hand the loop a fresh Map every render.

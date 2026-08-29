@@ -237,6 +237,8 @@ Composer chip rendering (~line 2379): attachments with a `previewUrl` render as 
 
 Note: in-thread attachment thumbnails are a *separate* concern from composer previews. Sent/received image attachments render via `AttachmentImage` (`app/web/src/pages/chat/AttachmentImage.tsx`), which fetches `GET /v1/blobs/<blobId>` with the admin bearer (an `<img>` tag can't send the auth header), turns the blob into an object URL, and shows a spinner while loading / a named placeholder chip on fetch failure. It re-fetches when `adminToken` lands and revokes the object URL on unmount. The thumbnail itself is a **button** — see the image viewer below.
 
+Non-image attachments render as named download chips. Pressing one calls the shared authenticated `downloadBlob` path (`app/web/src/api/blobs.ts`), which fetches `GET /v1/blobs/<blobId>` with the admin bearer, creates a short-lived object URL, and triggers a browser download under the attachment filename. A direct `<a href="/v1/blobs/…">` cannot be used because it would omit the bearer and download a 401 response instead of the file.
+
 ### Per-session model picker
 
 When a session is open and `models.length > 1`, the footer renders `ModelPicker` (~line 2471, component ~line 4635) just left of the send button. The model list and the global default name come from `GET /v1/llm/models`, fetched once on mount into `models` / `defaultModelName` (~line 601). The picker is hidden entirely when one or zero switchable models exist.
