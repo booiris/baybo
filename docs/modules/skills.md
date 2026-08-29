@@ -20,7 +20,7 @@ One directory per skill, a `SKILL.md` entrypoint with YAML frontmatter plus a Ma
 
 At startup the registry calls `SkillRegistry::register_builtins()` to register every skill compiled into the cargo `[[bin]]` (`crates/skills/src/builtin/<name>/SKILL.md`, embedded via `include_str!`), then scans the built-in agent's own directory, `<workspace.path>/personas/baybo/skills/<skill-name>/SKILL.md`. Every other agent's directory is scanned lazily — see [Every agent owns its skills](#every-agent-owns-its-skills). Compiled-in skills are `ArtifactSource::Inline` + `TrustLevel::Trusted`; an agent patches shipped behaviour for itself by having a same-named directory of its own, which shadows the builtin inside that agent's scope only.
 
-The first built-in is `baybo-cli` — a non-user-invocable skill that tells the agent to introspect the running Baybo instance through the `baybo` CLI (the BashTool auto-injects `BAYBO_HELP_AGENT` and `BAYBO_CONFIG_PATH`, so the agent sees the full inventory and the right config without needing flags). The second is `deck` — agent- and slash-invocable (`command: deck` with model invocation enabled) and owner-channel-only (`channels: [owner]`) — carrying the deck card bundle contract, the `ctx`/`deck` SDK surface, and worked examples for authoring or updating a card before `DeckCardCreate`/`DeckCardUpdate`. Its description lets the model select it for ordinary-language requests for persistent dashboard cards, while `/deck <request>` remains the explicit shortcut; see [`deck.md`](deck.md#authoring-pipeline). The third is `html-gen`: an agent- and slash-invocable, owner-only skill for authoring a self-contained HTML page, staging it through `PutBlob`, and returning the `baybo-html` blob marker understood by the iOS transcript.
+The first built-in is `baybo-cli` — a non-user-invocable skill that tells the agent to introspect the running Baybo instance through the `baybo` CLI (the BashTool auto-injects `BAYBO_HELP_AGENT` and `BAYBO_CONFIG_PATH`, so the agent sees the full inventory and the right config without needing flags). `baybo-help` is the user- and agent-invocable companion for Baybo concepts and troubleshooting: it defines the boundaries between agent, session, turn, channel, tool/skill, trace/log, workspace, context/memory, and gateway; links the relevant design docs; and makes source inspection local-first. When no checkout exists it must ask before downloading from `https://github.com/booiris/baybo`. `deck` is agent- and slash-invocable (`command: deck` with model invocation enabled) and owner-channel-only (`channels: [owner]`) — carrying the deck card bundle contract, the `ctx`/`deck` SDK surface, and worked examples for authoring or updating a card before `DeckCardCreate`/`DeckCardUpdate`. Its description lets the model select it for ordinary-language requests for persistent dashboard cards, while `/deck <request>` remains the explicit shortcut; see [`deck.md`](deck.md#authoring-pipeline). `html-gen` is an agent- and slash-invocable, owner-only skill for authoring a self-contained HTML page, staging it through `PutBlob`, and returning the `baybo-html` blob marker understood by the iOS transcript.
 
 ```
 <persona>/skills/     # personas/<agent_id>/, or personas/project/<agent_id>/
@@ -99,13 +99,14 @@ into the binary** (`crates/skills/src/builtin/<name>/SKILL.md`, embedded via
 `include_str!`). They belong to the process, not to any persona, which is what
 makes them safe to share: reaching one is never reaching into another agent's
 folder. The built-in scope sees all of them — the shipped set is what "default
-behaviour" means. A custom agent sees only `UNIVERSAL_SKILLS`, currently just
-`baybo-cli`: it tells the agent how to introspect the instance it is running
-inside (the Bash tool injects `BAYBO_HELP_AGENT` / `BAYBO_CONFIG_PATH` for
-exactly that), so it is runtime infrastructure rather than a capability anyone
-chose to grant — withholding it would not make a persona narrower, only
-blinder. `deck` is deliberately *not* in the list; an authoring tool is a
-capability, which is why a custom agent has no `/deck`.
+behaviour" means. A custom agent sees only `UNIVERSAL_SKILLS`: `baybo-cli`
+introspects the instance it is running inside (the Bash tool injects
+`BAYBO_HELP_AGENT` / `BAYBO_CONFIG_PATH` for exactly that), while `baybo-help`
+provides the Baybo-specific concept glossary, linked documentation, and
+consent-gated source lookup path. Both are runtime infrastructure rather than
+capabilities anyone chose to grant — withholding them would not make a persona
+narrower, only blinder. `deck` is deliberately *not* in the list; an authoring
+tool is a capability, which is why a custom agent has no `/deck`.
 
 `SkillRegistry` therefore holds two maps — compiled-in builtins, and a
 per-agent map keyed by profile id — and every session-scoped read goes through
