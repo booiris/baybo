@@ -187,7 +187,7 @@ impl Tool for CronCreateTool {
     }
 
     fn description(&self) -> String {
-        r#"Schedule a job whose `prompt` is run as a task on a timer. `title`, `timezone` and `prompt` are required; all times in and out are anchored to `timezone`. Supply exactly one of `schedule` (recurring cron expression, e.g. "0 9 * * *") or `at` (one-shot timestamp). A recurring fire opens its own conversation named after `title`; a one-shot fire reports its result back into THIS conversation and then stops, staying in the list as `executed`. When the scheduled task needs one or more MCP operations, include their exact current tool names in `permissions.mcp_tools`; the runtime binds those names to the live transport identities, so never invent an identity or omit a tool the future fire must call."#
+        r#"Schedule a job whose `prompt` is run as a task on a timer. `title`, `timezone` and `prompt` are required; all times in and out are anchored to `timezone`. Supply exactly one of `schedule` (recurring cron expression, e.g. "0 9 * * *") or `at` (one-shot timestamp). A recurring fire opens its own conversation named after `title`; a one-shot fire reports its result back into THIS conversation and then stops, staying in the list as `executed`."#
             .to_string()
     }
 
@@ -217,12 +217,12 @@ impl Tool for CronCreateTool {
                 },
                 "permissions": {
                     "type": "object",
-                    "description": "Authority the future unattended fire needs. Omit it when the task uses no MCP tools.",
+                    "description": "MCP access for future unattended fires. Omit it when none is needed.",
                     "properties": {
                         "mcp_tools": {
                             "type": "array",
                             "items": { "type": "string" },
-                            "description": "Complete current names of every MCP operation the scheduled task may call, exactly as they appear in the tool list (for example `browser/navigate_page`). Each name is resolved to its live transport identity before the job is saved."
+                            "description": "Exact current names of every MCP operation the task may call (for example `browser/navigate_page`)."
                         }
                     },
                     "required": ["mcp_tools"],
@@ -417,7 +417,7 @@ impl Tool for CronUpdateTool {
     }
 
     fn description(&self) -> String {
-        r#"Edit an existing cron job in place, by its ID: change its `prompt`, `title`, `schedule` / `at`, `timezone`, or MCP permissions. This is how you change a job the user already has ("move the reminder to 8am", "make it remind me about the dentist instead") — always prefer it to CronDelete + CronCreate, which mints a new job and throws away the old one's history; an edited job keeps its ID, its past runs, and the conversations they opened. Pass the ID plus only the fields that change: anything you leave out keeps its current value, and setting nothing at all is an error. Omit `permissions` to preserve existing authority; pass `permissions.mcp_tools: []` to revoke every MCP grant, or list the exact current MCP tool names the future fire needs to replace the grants. The runtime resolves names to live transport identities; never invent an identity. Changing `schedule` / `at` / `timezone` recomputes the next fire time FROM NOW — the fires the job missed are never made up — and a new `at` that has already passed is rejected. A PAUSED job stays paused: editing it does not start it again, so call CronResume when the user wants it running. A one-shot job that already fired CAN be re-armed by giving it a new `at` in the future. The updated job comes back with its new `next_trigger_at`, in its own timezone — tell the user when it will actually run next."#
+        r#"Edit an existing cron job in place, by its ID: change its `prompt`, `title`, `schedule` / `at`, `timezone`, or MCP permissions. This is how you change a job the user already has ("move the reminder to 8am", "make it remind me about the dentist instead") — always prefer it to CronDelete + CronCreate, which mints a new job and throws away the old one's history; an edited job keeps its ID, its past runs, and the conversations they opened. Pass the ID plus only the fields that change: anything you leave out keeps its current value, and setting nothing at all is an error. Changing `schedule` / `at` / `timezone` recomputes the next fire time FROM NOW — the fires the job missed are never made up — and a new `at` that has already passed is rejected. A PAUSED job stays paused: editing it does not start it again, so call CronResume when the user wants it running. A one-shot job that already fired CAN be re-armed by giving it a new `at` in the future. The updated job comes back with its new `next_trigger_at`, in its own timezone — tell the user when it will actually run next."#
             .to_string()
     }
 
@@ -451,12 +451,12 @@ impl Tool for CronUpdateTool {
                 },
                 "permissions": {
                     "type": "object",
-                    "description": "Replacement authority for future unattended fires. Omit this field to preserve the job's current MCP grants.",
+                    "description": "Replacement MCP access for future unattended fires. Omit it to preserve the current grants.",
                     "properties": {
                         "mcp_tools": {
                             "type": "array",
                             "items": { "type": "string" },
-                            "description": "Complete replacement list of current MCP operation names. Use an empty list to revoke every MCP grant. Each name is resolved to its live transport identity before the edit is saved."
+                            "description": "Exact current names of every permitted MCP operation; use an empty list to revoke all grants."
                         }
                     },
                     "required": ["mcp_tools"],
