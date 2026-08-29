@@ -58,9 +58,12 @@ pub struct PairingHostDeps {
     /// value must agree (anti-cross-binding: the relay can't wire the app to a
     /// gateway on a different endpoint).
     pub relay_url: String,
+    /// HTTP base for push `/register` + `/notify`. Kept separate from the relay
+    /// proxy because the public services may use different hosts.
+    pub push_url: String,
     /// The relay admission key (`x-remote-api-key`) the pairing legs present.
-    /// Persisted on the device row at `complete` so the gateway's later relay
-    /// control connection + push reuse the same key without a config block.
+    /// Persisted on the device row so the gateway's later relay control and data
+    /// legs reuse it without a config block. Push does not carry this key.
     pub remote_api_key: String,
 }
 
@@ -218,7 +221,8 @@ pub(crate) async fn drive<T: PairTransport + ?Sized>(
     // A's gateway push-signing key (Ed25519, vault-persisted, stable across
     // restarts). Its public half rides the welcome so the device can sign a
     // delegation authorizing it; its secret signs every later /register and
-    // /notify so C can reject a co-tenant's push under a shared remote_api_key.
+    // /notify so C can reject an unauthorized caller without a shared admission
+    // credential on the push path.
     let push_signing_key = crate::push::load_or_create_push_signing_key(&state.secret_vault)
         .await
         .map_err(|e| format!("push signing key: {e}"))?;
@@ -235,6 +239,7 @@ pub(crate) async fn drive<T: PairTransport + ?Sized>(
             &hello.device_id,
             app_static.to_vec(),
             &state.relay_url,
+            &state.push_url,
             &state.remote_api_key,
         )
         .await
@@ -464,6 +469,7 @@ mod tests {
             device_pairing: Arc::clone(&device_pairing),
             secret_vault: tg.deps.secret_vault.clone(),
             relay_url: String::new(),
+            push_url: "https://push.test".into(),
             remote_api_key: String::new(),
         };
         (deps, device_pairing)
@@ -616,6 +622,7 @@ mod tests {
         // active token, and the per-device push key (HKDF of `h`) is stored.
         let row = device_store.get(&device_id).await.unwrap().unwrap();
         assert_eq!(row.status, DeviceStatus::Approved);
+        assert_eq!(row.push_url, "https://push.test");
         assert_eq!(
             row.auth_token_sha256,
             baybo_store::device::hash_auth_token(&welcome.auth_token),

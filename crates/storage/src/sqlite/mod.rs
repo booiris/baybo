@@ -413,6 +413,11 @@ const ADD_COLUMNS: &[AddColumn] = &[
         definition: "TEXT NOT NULL DEFAULT ''",
     },
     AddColumn {
+        table: "devices",
+        column: "push_url",
+        definition: "TEXT NOT NULL DEFAULT ''",
+    },
+    AddColumn {
         table: "session_messages",
         column: "platform_msg_id",
         definition: "TEXT NOT NULL DEFAULT ''",
@@ -1508,6 +1513,7 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     approved_at   INTEGER,
                     last_seen_at  INTEGER,
                     relay_url     TEXT    NOT NULL DEFAULT '',
+                    push_url      TEXT    NOT NULL DEFAULT '',
                     remote_api_key  TEXT    NOT NULL DEFAULT '',
                     PRIMARY KEY (device_id)
                 );

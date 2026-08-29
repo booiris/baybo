@@ -7,7 +7,7 @@
 use crate::api::PairTarget;
 
 /// The hosted relay a QR without an explicit `h=` pairs against.
-pub(crate) const DEFAULT_ENDPOINT: &str = "wss://proxy.baybo.space";
+pub(crate) const DEFAULT_ENDPOINT: &str = remote_host_protocol::DEFAULT_PROXY_URL;
 
 const PAIR_SCHEME_PREFIX: &str = "baybo://pair";
 

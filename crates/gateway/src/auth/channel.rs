@@ -585,6 +585,7 @@ mod tests {
                 approved_at: Some(2),
                 last_seen_at: None,
                 relay_url: "wss://relay.test".into(),
+                push_url: "https://push.test".into(),
                 remote_api_key: "inst-test".into(),
             })
             .await
@@ -621,6 +622,7 @@ mod tests {
                 approved_at: Some(1),
                 last_seen_at: None,
                 relay_url: "wss://relay.test".into(),
+                push_url: "https://push.test".into(),
                 remote_api_key: "inst-test".into(),
             })
             .await

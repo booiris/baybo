@@ -29,7 +29,7 @@ use utoipa_axum::routes;
 
 use crate::api::dto::ErrorBody;
 use crate::auth::AuthedClient;
-use crate::push::{DEFAULT_PUSH_RELAY_URL, load_or_create_push_signing_key, web};
+use crate::push::{DEFAULT_PUSH_URL, load_or_create_push_signing_key, web};
 use crate::server::AdminState;
 use crate::{GatewayError, Result};
 
@@ -171,9 +171,8 @@ async fn register_push(
     })?;
     let device_id = delegation::device_id_for(&device_pub);
 
-    // Verify the delegation authorizes THIS gateway's push key. The remote API
-    // key marks admitted traffic but does not prove device ownership, so a
-    // binding without this delegation cannot prove ownership to C.
+    // Verify the delegation authorizes THIS gateway's push key. A binding
+    // without this delegation cannot prove ownership to C.
     let signing_key = load_or_create_push_signing_key(&state.secret_vault)
         .await
         .map_err(|e| GatewayError::Internal(format!("load push signing key: {e}")))?;
@@ -206,8 +205,7 @@ async fn register_push(
 
     let binding = web::WebPushBinding {
         device_id: device_id.clone(),
-        relay_url: DEFAULT_PUSH_RELAY_URL.to_string(),
-        remote_api_key: remote_host_protocol::DEFAULT_REMOTE_API_KEY.to_string(),
+        push_url: DEFAULT_PUSH_URL.to_string(),
         created_at: chrono::Utc::now().timestamp(),
     };
     web::store_binding(

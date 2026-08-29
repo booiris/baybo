@@ -5,8 +5,8 @@
 //! dispatcher in `dispatch_smoke.rs`.
 
 use baybo_cli::cli::{
-    ChannelCmd, Cli, Commands, ConfigCmd, CostCmd, CronCmd, LlmCmd, LogCmd, SessionCmd, ShellKind,
-    SkillsCmd, TurnCmd, TurnStatusArg,
+    ChannelCmd, Cli, Commands, ConfigCmd, CostCmd, CronCmd, DeviceCmd, LlmCmd, LogCmd, SessionCmd,
+    ShellKind, SkillsCmd, TurnCmd, TurnStatusArg,
 };
 use clap::Parser;
 
@@ -136,6 +136,37 @@ fn channels_list_parses() {
             cmd: ChannelCmd::List
         })
     ));
+}
+
+#[test]
+fn device_pair_parses_separate_proxy_and_push_urls() {
+    let cli = parse(&[
+        "device",
+        "pair",
+        "--proxy-url",
+        "relay.example",
+        "--push-url",
+        "push.example",
+        "--remote-api-key",
+        "tenant-key",
+    ]);
+    match cli.command {
+        Some(Commands::Device {
+            cmd:
+                DeviceCmd::Pair {
+                    proxy_url,
+                    push_url,
+                    remote_api_key,
+                },
+        }) => {
+            assert_eq!(proxy_url.as_deref(), Some("relay.example"));
+            assert_eq!(push_url.as_deref(), Some("push.example"));
+            assert_eq!(remote_api_key, "tenant-key");
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    assert!(Cli::try_parse_from(["baybo", "device", "pair", "--relay-url", "old"]).is_err());
 }
 
 #[test]

@@ -16,14 +16,14 @@ impl SqliteDeviceStore {
 }
 
 const COLS: &str = "device_id, device_pubkey, auth_token, status, \
-     rendezvous_id, created_at, approved_at, last_seen_at, relay_url, remote_api_key";
+     rendezvous_id, created_at, approved_at, last_seen_at, relay_url, push_url, remote_api_key";
 
 /// Shared INSERT for a device row — reused by `create` and the transactional
 /// `create_replacing_approved` so the column list has one source of truth.
 const INSERT_DEVICE: &str = "INSERT INTO devices
      (device_id, device_pubkey, auth_token, status,
-      rendezvous_id, created_at, approved_at, last_seen_at, relay_url, remote_api_key)
- VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)";
+      rendezvous_id, created_at, approved_at, last_seen_at, relay_url, push_url, remote_api_key)
+ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)";
 
 /// Re-pair tail appended to [`INSERT_DEVICE`], used only by
 /// [`SqliteDeviceStore::create_replacing_approved`]. `device_id` is a stable,
@@ -41,6 +41,7 @@ const REPAIR_UPSERT_TAIL: &str = " ON CONFLICT(device_id) DO UPDATE SET \
      approved_at = excluded.approved_at, \
      last_seen_at = excluded.last_seen_at, \
      relay_url = excluded.relay_url, \
+     push_url = excluded.push_url, \
      remote_api_key = excluded.remote_api_key";
 
 /// Map an INSERT error to a [`StorageError::Conflict`] when it tripped a
@@ -58,7 +59,7 @@ fn insert_conflict_err(op: &str, device_id: &str, msg: &str) -> StorageError {
     }
 }
 
-/// The ten positional params for [`INSERT_DEVICE`], in column order.
+/// The eleven positional params for [`INSERT_DEVICE`], in column order.
 fn insert_params(row: &DeviceRow) -> Vec<rusqlite::types::Value> {
     use rusqlite::types::Value;
     let opt_int = |v: Option<i64>| v.map_or(Value::Null, Value::Integer);
@@ -72,6 +73,7 @@ fn insert_params(row: &DeviceRow) -> Vec<rusqlite::types::Value> {
         opt_int(row.approved_at),
         opt_int(row.last_seen_at),
         Value::Text(row.relay_url.clone()),
+        Value::Text(row.push_url.clone()),
         Value::Text(row.remote_api_key.clone()),
     ]
 }
@@ -89,6 +91,7 @@ struct RawDevice {
     approved_at: Option<i64>,
     last_seen_at: Option<i64>,
     relay_url: String,
+    push_url: String,
     remote_api_key: String,
 }
 
@@ -103,7 +106,8 @@ fn raw_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawDevice> {
         approved_at: row.get(6)?,
         last_seen_at: row.get(7)?,
         relay_url: row.get(8)?,
-        remote_api_key: row.get(9)?,
+        push_url: row.get(9)?,
+        remote_api_key: row.get(10)?,
     })
 }
 
@@ -120,6 +124,7 @@ fn into_device_row(raw: RawDevice) -> anyhow::Result<DeviceRow> {
         approved_at: raw.approved_at,
         last_seen_at: raw.last_seen_at,
         relay_url: raw.relay_url,
+        push_url: raw.push_url,
         remote_api_key: raw.remote_api_key,
     })
 }
@@ -401,6 +406,7 @@ mod tests {
             approved_at: Some(100),
             last_seen_at: None,
             relay_url: "wss://relay.test".into(),
+            push_url: "https://push.test".into(),
             remote_api_key: "inst-test".into(),
         }
     }
@@ -424,6 +430,9 @@ mod tests {
         assert_eq!(got.device_pubkey, vec![7u8; 32]);
         assert_eq!(got.status, DeviceStatus::Approved);
         assert_eq!(got.rendezvous_id.as_deref(), Some("ABC123"));
+        assert_eq!(got.relay_url, "wss://relay.test");
+        assert_eq!(got.push_url, "https://push.test");
+        assert_eq!(got.remote_api_key, "inst-test");
     }
 
     #[tokio::test]

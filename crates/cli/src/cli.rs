@@ -558,15 +558,19 @@ pub enum DeviceCmd {
     /// Bluetooth-style code on both the phone and this terminal. Interactive —
     /// it stays live until both sides confirm (or it times out).
     Pair {
-        /// Relay (remote-host) to pair against — a bare host (`c.example.com`,
-        /// defaults to `wss://`) or an explicit `ws://`/`wss://` URL. Recorded on
-        /// the device row so the gateway reuses it for its relay control connection
-        /// + push (same host over https). Defaults to the built-in public proxy.
-        #[arg(long, value_name = "HOST")]
-        relay_url: Option<String>,
-        /// Remote-host traffic key (`x-remote-api-key`) used for relay and push.
-        /// Must be admitted on the relay. Defaults to `guest`, the built-in public
-        /// proxy's trial key; pass your own when using `--relay-url`.
+        /// Relay proxy to pair against — a bare host (`c.example.com`, defaults
+        /// to `wss://`) or an explicit `ws://`/`wss://` URL. Recorded on the
+        /// device row for subsequent relay control and content connections.
+        #[arg(long, value_name = "URL")]
+        proxy_url: Option<String>,
+        /// Push service base — a bare host (defaults to `https://`) or an
+        /// explicit `http://`/`https://` URL. Recorded independently from the
+        /// relay proxy and used for `/register` + `/notify`.
+        #[arg(long, value_name = "URL")]
+        push_url: Option<String>,
+        /// Remote-host traffic key (`x-remote-api-key`) used only for relay
+        /// WebSocket admission. Defaults to `guest`, the built-in public proxy's
+        /// trial key; pass your own when using `--proxy-url`.
         #[arg(
             long,
             value_name = "KEY",

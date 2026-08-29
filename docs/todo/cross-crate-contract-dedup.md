@@ -39,9 +39,8 @@ platform provider token:
 - `crates/gateway/src/api/admin/push.rs::PushTargetRequest` is the OpenAPI request
   mirror and converts into the protocol type.
 - `crates/gateway/src/push/mod.rs::PushTarget` is not a provider target at all. It
-  is a dispatch destination containing `device_id`, `relay_url`, and
-  `remote_api_key`. Rename it to `PushDestination` or `PushRoute`; do not merge it
-  with the protocol enum.
+  is a dispatch destination containing `device_id` and `push_url`. Rename it to
+  `PushDestination` or `PushRoute`; do not merge it with the protocol enum.
 
 The provider-token mirrors may remain, but their normalization rule must not
 drift. Trimming, non-empty validation, and the `PUSH_TOKEN_MAX_LEN` check currently

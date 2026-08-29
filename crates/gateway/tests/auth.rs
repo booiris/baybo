@@ -82,6 +82,7 @@ fn approved_device(device_id: &str, auth_token: &str) -> DeviceRow {
         approved_at: Some(2),
         last_seen_at: None,
         relay_url: "wss://relay.test".into(),
+        push_url: "https://push.test".into(),
         remote_api_key: "inst-test".into(),
     }
 }

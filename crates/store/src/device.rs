@@ -116,16 +116,17 @@ pub struct DeviceRow {
     pub approved_at: Option<i64>,
     /// Unix seconds; bumped on device activity.
     pub last_seen_at: Option<i64>,
-    /// The relay base WS URL this device paired against (the QR `h=`). Recorded
-    /// at pairing so the gateway re-establishes its relay control connection — and
-    /// pushes — to the same endpoint with no config block; both relay and push
-    /// read it from here (push swaps the scheme to `https`). Empty for rows paired
-    /// before this column existed (re-pair to populate). Not operator-configurable
-    /// yet — always the built-in relay endpoint.
+    /// The relay proxy base WS URL this device paired against (the QR `h=`).
+    /// Recorded so the gateway re-establishes its relay control connection with
+    /// no config block.
     pub relay_url: String,
+    /// HTTP base for push `/register` + `/notify`, independent of the relay
+    /// proxy.
+    pub push_url: String,
     /// The relay admission key (`x-remote-api-key`) used at pairing. The gateway
-    /// presents it on its relay control/host legs and on push `/notify` +
-    /// `/register`; relay and push share this one value. Empty for pre-existing rows.
+    /// presents it only on relay pairing/control/content legs. Push requests are
+    /// authorized by their Ed25519 delegation/signature chain and do not carry
+    /// this key.
     pub remote_api_key: String,
 }
 

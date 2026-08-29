@@ -21,11 +21,10 @@ and derived the per-binding `push_key` from the handshake hash.
 | **C** | The operator-run `remote-host` | Untrusted forwarding and push infrastructure. It performs relay admission, rendezvous matching, rate limiting, and configured-provider delivery, but must not learn chat plaintext, the pairing secret, Noise private keys, or encrypted-preview plaintext. |
 | **Push provider** | APNs today; FCM when Android is enabled | Delivery infrastructure. It sees its platform tokens, generic notification payloads, ciphertext preview fields, and delivery metadata, but does not hold the `push_key`. |
 
-C is a multi-tenant host. It has no Baybo account model; its tenant traffic key is
-`remote_api_key`. Relay uses that key for admission and quotas, and push HTTP
-requests carry it so the deployment edge can recognize expected Baybo traffic.
-Push bindings and notifications are still authorized by the device→gateway
-delegation chain, not by possession of that shared header. The key is not an
+C is a multi-tenant host. It has no Baybo account model; its relay traffic key is
+`remote_api_key`. Relay uses that key for admission and quotas. Push HTTP
+requests carry no relay admission key: push bindings and notifications are
+authorized by the device→gateway delegation chain. The relay key is not an
 end-to-end authentication secret between P and A.
 
 ## Protected Assets
@@ -84,7 +83,7 @@ the user-visible pairing action to a live cryptographic transcript.
 1. The operator runs:
 
 ```text
-baybo device pair [--relay-url <host>] [--remote-api-key <key>]
+baybo device pair [--proxy-url <url>] [--push-url <url>] [--remote-api-key <key>]
 ```
 
 2. If an approved device already exists, the CLI prints it and asks the operator
@@ -93,8 +92,9 @@ baybo device pair [--relay-url <host>] [--remote-api-key <key>]
 3. `DevicePairingService::mint` creates:
    - `rendezvous_id`: a public UUID used as C's pairing rendezvous key.
    - `secret`: a fresh 32-byte `PairingSecret`, used as the Noise XXpsk0 PSK.
-4. The CLI normalizes the relay endpoint. A bare host defaults to `wss://`; no
-   daemon-served local pairing route is used.
+4. The CLI normalizes the proxy and push endpoints independently. A bare proxy
+   host defaults to `wss://`, while a bare push host defaults to `https://`.
+   Only the proxy endpoint participates in pairing; the push URL remains on A.
 5. The CLI builds this QR payload:
 
 ```text
@@ -210,7 +210,7 @@ admission proves only that both legs may use C; the QR `s` value is what
 authenticates the pairing transcript against a hostile relay. The human
 confirmation then authorizes the resulting device binding.
 
-### 2. Remote-host traffic admission and push authorization at C
+### 2. Relay admission and keyless push authorization at C
 
 Every relay WebSocket route uses the `x-remote-api-key` header, defined by
 `remote-host-protocol` as `REMOTE_API_KEY_HEADER`:
@@ -226,15 +226,10 @@ C resolves the header through its admission layer. Unknown or expired keys get
 buckets, IP/rendezvous abuse controls, and live-connection kicks on admission
 reload.
 
-The push routes carry the same `x-remote-api-key` header:
+The push routes carry no `x-remote-api-key` header:
 
 - `POST /register`
 - `POST /notify`
-
-The paired-device path reads the value recorded from the pairing QR; the
-direct-mode path uses the built-in public proxy's `guest` key. A deployment edge
-may use the header to reject traffic that is not from an expected Baybo caller.
-The push handlers do not use this shared key as a device-binding boundary.
 
 `/register` authenticates a device's provider-tagged binding with a device→gateway Ed25519
 delegation plus the gateway's signature over the binding. `/notify` authenticates
@@ -401,6 +396,7 @@ Post-pairing state on A:
 
 - Approved device static public key
 - `relay_url`
+- `push_url`
 - `remote_api_key`
 - `device_id`
 - A Noise static private key
@@ -711,7 +707,7 @@ Relevant code:
 - Gateway endpoints: `crates/gateway/src/api/admin/push.rs`
   (`GET /v1/push/params`, `POST /v1/push/register`).
 - Gateway binding store: `crates/gateway/src/push/web.rs`.
-- Default remote host: `crates/gateway/src/push/mod.rs` (`DEFAULT_PUSH_RELAY_URL`).
+- Default push host: `crates/gateway/src/push/mod.rs` (`DEFAULT_PUSH_URL`).
 
 ### Flow
 
@@ -731,15 +727,15 @@ Relevant code:
    device key from `device_id`, **verifies the delegation under it**, and persists
    the binding — the `push_key` / target / delegation under the same
    `device.<id>.*` vault names a paired device uses, plus a `web_push.<id>` meta
-   record holding the remote-host endpoint and API key (the built-in defaults).
+   record holding the push endpoint (the built-in default).
 5. The dispatcher enumerates these web bindings alongside approved device rows and
    `/register` + `/notify`s them through that remote host **unchanged**.
 
 So the binding is cryptographically **identical** to a paired device's: C, the
 delegation chain, the AEAD preview, and the iOS NSE are all untouched. Direct mode
-uses the built-in remote-host endpoint and API key
-(`wss://proxy.baybo.space` + `guest`). They are not yet operator-configurable; a
-future `[push]` config block can override them.
+uses the built-in push endpoint (`https://push.baybo.space`) without a relay API
+key. It is not yet operator-configurable; a future `[push]` config block can
+override it.
 
 ### Trust-model difference (weaker than the Noise path)
 
@@ -760,11 +756,11 @@ direct-mode previews:
   forward-secret `push_key`) does **not** hold here.
 - **Binding integrity at C (Claim 4) is preserved.** The web identity still mints
   a real Ed25519 key and signs the delegation, so the per-binding delegation chain
-  C verifies is exactly the same — the shared remote API key marks traffic, while
-  that chain remains the authorization for the binding (just as for a paired device). Any caller,
-  even on the same blind remote host, still cannot register over, redirect,
-  suppress, or spam the binding — it can forge neither the device delegation nor
-  the gateway signature.
+  C verifies is exactly the same. That chain is the sole authorization for the
+  keyless push binding (just as for a paired device). Any caller, even on the
+  same blind remote host, still cannot register over, redirect, suppress, or spam
+  the binding — it can forge neither the device delegation nor the gateway
+  signature.
 - C and the provider see the **same** metadata and **only ciphertext** previews as on the
   relay path (the `push_key` never leaves the two endpoints).
 
@@ -847,10 +843,9 @@ Relevant code:
 
 C is multi-tenant and its relay tenant key is `remote_api_key`. The built-in
 public proxy hands out one **shared** trial key, `guest`, so many
-mutually-distrusting devices use the same key. Push carries it as a traffic marker,
-but the push device-token store cannot rely on that shared value to isolate one
-device's push binding from another's. Under `guest`, `remote_api_key` is not a
-sufficient tenant boundary.
+mutually-distrusting devices use the same key. Push does not carry that key at
+all, so the push device-token store must isolate bindings through the
+self-certifying `device_id` and delegation chain.
 
 The threat, absent further defense: C's `/register` would be an unconditional
 overwrite by `device_id`, and `device_id` is visible to C. So any caller who
@@ -944,12 +939,11 @@ the incoming notification content.
 Therefore C can drop, delay, or replay ciphertext notifications, but cannot learn
 or newly forge encrypted preview plaintext.
 
-### Claim 4: no caller key authorizes another device's push binding
+### Claim 4: no caller can authorize another device's push binding
 
-Admission (`remote_api_key`) is *not* the binding's isolation boundary — push
-carries the header, but the built-in `guest` trial key is shared by many
-mutually-distrusting tenants. Binding integrity instead comes from
-the per-device Ed25519 delegation chain C verifies statelessly (see
+Admission (`remote_api_key`) is *not* the binding's isolation boundary and is
+never sent on push. Binding integrity comes from the per-device Ed25519
+delegation chain C verifies statelessly (see
 [Shared relay key tenancy](#shared-relay-key-tenancy-and-push-binding-authentication)):
 `device_id` self-certifies its device key, `/register` carries the device's
 delegation + the gateway's signature, `/notify` is verified against the
@@ -1004,8 +998,8 @@ not from C admission.
 - Send the honest generic placeholder notification.
 - If malicious and holding `.p8`, send arbitrary ordinary APNs alerts outside the
   encrypted-preview path.
-- Leak metadata it sees, such as provider token, device id, `remote_api_key`, and
-  `collapse_key` (an opaque hash).
+- Leak metadata it sees, such as provider token, device id, relay
+  `remote_api_key`, and `collapse_key` (an opaque hash).
 
 ### C cannot do, assuming endpoint keys stay secret
 
@@ -1022,10 +1016,9 @@ not from C admission.
 
 ## Operational Notes
 
-- `remote_api_key` leakage is a remote-host traffic/resource-abuse risk. It is not
-  a content decryption key, not the pairing MITM defense, and — because the push
-  binding is gated by the per-device delegation chain — not a way to hijack,
-  redirect, or suppress another device's push binding.
+- `remote_api_key` leakage is a relay traffic/resource-abuse risk. The key is
+  never sent on push; it is not a content decryption key or the pairing MITM
+  defense, and cannot authorize, hijack, redirect, or suppress a push binding.
 - C's current `.p8` is an APNs provider credential. If it leaks, an attacker can send
   notifications to known APNs tokens, but cannot generate valid encrypted
   previews.

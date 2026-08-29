@@ -1150,6 +1150,7 @@ mod session_tests {
                 approved_at: Some(0),
                 last_seen_at: None,
                 relay_url: "wss://relay.test".into(),
+                push_url: "https://push.test".into(),
                 remote_api_key: "inst-test".into(),
             })
             .await

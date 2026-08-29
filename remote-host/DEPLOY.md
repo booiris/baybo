@@ -97,7 +97,7 @@ sqlite3 ./data/admission.db "DELETE FROM remote_api_keys WHERE remote_api_key='<
 sqlite3 ./data/admission.db "SELECT remote_api_key, label, max_conns, max_bps FROM remote_api_keys;"
 ```
 
-The `remote_api_keys` table is created on first start; an empty table admits no relay connection (fail-closed). It gates the **relay** (pairing + content legs). Baybo also sends the same key on **push** requests so a reverse proxy or deployment edge can recognize expected traffic; the push application handlers continue to authorize device bindings through the delegation chain (see below).
+The `remote_api_keys` table is created on first start; an empty table admits no relay connection (fail-closed). It gates only the **relay** (pairing + content legs). Push requests do not carry or consult this key; their application handlers authorize device bindings through the delegation chain (see below).
 
 **Every key must set `max_conns` + `max_bps`.** A `CHECK` constraint rejects a row that leaves either NULL — a key is meant to carry explicit limits, so the bare `INSERT(remote_api_key, label)` is not accepted. `per_server_max_bps` stays optional (NULL → falls back to the row's `max_bps`). (The `CHECK` guards freshly-created DBs only — `CREATE TABLE IF NOT EXISTS` can't add it to a DB made under an older schema; a NULL that survives on a legacy row floors to the role default below.)
 
@@ -149,7 +149,7 @@ sqlite3 ./data/admission.db \
    WHERE remote_api_key = '<key>';"
 ```
 
-**Push carries `x-remote-api-key`.** `/register` + `/notify` send the same key recorded at pairing (direct mode uses the built-in public proxy's `guest`). This lets a reverse proxy or deployment edge reject traffic that lacks an expected Baybo key. The header is not the device-binding boundary: the push handlers authorize the binding and every notify through the device→gateway Ed25519 **delegation chain**. Abuse inside the application is bounded by the per-device rate limit, the bounded device store, and the per-source-IP backstop below.
+**Push is keyless.** `/register` + `/notify` do not send `x-remote-api-key`; the push handlers authorize the binding and every notify through the device→gateway Ed25519 **delegation chain**. Abuse inside the application is bounded by the per-device rate limit, the bounded device store, and the per-source-IP backstop below.
 
 **Push frequency control.** `POST /notify` is rate-limited per **`device_id`** so a buggy or abusive gateway can't hammer APNs or spam a phone: **60 pushes/min sustained, burst 20** per device (override with `PUSH_NOTIFY_RATE_PER_MIN` / `PUSH_NOTIFY_BURST`). Over the limit `/notify` returns `429`.
 
@@ -174,13 +174,15 @@ CLIENT_IP_HEADERS=cf-connecting-ip
 
 ## Gateway wiring (pair against this host)
 
-The gateway holds **no** `.p8`, and there is **no `relay`/`push` block in `baybo.json`** — relay control + push are driven by the approved device row. Point them at this host by pairing with `--relay-url` (a one-time per-device choice, recorded on the row):
+The gateway holds **no** `.p8`, and there is **no `relay`/`push` block in `baybo.json`** — relay control + push are driven by the approved device row. Choose their endpoints independently when pairing (one-time per-device values recorded on the row):
 
 ```sh
-baybo device pair --relay-url wss://c.example.com --remote-api-key <admitted key>
+baybo device pair --proxy-url wss://proxy.example.com \
+  --push-url https://push.example.com \
+  --remote-api-key <admitted key>
 ```
 
-That single WS URL covers both roles: the gateway dials `wss://c.example.com` for the relay control/content legs and POSTs push to `https://c.example.com/notify` (same host, scheme swapped), carrying `x-remote-api-key` on both. Omit the flags to use the built-in public proxy + its default key `guest` (an ordinary admitted key on that proxy, not a special admission class). The `remote_api_key` must be admitted in the `remote_api_keys` table (see **Admission** above) for the **relay** legs; a deployment edge may enforce the same key on push. To move an already-paired device to a different host, re-pair with the new `--relay-url`.
+The gateway dials `--proxy-url` for pairing/control/content and POSTs keyless push to `--push-url`. Omit the flags to use `wss://proxy.baybo.space`, `https://push.baybo.space`, and the relay's default `guest` key (an ordinary admitted key on that proxy, not a special admission class). The `remote_api_key` must be admitted in the proxy's `remote_api_keys` table (see **Admission** above) and is sent only on relay legs. To change either endpoint for an already-paired device, re-pair with the new flags.
 
 ## Notes
 

@@ -30,16 +30,13 @@ const OUTCOME_POLL_INTERVAL: Duration = Duration::from_millis(400);
 const SCAN_WAIT: Duration = Duration::from_secs(300);
 /// How long to wait for the gateway to finalize once the operator confirmed.
 const OUTCOME_WAIT: Duration = Duration::from_secs(125);
-/// Built-in public relay embedded in the pairing QR when `--relay-url` is not
-/// passed. Point `--relay-url` at a self-hosted `remote-host` to use your own.
-const DEFAULT_GATEWAY_ENDPOINT: &str = "wss://proxy.baybo.space";
-
 pub async fn handle(ctx: &CommandContext, cmd: DeviceCmd) -> Result<CommandOutput> {
     match cmd {
         DeviceCmd::Pair {
-            relay_url,
+            proxy_url,
+            push_url,
             remote_api_key,
-        } => pair(ctx, relay_url, remote_api_key).await,
+        } => pair(ctx, proxy_url, push_url, remote_api_key).await,
         DeviceCmd::List { approved } => list(ctx, approved).await,
         DeviceCmd::Revoke { device_id, yes } => revoke(ctx, device_id, yes).await,
     }
@@ -112,7 +109,8 @@ fn qr_encode(s: &str) -> String {
 
 async fn pair(
     ctx: &CommandContext,
-    relay_url: Option<String>,
+    proxy_url: Option<String>,
+    push_url: Option<String>,
     remote_api_key: String,
 ) -> Result<CommandOutput> {
     let svc = require_service(ctx)?;
@@ -151,14 +149,16 @@ async fn pair(
         .await
         .map_err(|e| CliError::Manager(format!("mint device pairing: {e}")))?;
 
-    // Pairing always runs through the relay. The endpoint defaults to the built-in
-    // public proxy; `--relay-url` points it at a self-hosted remote-host. The
-    // admission key (`--remote-api-key`, default `guest`) and the endpoint are baked
-    // into the QR and recorded on the device row so the gateway reuses them for its
-    // relay control connection + push.
-    let endpoint = match relay_url {
-        Some(url) => normalize_relay_url(&url)?,
-        None => DEFAULT_GATEWAY_ENDPOINT.to_string(),
+    // Pairing and later content always run through the proxy. Its endpoint and
+    // admission key are baked into the QR; push is a separate HTTP service whose
+    // base stays gateway-side and is persisted independently on the device row.
+    let endpoint = match proxy_url {
+        Some(url) => normalize_proxy_url(&url)?,
+        None => remote_host_protocol::DEFAULT_PROXY_URL.to_string(),
+    };
+    let push_url = match push_url {
+        Some(url) => normalize_push_url(&url)?,
+        None => remote_host_protocol::DEFAULT_PUSH_URL.to_string(),
     };
     let k = qr_encode(&remote_api_key);
     // `s=` is the 256-bit secret, hex-encoded; it is bearer credential material.
@@ -197,6 +197,7 @@ async fn pair(
         device_pairing: Arc::clone(svc),
         secret_vault,
         relay_url: endpoint.clone(),
+        push_url,
         remote_api_key: remote_api_key.clone(),
     };
     let mut host = {
@@ -474,24 +475,41 @@ async fn wait_for_paired(
     }
 }
 
-/// Normalize a `--relay-url` to a WebSocket base URL. A bare host (`c.example.com`
+/// Normalize a `--proxy-url` to a WebSocket base URL. A bare host (`c.example.com`
 /// or `host:port`) defaults to `wss://`; an explicit `ws://`/`wss://` is kept (use
-/// `ws://` for a local plaintext relay). Any other scheme is rejected — the app
-/// dials `ws(s)://…` and the gateway derives the `https` push base from the same
-/// value, so a bad scheme would break both legs.
-fn normalize_relay_url(input: &str) -> Result<String> {
+/// `ws://` for a local plaintext relay). Any other scheme is rejected because
+/// both pairing and content dial WebSockets.
+fn normalize_proxy_url(input: &str) -> Result<String> {
     let url = input.trim();
     if url.is_empty() {
-        return Err(CliError::Config("--relay-url must not be empty".into()));
+        return Err(CliError::Config("--proxy-url must not be empty".into()));
     }
     if url.starts_with("wss://") || url.starts_with("ws://") {
         Ok(url.to_string())
     } else if url.contains("://") {
         Err(CliError::Config(format!(
-            "--relay-url must be a host or a ws://|wss:// URL (got `{url}`)"
+            "--proxy-url must be a host or a ws://|wss:// URL (got `{url}`)"
         )))
     } else {
         Ok(format!("wss://{url}"))
+    }
+}
+
+/// Normalize a `--push-url` to an HTTP base URL. A bare host defaults to
+/// `https://`; `http://` remains available for a local plaintext push service.
+fn normalize_push_url(input: &str) -> Result<String> {
+    let url = input.trim();
+    if url.is_empty() {
+        return Err(CliError::Config("--push-url must not be empty".into()));
+    }
+    if url.starts_with("https://") || url.starts_with("http://") {
+        Ok(url.to_string())
+    } else if url.contains("://") {
+        Err(CliError::Config(format!(
+            "--push-url must be a host or an http://|https:// URL (got `{url}`)"
+        )))
+    } else {
+        Ok(format!("https://{url}"))
     }
 }
 
@@ -611,27 +629,49 @@ mod tests {
     }
 
     #[test]
-    fn normalize_relay_url_defaults_bare_host_to_wss() {
+    fn normalize_proxy_url_defaults_bare_host_to_wss() {
         // A bare host (with or without a port) gets the wss:// scheme.
         assert_eq!(
-            normalize_relay_url("c.example.com").unwrap(),
+            normalize_proxy_url("c.example.com").unwrap(),
             "wss://c.example.com"
         );
         assert_eq!(
-            normalize_relay_url(" c.example.com:8443 ").unwrap(),
+            normalize_proxy_url(" c.example.com:8443 ").unwrap(),
             "wss://c.example.com:8443"
         );
         // An explicit ws/wss scheme is preserved (ws:// for a local plaintext relay).
         assert_eq!(
-            normalize_relay_url("wss://c.example.com").unwrap(),
+            normalize_proxy_url("wss://c.example.com").unwrap(),
             "wss://c.example.com"
         );
         assert_eq!(
-            normalize_relay_url("ws://127.0.0.1:7777").unwrap(),
+            normalize_proxy_url("ws://127.0.0.1:7777").unwrap(),
             "ws://127.0.0.1:7777"
         );
         // Any other scheme, or an empty value, is rejected.
-        assert!(normalize_relay_url("https://c.example.com").is_err());
-        assert!(normalize_relay_url("").is_err());
+        assert!(normalize_proxy_url("https://c.example.com").is_err());
+        assert!(normalize_proxy_url("").is_err());
+    }
+
+    #[test]
+    fn normalize_push_url_defaults_bare_host_to_https() {
+        assert_eq!(
+            normalize_push_url("push.example.com").unwrap(),
+            "https://push.example.com"
+        );
+        assert_eq!(
+            normalize_push_url(" push.example.com:8443 ").unwrap(),
+            "https://push.example.com:8443"
+        );
+        assert_eq!(
+            normalize_push_url("https://push.example.com").unwrap(),
+            "https://push.example.com"
+        );
+        assert_eq!(
+            normalize_push_url("http://127.0.0.1:7777").unwrap(),
+            "http://127.0.0.1:7777"
+        );
+        assert!(normalize_push_url("wss://push.example.com").is_err());
+        assert!(normalize_push_url("").is_err());
     }
 }

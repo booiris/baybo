@@ -16,15 +16,14 @@
 //! TLS + the admin bearer token rather than a Noise handshake hash — a weaker
 //! (but still endpoint-to-endpoint) trust model, see
 //! `docs/modules/mobile/relay-push-security.md`; and (b) the remote-host endpoint
-//! is the built-in default ([`super::DEFAULT_PUSH_RELAY_URL`]), not a pairing QR.
+//! is the built-in default ([`super::DEFAULT_PUSH_URL`]), not a pairing command.
 //!
 //! Storage reuses the per-device secret names (`device.{id}.push_key` /
 //! `.push_registration` / `.push_delegation`) so [`super::PushDispatcher`]'s read
 //! sites need no change; a
-//! small `web_push.{id}` meta record carries the remote-host endpoint and API key
-//! the dispatcher targets, and `SecretVault::list_names` enumerates them. The API
-//! key marks admitted traffic at the remote-host edge; the delegation chain
-//! remains the binding authorization.
+//! small `web_push.{id}` meta record carries the push endpoint the dispatcher
+//! targets, and `SecretVault::list_names` enumerates them. The delegation chain
+//! is the binding authorization; no relay admission key is stored or sent.
 
 use baybo_security::SecretVault;
 use device_proto::aead;
@@ -55,11 +54,8 @@ fn web_binding_secret_name(device_id: &str) -> String {
 pub(crate) struct WebPushBinding {
     /// `device-<hex(ed25519 pub)>` — the app's self-certifying identity.
     pub device_id: String,
-    /// Remote-host base WS URL (the built-in [`super::DEFAULT_PUSH_RELAY_URL`]).
-    /// The dispatcher maps `wss→https` for `/register` + `/notify` POSTs.
-    pub relay_url: String,
-    /// Remote-host API key sent on `/register` and `/notify`.
-    pub remote_api_key: String,
+    /// Push service HTTP base (the built-in [`super::DEFAULT_PUSH_URL`]).
+    pub push_url: String,
     /// Unix seconds the binding was registered (for observability only).
     pub created_at: i64,
 }
@@ -159,8 +155,7 @@ mod tests {
     fn binding(id: &str) -> WebPushBinding {
         WebPushBinding {
             device_id: id.to_string(),
-            relay_url: "wss://proxy.baybo.space".into(),
-            remote_api_key: remote_host_protocol::DEFAULT_REMOTE_API_KEY.into(),
+            push_url: remote_host_protocol::DEFAULT_PUSH_URL.into(),
             created_at: 1_700_000_000,
         }
     }

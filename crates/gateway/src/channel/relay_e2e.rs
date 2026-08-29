@@ -162,6 +162,7 @@ fn device_row(device_id: &str, pubkey: Vec<u8>) -> DeviceRow {
         approved_at: Some(0),
         last_seen_at: None,
         relay_url: "ws://relay.test".into(),
+        push_url: "https://push.test".into(),
         remote_api_key: REMOTE_API_KEY.into(),
     }
 }
@@ -325,6 +326,7 @@ async fn real_relay_pairs_gateway_and_mock_app() {
         device_pairing: Arc::clone(&device_pairing),
         secret_vault: tg.deps.secret_vault.clone(),
         relay_url: relay_url.clone(),
+        push_url: "https://push.test".into(),
         remote_api_key: REMOTE_API_KEY.into(),
     };
     let gateway = {

@@ -6,12 +6,17 @@
 pub mod push;
 pub mod relay;
 
-/// Header identifying the remote-host tenant on relay WebSocket upgrades and
-/// push HTTP requests.
+/// Header identifying the remote-host tenant on relay WebSocket upgrades.
 pub const REMOTE_API_KEY_HEADER: &str = "x-remote-api-key";
 
-/// Admission key used with the built-in public remote host when the operator
-/// does not provide one explicitly.
+/// Built-in public relay endpoint.
+pub const DEFAULT_PROXY_URL: &str = "wss://proxy.baybo.space";
+
+/// Built-in public push endpoint.
+pub const DEFAULT_PUSH_URL: &str = "https://push.baybo.space";
+
+/// Admission key used with the built-in public relay when the operator does not
+/// provide one explicitly.
 pub const DEFAULT_REMOTE_API_KEY: &str = "guest";
 
 /// Join a base URL to a route path, trimming a trailing slash on the base.

@@ -6,8 +6,8 @@
 //! bucket — but none bounds a single host *spraying requests* across many keys /
 //! rendezvous / device ids (or failing admission on each), which can still churn
 //! accept/upgrade/verify work. This is the coarse outer backstop: a token bucket
-//! per source IP, drawn one token per request, applied **ahead of admission and
-//! body parsing** so even unadmitted floods are shed cheaply with `429`.
+//! per source IP, drawn one token per request, applied **ahead of relay admission
+//! or push body parsing** so floods are shed cheaply with `429`.
 //!
 //! **Deployment caveat.** By default the key is the *socket* peer IP. With
 //! remote-host terminating TLS itself that is the real client (or its NAT). Behind

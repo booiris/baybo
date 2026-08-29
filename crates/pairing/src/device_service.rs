@@ -192,6 +192,7 @@ impl DevicePairingService {
         device_id: &str,
         device_pubkey: Vec<u8>,
         relay_url: &str,
+        push_url: &str,
         remote_api_key: &str,
     ) -> Result<StagedDevice, DevicePairingError> {
         // Consume the single-use slot up front: a second finalize for the same
@@ -218,10 +219,10 @@ impl DevicePairingService {
             created_at: now,
             approved_at: None,
             last_seen_at: None,
-            // Recorded so the gateway re-dials the relay (and pushes) to the same
-            // endpoint/key without a config block; both come from the pairing
-            // transport (the QR `h=` + admission key).
+            // Relay routing comes from the QR; push routing is supplied
+            // independently by the operator's pairing command.
             relay_url: relay_url.to_string(),
+            push_url: push_url.to_string(),
             remote_api_key: remote_api_key.to_string(),
         };
         self.devices.create_provisioning(&row).await?;
@@ -248,18 +249,26 @@ impl DevicePairingService {
         })
     }
 
-    /// Compatibility helper for tests and non-transport callers: stage and
-    /// approve immediately.
+    /// Convenience helper for tests and non-transport callers: stage and approve
+    /// immediately.
     pub async fn complete(
         &self,
         slot: &DevicePairingSlot,
         device_id: &str,
         device_pubkey: Vec<u8>,
         relay_url: &str,
+        push_url: &str,
         remote_api_key: &str,
     ) -> Result<StagedDevice, DevicePairingError> {
         let staged = self
-            .stage(slot, device_id, device_pubkey, relay_url, remote_api_key)
+            .stage(
+                slot,
+                device_id,
+                device_pubkey,
+                relay_url,
+                push_url,
+                remote_api_key,
+            )
             .await?;
         let row = self.approve_staged(&staged.row.device_id).await?;
         Ok(StagedDevice {
@@ -341,6 +350,7 @@ mod tests {
                 "dev-abc",
                 vec![3u8; 32],
                 "wss://relay.test",
+                "https://push.test",
                 "inst-test",
             )
             .await
@@ -350,6 +360,9 @@ mod tests {
         assert_eq!(row.status, DeviceStatus::Approved);
         assert!(row.approved_at.is_some());
         assert_eq!(row.device_pubkey, vec![3u8; 32]);
+        assert_eq!(row.relay_url, "wss://relay.test");
+        assert_eq!(row.push_url, "https://push.test");
+        assert_eq!(row.remote_api_key, "inst-test");
         assert_eq!(
             staged.auth_token.len(),
             AUTH_TOKEN_BYTES * 2,
@@ -388,6 +401,7 @@ mod tests {
             "dev-1",
             vec![1u8; 32],
             "wss://relay.test",
+            "https://push.test",
             "inst-test",
         )
         .await
@@ -398,6 +412,7 @@ mod tests {
                 "dev-2",
                 vec![2u8; 32],
                 "wss://relay.test",
+                "https://push.test",
                 "inst-test"
             )
             .await,
@@ -426,7 +441,14 @@ mod tests {
         let (rid, _) = svc.mint().await.unwrap();
         let slot = svc.claim_slot(&rid).await.unwrap().unwrap();
         let row = svc
-            .complete(&slot, "d1", vec![1u8; 32], "wss://relay.test", "inst-test")
+            .complete(
+                &slot,
+                "d1",
+                vec![1u8; 32],
+                "wss://relay.test",
+                "https://push.test",
+                "inst-test",
+            )
             .await
             .unwrap();
         assert_eq!(row.row.status, DeviceStatus::Approved);
@@ -451,6 +473,7 @@ mod tests {
             "dev-a",
             vec![1u8; 32],
             "wss://relay.test",
+            "https://push.test",
             "inst-test",
         )
         .await
@@ -468,6 +491,7 @@ mod tests {
             "dev-b",
             vec![2u8; 32],
             "wss://relay.test",
+            "https://push.test",
             "inst-test",
         )
         .await
