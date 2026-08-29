@@ -15,7 +15,7 @@ use baybo_turn::{TurnInput, TurnInputKind, TurnLifecycle, TurnOutput};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
-use baybo_model::{ControlEventKind, LineageKind, Session, TriggerSource};
+use baybo_model::{ControlEventKind, Session};
 use baybo_tools::{ApprovalDecision, ReadTracker, ToolConcurrency, ToolOutput, ToolRegistry};
 use baybo_trace::{
     CompressionTrigger, LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanRecorder, StepHandle,
@@ -433,33 +433,6 @@ fn cron_prompt_blocks(action_payload: &serde_json::Value) -> Vec<ContentBlock> {
     }
 }
 
-/// True for sessions spawned as a subagent (lineage `Subagent`); false for
-/// root sessions (no lineage). The single home for the subagent-vs-root
-/// classification — exhaustive on `LineageKind` so a new spawn kind forces a
-/// decision here rather than silently defaulting at each call site.
-fn is_subagent(session: &Session) -> bool {
-    match &session.lineage {
-        None => false,
-        Some(l) => match &l.kind {
-            LineageKind::Subagent => true,
-        },
-    }
-}
-
-/// Whether the `on_session_end` memory hook should fire for this session.
-/// The session-level analogue of [`memory_recall_query`]: only sessions a person
-/// would call "theirs" — root `User`/`Cron` sessions, not subagents.
-/// Subagent actors send `ActorStop` when they finish, but their shutdown
-/// is not a user-session ending. The exhaustive `TriggerSource` arm forces a
-/// classification when a new trigger variant is added.
-fn should_fire_session_end(session: &Session) -> bool {
-    let user_trigger = match &session.trigger {
-        TriggerSource::User | TriggerSource::Cron { .. } => true,
-        TriggerSource::Issue { .. } => false,
-    };
-    user_trigger && !is_subagent(session)
-}
-
 pub struct AgentLoop {
     /// Currently-active client, re-resolved from `llm_pool` at the
     /// start of each turn ([`Self::refresh_active_llm`]) so a config
@@ -498,8 +471,8 @@ pub struct AgentLoop {
     security_gateway: Arc<SecurityGateway>,
     error_handler: ErrorHandler,
     /// Cross-session manager — used by passes that operate across sessions
-    /// (the session-end memory write, the progress observer's durable
-    /// shadow, title generation). Distinct from the `SessionManager`
+    /// (the progress observer's durable shadow and title generation). Distinct
+    /// from the `SessionManager`
     /// plumbed inside `ContextManager` because that one is
     /// per-session-bound.
     sessions: Option<Arc<crate::SessionManager>>,
@@ -562,8 +535,8 @@ pub struct AgentLoopConfig {
     pub context_manager: ContextManager,
     pub max_iterations: usize,
     pub security_gateway: Arc<SecurityGateway>,
-    /// Cross-session manager. Used by the session-end memory write, the
-    /// progress observer's durable shadow, and title generation.
+    /// Cross-session manager. Used by the progress observer's durable shadow
+    /// and title generation.
     pub sessions: Option<Arc<crate::SessionManager>>,
     /// Pluggable long-term memory handle — one registered implementation, or
     /// `None` to disable the memory hooks (recall / `on_turn_complete`).
@@ -2256,91 +2229,6 @@ impl AgentLoop {
         Ok(())
     }
 
-    /// Fire-and-forget the [`Memory::on_session_end`] consolidation write at
-    /// actor shutdown. Detached on the tokio runtime root (not bound to the
-    /// actor's cancellation token, which the caller cancels immediately after
-    /// this returns), so the write survives the actor's teardown.
-    ///
-    /// Pulls the FULL durable transcript via [`SessionManager::history`] —
-    /// the actor's in-memory view may have been compressed, and
-    /// `on_session_end`'s contract is to see raw turns.
-    ///
-    /// No-op when memory is unwired, when `sessions` is unwired (test
-    /// harnesses with no cross-session store), or when the session isn't
-    /// user-facing per [`should_fire_session_end`] (subagents and
-    /// system-triggered actors all send `ActorStop` too, but their shutdown
-    /// is not a user-session ending).
-    ///
-    /// [`SessionManager::history`]: crate::SessionManager::history
-    pub fn spawn_session_end_write(&self, span_recorder: &Arc<SpanRecorder>, session: &Session) {
-        let Some(memory) = self.memory.clone() else {
-            return;
-        };
-        let Some(sessions) = self.sessions.clone() else {
-            return;
-        };
-        if !should_fire_session_end(session) {
-            return;
-        }
-        let user_id = session.user.id.clone();
-        let session_id = session.id.clone();
-        let agent_id = session.state.agent_id_or_builtin();
-        let recorder = Arc::clone(span_recorder);
-        tokio::spawn(async move {
-            // `full_transcript` (not `history`) so the impl sees the raw
-            // turns per `on_session_end`'s contract — `history` filters out
-            // rows marked `superseded_by`, so a session that has been
-            // compressed would otherwise lose all the user / assistant turns
-            // that the compaction folded into a summary.
-            let transcript = match sessions.full_transcript(&session_id).await {
-                Ok(t) => t,
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        session_id = %session_id,
-                        "memory on_session_end: failed to load durable transcript; skipping write",
-                    );
-                    return;
-                }
-            };
-            if transcript.is_empty() {
-                return;
-            }
-            // Synthetic TurnId — `on_session_end` isn't tied to a user turn; this
-            // id only exists so the trace step + any billed sub-call records
-            // share one key. Mirrors how compression mints its own ids for
-            // maintenance work.
-            let turn_id = TurnId::new();
-            let ctx_recorder = Arc::clone(&recorder);
-            let result = crate::runtime::scope::with_step(
-                recorder.as_ref(),
-                turn_id,
-                StepKind::MemoryWrite,
-                None,
-                move |step| async move {
-                    let ctx = MemoryContext::new(
-                        MemoryScope {
-                            user_id,
-                            session_id,
-                            turn_id,
-                            agent_id,
-                        },
-                        ctx_recorder,
-                        step,
-                    );
-                    match memory.on_session_end(&ctx, &transcript).await {
-                        Ok(()) => Ok((LifecycleOutcome::Ok, ())),
-                        Err(e) => Err(anyhow::Error::new(e)),
-                    }
-                },
-            )
-            .await;
-            if let Err(e) = result {
-                warn!(error = %e, "memory on_session_end write failed");
-            }
-        });
-    }
-
     /// Fire-and-forget the [`Memory::on_turn_complete`] write for a finished
     /// exchange. Detached so the actor returns the answer without waiting on
     /// the memory write; the impl bills its work against the minted
@@ -3886,113 +3774,6 @@ mod trim_response_text_edges_tests {
             ContentBlock::Text(t) => assert_eq!(t, body),
             other => panic!("expected text, got {other:?}"),
         }
-    }
-}
-
-#[cfg(test)]
-mod session_end_gate_tests {
-    //! `should_fire_session_end` decides whether `Memory::on_session_end`
-    //! runs when an actor processes `ActorStop`. Subagent actors also stop,
-    //! but their teardown is not a user-session ending — firing the hook for
-    //! them would write garbage memory. Also covers the shared `is_subagent`
-    //! predicate that gates the background-summary pass (subagents skip it).
-    use super::{is_subagent, should_fire_session_end};
-    use baybo_model::{
-        ChannelType, IssueId, Lineage, LineageKind, ProjectId, Session, SessionId, SessionState,
-        TriggerSource, TurnId, User,
-    };
-    use chrono::Utc;
-
-    fn session_with(trigger: TriggerSource, lineage: Option<Lineage>) -> Session {
-        let now = Utc::now();
-        let id = SessionId::from("sess-gate");
-        Session {
-            id: id.clone(),
-            user: User {
-                id: "user-gate".into(),
-                name: None,
-                channel: ChannelType::tui(),
-            },
-            channel: ChannelType::tui(),
-            created_at: now,
-            last_active: now,
-            state: SessionState::default(),
-            root_session_id: id,
-            trigger,
-            lineage,
-            hidden: false,
-            pinned: false,
-            archived: false,
-            folder_id: None,
-            title: None,
-        }
-    }
-
-    #[test]
-    fn fires_for_root_user_session() {
-        assert!(should_fire_session_end(&session_with(
-            TriggerSource::User,
-            None
-        )));
-    }
-
-    #[test]
-    fn fires_for_root_cron_session() {
-        let s = session_with(
-            TriggerSource::Cron {
-                cron_job_id: "c-1".into(),
-                origin_session_id: None,
-                conversation: true,
-                job_title: None,
-                project_id: None,
-            },
-            None,
-        );
-        assert!(should_fire_session_end(&s));
-    }
-
-    #[test]
-    fn skips_issue_run_session() {
-        let s = session_with(
-            TriggerSource::Issue {
-                project_id: ProjectId::generate(),
-                issue_id: IssueId::generate(),
-                number: 1,
-            },
-            None,
-        );
-        assert!(!should_fire_session_end(&s));
-    }
-
-    #[test]
-    fn skips_subagent_session() {
-        let lineage = Lineage {
-            parent_session_id: SessionId::from("parent"),
-            parent_turn_id: TurnId::new(),
-            parent_span_id: None,
-            kind: LineageKind::Subagent,
-        };
-        // Subagents inherit their parent's trigger, so the User flag alone
-        // shouldn't unlock the hook for them.
-        assert!(!should_fire_session_end(&session_with(
-            TriggerSource::User,
-            Some(lineage),
-        )));
-    }
-
-    #[test]
-    fn is_subagent_true_only_for_lineage_subagent() {
-        assert!(!is_subagent(&session_with(TriggerSource::User, None)));
-        let lineage = Lineage {
-            parent_session_id: SessionId::from("parent"),
-            parent_turn_id: TurnId::new(),
-            parent_span_id: None,
-            kind: LineageKind::Subagent,
-        };
-        assert!(is_subagent(&session_with(
-            TriggerSource::User,
-            Some(lineage)
-        )));
     }
 }
 

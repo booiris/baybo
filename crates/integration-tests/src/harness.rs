@@ -423,9 +423,8 @@ impl AgentTestHarnessBuilder {
         let approval_gates = Arc::new(ApprovalGateMap::new());
         let memory_session_store = Arc::new(baybo_session::test_support::MemorySessionStore::new());
         // Mirror production's "session row exists before the actor spawns"
-        // shape so cross-session lookups (`on_session_end` →
-        // `SessionManager::history`, and the transcript-read intercept →
-        // `SessionManager::full_transcript`) find the row instead of NotFound-ing.
+        // shape so the transcript-read intercept's cross-session lookup finds
+        // the row instead of returning NotFound.
         memory_session_store.seed_session(&session);
         let session_store =
             Arc::clone(&memory_session_store) as Arc<dyn baybo_session::SessionStore>;
@@ -534,10 +533,8 @@ impl AgentTestHarnessBuilder {
             context_manager,
             max_iterations: 20,
             security_gateway: gateway.clone(),
-            // Mirror what production wires so the `on_session_end` hook
-            // (which loads the durable transcript via `SessionManager`) is
-            // exercisable from tests instead of bailing at the `sessions`
-            // guard.
+            // Mirror production for the progress observer's durable shadow and
+            // title-generation paths.
             sessions: Some(Arc::clone(&session_manager)),
             memory: self.memory,
             task_store: task_store.clone(),

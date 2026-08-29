@@ -501,7 +501,7 @@ translation layer, which is the second reason the soul is a file.
 
 **Memory** works unchanged: recall before `run()` (framed with the standard
 `<recalled_memory>` envelope), `on_turn_complete` after `FinalContent`,
-`on_session_end` at `ActorStop`.
+with no actor-shutdown hook.
 
 **Capability gaps — stated, not hidden** (UI copy and docs): baybo tools,
 sandbox, approval gate, and secret injection do **not** apply. The security

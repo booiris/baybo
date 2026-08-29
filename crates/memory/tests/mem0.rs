@@ -214,33 +214,6 @@ async fn on_turn_complete_skips_when_both_sides_empty() {
 }
 
 // ---------------------------------------------------------------------------
-// on_session_end (mem0 → no-op)
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn on_session_end_is_a_noop() {
-    let captured = Captured::default();
-    // Refuse any call: a body push would prove the no-op contract is broken.
-    let app = Router::new()
-        .route(
-            "/v1/memories/",
-            post(
-                |State(c): State<Captured>, Json(b): Json<Value>| async move {
-                    c.bodies.lock().push(b);
-                    Json(json!({}))
-                },
-            ),
-        )
-        .with_state(captured.clone());
-    let server = spawn(app).await;
-    let m = build(&base_url(&server));
-
-    let ctx = memory_context("u-3", "s-3", StepKind::MemoryWrite).await;
-    m.on_session_end(&ctx, &[]).await.unwrap();
-    assert!(captured.bodies.lock().is_empty());
-}
-
-// ---------------------------------------------------------------------------
 // tool: mem0_search
 // ---------------------------------------------------------------------------
 

@@ -52,8 +52,6 @@ pub trait Memory: Send + Sync {
         -> Result<Vec<RecalledMemory>>;
     async fn on_turn_complete(&self, ctx: &MemoryContext,
         user_input: &[ContentBlock], final_output: &[ContentBlock]) -> Result<()>;
-    async fn on_session_end(&self, ctx: &MemoryContext,
-        transcript: &[ChatMessage]) -> Result<()>;
     fn tools(&self) -> Vec<(Arc<dyn Tool>, ToolManifest)> { Vec::new() }
 }
 ```
@@ -63,11 +61,10 @@ pub trait Memory: Send + Sync {
   to the impl** (keyed off `ctx`; one impl is a process singleton, so that state
   survives actor reap/rehydration for free). The core injects exactly what is
   returned.
-- **`on_turn_complete` / `on_session_end`** — fire-and-forget lifecycle events
-  (the read/write asymmetry is intentional; the verb is **not** "sync", which
-  would imply bidirectional reconciliation). `on_turn_complete` sees one finished
-  exchange (`user_input` includes mid-turn interjections); `on_session_end` sees
-  the full durable transcript at idle-timeout.
+- **`on_turn_complete`** — fire-and-forget lifecycle event (the read/write
+  asymmetry is intentional; the verb is **not** "sync", which would imply
+  bidirectional reconciliation). It sees one finished exchange (`user_input`
+  includes mid-turn interjections).
 - **`tools`** — the model's "explicit signal" path, coexisting with the
   automatic recall/write path. Registered statically at startup.
 
@@ -132,19 +129,14 @@ Recalled memories enter the prompt as a **persisted, framed** block — never
 
 ## Flow & hook points
 
-Two gates run independently:
-
 - **`memory_recall_query(&TurnInput)`** — per-turn gate for the read/write hooks
-  on a turn. Exhaustive match: returns the query for `UserChat` / `Cron`, `None`
-  for `System`, `Spawned` (subagent), and `SubagentNotification` (no direct
-  user input → would pollute / double-write).
-- **`should_fire_session_end(&Session)`** — session-level gate for the
-  shutdown hook. Returns true for root `User` / `Cron` sessions; false for
-  `Subagent`-lineage actors (they send `ActorStop` too but are not
-  user-session endings).
+  on a turn. Exhaustive match: returns the query for `UserChat` / `Cron` /
+  `IssueRun`, and `None` for `Compact`, `Spawned` (subagent),
+  `SubagentNotification`, and `CronNotification` (no direct user input would
+  pollute or double-write).
 
-The agent loop (`agent_loop.rs`) owns the first three hooks; the actor's
-`AgentMessage::ActorStop` handler (`actor/mod.rs`) owns the fourth.
+The agent loop (`agent_loop.rs`) owns both hooks. Actor shutdown has no memory
+side effect.
 
 1. **Recall — inline, turn start.** After the user message is in context and
    before the first LLM call, `recall_and_inject` opens a `MemoryRecall` step,
@@ -159,17 +151,6 @@ The agent loop (`agent_loop.rs`) owns the first three hooks; the actor's
    **Only on a clean `Final`** — a max-iterations, cancelled, or errored turn
    writes nothing (those paths return before this point), so memory only ever
    sees completed exchanges.
-4. **`on_session_end` — background, actor shutdown.** When the actor processes
-   `AgentMessage::ActorStop` (idle reap, supervised shutdown, …),
-   `spawn_session_end_write` detaches a task on the runtime root **before**
-   cancelling `actor_token`, so the write survives the actor's teardown. The
-   task loads the FULL durable transcript via `SessionManager::full_transcript`
-   (`history` filters out rows marked `superseded_by`, so a compacted session
-   would lose the turns compression folded into a summary), opens a
-   `MemoryWrite` step, mints a synthetic `TurnId` for trace/cost keying, and
-   calls `on_session_end`. The session-level gate skips subagent-lineage actors
-   (whose `ActorStop` is not a user-session ending). A missing session row or
-   empty transcript skips silently.
 
 With `memory == None` every hook above is skipped entirely — no trace step is
 opened and nothing is billed, so the no-op path is genuinely inert.
@@ -220,7 +201,6 @@ session via Mem0's `run_id` (sourced from `ToolContext::session_id`).
 | --- | --- |
 | `recall` | `POST /v2/memories/search/` with `{query, filters: {AND: [{user_id}]}, rerank, top_k}`; returns the `memory` text verbatim. |
 | `on_turn_complete` | `POST /v1/memories/` with `{messages: [{user,assistant}], user_id, agent_id}`; the Mem0 server runs LLM-based fact extraction. |
-| `on_session_end` | No-op (Mem0 has no session concept; extraction is per-`add`). |
 | `tools()` | Eight `mem0_*` tools — the model's explicit-signal path (see below). |
 
 The tool surface mirrors the Mem0 `openclaw` plugin (each `mem0_`-prefixed),
@@ -256,8 +236,7 @@ session id; `X-OpenViking-Account` (config) and `X-OpenViking-Agent`
 | Hook | Behaviour |
 | --- | --- |
 | `recall` | `POST /api/v1/search/find` with `{query, top_k}`; returns `"{abstract} (viking://uri)"`. |
-| `on_turn_complete` | `POST /api/v1/sessions/{ctx.session_id}/messages` ×2 (user, assistant). |
-| `on_session_end` | `POST /api/v1/sessions/{ctx.session_id}/commit` — triggers the 6-category server-side extraction (preferences / entities / events / cases / patterns / profile). Skipped if `transcript.is_empty()`. |
+| `on_turn_complete` | `POST /api/v1/sessions/{ctx.session_id}/messages` ×2 (user, assistant), then `POST /api/v1/sessions/{ctx.session_id}/commit` to trigger the 6-category server-side extraction (preferences / entities / events / cases / patterns / profile). |
 | `tools()` | Four `viking_*` tools (see below). |
 
 The tool surface mirrors the official OpenViking `openclaw-plugin`, each

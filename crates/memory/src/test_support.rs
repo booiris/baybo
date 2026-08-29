@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use baybo_model::{ChatMessage, ContentBlock};
+use baybo_model::ContentBlock;
 use parking_lot::Mutex;
 
 use crate::{Memory, MemoryContext, RecalledMemory, Result};
@@ -22,7 +22,6 @@ pub struct RecordingMemory {
     canned_recall: Mutex<Vec<RecalledMemory>>,
     recall_queries: Mutex<Vec<Vec<ContentBlock>>>,
     turn_completions: Mutex<Vec<(Vec<ContentBlock>, Vec<ContentBlock>)>>,
-    session_ends: Mutex<Vec<Vec<ChatMessage>>>,
 }
 
 impl RecordingMemory {
@@ -58,15 +57,6 @@ impl RecordingMemory {
     pub fn turn_completions(&self) -> Vec<(Vec<ContentBlock>, Vec<ContentBlock>)> {
         self.turn_completions.lock().clone()
     }
-
-    pub fn session_end_count(&self) -> usize {
-        self.session_ends.lock().len()
-    }
-
-    /// The transcript passed to each `on_session_end` call, in order.
-    pub fn session_ends(&self) -> Vec<Vec<ChatMessage>> {
-        self.session_ends.lock().clone()
-    }
 }
 
 #[async_trait]
@@ -89,11 +79,6 @@ impl Memory for RecordingMemory {
         self.turn_completions
             .lock()
             .push((user_input.to_vec(), final_output.to_vec()));
-        Ok(())
-    }
-
-    async fn on_session_end(&self, _ctx: &MemoryContext, transcript: &[ChatMessage]) -> Result<()> {
-        self.session_ends.lock().push(transcript.to_vec());
         Ok(())
     }
 }

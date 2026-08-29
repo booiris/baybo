@@ -17,7 +17,7 @@ it) — no linkage to Baybo's agent stack. Its one library dependency is
 ## You must build `baybo` with `--features bench-readonly-memory`
 
 QA drives the *real* agent, whose loop writes memory after every turn
-(`on_job_complete` / `on_session_end`). Left alone, each QA turn would write its
+(`on_turn_complete`). Left alone, each QA turn would write its
 question+answer into the conversation's recall scope and pollute later questions
 (the same exposure upstream's OpenClaw bench has). The `bench-readonly-memory`
 feature wraps the backend so it **recalls + exposes tools but never writes** —

@@ -11,7 +11,7 @@ use baybo_memory::backends::openviking::{
     OpenVikingConfig, OpenVikingMemory, OpenVikingTimeouts, TOOL_ARCHIVE_EXPAND, TOOL_FORGET,
     TOOL_RECALL, TOOL_STORE,
 };
-use baybo_model::{AgentProfileId, ChatMessage, ContentBlock};
+use baybo_model::{AgentProfileId, ContentBlock};
 use baybo_trace::StepKind;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
@@ -143,20 +143,25 @@ async fn recall_returns_empty_when_query_empty() {
 }
 
 #[tokio::test]
-async fn on_session_end_tolerates_slow_commit() {
+async fn on_turn_complete_tolerates_slow_commit() {
     // Commit can be slow when the server runs LLM-backed extraction. Verify the
     // call waits past the short per-request `http` budget — the commit path is
     // governed by the longer `write` budget, so a server stall between the two
     // completes successfully instead of being cancelled at `http`. Budgets are
     // injected at ms scale so the test trips the same code path without a
     // multi-second real sleep.
-    let app = Router::new().route(
-        "/api/v1/sessions/{sid}/commit",
-        post(|Path(_sid): Path<String>| async move {
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            Json(json!({}))
-        }),
-    );
+    let app = Router::new()
+        .route(
+            "/api/v1/sessions/{sid}/messages",
+            post(|| async { Json(json!({})) }),
+        )
+        .route(
+            "/api/v1/sessions/{sid}/commit",
+            post(|Path(_sid): Path<String>| async move {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                Json(json!({}))
+            }),
+        );
     let server = spawn(app).await;
     let m = OpenVikingMemory::with_timeouts(
         cfg(&base_url(&server)),
@@ -170,15 +175,20 @@ async fn on_session_end_tolerates_slow_commit() {
     )
     .unwrap();
     let ctx = memory_context("alice", "slow-commit", StepKind::MemoryWrite).await;
-    let transcript = vec![ChatMessage::user(vec![ContentBlock::Text("hi".into())])];
     let started = std::time::Instant::now();
-    m.on_session_end(&ctx, &transcript).await.unwrap();
+    m.on_turn_complete(
+        &ctx,
+        &[ContentBlock::Text("hi".into())],
+        &[ContentBlock::Text("hello".into())],
+    )
+    .await
+    .unwrap();
     let elapsed = started.elapsed();
     // The 300ms commit must have completed (not been cancelled at the 50ms http
     // budget) — `write` (10s) is the budget on this path.
     assert!(
         elapsed >= std::time::Duration::from_millis(250),
-        "on_session_end must wait through the slow commit; took {elapsed:?}"
+        "on_turn_complete must wait through the slow commit; took {elapsed:?}"
     );
 }
 
@@ -224,7 +234,7 @@ async fn recall_returns_empty_on_critical_path_timeout() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn on_turn_complete_posts_two_messages_keyed_on_session() {
+async fn on_turn_complete_posts_two_messages_then_commits() {
     let captured = Captured::default();
     let app =
         Router::new()
@@ -234,8 +244,17 @@ async fn on_turn_complete_posts_two_messages_keyed_on_session() {
                     |State(c): State<Captured>,
                      Path(sid): Path<String>,
                      Json(body): Json<Value>| async move {
-                        c.paths.lock().push(sid);
+                        c.paths.lock().push(format!("message:{sid}"));
                         c.bodies.lock().push(body);
+                        Json(json!({}))
+                    },
+                ),
+            )
+            .route(
+                "/api/v1/sessions/{sid}/commit",
+                post(
+                    |State(c): State<Captured>, Path(sid): Path<String>| async move {
+                        c.paths.lock().push(format!("commit:{sid}"));
                         Json(json!({}))
                     },
                 ),
@@ -254,64 +273,19 @@ async fn on_turn_complete_posts_two_messages_keyed_on_session() {
     .unwrap();
 
     let paths = captured.paths.lock().clone();
-    assert_eq!(paths.len(), 2);
-    assert_eq!(paths[0], "session-42");
-    assert_eq!(paths[1], "session-42");
+    assert_eq!(
+        paths,
+        vec![
+            "message:session-42".to_string(),
+            "message:session-42".to_string(),
+            "commit:session-42".to_string(),
+        ]
+    );
     let bodies = captured.bodies.lock().clone();
     assert_eq!(bodies[0]["role"], "user");
     assert_eq!(bodies[0]["content"], "hi");
     assert_eq!(bodies[1]["role"], "assistant");
     assert_eq!(bodies[1]["content"], "hello");
-}
-
-// ---------------------------------------------------------------------------
-// on_session_end
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn on_session_end_commits_when_transcript_non_empty() {
-    let captured = Captured::default();
-    let app = Router::new()
-        .route(
-            "/api/v1/sessions/{sid}/commit",
-            post(
-                |State(c): State<Captured>, Path(sid): Path<String>| async move {
-                    c.paths.lock().push(sid);
-                    Json(json!({}))
-                },
-            ),
-        )
-        .with_state(captured.clone());
-    let server = spawn(app).await;
-    let m = build(&base_url(&server));
-
-    let ctx = memory_context("alice", "session-99", StepKind::MemoryWrite).await;
-    let transcript = vec![ChatMessage::user(vec![ContentBlock::Text("hi".into())])];
-    m.on_session_end(&ctx, &transcript).await.unwrap();
-    let paths = captured.paths.lock().clone();
-    assert_eq!(paths, vec!["session-99".to_string()]);
-}
-
-#[tokio::test]
-async fn on_session_end_skips_commit_for_empty_transcript() {
-    let captured = Captured::default();
-    let app = Router::new()
-        .route(
-            "/api/v1/sessions/{sid}/commit",
-            post(
-                |State(c): State<Captured>, Path(sid): Path<String>| async move {
-                    c.paths.lock().push(sid);
-                    Json(json!({}))
-                },
-            ),
-        )
-        .with_state(captured.clone());
-    let server = spawn(app).await;
-    let m = build(&base_url(&server));
-
-    let ctx = memory_context("alice", "session-empty", StepKind::MemoryWrite).await;
-    m.on_session_end(&ctx, &[]).await.unwrap();
-    assert!(captured.paths.lock().is_empty());
 }
 
 // ---------------------------------------------------------------------------
