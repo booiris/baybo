@@ -84,14 +84,20 @@ struct ProjectSettingsSheet: View {
             .padding(.top, 6)
         }
         .background(Theme.paper)
-        .confirmationDialog(
+        .alert(
             lang.t(isArchived ? "settings.unarchiveTitle" : "settings.archiveTitle"),
-            isPresented: $confirmingArchive, titleVisibility: .visible
+            isPresented: $confirmingArchive
         ) {
-            Button(lang.t(isArchived ? "settings.unarchive" : "settings.archive")) {
-                setArchived(!isArchived)
-            }
             Button(lang.t("common.cancel"), role: .cancel) {}
+            if isArchived {
+                Button(lang.t("settings.unarchive")) {
+                    setArchived(false)
+                }
+            } else {
+                Button(lang.t("settings.archive"), role: .destructive) {
+                    setArchived(true)
+                }
+            }
         } message: {
             Text(verbatim: lang.t(isArchived ? "settings.unarchiveExplain" : "settings.archiveExplain"))
         }

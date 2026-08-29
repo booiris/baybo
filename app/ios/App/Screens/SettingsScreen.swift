@@ -33,8 +33,7 @@ struct SettingsScreen: View {
                 divider
                 actionRow(
                     icon: "hand.raised",
-                    title: lang.t("settings.privacyPolicy"),
-                    value: "GitHub"
+                    title: lang.t("settings.privacyPolicy")
                 ) {
                     Haptics.tap()
                     openExternalURL(Self.privacyPolicyURL)
@@ -42,8 +41,7 @@ struct SettingsScreen: View {
                 divider
                 actionRow(
                     icon: "questionmark.circle",
-                    title: lang.t("settings.support"),
-                    value: "GitHub"
+                    title: lang.t("settings.support")
                 ) {
                     Haptics.tap()
                     openExternalURL(Self.supportURL)
@@ -88,7 +86,7 @@ struct SettingsScreen: View {
     }
 
     private func actionRow(
-        icon: String, title: String, value: String, action: @escaping () -> Void
+        icon: String, title: String, value: String? = nil, action: @escaping () -> Void
     ) -> some View {
         Button(action: action) {
             rowContent(icon: icon, title: title, value: value, chevron: true)
@@ -105,7 +103,7 @@ struct SettingsScreen: View {
         rowContent(icon: icon, title: title, value: value, chevron: false)
     }
 
-    private func rowContent(icon: String, title: String, value: String, chevron: Bool)
+    private func rowContent(icon: String, title: String, value: String?, chevron: Bool)
         -> some View
     {
         HStack(spacing: 14) {
@@ -117,9 +115,11 @@ struct SettingsScreen: View {
                 .font(Theme.mono(15))
                 .foregroundStyle(Theme.ink)
             Spacer()
-            Text(verbatim: value)
-                .font(Theme.mono(14))
-                .foregroundStyle(Theme.inkSoft)
+            if let value {
+                Text(verbatim: value)
+                    .font(Theme.mono(14))
+                    .foregroundStyle(Theme.inkSoft)
+            }
             if chevron {
                 Image(systemName: "chevron.right")
                     .font(.system(size: 12, weight: .medium))

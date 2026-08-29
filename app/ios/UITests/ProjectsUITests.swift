@@ -297,7 +297,7 @@ final class ProjectsUITests: BayboUITestCase {
         XCTAssertFalse(merges.element.exists, "both sentences must never be on screen at once")
     }
 
-    func testArchivingAsksFirstAndTheTriggerSurvivesADismissal() {
+    func testArchivingShowsCancelAndTheTriggerSurvivesCancellation() {
         let app = openBoard()
         XCTAssertTrue(app.buttons["board-budget-chip"].waitForExistence(timeout: 5))
         app.buttons["board-budget-chip"].tap()
@@ -308,14 +308,15 @@ final class ProjectsUITests: BayboUITestCase {
         let confirm = app.staticTexts["Archive this project?"]
         XCTAssertTrue(confirm.waitForExistence(timeout: 3), "the pill did not raise the confirm")
 
-        app.coordinate(withNormalizedOffset: CGVector(dx: 0.06, dy: 0.5)).tap()
-        sleep(1)
-        XCTAssertFalse(confirm.exists, "the scrim did not dismiss it")
+        let cancel = app.buttons["Cancel"]
+        XCTAssertTrue(cancel.waitForExistence(timeout: 3), "the confirm has no cancel button")
+        cancel.tap()
+        XCTAssertFalse(confirm.exists, "cancel did not dismiss the confirm")
 
         archive.coordinate(withNormalizedOffset: CGVector(dx: 0.06, dy: 0.5)).tap()
         XCTAssertTrue(
             confirm.waitForExistence(timeout: 3),
-            "the pill's interior is dead, or the trigger did not survive a scrim dismiss")
+            "the pill's interior is dead, or the trigger did not survive cancellation")
     }
 
     func testTheFilterWidensToCancelledAndNarrowsToRunning() {
