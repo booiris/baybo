@@ -51,6 +51,7 @@ export const zh: typeof en = {
     },
     issue: {
       loading: "正在加载卡片…",
+      loadingActivity: "正在加载最新动态…",
       description: "描述",
       noDescription: "暂无描述。",
       attachments: "附件",

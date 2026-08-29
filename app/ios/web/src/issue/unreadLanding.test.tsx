@@ -129,6 +129,23 @@ function scroller(): HTMLElement | null {
 }
 
 describe("opening a card at its latest activity", () => {
+  it("keeps a loading animation at the bottom until the live timeline arrives", () => {
+    page();
+
+    const coldLoader = document.querySelector(".issue-loading .issue-loading-row");
+    expect(coldLoader).toHaveAttribute("role", "status");
+    expect(coldLoader?.textContent).toBe("Loading card…");
+
+    deliver(payload(undefined));
+    const tailLoader = document.querySelector(".issue-tail-loading");
+    expect(tailLoader).toHaveAttribute("role", "status");
+    expect(tailLoader?.textContent).toBe("Loading latest activity…");
+    expect(scroller()?.lastElementChild).toBe(tailLoader);
+
+    deliver(payload(undefined, true));
+    expect(document.querySelector(".issue-tail-loading")).toBeNull();
+  });
+
   it("draws the unread rule but lands at the bottom", () => {
     page();
     deliver(payload("e2"));

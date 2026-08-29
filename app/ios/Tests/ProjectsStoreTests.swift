@@ -121,6 +121,22 @@ struct ProjectsStoreTests {
         #expect(store.boards["p1"]?.issues.map(\.title) == ["second, renamed"])
     }
 
+    @Test func aConfirmedIssueReadClearsAndPersistsTheBoardBadge() async {
+        let dir = TempSupportDir()
+        let fake = FakeBayboClient()
+        fake.stubProjects = [project("p1", name: "rglide")]
+        fake.stubIssues = [issue(12, title: "the parser", unread: 3)]
+        let store = ProjectsStore(supportDirectory: dir.url, clientProvider: { fake })
+        await store.refreshRoot()
+        await store.refreshBoard("p1")
+
+        store.noteIssueRead(board: "p1", issue: 12)
+
+        #expect(store.boards["p1"]?.issues.first?.unread == 0)
+        let reopened = ProjectsStore(supportDirectory: dir.url, clientProvider: { fake })
+        #expect(reopened.boards["p1"]?.issues.first?.unread == 0)
+    }
+
     @Test func aFailedWriteRollsBackToTheSnapshotAndKeepsTheServersWords() async {
         let dir = TempSupportDir()
         let fake = FakeBayboClient()

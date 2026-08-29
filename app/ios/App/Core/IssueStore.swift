@@ -170,13 +170,10 @@ final class IssueStore: ObservableObject, WebMediaTarget {
         async let eventsJson = try? client.projectIssueEvents(
             projectId: projectId, number: number)
         async let runs = try? client.projectIssueRuns(projectId: projectId, number: number)
-        async let team = try? client.projectTeam(projectId: projectId)
         async let siblings = try? client.projectIssues(projectId: projectId)
 
-        let fetched = await (issue, eventsJson, runs, team, siblings)
+        let fetchedEventsJson = await eventsJson
         guard refreshGeneration == generation else { return }
-        let (fetchedIssue, fetchedEventsJson, fetchedRuns, fetchedTeam, fetchedSiblings) = fetched
-        if let fetchedIssue { self.issue = fetchedIssue }
         if let json = fetchedEventsJson {
             self.eventsJson = json
             let timeline =
@@ -186,27 +183,43 @@ final class IssueStore: ObservableObject, WebMediaTarget {
             timelineIsLive = true
             reconcileConfirmedComments()
         }
+        persistMirror()
+        deliver()
+        resumePersistedComments()
+
+        let fetchedIssue = await issue
+        guard refreshGeneration == generation else { return }
+        if let fetchedIssue {
+            self.issue = fetchedIssue
+            issueIsLive = true
+            isFromMirror = false
+        }
+        persistMirror()
+        deliver()
+
+        let (fetchedRuns, fetchedSiblings) = await (runs, siblings)
+        guard refreshGeneration == generation else { return }
         // The log carries totals beside the rows; the page prints the rows and
         // the totals belong to a screen that does not exist yet (P7).
         if let fetchedRuns {
             self.runs = fetchedRuns.runs
             runsAreLive = true
         }
-        if let fetchedTeam { self.team = fetchedTeam }
         // Children come from the board: the card DTO carries a done/total
         // count and no list at all.
         if let fetchedSiblings {
             children = fetchedSiblings.filter { $0.parent == number }
         }
-        // Test this response, not self.issue: a mirror may already have filled
-        // the property while this network read failed.
-        if fetchedIssue != nil {
-            issueIsLive = true
-            isFromMirror = false
-        }
         persistMirror()
         deliver()
-        resumePersistedComments()
+
+        guard team.isEmpty,
+            let fetchedTeam = try? await client.projectTeam(projectId: projectId)
+        else { return }
+        guard refreshGeneration == generation else { return }
+        team = fetchedTeam
+        persistMirror()
+        deliver()
     }
 
     // MARK: - Mirror
@@ -580,6 +593,12 @@ final class IssueStore: ObservableObject, WebMediaTarget {
                 NSLog("baybo: mark read #%lld: %@", number, bayboErrorText(error))
                 return
             }
+            if let issue {
+                self.issue = issue.with(unread: 0)
+                persistMirror()
+                deliver()
+            }
+            AppStore.shared?.projectsStore.noteIssueRead(board: projectId, issue: number)
             AppStore.shared?.projectsStore.scheduleBoardRefresh(projectId)
             AppStore.shared?.projectsStore.scheduleRootRefresh()
         }

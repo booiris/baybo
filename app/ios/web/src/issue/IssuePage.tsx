@@ -229,7 +229,14 @@ export function IssuePage({
   }, [latestLocalComment, schedulePageState]);
 
   if (!payload) {
-    return <div className="issue-loading">{t("issue.loading")}</div>;
+    return (
+      <div
+        className="issue-loading"
+        style={{ paddingBottom: `${String(bottomInset + 24)}px` }}
+      >
+        <IssueLoading label={t("issue.loading")} />
+      </div>
+    );
   }
 
   const { issue, events, runs, people } = payload;
@@ -292,6 +299,18 @@ export function IssuePage({
         folds={folds}
         onFold={changeFold}
       />
+      {payload.timelineLive !== true && (
+        <IssueLoading className="issue-tail-loading" label={t("issue.loadingActivity")} />
+      )}
+    </div>
+  );
+}
+
+function IssueLoading({ label, className = "" }: { label: string; className?: string }) {
+  return (
+    <div className={`issue-loading-row${className === "" ? "" : ` ${className}`}`} role="status">
+      <span className="issue-loading-ring" aria-hidden="true" />
+      <span>{label}</span>
     </div>
   );
 }

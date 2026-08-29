@@ -27,7 +27,11 @@ write state. The card web page owns markdown, timeline layout, attachment
 cards, sub-issue links, and scroll/fold state.
 
 A new card visit follows the bottom through the mirror paint and the first live
-timeline response, so the newest activity is the opening position. The native
+timeline response, so the newest activity is the opening position. The page
+keeps a small loading indicator at the activity tail until that live timeline
+arrives. That timeline is delivered and marked read without waiting for the run
+log, children, or team. The Issue List's team seeds the detail store; only a
+direct open with no team data fetches `/agents`. The native
 `#number ↑` header is one tap target that scrolls the web page smoothly to the
 top. The arrow is present only while the page is away from the top, including
 after a later downward scroll; at the top the header is the plain issue number.

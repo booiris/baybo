@@ -48,6 +48,7 @@ export const en = {
     },
     issue: {
       loading: "Loading card…",
+      loadingActivity: "Loading latest activity…",
       description: "Description",
       noDescription: "No description.",
       attachments: "Attachments",

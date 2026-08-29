@@ -81,6 +81,48 @@ struct IssueMirrorTests {
         #expect(store.pendingApprovals.isEmpty)
     }
 
+    @Test func aBoardSeedDoesNotRefetchTheTeam() async {
+        let dir = TempSupportDir()
+        let fake = FakeBayboClient()
+        fake.stubIssueDetail = issue(41)
+        fake.stubIssueEventsJson = "{\"items\":[]}"
+        fake.stubRunLog = IssueRunLog(
+            runs: [], totalCostMicros: 0, totalInputTokens: 0, totalOutputTokens: 0)
+        fake.stubIssues = [issue(41)]
+        let store = IssueStore(
+            projectId: "p1", number: 41, client: fake, supportDirectory: dir.url,
+            seed: IssueStore.Seed(
+                issue: issue(41), runs: [], team: [member()], children: []))
+
+        await store.refresh()
+
+        #expect(fake.projectTeamCalls == 0)
+        #expect(store.team.first?.handle == "dev-1")
+    }
+
+    @Test func theLiveTimelineCanMarkReadBeforeTheOtherDetailPlanesFinish() async {
+        let dir = TempSupportDir()
+        let fake = FakeBayboClient()
+        fake.stubIssueDetail = issue(41)
+        fake.issueDetailStallMs = 500
+        fake.stubIssueEventsJson = """
+            {"items":[{"id":"e1","number":41,"created_at_ms":1,
+             "body":{"kind":"comment","text":"new"}}]}
+            """
+        let store = IssueStore(
+            projectId: "p1", number: 41, client: fake, supportDirectory: dir.url,
+            seed: IssueStore.Seed(
+                issue: issue(41), runs: [], team: [member()], children: []))
+
+        let refresh = Task { await store.refresh() }
+        #expect(await waitUntil { store.events.count == 1 })
+        store.markRendered()
+
+        #expect(await waitUntil { fake.issueReads == [41] })
+        #expect(store.issue?.unread == 0)
+        await refresh.value
+    }
+
     @Test func aMirroredCardOffersNoApprovalUntilTheNetworkConfirmsIt() async {
         let dir = TempSupportDir()
         let first = await seeded(dir)
