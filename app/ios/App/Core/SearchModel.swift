@@ -23,12 +23,6 @@ final class SearchModel: ObservableObject {
     /// a keystroke costs materially more here.
     nonisolated static let defaultDebounce: Duration = .milliseconds(300)
 
-    /// Below this a CJK query matches nearly everything and the result list is
-    /// noise — the index makes every Han codepoint its own token, so one
-    /// character is a legitimate but useless query. Matches app/web's
-    /// `MIN_QUERY_LEN`.
-    nonisolated static let minQueryLength = 2
-
     @Published private(set) var phase: Phase = .idle
 
     private let client: any BayboClientProtocol
@@ -68,7 +62,7 @@ final class SearchModel: ObservableObject {
         let seq = sequence
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        guard trimmed.count >= Self.minQueryLength else {
+        guard !trimmed.isEmpty else {
             phase = .idle
             return
         }

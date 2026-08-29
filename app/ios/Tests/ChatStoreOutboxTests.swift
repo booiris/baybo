@@ -132,6 +132,17 @@ struct ChatStoreOutboxTests {
         #expect(client.transmissions.isEmpty)
     }
 
+    @Test func aLoadedSyncPageIsMarkedReadImmediately() async {
+        client.answerSync(with: syncPage())
+
+        store.requestSync(sinceOrdinal: nil, limit: 50)
+
+        #expect(await waitUntil { client.readOrdinals == [42] })
+        store.markRead(ordinal: 42)
+        _ = await waitUntil(timeout: Self.negativeTimeout) { client.readOrdinals.count > 1 }
+        #expect(client.readOrdinals == [42], "the transcript callback must be deduplicated")
+    }
+
     /// A rebased page hides the floor, so each unconfirmed entry resolves by
     /// point lookup instead — found → released, no transmission consumed.
     @Test func rebasedSyncResolvesEachEntryByPointLookup() async {

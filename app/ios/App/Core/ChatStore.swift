@@ -297,6 +297,10 @@ final class ChatStore: ObservableObject, TranscriptTarget {
     /// and pin the gateway to a pick the pill no longer shows.
     private var modelPutTail: Task<Void, Never>?
     private var modelPutsInFlight = 0
+    /// Highest read cursor this resident store has sent or is sending. Sync
+    /// completion and the transcript's live-frame callback can report the same
+    /// ordinal; one gateway write is enough because the cursor is max-wins.
+    private var markedReadOrdinal: Int64?
 
     /// Accepted floor: sinks below this are muted. Advanced when a dial
     /// actually REPLACES the pump (success) or on deliberate disconnect — NOT
@@ -1184,8 +1188,11 @@ final class ChatStore: ObservableObject, TranscriptTarget {
             do {
                 let frame = try await client.chatFetchSync(
                     sessionId: sessionId, sinceOrdinal: sinceOrdinal, limit: limit)
-                reconcileOutboxAfterSync(frameJson: frame)
+                let readOrdinal = reconcileOutboxAfterSync(frameJson: frame)
                 pushFrame(frame)
+                if chatOpen, let readOrdinal {
+                    markRead(ordinal: readOrdinal)
+                }
                 retractResyncNotice()
             } catch {
                 NSLog("baybo: sync: %@", bayboErrorText(error))
@@ -1201,10 +1208,14 @@ final class ChatStore: ObservableObject, TranscriptTarget {
     /// list pull; a draft (no remote session yet) has nothing to mark.
     func markRead(ordinal: Int64) {
         guard listed || remoteSessionEnsured else { return }
+        if let markedReadOrdinal, ordinal <= markedReadOrdinal { return }
+        let previous = markedReadOrdinal
+        markedReadOrdinal = ordinal
         Task {
             do {
                 try await client.chatMarkRead(sessionId: sessionId, ordinal: ordinal)
             } catch {
+                if markedReadOrdinal == ordinal { markedReadOrdinal = previous }
                 NSLog("baybo: mark read: %@", bayboErrorText(error))
             }
         }
@@ -1338,15 +1349,16 @@ final class ChatStore: ObservableObject, TranscriptTarget {
         index.recordAgentReply(sessionId: sessionId, text: content)
     }
 
-    /// Native holds the `sync_page` it fetched, so it reconciles the outbox
-    /// against it before the webview applies it: an ordinal-stamped row with a
-    /// matching `platform_msg_id` proves DURABILITY and releases the entry. A
-    /// rebased page hides the floor, so each still-unconfirmed entry resolves via
-    /// the per-key point lookup (no retry transmission consumed).
-    private func reconcileOutboxAfterSync(frameJson: String) {
+    /// Native holds the `sync_page` it fetched, so it reconciles the outbox and
+    /// captures the page's read cursor before the webview applies it. An
+    /// ordinal-stamped row with a matching `platform_msg_id` proves DURABILITY
+    /// and releases the entry. A rebased page hides the floor, so each
+    /// still-unconfirmed entry resolves via the per-key point lookup (no retry
+    /// transmission consumed).
+    private func reconcileOutboxAfterSync(frameJson: String) -> Int64? {
         guard let data = frameJson.data(using: .utf8),
             let frame = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return }
+        else { return nil }
         let rows = (frame["rows"] as? [[String: Any]]) ?? []
         for row in rows {
             if let pmid = row["platform_msg_id"] as? String, !pmid.isEmpty {
@@ -1359,6 +1371,7 @@ final class ChatStore: ObservableObject, TranscriptTarget {
                 resolveUnknownEntry(platformMsgId: entry.platformMsgId)
             }
         }
+        return (frame["next_cursor"] as? NSNumber)?.int64Value
     }
 
     /// Release a send the gateway has provably written: drop the outbox entry

@@ -1,7 +1,7 @@
 import XCTest
 
 /// Headless drive of the search surface: the tab-bar search button, the
-/// minimum-length gate, a result card, and the round trip that makes backing out
+/// single-character query, a result card, and the round trip that makes backing out
 /// of a hit return to the results rather than to the chat list.
 ///
 /// Runs against `-baybo-open-home` demo rows with `-baybo-demo-search` supplying
@@ -36,21 +36,15 @@ final class SearchUITests: BayboUITestCase {
         XCTAssertFalse(app.buttons["search.hit.demo-1.2"].exists)
     }
 
-    /// One character is a legitimate query the index can answer and a useless one
-    /// to answer — it matches nearly every conversation — so nothing is searched.
-    ///
-    /// Asserted on the RESULTS, not on a hint: the idle screen draws no text of
-    /// its own, and `-baybo-demo-search` answers any query of 2+ characters, so
-    /// "no cards" is exactly "no search ran".
-    func testASingleCharacterDoesNotSearch() {
+    func testASingleCharacterSearches() {
         let app = launchSearch()
         let field = openSearch(app)
         field.tap()
         field.typeText("d")
 
-        XCTAssertFalse(
-            app.buttons["search.hit.demo-1.2"].waitForExistence(timeout: 2),
-            "one character must not run a search")
+        XCTAssertTrue(
+            app.buttons["search.hit.demo-1.2"].waitForExistence(timeout: 10),
+            "one character must run a search")
     }
 
     func testTypingShowsGroupedResults() {

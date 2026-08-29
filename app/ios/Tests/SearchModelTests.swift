@@ -55,24 +55,21 @@ final class SearchModelTests: XCTestCase {
             truncated: false)
     }
 
-    /// One Han character is a legitimate query the index can answer and a useless
-    /// one to answer — it matches nearly every conversation.
-    func testAQueryShorterThanTheMinimumNeverReachesTheGateway() async {
+    func testASingleCharacterReachesTheGateway() async {
         let client = FakeBayboClient()
         let model = model(client)
 
         model.update(query: "数")
         await settle()
 
-        XCTAssertEqual(client.searchCalls, [])
-        XCTAssertTrue(isIdle(model))
+        XCTAssertEqual(client.searchCalls, ["数"])
     }
 
-    func testWhitespaceIsNotLength() async {
+    func testWhitespaceOnlyDoesNotReachTheGateway() async {
         let client = FakeBayboClient()
         let model = model(client)
 
-        model.update(query: "  a   ")
+        model.update(query: "  \n\t  ")
         await settle()
 
         XCTAssertEqual(client.searchCalls, [])

@@ -190,9 +190,10 @@ device channel's `Subscribe` both scope by CHANNEL only, so before
 `SearchScope::include_cron_workspaces` existed a hit there let the phone open,
 read and even post into a conversation no client can list.
 
-**`SearchModel` owns the querying**, apart from the view, so the three rules
+**`SearchModel` owns the querying**, apart from the view, so the four rules
 that are easy to get wrong are testable without a UI host:
 
+- every nonblank trimmed query is searched, including a single character;
 - a **300ms debounce** (longer than app/web's 200ms — that panel talks to
   localhost, this one may cross a relay tunnel budgeted at 15s to first byte);
 - a **monotonic sequence** guard, because cancelling the task cannot un-send a
@@ -304,9 +305,11 @@ the device never opened still updates the list.
 `SessionActivityHandler` → `SessionIndex.noteActivity` bumps `SessionRow.unread`
 and recency (persisted; ignored for the foreground session and unknown ids) as a
 between-pulls accelerator — the badge is server-computed (`unreadCount` on the
-list summary) and reconciled on every list merge, and the webview's `mark_read`
-advances the server-side read cursor (`chat_mark_read`) so the badge clears
-across devices.
+list summary) and reconciled on every list merge. Once a visible chat's sync
+loads its messages, `ChatStore` immediately advances the server-side read cursor
+to the page's `next_cursor`; the webview's `mark_read` keeps advancing it for
+live replies. The store deduplicates the two paths, and `chat_mark_read` clears
+the badge across devices.
 
 `ChatScreen` enter/leave marks the foreground session and clears its badge.
 
