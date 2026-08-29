@@ -39,7 +39,17 @@ A child actor boots with an empty context, the profile's `system_prompt` as its 
 1. Resolves `subagent_type` against the registry — an unknown type returns a hard `ToolError::InvalidParams` listing the catalogue (no soft fallback).
 2. Walks the parent's lineage via `SessionManager` to compute depth (the root session id is read off the denormalized `Session.root_session_id`; depth still needs the walk, capped at `MAX_LINEAGE_WALK_HOPS = 128` against corrupt chains). Depth `>= max_depth` → `ToolError::SubagentDepthExceeded`.
 3. Reserves a fan-out slot under the root via the dispatch limiter **before** shipping. Over cap → `ToolError::SubagentFanoutExceeded`.
-4. Hands the `SubagentSpawnRequest` (plus a `SubagentParentContext` carrying the parent's session/turn/span ids, cancel token, and the turn's `background_eligible` gate) to the actor-backed `SubagentSpawner` — reached via a late-set slot, since the tool is built before the spawner exists — and returns the `SubagentResult`: the child's terminal for a foreground spawn, or the dispatch ack for a background one.
+4. Hands the `SubagentSpawnRequest` (plus a `SubagentParentContext` carrying the parent's session/turn/span ids, cancel token, the turn's `background_eligible` gate, and any transient `InheritedToolContext`) to the actor-backed `SubagentSpawner` — reached via a late-set slot, since the tool is built before the spawner exists — and returns the `SubagentResult`: the child's terminal for a foreground spawn, or the dispatch ack for a background one.
+
+When a Baybo child is spawned from an execution carrying an
+`InheritedToolContext`, the tool forwards `ToolContext::inherited_context`
+unchanged and the actor-backed spawner installs it on the child's `Spawned`
+turn. Descendants repeat the same propagation, without knowing whether cron or
+another dispatcher created the context. This is execution context, not session
+identity: it is not stored on the child row, an independently resumed child does
+not recover it, and `Some(default())` deliberately keeps the child fail-closed.
+External backends do not consume it because they do not run through Baybo's MCP
+registry or `ToolExecutor`.
 
 The tool is registered by the runtime wiring code (`crates/baybo/src/runtime.rs`), **not** by `baybo_tools::builtin::default_tools`, because it needs the runtime-owned spawner slot and the live `SubagentRegistry` for its per-turn description. Its manifest carries `TrustLevel::Trusted` and an empty capability set.
 
@@ -78,9 +88,9 @@ Four profiles are compiled into the binary via `include_str!` (`builtin/*.md`) a
 
 | Module | Role |
 |--------|------|
-| `agent` | `crates/baybo/src/runtime.rs` constructs the `SubagentRegistry` (`new` → `register_builtins` → `load_dir(workspace_paths.agents_dir())`), the `FanOutLimiter`, and the `spawn_subagent` tool via `tool::make`. The `runtime::subagent_spawner::ActorSubagentSpawner` (with the wait routine in `actor/subagent.rs`) builds/links the child actor and releases the fan-out slot on the child's terminal event |
+| `agent` | `crates/baybo/src/runtime.rs` constructs the `SubagentRegistry` (`new` → `register_builtins` → `load_dir(workspace_paths.agents_dir())`), the `FanOutLimiter`, and the `spawn_subagent` tool via `tool::make`. The `runtime::subagent_spawner::ActorSubagentSpawner` (with the wait routine in `actor/subagent.rs`) builds/links the child actor, carries any transient `InheritedToolContext` into its spawned turn, and releases the fan-out slot on the child's terminal event |
 | `context` | `ContextManager` holds an optional `(Arc<SubagentRegistry>, subagent_type)`; on seed it resolves the type back to the profile's `system_prompt` and uses it as the child's system row in place of Soul |
-| `model` | Owns the spawn protocol (`SubagentSpawnRequest` / `SubagentResult` / `SubagentBackend` / `SPAWN_SUBAGENT_TOOL_NAME`) plus `ModelTier`, `ArtifactSource`, `TrustLevel` |
+| `model` | Owns `InheritedToolContext`, the spawn protocol (`SubagentSpawnRequest` / `SubagentResult` / `SubagentBackend` / `SPAWN_SUBAGENT_TOOL_NAME`), plus `ModelTier`, `ArtifactSource`, `TrustLevel` |
 | `tools` | Provides the `Tool` trait + `ToolContext` / `ToolManifest` the `spawn_subagent` tool implements |
 | `session` | `SessionManager` backs the lineage walk that powers the depth cap |
 | `workspace` | `WorkspacePaths::agents_dir()` resolves the `<workspace>/agents/` profile directory (a standalone git repo, created and `git init`-ed by `ensure_layout`) |

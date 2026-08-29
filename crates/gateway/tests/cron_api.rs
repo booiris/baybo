@@ -491,6 +491,15 @@ async fn grantable_mcp_tool_listing_is_authenticated_live_typed_and_sorted() {
     let zeta_identity =
         register_mcp_tool(&tg, "zeta", "zeta/search", "search", "Search zeta", 0x22);
     let alpha_identity = register_mcp_tool(&tg, "alpha", "alpha/read", "read", "Read alpha", 0x11);
+    let untrusted_identity = register_mcp_tool_with_trust(
+        &tg,
+        "unsafe",
+        "unsafe/read",
+        "read",
+        "Read unsafe",
+        0x33,
+        TrustLevel::Untrusted,
+    );
     let router = build_authenticated_router(&tg);
 
     get(&router, "/v1/cron/mcp-tools", StatusCode::UNAUTHORIZED).await;
@@ -519,6 +528,10 @@ async fn grantable_mcp_tool_listing_is_authenticated_live_typed_and_sorted() {
     let live = admin_get(&router, "/v1/cron/mcp-tools", StatusCode::OK).await;
     assert_eq!(live["items"].as_array().expect("items").len(), 1);
     assert_eq!(live["items"][0]["tool"].as_str(), Some("zeta/search"));
+
+    let mut create = new_cron_body("Unsafe grant");
+    create["mcp_tool_grants"] = json!([grant_json("unsafe/read", &untrusted_identity)]);
+    admin_post_expect(&router, "/v1/cron", create, StatusCode::BAD_REQUEST).await;
 }
 
 #[tokio::test]
@@ -683,6 +696,26 @@ fn register_mcp_tool(
     description: &str,
     identity_byte: u8,
 ) -> McpTransportIdentity {
+    register_mcp_tool_with_trust(
+        tg,
+        server,
+        name,
+        upstream,
+        description,
+        identity_byte,
+        TrustLevel::Trusted,
+    )
+}
+
+fn register_mcp_tool_with_trust(
+    tg: &baybo_gateway::test_support::TestGateway,
+    server: &str,
+    name: &str,
+    upstream: &str,
+    description: &str,
+    identity_byte: u8,
+    trust_level: TrustLevel,
+) -> McpTransportIdentity {
     let transport_identity = McpTransportIdentity::from_sha256([identity_byte; 32]);
     tg.deps.tool_registry.register_dynamic(
         server,
@@ -696,7 +729,7 @@ fn register_mcp_tool(
         ToolManifest {
             name: name.to_string(),
             description: description.to_string(),
-            trust_level: TrustLevel::Trusted,
+            trust_level,
             parameters_schema: json!({"type": "object"}),
             capabilities: Vec::new(),
             channels: Vec::new(),

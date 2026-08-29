@@ -2972,6 +2972,172 @@ async fn cron_tool_grants_are_initial_turn_only_and_never_persist_as_approvals()
     harness.shutdown().await;
 }
 
+#[tokio::test(start_paused = true)]
+async fn cron_mcp_grants_follow_a_spawned_child_without_becoming_session_approvals() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const TOOL_NAME: &str = "browser/navigate_page";
+
+    struct ZeroAccessMcpProbe {
+        calls: Arc<AtomicUsize>,
+        identity: baybo_model::McpTransportIdentity,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for ZeroAccessMcpProbe {
+        fn name(&self) -> &str {
+            TOOL_NAME
+        }
+
+        fn description(&self) -> String {
+            "zero-access typed MCP probe".to_string()
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type": "object", "properties": {}})
+        }
+
+        fn mcp_metadata(&self) -> Option<baybo_tools::mcp::McpToolMetadata> {
+            Some(baybo_tools::mcp::McpToolMetadata {
+                tool_name: TOOL_NAME.to_string(),
+                server_name: "browser".to_string(),
+                upstream_name: "navigate_page".to_string(),
+                transport_identity: self.identity.clone(),
+                transport_accesses: Vec::new(),
+            })
+        }
+
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _ctx: &baybo_tools::ToolContext,
+        ) -> baybo_tools::Result<ToolOutput> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolOutput::Text("page opened".to_string()))
+        }
+    }
+
+    let identity = baybo_model::McpTransportIdentity::from_sha256([41; 32]);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let tool: Arc<dyn Tool> = Arc::new(ZeroAccessMcpProbe {
+        calls: Arc::clone(&calls),
+        identity: identity.clone(),
+    });
+    let manifest = baybo_tools::ToolManifest {
+        name: TOOL_NAME.to_string(),
+        description: "zero-access typed MCP probe".to_string(),
+        trust_level: baybo_model::TrustLevel::Trusted,
+        parameters_schema: json!({"type": "object", "properties": {}}),
+        capabilities: Vec::new(),
+        channels: Vec::new(),
+    };
+    let mut session = SessionBuilder::new()
+        .channel(baybo_model::ChannelType::from("subagent"))
+        .build();
+    session.trigger = TriggerSource::Cron {
+        cron_job_id: "cj-child-grant".to_string(),
+        origin_session_id: None,
+        conversation: true,
+        job_title: Some("Child grant".to_string()),
+        project_id: None,
+    };
+    let session_id = session.id.clone();
+    let mut harness = AgentTestHarness::builder()
+        .session(session)
+        .with_tool(tool, manifest)
+        .build();
+
+    let child_session_id = harness.session.id.clone();
+    let child_channel = harness.session.channel.clone();
+    let child_user = harness.session.user.clone();
+    let child_message = move |id: &str| IncomingMessage {
+        message: Message {
+            id: id.to_string(),
+            session_id: child_session_id.clone(),
+            channel: child_channel.clone(),
+            sender: child_user.clone(),
+            content: vec![ContentBlock::Text("open the page".to_string())],
+            timestamp: Utc::now(),
+            reply_to: None,
+            metadata: MessageMetadata::default(),
+        },
+        platform_msg_id: String::new(),
+        bot_id: String::new(),
+    };
+    let queue_turn = |harness: &AgentTestHarness, id: &str| {
+        harness
+            .stub_llm
+            .push_stream(vec![StreamEvent::ToolCall(ToolCallInfo {
+                id: format!("call-{id}"),
+                name: TOOL_NAME.to_string(),
+                arguments: json!({}),
+                signature: None,
+            })]);
+        harness
+            .stub_llm
+            .push_stream(vec![StreamEvent::Text(format!("finished {id}"))]);
+    };
+
+    queue_turn(&harness, "granted");
+    harness
+        .mailbox
+        .send(AgentMessage::SubagentSpawned {
+            initial_message: Box::new(child_message("spawn-granted")),
+            parent_turn_id: baybo_model::TurnId::default(),
+            inherited_context: Some(baybo_model::InheritedToolContext::new(vec![
+                baybo_model::McpToolGrant::new(TOOL_NAME, identity),
+            ])),
+        })
+        .await
+        .expect("child turn accepted");
+    harness.drain_outputs(DRAIN_TIMEOUT).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    queue_turn(&harness, "ungranted");
+    harness
+        .mailbox
+        .send(AgentMessage::SubagentSpawned {
+            initial_message: Box::new(child_message("spawn-ungranted")),
+            parent_turn_id: baybo_model::TurnId::default(),
+            inherited_context: Some(baybo_model::InheritedToolContext::default()),
+        })
+        .await
+        .expect("ungranted child turn accepted");
+    harness.drain_outputs(DRAIN_TIMEOUT).await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "Some(empty) must retain unattended fail-closed policy"
+    );
+
+    queue_turn(&harness, "ordinary-resume");
+    harness
+        .mailbox
+        .send(AgentMessage::SubagentSpawned {
+            initial_message: Box::new(child_message("spawn-ordinary")),
+            parent_turn_id: baybo_model::TurnId::default(),
+            inherited_context: None,
+        })
+        .await
+        .expect("ordinary resumed child turn accepted");
+    harness.drain_outputs(DRAIN_TIMEOUT).await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "cron authority must not leak into an independently resumed child turn"
+    );
+
+    let stored = harness
+        .session_manager
+        .get(&session_id)
+        .await
+        .unwrap()
+        .expect("child session persists");
+    assert!(stored.state.approved_resources.is_empty());
+
+    harness.shutdown().await;
+}
+
 /// A recurring fire that calls `report_nothing` notifies no one: no channel
 /// `Message` is dispatched (no live pulse), the fire's own conversation is
 /// hidden (no chat-list row), and its `Cron` turn completes with a reply-less

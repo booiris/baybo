@@ -613,6 +613,7 @@ impl Tool for SpawnSubagentTool {
             span_id: ctx.span_id,
             cancel_token: ctx.cancellation_token.clone(),
             background_eligible: ctx.background_eligible,
+            inherited_context: ctx.inherited_context.clone(),
         };
         let mut request = request;
         request.fan_out_root = Some(root_session_id.clone());
@@ -809,7 +810,8 @@ mod tests {
         })
     }
 
-    type CapturedSpawn = Arc<parking_lot::Mutex<Option<(SubagentSpawnRequest, SessionId)>>>;
+    type CapturedSpawn =
+        Arc<parking_lot::Mutex<Option<(SubagentSpawnRequest, SubagentParentContext)>>>;
 
     /// Stand-in for the actor-backed spawner: records the (request, parent
     /// session id) it was handed and returns a canned result.
@@ -825,7 +827,7 @@ mod tests {
             parent: SubagentParentContext,
             request: SubagentSpawnRequest,
         ) -> SubagentResult {
-            *self.captured.lock() = Some((request, parent.session_id));
+            *self.captured.lock() = Some((request, parent));
             self.response.clone()
         }
     }
@@ -879,7 +881,7 @@ mod tests {
             }
             _ => panic!("expected Text output"),
         }
-        let (req, parent_id) = captured.lock().take().expect("spawner saw a request");
+        let (req, parent) = captured.lock().take().expect("spawner saw a request");
         assert_eq!(req.subagent_type, "general-purpose");
         assert_eq!(req.task_summary, "look up X");
         assert_eq!(req.prompt, "Investigate X and report what you find.");
@@ -890,7 +892,47 @@ mod tests {
             "default backend should be Baybo, got {:?}",
             req.backend
         );
-        assert_eq!(parent_id.as_ref(), "parent-sess");
+        assert_eq!(parent.session_id.as_ref(), "parent-sess");
+        assert!(parent.inherited_context.is_none());
+    }
+
+    #[tokio::test]
+    async fn forwards_inherited_tool_context_to_the_child_spawner() {
+        let (spawner, captured) = fake_spawner(SubagentResult {
+            child_session_id: baybo_model::SessionId::from("child-1"),
+            final_content: Some(vec![baybo_model::ContentBlock::Text("done".into())]),
+            status: SubagentExitStatus::Completed,
+        });
+        let grant = baybo_model::McpToolGrant::new(
+            "browser/navigate_page",
+            baybo_model::McpTransportIdentity::from_sha256([37; 32]),
+        );
+        let context = ToolContext {
+            inherited_context: Some(baybo_model::InheritedToolContext::new(vec![grant.clone()])),
+            ..ctx()
+        };
+
+        tool_with_default(spawner)
+            .await
+            .execute(
+                json!({
+                    "subagent_type": "general-purpose",
+                    "description": "browse the page",
+                    "prompt": "Open the page and report its title.",
+                }),
+                &context,
+            )
+            .await
+            .expect("spawn succeeds");
+
+        let (_, parent) = captured.lock().take().expect("spawner saw a request");
+        assert_eq!(
+            parent
+                .inherited_context
+                .as_ref()
+                .map(baybo_model::InheritedToolContext::mcp_tool_grants),
+            Some(std::slice::from_ref(&grant))
+        );
     }
 
     #[tokio::test]

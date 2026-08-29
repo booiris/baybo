@@ -6194,7 +6194,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Currently connected typed MCP tools that can be granted to a cron job, sorted by full tool name */
+            /** @description Currently connected auto-executable typed MCP tools that can be granted to a cron job, sorted by full tool name */
             200: {
                 headers: {
                     [name: string]: unknown;

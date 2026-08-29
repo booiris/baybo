@@ -200,10 +200,9 @@ impl CronScheduler {
         self.create_job_with_mcp_tool_grants(spec, Vec::new()).await
     }
 
-    /// Create a job with operator-selected exact MCP tool grants.
-    ///
-    /// LLM-facing cron tools call [`Self::create_job`], which always supplies
-    /// an empty set; only a human-facing domain caller should use this entry.
+    /// Create a job with exact MCP tool grants already resolved by the calling
+    /// authoring surface. The LLM-facing tool resolves operation names through
+    /// the live registry; HTTP callers validate exact tuples at their boundary.
     pub async fn create_job_with_mcp_tool_grants(
         &self,
         spec: NewCronJob,

@@ -717,7 +717,7 @@ impl From<baybo_model::McpToolGrant> for McpToolGrant {
     }
 }
 
-/// One currently connected MCP tool that an operator may grant to a cron job.
+/// One currently connected auto-executable MCP tool that may be granted to a cron job.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct GrantableMcpTool {
     /// Configured MCP server name.

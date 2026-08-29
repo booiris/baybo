@@ -136,6 +136,10 @@ pub enum AgentMessage {
     SubagentSpawned {
         initial_message: Box<IncomingMessage>,
         parent_turn_id: baybo_model::TurnId,
+        /// Transient tool authority inherited from the dispatching execution.
+        /// It follows in-process delegation, but is never reconstructed from
+        /// the persistent child session.
+        inherited_context: Option<baybo_model::InheritedToolContext>,
     },
     /// A detached subagent or `Bash` command reached a terminal state. The
     /// completion enters `session.state.background_notifications`, where it
@@ -555,9 +559,10 @@ impl AgentActor {
             AgentMessage::SubagentSpawned {
                 initial_message,
                 parent_turn_id,
+                inherited_context,
             } => {
                 if let Err(e) = self
-                    .handle_subagent_spawned(*initial_message, parent_turn_id)
+                    .handle_subagent_spawned(*initial_message, parent_turn_id, inherited_context)
                     .await
                 {
                     if is_turn_cancelled(&e) {
@@ -615,9 +620,9 @@ impl AgentActor {
         // A recurring cron fire's silence handle for `report_nothing`;
         // `None` for every other turn. See `dispatch_cron_prompt`.
         notify_silence: Option<baybo_tools::NotifySilence>,
-        // Present only for the first cron-triggered turn. A later reply in the
-        // same session passes `None` despite its persistent Cron trigger.
-        initial_cron: Option<crate::runtime::tool_executor::InitialCronToolContext>,
+        // Transient authority supplied by the turn dispatcher. It is not
+        // reconstructed from persistent session metadata on later turns.
+        inherited_context: Option<baybo_model::InheritedToolContext>,
     ) -> anyhow::Result<OutgoingMessage> {
         let is_user_turn = matches!(turn_input.input_kind(), baybo_turn::TurnInputKind::UserChat);
         // Kept so the error path below can tell a user `/stop` (token
@@ -629,11 +634,11 @@ impl AgentActor {
         // `agent_loop.run`, the end edge from its terminal transition. So
         // chat turn-activity has a single producer sourced from the one
         // truth, and the per-`Subscribe` snapshot can't disagree with it.
-        let result = match initial_cron {
+        let result = match inherited_context {
             Some(context) => {
                 self.volatile
                     .agent_loop
-                    .run_initial_cron(
+                    .run_with_inherited_context(
                         &mut self.durable.session,
                         turn_input,
                         &self.volatile.turn_lifecycle,
@@ -771,9 +776,7 @@ impl AgentActor {
                 None,
                 None,
                 silence.clone(),
-                Some(crate::runtime::tool_executor::InitialCronToolContext::new(
-                    mcp_tool_grants,
-                )),
+                Some(baybo_model::InheritedToolContext::new(mcp_tool_grants)),
             )
             .await?;
         let silenced = silence.as_ref().is_some_and(|s| s.requested());
@@ -1485,6 +1488,7 @@ impl AgentActor {
         &mut self,
         incoming: IncomingMessage,
         parent_turn_id: baybo_model::TurnId,
+        inherited_context: Option<baybo_model::InheritedToolContext>,
     ) -> anyhow::Result<()> {
         let content = incoming.message.content;
         let response_tx = self.volatile.response_tx.clone();
@@ -1502,7 +1506,7 @@ impl AgentActor {
                 None,
                 None,
                 None,
-                None,
+                inherited_context,
             )
             .await?;
         self.send_response(response.into(), "subagent").await;

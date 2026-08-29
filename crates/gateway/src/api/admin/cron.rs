@@ -49,7 +49,20 @@ fn validate_mcp_tool_grants(
         .collect::<Result<Vec<_>>>()?;
 
     for grant in &grants {
-        let Some(metadata) = state.tool_registry.mcp_metadata(&grant.tool_name) else {
+        let Some((tool, Some(manifest))) = state.tool_registry.get_with_manifest(&grant.tool_name)
+        else {
+            return Err(GatewayError::BadRequest(format!(
+                "MCP tool {:?} is not currently live; refresh GET /v1/cron/mcp-tools before granting it",
+                grant.tool_name
+            )));
+        };
+        manifest.validate_auto_execution().map_err(|error| {
+            GatewayError::BadRequest(format!(
+                "MCP tool {:?} cannot be granted: {error}",
+                grant.tool_name
+            ))
+        })?;
+        let Some(metadata) = tool.mcp_metadata() else {
             return Err(GatewayError::BadRequest(format!(
                 "MCP tool {:?} is not currently live; refresh GET /v1/cron/mcp-tools before granting it",
                 grant.tool_name
@@ -138,7 +151,7 @@ async fn list_cron(
     path = "/cron/mcp-tools",
     tag = "cron",
     responses(
-        (status = 200, description = "Currently connected typed MCP tools that can be granted to a cron job, sorted by full tool name", body = inline(ListResponse<GrantableMcpTool>)),
+        (status = 200, description = "Currently connected auto-executable typed MCP tools that can be granted to a cron job, sorted by full tool name", body = inline(ListResponse<GrantableMcpTool>)),
         (status = 401, description = "Unauthorized", body = ErrorBody),
     )
 )]
@@ -150,12 +163,14 @@ async fn list_grantable_mcp_tools(
         .tool_definitions()
         .into_iter()
         .filter_map(|definition| {
-            let metadata = state.tool_registry.mcp_metadata(&definition.name)?;
+            let (tool, manifest) = state.tool_registry.get_with_manifest(&definition.name)?;
+            manifest?.validate_auto_execution().ok()?;
+            let metadata = tool.mcp_metadata()?;
             Some(GrantableMcpTool {
                 server: metadata.server_name,
                 tool: metadata.tool_name,
                 upstream: metadata.upstream_name,
-                description: definition.description,
+                description: tool.description(),
                 transport_identity: metadata.transport_identity.to_string(),
             })
         })

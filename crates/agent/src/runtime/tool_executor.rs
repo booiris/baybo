@@ -5,9 +5,10 @@ use std::time::Duration;
 use parking_lot::Mutex;
 
 use baybo_llm::{Attribution, BillableLlm, BilledChat};
+#[cfg(test)]
+use baybo_model::TrustLevel;
 use baybo_model::{
-    ContentBlock, McpToolGrant, McpTransportIdentity, ParallelGroup, SessionId, SpanId, TrustLevel,
-    TurnId, User, normalize_mcp_tool_grants,
+    ContentBlock, InheritedToolContext, ParallelGroup, SessionId, SpanId, TurnId, User,
 };
 
 use baybo_sandbox::{NetworkPolicy, SandboxRunner, default_sensitive_denylist};
@@ -110,35 +111,6 @@ async fn board_handle(
 
 /// Preview length used when rendering parameters inside an approval prompt.
 const APPROVAL_PARAMS_PREVIEW_LEN: usize = 512;
-
-/// Authority available only while a cron fire runs its first, unattended
-/// turn. It is passed with that turn and never copied into `SessionState`, so
-/// a later user reply in the same cron conversation follows ordinary approval.
-#[derive(Debug, Clone, Default)]
-pub struct InitialCronToolContext {
-    mcp_tool_grants: Arc<[McpToolGrant]>,
-}
-
-impl InitialCronToolContext {
-    pub fn new(mut mcp_tool_grants: Vec<McpToolGrant>) -> Self {
-        normalize_mcp_tool_grants(&mut mcp_tool_grants);
-        Self {
-            mcp_tool_grants: mcp_tool_grants.into(),
-        }
-    }
-
-    fn grants(&self, tool_name: &str, transport_identity: &McpTransportIdentity) -> bool {
-        self.mcp_tool_grants
-            .binary_search_by(|grant| {
-                grant
-                    .tool_name
-                    .as_str()
-                    .cmp(tool_name)
-                    .then_with(|| grant.transport_identity.cmp(transport_identity))
-            })
-            .is_ok()
-    }
-}
 
 /// Headroom added to the per-tool outer timeout so a slow user
 /// approval (handled mid-execution via [`baybo_tools::ApprovalHandle`])
@@ -582,39 +554,9 @@ impl ToolExecutor {
 
     /// Validate that the tool's trust level permits execution with its declared capabilities.
     fn validate_trust(&self, tool_name: &str, manifest: &ToolManifest) -> anyhow::Result<()> {
-        match manifest.trust_level {
-            TrustLevel::Untrusted => {
-                anyhow::bail!(
-                    "security: tool '{}' has Untrusted trust level and cannot be auto-executed",
-                    tool_name
-                );
-            }
-            TrustLevel::Installed => {
-                for cap in &manifest.capabilities {
-                    match cap {
-                        ToolCapability::WriteFile => {
-                            anyhow::bail!(
-                                "security: tool '{}' is Installed but declares WriteFile capability; \
-                                 requires Trusted level",
-                                tool_name
-                            );
-                        }
-                        ToolCapability::ExecCommand => {
-                            anyhow::bail!(
-                                "security: tool '{}' is Installed but declares ExecCommand capability; \
-                                 requires Trusted level",
-                                tool_name
-                            );
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            TrustLevel::Trusted => {
-                // Trusted tools are allowed all capabilities
-            }
-        }
-        Ok(())
+        manifest
+            .validate_auto_execution()
+            .map_err(|error| anyhow::anyhow!("security: tool '{}' {error}", tool_name))
     }
 
     /// Execute a tool call inside the given `step`, with full
@@ -665,9 +607,10 @@ impl ToolExecutor {
         // Handle a cron-fire tool (`report_nothing`) flips to suppress this
         // fire's notification. `None` for every turn that cannot be silenced.
         notify_silence: Option<baybo_tools::NotifySilence>,
-        // Present only on the first turn started by a cron trigger. Never
-        // derived from the session trigger, which remains Cron on later replies.
-        initial_cron: Option<InitialCronToolContext>,
+        // Transient authority attached to this execution lineage. In-process
+        // subagents inherit it unchanged; independent turns do not reconstruct
+        // it from persistent session state.
+        inherited_context: Option<InheritedToolContext>,
     ) -> ExecutedTool {
         debug!(tool = tool_name, "executing tool");
 
@@ -776,14 +719,18 @@ impl ToolExecutor {
                     });
 
                 let mcp_metadata = pinned_tool.as_ref().and_then(|tool| tool.mcp_metadata());
-                let exact_mcp_grant = initial_cron.as_ref().is_some_and(|context| {
+                let exact_mcp_grant = inherited_context.as_ref().is_some_and(|context| {
                     mcp_metadata.as_ref().is_some_and(|metadata| {
                         metadata.tool_name == tool_name_owned
-                            && context.grants(&tool_name_owned, &metadata.transport_identity)
+                            && context.grants_mcp_tool(
+                                &tool_name_owned,
+                                &metadata.transport_identity,
+                            )
                     })
                 });
-                let initial_cron_requires_mcp_grant =
-                    initial_cron.is_some() && mcp_metadata.is_some() && !exact_mcp_grant;
+                let inherited_context_requires_mcp_grant = inherited_context.is_some()
+                    && mcp_metadata.is_some()
+                    && !exact_mcp_grant;
                 let uncovered: Vec<ResourceAccess> = {
                     let approved = approved_resources.lock();
                     accesses
@@ -808,8 +755,8 @@ impl ToolExecutor {
                     hook();
                 }
 
-                if initial_cron_requires_mcp_grant || !uncovered.is_empty() {
-                    if initial_cron.is_some() {
+                if inherited_context_requires_mcp_grant || !uncovered.is_empty() {
+                    if inherited_context.is_some() {
                         *approval_sink.lock() = Some(ApprovalDecision::Deny);
                         for access in &uncovered {
                             let _ = recorder
@@ -826,18 +773,18 @@ impl ToolExecutor {
                         }
                         let reason = match (&mcp_metadata, exact_mcp_grant) {
                             (Some(_), false) => String::from(
-                                "the initial scheduled turn is unattended and this exact MCP tool \
-                                 and transport configuration is not granted on the cron job; grant \
-                                 the current namespaced operation and transport identity in the \
-                                 job's settings before its next fire",
+                                "this execution inherited unattended authority and this exact MCP \
+                                 tool and transport configuration is not granted; grant the current \
+                                 namespaced operation and transport identity in the originating \
+                                 execution's permission settings",
                             ),
                             (Some(_), true) => String::from(
-                                "the cron job's exact MCP tool grant covers only that operation's \
+                                "the inherited exact MCP tool grant covers only that operation's \
                                  transport access; the call requested additional approval-gated \
-                                 resources, which an unattended initial turn cannot approve",
+                                 resources, which this unattended execution cannot approve",
                             ),
                             (None, _) => String::from(
-                                "the initial scheduled turn is unattended and cannot request new \
+                                "this execution inherited unattended authority and cannot request new \
                                  approval for a non-MCP tool; run this operation from a user reply \
                                  or expose it through an exact MCP tool grant",
                             ),
@@ -976,7 +923,7 @@ impl ToolExecutor {
                 // Mid-execution approval handle. The probe clone shares the
                 // handle's decision cell, so after the tool returns we can
                 // read back what any mid-call prompt decided.
-                let approval_gate: Arc<dyn ApprovalGate> = if initial_cron.is_some() {
+                let approval_gate: Arc<dyn ApprovalGate> = if inherited_context.is_some() {
                     Arc::new(AutoDenyGate)
                 } else {
                     self.gate_map.get(&user.channel, session_id)
@@ -1044,6 +991,7 @@ impl ToolExecutor {
                     // interactive agent loop, so `Edit`/`Write` enforce the
                     // contract here (unlike the background-summary pass).
                     read_tracker: Some(read_tracker),
+                    inherited_context: inherited_context.clone(),
                     background_eligible,
                     background_jobs: self.background_jobs.clone(),
                     background_control: self.background_control.clone(),
@@ -1227,10 +1175,8 @@ impl ToolExecutor {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ExecutedTool, InitialCronToolContext, ToolExecutor, admits_repo, admits_worktree,
-        permissive_scope,
-    };
+    use super::{ExecutedTool, ToolExecutor, admits_repo, admits_worktree, permissive_scope};
+    use baybo_model::{InheritedToolContext, McpToolGrant, McpTransportIdentity};
     use std::path::{Path, PathBuf};
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -2001,21 +1947,15 @@ mod tests {
         }
     }
 
-    fn cron_trigger() -> baybo_model::TriggerSource {
-        baybo_model::TriggerSource::Cron {
-            cron_job_id: "cron-1".to_string(),
-            origin_session_id: None,
-            conversation: true,
-            job_title: Some("MCP job".to_string()),
-            project_id: None,
-        }
+    fn ordinary_trigger() -> baybo_model::TriggerSource {
+        baybo_model::TriggerSource::User
     }
 
     async fn execute_authorization_tool(
         tool: Arc<dyn baybo_tools::Tool>,
         gate: Arc<dyn baybo_tools::ApprovalGate>,
         approved_resources: Arc<Mutex<Vec<ApprovedResource>>>,
-        initial_cron: Option<InitialCronToolContext>,
+        inherited_context: Option<InheritedToolContext>,
     ) -> ExecutedTool {
         let tool_name = tool.name().to_string();
         let mut registry = ToolRegistry::new();
@@ -2025,7 +1965,7 @@ mod tests {
             tool_name,
             gate,
             approved_resources,
-            initial_cron,
+            inherited_context,
             None,
         )
         .await
@@ -2047,7 +1987,7 @@ mod tests {
         tool_name: String,
         gate: Arc<dyn baybo_tools::ApprovalGate>,
         approved_resources: Arc<Mutex<Vec<ApprovedResource>>>,
-        initial_cron: Option<InitialCronToolContext>,
+        inherited_context: Option<InheritedToolContext>,
         after_authorization_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> ExecutedTool {
         let home = tempfile::tempdir().expect("tempdir");
@@ -2083,7 +2023,7 @@ mod tests {
             executor = executor.with_after_authorization_hook(hook);
         }
 
-        let session_id = SessionId::from("sess-cron-authorization");
+        let session_id = SessionId::from("sess-inherited-authorization");
         let recorder = Arc::new(SpanRecorder::new(
             session_id.clone(),
             "u1".to_string(),
@@ -2105,14 +2045,14 @@ mod tests {
                 &tool_name,
                 json!({}),
                 &session_id,
-                &cron_trigger(),
+                &ordinary_trigger(),
                 &baybo_model::AgentProfileId::generate(),
                 &user,
                 &approved_resources,
                 &recorder,
                 &step,
                 None,
-                "tool-use-cron".to_string(),
+                "tool-use-inherited-context".to_string(),
                 None,
                 None,
                 CancellationToken::new(),
@@ -2121,7 +2061,7 @@ mod tests {
                 false,
                 ReadTracker::default(),
                 None,
-                initial_cron,
+                inherited_context,
             )
             .await
     }
@@ -2152,7 +2092,7 @@ mod tests {
             }),
             gate,
             Arc::clone(&approved),
-            Some(InitialCronToolContext::new(vec![McpToolGrant::new(
+            Some(InheritedToolContext::new(vec![McpToolGrant::new(
                 SELECTED_MCP_TOOL,
                 identity,
             )])),
@@ -2167,7 +2107,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initial_cron_denies_ungranted_zero_access_typed_mcp() {
+    async fn inherited_context_denies_ungranted_zero_access_typed_mcp() {
         let ran = Arc::new(AtomicBool::new(false));
         let (gate_calls, gate) = counting_gate();
         let executed = execute_authorization_tool(
@@ -2182,7 +2122,7 @@ mod tests {
             }),
             gate,
             Arc::new(Mutex::new(Vec::new())),
-            Some(InitialCronToolContext::default()),
+            Some(InheritedToolContext::default()),
         )
         .await;
 
@@ -2201,7 +2141,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initial_cron_allows_granted_zero_access_typed_mcp() {
+    async fn inherited_context_allows_granted_zero_access_typed_mcp() {
         let identity = McpTransportIdentity::from_sha256([20; 32]);
         let ran = Arc::new(AtomicBool::new(false));
         let (gate_calls, gate) = counting_gate();
@@ -2217,7 +2157,7 @@ mod tests {
             }),
             gate,
             Arc::new(Mutex::new(Vec::new())),
-            Some(InitialCronToolContext::new(vec![McpToolGrant::new(
+            Some(InheritedToolContext::new(vec![McpToolGrant::new(
                 SELECTED_MCP_TOOL,
                 identity,
             )])),
@@ -2284,7 +2224,7 @@ mod tests {
             SELECTED_MCP_TOOL.to_string(),
             gate,
             Arc::clone(&approved),
-            Some(InitialCronToolContext::new(vec![McpToolGrant::new(
+            Some(InheritedToolContext::new(vec![McpToolGrant::new(
                 SELECTED_MCP_TOOL,
                 granted_identity,
             )])),
@@ -2316,7 +2256,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initial_cron_denies_another_tool_on_the_same_mcp_transport() {
+    async fn inherited_context_denies_another_tool_on_the_same_mcp_transport() {
         let identity = McpTransportIdentity::from_sha256([11; 32]);
         let ran = Arc::new(AtomicBool::new(false));
         let (gate_calls, gate) = counting_gate();
@@ -2332,7 +2272,7 @@ mod tests {
             }),
             gate,
             Arc::new(Mutex::new(Vec::new())),
-            Some(InitialCronToolContext::new(vec![McpToolGrant::new(
+            Some(InheritedToolContext::new(vec![McpToolGrant::new(
                 SELECTED_MCP_TOOL,
                 identity,
             )])),
@@ -2354,7 +2294,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initial_cron_denies_the_granted_tool_after_its_transport_identity_changes() {
+    async fn inherited_context_denies_the_granted_tool_after_its_transport_identity_changes() {
         let granted_identity = McpTransportIdentity::from_sha256([12; 32]);
         let current_identity = McpTransportIdentity::from_sha256([13; 32]);
         let ran = Arc::new(AtomicBool::new(false));
@@ -2371,7 +2311,7 @@ mod tests {
             }),
             gate,
             Arc::new(Mutex::new(Vec::new())),
-            Some(InitialCronToolContext::new(vec![McpToolGrant::new(
+            Some(InheritedToolContext::new(vec![McpToolGrant::new(
                 SELECTED_MCP_TOOL,
                 granted_identity,
             )])),
@@ -2409,7 +2349,7 @@ mod tests {
             }),
             gate,
             Arc::new(Mutex::new(Vec::new())),
-            Some(InitialCronToolContext::new(vec![McpToolGrant::new(
+            Some(InheritedToolContext::new(vec![McpToolGrant::new(
                 SELECTED_MCP_TOOL,
                 identity,
             )])),
@@ -2423,13 +2363,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initial_cron_denies_unapproved_non_mcp_access_without_prompting() {
+    async fn inherited_context_denies_unapproved_non_mcp_access_without_prompting() {
         let (gate_calls, gate) = counting_gate();
         let executed = execute_authorization_tool(
             Arc::new(GatedTool),
             gate,
             Arc::new(Mutex::new(Vec::new())),
-            Some(InitialCronToolContext::default()),
+            Some(InheritedToolContext::default()),
         )
         .await;
 
@@ -2439,7 +2379,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initial_cron_auto_denies_access_discovered_during_mcp_execution() {
+    async fn inherited_context_auto_denies_access_discovered_during_mcp_execution() {
         let identity = McpTransportIdentity::from_sha256([15; 32]);
         let ran = Arc::new(AtomicBool::new(false));
         let (gate_calls, gate) = counting_gate();
@@ -2456,7 +2396,7 @@ mod tests {
             }),
             gate,
             Arc::clone(&approved),
-            Some(InitialCronToolContext::new(vec![McpToolGrant::new(
+            Some(InheritedToolContext::new(vec![McpToolGrant::new(
                 SELECTED_MCP_TOOL,
                 identity,
             )])),

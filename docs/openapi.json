@@ -2890,7 +2890,7 @@
         "operationId": "list_grantable_mcp_tools",
         "responses": {
           "200": {
-            "description": "Currently connected typed MCP tools that can be granted to a cron job, sorted by full tool name",
+            "description": "Currently connected auto-executable typed MCP tools that can be granted to a cron job, sorted by full tool name",
             "content": {
               "application/json": {
                 "schema": {
@@ -2904,7 +2904,7 @@
                       "type": "array",
                       "items": {
                         "type": "object",
-                        "description": "One currently connected MCP tool that an operator may grant to a cron job.",
+                        "description": "One currently connected auto-executable MCP tool that may be granted to a cron job.",
                         "required": [
                           "server",
                           "tool",
