@@ -513,7 +513,18 @@ twice, arriving before React has committed the first pass and can recognise it.
 On the reconnect edge the sync runs first (the reconciliation gate), then
 unconfirmed entries resend. A **rebased** sync hides the floor, so each
 unconfirmed entry goes `unknown` and resolves via the per-key point lookup
-(`chatLookupMessage`) — found → released, absent → retry resumes.
+(`chatLookupMessage`) — found → released, absent → retry resumes. A lookup error
+leaves the entry `unknown`, and every later reconnect includes that state in the
+same gate; `unknown` is not a terminal parking state.
+
+Cold-start/foreground adoption applies the same rule before it synthesises a
+missing `SessionIndex` row. A durable outbox entry may belong to a session the
+user has since hidden, so `recordUserSend` is allowed only after point lookup
+proves at least one entry absent and eligible for redelivery. Found entries
+drain without touching the list; lookup failures stay `unknown` and invisible
+until a later recovery can resolve them. This keeps the server's non-hidden
+session list authoritative and prevents a hidden conversation from flashing
+locally on every launch.
 
 ## Session-list mutation outbox
 

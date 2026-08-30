@@ -274,8 +274,9 @@ struct ChatStoreOutboxTests {
 
     /// A lookup that ERRORS defers to the next reconnect. It must never fall
     /// back to a blind resend: the entry's durability is still unknown, and
-    /// that is precisely when a resend is unsafe.
-    @Test func aLookupFailureNeverFallsBackToABlindResend() async {
+    /// that is precisely when a resend is unsafe. The next reconnect must
+    /// include that `unknown` state again rather than stranding it forever.
+    @Test func aLookupFailureRetriesOnTheNextReconnectWithoutABlindResend() async {
         enrol()
         client.failLookup(with: BayboError.Other(message: "gateway unreachable"))
 
@@ -284,6 +285,16 @@ struct ChatStoreOutboxTests {
         _ = await waitUntil(timeout: Self.negativeTimeout) { !client.transmissions.isEmpty }
         #expect(client.transmissions.isEmpty)
         #expect(entry()?.state == .unknown)
+
+        client.clearLookupFailure()
+        client.answerLookup(platformMsgId: Self.msgId, found: true, ordinal: 7)
+        client.dropLeg(of: Self.sessionId)
+        #expect(await waitUntil { store.connState == .connecting })
+        store.connect()
+
+        #expect(await waitUntil { client.lookupCalls.count == 2 })
+        #expect(await waitUntil { outbox.entries().isEmpty })
+        #expect(client.transmissions.isEmpty, "a durable send must never be re-run")
     }
 
     /// The manual retry (the red dot) reuses the ORIGINAL key, so a resend that

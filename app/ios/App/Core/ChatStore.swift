@@ -332,6 +332,10 @@ final class ChatStore: ObservableObject, TranscriptTarget {
     /// loop retries the draft recovery on a backoff until the draft resolves (the
     /// reconnect machinery + sweep take over) or the outbox drains.
     private var sendRecoveryTask: Task<Void, Never>?
+    /// Launch and `didBecomeActive` can both discover the same persisted file.
+    /// Keep their adoption work single-flight so they cannot race two lookups or
+    /// two local list insertions for one outbox.
+    private var persistedSendRecoveryInFlight = false
     private weak var bridge: TranscriptBridge?
     private var bufferedFrames: [String] = []
     /// Durability releases that arrived while no bridge was attached — the
@@ -376,7 +380,15 @@ final class ChatStore: ObservableObject, TranscriptTarget {
     // MARK: - Connection lifecycle
 
     func connectIfNeeded() {
-        guard connState != .connected, connState != .draft else { return }
+        guard connState != .connected else { return }
+        // Persisted-send reconciliation can prove that a former draft exists
+        // remotely while correctly leaving it out of the local list. If that
+        // session later becomes reachable (for example via an unhide or push),
+        // its cached store must be able to connect on the explicit open edge.
+        if connState == .draft {
+            guard remoteSessionEnsured else { return }
+            connState = .connecting
+        }
         connect()
     }
 
@@ -937,19 +949,42 @@ final class ChatStore: ObservableObject, TranscriptTarget {
     /// session the gateway was never told about and `SessionIndex` never listed,
     /// and nothing would ever drain them: `connect()` is a no-op on a draft, the
     /// sweep only fires on a connected leg, and compose mints a FRESH id, so the
-    /// conversation is unreachable from the list. Ensure the row, list it, then
-    /// dial: the dial's reconciliation gate looks every entry up before any
-    /// resend, so a send that did land (and whose echo we simply never saw) is
-    /// released rather than re-run. Best-effort — a failure retries on the next
-    /// launch or foreground.
+    /// conversation is unreachable from the list. Ensure the remote row, then
+    /// resolve every entry by point lookup BEFORE synthesising a missing local
+    /// list row: a send that did land may belong to a session the user has since
+    /// hidden, and re-listing it first makes that conversation flash on every
+    /// launch until the REST list removes it again. Only a provably absent send
+    /// is made visible for redelivery. Best-effort — a failure stays `unknown`
+    /// and retries on the next launch or foreground.
     func resumePersistedSends() {
-        guard outbox.entries().contains(where: { $0.state != .failed }) else { return }
+        guard !persistedSendRecoveryInFlight,
+            outbox.entries().contains(where: { $0.state != .failed })
+        else { return }
+        persistedSendRecoveryInFlight = true
         Task {
+            defer {
+                persistedSendRecoveryInFlight = false
+                // The recovery path is what actually creates the session for an
+                // offline draft send, so a draft-time pin that failed inside its
+                // `ensureRemoteSession` must surface here too — not wait for the
+                // user's next (possibly never) manual send.
+                surfaceDraftPinFailure()
+            }
             do {
                 try await ensureRemoteSession()
-                // The row exists now, so this is no longer a draft — without the
-                // flip `connect()` would refuse it and the entries would strand
-                // exactly as they just did.
+                if !index.contains(sessionId: sessionId) {
+                    await reconcileStrandedOutboxBeforeListing()
+                    // All entries were either already durable or could not be
+                    // resolved safely. The authoritative session-list pull owns
+                    // whether a durable session is visible; an unresolved one
+                    // stays off-list until a later recovery can prove absence.
+                    let remaining = outbox.entries()
+                    guard remaining.contains(where: {
+                        $0.state == .sending || $0.state == .sent
+                    }) else { return }
+                }
+                // The remote row exists and at least one send needs redelivery,
+                // so `connect()` must no longer reject this store as a draft.
                 if connState == .draft {
                     connState = .connecting
                 }
@@ -965,20 +1000,26 @@ final class ChatStore: ObservableObject, TranscriptTarget {
             } catch {
                 NSLog("baybo: resume persisted sends: %@", bayboErrorText(error))
             }
-            // The recovery path is what actually creates the session for an
-            // offline draft send, so a draft-time pin that failed inside its
-            // `ensureRemoteSession` must surface here too — not wait for the
-            // user's next (possibly never) manual send.
-            surfaceDraftPinFailure()
         }
     }
 
-    /// The newest un-failed entry's text — the list preview for a conversation
-    /// the registry never learned about. Attachment-only sends carry none.
+    /// Resolve restored sends before deciding whether a missing registry row is
+    /// real. Sequential lookup keeps the state transition deterministic and the
+    /// outboxes involved here are normally one entry deep.
+    private func reconcileStrandedOutboxBeforeListing() async {
+        for entry in outbox.entries() where entry.state != .failed {
+            outbox.markUnknown(platformMsgId: entry.platformMsgId)
+            await lookUpUnknownEntry(platformMsgId: entry.platformMsgId)
+        }
+    }
+
+    /// The newest retryable entry's text — the list preview for a conversation
+    /// the registry never learned about. An unresolved `unknown` entry cannot
+    /// seed the row; attachment-only sends carry no text.
     private func strandedPreviewText() -> String? {
         let text =
             outbox.entries()
-            .filter { $0.state != .failed }
+            .filter { $0.state == .sending || $0.state == .sent }
             .max(by: { $0.createdAt < $1.createdAt })?
             .text
         return (text?.isEmpty ?? true) ? nil : text
@@ -1424,18 +1465,25 @@ final class ChatStore: ObservableObject, TranscriptTarget {
     private func resolveUnknownEntry(platformMsgId: String) {
         outbox.markUnknown(platformMsgId: platformMsgId)
         Task {
-            do {
-                let lookup = try await client.chatLookupMessage(
-                    sessionId: sessionId, platformMsgId: platformMsgId)
-                if lookup.found {
-                    releaseDurable(platformMsgId: platformMsgId, ordinal: lookup.ordinal)
-                } else {
-                    outbox.resumeSending(platformMsgId: platformMsgId)
-                    startOutboxTimerIfNeeded()
-                }
-            } catch {
-                NSLog("baybo: point lookup: %@", bayboErrorText(error))
+            await lookUpUnknownEntry(platformMsgId: platformMsgId)
+        }
+    }
+
+    /// Complete a point lookup for an entry already parked as `unknown`. A
+    /// transport error deliberately leaves it there; reconnect and persisted
+    /// recovery both include `unknown`, so either edge will try again.
+    private func lookUpUnknownEntry(platformMsgId: String) async {
+        do {
+            let lookup = try await client.chatLookupMessage(
+                sessionId: sessionId, platformMsgId: platformMsgId)
+            if lookup.found {
+                releaseDurable(platformMsgId: platformMsgId, ordinal: lookup.ordinal)
+            } else {
+                outbox.resumeSending(platformMsgId: platformMsgId)
+                startOutboxTimerIfNeeded()
             }
+        } catch {
+            NSLog("baybo: point lookup: %@", bayboErrorText(error))
         }
     }
 
@@ -1455,7 +1503,7 @@ final class ChatStore: ObservableObject, TranscriptTarget {
         // cap); a lookup error defers to the next reconnect (never a blind
         // resend). This is the iOS analogue of the web loop's "sync first".
         for entry in outbox.entries() {
-            guard entry.state == .sending || entry.state == .sent else { continue }
+            guard entry.state != .failed else { continue }
             // The send that DROVE this dial is microseconds old: the gateway has
             // not persisted it yet, so the lookup races its own write, answers
             // `found: false`, and `resumeSending` re-arms it for a blind resend

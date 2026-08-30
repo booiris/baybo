@@ -254,6 +254,8 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
 
     func failLookup(with error: Error) { lock.withLock { lookupError = error } }
 
+    func clearLookupFailure() { lock.withLock { lookupError = nil } }
+
     func stubSearch(_ query: String, with results: ChatSearchResults) {
         lock.withLock { searchResults[query] = results }
     }
