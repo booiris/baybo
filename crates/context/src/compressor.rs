@@ -311,6 +311,7 @@ impl ContextManager {
                     MessageSource::SystemPromptUpdate
                         | MessageSource::SkillListing
                         | MessageSource::SkillsUpdate
+                        | MessageSource::DeferredToolListing
                 )
             })
             .collect();
@@ -435,6 +436,7 @@ impl ContextManager {
             self.tokenizer.as_ref(),
             &self.called_skills,
             &self.invocable_skill_summaries(),
+            self.deferred_tool_notice.as_deref(),
         );
         let total = self.calibrate(body) + trailer;
         total < self.budget.current() && total <= self.budget.compression_ceiling()

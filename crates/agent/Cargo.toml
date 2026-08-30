@@ -12,6 +12,7 @@ baybo-model = { workspace = true }
 baybo-process = { workspace = true }
 baybo-llm = { workspace = true }
 baybo-tools = { workspace = true }
+jsonschema = { workspace = true }
 baybo-subagent = { workspace = true }
 baybo-skills = { workspace = true }
 baybo-skills-assessor = { workspace = true }

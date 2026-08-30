@@ -453,8 +453,13 @@ impl McpReconciler {
                 trust_level.clone(),
                 entry.capabilities.clone(),
             );
-            self.registry
-                .register_dynamic(&entry.name, Arc::new(tool), manifest);
+            if entry.defer {
+                self.registry
+                    .register_dynamic_deferred(&entry.name, Arc::new(tool), manifest);
+            } else {
+                self.registry
+                    .register_dynamic(&entry.name, Arc::new(tool), manifest);
+            }
         }
 
         self.state.lock().insert(
@@ -509,6 +514,9 @@ fn identity_hash(entry: &McpServerEntry, extra_env: &HashMap<String, String>) ->
     // Each registered tool captures the scope, so an edit has to go
     // through a reconnect to reach them.
     format!("{:?}", entry.trigger_scope).hash(&mut hasher);
+    // Same rule for lazy advertisement: the register call captured the bit,
+    // so flipping `defer` must force a reconnect to re-register under it.
+    entry.defer.hash(&mut hasher);
     let mut caps: Vec<String> = entry
         .capabilities
         .iter()
@@ -631,7 +639,9 @@ mod tests {
                 trust_level: crate::mcp::config::TrustLevelConfig::Trusted,
                 capabilities: Vec::new(),
                 oauth: None,
+                description: None,
                 trigger_scope: crate::ToolTriggerScope::Any,
+                defer: false,
             }],
         }
         .write(&root)
@@ -735,7 +745,9 @@ mod tests {
             trust_level: TrustLevelConfig::Trusted,
             capabilities: vec![],
             oauth: None,
+            description: None,
             trigger_scope: crate::ToolTriggerScope::Any,
+            defer: true,
         };
         let embedded = resource_access_for(&entry, true);
         assert!(
@@ -772,7 +784,9 @@ mod tests {
             trust_level: TrustLevelConfig::Trusted,
             capabilities: vec![ToolCapability::ExecCommand],
             oauth: None,
+            description: None,
             trigger_scope: crate::ToolTriggerScope::Any,
+            defer: true,
         };
         let access = resource_access_for(&entry, true);
         assert_eq!(
@@ -799,7 +813,9 @@ mod tests {
             trust_level: TrustLevelConfig::Trusted,
             capabilities: Vec::new(),
             oauth: None,
+            description: None,
             trigger_scope: crate::ToolTriggerScope::Any,
+            defer: true,
         };
         let narrowed = McpServerEntry {
             trigger_scope: crate::ToolTriggerScope::SharedWorkspace,
@@ -810,6 +826,37 @@ mod tests {
             identity_hash(&base, &env),
             identity_hash(&narrowed, &env),
             "a scope edit must reach the registered tools"
+        );
+    }
+
+    /// Same rule for `defer`: the register call routed on the bit, so a
+    /// flip must move the identity and force a reconnect.
+    #[test]
+    fn flipping_defer_changes_the_identity() {
+        use crate::mcp::config::{McpServerEntry, McpTransportConfig, TrustLevelConfig};
+
+        let deferred = McpServerEntry {
+            name: "srv".into(),
+            transport: McpTransportConfig::Stdio {
+                command: "node".into(),
+                args: vec!["/path/to/bundle.mjs".into()],
+            },
+            trust_level: TrustLevelConfig::Trusted,
+            capabilities: Vec::new(),
+            oauth: None,
+            description: None,
+            trigger_scope: crate::ToolTriggerScope::Any,
+            defer: true,
+        };
+        let eager = McpServerEntry {
+            defer: false,
+            ..deferred.clone()
+        };
+        let env = HashMap::new();
+        assert_ne!(
+            identity_hash(&deferred, &env),
+            identity_hash(&eager, &env),
+            "a defer flip must reach the registered tools"
         );
     }
 }

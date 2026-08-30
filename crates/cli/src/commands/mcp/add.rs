@@ -98,7 +98,13 @@ pub async fn run(ctx: &CommandContext, args: AddArgs) -> Result<CommandOutput> {
         trust_level,
         capabilities,
         oauth,
+        // Notice-row description: settable by hand-editing `.mcp.json`
+        // (a CLI flag can come later).
+        description: None,
         trigger_scope: baybo_tools::ToolTriggerScope::Any,
+        // The config default: lazy advertisement. Hand-edit `.mcp.json`
+        // (`"defer": false`) to advertise a server's schemas eagerly.
+        defer: true,
     };
     entry
         .validate()

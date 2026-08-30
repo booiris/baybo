@@ -441,6 +441,13 @@ pub enum MessageSource {
     /// `Role::User` row for the same reason [`MessageSource::SystemPromptUpdate`]
     /// does.
     SkillsUpdate,
+    /// The standing notice of deferred MCP tool servers — schemas withheld
+    /// from the tool block, discovered via `ToolSearch` and called via
+    /// `ToolInvoke`. Config-derived and seeded once per session
+    /// (byte-stable: never re-rendered from live reconciler state), framed
+    /// `Role::User` for the same provider reason as
+    /// [`MessageSource::SkillListing`]. Hidden from chat surfaces.
+    DeferredToolListing,
     /// The errand a parent agent handed a spawned subagent — the child
     /// session's opening prompt. Agent-authored (so NOT [`Self::from_user`]:
     /// no echo, no outbox, no idempotency key), but tracked distinctly because
@@ -473,6 +480,7 @@ impl MessageSource {
             MessageSource::SystemPromptUpdate => "system_prompt_update",
             MessageSource::SkillListing => "skill_listing",
             MessageSource::SkillsUpdate => "skills_update",
+            MessageSource::DeferredToolListing => "deferred_tool_listing",
             MessageSource::SubagentSeed => "subagent_seed",
             MessageSource::Agent => "agent",
         }
@@ -493,6 +501,7 @@ impl std::str::FromStr for MessageSource {
             "system_prompt_update" => Ok(MessageSource::SystemPromptUpdate),
             "skill_listing" => Ok(MessageSource::SkillListing),
             "skills_update" => Ok(MessageSource::SkillsUpdate),
+            "deferred_tool_listing" => Ok(MessageSource::DeferredToolListing),
             "subagent_seed" => Ok(MessageSource::SubagentSeed),
             "agent" => Ok(MessageSource::Agent),
             other => Err(format!("unknown message source: {other}")),
@@ -640,6 +649,20 @@ impl ChatMessage {
             content,
             platform_msg_id: String::new(),
             source: MessageSource::SkillListing,
+        }
+    }
+
+    /// The standing notice of deferred MCP tool servers — the only
+    /// constructor that marks a row [`MessageSource::DeferredToolListing`],
+    /// so compaction can drop the stale row and the trailer re-insert a
+    /// fresh one by provenance. `Role::User` for the same reason as
+    /// [`Self::skill_listing`].
+    pub fn deferred_tool_listing(content: Vec<ContentBlock>) -> Self {
+        Self {
+            role: Role::User,
+            content,
+            platform_msg_id: String::new(),
+            source: MessageSource::DeferredToolListing,
         }
     }
 
@@ -1113,6 +1136,7 @@ mod tests {
                 | MessageSource::SystemPromptUpdate
                 | MessageSource::SkillListing
                 | MessageSource::SkillsUpdate
+                | MessageSource::DeferredToolListing
                 | MessageSource::SubagentSeed
                 | MessageSource::Agent => {}
             }
@@ -1127,6 +1151,7 @@ mod tests {
             MessageSource::SystemPromptUpdate,
             MessageSource::SkillListing,
             MessageSource::SkillsUpdate,
+            MessageSource::DeferredToolListing,
             MessageSource::SubagentSeed,
             MessageSource::Agent,
         ]

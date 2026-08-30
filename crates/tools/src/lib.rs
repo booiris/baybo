@@ -1111,7 +1111,9 @@ pub fn resource_path(p: impl Into<PathBuf>) -> PathBuf {
     p.into()
 }
 
-pub use registry::{McpToolGrantResolveError, McpToolGrantResolver, ToolRegistry};
+pub use registry::{
+    DeferredLookup, DeferredToolIndex, McpToolGrantResolveError, McpToolGrantResolver, ToolRegistry,
+};
 
 #[cfg(test)]
 mod multi_modal_text_tests {

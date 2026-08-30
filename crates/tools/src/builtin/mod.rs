@@ -48,6 +48,7 @@ pub mod read;
 mod rg;
 pub mod secret;
 pub mod todo;
+pub mod tool_search;
 pub mod web_fetch;
 pub mod write;
 

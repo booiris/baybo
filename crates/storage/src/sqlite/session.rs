@@ -97,6 +97,7 @@ pub(super) fn rehydrate_message(
         MessageSource::RecalledMemory => ChatMessage::recalled_memory(content),
         MessageSource::SystemPromptUpdate => ChatMessage::system_prompt_update(content),
         MessageSource::SkillListing => ChatMessage::skill_listing(content),
+        MessageSource::DeferredToolListing => ChatMessage::deferred_tool_listing(content),
         MessageSource::SubagentSeed => ChatMessage::subagent_seed(content),
         MessageSource::SkillsUpdate => ChatMessage::skills_update(content),
         MessageSource::Agent => match role {

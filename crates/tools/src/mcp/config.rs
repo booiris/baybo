@@ -83,11 +83,47 @@ pub struct McpServerEntry {
     pub capabilities: Vec<ToolCapability>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth: Option<OAuthConfig>,
+    /// Operator one-liner shown to the model in the deferred-servers notice
+    /// row. Model-facing prose only: NOT part of the reconciler identity
+    /// hash (editing it must not tear down a live connection — it changes
+    /// what NEW sessions are told, nothing about the server itself) and not
+    /// part of the SHA-256 transport identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// Which sessions this server's tools are offered to. Defaults to
     /// [`ToolTriggerScope::Any`], so a config file written before this field
     /// existed keeps every server everywhere.
     #[serde(default)]
     pub trigger_scope: ToolTriggerScope,
+    /// Lazy advertisement. A deferred server's tools register and execute
+    /// exactly like eager ones — same trust, channel, trigger-scope and
+    /// approval doors — but their schemas are withheld from the LLM tool
+    /// block; the model discovers them via `ToolSearch` and calls them via
+    /// `ToolInvoke`. Defaults to `true` (MCP schemas are the bulk of the
+    /// prompt's tool bytes); set `"defer": false` to advertise eagerly.
+    ///
+    /// Not part of the SHA-256 transport identity (deferral does not change
+    /// what the server *is*, so persisted cron grants survive a flip), but
+    /// folded into the reconciler's identity hash so an edit forces a
+    /// reconnect and re-registration under the new bit.
+    ///
+    /// Version-skew hazard: a pre-`defer` binary's `baybo mcp add`/`remove`
+    /// re-serializes entries through its own struct, silently dropping this
+    /// field — an explicit `"defer": false` reverts to deferred on the
+    /// newer daemon's next tick. Unknown-field retention cannot be
+    /// retrofitted onto old readers; re-set the flag after mixed-version
+    /// edits.
+    #[serde(default = "default_defer", skip_serializing_if = "is_true")]
+    pub defer: bool,
+}
+
+fn default_defer() -> bool {
+    true
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 impl McpServerEntry {
@@ -383,7 +419,9 @@ mod tests {
             trust_level: TrustLevelConfig::Installed,
             capabilities: vec![ToolCapability::Http],
             oauth: None,
+            description: None,
             trigger_scope: ToolTriggerScope::Any,
+            defer: true,
         };
         let err = entry.validate().unwrap_err();
         let msg = format!("{err}");
@@ -403,7 +441,9 @@ mod tests {
             trust_level: TrustLevelConfig::Untrusted,
             capabilities: vec![ToolCapability::ExecCommand],
             oauth: None,
+            description: None,
             trigger_scope: ToolTriggerScope::Any,
+            defer: true,
         };
         let err = entry.validate().unwrap_err();
         assert!(matches!(err, McpError::InvalidConfig(_)));
@@ -432,10 +472,29 @@ mod tests {
             trust_level: TrustLevelConfig::Installed,
             capabilities: vec![ToolCapability::ExecCommand],
             oauth: None,
+            description: None,
             trigger_scope: ToolTriggerScope::Any,
+            defer: true,
         };
         let err = entry.validate().unwrap_err();
         assert!(matches!(err, McpError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn defer_defaults_true_and_false_round_trips() {
+        // A pre-defer config file gets lazy advertisement by default.
+        let json = r#"{ "name": "a", "transport": { "type": "http", "url": "https://x/" }, "trust_level": "trusted" }"#;
+        let entry: McpServerEntry = serde_json::from_str(json).unwrap();
+        assert!(entry.defer, "defer must default to true");
+        // The default is elided on write; an explicit opt-out survives.
+        let serialized = serde_json::to_string(&entry).unwrap();
+        assert!(!serialized.contains("defer"));
+        let mut eager = entry.clone();
+        eager.defer = false;
+        let serialized = serde_json::to_string(&eager).unwrap();
+        assert!(serialized.contains("\"defer\":false"));
+        let back: McpServerEntry = serde_json::from_str(&serialized).unwrap();
+        assert!(!back.defer);
     }
 
     #[tokio::test]
@@ -458,7 +517,9 @@ mod tests {
             trust_level: TrustLevelConfig::Trusted,
             capabilities: vec![ToolCapability::Http],
             oauth: None,
+            description: None,
             trigger_scope: ToolTriggerScope::Any,
+            defer: true,
         });
         file.write(dir.path()).await.unwrap();
         let loaded = McpFile::load(dir.path()).await.unwrap();

@@ -105,6 +105,9 @@ fn classify(message: &ChatMessage) -> ContextPart {
     match message.source() {
         MessageSource::RecalledMemory => ContextPart::Memory,
         MessageSource::SkillListing | MessageSource::SkillsUpdate => ContextPart::Skills,
+        // A capability listing like the skill rows: what the session may
+        // reach for, not conversation content.
+        MessageSource::DeferredToolListing => ContextPart::Skills,
         MessageSource::SystemPromptUpdate => ContextPart::SystemPrompt,
         MessageSource::Cron | MessageSource::CronNotification => ContextPart::Cron,
         // The child's errand plays the user-turn part in its session, and

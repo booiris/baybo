@@ -157,6 +157,69 @@ fn summarize_attachments(blocks: &[ContentBlock]) -> String {
     truncate_summary(&named.join(", "))
 }
 
+/// One tool call as it will be dispatched: the model's call, with a
+/// well-formed `ToolInvoke` envelope unwrapped to its target so permits,
+/// progress captions, trace spans and every executor door act on the real
+/// tool. A malformed envelope keeps the `ToolInvoke` name and falls through
+/// to the registered [`baybo_tools::builtin::tool_search::ToolInvokeTool`],
+/// whose execute answers with usage guidance.
+struct DispatchedToolCall {
+    name: String,
+    arguments: serde_json::Value,
+    /// True when this call arrived wrapped in `ToolInvoke`: the model wrote
+    /// its params from a `ToolSearch` result rather than a
+    /// provider-enforced schema, so the executor pre-validates them.
+    via_invoke: bool,
+}
+
+impl DispatchedToolCall {
+    fn resolve(tc: &baybo_llm::ToolCallInfo, registry: &baybo_tools::ToolRegistry) -> Self {
+        if tc.name == baybo_tools::builtin::tool_search::TOOL_INVOKE_NAME
+            && let Some(raw) = tc
+                .arguments
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+        {
+            // A deferred target resolves to its canonical registered name —
+            // including the `source/Name` spelling the ToolSearch directory
+            // grouping suggests for the un-namespaced cron/deck batches
+            // (`cron/CronCreate` → `CronCreate`), so that natural mistake
+            // costs no round-trip. A namespaced name nothing deferred
+            // matches still unwraps as-is: the executor's NotFound then
+            // names the real target (e.g. a disconnected MCP server).
+            // Eager builtins fall to the guidance path: every
+            // transcript-walking consumer — the read tracker's rebuild,
+            // self-write dedup, transcript repair — keys on the PERSISTED
+            // assistant block, which keeps the outer `ToolInvoke` name, so
+            // an unwrapped `Edit`/`Write` would execute fine live and then
+            // lose its anchors on rehydration. Deferred names never include
+            // those anchor tools, so this cannot reopen that hole.
+            let target = registry
+                .resolve_deferred_target(raw)
+                .or_else(|| raw.contains('/').then(|| raw.to_string()));
+            if let Some(target) = target {
+                let params = tc
+                    .arguments
+                    .get("params")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                return Self {
+                    name: target,
+                    arguments: params,
+                    via_invoke: true,
+                };
+            }
+        }
+        Self {
+            name: tc.name.clone(),
+            arguments: tc.arguments.clone(),
+            via_invoke: false,
+        }
+    }
+}
+
 /// Derive the `(status, summary)` for a finished tool call's
 /// `ToolCompleted` progress event from its result. Presentation-only and
 /// content-light; the summary still passes the leak boundary before it is
@@ -1359,14 +1422,34 @@ impl AgentLoop {
         let assistant_msg = ChatMessage::assistant(assistant_blocks);
         self.context_manager.append(&assistant_msg).await?;
 
+        // Resolve `ToolInvoke` envelopes to their targets before anything
+        // keys off the call's name: progress captions, permit sizing, the
+        // executor's security doors, trace spans, and result post-processing
+        // must all see the real tool. The assistant message above keeps the
+        // model's original `ToolInvoke` block — the provider echo must match
+        // what the model emitted — and results still pair by `tool_use_id`.
+        let dispatch_calls: Vec<DispatchedToolCall> = response
+            .tool_calls
+            .iter()
+            .map(|tc| DispatchedToolCall::resolve(tc, &self.tool_registry))
+            .collect();
+
         // Surface each tool call as a live progress line before dispatch
         // (streaming turns only; cron passes `delta_tx = None`).
         // Emitted ahead of `join_all` so the user sees "starting" before
         // any approval prompt the executor raises mid-call.
-        for tc in &response.tool_calls {
-            let label = self.tool_registry.progress_label(&tc.name, &tc.arguments);
-            self.emit_tool_started(delta_tx, session, tc.id.clone(), tc.name.clone(), label)
-                .await;
+        for (tc, dispatch) in response.tool_calls.iter().zip(&dispatch_calls) {
+            let label = self
+                .tool_registry
+                .progress_label(&dispatch.name, &dispatch.arguments);
+            self.emit_tool_started(
+                delta_tx,
+                session,
+                tc.id.clone(),
+                dispatch.name.clone(),
+                label,
+            )
+            .await;
         }
 
         // Execute tool calls under a bounded-concurrency limiter.
@@ -1431,72 +1514,78 @@ impl AgentLoop {
         let notify_silence_for_calls = notify_silence.clone();
         let inherited_context_for_calls = inherited_context.clone();
         let concurrency_limiter = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TOOL_CALLS));
-        let exec_futures = response.tool_calls.iter().map(|tc| {
-            let executor = Arc::clone(&executor);
-            let notify_silence = notify_silence_for_calls.clone();
-            let inherited_context = inherited_context_for_calls.clone();
-            let session_id = session_id_for_calls.clone();
-            let session_trigger = session_trigger_for_calls.clone();
-            let agent_id = agent_for_calls.clone();
-            let user = user_for_calls.clone();
-            let approved = Arc::clone(&approved);
-            let recorder = Arc::clone(&recorder_for_calls);
-            let step = step_for_calls.clone();
-            let cancel = cancel_token.child_token();
-            let notifier = notifier_for_calls.clone();
-            let bind_source = Arc::clone(&llm_for_calls);
-            let tool_name = tc.name.clone();
-            let arguments = tc.arguments.clone();
-            let tool_use_id = tc.id.clone();
-            let triggering_llm_span = Some(llm_span_id);
-            let limiter = Arc::clone(&concurrency_limiter);
-            let read_tracker = read_tracker_for_calls.clone();
-            // `Concurrent` → one permit (up to the cap run together);
-            // `Exclusive` → every permit, so the call runs alone among
-            // pool calls; `Independent` → no permit (self-bounded, e.g.
-            // `spawn_subagent`). Unknown tools fail safe to `Exclusive`
-            // inside `ToolRegistry::concurrency`.
-            let permits = match registry_for_calls.concurrency(&tool_name) {
-                ToolConcurrency::Concurrent => Some(1),
-                ToolConcurrency::Exclusive => Some(MAX_CONCURRENT_TOOL_CALLS as u32),
-                ToolConcurrency::Independent => None,
-            };
-            async move {
-                // Hold a pool permit for the whole call (none for an
-                // `Independent` call). `acquire` errors only if the
-                // semaphore is closed, which never happens for this
-                // per-response limiter.
-                let _permit = match permits {
-                    Some(n) => limiter.acquire_many_owned(n).await.ok(),
-                    None => None,
+        let exec_futures = response
+            .tool_calls
+            .iter()
+            .zip(&dispatch_calls)
+            .map(|(tc, dispatch)| {
+                let executor = Arc::clone(&executor);
+                let notify_silence = notify_silence_for_calls.clone();
+                let inherited_context = inherited_context_for_calls.clone();
+                let session_id = session_id_for_calls.clone();
+                let session_trigger = session_trigger_for_calls.clone();
+                let agent_id = agent_for_calls.clone();
+                let user = user_for_calls.clone();
+                let approved = Arc::clone(&approved);
+                let recorder = Arc::clone(&recorder_for_calls);
+                let step = step_for_calls.clone();
+                let cancel = cancel_token.child_token();
+                let notifier = notifier_for_calls.clone();
+                let bind_source = Arc::clone(&llm_for_calls);
+                let tool_name = dispatch.name.clone();
+                let arguments = dispatch.arguments.clone();
+                let via_invoke = dispatch.via_invoke;
+                let tool_use_id = tc.id.clone();
+                let triggering_llm_span = Some(llm_span_id);
+                let limiter = Arc::clone(&concurrency_limiter);
+                let read_tracker = read_tracker_for_calls.clone();
+                // `Concurrent` → one permit (up to the cap run together);
+                // `Exclusive` → every permit, so the call runs alone among
+                // pool calls; `Independent` → no permit (self-bounded, e.g.
+                // `spawn_subagent`). Unknown tools fail safe to `Exclusive`
+                // inside `ToolRegistry::concurrency`.
+                let permits = match registry_for_calls.concurrency(&tool_name) {
+                    ToolConcurrency::Concurrent => Some(1),
+                    ToolConcurrency::Exclusive => Some(MAX_CONCURRENT_TOOL_CALLS as u32),
+                    ToolConcurrency::Independent => None,
                 };
-                debug!(tool = %tool_name, "executing tool call");
-                executor
-                    .execute(
-                        &tool_name,
-                        arguments,
-                        &session_id,
-                        &session_trigger,
-                        &agent_id,
-                        &user,
-                        &approved,
-                        &recorder,
-                        &step,
-                        triggering_llm_span,
-                        tool_use_id,
-                        None,
-                        Some(turn_id),
-                        cancel,
-                        notifier,
-                        Some(&bind_source),
-                        background_eligible,
-                        read_tracker,
-                        notify_silence,
-                        inherited_context,
-                    )
-                    .await
-            }
-        });
+                async move {
+                    // Hold a pool permit for the whole call (none for an
+                    // `Independent` call). `acquire` errors only if the
+                    // semaphore is closed, which never happens for this
+                    // per-response limiter.
+                    let _permit = match permits {
+                        Some(n) => limiter.acquire_many_owned(n).await.ok(),
+                        None => None,
+                    };
+                    debug!(tool = %tool_name, "executing tool call");
+                    executor
+                        .execute(
+                            &tool_name,
+                            arguments,
+                            &session_id,
+                            &session_trigger,
+                            &agent_id,
+                            &user,
+                            &approved,
+                            &recorder,
+                            &step,
+                            triggering_llm_span,
+                            tool_use_id,
+                            None,
+                            Some(turn_id),
+                            cancel,
+                            notifier,
+                            Some(&bind_source),
+                            background_eligible,
+                            read_tracker,
+                            notify_silence,
+                            inherited_context,
+                            via_invoke,
+                        )
+                        .await
+                }
+            });
         // Race cancellation so tools that ignore the token cannot delay `/stop`.
         // Drain ready results first; dropping the remaining futures cancels them.
         let mut tool_results: Vec<Option<ExecutedTool>> = std::iter::repeat_with(|| None)
@@ -1521,7 +1610,12 @@ impl AgentLoop {
         // Sequential post-processing: append results in `tool_calls`
         // order so context state stays byte-stable across calls.
         let mut llm_visible_images: Vec<ContentBlock> = Vec::new();
-        for (tool_call, executed) in response.tool_calls.iter().zip(tool_results) {
+        for ((tool_call, dispatch), executed) in response
+            .tool_calls
+            .iter()
+            .zip(&dispatch_calls)
+            .zip(tool_results)
+        {
             // Every persisted tool use needs a result in the live context window.
             let Some(executed) = executed else {
                 self.emit_tool_completed(
@@ -1534,7 +1628,7 @@ impl AgentLoop {
                 )
                 .await;
                 let wrapped = baybo_model::wrap_tool_output(
-                    &tool_call.name,
+                    &dispatch.name,
                     baybo_context::prompts::cancelled_turn::TOOL_RESULT_BODY,
                     &[],
                 );
@@ -1567,9 +1661,9 @@ impl AgentLoop {
                 Ok(ToolOutput::Text(t))
                     if t.starts_with(baybo_model::BACKGROUND_DISPATCH_ACK_PREFIX)
             );
-            if tool_call.name == baybo_model::SPAWN_SUBAGENT_TOOL_NAME
+            if dispatch.name == baybo_model::SPAWN_SUBAGENT_TOOL_NAME
                 && dispatched
-                && let Some(group) = tool_call
+                && let Some(group) = dispatch
                     .arguments
                     .get("group")
                     .and_then(|v| v.as_str())
@@ -1615,7 +1709,7 @@ impl AgentLoop {
                             "The user explicitly denied permission for tool '{}'. \
                              Do NOT retry this tool call. Either use an alternative \
                              approach or inform the user that the operation was skipped.",
-                            tool_call.name
+                            dispatch.name
                         )
                     } else {
                         format!("{TOOL_RESULT_ERROR_PREFIX} {e}")
@@ -1631,7 +1725,7 @@ impl AgentLoop {
             let capped = self.context_manager.cap_tool_output(raw_result_text).await;
             let warnings = self.security_gateway.detect_injection(&capped);
             let warning_rules: Vec<&str> = warnings.iter().map(|w| w.rule_name.as_str()).collect();
-            let wrapped = baybo_model::wrap_tool_output(&tool_call.name, &capped, &warning_rules);
+            let wrapped = baybo_model::wrap_tool_output(&dispatch.name, &capped, &warning_rules);
 
             // Append tool result to context with the tool_use_id so the
             // LLM can correlate results with their originating calls. The
@@ -1648,9 +1742,9 @@ impl AgentLoop {
             // the *pre-edit* fingerprint — so the first write after a restart
             // was rejected as stale against the model's own edit.
             let read_fingerprint = baybo_tools::READ_TRACKER_ANCHORING_TOOLS
-                .contains(&tool_call.name.as_str())
+                .contains(&dispatch.name.as_str())
                 .then(|| {
-                    tool_call
+                    dispatch
                         .arguments
                         .get(baybo_tools::TOOL_FILE_PATH_ARG)
                         .and_then(|v| v.as_str())
@@ -1666,10 +1760,10 @@ impl AgentLoop {
             // `begin_response` already drained `pending`, so `get` returns the
             // post-write value and not a read staged earlier in this response.
             let write_fingerprint = (baybo_tools::FILE_WRITING_TOOLS
-                .contains(&tool_call.name.as_str())
+                .contains(&dispatch.name.as_str())
                 && tool_call_succeeded(&executed.output))
             .then(|| {
-                tool_call
+                dispatch
                     .arguments
                     .get(baybo_tools::TOOL_FILE_PATH_ARG)
                     .and_then(|v| v.as_str())
@@ -1679,11 +1773,10 @@ impl AgentLoop {
             // File calls retain their transitions; every other tool retains
             // only its current consecutive error signature. Both detectors
             // report through the same per-turn monitor.
-            if let Some(verdict) = self.progress_monitor.record(
-                &tool_call.name,
-                &tool_call.arguments,
-                &executed.output,
-            ) {
+            if let Some(verdict) =
+                self.progress_monitor
+                    .record(&dispatch.name, &dispatch.arguments, &executed.output)
+            {
                 self.note_no_progress(&verdict);
             }
             let meta = (read_fingerprint.is_some()
@@ -1724,10 +1817,9 @@ impl AgentLoop {
             return Err(anyhow::anyhow!("turn cancelled during tool execution"));
         }
 
-        let task_mutated = response
-            .tool_calls
+        let task_mutated = dispatch_calls
             .iter()
-            .any(|tc| baybo_model::TASK_MUTATING_TOOL_NAMES.contains(&tc.name.as_str()));
+            .any(|dc| baybo_model::TASK_MUTATING_TOOL_NAMES.contains(&dc.name.as_str()));
         Ok(IterationOutcome::Continue { task_mutated })
     }
 
@@ -3818,5 +3910,132 @@ mod tool_completion_summary_tests {
             tool_completion_summary(&executed(Ok(ToolOutput::Text("3 files".into())), None));
         assert_eq!(status, ToolStatus::Ok);
         assert_eq!(summary, "3 files");
+    }
+
+    #[test]
+    fn tool_invoke_envelopes_unwrap_at_dispatch() {
+        use super::DispatchedToolCall;
+        use baybo_tools::{Tool, ToolContext, ToolOutput};
+
+        struct FakeDeferred;
+
+        #[async_trait::async_trait]
+        impl Tool for FakeDeferred {
+            fn name(&self) -> &str {
+                "CronCreate"
+            }
+            fn description(&self) -> String {
+                "x".into()
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({ "type": "object" })
+            }
+            async fn execute(
+                &self,
+                _p: serde_json::Value,
+                _c: &ToolContext,
+            ) -> baybo_tools::Result<ToolOutput> {
+                Ok(ToolOutput::Text(String::new()))
+            }
+        }
+
+        let registry = baybo_tools::ToolRegistry::new();
+        registry.register_dynamic_deferred(
+            "cron",
+            std::sync::Arc::new(FakeDeferred),
+            baybo_tools::ToolManifest {
+                name: "CronCreate".into(),
+                description: "x".into(),
+                trust_level: baybo_model::TrustLevel::Trusted,
+                parameters_schema: serde_json::json!({ "type": "object" }),
+                capabilities: vec![],
+                channels: Vec::new(),
+            },
+        );
+
+        let call = |name: &str, arguments: serde_json::Value| baybo_llm::ToolCallInfo {
+            id: "t1".into(),
+            name: name.into(),
+            arguments,
+            signature: None,
+        };
+
+        // Well-formed envelope: rebinds to the target with its params.
+        let d = DispatchedToolCall::resolve(
+            &call(
+                "ToolInvoke",
+                serde_json::json!({ "name": "srv/op", "params": { "id": "a" } }),
+            ),
+            &registry,
+        );
+        assert_eq!(d.name, "srv/op");
+        assert_eq!(d.arguments, serde_json::json!({ "id": "a" }));
+        assert!(d.via_invoke);
+
+        // Params default to an empty object.
+        let d = DispatchedToolCall::resolve(
+            &call("ToolInvoke", serde_json::json!({ "name": "srv/op" })),
+            &registry,
+        );
+        assert_eq!(d.arguments, serde_json::json!({}));
+        assert!(d.via_invoke);
+
+        // Malformed, self-referential, and non-namespaced (builtin)
+        // envelopes stay `ToolInvoke` and fall through to the registered
+        // guidance tool.
+        for bad in [
+            serde_json::json!({ "params": {} }),
+            serde_json::json!({ "name": "" }),
+            serde_json::json!({ "name": "ToolInvoke" }),
+            serde_json::json!({ "name": "Edit", "params": { "file_path": "/x" } }),
+        ] {
+            let d = DispatchedToolCall::resolve(&call("ToolInvoke", bad.clone()), &registry);
+            assert_eq!(d.name, "ToolInvoke");
+            assert_eq!(d.arguments, bad);
+            assert!(!d.via_invoke);
+        }
+
+        // An un-namespaced name registered as DEFERRED unwraps too — that is
+        // how the cron/deck builtins stay callable.
+        let d = DispatchedToolCall::resolve(
+            &call(
+                "ToolInvoke",
+                serde_json::json!({ "name": "CronCreate", "params": { "schedule": "@daily" } }),
+            ),
+            &registry,
+        );
+        assert_eq!(d.name, "CronCreate");
+        assert!(d.via_invoke);
+
+        // The `source/Name` spelling the directory grouping suggests aliases
+        // to the canonical registered name — no NotFound round-trip.
+        let d = DispatchedToolCall::resolve(
+            &call(
+                "ToolInvoke",
+                serde_json::json!({ "name": "cron/CronCreate", "params": { "schedule": "@daily" } }),
+            ),
+            &registry,
+        );
+        assert_eq!(d.name, "CronCreate");
+        assert!(d.via_invoke);
+
+        // A bare name deferred under a DIFFERENT source does not alias: the
+        // wrong spelling passes through for the executor's NotFound to name.
+        let d = DispatchedToolCall::resolve(
+            &call(
+                "ToolInvoke",
+                serde_json::json!({ "name": "deck/CronCreate" }),
+            ),
+            &registry,
+        );
+        assert_eq!(d.name, "deck/CronCreate");
+
+        // Ordinary calls pass through untouched.
+        let d = DispatchedToolCall::resolve(
+            &call("Read", serde_json::json!({ "file_path": "/x" })),
+            &registry,
+        );
+        assert_eq!(d.name, "Read");
+        assert!(!d.via_invoke);
     }
 }

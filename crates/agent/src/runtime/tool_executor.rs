@@ -433,6 +433,9 @@ pub struct ToolExecutor {
     /// board wired (argv-mode boots, tests), and issue sessions then behave
     /// like ordinary ones.
     board: Option<BoardStores>,
+    /// Compiled `ToolInvoke` param validators, keyed by schema content —
+    /// see [`InvokeValidatorCache`].
+    invoke_validators: InvokeValidatorCache,
     #[cfg(test)]
     after_authorization_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -464,6 +467,7 @@ impl ToolExecutor {
             background_jobs,
             background_control,
             board,
+            invoke_validators: InvokeValidatorCache::default(),
             #[cfg(test)]
             after_authorization_hook: None,
         }
@@ -552,6 +556,51 @@ impl ToolExecutor {
         Some(resolved)
     }
 
+    /// `ToolInvoke` param pre-validation, run against a REVEALED copy of
+    /// the params so constraints on secret-bearing fields judge the real
+    /// value, not the placeholder the model holds. `Some(msg)` is the
+    /// model-visible rejection, already re-masked and leak-scrubbed:
+    /// 1. reveal a local copy (failure ⇒ skip — a gate that cannot see the
+    ///    real values cannot judge them; execution does its own reveal);
+    /// 2. validate via the compiled-schema cache;
+    /// 3. compose the message — secret-path errors go generic, every
+    ///    revealed value is exact-replaced back to its placeholder;
+    /// 4. `sanitize_error` as belt-and-braces before anything escapes into
+    ///    the transcript / trace.
+    async fn validate_invoke_params(
+        &self,
+        tool: &dyn baybo_tools::Tool,
+        params: &Value,
+    ) -> Option<String> {
+        let mut revealed = params.clone();
+        if let Err(e) = self.security_gateway.reveal_in_value(&mut revealed).await {
+            debug!(tool = tool.name(), error = %e, "invoke params reveal failed; skipping validation");
+            return None;
+        }
+        let rejection = match self.invoke_validators.validate(tool, &revealed) {
+            Ok(()) => return None,
+            Err(rejection) => rejection,
+        };
+        let mut secrets = Vec::new();
+        let mut path = String::new();
+        revealed_secret_values(params, &revealed, &mut path, &mut secrets);
+        let msg = compose_invoke_rejection(tool.name(), &rejection, &secrets);
+        match self.security_gateway.sanitize_error(&msg).await {
+            Ok(sanitized) => Some(sanitized),
+            // Never let an unscrubbed message escape: fall back to a
+            // value-free rejection.
+            Err(e) => {
+                debug!(tool = tool.name(), error = %e, "invoke rejection sanitize failed; withholding details");
+                Some(format!(
+                    "ToolInvoke params for '{}' failed schema validation \
+                     (details withheld: error sanitization failed). Fetch the \
+                     schema via ToolSearch and retry.",
+                    tool.name()
+                ))
+            }
+        }
+    }
+
     /// Validate that the tool's trust level permits execution with its declared capabilities.
     fn validate_trust(&self, tool_name: &str, manifest: &ToolManifest) -> anyhow::Result<()> {
         manifest
@@ -611,6 +660,13 @@ impl ToolExecutor {
         // subagents inherit it unchanged; independent turns do not reconstruct
         // it from persistent session state.
         inherited_context: Option<InheritedToolContext>,
+        // True when the agent loop unwrapped this call from a `ToolInvoke`
+        // envelope. The model wrote these params from a `ToolSearch` result
+        // rather than a provider-enforced schema, so the executor
+        // pre-validates them against the pinned tool's schema and hands a
+        // failing call the schema back for self-correction. Every security
+        // door above and below applies identically either way.
+        via_invoke: bool,
     ) -> ExecutedTool {
         debug!(tool = tool_name, "executing tool");
 
@@ -694,6 +750,19 @@ impl ToolExecutor {
             Some((&cancel_for_close, baybo_turn::CancelReason::ParentCancelled)),
             |span_handle| async move {
                 let mut event_seq: u32 = 0;
+
+                // `ToolInvoke`-routed params are validated before any
+                // approval prompt fires: a call that cannot execute must not
+                // cost the user a prompt. Validation runs on a revealed
+                // copy (constraints must judge real values, not
+                // placeholders); the reported message comes back re-masked
+                // and sanitized.
+                if via_invoke
+                    && let Some(tool) = pinned_tool.as_ref()
+                    && let Some(msg) = self.validate_invoke_params(tool.as_ref(), &params).await
+                {
+                    return Err(ToolError::InvalidParams(msg).into());
+                }
 
                 // Approval gate: derive resource accesses from the tool
                 // and check them against the session's cached approvals.
@@ -1173,13 +1242,395 @@ impl ToolExecutor {
     }
 }
 
+/// Bounded, content-keyed cache of compiled `ToolInvoke` param validators.
+///
+/// Keyed by the SERIALIZED SCHEMA, never the tool name: a reconnect can
+/// re-register the same name with a different schema, and a name-keyed
+/// entry would then validate against the wrong generation. Content keying
+/// makes that case a miss (new compile) and an unchanged schema across
+/// reconnects a hit. Compile happens outside the lock — two concurrent
+/// first calls both compile and one insert wins, which is cheaper than
+/// holding the lock across a compile. Uncompilable schemas are not
+/// negatively cached: they fail fast (the 64 KB cap bounds pathological
+/// compiles before they start) and stay the server's problem.
+#[derive(Default)]
+struct InvokeValidatorCache {
+    inner: Mutex<std::collections::HashMap<String, Arc<jsonschema::Validator>>>,
+}
+
+impl InvokeValidatorCache {
+    /// Enough for every distinct schema a deployment realistically holds
+    /// (each MCP tool contributes one). Overflow clears wholesale — crude,
+    /// but recompiling a handful of schemas beats LRU bookkeeping on a
+    /// path that is pure advisory validation.
+    const MAX_ENTRIES: usize = 256;
+
+    /// Schema pre-validation for `ToolInvoke`-routed calls. Advisory
+    /// quality gate, not a security door — skipped whenever it cannot give
+    /// a correct answer, letting the tool (or its MCP server) decide
+    /// exactly as a direct call would:
+    /// * an uncompilable schema skips (the server's problem, not the call's);
+    /// * an oversized schema skips (a pathological schema must not stall
+    ///   the loop before the execution timeout).
+    ///
+    /// The caller hands in the REVEALED copy of the params (see
+    /// [`ToolExecutor::validate_invoke_params`]) so that a `pattern`/`enum`/
+    /// length constraint on a secret-bearing field judges the real value,
+    /// not the `[{REDACTED_SECRET_…}]` placeholder the model holds — and is
+    /// responsible for re-masking every revealed value out of the message
+    /// it reports.
+    fn validate(
+        &self,
+        tool: &dyn baybo_tools::Tool,
+        params: &Value,
+    ) -> Result<(), InvokeParamsRejection> {
+        const MAX_REPORTED_ERRORS: usize = 3;
+        const MAX_SCHEMA_COMPILE_BYTES: usize = 65536;
+        /// Trace failure reasons stay bounded (every other failure path
+        /// caps its reason), so the quoted schema is cut here and the model
+        /// told where the full copy lives.
+        const MAX_QUOTED_SCHEMA_BYTES: usize = 4096;
+
+        let schema = tool.parameters_schema();
+        let serialized_schema = serde_json::to_string(&schema).unwrap_or_default();
+        if serialized_schema.len() > MAX_SCHEMA_COMPILE_BYTES {
+            debug!(
+                tool = tool.name(),
+                bytes = serialized_schema.len(),
+                "invoke params schema too large to compile; skipping validation"
+            );
+            return Ok(());
+        }
+        let cached = self.inner.lock().get(&serialized_schema).cloned();
+        let validator = match cached {
+            Some(v) => v,
+            None => {
+                let compiled = match jsonschema::validator_for(&schema) {
+                    Ok(v) => Arc::new(v),
+                    Err(e) => {
+                        debug!(tool = tool.name(), error = %e, "invoke params schema did not compile; skipping validation");
+                        return Ok(());
+                    }
+                };
+                let mut cache = self.inner.lock();
+                if cache.len() >= Self::MAX_ENTRIES {
+                    cache.clear();
+                }
+                cache
+                    .entry(serialized_schema.clone())
+                    .or_insert_with(|| Arc::clone(&compiled))
+                    .clone()
+            }
+        };
+        let errors: Vec<(String, String)> = validator
+            .iter_errors(params)
+            .take(MAX_REPORTED_ERRORS)
+            .map(|e| {
+                let at = e.instance_path().to_string();
+                let rendered = if at.is_empty() {
+                    e.to_string()
+                } else {
+                    format!("{at}: {e}")
+                };
+                (at, rendered)
+            })
+            .collect();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            let quoted_schema = if serialized_schema.len() > MAX_QUOTED_SCHEMA_BYTES {
+                let cut = serialized_schema
+                    .char_indices()
+                    .take_while(|(i, _)| *i < MAX_QUOTED_SCHEMA_BYTES)
+                    .last()
+                    .map(|(i, c)| i + c.len_utf8())
+                    .unwrap_or(0);
+                format!(
+                    "{}… (truncated; fetch the full schema via ToolSearch kind=\"exact\" query=\"{}\")",
+                    &serialized_schema[..cut],
+                    tool.name()
+                )
+            } else {
+                serialized_schema
+            };
+            Err(InvokeParamsRejection {
+                errors,
+                quoted_schema,
+            })
+        }
+    }
+}
+
+/// One failed `ToolInvoke` schema validation: per-error `(instance_path,
+/// rendered message)` pairs plus the (already truncated) schema to quote.
+/// Rendered into the model-visible error by
+/// [`ToolExecutor::validate_invoke_params`], which owns secret re-masking.
+struct InvokeParamsRejection {
+    errors: Vec<(String, String)>,
+    quoted_schema: String,
+}
+
+/// Collect every string leaf `reveal_in_value` changed, as
+/// `(json_pointer, original_masked, revealed)` triples. The original still
+/// carries the placeholder, so an exact `revealed → original` replacement
+/// re-masks any quotation of the value deterministically — no reliance on
+/// pattern-based leak rules.
+fn revealed_secret_values(
+    original: &Value,
+    revealed: &Value,
+    path: &mut String,
+    out: &mut Vec<(String, String, String)>,
+) {
+    match (original, revealed) {
+        (Value::String(o), Value::String(r)) if o != r => {
+            out.push((path.clone(), o.clone(), r.clone()));
+        }
+        (Value::Object(o), Value::Object(r)) => {
+            for (key, ov) in o {
+                if let Some(rv) = r.get(key) {
+                    let len = path.len();
+                    path.push('/');
+                    // JSON-pointer escaping, to match `instance_path()`.
+                    path.push_str(&key.replace('~', "~0").replace('/', "~1"));
+                    revealed_secret_values(ov, rv, path, out);
+                    path.truncate(len);
+                }
+            }
+        }
+        (Value::Array(o), Value::Array(r)) => {
+            for (i, (ov, rv)) in o.iter().zip(r).enumerate() {
+                let len = path.len();
+                path.push('/');
+                path.push_str(&i.to_string());
+                revealed_secret_values(ov, rv, path, out);
+                path.truncate(len);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Render a rejection into the model-visible message. Errors anchored at a
+/// secret-bearing path get a generic line instead of the validator's text —
+/// the model cannot see or fix a stored secret, so quoting the constraint
+/// failure would only start an unwinnable retry loop; everything else keeps
+/// the validator's message. Every revealed value is then exact-replaced
+/// back to its placeholder (longest first, so one revealed value embedded
+/// in another cannot leave a fragment behind).
+fn compose_invoke_rejection(
+    tool_name: &str,
+    rejection: &InvokeParamsRejection,
+    secrets: &[(String, String, String)],
+) -> String {
+    let parts: Vec<String> = rejection
+        .errors
+        .iter()
+        .map(|(path, rendered)| {
+            let secret_here = secrets
+                .iter()
+                .any(|(sp, _, _)| path == sp || path.starts_with(&format!("{sp}/")));
+            if secret_here {
+                format!(
+                    "{path}: the value is a stored secret and fails this field's schema \
+                     constraint; fix the stored secret — the model cannot see or edit it"
+                )
+            } else {
+                rendered.clone()
+            }
+        })
+        .collect();
+    let mut msg = format!(
+        "ToolInvoke params for '{}' failed schema validation: {}. Expected parameters_schema: {}",
+        tool_name,
+        parts.join("; "),
+        rejection.quoted_schema
+    );
+    let mut pairs: Vec<&(String, String, String)> = secrets.iter().collect();
+    pairs.sort_by_key(|(_, _, revealed)| std::cmp::Reverse(revealed.len()));
+    for (_, original, revealed) in pairs {
+        if !revealed.is_empty() {
+            msg = msg.replace(revealed, original);
+        }
+    }
+    msg
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ExecutedTool, ToolExecutor, admits_repo, admits_worktree, permissive_scope};
+    use super::{
+        ExecutedTool, InvokeValidatorCache, ToolExecutor, admits_repo, admits_worktree,
+        permissive_scope,
+    };
     use baybo_model::{InheritedToolContext, McpToolGrant, McpTransportIdentity};
     use std::path::{Path, PathBuf};
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[test]
+    fn invoke_params_validation_reports_schema_and_skips_uncompilable() {
+        let cache = InvokeValidatorCache::default();
+        use baybo_tools::{Tool, ToolContext, ToolOutput};
+
+        struct Fake(serde_json::Value);
+
+        #[async_trait::async_trait]
+        impl Tool for Fake {
+            fn name(&self) -> &str {
+                "srv/op"
+            }
+            fn description(&self) -> String {
+                "x".into()
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                self.0.clone()
+            }
+            async fn execute(
+                &self,
+                _p: serde_json::Value,
+                _c: &ToolContext,
+            ) -> baybo_tools::Result<ToolOutput> {
+                Ok(ToolOutput::Text(String::new()))
+            }
+        }
+
+        let strict = Fake(serde_json::json!({
+            "type": "object",
+            "properties": { "id": { "type": "string" } },
+            "required": ["id"],
+            "additionalProperties": false
+        }));
+        assert!(
+            cache
+                .validate(&strict, &serde_json::json!({ "id": "a" }))
+                .is_ok()
+        );
+        let rejection = cache
+            .validate(&strict, &serde_json::json!({ "id": 7 }))
+            .unwrap_err();
+        assert_eq!(rejection.errors.len(), 1);
+        assert_eq!(rejection.errors[0].0, "/id", "error carries its pointer");
+        let msg = super::compose_invoke_rejection("srv/op", &rejection, &[]);
+        assert!(msg.contains("srv/op"), "names the tool: {msg}");
+        assert!(
+            msg.contains("parameters_schema"),
+            "hands the schema back for self-correction: {msg}"
+        );
+        let rejection = cache.validate(&strict, &serde_json::json!({})).unwrap_err();
+        let msg = super::compose_invoke_rejection("srv/op", &rejection, &[]);
+        assert!(
+            msg.contains("required") || msg.contains("id"),
+            "missing field reported: {msg}"
+        );
+
+        // An uncompilable schema is the server's problem, not a reason to
+        // refuse the call before it can even reach the server.
+        let broken = Fake(serde_json::json!({ "type": "not-a-real-type" }));
+        assert!(cache.validate(&broken, &serde_json::json!({})).is_ok());
+
+        // The quoted schema in the error is bounded for the trace store.
+        let big_desc = "x".repeat(8192);
+        let bloated = Fake(serde_json::json!({
+            "type": "object",
+            "properties": { "id": { "type": "string", "description": big_desc } },
+            "required": ["id"],
+        }));
+        let rejection = cache
+            .validate(&bloated, &serde_json::json!({}))
+            .unwrap_err();
+        assert!(
+            rejection.quoted_schema.len() < 5000,
+            "quoted schema stays bounded, got {} bytes",
+            rejection.quoted_schema.len()
+        );
+        assert!(
+            rejection.quoted_schema.contains("truncated"),
+            "names the cut"
+        );
+
+        // Compiles are cached by schema CONTENT: `strict` ran three times
+        // and `bloated` once → two entries, not four. A schema change (a
+        // reconnect re-registering the name with a new surface) is a new
+        // key, and the uncompilable/oversize skips never populated
+        // anything.
+        assert_eq!(cache.inner.lock().len(), 2);
+        let mut evolved = strict.0.clone();
+        evolved["properties"]["id"]["maxLength"] = serde_json::json!(4);
+        assert!(
+            cache
+                .validate(&Fake(evolved), &serde_json::json!({ "id": "a" }))
+                .is_ok()
+        );
+        assert_eq!(
+            cache.inner.lock().len(),
+            3,
+            "a changed schema under the same tool name compiles fresh"
+        );
+    }
+
+    #[test]
+    fn invoke_rejection_masks_revealed_secrets_and_goes_generic_on_secret_paths() {
+        use super::{InvokeParamsRejection, compose_invoke_rejection, revealed_secret_values};
+
+        let placeholder = "[{REDACTED_SECRET_0123456789abcdef01234567}]";
+        let original = serde_json::json!({
+            "token": placeholder,
+            "region": "ap-guangzhou",
+            "nested": { "a/b~c": [placeholder, "plain"] }
+        });
+        let revealed = serde_json::json!({
+            "token": "sk-9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+            "region": "ap-guangzhou",
+            "nested": { "a/b~c": ["sk-9f8e7d6c5b4a39281706f5e4d3c2b1a0", "plain"] }
+        });
+        let mut secrets = Vec::new();
+        let mut path = String::new();
+        revealed_secret_values(&original, &revealed, &mut path, &mut secrets);
+        assert_eq!(
+            secrets
+                .iter()
+                .map(|(p, _, _)| p.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/nested/a~1b~0c/0", "/token"],
+            "diff walks nested values with pointer escaping"
+        );
+
+        // A validator-style rejection: one error at the secret path quoting
+        // the revealed value, one ordinary error, and the revealed value
+        // embedded in the quoted schema too.
+        let rejection = InvokeParamsRejection {
+            errors: vec![
+                (
+                    "/token".to_string(),
+                    "/token: \"sk-9f8e7d6c5b4a39281706f5e4d3c2b1a0\" does not match \"^tk-\""
+                        .to_string(),
+                ),
+                (
+                    "/region".to_string(),
+                    "/region: not one of the enum".to_string(),
+                ),
+            ],
+            quoted_schema:
+                "{\"example\":\"sk-9f8e7d6c5b4a39281706f5e4d3c2b1a0\",\"type\":\"object\"}"
+                    .to_string(),
+        };
+        let msg = compose_invoke_rejection("srv/op", &rejection, &secrets);
+        assert!(
+            !msg.contains("sk-9f8e7d6c5b4a39281706f5e4d3c2b1a0"),
+            "no revealed value may survive into the message: {msg}"
+        );
+        assert!(
+            msg.contains(placeholder),
+            "revealed values are re-masked to their placeholders: {msg}"
+        );
+        assert!(
+            msg.contains("stored secret"),
+            "secret-path errors go generic: {msg}"
+        );
+        assert!(
+            msg.contains("/region: not one of the enum"),
+            "non-secret errors keep the validator text: {msg}"
+        );
+    }
 
     #[test]
     fn the_mask_covers_the_live_workspace_not_just_the_default_location() {
@@ -1605,6 +2056,7 @@ mod tests {
                 ReadTracker::default(),
                 None,
                 None,
+                false,
             )
             .await;
         assert!(executed.output.is_ok(), "the capture tool ran");
@@ -2062,6 +2514,7 @@ mod tests {
                 ReadTracker::default(),
                 None,
                 inherited_context,
+                false,
             )
             .await
     }
@@ -2527,6 +2980,7 @@ mod tests {
                 ReadTracker::default(),
                 None,
                 None,
+                false,
             )
             .await;
         executed
