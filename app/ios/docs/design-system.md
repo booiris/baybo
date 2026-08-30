@@ -13,10 +13,13 @@ and the sibling docs under `app/ios/docs/` still apply.
 rounded / pill corners, FLAT surfaces (no shadows), generous whitespace, lighter
 weights — calm, airy, friendly.
 
-It is tuned to harmonize with the **app icon**
-(`app/ios/App/Resources/Assets.xcassets/AppIcon.appiconset`): a thin, rounded, friendly
-line-art robot with a `>_` terminal glyph. **When in doubt, look at the icon** — the UI
-should feel like it came from the same hand.
+It is tuned to harmonize with the **app icon** (canonical vector:
+`assets/baybo.svg`; generated iOS slots:
+`app/ios/App/Resources/Assets.xcassets/AppIcon.appiconset`): a bright blue, rounded robot
+face with subtle circuit traces, a dark visor, and mint eyes. The shared language is its
+friendly geometry and restrained detail, not its brand colours — resting UI chrome stays
+monochrome. **When in doubt, look at the icon** — the UI should feel like it came from the
+same hand.
 
 ## Relationship to `app/web` — diverge on purpose
 

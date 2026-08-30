@@ -870,7 +870,7 @@ already did.
 
 ## App icon (PWA)
 
-The installed app's icon is `assets/baybo.png` — the line-art robot, black on white, **not** restyled onto a brutalist gold tile. It is the same artwork the iOS app ships as its AppIcon, and one product should not wear two faces in a task switcher. The dashboard's neo-brutalism is the *interface's* language, not the brand's.
+The installed app's icon is `assets/baybo.svg` — the bright blue robot with a dark visor and mint eyes, **not** restyled onto a brutalist gold tile. It is the same artwork the iOS app ships as its AppIcon, and one product should not wear two faces in a task switcher. The dashboard's neo-brutalism is the *interface's* language, not the brand's.
 
 Every file in `public/` (`pwa-192`, `pwa-512`, `pwa-maskable-512`, `apple-touch-icon`, `favicon.ico`) is derived from that one source; the commands and the three non-obvious numbers in them are in [`../../docs/webui.md`](../../docs/webui.md).
 

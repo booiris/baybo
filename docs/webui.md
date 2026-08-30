@@ -22,43 +22,35 @@ The dashboard is an installable, offline-capable app: a web app manifest, an ico
 
 **Theme colour lives in two files and must match.** `<meta name="theme-color">` in `index.html` tints the browser tab; `theme_color` in the manifest tints the installed window's chrome, and is captured at install time (an already-installed app needs a reinstall to pick up a change). Neither can reference the other, nor the `index.css` token they copy — so the build compares them and fails on a mismatch rather than shipping an app whose title bar disagrees with its own tab.
 
-It is `--color-canvas` (`#faf6ec`), **not** the brand gold. Gold was the first choice and read as too much: the rail is the only gold surface and it is 48 px down the *left* edge, so a gold top bar sat above a page that is cream everywhere it touches. Canvas makes the chrome continuous with the header strip under it, which is what a theme colour is for. `background_color` is a third, separate thing — the splash behind the icon, white to match the icon's own background.
+It is `--color-canvas` (`#faf6ec`), **not** the brand gold. Gold was the first choice and read as too much: the rail is the only gold surface and it is 48 px down the *left* edge, so a gold top bar sat above a page that is cream everywhere it touches. Canvas makes the chrome continuous with the header strip under it, which is what a theme colour is for. `background_color` is a third, separate thing — the splash behind the icon stays white so the blue tile remains distinct.
 
 **The static half** lives in `app/web/public/`, which Vite copies to the output root verbatim (and which `crates/gateway/build.rs` already watches, so an icon edit rebuilds the bundle). `manifest.webmanifest` is hand-written — one file, reviewable in a diff, no plugin config to read it through. `index.html` carries the `theme-color`, the icon links, and the `apple-mobile-web-app-*` pair Safari still reads instead of `display: standalone`.
 
-**Icons** are all derived from `assets/baybo.png` — the brand mark, and the same artwork the iOS app ships as its AppIcon, so the two apps look like one product. Regenerate them from the repo root:
+**Icons** are all derived from `assets/baybo.svg` — the canonical brand vector, and the same artwork the iOS app ships as its AppIcon, so the two apps look like one product. Regenerate them from the repo root:
 
 ```bash
-# Normalize the source: flatten alpha and pull the near-white (254,254,254)
-# field to pure white, so a shrunk tile leaves no faint square on a white canvas.
-magick assets/baybo.png -alpha remove -alpha off -fuzz 3% -fill white -opaque white /tmp/src.png
-magick /tmp/src.png -fuzz 3% -trim +repage /tmp/mark.png
-
 cd app/web/public
-for n in 512 192; do magick /tmp/src.png -resize ${n}x${n} -strip -define png:compression-level=9 pwa-$n.png; done
-magick /tmp/src.png -resize 180x180 -strip -define png:compression-level=9 apple-touch-icon.png
-magick /tmp/src.png -resize 390x390 -background white -gravity center -extent 512x512 -strip -define png:compression-level=9 pwa-maskable-512.png
-
-# favicon.ico — three hand-tuned sizes, see below
-magick /tmp/mark.png -morphology Erode Disk:20 -resize 15x15 -background white -gravity center -extent 16x16 -strip /tmp/ico-16.png
-magick /tmp/mark.png -morphology Erode Disk:10 -resize 30x30 -background white -gravity center -extent 32x32 -strip /tmp/ico-32.png
-magick /tmp/mark.png -morphology Erode Disk:6  -resize 44x44 -background white -gravity center -extent 48x48 -strip /tmp/ico-48.png
-magick /tmp/ico-48.png /tmp/ico-32.png /tmp/ico-16.png favicon.ico
-
-# Grayscale palette: the mark is black on white and everything between is
-# antialiasing. Cuts the four PNGs 107 KB → 35 KB (they ride into the gateway
-# binary) at an RMSE of ~0.3%.
-for f in pwa-512 pwa-192 pwa-maskable-512 apple-touch-icon; do
-  magick $f.png -colorspace Gray -colors 64 -strip \
-    -define png:compression-level=9 -define png:compression-filter=5 $f.png
+for n in 512 192; do
+  magick ../../../assets/baybo.svg -resize ${n}x${n} -alpha remove -alpha off \
+    -strip -define png:compression-level=9 pwa-$n.png
 done
+magick ../../../assets/baybo.svg -resize 180x180 -alpha remove -alpha off \
+  -strip -define png:compression-level=9 apple-touch-icon.png
+magick ../../../assets/baybo.svg -resize 390x390 -background '#24A7E5' \
+  -gravity center -extent 512x512 -alpha remove -alpha off -strip \
+  -define png:compression-level=9 pwa-maskable-512.png
+
+for n in 16 32 48; do
+  magick ../../../assets/baybo.svg -resize ${n}x${n} -alpha remove -alpha off \
+    -strip /tmp/baybo-favicon-$n.png
+done
+magick /tmp/baybo-favicon-48.png /tmp/baybo-favicon-32.png \
+  /tmp/baybo-favicon-16.png favicon.ico
 ```
 
-Three of those numbers are not arbitrary:
+One of those numbers is not arbitrary:
 
-- **`-resize 390x390` for the maskable.** The platform crops a maskable icon to a circle/squircle and only the centred 80% circle is guaranteed to survive, so the mark's *diagonal* is the binding constraint — not its width. At 390 the mark measures 312×258, a half-diagonal of 202 against the 204.8 the safe circle allows. A straight 512 resize would put it at 266 and lose the antenna tips.
-- **`Erode Disk:N` before each favicon size.** The mark is line art whose strokes are ~14 px in a 1007 px source — under one pixel at 16, which downsamples to pale grey mush. Eroding thickens black against white by roughly the amount each size loses. The radii are eyeballed per size (20/10/6) because the right amount is a legibility judgement, not a ratio.
-- **Everything is opaque white.** iOS composites `apple-touch-icon` onto nothing and a transparent one comes out black; a transparent "any" icon disappears against a dark task switcher. `background_color` in the manifest is `#ffffff` to match — the splash screen draws the icon on it, and the app's cream canvas would frame it in a visible white square.
+- **`-resize 390x390` for the maskable.** The platform crops a maskable icon to a circle/squircle and only the centred 80% circle is guaranteed to survive, so the robot is inset on a field matching its blue background. The ordinary and Apple Touch icons remain full-bleed. Every output is opaque: iOS composites `apple-touch-icon` onto nothing, and a transparent "any" icon can disappear against a dark task switcher. `background_color` in the manifest stays white so the blue tile remains distinct on the splash screen.
 
 **The service worker** is hand-rolled: `app/web/pwa/service-worker.js` (the source, with two placeholders) plus `app/web/pwa/plugin.ts` (a ~120-line Vite plugin that fills them in). `vite-plugin-pwa` was tried and reverted — it pulls workbox and, transitively, 249 packages into a workspace whose whole point is a dependency-light dashboard. Doing it here also lets the precache list be chosen against this gateway's real asset semantics instead of a glob.
 
